@@ -1,0 +1,234 @@
+import React from "react";
+import { createPortal } from "react-dom";
+import { motion, AnimatePresence } from "framer-motion";
+import { ArrowLeft } from "lucide-react";
+import { Button } from "@/components/ui/button";
+import {
+  isWindows,
+  isLinux,
+  DRAG_REGION_ATTR,
+  DRAG_REGION_STYLE,
+} from "@/lib/platform";
+import { isTextEditableTarget } from "@/utils/domUtils";
+import { cn } from "@/lib/utils";
+import {
+  OverlayLayerContext,
+  useOverlayLayerContext,
+} from "@/components/ui/layer-context";
+
+interface FullScreenPanelProps {
+  isOpen: boolean;
+  title: string;
+  onClose: () => void;
+  children: React.ReactNode;
+  footer?: React.ReactNode;
+  /**
+   * 面板所在 portal 的层级。向导内部再打开全屏面板时需要高于向导遮罩。
+   */
+  zIndexClassName?: string;
+  /**
+   * 子树再次打开全屏面板时的层级。未传时根据当前面板层级给出保守的下一层。
+   */
+  childPanelZIndexClassName?: string;
+  /**
+   * 覆盖内容区滚动容器的内边距/间距类。默认 `px-6 py-6 space-y-6`。
+   * 通过 `cn`(twMerge) 合并，传入如 `pt-3` 只覆盖顶部内边距，其余保持默认。
+   */
+  contentClassName?: string;
+}
+
+const DRAG_BAR_HEIGHT = isWindows() || isLinux() ? 0 : 28; // px - match App.tsx
+const HEADER_HEIGHT = 64; // px - match App.tsx
+const DEFAULT_PANEL_Z_INDEX_CLASS = "z-[60]";
+const DEFAULT_CHILD_PANEL_Z_INDEX_CLASS = "z-[80]";
+const ELEVATED_CHILD_PANEL_Z_INDEX_CLASS = "z-[160]";
+let bodyOverflowLockCount = 0;
+let bodyOverflowBeforePanelOpen = "";
+
+/**
+ * 根据父面板层级推导下一层全屏面板层级。
+ * 目前 MultiRouter 向导会把新增 provider 面板提升到 z-[140]，子面板必须继续高于它。
+ */
+function resolveChildPanelZIndexClassName(panelZIndexClassName: string) {
+  return panelZIndexClassName === "z-[140]"
+    ? ELEVATED_CHILD_PANEL_Z_INDEX_CLASS
+    : DEFAULT_CHILD_PANEL_Z_INDEX_CLASS;
+}
+
+/**
+ * 用引用计数锁住 body 滚动。
+ * 多个 FullScreenPanel 嵌套时，子面板关闭不能提前解除父面板的滚动锁。
+ */
+function lockBodyOverflow() {
+  if (bodyOverflowLockCount === 0) {
+    bodyOverflowBeforePanelOpen = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+  }
+  bodyOverflowLockCount += 1;
+
+  return () => {
+    bodyOverflowLockCount = Math.max(0, bodyOverflowLockCount - 1);
+    if (bodyOverflowLockCount === 0) {
+      document.body.style.overflow = bodyOverflowBeforePanelOpen;
+      bodyOverflowBeforePanelOpen = "";
+    }
+  };
+}
+
+/**
+ * 复用的全屏面板组件。
+ * 负责 portal 渲染、标题栏、底部按钮、ESC 关闭和子弹层默认层级。
+ */
+export const FullScreenPanel: React.FC<FullScreenPanelProps> = ({
+  isOpen,
+  title,
+  onClose,
+  children,
+  footer,
+  zIndexClassName,
+  childPanelZIndexClassName,
+  contentClassName,
+}) => {
+  const parentLayer = useOverlayLayerContext();
+  const effectiveZIndexClassName =
+    zIndexClassName ??
+    parentLayer.childPanelZIndexClassName ??
+    DEFAULT_PANEL_Z_INDEX_CLASS;
+  const nextChildPanelZIndexClassName =
+    childPanelZIndexClassName ??
+    resolveChildPanelZIndexClassName(effectiveZIndexClassName);
+  const childLayer = React.useMemo(
+    () => ({
+      dialogLayer: "top" as const,
+      childPanelZIndexClassName: nextChildPanelZIndexClassName,
+    }),
+    [nextChildPanelZIndexClassName],
+  );
+
+  React.useEffect(() => {
+    if (!isOpen) return;
+    return lockBodyOverflow();
+  }, [isOpen]);
+
+  // ESC 键关闭面板
+  const onCloseRef = React.useRef(onClose);
+
+  React.useEffect(() => {
+    onCloseRef.current = onClose;
+  }, [onClose]);
+
+  React.useEffect(() => {
+    if (!isOpen) return;
+
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        // 子组件（例如 Radix 的 Select/Dialog/Dropdown）如果已经消费了 ESC，就不要再关闭整个面板
+        if (event.defaultPrevented) {
+          return;
+        }
+
+        if (isTextEditableTarget(event.target)) {
+          return; // 让输入框自己处理 ESC（比如清空、失焦等）
+        }
+
+        event.stopPropagation(); // 阻止事件继续冒泡到 window，避免触发 App.tsx 的全局监听
+        onCloseRef.current();
+      }
+    };
+
+    // 使用冒泡阶段监听，让子组件（如 Radix UI）优先处理 ESC
+    window.addEventListener("keydown", handleKeyDown, false);
+    return () => {
+      window.removeEventListener("keydown", handleKeyDown, false);
+    };
+  }, [isOpen]);
+
+  return createPortal(
+    <AnimatePresence>
+      {isOpen && (
+        <motion.div
+          initial={{ opacity: 0 }}
+          animate={{ opacity: 1 }}
+          exit={{ opacity: 0 }}
+          transition={{ duration: 0.2 }}
+          className={cn(
+            "fixed inset-0 flex flex-col",
+            effectiveZIndexClassName,
+          )}
+          style={{ backgroundColor: "hsl(var(--background))" }}
+        >
+          <OverlayLayerContext.Provider value={childLayer}>
+            {/* Drag region - match App.tsx. Linux 上 DRAG_BAR_HEIGHT=0，
+                直接跳过整个元素；macOS 保留 28px 拖拽占位。 */}
+            {DRAG_BAR_HEIGHT > 0 && (
+              <div
+                data-tauri-drag-region
+                style={
+                  {
+                    WebkitAppRegion: "drag",
+                    height: DRAG_BAR_HEIGHT,
+                  } as React.CSSProperties
+                }
+              />
+            )}
+
+            {/* Header - match App.tsx */}
+            <div
+              className="flex-shrink-0 flex items-center"
+              {...DRAG_REGION_ATTR}
+              style={
+                {
+                  ...DRAG_REGION_STYLE,
+                  backgroundColor: "hsl(var(--background))",
+                  height: HEADER_HEIGHT,
+                } as React.CSSProperties
+              }
+            >
+              <div
+                className="px-6 w-full flex items-center gap-4"
+                {...DRAG_REGION_ATTR}
+                style={{ ...DRAG_REGION_STYLE } as React.CSSProperties}
+              >
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="icon"
+                  onClick={onClose}
+                  className="rounded-lg select-none"
+                  style={{ WebkitAppRegion: "no-drag" } as React.CSSProperties}
+                >
+                  <ArrowLeft className="h-4 w-4" />
+                </Button>
+                <h2 className="text-lg font-semibold text-foreground select-none">
+                  {title}
+                </h2>
+              </div>
+            </div>
+
+            {/* Content */}
+            <div className="flex-1 overflow-y-auto scroll-overlay">
+              <div
+                className={cn("px-6 py-6 space-y-6 w-full", contentClassName)}
+              >
+                {children}
+              </div>
+            </div>
+
+            {/* Footer */}
+            {footer && (
+              <div
+                className="flex-shrink-0 py-4 border-t border-border-default"
+                style={{ backgroundColor: "hsl(var(--background))" }}
+              >
+                <div className="px-6 flex items-center justify-end gap-3">
+                  {footer}
+                </div>
+              </div>
+            )}
+          </OverlayLayerContext.Provider>
+        </motion.div>
+      )}
+    </AnimatePresence>,
+    document.body,
+  );
+};

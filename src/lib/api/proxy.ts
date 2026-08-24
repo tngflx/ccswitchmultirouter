@@ -1,0 +1,208 @@
+﻿import { invoke } from "@tauri-apps/api/core";
+import type {
+  ProxyStatus,
+  ProxyConfig,
+  ProxyServerInfo,
+  ProxyTakeoverStatus,
+  GlobalProxyConfig,
+  AppProxyConfig,
+  ExternalOpenAIAPIProfile,
+  ExternalOpenAIAPIProfileUpdate,
+  ExternalOpenAIAPIRuntimeStatus,
+  GeneratedExternalOpenAIAPIKey,
+  CodexMultiRouterDiagnostics,
+  CodexModelPickerUnlockResult,
+  CodexHistoryProviderBucketSyncOutcome,
+  CodexHistorySessionDetailOptions,
+  CodexHistorySessionDetailOutcome,
+  CodexHistorySessionListOptions,
+  CodexHistorySessionListOutcome,
+  CodexHistoryVisibilityRepairOptions,
+  CodexHistoryVisibilityRepairOutcome,
+  CodexGuardianStatus,
+} from "@/types/proxy";
+
+export const proxyApi = {
+  // ========== 代理服务器控制 API ==========
+
+  // 启动代理服务器
+  async startProxyServer(): Promise<ProxyServerInfo> {
+    return invoke("start_proxy_server");
+  },
+
+  // 停止代理服务器（不恢复已接管配置）
+  async stopProxyServer(): Promise<void> {
+    return invoke("stop_proxy_server");
+  },
+
+  // 停止代理服务器并恢复配置
+  async stopProxyWithRestore(): Promise<void> {
+    return invoke("stop_proxy_with_restore");
+  },
+
+  // 获取代理服务器状态
+  async getProxyStatus(): Promise<ProxyStatus> {
+    return invoke("get_proxy_status");
+  },
+
+  async diagnoseCodexMultiRouter(
+    providerId?: string | null,
+  ): Promise<CodexMultiRouterDiagnostics> {
+    return invoke("diagnose_codex_multirouter", { providerId });
+  },
+
+  // 解锁 Codex Desktop 模型菜单；CLI/app-server 支持由 live config/catalog/proxy 链路负责。
+
+  async getCodexGuardianStatus(): Promise<CodexGuardianStatus> {
+    return invoke("get_codex_guardian_status");
+  },
+  async unlockCodexModelPicker(): Promise<CodexModelPickerUnlockResult> {
+    return invoke("unlock_codex_model_picker");
+  },
+
+  async syncCodexHistoryToMultiRouter(): Promise<CodexHistoryProviderBucketSyncOutcome> {
+    return invoke("sync_codex_history_to_multirouter");
+  },
+
+  async repairCodexHistoryVisibility(
+    options: CodexHistoryVisibilityRepairOptions,
+  ): Promise<CodexHistoryVisibilityRepairOutcome> {
+    return invoke("repair_codex_history_visibility", { options });
+  },
+
+  async listCodexHistorySessions(
+    options: CodexHistorySessionListOptions,
+  ): Promise<CodexHistorySessionListOutcome> {
+    return invoke("list_codex_history_sessions", { options });
+  },
+
+  async readCodexHistorySession(
+    options: CodexHistorySessionDetailOptions,
+  ): Promise<CodexHistorySessionDetailOutcome> {
+    return invoke("read_codex_history_session", { options });
+  },
+
+  async startExternalOpenAIAPIServer(): Promise<ProxyServerInfo> {
+    return invoke("start_external_openai_api_server");
+  },
+
+  async getExternalOpenAIAPIServerStatus(): Promise<ProxyStatus> {
+    return invoke("get_external_openai_api_server_status");
+  },
+
+  // 检查代理服务器是否正在运行
+  async isProxyRunning(): Promise<boolean> {
+    return invoke("is_proxy_running");
+  },
+
+  // 检查是否处于接管模式
+  async isLiveTakeoverActive(): Promise<boolean> {
+    return invoke("is_live_takeover_active");
+  },
+
+  // 代理模式下切换供应商
+  async switchProxyProvider(
+    appType: string,
+    providerId: string,
+  ): Promise<void> {
+    return invoke("switch_proxy_provider", { appType, providerId });
+  },
+  // ========== 接管状态 API ==========
+
+  // 获取各应用接管状态
+  async getProxyTakeoverStatus(): Promise<ProxyTakeoverStatus> {
+    return invoke("get_proxy_takeover_status");
+  },
+
+  // 为指定应用开启/关闭接管
+  async setProxyTakeoverForApp(
+    appType: string,
+    enabled: boolean,
+  ): Promise<void> {
+    return invoke("set_proxy_takeover_for_app", { appType, enabled });
+  },
+
+  // ========== Legacy 代理配置 API (兼容) ==========
+
+  // 获取代理配置（旧版 v2 兼容接口）
+  async getProxyConfig(): Promise<ProxyConfig> {
+    return invoke("get_proxy_config");
+  },
+
+  // 更新代理配置（旧版 v2 兼容接口）
+  async updateProxyConfig(config: ProxyConfig): Promise<void> {
+    return invoke("update_proxy_config", { config });
+  },
+
+  // ========== External OpenAI-compatible API Profile ==========
+
+  async getExternalOpenAIAPIProfile(): Promise<ExternalOpenAIAPIProfile> {
+    return invoke("get_external_openai_api_profile");
+  },
+
+  async getExternalOpenAIAPIRuntimeStatus(): Promise<ExternalOpenAIAPIRuntimeStatus> {
+    return invoke("get_external_openai_api_runtime_status");
+  },
+
+  async updateExternalOpenAIAPIProfile(
+    profile: ExternalOpenAIAPIProfileUpdate,
+  ): Promise<ExternalOpenAIAPIProfile> {
+    return invoke("update_external_openai_api_profile", { profile });
+  },
+
+  async regenerateExternalOpenAIAPIKey(): Promise<GeneratedExternalOpenAIAPIKey> {
+    return invoke("regenerate_external_openai_api_key");
+  },
+
+  async deleteExternalOpenAIAPIKey(
+    keyId: string,
+  ): Promise<ExternalOpenAIAPIProfile> {
+    return invoke("delete_external_openai_api_key", { keyId });
+  },
+  // ========== v3+ 全局/应用级配置 API ==========
+
+  // 获取全局代理配置
+  async getGlobalProxyConfig(): Promise<GlobalProxyConfig> {
+    return invoke("get_global_proxy_config");
+  },
+
+  // 更新全局代理配置
+  async updateGlobalProxyConfig(config: GlobalProxyConfig): Promise<void> {
+    return invoke("update_global_proxy_config", { config });
+  },
+
+  // 获取指定应用的代理配置
+  async getProxyConfigForApp(appType: string): Promise<AppProxyConfig> {
+    return invoke("get_proxy_config_for_app", { appType });
+  },
+
+  // 更新指定应用的代理配置
+  async updateProxyConfigForApp(config: AppProxyConfig): Promise<void> {
+    return invoke("update_proxy_config_for_app", { config });
+  },
+
+  // ========== 计费默认配置 API ==========
+
+  // 获取默认成本倍率
+  async getDefaultCostMultiplier(appType: string): Promise<string> {
+    return invoke("get_default_cost_multiplier", { appType });
+  },
+
+  // 设置默认成本倍率
+  async setDefaultCostMultiplier(
+    appType: string,
+    value: string,
+  ): Promise<void> {
+    return invoke("set_default_cost_multiplier", { appType, value });
+  },
+
+  // 获取计费模式来源
+  async getPricingModelSource(appType: string): Promise<string> {
+    return invoke("get_pricing_model_source", { appType });
+  },
+
+  // 设置计费模式来源
+  async setPricingModelSource(appType: string, value: string): Promise<void> {
+    return invoke("set_pricing_model_source", { appType, value });
+  },
+};

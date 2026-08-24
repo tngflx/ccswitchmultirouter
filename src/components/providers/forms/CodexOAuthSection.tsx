@@ -1,0 +1,746 @@
+import React from "react";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useTranslation } from "react-i18next";
+import { Button } from "@/components/ui/button";
+import { Badge } from "@/components/ui/badge";
+import { Label } from "@/components/ui/label";
+import { Switch } from "@/components/ui/switch";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
+import {
+  Loader2,
+  LogOut,
+  Copy,
+  Check,
+  ExternalLink,
+  Plus,
+  X,
+  Sparkles,
+  User,
+  Monitor,
+  ArrowUp,
+  ArrowDown,
+} from "lucide-react";
+import { useCodexOauth } from "./hooks/useCodexOauth";
+import { copyText } from "@/lib/clipboard";
+import CodexOauthAccountQuota from "@/components/CodexOauthAccountQuota";
+import {
+  authApi,
+  type CodexAccountPoolPolicy,
+  type CodexAuthFacadeReprojectionOutcome,
+} from "@/lib/api/auth";
+import {
+  OAuthDeleteConfirmDialog,
+  type OAuthDeleteTarget,
+} from "./OAuthDeleteConfirmDialog";
+
+const NATIVE_CODEX_ACCOUNT_ID = "native_codex_auth";
+
+type UiTranslator = (
+  key: string,
+  options: { defaultValue: string; [key: string]: unknown },
+) => string;
+
+export function codexAccountPoolFacadeLabel(
+  policy: CodexAccountPoolPolicy,
+  translate?: UiTranslator,
+): string {
+  const canUseDesktop =
+    policy.enabled &&
+    policy.entries.some(
+      (entry) => entry.accountId === NATIVE_CODEX_ACCOUNT_ID && entry.enabled,
+    );
+  return canUseDesktop
+    ? (translate?.("codexOauth.facadeNativeMixed", {
+        defaultValue: "Desktop / 混合认证",
+      }) ?? "Desktop / 混合认证")
+    : (translate?.("codexOauth.facadeManaged", {
+        defaultValue: "CCSM 托管认证",
+      }) ?? "CCSM 托管认证");
+}
+
+export function codexPoolFacadeRestartMessage(
+  outcome: CodexAuthFacadeReprojectionOutcome,
+  translate?: UiTranslator,
+): string | null {
+  if (!outcome.codexRestartRequired) return null;
+  const facade =
+    outcome.facade === "native_mixed"
+      ? (translate?.("codexOauth.facadeNativeMixed", {
+          defaultValue: "Desktop / 混合认证",
+        }) ?? "Desktop / 混合认证")
+      : (translate?.("codexOauth.facadeManaged", {
+          defaultValue: "CCSM 托管认证",
+        }) ?? "CCSM 托管认证");
+  return (
+    translate?.("codexOauth.facadeRestartNotice", {
+      facade,
+      defaultValue:
+        "当前 MultiRouter 已切换为{{facade}}。请完全退出并重启 Codex；已有任务不会热加载新的认证门面。",
+    }) ??
+    `当前 MultiRouter 已切换为${facade}。请完全退出并重启 Codex；已有任务不会热加载新的认证门面。`
+  );
+}
+
+interface CodexOAuthSectionProps {
+  className?: string;
+  /** 是否展示每个账号的订阅额度 */
+  showAccountQuota?: boolean;
+  /** 当前选中的 ChatGPT 账号 ID */
+  selectedAccountId?: string | null;
+  /** 账号选择回调 */
+  onAccountSelect?: (accountId: string | null) => void;
+  /** 是否开启 Codex FAST mode */
+  fastModeEnabled?: boolean;
+  /** FAST mode 切换回调 */
+  onFastModeChange?: (enabled: boolean) => void;
+}
+
+/**
+ * Codex OAuth 认证区块
+ *
+ * 通过 OpenAI Device Code 流程登录 ChatGPT Plus/Pro 账号，
+ * 用于将 Claude Code 请求反代到 Codex 后端 API。
+ */
+export const CodexOAuthSection: React.FC<CodexOAuthSectionProps> = ({
+  className,
+  showAccountQuota = false,
+  selectedAccountId,
+  onAccountSelect,
+  fastModeEnabled = false,
+  onFastModeChange,
+}) => {
+  const { t } = useTranslation();
+  const [copied, setCopied] = React.useState(false);
+  const [poolFacadeNotice, setPoolFacadeNotice] = React.useState<string | null>(
+    null,
+  );
+  const [poolDraft, setPoolDraft] =
+    React.useState<CodexAccountPoolPolicy | null>(null);
+  const [deleteTarget, setDeleteTarget] =
+    React.useState<OAuthDeleteTarget | null>(null);
+  const queryClient = useQueryClient();
+  const poolQueryKey = ["codex-account-pool-policy"];
+
+  const {
+    accounts,
+    defaultAccountId,
+    hasAnyAccount,
+    pollingState,
+    deviceCode,
+    error,
+    authError,
+    isPolling,
+    isAddingAccount,
+    isRemovingAccount,
+    isSettingDefaultAccount,
+    addAccount,
+    removeAccount,
+    setDefaultAccount,
+    cancelAuth,
+    logout,
+  } = useCodexOauth();
+
+  const { data: poolPolicy } = useQuery({
+    queryKey: poolQueryKey,
+    queryFn: authApi.getCodexAccountPoolPolicy,
+  });
+  const { data: poolQuota = [], isFetching: isRefreshingPoolQuota } = useQuery({
+    queryKey: ["codex-account-pool-quota"],
+    queryFn: authApi.refreshCodexAccountPoolQuota,
+    enabled: poolPolicy?.enabled === true,
+    refetchInterval: 5 * 60 * 1000,
+    staleTime: 60 * 1000,
+  });
+  const poolMutation = useMutation({
+    mutationFn: authApi.setCodexAccountPoolPolicy,
+    onMutate: async (policy) => {
+      await queryClient.cancelQueries({ queryKey: poolQueryKey });
+      queryClient.setQueryData(poolQueryKey, policy);
+    },
+    onSuccess: (outcome) => {
+      setPoolFacadeNotice(codexPoolFacadeRestartMessage(outcome, t));
+    },
+    onSettled: () => queryClient.invalidateQueries({ queryKey: poolQueryKey }),
+  });
+
+  React.useEffect(() => {
+    if (poolPolicy && !poolMutation.isPending) {
+      setPoolDraft({
+        ...poolPolicy,
+        entries: poolPolicy.entries.map((entry) => ({ ...entry })),
+      });
+    }
+  }, [poolPolicy, poolMutation.isPending]);
+
+  const poolDraftDirty =
+    poolPolicy !== undefined &&
+    poolDraft !== null &&
+    JSON.stringify(poolPolicy) !== JSON.stringify(poolDraft);
+
+  const updatePool = (
+    transform: (policy: CodexAccountPoolPolicy) => CodexAccountPoolPolicy,
+  ) => {
+    if (!poolMutation.isPending) {
+      setPoolDraft((current) => (current ? transform(current) : current));
+    }
+  };
+
+  const movePoolEntry = (index: number, delta: number) => {
+    updatePool((policy) => {
+      const target = index + delta;
+      if (target < 0 || target >= policy.entries.length) return policy;
+      const entries = [...policy.entries];
+      [entries[index], entries[target]] = [entries[target], entries[index]];
+      return { ...policy, entries };
+    });
+  };
+
+  const copyUserCode = async () => {
+    if (deviceCode?.user_code) {
+      await copyText(deviceCode.user_code);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    }
+  };
+
+  const handleAccountSelect = (value: string) => {
+    onAccountSelect?.(value === "none" ? null : value);
+  };
+
+  const handleRemoveAccount = (accountId: string, e: React.MouseEvent) => {
+    e.stopPropagation();
+    e.preventDefault();
+    const account = accounts.find((item) => item.id === accountId);
+    setDeleteTarget({
+      kind: "account",
+      accountId,
+      label: account?.login ?? accountId,
+    });
+  };
+
+  const confirmDelete = () => {
+    if (deleteTarget?.kind === "account") {
+      removeAccount(deleteTarget.accountId);
+      if (selectedAccountId === deleteTarget.accountId) onAccountSelect?.(null);
+    } else if (deleteTarget?.kind === "all") {
+      logout();
+      onAccountSelect?.(null);
+    }
+    setDeleteTarget(null);
+  };
+
+  return (
+    <div className={`space-y-4 ${className || ""}`}>
+      {/* 认证状态标题 */}
+      <div className="flex items-center justify-between">
+        <Label>{t("codexOauth.authStatus", "认证状态")}</Label>
+        <Badge
+          variant={hasAnyAccount ? "default" : "secondary"}
+          className={hasAnyAccount ? "bg-green-500 hover:bg-green-600" : ""}
+        >
+          {hasAnyAccount
+            ? t("codexOauth.accountCount", {
+                count: accounts.length,
+                defaultValue: `${accounts.length} 个账号`,
+              })
+            : t("codexOauth.notAuthenticated", "未认证")}
+        </Badge>
+      </div>
+
+      {authError && (
+        <div className="rounded-md border border-amber-300 bg-amber-50 p-3 text-sm text-amber-900 dark:border-amber-800 dark:bg-amber-950/30 dark:text-amber-200">
+          {authError === "refresh_token_invalid"
+            ? t(
+                "codexOauth.refreshTokenInvalid",
+                "ChatGPT 登录凭据已失效，但账号记录已保留。请重新登录以恢复认证。",
+              )
+            : authError}
+        </div>
+      )}
+
+      {poolDraft && (
+        <div className="space-y-3 border-t pt-4">
+          <div className="flex items-center justify-between gap-4">
+            <div>
+              <Label>
+                {t("codexOauth.poolAutoSwitch", "ChatGPT 账号自动切换")}
+              </Label>
+              <p className="mt-1 text-xs text-muted-foreground">
+                {t(
+                  "codexOauth.poolDescription",
+                  "按列表顺序选择账号；达到保留额度后停止分配新任务。",
+                )}
+              </p>
+            </div>
+            <Switch
+              checked={poolDraft.enabled}
+              disabled={poolMutation.isPending}
+              onCheckedChange={(enabled) =>
+                updatePool((policy) => ({ ...policy, enabled }))
+              }
+              aria-label={t(
+                "codexOauth.poolAutoSwitch",
+                "ChatGPT 账号自动切换",
+              )}
+            />
+          </div>
+          <div className="space-y-1">
+            {poolDraft.entries.map((entry, index) => {
+              const account = accounts.find(
+                (item) => item.id === entry.accountId,
+              );
+              const native = entry.accountId === NATIVE_CODEX_ACCOUNT_ID;
+              const desktopAccount = poolDraft?.desktopAccountId
+                ? accounts.find(
+                    (item) => item.id === poolDraft.desktopAccountId,
+                  )
+                : undefined;
+              const quota = poolQuota.find(
+                (item) => item.accountId === entry.accountId,
+              );
+              const accountLabel = native
+                ? desktopAccount
+                  ? t("codexOauth.desktopAccountWithLogin", {
+                      login: desktopAccount.login,
+                      defaultValue: "{{login}}（Codex Desktop 当前登录）",
+                    })
+                  : t(
+                      "codexOauth.desktopCurrentAccount",
+                      "Codex Desktop 当前登录账号",
+                    )
+                : (account?.login ?? entry.accountId);
+              return (
+                <div
+                  key={entry.accountId}
+                  className="flex items-center gap-2 border-b py-2 last:border-b-0"
+                >
+                  <span className="w-7 text-center text-xs font-medium text-muted-foreground">
+                    P{index + 1}
+                  </span>
+                  {native ? (
+                    <Monitor className="h-4 w-4" />
+                  ) : (
+                    <User className="h-4 w-4" />
+                  )}
+                  <div className="min-w-0 flex-1">
+                    <div className="truncate text-sm font-medium">
+                      {accountLabel}
+                    </div>
+                    <div className="text-xs text-muted-foreground">
+                      {native && entry.enabled && desktopAccount && (
+                        <span className="mr-2">
+                          {t("codexOauth.desktopAccountSameAsManaged", {
+                            email: desktopAccount.login,
+                            defaultValue: "与已登录账号 {{email}} 相同，已合并",
+                          })}
+                        </span>
+                      )}
+                      {quota?.remainingPercent != null
+                        ? t("codexOauth.poolRemaining", {
+                            remaining: quota.remainingPercent.toFixed(1),
+                            reserve: entry.reservePercent,
+                            defaultValue:
+                              "剩余 {{remaining}}%，低于 {{reserve}}% 时保留",
+                          })
+                        : t("codexOauth.poolRemainingUnknown", {
+                            reserve: entry.reservePercent,
+                            defaultValue: "剩余低于 {{reserve}}% 时保留",
+                          })}
+                    </div>
+                  </div>
+                  <input
+                    type="number"
+                    min={0}
+                    max={100}
+                    step={1}
+                    value={entry.reservePercent}
+                    disabled={poolMutation.isPending}
+                    onChange={(event) => {
+                      const reservePercent = Math.min(
+                        100,
+                        Math.max(0, Number(event.target.value) || 0),
+                      );
+                      updatePool((policy) => ({
+                        ...policy,
+                        entries: policy.entries.map((item) =>
+                          item.accountId === entry.accountId
+                            ? { ...item, reservePercent }
+                            : item,
+                        ),
+                      }));
+                    }}
+                    className="h-8 w-16 rounded-md border bg-background px-2 text-right text-sm"
+                    aria-label={t("codexOauth.poolReserveAria", {
+                      account: accountLabel,
+                      defaultValue: "{{account}} 保留额度",
+                    })}
+                  />
+                  <span className="text-xs text-muted-foreground">%</span>
+                  <Switch
+                    checked={entry.enabled}
+                    disabled={poolMutation.isPending}
+                    onCheckedChange={(enabled) =>
+                      updatePool((policy) => ({
+                        ...policy,
+                        entries: policy.entries.map((item) =>
+                          item.accountId === entry.accountId
+                            ? { ...item, enabled }
+                            : item,
+                        ),
+                      }))
+                    }
+                    aria-label={t("codexOauth.poolEnableAria", {
+                      account: accountLabel,
+                      defaultValue: "启用 {{account}}",
+                    })}
+                  />
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="icon"
+                    className="h-7 w-7"
+                    disabled={poolMutation.isPending || index === 0}
+                    onClick={() => movePoolEntry(index, -1)}
+                    title={t("codexOauth.poolMoveUp", "上移")}
+                  >
+                    <ArrowUp className="h-4 w-4" />
+                  </Button>
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="icon"
+                    className="h-7 w-7"
+                    disabled={
+                      poolMutation.isPending ||
+                      index === poolDraft.entries.length - 1
+                    }
+                    onClick={() => movePoolEntry(index, 1)}
+                    title={t("codexOauth.poolMoveDown", "下移")}
+                  >
+                    <ArrowDown className="h-4 w-4" />
+                  </Button>
+                </div>
+              );
+            })}
+          </div>
+          {poolDraft.enabled && (
+            <p className="text-xs text-muted-foreground">
+              {isRefreshingPoolQuota
+                ? t("codexOauth.poolRefreshing", "正在刷新账号额度…")
+                : t(
+                    "codexOauth.poolRefreshHint",
+                    "额度每 5 分钟刷新；查询失败时保留上次可信状态。",
+                  )}
+            </p>
+          )}
+          <div className="rounded-md border bg-muted/30 px-3 py-2 text-xs leading-5 text-muted-foreground">
+            {t("codexOauth.poolFacadePreview", "账号池门面预览：")}
+            <span className="font-medium text-foreground">
+              {codexAccountPoolFacadeLabel(poolDraft, t)}
+            </span>
+            {t(
+              "codexOauth.poolScope",
+              "。仅影响明确选择“OAuth 账号池”的 MultiRouter。",
+            )}
+          </div>
+          {poolFacadeNotice && (
+            <div className="rounded-md border border-amber-300 bg-amber-50 p-3 text-xs leading-5 text-amber-900 dark:border-amber-700/60 dark:bg-amber-950/30 dark:text-amber-100">
+              {poolFacadeNotice}
+            </div>
+          )}
+          {poolMutation.isError && (
+            <p className="text-xs text-red-500">
+              {t("codexOauth.poolSaveFailed", {
+                error: String(poolMutation.error),
+                defaultValue: "账号切换策略保存失败：{{error}}",
+              })}
+            </p>
+          )}
+          <div className="flex justify-end gap-2">
+            <Button
+              type="button"
+              variant="outline"
+              disabled={!poolDraftDirty || poolMutation.isPending}
+              onClick={() => {
+                if (poolPolicy) {
+                  setPoolDraft({
+                    ...poolPolicy,
+                    entries: poolPolicy.entries.map((entry) => ({ ...entry })),
+                  });
+                }
+              }}
+            >
+              {t("codexOauth.poolDiscard", "放弃更改")}
+            </Button>
+            <Button
+              type="button"
+              disabled={!poolDraftDirty || poolMutation.isPending}
+              onClick={() => poolMutation.mutate(poolDraft)}
+            >
+              {poolMutation.isPending && (
+                <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+              )}
+              {t("codexOauth.poolSave", "保存账号池设置")}
+            </Button>
+          </div>
+        </div>
+      )}
+
+      {/* 账号选择器 */}
+      {hasAnyAccount && onAccountSelect && (
+        <div className="space-y-2">
+          <Label className="text-sm text-muted-foreground">
+            {t("codexOauth.selectAccount", "选择账号")}
+          </Label>
+          <Select
+            value={selectedAccountId || "none"}
+            onValueChange={handleAccountSelect}
+          >
+            <SelectTrigger>
+              <SelectValue
+                placeholder={t(
+                  "codexOauth.selectAccountPlaceholder",
+                  "选择一个 ChatGPT 账号",
+                )}
+              />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="none">
+                <span className="text-muted-foreground">
+                  {t("codexOauth.useDefaultAccount", "使用默认账号")}
+                </span>
+              </SelectItem>
+              {accounts.map((account) => (
+                <SelectItem key={account.id} value={account.id}>
+                  <div className="flex items-center gap-2">
+                    <User className="h-4 w-4 text-muted-foreground" />
+                    <span>{account.login}</span>
+                  </div>
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        </div>
+      )}
+
+      {onFastModeChange && (
+        <div className="flex items-center justify-between rounded-md border bg-muted/30 p-3">
+          <div className="space-y-1 pr-4">
+            <Label className="text-sm font-medium">
+              {t("codexOauth.fastMode", "FAST mode")}
+            </Label>
+            <p className="text-xs text-muted-foreground">
+              {t("codexOauth.fastModeDescription", {
+                defaultValue:
+                  'Send service_tier="priority" for lower latency. Turn it off if the ChatGPT Codex backend rejects the parameter.',
+              })}
+            </p>
+          </div>
+          <Switch
+            checked={fastModeEnabled}
+            onCheckedChange={onFastModeChange}
+            aria-label={t("codexOauth.fastMode", "FAST mode")}
+          />
+        </div>
+      )}
+
+      {/* 已登录账号列表 */}
+      {hasAnyAccount && (
+        <div className="space-y-2">
+          <Label className="text-sm text-muted-foreground">
+            {t("codexOauth.loggedInAccounts", "已登录账号")}
+          </Label>
+          <div className="space-y-1">
+            {accounts.map((account) => (
+              <div
+                key={account.id}
+                className="space-y-2 p-2 rounded-md border bg-muted/30"
+              >
+                <div className="flex items-center justify-between">
+                  <div className="flex items-center gap-2">
+                    <User className="h-5 w-5 text-muted-foreground" />
+                    <span className="text-sm font-medium">{account.login}</span>
+                    {defaultAccountId === account.id && (
+                      <Badge variant="secondary" className="text-xs">
+                        {t("codexOauth.defaultAccount", "默认")}
+                      </Badge>
+                    )}
+                    {selectedAccountId === account.id && (
+                      <Badge variant="outline" className="text-xs">
+                        {t("codexOauth.selected", "已选中")}
+                      </Badge>
+                    )}
+                  </div>
+                  <div className="flex items-center gap-1">
+                    {defaultAccountId !== account.id && (
+                      <Button
+                        type="button"
+                        variant="ghost"
+                        size="sm"
+                        className="h-7 px-2 text-xs text-muted-foreground"
+                        onClick={() => setDefaultAccount(account.id)}
+                        disabled={isSettingDefaultAccount}
+                      >
+                        {t("codexOauth.setAsDefault", "设为默认")}
+                      </Button>
+                    )}
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="icon"
+                      className="h-7 w-7 text-muted-foreground hover:text-red-500"
+                      onClick={(e) => handleRemoveAccount(account.id, e)}
+                      disabled={isRemovingAccount}
+                      title={t("codexOauth.removeAccount", "移除账号")}
+                    >
+                      <X className="h-4 w-4" />
+                    </Button>
+                  </div>
+                </div>
+                {showAccountQuota && (
+                  <CodexOauthAccountQuota accountId={account.id} />
+                )}
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* 未认证 - 登录按钮 */}
+      {!hasAnyAccount && pollingState === "idle" && (
+        <Button
+          type="button"
+          onClick={addAccount}
+          className="w-full"
+          variant="outline"
+        >
+          <Sparkles className="mr-2 h-4 w-4" />
+          {t("codexOauth.loginWithChatGPT", "使用 ChatGPT 登录")}
+        </Button>
+      )}
+
+      {/* 已有账号 - 添加更多按钮 */}
+      {hasAnyAccount && pollingState === "idle" && (
+        <Button
+          type="button"
+          onClick={addAccount}
+          className="w-full"
+          variant="outline"
+          disabled={isAddingAccount}
+        >
+          <Plus className="mr-2 h-4 w-4" />
+          {t("codexOauth.addAnotherAccount", "添加其他账号")}
+        </Button>
+      )}
+
+      {/* 轮询中状态 */}
+      {isPolling && deviceCode && (
+        <div className="space-y-3 p-4 rounded-lg border border-border bg-muted/50">
+          <div className="flex items-center justify-center gap-2 text-sm text-muted-foreground">
+            <Loader2 className="h-4 w-4 animate-spin" />
+            {t("codexOauth.waitingForAuth", "等待授权中...")}
+          </div>
+
+          <div className="text-center">
+            <p className="text-xs text-muted-foreground mb-1">
+              {t("codexOauth.enterCode", "在浏览器中输入以下代码：")}
+            </p>
+            <div className="flex items-center justify-center gap-2">
+              <code className="text-2xl font-mono font-bold tracking-wider bg-background px-4 py-2 rounded border">
+                {deviceCode.user_code}
+              </code>
+              <Button
+                type="button"
+                size="icon"
+                variant="ghost"
+                onClick={copyUserCode}
+                title={t("codexOauth.copyCode", "复制代码")}
+              >
+                {copied ? (
+                  <Check className="h-4 w-4 text-green-500" />
+                ) : (
+                  <Copy className="h-4 w-4" />
+                )}
+              </Button>
+            </div>
+          </div>
+
+          <div className="text-center">
+            <a
+              href={deviceCode.verification_uri}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="inline-flex items-center gap-1 text-sm text-blue-500 hover:underline"
+            >
+              {deviceCode.verification_uri}
+              <ExternalLink className="h-3 w-3" />
+            </a>
+          </div>
+
+          <div className="text-center">
+            <Button
+              type="button"
+              variant="ghost"
+              size="sm"
+              onClick={cancelAuth}
+            >
+              {t("common.cancel", "取消")}
+            </Button>
+          </div>
+        </div>
+      )}
+
+      {/* 错误状态 */}
+      {pollingState === "error" && error && (
+        <div className="space-y-2">
+          <p className="text-sm text-red-500">{error}</p>
+          <div className="flex gap-2">
+            <Button
+              type="button"
+              onClick={addAccount}
+              variant="outline"
+              size="sm"
+            >
+              {t("codexOauth.retry", "重试")}
+            </Button>
+            <Button
+              type="button"
+              onClick={cancelAuth}
+              variant="ghost"
+              size="sm"
+            >
+              {t("common.cancel", "取消")}
+            </Button>
+          </div>
+        </div>
+      )}
+
+      {/* 注销所有账号 */}
+      {hasAnyAccount && accounts.length > 1 && (
+        <Button
+          type="button"
+          variant="outline"
+          onClick={() => setDeleteTarget({ kind: "all" })}
+          className="w-full text-red-500 hover:text-red-600 hover:bg-red-50 dark:hover:bg-red-950"
+        >
+          <LogOut className="mr-2 h-4 w-4" />
+          {t("codexOauth.logoutAll", "注销所有账号")}
+        </Button>
+      )}
+      <OAuthDeleteConfirmDialog
+        target={deleteTarget}
+        providerLabel="ChatGPT"
+        onConfirm={confirmDelete}
+        onCancel={() => setDeleteTarget(null)}
+      />
+    </div>
+  );
+};
+
+export default CodexOAuthSection;
