@@ -67,14 +67,14 @@
 |------|---------|
 | `src/main.rs` | Tauri app entry point |
 | `src/lib.rs` | Library root, module declarations |
-| `src/provider.rs` | Provider metadata types (`ProviderMeta`, `ReasoningContentMode`, `CodexApiKeyGroup`) |
+| `src/provider.rs` | Provider metadata types (`ProviderMeta`, `ReasoningContentMode`) |
 | `src/config.rs` | App config, provider settings schema |
 | `src/settings.rs` | User settings (stream retry toggle, language, etc.) |
 | `src/codex_config.rs` | Codex config file parsing/writing |
 | `src/codex_desktop.rs` | CDP integration with Codex desktop app (model picker injection) |
 | `src/codex_multirouter/` | Multi-router compiler, mutation, projection logic |
 | `src/proxy/` | HTTP proxy server (axum) |
-| `src/proxy/codex_traffic_policy.rs` | Codex traffic routing policy (official vs third-party) |
+| `src/proxy/codex_traffic_policy.rs` | Codex admission + rejection retry policy (max in-flight, queue wait, 429/503 replay) |
 | `src/proxy/forwarder.rs` | Request forwarding, retry, streaming |
 | `src/proxy/provider_router.rs` | Provider selection and routing |
 | `src/proxy/providers/` | Per-provider adapters (Claude, Codex, OpenAI-compatible) |
@@ -122,9 +122,107 @@
 
 - `reasoning_content_mode` on `ProviderMeta` — controls reasoning text injection per provider
 - `enable_stream_retry` on settings — toggles stream retry behavior
-- `CodexApiKeyGroup` — grouped API keys for different model tiers (Sublyx)
-- `codex_traffic_policy` — official_first / third_party_first routing
+- `CodexApiKeyGroup` — grouped API keys for different model tiers (Sublyx); backend logic in `proxy/providers/codex.rs`, type in `src/types.ts`
+- `codex_traffic_policy` — admission control + rejection retry policy (backend: `proxy/codex_traffic_policy.rs`; frontend form helper: `codexTrafficPolicy.ts`)
 - `LanguageSwitcher` — i18n language selection component
+
+
+## ARCHITECTURE & CONVENTIONS
+
+### Project Overview
+
+**CCSwitchMulti** is a fork of cc-switch: a cross-platform Tauri 2 desktop app managing
+configurations for AI coding CLIs (Claude Code, Codex, Gemini CLI, OpenCode, OpenClaw).
+Fork-specific additions: **Codex MultiRouter** (multi-provider routing with verified
+protocol profiles), **Sub-Agent V2** profile editor, **deep protocol probe** (backend-driven
+Responses/Chat verification with stage events), **Codex traffic policy** (admission
+control + rejection retry), **Sub-Agent V2 selection policy** (official_first /
+third_party_first), **grouped API keys** (`CodexApiKeyGroup`), per-provider
+**reasoning content mode**, and **full i18n** (en/zh/zh-TW/ja, **English default**).
+
+### Architecture
+
+```text
+Frontend (React 18 + TS + Vite + Tailwind + shadcn/ui)
+  Components → Hooks → TanStack Query v5
+       │  src/lib/api/* (typed invoke wrappers — never call invoke in components)
+       ▼ Tauri IPC (camelCase commands)
+Backend (Rust, Tauri 2.8, rusqlite)
+  src-tauri/src/commands/*   (thin #[tauri::command] layer)
+       ▼
+  src-tauri/src/services/*   (business logic: provider, proxy, skill, presets, sync)
+       ▼
+  src-tauri/src/database/dao/* → Mutex<Connection> (lock_conn!)
+  + codex_multirouter/ (compiler, mutation, projection)
+  + proxy/ (axum forwarder, provider adapters, traffic policy, streaming retry, usage)
+  + protocol_compatibility/ (deep probe runner + selection)
+  + codex_desktop.rs (CDP model-picker injection)
+```
+
+### Core Design Principles
+
+- **SSOT** — SQLite at `~/.cc-switch/cc-switch.db` (schema v18) holds providers, MCP,
+  prompts, skills, settings. Device UI prefs live in `~/.cc-switch/settings.json`.
+- **Live-file sync** — switching writes the active provider into real CLI configs
+  (`~/.codex/config.toml`, `~/.claude/settings.json`, …); editing the active provider
+  backfills from the live file first.
+- **Atomic writes** — temp file + rename, always, via the per-app writer modules.
+- **Concurrency** — `Database` wraps the connection in a `Mutex`; use the `lock_conn!`
+  macro (`database/mod.rs`). Never hold a DB lock across `.await`.
+- **Layered backend** — `commands → services → dao`. Commands stay thin; DAOs own SQL.
+- **Auto backups** — `~/.cc-switch/backups/` keeps rotated DB snapshots.
+
+### Development Workflow
+
+```bash
+pnpm install               # deps
+pnpm dev                   # tauri dev (hot reload)
+pnpm dev:renderer          # Vite only, no Tauri shell
+pnpm build                 # production Tauri bundle
+pnpm build:exe             # renderer build + cargo release with custom-protocol (see rule 18)
+pnpm release:local         # full local release pipeline (artifacts + checksums)
+pnpm typecheck             # tsc --noEmit (strict)
+pnpm format:check          # prettier check
+pnpm test:unit             # vitest run
+cargo test --manifest-path src-tauri/Cargo.toml   # backend + integration tests
+```
+
+Pre-push checklist: `cargo check` + full `cargo test` + `pnpm typecheck` + full
+`pnpm test:unit` (rules 2/9).
+
+### Testing
+
+- **Frontend**: vitest + jsdom + Testing Library. Tauri `invoke` is mocked via
+  `tests/msw/tauriMocks.ts`; network via MSW; state resets in `tests/setupTests.ts`.
+  Use `tests/utils/testQueryClient.ts` (retries/cache disabled) instead of the app client.
+- **Backend**: integration tests in `src-tauri/tests/`; unit tests co-located in modules.
+  The `test-hooks` cargo feature gates test-only instrumentation.
+
+### Conventions
+
+- **IPC**: command names camelCase on the JS side; Rust `#[tauri::command]` fns are
+  snake_case behind the crate boundary. Payloads crossing IPC carry
+  `#[serde(rename_all = "camelCase")]`. Never call `invoke` directly in components —
+  add a typed wrapper in `src/lib/api/<domain>.ts` and re-export from `index.ts`.
+- **Frontend**: `@/` alias → `src/`. Prefer TanStack Query hooks from `src/lib/query/`.
+  Forms: react-hook-form + zod schemas in `src/lib/schemas/`. UI: shadcn primitives in
+  `src/components/ui/`, icons from lucide-react, `cn()` from `@/lib/utils`.
+- **Backend**: return `Result<T, AppError>`; no `unwrap()` outside tests; live-file IO
+  only through the per-app writer modules; use `database::to_json_string` for DB JSON.
+- **i18n**: FOUR locales — `en.json` (source of truth for keys, default language),
+  `zh.json`, `zh-TW.json`, `ja.json`. Never hardcode user-visible strings; when adding,
+  renaming, or removing a key, update **all four** files in the same commit.
+- **New Tauri command checklist**: service logic → thin command in `commands/<domain>.rs`
+  → register in `generate_handler!` (`lib.rs`) → typed wrapper in `lib/api/<domain>.ts`
+  → DB schema change ⇒ bump `SCHEMA_VERSION` + migration in `database/schema.rs`.
+
+### Things to Avoid
+
+- Don't bypass the service/DAO layers; don't call `invoke` in components.
+- Don't mutate live CLI config files outside the dedicated writer modules.
+- Don't add IPC fields without `rename_all = "camelCase"`.
+- Don't add an i18n key to only one locale file — CI won't catch it; users will.
+- Don't use plain `cargo build --release` for production (rule 18).
 
 ## COMMIT GUIDELINES
 
@@ -157,3 +255,6 @@
 30. **Before reverting or "cleaning up" anything unusual, search `docs/memory/` first** — the oddity may be a deliberate, documented decision.
 
 31. **Deep investigations** that exceed one entry go to `docs/memory/incidents/YYYY-MM-DD-<topic>.md`, linked from the journal entry.
+
+
+

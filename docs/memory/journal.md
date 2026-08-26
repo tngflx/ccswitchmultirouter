@@ -23,3 +23,10 @@
 - **Fix:** rebuilt as 16 coherent feature commits (provider schema → proxy policy → usage → codex routing → infra sync → services → backend tests → UI layers → presets → i18n → CI → frontend tests), verifying `git diff old-tested..HEAD` was empty so all prior test results stayed valid.
 - **Evidence:** pushed as `da53d93c` after byte-identity check; backup branch `codex/pre-consolidation-backup` retained.
 - **Don't again:** force-pushing rewritten history without the tree-identity check invalidates every previously-run test result.
+
+## 2026-08-26 — Adopted author-style AGENTS.md codebase guide; validation caught 3 real errors
+
+- **What happened:** enriched AGENTS.md with an author-style "Architecture & Conventions" guide (upstream's AGENTS.md `4c2f6485` was never merged to their main; adapted it to our fork). Added `scripts/validate-agents-md.ps1` to verify every documented path/command/identifier.
+- **Root cause of errors found:** wrote docs from memory instead of verifying — three claims were wrong: (1) `codex_traffic_policy.rs` is admission/rejection retry policy, NOT official-vs-third-party routing; (2) `official_first`/`third_party_first` is the Sub-Agent V2 selection policy (`types/codexSubagentV2.ts`, `forwarder.rs`); (3) `CodexApiKeyGroup` backend logic lives in `proxy/providers/codex.rs` (settings key `codexApiKeyGroups`), not `provider.rs`.
+- **Evidence:** validator 44/44 PASS after fixes.
+- **Don't again:** never document a module's purpose from its name alone — read the module header first; and always run the validator after editing AGENTS.md.
