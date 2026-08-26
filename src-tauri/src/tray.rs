@@ -67,6 +67,7 @@ pub struct TrayTexts {
 /// （`settings.language` 尚未写入）时托盘语言与界面语言一致：
 /// 繁中系统（zh-TW/HK/MO/Hant）→ `zh-TW`，其余 zh → `zh`，
 /// 日文 → `ja`，英文 → `en`，未知区域回退到 `zh`（与前端默认一致）。
+#[allow(dead_code)]
 fn map_locale_to_tray_language(locale: &str) -> &'static str {
     let locale = locale.to_lowercase();
     if locale == "zh" {
@@ -89,6 +90,7 @@ fn map_locale_to_tray_language(locale: &str) -> &'static str {
 }
 
 /// 读取系统区域并映射为托盘语言码；取不到区域时回退到 `zh`。
+#[allow(dead_code)]
 fn detect_system_tray_language() -> &'static str {
     sys_locale::get_locale()
         .as_deref()
@@ -642,12 +644,7 @@ pub fn create_tray_menu(
     app_state: &AppState,
 ) -> Result<Menu<tauri::Wry>, AppError> {
     let app_settings = crate::settings::get_settings();
-    // 用户未显式设置语言（首次安装）时，按系统区域回退而非硬编码简体，
-    // 否则繁中系统的托盘会固定显示简体直到用户手动切换一次。
-    let language: &str = match app_settings.language.as_deref() {
-        Some(lang) => lang,
-        None => detect_system_tray_language(),
-    };
+    let language: &str = app_settings.language.as_deref().unwrap_or("en");
     let tray_texts = TrayTexts::from_language(language);
 
     // Get visible apps setting, default to all visible

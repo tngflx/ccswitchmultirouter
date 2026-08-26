@@ -56,7 +56,7 @@ pub async fn check_for_updates(handle: AppHandle) -> Result<bool, String> {
     handle
         .opener()
         .open_url(
-            "https://github.com/BigStrongSun/ccswitchmulti/releases/latest",
+            "https://github.com/farion1231/cc-switch/releases/latest",
             None::<String>,
         )
         .map_err(|e| format!("打开更新页面失败: {e}"))?;
@@ -111,8 +111,8 @@ pub struct ToolVersion {
     wsl_distro: Option<String>,
 }
 
-const VALID_TOOLS: [&str; 7] = [
-    "claude", "codex", "gemini", "grok", "opencode", "openclaw", "hermes",
+const VALID_TOOLS: [&str; 8] = [
+    "claude", "codex", "gemini", "grok", "opencode", "openclaw", "hermes", "pi",
 ];
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -433,6 +433,7 @@ fn tool_display_name(tool: &str) -> &'static str {
         "opencode" => "OpenCode",
         "openclaw" => "OpenClaw",
         "hermes" => "Hermes",
+        "pi" => "Pi",
         _ => "Unknown",
     }
 }
@@ -513,6 +514,7 @@ fn npm_install_command_for(tool: &str) -> Option<&'static str> {
         "grok" => Some("npm i -g @xai-official/grok@latest"),
         "opencode" => Some("npm i -g opencode-ai@latest"),
         "openclaw" => Some("npm i -g openclaw@latest"),
+        "pi" => Some("npm i -g @earendil-works/pi-coding-agent@latest"),
         _ => None,
     }
 }
@@ -766,9 +768,22 @@ async fn get_single_tool_version_impl(
     } else {
         #[cfg(target_os = "windows")]
         {
-            // Windows 上只执行已经定位到的真实可执行文件，避免 `cmd /C tool`
-            // 误触发 App Execution Alias 或协议处理器。
-            scan_cli_version(tool)
+            // Probe the PATH-default entry (what `tool` resolves to in a
+            // terminal) first, and only fall back to the directory scan when it
+            // is genuinely absent (NotFound). Two goals:
+            // 1. Keep the displayed "current version" aligned with the version
+            //    the user actually runs — a stale shim in a hardcoded fallback
+            //    dir (e.g. an old `%APPDATA%\npm`) must not override a newer
+            //    PATH install (#4701: "updated but still shows the old version").
+            // 2. Mirror the non-Windows structure (`try_get_version` →
+            //    `scan_cli_version`).
+            // `probe_path_default_version` executes only the real executable
+            //    resolved by `where` (App Execution Aliases filtered out), so
+            //    it never `cmd /C tool` into a protocol handler.
+            match probe_path_default_version(tool) {
+                ShellProbe::NotFound(_) => scan_cli_version(tool),
+                found => found,
+            }
         }
 
         #[cfg(not(target_os = "windows"))]
@@ -807,6 +822,9 @@ async fn get_single_tool_version_impl(
         }
         "openclaw" => fetch_npm_latest_for_tool(&client, "openclaw", tool, local).await,
         "hermes" => fetch_pypi_latest_version(&client, "hermes-agent").await,
+        "pi" => {
+            fetch_npm_latest_for_tool(&client, "@earendil-works/pi-coding-agent", tool, local).await
+        }
         _ => None,
     };
 
@@ -1128,7 +1146,6 @@ fn valid_user_shell_path(shell: &str) -> bool {
 }
 
 #[cfg(unix)]
-#[cfg_attr(target_os = "windows", allow(dead_code))]
 fn is_executable_file(path: &std::path::Path) -> bool {
     use std::os::unix::fs::PermissionsExt;
 
@@ -1543,6 +1560,135 @@ fn extend_mise_node_search_paths(paths: &mut Vec<std::path::PathBuf>, home: &Pat
     }
 }
 
+/// The "effective PATH" used during detection. On Windows the inherited
+/// process PATH can be incomplete — most notably after an in-app self-update,
+/// where the MSI/WiX-auto-launched process inherits only the machine-level PATH
+/// and drops the user-level PATH (see #6061). Any CLI installed in a user-PATH
+/// location (winget Claude `%LOCALAPPDATA%\Programs\claude`, the standalone
+/// Codex installer `%LOCALAPPDATA%\Programs\OpenAI\Codex\bin`, a custom npm
+/// prefix `D:\npm-global`, …) then reads as "not installed".
+///
+/// Reconstruct the effective PATH by merging the process PATH with the machine
+/// and user registry PATH values (`REG_EXPAND_SZ` expanded), so detection sees
+/// the same installations a freshly logged-in shell would — regardless of how
+/// the current process was launched. Process entries are kept first (a runtime
+/// override wins); registry entries fill whatever the process is missing;
+/// duplicates are removed.
+///
+/// See `env_checker::check_system_env` for the same set of registry keys; here
+/// we read only the `Path` value.
+#[cfg(target_os = "windows")]
+fn effective_path_string() -> String {
+    use winreg::enums::{HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE};
+    use winreg::RegKey;
+
+    let process = std::env::var("PATH").unwrap_or_default();
+    let user = RegKey::predef(HKEY_CURRENT_USER)
+        .open_subkey("Environment")
+        .and_then(|k| k.get_value::<String, &str>("Path"))
+        .map(|raw| expand_env_chars(&raw))
+        .unwrap_or_default();
+    let machine = RegKey::predef(HKEY_LOCAL_MACHINE)
+        .open_subkey("SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Environment")
+        .and_then(|k| k.get_value::<String, &str>("Path"))
+        .map(|raw| expand_env_chars(&raw))
+        .unwrap_or_default();
+    merge_path_segments_win(&[&process, &user, &machine])
+}
+
+/// `extend_from_cli_path_env` consumes an `OsString` via `split_paths`. On
+/// Windows this is derived from `effective_path_string`; on other platforms the
+/// raw process value is returned unchanged (zero behaviour change).
+#[cfg(target_os = "windows")]
+fn effective_path_os() -> Option<std::ffi::OsString> {
+    Some(std::ffi::OsString::from(effective_path_string()))
+}
+
+#[cfg(not(target_os = "windows"))]
+fn effective_path_os() -> Option<std::ffi::OsString> {
+    std::env::var_os("PATH")
+}
+
+/// Prepend a candidate directory without converting the existing PATH to
+/// UTF-8. Unix permits arbitrary non-NUL bytes in environment values; keeping
+/// this as an `OsString` ensures one non-Unicode segment cannot discard or
+/// corrupt every other interpreter directory needed by an npm/python shim.
+#[cfg(not(target_os = "windows"))]
+fn prepend_search_dir_to_path(dir: &Path, current_path: &std::ffi::OsStr) -> std::ffi::OsString {
+    let mut path = dir.as_os_str().to_os_string();
+    if !current_path.is_empty() {
+        path.push(":");
+        path.push(current_path);
+    }
+    path
+}
+
+/// Expand `%VAR%` environment-variable references. The registry `Path` value is
+/// `REG_EXPAND_SZ`, and the `String` returned by `winreg` is not auto-expanded.
+/// Variables such as `%LOCALAPPDATA%` / `%USERPROFILE%` / `%SystemRoot%` are
+/// still defined in a process that lost its user PATH (Winlogon injects them
+/// from the user profile), so expanding each via `std::env::var` is safe.
+/// Undefined variables are preserved verbatim (no characters dropped).
+#[cfg(target_os = "windows")]
+fn expand_env_chars(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut rest = raw;
+    while let Some(open) = rest.find('%') {
+        out.push_str(&rest[..open]);
+        let after = &rest[open + 1..];
+        match after.find('%') {
+            None => {
+                out.push('%');
+                out.push_str(after);
+                rest = "";
+                break;
+            }
+            Some(close) => {
+                let name = &after[..close];
+                let is_ident =
+                    !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+                if is_ident {
+                    match std::env::var(name) {
+                        Ok(val) => out.push_str(&val),
+                        Err(_) => {
+                            out.push('%');
+                            out.push_str(name);
+                            out.push('%');
+                        }
+                    }
+                } else {
+                    out.push('%');
+                    out.push_str(name);
+                    out.push('%');
+                }
+                rest = &after[close + 1..];
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Merge several Windows PATH strings (`;`-separated) in order, keeping only
+/// the first occurrence of each segment (case-insensitive). Process segments
+/// come first to respect runtime overrides, followed by user- and
+/// machine-level registry segments.
+#[cfg(target_os = "windows")]
+fn merge_path_segments_win(parts: &[&str]) -> String {
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut merged: Vec<&str> = Vec::new();
+    for part in parts {
+        for seg in part.split(';') {
+            let s = seg.trim();
+            if s.is_empty() || !seen.insert(s.to_ascii_lowercase()) {
+                continue;
+            }
+            merged.push(s);
+        }
+    }
+    merged.join(";")
+}
+
 /// 构建某工具的候选搜索目录（原生安装优先，PATH 兜底）。
 /// 单探兜底 (`scan_cli_version`) 与全量枚举 (`enumerate_tool_installations`) 共用，
 /// 确保两条路径看到的是同一组安装位置。
@@ -1601,6 +1747,35 @@ fn build_tool_search_paths(tool: &str) -> Vec<std::path::PathBuf> {
 
     #[cfg(target_os = "windows")]
     {
+        // Official standalone (non-npm) installer locations — belt-and-suspenders
+        // alongside the registry-PATH merge in `effective_path_os`. These
+        // installers normally register themselves on the user PATH, but some
+        // per-user MSI/MSIX installs do not, and an in-app-update relaunch can
+        // drop the user PATH (#6061), so add them explicitly here. Placed ahead
+        // of the npm directory so a native install wins over a stale npm shim
+        // (#4701).
+        if let Some(local_data) = dirs::data_local_dir() {
+            if tool == "codex" {
+                // OpenAI Codex Installer.exe / .msi standalone install location
+                // (#6061, #6047).
+                push_unique_path(
+                    &mut search_paths,
+                    local_data
+                        .join("Programs")
+                        .join("OpenAI")
+                        .join("Codex")
+                        .join("bin"),
+                );
+            }
+            if tool == "claude" {
+                // `winget install Anthropic.ClaudeCode` / official native
+                // installer location (#6278).
+                push_unique_path(
+                    &mut search_paths,
+                    local_data.join("Programs").join("claude"),
+                );
+            }
+        }
         if let Some(appdata) = dirs::data_dir() {
             push_unique_path(&mut search_paths, appdata.join("npm"));
             if tool == "hermes" {
@@ -1676,7 +1851,7 @@ fn build_tool_search_paths(tool: &str) -> Vec<std::path::PathBuf> {
         }
     }
 
-    let path_env = std::env::var_os("PATH");
+    let path_env = effective_path_os();
     extend_from_cli_path_env(&mut search_paths, path_env);
     search_paths
 }
@@ -1687,6 +1862,24 @@ fn is_windows_command_script(path: &Path) -> bool {
         .and_then(|ext| ext.to_str())
         .map(|ext| ext.eq_ignore_ascii_case("cmd") || ext.eq_ignore_ascii_case("bat"))
         .unwrap_or(false)
+}
+
+/// Convert a canonicalized Windows path back to the form accepted by shell
+/// commands. `std::fs::canonicalize` prefixes local paths with `\\?\` (and UNC
+/// paths with `\\?\UNC\`), but `cmd.exe` cannot `call` a batch file through
+/// those verbatim paths and reports "The system cannot find the path
+/// specified." Direct Win32 executable launches accept the prefix; batch
+/// scripts do not.
+#[cfg(target_os = "windows")]
+fn windows_shell_compatible_path(path: &Path) -> std::path::PathBuf {
+    let raw = path.to_string_lossy();
+    if let Some(unc) = raw.strip_prefix(r"\\?\UNC\") {
+        std::path::PathBuf::from(format!(r"\\{unc}"))
+    } else if let Some(local) = raw.strip_prefix(r"\\?\") {
+        std::path::PathBuf::from(local)
+    } else {
+        path.to_path_buf()
+    }
 }
 
 #[cfg(target_os = "windows")]
@@ -1710,7 +1903,13 @@ fn run_windows_tool_command(
     use std::process::Command;
 
     if is_windows_command_script(tool_path) {
-        let path = tool_path.to_string_lossy();
+        // `resolve_path_default` returns a canonical path so callers can
+        // compare installation identities. Canonical Windows paths carry a
+        // `\\?\` prefix, which `cmd /C call` rejects for batch files. Normalize
+        // only at this shell boundary and keep the canonical identity intact
+        // everywhere else.
+        let shell_path = windows_shell_compatible_path(tool_path);
+        let path = shell_path.to_string_lossy();
         let args = args
             .iter()
             .map(|arg| windows_cmd_double_quote_arg(arg))
@@ -1749,15 +1948,59 @@ fn run_windows_tool_version_command(
     run_windows_tool_command(tool_path, &["--version"], new_path)
 }
 
+/// Probe the version of the PATH-default entry on Windows. Uses
+/// `resolve_path_default` (which merges the registry PATH and filters out
+/// App Execution Aliases) to get the executable the user actually runs, then
+/// runs `--version` on it. Consumed by `get_single_tool_version_impl` before
+/// the directory scan, so the displayed version matches what `tool` resolves
+/// to in a terminal (#4701).
+///
+/// Returns `NotFound` when no entry is resolved on PATH (the caller falls back
+/// to `scan_cli_version` over the hardcoded/registry dirs); `FoundButFailed`
+/// when an entry was resolved but `--version` exited non-zero (installed but
+/// not runnable), which is reported as-is without falling back, so an old
+/// install elsewhere cannot mask a broken default.
+#[cfg(target_os = "windows")]
+fn probe_path_default_version(tool: &str) -> ShellProbe {
+    let path_default = match resolve_path_default(tool, None) {
+        Ok(Some(p)) => p,
+        _ => return ShellProbe::NotFound(NOT_INSTALLED.to_string()),
+    };
+    let current_path = effective_path_string();
+    match run_windows_tool_version_command(&path_default, &current_path) {
+        Ok(out) => {
+            let stdout = decode_command_output(&out.stdout).trim().to_string();
+            let stderr = decode_command_output(&out.stderr).trim().to_string();
+            if out.status.success() {
+                let raw = if stdout.is_empty() { &stderr } else { &stdout };
+                if raw.is_empty() {
+                    ShellProbe::NotFound(NOT_INSTALLED.to_string())
+                } else {
+                    ShellProbe::Found(extract_version(raw))
+                }
+            } else {
+                let err = if stderr.is_empty() { stdout } else { stderr };
+                if err.is_empty() {
+                    ShellProbe::NotFound(NOT_INSTALLED.to_string())
+                } else {
+                    ShellProbe::FoundButFailed(last_lines(err.trim(), 4))
+                }
+            }
+        }
+        Err(_) => ShellProbe::NotFound(NOT_INSTALLED.to_string()),
+    }
+}
+
 /// 扫描常见路径查找 CLI（PATH 主命令未命中时的兜底单探）。
 fn scan_cli_version(tool: &str) -> ShellProbe {
     #[cfg(not(target_os = "windows"))]
     use std::process::Command;
 
     let search_paths = build_tool_search_paths(tool);
-    let current_path = std::env::var_os("PATH")
-        .map(|value| value.to_string_lossy().into_owned())
-        .unwrap_or_default();
+    #[cfg(target_os = "windows")]
+    let current_path = effective_path_string();
+    #[cfg(not(target_os = "windows"))]
+    let current_path = effective_path_os().unwrap_or_default();
 
     // 记录"可执行文件存在、但 `--version` 非零退出"时的首个诊断信息。
     // 典型场景：工具已安装但当前环境跑不起来（如 openclaw 要求 Node v22.19+）。
@@ -1769,7 +2012,7 @@ fn scan_cli_version(tool: &str) -> ShellProbe {
         let new_path = format!("{};{}", path.display(), current_path);
 
         #[cfg(not(target_os = "windows"))]
-        let new_path = format!("{}:{}", path.display(), current_path);
+        let new_path = prepend_search_dir_to_path(path, &current_path);
 
         for tool_path in tool_executable_candidates(tool, path) {
             if !tool_path.exists() {
@@ -1866,8 +2109,6 @@ fn infer_install_source(path: &Path) -> &'static str {
         "pnpm"
     } else if s.contains("/scoop/") {
         "scoop"
-    } else if is_codex_windows_app_path_str(&s) {
-        "codex-app"
     } else if s.contains("/library/python")
         || s.contains("/scripts/")
         || s.contains("/site-packages/")
@@ -1876,31 +2117,6 @@ fn infer_install_source(path: &Path) -> &'static str {
     } else {
         "system"
     }
-}
-
-/// 判断路径是否来自 OpenAI Codex Windows App/MSIX 运行时。
-///
-/// 这类路径由 Windows App 包或 AppData 下的 Codex launcher 提供，CLI 自身的
-/// `codex update` 不能识别安装方式；如果继续回退到 npm，会把 App 运行时和用户的
-/// Node/npm 混用，容易出现启动崩溃或安装卡住。
-fn is_codex_windows_app_path_str(normalized_lower: &str) -> bool {
-    normalized_lower.contains("/appdata/local/openai/codex/")
-        || normalized_lower.contains("/windowsapps/openai.codex_")
-        || normalized_lower.contains("/msix/openai.codex_")
-        || normalized_lower.contains("/microsoft/windowsapps/codex.exe")
-        || normalized_lower.ends_with("/microsoft/windowsapps/codex")
-}
-
-#[cfg(target_os = "windows")]
-fn is_codex_windows_app_install(bin_path: &str, real_target: &str) -> bool {
-    let bin = bin_path.replace('\\', "/").to_ascii_lowercase();
-    let real = real_target.replace('\\', "/").to_ascii_lowercase();
-    is_codex_windows_app_path_str(&bin) || is_codex_windows_app_path_str(&real)
-}
-
-#[cfg(target_os = "windows")]
-fn codex_windows_app_update_command() -> String {
-    r#""%LOCALAPPDATA%\Microsoft\WindowsApps\winget.exe" upgrade --id 9PLM9XGG6VKS --source msstore --accept-source-agreements --accept-package-agreements"#.to_string()
 }
 
 /// 从 shell 输出里挑出第一个绝对路径行（trim 后以 `/` 开头），跳过交互式登录 shell
@@ -2014,18 +2230,45 @@ fn resolve_path_default(
 }
 
 #[cfg(target_os = "windows")]
+fn windows_path_lookup_command(
+    tool: &str,
+    effective_path: &std::ffi::OsStr,
+) -> std::process::Command {
+    use std::os::windows::process::CommandExt;
+    use std::process::{Command, Stdio};
+
+    // Use the system copy explicitly so a project-local `where.exe` cannot
+    // hijack the passive lookup before the PATH-only pattern is evaluated.
+    let where_exe = PathBuf::from(
+        std::env::var_os("SystemRoot").unwrap_or_else(|| std::ffi::OsString::from(r"C:\Windows")),
+    )
+    .join("System32")
+    .join("where.exe");
+    let mut command = Command::new(where_exe);
+    command
+        // `$PATH:pattern` is where.exe's documented environment-variable
+        // search form. Unlike a bare pattern, it does not search the current
+        // directory before PATH.
+        .arg(format!("$PATH:{tool}"))
+        .env("PATH", effective_path)
+        .creation_flags(CREATE_NO_WINDOW)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    command
+}
+
+#[cfg(target_os = "windows")]
 fn resolve_path_default(
     tool: &str,
     deadline: Option<CommandDeadline>,
 ) -> Result<Option<std::path::PathBuf>, String> {
-    use std::os::windows::process::CommandExt;
-    use std::process::{Command, Stdio};
-
-    let child = Command::new("cmd")
-        .args(["/C", &format!("where {tool}")])
-        .creation_flags(CREATE_NO_WINDOW)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+    // Restrict `where` to the merged effective PATH. A bare `where {tool}` also
+    // searches the current directory first, which would let a project-local
+    // `codex.cmd` be executed by a passive version check. The `$PATH:pattern`
+    // form searches only the supplied environment variable while still seeing
+    // registry PATH entries lost by an in-app-update relaunch (#6061).
+    let current_path = effective_path_os().unwrap_or_default();
+    let child = windows_path_lookup_command(tool, &current_path)
         .spawn()
         .map_err(|e| format!("Failed to locate {tool}: {e}"))?;
     let out = wait_child_output(child, deadline)?;
@@ -2033,12 +2276,20 @@ fn resolve_path_default(
         return Ok(None);
     }
     let raw = decode_command_output(&out.stdout);
-    let Some(first) = raw.lines().next().map(str::trim) else {
+    // `where` lists every match on PATH in order; the first is what the user
+    // actually runs. Skip App Execution Aliases (reparse points under
+    // `Microsoft\WindowsApps`) — they launch the Store / a protocol handler,
+    // are not CLIs we can `--version`-probe, and must not be treated as the
+    // PATH default. Take the first remaining real entry.
+    let resolved = raw.lines().map(str::trim).find(|line| {
+        !line.is_empty()
+            && !is_windows_app_execution_alias_dir(
+                Path::new(line).parent().unwrap_or(Path::new("")),
+            )
+    });
+    let Some(first) = resolved else {
         return Ok(None);
     };
-    if first.is_empty() {
-        return Ok(None);
-    }
     let path = Path::new(first);
     let preferred =
         windows_runnable_sibling_for_extensionless_tool(path).unwrap_or_else(|| path.to_path_buf());
@@ -2053,9 +2304,10 @@ fn enumerate_tool_installations(tool: &str) -> Vec<ToolInstallation> {
     use std::process::Command;
 
     let search_paths = build_tool_search_paths(tool);
-    let current_path = std::env::var_os("PATH")
-        .map(|value| value.to_string_lossy().into_owned())
-        .unwrap_or_default();
+    #[cfg(target_os = "windows")]
+    let current_path = effective_path_string();
+    #[cfg(not(target_os = "windows"))]
+    let current_path = effective_path_os().unwrap_or_default();
     let path_default = resolve_path_default(tool, None).ok().flatten();
 
     let mut seen: std::collections::HashSet<std::path::PathBuf> = std::collections::HashSet::new();
@@ -2065,7 +2317,7 @@ fn enumerate_tool_installations(tool: &str) -> Vec<ToolInstallation> {
         #[cfg(target_os = "windows")]
         let new_path = format!("{};{}", dir.display(), current_path);
         #[cfg(not(target_os = "windows"))]
-        let new_path = format!("{}:{}", dir.display(), current_path);
+        let new_path = prepend_search_dir_to_path(dir, &current_path);
 
         for tool_path in tool_executable_candidates(tool, dir) {
             if !tool_path.exists() {
@@ -2141,6 +2393,7 @@ fn npm_package_for(tool: &str) -> Option<&'static str> {
         "grok" => Some("@xai-official/grok"),
         "opencode" => Some("opencode-ai"),
         "openclaw" => Some("openclaw"),
+        "pi" => Some("@earendil-works/pi-coding-agent"),
         _ => None,
     }
 }
@@ -2638,9 +2891,6 @@ fn package_manager_anchored_command_from_paths(tool: &str, bin_path: &str) -> Op
 fn anchored_command_from_paths(tool: &str, bin_path: &str, real_target: &str) -> Option<String> {
     if tool == "hermes" {
         return anchored_official_update_command(tool, bin_path);
-    }
-    if tool == "codex" && is_codex_windows_app_install(bin_path, real_target) {
-        return Some(codex_windows_app_update_command());
     }
     if tool == "grok" && is_grok_native_install(bin_path, real_target) {
         return Some(grok_native_update_command(
@@ -3145,20 +3395,6 @@ fn run_wsl_tool_command(
 /// 全平台共用——`anchored_command_from_paths` 自身是 cfg 二选一(POSIX 五分支 /
 /// Windows 三分支),这里只负责取默认那处 + 转发。
 fn installs_anchored_command(tool: &str, installs: &[ToolInstallation]) -> Option<String> {
-    #[cfg(target_os = "windows")]
-    {
-        // Codex Windows App/MSIX 可能同时暴露 AppData launcher 和 WindowsApps alias。
-        // 一旦 default_install 因多入口歧义返回 None,不要掉回 `codex update || npm ...`;
-        // 只要安装列表里出现 App/MSIX 痕迹,就走 Store 包更新通道。
-        if tool == "codex"
-            && installs.iter().any(|i| {
-                i.source == "codex-app"
-                    || is_codex_windows_app_install(&i.path, &i.real.to_string_lossy())
-            })
-        {
-            return Some(codex_windows_app_update_command());
-        }
-    }
     let inst = default_install(installs)?;
     let real = inst.real.to_string_lossy();
     // Codex 平台分发包损坏自愈：主包在但平台二进制缺失时 codex 跑不起来
@@ -3472,20 +3708,8 @@ fn resolve_launch_cwd(cwd: Option<String>) -> Result<Option<PathBuf>, String> {
         return Err(format!("选择的路径不是文件夹: {}", resolved.display()));
     }
 
-    // Strip Windows extended-length prefix that canonicalize produces,
-    // as it can break batch scripts and other shell commands.
-    // Special-case \\?\UNC\server\share -> \\server\share for network/WSL paths.
     #[cfg(target_os = "windows")]
-    let resolved = {
-        let s = resolved.to_string_lossy();
-        if let Some(unc) = s.strip_prefix(r"\\?\UNC\") {
-            PathBuf::from(format!(r"\\{unc}"))
-        } else if let Some(stripped) = s.strip_prefix(r"\\?\") {
-            PathBuf::from(stripped)
-        } else {
-            resolved
-        }
-    };
+    let resolved = windows_shell_compatible_path(&resolved);
 
     Ok(Some(resolved))
 }
@@ -4513,6 +4737,24 @@ mod tests {
     }
 
     #[test]
+    fn pi_lifecycle_metadata_matches_pinned_distribution() {
+        let requested = vec!["unsupported".to_string(), "pi".to_string()];
+        assert_eq!(normalize_requested_tools(&requested), vec!["pi"]);
+        assert_eq!(tool_display_name("pi"), "Pi");
+        assert_eq!(
+            npm_package_for("pi"),
+            Some("@earendil-works/pi-coding-agent")
+        );
+        assert_eq!(
+            npm_install_command_for("pi"),
+            Some("npm i -g @earendil-works/pi-coding-agent@latest")
+        );
+        // The verified distribution exposes `pi --version`, but no updater
+        // contract is assumed; upgrades stay on the package-manager path.
+        assert_eq!(official_update_args("pi"), None);
+    }
+
+    #[test]
     fn test_compare_semver() {
         use std::cmp::Ordering;
         assert_eq!(
@@ -4756,59 +4998,6 @@ mod tests {
         }
 
         #[test]
-        fn codex_windows_app_uses_ms_store_upgrade_without_npm_fallback() {
-            // OpenAI Codex Windows App/MSIX 自带的 `codex update` 无法识别安装方式。
-            // 继续接 `npm i -g` 会把 App 运行时和用户机器上的 Node/npm 混用；这里应改走
-            // Store/winget 包更新，并且绝不能附带 npm fallback。
-            let bin_path = r"C:\Users\me\AppData\Local\OpenAI\Codex\bin\codex.exe";
-            let real_target = r"C:\Program Files\WindowsApps\OpenAI.Codex_26.608.1337.0_x64__2p2nqsd0c76g0\app\resources\codex.exe";
-            let cmd = anchored_command_from_paths("codex", bin_path, real_target);
-            let expected = codex_windows_app_update_command();
-            assert_eq!(cmd.as_deref(), Some(expected.as_str()));
-            assert!(
-                !cmd.unwrap().contains("@openai/codex"),
-                "Codex App update must not fall back to npm"
-            );
-        }
-
-        #[test]
-        fn ambiguous_codex_app_install_uses_ms_store_upgrade() {
-            // 多个 Codex 入口并存且没有明确 PATH 默认项时,default_install 会返回 None。
-            // 只要其中一个入口属于 Codex App/MSIX,仍必须走 Store 更新,不能退到静态 npm 链。
-            let installs = vec![
-                ToolInstallation {
-                    path: r"C:\Users\me\AppData\Local\OpenAI\Codex\bin\codex.exe".to_string(),
-                    version: Some("0.137.0".to_string()),
-                    runnable: true,
-                    error: None,
-                    source: "codex-app".to_string(),
-                    is_path_default: false,
-                    real: std::path::PathBuf::from(
-                        r"C:\Users\me\AppData\Local\OpenAI\Codex\bin\codex.exe",
-                    ),
-                },
-                ToolInstallation {
-                    path: r"C:\Tools\node\codex.cmd".to_string(),
-                    version: Some("0.139.0".to_string()),
-                    runnable: true,
-                    error: None,
-                    source: "system".to_string(),
-                    is_path_default: false,
-                    real: std::path::PathBuf::from(r"C:\Tools\node\codex.cmd"),
-                },
-            ];
-            let cmd = installs_anchored_command("codex", &installs);
-            assert_eq!(
-                cmd.as_deref(),
-                Some(codex_windows_app_update_command().as_str())
-            );
-            assert!(
-                !cmd.unwrap().contains("@openai/codex"),
-                "ambiguous Codex App installs must not fall back to npm"
-            );
-        }
-
-        #[test]
         fn grok_windows_anchors_to_sibling_npm() {
             let (_dir, sub, bin_path) = setup_sibling("v22.0.0", "grok.cmd", &["npm.cmd"]);
             let cmd = anchored_command_from_paths("grok", &bin_path, &bin_path);
@@ -4860,15 +5049,6 @@ mod tests {
                     .map(|(_, encoded)| encoded),
                 Some(expected_encoded.as_str())
             );
-        }
-
-        #[test]
-        fn windows_codex_without_sibling_returns_none_for_static_fallback() {
-            // Codex 的 self-update 在 npm/optional dependency 损坏时会假成功，不能作为
-            // 无 sibling 包管理器时的锚定命令。返回 None 后由上层静态 npm fallback 处理。
-            let (_dir, _sub, bin_path) = setup_sibling("", "codex.cmd", &[]);
-            let cmd = anchored_command_from_paths("codex", &bin_path, &bin_path);
-            assert!(cmd.is_none());
         }
 
         #[test]
@@ -5273,30 +5453,6 @@ mod tests {
             assert_eq!(
                 infer_install_source(Path::new("C:\\Users\\me\\scoop\\shims\\codex.cmd")),
                 "scoop"
-            );
-        }
-
-        #[test]
-        fn windows_codex_app_is_identified() {
-            // Codex Windows App 会把 CLI launcher 放在 AppData,真身也可能落在 WindowsApps
-            // MSIX 包目录；两种路径都不是 npm 全局包,升级策略必须能单独识别。
-            assert_eq!(
-                infer_install_source(Path::new(
-                    "C:\\Users\\me\\AppData\\Local\\OpenAI\\Codex\\bin\\codex.exe"
-                )),
-                "codex-app"
-            );
-            assert_eq!(
-                infer_install_source(Path::new(
-                    "C:\\Program Files\\WindowsApps\\OpenAI.Codex_26.608.1337.0_x64__2p2nqsd0c76g0\\app\\resources\\codex.exe"
-                )),
-                "codex-app"
-            );
-            assert_eq!(
-                infer_install_source(Path::new(
-                    "C:\\Users\\me\\AppData\\Local\\Microsoft\\WindowsApps\\codex.exe"
-                )),
-                "codex-app"
             );
         }
     }
@@ -6004,6 +6160,13 @@ mod tests {
         }
 
         #[test]
+        fn pi_install_uses_the_verified_pinned_package() {
+            let cmd = install_command_for("pi");
+            assert_eq!(cmd, "npm i -g @earendil-works/pi-coding-agent@latest");
+            assert!(!cmd.contains("||"));
+        }
+
+        #[test]
         fn update_fallbacks_use_official_cli_only_when_supported() {
             assert_eq!(
                 static_fallback_command("claude"),
@@ -6032,6 +6195,11 @@ mod tests {
                 static_fallback_command("openclaw"),
                 "openclaw update --yes || npm i -g openclaw@latest"
             );
+            assert_eq!(
+                static_fallback_command("pi"),
+                "npm i -g @earendil-works/pi-coding-agent@latest"
+            );
+            assert!(!static_fallback_command("pi").contains("pi update"));
         }
 
         #[test]
@@ -6240,6 +6408,109 @@ mod tests {
         )));
     }
 
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn merge_path_segments_win_preserves_order_and_dedupes_case_insensitively() {
+        let merged = merge_path_segments_win(&[
+            r"C:\a;C:\B;%SystemRoot%\system32",
+            r"C:\b;C:\a", // dup of C:\a (case-insensitive) and C:\B
+            "",
+        ]);
+        assert_eq!(merged, r"C:\a;C:\B;%SystemRoot%\system32");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prepend_search_dir_to_path_preserves_non_utf8_bytes() {
+        use std::os::unix::ffi::{OsStrExt, OsStringExt};
+
+        let current = std::ffi::OsString::from_vec(b"/usr/bin:/tmp/\xff/bin".to_vec());
+        let combined = prepend_search_dir_to_path(Path::new("/candidate/bin"), &current);
+
+        assert_eq!(
+            combined.as_os_str().as_bytes(),
+            b"/candidate/bin:/usr/bin:/tmp/\xff/bin"
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn expand_env_chars_preserves_unknown_vars_and_plain_text() {
+        // No percent signs -> verbatim.
+        assert_eq!(
+            expand_env_chars(r"C:\Program Files\nodejs"),
+            r"C:\Program Files\nodejs"
+        );
+        // Undefined variable is preserved verbatim (nothing dropped).
+        assert_eq!(
+            expand_env_chars(r"D:\npm-global\%DEFINITELY_NOT_A_REAL_VAR_xyz%\bin"),
+            r"D:\npm-global\%DEFINITELY_NOT_A_REAL_VAR_xyz%\bin"
+        );
+        // Empty percent pair is not treated as a variable name.
+        assert_eq!(expand_env_chars(r"C:\path\%%\tail"), r"C:\path\%%\tail");
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn build_tool_search_paths_includes_standalone_installer_dirs() {
+        // Non-npm installer locations must be scanned even when the process PATH
+        // dropped them (regression guard for #6061 / #6278 / #6047).
+        let local_data = dirs::data_local_dir().expect("LOCALAPPDATA should resolve");
+
+        let codex_paths = build_tool_search_paths("codex");
+        assert!(codex_paths.contains(
+            &local_data
+                .join("Programs")
+                .join("OpenAI")
+                .join("Codex")
+                .join("bin")
+        ));
+
+        let claude_paths = build_tool_search_paths("claude");
+        assert!(claude_paths.contains(&local_data.join("Programs").join("claude")));
+
+        // The standalone Codex dir is codex-specific; it must not pollute other tools.
+        assert!(!build_tool_search_paths("gemini").contains(
+            &local_data
+                .join("Programs")
+                .join("OpenAI")
+                .join("Codex")
+                .join("bin")
+        ));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_path_lookup_ignores_same_named_file_in_current_directory() {
+        let current_dir = tempfile::tempdir().expect("current directory should be created");
+        let path_dir = tempfile::tempdir().expect("PATH directory should be created");
+        std::fs::write(current_dir.path().join("codex.cmd"), "@echo current\r\n")
+            .expect("current-directory shim should be created");
+        let expected = path_dir.path().join("codex.cmd");
+        std::fs::write(&expected, "@echo path\r\n").expect("PATH shim should be created");
+
+        let effective_path =
+            std::env::join_paths([path_dir.path()]).expect("test PATH should join");
+        let output = windows_path_lookup_command("codex", &effective_path)
+            .current_dir(current_dir.path())
+            .output()
+            .expect("where.exe should execute");
+        let stderr = decode_command_output(&output.stderr);
+        let matches = decode_command_output(&output.stdout)
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(PathBuf::from)
+            .collect::<Vec<_>>();
+
+        assert!(output.status.success(), "where.exe failed: {stderr}");
+        assert_eq!(matches.len(), 1);
+        assert_eq!(
+            std::fs::canonicalize(&matches[0]).expect("where.exe match should canonicalize"),
+            std::fs::canonicalize(&expected).expect("expected PATH shim should canonicalize")
+        );
+    }
+
     #[test]
     fn mise_node_search_paths_include_shims_and_installed_node_bins() {
         let temp = tempfile::tempdir().expect("temp dir should be created");
@@ -6308,6 +6579,49 @@ mod tests {
         let preferred = windows_runnable_sibling_for_extensionless_tool(&extensionless);
 
         assert_eq!(preferred.as_deref(), Some(cmd.as_path()));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_shell_compatible_path_strips_verbatim_prefixes() {
+        assert_eq!(
+            windows_shell_compatible_path(Path::new(r"\\?\C:\tools\codex.cmd")),
+            PathBuf::from(r"C:\tools\codex.cmd")
+        );
+        assert_eq!(
+            windows_shell_compatible_path(Path::new(r"\\?\UNC\server\share\tools\codex.cmd")),
+            PathBuf::from(r"\\server\share\tools\codex.cmd")
+        );
+        assert_eq!(
+            windows_shell_compatible_path(Path::new(r"C:\tools\codex.cmd")),
+            PathBuf::from(r"C:\tools\codex.cmd")
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn run_windows_tool_version_command_accepts_canonicalized_cmd_path() {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let cmd = dir.path().join("codex.cmd");
+        std::fs::write(&cmd, "@echo off\r\necho codex-cli 0.144.3\r\n")
+            .expect("cmd shim should be created");
+        let canonical = std::fs::canonicalize(&cmd).expect("cmd shim should canonicalize");
+        assert!(
+            canonical.to_string_lossy().starts_with(r"\\?\"),
+            "Windows canonical paths should use the verbatim prefix: {}",
+            canonical.display()
+        );
+
+        let current_path = std::env::var("PATH").unwrap_or_default();
+        let output = run_windows_tool_version_command(&canonical, &current_path)
+            .expect("canonicalized cmd shim should execute");
+        let stderr = decode_command_output(&output.stderr);
+
+        assert!(output.status.success(), "cmd shim failed: {stderr}");
+        assert_eq!(
+            decode_command_output(&output.stdout).trim(),
+            "codex-cli 0.144.3"
+        );
     }
 
     #[test]

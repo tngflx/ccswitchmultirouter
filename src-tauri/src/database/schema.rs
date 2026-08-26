@@ -1,4 +1,4 @@
-//! Schema 定义和迁移
+﻿//! Schema 定义和迁移
 //!
 //! 负责数据库表结构的创建和版本迁移。
 
@@ -1980,6 +1980,14 @@ impl Database {
             ("gpt-4.1", "GPT-4.1", "2", "8", "0.50", "0"),
             ("gpt-4.1-mini", "GPT-4.1 Mini", "0.40", "1.60", "0.10", "0"),
             ("gpt-4.1-nano", "GPT-4.1 Nano", "0.10", "0.40", "0.025", "0"),
+            (
+                "gemini-3.7-flash",
+                "Gemini 3.7 Flash",
+                "0.75",
+                "3.75",
+                "0.075",
+                "0",
+            ),
             // Gemini 3.6 系列
             (
                 "gemini-3.6-flash",
@@ -2199,34 +2207,34 @@ impl Database {
             (
                 "deepseek-chat",
                 "DeepSeek Chat",
-                "0.14",
-                "0.28",
-                "0.0028",
+                "0.44",
+                "1.32",
+                "0.014",
                 "0",
             ),
             (
                 "deepseek-reasoner",
                 "DeepSeek Reasoner",
-                "0.14",
-                "0.28",
-                "0.0028",
+                "0.44",
+                "1.32",
+                "0.014",
                 "0",
             ),
             // DeepSeek V4 系列（官方 CNY 按 1 USD ≈ 7.14 折算）
             (
                 "deepseek-v4-flash",
                 "DeepSeek V4 Flash",
-                "0.14",
-                "0.28",
-                "0.0028",
+                "0.44",
+                "1.32",
+                "0.014",
                 "0",
             ),
             (
                 "deepseek-v4-pro",
                 "DeepSeek V4 Pro",
-                "0.435",
-                "0.87",
-                "0.003625",
+                "1.32",
+                "3.96",
+                "0.044",
                 "0",
             ),
             // Kimi (月之暗面)
@@ -2415,7 +2423,7 @@ impl Database {
             ("qwq-32b", "QwQ 32B", "0.20", "0.60", "0", "0"),
             ("qwen3-32b", "Qwen3 32B", "0.16", "0.64", "0", "0"),
             // Grok 系列 (xAI)
-            ("grok-4.5", "Grok 4.5", "2", "6", "0.50", "0"),
+            ("grok-4.5", "Grok 4.5", "2", "6", "0.30", "0"),
             // Grok CLI 官方 OAuth 态 modelUsage 上报的内部别名。定价由
             // costUsdTicks（1 tick = 1e-10 USD）双轮实测反推：input/output 与
             // grok-4.5 同为 2/6，cache read 实际按 0.30 计（非 API 挂牌的 0.50）
@@ -2977,6 +2985,68 @@ impl Database {
                 "0.02",
                 "0",
             ),
+            // 2026-08-16 DeepSeek V4 peak-tier repricing — MUST stay at array end;
+            // earlier entries converge historical prices to old values first.
+            (
+                "deepseek-chat",
+                "DeepSeek Chat",
+                "0.44",
+                "1.32",
+                "0.014",
+                "0",
+                "0.14",
+                "0.28",
+                "0.0028",
+                "0",
+            ),
+            (
+                "deepseek-reasoner",
+                "DeepSeek Reasoner",
+                "0.44",
+                "1.32",
+                "0.014",
+                "0",
+                "0.14",
+                "0.28",
+                "0.0028",
+                "0",
+            ),
+            (
+                "deepseek-v4-flash",
+                "DeepSeek V4 Flash",
+                "0.44",
+                "1.32",
+                "0.014",
+                "0",
+                "0.14",
+                "0.28",
+                "0.0028",
+                "0",
+            ),
+            (
+                "deepseek-v4-flash-0731",
+                "DeepSeek V4 Flash",
+                "0.44",
+                "1.32",
+                "0.014",
+                "0",
+                "0.44",
+                "1.32",
+                "0.014",
+                "0",
+            ),
+            (
+                "deepseek-v4-pro",
+                "DeepSeek V4 Pro",
+                "1.32",
+                "3.96",
+                "0.044",
+                "0",
+                "0.435",
+                "0.87",
+                "0.003625",
+                "0",
+            ),
         ];
 
         for (
@@ -3029,7 +3099,7 @@ impl Database {
         Self::ensure_model_pricing_seeded_on_conn(&conn)
     }
 
-    fn ensure_model_pricing_seeded_on_conn(conn: &Connection) -> Result<(), AppError> {
+    pub(crate) fn ensure_model_pricing_seeded_on_conn(conn: &Connection) -> Result<(), AppError> {
         // 每次启动都执行 INSERT OR IGNORE，增量追加新模型；仅修复仍等于旧内置值的定价。
         Self::seed_model_pricing(conn)?;
         Self::repair_current_model_pricing(conn)
