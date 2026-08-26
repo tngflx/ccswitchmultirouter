@@ -1425,6 +1425,8 @@ fn sync_current_provider_for_app_respecting_takeover(
         return Ok(());
     };
 
+    super::ProviderService::sync_active_profile_provider_snapshot(state, app_type, &provider.id)?;
+
     if matches!(app_type, AppType::Codex)
         && provider
             .settings_config
