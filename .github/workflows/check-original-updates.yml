@@ -1,0 +1,29 @@
+name: Check Original Updates
+on:
+  schedule:
+    - cron: "0 8 * * 1"
+  workflow_dispatch:
+
+jobs:
+  check-upstream:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Fetch original cc-switch
+        run: |
+          git remote add original https://github.com/farion1231/cc-switch.git
+          git fetch original main
+
+      - name: List new commits not yet cherry-picked
+        run: |
+          MERGE_BASE=$(git merge-base HEAD original/main)
+          NEW_COMMITS=$(git log --oneline $MERGE_BASE..original/main --no-merges --format="%h %s" | head -50)
+          if [ -z "$NEW_COMMITS" ]; then
+            echo "No new commits from original cc-switch."
+          else
+            echo "::warning::New commits available from original cc-switch:"
+            echo "$NEW_COMMITS"
+          fi

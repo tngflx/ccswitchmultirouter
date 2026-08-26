@@ -36,3 +36,6 @@ mainWindow.js
 /scripts/codex-history-tool/__pycache__/
 /scripts/codex-history-tool/*.spec
 /scripts/logs/
+
+# Generated release-build cache used for a one-off release audit
+/src-tauri/target-release-audit/

@@ -9,6 +9,7 @@
     "tauri": "tauri",
     "dev:renderer": "vite",
     "build:renderer": "vite build",
+    "build:exe": "pnpm build:renderer && cargo build --manifest-path src-tauri\\Cargo.toml --bin cc-switch --release --features tauri/custom-protocol",
     "typecheck": "tsc --noEmit",
     "history:tool:check": "python -m py_compile scripts/codex-history-tool/codex_history_tool.py",
     "format": "prettier --write \"src/**/*.{js,jsx,ts,tsx,css,json}\"",
