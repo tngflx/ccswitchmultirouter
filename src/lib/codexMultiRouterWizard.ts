@@ -1,3 +1,5 @@
+import i18n from "@/i18n";
+
 import type {
   CodexApiFormat,
   CodexCacheConfig,
@@ -388,8 +390,8 @@ export function getWizardConfigIssues(
       providerId: provider.id,
       providerName: provider.name,
       reason: isWizardCatalogOnlyModelSource(provider)
-        ? "当前 Plan 缺少推理 API Key 或专用模型列表凭据，且没有可用 modelCatalog。"
-        : "缺少 Base URL/API Key，且当前没有可用 modelCatalog。",
+        ? i18n.t("codexWizard.lib.issueNoInferenceCreds")
+        : i18n.t("codexWizard.lib.issueNoBaseUrl"),
     }));
 }
 
@@ -739,7 +741,7 @@ export function classifyWizardConnectivityResult(args: {
       model: args.model,
       status: "pass",
       canContinue: true,
-      detail: "直接 /v1/responses 探测通过。",
+      detail: i18n.t("codexWizard.lib.probePass"),
       url: args.url,
       httpStatus: args.httpStatus,
     };
@@ -753,8 +755,12 @@ export function classifyWizardConnectivityResult(args: {
     status: chatOnlyCanContinue ? "warn" : "fail",
     canContinue: chatOnlyCanContinue,
     detail: chatOnlyCanContinue
-      ? `直接 /v1/responses 失败，但该 provider 配置为 Chat Completions；运行时会由 MultiRouter 转换到 /chat/completions。上游返回：${args.detail}`
-      : `该 provider 配置为 Responses 直连，/v1/responses 失败会阻塞真实 Codex 请求。上游返回：${args.detail}`,
+      ? i18n.t("codexWizard.lib.probeResponsesFailChatOnly", {
+          detail: args.detail,
+        })
+      : i18n.t("codexWizard.lib.probeResponsesFailBlocking", {
+          detail: args.detail,
+        }),
     url: args.url,
     httpStatus: args.httpStatus,
   };
@@ -780,8 +786,7 @@ export function classifyWizardDualProtocolConnectivityResult(args: {
       status: "pass",
       canContinue: true,
       recommendedApiFormat: "openai_responses",
-      detail:
-        "Responses 和 Chat Completions 的基础请求都可用；这只能证明协议入口、鉴权和模型名可用，Codex 原生工具链仍优先使用 Responses。",
+      detail: i18n.t("codexWizard.lib.probeDualPass"),
     };
   }
   if (args.responses.ok) {
@@ -790,7 +795,9 @@ export function classifyWizardDualProtocolConnectivityResult(args: {
       status: "pass",
       canContinue: true,
       recommendedApiFormat: "openai_responses",
-      detail: `Responses 基础请求可用，Chat Completions 不通；将使用 Responses。该结果不等于完整 Codex 功能验证，Chat 返回：${args.chat.detail}`,
+      detail: i18n.t("codexWizard.lib.probeResponsesPassChatFail", {
+        chat: args.chat.detail,
+      }),
     };
   }
   if (args.chat.ok) {
@@ -799,14 +806,19 @@ export function classifyWizardDualProtocolConnectivityResult(args: {
       status: "warn",
       canContinue: true,
       recommendedApiFormat: "openai_chat",
-      detail: `Responses 不通但 Chat Completions 可用；将保留 Chat 转换路径。Responses 返回：${args.responses.detail}`,
+      detail: i18n.t("codexWizard.lib.probeResponsesFailChatPass", {
+        responses: args.responses.detail,
+      }),
     };
   }
   return {
     ...base,
     status: "fail",
     canContinue: false,
-    detail: `Responses 和 Chat Completions 都不通，更可能是 API Key、Base URL、模型权限、额度、网络或上游可用性问题。Responses 返回：${args.responses.detail}；Chat 返回：${args.chat.detail}`,
+    detail: i18n.t("codexWizard.lib.probeBothFail", {
+      responses: args.responses.detail,
+      chat: args.chat.detail,
+    }),
   };
 }
 
@@ -823,8 +835,8 @@ export function skippedWizardConnectivityResult(
     status: hasCatalog ? "skipped" : "fail",
     canContinue: hasCatalog,
     detail: hasCatalog
-      ? `${reason}；已有 modelCatalog，允许继续但未验证真实响应。`
-      : `${reason}；且没有 modelCatalog，不能确认路由可用。`,
+      ? i18n.t("codexWizard.lib.skipWithCatalog", { reason })
+      : i18n.t("codexWizard.lib.skipWithoutCatalog", { reason }),
   };
 }
 
@@ -990,7 +1002,7 @@ export function collectWizardRouteAliasSelectionIssues(
           providerName: provider.name,
           alias,
           canonicalModel,
-          reason: "别名目标已从 Provider 模型目录移除或重命名。",
+          reason: i18n.t("codexWizard.lib.aliasRemovedOrRenamed"),
         });
       } else if (!selectedSet.has(canonicalKey)) {
         issues.push({
@@ -999,7 +1011,7 @@ export function collectWizardRouteAliasSelectionIssues(
           providerName: provider.name,
           alias,
           canonicalModel,
-          reason: "别名目标不在当前 Route 的 canonical selection 中。",
+          reason: i18n.t("codexWizard.lib.aliasNotSelected"),
         });
       }
     }

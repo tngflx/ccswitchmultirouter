@@ -24,6 +24,7 @@ import {
 import { CSS } from "@dnd-kit/utilities";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useTranslation } from "react-i18next";
+import { getI18n } from "react-i18next";
 import {
   Activity,
   AlertTriangle,
@@ -118,6 +119,7 @@ import {
   extractCodexExperimentalBearerToken,
   getCodexBaseUrl,
 } from "@/utils/providerConfigUtils";
+
 import {
   codexCatalogOnlyPlanModelFetchMessage,
   codexPlanModelListAction,
@@ -150,6 +152,21 @@ import type {
   ProxyStatus,
 } from "@/types/proxy";
 
+/// Render-time translator shared by module-level helpers; falls back to defaultValue.
+function tr(
+  key: string,
+  options?: { defaultValue?: string } & Record<string, unknown>,
+): string {
+  const instance = getI18n();
+  if (!instance) return options?.defaultValue ?? key;
+  const result = (
+    instance.t as (k: string, o?: Record<string, unknown>) => unknown
+  )(key, options);
+  return typeof result === "string" && result.length > 0
+    ? result
+    : (options?.defaultValue ?? key);
+}
+
 export type WorkspaceTab =
   | "overview"
   | "sources"
@@ -164,12 +181,18 @@ type StatusView = "link" | "protocol" | "debug" | "providers" | "traffic";
 type SpawnAgentCandidateView = "selected" | "routed" | "priority" | "all";
 
 // 模型菜单解锁只处理 Codex Desktop renderer 白名单，不改变 MultiRouter 路由或凭据。
-const MODEL_PICKER_UNLOCK_TOOLTIP =
-  "开启或确认 Codex 接管后，CCSwitchMulti 会自动尝试一次。只有当前 Codex Desktop 已普通启动且没有 remote debugging 时，才需要完全退出后点击这里；成功带 CDP 启动后，切换第三方 API Key 不需要重复解锁。它只注入 Desktop renderer 模型白名单补丁，不改变路由规则、API Key 或模型目录；CLI/app-server 仍由 config.toml、model_catalog_json、本地 /v1/models 和 MultiRouter 路由支持。";
+const modelPickerUnlockTooltip = () =>
+  tr("codexRouterWorkspace.s001", {
+    defaultValue:
+      "开启或确认 Codex 接管后，CCSwitchMulti 会自动尝试一次。只有当前 Codex Desktop 已普通启动且没有 remote debugging 时，才需要完全退出后点击这里；成功带 CDP 启动后，切换第三方 API Key 不需要重复解锁。它只注入 Desktop renderer 模型白名单补丁，不改变路由规则、API Key 或模型目录；CLI/app-server 仍由 config.toml、model_catalog_json、本地 /v1/models 和 MultiRouter 路由支持。",
+  });
 
 // 链路页需要给出明确下一步，避免用户只看到诊断异常却不知道要触发解锁。
-const MODEL_PICKER_UNLOCK_HINT =
-  "开启或确认 Codex 接管后会自动尝试一次；若当前 Desktop 已普通启动且菜单仍只显示“自定义”，请完全退出 Codex Desktop 后点击“解锁模型菜单”。CLI/app-server 的模型目录修复走 live config、model_catalog_json 和本地 /v1/models，不需要把小写 codex.exe 当 Desktop 启动。";
+const modelPickerUnlockHint = () =>
+  tr("codexRouterWorkspace.s002", {
+    defaultValue:
+      "开启或确认 Codex 接管后会自动尝试一次；若当前 Desktop 已普通启动且菜单仍只显示“自定义”，请完全退出 Codex Desktop 后点击“解锁模型菜单”。CLI/app-server 的模型目录修复走 live config、model_catalog_json 和本地 /v1/models，不需要把小写 codex.exe 当 Desktop 启动。",
+  });
 
 type CodexRoute = {
   id?: string;
@@ -308,7 +331,10 @@ function parseRouteAliases(value: string): {
     if (separator <= 0 || separator === trimmed.length - 1) {
       return {
         aliases,
-        error: `别名格式无效：${trimmed}，请使用“可见模型=上游模型”`,
+        error: tr("codexRouterWorkspace.s003", {
+          defaultValue: "别名格式无效：{{arg0}}，请使用“可见模型=上游模型”",
+          arg0: trimmed,
+        }),
       };
     }
     const visible = trimmed.slice(0, separator).trim();
@@ -316,7 +342,10 @@ function parseRouteAliases(value: string): {
     if (!visible || !canonical) {
       return {
         aliases,
-        error: `别名格式无效：${trimmed}，请使用“可见模型=上游模型”`,
+        error: tr("codexRouterWorkspace.s003", {
+          defaultValue: "别名格式无效：{{arg0}}，请使用“可见模型=上游模型”",
+          arg0: trimmed,
+        }),
       };
     }
     aliases[visible] = canonical;
@@ -480,22 +509,29 @@ export function resolveCodexRouterAuthFacadeLabel(
   if (officialAuth.mode === "desktop_current_login") {
     return (
       translate?.("codexRouterAuth.facadeNativeMixed", {
-        defaultValue: "Desktop / 混合认证",
-      }) ?? "Desktop / 混合认证"
+        defaultValue: tr("codexRouterWorkspace.s004", {
+          defaultValue: "Desktop / 混合认证",
+        }),
+      }) ??
+      tr("codexRouterWorkspace.s004", { defaultValue: "Desktop / 混合认证" })
     );
   }
   if (officialAuth.mode === "managed_oauth") {
     return (
       translate?.("codexRouterAuth.facadeManaged", {
-        defaultValue: "CCSM 托管认证",
-      }) ?? "CCSM 托管认证"
+        defaultValue: tr("codexRouterWorkspace.s005", {
+          defaultValue: "CCSM 托管认证",
+        }),
+      }) ?? tr("codexRouterWorkspace.s005", { defaultValue: "CCSM 托管认证" })
     );
   }
   if (!poolPolicy)
     return (
       translate?.("codexRouterAuth.facadePending", {
-        defaultValue: "待确认",
-      }) ?? "待确认"
+        defaultValue: tr("codexRouterWorkspace.s006", {
+          defaultValue: "待确认",
+        }),
+      }) ?? tr("codexRouterWorkspace.s006", { defaultValue: "待确认" })
     );
   const nativeMixed =
     poolPolicy.enabled &&
@@ -504,11 +540,16 @@ export function resolveCodexRouterAuthFacadeLabel(
     );
   return nativeMixed
     ? (translate?.("codexRouterAuth.facadeNativeMixed", {
-        defaultValue: "Desktop / 混合认证",
-      }) ?? "Desktop / 混合认证")
+        defaultValue: tr("codexRouterWorkspace.s004", {
+          defaultValue: "Desktop / 混合认证",
+        }),
+      }) ??
+        tr("codexRouterWorkspace.s004", { defaultValue: "Desktop / 混合认证" }))
     : (translate?.("codexRouterAuth.facadeManaged", {
-        defaultValue: "CCSM 托管认证",
-      }) ?? "CCSM 托管认证");
+        defaultValue: tr("codexRouterWorkspace.s005", {
+          defaultValue: "CCSM 托管认证",
+        }),
+      }) ?? tr("codexRouterWorkspace.s005", { defaultValue: "CCSM 托管认证" }));
 }
 
 type ProviderModelRefreshState = {
@@ -646,7 +687,11 @@ function withModelRefreshTimeout<T>(
       onTimeout?.();
       reject(
         new Error(
-          `模型列表读取或写回超过 ${Math.round(timeoutMs / 1000)} 秒，请检查网络、供应商的 /models 接口或本地配置写入状态。`,
+          tr("codexRouterWorkspace.s007", {
+            defaultValue:
+              "模型列表读取或写回超过 {{arg0}} 秒，请检查网络、供应商的 /models 接口或本地配置写入状态。",
+            arg0: Math.round(timeoutMs / 1000),
+          }),
         ),
       );
     }, timeoutMs);
@@ -659,16 +704,35 @@ function withModelRefreshTimeout<T>(
 export function workspaceErrorMessage(error: unknown): string {
   const message = error instanceof Error ? error.message : String(error);
   const knownMessages: Array<[string, string]> = [
-    ["include_models_empty", "请至少选择一个上游模型"],
+    [
+      "include_models_empty",
+      tr("codexRouterWorkspace.s008", {
+        defaultValue: "请至少选择一个上游模型",
+      }),
+    ],
     [
       "include_models_duplicate_or_empty",
-      "上游模型列表包含空项或重复项，请重新选择",
+      tr("codexRouterWorkspace.s009", {
+        defaultValue: "上游模型列表包含空项或重复项，请重新选择",
+      }),
     ],
-    ["alias_target_not_selected", "别名目标必须是当前已选择的上游模型"],
-    ["route_target_provider_required", "该路由还没有选择目标供应商"],
+    [
+      "alias_target_not_selected",
+      tr("codexRouterWorkspace.s010", {
+        defaultValue: "别名目标必须是当前已选择的上游模型",
+      }),
+    ],
+    [
+      "route_target_provider_required",
+      tr("codexRouterWorkspace.s011", {
+        defaultValue: "该路由还没有选择目标供应商",
+      }),
+    ],
     [
       "legacy_route_requires_migration",
-      "当前是旧版路由配置，请先完成迁移后再保存",
+      tr("codexRouterWorkspace.s012", {
+        defaultValue: "当前是旧版路由配置，请先完成迁移后再保存",
+      }),
     ],
   ];
   const matched = knownMessages.find(([code]) => message.includes(code));
@@ -677,8 +741,13 @@ export function workspaceErrorMessage(error: unknown): string {
 
   const errorCode = message.match(/\b[a-z][a-z0-9]*(?:_[a-z0-9]+)+\b/)?.[0];
   return errorCode
-    ? `操作失败，请查看日志中的详细原因（错误代码：${errorCode}）`
-    : "操作失败，请检查当前配置或查看日志中的详细原因";
+    ? tr("codexRouterWorkspace.s013", {
+        defaultValue: "操作失败，请查看日志中的详细原因（错误代码：{{arg0}}）",
+        arg0: errorCode,
+      })
+    : tr("codexRouterWorkspace.s014", {
+        defaultValue: "操作失败，请检查当前配置或查看日志中的详细原因",
+      });
 }
 
 /// 读取 provider 模型列表；官方 OAuth 在线失败时回退到本地 Codex 模型缓存。
@@ -777,7 +846,9 @@ function getProviderModelFetchConfig(
       baseUrl,
       apiKey,
       isFullUrl: false,
-      skipReason: "缺少 Base URL，无法读取模型列表。",
+      skipReason: tr("codexRouterWorkspace.s015", {
+        defaultValue: "缺少 Base URL，无法读取模型列表。",
+      }),
     };
   }
   if (isCatalogOnlyPlan) {
@@ -799,7 +870,9 @@ function getProviderModelFetchConfig(
       baseUrl,
       apiKey,
       isFullUrl: false,
-      skipReason: "缺少 API Key，无法读取模型列表。",
+      skipReason: tr("codexRouterWorkspace.s016", {
+        defaultValue: "缺少 API Key，无法读取模型列表。",
+      }),
     };
   }
 
@@ -976,11 +1049,21 @@ export function validateProxyListenDraft(
   const address = listenAddress.trim() || DEFAULT_CODEX_PROXY_LISTEN_ADDRESS;
   const portText = listenPort.trim();
   if (!/^\d+$/.test(portText)) {
-    return { ok: false, error: "监听端口必须是 1024-65535 之间的数字。" };
+    return {
+      ok: false,
+      error: tr("codexRouterWorkspace.s017", {
+        defaultValue: "监听端口必须是 1024-65535 之间的数字。",
+      }),
+    };
   }
   const port = Number.parseInt(portText, 10);
   if (!Number.isInteger(port) || port < 1024 || port > 65535) {
-    return { ok: false, error: "监听端口必须是 1024-65535 之间的数字。" };
+    return {
+      ok: false,
+      error: tr("codexRouterWorkspace.s017", {
+        defaultValue: "监听端口必须是 1024-65535 之间的数字。",
+      }),
+    };
   }
   return {
     ok: true,
@@ -1031,57 +1114,76 @@ export function buildMultiRouterRuntimeStatus({
   if (!selectedPlan) {
     return {
       running: false,
-      label: "未选择",
-      detail: "当前没有选中的 MultiRouter。",
+      label: tr("codexRouterWorkspace.s018", { defaultValue: "未选择" }),
+      detail: tr("codexRouterWorkspace.s019", {
+        defaultValue: "当前没有选中的 MultiRouter。",
+      }),
       tone: "warn",
     };
   }
   if (activeProviderId !== selectedPlan.id) {
     return {
       running: false,
-      label: "未发布",
-      detail: `当前 Codex provider 是 ${activeProviderId || "未设置"}，不是 ${selectedPlan.id}。`,
+      label: tr("codexRouterWorkspace.s020", { defaultValue: "未发布" }),
+      detail: tr("codexRouterWorkspace.s021", {
+        defaultValue: "当前 Codex provider 是 {{arg0}}，不是 {{arg1}}。",
+        arg0:
+          activeProviderId ||
+          tr("codexRouterWorkspace.s022", { defaultValue: "未设置" }),
+        arg1: selectedPlan.id,
+      }),
       tone: "warn",
     };
   }
   if (!isProxyRunning) {
     return {
       running: false,
-      label: "代理未启动",
-      detail: "本地 15721 接管代理未监听，Codex 请求不会进入 MultiRouter。",
+      label: tr("codexRouterWorkspace.s023", { defaultValue: "代理未启动" }),
+      detail: tr("codexRouterWorkspace.s024", {
+        defaultValue:
+          "本地 15721 接管代理未监听，Codex 请求不会进入 MultiRouter。",
+      }),
       tone: "warn",
     };
   }
   if (!isCodexTakeoverActive) {
     return {
       running: false,
-      label: "Codex 未接管",
-      detail: "Codex live config 尚未指向本地代理。",
+      label: tr("codexRouterWorkspace.s025", { defaultValue: "Codex 未接管" }),
+      detail: tr("codexRouterWorkspace.s026", {
+        defaultValue: "Codex live config 尚未指向本地代理。",
+      }),
       tone: "warn",
     };
   }
   if (selectedRouting?.enabled === false) {
     return {
       running: false,
-      label: "入口关闭",
-      detail: "当前 MultiRouter 入口已关闭，规则会保留但不参与分流。",
+      label: tr("codexRouterWorkspace.s027", { defaultValue: "入口关闭" }),
+      detail: tr("codexRouterWorkspace.s028", {
+        defaultValue: "当前 MultiRouter 入口已关闭，规则会保留但不参与分流。",
+      }),
       tone: "warn",
     };
   }
   if (enabledRouteCount === 0) {
     return {
       running: false,
-      label: "无启用规则",
-      detail:
-        "当前 MultiRouter 没有启用中的路由规则，Codex 请求无法按 model 分流。",
+      label: tr("codexRouterWorkspace.s029", { defaultValue: "无启用规则" }),
+      detail: tr("codexRouterWorkspace.s030", {
+        defaultValue:
+          "当前 MultiRouter 没有启用中的路由规则，Codex 请求无法按 model 分流。",
+      }),
       tone: "warn",
     };
   }
   return {
     running: true,
-    label: "运行中",
-    detail:
-      "当前 MultiRouter 已作为 Codex provider 启动，Codex 请求会进入本地代理分流。",
+    label: tr("codexRouterWorkspace.s031", { defaultValue: "运行中" }),
+    detail: tr("codexRouterWorkspace.s032", {
+      defaultValue:
+        "当前 MultiRouter 已作为 Codex provider 启动，Codex 请求会进入本地代理分流。",
+    }),
     tone: "ok",
   };
 }
@@ -1253,7 +1355,7 @@ function routeTargetProvider(
 function routeDisplayName(
   route: CodexRoute,
   providersById: Map<string, Provider>,
-  fallback = "未命名规则",
+  fallback = tr("codexRouterWorkspace.s033", { defaultValue: "未命名规则" }),
 ): string {
   const label = route.label?.trim();
   const routeId = route.id?.trim();
@@ -1268,7 +1370,7 @@ export function routeSummaryDisplayName(
   label: string | null | undefined,
   routeId: string | null | undefined,
   providerName: string | null | undefined,
-  fallback = "未命名规则",
+  fallback = tr("codexRouterWorkspace.s033", { defaultValue: "未命名规则" }),
 ): string {
   const normalizedLabel = label?.trim();
   const normalizedRouteId = routeId?.trim();
@@ -2299,11 +2401,16 @@ function routeBaseUrl(
       config.base_url ??
       config.baseURL ??
       config.baseUrl ??
-      `复用供应商配置：${target.name}`
+      tr("codexRouterWorkspace.s034", {
+        defaultValue: "复用供应商配置：{{arg0}}",
+        arg0: target.name,
+      })
     );
   }
   return (
-    route.upstream?.baseUrl ?? route.upstream?.base_url ?? "继承模型源地址"
+    route.upstream?.baseUrl ??
+    route.upstream?.base_url ??
+    tr("codexRouterWorkspace.s035", { defaultValue: "继承模型源地址" })
   );
 }
 
@@ -2311,17 +2418,25 @@ function routeBaseUrl(
 function authSourceLabel(source?: string): string {
   switch (source) {
     case "managed_codex_oauth":
-      return "托管 Codex OAuth";
+      return tr("codexRouterWorkspace.s036", {
+        defaultValue: "托管 Codex OAuth",
+      });
     case "native_codex_auth":
-      return "Codex 当前登录账号";
+      return tr("codexRouterWorkspace.s037", {
+        defaultValue: "Codex 当前登录账号",
+      });
     case "account_pool":
-      return "OAuth 账号池";
+      return tr("codexRouterWorkspace.s038", { defaultValue: "OAuth 账号池" });
     case "managed_account":
-      return "托管账号";
+      return tr("codexRouterWorkspace.s039", { defaultValue: "托管账号" });
     case "provider_config":
-      return "使用路由 API Key";
+      return tr("codexRouterWorkspace.s040", {
+        defaultValue: "使用路由 API Key",
+      });
     default:
-      return "继承模型源凭据";
+      return tr("codexRouterWorkspace.s041", {
+        defaultValue: "继承模型源凭据",
+      });
   }
 }
 
@@ -2343,19 +2458,29 @@ function apiFormatLabel(format: string): string {
 function protocolDecisionSourceLabel(source?: string | null): string {
   switch (source) {
     case "managed_codex_oauth":
-      return "官方 Codex OAuth";
+      return tr("codexRouterWorkspace.s042", {
+        defaultValue: "官方 Codex OAuth",
+      });
     case "provider_meta_api_format":
       return "Provider meta.apiFormat";
     case "settings_api_format":
-      return "Provider 配置 apiFormat";
+      return tr("codexRouterWorkspace.s043", {
+        defaultValue: "Provider 配置 apiFormat",
+      });
     case "known_chat_completions_only_url":
-      return "已知 Chat-only 地址";
+      return tr("codexRouterWorkspace.s044", {
+        defaultValue: "已知 Chat-only 地址",
+      });
     case "config_wire_api":
       return "config.toml wire_api";
     case "default_responses":
-      return "默认 Responses";
+      return tr("codexRouterWorkspace.s045", {
+        defaultValue: "默认 Responses",
+      });
     default:
-      return source || "未探测";
+      return (
+        source || tr("codexRouterWorkspace.s046", { defaultValue: "未探测" })
+      );
   }
 }
 
@@ -2364,10 +2489,23 @@ function routeMatchSummary(route: CodexRoute): string {
   const models = route.match?.models?.filter(Boolean) ?? [];
   const prefixes = route.match?.prefixes?.filter(Boolean) ?? [];
   const parts = [
-    models.length > 0 ? `精确模型：${models.join(", ")}` : "",
-    prefixes.length > 0 ? `模型前缀：${prefixes.join(", ")}` : "",
+    models.length > 0
+      ? tr("codexRouterWorkspace.s047", {
+          defaultValue: "精确模型：{{arg0}}",
+          arg0: models.join(", "),
+        })
+      : "",
+    prefixes.length > 0
+      ? tr("codexRouterWorkspace.s048", {
+          defaultValue: "模型前缀：{{arg0}}",
+          arg0: prefixes.join(", "),
+        })
+      : "",
   ].filter(Boolean);
-  return parts.join("；") || "尚未设置匹配条件";
+  return (
+    parts.join("；") ||
+    tr("codexRouterWorkspace.s049", { defaultValue: "尚未设置匹配条件" })
+  );
 }
 
 /// 将固定白名单与 Provider 当前模型目录对照展示，避免 Provider 新增模型后看起来像“没有刷新”。
@@ -2378,7 +2516,11 @@ function routeProviderModelSyncSummary(
   if (!provider) return null;
   const providerModels = collectProviderCanonicalModelIds(provider);
   if (route.modelSelection?.mode !== "include") {
-    return `已接入 ${providerModels.length}/${providerModels.length} 个模型（自动跟随供应商）`;
+    return tr("codexRouterWorkspace.s050", {
+      defaultValue: "已接入 {{arg0}}/{{arg1}} 个模型（自动跟随供应商）",
+      arg0: providerModels.length,
+      arg1: providerModels.length,
+    });
   }
 
   const selected = new Set(
@@ -2389,9 +2531,27 @@ function routeProviderModelSyncSummary(
   const stale = Array.from(selected).filter(
     (model) => !providerModels.includes(model),
   );
-  const parts = [`已接入 ${connected.length}/${providerModels.length} 个模型`];
-  if (excluded.length > 0) parts.push(`尚未接入：${excluded.join(", ")}`);
-  if (stale.length > 0) parts.push(`已不存在：${stale.join(", ")}`);
+  const parts = [
+    tr("codexRouterWorkspace.s051", {
+      defaultValue: "已接入 {{arg0}}/{{arg1}} 个模型",
+      arg0: connected.length,
+      arg1: providerModels.length,
+    }),
+  ];
+  if (excluded.length > 0)
+    parts.push(
+      tr("codexRouterWorkspace.s052", {
+        defaultValue: "尚未接入：{{arg0}}",
+        arg0: excluded.join(", "),
+      }),
+    );
+  if (stale.length > 0)
+    parts.push(
+      tr("codexRouterWorkspace.s053", {
+        defaultValue: "已不存在：{{arg0}}",
+        arg0: stale.join(", "),
+      }),
+    );
   return parts.join("；");
 }
 
@@ -2978,7 +3138,9 @@ export function CodexRouterWorkspacePage({
         ...current,
         [provider.id]: {
           status: "loading",
-          message: "正在读取模型列表...",
+          message: tr("codexRouterWorkspace.s054", {
+            defaultValue: "正在读取模型列表...",
+          }),
         },
       }));
 
@@ -2998,8 +3160,15 @@ export function CodexRouterWorkspacePage({
           return {
             status: "empty",
             message: onlineErrorMessage
-              ? `OAuth 在线模型列表获取失败：${onlineErrorMessage}；本地缓存没有可恢复的官方模型目录。`
-              : "获取模型列表失败：远端返回空列表，请检查当前供应商配置。",
+              ? tr("codexRouterWorkspace.s055", {
+                  defaultValue:
+                    "OAuth 在线模型列表获取失败：{{arg0}}；本地缓存没有可恢复的官方模型目录。",
+                  arg0: onlineErrorMessage,
+                })
+              : tr("codexRouterWorkspace.s056", {
+                  defaultValue:
+                    "获取模型列表失败：远端返回空列表，请检查当前供应商配置。",
+                }),
           };
         }
 
@@ -3009,8 +3178,15 @@ export function CodexRouterWorkspacePage({
           [provider.id]: {
             status: "loading",
             message: usedCodexCache
-              ? `OAuth 在线读取失败，已从本地 Codex 模型缓存读取 ${models.length} 个模型，正在写回本地配置...`
-              : `已读取 ${models.length} 个模型，正在写回本地配置...`,
+              ? tr("codexRouterWorkspace.s057", {
+                  defaultValue:
+                    "OAuth 在线读取失败，已从本地 Codex 模型缓存读取 {{arg0}} 个模型，正在写回本地配置...",
+                  arg0: models.length,
+                })
+              : tr("codexRouterWorkspace.s058", {
+                  defaultValue: "已读取 {{arg0}} 个模型，正在写回本地配置...",
+                  arg0: models.length,
+                }),
             modelCount: models.length,
           },
         }));
@@ -3041,7 +3217,10 @@ export function CodexRouterWorkspacePage({
                 status: "error",
                 message:
                   result.message ??
-                  "获取模型列表失败：远端返回空列表，请检查当前供应商配置。",
+                  tr("codexRouterWorkspace.s056", {
+                    defaultValue:
+                      "获取模型列表失败：远端返回空列表，请检查当前供应商配置。",
+                  }),
                 modelCount: 0,
               },
             }));
@@ -3065,12 +3244,18 @@ export function CodexRouterWorkspacePage({
             [provider.id]: {
               status: "success",
               message: result.usedCodexCache
-                ? `OAuth 在线读取失败，已使用本地 Codex 模型缓存更新 ${
-                    readCodexModelCatalog(result.nextProvider).models.length
-                  } 个模型。在线错误：${result.onlineErrorMessage}`
-                : `已读取并更新 ${
-                    readCodexModelCatalog(result.nextProvider).models.length
-                  } 个模型。`,
+                ? tr("codexRouterWorkspace.s059", {
+                    defaultValue:
+                      "OAuth 在线读取失败，已使用本地 Codex 模型缓存更新 {{arg0}} 个模型。在线错误：{{arg1}}",
+                    arg0: readCodexModelCatalog(result.nextProvider).models
+                      .length,
+                    arg1: result.onlineErrorMessage,
+                  })
+                : tr("codexRouterWorkspace.s060", {
+                    defaultValue: "已读取并更新 {{arg0}} 个模型。",
+                    arg0: readCodexModelCatalog(result.nextProvider).models
+                      .length,
+                  }),
               modelCount: readCodexModelCatalog(result.nextProvider).models
                 .length,
             },
@@ -3089,7 +3274,11 @@ export function CodexRouterWorkspacePage({
             ...current,
             [provider.id]: {
               status: "error",
-              message: `获取模型列表失败，请检查当前供应商配置：${workspaceErrorMessage(error)}`,
+              message: tr("codexRouterWorkspace.s061", {
+                defaultValue:
+                  "获取模型列表失败，请检查当前供应商配置：{{arg0}}",
+                arg0: workspaceErrorMessage(error),
+              }),
             },
           }));
         });
@@ -3236,7 +3425,11 @@ export function CodexRouterWorkspacePage({
       setActiveTab("routes");
       setRoutePickerSelectAll(true);
       setIsRoutePickerOpen(true);
-      setRoutePickerMessage("已创建新的多路路由，请选择要接入的候选 router。");
+      setRoutePickerMessage(
+        tr("codexRouterWorkspace.s062", {
+          defaultValue: "已创建新的多路路由，请选择要接入的候选 router。",
+        }),
+      );
     } catch (error) {
       setRoutePickerError(workspaceErrorMessage(error));
     } finally {
@@ -3287,7 +3480,11 @@ export function CodexRouterWorkspacePage({
       setOptimisticRoutingPlan(nextProvider);
       setSelectedPlanId(nextProvider.id);
       setIsPlanSettingsOpen(false);
-      setRoutePickerMessage("多路路由设置已保存，接管配置由系统继续自动维护。");
+      setRoutePickerMessage(
+        tr("codexRouterWorkspace.s063", {
+          defaultValue: "多路路由设置已保存，接管配置由系统继续自动维护。",
+        }),
+      );
     } catch (error) {
       setRoutePickerError(workspaceErrorMessage(error));
     } finally {
@@ -3361,7 +3558,10 @@ export function CodexRouterWorkspacePage({
         normalizedRoutes[0]?.id ? `${plan.id}:${normalizedRoutes[0].id}` : null,
       );
       setRoutePickerMessage(
-        "路由规则已保存，候选 router 选择已写入当前多路路由方案。",
+        tr("codexRouterWorkspace.s064", {
+          defaultValue:
+            "路由规则已保存，候选 router 选择已写入当前多路路由方案。",
+        }),
       );
       setRoutePickerSelectAll(false);
       setIsRoutePickerOpen(false);
@@ -3439,7 +3639,11 @@ export function CodexRouterWorkspacePage({
       if (action === "routes") {
         setActiveTab("routes");
         setRoutePickerError(null);
-        setRoutePickerMessage("旧方案已迁移为 schema v2，请检查后再保存规则。");
+        setRoutePickerMessage(
+          tr("codexRouterWorkspace.s065", {
+            defaultValue: "旧方案已迁移为 schema v2，请检查后再保存规则。",
+          }),
+        );
         setRoutePickerSelectAll(false);
         setIsRoutePickerOpen(true);
       } else if (action === "settings") {
@@ -3481,7 +3685,10 @@ export function CodexRouterWorkspacePage({
     const model = testModel.trim();
     if (!model) {
       setTestResult(
-        "请输入一个 Codex 请求里的 model，例如 gpt-5.4-mini 或 qwen3.6。",
+        tr("codexRouterWorkspace.s066", {
+          defaultValue:
+            "请输入一个 Codex 请求里的 model，例如 gpt-5.4-mini 或 qwen3.6。",
+        }),
       );
       return;
     }
@@ -3514,12 +3721,23 @@ export function CodexRouterWorkspacePage({
     });
 
     if (matched) {
-      const result = `${model} 会命中「${routeDisplayName(matched.route, providersById)}」，上游为 ${routeBaseUrl(matched.route, providersById)}。`;
+      const result = tr("codexRouterWorkspace.s067", {
+        defaultValue: "{{arg0}} 会命中「{{arg1}}」，上游为 {{arg2}}。",
+        arg0: model,
+        arg1: routeDisplayName(matched.route, providersById),
+        arg2: routeBaseUrl(matched.route, providersById),
+      });
       setTestResult(result);
       return;
     }
 
-    setTestResult(`${model} 不可路由：未命中当前方案中的任何已启用模型规则。`);
+    setTestResult(
+      tr("codexRouterWorkspace.s068", {
+        defaultValue:
+          "{{arg0}} 不可路由：未命中当前方案中的任何已启用模型规则。",
+        arg0: model,
+      }),
+    );
   }
 
   return (
@@ -3542,34 +3760,52 @@ export function CodexRouterWorkspacePage({
               <WorkspaceTabTrigger
                 value="overview"
                 icon={Layers3}
-                label="总览"
+                label={tr("codexRouterWorkspace.s069", {
+                  defaultValue: "总览",
+                })}
               />
               <WorkspaceTabTrigger
                 value="sources"
                 icon={Server}
-                label="模型源"
+                label={tr("codexRouterWorkspace.s070", {
+                  defaultValue: "模型源",
+                })}
               />
               <WorkspaceTabTrigger
                 value="routes"
                 icon={Route}
-                label="路由规则"
+                label={tr("codexRouterWorkspace.s071", {
+                  defaultValue: "路由规则",
+                })}
               />
               <WorkspaceTabTrigger
                 value="model-order"
                 icon={GripVertical}
-                label="模型排序"
+                label={tr("codexRouterWorkspace.s072", {
+                  defaultValue: "模型排序",
+                })}
               />
               <WorkspaceTabTrigger
                 value="subagents"
                 icon={Bot}
-                label="子 Agent"
+                label={tr("codexRouterWorkspace.s073", {
+                  defaultValue: "子 Agent",
+                })}
               />
               <WorkspaceTabTrigger
                 value="status"
                 icon={Activity}
-                label="状态"
+                label={tr("codexRouterWorkspace.s074", {
+                  defaultValue: "状态",
+                })}
               />
-              <WorkspaceTabTrigger value="test" icon={Play} label="测试发布" />
+              <WorkspaceTabTrigger
+                value="test"
+                icon={Play}
+                label={tr("codexRouterWorkspace.s075", {
+                  defaultValue: "测试发布",
+                })}
+              />
             </TabsList>
           </div>
 
@@ -3694,41 +3930,62 @@ export function CodexRouterWorkspacePage({
       >
         <DialogContent className="max-w-2xl">
           <DialogHeader>
-            <DialogTitle>迁移旧 MultiRouter 到 schema v2</DialogTitle>
+            <DialogTitle>
+              {tr("codexRouterWorkspace.s076", {
+                defaultValue: "迁移旧 MultiRouter 到 schema v2",
+              })}
+            </DialogTitle>
             <DialogDescription>
-              编辑或启用旧方案前必须显式迁移。预览只展示引用变化和字段类别，不会展示
-              API Key、Token 或 OAuth 凭据。
+              {tr("codexRouterWorkspace.s077", {
+                defaultValue:
+                  "编辑或启用旧方案前必须显式迁移。预览只展示引用变化和字段类别，不会展示\n              API Key、Token 或 OAuth 凭据。",
+              })}
             </DialogDescription>
           </DialogHeader>
           {isLoadingMigration ? (
             <div className="rounded-md border p-3 text-sm text-muted-foreground">
-              正在生成迁移预览…
+              {tr("codexRouterWorkspace.s078", {
+                defaultValue: "正在生成迁移预览…",
+              })}
             </div>
           ) : migrationPreview ? (
             <div className="space-y-3 text-sm">
               <div className="grid gap-2 sm:grid-cols-3">
                 <DetailRow
-                  label="删除冗余字段"
+                  label={tr("codexRouterWorkspace.s079", {
+                    defaultValue: "删除冗余字段",
+                  })}
                   value={String(
                     migrationPreview.diff.removedRouteFields.length,
                   )}
                 />
                 <DetailRow
-                  label="引用变化 Route"
+                  label={tr("codexRouterWorkspace.s080", {
+                    defaultValue: "引用变化 Route",
+                  })}
                   value={String(migrationPreview.diff.changedRouteIds.length)}
                 />
                 <DetailRow
-                  label="迁移生成 Provider"
+                  label={tr("codexRouterWorkspace.s081", {
+                    defaultValue: "迁移生成 Provider",
+                  })}
                   value={String(migrationPreview.generatedProviders.length)}
                 />
               </div>
               {migrationPreview.generatedProviders.length > 0 ? (
                 <div className="rounded-md border p-3">
-                  <div className="font-medium">将创建的 Provider</div>
+                  <div className="font-medium">
+                    {tr("codexRouterWorkspace.s082", {
+                      defaultValue: "将创建的 Provider",
+                    })}
+                  </div>
                   <ul className="mt-2 list-disc space-y-1 pl-5 text-muted-foreground">
                     {migrationPreview.generatedProviders.map((provider) => (
                       <li key={provider.id}>
-                        {provider.name} ({provider.id})，来源{" "}
+                        {provider.name} ({provider.id}
+                        {tr("codexRouterWorkspace.s083", {
+                          defaultValue: ")，来源",
+                        })}{" "}
                         {provider.sourceProviderId}
                       </li>
                     ))}
@@ -3737,7 +3994,11 @@ export function CodexRouterWorkspacePage({
               ) : null}
               {migrationPreview.warnings.length > 0 ? (
                 <div className="rounded-md border border-amber-300 bg-amber-50 p-3 text-amber-900 dark:border-amber-700/60 dark:bg-amber-950/30 dark:text-amber-100">
-                  <div className="font-medium">迁移警告</div>
+                  <div className="font-medium">
+                    {tr("codexRouterWorkspace.s084", {
+                      defaultValue: "迁移警告",
+                    })}
+                  </div>
                   <ul className="mt-2 list-disc space-y-1 pl-5">
                     {migrationPreview.warnings.map((warning) => (
                       <li key={warning}>{warning}</li>
@@ -3766,13 +4027,17 @@ export function CodexRouterWorkspacePage({
                 setMigrationError(null);
               }}
             >
-              取消
+              {tr("codexRouterWorkspace.s085", { defaultValue: "取消" })}
             </Button>
             <Button
               disabled={!migrationPreview || isApplyingMigration}
               onClick={() => void applyLegacyPlanMigration()}
             >
-              {isApplyingMigration ? "正在应用…" : "应用迁移并继续"}
+              {isApplyingMigration
+                ? tr("codexRouterWorkspace.s086", { defaultValue: "正在应用…" })
+                : tr("codexRouterWorkspace.s087", {
+                    defaultValue: "应用迁移并继续",
+                  })}
             </Button>
           </DialogFooter>
         </DialogContent>
@@ -3795,12 +4060,15 @@ function HeaderPanel({
         <div className="min-w-0 space-y-2">
           <div className="flex items-center gap-2 text-base font-semibold">
             <GitBranch className="h-4 w-4 text-blue-600 dark:text-blue-300" />
-            Codex 多模型路由工作台
+            {tr("codexRouterWorkspace.s088", {
+              defaultValue: "Codex 多模型路由工作台",
+            })}
           </div>
           <p className="max-w-4xl text-xs leading-5 text-muted-foreground dark:text-slate-400">
-            这里配置的是“Codex 自己怎么按 model 选择多个上游模型”。Codex
-            仍然只连接一个 CC Switch 本地代理；路由规则负责把
-            gpt、qwen、deepseek 等模型名分流到不同上游。
+            {tr("codexRouterWorkspace.s089", {
+              defaultValue:
+                "这里配置的是“Codex 自己怎么按 model 选择多个上游模型”。Codex\n            仍然只连接一个 CC Switch 本地代理；路由规则负责把\n            gpt、qwen、deepseek 等模型名分流到不同上游。",
+            })}
           </p>
           <div className="flex flex-wrap gap-2">
             <Button
@@ -3809,7 +4077,9 @@ function HeaderPanel({
               className="gap-2 bg-blue-600 hover:bg-blue-500"
             >
               <Plus className="h-4 w-4" />
-              创建多路路由
+              {tr("codexRouterWorkspace.s090", {
+                defaultValue: "创建多路路由",
+              })}
             </Button>
             <Button
               variant="outline"
@@ -3818,7 +4088,9 @@ function HeaderPanel({
               className="gap-2"
             >
               <Settings2 className="h-4 w-4" />
-              管理路由规则
+              {tr("codexRouterWorkspace.s091", {
+                defaultValue: "管理路由规则",
+              })}
             </Button>
             <Button
               variant="outline"
@@ -3827,7 +4099,9 @@ function HeaderPanel({
               className="gap-2"
             >
               <Activity className="h-4 w-4" />
-              查看链路状态
+              {tr("codexRouterWorkspace.s092", {
+                defaultValue: "查看链路状态",
+              })}
             </Button>
           </div>
         </div>
@@ -3883,8 +4157,10 @@ function OverviewTab({
       <section className="rounded-lg border border-blue-200 bg-blue-50/70 p-4 dark:border-blue-700/40 dark:bg-blue-950/15">
         <SectionHeader
           icon={Layers3}
-          title="多路路由"
-          detail="每个多路路由都是一个 Codex 可连接的本地代理入口。"
+          title={tr("codexRouterWorkspace.s093", { defaultValue: "多路路由" })}
+          detail={tr("codexRouterWorkspace.s094", {
+            defaultValue: "每个多路路由都是一个 Codex 可连接的本地代理入口。",
+          })}
           action={
             <Button
               size="sm"
@@ -3892,7 +4168,9 @@ function OverviewTab({
               className="gap-2 bg-blue-600 hover:bg-blue-500"
             >
               <Plus className="h-4 w-4" />
-              创建多路路由
+              {tr("codexRouterWorkspace.s090", {
+                defaultValue: "创建多路路由",
+              })}
             </Button>
           }
         />
@@ -3900,9 +4178,15 @@ function OverviewTab({
           {routingPlans.length === 0 ? (
             <EmptyState
               icon={Wand2}
-              title="还没有多路路由"
-              detail="先创建一个多路路由，再把多个模型源挂到它下面。"
-              actionLabel="创建多路路由"
+              title={tr("codexRouterWorkspace.s095", {
+                defaultValue: "还没有多路路由",
+              })}
+              detail={tr("codexRouterWorkspace.s096", {
+                defaultValue: "先创建一个多路路由，再把多个模型源挂到它下面。",
+              })}
+              actionLabel={tr("codexRouterWorkspace.s097", {
+                defaultValue: "创建多路路由",
+              })}
               onAction={onCreatePlan}
             />
           ) : (
@@ -3924,17 +4208,28 @@ function OverviewTab({
                     className="gap-2"
                   >
                     <Route className="h-4 w-4" />
-                    路由规则
+                    {tr("codexRouterWorkspace.s098", {
+                      defaultValue: "路由规则",
+                    })}
                   </Button>
                   <Button
                     type="button"
                     size="sm"
                     variant="outline"
-                    onClick={() => onEditPlan(provider, "重命名多路路由")}
+                    onClick={() =>
+                      onEditPlan(
+                        provider,
+                        tr("codexRouterWorkspace.s099", {
+                          defaultValue: "重命名多路路由",
+                        }),
+                      )
+                    }
                     className="gap-2"
                   >
                     <Pencil className="h-4 w-4" />
-                    重命名/设置
+                    {tr("codexRouterWorkspace.s100", {
+                      defaultValue: "重命名/设置",
+                    })}
                   </Button>
                   <Button
                     type="button"
@@ -3944,7 +4239,7 @@ function OverviewTab({
                     className="gap-2 border-rose-300 bg-background/70 text-rose-700 hover:bg-rose-50 dark:border-rose-500/50 dark:bg-rose-500/10 dark:text-rose-100 dark:hover:bg-rose-500/20"
                   >
                     <Trash2 className="h-4 w-4" />
-                    删除
+                    {tr("codexRouterWorkspace.s101", { defaultValue: "删除" })}
                   </Button>
                 </div>
               </div>
@@ -3956,8 +4251,12 @@ function OverviewTab({
       <section className="rounded-lg border border-emerald-200 bg-emerald-50/70 p-4 dark:border-emerald-700/40 dark:bg-emerald-950/10">
         <SectionHeader
           icon={Route}
-          title="最近路由规则"
-          detail="点击规则可以进入详情和测试。"
+          title={tr("codexRouterWorkspace.s102", {
+            defaultValue: "最近路由规则",
+          })}
+          detail={tr("codexRouterWorkspace.s103", {
+            defaultValue: "点击规则可以进入详情和测试。",
+          })}
           action={
             <Button
               size="sm"
@@ -3965,7 +4264,7 @@ function OverviewTab({
               onClick={() => onJump("routes")}
               className="gap-2"
             >
-              查看全部
+              {tr("codexRouterWorkspace.s104", { defaultValue: "查看全部" })}
               <ArrowRight className="h-4 w-4" />
             </Button>
           }
@@ -3982,9 +4281,15 @@ function OverviewTab({
           {routeEntries.length === 0 && (
             <EmptyState
               icon={Route}
-              title="还没有规则"
-              detail="创建多路路由后，在编辑表单里添加模型匹配规则。"
-              actionLabel="创建多路路由"
+              title={tr("codexRouterWorkspace.s105", {
+                defaultValue: "还没有规则",
+              })}
+              detail={tr("codexRouterWorkspace.s106", {
+                defaultValue: "创建多路路由后，在编辑表单里添加模型匹配规则。",
+              })}
+              actionLabel={tr("codexRouterWorkspace.s097", {
+                defaultValue: "创建多路路由",
+              })}
               onAction={onCreatePlan}
             />
           )}
@@ -3994,15 +4299,20 @@ function OverviewTab({
       <section className="rounded-lg border border-amber-200 bg-amber-50/70 p-4 dark:border-amber-700/40 dark:bg-amber-950/10 xl:col-span-2">
         <SectionHeader
           icon={Server}
-          title="可接入模型源"
-          detail="这些不是单独一类难懂的 Provider，而是可以被路由方案接入的上游模型源。"
+          title={tr("codexRouterWorkspace.s107", {
+            defaultValue: "可接入模型源",
+          })}
+          detail={tr("codexRouterWorkspace.s108", {
+            defaultValue:
+              "这些不是单独一类难懂的 Provider，而是可以被路由方案接入的上游模型源。",
+          })}
           action={
             <Button
               size="sm"
               variant="outline"
               onClick={() => onJump("sources")}
             >
-              选择模型源
+              {tr("codexRouterWorkspace.s109", { defaultValue: "选择模型源" })}
             </Button>
           }
         />
@@ -4043,8 +4353,13 @@ function SourcesTab({
       <section className="rounded-lg border border-blue-200 bg-blue-50/70 p-4 dark:border-blue-700/40 dark:bg-blue-950/15">
         <SectionHeader
           icon={Layers3}
-          title="多路路由方案"
-          detail="这是 Codex 最终连接的路由入口；选择后到“路由规则”里挂接模型源。"
+          title={tr("codexRouterWorkspace.s110", {
+            defaultValue: "多路路由方案",
+          })}
+          detail={tr("codexRouterWorkspace.s111", {
+            defaultValue:
+              "这是 Codex 最终连接的路由入口；选择后到“路由规则”里挂接模型源。",
+          })}
           action={
             <Button
               size="sm"
@@ -4052,7 +4367,9 @@ function SourcesTab({
               className="gap-2 bg-blue-600 hover:bg-blue-500"
             >
               <Plus className="h-4 w-4" />
-              创建多路路由
+              {tr("codexRouterWorkspace.s090", {
+                defaultValue: "创建多路路由",
+              })}
             </Button>
           }
         />
@@ -4076,17 +4393,28 @@ function SourcesTab({
                   className="gap-2"
                 >
                   <Route className="h-4 w-4" />
-                  路由规则
+                  {tr("codexRouterWorkspace.s098", {
+                    defaultValue: "路由规则",
+                  })}
                 </Button>
                 <Button
                   type="button"
                   size="sm"
                   variant="outline"
-                  onClick={() => onEditPlan(provider, "重命名多路路由")}
+                  onClick={() =>
+                    onEditPlan(
+                      provider,
+                      tr("codexRouterWorkspace.s099", {
+                        defaultValue: "重命名多路路由",
+                      }),
+                    )
+                  }
                   className="gap-2"
                 >
                   <Pencil className="h-4 w-4" />
-                  重命名/设置
+                  {tr("codexRouterWorkspace.s100", {
+                    defaultValue: "重命名/设置",
+                  })}
                 </Button>
               </div>
             </div>
@@ -4094,9 +4422,16 @@ function SourcesTab({
           {routingPlans.length === 0 && (
             <EmptyState
               icon={Layers3}
-              title="还没有多路路由"
-              detail="先创建一个 Codex 多模型路由入口，再选择模型源接入。"
-              actionLabel="创建多路路由"
+              title={tr("codexRouterWorkspace.s095", {
+                defaultValue: "还没有多路路由",
+              })}
+              detail={tr("codexRouterWorkspace.s112", {
+                defaultValue:
+                  "先创建一个 Codex 多模型路由入口，再选择模型源接入。",
+              })}
+              actionLabel={tr("codexRouterWorkspace.s097", {
+                defaultValue: "创建多路路由",
+              })}
               onAction={onCreatePlan}
             />
           )}
@@ -4106,8 +4441,13 @@ function SourcesTab({
       <section className="rounded-lg border border-amber-200 bg-amber-50/70 p-4 dark:border-amber-700/40 dark:bg-amber-950/10">
         <SectionHeader
           icon={Server}
-          title="选择模型源"
-          detail="这里选择要接入多路路由的上游模型源；点卡片进入模型源配置。"
+          title={tr("codexRouterWorkspace.s113", {
+            defaultValue: "选择模型源",
+          })}
+          detail={tr("codexRouterWorkspace.s114", {
+            defaultValue:
+              "这里选择要接入多路路由的上游模型源；点卡片进入模型源配置。",
+          })}
           action={
             <Button
               size="sm"
@@ -4116,7 +4456,7 @@ function SourcesTab({
               className="gap-2"
             >
               <Plus className="h-4 w-4" />
-              添加模型源
+              {tr("codexRouterWorkspace.s115", { defaultValue: "添加模型源" })}
             </Button>
           }
         />
@@ -4126,7 +4466,12 @@ function SourcesTab({
               key={provider.id}
               type="button"
               onClick={() =>
-                onEditPlan(provider, "选择并编辑模型源，准备接入多路路由")
+                onEditPlan(
+                  provider,
+                  tr("codexRouterWorkspace.s116", {
+                    defaultValue: "选择并编辑模型源，准备接入多路路由",
+                  }),
+                )
               }
               className="group rounded-lg border border-amber-200 bg-card p-4 text-left transition hover:border-amber-400 hover:bg-amber-50 hover:shadow-[0_0_0_1px_rgba(251,191,36,0.18)] dark:border-amber-700/40 dark:bg-slate-950/40 dark:hover:bg-amber-950/20 dark:hover:shadow-[0_0_0_1px_rgba(251,191,36,0.25)]"
             >
@@ -4140,15 +4485,17 @@ function SourcesTab({
                   </div>
                 </div>
                 <Badge className="border-amber-200 bg-amber-100 text-amber-800 dark:border-amber-500/50 dark:bg-amber-500/15 dark:text-amber-100">
-                  可选
+                  {tr("codexRouterWorkspace.s117", { defaultValue: "可选" })}
                 </Badge>
               </div>
               <div className="mt-4 flex items-center justify-between text-xs">
                 <span className="text-muted-foreground dark:text-slate-400">
-                  选择这个模型源
+                  {tr("codexRouterWorkspace.s118", {
+                    defaultValue: "选择这个模型源",
+                  })}
                 </span>
                 <span className="inline-flex items-center gap-1 text-amber-700 opacity-80 group-hover:opacity-100 dark:text-amber-200">
-                  选择
+                  {tr("codexRouterWorkspace.s119", { defaultValue: "选择" })}
                   <Pencil className="h-3.5 w-3.5" />
                 </span>
               </div>
@@ -4157,9 +4504,16 @@ function SourcesTab({
           {modelSources.length === 0 && (
             <EmptyState
               icon={Server}
-              title="还没有模型源"
-              detail="先添加一个普通 Codex 模型源，再把它接入多路路由。"
-              actionLabel="添加模型源"
+              title={tr("codexRouterWorkspace.s120", {
+                defaultValue: "还没有模型源",
+              })}
+              detail={tr("codexRouterWorkspace.s121", {
+                defaultValue:
+                  "先添加一个普通 Codex 模型源，再把它接入多路路由。",
+              })}
+              actionLabel={tr("codexRouterWorkspace.s122", {
+                defaultValue: "添加模型源",
+              })}
               onAction={onCreateProvider}
             />
           )}
@@ -4185,9 +4539,16 @@ function SubagentsTab({
     return (
       <EmptyState
         icon={Bot}
-        title="还没有可配置的 MultiRouter"
-        detail="先创建或选择一个多路路由方案，再配置它的子 Agent 协议和模型能力。"
-        actionLabel="创建多路路由"
+        title={tr("codexRouterWorkspace.s123", {
+          defaultValue: "还没有可配置的 MultiRouter",
+        })}
+        detail={tr("codexRouterWorkspace.s124", {
+          defaultValue:
+            "先创建或选择一个多路路由方案，再配置它的子 Agent 协议和模型能力。",
+        })}
+        actionLabel={tr("codexRouterWorkspace.s097", {
+          defaultValue: "创建多路路由",
+        })}
         onAction={onCreatePlan}
       />
     );
@@ -4196,12 +4557,16 @@ function SubagentsTab({
   return (
     <div className="space-y-3">
       <section
-        aria-label="当前子 Agent 方案"
+        aria-label={tr("codexRouterWorkspace.s125", {
+          defaultValue: "当前子 Agent 方案",
+        })}
         className="rounded-lg border border-blue-200 bg-blue-50/70 p-3 dark:border-blue-700/40 dark:bg-blue-950/15"
       >
         <div className="mb-2 flex items-center gap-2 text-sm font-semibold text-blue-800 dark:text-blue-100">
           <Bot className="h-4 w-4" />
-          当前 MultiRouter
+          {tr("codexRouterWorkspace.s126", {
+            defaultValue: "当前 MultiRouter",
+          })}
         </div>
         <PlanCardContent
           provider={selectedPlan}
@@ -4366,12 +4731,24 @@ function ModelOrderTab({
       setDraftModels(models);
       setMessage(
         reset
-          ? "已从目标 Provider 模型条目移除自定义顺序；投影刷新后生效。"
-          : `已把 ${models.length} 个模型的展示顺序保存到目标 Provider 模型条目；投影刷新后生效。`,
+          ? tr("codexRouterWorkspace.s127", {
+              defaultValue:
+                "已从目标 Provider 模型条目移除自定义顺序；投影刷新后生效。",
+            })
+          : tr("codexRouterWorkspace.s128", {
+              defaultValue:
+                "已把 {{arg0}} 个模型的展示顺序保存到目标 Provider 模型条目；投影刷新后生效。",
+              arg0: models.length,
+            }),
       );
       await queryClient.invalidateQueries({ queryKey: ["providers", "codex"] });
     } catch (saveError) {
-      setError(`保存模型顺序失败：${workspaceErrorMessage(saveError)}`);
+      setError(
+        tr("codexRouterWorkspace.s129", {
+          defaultValue: "保存模型顺序失败：{{arg0}}",
+          arg0: workspaceErrorMessage(saveError),
+        }),
+      );
     } finally {
       setIsSaving(false);
     }
@@ -4381,9 +4758,16 @@ function ModelOrderTab({
     return (
       <EmptyState
         icon={GripVertical}
-        title="还没有可排序的 MultiRouter"
-        detail="先创建或选择一个多路路由方案，再调整 Codex 模型选择器中的全量模型顺序。"
-        actionLabel="创建多路路由"
+        title={tr("codexRouterWorkspace.s130", {
+          defaultValue: "还没有可排序的 MultiRouter",
+        })}
+        detail={tr("codexRouterWorkspace.s131", {
+          defaultValue:
+            "先创建或选择一个多路路由方案，再调整 Codex 模型选择器中的全量模型顺序。",
+        })}
+        actionLabel={tr("codexRouterWorkspace.s097", {
+          defaultValue: "创建多路路由",
+        })}
         onAction={onCreatePlan}
       />
     );
@@ -4393,9 +4777,16 @@ function ModelOrderTab({
     return (
       <EmptyState
         icon={GripVertical}
-        title="当前方案没有模型目录"
-        detail="先在“路由规则”中接入模型源并保存，模型目录生成后即可在这里排序。"
-        actionLabel="前往路由规则"
+        title={tr("codexRouterWorkspace.s132", {
+          defaultValue: "当前方案没有模型目录",
+        })}
+        detail={tr("codexRouterWorkspace.s133", {
+          defaultValue:
+            "先在“路由规则”中接入模型源并保存，模型目录生成后即可在这里排序。",
+        })}
+        actionLabel={tr("codexRouterWorkspace.s134", {
+          defaultValue: "前往路由规则",
+        })}
       />
     );
   }
@@ -4404,8 +4795,13 @@ function ModelOrderTab({
     <section className="rounded-lg border border-blue-200 bg-blue-50/50 p-4 dark:border-blue-700/40 dark:bg-blue-950/10">
       <SectionHeader
         icon={GripVertical}
-        title="Codex 模型排序"
-        detail="拖动调整所有自定义模型在 Codex 模型选择器中的顺序。子 Agent 候选、路由规则和默认模型不会因此改变。"
+        title={tr("codexRouterWorkspace.s135", {
+          defaultValue: "Codex 模型排序",
+        })}
+        detail={tr("codexRouterWorkspace.s136", {
+          defaultValue:
+            "拖动调整所有自定义模型在 Codex 模型选择器中的顺序。子 Agent 候选、路由规则和默认模型不会因此改变。",
+        })}
         action={
           <div className="flex gap-2">
             <Button
@@ -4415,7 +4811,7 @@ function ModelOrderTab({
               disabled={isSaving || !hasCustomOrder}
               onClick={() => void saveOrder(true)}
             >
-              恢复默认
+              {tr("codexRouterWorkspace.s137", { defaultValue: "恢复默认" })}
             </Button>
             <Button
               type="button"
@@ -4425,7 +4821,7 @@ function ModelOrderTab({
               className="gap-2 bg-blue-600 hover:bg-blue-500"
             >
               <Save className="h-4 w-4" />
-              保存顺序
+              {tr("codexRouterWorkspace.s138", { defaultValue: "保存顺序" })}
             </Button>
           </div>
         }
@@ -4589,8 +4985,12 @@ function RoutesTab({
         <section className="rounded-lg border border-blue-200 bg-blue-50/70 p-3 dark:border-blue-700/40 dark:bg-blue-950/15">
           <SectionHeader
             icon={Layers3}
-            title="选择多路路由"
-            detail="每个多路路由可包含多条分流规则。"
+            title={tr("codexRouterWorkspace.s139", {
+              defaultValue: "选择多路路由",
+            })}
+            detail={tr("codexRouterWorkspace.s140", {
+              defaultValue: "每个多路路由可包含多条分流规则。",
+            })}
             action={
               <Button
                 size="sm"
@@ -4598,7 +4998,9 @@ function RoutesTab({
                 className="gap-2 bg-blue-600 hover:bg-blue-500"
               >
                 <Plus className="h-4 w-4" />
-                创建多路路由
+                {tr("codexRouterWorkspace.s090", {
+                  defaultValue: "创建多路路由",
+                })}
               </Button>
             }
           />
@@ -4632,17 +5034,32 @@ function RoutesTab({
                       )}
                     >
                       <CheckCircle2 className="h-4 w-4" />
-                      {active ? "当前选中" : "选择"}
+                      {active
+                        ? tr("codexRouterWorkspace.s141", {
+                            defaultValue: "当前选中",
+                          })
+                        : tr("codexRouterWorkspace.s142", {
+                            defaultValue: "选择",
+                          })}
                     </Button>
                     <Button
                       type="button"
                       size="sm"
                       variant="outline"
-                      onClick={() => onEditPlan(provider, "重命名多路路由")}
+                      onClick={() =>
+                        onEditPlan(
+                          provider,
+                          tr("codexRouterWorkspace.s099", {
+                            defaultValue: "重命名多路路由",
+                          }),
+                        )
+                      }
                       className="h-8 gap-1.5 px-2.5"
                     >
                       <Pencil className="h-4 w-4" />
-                      改名
+                      {tr("codexRouterWorkspace.s143", {
+                        defaultValue: "改名",
+                      })}
                     </Button>
                     <Button
                       type="button"
@@ -4652,7 +5069,9 @@ function RoutesTab({
                       className="h-8 gap-1.5 border-rose-300 bg-background/70 px-2.5 text-rose-700 hover:bg-rose-50 dark:border-rose-500/50 dark:bg-rose-500/10 dark:text-rose-100 dark:hover:bg-rose-500/20"
                     >
                       <Trash2 className="h-4 w-4" />
-                      删除
+                      {tr("codexRouterWorkspace.s101", {
+                        defaultValue: "删除",
+                      })}
                     </Button>
                   </div>
                 </div>
@@ -4665,8 +5084,13 @@ function RoutesTab({
           <div className="rounded-lg border border-emerald-200 bg-emerald-50/70 p-3 dark:border-emerald-700/40 dark:bg-emerald-950/10">
             <SectionHeader
               icon={Route}
-              title="规则列表"
-              detail="点击规则查看详情；每条规则的“启用”只表示参与匹配，不是启动服务。"
+              title={tr("codexRouterWorkspace.s144", {
+                defaultValue: "规则列表",
+              })}
+              detail={tr("codexRouterWorkspace.s145", {
+                defaultValue:
+                  "点击规则查看详情；每条规则的“启用”只表示参与匹配，不是启动服务。",
+              })}
               action={
                 selectedPlan ? (
                   <Button
@@ -4675,7 +5099,9 @@ function RoutesTab({
                     className="gap-2 bg-emerald-600 hover:bg-emerald-500"
                   >
                     <Pencil className="h-4 w-4" />
-                    编辑匹配规则
+                    {tr("codexRouterWorkspace.s146", {
+                      defaultValue: "编辑匹配规则",
+                    })}
                   </Button>
                 ) : null
               }
@@ -4696,9 +5122,15 @@ function RoutesTab({
               {selectedPlanRoutes.length === 0 && (
                 <EmptyState
                   icon={Route}
-                  title="这个方案还没有规则"
-                  detail="点击编辑规则，直接勾选要接入的候选 router。"
-                  actionLabel="编辑多路路由"
+                  title={tr("codexRouterWorkspace.s147", {
+                    defaultValue: "这个方案还没有规则",
+                  })}
+                  detail={tr("codexRouterWorkspace.s148", {
+                    defaultValue: "点击编辑规则，直接勾选要接入的候选 router。",
+                  })}
+                  actionLabel={tr("codexRouterWorkspace.s149", {
+                    defaultValue: "编辑多路路由",
+                  })}
                   onAction={() =>
                     selectedPlan
                       ? onOpenRoutePicker(selectedPlan)
@@ -4802,7 +5234,7 @@ function MultiRouterCurrentStatus({
 }) {
   const listenAddress = proxyStatus
     ? `${proxyStatus.address}:${proxyStatus.port}`
-    : "未监听";
+    : tr("codexRouterWorkspace.s150", { defaultValue: "未监听" });
   const runtimeClass =
     runtimeStatus.tone === "ok"
       ? "border-emerald-200 bg-emerald-50 text-emerald-800 dark:border-emerald-500/50 dark:bg-emerald-500/15 dark:text-emerald-100"
@@ -4814,14 +5246,19 @@ function MultiRouterCurrentStatus({
           <div className="flex flex-wrap items-center gap-2">
             <RadioTower className="h-4 w-4 text-blue-600 dark:text-blue-300" />
             <span className="text-sm font-semibold text-foreground dark:text-slate-100">
-              当前 MultiRouter
+              {tr("codexRouterWorkspace.s126", {
+                defaultValue: "当前 MultiRouter",
+              })}
             </span>
             <Badge className={cn("border", runtimeClass)}>
               {runtimeStatus.label}
             </Badge>
           </div>
           <div className="mt-1 truncate text-base font-semibold text-foreground dark:text-slate-50">
-            {selectedPlan?.name ?? "未选择多路路由"}
+            {selectedPlan?.name ??
+              tr("codexRouterWorkspace.s151", {
+                defaultValue: "未选择多路路由",
+              })}
           </div>
           <div
             className="mt-0.5 truncate text-xs text-muted-foreground dark:text-slate-400"
@@ -4832,38 +5269,74 @@ function MultiRouterCurrentStatus({
         </div>
         <div className="grid min-w-0 gap-1.5 text-xs sm:grid-cols-2 lg:grid-cols-4 xl:grid-cols-7">
           <StatusInlineItem
-            label="选中方案"
-            value={selectedPlan?.id ?? "无"}
+            label={tr("codexRouterWorkspace.s152", {
+              defaultValue: "选中方案",
+            })}
+            value={
+              selectedPlan?.id ??
+              tr("codexRouterWorkspace.s153", { defaultValue: "无" })
+            }
             ok={Boolean(selectedPlan)}
           />
           <StatusInlineItem
-            label="当前 Provider"
-            value={activeProviderId ?? "未设置"}
+            label={tr("codexRouterWorkspace.s154", {
+              defaultValue: "当前 Provider",
+            })}
+            value={
+              activeProviderId ??
+              tr("codexRouterWorkspace.s022", { defaultValue: "未设置" })
+            }
             ok={Boolean(selectedPlan && activeProviderId === selectedPlan.id)}
           />
           <StatusInlineItem
-            label="监听配置"
+            label={tr("codexRouterWorkspace.s155", {
+              defaultValue: "监听配置",
+            })}
             value={configuredListenAddress}
             ok={Boolean(configuredListenAddress)}
           />
           <StatusInlineItem
-            label="运行监听"
-            value={isProxyRunning ? listenAddress : "未运行"}
+            label={tr("codexRouterWorkspace.s156", {
+              defaultValue: "运行监听",
+            })}
+            value={
+              isProxyRunning
+                ? listenAddress
+                : tr("codexRouterWorkspace.s157", { defaultValue: "未运行" })
+            }
             ok={isProxyRunning}
           />
           <StatusInlineItem
-            label="Codex 接管"
-            value={isCodexTakeoverActive ? "已接管" : "未接管"}
+            label={tr("codexRouterWorkspace.s158", {
+              defaultValue: "Codex 接管",
+            })}
+            value={
+              isCodexTakeoverActive
+                ? tr("codexRouterWorkspace.s159", { defaultValue: "已接管" })
+                : tr("codexRouterWorkspace.s160", { defaultValue: "未接管" })
+            }
             ok={isCodexTakeoverActive}
           />
           <StatusInlineItem
-            label="启用规则"
-            value={`${enabledRouteCount} / ${totalRouteCount} 条`}
+            label={tr("codexRouterWorkspace.s161", {
+              defaultValue: "启用规则",
+            })}
+            value={tr("codexRouterWorkspace.s162", {
+              defaultValue: "{{arg0}} / {{arg1}} 条",
+              arg0: enabledRouteCount,
+              arg1: totalRouteCount,
+            })}
             ok={enabledRouteCount > 0}
           />
           <StatusInlineItem
-            label="入口状态"
-            value={selectedPlan ? runtimeStatus.label : "未选择"}
+            label={tr("codexRouterWorkspace.s163", {
+              defaultValue: "入口状态",
+            })}
+            value={
+              selectedPlan
+                ? runtimeStatus.label
+                : tr("codexRouterWorkspace.s018", { defaultValue: "未选择" })
+            }
             ok={runtimeStatus.running}
           />
         </div>
@@ -5081,28 +5554,39 @@ function MultiRouterSettingsPanel({
     {
       label: "Codex provider id",
       value: "codex_model_router_v2",
-      detail: "统一稳定桶，多个 MultiRouter 不需要分别填写",
+      detail: tr("codexRouterWorkspace.s164", {
+        defaultValue: "统一稳定桶，多个 MultiRouter 不需要分别填写",
+      }),
     },
     {
       label: "base_url",
       value: previewBaseUrl,
-      detail: "切换或接管时由 CC Switch 投影到 Codex live config",
+      detail: tr("codexRouterWorkspace.s165", {
+        defaultValue: "切换或接管时由 CC Switch 投影到 Codex live config",
+      }),
     },
     {
       label: "wire_api",
       value: "responses",
-      detail:
-        "Codex 通过 HTTP Responses 连接本地代理，真实上游协议由 route 决定",
+      detail: tr("codexRouterWorkspace.s166", {
+        defaultValue:
+          "Codex 通过 HTTP Responses 连接本地代理，真实上游协议由 route 决定",
+      }),
     },
     {
       label: "supports_websockets",
       value: "false",
-      detail: "禁用 WebSocket 并回退到 HTTP，便于按每个请求的 model 选择 route",
+      detail: tr("codexRouterWorkspace.s167", {
+        defaultValue:
+          "禁用 WebSocket 并回退到 HTTP，便于按每个请求的 model 选择 route",
+      }),
     },
     {
       label: "model_catalog_json",
       value: "cc-switch-model-catalog.json",
-      detail: "根据当前方案的 routes/modelCatalog 自动生成",
+      detail: tr("codexRouterWorkspace.s168", {
+        defaultValue: "根据当前方案的 routes/modelCatalog 自动生成",
+      }),
     },
   ];
 
@@ -5110,8 +5594,13 @@ function MultiRouterSettingsPanel({
     <section className="rounded-lg border border-blue-200 bg-card p-4 shadow-[0_0_0_1px_rgba(59,130,246,0.10)] dark:border-blue-700/50 dark:bg-slate-950/70 dark:shadow-[0_0_0_1px_rgba(59,130,246,0.15)]">
       <SectionHeader
         icon={Settings2}
-        title="多路路由设置"
-        detail="这里配置 MultiRouter 方案名称和本地代理监听入口；上游 API Key 仍由各 route 目标模型源维护。"
+        title={tr("codexRouterWorkspace.s169", {
+          defaultValue: "多路路由设置",
+        })}
+        detail={tr("codexRouterWorkspace.s170", {
+          defaultValue:
+            "这里配置 MultiRouter 方案名称和本地代理监听入口；上游 API Key 仍由各 route 目标模型源维护。",
+        })}
         action={
           <div className="flex flex-wrap gap-2">
             <Button
@@ -5120,7 +5609,7 @@ function MultiRouterSettingsPanel({
               onClick={onClose}
               disabled={isSaving || isSavingListener}
             >
-              关闭
+              {tr("codexRouterWorkspace.s171", { defaultValue: "关闭" })}
             </Button>
             <Button
               size="sm"
@@ -5129,7 +5618,9 @@ function MultiRouterSettingsPanel({
               className="gap-2 bg-blue-600 hover:bg-blue-500"
             >
               <Save className="h-4 w-4" />
-              {isSaving || isSavingListener ? "保存中" : "保存设置"}
+              {isSaving || isSavingListener
+                ? tr("codexRouterWorkspace.s172", { defaultValue: "保存中" })
+                : tr("codexRouterWorkspace.s173", { defaultValue: "保存设置" })}
             </Button>
           </div>
         }
@@ -5139,36 +5630,45 @@ function MultiRouterSettingsPanel({
         <div className="space-y-3">
           <div className="grid gap-2">
             <label className="text-xs font-semibold text-muted-foreground dark:text-slate-300">
-              方案名称
+              {tr("codexRouterWorkspace.s174", { defaultValue: "方案名称" })}
             </label>
             <input
               value={name}
               onChange={(event) => setName(event.target.value)}
               className="h-10 rounded-md border border-blue-200 bg-background px-3 text-sm outline-none transition placeholder:text-muted-foreground focus:border-blue-400 focus:ring-2 focus:ring-blue-500/20 dark:border-blue-700/50 dark:bg-slate-950/80 dark:placeholder:text-slate-500 dark:focus:ring-blue-500/30"
-              placeholder="例如：Codex MultiRouter"
+              placeholder={tr("codexRouterWorkspace.s175", {
+                defaultValue: "例如：Codex MultiRouter",
+              })}
               disabled={isSaving || isSavingListener}
             />
           </div>
           <div className="grid gap-2">
             <label className="text-xs font-semibold text-muted-foreground dark:text-slate-300">
-              备注
+              {tr("codexRouterWorkspace.s176", { defaultValue: "备注" })}
             </label>
             <textarea
               value={notes}
               onChange={(event) => setNotes(event.target.value)}
               rows={3}
               className="min-h-[84px] resize-y rounded-md border border-blue-200 bg-background px-3 py-2 text-sm outline-none transition placeholder:text-muted-foreground focus:border-blue-400 focus:ring-2 focus:ring-blue-500/20 dark:border-blue-700/50 dark:bg-slate-950/80 dark:placeholder:text-slate-500 dark:focus:ring-blue-500/30"
-              placeholder="例如：默认 Codex 多模型路由"
+              placeholder={tr("codexRouterWorkspace.s177", {
+                defaultValue: "例如：默认 Codex 多模型路由",
+              })}
               disabled={isSaving || isSavingListener}
             />
           </div>
           <label className="flex items-start justify-between gap-3 rounded-lg border border-border bg-muted/40 p-3 dark:border-slate-700 dark:bg-slate-950/50">
             <span>
               <span className="block text-sm font-semibold text-foreground dark:text-slate-100">
-                MultiRouter 入口
+                {tr("codexRouterWorkspace.s178", {
+                  defaultValue: "MultiRouter 入口",
+                })}
               </span>
               <span className="mt-1 block text-xs leading-5 text-muted-foreground dark:text-slate-400">
-                关闭后该方案不会参与 Codex model 分流，但 routes 会保留。
+                {tr("codexRouterWorkspace.s179", {
+                  defaultValue:
+                    "关闭后该方案不会参与 Codex model 分流，但 routes 会保留。",
+                })}
               </span>
             </span>
             <input
@@ -5190,10 +5690,23 @@ function MultiRouterSettingsPanel({
           />
           {selectedRouting.defaultRouteId && (
             <div className="grid gap-1 rounded-md border border-amber-300 bg-amber-50 p-3 text-xs text-amber-900 dark:border-amber-600/50 dark:bg-amber-950/20 dark:text-amber-100">
-              <span className="font-semibold">旧版默认路由已停用</span>
+              <span className="font-semibold">
+                {tr("codexRouterWorkspace.s180", {
+                  defaultValue: "旧版默认路由已停用",
+                })}
+              </span>
               <span className="leading-5">
-                旧配置指向「{legacyDefaultRouteName ?? "已删除的路由"}」。
-                严格路由不会使用它；保存设置后会自动清除该兼容字段。
+                {tr("codexRouterWorkspace.s181", {
+                  defaultValue: "旧配置指向「",
+                })}
+                {legacyDefaultRouteName ??
+                  tr("codexRouterWorkspace.s182", {
+                    defaultValue: "已删除的路由",
+                  })}
+                {tr("codexRouterWorkspace.s183", {
+                  defaultValue:
+                    "」。\n                严格路由不会使用它；保存设置后会自动清除该兼容字段。",
+                })}
               </span>
             </div>
           )}
@@ -5332,7 +5845,7 @@ function MultiRouterSettingsPanel({
           <div className="grid gap-3 rounded-lg border border-blue-200 bg-blue-50/70 p-3 dark:border-blue-700/40 dark:bg-blue-950/10 sm:grid-cols-[1fr_120px]">
             <div className="grid gap-2">
               <label className="text-xs font-semibold text-muted-foreground dark:text-slate-300">
-                监听接口
+                {tr("codexRouterWorkspace.s184", { defaultValue: "监听接口" })}
               </label>
               <input
                 value={listenAddress}
@@ -5344,7 +5857,7 @@ function MultiRouterSettingsPanel({
             </div>
             <div className="grid gap-2">
               <label className="text-xs font-semibold text-muted-foreground dark:text-slate-300">
-                监听端口
+                {tr("codexRouterWorkspace.s185", { defaultValue: "监听端口" })}
               </label>
               <input
                 value={listenPort}
@@ -5357,7 +5870,10 @@ function MultiRouterSettingsPanel({
             </div>
             <div className="sm:col-span-2">
               <p className="break-all text-xs leading-5 text-muted-foreground dark:text-slate-500">
-                Codex Desktop 使用：{previewBaseUrl}
+                {tr("codexRouterWorkspace.s186", {
+                  defaultValue: "Codex Desktop 使用：",
+                })}
+                {previewBaseUrl}
               </p>
               {listenerError ? (
                 <p className="mt-1 text-xs leading-5 text-rose-700 dark:text-rose-300">
@@ -5371,7 +5887,9 @@ function MultiRouterSettingsPanel({
         <div className="rounded-lg border border-border bg-muted/40 p-3 dark:border-slate-700 dark:bg-slate-950/45">
           <div className="mb-3 flex items-center gap-2 text-sm font-semibold text-foreground dark:text-slate-100">
             <Info className="h-4 w-4 text-blue-600 dark:text-blue-300" />
-            自动维护的接管配置
+            {tr("codexRouterWorkspace.s187", {
+              defaultValue: "自动维护的接管配置",
+            })}
           </div>
           <div className="grid gap-2">
             {autoManagedRows.map((row) => (
@@ -5384,7 +5902,7 @@ function MultiRouterSettingsPanel({
                     {row.label}
                   </span>
                   <Badge className="border-blue-200 bg-blue-50 text-blue-800 dark:border-blue-500/50 dark:bg-blue-500/15 dark:text-blue-100">
-                    自动
+                    {tr("codexRouterWorkspace.s188", { defaultValue: "自动" })}
                   </Badge>
                 </div>
                 <div className="mt-1 break-all font-mono text-xs text-foreground dark:text-slate-100">
@@ -5420,7 +5938,9 @@ function ProviderModelRefreshPanel({
     <section className="rounded-lg border border-border bg-card p-3 dark:border-slate-700 dark:bg-slate-950/45">
       <div className="mb-2 flex items-center gap-2 text-sm font-semibold text-foreground dark:text-slate-100">
         <RefreshCw className="h-4 w-4 text-sky-600 dark:text-sky-300" />
-        候选 provider 模型列表刷新
+        {tr("codexRouterWorkspace.s189", {
+          defaultValue: "候选 provider 模型列表刷新",
+        })}
       </div>
       <div className="grid gap-1.5 md:grid-cols-2 xl:grid-cols-4">
         {visibleRows.map(({ provider, state }) => {
@@ -5441,10 +5961,17 @@ function ProviderModelRefreshPanel({
                 </span>
                 <Badge className="shrink-0 border border-current bg-transparent text-[10px]">
                   {state.status === "success"
-                    ? `${state.modelCount ?? 0} 个模型`
+                    ? tr("codexRouterWorkspace.s190", {
+                        defaultValue: "{{arg0}} 个模型",
+                        arg0: state.modelCount ?? 0,
+                      })
                     : state.status === "loading"
-                      ? "读取中"
-                      : "失败"}
+                      ? tr("codexRouterWorkspace.s191", {
+                          defaultValue: "读取中",
+                        })
+                      : tr("codexRouterWorkspace.s192", {
+                          defaultValue: "失败",
+                        })}
                 </Badge>
               </div>
               <div className="mt-1 truncate text-xs" title={state.message}>
@@ -5609,7 +6136,10 @@ function RouteCandidatePicker({
       for (const upstreamModel of Object.values(aliasesResult.aliases)) {
         if (enabled && !canonicalSet.has(upstreamModel)) {
           setRoutePolicyError(
-            `别名目标“${upstreamModel}”不在目标供应商的上游模型列表中`,
+            tr("codexRouterWorkspace.s193", {
+              defaultValue: "别名目标“{{arg0}}”不在目标供应商的上游模型列表中",
+              arg0: upstreamModel,
+            }),
           );
           return;
         }
@@ -5619,7 +6149,11 @@ function RouteCandidatePicker({
         draft.route.modelSelection?.mode === "include" &&
         draft.route.modelSelection.models.length === 0
       ) {
-        setRoutePolicyError("请至少选择一个上游模型");
+        setRoutePolicyError(
+          tr("codexRouterWorkspace.s008", {
+            defaultValue: "请至少选择一个上游模型",
+          }),
+        );
         return;
       }
       routes.push({
@@ -5637,8 +6171,13 @@ function RouteCandidatePicker({
     <section className="rounded-lg border border-emerald-200 bg-card p-3 shadow-[0_0_0_1px_rgba(16,185,129,0.10)] dark:border-emerald-700/50 dark:bg-slate-950/70 dark:shadow-[0_0_0_1px_rgba(16,185,129,0.15)]">
       <SectionHeader
         icon={Route}
-        title="选择候选路由"
-        detail="这里直接选择哪些模型源进入当前多路路由；取消勾选会从规则中移除，不再打开普通供应商编辑表单。"
+        title={tr("codexRouterWorkspace.s194", {
+          defaultValue: "选择候选路由",
+        })}
+        detail={tr("codexRouterWorkspace.s195", {
+          defaultValue:
+            "这里直接选择哪些模型源进入当前多路路由；取消勾选会从规则中移除，不再打开普通供应商编辑表单。",
+        })}
         action={
           <div className="flex flex-wrap gap-2">
             <Button
@@ -5654,7 +6193,7 @@ function RouteCandidatePicker({
               }}
               disabled={candidates.length === 0 || isSaving}
             >
-              全选并启用
+              {tr("codexRouterWorkspace.s196", { defaultValue: "全选并启用" })}
             </Button>
             <Button
               size="sm"
@@ -5681,7 +6220,9 @@ function RouteCandidatePicker({
               }}
               disabled={isSaving}
             >
-              只保留当前状态
+              {tr("codexRouterWorkspace.s197", {
+                defaultValue: "只保留当前状态",
+              })}
             </Button>
             <Button
               size="sm"
@@ -5689,7 +6230,7 @@ function RouteCandidatePicker({
               onClick={onClose}
               disabled={isSaving}
             >
-              关闭
+              {tr("codexRouterWorkspace.s171", { defaultValue: "关闭" })}
             </Button>
             <Button
               size="sm"
@@ -5698,7 +6239,9 @@ function RouteCandidatePicker({
               className="gap-2 bg-emerald-600 hover:bg-emerald-500"
             >
               <Save className="h-4 w-4" />
-              {isSaving ? "保存中" : "保存规则"}
+              {isSaving
+                ? tr("codexRouterWorkspace.s172", { defaultValue: "保存中" })
+                : tr("codexRouterWorkspace.s198", { defaultValue: "保存规则" })}
             </Button>
           </div>
         }
@@ -5720,7 +6263,7 @@ function RouteCandidatePicker({
           const targetLabel =
             candidate.provider?.name ??
             routeTargetProviderId(candidate.route) ??
-            "自定义 route";
+            tr("codexRouterWorkspace.s199", { defaultValue: "自定义 route" });
           const refreshState = candidate.provider
             ? providerModelRefreshStates[candidate.provider.id]
             : undefined;
@@ -5780,15 +6323,27 @@ function RouteCandidatePicker({
                         )}
                       >
                         {!checked
-                          ? "未加入"
+                          ? tr("codexRouterWorkspace.s200", {
+                              defaultValue: "未加入",
+                            })
                           : enabled
-                            ? "已加入并启用"
-                            : "已加入但停用"}
+                            ? tr("codexRouterWorkspace.s201", {
+                                defaultValue: "已加入并启用",
+                              })
+                            : tr("codexRouterWorkspace.s202", {
+                                defaultValue: "已加入但停用",
+                              })}
                       </Badge>
                     </span>
                     <span className="mt-0.5 block truncate text-xs text-muted-foreground dark:text-slate-400">
                       {targetLabel} ·{" "}
-                      {candidate.isExisting ? "已在规则中" : "候选模型源"}
+                      {candidate.isExisting
+                        ? tr("codexRouterWorkspace.s203", {
+                            defaultValue: "已在规则中",
+                          })
+                        : tr("codexRouterWorkspace.s204", {
+                            defaultValue: "候选模型源",
+                          })}
                     </span>
                   </span>
                 </button>
@@ -5815,16 +6370,31 @@ function RouteCandidatePicker({
                       : "border-amber-300 text-amber-700 dark:border-amber-500/50 dark:text-amber-100",
                   )}
                 >
-                  {!checked ? "启用" : enabled ? "已启用" : "已停用"}
+                  {!checked
+                    ? tr("codexRouterWorkspace.s205", { defaultValue: "启用" })
+                    : enabled
+                      ? tr("codexRouterWorkspace.s206", {
+                          defaultValue: "已启用",
+                        })
+                      : tr("codexRouterWorkspace.s207", {
+                          defaultValue: "已停用",
+                        })}
                 </Button>
               </div>
               {checked ? (
                 <div className="mt-3 space-y-3 rounded-md border border-emerald-200/80 bg-background/80 p-2.5 dark:border-emerald-700/40 dark:bg-slate-950/50">
                   <div className="grid gap-2 sm:grid-cols-2">
                     <label className="space-y-1 text-xs text-muted-foreground">
-                      <span>路由名称</span>
+                      <span>
+                        {tr("codexRouterWorkspace.s208", {
+                          defaultValue: "路由名称",
+                        })}
+                      </span>
                       <input
-                        aria-label={`路由名称：${targetLabel}`}
+                        aria-label={tr("codexRouterWorkspace.s209", {
+                          defaultValue: "路由名称：{{arg0}}",
+                          arg0: targetLabel,
+                        })}
                         value={draft.route.label ?? ""}
                         onChange={(event) =>
                           updateRoutePolicyDraft(candidate.id, (current) => ({
@@ -5839,9 +6409,16 @@ function RouteCandidatePicker({
                       />
                     </label>
                     <label className="space-y-1 text-xs text-muted-foreground">
-                      <span>模型选择范围</span>
+                      <span>
+                        {tr("codexRouterWorkspace.s210", {
+                          defaultValue: "模型选择范围",
+                        })}
+                      </span>
                       <select
-                        aria-label={`模型选择范围：${targetLabel}`}
+                        aria-label={tr("codexRouterWorkspace.s211", {
+                          defaultValue: "模型选择范围：{{arg0}}",
+                          arg0: targetLabel,
+                        })}
                         value={modelSelection.mode}
                         onChange={(event) =>
                           updateRoutePolicyDraft(candidate.id, (current) => ({
@@ -5862,8 +6439,16 @@ function RouteCandidatePicker({
                         }
                         className="h-8 w-full rounded-md border border-input bg-background px-2 text-sm text-foreground"
                       >
-                        <option value="all">全部模型（自动接收新增）</option>
-                        <option value="include">仅选中的上游模型</option>
+                        <option value="all">
+                          {tr("codexRouterWorkspace.s212", {
+                            defaultValue: "全部模型（自动接收新增）",
+                          })}
+                        </option>
+                        <option value="include">
+                          {tr("codexRouterWorkspace.s213", {
+                            defaultValue: "仅选中的上游模型",
+                          })}
+                        </option>
                       </select>
                     </label>
                   </div>
@@ -5871,7 +6456,9 @@ function RouteCandidatePicker({
                   {modelSelection.mode === "include" ? (
                     <div className="space-y-1">
                       <div className="text-xs text-muted-foreground">
-                        供应商当前的上游模型
+                        {tr("codexRouterWorkspace.s214", {
+                          defaultValue: "供应商当前的上游模型",
+                        })}
                       </div>
                       <div className="text-xs leading-5 text-muted-foreground">
                         {routeProviderModelSyncSummary(
@@ -5887,7 +6474,10 @@ function RouteCandidatePicker({
                           >
                             <input
                               type="checkbox"
-                              aria-label={`选择上游模型 ${model}`}
+                              aria-label={tr("codexRouterWorkspace.s215", {
+                                defaultValue: "选择上游模型 {{arg0}}",
+                                arg0: model,
+                              })}
                               checked={modelSelection.models.includes(model)}
                               onChange={(event) =>
                                 updateRoutePolicyDraft(
@@ -5928,9 +6518,16 @@ function RouteCandidatePicker({
 
                   <div className="grid gap-2 sm:grid-cols-2">
                     <label className="space-y-1 text-xs text-muted-foreground">
-                      <span>匹配前缀（逗号或换行分隔）</span>
+                      <span>
+                        {tr("codexRouterWorkspace.s216", {
+                          defaultValue: "匹配前缀（逗号或换行分隔）",
+                        })}
+                      </span>
                       <textarea
-                        aria-label={`匹配前缀：${targetLabel}`}
+                        aria-label={tr("codexRouterWorkspace.s217", {
+                          defaultValue: "匹配前缀：{{arg0}}",
+                          arg0: targetLabel,
+                        })}
                         value={draft.prefixesText}
                         onChange={(event) =>
                           updateRoutePolicyDraft(candidate.id, (current) => ({
@@ -5943,9 +6540,16 @@ function RouteCandidatePicker({
                       />
                     </label>
                     <label className="space-y-1 text-xs text-muted-foreground">
-                      <span>可见别名（可见模型=上游模型）</span>
+                      <span>
+                        {tr("codexRouterWorkspace.s218", {
+                          defaultValue: "可见别名（可见模型=上游模型）",
+                        })}
+                      </span>
                       <textarea
-                        aria-label={`可见别名映射：${targetLabel}`}
+                        aria-label={tr("codexRouterWorkspace.s219", {
+                          defaultValue: "可见别名映射：{{arg0}}",
+                          arg0: targetLabel,
+                        })}
                         value={draft.aliasesText}
                         onChange={(event) =>
                           updateRoutePolicyDraft(candidate.id, (current) => ({
@@ -5961,9 +6565,16 @@ function RouteCandidatePicker({
 
                   <div className="grid gap-2 sm:grid-cols-2">
                     <label className="space-y-1 text-xs text-muted-foreground">
-                      <span>认证策略引用</span>
+                      <span>
+                        {tr("codexRouterWorkspace.s220", {
+                          defaultValue: "认证策略引用",
+                        })}
+                      </span>
                       <select
-                        aria-label={`认证策略：${targetLabel}`}
+                        aria-label={tr("codexRouterWorkspace.s221", {
+                          defaultValue: "认证策略：{{arg0}}",
+                          arg0: targetLabel,
+                        })}
                         value={authPolicy.source}
                         onChange={(event) => {
                           const source = event.target
@@ -5989,27 +6600,45 @@ function RouteCandidatePicker({
                         className="h-8 w-full rounded-md border border-input bg-background px-2 text-sm text-foreground"
                       >
                         <option value="provider_config">
-                          Provider 配置认证
+                          {tr("codexRouterWorkspace.s222", {
+                            defaultValue: "Provider 配置认证",
+                          })}
                         </option>
                         <option value="native_codex_auth">
-                          Codex Desktop 当前登录
+                          {tr("codexRouterWorkspace.s223", {
+                            defaultValue: "Codex Desktop 当前登录",
+                          })}
                         </option>
                         <option value="managed_codex_oauth">
-                          托管 Codex OAuth
+                          {tr("codexRouterWorkspace.s224", {
+                            defaultValue: "托管 Codex OAuth",
+                          })}
                         </option>
-                        <option value="account_pool">OAuth 账号池</option>
+                        <option value="account_pool">
+                          {tr("codexRouterWorkspace.s225", {
+                            defaultValue: "OAuth 账号池",
+                          })}
+                        </option>
                       </select>
                     </label>
                     {authPolicy.source === "managed_codex_oauth" ||
                     authPolicy.source === "managed_account" ||
                     authPolicy.source === "account_pool" ? (
                       <label className="space-y-1 text-xs text-muted-foreground">
-                        <span>账号/策略引用 ID（不保存 Token）</span>
+                        <span>
+                          {tr("codexRouterWorkspace.s226", {
+                            defaultValue: "账号/策略引用 ID（不保存 Token）",
+                          })}
+                        </span>
                         <input
                           aria-label={`${
                             authPolicy.source === "managed_codex_oauth"
-                              ? "托管 OAuth 账号 ID"
-                              : "账号池策略 ID"
+                              ? tr("codexRouterWorkspace.s227", {
+                                  defaultValue: "托管 OAuth 账号 ID",
+                                })
+                              : tr("codexRouterWorkspace.s228", {
+                                  defaultValue: "账号池策略 ID",
+                                })
                           }：${targetLabel}`}
                           value={authPolicy.accountId ?? ""}
                           onChange={(event) =>
@@ -6030,8 +6659,10 @@ function RouteCandidatePicker({
                     ) : null}
                   </div>
                   <p className="text-xs leading-5 text-muted-foreground">
-                    地址、API Key、协议、上下文和能力由目标
-                    Provider/模型条目维护；这里仅保存无密钥 Route policy。
+                    {tr("codexRouterWorkspace.s229", {
+                      defaultValue:
+                        "地址、API Key、协议、上下文和能力由目标\n                    Provider/模型条目维护；这里仅保存无密钥 Route policy。",
+                    })}
                   </p>
                 </div>
               ) : null}
@@ -6060,7 +6691,9 @@ function RouteCandidatePicker({
                 {candidate.matchModels.length === 0 &&
                 candidate.matchPrefixes.length === 0 ? (
                   <span className="rounded-full border border-amber-200 bg-amber-50 px-2 py-0.5 text-amber-800 dark:border-amber-600/60 dark:bg-amber-950/30 dark:text-amber-100">
-                    未发现模型目录，保存后可在模型源补充目录
+                    {tr("codexRouterWorkspace.s230", {
+                      defaultValue: "未发现模型目录，保存后可在模型源补充目录",
+                    })}
                   </span>
                 ) : null}
               </div>
@@ -6084,9 +6717,16 @@ function RouteCandidatePicker({
         {candidates.length === 0 ? (
           <EmptyState
             icon={Server}
-            title="没有可选 router"
-            detail="先添加至少一个 Codex 模型源，添加完成后会回到这里继续选择候选 router。"
-            actionLabel="添加模型源"
+            title={tr("codexRouterWorkspace.s231", {
+              defaultValue: "没有可选 router",
+            })}
+            detail={tr("codexRouterWorkspace.s232", {
+              defaultValue:
+                "先添加至少一个 Codex 模型源，添加完成后会回到这里继续选择候选 router。",
+            })}
+            actionLabel={tr("codexRouterWorkspace.s122", {
+              defaultValue: "添加模型源",
+            })}
             onAction={onCreateProvider}
           />
         ) : null}
@@ -6317,7 +6957,11 @@ function SpawnAgentCandidatesPanel({
       await providersApi.update(nextProvider, "codex");
       setDraftSpawnAgentModels(normalized);
       setCandidateSaveMessage(
-        `已保存 ${normalized.length} 个子 Agent 可见候选；重启 Codex 后生效。`,
+        tr("codexRouterWorkspace.s233", {
+          defaultValue:
+            "已保存 {{arg0}} 个子 Agent 可见候选；重启 Codex 后生效。",
+          arg0: normalized.length,
+        }),
       );
       await queryClient.invalidateQueries({ queryKey: ["providers", "codex"] });
     } catch (error) {
@@ -6352,7 +6996,11 @@ function SpawnAgentCandidatesPanel({
       await providersApi.update(nextProvider, "codex");
       setActiveSubagentVersion(version);
       setSubagentVersionMessage(
-        `已启用 ${version.toUpperCase()}；重启 Codex/app-server 并新建会话后生效。`,
+        tr("codexRouterWorkspace.s234", {
+          defaultValue:
+            "已启用 {{arg0}}；重启 Codex/app-server 并新建会话后生效。",
+          arg0: version.toUpperCase(),
+        }),
       );
       await queryClient.invalidateQueries({ queryKey: ["providers", "codex"] });
     } catch (error) {
@@ -6386,12 +7034,25 @@ function SpawnAgentCandidatesPanel({
       ];
       setCandidateValidationMessage(
         missing.length > 0
-          ? `live 前 ${actual.visibleModels.length} 个候选仍缺少：${missing.join(", ")}`
-          : `校验通过：live 可见窗口已覆盖当前选择，实际窗口为 ${actual.visibleModels.join(", ") || "空"}`,
+          ? tr("codexRouterWorkspace.s235", {
+              defaultValue: "live 前 {{arg0}} 个候选仍缺少：{{arg1}}",
+              arg0: actual.visibleModels.length,
+              arg1: missing.join(", "),
+            })
+          : tr("codexRouterWorkspace.s236", {
+              defaultValue:
+                "校验通过：live 可见窗口已覆盖当前选择，实际窗口为 {{arg0}}",
+              arg0:
+                actual.visibleModels.join(", ") ||
+                tr("codexRouterWorkspace.s237", { defaultValue: "空" }),
+            }),
       );
     } catch (error) {
       setCandidateValidationMessage(
-        `校验失败：${workspaceErrorMessage(error)}`,
+        tr("codexRouterWorkspace.s238", {
+          defaultValue: "校验失败：{{arg0}}",
+          arg0: workspaceErrorMessage(error),
+        }),
       );
     } finally {
       setIsValidatingCandidates(false);
@@ -6404,16 +7065,20 @@ function SpawnAgentCandidatesPanel({
         <div className="max-w-3xl">
           <div className="flex items-center gap-2 text-sm font-semibold text-violet-800 dark:text-violet-100">
             <Settings2 className="h-4 w-4" />
-            Sub-Agent 设置
+            {tr("codexRouterWorkspace.s239", {
+              defaultValue: "Sub-Agent 设置",
+            })}
           </div>
           <p className="mt-1 text-xs leading-5 text-violet-700/80 dark:text-violet-200/80">
-            V1 适合旧版 Codex 和需要手工指定子模型的兼容场景；V2 适合新版本
-            Codex，由父 Agent 按任务做 best-effort
-            语义角色选择。两套配置都会保留， 但同一会话只启用一种协议。
+            {tr("codexRouterWorkspace.s240", {
+              defaultValue:
+                "V1 适合旧版 Codex 和需要手工指定子模型的兼容场景；V2 适合新版本\n            Codex，由父 Agent 按任务做 best-effort\n            语义角色选择。两套配置都会保留， 但同一会话只启用一种协议。",
+            })}
           </p>
         </div>
         <Badge className="border border-violet-300 bg-background text-violet-800 dark:border-violet-500/50 dark:bg-violet-500/10 dark:text-violet-100">
-          当前使用 {activeSubagentVersion.toUpperCase()}
+          {tr("codexRouterWorkspace.s241", { defaultValue: "当前使用" })}{" "}
+          {activeSubagentVersion.toUpperCase()}
         </Badge>
       </div>
 
@@ -6443,16 +7108,25 @@ function SpawnAgentCandidatesPanel({
               onClick={() => saveSubagentVersion("v1")}
             >
               {pendingSubagentVersion === "v1"
-                ? "切换中…"
+                ? tr("codexRouterWorkspace.s242", { defaultValue: "切换中…" })
                 : activeSubagentVersion === "v1"
-                  ? "已启用 V1"
-                  : "启用 V1"}
+                  ? tr("codexRouterWorkspace.s243", {
+                      defaultValue: "已启用 V1",
+                    })
+                  : tr("codexRouterWorkspace.s244", {
+                      defaultValue: "启用 V1",
+                    })}
             </Button>
           </div>
           <p className="mt-1 text-xs leading-5 text-muted-foreground">
-            通过 direct model override 暴露并排序前 {spawnAgentVisibleLimit}
-            个候选。适用于旧版
-            Codex、兼容性排查，或明确需要手工控制子模型的场景。
+            {tr("codexRouterWorkspace.s245", {
+              defaultValue: "通过 direct model override 暴露并排序前",
+            })}{" "}
+            {spawnAgentVisibleLimit}
+            {tr("codexRouterWorkspace.s246", {
+              defaultValue:
+                "个候选。适用于旧版\n            Codex、兼容性排查，或明确需要手工控制子模型的场景。",
+            })}
           </p>
         </div>
         <div
@@ -6480,18 +7154,21 @@ function SpawnAgentCandidatesPanel({
               onClick={() => saveSubagentVersion("v2")}
             >
               {pendingSubagentVersion === "v2"
-                ? "切换中…"
+                ? tr("codexRouterWorkspace.s242", { defaultValue: "切换中…" })
                 : activeSubagentVersion === "v2"
-                  ? "已启用 V2"
-                  : "启用 V2"}
+                  ? tr("codexRouterWorkspace.s247", {
+                      defaultValue: "已启用 V2",
+                    })
+                  : tr("codexRouterWorkspace.s248", {
+                      defaultValue: "启用 V2",
+                    })}
             </Button>
           </div>
           <p className="mt-1 text-xs leading-5 text-muted-foreground">
-            使用任务路径、mailbox 和 follow-up；Codex 会在符合条件的内置与自定义
-            角色之间进行 best-effort
-            语义选择。能力问卷与角色说明只提供选择指导， 不保证选择 Flash 或
-            Pro；内置 default、worker、explorer 仍可能被选择。 推荐新版本 Codex
-            使用。
+            {tr("codexRouterWorkspace.s249", {
+              defaultValue:
+                "使用任务路径、mailbox 和 follow-up；Codex 会在符合条件的内置与自定义\n            角色之间进行 best-effort\n            语义选择。能力问卷与角色说明只提供选择指导， 不保证选择 Flash 或\n            Pro；内置 default、worker、explorer 仍可能被选择。 推荐新版本 Codex\n            使用。",
+            })}
           </p>
         </div>
       </div>
@@ -6501,7 +7178,8 @@ function SpawnAgentCandidatesPanel({
           role="alert"
           className="mt-3 rounded-md border border-rose-200 bg-rose-50 px-3 py-2 text-xs text-rose-700 dark:border-rose-700/50 dark:bg-rose-950/30 dark:text-rose-100"
         >
-          切换失败：{subagentVersionError}
+          {tr("codexRouterWorkspace.s250", { defaultValue: "切换失败：" })}
+          {subagentVersionError}
         </div>
       ) : null}
       {subagentVersionMessage ? (
@@ -6513,19 +7191,27 @@ function SpawnAgentCandidatesPanel({
         </div>
       ) : null}
       <div className="mt-3 rounded-md border border-sky-200 bg-sky-50 px-3 py-2 text-xs leading-5 text-sky-800 dark:border-sky-700/50 dark:bg-sky-950/25 dark:text-sky-100">
-        切换协议后请重启 Codex
-        Desktop/app-server，并新建会话；已有会话不会在中途更换子 Agent 协议。
+        {tr("codexRouterWorkspace.s251", {
+          defaultValue:
+            "切换协议后请重启 Codex\n        Desktop/app-server，并新建会话；已有会话不会在中途更换子 Agent 协议。",
+        })}
       </div>
 
       {activeSubagentVersion === "v2" && selectedPlan ? (
         <div className="mt-3">
           <div className="mb-2">
             <div className="text-sm font-semibold text-emerald-800 dark:text-emerald-100">
-              第一步：配置 V2 子 Agent 模型与能力
+              {tr("codexRouterWorkspace.s252", {
+                defaultValue: "第一步：配置 V2 子 Agent 模型与能力",
+              })}
             </div>
             <p className="mt-1 text-xs leading-5 text-muted-foreground">
-              先从完整可路由目录添加模型并配置角色能力；保存能力配置后，再在下方选择
-              Codex 工具说明优先展示的前 {spawnAgentVisibleLimit} 个模型。
+              {tr("codexRouterWorkspace.s253", {
+                defaultValue:
+                  "先从完整可路由目录添加模型并配置角色能力；保存能力配置后，再在下方选择\n              Codex 工具说明优先展示的前",
+              })}{" "}
+              {spawnAgentVisibleLimit}{" "}
+              {tr("codexRouterWorkspace.s254", { defaultValue: "个模型。" })}
             </p>
           </div>
           <CodexSubagentProfileEditor
@@ -6548,11 +7234,18 @@ function SpawnAgentCandidatesPanel({
                     : "border-amber-200 bg-amber-50 text-amber-800 dark:border-amber-500/40 dark:bg-amber-500/10 dark:text-amber-100",
                 )}
               >
-                {hasFlashRoleModel ? "可路由" : "目录中缺失"}
+                {hasFlashRoleModel
+                  ? tr("codexRouterWorkspace.s255", { defaultValue: "可路由" })
+                  : tr("codexRouterWorkspace.s256", {
+                      defaultValue: "目录中缺失",
+                    })}
               </Badge>
             </div>
             <p className="mt-2 text-xs leading-5 text-muted-foreground">
-              长上下文阅读、代码库扫描、架构追踪、并行证据收集和轻量验证。
+              {tr("codexRouterWorkspace.s257", {
+                defaultValue:
+                  "长上下文阅读、代码库扫描、架构追踪、并行证据收集和轻量验证。",
+              })}
             </p>
           </div>
           <div className="rounded-md border border-emerald-200 bg-background/75 p-3 dark:border-emerald-700/50 dark:bg-slate-950/30">
@@ -6566,17 +7259,25 @@ function SpawnAgentCandidatesPanel({
                     : "border-amber-200 bg-amber-50 text-amber-800 dark:border-amber-500/40 dark:bg-amber-500/10 dark:text-amber-100",
                 )}
               >
-                {hasProRoleModel ? "可路由" : "目录中缺失"}
+                {hasProRoleModel
+                  ? tr("codexRouterWorkspace.s255", { defaultValue: "可路由" })
+                  : tr("codexRouterWorkspace.s256", {
+                      defaultValue: "目录中缺失",
+                    })}
               </Badge>
             </div>
             <p className="mt-2 text-xs leading-5 text-muted-foreground">
-              复杂调试、跨模块推理、架构决策、高风险审查和复杂实现。
+              {tr("codexRouterWorkspace.s258", {
+                defaultValue:
+                  "复杂调试、跨模块推理、架构决策、高风险审查和复杂实现。",
+              })}
             </p>
           </div>
           <p className="text-xs leading-5 text-violet-700/80 dark:text-violet-200/80 lg:col-span-2">
-            V2 managed roles 仍从完整可路由模型目录生成；下方前五顺序只决定
-            spawn_agent 工具向父 Agent 优先宣传哪些 direct model
-            override，不会删除其余角色或模型。
+            {tr("codexRouterWorkspace.s259", {
+              defaultValue:
+                "V2 managed roles 仍从完整可路由模型目录生成；下方前五顺序只决定\n            spawn_agent 工具向父 Agent 优先宣传哪些 direct model\n            override，不会删除其余角色或模型。",
+            })}
           </p>
         </div>
       ) : null}
@@ -6585,13 +7286,21 @@ function SpawnAgentCandidatesPanel({
         <div className="mt-3 rounded-md border border-amber-200 bg-background/70 p-3 dark:border-amber-700/50 dark:bg-slate-950/30">
           <div className="text-sm font-semibold text-amber-800 dark:text-amber-100">
             {activeSubagentVersion === "v2"
-              ? "第二步：选择 V2 工具说明的前五模型"
+              ? tr("codexRouterWorkspace.s260", {
+                  defaultValue: "第二步：选择 V2 工具说明的前五模型",
+                })
               : "V1 direct model override"}
           </div>
           <p className="mt-1 text-xs text-amber-700/80 dark:text-amber-200/80">
             {activeSubagentVersion === "v2"
-              ? "Codex Multi-agent V2 当前也只在 spawn_agent 工具说明中展示前五个模型；其余可路由模型仍可被显式调用。这里保存 V1/V2 共用的宣传顺序。"
-              : "此排序用于 V1 的 direct model override 可见窗口，并保留在当前 MultiRouter 配置中；切换到 V2 后会继续复用。"}
+              ? tr("codexRouterWorkspace.s261", {
+                  defaultValue:
+                    "Codex Multi-agent V2 当前也只在 spawn_agent 工具说明中展示前五个模型；其余可路由模型仍可被显式调用。这里保存 V1/V2 共用的宣传顺序。",
+                })
+              : tr("codexRouterWorkspace.s262", {
+                  defaultValue:
+                    "此排序用于 V1 的 direct model override 可见窗口，并保留在当前 MultiRouter 配置中；切换到 V2 后会继续复用。",
+                })}
           </p>
           <div className="mt-3 flex flex-wrap items-center justify-end gap-2">
             <div className="flex flex-wrap gap-2">
@@ -6607,7 +7316,7 @@ function SpawnAgentCandidatesPanel({
                 ) : (
                   <CheckCircle2 className="h-4 w-4" />
                 )}
-                校验候选
+                {tr("codexRouterWorkspace.s263", { defaultValue: "校验候选" })}
               </Button>
               <Button
                 size="sm"
@@ -6622,7 +7331,7 @@ function SpawnAgentCandidatesPanel({
                 ) : (
                   <Save className="h-4 w-4" />
                 )}
-                保存排序
+                {tr("codexRouterWorkspace.s264", { defaultValue: "保存排序" })}
               </Button>
             </div>
           </div>
@@ -6631,7 +7340,9 @@ function SpawnAgentCandidatesPanel({
             <div className="space-y-2">
               <div>
                 <div className="mb-1.5 text-xs font-semibold text-violet-800 dark:text-violet-100">
-                  Codex spawn_agent 前五可用模型
+                  {tr("codexRouterWorkspace.s265", {
+                    defaultValue: "Codex spawn_agent 前五可用模型",
+                  })}
                 </div>
                 <div className="grid gap-1.5 md:grid-cols-5">
                   {previewVisibleModels.length > 0 ? (
@@ -6654,9 +7365,10 @@ function SpawnAgentCandidatesPanel({
                     ))
                   ) : (
                     <div className="rounded-md border border-violet-200 bg-background/80 px-3 py-2 text-xs text-violet-800 dark:border-violet-800/60 dark:bg-slate-950/45 dark:text-violet-100 md:col-span-5">
-                      当前 MultiRouter provider 还没有
-                      modelCatalog；请先在模型映射里添加 OpenAI / Qwen /
-                      DeepSeek 等候选模型。
+                      {tr("codexRouterWorkspace.s266", {
+                        defaultValue:
+                          "当前 MultiRouter provider 还没有\n                      modelCatalog；请先在模型映射里添加 OpenAI / Qwen /\n                      DeepSeek 等候选模型。",
+                      })}
                     </div>
                   )}
                 </div>
@@ -6665,7 +7377,9 @@ function SpawnAgentCandidatesPanel({
               <div>
                 <div className="mb-1.5 flex items-center justify-between gap-2">
                   <div className="text-xs font-semibold text-violet-800 dark:text-violet-100">
-                    可拖拽排序的前五候选
+                    {tr("codexRouterWorkspace.s267", {
+                      defaultValue: "可拖拽排序的前五候选",
+                    })}
                   </div>
                   <Badge className="border border-violet-200 bg-violet-50 text-violet-800 dark:border-violet-500/40 dark:bg-violet-500/10 dark:text-violet-100">
                     {draftSpawnAgentModels.length} / {spawnAgentVisibleLimit}
@@ -6692,8 +7406,14 @@ function SpawnAgentCandidatesPanel({
                         ))
                       ) : (
                         <div className="rounded-md border border-dashed border-violet-200 bg-background/70 px-3 py-2 text-xs text-violet-800 dark:border-violet-700/60 dark:bg-slate-950/30 dark:text-violet-100">
-                          还没有选择子 Agent 候选；从右侧候选池添加，最多{" "}
-                          {spawnAgentVisibleLimit} 个。
+                          {tr("codexRouterWorkspace.s268", {
+                            defaultValue:
+                              "还没有选择子 Agent 候选；从右侧候选池添加，最多",
+                          })}{" "}
+                          {spawnAgentVisibleLimit}{" "}
+                          {tr("codexRouterWorkspace.s269", {
+                            defaultValue: "个。",
+                          })}
                         </div>
                       )}
                     </div>
@@ -6711,10 +7431,18 @@ function SpawnAgentCandidatesPanel({
                 className="flex h-full min-h-0 flex-col"
               >
                 <TabsList className="grid w-full grid-cols-4 bg-muted p-1 dark:bg-slate-950/60">
-                  <TabsTrigger value="selected">已选</TabsTrigger>
-                  <TabsTrigger value="routed">路由</TabsTrigger>
-                  <TabsTrigger value="priority">重点</TabsTrigger>
-                  <TabsTrigger value="all">全部</TabsTrigger>
+                  <TabsTrigger value="selected">
+                    {tr("codexRouterWorkspace.s270", { defaultValue: "已选" })}
+                  </TabsTrigger>
+                  <TabsTrigger value="routed">
+                    {tr("codexRouterWorkspace.s271", { defaultValue: "路由" })}
+                  </TabsTrigger>
+                  <TabsTrigger value="priority">
+                    {tr("codexRouterWorkspace.s272", { defaultValue: "重点" })}
+                  </TabsTrigger>
+                  <TabsTrigger value="all">
+                    {tr("codexRouterWorkspace.s273", { defaultValue: "全部" })}
+                  </TabsTrigger>
                 </TabsList>
                 {(["selected", "routed", "priority", "all"] as const).map(
                   (view) => (
@@ -6766,15 +7494,22 @@ function SpawnAgentCandidatesPanel({
                                   )}
                                 >
                                   {isSelected
-                                    ? `前五 #${selectedIndex + 1}`
-                                    : "添加"}
+                                    ? tr("codexRouterWorkspace.s274", {
+                                        defaultValue: "前五 #{{arg0}}",
+                                        arg0: selectedIndex + 1,
+                                      })
+                                    : tr("codexRouterWorkspace.s275", {
+                                        defaultValue: "添加",
+                                      })}
                                 </Badge>
                               </button>
                             );
                           })
                         ) : (
                           <div className="rounded-md border border-dashed border-border px-3 py-2 text-xs text-muted-foreground dark:border-slate-700 dark:text-slate-400">
-                            这个来源暂时没有可用模型。
+                            {tr("codexRouterWorkspace.s276", {
+                              defaultValue: "这个来源暂时没有可用模型。",
+                            })}
                           </div>
                         )}
                       </div>
@@ -6790,11 +7525,14 @@ function SpawnAgentCandidatesPanel({
               catalog: {selectedCatalog.models.length}
             </Badge>
             <Badge className="border border-violet-200 bg-violet-50 text-violet-800 dark:border-violet-500/40 dark:bg-violet-500/10 dark:text-violet-100">
-              路由命中: {routedCatalogModelIds.length}
+              {tr("codexRouterWorkspace.s277", { defaultValue: "路由命中:" })}{" "}
+              {routedCatalogModelIds.length}
             </Badge>
             <Badge className="border border-violet-200 bg-violet-50 text-violet-800 dark:border-violet-500/40 dark:bg-violet-500/10 dark:text-violet-100">
-              来源:{" "}
-              {generatedVisibleModels.length > 0 ? "诊断实测" : "配置预览"}
+              {tr("codexRouterWorkspace.s278", { defaultValue: "来源:" })}{" "}
+              {generatedVisibleModels.length > 0
+                ? tr("codexRouterWorkspace.s279", { defaultValue: "诊断实测" })
+                : tr("codexRouterWorkspace.s280", { defaultValue: "配置预览" })}
             </Badge>
             <Badge
               className={cn(
@@ -6804,16 +7542,22 @@ function SpawnAgentCandidatesPanel({
                   : "border-amber-200 bg-amber-50 text-amber-800 dark:border-amber-500/40 dark:bg-amber-500/10 dark:text-amber-100",
               )}
             >
-              本地检查:{" "}
+              {tr("codexRouterWorkspace.s281", { defaultValue: "本地检查:" })}{" "}
               {localCandidateValidation.missingSelectedModels.length === 0
-                ? "已选已覆盖"
-                : `缺 ${localCandidateValidation.missingSelectedModels.length} 个已选`}
+                ? tr("codexRouterWorkspace.s282", {
+                    defaultValue: "已选已覆盖",
+                  })
+                : tr("codexRouterWorkspace.s283", {
+                    defaultValue: "缺 {{arg0}} 个已选",
+                    arg0: localCandidateValidation.missingSelectedModels.length,
+                  })}
             </Badge>
           </div>
 
           {candidateSaveError ? (
             <div className="mt-3 rounded-md border border-rose-200 bg-rose-50 px-3 py-2 text-xs leading-5 text-rose-700 dark:border-rose-700/50 dark:bg-rose-950/30 dark:text-rose-100">
-              保存失败：{candidateSaveError}
+              {tr("codexRouterWorkspace.s284", { defaultValue: "保存失败：" })}
+              {candidateSaveError}
             </div>
           ) : null}
           {candidateSaveMessage ? (
@@ -6828,16 +7572,30 @@ function SpawnAgentCandidatesPanel({
           ) : null}
           {actualCandidateValidation.missingSelectedModels.length > 0 ? (
             <div className="mt-3 rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-xs leading-5 text-amber-800 dark:border-amber-700/50 dark:bg-amber-950/30 dark:text-amber-100">
-              live 可见窗口还没覆盖已选模型：
+              {tr("codexRouterWorkspace.s285", {
+                defaultValue: "live 可见窗口还没覆盖已选模型：",
+              })}
               {actualCandidateValidation.missingSelectedModels.join(", ")}
-              。保存后请重启 Codex Desktop/app-server 再校验。
+              {tr("codexRouterWorkspace.s286", {
+                defaultValue:
+                  "。保存后请重启 Codex Desktop/app-server 再校验。",
+              })}
             </div>
           ) : null}
           {spawnAgentMissingPriorityModels.length > 0 ? (
             <div className="mt-3 rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-xs leading-5 text-amber-800 dark:border-amber-700/50 dark:bg-amber-950/30 dark:text-amber-100">
-              仍有重点模型不在前 {spawnAgentVisibleLimit} 个可见候选中：
+              {tr("codexRouterWorkspace.s287", {
+                defaultValue: "仍有重点模型不在前",
+              })}{" "}
+              {spawnAgentVisibleLimit}{" "}
+              {tr("codexRouterWorkspace.s288", {
+                defaultValue: "个可见候选中：",
+              })}
               {spawnAgentMissingPriorityModels.join(", ")}
-              。请把它们加入子 Agent 候选列表并重启 Codex Desktop/app-server。
+              {tr("codexRouterWorkspace.s289", {
+                defaultValue:
+                  "。请把它们加入子 Agent 候选列表并重启 Codex Desktop/app-server。",
+              })}
             </div>
           ) : null}
         </div>
@@ -6881,8 +7639,14 @@ function CodexProjectionStatusPanel({
     >
       <div className="flex flex-wrap items-center justify-between gap-2">
         <div className="font-semibold">
-          MultiRouter 目录投影：
-          {inactive ? "激活后生成" : pending ? "待同步" : "已同步"}
+          {tr("codexRouterWorkspace.s290", {
+            defaultValue: "MultiRouter 目录投影：",
+          })}
+          {inactive
+            ? tr("codexRouterWorkspace.s291", { defaultValue: "激活后生成" })
+            : pending
+              ? tr("codexRouterWorkspace.s292", { defaultValue: "待同步" })
+              : tr("codexRouterWorkspace.s293", { defaultValue: "已同步" })}
         </div>
         {pending && !inactive ? (
           <Button
@@ -6895,26 +7659,45 @@ function CodexProjectionStatusPanel({
             <RefreshCw
               className={cn("h-3.5 w-3.5", isRefreshing && "animate-spin")}
             />
-            {isRefreshing ? "同步中…" : "重新同步目录"}
+            {isRefreshing
+              ? tr("codexRouterWorkspace.s294", { defaultValue: "同步中…" })
+              : tr("codexRouterWorkspace.s295", {
+                  defaultValue: "重新同步目录",
+                })}
           </Button>
         ) : null}
       </div>
       <div className="mt-1">
         {inactive
-          ? "当前不是正在使用的 MultiRouter；它不拥有共享 live 文件，激活时会按最新 Provider 配置自动生成。"
+          ? tr("codexRouterWorkspace.s296", {
+              defaultValue:
+                "当前不是正在使用的 MultiRouter；它不拥有共享 live 文件，激活时会按最新 Provider 配置自动生成。",
+            })
           : pending
-            ? "当前 Provider/模型目录与 Codex live 投影可能不一致；先重新同步，再发送请求。"
-            : `已确认 ${status?.routes.length ?? 0} 条模型映射与当前 Provider 目录一致。`}
+            ? tr("codexRouterWorkspace.s297", {
+                defaultValue:
+                  "当前 Provider/模型目录与 Codex live 投影可能不一致；先重新同步，再发送请求。",
+              })
+            : tr("codexRouterWorkspace.s298", {
+                defaultValue:
+                  "已确认 {{arg0}} 条模型映射与当前 Provider 目录一致。",
+                arg0: status?.routes.length ?? 0,
+              })}
       </div>
       {errorMessage ? (
         <div className="mt-1">
-          原因：{errorMessage}
+          {tr("codexRouterWorkspace.s299", { defaultValue: "原因：" })}
+          {errorMessage}
           {status?.lastErrorCode ? `（${status.lastErrorCode}）` : ""}
         </div>
       ) : null}
       {(status?.warnings ?? []).length > 0 ? (
         <div className="mt-2 space-y-1 border-t border-current/15 pt-2">
-          <div className="font-medium">需要处理的策略引用</div>
+          <div className="font-medium">
+            {tr("codexRouterWorkspace.s300", {
+              defaultValue: "需要处理的策略引用",
+            })}
+          </div>
           {status!.warnings.map((warning) => (
             <div key={warning}>{warning}</div>
           ))}
@@ -6922,7 +7705,9 @@ function CodexProjectionStatusPanel({
       ) : null}
       {routeRows.length > 0 ? (
         <div className="mt-2 space-y-1 border-t border-current/15 pt-2">
-          <div className="font-medium">当前有效映射</div>
+          <div className="font-medium">
+            {tr("codexRouterWorkspace.s301", { defaultValue: "当前有效映射" })}
+          </div>
           {routeRows.map((route) => {
             const routeLabel = routeSummaryDisplayName(
               route.routeLabel,
@@ -6942,7 +7727,11 @@ function CodexProjectionStatusPanel({
           })}
           {status && status.routes.length > routeRows.length ? (
             <div>
-              其余 {status.routes.length - routeRows.length} 条映射已省略。
+              {tr("codexRouterWorkspace.s302", { defaultValue: "其余" })}{" "}
+              {status.routes.length - routeRows.length}{" "}
+              {tr("codexRouterWorkspace.s303", {
+                defaultValue: "条映射已省略。",
+              })}
             </div>
           ) : null}
         </div>
@@ -7092,11 +7881,12 @@ function StatusTab({
   const currentRouteForwardOk = trafficRows.some((row) => row.successCount > 0);
   const listenAddress = proxyStatus
     ? `${proxyStatus.address}:${proxyStatus.port}`
-    : "未启动";
+    : tr("codexRouterWorkspace.s304", { defaultValue: "未启动" });
   const activeTargetLabel =
     activeProviderId && providersById.get(activeProviderId)
       ? `${providersById.get(activeProviderId)?.name} (${activeProviderId})`
-      : activeProviderId || "未命中";
+      : activeProviderId ||
+        tr("codexRouterWorkspace.s305", { defaultValue: "未命中" });
   const routeEnabled = selectedRouting?.enabled !== false;
   const hasEnabledRoutes = selectedRoutes.some(
     ({ route }) => route.enabled !== false,
@@ -7122,15 +7912,31 @@ function StatusTab({
   const trafficVerified = currentRouteForwardOk;
   const linkOnline = Boolean(runtimeStatus.running && trafficVerified);
   const readinessIssues = [
-    !isProxyRunning ? "本地代理未监听" : "",
-    !isCodexTakeoverActive ? "Codex live 配置未接管" : "",
-    !selectedPlan ? "未选择 MultiRouter provider" : "",
-    selectedPlan && activeProviderId !== selectedPlan.id
-      ? "当前 Codex provider 不是选中的 MultiRouter"
+    !isProxyRunning
+      ? tr("codexRouterWorkspace.s306", { defaultValue: "本地代理未监听" })
       : "",
-    selectedPlan && !routeEnabled ? "MultiRouter 入口已关闭" : "",
+    !isCodexTakeoverActive
+      ? tr("codexRouterWorkspace.s307", {
+          defaultValue: "Codex live 配置未接管",
+        })
+      : "",
+    !selectedPlan
+      ? tr("codexRouterWorkspace.s308", {
+          defaultValue: "未选择 MultiRouter provider",
+        })
+      : "",
+    selectedPlan && activeProviderId !== selectedPlan.id
+      ? tr("codexRouterWorkspace.s309", {
+          defaultValue: "当前 Codex provider 不是选中的 MultiRouter",
+        })
+      : "",
+    selectedPlan && !routeEnabled
+      ? tr("codexRouterWorkspace.s310", {
+          defaultValue: "MultiRouter 入口已关闭",
+        })
+      : "",
     selectedPlan && routeEnabled && !hasEnabledRoutes
-      ? "没有启用的匹配规则"
+      ? tr("codexRouterWorkspace.s311", { defaultValue: "没有启用的匹配规则" })
       : "",
   ].filter(Boolean);
 
@@ -7161,11 +7967,16 @@ function StatusTab({
         queryClient.refetchQueries({ queryKey: usageKeys.all, type: "active" }),
       ]);
       setValidationRefreshMessage(
-        "已刷新校验状态，请查看链路卡片和最近转发表。",
+        tr("codexRouterWorkspace.s312", {
+          defaultValue: "已刷新校验状态，请查看链路卡片和最近转发表。",
+        }),
       );
     } catch (error) {
       setValidationRefreshMessage(
-        `刷新校验失败：${workspaceErrorMessage(error)}`,
+        tr("codexRouterWorkspace.s313", {
+          defaultValue: "刷新校验失败：{{arg0}}",
+          arg0: workspaceErrorMessage(error),
+        }),
       );
     } finally {
       setIsRefreshingValidation(false);
@@ -7200,12 +8011,22 @@ function StatusTab({
       const result = await usageApi.syncSessionUsage();
       setSessionSyncMessage(
         result.imported > 0
-          ? `已同步 ${result.imported} 条会话用量记录`
-          : "会话用量已是最新",
+          ? tr("codexRouterWorkspace.s314", {
+              defaultValue: "已同步 {{arg0}} 条会话用量记录",
+              arg0: result.imported,
+            })
+          : tr("codexRouterWorkspace.s315", {
+              defaultValue: "会话用量已是最新",
+            }),
       );
       await queryClient.invalidateQueries({ queryKey: usageKeys.all });
     } catch (error) {
-      setSessionSyncMessage(`同步失败：${workspaceErrorMessage(error)}`);
+      setSessionSyncMessage(
+        tr("codexRouterWorkspace.s316", {
+          defaultValue: "同步失败：{{arg0}}",
+          arg0: workspaceErrorMessage(error),
+        }),
+      );
     } finally {
       setIsSyncingSessionUsage(false);
     }
@@ -7259,8 +8080,13 @@ function StatusTab({
         <section className="rounded-lg border border-border bg-card p-4 dark:border-slate-700 dark:bg-slate-950/40">
           <SectionHeader
             icon={Activity}
-            title="链路状态"
-            detail="默认先看这里：只有监听、Codex 接管、路由入口和至少一条匹配规则都通过，Codex 请求才会进入 MultiRouter。"
+            title={tr("codexRouterWorkspace.s317", {
+              defaultValue: "链路状态",
+            })}
+            detail={tr("codexRouterWorkspace.s318", {
+              defaultValue:
+                "默认先看这里：只有监听、Codex 接管、路由入口和至少一条匹配规则都通过，Codex 请求才会进入 MultiRouter。",
+            })}
             action={
               <div className="flex flex-wrap gap-2">
                 <Button
@@ -7276,7 +8102,13 @@ function StatusTab({
                       isRefreshingValidation ? "animate-spin" : "",
                     )}
                   />
-                  {isRefreshingValidation ? "刷新中" : "刷新校验"}
+                  {isRefreshingValidation
+                    ? tr("codexRouterWorkspace.s319", {
+                        defaultValue: "刷新中",
+                      })
+                    : tr("codexRouterWorkspace.s320", {
+                        defaultValue: "刷新校验",
+                      })}
                 </Button>
                 <Button
                   size="sm"
@@ -7290,7 +8122,9 @@ function StatusTab({
                   ) : (
                     <Bug className="h-4 w-4" />
                   )}
-                  Debug 检查
+                  {tr("codexRouterWorkspace.s321", {
+                    defaultValue: "Debug 检查",
+                  })}
                 </Button>
                 <Button
                   size="sm"
@@ -7304,14 +8138,16 @@ function StatusTab({
                   ) : (
                     <GitBranch className="h-4 w-4" />
                   )}
-                  协议探测
+                  {tr("codexRouterWorkspace.s322", {
+                    defaultValue: "协议探测",
+                  })}
                 </Button>
                 <TooltipProvider delayDuration={200}>
                   <Tooltip>
                     <TooltipTrigger asChild>
                       <span
                         className="inline-flex"
-                        title={MODEL_PICKER_UNLOCK_TOOLTIP}
+                        title={modelPickerUnlockTooltip()}
                       >
                         <Button
                           size="sm"
@@ -7325,7 +8161,9 @@ function StatusTab({
                           ) : (
                             <Wand2 className="h-4 w-4" />
                           )}
-                          解锁模型菜单
+                          {tr("codexRouterWorkspace.s323", {
+                            defaultValue: "解锁模型菜单",
+                          })}
                         </Button>
                       </span>
                     </TooltipTrigger>
@@ -7334,7 +8172,7 @@ function StatusTab({
                       align="end"
                       className="max-w-80 whitespace-normal text-left leading-5"
                     >
-                      {MODEL_PICKER_UNLOCK_TOOLTIP}
+                      {modelPickerUnlockTooltip()}
                     </TooltipContent>
                   </Tooltip>
                 </TooltipProvider>
@@ -7343,12 +8181,19 @@ function StatusTab({
                     <Button
                       size="sm"
                       onClick={() =>
-                        onEditPlan(selectedPlan, "打开多路路由配置")
+                        onEditPlan(
+                          selectedPlan,
+                          tr("codexRouterWorkspace.s324", {
+                            defaultValue: "打开多路路由配置",
+                          }),
+                        )
                       }
                       className="gap-2 bg-blue-600 hover:bg-blue-500"
                     >
                       <Pencil className="h-4 w-4" />
-                      编辑配置
+                      {tr("codexRouterWorkspace.s325", {
+                        defaultValue: "编辑配置",
+                      })}
                     </Button>
                     <Button
                       size="sm"
@@ -7357,7 +8202,9 @@ function StatusTab({
                       className="gap-2 border-rose-300 bg-background/70 text-rose-700 hover:bg-rose-50 dark:border-rose-500/50 dark:bg-rose-500/10 dark:text-rose-100 dark:hover:bg-rose-500/20"
                     >
                       <Trash2 className="h-4 w-4" />
-                      删除
+                      {tr("codexRouterWorkspace.s101", {
+                        defaultValue: "删除",
+                      })}
                     </Button>
                   </>
                 ) : null}
@@ -7367,57 +8214,119 @@ function StatusTab({
           <div className="mt-4 grid gap-3 md:grid-cols-2 xl:grid-cols-5">
             <StatusCard
               ok={linkOnline}
-              label="当前链路"
+              label={tr("codexRouterWorkspace.s326", {
+                defaultValue: "当前链路",
+              })}
               value={
-                linkOnline ? "在线" : configReady ? "待请求验证" : "未就绪"
+                linkOnline
+                  ? tr("codexRouterWorkspace.s327", { defaultValue: "在线" })
+                  : configReady
+                    ? tr("codexRouterWorkspace.s328", {
+                        defaultValue: "待请求验证",
+                      })
+                    : tr("codexRouterWorkspace.s329", {
+                        defaultValue: "未就绪",
+                      })
               }
               detail={
                 linkOnline
-                  ? "Codex 请求会进入本地代理并按 model 分流"
+                  ? tr("codexRouterWorkspace.s330", {
+                      defaultValue: "Codex 请求会进入本地代理并按 model 分流",
+                    })
                   : configReady
-                    ? "配置和监听已就绪，等待当前方案的路由转发成功"
-                    : readinessIssues.join("；") || "等待状态刷新"
+                    ? tr("codexRouterWorkspace.s331", {
+                        defaultValue:
+                          "配置和监听已就绪，等待当前方案的路由转发成功",
+                      })
+                    : readinessIssues.join("；") ||
+                      tr("codexRouterWorkspace.s332", {
+                        defaultValue: "等待状态刷新",
+                      })
               }
             />
             <StatusCard
               ok={isProxyRunning}
-              label="监听"
-              value={isProxyRunning ? "成功" : "未启动"}
+              label={tr("codexRouterWorkspace.s333", { defaultValue: "监听" })}
+              value={
+                isProxyRunning
+                  ? tr("codexRouterWorkspace.s334", { defaultValue: "成功" })
+                  : tr("codexRouterWorkspace.s304", { defaultValue: "未启动" })
+              }
               detail={listenAddress}
             />
             <StatusCard
               ok={isCodexTakeoverActive}
-              label="Codex 接管"
-              value={isCodexTakeoverActive ? "已接管" : "未接管"}
-              detail="Codex 请求需要指向本地代理才会进入路由"
+              label={tr("codexRouterWorkspace.s158", {
+                defaultValue: "Codex 接管",
+              })}
+              value={
+                isCodexTakeoverActive
+                  ? tr("codexRouterWorkspace.s159", { defaultValue: "已接管" })
+                  : tr("codexRouterWorkspace.s160", { defaultValue: "未接管" })
+              }
+              detail={tr("codexRouterWorkspace.s335", {
+                defaultValue: "Codex 请求需要指向本地代理才会进入路由",
+              })}
             />
             <StatusCard
               ok={Boolean(selectedPlan && routeEnabled)}
-              label="路由入口"
+              label={tr("codexRouterWorkspace.s336", {
+                defaultValue: "路由入口",
+              })}
               value={
-                selectedPlan ? (routeEnabled ? "已启用" : "已关闭") : "未选择"
+                selectedPlan
+                  ? routeEnabled
+                    ? tr("codexRouterWorkspace.s206", {
+                        defaultValue: "已启用",
+                      })
+                    : tr("codexRouterWorkspace.s337", {
+                        defaultValue: "已关闭",
+                      })
+                  : tr("codexRouterWorkspace.s018", { defaultValue: "未选择" })
               }
-              detail={selectedPlan?.name ?? "暂无 MultiRouter provider"}
+              detail={
+                selectedPlan?.name ??
+                tr("codexRouterWorkspace.s338", {
+                  defaultValue: "暂无 MultiRouter provider",
+                })
+              }
             />
             <StatusCard
               ok={currentRouteForwardOk}
-              label="最近转发"
+              label={tr("codexRouterWorkspace.s339", {
+                defaultValue: "最近转发",
+              })}
               value={
                 currentRouteForwardOk
-                  ? "当前方案成功"
+                  ? tr("codexRouterWorkspace.s340", {
+                      defaultValue: "当前方案成功",
+                    })
                   : latestLog
                     ? latestForwardOk
-                      ? `成功 ${latestLog.statusCode}`
-                      : `失败 ${latestLog.statusCode}`
-                    : "暂无请求"
+                      ? tr("codexRouterWorkspace.s341", {
+                          defaultValue: "成功 {{arg0}}",
+                          arg0: latestLog.statusCode,
+                        })
+                      : tr("codexRouterWorkspace.s342", {
+                          defaultValue: "失败 {{arg0}}",
+                          arg0: latestLog.statusCode,
+                        })
+                    : tr("codexRouterWorkspace.s343", {
+                        defaultValue: "暂无请求",
+                      })
               }
               detail={
                 currentRouteForwardOk
-                  ? "已确认当前 MultiRouter route 命中并完成上游转发"
+                  ? tr("codexRouterWorkspace.s344", {
+                      defaultValue:
+                        "已确认当前 MultiRouter route 命中并完成上游转发",
+                    })
                   : latestLog?.errorMessage ||
                     latestLog?.requestModel ||
                     latestLog?.model ||
-                    "等待 Codex 请求"
+                    tr("codexRouterWorkspace.s345", {
+                      defaultValue: "等待 Codex 请求",
+                    })
               }
             />
           </div>
@@ -7427,11 +8336,15 @@ function StatusTab({
               className="mt-3 rounded-lg border border-emerald-200 bg-emerald-50 p-3 text-sm leading-6 text-emerald-800 dark:border-emerald-700/50 dark:bg-emerald-950/25 dark:text-emerald-100"
             >
               <div className="font-semibold">
-                MultiRouter 已通过真实请求验证
+                {tr("codexRouterWorkspace.s346", {
+                  defaultValue: "MultiRouter 已通过真实请求验证",
+                })}
               </div>
               <div className="text-xs">
-                当前 Provider、代理监听、Codex
-                接管、路由入口和最近一次路由转发均正常。你可以继续留在状态页观察流量或调整路由。
+                {tr("codexRouterWorkspace.s347", {
+                  defaultValue:
+                    "当前 Provider、代理监听、Codex\n                接管、路由入口和最近一次路由转发均正常。你可以继续留在状态页观察流量或调整路由。",
+                })}
               </div>
             </div>
           ) : null}
@@ -7471,33 +8384,57 @@ function StatusTab({
                         : "bg-slate-400",
                   )}
                 />
-                模型菜单守护
+                {tr("codexRouterWorkspace.s348", {
+                  defaultValue: "模型菜单守护",
+                })}
                 {guardianStatus.injected
-                  ? " · 已注入"
+                  ? tr("codexRouterWorkspace.s349", {
+                      defaultValue: " · 已注入",
+                    })
                   : guardianStatus.cdpAvailable
-                    ? " · 待注入"
-                    : " · 轮询中"}
+                    ? tr("codexRouterWorkspace.s350", {
+                        defaultValue: " · 待注入",
+                      })
+                    : tr("codexRouterWorkspace.s351", {
+                        defaultValue: " · 轮询中",
+                      })}
               </div>
               <div className="mt-1">{guardianStatus.message}</div>
               <div className="mt-1 font-mono text-[11px] opacity-80">
-                codex={guardianStatus.codexRunning ? "运行中" : "未运行"} cdp=
-                {guardianStatus.cdpAvailable ? "可用" : "不可用"} targets=
+                codex=
+                {guardianStatus.codexRunning
+                  ? tr("codexRouterWorkspace.s031", { defaultValue: "运行中" })
+                  : tr("codexRouterWorkspace.s157", {
+                      defaultValue: "未运行",
+                    })}{" "}
+                cdp=
+                {guardianStatus.cdpAvailable
+                  ? tr("codexRouterWorkspace.s352", { defaultValue: "可用" })
+                  : tr("codexRouterWorkspace.s353", {
+                      defaultValue: "不可用",
+                    })}{" "}
+                targets=
                 {guardianStatus.injectedTargetCount}
               </div>
             </div>
           ) : isCodexTakeoverActive ? (
             <div className="mt-3 rounded-lg border border-slate-200 bg-slate-50 p-3 text-xs leading-5 text-slate-600 dark:border-slate-600/50 dark:bg-slate-900/60 dark:text-slate-300">
-              模型菜单守护未启动；重新开启 Codex 接管以激活。
+              {tr("codexRouterWorkspace.s354", {
+                defaultValue: "模型菜单守护未启动；重新开启 Codex 接管以激活。",
+              })}
             </div>
           ) : null}
           {!modelPickerUnlockResult ? (
             <div className="mt-3 rounded-lg border border-indigo-200 bg-indigo-50 p-3 text-xs leading-5 text-indigo-800 dark:border-indigo-700/50 dark:bg-indigo-950/25 dark:text-indigo-100">
-              {MODEL_PICKER_UNLOCK_HINT}
+              {modelPickerUnlockHint()}
             </div>
           ) : null}
           {modelPickerUnlockError ? (
             <div className="mt-3 rounded-lg border border-rose-200 bg-rose-50 p-3 text-xs leading-5 text-rose-700 dark:border-rose-700/50 dark:bg-rose-950/30 dark:text-rose-100">
-              模型菜单解锁失败：{modelPickerUnlockError}
+              {tr("codexRouterWorkspace.s355", {
+                defaultValue: "模型菜单解锁失败：",
+              })}
+              {modelPickerUnlockError}
             </div>
           ) : null}
           {modelPickerUnlockResult ? (
@@ -7511,8 +8448,12 @@ function StatusTab({
             >
               <div className="font-semibold">
                 {modelPickerUnlockResult.injected
-                  ? "模型菜单白名单已注入"
-                  : "模型菜单白名单尚未注入"}
+                  ? tr("codexRouterWorkspace.s356", {
+                      defaultValue: "模型菜单白名单已注入",
+                    })
+                  : tr("codexRouterWorkspace.s357", {
+                      defaultValue: "模型菜单白名单尚未注入",
+                    })}
               </div>
               <div className="mt-1">{modelPickerUnlockResult.message}</div>
               <div className="mt-1 font-mono text-[11px] opacity-80">
@@ -7522,32 +8463,56 @@ function StatusTab({
               </div>
               {modelPickerUnlockResult.codexExecutable ? (
                 <div className="mt-2 rounded-md border border-current/20 bg-white/40 p-2 text-[11px] leading-5 dark:bg-black/10">
-                  Codex Desktop 主程序：
+                  {tr("codexRouterWorkspace.s358", {
+                    defaultValue: "Codex Desktop 主程序：",
+                  })}
                   <span className="font-mono break-all">
                     {modelPickerUnlockResult.codexExecutable}
                   </span>
                   {!modelPickerUnlockResult.injected
-                    ? "。已捕获该 Desktop 路径；请完全退出 Codex Desktop 后再次点击“解锁模型菜单”，让 CCSwitchMulti 用 remote debugging 启动同一个 Desktop。成功注入后，切换第三方 API Key 不需要重复解锁；CLI/app-server 继续使用 live config、model_catalog_json 和本地 /v1/models 路径。"
+                    ? tr("codexRouterWorkspace.s359", {
+                        defaultValue:
+                          "。已捕获该 Desktop 路径；请完全退出 Codex Desktop 后再次点击“解锁模型菜单”，让 CCSwitchMulti 用 remote debugging 启动同一个 Desktop。成功注入后，切换第三方 API Key 不需要重复解锁；CLI/app-server 继续使用 live config、model_catalog_json 和本地 /v1/models 路径。",
+                      })
                     : ""}
                 </div>
               ) : null}
             </div>
           ) : null}
           <div className="mt-4 grid gap-3 text-sm md:grid-cols-3">
-            <DetailRow label="当前代理目标" value={activeTargetLabel} />
             <DetailRow
-              label="启用匹配规则"
+              label={tr("codexRouterWorkspace.s360", {
+                defaultValue: "当前代理目标",
+              })}
+              value={activeTargetLabel}
+            />
+            <DetailRow
+              label={tr("codexRouterWorkspace.s361", {
+                defaultValue: "启用匹配规则",
+              })}
               value={`${selectedRoutes.filter(({ route }) => route.enabled !== false).length} / ${selectedRoutes.length}`}
             />
             <DetailRow
-              label="代理累计请求"
-              value={`${proxyStatus?.total_requests ?? 0} 次，成功率 ${proxyStatus?.success_rate ?? 0}%`}
+              label={tr("codexRouterWorkspace.s362", {
+                defaultValue: "代理累计请求",
+              })}
+              value={tr("codexRouterWorkspace.s363", {
+                defaultValue: "{{arg0}} 次，成功率 {{arg1}}%",
+                arg0: proxyStatus?.total_requests ?? 0,
+                arg1: proxyStatus?.success_rate ?? 0,
+              })}
             />
           </div>
           <div className="mt-3">
             <DetailRow
-              label="最近错误"
-              value={proxyStatus?.last_error || latestLog?.errorMessage || "无"}
+              label={tr("codexRouterWorkspace.s364", {
+                defaultValue: "最近错误",
+              })}
+              value={
+                proxyStatus?.last_error ||
+                latestLog?.errorMessage ||
+                tr("codexRouterWorkspace.s153", { defaultValue: "无" })
+              }
             />
           </div>
         </section>
@@ -7566,8 +8531,13 @@ function StatusTab({
         <section className="rounded-lg border border-cyan-200 bg-cyan-50/70 p-4 dark:border-cyan-700/40 dark:bg-cyan-950/10">
           <SectionHeader
             icon={GitBranch}
-            title="协议探测"
-            detail="配置判定来自后端共享协议决策；最近实测来自 request_prepared 日志，能直接看到某个模型最后真实出站走的是 Responses、Chat 还是 Messages。"
+            title={tr("codexRouterWorkspace.s365", {
+              defaultValue: "协议探测",
+            })}
+            detail={tr("codexRouterWorkspace.s366", {
+              defaultValue:
+                "配置判定来自后端共享协议决策；最近实测来自 request_prepared 日志，能直接看到某个模型最后真实出站走的是 Responses、Chat 还是 Messages。",
+            })}
             action={
               <Button
                 size="sm"
@@ -7581,15 +8551,16 @@ function StatusTab({
                 ) : (
                   <RefreshCw className="h-4 w-4" />
                 )}
-                重新探测
+                {tr("codexRouterWorkspace.s367", { defaultValue: "重新探测" })}
               </Button>
             }
           />
           {!diagnostics && !isDiagnosing ? (
             <div className="mt-3 rounded-lg border border-border bg-muted/40 p-4 text-sm leading-6 text-muted-foreground dark:border-slate-700 dark:bg-slate-950/50 dark:text-slate-300">
-              尚未执行协议探测。点击右上角按钮后，会读取当前 MultiRouter route
-              规则并结合最近 router
-              日志，展示每个模型的配置协议和最近一次真实出站协议。
+              {tr("codexRouterWorkspace.s368", {
+                defaultValue:
+                  "尚未执行协议探测。点击右上角按钮后，会读取当前 MultiRouter route\n              规则并结合最近 router\n              日志，展示每个模型的配置协议和最近一次真实出站协议。",
+              })}
             </div>
           ) : null}
           {protocolRows.length > 0 ? (
@@ -7597,9 +8568,19 @@ function StatusTab({
               <div className="grid grid-cols-[1.1fr_1fr_1fr_1fr_1.4fr] gap-2 bg-muted px-3 py-2 text-xs font-semibold text-muted-foreground dark:bg-slate-900/80 dark:text-slate-300">
                 <span>Provider / Route</span>
                 <span>Model</span>
-                <span>配置判定</span>
-                <span>最近实测</span>
-                <span>来源</span>
+                <span>
+                  {tr("codexRouterWorkspace.s369", {
+                    defaultValue: "配置判定",
+                  })}
+                </span>
+                <span>
+                  {tr("codexRouterWorkspace.s370", {
+                    defaultValue: "最近实测",
+                  })}
+                </span>
+                <span>
+                  {tr("codexRouterWorkspace.s371", { defaultValue: "来源" })}
+                </span>
               </div>
               {protocolRows.map((row) => (
                 <div
@@ -7621,7 +8602,9 @@ function StatusTab({
                     <div className="truncate">
                       {row.configuredProtocol
                         ? apiFormatLabel(row.configuredProtocol)
-                        : "待探测"}
+                        : tr("codexRouterWorkspace.s372", {
+                            defaultValue: "待探测",
+                          })}
                     </div>
                     <div
                       className="truncate text-[11px] text-muted-foreground dark:text-slate-500"
@@ -7636,10 +8619,15 @@ function StatusTab({
                     <div className="truncate">
                       {row.lastObservedProtocol
                         ? apiFormatLabel(row.lastObservedProtocol)
-                        : "暂无实测"}
+                        : tr("codexRouterWorkspace.s373", {
+                            defaultValue: "暂无实测",
+                          })}
                     </div>
                     <div className="truncate text-[11px] text-muted-foreground dark:text-slate-500">
-                      {row.lastObservedAt ?? "等待新请求"}
+                      {row.lastObservedAt ??
+                        tr("codexRouterWorkspace.s374", {
+                          defaultValue: "等待新请求",
+                        })}
                     </div>
                   </div>
                   <div className="min-w-0">
@@ -7655,10 +8643,18 @@ function StatusTab({
                       {row.lastObservedUpstreamUrl ??
                         row.lastObservedEndpoint ??
                         row.configuredProtocolDetail ??
-                        "无"}
+                        tr("codexRouterWorkspace.s153", { defaultValue: "无" })}
                     </div>
                     <div className="truncate text-[11px] text-muted-foreground dark:text-slate-500">
-                      最近请求 {row.requestCount} 次，失败 {row.failedCount} 次
+                      {tr("codexRouterWorkspace.s375", {
+                        defaultValue: "最近请求",
+                      })}{" "}
+                      {row.requestCount}{" "}
+                      {tr("codexRouterWorkspace.s376", {
+                        defaultValue: "次，失败",
+                      })}{" "}
+                      {row.failedCount}{" "}
+                      {tr("codexRouterWorkspace.s377", { defaultValue: "次" })}
                     </div>
                   </div>
                 </div>
@@ -7666,9 +8662,18 @@ function StatusTab({
             </div>
           ) : diagnostics ? (
             <div className="mt-3 rounded-lg border border-border bg-muted/40 p-4 text-sm leading-6 text-muted-foreground dark:border-slate-700 dark:bg-slate-950/50 dark:text-slate-300">
-              当前没有可归属的协议探测结果。已加载 route {selectedRoutes.length}{" "}
-              条， router 事件 {routerRequestEvents.length} 条；请先让 Codex
-              发起一次真实请求，再重新探测。
+              {tr("codexRouterWorkspace.s378", {
+                defaultValue: "当前没有可归属的协议探测结果。已加载 route",
+              })}{" "}
+              {selectedRoutes.length}{" "}
+              {tr("codexRouterWorkspace.s379", {
+                defaultValue: "条， router 事件",
+              })}{" "}
+              {routerRequestEvents.length}{" "}
+              {tr("codexRouterWorkspace.s380", {
+                defaultValue:
+                  "条；请先让 Codex\n              发起一次真实请求，再重新探测。",
+              })}
             </div>
           ) : null}
         </section>
@@ -7678,8 +8683,13 @@ function StatusTab({
         <section className="rounded-lg border border-blue-200 bg-blue-50/70 p-4 dark:border-blue-700/40 dark:bg-blue-950/15">
           <SectionHeader
             icon={GitFork}
-            title="分流子 Provider"
-            detail="这些子 Provider 来自当前 MultiRouter 的 route target，转换层跟随各自供应商配置。"
+            title={tr("codexRouterWorkspace.s381", {
+              defaultValue: "分流子 Provider",
+            })}
+            detail={tr("codexRouterWorkspace.s382", {
+              defaultValue:
+                "这些子 Provider 来自当前 MultiRouter 的 route target，转换层跟随各自供应商配置。",
+            })}
           />
           <div className="mt-3 grid gap-3 md:grid-cols-2 xl:grid-cols-3">
             {selectedRoutes.map((entry) => {
@@ -7696,7 +8706,11 @@ function StatusTab({
                   <div className="flex flex-wrap items-center justify-between gap-2">
                     <div className="min-w-0">
                       <div className="truncate text-sm font-semibold text-foreground dark:text-slate-100">
-                        {targetProvider?.name ?? targetProviderId ?? "内联上游"}
+                        {targetProvider?.name ??
+                          targetProviderId ??
+                          tr("codexRouterWorkspace.s383", {
+                            defaultValue: "内联上游",
+                          })}
                       </div>
                       <div className="mt-1 truncate text-xs text-muted-foreground dark:text-slate-400">
                         {routeDisplayName(entry.route, providersById)}
@@ -7710,7 +8724,13 @@ function StatusTab({
                           : "border-emerald-500/50 bg-emerald-500/15 text-emerald-100",
                       )}
                     >
-                      {entry.route.enabled === false ? "已停用" : "已启用"}
+                      {entry.route.enabled === false
+                        ? tr("codexRouterWorkspace.s207", {
+                            defaultValue: "已停用",
+                          })
+                        : tr("codexRouterWorkspace.s206", {
+                            defaultValue: "已启用",
+                          })}
                     </Badge>
                   </div>
                   <div className="mt-3 text-xs leading-5 text-muted-foreground dark:text-slate-400">
@@ -7722,9 +8742,16 @@ function StatusTab({
             {selectedRoutes.length === 0 && (
               <EmptyState
                 icon={Route}
-                title="还没有分流规则"
-                detail="添加 route 后，这里会列出每个子 Provider 和它负责的模型。"
-                actionLabel="编辑多路路由"
+                title={tr("codexRouterWorkspace.s384", {
+                  defaultValue: "还没有分流规则",
+                })}
+                detail={tr("codexRouterWorkspace.s385", {
+                  defaultValue:
+                    "添加 route 后，这里会列出每个子 Provider 和它负责的模型。",
+                })}
+                actionLabel={tr("codexRouterWorkspace.s149", {
+                  defaultValue: "编辑多路路由",
+                })}
                 onAction={() => selectedPlan && onEditPlan(selectedPlan)}
               />
             )}
@@ -7737,21 +8764,34 @@ function StatusTab({
           <section className="rounded-lg border border-emerald-200 bg-emerald-50/70 p-4 dark:border-emerald-700/40 dark:bg-emerald-950/10">
             <SectionHeader
               icon={Database}
-              title="今日子 Provider / Model 流量"
-              detail="基于真实 Codex 代理请求日志聚合；若后端只记录外层 MultiRouter，页面会按 requestModel 尝试回归属到 route target。"
+              title={tr("codexRouterWorkspace.s386", {
+                defaultValue: "今日子 Provider / Model 流量",
+              })}
+              detail={tr("codexRouterWorkspace.s387", {
+                defaultValue:
+                  "基于真实 Codex 代理请求日志聚合；若后端只记录外层 MultiRouter，页面会按 requestModel 尝试回归属到 route target。",
+              })}
             />
             <div className="mt-3 overflow-hidden rounded-lg border border-border dark:border-slate-700">
               <div className="grid grid-cols-[1.2fr_1.2fr_0.7fr_0.7fr_0.8fr_0.8fr] gap-2 bg-muted px-3 py-2 text-xs font-semibold text-muted-foreground dark:bg-slate-900/80 dark:text-slate-300">
                 <span>Provider</span>
                 <span>Model</span>
-                <span className="text-right">请求</span>
-                <span className="text-right">失败</span>
+                <span className="text-right">
+                  {tr("codexRouterWorkspace.s388", { defaultValue: "请求" })}
+                </span>
+                <span className="text-right">
+                  {tr("codexRouterWorkspace.s389", { defaultValue: "失败" })}
+                </span>
                 <span className="text-right">Tokens</span>
-                <span className="text-right">延迟</span>
+                <span className="text-right">
+                  {tr("codexRouterWorkspace.s390", { defaultValue: "延迟" })}
+                </span>
               </div>
               {isLoading ? (
                 <div className="p-4 text-sm text-muted-foreground">
-                  正在读取统计...
+                  {tr("codexRouterWorkspace.s391", {
+                    defaultValue: "正在读取统计...",
+                  })}
                 </div>
               ) : trafficRows.length > 0 ? (
                 trafficRows.map((row) => (
@@ -7771,26 +8811,58 @@ function StatusTab({
                 ))
               ) : (
                 <div className="p-4 text-sm leading-6 text-muted-foreground">
-                  暂无可归属到子 Provider 的请求日志。今日 Codex 日志{" "}
-                  {logs.length} 条，其中真实代理转发 {proxyLogs.length}{" "}
-                  条，Codex 会话同步 {sessionLogs.length} 条，外层 MultiRouter
-                  日志 {routerLogs.length} 条，目标 Provider 数{" "}
-                  {routeTargetCount} 个。
+                  {tr("codexRouterWorkspace.s392", {
+                    defaultValue:
+                      "暂无可归属到子 Provider 的请求日志。今日 Codex 日志",
+                  })}{" "}
+                  {logs.length}{" "}
+                  {tr("codexRouterWorkspace.s393", {
+                    defaultValue: "条，其中真实代理转发",
+                  })}{" "}
+                  {proxyLogs.length}{" "}
+                  {tr("codexRouterWorkspace.s394", {
+                    defaultValue: "条，Codex 会话同步",
+                  })}{" "}
+                  {sessionLogs.length}{" "}
+                  {tr("codexRouterWorkspace.s395", {
+                    defaultValue:
+                      "条，外层 MultiRouter\n                  日志",
+                  })}{" "}
+                  {routerLogs.length}{" "}
+                  {tr("codexRouterWorkspace.s396", {
+                    defaultValue: "条，目标 Provider 数",
+                  })}{" "}
+                  {routeTargetCount}{" "}
+                  {tr("codexRouterWorkspace.s269", { defaultValue: "个。" })}
                 </div>
               )}
             </div>
             <div className="mt-3 text-xs text-muted-foreground">
-              已尝试归属真实代理日志 {routedLogs.length} 条、router 诊断事件{" "}
-              {routerRequestEvents.length} 条；这里不把 codex_session
-              历史同步当作转发。
+              {tr("codexRouterWorkspace.s397", {
+                defaultValue: "已尝试归属真实代理日志",
+              })}{" "}
+              {routedLogs.length}{" "}
+              {tr("codexRouterWorkspace.s398", {
+                defaultValue: "条、router 诊断事件",
+              })}{" "}
+              {routerRequestEvents.length}{" "}
+              {tr("codexRouterWorkspace.s399", {
+                defaultValue:
+                  "条；这里不把 codex_session\n              历史同步当作转发。",
+              })}
             </div>
           </section>
 
           <section className="rounded-lg border border-violet-200 bg-violet-50/70 p-4 dark:border-violet-700/40 dark:bg-violet-950/10">
             <SectionHeader
               icon={GitFork}
-              title="今日子 Agent 会话流量"
-              detail="基于 Codex 本地 JSONL/SQLite 的 subagent 会话列表和 token_count 用量；按模型汇总子 Agent 数、请求和 token。"
+              title={tr("codexRouterWorkspace.s400", {
+                defaultValue: "今日子 Agent 会话流量",
+              })}
+              detail={tr("codexRouterWorkspace.s401", {
+                defaultValue:
+                  "基于 Codex 本地 JSONL/SQLite 的 subagent 会话列表和 token_count 用量；按模型汇总子 Agent 数、请求和 token。",
+              })}
               action={
                 <Button
                   size="sm"
@@ -7804,7 +8876,9 @@ function StatusTab({
                   ) : (
                     <RefreshCw className="h-4 w-4" />
                   )}
-                  同步会话用量
+                  {tr("codexRouterWorkspace.s402", {
+                    defaultValue: "同步会话用量",
+                  })}
                 </Button>
               }
             />
@@ -7815,7 +8889,9 @@ function StatusTab({
             )}
             {subagentUsageError && (
               <div className="mt-3 rounded-md border border-rose-200 bg-rose-50 px-3 py-2 text-xs text-rose-700 dark:border-rose-700/50 dark:bg-rose-950/30 dark:text-rose-100">
-                子 Agent 用量读取失败：
+                {tr("codexRouterWorkspace.s403", {
+                  defaultValue: "子 Agent 用量读取失败：",
+                })}
                 {subagentUsageError instanceof Error
                   ? subagentUsageError.message
                   : String(subagentUsageError)}
@@ -7823,21 +8899,36 @@ function StatusTab({
             )}
             {subagentUsage?.skippedReason && (
               <div className="mt-3 rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800 dark:border-amber-700/50 dark:bg-amber-950/30 dark:text-amber-100">
-                Codex 历史读取跳过：{subagentUsage.skippedReason}
+                {tr("codexRouterWorkspace.s404", {
+                  defaultValue: "Codex 历史读取跳过：",
+                })}
+                {subagentUsage.skippedReason}
               </div>
             )}
 
             <div className="mt-3 overflow-hidden rounded-lg border border-border dark:border-slate-700">
               <div className="grid grid-cols-[1.4fr_0.7fr_0.7fr_0.9fr_0.7fr] gap-2 bg-muted px-3 py-2 text-xs font-semibold text-muted-foreground dark:bg-slate-900/80 dark:text-slate-300">
-                <span>模型</span>
-                <span className="text-right">子 Agent</span>
-                <span className="text-right">请求</span>
+                <span>
+                  {tr("codexRouterWorkspace.s405", { defaultValue: "模型" })}
+                </span>
+                <span className="text-right">
+                  {tr("codexRouterWorkspace.s406", {
+                    defaultValue: "子 Agent",
+                  })}
+                </span>
+                <span className="text-right">
+                  {tr("codexRouterWorkspace.s388", { defaultValue: "请求" })}
+                </span>
                 <span className="text-right">Tokens</span>
-                <span className="text-right">费用</span>
+                <span className="text-right">
+                  {tr("codexRouterWorkspace.s407", { defaultValue: "费用" })}
+                </span>
               </div>
               {isLoadingSubagentUsage ? (
                 <div className="p-4 text-sm text-muted-foreground">
-                  正在读取子 Agent 统计...
+                  {tr("codexRouterWorkspace.s408", {
+                    defaultValue: "正在读取子 Agent 统计...",
+                  })}
                 </div>
               ) : subagentUsage?.modelStats.length ? (
                 subagentUsage.modelStats.map((row) => (
@@ -7858,18 +8949,31 @@ function StatusTab({
                 ))
               ) : (
                 <div className="p-4 text-sm leading-6 text-muted-foreground">
-                  暂无子 Agent 会话用量。已读取{" "}
-                  {subagentUsage?.totalAgents ?? 0} 个本地子 Agent
-                  会话；如果刚刚运行过子 Agent，请先点击“同步会话用量”。
+                  {tr("codexRouterWorkspace.s409", {
+                    defaultValue: "暂无子 Agent 会话用量。已读取",
+                  })}{" "}
+                  {subagentUsage?.totalAgents ?? 0}{" "}
+                  {tr("codexRouterWorkspace.s410", {
+                    defaultValue:
+                      "个本地子 Agent\n                  会话；如果刚刚运行过子 Agent，请先点击“同步会话用量”。",
+                  })}
                 </div>
               )}
             </div>
 
             <div className="mt-3 rounded-lg border border-border bg-background/70 px-3 py-2 text-xs leading-6 text-muted-foreground dark:border-slate-700 dark:bg-slate-950/20 dark:text-slate-300">
-              已读取 {subagentUsage?.totalAgents ?? 0} 个本地子 Agent 会话，
-              归并为 {subagentUsage?.modelStats.length ?? 0}{" "}
-              个模型分组。状态库：
-              {subagentUsage?.stateDbPath ?? "未定位"}。
+              {tr("codexRouterWorkspace.s411", { defaultValue: "已读取" })}{" "}
+              {subagentUsage?.totalAgents ?? 0}{" "}
+              {tr("codexRouterWorkspace.s412", {
+                defaultValue: "个本地子 Agent 会话，\n              归并为",
+              })}{" "}
+              {subagentUsage?.modelStats.length ?? 0}{" "}
+              {tr("codexRouterWorkspace.s413", {
+                defaultValue: "个模型分组。状态库：",
+              })}
+              {subagentUsage?.stateDbPath ??
+                tr("codexRouterWorkspace.s414", { defaultValue: "未定位" })}
+              。
             </div>
           </section>
         </div>
@@ -7910,14 +9014,19 @@ function TestTab({
       <section className="rounded-lg border border-purple-200 bg-purple-50/70 p-4 dark:border-purple-700/40 dark:bg-purple-950/10">
         <SectionHeader
           icon={Play}
-          title="匹配预览"
-          detail="输入 Codex 请求中的 model，先在本地预览会命中哪条规则。"
+          title={tr("codexRouterWorkspace.s415", { defaultValue: "匹配预览" })}
+          detail={tr("codexRouterWorkspace.s416", {
+            defaultValue:
+              "输入 Codex 请求中的 model，先在本地预览会命中哪条规则。",
+          })}
         />
         <div className="mt-4 grid gap-3 md:grid-cols-[1fr_auto]">
           <input
             value={testModel}
             onChange={(event) => onModelChange(event.target.value)}
-            placeholder="例如：gpt-5.4-mini、qwen3.6、deepseek-v4-flash"
+            placeholder={tr("codexRouterWorkspace.s417", {
+              defaultValue: "例如：gpt-5.4-mini、qwen3.6、deepseek-v4-flash",
+            })}
             className="h-10 rounded-md border border-purple-200 bg-background px-3 text-sm outline-none transition placeholder:text-muted-foreground focus:border-purple-400 focus:ring-2 focus:ring-purple-500/20 dark:border-purple-700/50 dark:bg-slate-950/70 dark:placeholder:text-slate-500 dark:focus:ring-purple-500/30"
           />
           <Button
@@ -7925,7 +9034,7 @@ function TestTab({
             className="gap-2 bg-purple-600 hover:bg-purple-500"
           >
             <Play className="h-4 w-4" />
-            预览命中
+            {tr("codexRouterWorkspace.s418", { defaultValue: "预览命中" })}
           </Button>
         </div>
         {routeModels.length > 0 && (
@@ -7945,11 +9054,14 @@ function TestTab({
         <div className="mt-4 rounded-lg border border-purple-200 bg-background/80 p-4 dark:border-purple-700/40 dark:bg-slate-950/50">
           <div className="mb-2 flex items-center gap-2 text-sm font-semibold">
             <Activity className="h-4 w-4 text-purple-600 dark:text-purple-300" />
-            预览结果
+            {tr("codexRouterWorkspace.s419", { defaultValue: "预览结果" })}
           </div>
           <p className="text-sm leading-6 text-muted-foreground dark:text-slate-300">
             {testResult ??
-              "还没有执行预览。这里不会请求真实上游，也不会消耗额度。"}
+              tr("codexRouterWorkspace.s420", {
+                defaultValue:
+                  "还没有执行预览。这里不会请求真实上游，也不会消耗额度。",
+              })}
           </p>
         </div>
       </section>
@@ -7957,33 +9069,63 @@ function TestTab({
       <section className="rounded-lg border border-emerald-200 bg-emerald-50/70 p-4 dark:border-emerald-700/40 dark:bg-emerald-950/10">
         <SectionHeader
           icon={RadioTower}
-          title="发布检查"
-          detail="确认后再到配置表单保存。"
+          title={tr("codexRouterWorkspace.s421", { defaultValue: "发布检查" })}
+          detail={tr("codexRouterWorkspace.s422", {
+            defaultValue: "确认后再到配置表单保存。",
+          })}
           action={
             selectedPlan ? (
               <Button
                 size="sm"
-                onClick={() => onEditPlan(selectedPlan, "打开发布前配置检查")}
+                onClick={() =>
+                  onEditPlan(
+                    selectedPlan,
+                    tr("codexRouterWorkspace.s423", {
+                      defaultValue: "打开发布前配置检查",
+                    }),
+                  )
+                }
                 className="gap-2 bg-emerald-600 hover:bg-emerald-500"
               >
                 <Pencil className="h-4 w-4" />
-                编辑多路路由
+                {tr("codexRouterWorkspace.s424", {
+                  defaultValue: "编辑多路路由",
+                })}
               </Button>
             ) : null
           }
         />
         <div className="mt-4 space-y-3">
-          <ChecklistItem ok={Boolean(selectedPlan)} label="已选择多路路由" />
+          <ChecklistItem
+            ok={Boolean(selectedPlan)}
+            label={tr("codexRouterWorkspace.s425", {
+              defaultValue: "已选择多路路由",
+            })}
+          />
           <ChecklistItem
             ok={selectedRouting?.enabled !== false}
-            label="多路路由处于启用状态"
+            label={tr("codexRouterWorkspace.s426", {
+              defaultValue: "多路路由处于启用状态",
+            })}
           />
-          <ChecklistItem ok label="未匹配模型会拒绝转发" />
+          <ChecklistItem
+            ok
+            label={tr("codexRouterWorkspace.s427", {
+              defaultValue: "未匹配模型会拒绝转发",
+            })}
+          />
           <ChecklistItem
             ok={(selectedRouting?.routes?.length ?? 0) > 0}
-            label="至少有一条路由规则"
+            label={tr("codexRouterWorkspace.s428", {
+              defaultValue: "至少有一条路由规则",
+            })}
           />
-          <ChecklistItem ok label="不会切换 Codex 当前 Provider" />
+          <ChecklistItem
+            ok
+            label={tr("codexRouterWorkspace.s429", {
+              defaultValue: "不会切换 Codex 当前 Provider",
+            })}
+          />
         </div>
       </section>
     </div>
@@ -8012,11 +9154,17 @@ function StatusViewSwitcher({
     diagnostics?.checks.filter((check) => check.status === "warn").length ?? 0;
   const debugBadge = diagnostics
     ? failedCount > 0
-      ? `${failedCount} 阻塞`
+      ? tr("codexRouterWorkspace.s430", {
+          defaultValue: "{{arg0}} 阻塞",
+          arg0: failedCount,
+        })
       : warnCount > 0
-        ? `${warnCount} 警告`
-        : "已检查"
-    : "未检查";
+        ? tr("codexRouterWorkspace.s431", {
+            defaultValue: "{{arg0}} 警告",
+            arg0: warnCount,
+          })
+        : tr("codexRouterWorkspace.s432", { defaultValue: "已检查" })
+    : tr("codexRouterWorkspace.s433", { defaultValue: "未检查" });
 
   const items: Array<{
     value: StatusView;
@@ -8027,14 +9175,19 @@ function StatusViewSwitcher({
     {
       value: "link",
       icon: Activity,
-      label: "链路",
-      detail: "监听 / 接管 / 入口",
+      label: tr("codexRouterWorkspace.s434", { defaultValue: "链路" }),
+      detail: tr("codexRouterWorkspace.s435", {
+        defaultValue: "监听 / 接管 / 入口",
+      }),
     },
     {
       value: "protocol",
       icon: GitBranch,
-      label: "协议",
-      detail: `${protocolCount} 个模型`,
+      label: tr("codexRouterWorkspace.s436", { defaultValue: "协议" }),
+      detail: tr("codexRouterWorkspace.s190", {
+        defaultValue: "{{arg0}} 个模型",
+        arg0: protocolCount,
+      }),
     },
     {
       value: "debug",
@@ -8045,14 +9198,20 @@ function StatusViewSwitcher({
     {
       value: "providers",
       icon: GitFork,
-      label: "分流",
-      detail: `${providerCount} 个目标`,
+      label: tr("codexRouterWorkspace.s437", { defaultValue: "分流" }),
+      detail: tr("codexRouterWorkspace.s438", {
+        defaultValue: "{{arg0}} 个目标",
+        arg0: providerCount,
+      }),
     },
     {
       value: "traffic",
       icon: Database,
-      label: "流量",
-      detail: `${trafficCount} 组统计`,
+      label: tr("codexRouterWorkspace.s439", { defaultValue: "流量" }),
+      detail: tr("codexRouterWorkspace.s440", {
+        defaultValue: "{{arg0}} 组统计",
+        arg0: trafficCount,
+      }),
     },
   ];
 
@@ -8116,8 +9275,11 @@ function DiagnosticsPanel({
     <div className="rounded-lg border border-amber-200 bg-amber-50/70 p-4 dark:border-amber-600/40 dark:bg-amber-950/10">
       <SectionHeader
         icon={Bug}
-        title="Debug 检查"
-        detail="只检查本机监听、Codex live config、WebSocket 回退、路由规则和 router 日志，不会向真实上游发送模型请求。"
+        title={tr("codexRouterWorkspace.s441", { defaultValue: "Debug 检查" })}
+        detail={tr("codexRouterWorkspace.s442", {
+          defaultValue:
+            "只检查本机监听、Codex live config、WebSocket 回退、路由规则和 router 日志，不会向真实上游发送模型请求。",
+        })}
         action={
           <Button
             size="sm"
@@ -8131,7 +9293,7 @@ function DiagnosticsPanel({
             ) : (
               <RefreshCw className="h-4 w-4" />
             )}
-            重新检查
+            {tr("codexRouterWorkspace.s443", { defaultValue: "重新检查" })}
           </Button>
         }
       />
@@ -8144,8 +9306,10 @@ function DiagnosticsPanel({
 
       {!diagnostics && !error && (
         <div className="mt-3 rounded-lg border border-border bg-muted/40 p-3 text-sm leading-6 text-muted-foreground dark:border-slate-700 dark:bg-slate-950/50 dark:text-slate-300">
-          尚未运行 Debug 检查。点击按钮后会读取真实 Codex live
-          配置和本地路由日志，用来确认请求是否进入 MultiRouter。
+          {tr("codexRouterWorkspace.s444", {
+            defaultValue:
+              "尚未运行 Debug 检查。点击按钮后会读取真实 Codex live\n          配置和本地路由日志，用来确认请求是否进入 MultiRouter。",
+          })}
         </div>
       )}
 
@@ -8162,7 +9326,13 @@ function DiagnosticsPanel({
             <div className="flex flex-wrap items-start justify-between gap-3">
               <div>
                 <div className="text-sm font-semibold">
-                  {diagnostics.ready ? "关键链路通过" : "发现阻塞项"}
+                  {diagnostics.ready
+                    ? tr("codexRouterWorkspace.s445", {
+                        defaultValue: "关键链路通过",
+                      })
+                    : tr("codexRouterWorkspace.s446", {
+                        defaultValue: "发现阻塞项",
+                      })}
                 </div>
                 <div className="mt-1 text-xs leading-5 opacity-80">
                   {diagnostics.nextAction}
@@ -8185,14 +9355,18 @@ function DiagnosticsPanel({
             <div className="grid gap-3 md:grid-cols-2">
               {failedChecks.length > 0 && (
                 <DebugIssueList
-                  title="阻塞项"
+                  title={tr("codexRouterWorkspace.s447", {
+                    defaultValue: "阻塞项",
+                  })}
                   tone="fail"
                   items={diagnostics.blockingIssues}
                 />
               )}
               {warningChecks.length > 0 && (
                 <DebugIssueList
-                  title="警告"
+                  title={tr("codexRouterWorkspace.s448", {
+                    defaultValue: "警告",
+                  })}
                   tone="warn"
                   items={diagnostics.warnings}
                 />
@@ -8214,16 +9388,24 @@ function DiagnosticsPanel({
               </div>
               <div className="space-y-2">
                 <DetailRow
-                  label="配置文件"
+                  label={tr("codexRouterWorkspace.s449", {
+                    defaultValue: "配置文件",
+                  })}
                   value={diagnostics.liveConfig.path}
                 />
                 <DetailRow
                   label="model_provider"
-                  value={diagnostics.liveConfig.modelProvider ?? "未设置"}
+                  value={
+                    diagnostics.liveConfig.modelProvider ??
+                    tr("codexRouterWorkspace.s022", { defaultValue: "未设置" })
+                  }
                 />
                 <DetailRow
                   label="active base_url"
-                  value={diagnostics.liveConfig.activeBaseUrl ?? "未设置"}
+                  value={
+                    diagnostics.liveConfig.activeBaseUrl ??
+                    tr("codexRouterWorkspace.s022", { defaultValue: "未设置" })
+                  }
                 />
                 <DetailRow
                   label="supports_websockets"
@@ -8231,28 +9413,46 @@ function DiagnosticsPanel({
                 />
                 <DetailRow
                   label="wire_api"
-                  value={diagnostics.liveConfig.wireApi ?? "未设置"}
+                  value={
+                    diagnostics.liveConfig.wireApi ??
+                    tr("codexRouterWorkspace.s022", { defaultValue: "未设置" })
+                  }
                 />
                 <DetailRow
                   label="model_catalog_json"
-                  value={diagnostics.liveConfig.modelCatalogJson ?? "未设置"}
+                  value={
+                    diagnostics.liveConfig.modelCatalogJson ??
+                    tr("codexRouterWorkspace.s022", { defaultValue: "未设置" })
+                  }
                 />
                 <DetailRow
-                  label="catalog 模型数"
+                  label={tr("codexRouterWorkspace.s450", {
+                    defaultValue: "catalog 模型数",
+                  })}
                   value={
                     diagnostics.liveConfig.modelCatalogModelCount == null
-                      ? "未知"
+                      ? tr("codexRouterWorkspace.s451", {
+                          defaultValue: "未知",
+                        })
                       : `${diagnostics.liveConfig.modelCatalogModelCount}`
                   }
                 />
                 <DetailRow
-                  label="config 修改时间"
-                  value={diagnostics.liveConfig.configModifiedAt ?? "未知"}
+                  label={tr("codexRouterWorkspace.s452", {
+                    defaultValue: "config 修改时间",
+                  })}
+                  value={
+                    diagnostics.liveConfig.configModifiedAt ??
+                    tr("codexRouterWorkspace.s451", { defaultValue: "未知" })
+                  }
                 />
                 <DetailRow
-                  label="catalog 修改时间"
+                  label={tr("codexRouterWorkspace.s453", {
+                    defaultValue: "catalog 修改时间",
+                  })}
                   value={
-                    diagnostics.liveConfig.modelCatalogModifiedAt ?? "未知"
+                    diagnostics.liveConfig.modelCatalogModifiedAt ??
+                    tr("codexRouterWorkspace.s451", { defaultValue: "未知" })
                   }
                 />
               </div>
@@ -8265,39 +9465,62 @@ function DiagnosticsPanel({
               </div>
               <div className="space-y-2">
                 <DetailRow
-                  label="进程"
+                  label={tr("codexRouterWorkspace.s454", {
+                    defaultValue: "进程",
+                  })}
                   value={
                     diagnostics.desktopRuntime?.running
-                      ? `${diagnostics.desktopRuntime.processCount} 个`
-                      : "未检测到"
+                      ? tr("codexRouterWorkspace.s455", {
+                          defaultValue: "{{arg0}} 个",
+                          arg0: diagnostics.desktopRuntime.processCount,
+                        })
+                      : tr("codexRouterWorkspace.s456", {
+                          defaultValue: "未检测到",
+                        })
                   }
                 />
                 <DetailRow
                   label="app-server"
                   value={
                     diagnostics.desktopRuntime?.appServerRunning
-                      ? `${diagnostics.desktopRuntime.appServerCount} 个`
-                      : "未检测到"
+                      ? tr("codexRouterWorkspace.s455", {
+                          defaultValue: "{{arg0}} 个",
+                          arg0: diagnostics.desktopRuntime.appServerCount,
+                        })
+                      : tr("codexRouterWorkspace.s456", {
+                          defaultValue: "未检测到",
+                        })
                   }
                 />
                 <DetailRow
-                  label="最新 app-server 启动"
+                  label={tr("codexRouterWorkspace.s457", {
+                    defaultValue: "最新 app-server 启动",
+                  })}
                   value={
                     diagnostics.desktopRuntime?.newestAppServerStartedAt ??
-                    "未知"
+                    tr("codexRouterWorkspace.s451", { defaultValue: "未知" })
                   }
                 />
                 <DetailRow
                   label="stale catalog"
                   value={
                     diagnostics.desktopRuntime?.mayHaveStaleModelCatalog
-                      ? "可能"
-                      : "未发现"
+                      ? tr("codexRouterWorkspace.s458", {
+                          defaultValue: "可能",
+                        })
+                      : tr("codexRouterWorkspace.s459", {
+                          defaultValue: "未发现",
+                        })
                   }
                 />
                 <DetailRow
-                  label="检测错误"
-                  value={diagnostics.desktopRuntime?.detectionError ?? "无"}
+                  label={tr("codexRouterWorkspace.s460", {
+                    defaultValue: "检测错误",
+                  })}
+                  value={
+                    diagnostics.desktopRuntime?.detectionError ??
+                    tr("codexRouterWorkspace.s153", { defaultValue: "无" })
+                  }
                 />
               </div>
             </div>
@@ -8313,19 +9536,33 @@ function DiagnosticsPanel({
                   value={
                     diagnostics.routePlan.providerName ??
                     diagnostics.routePlan.providerId ??
-                    "未找到"
+                    tr("codexRouterWorkspace.s461", { defaultValue: "未找到" })
                   }
                 />
                 <DetailRow
-                  label="入口状态"
-                  value={diagnostics.routePlan.routingEnabled ? "启用" : "关闭"}
+                  label={tr("codexRouterWorkspace.s163", {
+                    defaultValue: "入口状态",
+                  })}
+                  value={
+                    diagnostics.routePlan.routingEnabled
+                      ? tr("codexRouterWorkspace.s205", {
+                          defaultValue: "启用",
+                        })
+                      : tr("codexRouterWorkspace.s462", {
+                          defaultValue: "关闭",
+                        })
+                  }
                 />
                 <DetailRow
-                  label="启用规则"
+                  label={tr("codexRouterWorkspace.s161", {
+                    defaultValue: "启用规则",
+                  })}
                   value={`${diagnostics.routePlan.enabledRouteCount} / ${diagnostics.routePlan.routeCount}`}
                 />
                 <DetailRow
-                  label="旧版默认路由（已停用）"
+                  label={tr("codexRouterWorkspace.s463", {
+                    defaultValue: "旧版默认路由（已停用）",
+                  })}
                   value={(() => {
                     const defaultRoute =
                       diagnostics.routePlan.routeSummaries.find(
@@ -8336,10 +9573,13 @@ function DiagnosticsPanel({
                       defaultRoute?.label,
                       diagnostics.routePlan.defaultRouteId,
                       defaultRoute?.targetProviderName,
-                      "无",
+                      tr("codexRouterWorkspace.s153", { defaultValue: "无" }),
                     );
                     return diagnostics.routePlan.defaultRouteId
-                      ? `${displayName}（不会参与转发）`
+                      ? tr("codexRouterWorkspace.s464", {
+                          defaultValue: "{{arg0}}（不会参与转发）",
+                          arg0: displayName,
+                        })
                       : displayName;
                   })()}
                 />
@@ -8353,28 +9593,57 @@ function DiagnosticsPanel({
               </div>
               <div className="space-y-2">
                 <DetailRow
-                  label="日志文件"
-                  value={diagnostics.routerLog.exists ? "存在" : "不存在"}
+                  label={tr("codexRouterWorkspace.s465", {
+                    defaultValue: "日志文件",
+                  })}
+                  value={
+                    diagnostics.routerLog.exists
+                      ? tr("codexRouterWorkspace.s466", {
+                          defaultValue: "存在",
+                        })
+                      : tr("codexRouterWorkspace.s467", {
+                          defaultValue: "不存在",
+                        })
+                  }
                 />
                 <DetailRow
-                  label="已扫描事件"
+                  label={tr("codexRouterWorkspace.s468", {
+                    defaultValue: "已扫描事件",
+                  })}
                   value={`${diagnostics.routerLog.totalScanned}`}
                 />
                 <DetailRow
-                  label="匹配当前 Router"
+                  label={tr("codexRouterWorkspace.s469", {
+                    defaultValue: "匹配当前 Router",
+                  })}
                   value={`${diagnostics.routerLog.matchedScanned}`}
                 />
                 <DetailRow
-                  label="最近请求"
-                  value={diagnostics.routerLog.latestRequestAt ?? "无"}
+                  label={tr("codexRouterWorkspace.s470", {
+                    defaultValue: "最近请求",
+                  })}
+                  value={
+                    diagnostics.routerLog.latestRequestAt ??
+                    tr("codexRouterWorkspace.s153", { defaultValue: "无" })
+                  }
                 />
                 <DetailRow
-                  label="最近错误"
-                  value={diagnostics.routerLog.latestError ?? "无"}
+                  label={tr("codexRouterWorkspace.s364", {
+                    defaultValue: "最近错误",
+                  })}
+                  value={
+                    diagnostics.routerLog.latestError ??
+                    tr("codexRouterWorkspace.s153", { defaultValue: "无" })
+                  }
                 />
                 <DetailRow
-                  label="Hosted tool 未调用"
-                  value={diagnostics.routerLog.latestHostedToolWarning ?? "无"}
+                  label={tr("codexRouterWorkspace.s471", {
+                    defaultValue: "Hosted tool 未调用",
+                  })}
+                  value={
+                    diagnostics.routerLog.latestHostedToolWarning ??
+                    tr("codexRouterWorkspace.s153", { defaultValue: "无" })
+                  }
                 />
               </div>
             </div>
@@ -8383,11 +9652,27 @@ function DiagnosticsPanel({
           {diagnostics.routePlan.routeSummaries.length > 0 && (
             <div className="overflow-hidden rounded-lg border border-border dark:border-slate-700">
               <div className="grid grid-cols-[1fr_1fr_1fr_1fr_0.8fr] gap-2 bg-muted px-3 py-2 text-xs font-semibold text-muted-foreground dark:bg-slate-900/80 dark:text-slate-300">
-                <span>规则</span>
-                <span>目标 Provider</span>
-                <span>配置协议</span>
-                <span>判定来源</span>
-                <span>模型</span>
+                <span>
+                  {tr("codexRouterWorkspace.s472", { defaultValue: "规则" })}
+                </span>
+                <span>
+                  {tr("codexRouterWorkspace.s473", {
+                    defaultValue: "目标 Provider",
+                  })}
+                </span>
+                <span>
+                  {tr("codexRouterWorkspace.s474", {
+                    defaultValue: "配置协议",
+                  })}
+                </span>
+                <span>
+                  {tr("codexRouterWorkspace.s475", {
+                    defaultValue: "判定来源",
+                  })}
+                </span>
+                <span>
+                  {tr("codexRouterWorkspace.s405", { defaultValue: "模型" })}
+                </span>
               </div>
               {diagnostics.routePlan.routeSummaries.map((route, index) => (
                 <div
@@ -8399,16 +9684,27 @@ function DiagnosticsPanel({
                       route.label,
                       route.id,
                       route.targetProviderName,
-                      `规则 ${index + 1}`,
+                      tr("codexRouterWorkspace.s476", {
+                        defaultValue: "规则 {{arg0}}",
+                        arg0: index + 1,
+                      }),
                     )}
-                    {route.enabled ? "" : "（停用）"}
+                    {route.enabled
+                      ? ""
+                      : tr("codexRouterWorkspace.s477", {
+                          defaultValue: "（停用）",
+                        })}
                   </span>
                   <span className="truncate">
                     {route.targetProviderName ??
                       route.targetProviderId ??
-                      "内联配置"}
+                      tr("codexRouterWorkspace.s478", {
+                        defaultValue: "内联配置",
+                      })}
                     {route.targetProviderId && !route.targetExists
-                      ? "（不存在）"
+                      ? tr("codexRouterWorkspace.s479", {
+                          defaultValue: "（不存在）",
+                        })
                       : ""}
                   </span>
                   <span
@@ -8417,7 +9713,10 @@ function DiagnosticsPanel({
                   >
                     {route.configuredProtocol
                       ? apiFormatLabel(route.configuredProtocol)
-                      : (route.apiFormat ?? "跟随")}
+                      : (route.apiFormat ??
+                        tr("codexRouterWorkspace.s480", {
+                          defaultValue: "跟随",
+                        }))}
                   </span>
                   <span className="truncate">
                     {protocolDecisionSourceLabel(
@@ -8430,7 +9729,8 @@ function DiagnosticsPanel({
                       ...route.prefixes.map((prefix) => `${prefix}*`),
                     ]
                       .slice(0, 3)
-                      .join(", ") || "默认"}
+                      .join(", ") ||
+                      tr("codexRouterWorkspace.s481", { defaultValue: "默认" })}
                   </span>
                 </div>
               ))}
@@ -8440,12 +9740,22 @@ function DiagnosticsPanel({
           {diagnostics.routerLog.recentEvents.length > 0 && (
             <div className="overflow-hidden rounded-lg border border-border dark:border-slate-700">
               <div className="grid grid-cols-[1fr_0.9fr_0.8fr_0.9fr_0.6fr_1.6fr] gap-2 bg-muted px-3 py-2 text-xs font-semibold text-muted-foreground dark:bg-slate-900/80 dark:text-slate-300">
-                <span>时间</span>
-                <span>事件</span>
-                <span>协议</span>
+                <span>
+                  {tr("codexRouterWorkspace.s482", { defaultValue: "时间" })}
+                </span>
+                <span>
+                  {tr("codexRouterWorkspace.s483", { defaultValue: "事件" })}
+                </span>
+                <span>
+                  {tr("codexRouterWorkspace.s484", { defaultValue: "协议" })}
+                </span>
                 <span>Provider</span>
-                <span>状态</span>
-                <span>摘要</span>
+                <span>
+                  {tr("codexRouterWorkspace.s485", { defaultValue: "状态" })}
+                </span>
+                <span>
+                  {tr("codexRouterWorkspace.s486", { defaultValue: "摘要" })}
+                </span>
               </div>
               {diagnostics.routerLog.recentEvents.slice(0, 12).map((event) => (
                 <div
@@ -8471,7 +9781,7 @@ function DiagnosticsPanel({
                   >
                     {event.error ??
                       (event.event === "hosted_tool_not_called"
-                        ? `${event.tool ?? "hosted tool"}：${event.reason ?? "上游未发起调用"}`
+                        ? `${event.tool ?? "hosted tool"}：${event.reason ?? tr("codexRouterWorkspace.s487", { defaultValue: "上游未发起调用" })}`
                         : null) ??
                       event.upstreamUrl ??
                       event.model ??
@@ -8679,7 +9989,10 @@ function SortableSpawnAgentCandidate({
         className="grid h-7 w-7 shrink-0 place-items-center rounded border border-violet-200 bg-violet-50 text-violet-700 hover:bg-violet-100 dark:border-violet-700/60 dark:bg-violet-500/10 dark:text-violet-200 dark:hover:bg-violet-500/20"
         {...attributes}
         {...listeners}
-        aria-label={`拖动 ${modelId}`}
+        aria-label={tr("codexRouterWorkspace.s488", {
+          defaultValue: "拖动 {{arg0}}",
+          arg0: modelId,
+        })}
       >
         <GripVertical className="h-4 w-4" />
       </button>
@@ -8739,7 +10052,10 @@ function SortableCatalogModel({
         className="grid h-7 w-7 shrink-0 place-items-center rounded border border-blue-200 bg-blue-50 text-blue-700 hover:bg-blue-100 dark:border-blue-700/60 dark:bg-blue-500/10 dark:text-blue-200 dark:hover:bg-blue-500/20"
         {...attributes}
         {...listeners}
-        aria-label={`拖动 ${modelId}`}
+        aria-label={tr("codexRouterWorkspace.s488", {
+          defaultValue: "拖动 {{arg0}}",
+          arg0: modelId,
+        })}
       >
         <GripVertical className="h-4 w-4" />
       </button>
@@ -8796,19 +10112,29 @@ function PlanCardContent({
               : "border-emerald-200 bg-emerald-50 text-emerald-800 dark:border-emerald-500/50 dark:bg-emerald-500/15 dark:text-emerald-100",
           )}
         >
-          {routing?.enabled === false ? "入口已停用" : "入口已启用"}
+          {routing?.enabled === false
+            ? tr("codexRouterWorkspace.s489", { defaultValue: "入口已停用" })
+            : tr("codexRouterWorkspace.s490", { defaultValue: "入口已启用" })}
         </Badge>
       </div>
       <div className="mt-2 flex flex-wrap gap-2 text-xs text-muted-foreground dark:text-slate-400">
-        <span>规则 {routes.length} 条</span>
+        <span>
+          {tr("codexRouterWorkspace.s472", { defaultValue: "规则" })}{" "}
+          {routes.length}{" "}
+          {tr("codexRouterWorkspace.s491", { defaultValue: "条" })}
+        </span>
         {routing?.defaultRouteId && (
           <span
             title={routeDisplayTitle(
-              defaultRouteName ?? "默认路由",
+              defaultRouteName ??
+                tr("codexRouterWorkspace.s492", { defaultValue: "默认路由" }),
               routing.defaultRouteId,
             )}
           >
-            旧默认（已停用） {defaultRouteName ?? routing.defaultRouteId}
+            {tr("codexRouterWorkspace.s493", {
+              defaultValue: "旧默认（已停用）",
+            })}{" "}
+            {defaultRouteName ?? routing.defaultRouteId}
           </span>
         )}
         {!compact && <span>ID {provider.id}</span>}
@@ -8850,7 +10176,10 @@ function RouteListButton({
             {routeDisplayName(entry.route, providersById)}
           </div>
           <div className="mt-1 truncate text-xs text-muted-foreground dark:text-slate-400">
-            所属多路路由：{entry.provider.name}
+            {tr("codexRouterWorkspace.s494", {
+              defaultValue: "所属多路路由：",
+            })}
+            {entry.provider.name}
           </div>
         </div>
         <Badge
@@ -8861,12 +10190,18 @@ function RouteListButton({
               : "border-emerald-200 bg-emerald-50 text-emerald-800 dark:border-emerald-500/50 dark:bg-emerald-500/15 dark:text-emerald-100",
           )}
         >
-          {entry.route.enabled === false ? "已停用" : "已启用"}
+          {entry.route.enabled === false
+            ? tr("codexRouterWorkspace.s207", { defaultValue: "已停用" })
+            : tr("codexRouterWorkspace.s206", { defaultValue: "已启用" })}
         </Badge>
       </div>
       <div className="mt-2 flex flex-wrap gap-1.5 text-xs">
         <span className="rounded-full border border-blue-200 bg-blue-50 px-2 py-0.5 text-blue-800 dark:border-blue-500/40 dark:bg-blue-500/10 dark:text-blue-100">
-          {targetProvider ? "复用供应商配置" : apiFormatLabel(format)}
+          {targetProvider
+            ? tr("codexRouterWorkspace.s495", {
+                defaultValue: "复用供应商配置",
+              })
+            : apiFormatLabel(format)}
         </span>
         <span className="rounded-full border border-border bg-muted px-2 py-0.5 text-muted-foreground dark:border-slate-600 dark:bg-slate-900 dark:text-slate-300">
           {authSourceLabel(
@@ -8908,9 +10243,22 @@ function RouteDetailPanel({
       <section className="rounded-lg border border-border bg-card p-3 dark:border-slate-700 dark:bg-slate-950/40">
         <EmptyState
           icon={Route}
-          title="请选择一条规则"
-          detail="左侧点击规则后，这里会展示上游、匹配条件和操作入口。"
-          actionLabel={selectedPlan ? "编辑多路路由" : "创建多路路由"}
+          title={tr("codexRouterWorkspace.s496", {
+            defaultValue: "请选择一条规则",
+          })}
+          detail={tr("codexRouterWorkspace.s497", {
+            defaultValue:
+              "左侧点击规则后，这里会展示上游、匹配条件和操作入口。",
+          })}
+          actionLabel={
+            selectedPlan
+              ? tr("codexRouterWorkspace.s149", {
+                  defaultValue: "编辑多路路由",
+                })
+              : tr("codexRouterWorkspace.s097", {
+                  defaultValue: "创建多路路由",
+                })
+          }
           onAction={() => selectedPlan && onOpenRoutePicker(selectedPlan)}
         />
       </section>
@@ -8929,8 +10277,15 @@ function RouteDetailPanel({
     <section className="rounded-lg border border-emerald-200 bg-emerald-50/70 p-3 dark:border-emerald-700/40 dark:bg-slate-950/50">
       <SectionHeader
         icon={Database}
-        title={routeDisplayName(route, providersById, "规则详情")}
-        detail="这里是当前规则的只读摘要；修改接入范围请打开候选 router 选择器。"
+        title={routeDisplayName(
+          route,
+          providersById,
+          tr("codexRouterWorkspace.s498", { defaultValue: "规则详情" }),
+        )}
+        detail={tr("codexRouterWorkspace.s499", {
+          defaultValue:
+            "这里是当前规则的只读摘要；修改接入范围请打开候选 router 选择器。",
+        })}
         action={
           <Button
             size="sm"
@@ -8938,45 +10293,72 @@ function RouteDetailPanel({
             className="gap-2 bg-emerald-600 hover:bg-emerald-500"
           >
             <Pencil className="h-4 w-4" />
-            编辑
+            {tr("codexRouterWorkspace.s500", { defaultValue: "编辑" })}
           </Button>
         }
       />
       <div className="mt-3 space-y-2 text-sm">
-        <DetailRow label="匹配条件" value={routeMatchSummary(route)} />
+        <DetailRow
+          label={tr("codexRouterWorkspace.s501", { defaultValue: "匹配条件" })}
+          value={routeMatchSummary(route)}
+        />
         {targetProviderId ? (
           <DetailRow
-            label="目标供应商"
+            label={tr("codexRouterWorkspace.s502", {
+              defaultValue: "目标供应商",
+            })}
             value={
               targetProvider
                 ? `${targetProvider.name} (${targetProvider.id})`
-                : `未找到目标供应商：${targetProviderId}`
+                : tr("codexRouterWorkspace.s503", {
+                    defaultValue: "未找到目标供应商：{{arg0}}",
+                    arg0: targetProviderId,
+                  })
             }
           />
         ) : null}
         <DetailRow
-          label="模型选择"
+          label={tr("codexRouterWorkspace.s504", { defaultValue: "模型选择" })}
           value={
             route.modelSelection?.mode === "all"
-              ? "目标供应商的全部模型（自动接收新增模型）"
-              : `${matchedModels.length} 个上游模型；${routeProviderModelSyncSummary(route, targetProvider) ?? "无法读取供应商当前模型目录"}`
+              ? tr("codexRouterWorkspace.s505", {
+                  defaultValue: "目标供应商的全部模型（自动接收新增模型）",
+                })
+              : tr("codexRouterWorkspace.s506", {
+                  defaultValue: "{{arg0}} 个上游模型；{{arg1}}",
+                  arg0: matchedModels.length,
+                  arg1:
+                    routeProviderModelSyncSummary(route, targetProvider) ??
+                    tr("codexRouterWorkspace.s507", {
+                      defaultValue: "无法读取供应商当前模型目录",
+                    }),
+                })
           }
         />
         <DetailRow
-          label="认证方式"
+          label={tr("codexRouterWorkspace.s508", { defaultValue: "认证方式" })}
           value={authSourceLabel(
             route.authPolicy?.source ?? route.upstream?.auth?.source,
           )}
         />
         {codexRouteUsesOfficialAuthentication(route) ? (
           <DetailRow
-            label="客户端传输"
-            value="HTTP Responses（WebSocket 已禁用）"
+            label={tr("codexRouterWorkspace.s509", {
+              defaultValue: "客户端传输",
+            })}
+            value={tr("codexRouterWorkspace.s510", {
+              defaultValue: "HTTP Responses（WebSocket 已禁用）",
+            })}
           />
         ) : null}
         <DetailRow
-          label="配置所有权"
-          value="地址、凭据、协议和模型能力由目标 Provider/模型条目维护；Route 只保存选择、前缀、别名和认证策略。"
+          label={tr("codexRouterWorkspace.s511", {
+            defaultValue: "配置所有权",
+          })}
+          value={tr("codexRouterWorkspace.s512", {
+            defaultValue:
+              "地址、凭据、协议和模型能力由目标 Provider/模型条目维护；Route 只保存选择、前缀、别名和认证策略。",
+          })}
         />
       </div>
       <div className="mt-3 grid gap-2">
@@ -8986,7 +10368,9 @@ function RouteDetailPanel({
             onClick={() => void onFollowAllModels()}
           >
             <RefreshCw className="h-4 w-4" />
-            改为自动跟随全部模型
+            {tr("codexRouterWorkspace.s513", {
+              defaultValue: "改为自动跟随全部模型",
+            })}
           </Button>
         ) : null}
         {targetProvider ? (
@@ -8996,7 +10380,9 @@ function RouteDetailPanel({
             onClick={() => onEditProvider(targetProvider)}
           >
             <Settings2 className="h-4 w-4" />
-            编辑目标 Provider/模型配置
+            {tr("codexRouterWorkspace.s514", {
+              defaultValue: "编辑目标 Provider/模型配置",
+            })}
           </Button>
         ) : null}
         <Button
@@ -9008,7 +10394,7 @@ function RouteDetailPanel({
           disabled={matchedModels.length === 0}
         >
           <Clipboard className="h-4 w-4" />
-          复制精确模型名
+          {tr("codexRouterWorkspace.s515", { defaultValue: "复制精确模型名" })}
         </Button>
         <Button
           variant="outline"
@@ -9016,7 +10402,9 @@ function RouteDetailPanel({
           onClick={() => onOpenRoutePicker(selectedRoute.provider)}
         >
           <Trash2 className="h-4 w-4" />
-          到候选列表取消勾选
+          {tr("codexRouterWorkspace.s516", {
+            defaultValue: "到候选列表取消勾选",
+          })}
         </Button>
       </div>
     </section>
@@ -9031,7 +10419,7 @@ function DetailRow({ label, value }: { label: string; value?: string }) {
         {label}
       </div>
       <div className="mt-1 break-words text-foreground dark:text-slate-200">
-        {value || "未配置"}
+        {value || tr("codexRouterWorkspace.s517", { defaultValue: "未配置" })}
       </div>
     </div>
   );

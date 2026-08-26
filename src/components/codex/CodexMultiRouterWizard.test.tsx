@@ -9,6 +9,30 @@ const { initializeProviderConfig } = vi.hoisted(() => ({
   initializeProviderConfig: vi.fn(),
 }));
 
+// 组件已接入 i18n；这里用真实 zh 资源驱动 useTranslation，
+// 避免全局测试 setup 用空资源初始化 i18next 导致断言拿到原始 key。
+vi.mock("react-i18next", async () => {
+  const zh = (await import("@/i18n/locales/zh.json")).default;
+  const resolve = (key: string) =>
+    key
+      .split(".")
+      .reduce<any>((obj, part) => (obj == null ? obj : obj[part]), zh);
+  return {
+    initReactI18next: { type: "3rdParty", init: () => {} },
+    useTranslation: () => ({
+      t: (key: string, params?: Record<string, unknown>) => {
+        let value: string = resolve(key) ?? key;
+        if (params) {
+          for (const [name, replacement] of Object.entries(params)) {
+            value = value.split("{{" + name + "}}").join(String(replacement));
+          }
+        }
+        return value;
+      },
+    }),
+  };
+});
+
 vi.mock("@/lib/api/codexSubagentV2", () => ({
   codexSubagentV2Api: {
     initializeProviderConfig,
