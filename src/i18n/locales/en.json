@@ -1132,7 +1132,10 @@
       "qiniu": "Qiniu",
       "openrouter": "OpenRouter",
       "deepseek": "DeepSeek",
-      "together": "Together AI"
+      "together": "Together AI",
+      "volcengineAgentplan": "Volcengine Agent Plan",
+      "volcengineCodingplan": "Volcengine Coding Plan",
+      "custom": "Custom"
     },
     "parameterConfig": "Parameter Config - {{name}} *",
     "mainModel": "Main Model (optional)",
@@ -1950,7 +1953,12 @@
     "fieldExtra": "• extra: String, custom display text",
     "tip1": "• Variables {{apiKey}} and {{baseUrl}} are automatically replaced",
     "tip2": "• Extractor function runs in sandbox environment, supports ES2020+ syntax",
-    "tip3": "• Entire config must be wrapped in () to form object literal expression"
+    "tip3": "• Entire config must be wrapped in () to form object literal expression",
+    "codingPlan": {
+      "zhipu": "Zhipu GLM",
+      "zhipuTeam": "Zhipu GLM Team",
+      "volcengine": "Volcengine Ark"
+    }
   },
   "dbUpgrade": {
     "title": "Database version is too new",
@@ -3038,7 +3046,12 @@
     "savedAndSynced": "Saved and synced to all apps",
     "saveAndSyncError": "Failed to save and sync",
     "configJsonPreview": "Config JSON Preview",
-    "configJsonPreviewHint": "The following configurations will be synced to each app (only the displayed fields will be overwritten, other custom settings will be preserved)"
+    "configJsonPreviewHint": "The following configurations will be synced to each app (only the displayed fields will be overwritten, other custom settings will be preserved)",
+    "presets": {
+      "newapiDescription": "Self-hostable API gateway supporting Anthropic, OpenAI, Gemini, and other protocols",
+      "customGatewayName": "Custom Gateway",
+      "customGatewayDescription": "A custom-configured API gateway"
+    }
   },
   "omo": {
     "editProfile": "Edit OMO Config",
@@ -5037,5 +5050,17 @@
       "textOnly": "Text only",
       "textAndImage": "Text and image"
     }
+  },
+  "providerConfig": {
+    "field": {
+      "config": "Config",
+      "commonSnippet": "Common config snippet"
+    },
+    "notJsonObject": "{{field}} must be a JSON object",
+    "invalidJsonSyntax": "{{field}} contains invalid JSON syntax; please check",
+    "parseFailedCommonConfig": "Failed to parse config JSON; cannot apply the common config snippet"
+  },
+  "update": {
+    "checkFailed": "Failed to check for updates"
   }
 }

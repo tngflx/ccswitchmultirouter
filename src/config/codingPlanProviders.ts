@@ -14,6 +14,8 @@ export interface CodingPlanProviderEntry {
   id: "kimi" | "zhipu" | "zhipu_team" | "minimax" | "zenmux" | "volcengine";
   /** UsageScriptModal 下拉显示用 */
   label: string;
+  /** i18n key for localized display name */
+  labelKey?: string;
   /** base_url 匹配规则 */
   pattern: RegExp;
 }
@@ -22,6 +24,7 @@ export const CODING_PLAN_PROVIDERS: readonly CodingPlanProviderEntry[] = [
   { id: "kimi", label: "Kimi For Coding", pattern: /api\.kimi\.com\/coding/i },
   {
     id: "zhipu",
+    labelKey: "usageScript.codingPlan.zhipu",
     label: "Zhipu GLM (智谱)",
     pattern: /bigmodel\.cn|api\.z\.ai/i,
   },
@@ -32,6 +35,7 @@ export const CODING_PLAN_PROVIDERS: readonly CodingPlanProviderEntry[] = [
     // 故团队版永不被 injectCodingPlanUsageScript 自动注入（必须用户手动选）。
     // pattern 仅占位（下拉展示用），实际不参与自动检测。
     id: "zhipu_team",
+    labelKey: "usageScript.codingPlan.zhipuTeam",
     label: "Zhipu GLM Team (智谱团队)",
     pattern: /bigmodel\.cn/i,
   },
@@ -51,6 +55,7 @@ export const CODING_PLAN_PROVIDERS: readonly CodingPlanProviderEntry[] = [
     // /api/coding[/v3]（Coding Plan）；与后端 detect_provider 的
     // `volces.com/api/plan` / `volces.com/api/coding` 子串判断同效。
     id: "volcengine",
+    labelKey: "usageScript.codingPlan.volcengine",
     label: "火山方舟 (Volcengine)",
     pattern: /volces\.com\/api\/(plan|coding)/i,
   },

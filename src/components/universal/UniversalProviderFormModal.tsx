@@ -37,6 +37,12 @@ export function UniversalProviderFormModal({
 }: UniversalProviderFormModalProps) {
   const isDarkMode = useDarkMode();
   const { t } = useTranslation();
+
+  const getPresetName = useCallback(
+    (preset: UniversalProviderPreset) =>
+      preset.nameKey ? t(preset.nameKey) : preset.name,
+    [t],
+  );
   const isEditMode = !!editingProvider;
 
   // 表单状态
@@ -85,7 +91,7 @@ export function UniversalProviderFormModal({
       // 新建模式：使用传入的预设或默认选择第一个预设
       const defaultPreset = initialPreset || universalProviderPresets[0];
       setSelectedPreset(defaultPreset);
-      setName(defaultPreset.name);
+      setName(getPresetName(defaultPreset));
       setBaseUrl("");
       setApiKey("");
       setWebsiteUrl(defaultPreset.websiteUrl || "");
@@ -102,7 +108,7 @@ export function UniversalProviderFormModal({
     (preset: UniversalProviderPreset) => {
       setSelectedPreset(preset);
       if (!isEditMode) {
-        setName(preset.name);
+        setName(getPresetName(preset));
         setClaudeEnabled(preset.defaultApps.claude);
         setCodexEnabled(preset.defaultApps.codex);
         setGeminiEnabled(preset.defaultApps.gemini);
@@ -376,16 +382,18 @@ wire_api = "responses"`;
                 >
                   <ProviderIcon
                     icon={preset.icon}
-                    name={preset.name}
+                    name={getPresetName(preset)}
                     size={16}
                   />
-                  {preset.name}
+                  {getPresetName(preset)}
                 </button>
               ))}
             </div>
-            {selectedPreset?.description && (
+            {(selectedPreset?.descriptionKey || selectedPreset?.description) && (
               <p className="text-xs text-muted-foreground">
-                {selectedPreset.description}
+                {selectedPreset.descriptionKey
+                  ? t(selectedPreset.descriptionKey)
+                  : selectedPreset.description}
               </p>
             )}
           </div>

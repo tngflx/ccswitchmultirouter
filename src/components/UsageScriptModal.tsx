@@ -1067,7 +1067,7 @@ const UsageScriptModal: React.FC<UsageScriptModalProps> = ({
                         })
                       }
                     >
-                      {cp.label}
+                      {cp.labelKey ? t(cp.labelKey) : cp.label}
                     </Button>
                   ))}
                 </div>

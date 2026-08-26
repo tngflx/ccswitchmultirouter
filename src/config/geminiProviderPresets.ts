@@ -490,6 +490,7 @@ export const geminiProviderPresets: GeminiProviderPreset[] = [
   },
   {
     name: "自定义",
+    nameKey: "providerForm.presets.custom",
     websiteUrl: "",
     settingsConfig: {
       env: {
