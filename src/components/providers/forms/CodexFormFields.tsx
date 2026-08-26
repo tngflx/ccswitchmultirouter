@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+﻿import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { useTranslation } from "react-i18next";
 import { Button } from "@/components/ui/button";
@@ -50,6 +50,12 @@ import {
 import { CustomUserAgentField } from "./CustomUserAgentField";
 import { LocalProxyRequestOverridesField } from "./LocalProxyRequestOverridesField";
 import { CodexProviderReadinessSection } from "./CodexProviderReadinessSection";
+import {
+  customCodexTrafficPolicySeed,
+  normalizeCodexTrafficPolicy,
+  resolveCodexTrafficPolicy,
+} from "./codexTrafficPolicy";
+import { reconcileFetchedCodexCatalogRows } from "./codexCatalogSync";
 import { CodexModelReasoningCard } from "./CodexModelReasoningCard";
 import { CodexModelReasoningEditor } from "./CodexModelReasoningEditor";
 import { CodexModelReasoningSummary } from "./CodexModelReasoningSummary";
@@ -65,12 +71,14 @@ import type {
   CodexApiFormat,
   CodexCatalogModel,
   CodexChatReasoning,
+  CodexTrafficPolicy,
   CodexModelReasoningCapability,
   CodexReasoningEffort,
   CodexRoutingConfig,
   PromptCacheRoutingMode,
   Provider,
   ProviderCategory,
+  CodexApiKeyGroup,
 } from "@/types";
 import type { AppId } from "@/lib/api";
 import { codexSubagentV2Api } from "@/lib/api/codexSubagentV2";
@@ -78,6 +86,7 @@ import type {
   CodexModelReasoningResolution,
   CodexReasoningDiscoveryOutcome,
 } from "@/types/codexSubagentV2";
+import i18n from "@/i18n";
 
 interface EndpointCandidate {
   url: string;
@@ -137,7 +146,11 @@ export function validateCodexReasoningCapabilityDraft(
     !Array.isArray(capability.supportedEfforts) ||
     capability.supportedEfforts.some((effort) => !allowed.has(effort))
   ) {
-    throw new Error("支持的推理强度包含未知档位，或包含仅供 Codex 使用的档位");
+    throw new Error(
+      i18n.t("codexForm.reasoningUnknownEffort", {
+        defaultValue: "支持的推理强度包含未知档位，或包含仅供 Codex 使用的档位",
+      }),
+    );
   }
   // schema v2 用 supportStatus；legacy 数据用 supported。至少声明其一，
   // 同时存在时不得矛盾。
@@ -145,7 +158,11 @@ export function validateCodexReasoningCapabilityDraft(
     capability.supportStatus === undefined &&
     typeof capability.supported !== "boolean"
   ) {
-    throw new Error("必须声明该模型是否支持推理");
+    throw new Error(
+      i18n.t("codexForm.reasoningSupportRequired", {
+        defaultValue: "必须声明该模型是否支持推理",
+      }),
+    );
   }
   if (
     capability.supportStatus !== undefined &&
@@ -153,27 +170,48 @@ export function validateCodexReasoningCapabilityDraft(
     (capability.supportStatus === "confirmed_supported") !==
       capability.supported
   ) {
-    throw new Error("新旧推理支持状态相互冲突");
+    throw new Error(
+      i18n.t("codexForm.reasoningSupportConflict", {
+        defaultValue: "新旧推理支持状态相互冲突",
+      }),
+    );
   }
   if (
     capability.defaultEffort !== undefined &&
     !capability.supportedEfforts.includes(capability.defaultEffort)
   ) {
-    throw new Error("默认推理强度不是供应商支持的档位");
+    throw new Error(
+      i18n.t("codexForm.defaultEffortUnsupported", {
+        defaultValue: "默认推理强度不是供应商支持的档位",
+      }),
+    );
   }
   if (typeof capability.disableAllowed !== "boolean") {
-    throw new Error("是否允许关闭推理必须是布尔值");
+    throw new Error(
+      i18n.t("codexForm.disableToggleMustBeBoolean", {
+        defaultValue: "是否允许关闭推理必须是布尔值",
+      }),
+    );
   }
   if (
     !capability.upstream ||
     typeof capability.upstream.parameter !== "string" ||
     !capability.upstream.parameter.trim()
   ) {
-    throw new Error("上游推理参数名不能为空");
+    throw new Error(
+      i18n.t("codexForm.upstreamParamRequired", {
+        defaultValue: "上游推理参数名不能为空",
+      }),
+    );
   }
   for (const target of Object.values(capability.upstream.effortMap ?? {})) {
     if (target && !capability.supportedEfforts.includes(target)) {
-      throw new Error(`映射目标 ${target} 不是供应商支持的推理强度`);
+      throw new Error(
+        i18n.t("codexForm.mappingTargetUnsupported", {
+          defaultValue: "映射目标 {{target}} 不是供应商支持的推理强度",
+          target: target,
+        }),
+      );
     }
   }
   const requiresEffortMap =
@@ -190,13 +228,22 @@ export function validateCodexReasoningCapabilityDraft(
       (effort) => !capability.upstream.effortMap?.[effort],
     );
     if (missing.length > 0) {
-      throw new Error(`推理强度映射缺少 ${missing.join(", ")} 档`);
+      throw new Error(
+        i18n.t("codexForm.mappingMissingLevels", {
+          defaultValue: "推理强度映射缺少 {{levels}} 档",
+          levels: missing.join(", "),
+        }),
+      );
     }
   }
   if (capability.codexUltraOrchestration?.enabled) {
     const ultraTarget = capability.upstream.effortMap?.max;
     if (!ultraTarget || !capability.supportedEfforts.includes(ultraTarget)) {
-      throw new Error("解锁 Ultra 档需要有效的 max 到供应商推理强度映射");
+      throw new Error(
+        i18n.t("codexForm.ultraRequiresMaxMapping", {
+          defaultValue: "解锁 Ultra 档需要有效的 max 到供应商推理强度映射",
+        }),
+      );
     }
   }
 }
@@ -242,7 +289,10 @@ function summarizeProbeModels(
 ) {
   if (outcomes.length === 0) return "";
   const names = outcomes.slice(0, limit).map((outcome) => outcome.model);
-  return `${names.join("、")}${outcomes.length > limit ? ` 等 ${outcomes.length} 个` : ""}`;
+  return `${names.join("、")}${i18n.t("codexForm.probeMoreModels", {
+    defaultValue: " 等 {{count}} 个",
+    count: outcomes.length,
+  })}`;
 }
 
 // 生成每个协议探测分类的摘要，确保用户能同时看到其它模型是成功、部分成功还是失败。
@@ -266,22 +316,35 @@ export function summarizeCodexProtocolProbeOutcomes(
 
   const details = [
     groups.both.length > 0
-      ? `双协议通过：${summarizeProbeModels(groups.both)}`
+      ? i18n.t("codexForm.probeBothPassed", {
+          defaultValue: "双协议通过：{{models}}",
+          models: summarizeProbeModels(groups.both),
+        })
       : "",
     groups.responses.length > 0
-      ? `仅 Responses 通过：${summarizeProbeModels(groups.responses)}`
+      ? i18n.t("codexForm.probeOnlyResponsesPassed", {
+          defaultValue: "仅 Responses 通过：{{models}}",
+          models: summarizeProbeModels(groups.responses),
+        })
       : "",
     groups.chat.length > 0
-      ? `仅 Chat 通过：${summarizeProbeModels(groups.chat)}`
+      ? i18n.t("codexForm.probeOnlyChatPassed", {
+          defaultValue: "仅 Chat 通过：{{models}}",
+          models: summarizeProbeModels(groups.chat),
+        })
       : "",
     groups.failed.length > 0
-      ? `双协议失败：${groups.failed
-          .slice(0, 3)
-          .map(
-            (outcome) =>
-              `${outcome.model}（Responses=${outcome.responses.detail}; Chat=${outcome.chat.detail}）`,
-          )
-          .join("；")}${groups.failed.length > 3 ? "；..." : ""}`
+      ? i18n.t("codexForm.probeBothFailed", {
+          defaultValue: "双协议失败：{{details}}{{ellipsis}}",
+          details: groups.failed
+            .slice(0, 3)
+            .map(
+              (outcome) =>
+                `${outcome.model}（Responses=${outcome.responses.detail}; Chat=${outcome.chat.detail}）`,
+            )
+            .join("；"),
+          ellipsis: groups.failed.length > 3 ? "；..." : "",
+        })
       : "",
   ].filter(Boolean);
 
@@ -289,7 +352,13 @@ export function summarizeCodexProtocolProbeOutcomes(
     responsesPass: groups.both.length + groups.responses.length,
     chatPass: groups.both.length + groups.chat.length,
     failedCount: groups.failed.length,
-    detail: details.length > 0 ? ` 结果明细：${details.join("；")}。` : "",
+    detail:
+      details.length > 0
+        ? i18n.t("codexForm.probeResultDetails", {
+            defaultValue: " 结果明细：{{details}}。",
+            details: details.join("；"),
+          })
+        : "",
   };
 }
 
@@ -325,7 +394,7 @@ function getProtocolProbeBadge(outcome?: CodexProtocolProbeOutcome) {
   const kind = classifyProtocolProbeOutcome(outcome);
   if (kind === "both") {
     return {
-      label: "双协议",
+      label: i18n.t("codexForm.protocolBoth", { defaultValue: "双协议" }),
       title: `Responses=${outcome.responses.detail}; Chat=${outcome.chat.detail}`,
       className:
         "border-emerald-500/40 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300",
@@ -348,7 +417,7 @@ function getProtocolProbeBadge(outcome?: CodexProtocolProbeOutcome) {
     };
   }
   return {
-    label: "不可用",
+    label: i18n.t("codexForm.protocolUnavailable", { defaultValue: "不可用" }),
     title: `Responses=${outcome.responses.detail}; Chat=${outcome.chat.detail}`,
     className: "border-destructive/40 bg-destructive/10 text-destructive",
   };
@@ -368,6 +437,8 @@ interface CodexFormFieldsProps {
   // API Key
   codexApiKey: string;
   onApiKeyChange: (key: string) => void;
+  apiKeyGroups?: CodexApiKeyGroup[];
+  onApiKeyGroupsChange?: (groups: CodexApiKeyGroup[]) => void;
   category?: ProviderCategory;
   shouldShowApiKeyLink: boolean;
   websiteUrl: string;
@@ -410,6 +481,8 @@ interface CodexFormFieldsProps {
   onCodexChatReasoningChange?: (value: CodexChatReasoning) => void;
   promptCacheRouting?: PromptCacheRoutingMode;
   onPromptCacheRoutingChange?: (value: PromptCacheRoutingMode) => void;
+  codexTrafficPolicy?: CodexTrafficPolicy;
+  onCodexTrafficPolicyChange?: (value: CodexTrafficPolicy | undefined) => void;
 
   // Model Catalog
   catalogModels?: CodexCatalogModel[];
@@ -566,6 +639,7 @@ function catalogRowsMatchModels(
     Pick<
       CodexCatalogRow,
       | "model"
+      | "enabled"
       | "upstreamModel"
       | "upstream_model"
       | "displayName"
@@ -589,6 +663,7 @@ function catalogRowsMatchModels(
     const incoming = models[i];
     return (
       row.model === (incoming.model ?? "") &&
+      (row.enabled ?? true) === (incoming.enabled ?? true) &&
       catalogRowUpstreamModel(row) === catalogRowUpstreamModel(incoming) &&
       (row.displayName ?? "") === (incoming.displayName ?? "") &&
       String(row.contextWindow ?? "") ===
@@ -860,6 +935,8 @@ export function CodexFormFields({
   onXaiAccountSelect,
   codexApiKey,
   onApiKeyChange,
+  apiKeyGroups = [],
+  onApiKeyGroupsChange,
   category,
   shouldShowApiKeyLink,
   websiteUrl,
@@ -894,6 +971,8 @@ export function CodexFormFields({
   onCodexChatReasoningChange,
   promptCacheRouting = "auto",
   onPromptCacheRoutingChange = () => undefined,
+  codexTrafficPolicy,
+  onCodexTrafficPolicyChange = () => undefined,
   catalogModels = [],
   presetCatalogModels = [],
   onCatalogModelsChange,
@@ -910,6 +989,10 @@ export function CodexFormFields({
 
   const [fetchedModels, setFetchedModels] = useState<FetchedModel[]>([]);
   const [isFetchingModels, setIsFetchingModels] = useState(false);
+  const [catalogSearch, setCatalogSearch] = useState("");
+  const [catalogVisibility, setCatalogVisibility] = useState<
+    "all" | "included" | "excluded"
+  >("all");
   const [reasoningResolutions, setReasoningResolutions] = useState<
     Record<string, CodexModelReasoningResolution>
   >({});
@@ -960,6 +1043,21 @@ export function CodexFormFields({
   const isChatFormat = apiFormat === "openai_chat";
   const isAnthropicFormat = apiFormat === "anthropic";
   const canEditCatalog = Boolean(onCatalogModelsChange);
+  const resolvedTrafficPolicy = useMemo(
+    () => resolveCodexTrafficPolicy(codexBaseUrl, codexTrafficPolicy),
+    [codexBaseUrl, codexTrafficPolicy],
+  );
+  const updateTrafficPolicy = useCallback(
+    (patch: Partial<CodexTrafficPolicy>) => {
+      onCodexTrafficPolicyChange(
+        normalizeCodexTrafficPolicy({
+          ...(codexTrafficPolicy ?? customCodexTrafficPolicySeed(codexBaseUrl)),
+          ...patch,
+        }),
+      );
+    },
+    [codexBaseUrl, codexTrafficPolicy, onCodexTrafficPolicyChange],
+  );
 
   // 普通 Provider 表单只消费并原样回传历史 codexRouting；可见编辑入口统一收口到
   // CodexRouterWorkspacePage，避免与完整 MultiRouter 工作台形成两套配置界面。
@@ -980,6 +1078,7 @@ export function CodexFormFields({
     (!isMaintainedPreset &&
       (isAnthropicFormat || supportsThinking || supportsEffort)) ||
     promptCacheRouting !== "auto" ||
+    codexTrafficPolicy !== undefined ||
     !!maxOutputTokens;
   const [advancedExpanded, setAdvancedExpanded] = useState(
     isXaiOauthPreset ? false : hasAnyAdvancedValue,
@@ -1020,6 +1119,29 @@ export function CodexFormFields({
     }),
     [providerId, providerName, codexBaseUrl, category],
   );
+
+  const visibleCatalogRows = useMemo(() => {
+    const query = catalogSearch.trim().toLowerCase();
+    return catalogRows
+      .map((row, index) => ({ row, index }))
+      .filter(({ row }) => {
+        const isIncluded = row.enabled !== false;
+        if (
+          (catalogVisibility === "included" && !isIncluded) ||
+          (catalogVisibility === "excluded" && isIncluded)
+        ) {
+          return false;
+        }
+        if (!query) return true;
+        return [
+          row.model,
+          row.upstreamModel ?? row.upstream_model,
+          row.displayName ?? row.display_name,
+        ]
+          .filter(Boolean)
+          .some((value) => String(value).toLowerCase().includes(query));
+      });
+  }, [catalogRows, catalogSearch, catalogVisibility]);
 
   useEffect(() => {
     const models = catalogRows
@@ -1174,7 +1296,10 @@ export function CodexFormFields({
     bindProtocolProbeIdentity(readinessIdentity);
     setProtocolProbeTone("warning");
     setProtocolProbeSummary(
-      "请先在“模型与兼容性”同步模型，或在高级设置中手动添加至少一个模型后再验证。",
+      i18n.t("codexForm.probeNeedsModels", {
+        defaultValue:
+          "请先在“模型与兼容性”同步模型，或在高级设置中手动添加至少一个模型后再验证。",
+      }),
     );
     setShouldHighlightFetchModels(true);
     window.setTimeout(() => {
@@ -1251,162 +1376,199 @@ export function CodexFormFields({
     [codexChatReasoning, onCodexChatReasoningChange],
   );
 
-  const handleFetchModels = useCallback(() => {
-    // xAI OAuth 托管预设不使用表单里的 Base URL 与 API Key。
-    if (isXaiOauthPreset) {
-      if (!isXaiOauthAuthenticated) {
-        toast.error(
-          t("xaiOauth.loginRequired", {
-            defaultValue: "请先登录 xAI 账号",
-          }),
+  const handleFetchModels = useCallback(
+    (fetchMode: "sync" | "fill-missing" = "sync") => {
+      // xAI OAuth 托管预设不使用表单里的 Base URL 与 API Key。
+      if (isXaiOauthPreset) {
+        if (!isXaiOauthAuthenticated) {
+          toast.error(
+            t("xaiOauth.loginRequired", {
+              defaultValue: "请先登录 xAI 账号",
+            }),
+          );
+          return;
+        }
+        const seq = ++fetchModelsSeqRef.current;
+        setIsFetchingModels(true);
+        fetchXaiOauthModels(selectedXaiAccountId ?? null)
+          .then((models) => {
+            if (seq !== fetchModelsSeqRef.current) return;
+            setFetchedModels(models);
+            if (models.length === 0) {
+              toast.info(t("providerForm.fetchModelsEmpty"));
+            } else {
+              toast.success(
+                t("providerForm.fetchModelsSuccess", { count: models.length }),
+              );
+            }
+          })
+          .catch((err) => {
+            if (seq !== fetchModelsSeqRef.current) return;
+            console.warn("[XaiOAuth] Failed to fetch models:", err);
+            showFetchModelsError(err, t);
+          })
+          .finally(() => {
+            if (seq === fetchModelsSeqRef.current) setIsFetchingModels(false);
+          });
+        return;
+      }
+
+      const planFetchSource = {
+        baseUrl: codexBaseUrl,
+        partnerPromotionKey,
+        providerName,
+        apiKey: codexApiKey,
+        accessKeyId: planAccessKeyId,
+        secretAccessKey: planSecretAccessKey,
+      };
+      const planModelListAction = codexPlanModelListAction(planFetchSource);
+      const isCatalogOnlyPlan =
+        isCodexCatalogOnlyPlanModelFetch(planFetchSource);
+      if (isCatalogOnlyPlan) {
+        const hasModelCatalog = catalogRowsRef.current.some((row) =>
+          row.model.trim(),
         );
+        const message = codexCatalogOnlyPlanModelFetchMessage(
+          hasModelCatalog,
+          planFetchSource,
+        );
+        if (hasModelCatalog) {
+          toast.info(message);
+        } else {
+          toast.warning(message);
+        }
+        return;
+      }
+
+      if (!codexBaseUrl || (!codexApiKey && !planModelListAction)) {
+        showFetchModelsError(null, t, {
+          hasApiKey: !!codexApiKey,
+          hasBaseUrl: !!codexBaseUrl,
+        });
         return;
       }
       const seq = ++fetchModelsSeqRef.current;
       setIsFetchingModels(true);
-      fetchXaiOauthModels(selectedXaiAccountId ?? null)
+      fetchModelsForConfig(
+        codexBaseUrl,
+        codexApiKey,
+        isFullUrl,
+        undefined,
+        customUserAgent,
+        planModelListAction
+          ? {
+              action: planModelListAction,
+              accessKeyId: planAccessKeyId ?? "",
+              secretAccessKey: planSecretAccessKey ?? "",
+            }
+          : undefined,
+      )
         .then((models) => {
           if (seq !== fetchModelsSeqRef.current) return;
           setFetchedModels(models);
+          let splitCatalogRows = catalogRowsRef.current;
+          if (
+            fetchMode === "sync" &&
+            onCatalogModelsChange &&
+            models.length > 0
+          ) {
+            const mergedRows = mergeFetchedModelsIntoCatalogRows(
+              catalogRowsRef.current,
+              models,
+              {
+                providerId,
+                providerName,
+                baseUrl: codexBaseUrl,
+                websiteUrl,
+              },
+            );
+            catalogRowsRef.current = mergedRows;
+            splitCatalogRows = mergedRows;
+            setCatalogRows(mergedRows);
+          }
+          const shouldAutoSplitRouting =
+            models.length > 0 && Boolean(onProviderSplitSuggestionChange);
+          if (shouldAutoSplitRouting) {
+            const splitRouting =
+              buildSplitCodexProviderSuggestionForFetchedModels({
+                providerName,
+                models,
+              });
+            if (splitRouting) {
+              bindPendingSplitRouting(
+                splitRouting,
+                buildReadinessIdentityFor(apiFormat, splitCatalogRows),
+              );
+            }
+          }
           if (models.length === 0) {
             toast.info(t("providerForm.fetchModelsEmpty"));
           } else {
             toast.success(
               t("providerForm.fetchModelsSuccess", { count: models.length }),
             );
+            if (fetchMode === "fill-missing" && onCatalogModelsChange) {
+              const result = reconcileFetchedCodexCatalogRows(
+                catalogRowsRef.current,
+                models,
+                {
+                  providerId,
+                  providerName,
+                  baseUrl: codexBaseUrl,
+                  websiteUrl,
+                },
+                {
+                  appendNew: false,
+                  createRow: (seed) => createCatalogRow(seed),
+                },
+              );
+              catalogRowsRef.current = result.rows;
+              setCatalogRows(result.rows);
+              const persistedRows = result.rows.map(
+                ({ rowId: _rowId, ...row }) => row,
+              );
+              lastSentModelsRef.current = persistedRows;
+              onCatalogModelsChange(persistedRows);
+              toast.info(
+                t("providerForm.fillMissingFieldsResult", {
+                  checked: models.length,
+                  hydrated: result.hydrated,
+                }),
+              );
+            }
           }
         })
         .catch((err) => {
           if (seq !== fetchModelsSeqRef.current) return;
-          console.warn("[XaiOAuth] Failed to fetch models:", err);
+          console.warn("[ModelFetch] Failed:", err);
           showFetchModelsError(err, t);
         })
         .finally(() => {
           if (seq === fetchModelsSeqRef.current) setIsFetchingModels(false);
         });
-      return;
-    }
-
-    const planFetchSource = {
-      baseUrl: codexBaseUrl,
-      partnerPromotionKey,
-      providerName,
-      apiKey: codexApiKey,
-      accessKeyId: planAccessKeyId,
-      secretAccessKey: planSecretAccessKey,
-    };
-    const planModelListAction = codexPlanModelListAction(planFetchSource);
-    const isCatalogOnlyPlan = isCodexCatalogOnlyPlanModelFetch(planFetchSource);
-    if (isCatalogOnlyPlan) {
-      const hasModelCatalog = catalogRowsRef.current.some((row) =>
-        row.model.trim(),
-      );
-      const message = codexCatalogOnlyPlanModelFetchMessage(
-        hasModelCatalog,
-        planFetchSource,
-      );
-      if (hasModelCatalog) {
-        toast.info(message);
-      } else {
-        toast.warning(message);
-      }
-      return;
-    }
-
-    if (!codexBaseUrl || (!codexApiKey && !planModelListAction)) {
-      showFetchModelsError(null, t, {
-        hasApiKey: !!codexApiKey,
-        hasBaseUrl: !!codexBaseUrl,
-      });
-      return;
-    }
-    const seq = ++fetchModelsSeqRef.current;
-    setIsFetchingModels(true);
-    fetchModelsForConfig(
+    },
+    [
+      apiFormat,
+      bindPendingSplitRouting,
+      buildReadinessIdentityFor,
       codexBaseUrl,
       codexApiKey,
       isFullUrl,
-      undefined,
       customUserAgent,
-      planModelListAction
-        ? {
-            action: planModelListAction,
-            accessKeyId: planAccessKeyId ?? "",
-            secretAccessKey: planSecretAccessKey ?? "",
-          }
-        : undefined,
-    )
-      .then((models) => {
-        if (seq !== fetchModelsSeqRef.current) return;
-        setFetchedModels(models);
-        let splitCatalogRows = catalogRowsRef.current;
-        if (onCatalogModelsChange && models.length > 0) {
-          const mergedRows = mergeFetchedModelsIntoCatalogRows(
-            catalogRowsRef.current,
-            models,
-            {
-              providerId,
-              providerName,
-              baseUrl: codexBaseUrl,
-              websiteUrl,
-            },
-          );
-          catalogRowsRef.current = mergedRows;
-          splitCatalogRows = mergedRows;
-          setCatalogRows(mergedRows);
-        }
-        const shouldAutoSplitRouting =
-          models.length > 0 && Boolean(onProviderSplitSuggestionChange);
-        if (shouldAutoSplitRouting) {
-          const splitRouting =
-            buildSplitCodexProviderSuggestionForFetchedModels({
-              providerName,
-              models,
-            });
-          if (splitRouting) {
-            bindPendingSplitRouting(
-              splitRouting,
-              buildReadinessIdentityFor(apiFormat, splitCatalogRows),
-            );
-          }
-        }
-        if (models.length === 0) {
-          toast.info(t("providerForm.fetchModelsEmpty"));
-        } else {
-          toast.success(
-            t("providerForm.fetchModelsSuccess", { count: models.length }),
-          );
-        }
-      })
-      .catch((err) => {
-        if (seq !== fetchModelsSeqRef.current) return;
-        console.warn("[ModelFetch] Failed:", err);
-        showFetchModelsError(err, t);
-      })
-      .finally(() => {
-        if (seq === fetchModelsSeqRef.current) setIsFetchingModels(false);
-      });
-  }, [
-    apiFormat,
-    bindPendingSplitRouting,
-    buildReadinessIdentityFor,
-    codexBaseUrl,
-    codexApiKey,
-    isFullUrl,
-    customUserAgent,
-    providerId,
-    providerName,
-    partnerPromotionKey,
-    planAccessKeyId,
-    planSecretAccessKey,
-    websiteUrl,
-    onCatalogModelsChange,
-    onProviderSplitSuggestionChange,
-    isXaiOauthPreset,
-    isXaiOauthAuthenticated,
-    selectedXaiAccountId,
-    t,
-  ]);
+      providerId,
+      providerName,
+      partnerPromotionKey,
+      planAccessKeyId,
+      planSecretAccessKey,
+      websiteUrl,
+      onCatalogModelsChange,
+      onProviderSplitSuggestionChange,
+      isXaiOauthPreset,
+      isXaiOauthAuthenticated,
+      selectedXaiAccountId,
+      t,
+    ],
+  );
 
   const handleProtocolProbe = useCallback(async () => {
     if (!codexBaseUrl || !codexApiKey) {
@@ -1426,7 +1588,11 @@ export function CodexFormFields({
     );
     if (models.length === 0) {
       setIsProtocolProbeConfirmOpen(false);
-      toast.warning("请先点击“获取模型列表”，或手动添加至少一个模型。");
+      toast.warning(
+        i18n.t("codexForm.fetchModelsFirst", {
+          defaultValue: "请先点击“获取模型列表”，或手动添加至少一个模型。",
+        }),
+      );
       revealModelCatalogFetchAction();
       return;
     }
@@ -1442,7 +1608,12 @@ export function CodexFormFields({
     setProtocolProbeTone("muted");
     setProtocolProbeOutcomesByModel({});
     setProtocolProbeSummary(
-      `正在并发测试 ${models.length} 个模型的 Chat / Responses 基础连通性，最多同时测试 ${CODEX_PROTOCOL_PROBE_MODEL_CONCURRENCY} 个模型...`,
+      i18n.t("codexForm.probeStarted", {
+        defaultValue:
+          "正在并发测试 {{count}} 个模型的 Chat / Responses 基础连通性，最多同时测试 {{concurrency}} 个模型...",
+        count: models.length,
+        concurrency: CODEX_PROTOCOL_PROBE_MODEL_CONCURRENCY,
+      }),
     );
     try {
       let completedCount = 0;
@@ -1470,7 +1641,13 @@ export function CodexFormFields({
           const outcome = { model, responses, chat };
           if (!ownsCurrentIdentity()) return outcome;
           setProtocolProbeSummary(
-            `正在并发测试 ${completedCount}/${models.length}：刚完成 ${model}。失败会在这里显示。`,
+            i18n.t("codexForm.probeProgress", {
+              defaultValue:
+                "正在并发测试 {{done}}/{{total}}：刚完成 {{model}}。失败会在这里显示。",
+              done: completedCount,
+              total: models.length,
+              model: model,
+            }),
           );
           setProtocolProbeOutcomesByModel((current) => ({
             ...current,
@@ -1501,11 +1678,20 @@ export function CodexFormFields({
       }
 
       if (responsesPass > 0 && chatPass > 0) {
-        const summary = `Responses 和 Chat 的基础请求都有模型可用，保留当前上游格式；Responses 通常是 Codex 原生优先选择，但你可以继续使用 Chat Completions。Responses 通过 ${responsesPass}/${models.length}，Chat 通过 ${chatPass}/${models.length}。${
-          canApplySplitSuggestion
-            ? "检测到真实协议结果混合，建议下一步拆成 Responses / Chat 两个 provider。"
-            : ""
-        }通过不等于完整 Codex 功能验证。${detail}`;
+        const summary = i18n.t("codexForm.probeBothUsableSummary", {
+          defaultValue:
+            "Responses 和 Chat 的基础请求都有模型可用，保留当前上游格式；Responses 通常是 Codex 原生优先选择，但你可以继续使用 Chat Completions。Responses 通过 {{responsesPass}}/{{total}}，Chat 通过 {{chatPass}}/{{total}}。{{splitHint}}通过不等于完整 Codex 功能验证。{{detail}}",
+          responsesPass: responsesPass,
+          chatPass: chatPass,
+          total: models.length,
+          splitHint: canApplySplitSuggestion
+            ? i18n.t("codexForm.probeMixedSuggestion", {
+                defaultValue:
+                  "检测到真实协议结果混合，建议下一步拆成 Responses / Chat 两个 provider。",
+              })
+            : "",
+          detail,
+        });
         const tone = failedCount > 0 ? "warning" : "success";
         bindProtocolProbeIdentity(probeIdentity);
         setProtocolProbeTone(tone);
@@ -1525,7 +1711,13 @@ export function CodexFormFields({
         );
         bindProtocolProbeIdentity(resultIdentity);
         onApiFormatChange("openai_responses");
-        const summary = `只有 Responses 基础请求可用，已切换为 Responses。Responses 通过 ${responsesPass}/${models.length}。通过不等于完整 Codex 功能验证。${detail}`;
+        const summary = i18n.t("codexForm.probeOnlyResponsesSwitched", {
+          defaultValue:
+            "只有 Responses 基础请求可用，已切换为 Responses。Responses 通过 {{responsesPass}}/{{total}}。通过不等于完整 Codex 功能验证。{{detail}}",
+          responsesPass: responsesPass,
+          total: models.length,
+          detail,
+        });
         const tone = failedCount > 0 ? "warning" : "success";
         setProtocolProbeTone(tone);
         setProtocolProbeSummary(summary);
@@ -1543,25 +1735,40 @@ export function CodexFormFields({
         );
         bindProtocolProbeIdentity(resultIdentity);
         onApiFormatChange("openai_chat");
-        const summary = `Responses 不通但 Chat 可用，已切换为 Chat Completions。Chat 通过 ${chatPass}/${models.length}。${
-          canApplySplitSuggestion
-            ? "检测到真实协议结果混合，建议下一步拆成 Responses / Chat 两个 provider。"
-            : ""
-        }${detail}`;
+        const summary = i18n.t("codexForm.probeChatFallbackSwitched", {
+          defaultValue:
+            "Responses 不通但 Chat 可用，已切换为 Chat Completions。Chat 通过 {{chatPass}}/{{total}}。{{splitHint}}{{detail}}",
+          chatPass: chatPass,
+          total: models.length,
+          splitHint: canApplySplitSuggestion
+            ? i18n.t("codexForm.probeMixedSuggestion", {
+                defaultValue:
+                  "检测到真实协议结果混合，建议下一步拆成 Responses / Chat 两个 provider。",
+              })
+            : "",
+          detail,
+        });
         setProtocolProbeTone("warning");
         setProtocolProbeSummary(summary);
         toast.warning(summary, { closeButton: true });
         return;
       }
 
-      const summary = `Responses 和 Chat Completions 都不通，请检查 API Key、Base URL、模型权限、额度、网络或上游状态。${detail}`;
+      const summary = i18n.t("codexForm.probeBothFailedCheckConfig", {
+        defaultValue:
+          "Responses 和 Chat Completions 都不通，请检查 API Key、Base URL、模型权限、额度、网络或上游状态。{{detail}}",
+        detail,
+      });
       bindProtocolProbeIdentity(probeIdentity);
       setProtocolProbeTone("error");
       setProtocolProbeSummary(summary);
       toast.error(summary, { closeButton: true });
     } catch (error) {
       if (!ownsCurrentIdentity()) return;
-      const summary = `协议测试中断：${error instanceof Error ? error.message : String(error)}`;
+      const summary = i18n.t("codexForm.probeInterrupted", {
+        defaultValue: "协议测试中断：{{message}}",
+        message: error instanceof Error ? error.message : String(error),
+      });
       bindProtocolProbeIdentity(probeIdentity);
       setProtocolProbeTone("error");
       setProtocolProbeSummary(summary);
@@ -1588,10 +1795,26 @@ export function CodexFormFields({
     t,
   ]);
 
+  const handleFillMissingModelFields = useCallback(
+    () => handleFetchModels("fill-missing"),
+    [handleFetchModels],
+  );
+
   const handleAddCatalogRow = useCallback(() => {
     if (!onCatalogModelsChange) return;
     setCatalogRows((current) => [...current, createCatalogRow()]);
   }, [onCatalogModelsChange]);
+
+  const setCatalogRowsEnabled = useCallback(
+    (indexes: number[], enabled: boolean) => {
+      setCatalogRows((current) =>
+        current.map((row, index) =>
+          indexes.includes(index) ? { ...row, enabled } : row,
+        ),
+      );
+    },
+    [],
+  );
 
   const handleUpdateCatalogRow = useCallback(
     (index: number, patch: Partial<CodexCatalogModel>) => {
@@ -1631,7 +1854,11 @@ export function CodexFormFields({
       try {
         const reasoning = JSON.parse(trimmed) as CodexCatalogModel["reasoning"];
         if (!reasoning) {
-          throw new Error("推理能力配置必须是一个对象");
+          throw new Error(
+            i18n.t("codexForm.capabilityConfigMustBeObject", {
+              defaultValue: "推理能力配置必须是一个对象",
+            }),
+          );
         }
         validateCodexReasoningCapabilityDraft(reasoning);
         handleUpdateCatalogRow(index, {
@@ -1639,7 +1866,10 @@ export function CodexFormFields({
         });
       } catch (error) {
         toast.error(
-          `推理能力 JSON 无效，未修改草稿：${error instanceof Error ? error.message : String(error)}`,
+          i18n.t("codexForm.reasoningJsonInvalid", {
+            defaultValue: "推理能力 JSON 无效，未修改草稿：{{message}}",
+            message: error instanceof Error ? error.message : String(error),
+          }),
         );
       }
     },
@@ -1739,7 +1969,10 @@ export function CodexFormFields({
     onProviderSplitSuggestionChange(pendingSplitRouting);
     setPendingSplitRoutingState(null);
     toast.info(
-      `保存时将生成 ${pendingSplitRouting.providerName}-responses / ${pendingSplitRouting.providerName}-chat 两个 provider。`,
+      i18n.t("codexForm.splitProvidersPreview", {
+        defaultValue: "保存时将生成 {{providers}} 两个 provider。",
+        providers: `${pendingSplitRouting.providerName}-responses / ${pendingSplitRouting.providerName}-chat`,
+      }),
     );
   }, [
     onTakeoverEnabledChange,
@@ -1779,24 +2012,35 @@ export function CodexFormFields({
       >
         <DialogContent className="max-w-lg" zIndex="top">
           <DialogHeader>
-            <DialogTitle>确认测试 Chat / Responses</DialogTitle>
+            <DialogTitle>
+              {i18n.t("codexForm.confirmProbeTitle", {
+                defaultValue: "确认测试 Chat / Responses",
+              })}
+            </DialogTitle>
             <DialogDescription className="space-y-2 text-left">
               <span className="block">
-                这个测试会帮助判断当前 provider 应该选择 Responses 还是 Chat
-                Completions。它会对当前模型目录里的模型发送真实请求，可能产生少量额度或流量消耗，也可能触发限流。
+                {i18n.t("codexForm.probeDialogIntro", {
+                  defaultValue:
+                    "这个测试会帮助判断当前 provider 应该选择 Responses 还是 Chat Completions。它会对当前模型目录里的模型发送真实请求，可能产生少量额度或流量消耗，也可能触发限流。",
+                })}
               </span>
               <span className="block">
-                如果还没有模型目录，请先到上方“模型目录与上下文”点击“获取模型列表”，或手动添加至少一个模型。
+                {i18n.t("codexForm.probeDialogNoCatalog", {
+                  defaultValue:
+                    "如果还没有模型目录，请先到上方“模型目录与上下文”点击“获取模型列表”，或手动添加至少一个模型。",
+                })}
               </span>
               <span className="block">
-                每个模型会分别测试对应的 Responses 和 Chat Completions
-                endpoint，输出上限为 1024。都不通时通常不是协议问题，而是 API
-                Key、Base URL、模型权限、额度、网络或上游故障。
+                {i18n.t("codexForm.probeDialogPerModel", {
+                  defaultValue:
+                    "每个模型会分别测试对应的 Responses 和 Chat Completions endpoint，输出上限为 1024。都不通时通常不是协议问题，而是 API Key、Base URL、模型权限、额度、网络或上游故障。",
+                })}
               </span>
               <span className="block">
-                注意：Responses 通过只证明最小非流式请求能返回成功，不等于完整
-                Codex
-                功能验证；真实会话里的流式输出、工具调用、长上下文和限流稳定性仍要继续观察。
+                {i18n.t("codexForm.probeDialogNote", {
+                  defaultValue:
+                    "注意：Responses 通过只证明最小非流式请求能返回成功，不等于完整 Codex 功能验证；真实会话里的流式输出、工具调用、长上下文和限流稳定性仍要继续观察。",
+                })}
               </span>
             </DialogDescription>
           </DialogHeader>
@@ -1806,10 +2050,12 @@ export function CodexFormFields({
               variant="outline"
               onClick={() => setIsProtocolProbeConfirmOpen(false)}
             >
-              取消
+              {i18n.t("codexForm.cancel", { defaultValue: "取消" })}
             </Button>
             <Button type="button" onClick={handleProtocolProbe}>
-              确认测试
+              {i18n.t("codexForm.confirmProbeRun", {
+                defaultValue: "确认测试",
+              })}
             </Button>
           </DialogFooter>
         </DialogContent>
@@ -1844,6 +2090,257 @@ export function CodexFormFields({
             }),
           }}
         />
+      )}
+
+      {!isXaiOauthPreset && category !== "official" && onApiKeyGroupsChange && (
+        <div className="space-y-2 rounded-md border p-3">
+          <div className="flex items-center justify-between gap-2">
+            <div>
+              <FormLabel>
+                {t("codexConfig.apiKeyGroupsTitle", {
+                  defaultValue: "Model API key groups",
+                })}
+              </FormLabel>
+              <p className="text-xs text-muted-foreground">
+                {t("codexConfig.apiKeyGroupsHint", {
+                  defaultValue:
+                    "Match exact models first, then prefixes. Keys rotate within each group.",
+                })}
+              </p>
+            </div>
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              onClick={() =>
+                onApiKeyGroupsChange([
+                  ...apiKeyGroups,
+                  {
+                    id: crypto.randomUUID(),
+                    label: "",
+                    apiKeys: [""],
+                    models: [],
+                    prefixes: [],
+                    enabled: true,
+                    strategy: "round_robin",
+                  },
+                ])
+              }
+            >
+              <Plus className="mr-1 h-3.5 w-3.5" />
+              {t("codexConfig.apiKeyGroupsAdd", { defaultValue: "Add group" })}
+            </Button>
+          </div>
+          {apiKeyGroups.map((group, groupIndex) => (
+            <div key={group.id} className="space-y-2 rounded border p-2">
+              <div className="flex gap-2">
+                <Input
+                  value={group.label ?? ""}
+                  placeholder={t("codexConfig.apiKeyGroupLabel", {
+                    defaultValue: "Group label",
+                  })}
+                  onChange={(event) =>
+                    onApiKeyGroupsChange(
+                      apiKeyGroups.map((item, index) =>
+                        index === groupIndex
+                          ? { ...item, label: event.target.value }
+                          : item,
+                      ),
+                    )
+                  }
+                />
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="icon"
+                  onClick={() =>
+                    onApiKeyGroupsChange(
+                      apiKeyGroups.filter((_, index) => index !== groupIndex),
+                    )
+                  }
+                  aria-label={t("common.delete", { defaultValue: "Delete" })}
+                >
+                  <Trash2 className="h-4 w-4" />
+                </Button>
+              </div>
+              <div className="flex items-center justify-between gap-3 text-sm">
+                <label className="flex items-center gap-2 text-muted-foreground">
+                  <Switch
+                    checked={group.enabled !== false}
+                    onCheckedChange={(checked) =>
+                      onApiKeyGroupsChange(
+                        apiKeyGroups.map((item, index) =>
+                          index === groupIndex
+                            ? { ...item, enabled: checked }
+                            : item,
+                        ),
+                      )
+                    }
+                  />
+                  {t("codexConfig.apiKeyGroupEnabled", {
+                    defaultValue: "Enabled",
+                  })}
+                </label>
+                <div className="flex items-center gap-2">
+                  <span className="text-xs text-muted-foreground">
+                    {t("codexConfig.apiKeyGroupStrategy", {
+                      defaultValue: "Rotation",
+                    })}
+                  </span>
+                  <Select
+                    value={group.strategy ?? "round_robin"}
+                    onValueChange={(value: "round_robin" | "random") =>
+                      onApiKeyGroupsChange(
+                        apiKeyGroups.map((item, index) =>
+                          index === groupIndex
+                            ? { ...item, strategy: value }
+                            : item,
+                        ),
+                      )
+                    }
+                  >
+                    <SelectTrigger className="h-8 w-36">
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="round_robin">
+                        {t("codexConfig.apiKeyGroupRoundRobin", {
+                          defaultValue: "Round robin",
+                        })}
+                      </SelectItem>
+                      <SelectItem value="random">
+                        {t("codexConfig.apiKeyGroupRandom", {
+                          defaultValue: "Random",
+                        })}
+                      </SelectItem>
+                    </SelectContent>
+                  </Select>
+                </div>
+              </div>
+              <div className="space-y-1">
+                {(group.apiKeys.length > 0 ? group.apiKeys : [""]).map(
+                  (key, keyIndex) => (
+                    <div
+                      key={`${group.id}-key-${keyIndex}`}
+                      className="flex gap-2"
+                    >
+                      <Input
+                        type="password"
+                        value={key}
+                        placeholder={t("codexConfig.apiKeyGroupKey", {
+                          defaultValue: "API key",
+                        })}
+                        onChange={(event) =>
+                          onApiKeyGroupsChange(
+                            apiKeyGroups.map((item, index) =>
+                              index === groupIndex
+                                ? {
+                                    ...item,
+                                    apiKeys: item.apiKeys.map(
+                                      (value, current) =>
+                                        current === keyIndex
+                                          ? event.target.value
+                                          : value,
+                                    ),
+                                  }
+                                : item,
+                            ),
+                          )
+                        }
+                      />
+                      <Button
+                        type="button"
+                        variant="ghost"
+                        size="icon"
+                        disabled={group.apiKeys.length <= 1}
+                        onClick={() =>
+                          onApiKeyGroupsChange(
+                            apiKeyGroups.map((item, index) =>
+                              index === groupIndex
+                                ? {
+                                    ...item,
+                                    apiKeys: item.apiKeys.filter(
+                                      (_, current) => current !== keyIndex,
+                                    ),
+                                  }
+                                : item,
+                            ),
+                          )
+                        }
+                        aria-label={t("common.delete", {
+                          defaultValue: "Delete",
+                        })}
+                      >
+                        <Trash2 className="h-4 w-4" />
+                      </Button>
+                    </div>
+                  ),
+                )}
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="sm"
+                  onClick={() =>
+                    onApiKeyGroupsChange(
+                      apiKeyGroups.map((item, index) =>
+                        index === groupIndex
+                          ? { ...item, apiKeys: [...item.apiKeys, ""] }
+                          : item,
+                      ),
+                    )
+                  }
+                >
+                  <Plus className="mr-1 h-3.5 w-3.5" />
+                  {t("codexConfig.apiKeyGroupAddKey", {
+                    defaultValue: "Add key",
+                  })}
+                </Button>
+              </div>
+              <Input
+                value={(group.models ?? []).join(", ")}
+                placeholder={t("codexConfig.apiKeyGroupModels", {
+                  defaultValue: "Exact models, comma separated",
+                })}
+                onChange={(event) =>
+                  onApiKeyGroupsChange(
+                    apiKeyGroups.map((item, index) =>
+                      index === groupIndex
+                        ? {
+                            ...item,
+                            models: event.target.value
+                              .split(",")
+                              .map((value) => value.trim())
+                              .filter(Boolean),
+                          }
+                        : item,
+                    ),
+                  )
+                }
+              />
+              <Input
+                value={(group.prefixes ?? []).join(", ")}
+                placeholder={t("codexConfig.apiKeyGroupPrefixes", {
+                  defaultValue: "Model prefixes, comma separated",
+                })}
+                onChange={(event) =>
+                  onApiKeyGroupsChange(
+                    apiKeyGroups.map((item, index) =>
+                      index === groupIndex
+                        ? {
+                            ...item,
+                            prefixes: event.target.value
+                              .split(",")
+                              .map((value) => value.trim())
+                              .filter(Boolean),
+                          }
+                        : item,
+                    ),
+                  )
+                }
+              />
+            </div>
+          ))}
+        </div>
       )}
 
       {/* Codex Base URL 输入框（托管 OAuth 端点由 adapter 硬定向，不展示） */}
@@ -1900,12 +2397,16 @@ export function CodexFormFields({
       >
         <DialogContent className="max-w-2xl">
           <DialogHeader>
-            <DialogTitle>检测到混合协议模型</DialogTitle>
+            <DialogTitle>
+              {i18n.t("codexForm.mixedProtocolTitle", {
+                defaultValue: "检测到混合协议模型",
+              })}
+            </DialogTitle>
             <DialogDescription>
-              当前中转同时返回了 GPT-like 模型和非 GPT-like 模型。建议保存时拆成
-              Responses 与 Chat 两个
-              provider，避免把两种协议混在同一个配置里导致后续分不清。
-              确认后不会立即保存；点击新增时才会创建两个 provider。
+              {i18n.t("codexForm.mixedProtocolDesc", {
+                defaultValue:
+                  "当前中转同时返回了 GPT-like 模型和非 GPT-like 模型。建议保存时拆成 Responses 与 Chat 两个 provider，避免把两种协议混在同一个配置里导致后续分不清。 确认后不会立即保存；点击新增时才会创建两个 provider。",
+              })}
             </DialogDescription>
           </DialogHeader>
 
@@ -1917,11 +2418,15 @@ export function CodexFormFields({
                   OpenAI Responses
                 </span>
                 <span className="rounded bg-background/70 px-1.5 py-0.5 text-[11px] text-muted-foreground">
-                  单独 provider
+                  {i18n.t("codexForm.separateProvider", {
+                    defaultValue: "单独 provider",
+                  })}
                 </span>
               </div>
               <p className="mt-1 text-xs text-muted-foreground">
-                匹配模型：
+                {i18n.t("codexForm.matchingModels", {
+                  defaultValue: "匹配模型：",
+                })}
                 {pendingResponsesModels.join(", ") || "-"}
               </p>
             </div>
@@ -1932,11 +2437,16 @@ export function CodexFormFields({
                   OpenAI Chat Completions
                 </span>
                 <span className="rounded bg-background/70 px-1.5 py-0.5 text-[11px] text-muted-foreground">
-                  单独 provider
+                  {i18n.t("codexForm.separateProviderChat", {
+                    defaultValue: "单独 provider",
+                  })}
                 </span>
               </div>
               <p className="mt-1 text-xs text-muted-foreground">
-                匹配模型：{pendingChatModels.join(", ") || "-"}
+                {i18n.t("codexForm.matchingModels", {
+                  defaultValue: "匹配模型：",
+                })}
+                {pendingChatModels.join(", ") || "-"}
               </p>
             </div>
           </div>
@@ -1947,10 +2457,12 @@ export function CodexFormFields({
               variant="outline"
               onClick={handleCancelSplitRouting}
             >
-              暂不拆分
+              {i18n.t("codexForm.skipSplit", { defaultValue: "暂不拆分" })}
             </Button>
             <Button type="button" onClick={handleConfirmSplitRouting}>
-              确认生成两个 provider
+              {i18n.t("codexForm.confirmSplitCreate", {
+                defaultValue: "确认生成两个 provider",
+              })}
             </Button>
           </DialogFooter>
         </DialogContent>
@@ -1961,6 +2473,7 @@ export function CodexFormFields({
           models={catalogRows}
           defaultModel={codexModel}
           apiFormat={apiFormat}
+          trafficPolicy={resolvedTrafficPolicy}
           isMaintainedPreset={isMaintainedPreset}
           isSyncingModels={isFetchingModels}
           isValidatingConnection={
@@ -1976,11 +2489,15 @@ export function CodexFormFields({
           syncButtonRef={fetchModelsButtonRef}
           sectionRef={modelMappingSectionRef}
           onSyncModels={handleFetchModels}
+          onFillMissingFields={handleFillMissingModelFields}
           onValidateConnection={() => {
             bindProtocolProbeIdentity(readinessIdentity);
             setProtocolProbeTone("muted");
             setProtocolProbeSummary(
-              "已打开验证确认框；如果没有看到弹窗，请按 Esc 后重试。",
+              i18n.t("codexForm.verifyDialogOpened", {
+                defaultValue:
+                  "已打开验证确认框；如果没有看到弹窗，请按 Esc 后重试。",
+              }),
             );
             setIsProtocolProbeConfirmOpen(true);
           }}
@@ -2001,22 +2518,28 @@ export function CodexFormFields({
               id="codex-model-reasoning-title"
               className="text-sm font-semibold text-foreground"
             >
-              模型推理能力
+              {i18n.t("codexForm.reasoningSectionTitle", {
+                defaultValue: "模型推理能力",
+              })}
             </h3>
             <p className="text-xs leading-relaxed text-muted-foreground">
-              每个模型独立配置。这里决定 Codex
-              可以选择哪些推理档位，以及请求最终如何发送给
-              Provider；能力不完整时会在保存 Provider 前阻止并指出缺失项。
+              {i18n.t("codexForm.reasoningSectionDesc", {
+                defaultValue:
+                  "每个模型独立配置。这里决定 Codex 可以选择哪些推理档位，以及请求最终如何发送给 Provider；能力不完整时会在保存 Provider 前阻止并指出缺失项。",
+              })}
             </p>
           </div>
 
           {catalogRows.length === 0 ? (
             <p className="rounded-md border border-dashed p-3 text-xs text-muted-foreground">
-              暂无模型。请先在上方同步模型，或在高级选项的模型目录明细中添加模型。
+              {i18n.t("codexForm.reasoningEmptyModels", {
+                defaultValue:
+                  "暂无模型。请先在上方同步模型，或在高级选项的模型目录明细中添加模型。",
+              })}
             </p>
           ) : (
             <div className="space-y-3">
-              {catalogRows.map((row, index) => {
+              {visibleCatalogRows.map(({ row, index }) => {
                 const model = row.model.trim();
                 const probeModel = catalogRowUpstreamModel(row) || model;
                 const reasoningResolution = reasoningResolutions[probeModel];
@@ -2035,16 +2558,28 @@ export function CodexFormFields({
                 const isReasoningEditorExpanded =
                   expandedReasoningRowId === row.rowId;
                 const reasoningSourceLabel = isBuiltinReasoning
-                  ? "CCSM 受维护声明"
+                  ? i18n.t("codexForm.sourceMaintainedClaim", {
+                      defaultValue: "CCSM 受维护声明",
+                    })
                   : isUserPresetOverride
-                    ? "用户声明（已覆盖维护值）"
+                    ? i18n.t("codexForm.sourceUserOverriding", {
+                        defaultValue: "用户声明（已覆盖维护值）",
+                      })
                     : row.reasoning
-                      ? "用户声明"
+                      ? i18n.t("codexForm.sourceUserClaim", {
+                          defaultValue: "用户声明",
+                        })
                       : reasoningResolution?.source === "detection"
-                        ? "自动检测"
+                        ? i18n.t("codexForm.sourceAutoDetected", {
+                            defaultValue: "自动检测",
+                          })
                         : reasoningResolution?.source === "library"
-                          ? "维护能力库"
-                          : "自动发现或服务端默认";
+                          ? i18n.t("codexForm.sourceMaintainedLibrary", {
+                              defaultValue: "维护能力库",
+                            })
+                          : i18n.t("codexForm.sourceAutoOrDefault", {
+                              defaultValue: "自动发现或服务端默认",
+                            });
                 const selectableEfforts =
                   reasoningResolution?.resolved.codexSelectableEfforts ??
                   row.reasoning?.supportedEfforts ??
@@ -2062,7 +2597,13 @@ export function CodexFormFields({
                     className="space-y-3 rounded-md border bg-background p-3 text-xs"
                   >
                     <CodexModelReasoningSummary
-                      model={row.displayName?.trim() || model || "未命名模型"}
+                      model={
+                        row.displayName?.trim() ||
+                        model ||
+                        i18n.t("codexForm.unnamedModel", {
+                          defaultValue: "未命名模型",
+                        })
+                      }
                       source={reasoningSourceLabel}
                       selectableEfforts={selectableEfforts}
                       defaultEffort={defaultEffort}
@@ -2086,11 +2627,25 @@ export function CodexFormFields({
                     {isReasoningEditorExpanded && (
                       <>
                         <label className="grid min-w-52 gap-1">
-                          <span className="font-medium">能力来源</span>
+                          <span className="font-medium">
+                            {i18n.t("codexForm.capabilitySourceLabel", {
+                              defaultValue: "能力来源",
+                            })}
+                          </span>
                           <select
                             className="rounded-md border bg-background px-3 py-2"
                             value={reasoningSourceMode}
-                            aria-label={`${model || "模型"}推理能力来源`}
+                            aria-label={i18n.t(
+                              "codexForm.reasoningSourceAria",
+                              {
+                                defaultValue: "{{model}}推理能力来源",
+                                model:
+                                  model ||
+                                  i18n.t("codexForm.modelFallback", {
+                                    defaultValue: "模型",
+                                  }),
+                              },
+                            )}
                             onChange={(event) =>
                               handleUpdateCatalogRow(index, {
                                 reasoning: applyCodexReasoningCapabilitySource(
@@ -2103,17 +2658,28 @@ export function CodexFormFields({
                               })
                             }
                           >
-                            <option value="automatic">自动发现</option>
-                            <option value="builtin" disabled={!presetReasoning}>
-                              使用 CCSM 受维护声明
+                            <option value="automatic">
+                              {i18n.t("codexForm.sourceAutomaticOption", {
+                                defaultValue: "自动发现",
+                              })}
                             </option>
-                            <option value="manual">手动声明</option>
+                            <option value="builtin" disabled={!presetReasoning}>
+                              {i18n.t("codexForm.useMaintainedClaimOption", {
+                                defaultValue: "使用 CCSM 受维护声明",
+                              })}
+                            </option>
+                            <option value="manual">
+                              {i18n.t("codexForm.manualClaimOption", {
+                                defaultValue: "手动声明",
+                              })}
+                            </option>
                           </select>
                           {reasoningSourceMode === "automatic" ? (
                             <span className="text-muted-foreground">
-                              自动发现会按当前
-                              Provider、模型和已验证声明解析能力；它不会写入本模型配置。需要调整档位、映射或开启
-                              Ultra 时，请按当前结果创建用户覆盖。
+                              {i18n.t("codexForm.automaticSourceDesc", {
+                                defaultValue:
+                                  "自动发现会按当前 Provider、模型和已验证声明解析能力；它不会写入本模型配置。需要调整档位、映射或开启 Ultra 时，请按当前结果创建用户覆盖。",
+                              })}
                             </span>
                           ) : null}
                         </label>
@@ -2147,10 +2713,24 @@ export function CodexFormFields({
                                     ...current,
                                     [probeModel]: next,
                                   }));
-                                  toast.success("已更新模型推理能力检测结果");
+                                  toast.success(
+                                    i18n.t(
+                                      "codexForm.capabilityDetectionUpdated",
+                                      {
+                                        defaultValue:
+                                          "已更新模型推理能力检测结果",
+                                      },
+                                    ),
+                                  );
                                 } else {
                                   toast.info(
-                                    "未获得可采纳的模型推理能力声明，继续使用服务端默认。",
+                                    i18n.t(
+                                      "codexForm.noActionableCapabilityClaims",
+                                      {
+                                        defaultValue:
+                                          "未获得可采纳的模型推理能力声明，继续使用服务端默认。",
+                                      },
+                                    ),
                                   );
                                 }
                               } catch (error) {
@@ -2158,7 +2738,12 @@ export function CodexFormFields({
                                   "[CodexFormFields] reasoning detection failed",
                                   error,
                                 );
-                                toast.error("模型推理能力检测失败");
+                                toast.error(
+                                  i18n.t(
+                                    "codexForm.capabilityDetectionFailed",
+                                    { defaultValue: "模型推理能力检测失败" },
+                                  ),
+                                );
                               } finally {
                                 setRedetectingReasoningModel(null);
                               }
@@ -2171,14 +2756,22 @@ export function CodexFormFields({
                                 : undefined;
                               if (!detected) {
                                 toast.info(
-                                  "当前检测结果没有可采纳的推理档位声明。",
+                                  i18n.t("codexForm.noActionableEffortClaims", {
+                                    defaultValue:
+                                      "当前检测结果没有可采纳的推理档位声明。",
+                                  }),
                                 );
                                 return;
                               }
                               handleUpdateCatalogRow(index, {
                                 reasoning: detected,
                               });
-                              toast.success("已采用检测到的推理能力");
+                              toast.success(
+                                i18n.t(
+                                  "codexForm.detectedCapabilitiesAdopted",
+                                  { defaultValue: "已采用检测到的推理能力" },
+                                ),
+                              );
                             }}
                             onManualDeclare={() =>
                               handleUpdateCatalogRow(index, {
@@ -2216,7 +2809,10 @@ export function CodexFormFields({
                           />
                         ) : (
                           <p className="text-muted-foreground">
-                            正在读取该模型的统一推理能力解析结果…
+                            {i18n.t("codexForm.resolvingCapability", {
+                              defaultValue:
+                                "正在读取该模型的统一推理能力解析结果…",
+                            })}
                           </p>
                         )}
 
@@ -2235,7 +2831,9 @@ export function CodexFormFields({
                               })
                             }
                           >
-                            恢复内置默认
+                            {i18n.t("codexForm.restoreBuiltinDefault", {
+                              defaultValue: "恢复内置默认",
+                            })}
                           </Button>
                         ) : null}
                         {isBuiltinReasoning && row.reasoning ? (
@@ -2253,13 +2851,20 @@ export function CodexFormFields({
                               })
                             }
                           >
-                            创建高级覆盖
+                            {i18n.t("codexForm.createAdvancedOverride", {
+                              defaultValue: "创建高级覆盖",
+                            })}
                           </Button>
                         ) : null}
 
                         {row.reasoning ? (
                           <CodexModelReasoningEditor
-                            model={model || "模型"}
+                            model={
+                              model ||
+                              i18n.t("codexForm.modelFallback", {
+                                defaultValue: "模型",
+                              })
+                            }
                             capability={row.reasoning}
                             readOnly={isBuiltinReasoning}
                             onChange={(reasoning) =>
@@ -2270,7 +2875,9 @@ export function CodexFormFields({
 
                         <details>
                           <summary className="cursor-pointer text-muted-foreground">
-                            专家 JSON
+                            {i18n.t("codexForm.expertJson", {
+                              defaultValue: "专家 JSON",
+                            })}
                           </summary>
                           <Textarea
                             key={`reasoning-json:${row.rowId}:${JSON.stringify(row.reasoning)}`}
@@ -2289,7 +2896,14 @@ export function CodexFormFields({
                               }
                             }}
                             readOnly={isBuiltinReasoning}
-                            aria-label={`${model || "模型"}推理能力 JSON`}
+                            aria-label={i18n.t("codexForm.reasoningJsonAria", {
+                              defaultValue: "{{model}}推理能力 JSON",
+                              model:
+                                model ||
+                                i18n.t("codexForm.modelFallback", {
+                                  defaultValue: "模型",
+                                }),
+                            })}
                           />
                         </details>
                       </>
@@ -2335,6 +2949,257 @@ export function CodexFormFields({
             </p>
           )}
           <CollapsibleContent className="space-y-3 pt-3">
+            <section
+              className="space-y-3 rounded-md border border-border-default bg-muted/10 p-3"
+              aria-labelledby="codex-traffic-policy-title"
+            >
+              <div className="flex flex-wrap items-start justify-between gap-2">
+                <div className="space-y-1">
+                  <FormLabel id="codex-traffic-policy-title">
+                    {t("codexConfig.trafficPolicy.title", {
+                      defaultValue: "Concurrency & Retry Policy",
+                    })}
+                  </FormLabel>
+                  <p className="text-xs leading-relaxed text-muted-foreground">
+                    {t("codexConfig.trafficPolicy.description", {
+                      defaultValue:
+                        "Limit local in-flight requests and replay only explicit upstream rejections that are known to be safe. This policy is per provider.",
+                    })}
+                  </p>
+                </div>
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  onClick={() =>
+                    onCodexTrafficPolicyChange(
+                      codexTrafficPolicy
+                        ? undefined
+                        : customCodexTrafficPolicySeed(codexBaseUrl),
+                    )
+                  }
+                >
+                  {codexTrafficPolicy
+                    ? t("codexConfig.trafficPolicy.useRecommended", {
+                        defaultValue: "Use recommendation",
+                      })
+                    : t("codexConfig.trafficPolicy.customize", {
+                        defaultValue: "Customize",
+                      })}
+                </Button>
+              </div>
+              <p className="text-xs font-medium text-blue-700 dark:text-blue-300">
+                {resolvedTrafficPolicy.source === "recommended"
+                  ? t("codexConfig.trafficPolicy.zenRecommended", {
+                      defaultValue:
+                        "OpenCode Zen recommendation: 4 in flight, 5 rate-limit retries, and 2 recognized admission retries.",
+                    })
+                  : resolvedTrafficPolicy.source === "custom"
+                    ? t("codexConfig.trafficPolicy.customActive", {
+                        defaultValue: "Custom provider policy is active.",
+                      })
+                    : t("codexConfig.trafficPolicy.unknownSafe", {
+                        defaultValue:
+                          "No capacity claim is known for this provider. Provider-specific 503 replay is disabled by default.",
+                      })}
+              </p>
+              <div className="grid gap-3 md:grid-cols-4">
+                <label className="flex items-center justify-between gap-3 rounded-md border border-border-default p-3 text-sm">
+                  <span>
+                    {t("codexConfig.trafficPolicy.limitConcurrency", {
+                      defaultValue: "Limit concurrency",
+                    })}
+                  </span>
+                  <Switch
+                    checked={resolvedTrafficPolicy.admissionEnabled}
+                    disabled={!codexTrafficPolicy}
+                    onCheckedChange={(checked) =>
+                      updateTrafficPolicy({ admissionEnabled: checked })
+                    }
+                    aria-label={t(
+                      "codexConfig.trafficPolicy.limitConcurrency",
+                      { defaultValue: "Limit concurrency" },
+                    )}
+                  />
+                </label>
+                <div className="space-y-1.5">
+                  <FormLabel htmlFor="codex-max-in-flight">
+                    {t("codexConfig.trafficPolicy.maxInFlight", {
+                      defaultValue: "Maximum in flight",
+                    })}
+                  </FormLabel>
+                  <Input
+                    id="codex-max-in-flight"
+                    type="number"
+                    min={1}
+                    max={64}
+                    disabled={
+                      !codexTrafficPolicy ||
+                      !resolvedTrafficPolicy.admissionEnabled
+                    }
+                    value={resolvedTrafficPolicy.maxInFlight}
+                    onChange={(event) =>
+                      updateTrafficPolicy({
+                        maxInFlight: Number(event.target.value),
+                      })
+                    }
+                  />
+                </div>
+                <div className="space-y-1.5">
+                  <FormLabel htmlFor="codex-max-queue-wait">
+                    {t("codexConfig.trafficPolicy.maxQueueWait", {
+                      defaultValue: "Maximum queue wait (ms)",
+                    })}
+                  </FormLabel>
+                  <Input
+                    id="codex-max-queue-wait"
+                    type="number"
+                    min={100}
+                    max={300000}
+                    disabled={
+                      !codexTrafficPolicy ||
+                      !resolvedTrafficPolicy.admissionEnabled
+                    }
+                    value={resolvedTrafficPolicy.maxQueueWaitMs}
+                    onChange={(event) =>
+                      updateTrafficPolicy({
+                        maxQueueWaitMs: Number(event.target.value),
+                      })
+                    }
+                  />
+                </div>
+                <div className="space-y-1.5">
+                  <FormLabel htmlFor="codex-rate-limit-retries">
+                    {t("codexConfig.trafficPolicy.rateLimitRetries", {
+                      defaultValue: "429 retries",
+                    })}
+                  </FormLabel>
+                  <Input
+                    id="codex-rate-limit-retries"
+                    type="number"
+                    min={0}
+                    max={5}
+                    disabled={!codexTrafficPolicy}
+                    value={resolvedTrafficPolicy.rateLimitMaxRetries}
+                    onChange={(event) =>
+                      updateTrafficPolicy({
+                        rateLimitMaxRetries: Number(event.target.value),
+                      })
+                    }
+                  />
+                </div>
+              </div>
+              <div className="grid gap-3 md:grid-cols-4">
+                <div className="space-y-1.5">
+                  <FormLabel htmlFor="codex-rejection-retry-mode">
+                    {t("codexConfig.trafficPolicy.rejectionMode", {
+                      defaultValue: "Recognized rejection retry",
+                    })}
+                  </FormLabel>
+                  <Select
+                    disabled={!codexTrafficPolicy}
+                    value={resolvedTrafficPolicy.rejectionRetryMode}
+                    onValueChange={(value) =>
+                      updateTrafficPolicy({
+                        rejectionRetryMode:
+                          value as CodexTrafficPolicy["rejectionRetryMode"],
+                      })
+                    }
+                  >
+                    <SelectTrigger id="codex-rejection-retry-mode">
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="disabled">
+                        {t("codexConfig.trafficPolicy.disabled", {
+                          defaultValue: "Disabled",
+                        })}
+                      </SelectItem>
+                      <SelectItem value="opencode_endpoint_unavailable">
+                        {t("codexConfig.trafficPolicy.opencodeSignature", {
+                          defaultValue: "OpenCode endpoint unavailable only",
+                        })}
+                      </SelectItem>
+                    </SelectContent>
+                  </Select>
+                </div>
+                <div className="space-y-1.5">
+                  <FormLabel htmlFor="codex-rejection-retries">
+                    {t("codexConfig.trafficPolicy.rejectionRetries", {
+                      defaultValue: "Rejection retries",
+                    })}
+                  </FormLabel>
+                  <Input
+                    id="codex-rejection-retries"
+                    type="number"
+                    min={0}
+                    max={5}
+                    disabled={
+                      !codexTrafficPolicy ||
+                      resolvedTrafficPolicy.rejectionRetryMode === "disabled"
+                    }
+                    value={resolvedTrafficPolicy.rejectionMaxRetries}
+                    onChange={(event) =>
+                      updateTrafficPolicy({
+                        rejectionMaxRetries: Number(event.target.value),
+                      })
+                    }
+                  />
+                </div>
+                <div className="space-y-1.5">
+                  <FormLabel htmlFor="codex-rejection-delay">
+                    {t("codexConfig.trafficPolicy.initialDelay", {
+                      defaultValue: "Initial delay (ms)",
+                    })}
+                  </FormLabel>
+                  <Input
+                    id="codex-rejection-delay"
+                    type="number"
+                    min={100}
+                    max={60000}
+                    disabled={
+                      !codexTrafficPolicy ||
+                      resolvedTrafficPolicy.rejectionRetryMode === "disabled"
+                    }
+                    value={resolvedTrafficPolicy.rejectionInitialDelayMs}
+                    onChange={(event) =>
+                      updateTrafficPolicy({
+                        rejectionInitialDelayMs: Number(event.target.value),
+                      })
+                    }
+                  />
+                </div>
+                <div className="space-y-1.5">
+                  <FormLabel htmlFor="codex-rejection-max-delay">
+                    {t("codexConfig.trafficPolicy.maxDelay", {
+                      defaultValue: "Maximum delay (ms)",
+                    })}
+                  </FormLabel>
+                  <Input
+                    id="codex-rejection-max-delay"
+                    type="number"
+                    min={100}
+                    max={60000}
+                    disabled={
+                      !codexTrafficPolicy ||
+                      resolvedTrafficPolicy.rejectionRetryMode === "disabled"
+                    }
+                    value={resolvedTrafficPolicy.rejectionMaxDelayMs}
+                    onChange={(event) =>
+                      updateTrafficPolicy({
+                        rejectionMaxDelayMs: Number(event.target.value),
+                      })
+                    }
+                  />
+                </div>
+              </div>
+              <p className="text-xs leading-relaxed text-amber-700 dark:text-amber-300">
+                {t("codexConfig.trafficPolicy.safetyWarning", {
+                  defaultValue:
+                    "Do not enable the OpenCode rejection signature for unrelated providers unless they guarantee the same pre-inference rejection semantics. Arbitrary 5xx responses are never retried.",
+                })}
+              </p>
+            </section>
             {/* 上游格式与协议探测沿用 shouldShowSpeedTest 门控，
                 cloud_provider 保持不可切换；xAI OAuth 托管预设格式固定为 Responses。 */}
             {shouldShowSpeedTest && !isXaiOauthPreset && (
@@ -2465,7 +3330,10 @@ export function CodexFormFields({
                     </div>
                   )}
                   <div className="rounded-md border border-amber-500/30 bg-amber-500/10 p-3 text-xs leading-relaxed text-amber-900 dark:text-amber-200">
-                    上游格式通常由维护预设或主流程的连接验证确定。只有自动识别不正确时才在这里手动覆盖；验证会发送真实模型请求，可能产生少量额度或流量消耗。
+                    {i18n.t("codexForm.upstreamFormatManualHint", {
+                      defaultValue:
+                        "上游格式通常由维护预设或主流程的连接验证确定。只有自动识别不正确时才在这里手动覆盖；验证会发送真实模型请求，可能产生少量额度或流量消耗。",
+                    })}
                   </div>
                 </div>
               </div>
@@ -2483,13 +3351,17 @@ export function CodexFormFields({
                   )}
                 >
                   <summary className="cursor-pointer text-sm font-medium text-foreground">
-                    旧版兼容兜底
+                    {i18n.t("codexForm.legacyFallbackTitle", {
+                      defaultValue: "旧版兼容兜底",
+                    })}
                   </summary>
                   <div className="space-y-3 pt-2">
                     <div className="space-y-1">
                       <p className="text-xs leading-relaxed text-muted-foreground">
-                        这是一份旧 Provider
-                        级推理配置：它会影响所有未单独配置模型推理能力的模型。请优先使用上方“模型推理能力”为每个模型声明能力；这里只保留对既有配置的兼容编辑。
+                        {i18n.t("codexForm.legacyFallbackDesc", {
+                          defaultValue:
+                            "这是一份旧 Provider 级推理配置：它会影响所有未单独配置模型推理能力的模型。请优先使用上方“模型推理能力”为每个模型声明能力；这里只保留对既有配置的兼容编辑。",
+                        })}
                       </p>
                     </div>
                     <div className="flex items-center justify-between gap-4">
@@ -2500,8 +3372,10 @@ export function CodexFormFields({
                           })}
                         </FormLabel>
                         <p className="text-xs leading-relaxed text-muted-foreground">
-                          旧配置：为没有模型级声明的 Chat 模型启用 thinking
-                          开关。
+                          {i18n.t("codexForm.legacyThinkingDesc", {
+                            defaultValue:
+                              "旧配置：为没有模型级声明的 Chat 模型启用 thinking 开关。",
+                          })}
                         </p>
                       </div>
                       <Switch
@@ -2520,8 +3394,10 @@ export function CodexFormFields({
                           })}
                         </FormLabel>
                         <p className="text-xs leading-relaxed text-muted-foreground">
-                          旧配置：为没有模型级声明的 Chat 模型启用 effort
-                          参数转换。
+                          {i18n.t("codexForm.legacyEffortDesc", {
+                            defaultValue:
+                              "旧配置：为没有模型级声明的 Chat 模型启用 effort 参数转换。",
+                          })}
                         </p>
                       </div>
                       <Switch
@@ -2571,6 +3447,108 @@ export function CodexFormFields({
                         "这里保存候选模型、真实上游模型和上下文窗口。开启“在 Codex /model 菜单中显示”后，菜单显示名和上游模型名才会参与 Codex 菜单映射；关闭时仍会作为目录元数据保存。",
                     })}
                   </p>
+                  {catalogRows.length > 0 && (
+                    <div className="space-y-2">
+                      <div className="flex flex-col gap-2 rounded-md border border-border-default bg-background/60 p-2 sm:flex-row sm:items-center">
+                        <Input
+                          value={catalogSearch}
+                          onChange={(event) =>
+                            setCatalogSearch(event.target.value)
+                          }
+                          placeholder={t(
+                            "codexConfig.catalogSearchPlaceholder",
+                            {
+                              defaultValue: "Search models",
+                            },
+                          )}
+                          className="h-8 sm:max-w-xs"
+                          aria-label={t("codexConfig.catalogSearchLabel", {
+                            defaultValue: "Filter model catalog",
+                          })}
+                        />
+                        <div
+                          className="inline-flex overflow-hidden rounded-md border"
+                          role="group"
+                          aria-label={t(
+                            "codexConfig.catalogStatusFilterLabel",
+                            {
+                              defaultValue: "Filter by inclusion status",
+                            },
+                          )}
+                        >
+                          {(["all", "included", "excluded"] as const).map(
+                            (value) => (
+                              <Button
+                                key={value}
+                                type="button"
+                                size="sm"
+                                variant={
+                                  catalogVisibility === value
+                                    ? "default"
+                                    : "ghost"
+                                }
+                                aria-pressed={catalogVisibility === value}
+                                onClick={() => setCatalogVisibility(value)}
+                              >
+                                {value === "all"
+                                  ? t("codexConfig.catalogFilterAll", {
+                                      count: catalogRows.length,
+                                      defaultValue: "All {{count}}",
+                                    })
+                                  : value === "included"
+                                    ? t("codexConfig.catalogFilterIncluded", {
+                                        count: catalogRows.filter(
+                                          (row) => row.enabled !== false,
+                                        ).length,
+                                        defaultValue: "Included {{count}}",
+                                      })
+                                    : t("codexConfig.catalogFilterExcluded", {
+                                        count: catalogRows.filter(
+                                          (row) => row.enabled === false,
+                                        ).length,
+                                        defaultValue: "Excluded {{count}}",
+                                      })}
+                              </Button>
+                            ),
+                          )}
+                        </div>
+                        <div className="flex flex-wrap gap-1 sm:ml-auto">
+                          <Button
+                            type="button"
+                            size="sm"
+                            variant="outline"
+                            disabled={visibleCatalogRows.length === 0}
+                            onClick={() =>
+                              setCatalogRowsEnabled(
+                                visibleCatalogRows.map(({ index }) => index),
+                                true,
+                              )
+                            }
+                          >
+                            {t("codexConfig.catalogIncludeFiltered", {
+                              defaultValue: "Include Filtered",
+                            })}
+                          </Button>
+                          <Button
+                            type="button"
+                            size="sm"
+                            variant="outline"
+                            disabled={visibleCatalogRows.length === 0}
+                            onClick={() =>
+                              setCatalogRowsEnabled(
+                                visibleCatalogRows.map(({ index }) => index),
+                                false,
+                              )
+                            }
+                          >
+                            {t("codexConfig.catalogExcludeFiltered", {
+                              defaultValue: "Exclude Filtered",
+                            })}
+                          </Button>
+                        </div>
+                      </div>
+                    </div>
+                  )}
                 </div>
 
                 {catalogRows.length > 0 && (
@@ -2579,7 +3557,7 @@ export function CodexFormFields({
                     <div className="hidden grid-cols-[88px_1fr_1fr_1fr_132px_76px_36px] gap-2 px-1 text-xs font-medium text-muted-foreground md:grid">
                       <span>
                         {t("codexConfig.keepCatalogModelColumn", {
-                          defaultValue: "保留",
+                          defaultValue: "Included",
                         })}
                       </span>
                       <span>
@@ -2610,7 +3588,7 @@ export function CodexFormFields({
                       <span />
                     </div>
 
-                    {catalogRows.map((row, index) => {
+                    {visibleCatalogRows.map(({ row, index }) => {
                       const model = row.model.trim();
                       const probeModel = catalogRowUpstreamModel(row) || model;
                       const presetCatalogModel =
@@ -2640,20 +3618,21 @@ export function CodexFormFields({
                             <input
                               type="checkbox"
                               className="h-4 w-4 rounded border-border-default"
-                              checked
-                              onChange={(event) => {
-                                if (!event.target.checked) {
-                                  handleRemoveCatalogRow(index);
-                                }
-                              }}
+                              checked={row.enabled !== false}
+                              onChange={(event) =>
+                                setCatalogRowsEnabled(
+                                  [index],
+                                  event.target.checked,
+                                )
+                              }
                               aria-label={t("codexConfig.keepCatalogModel", {
-                                model: row.model || row.displayName || "",
-                                defaultValue: `保留 ${row.model || row.displayName || "这个模型"}`,
+                                model: row.model || row.displayName || "model",
+                                defaultValue: `Include ${row.model || row.displayName || "model"}`,
                               })}
                             />
                             <span className="md:hidden">
                               {t("codexConfig.keepCatalogModelColumn", {
-                                defaultValue: "保留",
+                                defaultValue: "Included",
                               })}
                             </span>
                           </label>
@@ -2805,15 +3784,37 @@ export function CodexFormFields({
                           </Button>
                           <fieldset
                             className="col-span-full flex flex-wrap items-center gap-2 border-t border-border-default pt-2 text-xs"
-                            aria-label={`${model || "模型"} 输入能力`}
+                            aria-label={i18n.t(
+                              "codexForm.inputCapabilityAria",
+                              {
+                                defaultValue: "{{model}} 输入能力",
+                                model:
+                                  model ||
+                                  i18n.t("codexForm.modelFallback", {
+                                    defaultValue: "模型",
+                                  }),
+                              },
+                            )}
                           >
                             <legend className="mr-1 font-medium">
-                              输入能力
+                              {i18n.t("codexForm.inputCapabilityLabel", {
+                                defaultValue: "输入能力",
+                              })}
                             </legend>
                             <div
                               className="inline-flex overflow-hidden rounded-md border"
                               role="radiogroup"
-                              aria-label={`${model || "模型"} 输入能力选择`}
+                              aria-label={i18n.t(
+                                "codexForm.inputCapabilitySelectAria",
+                                {
+                                  defaultValue: "{{model}} 输入能力选择",
+                                  model:
+                                    model ||
+                                    i18n.t("codexForm.modelFallback", {
+                                      defaultValue: "模型",
+                                    }),
+                                },
+                              )}
                             >
                               <Button
                                 type="button"
@@ -2821,7 +3822,14 @@ export function CodexFormFields({
                                 variant={supportsImage ? "default" : "ghost"}
                                 className="rounded-none"
                                 aria-pressed={supportsImage}
-                                aria-label={`${model || "模型"} 文本与图像`}
+                                aria-label={i18n.t("codexForm.textImageAria", {
+                                  defaultValue: "{{model}} 文本与图像",
+                                  model:
+                                    model ||
+                                    i18n.t("codexForm.modelFallback", {
+                                      defaultValue: "模型",
+                                    }),
+                                })}
                                 onClick={() =>
                                   handleUpdateCatalogRow(
                                     index,
@@ -2829,7 +3837,9 @@ export function CodexFormFields({
                                   )
                                 }
                               >
-                                文本与图像
+                                {i18n.t("codexForm.textAndImageLabel", {
+                                  defaultValue: "文本与图像",
+                                })}
                               </Button>
                               <Button
                                 type="button"
@@ -2837,7 +3847,14 @@ export function CodexFormFields({
                                 variant={!supportsImage ? "default" : "ghost"}
                                 className="rounded-none border-l"
                                 aria-pressed={!supportsImage}
-                                aria-label={`${model || "模型"} 仅文本`}
+                                aria-label={i18n.t("codexForm.textOnlyAria", {
+                                  defaultValue: "{{model}} 仅文本",
+                                  model:
+                                    model ||
+                                    i18n.t("codexForm.modelFallback", {
+                                      defaultValue: "模型",
+                                    }),
+                                })}
                                 onClick={() =>
                                   handleUpdateCatalogRow(
                                     index,
@@ -2845,11 +3862,16 @@ export function CodexFormFields({
                                   )
                                 }
                               >
-                                仅文本
+                                {i18n.t("codexForm.textOnlyLabel", {
+                                  defaultValue: "仅文本",
+                                })}
                               </Button>
                             </div>
                             <span className="text-muted-foreground">
-                              保存后覆盖当前 Provider 的预设，不需要等待发布。
+                              {i18n.t("codexForm.presetOverrideHint", {
+                                defaultValue:
+                                  "保存后覆盖当前 Provider 的预设，不需要等待发布。",
+                              })}
                             </span>
                             {presetDeclaresInputCapability &&
                             presetCatalogModel ? (
@@ -2857,7 +3879,18 @@ export function CodexFormFields({
                                 type="button"
                                 variant="ghost"
                                 size="sm"
-                                aria-label={`${model || "模型"} 恢复 CCSM 输入能力预设`}
+                                aria-label={i18n.t(
+                                  "codexForm.restorePresetAria",
+                                  {
+                                    defaultValue:
+                                      "{{model}} 恢复 CCSM 输入能力预设",
+                                    model:
+                                      model ||
+                                      i18n.t("codexForm.modelFallback", {
+                                        defaultValue: "模型",
+                                      }),
+                                  },
+                                )}
                                 onClick={() =>
                                   handleUpdateCatalogRow(
                                     index,
@@ -2867,7 +3900,9 @@ export function CodexFormFields({
                                   )
                                 }
                               >
-                                恢复 CCSM 预设
+                                {i18n.t("codexForm.restoreCcsmPreset", {
+                                  defaultValue: "恢复 CCSM 预设",
+                                })}
                               </Button>
                             ) : null}
                           </fieldset>

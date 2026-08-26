@@ -1,4 +1,6 @@
 import { Button } from "@/components/ui/button";
+import { useTranslation } from "react-i18next";
+import i18n from "@/i18n";
 import type {
   CodexModelReasoningResolution,
   CodexReasoningControlKind,
@@ -10,27 +12,36 @@ import type {
  * 同源），以及 unknown 状态下的动作。
  *
  * 设计原则：
- * - 只读展示 resolved 结果，不在此处编辑（编辑走下方既有手动声明 UI）。
+ * - 只读展示 resolved 结果，不在此处编辑（编辑走下方既有{t("codexReasoning.manualDeclare", { defaultValue: "手动声明" })} UI）。
  * - 具体模型只显示其 resolved capability 的子集，不因公共词表存在就宣称全部支持。
- * - unknown 状态默认「使用服务端默认」，并提供重新检测 / 采用检测结果 /
- *   手动声明 / 恢复内置值 动作。
+ * - unknown 状态默认「使用服务端默认」，并提供重新检测 / {t("codexReasoning.adoptDetection", { defaultValue: "采用检测结果" })} /
+ *   手动声明 / {t("codexReasoning.restoreBuiltin", { defaultValue: "恢复内置值" })} 动作。
  */
 
-const CONTROL_KIND_LABEL: Record<CodexReasoningControlKind, string> = {
-  none: "无控制",
-  boolean: "布尔开关",
-  graded: "分档 effort",
-  budget: "token 预算",
-  unknown: "未知",
+const CONTROL_KIND_KEY: Record<CodexReasoningControlKind, string> = {
+  none: "codexReasoning.controlKind.none",
+  boolean: "codexReasoning.controlKind.boolean",
+  graded: "codexReasoning.controlKind.graded",
+  budget: "codexReasoning.controlKind.budget",
+  unknown: "codexReasoning.controlKind.unknown",
 };
 
-const SOURCE_LABEL: Record<string, string> = {
+const SOURCE_DEFAULTS: Record<string, string> = {
   user: "用户声明",
   detection: "自动检测",
   library: "维护能力库",
   builtin: "内置预设",
   official: "官方模型",
   unknown: "未知",
+};
+
+const SOURCE_KEY: Record<string, string> = {
+  user: "codexReasoning.source.user",
+  detection: "codexReasoning.source.detection",
+  library: "codexReasoning.source.library",
+  builtin: "codexReasoning.source.builtin",
+  official: "codexReasoning.source.official",
+  unknown: "codexReasoning.source.unknown",
 };
 
 export type CodexReasoningCardStatus = "supported" | "unsupported" | "unknown";
@@ -56,12 +67,11 @@ export function reasoningCardStatus(
   }
 }
 
-export const REASONING_STATUS_LABEL: Record<CodexReasoningCardStatus, string> =
-  {
-    supported: "支持推理",
-    unsupported: "不支持推理",
-    unknown: "未知（使用服务端默认）",
-  };
+const REASONING_STATUS_KEY: Record<CodexReasoningCardStatus, string> = {
+  supported: "codexReasoning.status.supported",
+  unsupported: "codexReasoning.status.unsupported",
+  unknown: "codexReasoning.status.unknown",
+};
 
 /** 控制类型：优先用声明的 controlKind，否则由 resolved.supportKind 推导。 */
 export function reasoningControlKind(
@@ -89,20 +99,46 @@ export function describeFinalBehavior(
   const parameter = resolution.capability?.upstream?.parameter;
   switch (resolved.supportKind) {
     case "effort_levels": {
-      const selectable = resolved.codexSelectableEfforts.join(" / ") || "无";
-      const def = resolved.providerDefaultEffort ?? "模型默认";
-      const param = parameter ? `（参数 ${parameter}）` : "";
-      return `按档位发送 reasoning effort${param}；Codex 可选：${selectable}；默认：${def}。`;
+      const selectable =
+        resolved.codexSelectableEfforts.join(" / ") ||
+        i18n.t("codexReasoning.effortNone", { defaultValue: "无" });
+      const def =
+        resolved.providerDefaultEffort ??
+        i18n.t("codexReasoning.modelDefault", { defaultValue: "模型默认" });
+      const param = parameter
+        ? i18n.t("codexReasoning.finalBehavior.param", {
+            parameter,
+            defaultValue: `（参数 ${parameter}）`,
+          })
+        : "";
+      return i18n.t("codexReasoning.finalBehavior.effortLevels", {
+        param,
+        selectable,
+        def,
+        defaultValue: `按档位发送 reasoning effort${param}；Codex 可选：${selectable}；默认：${def}。`,
+      });
     }
     case "boolean_only": {
-      const param = parameter ? `（参数 ${parameter}）` : "";
-      return `发送布尔开关${param}，不区分档位。`;
+      const param = parameter
+        ? i18n.t("codexReasoning.finalBehavior.param", {
+            parameter,
+            defaultValue: `（参数 ${parameter}）`,
+          })
+        : "";
+      return i18n.t("codexReasoning.finalBehavior.booleanOnly", {
+        param,
+        defaultValue: `发送布尔开关${param}，不区分档位。`,
+      });
     }
     case "unsupported":
-      return "不发送推理参数（模型不支持推理）。";
+      return i18n.t("codexReasoning.finalBehavior.unsupported", {
+        defaultValue: "不发送推理参数（模型不支持推理）。",
+      });
     case "unknown":
     default:
-      return "使用服务端默认（不发送推理参数）。";
+      return i18n.t("codexReasoning.finalBehavior.serverDefault", {
+        defaultValue: "使用服务端默认（不发送推理参数）。",
+      });
   }
 }
 
@@ -116,7 +152,12 @@ function formatFetchedAt(ms: number): string {
 }
 
 function EffortList({ efforts }: { efforts: string[] }) {
-  if (!efforts.length) return <span className="text-muted-foreground">无</span>;
+  if (!efforts.length)
+    return (
+      <span className="text-muted-foreground">
+        <TranslationText k="codexReasoning.effortNone" fallback="无" />
+      </span>
+    );
   return (
     <span className="flex flex-wrap gap-1">
       {efforts.map((e) => (
@@ -129,6 +170,11 @@ function EffortList({ efforts }: { efforts: string[] }) {
       ))}
     </span>
   );
+}
+
+function TranslationText({ k, fallback }: { k: string; fallback: string }) {
+  const { t } = useTranslation();
+  return <>{t(k, { defaultValue: fallback })}</>;
 }
 
 function Field({
@@ -169,6 +215,7 @@ export function CodexModelReasoningCard({
   onCustomizeEffective,
   onRestoreBuiltin,
 }: CodexModelReasoningCardProps) {
+  const { t } = useTranslation();
   const status = reasoningCardStatus(resolution);
   const controlKind = reasoningControlKind(resolution);
   const { resolved, detection } = resolution;
@@ -177,7 +224,9 @@ export function CodexModelReasoningCard({
   return (
     <div className="space-y-3 rounded-md border bg-muted/30 p-3">
       <div className="flex items-center justify-between gap-2">
-        <span className="font-medium">最终生效能力</span>
+        <span className="font-medium">
+          {t("codexReasoning.title", { defaultValue: "最终生效能力" })}
+        </span>
         <span
           className={
             "rounded-full px-2 py-0.5 text-[11px] " +
@@ -188,46 +237,119 @@ export function CodexModelReasoningCard({
                 : "bg-amber-500/15 text-amber-600 dark:text-amber-400")
           }
         >
-          {REASONING_STATUS_LABEL[status]}
+          {t(REASONING_STATUS_KEY[status], {
+            defaultValue:
+              status === "supported"
+                ? "支持推理"
+                : status === "unsupported"
+                  ? "不支持推理"
+                  : "未知（使用服务端默认）",
+          })}
         </span>
       </div>
 
       <dl className="grid grid-cols-1 gap-2 sm:grid-cols-2">
-        <Field label="控制类型">{CONTROL_KIND_LABEL[controlKind]}</Field>
-        <Field label="能力来源">
-          {SOURCE_LABEL[resolution.source] ?? resolution.source}
+        <Field
+          label={t("codexReasoning.field.controlType", {
+            defaultValue: "控制类型",
+          })}
+        >
+          {t(CONTROL_KIND_KEY[controlKind], {
+            defaultValue:
+              controlKind === "none"
+                ? "无控制"
+                : controlKind === "boolean"
+                  ? "布尔开关"
+                  : controlKind === "graded"
+                    ? "分档 effort"
+                    : controlKind === "budget"
+                      ? "token 预算"
+                      : "未知",
+          })}
         </Field>
-        <Field label="能力指纹">
+        <Field
+          label={t("codexReasoning.field.source", {
+            defaultValue: "能力来源",
+          })}
+        >
+          {SOURCE_KEY[resolution.source]
+            ? t(SOURCE_KEY[resolution.source], {
+                defaultValue:
+                  SOURCE_DEFAULTS[resolution.source] ?? resolution.source,
+              })
+            : resolution.source}
+        </Field>
+        <Field
+          label={t("codexReasoning.field.fingerprint", {
+            defaultValue: "能力指纹",
+          })}
+        >
           <code
             className="font-mono text-[11px]"
-            title={resolution.fingerprint || "未生成"}
+            title={
+              resolution.fingerprint ||
+              t("codexReasoning.fingerprintNone", {
+                defaultValue: "未生成",
+              })
+            }
           >
             {resolution.fingerprint
               ? `${resolution.fingerprint.slice(0, 16)}…`
-              : "未生成（未知能力）"}
+              : t("codexReasoning.fingerprintUnknown", {
+                  defaultValue: "未生成（未知能力）",
+                })}
           </code>
         </Field>
         {detection ? (
-          <Field label="核验时间">
+          <Field
+            label={t("codexReasoning.field.verifiedAt", {
+              defaultValue: "核验时间",
+            })}
+          >
             {formatFetchedAt(detection.fetchedAt)}
             <span className="ml-1 text-muted-foreground">
               （{detection.source}）
             </span>
           </Field>
         ) : null}
-        <Field label="Provider 原生档位">
+        <Field
+          label={t("codexReasoning.field.providerEfforts", {
+            defaultValue: "Provider 原生档位",
+          })}
+        >
           <EffortList efforts={resolved.providerAcceptedEfforts} />
         </Field>
-        <Field label="Codex 可选档位">
+        <Field
+          label={t("codexReasoning.field.codexEfforts", {
+            defaultValue: "Codex 可选档位",
+          })}
+        >
           <EffortList efforts={resolved.codexSelectableEfforts} />
         </Field>
-        <Field label="默认值">
-          {resolved.providerDefaultEffort ?? "模型默认"}
+        <Field
+          label={t("codexReasoning.field.defaultValue", {
+            defaultValue: "默认值",
+          })}
+        >
+          {resolved.providerDefaultEffort ??
+            t("codexReasoning.modelDefault", { defaultValue: "模型默认" })}
         </Field>
-        <Field label="关闭能力">
-          {resolved.disableAllowed ? "可关闭（none）" : "不可关闭"}
+        <Field
+          label={t("codexReasoning.field.disable", {
+            defaultValue: "关闭能力",
+          })}
+        >
+          {resolved.disableAllowed
+            ? t("codexReasoning.disableAllowed", {
+                defaultValue: "可关闭（none）",
+              })
+            : t("codexReasoning.disableNotAllowed", {
+                defaultValue: "不可关闭",
+              })}
         </Field>
-        <Field label="映射">
+        <Field
+          label={t("codexReasoning.field.mapping", { defaultValue: "映射" })}
+        >
           {Object.keys(resolved.effortMap).length ? (
             <span className="font-mono text-[11px]">
               {Object.entries(resolved.effortMap)
@@ -235,21 +357,27 @@ export function CodexModelReasoningCard({
                 .join("，")}
             </span>
           ) : (
-            <span className="text-muted-foreground">恒等</span>
+            <span className="text-muted-foreground">
+              {t("codexReasoning.mappingIdentity", { defaultValue: "恒等" })}
+            </span>
           )}
         </Field>
       </dl>
 
       <div className="rounded-md border bg-background p-2">
-        <div className="text-muted-foreground">最终行为</div>
+        <div className="text-muted-foreground">
+          {t("codexReasoning.finalBehaviorTitle", { defaultValue: "最终行为" })}
+        </div>
         <div>{describeFinalBehavior(resolution)}</div>
       </div>
 
       {onCustomizeEffective ? (
         <div className="flex flex-wrap items-center justify-between gap-2 rounded-md border border-primary/30 bg-primary/5 p-2">
           <p className="text-muted-foreground">
-            当前是自动发现的结果，会随来源变化。需要调整 Provider
-            能力或档位映射时可创建用户覆盖。
+            {t("codexReasoning.customizeHint", {
+              defaultValue:
+                "当前是自动发现的结果，会随来源变化。需要调整 Provider 能力或档位映射时可创建用户覆盖。",
+            })}
           </p>
           <Button
             type="button"
@@ -257,7 +385,9 @@ export function CodexModelReasoningCard({
             size="sm"
             onClick={onCustomizeEffective}
           >
-            按当前结果自定义
+            {t("codexReasoning.customizeButton", {
+              defaultValue: "按当前结果自定义",
+            })}
           </Button>
         </div>
       ) : null}
@@ -265,7 +395,10 @@ export function CodexModelReasoningCard({
       {isUnknown ? (
         <div className="space-y-2">
           <p className="text-muted-foreground">
-            当前未读到该模型的推理能力声明，默认使用服务端默认。可执行以下动作：
+            {t("codexReasoning.unknownHint", {
+              defaultValue:
+                "当前未读到该模型的推理能力声明，默认使用服务端默认。可执行以下动作：",
+            })}
           </p>
           <div className="flex flex-wrap gap-2">
             <Button
@@ -275,7 +408,9 @@ export function CodexModelReasoningCard({
               onClick={onRedetect}
               disabled={redetecting}
             >
-              {redetecting ? "检测中…" : "重新检测"}
+              {redetecting
+                ? t("codexReasoning.redetecting", { defaultValue: "检测中…" })
+                : t("codexReasoning.redetect", { defaultValue: "重新检测" })}
             </Button>
             {resolution.hasDetectionCandidate ? (
               <Button
@@ -284,7 +419,9 @@ export function CodexModelReasoningCard({
                 size="sm"
                 onClick={onAdoptDetection}
               >
-                采用检测结果
+                {t("codexReasoning.adoptDetection", {
+                  defaultValue: "采用检测结果",
+                })}
               </Button>
             ) : null}
             <Button
@@ -293,7 +430,7 @@ export function CodexModelReasoningCard({
               size="sm"
               onClick={onManualDeclare}
             >
-              手动声明
+              {t("codexReasoning.manualDeclare", { defaultValue: "手动声明" })}
             </Button>
             {hasBuiltinPreset ? (
               <Button
@@ -302,7 +439,9 @@ export function CodexModelReasoningCard({
                 size="sm"
                 onClick={onRestoreBuiltin}
               >
-                恢复内置值
+                {t("codexReasoning.restoreBuiltin", {
+                  defaultValue: "恢复内置值",
+                })}
               </Button>
             ) : null}
           </div>

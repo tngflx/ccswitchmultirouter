@@ -1,6 +1,7 @@
 import { Button } from "@/components/ui/button";
 import type { CodexReasoningEffort } from "@/types";
 import { useState } from "react";
+import { useTranslation } from "react-i18next";
 
 export interface CodexModelReasoningSummaryProps {
   model: string;
@@ -30,7 +31,9 @@ export function CodexModelReasoningSummary({
   expanded,
   onToggle,
 }: CodexModelReasoningSummaryProps) {
-  const displayModel = model || "未命名模型";
+  const { t } = useTranslation();
+  const displayModel =
+    model || t("codexReasoning.unnamedModel", { defaultValue: "未命名模型" });
   const [requestedUltraSetup, setRequestedUltraSetup] = useState(false);
 
   return (
@@ -39,12 +42,27 @@ export function CodexModelReasoningSummary({
         <p className="font-medium text-foreground">{displayModel}</p>
       </div>
       <div className="space-y-1 border-t pt-3 lg:border-l lg:border-t-0 lg:pl-3 lg:pt-0">
-        <p className="text-muted-foreground">能力来源：{source}</p>
         <p className="text-muted-foreground">
-          Codex 档位：{selectableEfforts.join(" / ") || "未声明"}
+          {t("codexReasoning.summarySource", {
+            source,
+            defaultValue: `能力来源：${source}`,
+          })}
         </p>
         <p className="text-muted-foreground">
-          默认值：{defaultEffort ?? "模型默认"}
+          {t("codexReasoning.summaryEfforts", {
+            efforts:
+              selectableEfforts.join(" / ") ||
+              t("codexReasoning.undeclared", { defaultValue: "未声明" }),
+            defaultValue: `Codex 档位：${selectableEfforts.join(" / ")}`,
+          })}
+        </p>
+        <p className="text-muted-foreground">
+          {t("codexReasoning.summaryDefaultValue", {
+            value:
+              defaultEffort ??
+              t("codexReasoning.modelDefault", { defaultValue: "模型默认" }),
+            defaultValue: `默认值：${defaultEffort ?? "模型默认"}`,
+          })}
         </p>
       </div>
       <div className="space-y-1 border-t pt-3 lg:border-l lg:border-t-0 lg:pl-3 lg:pt-0">
@@ -52,7 +70,10 @@ export function CodexModelReasoningSummary({
         <label className="flex items-center gap-2 font-medium">
           <input
             type="checkbox"
-            aria-label={`解锁 ${displayModel} 的 Ultra 档`}
+            aria-label={t("codexReasoning.ariaUltraToggle", {
+              model: displayModel,
+              defaultValue: `解锁 ${displayModel} 的 Ultra 档`,
+            })}
             checked={ultraEnabled}
             onChange={(event) => {
               setRequestedUltraSetup(
@@ -71,11 +92,14 @@ export function CodexModelReasoningSummary({
               });
             }}
           />
-          解锁 Ultra 档
+          {t("codexReasoning.unlockUltra", { defaultValue: "解锁 Ultra 档" })}
         </label>
         <select
           className="w-full rounded border bg-background px-2 py-1"
-          aria-label={`${displayModel} Ultra 对应的 Provider 推理强度`}
+          aria-label={t("codexReasoning.ariaUltraSelect", {
+            model: displayModel,
+            defaultValue: `${displayModel} Ultra 对应的 Provider 推理强度`,
+          })}
           value={ultraEffort ?? ""}
           disabled={!ultraEnabled || ultraEfforts.length === 0}
           onChange={(event) =>
@@ -87,7 +111,11 @@ export function CodexModelReasoningSummary({
             })
           }
         >
-          <option value="">选择 Provider 强度…</option>
+          <option value="">
+            {t("codexReasoning.selectProviderEffort", {
+              defaultValue: "选择 Provider 强度…",
+            })}
+          </option>
           {ultraEfforts.map((effort) => (
             <option key={effort} value={effort}>
               {effort}
@@ -96,20 +124,42 @@ export function CodexModelReasoningSummary({
         </select>
         <p className="text-muted-foreground">
           {requestedUltraSetup || (ultraEnabled && ultraEfforts.length === 0)
-            ? "需要先确认该模型可接收的推理强度；已为你展开推理能力配置，完成后才能保存。"
+            ? t("codexReasoning.needSetup", {
+                defaultValue:
+                  "需要先确认该模型可接收的推理强度；已为你展开推理能力配置，完成后才能保存。",
+              })
             : ultraEnabled && ultraEffort
-              ? `已解锁，使用 ${ultraEffort}`
-              : "独立于能力来源；解锁后请选择强度"}
+              ? t("codexReasoning.unlockedUsing", {
+                  effort: ultraEffort,
+                  defaultValue: `已解锁，使用 ${ultraEffort}`,
+                })
+              : t("codexReasoning.independent", {
+                  defaultValue: "独立于能力来源；解锁后请选择强度",
+                })}
         </p>
       </div>
       <Button
         type="button"
         variant={expanded ? "secondary" : "outline"}
         size="sm"
-        aria-label={`${expanded ? "收起" : "配置"} ${displayModel} 的推理能力`}
+        aria-label={
+          expanded
+            ? t("codexReasoning.ariaCollapse", {
+                model: displayModel,
+                defaultValue: `收起 ${displayModel} 的推理能力`,
+              })
+            : t("codexReasoning.ariaConfigure", {
+                model: displayModel,
+                defaultValue: `配置 ${displayModel} 的推理能力`,
+              })
+        }
         onClick={onToggle}
       >
-        {expanded ? "收起配置" : "配置推理能力"}
+        {expanded
+          ? t("codexReasoning.collapseConfig", { defaultValue: "收起配置" })
+          : t("codexReasoning.configureCapability", {
+              defaultValue: "配置推理能力",
+            })}
       </Button>
     </div>
   );

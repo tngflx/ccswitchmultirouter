@@ -1,11 +1,21 @@
-import { describe, expect, it } from "vitest";
+import { beforeAll, describe, expect, it } from "vitest";
 import type { CodexModelReasoningResolution } from "@/types/codexSubagentV2";
+import i18n from "@/i18n";
+import zh from "@/i18n/locales/zh.json";
 
 import {
   describeFinalBehavior,
   reasoningCardStatus,
   reasoningControlKind,
 } from "./CodexModelReasoningCard";
+
+// 组件与 describeFinalBehavior 都依赖真实翻译资源；
+// 全局 setup 用空资源初始化 i18next，这里补挂真实 zh 资源。
+beforeAll(async () => {
+  // 全局 setup 已注册空 zh bundle，必须强制合并真实资源
+  i18n.addResourceBundle("zh", "translation", zh, true, true);
+  await i18n.changeLanguage("zh");
+});
 
 function resolution(
   supportKind: CodexModelReasoningResolution["resolved"]["supportKind"],

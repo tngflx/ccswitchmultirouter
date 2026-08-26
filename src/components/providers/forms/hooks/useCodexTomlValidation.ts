@@ -1,4 +1,5 @@
 import { useState, useCallback, useEffect, useRef } from "react";
+import { useTranslation } from "react-i18next";
 import TOML from "smol-toml";
 
 /**
@@ -6,6 +7,7 @@ import TOML from "smol-toml";
  * 使用 smol-toml 进行实时 TOML 语法校验（带 debounce）
  */
 export function useCodexTomlValidation() {
+  const { t } = useTranslation();
   const [configError, setConfigError] = useState("");
   const debounceTimerRef = useRef<NodeJS.Timeout | null>(null);
 
@@ -27,7 +29,7 @@ export function useCodexTomlValidation() {
       return true;
     } catch (error) {
       const errorMessage =
-        error instanceof Error ? error.message : "TOML 格式错误";
+        error instanceof Error ? error.message : t("codexForm.tomlFormatError");
       setConfigError(errorMessage);
       return false;
     }
