@@ -1,4 +1,6 @@
-//! Responses SSE 流中断的有界自动重连
+#![allow(dead_code)]
+
+//! Responses SSE stream reconnection with bounded and relentless modes
 //!
 //! forwarder 的语义预热（`validate_responses_stream_start`）只保护提交前的失败：
 //! 一旦上游发出第一个 productive 事件，响应就提交给下游客户端，此后上游掐断
@@ -76,6 +78,8 @@ pub(crate) type ConnectFn = Box<dyn Fn() -> ConnectFuture + Send + Sync>;
 pub struct StreamReconnector {
     connect: ConnectFn,
     first_byte_timeout: Duration,
+    /// `u32::MAX` enables relentless retries; all other values are bounded.
+    max_retries: u32,
 }
 
 /// 上游原生 Responses SSE 的最小排障关联信息。
@@ -94,7 +98,17 @@ impl StreamReconnector {
         Self {
             connect,
             first_byte_timeout,
+            max_retries: RESPONSES_STREAM_MAX_RETRIES,
         }
+    }
+
+    pub fn with_max_retries(mut self, max_retries: u32) -> Self {
+        self.max_retries = max_retries;
+        self
+    }
+
+    fn retry_limit(&self) -> u32 {
+        self.max_retries
     }
 
     async fn connect(&self) -> Result<ProxyResponse, ProxyError> {
@@ -471,6 +485,10 @@ pub(crate) fn create_resilient_responses_sse_stream_with_context(
             };
 
             loop {
+                let effective_max_retries = reconnector
+                    .as_ref()
+                    .map(StreamReconnector::retry_limit)
+                    .unwrap_or(RESPONSES_STREAM_MAX_RETRIES);
                 let Some(reconnector) = reconnector.as_ref() else {
                     let message = if semantic_output_forwarded {
                         "Upstream Responses SSE ended without a terminal event after semantic output"
@@ -484,7 +502,7 @@ pub(crate) fn create_resilient_responses_sse_stream_with_context(
                     ));
                     break 'attempts;
                 };
-                if attempt >= RESPONSES_STREAM_MAX_RETRIES {
+                if attempt >= effective_max_retries {
                     let message = "上游响应流在输出正文前反复中断，自动重连已耗尽，请检查网络或代理后重试";
                     log::error!(
                         "[Codex/Responses] stream failed after {attempt} reconnect attempt(s): {reason}; client_message={message}"
@@ -492,10 +510,16 @@ pub(crate) fn create_resilient_responses_sse_stream_with_context(
                     yield Ok(native_responses_transport_error_sse(message));
                     break 'attempts;
                 }
-                attempt += 1;
-                log::warn!(
-                    "[Codex/Responses] upstream stream dropped before semantic output ({reason}); reconnecting (attempt {attempt}/{RESPONSES_STREAM_MAX_RETRIES})"
-                );
+                attempt = attempt.saturating_add(1);
+                if effective_max_retries == u32::MAX {
+                    log::warn!(
+                        "[Codex/Responses] upstream stream dropped before semantic output ({reason}); reconnecting (relentless attempt {attempt})"
+                    );
+                } else {
+                    log::warn!(
+                        "[Codex/Responses] upstream stream dropped before semantic output ({reason}); reconnecting (attempt {attempt}/{effective_max_retries})"
+                    );
+                }
                 if created_forwarded {
                     yield Ok(Bytes::from_static(b": ping\n\n"));
                 }
@@ -643,6 +667,7 @@ pub fn create_resilient_anthropic_sse_stream_from_responses(
             return;
         };
 
+        let effective_max_retries = reconnector.retry_limit();
         let mut attempt: u32 = 0;
         let mut message_start_forwarded = false;
         let mut content_forwarded = false;
@@ -758,7 +783,7 @@ pub fn create_resilient_anthropic_sse_stream_from_responses(
             };
 
             loop {
-                if attempt >= RESPONSES_STREAM_MAX_RETRIES {
+                if attempt >= effective_max_retries {
                     log::error!(
                         "[Claude/Responses] stream failed after {attempt} reconnect attempt(s): {reason}"
                     );
@@ -770,10 +795,16 @@ pub fn create_resilient_anthropic_sse_stream_from_responses(
                     ));
                     break 'attempts;
                 }
-                attempt += 1;
-                log::warn!(
-                    "[Claude/Responses] upstream stream dropped before any content reached the client ({reason}); reconnecting (attempt {attempt}/{RESPONSES_STREAM_MAX_RETRIES})"
-                );
+                attempt = attempt.saturating_add(1);
+                if effective_max_retries == u32::MAX {
+                    log::warn!(
+                        "[Claude/Responses] upstream stream dropped before any content reached the client ({reason}); reconnecting (relentless attempt {attempt})"
+                    );
+                } else {
+                    log::warn!(
+                        "[Claude/Responses] upstream stream dropped before any content reached the client ({reason}); reconnecting (attempt {attempt}/{effective_max_retries})"
+                    );
+                }
                 if message_start_forwarded {
                     // 喂一下下游的空闲计时器（Anthropic 协议允许任意时刻出现 ping）。
                     yield Ok(anthropic_sse("ping", &json!({"type": "ping"})));
@@ -810,6 +841,380 @@ pub fn create_resilient_anthropic_sse_stream_from_responses(
                 }
             }
         }
+    }
+}
+
+/// Chat Completions SSE 的安全重连。
+///
+/// OpenCode/OpenAI-compatible 上游通常不提供 Responses SSE，而是返回
+/// Chat Completions SSE。该包装器在尚未向下游转发任何实质 Chat 内容前，
+/// 允许重新执行同一上游请求；role-only 首块视为协议脚手架，重连后只保留一次。
+pub(crate) fn create_resilient_chat_sse_stream_with_context(
+    initial: ByteStream,
+    reconnector: Option<StreamReconnector>,
+    log_context: Option<StreamLogContext>,
+) -> impl Stream<Item = Result<Bytes, std::io::Error>> + Send {
+    async_stream::stream! {
+        let mut attempt = 0;
+        let mut current = Some(initial);
+        let mut scaffold_forwarded = false;
+        let mut semantic_output_forwarded = false;
+
+        'attempts: loop {
+            let Some(mut stream) = current.take() else { break };
+            let mut buffer = BytesMut::new();
+            let mut silence = Duration::ZERO;
+            let mut failure: Option<(String, String)> = None;
+            let mut terminal = false;
+
+            loop {
+                let item = match tokio::time::timeout(KEEPALIVE_INTERVAL, stream.next()).await {
+                    Ok(item) => {
+                        silence = Duration::ZERO;
+                        item
+                    }
+                    Err(_) => {
+                        silence += KEEPALIVE_INTERVAL;
+                        if scaffold_forwarded && silence <= UPSTREAM_SILENCE_KEEPALIVE_LIMIT {
+                            yield Ok(Bytes::from_static(b": ping\n\n"));
+                        }
+                        continue;
+                    }
+                };
+
+                let Some(item) = item else {
+                    if !buffer.is_empty() {
+                        semantic_output_forwarded = true;
+                        yield Ok(buffer.split().freeze());
+                        failure = Some((
+                            "residual_before_terminal".to_string(),
+                            "upstream Chat Completions SSE ended with an unparsed residual block".to_string(),
+                        ));
+                    } else if !terminal && !semantic_output_forwarded {
+                        failure = Some((
+                            "premature_eof".to_string(),
+                            "upstream Chat Completions SSE ended before semantic output".to_string(),
+                        ));
+                    }
+                    break;
+                };
+
+                let chunk = match item {
+                    Ok(chunk) => chunk,
+                    Err(error) => {
+                        if semantic_output_forwarded {
+                            let message = native_responses_transport_error_message(&error);
+                            log::error!(
+                                "[Chat/Completions] upstream stream failed after semantic output: {}; client_message={message}",
+                                crate::proxy::error::error_chain_message(&error)
+                            );
+                            if let Some(context) = log_context.as_ref() {
+                                log_chat_stream_drop(
+                                    context,
+                                    "transport_error_after_semantic_output",
+                                    &crate::proxy::error::error_chain_message(&error),
+                                    attempt,
+                                );
+                            }
+                            yield Ok(chat_transport_error_sse(message));
+                            terminal = true;
+                        } else {
+                            failure = Some((
+                                "transport_error".to_string(),
+                                format!("upstream Chat Completions SSE transport error: {error}"),
+                            ));
+                        }
+                        break;
+                    }
+                };
+                buffer.extend_from_slice(&chunk);
+
+                while let Some(block) = take_raw_sse_block(&mut buffer) {
+                    match classify_chat_sse_block(&block) {
+                        ChatSseBlockDisposition::Ignore => {}
+                        ChatSseBlockDisposition::Comment => yield Ok(block),
+                        ChatSseBlockDisposition::Done => {
+                            terminal = true;
+                            yield Ok(block);
+                            break;
+                        }
+                        ChatSseBlockDisposition::Error => {
+                            if let Some(context) = log_context.as_ref() {
+                                log_chat_upstream_error(context, &block, attempt);
+                            }
+                            semantic_output_forwarded = true;
+                            terminal = true;
+                            yield Ok(block);
+                            break;
+                        }
+                        ChatSseBlockDisposition::Scaffold => {
+                            // role-only chunk 只用于建立流生命周期；重连后的重复首块必须抑制。
+                            if !scaffold_forwarded {
+                                scaffold_forwarded = true;
+                                yield Ok(block);
+                            }
+                        }
+                        ChatSseBlockDisposition::Semantic => {
+                            semantic_output_forwarded = true;
+                            yield Ok(block);
+                        }
+                    }
+                }
+
+                if failure.is_some() || terminal {
+                    break;
+                }
+            }
+
+            if terminal {
+                break 'attempts;
+            }
+
+            if let Some((reason_class, reason)) = failure {
+                if semantic_output_forwarded {
+                    let message = "上游 Chat Completions 响应流在输出正文后中断，无法安全自动重放";
+                    log::error!("[Chat/Completions] {message}: {reason}");
+                    if let Some(context) = log_context.as_ref() {
+                        log_chat_stream_drop(
+                            context,
+                            "dropped_after_semantic_output",
+                            &reason,
+                            attempt,
+                        );
+                    }
+                    yield Ok(chat_transport_error_sse(message));
+                    break 'attempts;
+                }
+
+                let effective_max_retries = reconnector
+                    .as_ref()
+                    .map(StreamReconnector::retry_limit)
+                    .unwrap_or(RESPONSES_STREAM_MAX_RETRIES);
+                let Some(reconnector) = reconnector.as_ref() else {
+                    let message = "上游 Chat Completions 响应流在输出正文前中断";
+                    log::error!("[Chat/Completions] stream dropped without reconnector ({reason})");
+                    if let Some(context) = log_context.as_ref() {
+                        log_chat_stream_drop(context, &reason_class, &reason, attempt);
+                    }
+                    yield Ok(chat_transport_error_sse(message));
+                    break 'attempts;
+                };
+
+                let mut reason = reason;
+                loop {
+                    if attempt >= effective_max_retries {
+                        let message = "上游 Chat Completions 响应流反复中断，自动重连已耗尽，请检查网络或代理后重试";
+                        log::error!(
+                            "[Chat/Completions] stream failed after {attempt} reconnect attempt(s): {reason}"
+                        );
+                        if let Some(context) = log_context.as_ref() {
+                            log_chat_stream_drop(context, "retries_exhausted", &reason, attempt);
+                        }
+                        yield Ok(chat_retries_exhausted_error_sse(message));
+                        break 'attempts;
+                    }
+
+                    attempt = attempt.saturating_add(1);
+                    if effective_max_retries == u32::MAX {
+                        log::warn!(
+                            "[Chat/Completions] upstream stream dropped before semantic output ({reason}); reconnecting (relentless attempt {attempt})"
+                        );
+                    } else {
+                        log::warn!(
+                            "[Chat/Completions] upstream stream dropped before semantic output ({reason}); reconnecting (attempt {attempt}/{effective_max_retries})"
+                        );
+                    }
+                    if let Some(context) = log_context.as_ref() {
+                        log_chat_stream_drop(context, "retry_scheduled", &reason, attempt);
+                    }
+                    if scaffold_forwarded {
+                        yield Ok(Bytes::from_static(b": ping\n\n"));
+                    }
+                    tokio::time::sleep(backoff_delay(attempt)).await;
+                    match reconnector.connect().await {
+                        Ok(response) if response.status().is_success() => {
+                            current = Some(Box::pin(response.bytes_stream()));
+                            continue 'attempts;
+                        }
+                        Ok(response) => {
+                            reason = format!(
+                                "reconnect got HTTP {} from upstream",
+                                response.status().as_u16()
+                            );
+                        }
+                        Err(error) => {
+                            reason = format!("reconnect failed: {error}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+enum ChatSseBlockDisposition {
+    Ignore,
+    Comment,
+    Scaffold,
+    Semantic,
+    Done,
+    Error,
+}
+
+/// 按 OpenAI Chat Completions 语义保守分类一个完整 SSE block。
+fn classify_chat_sse_block(block: &[u8]) -> ChatSseBlockDisposition {
+    let text = match std::str::from_utf8(block) {
+        Ok(text) => text,
+        Err(_) => return ChatSseBlockDisposition::Semantic,
+    };
+    if text
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .is_some_and(|line| line.starts_with(':'))
+    {
+        return ChatSseBlockDisposition::Comment;
+    }
+
+    let mut event_name = None;
+    let mut data_lines = Vec::new();
+    for line in text.lines() {
+        if let Some(event) = strip_sse_field(line, "event") {
+            event_name = Some(event.trim().to_string());
+        } else if let Some(data) = strip_sse_field(line, "data") {
+            data_lines.push(data.to_string());
+        }
+    }
+
+    let Some(data) = data_lines.first() else {
+        return ChatSseBlockDisposition::Ignore;
+    };
+    let joined = data_lines.join("\n");
+    let _ = data;
+    if joined.trim() == "[DONE]" {
+        return ChatSseBlockDisposition::Done;
+    }
+
+    let value = match serde_json::from_str::<Value>(&joined) {
+        Ok(value) => value,
+        Err(_) => return ChatSseBlockDisposition::Semantic,
+    };
+    if event_name.as_deref() == Some("error") || value.get("error").is_some_and(|e| !e.is_null()) {
+        return ChatSseBlockDisposition::Error;
+    }
+
+    let has_semantic_choice =
+        value
+            .get("choices")
+            .and_then(Value::as_array)
+            .is_some_and(|choices| {
+                choices.iter().any(|choice| {
+                    let finish_reason = choice.get("finish_reason").is_some_and(|v| !v.is_null());
+                    let delta_semantic = choice.get("delta").is_some_and(|delta| {
+                        delta.as_object().is_some_and(|delta| {
+                            delta.iter().any(|(key, value)| match value {
+                                Value::Null => false,
+                                Value::String(text) => key != "role" && !text.is_empty(),
+                                _ => key != "role",
+                            })
+                        })
+                    });
+                    let message_semantic = choice.get("message").is_some_and(|message| {
+                        message.as_object().is_some_and(|message| {
+                            message.iter().any(|(key, value)| match value {
+                                Value::Null => false,
+                                Value::String(text) => key != "role" && !text.is_empty(),
+                                _ => key != "role",
+                            })
+                        })
+                    });
+                    finish_reason || delta_semantic || message_semantic
+                })
+            });
+    if has_semantic_choice {
+        return ChatSseBlockDisposition::Semantic;
+    }
+
+    let known_scaffold_keys = [
+        "id",
+        "object",
+        "created",
+        "model",
+        "choices",
+        "system_fingerprint",
+        "service_tier",
+    ];
+    let unknown_top_level = value.as_object().is_some_and(|object| {
+        object
+            .keys()
+            .any(|key| !known_scaffold_keys.contains(&key.as_str()))
+    });
+    if unknown_top_level {
+        return ChatSseBlockDisposition::Semantic;
+    }
+    ChatSseBlockDisposition::Scaffold
+}
+
+fn chat_transport_error_sse(message: &str) -> Bytes {
+    chat_stream_error_sse(message, "ccswitch_chat_stream_interrupted")
+}
+
+fn chat_retries_exhausted_error_sse(message: &str) -> Bytes {
+    chat_stream_error_sse(message, "ccswitch_chat_stream_retries_exhausted")
+}
+
+fn chat_stream_error_sse(message: &str, code: &'static str) -> Bytes {
+    let payload = json!({
+        "error": {
+            "type": "stream_error",
+            "code": code,
+            "retryable": true,
+            "message": message,
+        }
+    });
+    Bytes::from(format!("event: error\ndata: {payload}\n\n"))
+}
+
+fn chat_drop_message_hash(reason: &str) -> String {
+    let digest = Sha256::digest(reason.as_bytes());
+    format!("{digest:x}")[..16].to_string()
+}
+
+fn log_chat_stream_drop(
+    context: &StreamLogContext,
+    reason_class: &str,
+    reason: &str,
+    attempt: u32,
+) {
+    crate::proxy::codex_router_log::append_event(
+        "upstream_sse_drop",
+        &[
+            ("stage", "chat_completions".to_string()),
+            ("session", context.session_id.clone()),
+            ("model", context.model.clone()),
+            ("provider", context.provider_id.clone()),
+            ("reason_class", reason_class.to_string()),
+            ("message_hash", chat_drop_message_hash(reason)),
+            ("attempt", attempt.to_string()),
+        ],
+    );
+}
+
+fn log_chat_upstream_error(context: &StreamLogContext, block: &[u8], attempt: u32) {
+    if let Some(diagnostic) = native_responses_sse_error_diagnostic(block) {
+        crate::proxy::codex_router_log::append_event(
+            "upstream_sse_error",
+            &[
+                ("stage", "chat_completions".to_string()),
+                ("session", context.session_id.clone()),
+                ("model", context.model.clone()),
+                ("provider", context.provider_id.clone()),
+                ("event", diagnostic.event_name),
+                ("error_type", diagnostic.error_type),
+                ("message_class", diagnostic.message_class.to_string()),
+                ("message_hash", diagnostic.message_hash),
+                ("attempt", attempt.to_string()),
+            ],
+        );
     }
 }
 
@@ -1406,6 +1811,31 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn configured_retry_limit_can_recover_after_more_than_default_five_attempts() {
+        let retry_body = [created(), text_delta("recovered"), completed()].concat();
+        // scripted_reconnector consumes from the end: fail six times, then succeed on attempt 7.
+        let mut script = vec![Ok(streamed_response(&[retry_body.as_str()]))];
+        script.extend((0..6).map(|attempt| {
+            Err(ProxyError::ForwardFailed(format!(
+                "temporary reconnect failure {attempt}"
+            )))
+        }));
+        let (reconnector, calls) = scripted_reconnector(script);
+        let reconnector = reconnector.with_max_retries(7);
+        let first = chunks_then_error(&[created().as_str()]);
+        let out = collect(create_resilient_anthropic_sse_stream_from_responses(
+            first,
+            Some(reconnector),
+        ))
+        .await;
+
+        assert_eq!(calls.load(Ordering::SeqCst), 7);
+        assert!(out.contains("recovered"), "got: {out}");
+        assert!(out.contains("event: message_stop"), "got: {out}");
+        assert!(!out.contains("event: error"), "unexpected error in: {out}");
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn reconnect_failure_counts_as_attempt() {
         let retry_body = [created(), text_delta("ok"), completed()].concat();
         // 脚本按 pop() 逆序消费：两次失败后第三次成功。
@@ -1657,5 +2087,133 @@ mod tests {
         .await;
 
         assert!(out.contains("\"type\":\"stream_error\""));
+    }
+    fn chat_role() -> String {
+        sse(
+            "message",
+            json!({"id":"chatcmpl-test","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}),
+        )
+    }
+
+    fn chat_delta(text: &str) -> String {
+        sse(
+            "message",
+            json!({"id":"chatcmpl-test","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":text},"finish_reason":null}]}),
+        )
+    }
+
+    fn chat_finish() -> String {
+        sse(
+            "message",
+            json!({"id":"chatcmpl-test","object":"chat.completion.chunk","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}),
+        )
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn chat_transport_drop_after_role_only_retries_transparently() {
+        let retry_body = [
+            chat_role(),
+            chat_delta("hello"),
+            chat_finish(),
+            "data: [DONE]\n\n".to_string(),
+        ]
+        .concat();
+        let (reconnector, calls) =
+            scripted_reconnector(vec![Ok(streamed_response(&[retry_body.as_str()]))]);
+        let first = chunks_then_error(&[chat_role().as_str()]);
+        let out = collect(create_resilient_chat_sse_stream_with_context(
+            first,
+            Some(reconnector),
+            None,
+        ))
+        .await;
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(out.matches("\"role\":\"assistant\"").count(), 1);
+        assert!(out.contains("hello"));
+        assert!(out.contains("\"finish_reason\":\"stop\""));
+        assert!(out.contains("[DONE]"));
+        assert!(!out.contains("event: error"), "unexpected error in: {out}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn chat_premature_eof_without_semantic_output_retries() {
+        let retry_body = [
+            chat_role(),
+            chat_delta("ok"),
+            chat_finish(),
+            "data: [DONE]\n\n".to_string(),
+        ]
+        .concat();
+        let (reconnector, calls) =
+            scripted_reconnector(vec![Ok(streamed_response(&[retry_body.as_str()]))]);
+        let first = ok_chunks(&[chat_role().as_str()]);
+        let out = collect(create_resilient_chat_sse_stream_with_context(
+            first,
+            Some(reconnector),
+            None,
+        ))
+        .await;
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(out.contains("\"finish_reason\":\"stop\""));
+        assert!(!out.contains("event: error"), "unexpected error in: {out}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn chat_never_retries_after_semantic_output() {
+        let (reconnector, calls) = scripted_reconnector(vec![]);
+        let first = chunks_then_error(&[chat_role().as_str(), chat_delta("visible").as_str()]);
+        let out = collect(create_resilient_chat_sse_stream_with_context(
+            first,
+            Some(reconnector),
+            None,
+        ))
+        .await;
+
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert!(out.contains("visible"));
+        assert!(out.contains("ccswitch_chat_stream_interrupted"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn chat_exhausts_bounded_reconnects_then_surfaces_retryable_error() {
+        let (reconnector, calls) = scripted_reconnector(vec![
+            Err(ProxyError::ForwardFailed("five".into())),
+            Err(ProxyError::ForwardFailed("four".into())),
+            Err(ProxyError::ForwardFailed("three".into())),
+            Err(ProxyError::ForwardFailed("two".into())),
+            Err(ProxyError::ForwardFailed("one".into())),
+        ]);
+        let first = chunks_then_error(&[chat_role().as_str()]);
+        let out = collect(create_resilient_chat_sse_stream_with_context(
+            first,
+            Some(reconnector),
+            None,
+        ))
+        .await;
+
+        assert_eq!(calls.load(Ordering::SeqCst), 5);
+        assert!(out.contains("ccswitch_chat_stream_retries_exhausted"));
+        assert!(out.contains("\"retryable\":true"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn chat_upstream_error_is_not_retried() {
+        let upstream_error = r#"event: error
+data: {"error":{"type":"upstream_down","message":"explicit upstream failure"}}
+
+"#;
+        let first = chunks_then_error(&[chat_role().as_str(), upstream_error]);
+        let (reconnector, calls) = scripted_reconnector(vec![]);
+        let out = collect(create_resilient_chat_sse_stream_with_context(
+            first,
+            Some(reconnector),
+            None,
+        ))
+        .await;
+
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert!(out.contains("explicit upstream failure"));
     }
 }

@@ -677,7 +677,7 @@ async fn log_usage_internal(
     };
 
     let dedup_scope = super::usage::parser::dedup_scope_for_app(app_type, provider_id);
-    let request_id = usage.dedup_request_id(dedup_scope);
+    let request_id = usage.dedup_request_id_with_session(dedup_scope, session_id.as_deref());
 
     log::debug!(
         "[{app_type}] 记录请求日志: id={request_id}, provider={provider_id}, model={model}, streaming={is_streaming}, status={status_code}, latency_ms={latency_ms}, first_token_ms={first_token_ms:?}, session={}, input={}, output={}, cache_read={}, cache_creation={}",

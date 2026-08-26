@@ -227,6 +227,14 @@ const CUSTOM_TOOL_INPUT_DESCRIPTION: &str = "Raw string input for the original c
 const CUSTOM_TOOL_PRESERVED_METADATA_HEADING: &str = "Original tool definition:";
 const TOOL_RESULT_MEDIA_OMITTED_MARKER: &str =
     "[cc-switch: tool result media omitted for text-only model]";
+
+/// OpenAI has used both `web_search` and the dated `web_search_preview*`
+/// names for the Responses hosted web-search tool.  They all share the same
+/// bridge semantics when the request is projected to Chat Completions.
+fn is_web_search_response_tool_type(tool_type: &str) -> bool {
+    tool_type == "web_search" || tool_type.starts_with("web_search_preview")
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum CodexToolKind {
     Function,
@@ -522,7 +530,9 @@ impl CodexToolContext {
                 Some("function") => self.add_function_tool(tool, None),
                 Some("custom") => self.add_custom_tool(tool),
                 Some("tool_search") => self.add_tool_search_tool(),
-                Some("web_search") => self.add_hosted_web_search_tool(tool),
+                Some(tool_type) if is_web_search_response_tool_type(tool_type) => {
+                    self.add_hosted_web_search_tool(tool)
+                }
                 Some("image_generation") => self.add_hosted_image_generation_tool(tool),
                 Some("namespace") => self.add_namespace_tool(tool),
                 Some(tool_type) => self.unsupported_response_tools.push(tool_type.to_string()),
@@ -2190,7 +2200,12 @@ fn responses_tool_choice_to_chat(tool_choice: &Value, tool_context: &CodexToolCo
                 }
             })
         }
-        Value::Object(obj) if obj.get("type").and_then(|v| v.as_str()) == Some("web_search") => {
+        Value::Object(obj)
+            if obj
+                .get("type")
+                .and_then(|v| v.as_str())
+                .is_some_and(is_web_search_response_tool_type) =>
+        {
             json!({
                 "type": "function",
                 "function": {
@@ -3695,6 +3710,21 @@ mod tests {
                 .all(|tool| tool.get("type").and_then(Value::as_str) != Some("web_search")),
             "hosted web_search must not be sent to third-party Chat upstream"
         );
+        assert_eq!(result["tool_choice"]["type"], "function");
+        assert_eq!(result["tool_choice"]["function"]["name"], "web_search");
+    }
+
+    #[test]
+    fn responses_request_to_chat_maps_web_search_preview_alias_to_function_tool() {
+        let input = json!({
+            "model": "gpt-5.6-sol-sublyx",
+            "tools": [{"type": "web_search_preview"}],
+            "tool_choice": {"type": "web_search_preview"},
+            "input": "Search for current OpenAI docs."
+        });
+
+        let result = responses_to_chat_completions(input).unwrap();
+        assert_eq!(result["tools"][0]["function"]["name"], "web_search");
         assert_eq!(result["tool_choice"]["type"], "function");
         assert_eq!(result["tool_choice"]["function"]["name"], "web_search");
     }

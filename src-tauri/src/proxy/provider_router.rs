@@ -10,7 +10,18 @@ use crate::proxy::circuit_breaker::{AllowResult, CircuitBreaker, CircuitBreakerC
 use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use std::time::Instant;
+use tokio::sync::{OwnedSemaphorePermit, RwLock, Semaphore};
+use tokio::time::timeout;
+
+use super::codex_traffic_policy::resolve_codex_traffic_policy;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CodexAdmissionQueueTimeout {
+    pub provider_id: String,
+    pub max_in_flight: usize,
+    pub waited_ms: u64,
+}
 
 /// 供应商路由器
 pub struct ProviderRouter {
@@ -18,6 +29,9 @@ pub struct ProviderRouter {
     db: Arc<Database>,
     /// 熔断器管理器 - key 格式: "app_type:provider_id"
     circuit_breakers: Arc<RwLock<HashMap<String, Arc<CircuitBreaker>>>>,
+    /// Codex MultiRouter route admission gates. These are shared by every request
+    /// forwarder and the permit is retained for the complete response stream.
+    codex_route_admission: Arc<RwLock<HashMap<String, Arc<Semaphore>>>>,
 }
 
 impl ProviderRouter {
@@ -26,6 +40,118 @@ impl ProviderRouter {
         Self {
             db,
             circuit_breakers: Arc::new(RwLock::new(HashMap::new())),
+            codex_route_admission: Arc::new(RwLock::new(HashMap::new())),
+        }
+    }
+
+    /// Acquire the provider's shared Codex admission slot when its resolved traffic
+    /// policy enables local limiting. The owned permit is retained by the caller for
+    /// the complete buffered response or SSE stream, not just response headers.
+    pub async fn acquire_codex_route_admission(
+        &self,
+        provider: &Provider,
+        app_type: &str,
+    ) -> Result<Option<OwnedSemaphorePermit>, CodexAdmissionQueueTimeout> {
+        if app_type != "codex" {
+            return Ok(None);
+        }
+
+        let policy = resolve_codex_traffic_policy(provider);
+        if !policy.admission_enabled {
+            return Ok(None);
+        }
+        let max_in_flight = policy.max_in_flight;
+        // Include the limit in the key so a saved policy change takes effect for new
+        // requests without mutating a live Tokio semaphore. Routes sharing an endpoint
+        // and effective limit intentionally share one process-local admission budget.
+        let admission_target = policy.admission_key;
+        let key = format!("{app_type}:{admission_target}:limit={max_in_flight}");
+        // Keep the read guard in its own scope. An `if let` directly over
+        // `read().await` can retain the temporary guard into the `else` branch,
+        // then deadlock while that branch waits for the write lock.
+        let existing = {
+            let gates = self.codex_route_admission.read().await;
+            gates.get(&key).cloned()
+        };
+        let semaphore = if let Some(existing) = existing {
+            existing
+        } else {
+            let mut gates = self.codex_route_admission.write().await;
+            gates
+                .entry(key.clone())
+                .or_insert_with(|| Arc::new(Semaphore::new(max_in_flight)))
+                .clone()
+        };
+
+        match semaphore.clone().try_acquire_owned() {
+            Ok(permit) => Ok(Some(permit)),
+            Err(tokio::sync::TryAcquireError::NoPermits) => {
+                let max_queue_wait = policy.max_queue_wait;
+                let wait_started = Instant::now();
+                log::warn!(
+                    "[{app_type}] Codex provider {} reached its configured {max_in_flight} in-flight requests; queueing locally for at most {} ms (admission_target={admission_target})",
+                    provider.id,
+                    max_queue_wait.as_millis()
+                );
+                super::codex_router_log::append_event(
+                    "admission_queue_wait",
+                    &[
+                        ("provider", provider.id.clone()),
+                        ("admission_target", admission_target.clone()),
+                        ("max_in_flight", max_in_flight.to_string()),
+                        ("max_queue_wait_ms", max_queue_wait.as_millis().to_string()),
+                    ],
+                );
+                match timeout(max_queue_wait, semaphore.acquire_owned()).await {
+                    Ok(Ok(permit)) => {
+                        let waited_ms =
+                            wait_started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+                        super::codex_router_log::append_event(
+                            "admission_queue_acquired",
+                            &[
+                                ("provider", provider.id.clone()),
+                                ("admission_target", admission_target),
+                                ("max_in_flight", max_in_flight.to_string()),
+                                ("waited_ms", waited_ms.to_string()),
+                            ],
+                        );
+                        Ok(Some(permit))
+                    }
+                    Ok(Err(_)) | Err(_) => {
+                        let waited_ms =
+                            wait_started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+                        super::codex_router_log::append_event(
+                            "admission_queue_timeout",
+                            &[
+                                ("provider", provider.id.clone()),
+                                ("admission_target", admission_target),
+                                ("max_in_flight", max_in_flight.to_string()),
+                                ("waited_ms", waited_ms.to_string()),
+                            ],
+                        );
+                        Err(CodexAdmissionQueueTimeout {
+                            provider_id: provider.id.clone(),
+                            max_in_flight,
+                            waited_ms,
+                        })
+                    }
+                }
+            }
+            Err(tokio::sync::TryAcquireError::Closed) => {
+                super::codex_router_log::append_event(
+                    "admission_queue_closed",
+                    &[
+                        ("provider", provider.id.clone()),
+                        ("admission_target", admission_target),
+                        ("max_in_flight", max_in_flight.to_string()),
+                    ],
+                );
+                Err(CodexAdmissionQueueTimeout {
+                    provider_id: provider.id.clone(),
+                    max_in_flight,
+                    waited_ms: 0,
+                })
+            }
         }
     }
 
@@ -567,5 +693,216 @@ mod tests {
         let third = router.allow_provider_request("a", "claude").await;
         assert!(third.allowed);
         assert!(third.used_half_open_permit);
+    }
+    fn codex_route_provider(id: &str, base_url: Option<&str>) -> Provider {
+        let settings = base_url.map_or_else(
+            || json!({}),
+            |base_url| {
+                json!({
+                    "config": format!(
+                        "model_provider = \"opencode_go\"\n[model_providers.opencode_go]\nbase_url = \"{base_url}\""
+                    )
+                })
+            },
+        );
+        Provider::with_id(id.to_string(), id.to_string(), settings, None)
+    }
+
+    #[tokio::test]
+    async fn codex_route_admission_queues_above_the_per_route_limit() {
+        let db = Arc::new(Database::memory().unwrap());
+        let router = Arc::new(ProviderRouter::new(db));
+        let mut provider = codex_route_provider("codex-multirouter::route::generic", None);
+        provider.meta = Some(crate::provider::ProviderMeta {
+            codex_traffic_policy: Some(crate::provider::CodexTrafficPolicy {
+                admission_enabled: Some(true),
+                max_in_flight: Some(2),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+
+        let mut permits = Vec::with_capacity(2);
+        for _ in 0..2 {
+            permits.push(
+                router
+                    .acquire_codex_route_admission(&provider, "codex")
+                    .await
+                    .expect("admission should not time out")
+                    .expect("materialized Codex routes must receive an admission permit"),
+            );
+        }
+
+        let waiting_router = router.clone();
+        let waiting_provider = provider.clone();
+        let waiter = tokio::spawn(async move {
+            waiting_router
+                .acquire_codex_route_admission(&waiting_provider, "codex")
+                .await
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        assert!(
+            !waiter.is_finished(),
+            "the request above the route limit must queue instead of reaching upstream"
+        );
+
+        drop(permits.pop());
+        let queued_permit = tokio::time::timeout(std::time::Duration::from_secs(1), waiter)
+            .await
+            .expect("queued request should wake after a permit is released")
+            .expect("admission task should not panic")
+            .expect("queued admission should not time out");
+        assert!(queued_permit.is_some());
+    }
+
+    #[tokio::test]
+    async fn opencode_zen_routes_share_the_conservative_admission_limit() {
+        let db = Arc::new(Database::memory().unwrap());
+        let router = Arc::new(ProviderRouter::new(db));
+        let first_route = codex_route_provider(
+            "codex-multirouter::route::zen-a",
+            Some("https://opencode.ai/zen/go/v1"),
+        );
+        let mut second_route = codex_route_provider(
+            "codex-multirouter::route::zen-b",
+            Some("https://opencode.ai/zen/go/v1/"),
+        );
+        let mut first_route = first_route;
+        first_route.settings_config["codexResolvedTargetProviderId"] =
+            serde_json::Value::String("zen-provider".to_string());
+        second_route.settings_config["codexResolvedTargetProviderId"] =
+            serde_json::Value::String("zen-provider".to_string());
+
+        let mut permits = Vec::with_capacity(4);
+        for _ in 0..4 {
+            permits.push(
+                router
+                    .acquire_codex_route_admission(&first_route, "codex")
+                    .await
+                    .expect("admission should not time out")
+                    .expect("OpenCode Zen route must receive a permit"),
+            );
+        }
+
+        let waiting_router = router.clone();
+        let waiter = tokio::spawn(async move {
+            waiting_router
+                .acquire_codex_route_admission(&second_route, "codex")
+                .await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        assert!(
+            !waiter.is_finished(),
+            "a second OpenCode Zen route must share the provider-level gate"
+        );
+
+        drop(permits.pop());
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), waiter)
+                .await
+                .expect("shared OpenCode Zen waiter should wake")
+                .expect("admission task should not panic")
+                .expect("shared admission should not time out")
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn providers_with_the_same_endpoint_keep_independent_admission_budgets() {
+        let db = Arc::new(Database::memory().unwrap());
+        let router = ProviderRouter::new(db);
+        let policy = crate::provider::CodexTrafficPolicy {
+            admission_enabled: Some(true),
+            max_in_flight: Some(1),
+            max_queue_wait_ms: Some(100),
+            ..Default::default()
+        };
+        let mut first = codex_route_provider("provider-a", Some("https://same.example/v1"));
+        first.meta = Some(crate::provider::ProviderMeta {
+            codex_traffic_policy: Some(policy.clone()),
+            ..Default::default()
+        });
+        let mut second = codex_route_provider("provider-b", Some("https://same.example/v1"));
+        second.meta = Some(crate::provider::ProviderMeta {
+            codex_traffic_policy: Some(policy),
+            ..Default::default()
+        });
+
+        let _first = router
+            .acquire_codex_route_admission(&first, "codex")
+            .await
+            .expect("first provider admission should not fail")
+            .expect("first provider must have a permit");
+        let second_permit = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            router.acquire_codex_route_admission(&second, "codex"),
+        )
+        .await
+        .expect("unrelated provider must not wait behind the first")
+        .expect("second provider admission should not fail");
+        assert!(second_permit.is_some());
+    }
+
+    #[tokio::test]
+    async fn codex_route_admission_times_out_within_configured_bound() {
+        let db = Arc::new(Database::memory().unwrap());
+        let router = ProviderRouter::new(db);
+        let mut provider = codex_route_provider("bounded-provider", None);
+        provider.meta = Some(crate::provider::ProviderMeta {
+            codex_traffic_policy: Some(crate::provider::CodexTrafficPolicy {
+                admission_enabled: Some(true),
+                max_in_flight: Some(1),
+                max_queue_wait_ms: Some(100),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+
+        let _held = router
+            .acquire_codex_route_admission(&provider, "codex")
+            .await
+            .expect("first admission should not fail")
+            .expect("first admission must have a permit");
+        let started = std::time::Instant::now();
+        let error = router
+            .acquire_codex_route_admission(&provider, "codex")
+            .await
+            .expect_err("second admission must time out");
+
+        assert_eq!(error.provider_id, "bounded-provider");
+        assert_eq!(error.max_in_flight, 1);
+        // Timer wakeups can overshoot the configured wait slightly; assert a sane range.
+        assert!(
+            error.waited_ms >= 100,
+            "reported wait {} ms should be at least the configured bound",
+            error.waited_ms
+        );
+        assert!(
+            error.waited_ms < 500,
+            "reported wait {} ms should stay close to the configured bound",
+            error.waited_ms
+        );
+        assert!(started.elapsed() >= std::time::Duration::from_millis(90));
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+    }
+
+    #[tokio::test]
+    async fn codex_route_admission_does_not_throttle_other_traffic() {
+        let db = Arc::new(Database::memory().unwrap());
+        let router = ProviderRouter::new(db);
+        let ordinary = codex_route_provider("ordinary-provider", None);
+        let codex_route = codex_route_provider("codex-multirouter::route::generic", None);
+
+        assert!(router
+            .acquire_codex_route_admission(&ordinary, "codex")
+            .await
+            .expect("disabled admission must not fail")
+            .is_none());
+        assert!(router
+            .acquire_codex_route_admission(&codex_route, "claude")
+            .await
+            .expect("disabled admission must not fail")
+            .is_none());
     }
 }

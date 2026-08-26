@@ -76,14 +76,16 @@ pub use codex::{
     resolve_codex_catalog_tool_profile, resolve_codex_chat_reasoning_config,
     resolve_codex_model_routed_provider, resolve_codex_model_routed_providers,
     resolve_codex_v2_raw_passthrough_provider, resolve_codex_v2_routed_provider,
-    should_convert_codex_responses_to_anthropic, should_convert_codex_responses_to_chat,
-    should_convert_codex_responses_to_messages, CodexMultiRouterAuthFacade, ResolvedCodexRoute,
+    resolve_reasoning_content_mode, should_convert_codex_responses_to_anthropic,
+    should_convert_codex_responses_to_chat, should_convert_codex_responses_to_messages,
+    CodexMultiRouterAuthFacade, ReasoningContentMode, ResolvedCodexRoute,
 };
 pub(crate) use codex::{
     apply_detected_codex_transport_to_effective_provider, codex_provider_remote_compaction_enabled,
     codex_route_auth_source, codex_route_supports_responses_compaction,
     codex_route_target_provider_id_from_route, codex_route_uses_official_agent_backend,
-    is_codex_remote_compact_endpoint, is_codex_responses_endpoint, provider_uses_native_codex_auth,
+    is_codex_chat_completions_endpoint, is_codex_remote_compact_endpoint,
+    is_codex_responses_endpoint, provider_uses_native_codex_auth,
     resolve_codex_chat_protocol_target, resolve_codex_chat_reasoning_projection,
     resolve_codex_primary_route_from_settings, CODEX_ACCOUNT_POOL_ENABLED,
 };

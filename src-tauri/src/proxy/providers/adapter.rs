@@ -23,6 +23,17 @@ pub trait ProviderAdapter: Send + Sync {
     /// 从 Provider 配置中提取认证信息
     fn extract_auth(&self, provider: &Provider) -> Option<AuthInfo>;
 
+    /// Extract authentication for a specific outbound model. Adapters that
+    /// support model-scoped credentials may override this; the default keeps
+    /// existing provider behavior unchanged.
+    fn extract_auth_for_model(
+        &self,
+        provider: &Provider,
+        _model: Option<&str>,
+    ) -> Option<AuthInfo> {
+        self.extract_auth(provider)
+    }
+
     /// 构建请求 URL
     fn build_url(&self, base_url: &str, endpoint: &str) -> String;
 

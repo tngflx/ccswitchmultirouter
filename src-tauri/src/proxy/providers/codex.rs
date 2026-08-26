@@ -28,7 +28,14 @@ use crate::{
 };
 use regex::Regex;
 use serde_json::{Map, Value as JsonValue};
-use std::{collections::HashMap, sync::LazyLock};
+use std::{
+    collections::HashMap,
+    sync::{LazyLock, Mutex},
+};
+use uuid::Uuid;
+
+static CODEX_API_KEY_GROUP_CURSORS: LazyLock<Mutex<HashMap<String, usize>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 use toml::Value as TomlValue;
 
 const CODEX_ROUTER_PARENT_PROVIDER_ID: &str = "codexRouterParentProviderId";
@@ -2332,6 +2339,70 @@ pub fn provider_needs_responses_namespace_flatten(provider: &Provider) -> bool {
     provider.is_xai_oauth()
 }
 
+/// 第三方原生 Responses 上游的 reasoning 内容注入策略。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReasoningContentMode {
+    /// 透传 reasoning item，不做任何修改（严格 OpenAI Responses schema）。
+    Passthrough,
+    /// 注入 `content: [{type:"reasoning_text",...}]`（DeepSeek 等要求回传可读推理）。
+    InjectContent,
+}
+
+impl ReasoningContentMode {
+    #[allow(dead_code)]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Passthrough => "passthrough",
+            Self::InjectContent => "inject_content",
+        }
+    }
+}
+
+/// 解释当前 provider 的 reasoning 内容注入策略。
+///
+/// 解析优先级（与 explain_codex_responses_upstream_protocol 一致）：
+/// 1. meta.reasoningContentMode / settings_config.reasoningContentMode 显式配置
+/// 2. 已知 DeepSeek URL 自动检测
+/// 3. 默认 Passthrough（安全：不碰 reasoning item，兼容所有严格 schema）
+pub fn resolve_reasoning_content_mode(provider: &Provider) -> ReasoningContentMode {
+    // Tier 1: Explicit provider-level override
+    if let Some(mode) = provider
+        .meta
+        .as_ref()
+        .and_then(|meta| meta.reasoning_content_mode.as_deref())
+    {
+        return parse_reasoning_content_mode(mode);
+    }
+    if let Some(mode) = provider
+        .settings_config
+        .get("reasoningContentMode")
+        .or_else(|| provider.settings_config.get("reasoning_content_mode"))
+        .and_then(|value| value.as_str())
+    {
+        return parse_reasoning_content_mode(mode);
+    }
+
+    // Tier 2: Known URL patterns that require inject_content
+    if let Some(base_url) = provider_codex_base_url(provider) {
+        let lower = base_url.to_ascii_lowercase();
+        if lower.contains("api.deepseek.com") {
+            return ReasoningContentMode::InjectContent;
+        }
+    }
+
+    // Tier 3: Safe default — passthrough for unknown third-party upstreams
+    ReasoningContentMode::Passthrough
+}
+
+fn parse_reasoning_content_mode(value: &str) -> ReasoningContentMode {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "inject" | "inject_content" | "inject-content" | "deepseek" => {
+            ReasoningContentMode::InjectContent
+        }
+        _ => ReasoningContentMode::Passthrough,
+    }
+}
+
 /// The single built-in official Codex provider.  Unlike managed Codex OAuth
 /// providers used by Claude, this route receives authentication from the
 /// calling Codex client (`requires_openai_auth = true`).
@@ -3209,6 +3280,13 @@ fn is_chat_completions_url(value: &str) -> bool {
 /// - `true` 表示该请求是 Codex `/responses` 或 `/responses/compact`。
 ///   副作用:
 /// - 无。
+pub(crate) fn is_codex_chat_completions_endpoint(endpoint: &str) -> bool {
+    let path = endpoint
+        .split_once('?')
+        .map_or(endpoint, |(path, _query)| path);
+    matches!(path, "/chat/completions" | "/v1/chat/completions")
+}
+
 pub(crate) fn is_codex_responses_endpoint(endpoint: &str) -> bool {
     let path = endpoint
         .split_once('?')
@@ -3364,6 +3442,133 @@ impl CodexAdapter {
 
         None
     }
+
+    fn extract_grouped_key(&self, provider: &Provider, model: &str) -> Option<String> {
+        let groups = provider
+            .settings_config
+            .get("codexApiKeyGroups")
+            .or_else(|| provider.settings_config.get("codex_api_key_groups"))?
+            .as_array()?;
+        let model = model.trim();
+        if model.is_empty() {
+            return None;
+        }
+        let mut selected: Option<(&serde_json::Value, usize)> = None;
+        for group in groups {
+            if group.get("enabled").and_then(|v| v.as_bool()) == Some(false) {
+                continue;
+            }
+            let keys = group
+                .get("apiKeys")
+                .or_else(|| group.get("api_keys"))
+                .and_then(|v| v.as_array())
+                .map(|values| {
+                    values
+                        .iter()
+                        .filter_map(|v| v.as_str())
+                        .map(str::trim)
+                        .filter(|v| !v.is_empty())
+                        .count()
+                })
+                .unwrap_or(0);
+            if keys == 0 {
+                continue;
+            }
+            let exact = group
+                .get("models")
+                .and_then(|v| v.as_array())
+                .is_some_and(|models| {
+                    models.iter().any(|v| {
+                        v.as_str()
+                            .is_some_and(|candidate| candidate.trim().eq_ignore_ascii_case(model))
+                    })
+                });
+            let prefix_len = group
+                .get("prefixes")
+                .and_then(|v| v.as_array())
+                .map(|prefixes| {
+                    prefixes
+                        .iter()
+                        .filter_map(|v| v.as_str())
+                        .map(str::trim)
+                        .filter(|prefix| {
+                            !prefix.is_empty()
+                                && model
+                                    .get(..prefix.len())
+                                    .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
+                        })
+                        .map(str::len)
+                        .max()
+                        .unwrap_or(0)
+                })
+                .unwrap_or(0);
+            let has_model_restrictions = group
+                .get("models")
+                .and_then(|value| value.as_array())
+                .is_some_and(|values| {
+                    values
+                        .iter()
+                        .any(|value| value.as_str().is_some_and(|v| !v.trim().is_empty()))
+                });
+            let has_prefix_restrictions = group
+                .get("prefixes")
+                .and_then(|value| value.as_array())
+                .is_some_and(|values| {
+                    values
+                        .iter()
+                        .any(|value| value.as_str().is_some_and(|v| !v.trim().is_empty()))
+                });
+            let specificity = if exact {
+                1_000_000
+            } else if prefix_len > 0 {
+                100_000 + prefix_len
+            } else if !has_model_restrictions && !has_prefix_restrictions {
+                1
+            } else {
+                0
+            };
+            if specificity == 0 {
+                continue;
+            }
+            if selected.is_none_or(|(_, current)| specificity > current) {
+                selected = Some((group, specificity));
+            }
+        }
+        let (group, _) = selected?;
+        let keys = group
+            .get("apiKeys")
+            .or_else(|| group.get("api_keys"))
+            .and_then(|v| v.as_array())?;
+        let keys = keys
+            .iter()
+            .filter_map(|v| v.as_str())
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .collect::<Vec<_>>();
+        if keys.is_empty() {
+            return None;
+        }
+        let group_id = group
+            .get("id")
+            .and_then(|v| v.as_str())
+            .filter(|v| !v.trim().is_empty())
+            .unwrap_or("default");
+        let strategy = group
+            .get("strategy")
+            .and_then(|value| value.as_str())
+            .unwrap_or("round_robin");
+        let index = if strategy.eq_ignore_ascii_case("random") {
+            (Uuid::new_v4().as_u128() as usize) % keys.len()
+        } else {
+            let cursor_key = format!("{}:{group_id}", provider.id);
+            let mut cursors = CODEX_API_KEY_GROUP_CURSORS.lock().ok()?;
+            let cursor = cursors.entry(cursor_key).or_insert(0);
+            let index = *cursor % keys.len();
+            *cursor = cursor.wrapping_add(1);
+            index
+        };
+        Some(keys[index].to_string())
+    }
 }
 
 impl Default for CodexAdapter {
@@ -3478,6 +3683,30 @@ impl ProviderAdapter for CodexAdapter {
         };
         self.extract_key(provider)
             .map(|key| AuthInfo::new(key, strategy))
+    }
+
+    fn extract_auth_for_model(&self, provider: &Provider, model: Option<&str>) -> Option<AuthInfo> {
+        if provider_uses_native_codex_auth(provider)
+            || provider_is_managed_codex_oauth(provider)
+            || provider.is_xai_oauth()
+        {
+            return self.extract_auth(provider);
+        }
+        let strategy = if codex_provider_uses_anthropic(provider)
+            && provider
+                .meta
+                .as_ref()
+                .and_then(|meta| meta.api_key_field.as_deref())
+                .is_some_and(|field| field.eq_ignore_ascii_case("ANTHROPIC_API_KEY"))
+        {
+            AuthStrategy::Anthropic
+        } else {
+            AuthStrategy::Bearer
+        };
+        model
+            .and_then(|model| self.extract_grouped_key(provider, model))
+            .map(|key| AuthInfo::new(key, strategy))
+            .or_else(|| self.extract_auth(provider))
     }
 
     fn build_url(&self, base_url: &str, endpoint: &str) -> String {
@@ -3612,6 +3841,46 @@ mod tests {
             icon_color: None,
             in_failover_queue: false,
         }
+    }
+
+    #[test]
+    fn grouped_api_keys_prefer_exact_then_longest_prefix_and_rotate() {
+        let provider = create_provider(json!({
+            "codexApiKeyGroups": [
+                {"id": "generic", "apiKeys": ["generic-key"]},
+                {"id": "deepseek", "apiKeys": ["deep-a", "deep-b"], "prefixes": ["deepseek-"]},
+                {"id": "exact", "apiKeys": ["exact-key"], "models": ["deepseek-v4-flash"]}
+            ]
+        }));
+        let adapter = CodexAdapter::new();
+        assert_eq!(
+            adapter
+                .extract_auth_for_model(&provider, Some("deepseek-v4-flash"))
+                .unwrap()
+                .api_key,
+            "exact-key"
+        );
+        assert_eq!(
+            adapter
+                .extract_auth_for_model(&provider, Some("deepseek-v4-pro"))
+                .unwrap()
+                .api_key,
+            "deep-a"
+        );
+        assert_eq!(
+            adapter
+                .extract_auth_for_model(&provider, Some("deepseek-v4-pro"))
+                .unwrap()
+                .api_key,
+            "deep-b"
+        );
+        assert_eq!(
+            adapter
+                .extract_auth_for_model(&provider, Some("gpt-5.6"))
+                .unwrap()
+                .api_key,
+            "generic-key"
+        );
     }
 
     fn multirouter_with_routes(
@@ -3957,6 +4226,49 @@ experimental_bearer_token = "PROXY_MANAGED"
     }
 
     #[test]
+    fn test_reasoning_content_mode_resolution() {
+        // DeepSeek URL auto-detects as InjectContent
+        let deepseek = create_provider(json!({
+            "base_url": "https://api.deepseek.com",
+            "model": "deepseek-v4-flash"
+        }));
+        assert_eq!(
+            resolve_reasoning_content_mode(&deepseek),
+            ReasoningContentMode::InjectContent
+        );
+
+        // Unknown third-party defaults to Passthrough
+        let sublyx = create_provider(json!({
+            "base_url": "https://api.sublyx.ai/v1",
+            "model": "gpt-5.6-sol-sublyx"
+        }));
+        assert_eq!(
+            resolve_reasoning_content_mode(&sublyx),
+            ReasoningContentMode::Passthrough
+        );
+
+        // Explicit override wins over URL detection
+        let forced_passthrough = create_provider(json!({
+            "base_url": "https://api.deepseek.com",
+            "reasoningContentMode": "passthrough"
+        }));
+        assert_eq!(
+            resolve_reasoning_content_mode(&forced_passthrough),
+            ReasoningContentMode::Passthrough
+        );
+
+        // Explicit inject on non-DeepSeek provider
+        let custom_inject = create_provider(json!({
+            "base_url": "https://my-relay.example.com/v1",
+            "reasoningContentMode": "inject_content"
+        }));
+        assert_eq!(
+            resolve_reasoning_content_mode(&custom_inject),
+            ReasoningContentMode::InjectContent
+        );
+    }
+
+    #[test]
     fn test_codex_model_route_resolves_deepseek_chat_provider() {
         let provider = create_provider(json!({
             "modelCatalog": {
@@ -4003,6 +4315,40 @@ experimental_bearer_token = "PROXY_MANAGED"
             &routed,
             "/responses"
         ));
+    }
+
+    #[test]
+    fn materialized_route_preserves_target_codex_traffic_policy() {
+        let mut route = create_provider(json!({
+            "codexResolvedTargetProviderId": "target-provider",
+            "codexResolvedRouteId": "route-a"
+        }));
+        route.id = "router::route::route-a".to_string();
+        let mut target = create_provider(json!({"base_url": "https://example.test/v1"}));
+        target.id = "target-provider".to_string();
+        target.meta = Some(ProviderMeta {
+            codex_traffic_policy: Some(crate::provider::CodexTrafficPolicy {
+                admission_enabled: Some(true),
+                max_in_flight: Some(3),
+                max_queue_wait_ms: Some(2_000),
+                rate_limit_max_retries: Some(1),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+
+        let materialized = materialize_codex_routed_provider_from_target(&route, &target);
+        let policy = materialized
+            .meta
+            .as_ref()
+            .and_then(|meta| meta.codex_traffic_policy.as_ref())
+            .expect("target traffic policy must survive materialization");
+        assert_eq!(policy.max_in_flight, Some(3));
+        assert_eq!(policy.max_queue_wait_ms, Some(2_000));
+        assert_eq!(
+            codex_route_target_provider_id(&materialized),
+            Some("target-provider")
+        );
     }
 
     #[test]
@@ -6608,7 +6954,7 @@ wire_api = "chat"
         let provider = create_provider(json!({
             "config": r#"
 model_provider = "siliconflow"
-model = "MiniMaxAI/MiniMax-M2.7"
+model = "MiniMaxAI/MiniMax-M2.5"
 
 [model_providers.siliconflow]
 name = "SiliconFlow"
@@ -6620,7 +6966,7 @@ wire_api = "chat"
         // 模型是 MiniMax（官方用 reasoning_split），但平台是 SiliconFlow —— 应走平台的 enable_thinking。
         let config = resolve_codex_chat_reasoning_config(
             &provider,
-            &json!({ "model": "MiniMaxAI/MiniMax-M2.7" }),
+            &json!({ "model": "MiniMaxAI/MiniMax-M2.5" }),
         )
         .unwrap();
 
