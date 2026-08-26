@@ -3856,9 +3856,31 @@ fn restore_codex_state_db_official_threads(
     conn.busy_timeout(Duration::from_secs(5))
         .map_err(|e| AppError::Database(format!("设置 Codex state DB busy_timeout 失败: {e}")))?;
 
-    if !Database::table_exists(&conn, "threads")?
-        || !Database::has_column(&conn, "threads", "model_provider")?
-    {
+    // The candidate list can contain stale or partially-written files while Codex is
+    // running.  `Connection::open` accepts those files, but schema inspection then
+    // reports `file is not a database`; that file is not a restore target and must not
+    // abort the whole restore operation.
+    let has_threads = match Database::table_exists(&conn, "threads") {
+        Ok(value) => value,
+        Err(error) => {
+            log::debug!(
+                "Skipping malformed Codex state DB during restore {}: {error}",
+                db_path.display()
+            );
+            return Ok(0);
+        }
+    };
+    let has_provider_column = match Database::has_column(&conn, "threads", "model_provider") {
+        Ok(value) => value,
+        Err(error) => {
+            log::debug!(
+                "Skipping unreadable Codex state DB during restore {}: {error}",
+                db_path.display()
+            );
+            return Ok(0);
+        }
+    };
+    if !has_threads || !has_provider_column {
         return Ok(0);
     }
 

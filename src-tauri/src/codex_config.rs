@@ -1545,7 +1545,7 @@ struct CodexCatalogModelSpec {
 fn codex_catalog_model_priority_key(
     spec: &CodexCatalogModelSpec,
     original_index: usize,
-) -> (u8, usize) {
+) -> (String, u8, String, usize) {
     let model = spec.model.to_ascii_lowercase();
     let provider_rank = if spec.is_default {
         0
@@ -1558,8 +1558,16 @@ fn codex_catalog_model_priority_key(
     } else {
         4
     };
+    // MultiRouter prefixes flat Codex labels as `[Provider] Model`. Codex has no native
+    // picker-section field, so the prefix doubles as a stable provider-group sort key.
+    let display_name = spec.display_name.to_ascii_lowercase();
+    let provider_group = display_name
+        .strip_prefix('[')
+        .and_then(|value| value.split_once("] "))
+        .map(|(provider, _)| provider.to_string())
+        .unwrap_or_default();
 
-    (provider_rank, original_index)
+    (provider_group, provider_rank, display_name, original_index)
 }
 
 /// 读取用户在 CCSwitchMulti 中选择的 Codex 子 Agent 候选模型顺序。
@@ -1607,23 +1615,40 @@ fn sort_codex_catalog_specs_for_picker(
     indexed_specs.sort_by_key(|(original_index, spec)| {
         // 优先级1: 用户设置的 sortIndex（数字越小越靠前）
         if let Some(sort_idx) = spec.sort_index {
-            return (0_u8, sort_idx as usize, *original_index);
+            return (
+                0_u8,
+                sort_idx as usize,
+                String::new(),
+                0_u8,
+                String::new(),
+                *original_index,
+            );
         }
 
         // 优先级2: spawn_agent_model_priority 列表
         if let Some(priority_index) =
             codex_spawn_agent_model_priority_index(spawn_agent_model_priority, &spec.model)
         {
-            return (1_u8, priority_index, *original_index);
+            return (
+                1_u8,
+                priority_index,
+                String::new(),
+                0_u8,
+                String::new(),
+                *original_index,
+            );
         }
 
-        // 优先级3: 默认供应商排序逻辑
-        let (provider_rank, fallback_index) =
+        // 优先级3: provider 分组，再沿用原有模型族优先级和稳定顺序。
+        let (provider_group, provider_rank, display_name, fallback_index) =
             codex_catalog_model_priority_key(spec, *original_index);
         (
-            provider_rank.saturating_add(2),
+            2_u8,
+            0_usize,
+            provider_group,
+            provider_rank,
+            display_name,
             fallback_index,
-            *original_index,
         )
     });
     indexed_specs.into_iter().map(|(_, spec)| spec).collect()
@@ -1687,6 +1712,116 @@ fn official_models_with_bundled_fallback(
     (!models.is_empty()).then_some(models)
 }
 
+/// Build a fallback reasoning index from inline `[model_providers.*].models[]` entries.
+/// Visible MultiRouter aliases frequently have no capability metadata of their own.
+fn codex_config_reasoning_capabilities(
+    config_text: &str,
+) -> std::collections::HashMap<
+    String,
+    crate::proxy::providers::codex_reasoning::CodexModelReasoningCapability,
+> {
+    let Ok(config) = toml::from_str::<toml::Value>(config_text) else {
+        return std::collections::HashMap::new();
+    };
+    let Some(providers) = config
+        .get("model_providers")
+        .and_then(toml::Value::as_table)
+    else {
+        return std::collections::HashMap::new();
+    };
+
+    let mut result = std::collections::HashMap::new();
+    for provider in providers.values() {
+        let Some(models) = provider.get("models").and_then(toml::Value::as_array) else {
+            continue;
+        };
+        for model in models {
+            let Ok(model_json) = serde_json::to_value(model) else {
+                continue;
+            };
+            let Some(levels) = model_json
+                .get("supported_reasoning_levels")
+                .or_else(|| model_json.get("supported_reasoning_efforts"))
+                .or_else(|| model_json.get("supportedReasoningEfforts"))
+                .and_then(Value::as_array)
+            else {
+                continue;
+            };
+            let supported_efforts = levels
+                .iter()
+                .filter_map(|level| {
+                    level
+                        .as_str()
+                        .or_else(|| level.get("effort").and_then(Value::as_str))
+                        .or_else(|| level.get("reasoning_effort").and_then(Value::as_str))
+                        .or_else(|| level.get("reasoningEffort").and_then(Value::as_str))
+                        .map(str::trim)
+                        .filter(|effort| !effort.is_empty())
+                        .map(ToString::to_string)
+                })
+                .collect::<Vec<_>>();
+            if supported_efforts.is_empty() {
+                continue;
+            }
+            let default_effort = model_json
+                .get("default_reasoning_level")
+                .or_else(|| model_json.get("default_reasoning_effort"))
+                .or_else(|| model_json.get("defaultReasoningEffort"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|effort| !effort.is_empty())
+                .map(ToString::to_string);
+            let capability = crate::proxy::providers::codex_reasoning::CodexModelReasoningCapability {
+                schema_version: Some(2),
+                support_status: Some(crate::proxy::providers::codex_reasoning::ReasoningSupportStatus::ConfirmedSupported),
+                control_kind: Some(crate::proxy::providers::codex_reasoning::ReasoningControlKind::Graded),
+                supported: Some(true),
+                supported_efforts: supported_efforts.clone(),
+                default_effort,
+                disable_allowed: supported_efforts.iter().any(|effort| effort == "none"),
+                upstream: crate::proxy::providers::codex_reasoning::CodexModelReasoningUpstream {
+                    format: "string".to_string(),
+                    parameter: model_json
+                        .get("reasoning_parameter")
+                        .or_else(|| model_json.get("reasoningParameter"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("reasoning_effort")
+                        .to_string(),
+                    effort_map: supported_efforts
+                        .iter()
+                        .map(|effort| (effort.clone(), effort.clone()))
+                        .collect(),
+                },
+                output_format: model_json
+                    .get("reasoning_output_format")
+                    .or_else(|| model_json.get("reasoningOutputFormat"))
+                    .and_then(Value::as_str)
+                    .map(ToString::to_string),
+                source: Some("provider_config".to_string()),
+                confidence: None,
+                fetched_at: None,
+                provider_key: None,
+                model_revision: None,
+                codex_ultra_orchestration: None,
+            };
+            if capability.validate().is_err() {
+                continue;
+            }
+            for field in ["model", "id", "slug", "upstreamModel", "upstream_model"] {
+                if let Some(identifier) = model_json
+                    .get(field)
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|identifier| !identifier.is_empty())
+                {
+                    result.insert(identifier.to_ascii_lowercase(), capability.clone());
+                }
+            }
+        }
+    }
+    result
+}
+
 fn codex_catalog_model_specs(settings: &Value, config_text: &str) -> Vec<CodexCatalogModelSpec> {
     let Some(models) = settings
         .get("modelCatalog")
@@ -1703,6 +1838,7 @@ fn codex_catalog_model_specs(settings: &Value, config_text: &str) -> Vec<CodexCa
     let mut seen = std::collections::HashSet::new();
     let mut specs = Vec::new();
     let official_models = codex_official_models_cache().unwrap_or_default();
+    let configured_reasoning = codex_config_reasoning_capabilities(config_text);
     let mut resolver_settings = settings.clone();
     if !config_text.trim().is_empty() {
         resolver_settings["config"] = json!(config_text);
@@ -1823,7 +1959,19 @@ fn codex_catalog_model_specs(settings: &Value, config_text: &str) -> Vec<CodexCa
                 }
             }
         }
-        let reasoning = resolved.capability;
+        let reasoning = resolved
+            .capability
+            .or_else(|| {
+                configured_reasoning
+                    .get(&model.to_ascii_lowercase())
+                    .cloned()
+            })
+            .or_else(|| {
+                upstream_model
+                    .as_deref()
+                    .and_then(|upstream| configured_reasoning.get(&upstream.to_ascii_lowercase()))
+                    .cloned()
+            });
         let reasoning_fingerprint = resolved.fingerprint;
         let reasoning_source = resolved.source.as_str().to_string();
 
