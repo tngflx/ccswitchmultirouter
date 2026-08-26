@@ -1,4 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
+import { useTranslation } from "react-i18next";
+
+type TFunction = (key: string, options?: Record<string, unknown>) => string;
 import { useQueryClient } from "@tanstack/react-query";
 import { Code2, Database, Search, SlidersHorizontal } from "lucide-react";
 import {
@@ -37,30 +40,27 @@ import {
   type CodexSubagentV2Profile,
 } from "@/types/codexSubagentV2";
 
-const TASK_STRENGTHS: Array<{
-  value: CodexSubagentTaskStrength;
-  label: string;
-}> = [
-  { value: "long_context_reading", label: "长上下文阅读" },
-  { value: "repository_exploration", label: "仓库探索" },
-  { value: "evidence_collection", label: "证据收集" },
-  { value: "summarization", label: "总结归纳" },
-  { value: "complex_debugging", label: "复杂调试" },
-  { value: "architecture_design", label: "架构设计" },
-  { value: "bounded_implementation", label: "有限实现" },
-  { value: "complex_implementation", label: "复杂实现" },
-  { value: "testing", label: "测试验证" },
-  { value: "high_risk_review", label: "高风险审查" },
+const TASK_STRENGTHS: Array<{ value: CodexSubagentTaskStrength }> = [
+  { value: "long_context_reading" },
+  { value: "repository_exploration" },
+  { value: "evidence_collection" },
+  { value: "summarization" },
+  { value: "complex_debugging" },
+  { value: "architecture_design" },
+  { value: "bounded_implementation" },
+  { value: "complex_implementation" },
+  { value: "testing" },
+  { value: "high_risk_review" },
 ];
 
 type ProfileFilter = "enabled" | "draft" | "unroutable" | "all";
 type ProfileTone = "enabled-routable" | "draft" | "unroutable";
 
-const PROFILE_FILTERS: Array<{ value: ProfileFilter; label: string }> = [
-  { value: "enabled", label: "已启用" },
-  { value: "draft", label: "待配置" },
-  { value: "unroutable", label: "不可路由" },
-  { value: "all", label: "全部" },
+const PROFILE_FILTERS: Array<{ value: ProfileFilter }> = [
+  { value: "enabled" },
+  { value: "draft" },
+  { value: "unroutable" },
+  { value: "all" },
 ];
 
 const EXPLICIT_REASONING_EFFORTS = new Set([
@@ -113,16 +113,29 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function evaluateMutationResult(
   result: CodexSubagentV2MutationProvider,
+  t: TFunction,
 ): string {
   const verification = result.verification;
   if (!verification) {
-    throw new Error("后端未返回 Codex Agent 文件写入验证结果。");
+    throw new Error(
+      t("subagentEditor.error.noVerificationResult", {
+        defaultValue: "后端未返回 Codex Agent 文件写入验证结果。",
+      }),
+    );
   }
   if (!verification.databasePersisted) {
-    throw new Error("后端未确认 V2 子 Agent 配置已写入数据库。");
+    throw new Error(
+      t("subagentEditor.error.databaseNotConfirmed", {
+        defaultValue: "后端未确认 V2 子 Agent 配置已写入数据库。",
+      }),
+    );
   }
   if (verification.activation !== "restart_codex_and_start_new_session") {
-    throw new Error("后端返回的 Codex Agent 激活条件不一致。");
+    throw new Error(
+      t("subagentEditor.error.activationMismatch", {
+        defaultValue: "后端返回的 Codex Agent 激活条件不一致。",
+      }),
+    );
   }
 
   switch (result.projection?.status) {
@@ -133,9 +146,16 @@ function evaluateMutationResult(
           (file) => file.exists && file.contentMatches,
         );
       if (verification.roleFilesStatus !== "verified" || !filesVerified) {
-        throw new Error("Codex Agent 文件写入后回读校验失败。");
+        throw new Error(
+          t("subagentEditor.error.fileReadbackFailed", {
+            defaultValue: "Codex Agent 文件写入后回读校验失败。",
+          }),
+        );
       }
-      return "数据库与 Codex Agent 文件均已写入并回读验证；重启 Codex/app-server 并新建会话后生效";
+      return t("subagentEditor.error.appliedDetail", {
+        defaultValue:
+          "数据库与 Codex Agent 文件均已写入并回读验证；重启 Codex/app-server 并新建会话后生效",
+      });
     }
     case "not_required":
       if (
@@ -143,20 +163,37 @@ function evaluateMutationResult(
         !Array.isArray(verification.roleFiles) ||
         verification.roleFiles.length !== 0
       ) {
-        throw new Error("非当前方案的 Codex Agent 文件验证状态不一致。");
+        throw new Error(
+          t("subagentEditor.error.notRequiredStatusMismatch", {
+            defaultValue: "非当前方案的 Codex Agent 文件验证状态不一致。",
+          }),
+        );
       }
-      return "数据库已保存；当前方案未激活，因此未改写 Codex Agent 文件";
+      return t("subagentEditor.error.notRequiredDetail", {
+        defaultValue:
+          "数据库已保存；当前方案未激活，因此未改写 Codex Agent 文件",
+      });
     case "pending_retry":
       if (
         verification.roleFilesStatus !== "pending_retry" ||
         !Array.isArray(verification.roleFiles) ||
         verification.roleFiles.length !== 0
       ) {
-        throw new Error("Codex Agent 待重试状态未通过后端一致性检查。");
+        throw new Error(
+          t("subagentEditor.error.pendingRetryCheckFailed", {
+            defaultValue: "Codex Agent 待重试状态未通过后端一致性检查。",
+          }),
+        );
       }
-      return "数据库已保存；Codex Agent 文件投影待自动重试";
+      return t("subagentEditor.error.pendingRetryDetail", {
+        defaultValue: "数据库已保存；Codex Agent 文件投影待自动重试",
+      });
     default:
-      throw new Error("后端未返回明确的 Codex Agent 投影状态。");
+      throw new Error(
+        t("subagentEditor.error.projectionStatusMissing", {
+          defaultValue: "后端未返回明确的 Codex Agent 投影状态。",
+        }),
+      );
   }
 }
 
@@ -346,26 +383,44 @@ function inferredInputModalities(
   return undefined;
 }
 
-function formatInputModalities(modalities?: string[]): string {
-  if (!modalities || modalities.length === 0) return "未知";
-  if (modalities.some((m) => m.toLowerCase() === "image")) return "文本+图像";
-  return "纯文本";
+function formatInputModalities(
+  modalities: string[] | undefined,
+  t: TFunction,
+): string {
+  if (!modalities || modalities.length === 0)
+    return t("subagentEditor.modality.unknown", { defaultValue: "未知" });
+  if (modalities.some((m) => m.toLowerCase() === "image"))
+    return t("subagentEditor.modality.textAndImage", {
+      defaultValue: "文本+图像",
+    });
+  return t("subagentEditor.modality.textOnly", { defaultValue: "纯文本" });
 }
 
 function formatModalitySource(
   source: CodexSubagentInputModalitySource,
+  t: TFunction,
 ): string {
   switch (source) {
     case "profile_explicit":
-      return "profile 显式声明";
+      return t("subagentEditor.modalitySource.profileExplicit", {
+        defaultValue: "profile 显式声明",
+      });
     case "route":
-      return "路由能力";
+      return t("subagentEditor.modalitySource.route", {
+        defaultValue: "路由能力",
+      });
     case "catalog":
-      return "模型目录";
+      return t("subagentEditor.modalitySource.catalog", {
+        defaultValue: "模型目录",
+      });
     case "name_registry":
-      return "内置模型名注册表";
+      return t("subagentEditor.modalitySource.nameRegistry", {
+        defaultValue: "内置模型名注册表",
+      });
     case "unknown":
-      return "未知（无来源声明）";
+      return t("subagentEditor.modalitySource.unknown", {
+        defaultValue: "未知（无来源声明）",
+      });
   }
 }
 
@@ -423,7 +478,7 @@ function parseNicknames(value: string): string[] {
     .filter(Boolean);
 }
 
-function nicknameError(profiles: Record<string, unknown>) {
+function nicknameError(profiles: Record<string, unknown>, t: TFunction) {
   for (const profile of Object.values(profiles)) {
     if (!isUsableProfile(profile)) continue;
     const values = profile.overrides?.nicknameCandidates;
@@ -435,13 +490,16 @@ function nicknameError(profiles: Record<string, unknown>) {
       unique.size !== values.length ||
       values.some((value) => !/^[A-Za-z0-9 _-]+$/.test(value))
     ) {
-      return "昵称候选需为 1 至 3 个不重复的 ASCII 字母、数字、空格、短横线或下划线";
+      return t("subagentEditor.error.nicknameInvalid", {
+        defaultValue:
+          "昵称候选需为 1 至 3 个不重复的 ASCII 字母、数字、空格、短横线或下划线",
+      });
     }
   }
   return null;
 }
 
-function strengthError(profiles: Record<string, unknown>) {
+function strengthError(profiles: Record<string, unknown>, t: TFunction) {
   return Object.values(profiles).some(
     (profile) =>
       (isUsableProfile(profile) &&
@@ -451,7 +509,9 @@ function strengthError(profiles: Record<string, unknown>) {
           new Set(profile.questionnaire.taskStrengths).size !==
             profile.questionnaire.taskStrengths.length)),
   )
-    ? "每个模型需选择 1 至 5 项不重复的任务优势"
+    ? t("subagentEditor.error.strengthCountInvalid", {
+        defaultValue: "每个模型需选择 1 至 5 项不重复的任务优势",
+      })
     : null;
 }
 
@@ -465,6 +525,7 @@ export function CodexSubagentProfileEditor({
   onPersisted?: (provider: Provider) => void;
 }) {
   const queryClient = useQueryClient();
+  const { t } = useTranslation();
   const persistedConfig = readPersistedConfig(provider);
   const persistedKey = JSON.stringify(persistedConfig);
   const [draft, setDraft] = useState<CodexSubagentV2Config | null>(
@@ -651,7 +712,11 @@ export function CodexSubagentProfileEditor({
   ) {
     const nextConfig = readPersistedConfig(nextProvider);
     if (!nextConfig) {
-      throw new Error("后端未返回已保存的 V2 子 Agent 能力配置。");
+      throw new Error(
+        t("subagentEditor.error.savedConfigMissing", {
+          defaultValue: "后端未返回已保存的 V2 子 Agent 能力配置。",
+        }),
+      );
     }
     backendAdoptedPersistedKey.current = {
       providerId: nextProvider.id,
@@ -682,7 +747,10 @@ export function CodexSubagentProfileEditor({
       );
       await adoptBackendProvider(nextProvider);
       setSaveMessage(
-        `V2 子 Agent 能力配置已初始化；${evaluateMutationResult(nextProvider)}`,
+        t("subagentEditor.initializedWithDetail", {
+          defaultValue: "V2 子 Agent 能力配置已初始化；{{detail}}",
+          detail: evaluateMutationResult(nextProvider, t),
+        }),
       );
     } catch (error) {
       setSaveError(error instanceof Error ? error.message : String(error));
@@ -707,14 +775,26 @@ export function CodexSubagentProfileEditor({
       await adoptBackendProvider(nextProvider);
       const actionMessage =
         action === "sync_catalog"
-          ? "已修复缺失的模型档案；已有设置保持不变"
+          ? t("subagentEditor.reconcile.syncCatalogDone", {
+              defaultValue: "已修复缺失的模型档案；已有设置保持不变",
+            })
           : action === "remove_all_invalid"
-            ? "无效能力配置已删除"
+            ? t("subagentEditor.reconcile.invalidRemoved", {
+                defaultValue: "无效能力配置已删除",
+              })
             : action === "prune_unroutable"
-              ? "已删除模型目录中不存在的失效配置"
-              : "无效能力配置已从模型目录恢复";
+              ? t("subagentEditor.reconcile.unroutablePruned", {
+                  defaultValue: "已删除模型目录中不存在的失效配置",
+                })
+              : t("subagentEditor.reconcile.invalidRecovered", {
+                  defaultValue: "无效能力配置已从模型目录恢复",
+                });
       setSaveMessage(
-        `${actionMessage}；${evaluateMutationResult(nextProvider)}`,
+        t("subagentEditor.reconcile.resultWithDetail", {
+          defaultValue: "{{action}}；{{detail}}",
+          action: actionMessage,
+          detail: evaluateMutationResult(nextProvider, t),
+        }),
       );
     } catch (error) {
       setSaveError(error instanceof Error ? error.message : String(error));
@@ -745,7 +825,11 @@ export function CodexSubagentProfileEditor({
   function repairProfile(profileKey: string) {
     const replacement = defaultProfileForModel(profileKey);
     if (!replacement) {
-      setSaveError("此无效能力配置无法安全修复。");
+      setSaveError(
+        t("subagentEditor.error.cannotRepair", {
+          defaultValue: "此无效能力配置无法安全修复。",
+        }),
+      );
       return;
     }
     setSaveMessage(null);
@@ -802,7 +886,8 @@ export function CodexSubagentProfileEditor({
   async function save() {
     if (!draft) return;
     const rawProfiles = readRawProfiles(draft);
-    const localError = strengthError(rawProfiles) ?? nicknameError(rawProfiles);
+    const localError =
+      strengthError(rawProfiles, t) ?? nicknameError(rawProfiles, t);
     if (localError) {
       setSaveError(localError);
       return;
@@ -833,11 +918,16 @@ export function CodexSubagentProfileEditor({
         if (incompleteReasoning.length > 0) {
           throw new Error(
             incompleteReasoning
-              .map(
-                (profile) =>
-                  `${profile.profileKey ?? profile.model ?? "V2 profile"}：推理能力未配置，请先在模型目录中声明能力后再保存。`,
+              .map((profile) =>
+                t("subagentEditor.error.reasoningNotConfiguredEntry", {
+                  defaultValue:
+                    "{{profile}}：推理能力未配置，请先在模型目录中声明能力后再保存。",
+                  profile: profile.profileKey ?? profile.model ?? "V2 profile",
+                }),
               )
-              .join("；"),
+              .join(
+                t("subagentEditor.error.listSeparator", { defaultValue: "；" }),
+              ),
           );
         }
         if (
@@ -845,21 +935,30 @@ export function CodexSubagentProfileEditor({
             (profile) => !isUsableProfile(profile),
           )
         ) {
-          throw new Error("存在无效能力配置，无法保存。");
+          throw new Error(
+            t("subagentEditor.error.invalidConfigExists", {
+              defaultValue: "存在无效能力配置，无法保存。",
+            }),
+          );
         }
         const details = blocking.flatMap((profile) => profile.warnings);
         throw new Error(
           details[0] ??
             blocking
-              .map(
-                (profile) =>
-                  `${profile.profileKey ?? profile.model ?? "V2 profile"}：${profile.status}`,
+              .map((profile) =>
+                t("subagentEditor.error.statusEntry", {
+                  defaultValue: "{{profile}}：{{status}}",
+                  profile: profile.profileKey ?? profile.model ?? "V2 profile",
+                  status: profile.status,
+                }),
               )
-              .join("；"),
+              .join(
+                t("subagentEditor.error.listSeparator", { defaultValue: "；" }),
+              ),
         );
       }
       const result = await persist(draft);
-      setSaveMessage(evaluateMutationResult(result));
+      setSaveMessage(evaluateMutationResult(result, t));
     } catch (error) {
       setSaveError(error instanceof Error ? error.message : String(error));
     } finally {
@@ -871,11 +970,15 @@ export function CodexSubagentProfileEditor({
     return (
       <section className="rounded-lg border border-emerald-200 bg-emerald-50/50 p-4 dark:border-emerald-700/50 dark:bg-emerald-950/20">
         <p className="text-sm text-muted-foreground">
-          当前方案仍使用兼容的 legacy managed
-          roles。初始化后才会持久化显式问卷输入。
+          {t("subagentEditor.legacyNotice", {
+            defaultValue:
+              "当前方案仍使用兼容的 legacy managed roles。初始化后才会持久化显式问卷输入。",
+          })}
         </p>
         <Button className="mt-3" onClick={initialize} disabled={isSaving}>
-          初始化 V2 子 Agent 能力配置
+          {t("subagentEditor.initializeConfig", {
+            defaultValue: "初始化 V2 子 Agent 能力配置",
+          })}
         </Button>
         {saveError ? (
           <p className="mt-2 text-sm text-rose-600">{saveError}</p>
@@ -972,11 +1075,15 @@ export function CodexSubagentProfileEditor({
         >
           <div className="flex items-center gap-2 text-blue-900 dark:text-blue-100">
             <SlidersHorizontal aria-hidden="true" className="h-4 w-4" />
-            <h3 className="text-sm font-semibold">选择策略</h3>
+            <h3 className="text-sm font-semibold">
+              {t("subagentEditor.strategyTitle", { defaultValue: "选择策略" })}
+            </h3>
           </div>
           <label className="grid gap-1 text-sm">
             <span className="font-medium text-blue-950 dark:text-blue-100">
-              第三方子 Agent 选择策略
+              {t("subagentEditor.thirdPartyPolicyLabel", {
+                defaultValue: "第三方子 Agent 选择策略",
+              })}
             </span>
             <select
               className="rounded-md border border-blue-200 bg-background/90 px-3 py-2 dark:border-blue-500/35 dark:bg-slate-950/60"
@@ -991,9 +1098,19 @@ export function CodexSubagentProfileEditor({
                 });
               }}
             >
-              <option value="balanced">均衡</option>
-              <option value="official_first">官方优先</option>
-              <option value="third_party_first">第三方优先</option>
+              <option value="balanced">
+                {t("subagentEditor.policy.balanced", { defaultValue: "均衡" })}
+              </option>
+              <option value="official_first">
+                {t("subagentEditor.policy.officialFirst", {
+                  defaultValue: "官方优先",
+                })}
+              </option>
+              <option value="third_party_first">
+                {t("subagentEditor.policy.thirdPartyFirst", {
+                  defaultValue: "第三方优先",
+                })}
+              </option>
             </select>
           </label>
 
@@ -1003,7 +1120,9 @@ export function CodexSubagentProfileEditor({
               className="grid gap-1 text-sm"
             >
               <span className="font-medium text-blue-950 dark:text-blue-100">
-                搜索子 Agent 模型
+                {t("subagentEditor.searchLabel", {
+                  defaultValue: "搜索子 Agent 模型",
+                })}
               </span>
               <span className="relative">
                 <Search
@@ -1015,7 +1134,9 @@ export function CodexSubagentProfileEditor({
                   type="search"
                   value={profileSearch}
                   onChange={(event) => setProfileSearch(event.target.value)}
-                  placeholder="模型、角色名或 Provider 类型"
+                  placeholder={t("subagentEditor.searchPlaceholder", {
+                    defaultValue: "模型、角色名或 Provider 类型",
+                  })}
                   className="border-blue-200 bg-background/90 pl-9 dark:border-blue-500/35 dark:bg-slate-950/60"
                 />
               </span>
@@ -1023,7 +1144,9 @@ export function CodexSubagentProfileEditor({
             <div
               className="flex flex-wrap gap-2"
               role="group"
-              aria-label="子 Agent 模型筛选"
+              aria-label={t("subagentEditor.filterGroupLabel", {
+                defaultValue: "子 Agent 模型筛选",
+              })}
             >
               {PROFILE_FILTERS.map((filter) => (
                 <Button
@@ -1041,7 +1164,7 @@ export function CodexSubagentProfileEditor({
                   aria-pressed={profileFilter === filter.value}
                   onClick={() => setProfileFilter(filter.value)}
                 >
-                  {filter.label}
+                  {t(`subagentEditor.filter.${filter.value}`)}
                 </Button>
               ))}
             </div>
@@ -1060,11 +1183,15 @@ export function CodexSubagentProfileEditor({
               onClick={() => reconcile("sync_catalog", draft)}
             >
               <Database aria-hidden="true" className="h-4 w-4" />
-              修复缺失的模型档案
+              {t("subagentEditor.syncCatalog", {
+                defaultValue: "修复缺失的模型档案",
+              })}
             </Button>
             <p className="max-w-2xl text-xs leading-5 text-cyan-900/75 dark:text-cyan-100/75">
-              正常情况下，新模型会在 Provider
-              保存时自动加入并默认关闭；这里只用于修复历史配置或异常中断造成的缺失，已有问卷和手工设置不会被覆盖。
+              {t("subagentEditor.syncCatalogHint", {
+                defaultValue:
+                  "正常情况下，新模型会在 Provider 保存时自动加入并默认关闭；这里只用于修复历史配置或异常中断造成的缺失，已有问卷和手工设置不会被覆盖。",
+              })}
             </p>
           </div>
           {reconciliableProfileCount > 0 ? (
@@ -1074,7 +1201,10 @@ export function CodexSubagentProfileEditor({
                 variant="outline"
                 onClick={() => reconcile("remove_all_invalid", draft)}
               >
-                删除全部无效能力配置（{reconciliableProfileCount} 项）
+                {t("subagentEditor.removeAllInvalid", {
+                  defaultValue: "删除全部无效能力配置（{{count}} 项）",
+                  count: reconciliableProfileCount,
+                })}
               </Button>
               <Button
                 type="button"
@@ -1083,8 +1213,11 @@ export function CodexSubagentProfileEditor({
                   reconcile("recover_all_invalid_from_catalog", draft)
                 }
               >
-                从模型目录恢复全部无效能力配置（
-                {reconciliableProfileCount} 项）
+                {t("subagentEditor.recoverAllInvalid", {
+                  defaultValue:
+                    "从模型目录恢复全部无效能力配置（{{count}} 项）",
+                  count: reconciliableProfileCount,
+                })}
               </Button>
             </div>
           ) : null}
@@ -1096,11 +1229,16 @@ export function CodexSubagentProfileEditor({
                 className="border-amber-300 bg-background/85 text-amber-800 hover:bg-amber-100 dark:border-amber-500/40 dark:bg-amber-950/30 dark:text-amber-100 dark:hover:bg-amber-500/20"
                 onClick={() => reconcile("prune_unroutable", draft)}
               >
-                与目录同步：删除已失效模型（{unroutableProfileCount} 项）
+                {t("subagentEditor.pruneUnroutable", {
+                  defaultValue: "与目录同步：删除已失效模型（{{count}} 项）",
+                  count: unroutableProfileCount,
+                })}
               </Button>
               <p className="max-w-2xl text-xs leading-5 text-amber-900/75 dark:text-amber-100/75">
-                这些配置的模型已不在当前 MultiRouter
-                模型目录中。同步后会删除它们；若模型重新加入目录，可再次添加。
+                {t("subagentEditor.pruneUnroutableHint", {
+                  defaultValue:
+                    "这些配置的模型已不在当前 MultiRouter 模型目录中。同步后会删除它们；若模型重新加入目录，可再次添加。",
+                })}
               </p>
             </div>
           ) : null}
@@ -1115,15 +1253,24 @@ export function CodexSubagentProfileEditor({
               aria-expanded={showOfficialProfiles}
               onClick={() => setShowOfficialProfiles((current) => !current)}
             >
-              <span>官方模型（高级） · {officialProfileCount} 个</span>
+              <span>
+                {t("subagentEditor.officialToggle", {
+                  defaultValue: "官方模型（高级） · {{count}} 个",
+                  count: officialProfileCount,
+                })}
+              </span>
               <span className="text-xs text-muted-foreground">
-                {showOfficialProfiles ? "收起" : "查看"}
+                {showOfficialProfiles
+                  ? t("subagentEditor.collapse", { defaultValue: "收起" })
+                  : t("subagentEditor.view", { defaultValue: "查看" })}
               </span>
             </Button>
             {showOfficialProfiles ? (
               <p className="px-2 pt-2 text-xs leading-5 text-muted-foreground">
-                官方模型通常不需要创建固定角色，Codex
-                内置角色会继承当前官方模型。仅在你明确需要锁定某个官方模型时才启用这里的配置。
+                {t("subagentEditor.officialHint", {
+                  defaultValue:
+                    "官方模型通常不需要创建固定角色，Codex 内置角色会继承当前官方模型。仅在你明确需要锁定某个官方模型时才启用这里的配置。",
+                })}
               </p>
             ) : null}
           </div>
@@ -1157,19 +1304,36 @@ export function CodexSubagentProfileEditor({
                     effort !== "none" && EXPLICIT_REASONING_EFFORTS.has(effort),
                 );
                 const reasoningPolicyOptions: Array<[string, string]> = [
-                  ["delegated", "允许主 Agent / spawn 指定"],
+                  [
+                    "delegated",
+                    t("subagentEditor.policy.delegated", {
+                      defaultValue: "允许主 Agent / spawn 指定",
+                    }),
+                  ],
                 ];
                 if (reasoningCapability?.providerDefaultEffort) {
                   reasoningPolicyOptions.push([
                     "model_default",
-                    "使用模型默认（固定）",
+                    t("subagentEditor.policy.modelDefault", {
+                      defaultValue: "使用模型默认（固定）",
+                    }),
                   ]);
                 }
                 if (selectableFixedEfforts.length > 0) {
-                  reasoningPolicyOptions.push(["fixed", "固定档位"]);
+                  reasoningPolicyOptions.push([
+                    "fixed",
+                    t("subagentEditor.policy.fixed", {
+                      defaultValue: "固定档位",
+                    }),
+                  ]);
                 }
                 if (reasoningCapability?.disableAllowed) {
-                  reasoningPolicyOptions.push(["disabled", "关闭推理"]);
+                  reasoningPolicyOptions.push([
+                    "disabled",
+                    t("subagentEditor.policy.disabled", {
+                      defaultValue: "关闭推理",
+                    }),
+                  ]);
                 }
                 const profileTone = profileToneFor(profile, status);
                 const overrides = profile.overrides ?? {};
@@ -1198,7 +1362,10 @@ export function CodexSubagentProfileEditor({
                     <div className="flex items-center gap-3">
                       <div className="min-w-0 flex-1">
                         <AccordionTrigger
-                          aria-label={`配置 ${profile.model}`}
+                          aria-label={t("subagentEditor.configureModelAria", {
+                            defaultValue: "配置 {{model}}",
+                            model: profile.model,
+                          })}
                           className="py-3 hover:no-underline"
                         >
                           <ProfileSummary
@@ -1212,7 +1379,10 @@ export function CodexSubagentProfileEditor({
                         type="button"
                         size="sm"
                         variant="outline"
-                        aria-label={`编辑 ${profile.model}`}
+                        aria-label={t("subagentEditor.editModelAria", {
+                          defaultValue: "编辑 {{model}}",
+                          model: profile.model,
+                        })}
                         onClick={() => setOpenProfileKey(profileKey)}
                         // 真不可路由（编译状态 Unroutable）一律禁止编辑；
                         // 未启用的可路由 profile（编译状态 Disabled）必须可编辑，
@@ -1220,11 +1390,14 @@ export function CodexSubagentProfileEditor({
                         disabled={isSaving || status?.status === "unroutable"}
                         className="shrink-0"
                       >
-                        编辑
+                        {t("subagentEditor.edit", { defaultValue: "编辑" })}
                       </Button>
                       <label className="flex shrink-0 items-center gap-2 text-xs">
                         <Switch
-                          aria-label={`启用 ${profile.model} 作为 V2 子 Agent`}
+                          aria-label={t("subagentEditor.enableAsSubagentAria", {
+                            defaultValue: "启用 {{model}} 作为 V2 子 Agent",
+                            model: profile.model,
+                          })}
                           checked={profile.enabled}
                           // 用 status.status 区分"未启用（disabled）"与"真不可路由
                           // （unroutable）"：未启用 profile 的后端编译状态是 Disabled，
@@ -1239,7 +1412,13 @@ export function CodexSubagentProfileEditor({
                             }))
                           }
                         />
-                        {profile.enabled ? "已启用" : "未启用"}
+                        {profile.enabled
+                          ? t("subagentEditor.statusEnabled", {
+                              defaultValue: "已启用",
+                            })
+                          : t("subagentEditor.statusDisabled", {
+                              defaultValue: "未启用",
+                            })}
                       </label>
                     </div>
                     <AccordionContent
@@ -1251,14 +1430,21 @@ export function CodexSubagentProfileEditor({
                         id={`codex-subagent-${profileIndex}-region-label`}
                         className="sr-only"
                       >
-                        {profile.model} 子 Agent 配置
+                        {t("subagentEditor.subagentConfigFor", {
+                          defaultValue: "{{model}} 子 Agent 配置",
+                          model: profile.model,
+                        })}
                       </span>
                       <fieldset
                         className="grid gap-3 rounded-lg border border-sky-200 bg-sky-50/60 p-3 dark:border-sky-500/40 dark:bg-sky-950/20"
-                        aria-label="任务优势"
+                        aria-label={t("subagentEditor.taskStrengthsTitle", {
+                          defaultValue: "任务优势",
+                        })}
                       >
                         <legend className="px-1 text-sm font-semibold text-sky-900 dark:text-sky-100">
-                          任务优势
+                          {t("subagentEditor.taskStrengthsTitle", {
+                            defaultValue: "任务优势",
+                          })}
                         </legend>
                         <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-5">
                           {TASK_STRENGTHS.map((strength) => (
@@ -1288,7 +1474,9 @@ export function CodexSubagentProfileEditor({
                                     selected.length >= 5
                                   ) {
                                     setStrengthLimitMessage(
-                                      "任务优势最多选择 5 项",
+                                      t("subagentEditor.strengthLimitReached", {
+                                        defaultValue: "任务优势最多选择 5 项",
+                                      }),
                                     );
                                     return;
                                   }
@@ -1309,7 +1497,7 @@ export function CodexSubagentProfileEditor({
                                   }));
                                 }}
                               />
-                              {strength.label}
+                              {t(`subagentEditor.strength.${strength.value}`)}
                             </label>
                           ))}
                         </div>
@@ -1317,7 +1505,9 @@ export function CodexSubagentProfileEditor({
 
                       <div className="grid gap-3 sm:grid-cols-2">
                         <QuestionnaireSelect
-                          label="输入能力"
+                          label={t("subagentEditor.modalityLabel", {
+                            defaultValue: "输入能力",
+                          })}
                           value={
                             effectiveInputModalities?.[1] === "image"
                               ? "text_and_image"
@@ -1326,9 +1516,24 @@ export function CodexSubagentProfileEditor({
                                 : "unknown"
                           }
                           options={[
-                            ["unknown", "未声明"],
-                            ["text_only", "仅文本"],
-                            ["text_and_image", "文本与图像"],
+                            [
+                              "unknown",
+                              t("subagentEditor.modalityOption.unknown", {
+                                defaultValue: "未声明",
+                              }),
+                            ],
+                            [
+                              "text_only",
+                              t("subagentEditor.modalityOption.textOnly", {
+                                defaultValue: "仅文本",
+                              }),
+                            ],
+                            [
+                              "text_and_image",
+                              t("subagentEditor.modalityOption.textAndImage", {
+                                defaultValue: "文本与图像",
+                              }),
+                            ],
                           ]}
                           onChange={(value) =>
                             updateProfile(profileKey, (current) => {
@@ -1347,12 +1552,29 @@ export function CodexSubagentProfileEditor({
                           }
                         />
                         <QuestionnaireSelect
-                          label="优化目标"
+                          label={t("subagentEditor.optimizationLabel", {
+                            defaultValue: "优化目标",
+                          })}
                           value={profile.questionnaire.optimization}
                           options={[
-                            ["speed", "速度"],
-                            ["balanced", "均衡"],
-                            ["quality", "质量"],
+                            [
+                              "speed",
+                              t("subagentEditor.optimization.speed", {
+                                defaultValue: "速度",
+                              }),
+                            ],
+                            [
+                              "balanced",
+                              t("subagentEditor.optimization.balanced", {
+                                defaultValue: "均衡",
+                              }),
+                            ],
+                            [
+                              "quality",
+                              t("subagentEditor.optimization.quality", {
+                                defaultValue: "质量",
+                              }),
+                            ],
                           ]}
                           onChange={(value) =>
                             updateProfile(profileKey, (current) => ({
@@ -1366,12 +1588,29 @@ export function CodexSubagentProfileEditor({
                           }
                         />
                         <QuestionnaireSelect
-                          label="写入范围"
+                          label={t("subagentEditor.writeScopeLabel", {
+                            defaultValue: "写入范围",
+                          })}
                           value={profile.questionnaire.writeScope}
                           options={[
-                            ["read_only", "只读"],
-                            ["bounded_changes", "有限修改"],
-                            ["complex_changes", "复杂修改"],
+                            [
+                              "read_only",
+                              t("subagentEditor.writeScope.readOnly", {
+                                defaultValue: "只读",
+                              }),
+                            ],
+                            [
+                              "bounded_changes",
+                              t("subagentEditor.writeScope.bounded", {
+                                defaultValue: "有限修改",
+                              }),
+                            ],
+                            [
+                              "complex_changes",
+                              t("subagentEditor.writeScope.complex", {
+                                defaultValue: "复杂修改",
+                              }),
+                            ],
                           ]}
                           onChange={(value) =>
                             updateProfile(profileKey, (current) => ({
@@ -1385,12 +1624,29 @@ export function CodexSubagentProfileEditor({
                           }
                         />
                         <QuestionnaireSelect
-                          label="模型偏好"
+                          label={t("subagentEditor.preferenceLabel", {
+                            defaultValue: "模型偏好",
+                          })}
                           value={profile.questionnaire.preference}
                           options={[
-                            ["preferred", "优先"],
-                            ["eligible", "可用"],
-                            ["fallback", "后备"],
+                            [
+                              "preferred",
+                              t("subagentEditor.preference.preferred", {
+                                defaultValue: "优先",
+                              }),
+                            ],
+                            [
+                              "eligible",
+                              t("subagentEditor.preference.eligible", {
+                                defaultValue: "可用",
+                              }),
+                            ],
+                            [
+                              "fallback",
+                              t("subagentEditor.preference.fallback", {
+                                defaultValue: "后备",
+                              }),
+                            ],
                           ]}
                           onChange={(value) =>
                             updateProfile(profileKey, (current) => ({
@@ -1404,7 +1660,9 @@ export function CodexSubagentProfileEditor({
                           }
                         />
                         <QuestionnaireSelect
-                          label="推理策略"
+                          label={t("subagentEditor.reasoningPolicyLabel", {
+                            defaultValue: "推理策略",
+                          })}
                           value={profile.reasoning.policy}
                           options={reasoningPolicyOptions}
                           onChange={(value) =>
@@ -1450,20 +1708,26 @@ export function CodexSubagentProfileEditor({
                               aria-hidden="true"
                               className="h-4 w-4"
                             />
-                            高级字段
+                            {t("subagentEditor.advancedFields", {
+                              defaultValue: "高级字段",
+                            })}
                           </Button>
                         </CollapsibleTrigger>
                         <CollapsibleContent className="mt-3 space-y-3 rounded-lg border border-violet-200 bg-violet-50/55 p-3 dark:border-violet-500/35 dark:bg-violet-950/20">
                           <OverrideField
                             id={`codex-subagent-${profileIndex}-role-name`}
-                            label="角色名称"
+                            label={t("subagentEditor.roleNameLabel", {
+                              defaultValue: "角色名称",
+                            })}
                             value={
                               overrides.roleName ??
                               preview?.requestedRoleName ??
                               ""
                             }
                             automatic={overrides.roleName === undefined}
-                            restoreLabel="恢复角色名称自动值"
+                            restoreLabel={t("subagentEditor.restoreRoleName", {
+                              defaultValue: "恢复角色名称自动值",
+                            })}
                             onChange={(value) =>
                               setOverride(profileKey, "roleName", value)
                             }
@@ -1473,14 +1737,21 @@ export function CodexSubagentProfileEditor({
                           />
                           <OverrideField
                             id={`codex-subagent-${profileIndex}-description`}
-                            label="角色描述"
+                            label={t("subagentEditor.descriptionLabel", {
+                              defaultValue: "角色描述",
+                            })}
                             value={
                               overrides.description ??
                               preview?.description ??
                               ""
                             }
                             automatic={overrides.description === undefined}
-                            restoreLabel="恢复角色描述自动值"
+                            restoreLabel={t(
+                              "subagentEditor.restoreDescription",
+                              {
+                                defaultValue: "恢复角色描述自动值",
+                              },
+                            )}
                             multiline
                             onChange={(value) =>
                               setOverride(profileKey, "description", value)
@@ -1491,7 +1762,12 @@ export function CodexSubagentProfileEditor({
                           />
                           <OverrideField
                             id={`codex-subagent-${profileIndex}-developer-instructions`}
-                            label="开发者指令"
+                            label={t(
+                              "subagentEditor.developerInstructionsLabel",
+                              {
+                                defaultValue: "开发者指令",
+                              },
+                            )}
                             value={
                               overrides.developerInstructions ??
                               preview?.developerInstructions ??
@@ -1500,7 +1776,12 @@ export function CodexSubagentProfileEditor({
                             automatic={
                               overrides.developerInstructions === undefined
                             }
-                            restoreLabel="恢复开发者指令自动值"
+                            restoreLabel={t(
+                              "subagentEditor.restoreDeveloperInstructions",
+                              {
+                                defaultValue: "恢复开发者指令自动值",
+                              },
+                            )}
                             multiline
                             onChange={(value) =>
                               setOverride(
@@ -1518,12 +1799,19 @@ export function CodexSubagentProfileEditor({
                           />
                           <OverrideField
                             id={`codex-subagent-${profileIndex}-nickname-candidates`}
-                            label="昵称候选"
+                            label={t("subagentEditor.nicknameCandidatesLabel", {
+                              defaultValue: "昵称候选",
+                            })}
                             value={nicknameValue}
                             automatic={
                               overrides.nicknameCandidates === undefined
                             }
-                            restoreLabel="恢复昵称候选自动值"
+                            restoreLabel={t(
+                              "subagentEditor.restoreNicknameCandidates",
+                              {
+                                defaultValue: "恢复昵称候选自动值",
+                              },
+                            )}
                             onChange={(value) => {
                               setNicknameDrafts((current) => ({
                                 ...current,
@@ -1544,12 +1832,18 @@ export function CodexSubagentProfileEditor({
                               <label
                                 htmlFor={`codex-subagent-${profileIndex}-model-reasoning`}
                               >
-                                模型推理强度
+                                {t("subagentEditor.modelReasoningLabel", {
+                                  defaultValue: "模型推理强度",
+                                })}
                               </label>
                               <span className="text-xs text-muted-foreground">
                                 {profile.reasoning.policy === "fixed"
-                                  ? "固定"
-                                  : "未固定"}
+                                  ? t("subagentEditor.fixedTag", {
+                                      defaultValue: "固定",
+                                    })
+                                  : t("subagentEditor.unfixedTag", {
+                                      defaultValue: "未固定",
+                                    })}
                               </span>
                             </span>
                             <div className="flex gap-2">
@@ -1575,7 +1869,12 @@ export function CodexSubagentProfileEditor({
                               >
                                 {profile.reasoning.policy !== "fixed" ? (
                                   <option value="" disabled>
-                                    等待后端能力
+                                    {t(
+                                      "subagentEditor.waitingCapabilityOption",
+                                      {
+                                        defaultValue: "等待后端能力",
+                                      },
+                                    )}
                                   </option>
                                 ) : null}
                                 {selectableFixedEfforts.map((effort) => (
@@ -1594,7 +1893,9 @@ export function CodexSubagentProfileEditor({
                                   }))
                                 }
                               >
-                                允许主 Agent / spawn 指定
+                                {t("subagentEditor.policy.delegated", {
+                                  defaultValue: "允许主 Agent / spawn 指定",
+                                })}
                               </Button>
                             </div>
                           </div>
@@ -1609,7 +1910,9 @@ export function CodexSubagentProfileEditor({
                             className="border-cyan-200 bg-cyan-50 text-cyan-800 hover:bg-cyan-100 dark:border-cyan-500/40 dark:bg-cyan-950/25 dark:text-cyan-100 dark:hover:bg-cyan-500/20"
                           >
                             <Code2 aria-hidden="true" className="h-4 w-4" />
-                            生成结果与 TOML
+                            {t("subagentEditor.generationAndToml", {
+                              defaultValue: "生成结果与 TOML",
+                            })}
                           </Button>
                         </CollapsibleTrigger>
                         <CollapsibleContent className="mt-3 space-y-3 rounded-lg border border-cyan-200 bg-cyan-50/55 p-3 dark:border-cyan-500/35 dark:bg-cyan-950/20">
@@ -1634,7 +1937,11 @@ export function CodexSubagentProfileEditor({
           </Accordion>
         ) : (
           <div className="rounded-lg border border-dashed bg-background/70 p-6 text-center">
-            <p className="text-sm font-medium">没有符合条件的子 Agent 模型</p>
+            <p className="text-sm font-medium">
+              {t("subagentEditor.noMatchingModels", {
+                defaultValue: "没有符合条件的子 Agent 模型",
+              })}
+            </p>
             <Button
               type="button"
               variant="outline"
@@ -1644,23 +1951,30 @@ export function CodexSubagentProfileEditor({
                 setProfileFilter("all");
               }}
             >
-              清除筛选
+              {t("subagentEditor.clearFilters", { defaultValue: "清除筛选" })}
             </Button>
           </div>
         )}
 
         {invalidProfileEntries.length > 0 ? (
           <section
-            aria-label="需要处理"
+            aria-label={t("subagentEditor.needsAttention", {
+              defaultValue: "需要处理",
+            })}
             className="space-y-3 rounded-lg border border-rose-300 bg-rose-50/40 p-3 dark:bg-rose-950/15"
           >
             <h3 className="text-sm font-semibold text-rose-800 dark:text-rose-100">
-              需要处理
+              {t("subagentEditor.needsAttention", {
+                defaultValue: "需要处理",
+              })}
             </h3>
             <div className="grid gap-3 lg:grid-cols-2">
               {invalidProfileEntries.map(([profileKey], index) => {
                 const ordinal = index + 1;
-                const title = `无效能力配置 ${ordinal}`;
+                const title = t("subagentEditor.invalidProfileTitle", {
+                  defaultValue: "无效能力配置 {{index}}",
+                  index: ordinal,
+                });
                 return (
                   <section
                     key={profileKey}
@@ -1669,7 +1983,10 @@ export function CodexSubagentProfileEditor({
                   >
                     <div className="font-medium">{title}</div>
                     <p className="text-sm text-rose-700">
-                      持久化的 profile 结构无效，原始条目尚未被修改。
+                      {t("subagentEditor.invalidProfileDescription", {
+                        defaultValue:
+                          "持久化的 profile 结构无效，原始条目尚未被修改。",
+                      })}
                     </p>
                     <ProfileBackendOutput status={undefined} />
                     <Button
@@ -1677,7 +1994,10 @@ export function CodexSubagentProfileEditor({
                       variant="outline"
                       onClick={() => repairProfile(profileKey)}
                     >
-                      修复无效能力配置 {ordinal}
+                      {t("subagentEditor.repairInvalidProfile", {
+                        defaultValue: "修复无效能力配置 {{index}}",
+                        index: ordinal,
+                      })}
                     </Button>
                   </section>
                 );
@@ -1700,7 +2020,12 @@ export function CodexSubagentProfileEditor({
       ) : null}
       {statuses ? (
         <div className="space-y-2 rounded-lg border border-indigo-200 bg-indigo-50/65 p-4 text-sm text-indigo-950 dark:border-indigo-500/35 dark:bg-indigo-950/20 dark:text-indigo-100">
-          <p className="font-medium">生成来源：{statuses.generationSource}</p>
+          <p className="font-medium">
+            {t("subagentEditor.generationSourceLabel", {
+              defaultValue: "生成来源：{{source}}",
+              source: statuses.generationSource,
+            })}
+          </p>
           {unassignedStatuses.map((status, index) => (
             <ProfileBackendOutput key={`unassigned-${index}`} status={status} />
           ))}
@@ -1733,14 +2058,24 @@ export function CodexSubagentProfileEditor({
                 : "text-emerald-800 dark:text-emerald-100",
           )}
         >
-          {isDirty ? "有未保存更改" : "所有更改均已保存"}
+          {isDirty
+            ? t("subagentEditor.unsavedChanges", {
+                defaultValue: "有未保存更改",
+              })
+            : t("subagentEditor.allChangesSaved", {
+                defaultValue: "所有更改均已保存",
+              })}
         </span>
         <Button
           className="bg-blue-600 text-white hover:bg-blue-500"
           onClick={save}
           disabled={isSaving || !isDirty}
         >
-          {isSaving ? "保存中…" : "保存 V2 子 Agent 配置"}
+          {isSaving
+            ? t("subagentEditor.saving", { defaultValue: "保存中…" })
+            : t("subagentEditor.saveButton", {
+                defaultValue: "保存 V2 子 Agent 配置",
+              })}
         </Button>
         {saveMessage ? (
           <span
@@ -1779,10 +2114,14 @@ function ReasoningCapabilitySummary({
   capability?: CodexSubagentReasoningCapability;
   policy: CodexSubagentV2Profile["reasoning"];
 }) {
+  const { t } = useTranslation();
   if (!capability) {
     return (
       <div className="rounded-md border border-amber-200 bg-amber-50/70 p-3 text-xs text-amber-900 dark:border-amber-500/35 dark:bg-amber-950/20 dark:text-amber-100">
-        正在读取后端解析后的推理能力；未确认前不会启用固定档位或关闭推理。
+        {t("subagentEditor.reasoning.loadingCapabilities", {
+          defaultValue:
+            "正在读取后端解析后的推理能力；未确认前不会启用固定档位或关闭推理。",
+        })}
       </div>
     );
   }
@@ -1790,50 +2129,103 @@ function ReasoningCapabilitySummary({
   const mappings = capability.codexSelectableEfforts
     .filter((effort) => effort !== "none" && capability.effortMap[effort])
     .map((effort) => `${effort}→${capability.effortMap[effort]}`)
-    .join("，");
+    .join(t("subagentEditor.mappingSeparator", { defaultValue: "，" }));
   const behavior =
     policy.policy === "delegated"
-      ? "由主 Agent、spawn 参数或 Codex 默认值决定"
+      ? t("subagentEditor.behavior.delegated", {
+          defaultValue: "由主 Agent、spawn 参数或 Codex 默认值决定",
+        })
       : policy.policy === "model_default"
-        ? `固定为模型当前默认 ${capability.providerDefaultEffort ?? "未声明"}`
+        ? t("subagentEditor.behavior.modelDefault", {
+            defaultValue: "固定为模型当前默认 {{effort}}",
+            effort:
+              capability.providerDefaultEffort ??
+              t("subagentEditor.undeclared", { defaultValue: "未声明" }),
+          })
         : policy.policy === "fixed"
-          ? `固定 ${policy.effort}；主 Agent 无法覆盖`
-          : "关闭推理；上游将使用已确认的 Provider 关闭语义";
+          ? t("subagentEditor.behavior.fixed", {
+              defaultValue: "固定 {{effort}}；主 Agent 无法覆盖",
+              effort: policy.effort,
+            })
+          : t("subagentEditor.behavior.disabled", {
+              defaultValue: "关闭推理；上游将使用已确认的 Provider 关闭语义",
+            });
   const ultraEnabled = capability.codexUltraOrchestrationEnabled;
 
   return (
     <div className="space-y-1 rounded-md border border-indigo-200 bg-indigo-50/70 p-3 text-xs text-indigo-950 dark:border-indigo-500/35 dark:bg-indigo-950/20 dark:text-indigo-100">
       <p>
-        能力来源：{capability.source ?? "未声明"}（{capability.confidence}）
+        {t("subagentEditor.capability.sourceLabel", {
+          defaultValue: "能力来源：{{source}}（{{confidence}}）",
+          source:
+            capability.source ??
+            t("subagentEditor.undeclared", { defaultValue: "未声明" }),
+          confidence: capability.confidence,
+        })}
       </p>
       <p>
-        Provider 原生档位：
-        {capability.providerAcceptedEfforts.join(" / ") || "未声明"}
+        {t("subagentEditor.capability.providerEffortsLabel", {
+          defaultValue: "Provider 原生档位：{{efforts}}",
+          efforts:
+            capability.providerAcceptedEfforts.join(" / ") ||
+            t("subagentEditor.undeclared", { defaultValue: "未声明" }),
+        })}
       </p>
       <p>
-        Codex 可选档位：
-        {capability.codexSelectableEfforts.join(" / ") || "未确认"}
+        {t("subagentEditor.capability.codexEffortsLabel", {
+          defaultValue: "Codex 可选档位：{{efforts}}",
+          efforts:
+            capability.codexSelectableEfforts.join(" / ") ||
+            t("subagentEditor.unconfirmed", { defaultValue: "未确认" }),
+        })}
       </p>
-      <p>模型默认：{capability.providerDefaultEffort ?? "未声明"}</p>
-      <p>允许关闭：{capability.disableAllowed ? "是" : "否"}</p>
-      {mappings ? <p>映射：{mappings}</p> : null}
+      <p>
+        {t("subagentEditor.capability.modelDefaultLabel", {
+          defaultValue: "模型默认：{{effort}}",
+          effort:
+            capability.providerDefaultEffort ??
+            t("subagentEditor.undeclared", { defaultValue: "未声明" }),
+        })}
+      </p>
+      <p>
+        {t("subagentEditor.capability.allowDisableLabel", {
+          defaultValue: "允许关闭：{{value}}",
+          value: capability.disableAllowed
+            ? t("subagentEditor.yes", { defaultValue: "是" })
+            : t("subagentEditor.no", { defaultValue: "否" }),
+        })}
+      </p>
+      {mappings ? (
+        <p>
+          {t("subagentEditor.capability.mappingsLabel", {
+            defaultValue: "映射：{{mappings}}",
+            mappings,
+          })}
+        </p>
+      ) : null}
       {ultraEnabled ? (
         <p>
-          Ultra 已启用：这是 Codex V2 的“最大推理 + 主动 Sub-Agent 委派”模式；
-          第三方 Provider 实际接收 {capability.effortMap.ultra ?? "max"}。
+          {t("subagentEditor.ultraEnabledNote", {
+            defaultValue:
+              "Ultra 已启用：这是 Codex V2 的“最大推理 + 主动 Sub-Agent 委派”模式； 第三方 Provider 实际接收 {{effort}}。",
+            effort: capability.effortMap.ultra ?? "max",
+          })}
         </p>
       ) : (
         <p>
-          Ultra 未启用：若父 Agent 使用
-          Ultra，当前角色应使用模型默认或固定兼容档位，
-          或在该模型的推理能力中启用 Codex Ultra 编排。
+          {t("subagentEditor.ultraDisabledNote", {
+            defaultValue:
+              "Ultra 未启用：若父 Agent 使用 Ultra，当前角色应使用模型默认或固定兼容档位， 或在该模型的推理能力中启用 Codex Ultra 编排。",
+          })}
         </p>
       )}
       <p className="font-medium">{behavior}</p>
       {capability.supportKind === "unknown" ? (
         <p className="font-medium text-rose-700 dark:text-rose-300">
-          推理能力未配置，当前可路由角色无法保存。请先在 Provider
-          模型目录中声明能力，或完成只读能力检测并采用检测结果。
+          {t("subagentEditor.reasoning.requiredWarning", {
+            defaultValue:
+              "推理能力未配置，当前可路由角色无法保存。请先在 Provider 模型目录中声明能力，或完成只读能力检测并采用检测结果。",
+          })}
         </p>
       ) : null}
     </div>
@@ -1849,20 +2241,13 @@ function ProfileSummary({
   preview?: CodexSubagentProfilePreview;
   status?: CodexSubagentProfileStatus;
 }) {
-  const preferenceLabels = {
-    preferred: "优先",
-    eligible: "可用",
-    fallback: "后备",
-  } as const;
+  const { t } = useTranslation();
   const providerKind = status?.providerKind ?? preview?.providerKind;
   const reasoning =
     profile.reasoning.policy === "fixed"
       ? profile.reasoning.effort
       : profile.reasoning.policy;
-  const strengthLabels = profile.questionnaire.taskStrengths
-    .slice(0, 3)
-    .map((value) => TASK_STRENGTHS.find((item) => item.value === value)?.label)
-    .filter((label): label is string => Boolean(label));
+  const topStrengths = profile.questionnaire.taskStrengths.slice(0, 3);
   const hasOverrides = Boolean(
     profile.overrides && Object.keys(profile.overrides).length > 0,
   );
@@ -1879,7 +2264,9 @@ function ProfileSummary({
               : "border-violet-200 bg-violet-100/80 text-violet-800 dark:border-violet-500/40 dark:bg-violet-500/15 dark:text-violet-100"
           }
         >
-          {providerKind === "official" ? "官方" : "第三方"}
+          {providerKind === "official"
+            ? t("subagentEditor.badge.official", { defaultValue: "官方" })
+            : t("subagentEditor.badge.thirdParty", { defaultValue: "第三方" })}
         </Badge>
         <Badge
           variant="outline"
@@ -1889,7 +2276,11 @@ function ProfileSummary({
               : "border-emerald-200 bg-emerald-100/80 text-emerald-800 dark:border-emerald-500/40 dark:bg-emerald-500/15 dark:text-emerald-100"
           }
         >
-          {status?.status === "unroutable" ? "不可路由" : "可路由"}
+          {status?.status === "unroutable"
+            ? t("subagentEditor.filter.unroutable", {
+                defaultValue: "不可路由",
+              })
+            : t("subagentEditor.badge.routable", { defaultValue: "可路由" })}
         </Badge>
         <Badge
           variant="outline"
@@ -1899,33 +2290,42 @@ function ProfileSummary({
               : "border-amber-200 bg-amber-100/80 text-amber-800 dark:border-amber-500/40 dark:bg-amber-500/15 dark:text-amber-100"
           }
         >
-          {profile.enabled ? "已启用" : "待配置"}
+          {profile.enabled
+            ? t("subagentEditor.statusEnabled", { defaultValue: "已启用" })
+            : t("subagentEditor.filter.draft", { defaultValue: "待配置" })}
         </Badge>
         <Badge
           variant="outline"
           className="border-amber-200 bg-amber-100/70 text-amber-800 dark:border-amber-500/40 dark:bg-amber-500/15 dark:text-amber-100"
         >
-          {preferenceLabels[profile.questionnaire.preference]}
+          {t(`subagentEditor.preference.${profile.questionnaire.preference}`)}
         </Badge>
         <Badge
           variant="outline"
           className="border-sky-200 bg-sky-100/70 text-sky-800 dark:border-sky-500/40 dark:bg-sky-500/15 dark:text-sky-100"
         >
-          推理 {reasoning}
+          {t("subagentEditor.badge.reasoning", {
+            defaultValue: "推理 {{effort}}",
+            effort: reasoning,
+          })}
         </Badge>
         <Badge
           variant="outline"
           className="border-indigo-200 bg-indigo-100/70 text-indigo-800 dark:border-indigo-500/40 dark:bg-indigo-500/15 dark:text-indigo-100"
         >
-          {hasOverrides ? "含手工覆盖" : "自动生成"}
+          {hasOverrides
+            ? t("subagentEditor.badge.withOverrides", {
+                defaultValue: "含手工覆盖",
+              })
+            : t("subagentEditor.badge.automatic", { defaultValue: "自动生成" })}
         </Badge>
-        {strengthLabels.map((label) => (
+        {topStrengths.map((strengthValue) => (
           <Badge
-            key={label}
+            key={strengthValue}
             variant="outline"
             className="border-cyan-200 bg-cyan-100/70 text-cyan-800 dark:border-cyan-500/40 dark:bg-cyan-500/15 dark:text-cyan-100"
           >
-            {label}
+            {t(`subagentEditor.strength.${strengthValue}`)}
           </Badge>
         ))}
       </div>
@@ -1944,6 +2344,7 @@ function ProfileBackendOutput({
   preview?: CodexSubagentProfilePreview;
   status?: CodexSubagentProfileStatus;
 }) {
+  const { t } = useTranslation();
   if (!preview && !status) return null;
   const requestedRoleName =
     status?.requestedRoleName ?? preview?.requestedRoleName;
@@ -1956,53 +2357,130 @@ function ProfileBackendOutput({
   return (
     <div
       role="region"
-      aria-label={`${profileKey ?? "未识别 profile"} 后端预览状态`}
+      aria-label={t("subagentEditor.backendOutput.regionAria", {
+        defaultValue: "{{profile}} 后端预览状态",
+        profile:
+          profileKey ??
+          t("subagentEditor.backendOutput.unidentifiedProfile", {
+            defaultValue: "未识别 profile",
+          }),
+      })}
       className="space-y-2 rounded-lg border border-cyan-200 bg-cyan-50/65 p-3 text-sm text-cyan-950 dark:border-cyan-500/35 dark:bg-cyan-950/20 dark:text-cyan-100"
     >
       {status ? (
         <>
           <p>
             {profileKey
-              ? `${profileKey}：${status.status}`
-              : `生成状态：${status.status}`}
+              ? t("subagentEditor.backendOutput.statusWithKey", {
+                  defaultValue: "{{profileKey}}：{{status}}",
+                  profileKey,
+                  status: status.status,
+                })
+              : t("subagentEditor.backendOutput.generationStatusLabel", {
+                  defaultValue: "生成状态：{{status}}",
+                  status: status.status,
+                })}
           </p>
-          <p>生成状态：{status.status}</p>
           <p>
-            Provider 类型：
-            {status.providerKind ?? preview?.providerKind ?? "未知"}
+            {t("subagentEditor.backendOutput.generationStatusLabel", {
+              defaultValue: "生成状态：{{status}}",
+              status: status.status,
+            })}
           </p>
-          <p>可路由：{status.routable ? "是" : "否"}</p>
           <p>
-            已启用：
-            {(status.enabled ?? profile?.enabled) ? "是" : "否"}
+            {t("subagentEditor.backendOutput.providerKindLabel", {
+              defaultValue: "Provider 类型：{{kind}}",
+              kind:
+                status.providerKind ??
+                preview?.providerKind ??
+                t("subagentEditor.modality.unknown", { defaultValue: "未知" }),
+            })}
+          </p>
+          <p>
+            {t("subagentEditor.backendOutput.routableLabel", {
+              defaultValue: "可路由：{{value}}",
+              value: status.routable
+                ? t("subagentEditor.yes", { defaultValue: "是" })
+                : t("subagentEditor.no", { defaultValue: "否" }),
+            })}
+          </p>
+          <p>
+            {t("subagentEditor.backendOutput.enabledLabel", {
+              defaultValue: "已启用：{{value}}",
+              value:
+                (status.enabled ?? profile?.enabled)
+                  ? t("subagentEditor.yes", { defaultValue: "是" })
+                  : t("subagentEditor.no", { defaultValue: "否" }),
+            })}
           </p>
           {status.fieldSources ? (
             <>
-              <p>角色名称来源：{status.fieldSources.roleName}</p>
-              <p>角色描述来源：{status.fieldSources.description}</p>
-              <p>开发者指令来源：{status.fieldSources.developerInstructions}</p>
-              <p>昵称候选来源：{status.fieldSources.nicknameCandidates}</p>
               <p>
-                模型推理强度来源：
-                {status.fieldSources.modelReasoningEffort}
+                {t("subagentEditor.backendOutput.roleNameSource", {
+                  defaultValue: "角色名称来源：{{source}}",
+                  source: status.fieldSources.roleName,
+                })}
+              </p>
+              <p>
+                {t("subagentEditor.backendOutput.descriptionSource", {
+                  defaultValue: "角色描述来源：{{source}}",
+                  source: status.fieldSources.description,
+                })}
+              </p>
+              <p>
+                {t("subagentEditor.backendOutput.developerInstructionsSource", {
+                  defaultValue: "开发者指令来源：{{source}}",
+                  source: status.fieldSources.developerInstructions,
+                })}
+              </p>
+              <p>
+                {t("subagentEditor.backendOutput.nicknameCandidatesSource", {
+                  defaultValue: "昵称候选来源：{{source}}",
+                  source: status.fieldSources.nicknameCandidates,
+                })}
+              </p>
+              <p>
+                {t("subagentEditor.backendOutput.modelReasoningSource", {
+                  defaultValue: "模型推理强度来源：{{source}}",
+                  source: status.fieldSources.modelReasoningEffort,
+                })}
               </p>
             </>
           ) : null}
           {status.inputModality ? (
             <>
               <p>
-                输入能力：
-                {formatInputModalities(status.inputModality.modalities)}
-                （来源：{formatModalitySource(status.inputModality.source)}）
+                {t("subagentEditor.backendOutput.inputModalityLabel", {
+                  defaultValue: "输入能力：{{modalities}}（来源：{{source}}）",
+                  modalities: formatInputModalities(
+                    status.inputModality.modalities,
+                    t,
+                  ),
+                  source: formatModalitySource(status.inputModality.source, t),
+                })}
               </p>
               {status.inputModality.declarations.length > 0 ? (
                 <div className="space-y-0.5 rounded-md border border-cyan-200/70 bg-background/45 px-2 py-1.5 text-xs dark:border-cyan-500/25 dark:bg-slate-950/25">
-                  <p className="font-medium">判定链</p>
+                  <p className="font-medium">
+                    {t("subagentEditor.backendOutput.decisionChain", {
+                      defaultValue: "判定链",
+                    })}
+                  </p>
                   {status.inputModality.declarations.map((declaration) => (
                     <p key={declaration.source}>
-                      {formatModalitySource(declaration.source)}：
-                      {formatInputModalities(declaration.declared)}
-                      {declaration.adopted ? "（采用）" : ""}
+                      {t("subagentEditor.backendOutput.declarationLine", {
+                        defaultValue: "{{source}}：{{declared}}{{adopted}}",
+                        source: formatModalitySource(declaration.source, t),
+                        declared: formatInputModalities(
+                          declaration.declared,
+                          t,
+                        ),
+                        adopted: declaration.adopted
+                          ? t("subagentEditor.backendOutput.adoptedTag", {
+                              defaultValue: "（采用）",
+                            })
+                          : "",
+                      })}
                     </p>
                   ))}
                 </div>
@@ -2015,15 +2493,37 @@ function ProfileBackendOutput({
             </>
           ) : null}
           {status.roleFilePath ? <p>{status.roleFilePath}</p> : null}
-          {status.model ? <p>模型：{status.model}</p> : null}
+          {status.model ? (
+            <p>
+              {t("subagentEditor.backendOutput.modelLabel", {
+                defaultValue: "模型：{{model}}",
+                model: status.model,
+              })}
+            </p>
+          ) : null}
           {status.modelProvider ? (
-            <p>模型 Provider：{status.modelProvider}</p>
+            <p>
+              {t("subagentEditor.backendOutput.modelProviderLabel", {
+                defaultValue: "模型 Provider：{{provider}}",
+                provider: status.modelProvider,
+              })}
+            </p>
           ) : null}
           {status.modelReasoningEffort ? (
-            <p>推理强度：{status.modelReasoningEffort}</p>
+            <p>
+              {t("subagentEditor.backendOutput.effortLabel", {
+                defaultValue: "推理强度：{{effort}}",
+                effort: status.modelReasoningEffort,
+              })}
+            </p>
           ) : null}
           {status.nonGenerationReason ? (
-            <p>未生成原因：{status.nonGenerationReason}</p>
+            <p>
+              {t("subagentEditor.backendOutput.nonGenerationReasonLabel", {
+                defaultValue: "未生成原因：{{reason}}",
+                reason: status.nonGenerationReason,
+              })}
+            </p>
           ) : null}
         </>
       ) : null}
@@ -2031,12 +2531,30 @@ function ProfileBackendOutput({
       {requestedRoleName || effectiveRoleName ? (
         <div className="grid gap-2 md:grid-cols-2">
           <div>
-            <span className="font-medium">请求角色名</span>
-            <div>{requestedRoleName ?? "后端未返回"}</div>
+            <span className="font-medium">
+              {t("subagentEditor.backendOutput.requestedRoleName", {
+                defaultValue: "请求角色名",
+              })}
+            </span>
+            <div>
+              {requestedRoleName ??
+                t("subagentEditor.backendOutput.notReturned", {
+                  defaultValue: "后端未返回",
+                })}
+            </div>
           </div>
           <div>
-            <span className="font-medium">实际角色名</span>
-            <div>{effectiveRoleName ?? "后端未返回"}</div>
+            <span className="font-medium">
+              {t("subagentEditor.backendOutput.effectiveRoleName", {
+                defaultValue: "实际角色名",
+              })}
+            </span>
+            <div>
+              {effectiveRoleName ??
+                t("subagentEditor.backendOutput.notReturned", {
+                  defaultValue: "后端未返回",
+                })}
+            </div>
           </div>
         </div>
       ) : null}
@@ -2058,7 +2576,11 @@ function ProfileBackendOutput({
           </pre>
         </>
       ) : (
-        <p className="text-xs text-muted-foreground">后端预览不可用。</p>
+        <p className="text-xs text-muted-foreground">
+          {t("subagentEditor.backendOutput.unavailable", {
+            defaultValue: "后端预览不可用。",
+          })}
+        </p>
       )}
 
       {warnings.map((warning) => (
@@ -2120,6 +2642,7 @@ function OverrideField({
   onChange: (value: string) => void;
   onRestore: () => void;
 }) {
+  const { t } = useTranslation();
   const control = multiline ? (
     <textarea
       id={id}
@@ -2140,7 +2663,9 @@ function OverrideField({
       <span className="flex items-center justify-between gap-2">
         <label htmlFor={id}>{label}</label>
         <span className="text-xs text-muted-foreground">
-          {automatic ? "自动" : "手工覆盖"}
+          {automatic
+            ? t("subagentEditor.overrideAuto", { defaultValue: "自动" })
+            : t("subagentEditor.overrideManual", { defaultValue: "手工覆盖" })}
         </span>
       </span>
       <div className="flex gap-2">
