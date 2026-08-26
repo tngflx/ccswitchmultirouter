@@ -16,6 +16,9 @@ struct UsageSemantic {
     app_type: String,
     provider_id: String,
     model: String,
+    /// Included only to disambiguate collision fallbacks. Upstream envelope ids are
+    /// sometimes reused across concurrent Codex sessions (observed as `resp_0`).
+    session_id: Option<String>,
     input_token_semantics: i64,
     input_tokens: u32,
     output_tokens: u32,
@@ -30,6 +33,7 @@ impl UsageSemantic {
             app_type: log.app_type.clone(),
             provider_id: log.provider_id.clone(),
             model: log.model.clone(),
+            session_id: log.session_id.clone(),
             input_token_semantics,
             input_tokens: log.usage.input_tokens,
             output_tokens: log.usage.output_tokens,
@@ -44,6 +48,7 @@ impl UsageSemantic {
             &self.app_type,
             &self.provider_id,
             &self.model,
+            &self.session_id,
             self.input_token_semantics,
             self.input_tokens,
             self.output_tokens,
@@ -227,9 +232,9 @@ impl<'a> UsageLogger<'a> {
         request_id: &str,
     ) -> Result<Option<(Option<String>, UsageSemantic)>, AppError> {
         conn.query_row(
-            "SELECT data_source, app_type, provider_id, model, input_token_semantics,
-                    input_tokens, output_tokens, cache_read_tokens,
-                    cache_creation_tokens, status_code
+            "SELECT data_source, app_type, provider_id, model, session_id,
+                    input_token_semantics, input_tokens, output_tokens,
+                    cache_read_tokens, cache_creation_tokens, status_code
              FROM proxy_request_logs WHERE request_id = ?1",
             [request_id],
             |row| {
@@ -239,12 +244,13 @@ impl<'a> UsageLogger<'a> {
                         app_type: row.get(1)?,
                         provider_id: row.get(2)?,
                         model: row.get(3)?,
-                        input_token_semantics: row.get(4)?,
-                        input_tokens: row.get::<_, i64>(5)? as u32,
-                        output_tokens: row.get::<_, i64>(6)? as u32,
-                        cache_read_tokens: row.get::<_, i64>(7)? as u32,
-                        cache_creation_tokens: row.get::<_, i64>(8)? as u32,
-                        status_code: row.get::<_, i64>(9)? as u16,
+                        session_id: row.get(4)?,
+                        input_token_semantics: row.get(5)?,
+                        input_tokens: row.get::<_, i64>(6)? as u32,
+                        output_tokens: row.get::<_, i64>(7)? as u32,
+                        cache_read_tokens: row.get::<_, i64>(8)? as u32,
+                        cache_creation_tokens: row.get::<_, i64>(9)? as u32,
+                        status_code: row.get::<_, i64>(10)? as u16,
                     },
                 ))
             },
@@ -635,6 +641,40 @@ mod tests {
         assert!(rows[1].0.starts_with("shared-id:collision:"));
         assert_eq!(rows[1].1, 20);
         assert_eq!(crate::usage_events::take_test_notify_count(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn same_upstream_id_in_different_sessions_does_not_overwrite() -> Result<(), AppError> {
+        let db = Database::memory()?;
+        let logger = UsageLogger::new(&db);
+        crate::usage_events::take_test_notify_count();
+
+        // Some OpenAI-compatible upstreams return `resp_0` to every Codex turn.
+        // The proxy key can therefore collide even when token totals happen to match.
+        let mut first = request_log("session:codex:provider-a:resp_0", 10);
+        first.session_id = Some("01aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string());
+        let mut second = request_log("session:codex:provider-a:resp_0", 10);
+        second.session_id = Some("01bbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string());
+
+        logger.log_request(&first)?;
+        logger.log_request(&second)?;
+        logger.log_request(&second)?;
+
+        let conn = crate::database::lock_conn!(db.conn);
+        let count: i64 = conn.query_row("SELECT COUNT(*) FROM proxy_request_logs", [], |row| {
+            row.get(0)
+        })?;
+        assert_eq!(count, 2);
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM proxy_request_logs
+                 WHERE request_id LIKE 'session:codex:provider-a:resp_0:collision:%'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )?,
+            1
+        );
         Ok(())
     }
 

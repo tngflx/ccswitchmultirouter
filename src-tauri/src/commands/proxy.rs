@@ -297,6 +297,17 @@ pub async fn diagnose_codex_multirouter(
     let desktop_runtime = codex_desktop_runtime_diagnostics(&live_config);
 
     let mut checks = Vec::new();
+    if let Some(warning) =
+        codex_legacy_default_route_warning(route_plan.default_route_id.as_deref())
+    {
+        checks.push(codex_check(
+            "default_route_legacy_ignored",
+            "Legacy default route field",
+            CodexDiagnosticStatus::Warn,
+            warning,
+            vec!["defaultRouteId is compatibility metadata only".to_string()],
+        ));
+    }
     checks.push(codex_check(
         "proxy_running",
         "本地代理进程",
@@ -1241,6 +1252,15 @@ fn codex_url_points_to_local_proxy(url: &str, proxy_port: u16) -> bool {
     is_local_host && parsed.port_or_known_default() == Some(proxy_port)
 }
 
+fn codex_legacy_default_route_warning(default_route_id: Option<&str>) -> Option<String> {
+    let route_id = default_route_id?.trim();
+    (!route_id.is_empty()).then(|| {
+        format!(
+            "default_route_legacy_ignored: unmatched requests are rejected; defaultRouteId is compatibility metadata only (route `{route_id}`)."
+        )
+    })
+}
+
 /// 读取当前页面选择的 MultiRouter provider，并汇总 `codexRouting` 规则。
 fn codex_route_plan_diagnostics(
     state: &AppState,
@@ -1770,6 +1790,16 @@ fn codex_router_log_protocol_from_path(value: &str) -> Option<&'static str> {
 mod codex_router_log_diagnostics_tests {
     use super::*;
     use std::sync::{Mutex, OnceLock};
+
+    #[test]
+    fn legacy_default_route_warning_is_compatibility_only() {
+        assert!(codex_legacy_default_route_warning(None).is_none());
+        assert!(codex_legacy_default_route_warning(Some("  ")).is_none());
+        let warning = codex_legacy_default_route_warning(Some("route-a")).unwrap();
+        assert!(warning.contains("default_route_legacy_ignored"));
+        assert!(warning.contains("route-a"));
+        assert!(warning.contains("compatibility metadata only"));
+    }
 
     #[test]
     fn disabled_websocket_transport_does_not_report_probe_failure() {

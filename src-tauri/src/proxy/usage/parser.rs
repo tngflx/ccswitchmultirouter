@@ -6,6 +6,7 @@
 //! - Codex API (非流式和流式)
 //! - Gemini API (非流式和流式)
 
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -29,6 +30,20 @@ pub fn dedup_scope_for_app<'a>(
     provider_id: &'a str,
 ) -> Option<(&'a str, &'a str)> {
     (!matches!(app_type, "claude" | "claude-desktop")).then_some((app_type, provider_id))
+}
+
+/// Detect placeholder envelope ids that upstreams reuse across concurrent turns.
+///
+/// Real OpenAI-style ids contain substantial random material (`resp_...`,
+/// `chatcmpl-...`). A bare zero/padded counter does not and must never be used as
+/// the sole global dedup key.
+fn is_weak_upstream_response_id(message_id: &str) -> bool {
+    let value = message_id
+        .strip_prefix("resp_")
+        .or_else(|| message_id.strip_prefix("chatcmpl-"))
+        .or_else(|| message_id.strip_prefix("chatcmpl_"))
+        .unwrap_or(message_id);
+    !value.is_empty() && value.bytes().all(|byte| byte == b'0')
 }
 
 fn response_id(body: &Value, field: &str) -> Option<String> {
@@ -58,8 +73,26 @@ impl TokenUsage {
     /// 生成稳定 request_id。Claude 不加作用域，以便继续与 session JSONL 的
     /// `session:{message_id}` 主键收敛；其他协议加入 app/provider 作用域，避免
     /// 不同上游复用 envelope id 时互相覆盖。
+    #[allow(dead_code)]
     pub fn dedup_request_id(&self, scope: Option<(&str, &str)>) -> String {
-        self.message_id
+        self.dedup_request_id_with_session(scope, None)
+    }
+
+    /// Like [`Self::dedup_request_id`], but scopes weak upstream ids to the local
+    /// client turn/session.
+    ///
+    /// OpenAI-compatible providers occasionally return a placeholder such as
+    /// `resp_0` for every stream. Those ids identify neither a response nor a
+    /// provider-wide turn, so two concurrent Codex sessions can finish with the
+    /// same primary key. Strong provider ids retain the original key so retries
+    /// still deduplicate and session-log convergence is unaffected.
+    pub fn dedup_request_id_with_session(
+        &self,
+        scope: Option<(&str, &str)>,
+        session_id: Option<&str>,
+    ) -> String {
+        let base = self
+            .message_id
             .as_ref()
             .map(|message_id| match scope {
                 Some((app_type, provider_id)) => {
@@ -67,7 +100,14 @@ impl TokenUsage {
                 }
                 None => format!("{SESSION_REQUEST_ID_PREFIX}{message_id}"),
             })
-            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string())
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+
+        match (self.message_id.as_deref(), session_id) {
+            (Some(message_id), Some(session_id)) if is_weak_upstream_response_id(message_id) => {
+                format!("{base}:session/{}", URL_SAFE_NO_PAD.encode(session_id))
+            }
+            _ => base,
+        }
     }
 
     /// 是否产生了任一计费维度的 token。
@@ -601,6 +641,36 @@ mod tests {
         assert!(!empty_usage
             .dedup_request_id(Some(("codex", "provider-a")))
             .starts_with("session:"));
+    }
+
+    #[test]
+    fn weak_upstream_ids_are_scoped_to_client_session() {
+        let usage = TokenUsage {
+            input_tokens: 10,
+            output_tokens: 2,
+            message_id: Some("resp_0".to_string()),
+            ..Default::default()
+        };
+        let scope = Some(("codex", "provider-a"));
+
+        assert_ne!(
+            usage.dedup_request_id_with_session(scope, Some("session-a")),
+            usage.dedup_request_id_with_session(scope, Some("session-b"))
+        );
+        assert_eq!(
+            usage.dedup_request_id_with_session(scope, Some("session/a b")),
+            "session:codex:provider-a:resp_0:session/c2Vzc2lvbi9hIGI"
+        );
+
+        // Strong ids continue to converge for retry/idempotency deduplication.
+        let strong = TokenUsage {
+            message_id: Some("resp_1a2b3c".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            strong.dedup_request_id_with_session(scope, Some("session-a")),
+            "session:codex:provider-a:resp_1a2b3c"
+        );
     }
 
     #[test]
