@@ -1,3 +1,42 @@
+// Component uses i18n; drive useTranslation with real zh resources so assertions get text, not raw keys.
+vi.mock("react-i18next", async () => {
+  const zh = (await import("@/i18n/locales/zh.json")).default;
+  const resolve = (key: string) =>
+    key
+      .split(".")
+      .reduce<any>((obj, part) => (obj == null ? obj : obj[part]), zh);
+  return {
+    getI18n: () => ({
+      language: "zh",
+      t: (key: string, params?: Record<string, unknown>) => {
+        let value: string = resolve(key) ?? key;
+        if (params) {
+          for (const [name, replacement] of Object.entries(params)) {
+            value = value.split("{{" + name + "}}").join(String(replacement));
+          }
+        }
+        return value;
+      },
+    }),
+    useTranslation: () => ({
+      t: (key: string, params?: Record<string, unknown>) => {
+        let value: string = resolve(key) ?? key;
+        if (params) {
+          for (const [name, replacement] of Object.entries(params)) {
+            value = value.split("{{" + name + "}}").join(String(replacement));
+          }
+        }
+        return value;
+      },
+    }),
+    initReactI18next: {
+      // Real @/i18n initializer runs during import of wizard libs; keep it inert.
+      type: "3rdParty",
+      init: () => {},
+    },
+  };
+});
+
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import {
   getDefaultNormalizer,
