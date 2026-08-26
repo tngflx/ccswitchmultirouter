@@ -3991,6 +3991,7 @@ supported in one streaming turn`。
 
 - 截图任务 `01a00e49-e614-7251-a91f-96a9e8889104` 创建于语言策略写入 `~/.codex/config.toml` 之前；任务创建时冻结的 developer instructions 没有新策略，所以该旧任务中的英文 commentary 不能用来判定新配置失效。新建的受控 Codex CLI 任务 `01a00e9c-4b41-7263-86a9-3b14a7b4cb07` 已证明边界：三个 `type=reasoning` item 仍为英文，但两个进度 `agent_message` 和最终 `agent_message` 全为中文。
 - vLLM 与 parser 没有把中文 reasoning 转成英文。直接对 roglinux `127.0.0.1:5001/v1/chat/completions` 发送流式请求，在短 Agent 提示并明确要求中文思考时，服务原生 `delta.reasoning` 持续输出中文；因此编码、SSE 映射和 CCSM Chat→Responses 适配都不是该语言现象的起点。
+- 2026-08-25 继续审计 Qwen3.8 reasoning-only：现场 Qwen Provider 从至少 2026-08-16 起一直有 `localProxyRequestOverrides.body.temperature=0.1`，MultiRouter 正确继承后导致 Qwen3.8 thinking 请求偏离官方 `temperature=1.0/top_p=0.95/top_k=20/min_p=0/presence_penalty=0/repetition_penalty=1` 推荐。roglinux 代理只补缺失的 `top_p=1`，不是 `0.1` 的来源。已通过 CCSM Provider UI 保存官方采样参数并只读回验 DB，未重启也未追加模型请求。与此同时，Qwen verified profile 自动选择 raw `reasoning_text`，当前 Codex Desktop 主会话只投影 summary；这是独立的 downstream 兼容问题。完整证据见 `memory-2026-08-25-codex-desktop-raw-reasoning-renderer.md`。
 - 已用 `codex debug prompt-input` 取得 37,111 字符的真实新任务输入，并按 CCSM 的规则将 developer/system 合并为约 30,112 字符的首部 system 后直连 vLLM 重放。语言策略保持 system 开头时，reasoning 为 1,111 字符、中文汉字 28 个、英文字母 840 个；把同一策略移动到 system 末尾时，reasoning 为 1,134 字符、中文汉字 28 个、英文字母 864 个。两者都以 `The user is asking in Chinese...` 开始，否定了“只要尾置 system 约束即可修复”的假设。
 - 即使把“必须使用中文进行内部思考、进度说明和最终回答”直接追加到当前中文用户消息，真实 Codex 长提示重放仍以英文 reasoning 开始（1,064 字符中中文汉字 91 个、英文字母 764 个）。因此当前剩余问题是 Qwen 在大型、以英文为主的 Codex Agent 上下文中不能可靠遵循 reasoning 语言约束，而不是 Responses→Chat 角色合并、策略位置或 vLLM parser 的 bug。
 - 产品边界必须区分 raw reasoning 与用户可见 commentary/final：新任务的后两者已由现有语言策略修复；raw reasoning 若继续开启显示，语言无法由 CCSM 提示词确定性保证。CCSM 不应在协议转换层静默翻译、改写或伪造模型 reasoning。可接受的产品选择只有保留原始英文 reasoning、隐藏 raw reasoning，或另行设计明确标注且有额外成本/延迟的翻译展示层；不得把后两者包装成模型已经用中文思考。
@@ -4508,3 +4509,33 @@ supported in one streaming turn`。
 - 循环时目标 Qwen Provider 档案已 `verified/readable`，MultiRouter route 仍为旧 `partial`，26 个循环工具调用之间没有 reasoning/commentary item。旧运行时只查 route key，导致真实 reasoning 不进入 Codex 历史，只能在下一轮补 `tool call` 占位。
 - 在保存时物化 route 档案之外，运行时现允许 route 档案不可用时继承 `codexResolvedTargetProviderId` 的完全等价 Provider 档案；完整目标键仍约束模型、transport、endpoint、认证和凭据。旧安装升级后不需要重新保存 Provider，endpoint 改变或 route identity 不完整时仍 fail closed。
 - 同一继承边界同时用于 reasoning projection 和 detected transport。详见 `memory-2026-08-25-qwen-tool-loop-runtime-inheritance.md`；当前仍未替换安装态，Qwen/vLLM 自身公开同类 loop 风险需在新构建 canary 中继续区分。
+- 未升级安装态的临时恢复已完成：对 live DB 做 SQLite 在线备份后，将完全等价 standalone Qwen `verified` 档案复制到既有 route identity；原 CCSM 进程和 15721 未重启，health 与新连接读回均正常。备份和事务边界记录在上述专项 memory；这只修当前 route，长期修复仍是 `584a1834`。
+
+## 2026-08-25 Codex 深度协议探测进度页
+
+- 普通 Codex Provider 的“验证连接”不再调用只返回 HTTP 成败的旧浅探测。入口由 `CodexFormFields` 构造当前未保存 Provider 草稿，调用带 Tauri `Channel` 的 `preflight_codex_provider_protocol_compatibility`；后端 runner 在真实状态转换处发送有序进度，前端不使用计时器伪造阶段。
+- 每个启用模型固定测试 Responses 与 Chat Completions 两条分支，并展示基础响应、SSE 流式、思考分类、强制工具调用、工具结果续轮五项状态。进度事件包括 candidate/stage/reasoning/branch/batch 的 started/finished 结果，只含模型、协议、阶段、结构分类与 readiness；不含 endpoint、API Key、prompt、响应正文、nonce 或工具 payload。
+- 进度弹窗在请求开始前即列出全部启用模型，稳定显示完成数/总数；每个模型卡片并排显示两条协议、阶段状态、reasoning 的 readable/summary/opaque/none、选中协议和 Verified/Partial/Failed。最终结果保留在弹窗内，可重试；Provider 身份变化会使旧事件和结果失效。
+- 普通 Provider 会探测目录中所有 `enabled != false` 的模型；没有目录时回退默认模型。所有模型选择同一 transport 才更新全局 `apiFormat/wire_api`；混合结果保持原协议并生成拆分 Provider 建议。修复了保存命令曾用“任一模型有选择”错误回报 `protocolApplied=true` 的契约问题，也补回了表单行对 `enabled=false` 的保真，停用模型不会发探测请求。
+- Fresh 验证：Rust `protocol_compatibility` 70/70；前端深探测/表单/就绪组件 37/37；`pnpm typecheck`、`cargo check --tests --no-default-features`、rustfmt、Prettier、`git diff --check`、11 个变更文本 UTF-8 严格解码/no-BOM/U+FFFD 检查通过。`cargo check` 仅保留 5 条既有 dead-code warning，Vitest 保留既有 React `act(...)` warning。
+- 浏览器源码态验收实际走通“Codex → 添加供应商 → 单独接入模型源 → 自定义模型源 → 验证连接 → 确认测试 → 深度探测弹窗”，确认弹窗层级、说明、模型卡片、双协议列、错误、重试和关闭入口可见。独立 Vite renderer 缺少 Tauri Channel runtime，所以不能在该环境产生真实阶段事件；当前未构建/安装、未替换 `3.19.2-17`、未重启或修改 live `127.0.0.1:15721`，真实 Provider 与安装态验收仍待后续发布 canary。
+- 联网交叉验证沿用本次实现前的两条独立链：Codex 内置搜索读取 Tauri 官方 Channel 文档与 OpenAI 官方 Responses reasoning 事件参考；Matrix WebSearch 独立读取 Tauri 官方 Channel 页面。Matrix 打开 OpenAI 页面遇到 403/JS challenge，因此 OpenAI 字段以 Codex 内置链的官方 API Reference 为证据；两条可用证据共同支持有序 Channel 进度以及 `reasoning_text` 与 reasoning summary 的结构区别。
+
+## 2026-08-26 Qwen 深度探测 HTTP 521 与 MODT 异常重启取证
+
+- 安装态 CCSwitchMulti 的 Qwen 双协议基础探测确实请求了公网 Zoraxy 的 `/vllm` 路径；Responses 与 Chat Completions 同时失败时，上游返回 Zoraxy HTTP 521 页面。Matrix WebSearch 的 `/websearch` 同期也返回相同 521，而本机 `127.0.0.1:15721/health` 正常，因此 521 发生在 CCSM 之后、模型协议解析之前。
+- Zoraxy 路由事实源显示 `/vllm -> 100.85.95.33:5000`、`/websearch -> 100.85.95.33:8891`。从工作站直连 roglinux 的 5000/5050/8891 均可达；通过 Tailscale IP 直接 SSH 后，`vllm-qwen36-tp`、`vllm-dashboard-proxy`、`vllm-dashboard-web`、`agent-websearch-unified` 全部为 active，本机 `/v1/models` 与 WebSearch `/health` 都为 HTTP 200。不能把本次 521 归因于 Qwen、vLLM Responses/Chat 协议或 roglinux 模型服务停机。
+- MODT 是 `:24443` Zoraxy 中转机。现场 Tailscale Windows 服务虽为 Running/Automatic，但 `tailscale status --json` 为 `BackendState=NoState`、无 Tailscale IP，health 为 `Tailscale is starting. Please wait.`；MODT 到 roglinux 目标端口不可达。MODT 普通公网、控制平面 443 与 `tailscale netcheck` 均正常，所以直接根因是 MODT 的 Tailscale daemon 在异常重启后卡死，Zoraxy 能接收公网请求却无法经 Tailscale 回源。
+- MODT 系统日志确认近两天多次异常重启。最近三次分别为 2026-08-25 22:28（bugcheck 0x50）、2026-08-26 01:28（0x1A，参数 1 为 0x41792）和 2026-08-26 02:36（0xA）；均伴随 Kernel-Power 41 与 EventLog 6008。更早还有 bugcheck 0x1A 以及带 PowerButtonTimestamp 的硬复位。当前系统从 02:36 启动；Tailscale 从该次启动即处于 NoState。2026-08-25 08:38 还存在一次独立的 Tailscale 服务意外终止（SCM 7031，系统自动重启服务）。
+- 这组三种 stop code 共同指向内核驱动错误或内存损坏，不能只通过重启 Tailscale 当作已修复。先恢复 MODT Tailscale 并验证 `BackendState=Running`、MODT 到 100.85.95.33:5000/8891 可达，可消除当前 521；随后必须取得 `C:\Windows\Minidump`/`MEMORY.DMP` 用 WinDbg `!analyze -v` 确认故障模块，并检查 RAM、超频/内存时序和近期内核驱动。不得删除 Tailscale state、logout 或重建节点身份来掩盖问题。
+- Zoraxy 由 NSSM 自动服务托管，系统启动后正常加载路由；05:02 还出现一次无完整原因记录的进程重启。当前证据未显示 Zoraxy 本身导致三次蓝屏。远程 SSH 后续出现“公网 TCP 22024 可达但 banner 超时”，使 dump 文件索引尚未完成；在取得转储分析前，物理 RAM 与具体驱动之间仍属未决。
+- 联网交叉验证：Codex 内置 WebSearch 命中 Zoraxy 521 的 upstream-unreachable/无在线 upstream 案例、Tailscale Windows 异常重启后 NoState 的公开问题，以及 Microsoft 对 0x1A/0x50/0xA 的官方说明。Matrix WebSearch 独立调用本身被同一 Zoraxy 521 阻断，因此它是故障同源证据，不作为技术结论的支持来源。
+
+## 2026-08-26 深度探测 521 状态语义与脱敏错误呈现根修
+
+- MODT 恢复后重新验证：`https://www.matrixminecraft.cn:24443/vllm/v1/models`、`/vllm-dashboard/api/health`、`/websearch/health` 均为 HTTP 200，`/relay-dashboard/` 为 302，本机 CCSM `127.0.0.1:15721/health` 为 200。之前的 521 结果是过期的环境故障证据，不能继续用于判断 Qwen 协议或推理能力。
+- 后端 runner 原本已经在基础响应未通过时把 reasoning stage 标成 `skipped`；真正的产品 bug 在两层：前端最终 `applyRecord` 和中途 `reasoning_classified` 都无条件把 `semantic=none` 改成 `unsupported`，覆盖了后端状态；非 2xx 在 capture 层以 `ProbeCaptureError::HttpStatus` 提前返回，branch record 又没有保留脱敏失败原因，导致用户只看到“基础响应失败”。
+- 根修不新增模型名特判，也不先调用不可移植的 `/health`：双协议各自的 baseline 就是通用可用性门。只有 baseline 成功后 `semantic=none` 才表示“未返回/不支持”；baseline 失败时 reasoning 显示“未检测/已跳过”，后续 SSE、工具和续轮保持跳过，不把链路故障写成模型能力结论。
+- `TransportBranchResult.failures` 与 `StageFinished.failure` 现在传递安全结构：仅包含 stage、kind 和可选 HTTP status；覆盖 http_status、timeout、network、response_too_large、invalid_response、invalid_request。禁止包含 endpoint、API Key、prompt、响应正文、nonce 或工具参数。UI 会即时和最终显示 `HTTP 521 · 上游不可达`，404/405/415 显示接口不支持，其他失败显示安全类别。
+- TDD 先证明旧实现下两项 RED：失败 baseline 的 reasoning 被显示成“不支持”，HTTP 521 没有任何详情；Rust 521 fixture 的 `failures` 为 null。GREEN 后前端进度弹窗 6/6、相关表单 36/36、Rust protocol compatibility 71/71、完整 Rust lib 3514/3514、完整 Vitest 全过；`pnpm typecheck`、`pnpm build:renderer`、`cargo check --tests --no-default-features` 和 `git diff --check` 通过。保留既有 React act/MSW、浏览器数据过期、bundle size 与 5 条 dead-code warning。
+- 联网交叉验证：Codex 内置搜索读取 Cloudflare 官方 521/结构化 5xx 与 Tauri Channel 文档；Matrix WebSearch 独立读取 vLLM 官方 reasoning outputs，确认 Qwen reasoning 只能在成功的 Chat/Responses 响应后按 `reasoning`/delta/Responses reasoning item 分类。具体 CCSM 根因和修复以本地源码、RED/GREEN 与实时端点为权威证据。
