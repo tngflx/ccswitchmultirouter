@@ -1,4 +1,5 @@
 import { useMemo } from "react";
+import { useTranslation } from "react-i18next";
 import {
   CheckCircle2,
   Circle,
@@ -59,12 +60,24 @@ interface CodexProtocolProbeProgressDialogProps {
   onRetry?: () => void;
 }
 
-const STAGES: Array<{ id: CodexProtocolProbeStage; label: string }> = [
-  { id: "baseline", label: "基础响应" },
-  { id: "streaming", label: "流式 SSE" },
-  { id: "reasoning", label: "思考内容" },
-  { id: "forced_tool", label: "工具调用" },
-  { id: "continuation", label: "工具续轮" },
+const STAGES: Array<{
+  id: CodexProtocolProbeStage;
+  label: string;
+  labelKey: string;
+}> = [
+  { id: "baseline", label: "基础响应", labelKey: "codexProbe.stageBaseline" },
+  { id: "streaming", label: "流式 SSE", labelKey: "codexProbe.stageStreaming" },
+  { id: "reasoning", label: "思考内容", labelKey: "codexProbe.stageReasoning" },
+  {
+    id: "forced_tool",
+    label: "工具调用",
+    labelKey: "codexProbe.stageForcedTool",
+  },
+  {
+    id: "continuation",
+    label: "工具续轮",
+    labelKey: "codexProbe.stageContinuation",
+  },
 ];
 
 const TRANSPORTS: CodexProtocolTransport[] = [
@@ -184,70 +197,136 @@ function buildProgress(
   return [...models.values()];
 }
 
-function statusPresentation(status: VisibleStageStatus) {
+type TranslateFn = (key: string, opts?: Record<string, unknown>) => string;
+
+function statusPresentation(status: VisibleStageStatus, t: TranslateFn) {
   if (status === "running") {
     return {
-      label: "检测中",
+      label: t("codexProbe.statusRunning", { defaultValue: "检测中" }),
       icon: Loader2,
       className: "text-sky-600 animate-spin",
     };
   }
   if (status === "passed") {
-    return { label: "通过", icon: CheckCircle2, className: "text-emerald-600" };
+    return {
+      label: t("codexProbe.statusPassed", { defaultValue: "通过" }),
+      icon: CheckCircle2,
+      className: "text-emerald-600",
+    };
   }
   if (status === "failed") {
-    return { label: "失败", icon: XCircle, className: "text-destructive" };
+    return {
+      label: t("codexProbe.statusFailed", { defaultValue: "失败" }),
+      icon: XCircle,
+      className: "text-destructive",
+    };
   }
   if (status === "unsupported") {
-    return { label: "不支持", icon: MinusCircle, className: "text-amber-600" };
+    return {
+      label: t("codexProbe.statusUnsupported", { defaultValue: "不支持" }),
+      icon: MinusCircle,
+      className: "text-amber-600",
+    };
   }
   if (status === "skipped") {
     return {
-      label: "已跳过",
+      label: t("codexProbe.statusSkipped", { defaultValue: "已跳过" }),
       icon: MinusCircle,
       className: "text-muted-foreground",
     };
   }
-  return { label: "等待", icon: Circle, className: "text-muted-foreground/60" };
+  return {
+    label: t("codexProbe.statusPending", { defaultValue: "等待" }),
+    icon: Circle,
+    className: "text-muted-foreground/60",
+  };
 }
 
 function reasoningLabel(
   semantic: CodexReasoningSemantic | null,
   status: VisibleStageStatus,
+  t: TranslateFn,
 ) {
-  if (semantic === "readable") return "可读正文";
-  if (semantic === "summary") return "摘要";
-  if (semantic === "opaque") return "加密/不透明";
-  if (semantic === "none") return status === "skipped" ? "未检测" : "未返回";
-  return "待识别";
+  if (semantic === "readable") {
+    return t("codexProbe.reasoningReadable", { defaultValue: "可读正文" });
+  }
+  if (semantic === "summary") {
+    return t("codexProbe.reasoningSummary", { defaultValue: "摘要" });
+  }
+  if (semantic === "opaque") {
+    return t("codexProbe.reasoningOpaque", {
+      defaultValue: "加密/不透明",
+    });
+  }
+  if (semantic === "none") {
+    return status === "skipped"
+      ? t("codexProbe.reasoningNoneSkipped", { defaultValue: "未检测" })
+      : t("codexProbe.reasoningNone", { defaultValue: "未返回" });
+  }
+  return t("codexProbe.reasoningPending", { defaultValue: "待识别" });
 }
 
-function failureLabel(failure: CodexProtocolProbeFailure) {
+function failureLabel(failure: CodexProtocolProbeFailure, t: TranslateFn) {
   if (failure.kind === "http_status") {
-    if (failure.status_code === 521) return "HTTP 521 · 上游不可达";
+    if (failure.status_code === 521) {
+      return t("codexProbe.failureHttp521", {
+        defaultValue: "HTTP 521 · 上游不可达",
+      });
+    }
     if ([404, 405, 415].includes(failure.status_code ?? 0)) {
-      return `HTTP ${failure.status_code} · 接口不支持`;
+      return t("codexProbe.failureHttpUnsupported", {
+        defaultValue: "HTTP {{code}} · 接口不支持",
+        code: failure.status_code,
+      });
     }
     return failure.status_code
-      ? `HTTP ${failure.status_code} · 上游请求失败`
-      : "上游请求失败";
+      ? t("codexProbe.failureHttp", {
+          defaultValue: "HTTP {{code}} · 上游请求失败",
+          code: failure.status_code,
+        })
+      : t("codexProbe.failureHttpNoCode", {
+          defaultValue: "上游请求失败",
+        });
   }
-  if (failure.kind === "timeout") return "请求超时";
-  if (failure.kind === "network") return "网络连接失败";
-  if (failure.kind === "response_too_large") return "响应超过探测上限";
-  if (failure.kind === "invalid_request") return "探测地址无效";
-  return "响应格式无效";
+  if (failure.kind === "timeout") {
+    return t("codexProbe.failureTimeout", { defaultValue: "请求超时" });
+  }
+  if (failure.kind === "network") {
+    return t("codexProbe.failureNetwork", { defaultValue: "网络连接失败" });
+  }
+  if (failure.kind === "response_too_large") {
+    return t("codexProbe.failureTooLarge", {
+      defaultValue: "响应超过探测上限",
+    });
+  }
+  if (failure.kind === "invalid_request") {
+    return t("codexProbe.failureInvalidRequest", {
+      defaultValue: "探测地址无效",
+    });
+  }
+  return t("codexProbe.failureInvalidFormat", { defaultValue: "响应格式无效" });
 }
 
-function readinessLabel(readiness: CodexProtocolProbeReadiness | null) {
-  if (readiness === "verified") return "Verified";
-  if (readiness === "partial") return "Partial";
-  if (readiness === "unverified") return "Failed";
-  return "待评估";
+function readinessLabel(
+  readiness: CodexProtocolProbeReadiness | null,
+  t: TranslateFn,
+) {
+  if (readiness === "verified") {
+    return t("codexProbe.readinessVerified", { defaultValue: "Verified" });
+  }
+  if (readiness === "partial") {
+    return t("codexProbe.readinessPartial", { defaultValue: "Partial" });
+  }
+  if (readiness === "unverified") {
+    return t("codexProbe.readinessFailed", { defaultValue: "Failed" });
+  }
+  return t("codexProbe.readinessPending", { defaultValue: "待评估" });
 }
 
-function transportLabel(transport: CodexProtocolTransport) {
-  return transport === "open_ai_responses" ? "Responses" : "Chat Completions";
+function transportLabel(transport: CodexProtocolTransport, t: TranslateFn) {
+  return transport === "open_ai_responses"
+    ? t("codexProbe.transportResponses", { defaultValue: "Responses" })
+    : t("codexProbe.transportChat", { defaultValue: "Chat Completions" });
 }
 
 export function CodexProtocolProbeProgressDialog({
@@ -260,6 +339,7 @@ export function CodexProtocolProbeProgressDialog({
   onOpenChange,
   onRetry,
 }: CodexProtocolProbeProgressDialogProps) {
+  const { t } = useTranslation();
   const models = useMemo(
     () => buildProgress(expectedModels, events, outcome),
     [expectedModels, events, outcome],
@@ -282,13 +362,29 @@ export function CodexProtocolProbeProgressDialog({
         zIndex="top"
       >
         <DialogHeader>
-          <DialogTitle>Codex 兼容性深度探测</DialogTitle>
+          <DialogTitle>
+            {t("codexProbe.title", { defaultValue: "Codex 兼容性深度探测" })}
+          </DialogTitle>
           <DialogDescription>
             {running
-              ? `正在验证模型 ${completed}/${models.length || "…"}。每个模型会依次检查 Responses 与 Chat。`
+              ? t("codexProbe.runningSummary", {
+                  defaultValue:
+                    "正在验证模型 {{completed}}/{{total}}。每个模型会依次检查 Responses 与 Chat。",
+                  completed,
+                  total: models.length || "…",
+                })
               : batch
-                ? `已完成 ${batch.total} 个模型：Verified ${batch.verified}，Partial ${batch.partial}，Failed ${batch.failed}。`
-                : "探测已结束。"}
+                ? t("codexProbe.batchSummary", {
+                    defaultValue:
+                      "已完成 {{total}} 个模型：Verified {{verified}}，Partial {{partial}}，Failed {{failed}}。",
+                    total: batch.total,
+                    verified: batch.verified,
+                    partial: batch.partial,
+                    failed: batch.failed,
+                  })
+                : t("codexProbe.finishedSummary", {
+                    defaultValue: "探测已结束。",
+                  })}
           </DialogDescription>
         </DialogHeader>
 
@@ -302,18 +398,26 @@ export function CodexProtocolProbeProgressDialog({
               className="rounded-md border border-destructive/40 bg-destructive/10 p-3 text-sm text-destructive"
               role="alert"
             >
-              探测中断：{error}
+              {t("codexProbe.interrupted", {
+                defaultValue: "探测中断：{{error}}",
+                error,
+              })}
             </div>
           )}
           {models.length === 0 && !error && (
             <div className="rounded-md border border-dashed p-6 text-center text-sm text-muted-foreground">
-              正在准备模型和探测请求…
+              {t("codexProbe.preparing", {
+                defaultValue: "正在准备模型和探测请求…",
+              })}
             </div>
           )}
           {models.map((model) => (
             <article
               key={model.model}
-              aria-label={`${model.model} 探测进度`}
+              aria-label={t("codexProbe.modelAria", {
+                defaultValue: "{{model}} 探测进度",
+                model: model.model,
+              })}
               className="space-y-3 rounded-lg border border-border-default bg-muted/10 p-4"
             >
               <div className="flex flex-wrap items-center justify-between gap-2">
@@ -321,11 +425,14 @@ export function CodexProtocolProbeProgressDialog({
                 <div className="flex items-center gap-2 text-xs">
                   {model.selectedTransport && (
                     <span className="rounded-full border border-sky-500/30 bg-sky-500/10 px-2 py-0.5 text-sky-700 dark:text-sky-300">
-                      选择 {transportLabel(model.selectedTransport)}
+                      {t("codexProbe.selectedTransport", {
+                        defaultValue: "选择 {{transport}}",
+                        transport: transportLabel(model.selectedTransport, t),
+                      })}
                     </span>
                   )}
                   <span className="rounded-full border px-2 py-0.5 text-muted-foreground">
-                    {readinessLabel(model.readiness)}
+                    {readinessLabel(model.readiness, t)}
                   </span>
                 </div>
               </div>
@@ -340,21 +447,24 @@ export function CodexProtocolProbeProgressDialog({
                     >
                       <div className="mb-3 flex items-center justify-between gap-2">
                         <h4 className="text-sm font-medium">
-                          {transportLabel(transport)}
+                          {transportLabel(transport, t)}
                         </h4>
                         <span className="text-xs text-muted-foreground">
-                          {readinessLabel(branch.readiness)}
+                          {readinessLabel(branch.readiness, t)}
                         </span>
                       </div>
                       {!branch.touched ? (
                         <p className="text-xs text-muted-foreground">
-                          等待开始
+                          {t("codexProbe.waiting", {
+                            defaultValue: "等待开始",
+                          })}
                         </p>
                       ) : (
                         <div className="space-y-2">
                           {STAGES.map((stage) => {
                             const status = statusPresentation(
                               branch.stages[stage.id],
+                              t,
                             );
                             const Icon = status.icon;
                             return (
@@ -362,13 +472,18 @@ export function CodexProtocolProbeProgressDialog({
                                 key={stage.id}
                                 className="flex items-center justify-between gap-3 text-sm"
                               >
-                                <span>{stage.label}</span>
+                                <span>
+                                  {t(stage.labelKey, {
+                                    defaultValue: stage.label,
+                                  })}
+                                </span>
                                 <span className="flex items-center gap-1.5 text-xs text-muted-foreground">
                                   {stage.id === "reasoning" && (
                                     <span>
                                       {reasoningLabel(
                                         branch.reasoningSemantic,
                                         branch.stages.reasoning,
+                                        t,
                                       )}
                                     </span>
                                   )}
@@ -387,7 +502,7 @@ export function CodexProtocolProbeProgressDialog({
                                 <p
                                   key={`${failure.stage}:${failure.kind}:${failure.status_code ?? ""}`}
                                 >
-                                  {failureLabel(failure)}
+                                  {failureLabel(failure, t)}
                                 </p>
                               ))}
                             </div>
@@ -405,7 +520,7 @@ export function CodexProtocolProbeProgressDialog({
         <DialogFooter>
           {!running && onRetry && (
             <Button type="button" variant="outline" onClick={onRetry}>
-              重新探测
+              {t("codexProbe.retry", { defaultValue: "重新探测" })}
             </Button>
           )}
           <Button
@@ -413,7 +528,9 @@ export function CodexProtocolProbeProgressDialog({
             onClick={() => onOpenChange(false)}
             disabled={running}
           >
-            {running ? "探测进行中" : "关闭"}
+            {running
+              ? t("codexProbe.runningClose", { defaultValue: "探测进行中" })
+              : t("codexProbe.close", { defaultValue: "关闭" })}
           </Button>
         </DialogFooter>
       </DialogContent>

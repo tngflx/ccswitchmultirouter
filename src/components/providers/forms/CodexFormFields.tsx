@@ -1,4 +1,4 @@
-﻿import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { useTranslation } from "react-i18next";
 import { Button } from "@/components/ui/button";
@@ -40,13 +40,17 @@ import { ApiKeySection, EndpointField, ModelDropdown } from "./shared";
 import { XaiOAuthSection } from "./XaiOAuthSection";
 import {
   fetchModelsForConfig,
-  probeCodexChatForConfig,
-  probeCodexResponsesForConfig,
   fetchXaiOauthModels,
   showFetchModelsError,
-  type CodexResponsesProbeResult,
   type FetchedModel,
 } from "@/lib/api/model-fetch";
+import {
+  preflightCodexProviderProtocolCompatibility,
+  type CodexProtocolCompatibilityRecord,
+  type CodexProtocolProbeProgressEvent,
+  type CodexProviderProtocolPreflightOutcome,
+} from "@/lib/api/protocol-compatibility";
+import { CodexProtocolProbeProgressDialog } from "./CodexProtocolProbeProgressDialog";
 import { CustomUserAgentField } from "./CustomUserAgentField";
 import { LocalProxyRequestOverridesField } from "./LocalProxyRequestOverridesField";
 import { CodexProviderReadinessSection } from "./CodexProviderReadinessSection";
@@ -92,13 +96,6 @@ interface EndpointCandidate {
   url: string;
 }
 
-interface CodexProtocolProbeOutcome {
-  model: string;
-  responses: CodexResponsesProbeResult;
-  chat: CodexResponsesProbeResult;
-}
-
-const CODEX_PROTOCOL_PROBE_MODEL_CONCURRENCY = 3;
 const PROVIDER_REASONING_EFFORT_CHOICES: CodexReasoningEffort[] = [
   "minimal",
   "low",
@@ -248,137 +245,21 @@ export function validateCodexReasoningCapabilityDraft(
   }
 }
 
-// 用小并发池执行真实上游探测，避免串行太慢，也避免一次性打爆供应商限流。
-async function runCodexProtocolProbePool(
-  models: string[],
-  concurrency: number,
-  probeModel: (
-    model: string,
-    index: number,
-  ) => Promise<CodexProtocolProbeOutcome>,
-): Promise<CodexProtocolProbeOutcome[]> {
-  const outcomes = new Array<CodexProtocolProbeOutcome>(models.length);
-  let nextIndex = 0;
-
-  // 每个 worker 领取下一个模型；Promise.all 保证全部 worker 结束后再汇总。
-  async function worker() {
-    while (nextIndex < models.length) {
-      const index = nextIndex;
-      nextIndex += 1;
-      outcomes[index] = await probeModel(models[index], index);
-    }
-  }
-
-  const workerCount = Math.min(Math.max(1, concurrency), models.length);
-  await Promise.all(Array.from({ length: workerCount }, () => worker()));
-  return outcomes;
-}
-
-// 把单模型双协议探测结果归类，供汇总文案和协议自动选择复用。
-function classifyProtocolProbeOutcome(outcome: CodexProtocolProbeOutcome) {
-  if (outcome.responses.ok && outcome.chat.ok) return "both";
-  if (outcome.responses.ok) return "responses";
-  if (outcome.chat.ok) return "chat";
-  return "failed";
-}
-
-// 将模型名压缩成适合内联展示的列表，避免大量模型时把表单撑爆。
-function summarizeProbeModels(
-  outcomes: CodexProtocolProbeOutcome[],
-  limit = 4,
-) {
-  if (outcomes.length === 0) return "";
-  const names = outcomes.slice(0, limit).map((outcome) => outcome.model);
-  return `${names.join("、")}${i18n.t("codexForm.probeMoreModels", {
-    defaultValue: " 等 {{count}} 个",
-    count: outcomes.length,
-  })}`;
-}
-
-// 生成每个协议探测分类的摘要，确保用户能同时看到其它模型是成功、部分成功还是失败。
-export function summarizeCodexProtocolProbeOutcomes(
-  outcomes: CodexProtocolProbeOutcome[],
-) {
-  const groups = {
-    both: outcomes.filter(
-      (outcome) => classifyProtocolProbeOutcome(outcome) === "both",
-    ),
-    responses: outcomes.filter(
-      (outcome) => classifyProtocolProbeOutcome(outcome) === "responses",
-    ),
-    chat: outcomes.filter(
-      (outcome) => classifyProtocolProbeOutcome(outcome) === "chat",
-    ),
-    failed: outcomes.filter(
-      (outcome) => classifyProtocolProbeOutcome(outcome) === "failed",
-    ),
-  };
-
-  const details = [
-    groups.both.length > 0
-      ? i18n.t("codexForm.probeBothPassed", {
-          defaultValue: "双协议通过：{{models}}",
-          models: summarizeProbeModels(groups.both),
-        })
-      : "",
-    groups.responses.length > 0
-      ? i18n.t("codexForm.probeOnlyResponsesPassed", {
-          defaultValue: "仅 Responses 通过：{{models}}",
-          models: summarizeProbeModels(groups.responses),
-        })
-      : "",
-    groups.chat.length > 0
-      ? i18n.t("codexForm.probeOnlyChatPassed", {
-          defaultValue: "仅 Chat 通过：{{models}}",
-          models: summarizeProbeModels(groups.chat),
-        })
-      : "",
-    groups.failed.length > 0
-      ? i18n.t("codexForm.probeBothFailed", {
-          defaultValue: "双协议失败：{{details}}{{ellipsis}}",
-          details: groups.failed
-            .slice(0, 3)
-            .map(
-              (outcome) =>
-                `${outcome.model}（Responses=${outcome.responses.detail}; Chat=${outcome.chat.detail}）`,
-            )
-            .join("；"),
-          ellipsis: groups.failed.length > 3 ? "；..." : "",
-        })
-      : "",
-  ].filter(Boolean);
-
-  return {
-    responsesPass: groups.both.length + groups.responses.length,
-    chatPass: groups.both.length + groups.chat.length,
-    failedCount: groups.failed.length,
-    detail:
-      details.length > 0
-        ? i18n.t("codexForm.probeResultDetails", {
-            defaultValue: " 结果明细：{{details}}。",
-            details: details.join("；"),
-          })
-        : "",
-  };
-}
-
-// 根据真实探测结果生成拆分建议：双协议通过默认归入 Responses，只 Chat 通过归入 Chat，双失败不参与建议。
-function buildSplitCodexProviderSuggestionForProbeOutcomes({
+function buildSplitCodexProviderSuggestionForProbeRecords({
   providerName,
-  outcomes,
+  records,
 }: {
   providerName?: string;
-  outcomes: CodexProtocolProbeOutcome[];
+  records: CodexProtocolCompatibilityRecord[];
 }): CodexProviderSplitSuggestion | null {
-  const responsesModels = outcomes
-    .filter((outcome) => {
-      const kind = classifyProtocolProbeOutcome(outcome);
-      return kind === "both" || kind === "responses";
-    })
-    .map((outcome) => outcome.model);
-  const chatModels = outcomes
-    .filter((outcome) => classifyProtocolProbeOutcome(outcome) === "chat")
-    .map((outcome) => outcome.model);
+  const responsesModels = records
+    .filter(
+      (record) => record.result.selected_transport === "open_ai_responses",
+    )
+    .map((record) => record.target.public_model);
+  const chatModels = records
+    .filter((record) => record.result.selected_transport === "open_ai_chat")
+    .map((record) => record.target.public_model);
 
   if (responsesModels.length === 0 || chatModels.length === 0) return null;
   return {
@@ -387,42 +268,6 @@ function buildSplitCodexProviderSuggestionForProbeOutcomes({
     chatModels,
   };
 }
-
-// 为模型行生成紧凑的协议状态 tag，用户不需要回读长摘要也能知道每个模型该走哪种协议。
-function getProtocolProbeBadge(outcome?: CodexProtocolProbeOutcome) {
-  if (!outcome) return null;
-  const kind = classifyProtocolProbeOutcome(outcome);
-  if (kind === "both") {
-    return {
-      label: i18n.t("codexForm.protocolBoth", { defaultValue: "双协议" }),
-      title: `Responses=${outcome.responses.detail}; Chat=${outcome.chat.detail}`,
-      className:
-        "border-emerald-500/40 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300",
-    };
-  }
-  if (kind === "responses") {
-    return {
-      label: "Responses",
-      title: `Responses=${outcome.responses.detail}; Chat=${outcome.chat.detail}`,
-      className:
-        "border-emerald-500/40 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300",
-    };
-  }
-  if (kind === "chat") {
-    return {
-      label: "Chat",
-      title: `Responses=${outcome.responses.detail}; Chat=${outcome.chat.detail}`,
-      className:
-        "border-sky-500/40 bg-sky-500/10 text-sky-700 dark:text-sky-300",
-    };
-  }
-  return {
-    label: i18n.t("codexForm.protocolUnavailable", { defaultValue: "不可用" }),
-    title: `Responses=${outcome.responses.detail}; Chat=${outcome.chat.detail}`,
-    className: "border-destructive/40 bg-destructive/10 text-destructive",
-  };
-}
-
 interface CodexFormFieldsProps {
   appId?: AppId;
   providerId?: string;
@@ -599,6 +444,7 @@ function createCatalogRow(seed?: Partial<CodexCatalogModel>): CodexCatalogRow {
     ...(seed?.codexUltra ? { codexUltra: seed.codexUltra } : {}),
     ...(seed?.apiFormat ? { apiFormat: seed.apiFormat } : {}),
     ...(seed?.codexCache ? { codexCache: seed.codexCache } : {}),
+    ...(seed?.enabled !== undefined ? { enabled: seed.enabled } : {}),
     ...(seed?.sortIndex !== undefined ? { sortIndex: seed.sortIndex } : {}),
   };
 }
@@ -1007,8 +853,16 @@ export function CodexFormFields({
   const [protocolProbeTone, setProtocolProbeTone] = useState<
     "muted" | "success" | "warning" | "error"
   >("muted");
-  const [protocolProbeOutcomesByModel, setProtocolProbeOutcomesByModel] =
-    useState<Record<string, CodexProtocolProbeOutcome>>({});
+  const [isProtocolProbeProgressOpen, setIsProtocolProbeProgressOpen] =
+    useState(false);
+  const [protocolProbeEvents, setProtocolProbeEvents] = useState<
+    CodexProtocolProbeProgressEvent[]
+  >([]);
+  const [protocolProbeExpectedModels, setProtocolProbeExpectedModels] =
+    useState<string[]>([]);
+  const [protocolProbeOutcome, setProtocolProbeOutcome] =
+    useState<CodexProviderProtocolPreflightOutcome | null>(null);
+  const [protocolProbeError, setProtocolProbeError] = useState("");
   const [protocolProbeIdentity, setProtocolProbeIdentity] = useState<
     string | null
   >(null);
@@ -1276,7 +1130,11 @@ export function CodexFormFields({
       setIsProtocolProbeConfirmOpen(false);
       setProtocolProbeTone("muted");
       setProtocolProbeSummary("");
-      setProtocolProbeOutcomesByModel({});
+      setIsProtocolProbeProgressOpen(false);
+      setProtocolProbeEvents([]);
+      setProtocolProbeExpectedModels([]);
+      setProtocolProbeOutcome(null);
+      setProtocolProbeError("");
     }
     setPendingSplitRoutingState((current) =>
       current === null || current.identity === readinessIdentity
@@ -1578,15 +1436,23 @@ export function CodexFormFields({
       });
       return;
     }
-    const models = Array.from(
-      new Set(
-        [
-          ...catalogRowsRef.current.map((row) => catalogRowUpstreamModel(row)),
-          ...fetchedModels.map((model) => model.id.trim()),
-        ].filter(Boolean),
-      ),
-    );
-    if (models.length === 0) {
+    const probeModels = catalogRowsRef.current
+      .filter(
+        (row) =>
+          row.enabled !== false &&
+          (row.model.trim() || catalogRowUpstreamModel(row)),
+      )
+      .map((row) => {
+        const { rowId: _rowId, ...model } = row;
+        const publicModel =
+          model.model.trim() || catalogRowUpstreamModel(model);
+        return {
+          ...model,
+          model: publicModel,
+          upstreamModel: catalogRowUpstreamModel(model) || publicModel,
+        };
+      });
+    if (probeModels.length === 0) {
       setIsProtocolProbeConfirmOpen(false);
       toast.warning(
         i18n.t("codexForm.fetchModelsFirst", {
@@ -1604,71 +1470,58 @@ export function CodexFormFields({
       readinessIdentityRef.current === probeIdentity;
     bindProtocolProbeIdentity(probeIdentity);
     setIsProtocolProbeConfirmOpen(false);
+    setIsProtocolProbeProgressOpen(true);
     setIsProbingProtocol(true);
     setProtocolProbeTone("muted");
-    setProtocolProbeOutcomesByModel({});
+    setProtocolProbeEvents([]);
+    setProtocolProbeExpectedModels(probeModels.map((model) => model.model));
+    setProtocolProbeOutcome(null);
+    setProtocolProbeError("");
     setProtocolProbeSummary(
-      i18n.t("codexForm.probeStarted", {
+      i18n.t("codexForm.deepProbeStarted", {
         defaultValue:
-          "正在并发测试 {{count}} 个模型的 Chat / Responses 基础连通性，最多同时测试 {{concurrency}} 个模型...",
-        count: models.length,
-        concurrency: CODEX_PROTOCOL_PROBE_MODEL_CONCURRENCY,
+          "正在深度测试 {{count}} 个模型的 Responses / Chat、SSE、思考内容、工具调用和工具续轮。",
+        count: probeModels.length,
       }),
     );
     try {
-      let completedCount = 0;
-      const outcomes = await runCodexProtocolProbePool(
-        models,
-        CODEX_PROTOCOL_PROBE_MODEL_CONCURRENCY,
-        async (model) => {
-          const [responses, chat] = await Promise.all([
-            probeCodexResponsesForConfig(
-              codexBaseUrl,
-              codexApiKey,
-              model,
-              isFullUrl,
-              customUserAgent,
-            ),
-            probeCodexChatForConfig(
-              codexBaseUrl,
-              codexApiKey,
-              model,
-              isFullUrl,
-              customUserAgent,
-            ),
-          ]);
-          completedCount += 1;
-          const outcome = { model, responses, chat };
-          if (!ownsCurrentIdentity()) return outcome;
-          setProtocolProbeSummary(
-            i18n.t("codexForm.probeProgress", {
-              defaultValue:
-                "正在并发测试 {{done}}/{{total}}：刚完成 {{model}}。失败会在这里显示。",
-              done: completedCount,
-              total: models.length,
-              model: model,
-            }),
-          );
-          setProtocolProbeOutcomesByModel((current) => ({
-            ...current,
-            [model]: outcome,
-          }));
-          return outcome;
+      const defaultModel =
+        codexModel?.trim() ||
+        probeModels[0].model ||
+        probeModels[0].upstreamModel;
+      const providerDraft: Provider = {
+        id: providerId ?? "codex-draft",
+        name: providerName?.trim() || "Codex provider",
+        settingsConfig: {
+          auth: { OPENAI_API_KEY: codexApiKey },
+          config: [
+            `model = ${JSON.stringify(defaultModel)}`,
+            'model_provider = "ccswitch_probe"',
+            "[model_providers.ccswitch_probe]",
+            `base_url = ${JSON.stringify(codexBaseUrl.trim())}`,
+            `wire_api = ${JSON.stringify(apiFormat === "openai_chat" ? "chat" : "responses")}`,
+          ].join("\n"),
+          apiFormat,
+          modelCatalog: { models: probeModels },
+        },
+        websiteUrl: websiteUrl || undefined,
+        category,
+        meta: { apiFormat, isFullUrl },
+        inFailoverQueue: false,
+      };
+      const outcome = await preflightCodexProviderProtocolCompatibility(
+        providerDraft,
+        (event) => {
+          if (!ownsCurrentIdentity()) return;
+          setProtocolProbeEvents((current) => [...current, event]);
         },
       );
       if (!ownsCurrentIdentity()) return;
-
-      const { responsesPass, chatPass, failedCount, detail } =
-        summarizeCodexProtocolProbeOutcomes(outcomes);
-      setProtocolProbeOutcomesByModel(
-        Object.fromEntries(outcomes.map((outcome) => [outcome.model, outcome])),
-      );
-      const splitSuggestion = buildSplitCodexProviderSuggestionForProbeOutcomes(
-        {
-          providerName,
-          outcomes,
-        },
-      );
+      setProtocolProbeOutcome(outcome);
+      const splitSuggestion = buildSplitCodexProviderSuggestionForProbeRecords({
+        providerName,
+        records: outcome.records,
+      });
       const canApplySplitSuggestion = Boolean(
         splitSuggestion && onProviderSplitSuggestionChange,
       );
@@ -1677,48 +1530,43 @@ export function CodexFormFields({
         onProviderSplitSuggestionChange(null);
       }
 
-      if (responsesPass > 0 && chatPass > 0) {
-        const summary = i18n.t("codexForm.probeBothUsableSummary", {
-          defaultValue:
-            "Responses 和 Chat 的基础请求都有模型可用，保留当前上游格式；Responses 通常是 Codex 原生优先选择，但你可以继续使用 Chat Completions。Responses 通过 {{responsesPass}}/{{total}}，Chat 通过 {{chatPass}}/{{total}}。{{splitHint}}通过不等于完整 Codex 功能验证。{{detail}}",
-          responsesPass: responsesPass,
-          chatPass: chatPass,
-          total: models.length,
-          splitHint: canApplySplitSuggestion
-            ? i18n.t("codexForm.probeMixedSuggestion", {
-                defaultValue:
-                  "检测到真实协议结果混合，建议下一步拆成 Responses / Chat 两个 provider。",
-              })
-            : "",
-          detail,
-        });
-        const tone = failedCount > 0 ? "warning" : "success";
-        bindProtocolProbeIdentity(probeIdentity);
-        setProtocolProbeTone(tone);
-        setProtocolProbeSummary(summary);
-        if (tone === "warning") {
-          toast.warning(summary, { closeButton: true });
-        } else {
-          toast.success(summary, { closeButton: true });
-        }
-        return;
-      }
+      const selected = outcome.records.map(
+        (record) => record.result.selected_transport,
+      );
+      const allResponses =
+        selected.length > 0 &&
+        selected.every((transport) => transport === "open_ai_responses");
+      const allChat =
+        selected.length > 0 &&
+        selected.every((transport) => transport === "open_ai_chat");
+      const verified = outcome.records.filter(
+        (record) => record.result.readiness === "verified",
+      ).length;
+      const partial = outcome.records.filter(
+        (record) => record.result.readiness === "partial",
+      ).length;
+      const failed = outcome.records.length - verified - partial;
+      const resultCounts = i18n.t("codexForm.deepProbeResultCounts", {
+        defaultValue:
+          "Verified {{verified}}，Partial {{partial}}，Failed {{failed}}",
+        verified,
+        partial,
+        failed,
+      });
 
-      if (responsesPass > 0) {
+      if (allResponses) {
         const resultIdentity = buildReadinessIdentityFor(
           "openai_responses",
           catalogRowsRef.current,
         );
         bindProtocolProbeIdentity(resultIdentity);
         onApiFormatChange("openai_responses");
-        const summary = i18n.t("codexForm.probeOnlyResponsesSwitched", {
+        const summary = i18n.t("codexForm.deepProbeAllResponsesSummary", {
           defaultValue:
-            "只有 Responses 基础请求可用，已切换为 Responses。Responses 通过 {{responsesPass}}/{{total}}。通过不等于完整 Codex 功能验证。{{detail}}",
-          responsesPass: responsesPass,
-          total: models.length,
-          detail,
+            "深度探测完成：全部模型选择 Responses；{{resultCounts}}。",
+          resultCounts,
         });
-        const tone = failedCount > 0 ? "warning" : "success";
+        const tone = failed > 0 || partial > 0 ? "warning" : "success";
         setProtocolProbeTone(tone);
         setProtocolProbeSummary(summary);
         if (tone === "warning") {
@@ -1728,50 +1576,66 @@ export function CodexFormFields({
         }
         return;
       }
-      if (chatPass > 0) {
+      if (allChat) {
         const resultIdentity = buildReadinessIdentityFor(
           "openai_chat",
           catalogRowsRef.current,
         );
         bindProtocolProbeIdentity(resultIdentity);
         onApiFormatChange("openai_chat");
-        const summary = i18n.t("codexForm.probeChatFallbackSwitched", {
+        const summary = i18n.t("codexForm.deepProbeAllChatSummary", {
           defaultValue:
-            "Responses 不通但 Chat 可用，已切换为 Chat Completions。Chat 通过 {{chatPass}}/{{total}}。{{splitHint}}{{detail}}",
-          chatPass: chatPass,
-          total: models.length,
-          splitHint: canApplySplitSuggestion
-            ? i18n.t("codexForm.probeMixedSuggestion", {
-                defaultValue:
-                  "检测到真实协议结果混合，建议下一步拆成 Responses / Chat 两个 provider。",
-              })
-            : "",
-          detail,
+            "深度探测完成：全部模型选择 Chat Completions；{{resultCounts}}。",
+          resultCounts,
         });
-        setProtocolProbeTone("warning");
+        const tone = failed > 0 || partial > 0 ? "warning" : "success";
+        setProtocolProbeTone(tone);
         setProtocolProbeSummary(summary);
-        toast.warning(summary, { closeButton: true });
+        if (tone === "warning") {
+          toast.warning(summary, { closeButton: true });
+        } else {
+          toast.success(summary, { closeButton: true });
+        }
         return;
       }
 
-      const summary = i18n.t("codexForm.probeBothFailedCheckConfig", {
-        defaultValue:
-          "Responses 和 Chat Completions 都不通，请检查 API Key、Base URL、模型权限、额度、网络或上游状态。{{detail}}",
-        detail,
-      });
+      const summary = splitSuggestion
+        ? i18n.t("codexForm.deepProbeMixedSummary", {
+            defaultValue:
+              "深度探测完成：检测到混合协议模型；{{resultCounts}}。{{splitHint}}",
+            resultCounts,
+            splitHint: canApplySplitSuggestion
+              ? i18n.t("codexForm.probeMixedSuggestion", {
+                  defaultValue: "建议拆成 Responses / Chat 两个 provider。",
+                })
+              : i18n.t("codexForm.deepProbePerModelHint", {
+                  defaultValue: "请按模型分别配置路由。",
+                }),
+          })
+        : i18n.t("codexForm.deepProbeNoConsistentSummary", {
+            defaultValue:
+              "深度探测完成，但没有得到所有模型一致且可用的协议；{{resultCounts}}。请查看失败阶段并检查 Key、Base URL、模型权限、额度或上游状态。",
+            resultCounts,
+          });
       bindProtocolProbeIdentity(probeIdentity);
-      setProtocolProbeTone("error");
+      setProtocolProbeTone(splitSuggestion ? "warning" : "error");
       setProtocolProbeSummary(summary);
-      toast.error(summary, { closeButton: true });
+      if (splitSuggestion) {
+        toast.warning(summary, { closeButton: true });
+      } else {
+        toast.error(summary, { closeButton: true });
+      }
     } catch (error) {
       if (!ownsCurrentIdentity()) return;
+      const message = error instanceof Error ? error.message : String(error);
       const summary = i18n.t("codexForm.probeInterrupted", {
         defaultValue: "协议测试中断：{{message}}",
-        message: error instanceof Error ? error.message : String(error),
+        message,
       });
       bindProtocolProbeIdentity(probeIdentity);
       setProtocolProbeTone("error");
       setProtocolProbeSummary(summary);
+      setProtocolProbeError(message);
       toast.error(summary, { closeButton: true });
     } finally {
       if (probeSeq === protocolProbeSeqRef.current) {
@@ -1784,15 +1648,18 @@ export function CodexFormFields({
     buildReadinessIdentityFor,
     codexBaseUrl,
     codexApiKey,
-    customUserAgent,
-    fetchedModels,
+    codexModel,
+    apiFormat,
+    category,
     isFullUrl,
     onApiFormatChange,
     onProviderSplitSuggestionChange,
     providerName,
+    providerId,
     readinessIdentity,
     revealModelCatalogFetchAction,
     t,
+    websiteUrl,
   ]);
 
   const handleFillMissingModelFields = useCallback(
@@ -2060,6 +1927,20 @@ export function CodexFormFields({
           </DialogFooter>
         </DialogContent>
       </Dialog>
+
+      <CodexProtocolProbeProgressDialog
+        open={isProtocolProbeProgressOpen}
+        running={isProbingProtocol}
+        expectedModels={protocolProbeExpectedModels}
+        events={protocolProbeEvents}
+        outcome={protocolProbeOutcome}
+        error={protocolProbeError}
+        onOpenChange={setIsProtocolProbeProgressOpen}
+        onRetry={() => {
+          setIsProtocolProbeProgressOpen(false);
+          setIsProtocolProbeConfirmOpen(true);
+        }}
+      />
 
       {/* xAI OAuth 认证（Grok 订阅托管账号） */}
       {isXaiOauthPreset && (
@@ -3590,7 +3471,6 @@ export function CodexFormFields({
 
                     {visibleCatalogRows.map(({ row, index }) => {
                       const model = row.model.trim();
-                      const probeModel = catalogRowUpstreamModel(row) || model;
                       const presetCatalogModel =
                         presetCatalogByModel.get(model) ??
                         presetCatalogByModel.get(catalogRowUpstreamModel(row));
@@ -3604,9 +3484,6 @@ export function CodexFormFields({
                             presetCatalogModel.vision !== undefined ||
                             presetCatalogModel.textOnly !== undefined ||
                             presetCatalogModel.text_only !== undefined),
-                      );
-                      const probeBadge = getProtocolProbeBadge(
-                        protocolProbeOutcomesByModel[probeModel],
                       );
 
                       return (
@@ -3709,17 +3586,6 @@ export function CodexFormFields({
                                 />
                               )}
                             </div>
-                            {probeBadge && (
-                              <span
-                                className={cn(
-                                  "inline-flex w-fit items-center rounded border px-1.5 py-0.5 text-[11px] font-medium",
-                                  probeBadge.className,
-                                )}
-                                title={probeBadge.title}
-                              >
-                                {probeBadge.label}
-                              </span>
-                            )}
                           </div>
                           <Input
                             type="number"
