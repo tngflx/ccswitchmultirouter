@@ -1,4 +1,5 @@
 import { Image, Search } from "lucide-react";
+import { useTranslation } from "react-i18next";
 
 export interface HostedToolsSwitchPanelProps {
   webSearchEnabled: boolean;
@@ -16,6 +17,8 @@ export function HostedToolsSwitchPanel({
   onChange,
   disabled = false,
 }: HostedToolsSwitchPanelProps) {
+  const { t } = useTranslation();
+
   return (
     <div className="space-y-3 rounded-lg border border-blue-200 bg-blue-50/70 p-3 dark:border-blue-700/40 dark:bg-blue-950/10">
       <div>
@@ -23,9 +26,7 @@ export function HostedToolsSwitchPanel({
           OpenAI Hosted Tools
         </div>
         <p className="mt-1 text-xs leading-5 text-muted-foreground dark:text-slate-400">
-          Codex 请求里的 OpenAI hosted tool 会由 CCSM 转成第三方模型可调用的普通
-          function；实际执行优先复用已登录的 Codex OAuth，也可使用独立 OpenAI
-          hosted 凭据。
+          {t("hostedTools.description")}
         </p>
       </div>
       <label className="flex cursor-pointer items-start justify-between gap-3 rounded-md border border-border bg-background/80 p-3 dark:border-slate-700 dark:bg-slate-950/60">
@@ -36,7 +37,7 @@ export function HostedToolsSwitchPanel({
               Web Search
             </span>
             <span className="mt-1 block text-xs leading-5 text-muted-foreground dark:text-slate-400">
-              开启后，Codex 的 hosted web_search 会桥接给第三方 Chat 模型。
+              {t("hostedTools.webSearchDescription")}
             </span>
           </span>
         </span>
@@ -62,8 +63,7 @@ export function HostedToolsSwitchPanel({
               Image Generation
             </span>
             <span className="mt-1 block text-xs leading-5 text-muted-foreground dark:text-slate-400">
-              开启后，Codex 的 hosted image_generation 会桥接成 generate_image
-              函数。
+              {t("hostedTools.imageGenerationDescription")}
             </span>
           </span>
         </span>

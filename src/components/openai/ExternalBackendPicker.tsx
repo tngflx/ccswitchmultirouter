@@ -8,6 +8,8 @@ import {
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
+import { useTranslation } from "react-i18next";
+import i18n from "@/i18n";
 import type { ExternalOpenAIAPIBackendOption } from "@/types/proxy";
 import {
   describeBackendTarget,
@@ -26,11 +28,12 @@ export function ExternalBackendPicker({
   selectedKey: string;
   onSelect: (key: string) => void;
 }) {
+  const { t } = useTranslation();
+
   if (groups.length === 0) {
     return (
       <div className="rounded-lg border border-dashed border-border bg-muted/40 p-5 text-sm text-muted-foreground dark:border-slate-700 dark:bg-slate-950/40 dark:text-slate-400">
-        还没有可作为 OpenAI-compatible API 的服务来源。先添加 OpenAI-compatible
-        模型源，或配置 OpenAI 官方登录。
+        {t("externalBackend.emptyState")}
       </div>
     );
   }
@@ -44,7 +47,9 @@ export function ExternalBackendPicker({
               {group.label}
             </div>
             <Badge className={groupBadgeClass(group.tone)}>
-              {group.options.length} 个来源
+              {t("externalBackend.sourceCount", {
+                count: group.options.length,
+              })}
             </Badge>
           </div>
           <div className="grid gap-2 xl:grid-cols-2">
@@ -76,6 +81,7 @@ function BackendSourceCard({
   selected: boolean;
   onSelect: () => void;
 }) {
+  const { t } = useTranslation();
   const details = describeBackendTarget(option);
   const Icon = option.isManagedOAuth
     ? LockKeyhole
@@ -122,7 +128,9 @@ function BackendSourceCard({
               : "bg-muted text-muted-foreground dark:bg-slate-500/15 dark:text-slate-300"
           }
         >
-          {option.available ? "可接入" : "需补配置"}
+          {option.available
+            ? t("externalBackend.compat.available")
+            : t("externalBackend.compat.needsSetupShort")}
         </Badge>
         <Badge variant="outline">{details.kind}</Badge>
         <Badge variant="outline">{details.modelSource}</Badge>
@@ -147,22 +155,41 @@ export function SelectedBackendSummary({
   description: BackendTargetDescription;
   hasDraftChanges: boolean;
 }) {
+  const { t } = useTranslation();
+
   return (
     <div className="rounded-lg border border-blue-200 bg-blue-50/70 p-4 dark:border-blue-700/40 dark:bg-blue-950/15">
       <div className="mb-3 flex items-center justify-between gap-2">
         <div className="text-sm font-semibold text-foreground dark:text-slate-100">
-          对外服务来源
+          {t("externalBackend.summaryTitle")}
         </div>
         <Badge variant={hasDraftChanges ? "outline" : "secondary"}>
-          {hasDraftChanges ? "待保存" : "已保存"}
+          {hasDraftChanges
+            ? t("externalBackend.draftPending")
+            : t("externalBackend.saved")}
         </Badge>
       </div>
       <div className="space-y-2 text-xs text-muted-foreground dark:text-slate-400">
-        <SummaryLine label="来源" value={backend?.label ?? "未选择"} />
-        <SummaryLine label="类型" value={description.kind} />
-        <SummaryLine label="路径" value={description.protocol} />
-        <SummaryLine label="认证" value={description.auth} />
-        <SummaryLine label="模型" value={description.modelSource} />
+        <SummaryLine
+          label={t("externalBackend.label.source")}
+          value={backend?.label ?? t("externalBackend.notSelected")}
+        />
+        <SummaryLine
+          label={t("externalBackend.label.type")}
+          value={description.kind}
+        />
+        <SummaryLine
+          label={t("externalBackend.label.path")}
+          value={description.protocol}
+        />
+        <SummaryLine
+          label={t("externalBackend.label.auth")}
+          value={description.auth}
+        />
+        <SummaryLine
+          label={t("externalBackend.label.model")}
+          value={description.modelSource}
+        />
       </div>
       <div className="mt-3 flex flex-wrap gap-1.5">
         {description.compatibility.map((item) => (
@@ -173,7 +200,7 @@ export function SelectedBackendSummary({
       </div>
       {backend && !backend.available && (
         <Button disabled className="mt-3 w-full">
-          当前来源需要补配置，不能启用
+          {t("externalBackend.cannotEnable")}
         </Button>
       )}
     </div>
@@ -247,22 +274,23 @@ function cardToneClass(
 }
 
 function translateBackendError(error: string): string {
+  const t = (key: string) => i18n.t(key);
   if (error.includes("native protocol")) {
-    return "这是 Claude/Gemini 等原生协议配置，不能直接伪装成 OpenAI v1 API。";
+    return t("externalBackend.error.nativeProtocol");
   }
   if (error.includes("no usable base URL or credential")) {
-    return "缺少可用的 Base URL 或凭据。补齐后才能作为第三方 Agent 的模型来源。";
+    return t("externalBackend.error.noBaseUrl");
   }
   if (error.includes("route needs managed OAuth")) {
-    return "这条路由缺少托管 OAuth、路由 API Key 或可继承的模型源凭据。";
+    return t("externalBackend.error.routeNeedsManagedOAuth");
   }
   if (error.includes("route target provider not found")) {
-    return "这条路由引用的目标 Provider 已不存在，请回到 MultiRouter 修复或删除该路由。";
+    return t("externalBackend.error.routeTargetNotFound");
   }
   if (
     error.includes("route target provider has no usable base URL or credential")
   ) {
-    return "这条路由引用的目标 Provider 缺少可用的 Base URL 或凭据。";
+    return t("externalBackend.error.routeTargetNoBaseUrl");
   }
   return error;
 }

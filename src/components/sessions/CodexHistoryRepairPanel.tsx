@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { useTranslation } from "react-i18next";
 import {
   CheckCircle2,
   Copy,
@@ -43,6 +44,8 @@ import { SessionMessageItem } from "./SessionMessageItem";
 
 const AUTO_TARGET = "__auto__";
 const DEFAULT_SOURCE_FILTER = "all";
+
+type TranslateFn = (key: string, params?: Record<string, unknown>) => string;
 
 interface CodexHistoryRepairPanelProps {
   initialProjectPath?: string | null;
@@ -90,6 +93,8 @@ export function CodexHistoryRepairPanel({
   const [isRepairingAppHistory, setIsRepairingAppHistory] = useState(false);
   const didAutoLoadRef = useRef(false);
 
+  const { t } = useTranslation();
+
   const normalizedCodexHome = codexHome.trim();
   const normalizedStateDbPath = stateDbPath.trim();
   const normalizedProjectPath = limitToSingleProject ? projectPath.trim() : "";
@@ -105,7 +110,7 @@ export function CodexHistoryRepairPanel({
   );
   const selectedTargetProviderLabel =
     targetProvider === AUTO_TARGET
-      ? autoTargetProviderLabel(historyList)
+      ? autoTargetProviderLabel(historyList, t)
       : targetProvider;
 
   /// 修改输入后清掉旧结果，确保“确认修复”永远基于最新参数重新 dry-run。
@@ -122,7 +127,7 @@ export function CodexHistoryRepairPanel({
       const result = await proxyApi.unlockCodexModelPicker();
       setAppRepairResult(result);
       if (result.historySyncRequested) {
-        toast.success("已触发新版 Codex App 原生历史目录重建");
+        toast.success(t("historyRepair.appNativeRebuildTriggered"));
       } else {
         toast.info(result.message);
       }
@@ -252,7 +257,10 @@ export function CodexHistoryRepairPanel({
           await onRepairApplied?.();
         } catch (callbackError) {
           toast.error(
-            `历史修复已完成，但后续引导失败：${extractErrorMessage(callbackError) || String(callbackError)}`,
+            t("historyRepair.repairCompletedGuideFailed", {
+              error:
+                extractErrorMessage(callbackError) || String(callbackError),
+            }),
           );
         }
       }
@@ -260,6 +268,7 @@ export function CodexHistoryRepairPanel({
     } catch (error) {
       const message = historyRepairErrorMessage(
         extractErrorMessage(error) || String(error),
+        t,
       );
       setRepairError(message);
       toast.error(message);
@@ -274,7 +283,7 @@ export function CodexHistoryRepairPanel({
   async function confirmAndRepairHistory() {
     if (!canConfirmRepair) return;
     if (limitToSingleProject && !normalizedProjectPath) {
-      const message = "已勾选只修复单个项目，请先填写项目路径。";
+      const message = t("historyRepair.singleProjectPathRequired");
       setRepairError(message);
       toast.error(message);
       return;
@@ -283,34 +292,56 @@ export function CodexHistoryRepairPanel({
     if (!preview) return;
     const confirmed = window.confirm(
       [
-        "确认修复前，请先完全退出 Codex / ChatGPT App。",
-        "如果 App 还开着，CCSwitchMulti 会拒绝写入，避免运行中的 app-server 覆盖修复结果。",
+        t("historyRepair.confirmExitAppFirst"),
+        t("historyRepair.confirmRejectWritesWhileRunning"),
         "",
-        `active DB: ${preview.stateDbPath ?? "未找到"}`,
-        `目标 provider: ${preview.targetProvider}`,
-        `范围: ${repairScopeLabel}`,
-        `已选 session: ${selectedSessionIds.length}`,
-        `rollout 发现: ${preview.rolloutThreadsDiscovered}`,
-        `新增 thread-store 行: ${preview.threadRowsToInsert}`,
-        `回收被最长对话覆盖的 thread: ${preview.prefixDuplicateRowsToRemove}`,
-        `回收误索引的内部转录: ${preview.internalTranscriptRowsToRemove}`,
-        `重建索引元数据: ${preview.threadMetadataRowsToRebuild}`,
-        `backfill 状态: ${preview.backfillStateToUpdate ? "将更新为 complete" : "当前 DB 无此表"}`,
+        t("historyRepair.confirmActiveDb", {
+          path: preview.stateDbPath ?? t("historyRepair.notFound"),
+        }),
+        t("historyRepair.confirmTargetProvider", {
+          provider: preview.targetProvider,
+        }),
+        t("historyRepair.confirmScope", { scope: repairScopeLabel }),
+        t("historyRepair.confirmSelectedSessions", {
+          count: selectedSessionIds.length,
+        }),
+        t("historyRepair.confirmRolloutDiscovered", {
+          count: preview.rolloutThreadsDiscovered,
+        }),
+        t("historyRepair.confirmThreadRowsToInsert", {
+          count: preview.threadRowsToInsert,
+        }),
+        t("historyRepair.confirmPrefixDuplicates", {
+          count: preview.prefixDuplicateRowsToRemove,
+        }),
+        t("historyRepair.confirmInternalTranscripts", {
+          count: preview.internalTranscriptRowsToRemove,
+        }),
+        t("historyRepair.confirmMetadataRowsToRebuild", {
+          count: preview.threadMetadataRowsToRebuild,
+        }),
+        t("historyRepair.confirmBackfillStatus", {
+          status: preview.backfillStateToUpdate
+            ? t("historyRepair.backfillWillComplete")
+            : t("historyRepair.backfillTableMissing"),
+        }),
         `provider rows: ${preview.providerRowsToUpdate}`,
         `session_index append: ${preview.sessionIndexMissingToAppend}`,
-        `session_index 回收: ${preview.sessionIndexDuplicateRowsToRemove}`,
+        t("historyRepair.confirmSessionIndexCleanup", {
+          count: preview.sessionIndexDuplicateRowsToRemove,
+        }),
         `recent rows: ${preview.balancedRecentWindowRows}`,
         `rollout mtimes: ${preview.rolloutMtimesToTouch}`,
         "",
-        "写入成功后重新打开 Codex；新版 App 会从 active DB 重建侧边栏目录。若侧边栏仍未刷新，再使用“启动并刷新新版目录”。",
+        t("historyRepair.confirmPostWriteHint"),
         "",
-        "确认现在写入吗？",
+        t("historyRepair.confirmWriteNow"),
       ].join("\n"),
     );
     if (!confirmed) return;
     const applied = await runHistoryRepair(false);
     if (applied) {
-      toast.success("历史修复已写入。请重新启动 Codex / ChatGPT App。");
+      toast.success(t("historyRepair.writeSuccessRestart"));
     }
   }
 
@@ -320,7 +351,7 @@ export function CodexHistoryRepairPanel({
       await navigator.clipboard.writeText(text);
       toast.success(message);
     } catch (error) {
-      toast.error(extractErrorMessage(error) || "复制失败");
+      toast.error(extractErrorMessage(error) || t("historyRepair.copyFailed"));
     }
   }
 
@@ -334,10 +365,12 @@ export function CodexHistoryRepairPanel({
 
   const repairScopeLabel =
     selectedSessionIds.length > 0
-      ? `定向修复 ${selectedSessionIds.length} 个 session`
+      ? t("historyRepair.scopeTargetedSessions", {
+          count: selectedSessionIds.length,
+        })
       : limitToSingleProject && normalizedProjectPath
-        ? "只修复单个项目"
-        : "修复所有项目";
+        ? t("historyRepair.scopeSingleProject")
+        : t("historyRepair.scopeAllProjects");
   const activeDbLabel =
     historyList?.stateDbPath ||
     normalizedStateDbPath ||
@@ -350,15 +383,21 @@ export function CodexHistoryRepairPanel({
           <div className="min-w-0">
             <div className="flex flex-wrap items-center gap-2 text-base font-semibold">
               <ProviderIcon icon="openai" name="Codex" size={20} />
-              <span>Codex 历史修复</span>
+              <span>{t("historyRepair.title")}</span>
               <Badge variant="secondary">Desktop history</Badge>
               <Badge variant="outline">
-                {includeSubagents ? "含 subagent" : "主线程"}
+                {includeSubagents
+                  ? t("historyRepair.withSubagents")
+                  : t("historyRepair.mainThreadOnly")}
               </Badge>
             </div>
             <div className="mt-1 flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
               <span>{repairScopeLabel}</span>
-              <span>目标：{selectedTargetProviderLabel}</span>
+              <span>
+                {t("historyRepair.targetWithValue", {
+                  target: selectedTargetProviderLabel,
+                })}
+              </span>
             </div>
           </div>
           <div className="flex flex-wrap gap-2">
@@ -374,7 +413,7 @@ export function CodexHistoryRepairPanel({
               ) : (
                 <Database className="size-4" />
               )}
-              刷新记录
+              {t("historyRepair.refreshRecords")}
             </Button>
             <Button
               size="sm"
@@ -387,12 +426,12 @@ export function CodexHistoryRepairPanel({
               ) : (
                 <ShieldCheck className="size-4" />
               )}
-              确认修复
+              {t("historyRepair.confirmRepair")}
             </Button>
             {onClose ? (
               <Button size="sm" variant="ghost" onClick={onClose}>
                 <X className="size-4" />
-                会话浏览
+                {t("historyRepair.sessionBrowser")}
               </Button>
             ) : null}
           </div>
@@ -404,16 +443,19 @@ export function CodexHistoryRepairPanel({
             <div className="min-w-0 space-y-2">
               <div className="font-medium">
                 {showAutomationGuide
-                  ? "MultiRouter 已配置成功，修复前先完全退出 Codex / ChatGPT App"
-                  : "修复前先完全退出 Codex / ChatGPT App"}
+                  ? t("historyRepair.guideMultiRouterReady")
+                  : t("historyRepair.guideExitFirst")}
               </div>
               <p className="text-xs leading-5">
-                选择记录、项目范围和目标 provider 后点击
-                <span className="font-medium"> 确认修复</span>。写入会修改
-                active DB、索引和 rollout 元数据；如果 Codex
-                仍在运行，后端会拒绝写入。 写入成功后重新打开
-                Codex；若新版侧边栏仍未刷新，再到高级设置里使用
-                <span className="font-medium"> 启动并刷新新版目录</span>。
+                {t("historyRepair.guideIntro")}
+                <span className="font-medium">
+                  {t("historyRepair.confirmRepair")}
+                </span>
+                {t("historyRepair.guideBody")}
+                <span className="font-medium">
+                  {t("historyRepair.launchAndRefreshCatalog")}
+                </span>
+                。
               </p>
             </div>
           </div>
@@ -442,12 +484,12 @@ export function CodexHistoryRepairPanel({
           />
           <RepairStatusTile
             icon={<ListChecks className="size-4" />}
-            label="已加载 / 已选"
+            label={t("historyRepair.loadedSelectedTile")}
             value={`${historyList?.totalMatched ?? 0} / ${selectedSessionIds.length}`}
           />
           <RepairStatusTile
             icon={<ShieldCheck className="size-4" />}
-            label="目标 provider"
+            label={t("historyRepair.targetProviderTile")}
             value={selectedTargetProviderLabel}
           />
         </div>
@@ -502,12 +544,16 @@ export function CodexHistoryRepairPanel({
             <div className="flex items-center justify-between gap-2">
               <div className="flex items-center gap-2 text-sm font-semibold">
                 <FileClock className="size-4" />
-                SQLite 历史
+                {t("historyRepair.sqliteHistoryTitle")}
                 <Badge variant="secondary">
                   {historyList?.totalMatched ?? 0}
                 </Badge>
               </div>
-              <Badge variant="outline">已选 {selectedSessionIds.length}</Badge>
+              <Badge variant="outline">
+                {t("historyRepair.selectedCountBadge", {
+                  count: selectedSessionIds.length,
+                })}
+              </Badge>
             </div>
             <div className="mt-2 flex gap-2">
               <div className="relative min-w-0 flex-1">
@@ -515,7 +561,7 @@ export function CodexHistoryRepairPanel({
                 <Input
                   value={historyQuery}
                   onChange={(event) => setHistoryQuery(event.target.value)}
-                  placeholder="搜索标题、路径、provider 或 session id"
+                  placeholder={t("historyRepair.searchPlaceholder")}
                   className="h-8 pl-8"
                 />
               </div>
@@ -537,7 +583,7 @@ export function CodexHistoryRepairPanel({
                 onClick={selectAllLoadedSessions}
                 disabled={!historyList?.items.length}
               >
-                全选本页
+                {t("historyRepair.selectAllLoaded")}
               </Button>
               <Button
                 size="sm"
@@ -548,14 +594,16 @@ export function CodexHistoryRepairPanel({
                 }}
                 disabled={selectedSessionIds.length === 0}
               >
-                清空选择
+                {t("historyRepair.clearSelection")}
               </Button>
             </div>
           </div>
 
           {historyListError ? (
             <div className="m-3 rounded-md border border-destructive/40 bg-destructive/10 p-3 text-xs text-destructive">
-              加载失败：{historyListError}
+              {t("historyRepair.loadFailedWithReason", {
+                error: historyListError,
+              })}
             </div>
           ) : null}
 
@@ -578,10 +626,10 @@ export function CodexHistoryRepairPanel({
                 <Database className="size-8 opacity-40" />
                 <span>
                   {historyList
-                    ? "没有匹配的历史记录。"
+                    ? t("historyRepair.noMatches")
                     : isLoadingHistory
-                      ? "正在加载 active SQLite..."
-                      : "加载 active SQLite 后选择需要修复的 session。"}
+                      ? t("historyRepair.loadingActiveSqlite")
+                      : t("historyRepair.loadActiveSqliteHint")}
                 </span>
               </div>
             )}
@@ -677,6 +725,7 @@ function RepairSettings({
   isRepairingAppHistory,
   onRepairNewCodexAppHistory,
 }: RepairSettingsProps) {
+  const { t } = useTranslation();
   const providerCountsByValue = useMemo(
     () =>
       new Map(
@@ -691,14 +740,14 @@ function RepairSettings({
     <div className="grid gap-3">
       <div className="flex items-center gap-2 text-sm font-semibold">
         <SlidersHorizontal className="size-4" />
-        修复范围
+        {t("historyRepair.scopeSectionTitle")}
       </div>
       <div className="grid gap-3 xl:grid-cols-[minmax(0,1.35fr)_320px]">
         <div className="rounded-md border bg-background/70 p-3">
           <div className="flex flex-wrap items-center justify-between gap-2">
             <ToggleLine
               checked={limitToSingleProject}
-              label="只修复单个项目"
+              label={t("historyRepair.scopeSingleProject")}
               onChange={onLimitToSingleProjectChange}
             />
             {suggestedProjectPath && limitToSingleProject ? (
@@ -708,34 +757,34 @@ function RepairSettings({
                 variant="outline"
                 onClick={onUseSuggestedProjectPath}
               >
-                带入当前项目
+                {t("historyRepair.bringCurrentProject")}
               </Button>
             ) : null}
           </div>
           <Input
             value={projectPath}
             onChange={(event) => onProjectPathChange(event.target.value)}
-            placeholder="勾选后填写项目路径；不勾选则修复所有项目"
+            placeholder={t("historyRepair.projectPathPlaceholder")}
             disabled={!limitToSingleProject}
             className="mt-2 h-9"
           />
           <div className="mt-2 rounded-md bg-muted/60 px-2 py-1 text-[11px] text-muted-foreground">
             {limitToSingleProject && projectPath.trim()
-              ? "当前只读取和修复这个项目路径。"
+              ? t("historyRepair.scopeSingleProjectHint")
               : limitToSingleProject
-                ? "已限制单个项目，请填写路径或带入当前项目。"
-                : "未限制项目；会跨项目读取并修复所有匹配记录。"}
+                ? t("historyRepair.scopeSingleProjectNeedsPath")
+                : t("historyRepair.scopeAllProjectsHint")}
           </div>
         </div>
         <label className="text-xs font-medium xl:self-start">
-          修复到 provider 桶
+          {t("historyRepair.repairToProviderBucket")}
           <Select value={targetProvider} onValueChange={onTargetProviderChange}>
             <SelectTrigger className="mt-1 h-9">
               <SelectValue />
             </SelectTrigger>
             <SelectContent>
               <SelectItem value={AUTO_TARGET}>
-                {autoTargetProviderLabel(historyList)}
+                {autoTargetProviderLabel(historyList, t)}
               </SelectItem>
               {targetProviderOptions.map((provider) => (
                 <SelectItem key={provider} value={provider}>
@@ -743,50 +792,53 @@ function RepairSettings({
                     provider,
                     historyList,
                     providerCountsByValue,
+                    t,
                   )}
                 </SelectItem>
               ))}
             </SelectContent>
           </Select>
           <div className="mt-1 rounded-md bg-muted/60 px-2 py-1 font-mono text-[11px] text-muted-foreground">
-            live: {historyList?.liveConfigModelProvider ?? "加载后显示"}
+            live:
+            {historyList?.liveConfigModelProvider ??
+              t("historyRepair.loadedValueFallback")}
           </div>
         </label>
       </div>
 
       <details className="rounded-md border bg-muted/20">
         <summary className="cursor-pointer px-3 py-2 text-xs font-medium text-muted-foreground">
-          高级设置和新版目录兜底
+          {t("historyRepair.advancedCatalogSection")}
         </summary>
         <div className="grid gap-3 border-t p-3 lg:grid-cols-2 2xl:grid-cols-[minmax(0,1fr)_minmax(0,1.15fr)_220px_240px]">
           <LabeledInput
-            label="Codex 目录"
+            label={t("historyRepair.codexDirLabel")}
             value={codexHome}
-            placeholder="默认 ~/.codex"
+            placeholder={t("historyRepair.codexDirPlaceholder")}
             hint={
-              historyList?.codexHome ?? "将自动解析为当前用户的 .codex 目录"
+              historyList?.codexHome ?? t("historyRepair.codexDirHintFallback")
             }
             onChange={onCodexHomeChange}
           />
           <LabeledInput
             label="Active DB"
             value={stateDbPath}
-            placeholder="默认 ~/.codex/state_5.sqlite"
+            placeholder={t("historyRepair.activeDbPlaceholder")}
             hint={
               historyList?.stateDbPath ??
-              "自动识别 sqlite_home / CODEX_SQLITE_HOME；默认优先 ~/.codex/state_5.sqlite"
+              t("historyRepair.activeDbHintFallback")
             }
             onChange={onStateDbPathChange}
           />
           <div className="grid gap-2 text-xs">
             <ToggleLine
               checked={includeArchived}
-              label="包含 archived"
+              label={t("historyRepair.includeArchivedToggle")}
               onChange={onIncludeArchivedChange}
             />
             <ToggleLine
               checked={includeSubagents}
-              label="包含 subagent thread_source"
+              label={t("historyRepair.includeSubagentSourceToggle")}
               onChange={onIncludeSubagentsChange}
             />
           </div>
@@ -803,12 +855,9 @@ function RepairSettings({
               ) : (
                 <Eye className="size-4" />
               )}
-              启动并刷新新版目录
+              {t("historyRepair.launchAndRefreshCatalog")}
             </Button>
-            <div>
-              仅在确认修复写入后，新版 Codex 侧边栏仍没有从 active DB
-              重建时使用。
-            </div>
+            <div>{t("historyRepair.launchCatalogUsageHint")}</div>
           </div>
         </div>
       </details>
@@ -904,6 +953,7 @@ function HistoryRepairSessionRow({
   onToggle,
   onOpen,
 }: HistoryRepairSessionRowProps) {
+  const { t } = useTranslation();
   return (
     <div
       className={cn(
@@ -913,7 +963,9 @@ function HistoryRepairSessionRow({
     >
       <Checkbox
         checked={selected}
-        aria-label={`选择 ${session.title || session.id}`}
+        aria-label={t("historyRepair.selectSessionAria", {
+          name: session.title || session.id,
+        })}
         onCheckedChange={() => onToggle()}
         className="mt-1"
       />
@@ -955,6 +1007,7 @@ function HistorySessionDetail({
   isLoading,
   onCopy,
 }: HistorySessionDetailProps) {
+  const { t } = useTranslation();
   const session = detail?.session;
   return (
     <div className="flex min-h-0 flex-col bg-card">
@@ -962,10 +1015,10 @@ function HistorySessionDetail({
         <div className="min-w-0">
           <div className="flex items-center gap-2 text-sm font-semibold">
             <Eye className="size-4" />
-            Session 内容
+            {t("historyRepair.sessionContent")}
           </div>
           <div className="mt-1 truncate font-mono text-[11px] text-muted-foreground">
-            {session?.id ?? "未选择 session"}
+            {session?.id ?? t("historyRepair.noSessionSelected")}
           </div>
         </div>
         {detail?.rolloutPath ? (
@@ -973,10 +1026,12 @@ function HistorySessionDetail({
             size="sm"
             variant="outline"
             className="gap-2"
-            onClick={() => onCopy(detail.rolloutPath!, "已复制 rollout 路径")}
+            onClick={() =>
+              onCopy(detail.rolloutPath!, t("historyRepair.copiedRolloutPath"))
+            }
           >
             <Copy className="size-3.5" />
-            路径
+            {t("historyRepair.pathButton")}
           </Button>
         ) : null}
       </div>
@@ -984,11 +1039,11 @@ function HistorySessionDetail({
       {isLoading ? (
         <div className="flex flex-1 items-center justify-center gap-2 text-sm text-muted-foreground">
           <RefreshCw className="size-4 animate-spin" />
-          加载会话内容中...
+          {t("historyRepair.loadingSessionContent")}
         </div>
       ) : error ? (
         <div className="m-3 rounded-md border border-destructive/40 bg-destructive/10 p-3 text-xs text-destructive">
-          读取失败：{error}
+          {t("historyRepair.readFailedWithReason", { error })}
         </div>
       ) : detail?.skippedReason ? (
         <div className="m-3 rounded-md border border-amber-500/40 bg-amber-500/10 p-3 text-xs text-amber-700 dark:text-amber-200">
@@ -1002,7 +1057,9 @@ function HistorySessionDetail({
                 key={`${index}-${message.role}-${message.ts ?? "no-ts"}`}
                 message={message}
                 isActive={false}
-                onCopy={(content) => onCopy(content, "已复制消息内容")}
+                onCopy={(content) =>
+                  onCopy(content, t("historyRepair.copiedMessageContent"))
+                }
               />
             ))}
           </div>
@@ -1010,7 +1067,7 @@ function HistorySessionDetail({
       ) : (
         <div className="flex flex-1 flex-col items-center justify-center gap-2 p-8 text-center text-sm text-muted-foreground">
           <Eye className="size-9 opacity-35" />
-          <span>选择左侧 session 后查看本地 JSONL 内容。</span>
+          <span>{t("historyRepair.selectSessionToView")}</span>
         </div>
       )}
     </div>
@@ -1031,12 +1088,13 @@ function RepairResultPanel({
   sourceCounts,
   providerCounts,
 }: RepairResultPanelProps) {
+  const { t } = useTranslation();
   return (
     <div className="flex min-h-0 flex-col border-t bg-card 2xl:border-t-0 2xl:border-l">
       <div className="border-b px-3 py-2">
         <div className="flex items-center gap-2 text-sm font-semibold">
           <Info className="size-4" />
-          修复结果
+          {t("historyRepair.resultPanelTitle")}
         </div>
       </div>
       <ScrollArea className="min-h-0 flex-1">
@@ -1048,7 +1106,11 @@ function RepairResultPanel({
           ) : result ? (
             <div className="space-y-3">
               <div className="flex flex-wrap items-center gap-2">
-                <Badge>{result.dryRun ? "预览" : "已写入"}</Badge>
+                <Badge>
+                  {result.dryRun
+                    ? t("historyRepair.resultPreview")
+                    : t("historyRepair.resultApplied")}
+                </Badge>
                 <Badge variant="outline">target={result.targetProvider}</Badge>
                 <Badge variant="outline">
                   source={result.sourceFilter || "all"}
@@ -1091,18 +1153,25 @@ function RepairResultPanel({
                   live={result.liveConfigModelProvider ?? "-"}
                 </div>
                 <div className="truncate">
-                  backup={result.backupDir ?? "写入后显示"}
+                  backup=
+                  {result.backupDir ?? t("historyRepair.backupPendingValue")}
                 </div>
               </div>
             </div>
           ) : (
             <div className="rounded-md border border-dashed p-4 text-sm text-muted-foreground">
-              选择范围和目标 provider 后，点击“确认修复”。
+              {t("historyRepair.resultEmptyHint")}
             </div>
           )}
 
-          <ValueCountPanel title="source 分布" rows={sourceCounts} />
-          <ValueCountPanel title="provider 桶分布" rows={providerCounts} />
+          <ValueCountPanel
+            title={t("historyRepair.sourceDistribution")}
+            rows={sourceCounts}
+          />
+          <ValueCountPanel
+            title={t("historyRepair.providerBucketDistribution")}
+            rows={providerCounts}
+          />
         </div>
       </ScrollArea>
     </div>
@@ -1131,6 +1200,7 @@ interface ValueCountPanelProps {
 
 /// 渲染 active SQLite 字段分布，帮助判断 source 和 provider 桶的真实含义。
 function ValueCountPanel({ title, rows }: ValueCountPanelProps) {
+  const { t } = useTranslation();
   return (
     <div className="rounded-md border bg-muted/20 p-3">
       <div className="mb-2 text-sm font-semibold">{title}</div>
@@ -1149,7 +1219,9 @@ function ValueCountPanel({ title, rows }: ValueCountPanelProps) {
           ))}
         </div>
       ) : (
-        <div className="text-xs text-muted-foreground">加载后显示</div>
+        <div className="text-xs text-muted-foreground">
+          {t("historyRepair.loadedValueFallback")}
+        </div>
       )}
     </div>
   );
@@ -1179,11 +1251,12 @@ function buildTargetProviderOptions(
 /// 生成自动目标项文案，说明 apply 时会把 null 交给后端按 live config 解析。
 function autoTargetProviderLabel(
   historyList: CodexHistorySessionListOutcome | null,
+  t: TranslateFn,
 ): string {
   const live = historyList?.liveConfigModelProvider?.trim();
   return live
-    ? `当前 provider：${live}`
-    : "当前 provider：live config 或 codex_model_router_v2";
+    ? t("historyRepair.currentProviderLive", { live })
+    : t("historyRepair.currentProviderAuto");
 }
 
 /// 为 provider 候选追加来源和计数，避免用户误以为下拉只读了当前项目。
@@ -1191,25 +1264,27 @@ function targetProviderOptionLabel(
   provider: string,
   historyList: CodexHistorySessionListOutcome | null,
   providerCountsByValue: Map<string, number>,
+  t: TranslateFn,
 ): string {
   const badges = [];
   const count = providerCountsByValue.get(provider);
   if (provider === historyList?.liveConfigModelProvider) badges.push("live");
-  if (typeof count === "number") badges.push(`${count} 条`);
+  if (typeof count === "number")
+    badges.push(t("historyRepair.countEntries", { count }));
   if (provider === "codex_model_router_v2" && typeof count !== "number") {
-    badges.push("稳定 MultiRouter 桶");
+    badges.push(t("historyRepair.stableRouterBucket"));
   }
   return badges.length ? `${provider} (${badges.join(" / ")})` : provider;
 }
 
 /// 把后端并发保护错误改写成用户可执行的关 App 指引。
-function historyRepairErrorMessage(message: string): string {
+function historyRepairErrorMessage(message: string, t: TranslateFn): string {
   const text = message.trim();
   if (
     /Codex|ChatGPT|app-server|running|进程|运行/i.test(text) &&
     !text.includes("完全退出")
   ) {
-    return `${text}\n请完全退出 Codex / ChatGPT App 后再点“确认修复”；写入成功后重新打开 Codex 等新版目录重建。`;
+    return `${text}\n${t("historyRepair.exitAppReminder")}`;
   }
   return text;
 }

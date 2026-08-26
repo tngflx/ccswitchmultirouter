@@ -43,6 +43,7 @@ import type {
 } from "@/types/subscription";
 import type { ModelStats, UsageSummary } from "@/types/usage";
 import type { QuotaCollaborationOverview } from "@/types/usage";
+import i18n from "@/i18n";
 
 const TRACKED_TIERS = new Set(["five_hour", "seven_day"]);
 const FIVE_HOUR_WINDOW_MS = 5 * 60 * 60 * 1000;
@@ -50,11 +51,21 @@ const SEVEN_DAY_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
 const TODAY_RANGE = { preset: "today" } as const;
 const SEVEN_DAY_RANGE = { preset: "7d" } as const;
 
-const TIER_LABELS: Record<string, string> = {
-  five_hour: "5 小时窗口",
-  seven_day: "每周窗口",
-  weekly_limit: "每周窗口",
-};
+const TIER_LABEL_KEYS = ["five_hour", "seven_day", "weekly_limit"];
+
+function tierLabel(name: string): string {
+  if (name === "five_hour")
+    return i18n.t("codexUsagePage.tierFiveHourLabel", {
+      defaultValue: "5 小时窗口",
+    });
+  if (name === "weekly_limit")
+    return i18n.t("codexUsagePage.tierWeeklyLimitLabel", {
+      defaultValue: "每周窗口",
+    });
+  return i18n.t("codexUsagePage.tierSevenDayLabel", {
+    defaultValue: "每周窗口",
+  });
+}
 
 interface UsageWindowCardProps {
   tier: QuotaTier;
@@ -129,10 +140,15 @@ function clampPercent(value: number): number {
 
 /** 根据已用百分比返回容量状态文案。 */
 function describeCapacity(utilization: number): string {
-  if (utilization >= 95) return "接近耗尽";
-  if (utilization >= 75) return "偏紧";
-  if (utilization >= 50) return "正常";
-  return "充足";
+  if (utilization >= 95)
+    return i18n.t("codexUsagePage.capacityNearDepletion", {
+      defaultValue: "接近耗尽",
+    });
+  if (utilization >= 75)
+    return i18n.t("codexUsagePage.capacityTight", { defaultValue: "偏紧" });
+  if (utilization >= 50)
+    return i18n.t("codexUsagePage.capacityNormal", { defaultValue: "正常" });
+  return i18n.t("codexUsagePage.capacityPlenty", { defaultValue: "充足" });
 }
 
 /** 根据已用百分比返回页面上的语义颜色。 */
@@ -153,9 +169,13 @@ function capacityBarTone(utilization: number): string {
 
 /** 把 ISO 时间格式化为本地可读时间；无效或缺失时返回兜底文案。 */
 function formatDateTime(value: string | null | undefined): string {
-  if (!value) return "未返回";
+  if (!value)
+    return i18n.t("codexUsagePage.timeNotReturned", { defaultValue: "未返回" });
   const date = new Date(value);
-  if (Number.isNaN(date.getTime())) return "无法解析";
+  if (Number.isNaN(date.getTime()))
+    return i18n.t("codexUsagePage.timeUnparseable", {
+      defaultValue: "无法解析",
+    });
   return date.toLocaleString(undefined, {
     month: "short",
     day: "numeric",
@@ -166,7 +186,10 @@ function formatDateTime(value: string | null | undefined): string {
 
 /** 把毫秒时间戳格式化为最近刷新时间。 */
 function formatCheckedAt(value: number | null | undefined): string {
-  if (!value) return "尚未刷新";
+  if (!value)
+    return i18n.t("codexUsagePage.notRefreshedYet", {
+      defaultValue: "尚未刷新",
+    });
   return new Date(value).toLocaleString(undefined, {
     month: "short",
     day: "numeric",
@@ -239,28 +262,48 @@ function getWindowRecommendation(
   const hoursUntilReset = getHoursUntil(tier.resetsAt);
   if (!forecast || hoursUntilReset === null) {
     return {
-      title: "等待更多窗口数据",
-      detail: "官方尚未提供足够的有效窗口读数，暂不显示耗尽预测。",
+      title: i18n.t("codexUsagePage.forecastWaitTitle", {
+        defaultValue: "等待更多窗口数据",
+      }),
+      detail: i18n.t("codexUsagePage.forecastWaitDetail", {
+        defaultValue: "官方尚未提供足够的有效窗口读数，暂不显示耗尽预测。",
+      }),
       tone: "warn",
     };
   }
   if (forecast.depletesBeforeReset) {
     return {
-      title: "按当前节奏可能提前耗尽",
-      detail: `预计 ${formatDateTime(forecast.depletionAt?.toISOString())} 用尽，建议降低并发或把轻量任务切到其它模型。`,
+      title: i18n.t("codexUsagePage.forecastEarlyTitle", {
+        defaultValue: "按当前节奏可能提前耗尽",
+      }),
+      detail: i18n.t("codexUsagePage.forecastEarlyDetail", {
+        defaultValue:
+          "预计 {{time}} 用尽，建议降低并发或把轻量任务切到其它模型。",
+        time: formatDateTime(forecast.depletionAt?.toISOString()),
+      }),
       tone: "risk",
     };
   }
   if (forecast.percentPerHour >= 15) {
     return {
-      title: "消耗节奏偏快",
-      detail: `重置前约剩 ${Math.ceil(hoursUntilReset)} 小时；优先避免大上下文重复提交。`,
+      title: i18n.t("codexUsagePage.forecastFastTitle", {
+        defaultValue: "消耗节奏偏快",
+      }),
+      detail: i18n.t("codexUsagePage.forecastFastDetail", {
+        defaultValue: "重置前约剩 {{hours}} 小时；优先避免大上下文重复提交。",
+        hours: Math.ceil(hoursUntilReset),
+      }),
       tone: "warn",
     };
   }
   return {
-    title: "当前节奏可覆盖至重置",
-    detail: `按已过周期平均速度估算，仍会在 ${formatDateTime(tier.resetsAt)} 前保有余量。`,
+    title: i18n.t("codexUsagePage.forecastOkTitle", {
+      defaultValue: "当前节奏可覆盖至重置",
+    }),
+    detail: i18n.t("codexUsagePage.forecastOkDetail", {
+      defaultValue: "按已过周期平均速度估算，仍会在 {{time}} 前保有余量。",
+      time: formatDateTime(tier.resetsAt),
+    }),
     tone: "ok",
   };
 }
@@ -292,44 +335,54 @@ function resetCreditUrgency(expiresAt: string | null | undefined): {
 } {
   if (!expiresAt) {
     return {
-      label: "无到期记录",
+      label: i18n.t("codexUsagePage.expiryNoRecord", {
+        defaultValue: "无到期记录",
+      }),
       className: "text-muted-foreground",
     };
   }
   const expiresAtMs = new Date(expiresAt).getTime();
   if (Number.isNaN(expiresAtMs)) {
     return {
-      label: "到期时间异常",
+      label: i18n.t("codexUsagePage.expiryInvalidDate", {
+        defaultValue: "到期时间异常",
+      }),
       className: "text-amber-600 dark:text-amber-400",
     };
   }
   const hoursLeft = (expiresAtMs - Date.now()) / (1000 * 60 * 60);
   if (hoursLeft <= 0) {
     return {
-      label: "已过期",
+      label: i18n.t("codexUsagePage.expired", { defaultValue: "已过期" }),
       className: "text-red-600 dark:text-red-400",
     };
   }
   if (hoursLeft <= 24) {
     return {
-      label: "今天到期",
+      label: i18n.t("codexUsagePage.expiresToday", {
+        defaultValue: "今天到期",
+      }),
       className: "text-red-600 dark:text-red-400",
     };
   }
   if (hoursLeft <= 72) {
     return {
-      label: "即将到期",
+      label: i18n.t("codexUsagePage.expiringSoon", {
+        defaultValue: "即将到期",
+      }),
       className: "text-amber-600 dark:text-amber-400",
     };
   }
   if (hoursLeft <= 24 * 7) {
     return {
-      label: "本周到期",
+      label: i18n.t("codexUsagePage.expiresThisWeek", {
+        defaultValue: "本周到期",
+      }),
       className: "text-blue-600 dark:text-blue-400",
     };
   }
   return {
-    label: "可用",
+    label: i18n.t("codexUsagePage.creditAvailable", { defaultValue: "可用" }),
     className: "text-emerald-600 dark:text-emerald-400",
   };
 }
@@ -342,7 +395,8 @@ function isAvailableCredit(credit: ResetCreditInfo): boolean {
 /** 从额度响应中挑出主页面展示的 Codex 速率窗口。 */
 function getVisibleTiers(quota: SubscriptionQuota | undefined): QuotaTier[] {
   return (quota?.tiers ?? []).filter(
-    (tier) => TRACKED_TIERS.has(tier.name) || tier.name in TIER_LABELS,
+    (tier) =>
+      TRACKED_TIERS.has(tier.name) || TIER_LABEL_KEYS.includes(tier.name),
   );
 }
 
@@ -382,40 +436,66 @@ const UsageGuidePanel: React.FC = () => (
   <section className={`rounded-lg border p-4 ${USAGE_PAGE_COLORS.guide}`}>
     <div className="mb-3 flex items-center gap-2 text-sm font-semibold">
       <Info className="h-4 w-4" />
-      使用引导
+      {i18n.t("codexUsagePage.usageGuideTitle", { defaultValue: "使用引导" })}
     </div>
     <div className="grid gap-3 lg:grid-cols-3">
       <GuideStep
         index={1}
-        title="从 Codex 工具栏进入"
-        detail="主界面先切到 Codex，再点多模型路由旁边的柱状图按钮。"
+        title={i18n.t("codexUsagePage.guideEnterTitle", {
+          defaultValue: "从 Codex 工具栏进入",
+        })}
+        detail={i18n.t("codexUsagePage.guideEnterDetail", {
+          defaultValue: "主界面先切到 Codex，再点多模型路由旁边的柱状图按钮。",
+        })}
       />
       <GuideStep
         index={2}
-        title="先刷新当前登录"
-        detail="页面读取本机 Codex Desktop / CLI 登录；刷新只重新查询，不兑换 reset。"
+        title={i18n.t("codexUsagePage.guideRefreshTitle", {
+          defaultValue: "先刷新当前登录",
+        })}
+        detail={i18n.t("codexUsagePage.guideRefreshDetail", {
+          defaultValue:
+            "页面读取本机 Codex Desktop / CLI 登录；刷新只重新查询，不兑换 reset。",
+        })}
       />
       <GuideStep
         index={3}
-        title="按窗口和到期时间决策"
-        detail="先看 5 小时与每周剩余额度，再看 reset 是否临近到期。"
+        title={i18n.t("codexUsagePage.guideDecideTitle", {
+          defaultValue: "按窗口和到期时间决策",
+        })}
+        detail={i18n.t("codexUsagePage.guideDecideDetail", {
+          defaultValue: "先看 5 小时与每周剩余额度，再看 reset 是否临近到期。",
+        })}
       />
     </div>
     <div className="mt-3 grid gap-2 lg:grid-cols-3">
       <UsageReadingHint
         tone="ok"
-        title="绿色 / 蓝色"
-        detail="容量还可用，适合继续工作或保留 reset。"
+        title={i18n.t("codexUsagePage.toneGreenBlue", {
+          defaultValue: "绿色 / 蓝色",
+        })}
+        detail={i18n.t("codexUsagePage.toneGreenBlueDetail", {
+          defaultValue: "容量还可用，适合继续工作或保留 reset。",
+        })}
       />
       <UsageReadingHint
         tone="warn"
-        title="黄色 / 红色"
-        detail="窗口偏紧；如果刷新还远，优先规划 reset 或等待。"
+        title={i18n.t("codexUsagePage.toneYellowRed", {
+          defaultValue: "黄色 / 红色",
+        })}
+        detail={i18n.t("codexUsagePage.toneYellowRedDetail", {
+          defaultValue: "窗口偏紧；如果刷新还远，优先规划 reset 或等待。",
+        })}
       />
       <UsageReadingHint
         tone="info"
-        title="到期提示"
-        detail="今天到期、即将到期、本周到期会单独标出，避免 reset 白白过期。"
+        title={i18n.t("codexUsagePage.expiryNoticeTitle", {
+          defaultValue: "到期提示",
+        })}
+        detail={i18n.t("codexUsagePage.expiryNoticeDetail", {
+          defaultValue:
+            "今天到期、即将到期、本周到期会单独标出，避免 reset 白白过期。",
+        })}
       />
     </div>
   </section>
@@ -444,7 +524,7 @@ function ForecastStatusIcon({
 const UsageWindowCard: React.FC<UsageWindowCardProps> = ({ tier }) => {
   const used = clampPercent(tier.utilization);
   const remaining = Math.max(0, 100 - used);
-  const label = TIER_LABELS[tier.name] ?? tier.name;
+  const label = tierLabel(tier.name);
   const forecast = buildWindowForecast(tier);
   const recommendation = getWindowRecommendation(tier, forecast);
 
@@ -454,14 +534,19 @@ const UsageWindowCard: React.FC<UsageWindowCardProps> = ({ tier }) => {
         <div>
           <div className="text-sm font-semibold text-foreground">{label}</div>
           <div className="mt-1 text-xs text-muted-foreground">
-            重置时间：{formatDateTime(tier.resetsAt)}
+            {i18n.t("codexUsagePage.resetsAtLabel", {
+              defaultValue: "重置时间：",
+            })}
+            {formatDateTime(tier.resetsAt)}
           </div>
         </div>
         <div className={`text-right ${capacityTone(used)}`}>
           <div className="text-2xl font-semibold tabular-nums">
             {Math.round(remaining)}%
           </div>
-          <div className="text-xs font-medium">剩余</div>
+          <div className="text-xs font-medium">
+            {i18n.t("codexUsagePage.remainingLabel", { defaultValue: "剩余" })}
+          </div>
         </div>
       </div>
 
@@ -477,7 +562,8 @@ const UsageWindowCard: React.FC<UsageWindowCardProps> = ({ tier }) => {
       <div className="mt-3 flex items-center justify-between text-xs">
         <span className={capacityTone(used)}>{describeCapacity(used)}</span>
         <span className="text-muted-foreground tabular-nums">
-          已用 {Math.round(used)}%
+          {i18n.t("codexUsagePage.usedPrefix", { defaultValue: "已用" })}
+          {Math.round(used)}%
         </span>
       </div>
 
@@ -500,10 +586,23 @@ const UsageWindowCard: React.FC<UsageWindowCardProps> = ({ tier }) => {
         {forecast && (
           <div className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1 border-t border-current/10 pt-2 text-[11px] text-muted-foreground">
             <span className="tabular-nums">
-              平均 {forecast.percentPerHour.toFixed(1)}% / 小时
+              {i18n.t("codexUsagePage.avgPrefix", { defaultValue: "平均" })}
+              {forecast.percentPerHour.toFixed(1)}
+              {i18n.t("codexUsagePage.perHourSuffix", {
+                defaultValue: "% / 小时",
+              })}
             </span>
             <span>
-              置信度：{forecast.confidence === "medium" ? "中" : "低"}
+              {i18n.t("codexUsagePage.confidenceLabel", {
+                defaultValue: "置信度：",
+              })}
+              {forecast.confidence === "medium"
+                ? i18n.t("codexUsagePage.confidenceMedium", {
+                    defaultValue: "中",
+                  })
+                : i18n.t("codexUsagePage.confidenceLow", {
+                    defaultValue: "低",
+                  })}
             </span>
           </div>
         )}
@@ -544,31 +643,41 @@ const LocalUsageAnalytics: React.FC<{
           <LineChart className="mt-0.5 h-4 w-4 text-violet-700 dark:text-violet-300" />
           <div>
             <h3 className="text-base font-semibold text-foreground">
-              本地消耗节奏
+              {i18n.t("codexUsagePage.localPaceTitle", {
+                defaultValue: "本地消耗节奏",
+              })}
             </h3>
             <p className="mt-1 text-xs leading-5 text-muted-foreground">
-              来自本机已同步的 Codex 会话与代理日志，仅用于识别 token
-              和模型消耗趋势，不换算官方窗口额度。
+              {i18n.t("codexUsagePage.localPaceDesc", {
+                defaultValue:
+                  "来自本机已同步的 Codex 会话与代理日志，仅用于识别 token 和模型消耗趋势，不换算官方窗口额度。",
+              })}
             </p>
           </div>
         </div>
         <span className="inline-flex w-fit items-center gap-1 rounded-md border border-violet-200 bg-white/80 px-2 py-1 text-xs text-violet-800 dark:border-violet-800/70 dark:bg-slate-950/35 dark:text-violet-200">
           <Database className="h-3.5 w-3.5" />
-          本地日志口径
+          {i18n.t("codexUsagePage.localLogScopeLabel", {
+            defaultValue: "本地日志口径",
+          })}
         </span>
       </div>
 
       {isLoading && !summary ? (
         <div className="flex items-center gap-2 py-6 text-sm text-muted-foreground">
           <LoaderCircle className="h-4 w-4 animate-spin" />
-          正在汇总本地 Codex 使用记录...
+          {i18n.t("codexUsagePage.summarizingLocal", {
+            defaultValue: "正在汇总本地 Codex 使用记录...",
+          })}
         </div>
       ) : !summary || summary.totalRequests === 0 ? (
         <div
           className={`mt-4 rounded-md border border-dashed px-3 py-4 text-sm text-muted-foreground ${USAGE_PAGE_COLORS.analyticsInset}`}
         >
-          暂无可分析的本地 Codex 使用记录。完成一次 Codex
-          会话同步或通过本机代理发起请求后，这里会显示 token 速度和模型分布。
+          {i18n.t("codexUsagePage.emptyLocalRecords", {
+            defaultValue:
+              "暂无可分析的本地 Codex 使用记录。完成一次 Codex 会话同步或通过本机代理发起请求后，这里会显示 token 速度和模型分布。",
+          })}
         </div>
       ) : (
         <>
@@ -576,48 +685,79 @@ const LocalUsageAnalytics: React.FC<{
             <div
               className={`rounded-md border p-3 ${USAGE_PAGE_COLORS.analyticsInset}`}
             >
-              <div className="text-xs text-muted-foreground">今日 token</div>
+              <div className="text-xs text-muted-foreground">
+                {i18n.t("codexUsagePage.todayTokenLabel", {
+                  defaultValue: "今日 token",
+                })}
+              </div>
               <div className="mt-1 text-xl font-semibold tabular-nums">
                 {formatTokens(summary.realTotalTokens)}
               </div>
               <div className="mt-1 text-xs text-muted-foreground">
-                {summary.totalRequests} 次请求
+                {summary.totalRequests}{" "}
+                {i18n.t("codexUsagePage.requestsSuffix", {
+                  defaultValue: "次请求",
+                })}
               </div>
             </div>
             <div
               className={`rounded-md border p-3 ${USAGE_PAGE_COLORS.analyticsInset}`}
             >
-              <div className="text-xs text-muted-foreground">当前消耗速度</div>
+              <div className="text-xs text-muted-foreground">
+                {i18n.t("codexUsagePage.currentRateLabel", {
+                  defaultValue: "当前消耗速度",
+                })}
+              </div>
               <div className="mt-1 text-xl font-semibold tabular-nums">
                 {formatTokens(tokensPerHour)}
                 <span className="ml-1 text-xs font-medium text-muted-foreground">
-                  token / 小时
+                  {i18n.t("codexUsagePage.tokensPerHour", {
+                    defaultValue: "token / 小时",
+                  })}
                 </span>
               </div>
               <div className="mt-1 text-xs text-muted-foreground">
-                按今日已过时间平均
+                {i18n.t("codexUsagePage.averagedElapsedToday", {
+                  defaultValue: "按今日已过时间平均",
+                })}
               </div>
             </div>
             <div
               className={`rounded-md border p-3 ${USAGE_PAGE_COLORS.analyticsInset}`}
             >
-              <div className="text-xs text-muted-foreground">缓存命中率</div>
+              <div className="text-xs text-muted-foreground">
+                {i18n.t("codexUsagePage.cacheHitRateLabel", {
+                  defaultValue: "缓存命中率",
+                })}
+              </div>
               <div className="mt-1 text-xl font-semibold tabular-nums">
                 {cachePercent}%
               </div>
               <div className="mt-1 text-xs text-muted-foreground">
-                {cachePercent < 30 ? "重复上下文可优先复用" : "上下文复用正常"}
+                {cachePercent < 30
+                  ? i18n.t("codexUsagePage.cacheReuseHint", {
+                      defaultValue: "重复上下文可优先复用",
+                    })
+                  : i18n.t("codexUsagePage.cacheOkHint", {
+                      defaultValue: "上下文复用正常",
+                    })}
               </div>
             </div>
             <div
               className={`rounded-md border p-3 ${USAGE_PAGE_COLORS.analyticsInset}`}
             >
-              <div className="text-xs text-muted-foreground">请求成功率</div>
+              <div className="text-xs text-muted-foreground">
+                {i18n.t("codexUsagePage.successRateLabel", {
+                  defaultValue: "请求成功率",
+                })}
+              </div>
               <div className="mt-1 text-xl font-semibold tabular-nums">
                 {Math.round(summary.successRate)}%
               </div>
               <div className="mt-1 text-xs text-muted-foreground">
-                已计入成功请求
+                {i18n.t("codexUsagePage.successOnlyNote", {
+                  defaultValue: "已计入成功请求",
+                })}
               </div>
             </div>
           </div>
@@ -630,15 +770,35 @@ const LocalUsageAnalytics: React.FC<{
               <div className="min-w-0 text-sm">
                 <div className="font-semibold text-foreground">
                   {highBurn
-                    ? "建议先降低高上下文任务密度"
-                    : "本地 token 节奏处于可观察范围"}
+                    ? i18n.t("codexUsagePage.paceAdviceHigh", {
+                        defaultValue: "建议先降低高上下文任务密度",
+                      })
+                    : i18n.t("codexUsagePage.paceAdviceNormal", {
+                        defaultValue: "本地 token 节奏处于可观察范围",
+                      })}
                 </div>
                 <p className="mt-1 leading-5 text-muted-foreground">
                   {highBurn
-                    ? `当前约 ${formatTokens(tokensPerHour)} token / 小时。将大任务拆分、避免重复粘贴长上下文，并把轻量任务分配到低成本模型可降低消耗。`
+                    ? i18n.t("codexUsagePage.paceAdviceHighDetail", {
+                        defaultValue:
+                          "当前约 {{rate}} token / 小时。将大任务拆分、避免重复粘贴长上下文，并把轻量任务分配到低成本模型可降低消耗。",
+                        rate: formatTokens(tokensPerHour),
+                      })
                     : heavyModel
-                      ? `${heavyModel.model} 是近 7 天 token 消耗最多的模型，占展示模型总量约 ${Math.round((heavyModel.totalTokens / Math.max(topModelsTotalTokens, 1)) * 100)}%。`
-                      : "继续积累本地会话记录后，可获得模型级别的消耗建议。"}
+                      ? i18n.t("codexUsagePage.heavyModelAdvice", {
+                          defaultValue:
+                            "{{model}} 是近 7 天 token 消耗最多的模型，占展示模型总量约 {{percent}}%。",
+                          model: heavyModel.model,
+                          percent: Math.round(
+                            (heavyModel.totalTokens /
+                              Math.max(topModelsTotalTokens, 1)) *
+                              100,
+                          ),
+                        })
+                      : i18n.t("codexUsagePage.adviceNeedMoreData", {
+                          defaultValue:
+                            "继续积累本地会话记录后，可获得模型级别的消耗建议。",
+                        })}
                 </p>
               </div>
             </div>
@@ -647,7 +807,9 @@ const LocalUsageAnalytics: React.FC<{
           <div className="mt-4">
             <div className="mb-2 flex items-center gap-2 text-sm font-semibold">
               <BarChart3 className="h-4 w-4 text-violet-700 dark:text-violet-300" />
-              近 7 天模型分布
+              {i18n.t("codexUsagePage.modelDistribution7d", {
+                defaultValue: "近 7 天模型分布",
+              })}
             </div>
             {topModels.length > 0 ? (
               <div className="divide-y rounded-md border bg-white/70 dark:divide-slate-700/70 dark:bg-slate-950/20">
@@ -679,7 +841,10 @@ const LocalUsageAnalytics: React.FC<{
                         {formatTokens(item.totalTokens)} token
                       </div>
                       <div className="text-right text-xs text-muted-foreground tabular-nums">
-                        {item.requestCount} 次请求
+                        {item.requestCount}{" "}
+                        {i18n.t("codexUsagePage.requestsSuffix2", {
+                          defaultValue: "次请求",
+                        })}
                       </div>
                     </div>
                   );
@@ -687,7 +852,9 @@ const LocalUsageAnalytics: React.FC<{
               </div>
             ) : (
               <div className="text-sm text-muted-foreground">
-                本地日志没有返回可展示的模型级 token 记录。
+                {i18n.t("codexUsagePage.emptyModelStats", {
+                  defaultValue: "本地日志没有返回可展示的模型级 token 记录。",
+                })}
               </div>
             )}
           </div>
@@ -728,7 +895,11 @@ const QuotaCollaborationPanel: React.FC<{
     nextMode: "observe" | "enforce" = mode,
   ) => {
     if (!settings) {
-      toast.error("设置尚未加载完成，请稍后重试。");
+      toast.error(
+        i18n.t("codexUsagePage.settingsNotReady", {
+          defaultValue: "设置尚未加载完成，请稍后重试。",
+        }),
+      );
       return;
     }
     setIsSaving(true);
@@ -752,10 +923,22 @@ const QuotaCollaborationPanel: React.FC<{
           queryKey: ["usage", "quota-collaboration"],
         }),
       ]);
-      toast.success("多设备协作设置已保存。");
+      toast.success(
+        i18n.t("codexUsagePage.collabSaved", {
+          defaultValue: "多设备协作设置已保存。",
+        }),
+      );
     } catch (error) {
       toast.error(
-        `保存多设备协作设置失败：${error instanceof Error ? error.message : "未知错误"}`,
+        i18n.t("codexUsagePage.collabSaveFailed", {
+          defaultValue: "保存多设备协作设置失败：{{message}}",
+          message:
+            error instanceof Error
+              ? error.message
+              : i18n.t("codexUsagePage.unknownError", {
+                  defaultValue: "未知错误",
+                }),
+        }),
       );
     } finally {
       setIsSaving(false);
@@ -773,7 +956,9 @@ const QuotaCollaborationPanel: React.FC<{
       <section className={`rounded-lg border p-5 ${USAGE_PAGE_COLORS.card}`}>
         <div className="flex items-center gap-2 text-sm text-muted-foreground">
           <LoaderCircle className="h-4 w-4 animate-spin" />
-          正在读取多设备协作缓存...
+          {i18n.t("codexUsagePage.readingCollabCache", {
+            defaultValue: "正在读取多设备协作缓存...",
+          })}
         </div>
       </section>
     );
@@ -796,11 +981,15 @@ const QuotaCollaborationPanel: React.FC<{
           <MonitorSmartphone className="mt-0.5 h-4 w-4 text-emerald-700 dark:text-emerald-300" />
           <div>
             <h3 className="text-base font-semibold text-foreground">
-              多设备额度协作
+              {i18n.t("codexUsagePage.collabSectionTitle", {
+                defaultValue: "多设备额度协作",
+              })}
             </h3>
             <p className="mt-1 text-xs leading-5 text-muted-foreground">
-              官方窗口是同一 Codex 账号的总量；下表只汇总已接入 CCSwitchMulti
-              的设备 token，不把两种口径相互换算。
+              {i18n.t("codexUsagePage.collabSectionDesc", {
+                defaultValue:
+                  "官方窗口是同一 Codex 账号的总量；下表只汇总已接入 CCSwitchMulti 的设备 token，不把两种口径相互换算。",
+              })}
             </p>
           </div>
         </div>
@@ -812,7 +1001,11 @@ const QuotaCollaborationPanel: React.FC<{
           }`}
         >
           <ShieldCheck className="h-3.5 w-3.5" />
-          {isEnforcing ? "约束模式" : "观测模式"}
+          {isEnforcing
+            ? i18n.t("codexUsagePage.modeEnforce", { defaultValue: "约束模式" })
+            : i18n.t("codexUsagePage.modeObserve", {
+                defaultValue: "观测模式",
+              })}
         </span>
       </div>
       <div className="mt-3">
@@ -827,24 +1020,37 @@ const QuotaCollaborationPanel: React.FC<{
           <RefreshCw
             className={`h-3.5 w-3.5 ${isSyncing ? "animate-spin" : ""}`}
           />
-          同步设备报告
+          {i18n.t("codexUsagePage.syncDeviceReports", {
+            defaultValue: "同步设备报告",
+          })}
         </Button>
       </div>
 
       <div className={`mt-4 rounded-md border p-3 ${USAGE_PAGE_COLORS.inset}`}>
         <div className="flex flex-wrap items-center justify-between gap-2">
           <div>
-            <h4 className="text-sm font-semibold text-foreground">协作设置</h4>
+            <h4 className="text-sm font-semibold text-foreground">
+              {i18n.t("codexUsagePage.collabSettingsHeading", {
+                defaultValue: "协作设置",
+              })}
+            </h4>
             <p className="mt-0.5 text-xs text-muted-foreground">
-              每台设备都使用同一 WebDAV 或 S3 目录；设备名称只影响列表显示。
+              {i18n.t("codexUsagePage.collabSettingsDesc", {
+                defaultValue:
+                  "每台设备都使用同一 WebDAV 或 S3 目录；设备名称只影响列表显示。",
+              })}
             </p>
           </div>
           <Button
             type="button"
             size="icon"
             variant="ghost"
-            aria-label="打开多设备协作教程"
-            title="打开多设备协作教程"
+            aria-label={i18n.t("codexUsagePage.openTutorialAria", {
+              defaultValue: "打开多设备协作教程",
+            })}
+            title={i18n.t("codexUsagePage.openTutorialTitle", {
+              defaultValue: "打开多设备协作教程",
+            })}
             onClick={() =>
               void settingsApi.openExternal(
                 "https://github.com/BigStrongSun/ccswitchmulti/blob/main/docs/guides/codex-multi-device-quota-collaboration-zh.md",
@@ -856,17 +1062,27 @@ const QuotaCollaborationPanel: React.FC<{
         </div>
         <div className="mt-3 grid gap-3 md:grid-cols-[minmax(0,1fr)_auto]">
           <div className="space-y-1.5">
-            <Label htmlFor="quota-collaboration-device-name">设备名称</Label>
+            <Label htmlFor="quota-collaboration-device-name">
+              {i18n.t("codexUsagePage.deviceNameLabel", {
+                defaultValue: "设备名称",
+              })}
+            </Label>
             <Input
               id="quota-collaboration-device-name"
               value={deviceName}
               maxLength={64}
-              placeholder="例如：办公室 Windows"
+              placeholder={i18n.t("codexUsagePage.deviceNamePlaceholder", {
+                defaultValue: "例如：办公室 Windows",
+              })}
               onChange={(event) => setDeviceName(event.target.value)}
             />
           </div>
           <div className="space-y-1.5">
-            <Label>协作模式</Label>
+            <Label>
+              {i18n.t("codexUsagePage.collabModeLabel", {
+                defaultValue: "协作模式",
+              })}
+            </Label>
             <div className="flex rounded-md border p-1">
               <Button
                 type="button"
@@ -874,7 +1090,9 @@ const QuotaCollaborationPanel: React.FC<{
                 variant={mode === "observe" ? "default" : "ghost"}
                 onClick={() => setMode("observe")}
               >
-                观测
+                {i18n.t("codexUsagePage.modeShortObserve", {
+                  defaultValue: "观测",
+                })}
               </Button>
               <Button
                 type="button"
@@ -884,7 +1102,9 @@ const QuotaCollaborationPanel: React.FC<{
                   if (mode !== "enforce") setConfirmEnforceOpen(true);
                 }}
               >
-                约束
+                {i18n.t("codexUsagePage.modeShortEnforce", {
+                  defaultValue: "约束",
+                })}
               </Button>
             </div>
           </div>
@@ -893,7 +1113,9 @@ const QuotaCollaborationPanel: React.FC<{
           <div className="mt-3 grid gap-2 md:grid-cols-[minmax(0,1fr)_96px] md:items-end">
             <div className="space-y-1.5">
               <Label htmlFor="quota-collaboration-threshold">
-                窗口剩余阈值
+                {i18n.t("codexUsagePage.windowThresholdLabel", {
+                  defaultValue: "窗口剩余阈值",
+                })}
               </Label>
               <input
                 id="quota-collaboration-threshold"
@@ -906,7 +1128,9 @@ const QuotaCollaborationPanel: React.FC<{
               />
             </div>
             <Input
-              aria-label="窗口剩余阈值百分比"
+              aria-label={i18n.t("codexUsagePage.enforceThresholdAria", {
+                defaultValue: "窗口剩余阈值百分比",
+              })}
               type="number"
               min="1"
               max="90"
@@ -926,11 +1150,19 @@ const QuotaCollaborationPanel: React.FC<{
             onClick={() => void saveCollaborationSettings()}
             disabled={!settings || isSaving}
           >
-            {isSaving ? "保存中..." : "保存协作设置"}
+            {isSaving
+              ? i18n.t("codexUsagePage.savingCollab", {
+                  defaultValue: "保存中...",
+                })
+              : i18n.t("codexUsagePage.saveCollabSettings", {
+                  defaultValue: "保存协作设置",
+                })}
           </Button>
           {!overview?.configured ? (
             <span className="text-xs text-amber-700 dark:text-amber-300">
-              先在设置中启用 WebDAV 或 S3，才能同步其它设备。
+              {i18n.t("codexUsagePage.enableWebdavFirst", {
+                defaultValue: "先在设置中启用 WebDAV 或 S3，才能同步其它设备。",
+              })}
             </span>
           ) : null}
         </div>
@@ -940,22 +1172,30 @@ const QuotaCollaborationPanel: React.FC<{
         <li
           className={`rounded-md border px-3 py-2 ${USAGE_PAGE_COLORS.inset}`}
         >
-          1. 每台设备启用相同的 WebDAV 或 S3
+          {i18n.t("codexUsagePage.collabStep1", {
+            defaultValue: "1. 每台设备启用相同的 WebDAV 或 S3",
+          })}
         </li>
         <li
           className={`rounded-md border px-3 py-2 ${USAGE_PAGE_COLORS.inset}`}
         >
-          2. 每台设备刷新一次官方额度
+          {i18n.t("codexUsagePage.collabStep2", {
+            defaultValue: "2. 每台设备刷新一次官方额度",
+          })}
         </li>
         <li
           className={`rounded-md border px-3 py-2 ${USAGE_PAGE_COLORS.inset}`}
         >
-          3. 分别点击同步设备报告
+          {i18n.t("codexUsagePage.collabStep3", {
+            defaultValue: "3. 分别点击同步设备报告",
+          })}
         </li>
         <li
           className={`rounded-md border px-3 py-2 ${USAGE_PAGE_COLORS.inset}`}
         >
-          4. 返回任意设备确认列表已汇总
+          {i18n.t("codexUsagePage.collabStep4", {
+            defaultValue: "4. 返回任意设备确认列表已汇总",
+          })}
         </li>
       </ol>
 
@@ -969,18 +1209,39 @@ const QuotaCollaborationPanel: React.FC<{
         <div
           className={`mt-4 rounded-md border border-dashed px-3 py-4 text-sm text-muted-foreground ${USAGE_PAGE_COLORS.inset}`}
         >
-          当前只有本机缓存。完成一次官方额度刷新后会生成本机报告；配置协作同步后，其他设备会出现在这里。
+          {i18n.t("codexUsagePage.localOnlyCacheHint", {
+            defaultValue:
+              "当前只有本机缓存。完成一次官方额度刷新后会生成本机报告；配置协作同步后，其他设备会出现在这里。",
+          })}
         </div>
       ) : (
         <>
           <div className="mt-4 overflow-x-auto rounded-md border">
             <div className="min-w-[620px] divide-y">
               <div className="grid grid-cols-[minmax(150px,1fr)_110px_110px_80px_130px] gap-3 bg-slate-50 px-3 py-2 text-xs font-medium text-muted-foreground dark:bg-slate-900/50">
-                <span>设备</span>
-                <span className="text-right">今日 token</span>
-                <span className="text-right">7 天 token</span>
-                <span className="text-right">请求</span>
-                <span className="text-right">最后上报</span>
+                <span>
+                  {i18n.t("codexUsagePage.colDevice", { defaultValue: "设备" })}
+                </span>
+                <span className="text-right">
+                  {i18n.t("codexUsagePage.colTodayTokens", {
+                    defaultValue: "今日 token",
+                  })}
+                </span>
+                <span className="text-right">
+                  {i18n.t("codexUsagePage.colWeekTokens", {
+                    defaultValue: "7 天 token",
+                  })}
+                </span>
+                <span className="text-right">
+                  {i18n.t("codexUsagePage.colRequests", {
+                    defaultValue: "请求",
+                  })}
+                </span>
+                <span className="text-right">
+                  {i18n.t("codexUsagePage.colLastReport", {
+                    defaultValue: "最后上报",
+                  })}
+                </span>
               </div>
               {reports.map((report) => (
                 <div
@@ -989,7 +1250,11 @@ const QuotaCollaborationPanel: React.FC<{
                 >
                   <div className="min-w-0 truncate font-medium">
                     {report.deviceName}
-                    {report.deviceId === overview?.deviceId ? "（本机）" : ""}
+                    {report.deviceId === overview?.deviceId
+                      ? i18n.t("codexUsagePage.localDeviceTag", {
+                          defaultValue: "（本机）",
+                        })
+                      : ""}
                   </div>
                   <span className="text-right tabular-nums">
                     {formatTokens(report.todayTokens)}
@@ -1010,9 +1275,27 @@ const QuotaCollaborationPanel: React.FC<{
             </div>
           </div>
           <div className="mt-3 flex flex-wrap gap-x-4 gap-y-1 text-xs text-muted-foreground">
-            <span>已覆盖 {reports.length} 台设备</span>
-            <span>今日合计 {formatTokens(todayTokens)} token</span>
-            <span>7 天合计 {formatTokens(weekTokens)} token</span>
+            <span>
+              {i18n.t("codexUsagePage.coveredDevicesPrefix", {
+                defaultValue: "已覆盖",
+              })}
+              {reports.length}{" "}
+              {i18n.t("codexUsagePage.coveredDevicesSuffix", {
+                defaultValue: "台设备",
+              })}
+            </span>
+            <span>
+              {i18n.t("codexUsagePage.todayTotalPrefix", {
+                defaultValue: "今日合计",
+              })}
+              {formatTokens(todayTokens)} token
+            </span>
+            <span>
+              {i18n.t("codexUsagePage.weekTotalPrefix", {
+                defaultValue: "7 天合计",
+              })}
+              {formatTokens(weekTokens)} token
+            </span>
           </div>
         </>
       )}
@@ -1020,17 +1303,31 @@ const QuotaCollaborationPanel: React.FC<{
         className={`mt-4 rounded-md border px-3 py-2.5 text-xs leading-5 ${isEnforcing ? USAGE_PAGE_COLORS.warning : USAGE_PAGE_COLORS.inset}`}
       >
         {isEnforcing
-          ? `窗口剩余不高于 ${Math.round(overview?.enforceRemainingPercent ?? 20)}% 时，本机网关会拒绝继续转发 Codex 请求。未经过 CCSwitchMulti 的原生 Codex App 仍不受此策略控制。`
-          : "观测模式不会拦截请求。约束模式只对经过 CCSwitchMulti 网关的实例生效。"}
+          ? i18n.t("codexUsagePage.enforceModeDescription", {
+              defaultValue:
+                "窗口剩余不高于 {{percent}}% 时，本机网关会拒绝继续转发 Codex 请求。未经过 CCSwitchMulti 的原生 Codex App 仍不受此策略控制。",
+              percent: Math.round(overview?.enforceRemainingPercent ?? 20),
+            })
+          : i18n.t("codexUsagePage.observeModeNote", {
+              defaultValue:
+                "观测模式不会拦截请求。约束模式只对经过 CCSwitchMulti 网关的实例生效。",
+            })}
       </div>
       <ConfirmDialog
         isOpen={confirmEnforceOpen}
-        title="启用约束模式？"
-        message={
-          "当官方窗口剩余不高于阈值时，本机 CCSwitchMulti 网关会拒绝继续转发 Codex 请求。\n\n直接使用原生 Codex App、CLI 或其它未经过 CCSwitchMulti 网关的请求不受此策略控制，仍会消耗同一账号额度。"
-        }
-        confirmText="我了解，启用约束"
-        cancelText="保持观测"
+        title={i18n.t("codexUsagePage.enableEnforceTitle", {
+          defaultValue: "启用约束模式？",
+        })}
+        message={i18n.t("codexUsagePage.enforceConfirmMessage", {
+          defaultValue:
+            "当官方窗口剩余不高于阈值时，本机 CCSwitchMulti 网关会拒绝继续转发 Codex 请求。\n\n直接使用原生 Codex App、CLI 或其它未经过 CCSwitchMulti 网关的请求不受此策略控制，仍会消耗同一账号额度。",
+        })}
+        confirmText={i18n.t("codexUsagePage.confirmEnableEnforce", {
+          defaultValue: "我了解，启用约束",
+        })}
+        cancelText={i18n.t("codexUsagePage.stayObserve", {
+          defaultValue: "保持观测",
+        })}
         variant="info"
         onConfirm={confirmEnforce}
         onCancel={() => setConfirmEnforceOpen(false)}
@@ -1052,7 +1349,8 @@ const ResetCreditRow: React.FC<ResetCreditRowProps> = ({ credit, index }) => {
           {credit.title || `Reset ${index + 1}`}
         </div>
         <div className="text-xs text-muted-foreground">
-          状态：{credit.status ?? "unknown"}
+          {i18n.t("codexUsagePage.statusPrefix", { defaultValue: "状态：" })}
+          {credit.status ?? "unknown"}
         </div>
       </div>
       <div className="text-xs text-muted-foreground tabular-nums">
@@ -1076,7 +1374,9 @@ function renderQuotaProblem(
       <div
         className={`rounded-lg border p-6 text-sm text-muted-foreground ${USAGE_PAGE_COLORS.card}`}
       >
-        正在读取本机 Codex 登录状态...
+        {i18n.t("codexUsagePage.readingLoginStatus", {
+          defaultValue: "正在读取本机 Codex 登录状态...",
+        })}
       </div>
     );
   }
@@ -1090,11 +1390,19 @@ function renderQuotaProblem(
 
   if (!isCredentialProblem && quota.success) return null;
 
-  const title = isCredentialProblem ? "Codex 登录不可用" : "额度查询失败";
+  const title = isCredentialProblem
+    ? i18n.t("codexUsagePage.loginUnavailableTitle", {
+        defaultValue: "Codex 登录不可用",
+      })
+    : i18n.t("codexUsagePage.quotaQueryFailed", {
+        defaultValue: "额度查询失败",
+      });
   const detail =
     quota.credentialMessage ||
     quota.error ||
-    "请确认 Codex Desktop / CLI 已登录，然后刷新。";
+    i18n.t("codexUsagePage.credentialProblemHint", {
+      defaultValue: "请确认 Codex Desktop / CLI 已登录，然后刷新。",
+    });
 
   return (
     <section
@@ -1114,7 +1422,7 @@ function renderQuotaProblem(
         className={`gap-2 ${USAGE_PAGE_COLORS.warningButton}`}
       >
         <RefreshCw className={`h-3.5 w-3.5 ${loading ? "animate-spin" : ""}`} />
-        重新刷新
+        {i18n.t("codexUsagePage.refreshAgain", { defaultValue: "重新刷新" })}
       </Button>
     </section>
   );
@@ -1164,30 +1472,41 @@ export const CodexUsagePage: React.FC = () => {
           <div className="min-w-0 space-y-2">
             <div className="flex items-center gap-2 text-base font-semibold">
               <Gauge className="h-4 w-4 text-sky-600 dark:text-blue-300" />
-              Codex 用量与重置额度
+              {i18n.t("codexUsagePage.pageTitle", {
+                defaultValue: "Codex 用量与重置额度",
+              })}
             </div>
             <p className="max-w-4xl text-xs leading-5 text-muted-foreground dark:text-slate-400">
-              这里查看的是当前 Codex 登录账号的速率窗口和已存 reset
-              额度。页面只读：不会兑换 reset、不会修改账号，也不会写入 Codex
-              配置。
+              {i18n.t("codexUsagePage.pageDesc", {
+                defaultValue:
+                  "这里查看的是当前 Codex 登录账号的速率窗口和已存 reset 额度。页面只读：不会兑换 reset、不会修改账号，也不会写入 Codex 配置。",
+              })}
             </p>
             <div className="flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
               <span
                 className={`inline-flex items-center gap-1 rounded-md border px-2 py-1 ${USAGE_PAGE_COLORS.chip}`}
               >
-                Codex 工具栏
+                {i18n.t("codexUsagePage.codexToolbarLink", {
+                  defaultValue: "Codex 工具栏",
+                })}
                 <ArrowRight className="h-3 w-3" />
-                柱状图按钮
+                {i18n.t("codexUsagePage.barChartButtonLink", {
+                  defaultValue: "柱状图按钮",
+                })}
               </span>
               <span
                 className={`inline-flex items-center gap-1 rounded-md border px-2 py-1 ${USAGE_PAGE_COLORS.chip}`}
               >
-                只读查询
+                {i18n.t("codexUsagePage.readOnlyBadge", {
+                  defaultValue: "只读查询",
+                })}
               </span>
               <span
                 className={`inline-flex items-center gap-1 rounded-md border px-2 py-1 ${USAGE_PAGE_COLORS.chip}`}
               >
-                自动 5 分钟刷新
+                {i18n.t("codexUsagePage.autoRefreshBadge", {
+                  defaultValue: "自动 5 分钟刷新",
+                })}
               </span>
             </div>
           </div>
@@ -1214,7 +1533,7 @@ export const CodexUsagePage: React.FC = () => {
               <RefreshCw
                 className={`h-4 w-4 ${isFetching ? "animate-spin" : ""}`}
               />
-              刷新
+              {i18n.t("codexUsagePage.refreshButton", { defaultValue: "刷新" })}
             </Button>
           </div>
         </div>
@@ -1234,7 +1553,9 @@ export const CodexUsagePage: React.FC = () => {
               <section
                 className={`rounded-lg border p-5 text-sm text-muted-foreground lg:col-span-2 ${USAGE_PAGE_COLORS.card}`}
               >
-                Codex 没有返回 5 小时或每周用量窗口。
+                {i18n.t("codexUsagePage.noUsageWindows", {
+                  defaultValue: "Codex 没有返回 5 小时或每周用量窗口。",
+                })}
               </section>
             )}
           </div>
@@ -1252,7 +1573,15 @@ export const CodexUsagePage: React.FC = () => {
             onSync={() => {
               void syncQuotaCollaboration.mutateAsync().catch((error) => {
                 toast.error(
-                  `同步设备报告失败：${error instanceof Error ? error.message : "请检查 WebDAV 或 S3 配置。"}`,
+                  i18n.t("codexUsagePage.syncReportsFailed", {
+                    defaultValue: "同步设备报告失败：{{message}}",
+                    message:
+                      error instanceof Error
+                        ? error.message
+                        : i18n.t("codexUsagePage.checkWebdavConfig", {
+                            defaultValue: "请检查 WebDAV 或 S3 配置。",
+                          }),
+                  }),
                 );
               });
             }}
@@ -1265,14 +1594,19 @@ export const CodexUsagePage: React.FC = () => {
               <div className="flex items-center gap-2">
                 <RotateCcw className="h-4 w-4 text-sky-600 dark:text-sky-400" />
                 <h3 className="text-base font-semibold text-foreground">
-                  已存 reset 额度
+                  {i18n.t("codexUsagePage.bankedCreditsTitle", {
+                    defaultValue: "已存 reset 额度",
+                  })}
                 </h3>
               </div>
               <div
                 className={`inline-flex items-center gap-2 rounded-lg px-3 py-2 text-sm font-semibold ${USAGE_PAGE_COLORS.resetSummary}`}
               >
                 <TimerReset className="h-4 w-4" />
-                {availableCount} 个可用
+                {availableCount}{" "}
+                {i18n.t("codexUsagePage.availableCountSuffix", {
+                  defaultValue: "个可用",
+                })}
               </div>
             </div>
 
@@ -1289,8 +1623,13 @@ export const CodexUsagePage: React.FC = () => {
                   <div
                     className={`rounded-lg border border-dashed px-3 py-2 text-sm text-muted-foreground ${USAGE_PAGE_COLORS.inset}`}
                   >
-                    还有 {missingExpiryCount} 个可用 reset
-                    没有返回可展示的到期明细。
+                    {i18n.t("codexUsagePage.moreAvailablePrefix", {
+                      defaultValue: "还有",
+                    })}
+                    {missingExpiryCount}{" "}
+                    {i18n.t("codexUsagePage.missingExpiryDetail", {
+                      defaultValue: "个可用 reset 没有返回可展示的到期明细。",
+                    })}
                   </div>
                 )}
               </div>
@@ -1299,7 +1638,9 @@ export const CodexUsagePage: React.FC = () => {
                 className={`flex items-center gap-2 rounded-lg border px-3 py-3 text-sm text-muted-foreground ${USAGE_PAGE_COLORS.inset}`}
               >
                 <CheckCircle2 className="h-4 w-4 text-emerald-600 dark:text-emerald-400" />
-                当前没有已存 reset 额度。
+                {i18n.t("codexUsagePage.noBankedCredits", {
+                  defaultValue: "当前没有已存 reset 额度。",
+                })}
               </div>
             )}
 
@@ -1307,7 +1648,10 @@ export const CodexUsagePage: React.FC = () => {
               <div
                 className={`mt-3 rounded-lg border px-3 py-2 text-sm ${USAGE_PAGE_COLORS.warning}`}
               >
-                Reset credit 明细读取不完整：{quota.resetCreditsError}
+                {i18n.t("codexUsagePage.resetCreditErrorPrefix", {
+                  defaultValue: "Reset credit 明细读取不完整：",
+                })}
+                {quota.resetCreditsError}
               </div>
             )}
           </section>

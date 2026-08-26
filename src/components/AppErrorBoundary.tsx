@@ -1,6 +1,7 @@
 import { Component, type ErrorInfo, type ReactNode } from "react";
 import { AlertTriangle, RefreshCw } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import i18n from "@/i18n";
 
 /** 应用根错误边界的属性。 */
 interface AppErrorBoundaryProps {
@@ -80,7 +81,7 @@ export class AppErrorBoundary extends Component<
       return this.props.children;
     }
 
-    const detail = this.state.error.message || "未提供错误详情";
+    const detail = this.state.error.message || i18n.t("errorBoundary.noDetail");
     const componentStack = this.state.componentStack.trim();
     return (
       <main className="flex min-h-screen items-center justify-center bg-background p-6 text-foreground">
@@ -89,9 +90,12 @@ export class AppErrorBoundary extends Component<
             <AlertTriangle className="mt-0.5 h-5 w-5 shrink-0 text-destructive" />
             <div className="min-w-0 space-y-3">
               <div>
-                <h1 className="text-lg font-semibold">应用界面加载失败</h1>
+                <h1 className="text-lg font-semibold">
+                  {" "}
+                  {i18n.t("errorBoundary.title")}
+                </h1>
                 <p className="mt-1 text-sm leading-6 text-muted-foreground">
-                  请重新加载应用；若仍失败，请将下方错误详情和日志提供给维护者。
+                  {i18n.t("errorBoundary.description")}
                 </p>
               </div>
               <pre className="max-h-40 overflow-auto whitespace-pre-wrap break-words border bg-muted/40 p-3 text-xs text-muted-foreground">
@@ -104,7 +108,7 @@ export class AppErrorBoundary extends Component<
               )}
               <Button type="button" onClick={() => window.location.reload()}>
                 <RefreshCw className="h-4 w-4" />
-                重新加载
+                {i18n.t("errorBoundary.reload")}
               </Button>
             </div>
           </div>

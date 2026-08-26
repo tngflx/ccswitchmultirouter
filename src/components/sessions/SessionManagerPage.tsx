@@ -1195,7 +1195,9 @@ export function SessionManagerPage({
                           }}
                         >
                           <FileClock className="size-3.5" />
-                          <span className="truncate">历史修复</span>
+                          <span className="truncate">
+                            {t("sessionManager.historyRepairTab")}
+                          </span>
                         </Button>
                         <Button
                           type="button"
@@ -1210,7 +1212,9 @@ export function SessionManagerPage({
                           }}
                         >
                           <MessageSquare className="size-3.5" />
-                          <span className="truncate">会话浏览</span>
+                          <span className="truncate">
+                            {t("sessionManager.sessionBrowseTab")}
+                          </span>
                         </Button>
                       </div>
                     )}

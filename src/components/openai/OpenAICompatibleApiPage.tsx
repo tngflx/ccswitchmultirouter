@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
+import { useTranslation } from "react-i18next";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
 import {
@@ -54,6 +55,8 @@ const FALLBACK_MODEL = "gpt-5.4-mini";
 
 type ApiTab = "source" | "access" | "config" | "check";
 
+type TranslateFn = (key: string, params?: Record<string, unknown>) => string;
+
 /// 读取用户上次在页面选择的服务来源 key。
 function getSavedBackendKey(): string {
   return localStorage.getItem(BACKEND_STORAGE_KEY) ?? "";
@@ -62,6 +65,7 @@ function getSavedBackendKey(): string {
 /// 第三方 Agent OpenAI-compatible API 顶层工具页。
 export function OpenAICompatibleApiPage() {
   const queryClient = useQueryClient();
+  const { t } = useTranslation();
   const [activeTab, setActiveTab] = useState<ApiTab>("source");
   const [visibleApiKey, setVisibleApiKey] = useState("");
   const [selectedBackendKey, setSelectedBackendKey] =
@@ -129,7 +133,9 @@ export function OpenAICompatibleApiPage() {
   const displayApiKey =
     latestCopyableApiKey ||
     visibleApiKey ||
-    (profile?.hasApiKey ? `${profile.apiKeyPrefix ?? "ccsw_"}...` : "尚未生成");
+    (profile?.hasApiKey
+      ? `${profile.apiKeyPrefix ?? "ccsw_"}...`
+      : t("openaiApiPage.keyNotGenerated"));
   const runnableApiKey =
     latestCopyableApiKey || visibleApiKey || "<generate-key-to-reveal>";
   const statusIssues = runtimeStatus?.issues ?? [];
@@ -158,7 +164,9 @@ export function OpenAICompatibleApiPage() {
   /// 复制普通配置文本并给出反馈。
   async function handleCopy(text: string, label: string) {
     await copyText(text);
-    toast.success(`${label} 已复制`, { closeButton: true });
+    toast.success(t("openaiApiPage.copiedLabel", { label }), {
+      closeButton: true,
+    });
   }
 
   /// 新增本地 External API key；新格式 key 会随 profile 返回，后续仍可复制。
@@ -168,7 +176,7 @@ export function OpenAICompatibleApiPage() {
     await queryClient.invalidateQueries({
       queryKey: ["externalOpenAIAPIRuntimeStatus"],
     });
-    toast.success("外部 API Key 已新增", { closeButton: true });
+    toast.success(t("openaiApiPage.externalKeyAdded"), { closeButton: true });
     setActiveTab("config");
   }
 
@@ -181,18 +189,18 @@ export function OpenAICompatibleApiPage() {
     await queryClient.invalidateQueries({
       queryKey: ["externalOpenAIAPIRuntimeStatus"],
     });
-    toast.success("本地 API Key 已删除", { closeButton: true });
+    toast.success(t("openaiApiPage.localKeyDeleted"), { closeButton: true });
   }
 
   /// 保存第三方 Agent API 的独立监听地址和端口；不修改全局 proxy_config 或 app takeover。
   async function handleSaveListenerConfig() {
     const parsedPort = Number(listenPort);
     if (!Number.isInteger(parsedPort) || parsedPort < 1 || parsedPort > 65535) {
-      toast.error("端口必须是 1-65535 之间的整数");
+      toast.error(t("openaiApiPage.invalidPortRange"));
       return;
     }
     if (!selectedBackend) {
-      toast.error("请先选择一个服务来源");
+      toast.error(t("openaiApiPage.selectSourceFirst"));
       return;
     }
 
@@ -211,13 +219,13 @@ export function OpenAICompatibleApiPage() {
       });
       toast.success(
         isRunning
-          ? "监听配置已保存，重启第三方 Agent API 后生效"
-          : "监听配置已保存",
+          ? t("openaiApiPage.listenerSavedNeedsRestart")
+          : t("openaiApiPage.listenerSaved"),
         { closeButton: true },
       );
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      toast.error(`保存监听配置失败: ${message}`);
+      toast.error(t("openaiApiPage.listenerSaveFailed", { message }));
     } finally {
       setIsSavingListener(false);
     }
@@ -226,7 +234,7 @@ export function OpenAICompatibleApiPage() {
   /// 复制含 API key 的片段；没有明文 key 时拒绝复制占位配置。
   async function handleCopyRunnableConfig(value: string, label: string) {
     if (!latestCopyableApiKey && !visibleApiKey) {
-      toast.error("请先生成一个可复制的本地 API Key");
+      toast.error(t("openaiApiPage.generateCopyableKeyFirst"));
       setActiveTab("access");
       return;
     }
@@ -243,11 +251,11 @@ export function OpenAICompatibleApiPage() {
   /// 保存当前服务来源 profile，但不启动 proxy server。
   async function handleSaveProfile(enabled = profile?.enabled ?? false) {
     if (!selectedBackend) {
-      toast.error("请先选择一个服务来源");
+      toast.error(t("openaiApiPage.selectSourceFirst"));
       return;
     }
     if (!selectedBackend.available) {
-      toast.error(selectedBackend.error ?? "当前服务来源还不能接入");
+      toast.error(selectedBackend.error ?? t("openaiApiPage.backendNotReady"));
       return;
     }
 
@@ -264,21 +272,21 @@ export function OpenAICompatibleApiPage() {
       await queryClient.invalidateQueries({
         queryKey: ["externalOpenAIAPIRuntimeStatus"],
       });
-      toast.success("第三方 Agent API 配置已保存", { closeButton: true });
+      toast.success(t("openaiApiPage.profileSaved"), { closeButton: true });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      toast.error(`保存失败: ${message}`);
+      toast.error(t("openaiApiPage.saveFailed", { message }));
     }
   }
 
   /// 保存 profile、必要时生成 key，并启动本地 proxy server。
   async function handlePrepareService() {
     if (!selectedBackend) {
-      toast.error("请先选择一个服务来源");
+      toast.error(t("openaiApiPage.selectSourceFirst"));
       return;
     }
     if (!selectedBackend.available) {
-      toast.error(selectedBackend.error ?? "当前服务来源还不能接入");
+      toast.error(selectedBackend.error ?? t("openaiApiPage.backendNotReady"));
       return;
     }
 
@@ -306,11 +314,11 @@ export function OpenAICompatibleApiPage() {
           queryKey: ["externalOpenAIAPIRuntimeStatus"],
         }),
       ]);
-      toast.success("第三方 Agent API 已启用", { closeButton: true });
+      toast.success(t("openaiApiPage.apiEnabled"), { closeButton: true });
       setActiveTab("config");
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      toast.error(`准备失败: ${message}`);
+      toast.error(t("openaiApiPage.prepareFailed", { message }));
     } finally {
       setIsPreparing(false);
     }
@@ -342,7 +350,9 @@ export function OpenAICompatibleApiPage() {
           profileEnabled={profile?.enabled === true}
           ready={runtimeStatus?.ready === true}
           baseUrl={baseUrl}
-          selectedLabel={selectedBackend?.label ?? "未选择服务来源"}
+          selectedLabel={
+            selectedBackend?.label ?? t("openaiApiPage.noSourceSelected")
+          }
           onPrepare={() => void handlePrepareService()}
           onRefresh={() => void handleRefresh()}
           isPreparing={isPreparing}
@@ -354,14 +364,26 @@ export function OpenAICompatibleApiPage() {
         >
           <div className="sticky top-0 z-10 -mx-1 bg-background/95 px-1 py-2 backdrop-blur">
             <TabsList className="grid w-full grid-cols-4 bg-muted p-1 dark:bg-slate-950/40">
-              <ApiTabTrigger value="source" icon={PlugZap} label="服务来源" />
-              <ApiTabTrigger value="access" icon={KeyRound} label="访问凭据" />
+              <ApiTabTrigger
+                value="source"
+                icon={PlugZap}
+                label={t("openaiApiPage.tabSource")}
+              />
+              <ApiTabTrigger
+                value="access"
+                icon={KeyRound}
+                label={t("openaiApiPage.tabAccess")}
+              />
               <ApiTabTrigger
                 value="config"
                 icon={FileText}
-                label="Agent 配置"
+                label={t("openaiApiPage.tabAgentConfig")}
               />
-              <ApiTabTrigger value="check" icon={ShieldCheck} label="检查" />
+              <ApiTabTrigger
+                value="check"
+                icon={ShieldCheck}
+                label={t("openaiApiPage.tabCheck")}
+              />
             </TabsList>
           </div>
 
@@ -370,8 +392,8 @@ export function OpenAICompatibleApiPage() {
               <section className="rounded-lg border border-blue-700/40 bg-blue-950/10 p-4">
                 <SectionHeader
                   icon={PlugZap}
-                  title="选择对外服务来源"
-                  detail="第三方 agent 只看到 OpenAI v1 API；这里选择 CC Switch 内部实际调用哪个模型源。"
+                  title={t("openaiApiPage.pickSourceTitle")}
+                  detail={t("openaiApiPage.pickSourceDetail")}
                 />
                 <div className="mt-4">
                   <ExternalBackendPicker
@@ -402,7 +424,7 @@ export function OpenAICompatibleApiPage() {
                   className="w-full gap-2 bg-blue-600 hover:bg-blue-500"
                 >
                   <Settings2 className="h-4 w-4" />
-                  保存来源和模型
+                  {t("openaiApiPage.saveSourceAndModel")}
                 </Button>
               </aside>
             </div>
@@ -413,8 +435,8 @@ export function OpenAICompatibleApiPage() {
               <section className="rounded-lg border border-emerald-700/40 bg-emerald-950/10 p-4">
                 <SectionHeader
                   icon={KeyRound}
-                  title="本地访问凭据"
-                  detail="这个 Key 只保护本机 API，不是上游 OpenAI 或 ChatGPT 的真实凭据。"
+                  title={t("openaiApiPage.accessCredentialsTitle")}
+                  detail={t("openaiApiPage.accessCredentialsDetail")}
                 />
                 <div className="mt-4 grid gap-3 md:grid-cols-2">
                   <ConfigValue
@@ -433,7 +455,9 @@ export function OpenAICompatibleApiPage() {
                             latestCopyableApiKey || visibleApiKey,
                             "api_key",
                           )
-                        : toast.error("请先生成一个可复制的本地 API Key")
+                        : toast.error(
+                            t("openaiApiPage.generateCopyableKeyFirst"),
+                          )
                     }
                   />
                 </div>
@@ -461,7 +485,7 @@ export function OpenAICompatibleApiPage() {
                     className="gap-2 bg-emerald-600 hover:bg-emerald-500"
                   >
                     <KeyRound className="h-4 w-4" />
-                    生成新的 ccsw_ Key
+                    {t("openaiApiPage.generateNewKeyButton")}
                   </Button>
                   <Button
                     variant="outline"
@@ -474,7 +498,7 @@ export function OpenAICompatibleApiPage() {
                     ) : (
                       <Play className="h-4 w-4" />
                     )}
-                    保存并启动 API
+                    {t("openaiApiPage.saveAndStartApi")}
                   </Button>
                 </div>
               </section>
@@ -486,7 +510,7 @@ export function OpenAICompatibleApiPage() {
           <TabsContent value="config" className="mt-3">
             <div className="grid gap-4 lg:grid-cols-2">
               <SnippetPanel
-                title="Agent JSON 配置"
+                title={t("openaiApiPage.snippetAgentJson")}
                 value={buildJsonConfig(
                   agentBaseUrl,
                   runnableApiKey,
@@ -495,12 +519,12 @@ export function OpenAICompatibleApiPage() {
                 onCopy={() =>
                   handleCopyRunnableConfig(
                     buildJsonConfig(agentBaseUrl, runnableApiKey, defaultModel),
-                    "Agent JSON 配置",
+                    t("openaiApiPage.snippetAgentJson"),
                   )
                 }
               />
               <SnippetPanel
-                title="OpenAI Python SDK 示例"
+                title={t("openaiApiPage.snippetPythonSdk")}
                 value={buildPythonSnippet(
                   agentBaseUrl,
                   runnableApiKey,
@@ -513,7 +537,7 @@ export function OpenAICompatibleApiPage() {
                       runnableApiKey,
                       defaultModel,
                     ),
-                    "Python 示例",
+                    t("openaiApiPage.snippetPythonShort"),
                   )
                 }
               />
@@ -558,18 +582,17 @@ function ApiHero({
   onRefresh: () => void;
   isPreparing: boolean;
 }) {
+  const { t } = useTranslation();
   return (
     <div className="overflow-hidden rounded-lg border border-border bg-card dark:border-slate-700/80 dark:bg-slate-950/30">
       <div className="grid gap-4 border-b border-border bg-gradient-to-r from-emerald-50 via-background to-blue-50 p-5 xl:grid-cols-[1fr_auto] dark:border-slate-700/70 dark:from-emerald-950/50 dark:via-slate-900 dark:to-blue-950/50">
         <div>
           <div className="flex items-center gap-2 text-xl font-semibold">
             <RadioTower className="h-5 w-5 text-emerald-600 dark:text-emerald-300" />
-            第三方 Agent API
+            {t("openaiApiPage.heroTitle")}
           </div>
           <p className="mt-2 max-w-4xl text-sm leading-6 text-muted-foreground dark:text-slate-300">
-            对外固定提供 OpenAI v1 compatible API。第三方 agent 只需要填写
-            base_url、api_key、model；OAuth、真实上游凭据和路由细节都留在 CC
-            Switch 内部。
+            {t("openaiApiPage.heroDescription")}
           </p>
         </div>
         <div className="flex flex-wrap items-start justify-end gap-2">
@@ -583,11 +606,11 @@ function ApiHero({
             ) : (
               <Play className="h-4 w-4" />
             )}
-            保存并启动
+            {t("openaiApiPage.saveAndStart")}
           </Button>
           <Button variant="outline" onClick={onRefresh} className="gap-2">
             <RefreshCw className="h-4 w-4" />
-            刷新
+            {t("openaiApiPage.refresh")}
           </Button>
         </div>
       </div>
@@ -595,30 +618,42 @@ function ApiHero({
         <HeroMetric
           color="emerald"
           icon={Server}
-          label="API 端点"
-          value={isRunning ? "运行中" : "未启动"}
+          label={t("openaiApiPage.endpointLabel")}
+          value={
+            isRunning
+              ? t("openaiApiPage.statusRunning")
+              : t("openaiApiPage.statusNotRunning")
+          }
           detail={baseUrl}
         />
         <HeroMetric
           color="blue"
           icon={PlugZap}
-          label="服务来源"
+          label={t("openaiApiPage.sourceLabel")}
           value={selectedLabel}
-          detail="可在下方选择"
+          detail={t("openaiApiPage.chooseBelowDetail")}
         />
         <HeroMetric
           color="amber"
           icon={KeyRound}
-          label="访问状态"
-          value={profileEnabled ? "已启用" : "未启用"}
-          detail="使用 ccsw_ 本地 Key"
+          label={t("openaiApiPage.accessStatusLabel")}
+          value={
+            profileEnabled
+              ? t("openaiApiPage.statusEnabled")
+              : t("openaiApiPage.statusDisabled")
+          }
+          detail={t("openaiApiPage.localKeyDetail")}
         />
         <HeroMetric
           color={ready ? "emerald" : "rose"}
           icon={ready ? CheckCircle2 : AlertCircle}
-          label="接入检查"
-          value={ready ? "可接入" : "待配置"}
-          detail="不会切换 Codex 当前模型源"
+          label={t("openaiApiPage.readinessCheckTitle")}
+          value={
+            ready
+              ? t("openaiApiPage.statusReady")
+              : t("openaiApiPage.statusPendingConfig")
+          }
+          detail={t("openaiApiPage.noCodexSwitchDetail")}
         />
       </div>
     </div>
@@ -655,10 +690,11 @@ function ModelPicker({
   selectedModel: string;
   onModelChange: (value: string) => void;
 }) {
+  const { t } = useTranslation();
   return (
     <div className="rounded-lg border border-amber-200 bg-amber-50/70 p-4 dark:border-amber-700/40 dark:bg-amber-950/10">
       <div className="mb-2 text-sm font-semibold text-foreground dark:text-slate-100">
-        默认模型
+        {t("openaiApiPage.defaultModelTitle")}
       </div>
       {availableModels.length > 0 ? (
         <Select value={defaultModel} onValueChange={onModelChange}>
@@ -681,8 +717,7 @@ function ModelPicker({
         />
       )}
       <p className="mt-2 text-xs leading-5 text-muted-foreground dark:text-slate-400">
-        第三方 agent 请求里也可以显式传
-        model；这里是默认值和配置示例使用的模型。
+        {t("openaiApiPage.defaultModelHint")}
       </p>
     </div>
   );
@@ -699,17 +734,18 @@ function ApiKeyList({
   onCopy: (apiKey: string) => void;
   onDelete: (keyId: string, apiKey?: string | null) => void;
 }) {
+  const { t } = useTranslation();
   return (
     <div className="mt-4 rounded-lg border border-emerald-200 bg-emerald-50/60 p-3 dark:border-emerald-700/40 dark:bg-slate-950/30">
       <div className="mb-3 flex items-center justify-between gap-2">
         <div className="text-sm font-semibold text-emerald-800 dark:text-emerald-100">
-          当前可用 Key
+          {t("openaiApiPage.availableKeysTitle")}
         </div>
         <Badge variant="outline">{keys.length}</Badge>
       </div>
       {keys.length === 0 ? (
         <div className="rounded-md border border-dashed border-emerald-200 px-3 py-4 text-sm text-muted-foreground dark:border-emerald-700/40 dark:text-slate-400">
-          还没有生成本地 API Key。
+          {t("openaiApiPage.noKeysYet")}
         </div>
       ) : (
         <div className="space-y-2">
@@ -726,18 +762,22 @@ function ApiKeyList({
                   variant="outline"
                   className="border-amber-600/50 text-amber-200"
                 >
-                  旧版
+                  {t("openaiApiPage.legacyKeyBadge")}
                 </Badge>
               ) : null}
               <span className="text-xs text-muted-foreground dark:text-slate-500">
-                {formatKeyCreatedAt(key.createdAt)}
+                {formatKeyCreatedAt(key.createdAt, t)}
               </span>
               <Button
                 variant="ghost"
                 size="icon"
                 disabled={!key.apiKey}
                 onClick={() => key.apiKey && onCopy(key.apiKey)}
-                title={key.apiKey ? "复制 key" : "旧版 key 没有保存明文"}
+                title={
+                  key.apiKey
+                    ? t("openaiApiPage.copyKeyTitle")
+                    : t("openaiApiPage.legacyKeyNoPlainTitle")
+                }
               >
                 <Copy className="h-4 w-4" />
               </Button>
@@ -745,7 +785,7 @@ function ApiKeyList({
                 variant="ghost"
                 size="icon"
                 onClick={() => onDelete(key.id, key.apiKey)}
-                title="删除 key"
+                title={t("openaiApiPage.deleteKeyTitle")}
               >
                 <Trash2 className="h-4 w-4 text-rose-300" />
               </Button>
@@ -758,8 +798,8 @@ function ApiKeyList({
 }
 
 /// 将 Unix 秒级时间戳格式化为紧凑的本地时间；0 表示旧数据没有创建时间。
-function formatKeyCreatedAt(createdAt: number): string {
-  if (!createdAt) return "未知时间";
+function formatKeyCreatedAt(createdAt: number, t: TranslateFn): string {
+  if (!createdAt) return t("openaiApiPage.unknownTime");
   return new Date(createdAt * 1000).toLocaleString();
 }
 
@@ -784,6 +824,7 @@ function ListenerSettings({
   onPortChange: (value: string) => void;
   onSave: () => void;
 }) {
+  const { t } = useTranslation();
   const isPublicBind = listenAddress === "0.0.0.0" || listenAddress === "::";
 
   return (
@@ -792,11 +833,10 @@ function ListenerSettings({
         <div>
           <div className="flex items-center gap-2 text-sm font-semibold text-cyan-800 dark:text-cyan-100">
             <RadioTower className="h-4 w-4 text-cyan-600 dark:text-cyan-300" />
-            监听地址和端口
+            {t("openaiApiPage.listenerTitle")}
           </div>
           <p className="mt-1 text-xs leading-5 text-muted-foreground dark:text-slate-400">
-            默认只允许本机访问；需要给局域网或公网 Agent
-            使用时，可以改成全网监听或指定网卡地址。
+            {t("openaiApiPage.listenerDescription")}
           </p>
         </div>
         <Button
@@ -810,7 +850,7 @@ function ListenerSettings({
           ) : (
             <Settings2 className="h-4 w-4" />
           )}
-          保存监听
+          {t("openaiApiPage.saveListener")}
         </Button>
       </div>
       <div className="grid gap-3 md:grid-cols-[220px_140px_1fr]">
@@ -819,8 +859,12 @@ function ListenerSettings({
             <SelectValue />
           </SelectTrigger>
           <SelectContent>
-            <SelectItem value="127.0.0.1">仅本机 127.0.0.1</SelectItem>
-            <SelectItem value="0.0.0.0">所有网卡 0.0.0.0</SelectItem>
+            <SelectItem value="127.0.0.1">
+              {t("openaiApiPage.bindLocalhostOnly")}
+            </SelectItem>
+            <SelectItem value="0.0.0.0">
+              {t("openaiApiPage.bindAllInterfaces")}
+            </SelectItem>
             <SelectItem value="localhost">localhost</SelectItem>
           </SelectContent>
         </Select>
@@ -834,28 +878,26 @@ function ListenerSettings({
         <Input
           value={listenAddress}
           onChange={(event) => onAddressChange(event.target.value)}
-          placeholder="自定义地址，例如 192.168.1.20"
+          placeholder={t("openaiApiPage.customAddressPlaceholder")}
           className="border-cyan-200 bg-background dark:border-cyan-700/40 dark:bg-slate-950/60"
         />
       </div>
       <div className="mt-3 grid gap-2 md:grid-cols-2">
         <code className="rounded-md border border-cyan-200 bg-background/70 px-3 py-2 text-xs text-cyan-800 dark:border-cyan-700/30 dark:bg-black/20 dark:text-cyan-100">
-          本机: {baseUrl}
+          {t("openaiApiPage.localUrl", { url: baseUrl })}
         </code>
         <code className="rounded-md border border-cyan-200 bg-background/70 px-3 py-2 text-xs text-cyan-800 dark:border-cyan-700/30 dark:bg-black/20 dark:text-cyan-100">
-          外部 Agent: {reachableBaseUrl}
+          {t("openaiApiPage.externalUrl", { url: reachableBaseUrl })}
         </code>
       </div>
       {isPublicBind && (
         <div className="mt-3 rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-xs leading-5 text-amber-800 dark:border-amber-500/40 dark:bg-amber-500/10 dark:text-amber-100">
-          全网监听会让同网段或公网转发进来的客户端访问这个
-          API。请配合防火墙、强随机 ccsw_ Key 和可信网络使用。
+          {t("openaiApiPage.publicBindWarning")}
         </div>
       )}
       {isRunning && (
         <div className="mt-2 text-xs text-muted-foreground dark:text-slate-400">
-          服务运行中修改监听地址或端口后，需要停止并重新启动本地 API
-          才会绑定到新地址。
+          {t("openaiApiPage.listenerRestartHint")}
         </div>
       )}
     </div>
@@ -864,24 +906,19 @@ function ListenerSettings({
 
 /// 安全说明区，强调 Key 和 OAuth 的隔离边界。
 function SecurityPanel() {
+  const { t } = useTranslation();
   return (
     <section className="rounded-lg border border-blue-700/40 bg-blue-950/10 p-4">
       <SectionHeader
         icon={ShieldCheck}
-        title="隔离边界"
-        detail="这个页面只管理第三方 Agent API profile。"
+        title={t("openaiApiPage.isolationTitle")}
+        detail={t("openaiApiPage.isolationDetail")}
       />
       <div className="mt-4 space-y-2">
-        <BoundaryItem
-          ok
-          text="不暴露 OAuth token、refresh token、真实上游 API Key"
-        />
-        <BoundaryItem ok text="不切换 Codex 当前模型源，不打开 takeover" />
-        <BoundaryItem ok text="只保存并展示 CCSwitchMulti 本地 ccsw_ Key" />
-        <BoundaryItem
-          ok
-          text="原生 Claude/Gemini 协议不会静默伪装成 OpenAI API"
-        />
+        <BoundaryItem ok text={t("openaiApiPage.boundaryNoOAuthExposed")} />
+        <BoundaryItem ok text={t("openaiApiPage.boundaryNoCodexSwitch")} />
+        <BoundaryItem ok text={t("openaiApiPage.boundaryLocalKeysOnly")} />
+        <BoundaryItem ok text={t("openaiApiPage.boundaryNoProtocolMasking")} />
       </div>
     </section>
   );
@@ -907,45 +944,54 @@ function CheckTab({
   issues: string[];
   onRefresh: () => void;
 }) {
+  const { t } = useTranslation();
   return (
     <section className="rounded-lg border border-border bg-card p-4 dark:border-slate-700 dark:bg-slate-950/40">
       <SectionHeader
         icon={ShieldCheck}
-        title="接入检查"
-        detail="这些状态都通过后，外部 agent 才能稳定使用 /v1/chat/completions。"
+        title={t("openaiApiPage.readinessCheckTitle")}
+        detail={t("openaiApiPage.readinessCheckDetail")}
         action={
           <Button variant="outline" onClick={onRefresh} className="gap-2">
             <RefreshCw className="h-4 w-4" />
-            重新检查
+            {t("openaiApiPage.recheckButton")}
           </Button>
         }
       />
       <div className="mt-4 grid gap-3 md:grid-cols-2">
-        <ChecklistItem ok={isRunning} label="本地 API 服务已启动" />
+        <ChecklistItem
+          ok={isRunning}
+          label={t("openaiApiPage.checkApiRunning")}
+        />
         <ChecklistItem
           ok={profileEnabled}
-          label="第三方 Agent API profile 已启用"
+          label={t("openaiApiPage.checkProfileEnabled")}
         />
-        <ChecklistItem ok={hasApiKey} label="已生成 ccsw_ 本地访问 Key" />
+        <ChecklistItem
+          ok={hasApiKey}
+          label={t("openaiApiPage.checkKeyGenerated")}
+        />
         <ChecklistItem
           ok={hasBackend && backendAvailable}
-          label="已选择可接入服务来源"
+          label={t("openaiApiPage.checkBackendAvailable")}
         />
         <ChecklistItem
           ok={Boolean(model)}
-          label={`默认模型：${model || "未选择"}`}
+          label={t("openaiApiPage.checkDefaultModel", {
+            model: model || t("openaiApiPage.notSelectedYet"),
+          })}
         />
-        <ChecklistItem ok label="Codex 自身服务不受影响" />
+        <ChecklistItem ok label={t("openaiApiPage.checkCodexUnaffected")} />
       </div>
       {issues.length > 0 && (
         <div className="mt-4 rounded-lg border border-amber-500/30 bg-amber-500/10 p-3">
           <div className="mb-2 text-sm font-semibold text-amber-100">
-            当前问题
+            {t("openaiApiPage.currentIssues")}
           </div>
           <div className="flex flex-wrap gap-2">
             {issues.map((issue) => (
               <Badge key={issue} variant="outline">
-                {translateIssue(issue)}
+                {translateIssue(issue, t)}
               </Badge>
             ))}
           </div>
@@ -1032,6 +1078,7 @@ function ConfigValue({
   tone: "emerald" | "amber";
   onCopy: () => void;
 }) {
+  const { t } = useTranslation();
   const toneClass =
     tone === "emerald"
       ? "border-emerald-200 bg-emerald-50/70 dark:border-emerald-700/40 dark:bg-emerald-950/20"
@@ -1049,7 +1096,7 @@ function ConfigValue({
           variant="ghost"
           size="icon"
           onClick={onCopy}
-          title={`复制 ${label}`}
+          title={t("openaiApiPage.copyFieldTitle", { name: label })}
         >
           <Copy className="h-4 w-4" />
         </Button>
@@ -1068,6 +1115,7 @@ function SnippetPanel({
   value: string;
   onCopy: () => void;
 }) {
+  const { t } = useTranslation();
   return (
     <div className="rounded-lg border border-border bg-card p-4 dark:border-slate-700 dark:bg-slate-950/40">
       <div className="mb-3 flex items-center justify-between gap-3">
@@ -1079,7 +1127,7 @@ function SnippetPanel({
           variant="ghost"
           size="icon"
           onClick={onCopy}
-          title={`复制 ${title}`}
+          title={t("openaiApiPage.copyFieldTitle", { name: title })}
         >
           <Copy className="h-4 w-4" />
         </Button>
@@ -1124,12 +1172,13 @@ function ChecklistItem({ ok, label }: { ok: boolean; label: string }) {
   );
 }
 
-function translateIssue(issue: string): string {
-  const translations: Record<string, string> = {
-    "profile disabled": "profile 未启用",
-    "api key not generated": "还没有生成 ccsw_ Key",
-    "backend not selected": "还没有选择服务来源",
-    "model not selected": "还没有选择默认模型",
+function translateIssue(issue: string, t: TranslateFn): string {
+  const translationKeys: Record<string, string> = {
+    "profile disabled": "openaiApiPage.issueProfileDisabled",
+    "api key not generated": "openaiApiPage.issueKeyNotGenerated",
+    "backend not selected": "openaiApiPage.issueBackendNotSelected",
+    "model not selected": "openaiApiPage.issueModelNotSelected",
   };
-  return translations[issue] ?? issue;
+  const key = translationKeys[issue];
+  return key ? t(key) : issue;
 }

@@ -73,12 +73,14 @@ import { AddProviderDialog } from "@/components/providers/AddProviderDialog";
 import { EditProviderDialog } from "@/components/providers/EditProviderDialog";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { SettingsPage } from "@/components/settings/SettingsPage";
+import { LanguageSwitcher } from "@/components/settings/LanguageSwitcher";
 import { UpdateBadge } from "@/components/UpdateBadge";
 import { CCSWITCHMULTI_REPOSITORY_URL } from "@/config/productLinks";
 import { EnvWarningBanner } from "@/components/env/EnvWarningBanner";
 import { ProxyToggle } from "@/components/proxy/ProxyToggle";
 import { ClaudeDesktopRouteToggle } from "@/components/proxy/ClaudeDesktopRouteToggle";
 import { FailoverToggle } from "@/components/proxy/FailoverToggle";
+import { StreamRetryToggle } from "@/components/proxy/StreamRetryToggle";
 import UsageScriptModal from "@/components/UsageScriptModal";
 import UnifiedMcpPanel from "@/components/mcp/UnifiedMcpPanel";
 import PromptPanel from "@/components/prompts/PromptPanel";
@@ -847,16 +849,16 @@ function App() {
       })[0];
 
     if (!fallbackProvider) {
-      throw new Error(
-        "删除当前 MultiRouter 前需要至少保留一个普通 Codex provider 作为 fallback。",
-      );
+      throw new Error(t("appShell.multiRouterFallbackRequired"));
     }
 
     await providersApi.switch(fallbackProvider.id, "codex");
     await queryClient.invalidateQueries({ queryKey: ["providers", "codex"] });
     await queryClient.invalidateQueries({ queryKey: ["proxyStatus"] });
     toast.info(
-      `已先切换到 ${fallbackProvider.name}，正在删除当前 MultiRouter。`,
+      t("provider.codexRouterFallbackSwitched", {
+        name: fallbackProvider.name,
+      }),
       { closeButton: true },
     );
   };
@@ -1149,16 +1151,16 @@ function App() {
 
   // 历史修复写入完成后，先提示重启 Codex，再征求点赞并用默认浏览器打开 CCSwitchMulti 仓库。
   const handleCodexHistoryRepairCompleted = async () => {
-    toast.success("历史记录修复已完成。请完整重启 Codex 后再继续使用。", {
+    toast.success(t("codexHistoryRepair.completedToast"), {
       closeButton: true,
       duration: 10000,
     });
     const shouldOpenHome = window.confirm(
       [
-        "历史记录修复已完成，请完整重启 Codex，让侧边栏和模型状态重新加载。",
+        t("codexHistoryRepair.completedRestartPrompt"),
         "",
-        "如果 CCSwitchMulti 这套 MultiRouter 配置帮到了你，可以帮我在 GitHub 仓库点个 Star 吗？",
-        "点击“确定”会用默认浏览器打开 CCSwitchMulti 的 GitHub 仓库页面。",
+        t("codexHistoryRepair.starAsk"),
+        t("codexHistoryRepair.openRepoHint"),
       ].join("\n"),
     );
     if (shouldOpenHome) {
@@ -1563,9 +1565,9 @@ function App() {
                   {currentView === "openclawAgents" &&
                     t("openclaw.agents.title")}
                   {currentView === "hermesMemory" && t("hermes.memory.title")}
-                  {currentView === "codexRouter" && "Codex 多模型路由"}
-                  {currentView === "codexUsage" && "Codex 用量与重置额度"}
-                  {currentView === "openaiApi" && "第三方 Agent API"}
+                  {currentView === "codexRouter" && t("codexRouter.title")}
+                  {currentView === "codexUsage" && t("codexUsage.title")}
+                  {currentView === "openaiApi" && t("openaiApi.title")}
                 </h1>
               </div>
             ) : (
@@ -1643,6 +1645,7 @@ function App() {
                     settingsData?.enableFailoverToggle && (
                       <FailoverToggle activeApp={activeApp} />
                     )}
+                  {activeApp !== "claude-desktop" && <StreamRetryToggle />}
                 </div>
               )}
             {currentView === "providers" &&
@@ -1668,6 +1671,7 @@ function App() {
                 className="flex shrink-0 items-center gap-1.5"
                 style={{ WebkitAppRegion: "no-drag" } as any}
               >
+                <LanguageSwitcher />
                 {currentView === "prompts" && (
                   <Button
                     variant="ghost"
@@ -1928,7 +1932,7 @@ function App() {
                                       openCodexRouterWorkspace(null, "status")
                                     }
                                     className="text-muted-foreground hover:text-foreground hover:bg-black/5 dark:hover:bg-white/5 w-8 px-2"
-                                    title="Codex 多模型路由"
+                                    title={t("codexRouter.title")}
                                   >
                                     <RouteIcon className="w-4 h-4" />
                                   </Button>
@@ -1937,7 +1941,7 @@ function App() {
                                     size="sm"
                                     onClick={() => setCurrentView("codexUsage")}
                                     className="text-muted-foreground hover:text-foreground hover:bg-black/5 dark:hover:bg-white/5 w-8 px-2"
-                                    title="Codex 用量与重置额度"
+                                    title={t("codexUsage.title")}
                                   >
                                     <BarChart2 className="w-4 h-4" />
                                   </Button>
@@ -1948,7 +1952,7 @@ function App() {
                                 size="sm"
                                 onClick={() => setCurrentView("openaiApi")}
                                 className="text-muted-foreground hover:text-foreground hover:bg-black/5 dark:hover:bg-white/5 w-8 px-2"
-                                title="第三方 Agent API"
+                                title={t("openaiApi.title")}
                               >
                                 <Network className="w-4 h-4" />
                               </Button>
@@ -2046,11 +2050,10 @@ function App() {
           <DialogHeader>
             <DialogTitle className="flex items-center gap-2">
               <RouteIcon className="h-5 w-5 text-primary" />
-              配置多路模型
+              {t("codexMultiRouter.entryChoice.title")}
             </DialogTitle>
             <DialogDescription className="leading-6">
-              先明确是创建独立的新方案，还是编辑一条已有方案。打开此窗口时会重新读取
-              Provider 数据，避免沿用上次向导草稿。
+              {t("codexMultiRouter.entryChoice.description")}
             </DialogDescription>
           </DialogHeader>
 
@@ -2062,20 +2065,20 @@ function App() {
             >
               <div className="flex items-center gap-2 font-medium">
                 <Plus className="h-4 w-4 text-blue-500" />
-                创建新配置
+                {t("codexMultiRouter.entryChoice.createTitle")}
               </div>
               <p className="mt-2 text-sm leading-6 text-muted-foreground">
-                从空白方案开始选择模型源。不会覆盖任何已有 MultiRouter。
+                {t("codexMultiRouter.entryChoice.createDescription")}
               </p>
             </button>
 
             <div className="rounded-xl border border-violet-500/25 bg-gradient-to-r from-violet-500/10 via-background to-fuchsia-500/10 p-4 shadow-sm">
               <div className="flex items-center gap-2 font-medium">
                 <Wrench className="h-4 w-4 text-violet-500" />
-                编辑旧配置
+                {t("codexMultiRouter.entryChoice.editTitle")}
               </div>
               <p className="mt-2 text-sm leading-6 text-muted-foreground">
-                选择明确的方案后再进入向导；方案名称和 ID 会始终显示在顶部。
+                {t("codexMultiRouter.entryChoice.editDescription")}
               </p>
               <div className="mt-3 max-h-40 space-y-2 overflow-y-auto pr-1">
                 {codexRoutingPlans.length > 0 ? (
@@ -2095,13 +2098,13 @@ function App() {
                         </span>
                       </span>
                       <span className="shrink-0 text-xs text-violet-600 dark:text-violet-300">
-                        编辑
+                        {t("codexMultiRouter.entryChoice.editAction")}
                       </span>
                     </button>
                   ))
                 ) : (
                   <div className="rounded-lg border border-dashed border-border/70 px-3 py-3 text-xs text-muted-foreground">
-                    暂无已有 MultiRouter，请先创建新配置。
+                    {t("codexMultiRouter.entryChoice.empty")}
                   </div>
                 )}
               </div>
@@ -2113,14 +2116,14 @@ function App() {
               variant="outline"
               onClick={() => setIsCodexMultiRouterEntryChoiceOpen(false)}
             >
-              暂不配置
+              {t("codexMultiRouter.entryChoice.laterButton")}
             </Button>
             <Button
               variant="outline"
               onClick={handleOpenCodexMultiRouterWorkspaceDirectly}
             >
               <LayoutDashboard className="mr-2 h-4 w-4" />
-              直接打开工作台
+              {t("codexMultiRouter.entryChoice.openWorkspaceButton")}
             </Button>
           </DialogFooter>
         </DialogContent>
@@ -2234,15 +2237,16 @@ function App() {
           <DialogHeader>
             <DialogTitle className="flex items-center gap-2">
               <Shield className="h-5 w-5 text-amber-500" />
-              Codex 本地路由已开启
+              {t("codexLocalRouting.noticeTitle")}
             </DialogTitle>
             <DialogDescription className="leading-6">
-              您正在使用本地路由功能，将由 ccsm 接管所有 codex
-              流量，所以不要在使用 codex 时关闭本软件。
+              {t("codexLocalRouting.noticeDescription")}
             </DialogDescription>
           </DialogHeader>
           <DialogFooter>
-            <Button onClick={codexLocalRoutingNotice.dismiss}>我知道了</Button>
+            <Button onClick={codexLocalRoutingNotice.dismiss}>
+              {t("codexLocalRouting.acknowledgeButton")}
+            </Button>
           </DialogFooter>
         </DialogContent>
       </Dialog>
