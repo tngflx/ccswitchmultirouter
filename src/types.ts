@@ -920,6 +920,7 @@ export interface OpenCodeProviderOptions {
 export interface OpenCodeProviderConfig {
   npm: string; // AI SDK 包名，如 "@ai-sdk/openai-compatible"
   name?: string; // 供应商显示名称
+  nameKey?: string; // i18n key for provider display name
   options: OpenCodeProviderOptions;
   models: Record<string, OpenCodeModel>;
 }
@@ -1039,3 +1040,4 @@ export interface HermesMemoryLimits {
   memoryEnabled: boolean;
   userEnabled: boolean;
 }
+
