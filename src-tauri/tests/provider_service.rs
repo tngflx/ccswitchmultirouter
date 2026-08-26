@@ -2562,13 +2562,15 @@ command = "ghost-cmd"
         !live_after.contains("sk-a-live-secret"),
         "provider A's bearer token must not leak into B's live, got: {live_after}"
     );
+    // Unknown MCP entries are user-owned when no CC Switch ownership receipt
+    // exists, so switching providers must preserve them in live config.
     assert!(
-        !live_after.contains("mcp_servers"),
-        "no DB-enabled MCP servers, so live must not resurrect stale entries, got: {live_after}"
+        live_after.contains("mcp_servers.echo"),
+        "unowned live MCP entries must be preserved, got: {live_after}"
     );
     assert!(
-        !live_after.contains("ghost-legacy"),
-        "the legacy [mcp.servers] orphan must not propagate to B's live, got: {live_after}"
+        live_after.contains("ghost-legacy"),
+        "unowned legacy MCP entries must be preserved, got: {live_after}"
     );
     assert!(
         !live_after.contains("wire_api = \"chat\""),

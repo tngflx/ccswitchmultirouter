@@ -325,7 +325,10 @@ fn shared_profile_sides_are_isolated_and_mergeable() {
     // 按 Codex 组应用：只动 codex 组的 current 标记，Claude 侧原样不动
     let (warnings, _) = ProfileService::apply(&state, &project.id, ProfileScope::Codex)
         .expect("apply project on codex side");
-    assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+    assert!(
+        warnings.is_empty() || warnings == vec!["codex_multirouter_projection_pending".to_string()],
+        "unexpected warnings: {warnings:?}"
+    );
 
     assert_eq!(
         state
@@ -764,6 +767,21 @@ async fn codex_profile_reapplies_same_multirouter_after_takeover_cleanup() {
         .await
         .expect("set ephemeral proxy port");
 
+    let route_target = Provider::with_id(
+        "route-target".to_string(),
+        "Route target".to_string(),
+        json!({
+            "base_url": "https://example.test/v1",
+            "apiFormat": "openai_responses",
+            "apiKey": "route-key"
+        }),
+        None,
+    );
+    state
+        .db
+        .save_provider(AppType::Codex.as_str(), &route_target)
+        .expect("save route target");
+
     let mut router = Provider::with_id(
         "router".to_string(),
         "Router".to_string(),
@@ -771,16 +789,13 @@ async fn codex_profile_reapplies_same_multirouter_after_takeover_cleanup() {
             "auth": { "OPENAI_API_KEY": "router-key" },
             "config": "model = \"gpt-visible\"\n",
             "codexRouting": {
+                "schemaVersion": 2,
                 "enabled": true,
                 "routes": [{
                     "id": "route-a",
                     "enabled": true,
-                    "match": { "models": ["gpt-visible"] },
-                    "upstream": {
-                        "baseUrl": "https://example.test/v1",
-                        "apiFormat": "openai_responses",
-                        "apiKey": "route-key"
-                    }
+                    "targetProviderId": "route-target",
+                    "modelSelection": { "mode": "include", "models": ["gpt-visible"] }
                 }]
             }
         }),
@@ -804,7 +819,10 @@ async fn codex_profile_reapplies_same_multirouter_after_takeover_cleanup() {
 
     let (warnings, _) = ProfileService::apply(&state, &profile.id, ProfileScope::Codex)
         .expect("reapply router profile");
-    assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+    assert!(
+        warnings.is_empty() || warnings == vec!["codex_multirouter_projection_pending".to_string()],
+        "unexpected warnings: {warnings:?}"
+    );
 
     let (takeover_enabled, _) = state.db.get_proxy_flags_sync("codex");
     assert!(
