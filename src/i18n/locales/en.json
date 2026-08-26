@@ -45,7 +45,6 @@
     "runningClose": "Probing…",
     "close": "Close"
   },
-
   "app": {
     "title": "CCSwitchMulti",
     "description": "All-in-One Assistant for Claude Code, Codex & Gemini CLI"
@@ -988,7 +987,9 @@
       "goalModeLabel": "Enable Goal mode",
       "goalModeDescription": "Writes to the shared Codex TOML; no longer requires repeating the setting on each Provider configuration page.",
       "editorLabel": "Codex global TOML",
-      "save": "Save Codex global configuration"
+      "save": "Save Codex global configuration",
+      "guardianV2Label": "Disable Guardian v2 compatibility mode",
+      "guardianV2Description": "Writes the scalar `features.guardianv2 = false` override to avoid Desktop/app-server schema mismatches. Re-enable it after Codex versions are aligned."
     }
   },
   "apps": {

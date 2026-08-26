@@ -166,7 +166,10 @@ export const updateCommonConfigSnippet = (
   }
 
   // 使用统一的验证函数
-  const snippetError = validateJsonConfig(snippetString, i18n.t("providerConfig.field.commonSnippet"));
+  const snippetError = validateJsonConfig(
+    snippetString,
+    i18n.t("providerConfig.field.commonSnippet"),
+  );
   if (snippetError) {
     return {
       updatedConfig: JSON.stringify(config, null, 2),
@@ -464,6 +467,10 @@ const TOML_PROVIDER_NAME_REPLACE_PATTERN =
 const TOML_GOALS_FEATURE_PATTERN = /^\s*goals\s*=\s*(true|false)\s*(?:#.*)?$/;
 const TOML_GOALS_FEATURE_REPLACE_PATTERN =
   /^(\s*goals\s*=\s*)(true|false)(\s*(?:#.*)?)$/;
+const TOML_GUARDIAN_FEATURE_PATTERN =
+  /^\s*guardianv2\s*=\s*(true|false)\s*(?:#.*)?$/;
+const TOML_GUARDIAN_FEATURE_ASSIGNMENT_PATTERN =
+  /^(\s*guardianv2\s*=\s*)(.*?)(\s*(?:#.*)?)$/;
 const CODEX_RESERVED_MODEL_PROVIDER_IDS = new Set([
   "amazon-bedrock",
   "openai",
@@ -1040,6 +1047,128 @@ export const setCodexGoalMode = (
     sectionLines.push("");
   }
 
+  lines.splice(topLevelEndIndex, 0, ...sectionLines);
+  return finalizeTomlText(lines);
+};
+
+/** Whether the shared Codex config contains the scalar Guardian v2 compatibility override. */
+export const isCodexGuardianV2Disabled = (
+  configText: string | undefined | null,
+): boolean => {
+  const text = normalizeTomlText(
+    typeof configText === "string" ? configText : "",
+  );
+  if (!text) return false;
+  try {
+    const parsed = parseToml(text) as Record<string, any>;
+    return parsed.features?.guardianv2 === false;
+  } catch {
+    // Fall back to line scanning while the user is editing invalid TOML.
+  }
+  const lines = text.split("\n");
+  const featureRange = getTomlSectionRange(lines, "features");
+  if (!featureRange) return false;
+  const index = findTomlLineInRange(
+    lines,
+    TOML_GUARDIAN_FEATURE_PATTERN,
+    featureRange.bodyStartIndex,
+    featureRange.bodyEndIndex,
+  );
+  return (
+    index !== -1 &&
+    lines[index].match(TOML_GUARDIAN_FEATURE_PATTERN)?.[1] === "false"
+  );
+};
+
+/** Add/remove the scalar Guardian v2 compatibility override without rewriting unrelated TOML. */
+export const setCodexGuardianV2Disabled = (
+  configText: string,
+  disabled: boolean,
+): string => {
+  const normalizedText = normalizeTomlText(configText);
+  const lines = normalizedText ? normalizedText.split("\n") : [];
+  let featureRange = getTomlSectionRange(lines, "features");
+
+  // A previous Codex/Desktop build may have emitted the object as a nested
+  // `[features.guardianv2]` table. Remove that table before writing the scalar
+  // override; TOML cannot represent both a table and a scalar at the same key.
+  const nestedGuardianRange = getTomlSectionRange(lines, "features.guardianv2");
+  if (nestedGuardianRange) {
+    lines.splice(
+      nestedGuardianRange.headerLineIndex,
+      nestedGuardianRange.bodyEndIndex - nestedGuardianRange.headerLineIndex,
+    );
+    featureRange = getTomlSectionRange(lines, "features");
+  }
+
+  if (featureRange) {
+    const featureBodyStart = featureRange.bodyStartIndex;
+    const featureBodyEnd = featureRange.bodyEndIndex;
+    const assignmentIndex = lines.findIndex(
+      (line, index) =>
+        index >= featureBodyStart &&
+        index < featureBodyEnd &&
+        /^\s*guardianv2\s*=/.test(line),
+    );
+    if (assignmentIndex !== -1) {
+      const assignment = lines[assignmentIndex];
+      const match = assignment.match(TOML_GUARDIAN_FEATURE_ASSIGNMENT_PATTERN);
+      const value = match?.[2].trim() ?? "";
+      if (value.startsWith("{") || value.startsWith("[")) {
+        let balance = 0;
+        let end = assignmentIndex;
+        let balanced = false;
+        for (; end < featureBodyEnd; end += 1) {
+          const line = lines[end];
+          balance += (line.match(/[\[{]/g) ?? []).length;
+          balance -= (line.match(/[\]}]/g) ?? []).length;
+          if (balance <= 0) {
+            balanced = true;
+            break;
+          }
+        }
+        // Never delete the rest of the section when a user is midway through
+        // typing an unmatched object/array in the editor.
+        if (!balanced) return finalizeTomlText(lines);
+        lines.splice(assignmentIndex, end - assignmentIndex + 1);
+        featureRange = getTomlSectionRange(lines, "features");
+      } else if (disabled) {
+        lines[assignmentIndex] = match
+          ? `${match[1]}false${match[3] ?? ""}`
+          : "guardianv2 = false";
+        return finalizeTomlText(lines);
+      } else {
+        lines.splice(assignmentIndex, 1);
+        featureRange = getTomlSectionRange(lines, "features");
+      }
+    }
+    if (!disabled) {
+      if (featureRange && !hasTomlSectionBodyContent(lines, featureRange)) {
+        lines.splice(
+          featureRange.headerLineIndex,
+          featureRange.bodyEndIndex - featureRange.headerLineIndex,
+        );
+      }
+      return finalizeTomlText(lines);
+    }
+    if (featureRange) {
+      lines.splice(
+        getTomlSectionInsertIndex(lines, featureRange),
+        0,
+        "guardianv2 = false",
+      );
+      return finalizeTomlText(lines);
+    }
+  }
+
+  if (!disabled) return normalizedText;
+  const topLevelEndIndex = getTopLevelEndIndex(lines);
+  const sectionLines: string[] = [];
+  if (topLevelEndIndex > 0 && lines[topLevelEndIndex - 1].trim() !== "")
+    sectionLines.push("");
+  sectionLines.push("[features]", "guardianv2 = false");
+  if (topLevelEndIndex < lines.length && lines[topLevelEndIndex]?.trim() !== "")
+    sectionLines.push("");
   lines.splice(topLevelEndIndex, 0, ...sectionLines);
   return finalizeTomlText(lines);
 };

@@ -10,7 +10,9 @@ import { isCodexGoalModeEnabled } from "@/utils/providerConfigUtils";
 vi.mock("react-i18next", async () => {
   const zh = (await import("@/i18n/locales/zh.json")).default;
   const resolve = (key: string) =>
-    key.split(".").reduce<any>((obj, part) => (obj == null ? obj : obj[part]), zh);
+    key
+      .split(".")
+      .reduce<any>((obj, part) => (obj == null ? obj : obj[part]), zh);
   return {
     initReactI18next: { type: "3rdParty", init: () => {} },
     useTranslation: () => ({
@@ -99,6 +101,26 @@ describe("CodexGlobalConfigSettings", () => {
     ).toBe(true);
   });
 
+  it("offers a Guardian v2 compatibility switch and updates shared TOML", async () => {
+    vi.mocked(configApi.getCommonConfigSnippet).mockResolvedValue(
+      "[features]\nguardianv2 = { enabled = true }\ngoals = true\n",
+    );
+    render(<CodexGlobalConfigSettings />);
+
+    const guardian = await screen.findByRole("checkbox", {
+      name: "禁用 Guardian v2 兼容模式",
+    });
+    expect(guardian).not.toBeChecked();
+    fireEvent.click(guardian);
+    expect(guardian).toBeChecked();
+    expect(
+      (screen.getByLabelText("Codex 全局 TOML") as HTMLTextAreaElement).value,
+    ).toContain("guardianv2 = false");
+    expect(
+      (screen.getByLabelText("Codex 全局 TOML") as HTMLTextAreaElement).value,
+    ).not.toContain("enabled = true");
+  });
+
   it("fails closed after a load error and retries before exposing editable shared config", async () => {
     vi.mocked(configApi.getCommonConfigSnippet)
       .mockRejectedValueOnce(new Error("shared config unavailable"))
@@ -129,4 +151,3 @@ describe("CodexGlobalConfigSettings", () => {
     expect(configApi.getCommonConfigSnippet).toHaveBeenCalledTimes(2);
   });
 });
-

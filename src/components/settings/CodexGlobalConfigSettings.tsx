@@ -9,6 +9,8 @@ import { configApi } from "@/lib/api";
 import {
   isCodexGoalModeEnabled,
   setCodexGoalMode,
+  isCodexGuardianV2Disabled,
+  setCodexGuardianV2Disabled,
 } from "@/utils/providerConfigUtils";
 
 const DEFAULT_CODEX_GLOBAL_CONFIG = `# Shared Codex configuration
@@ -136,6 +138,28 @@ export function CodexGlobalConfigSettings() {
             )
           }
           className="mt-0.5 h-4 w-4 rounded border-border-default text-blue-500 focus:ring-blue-500"
+        />
+      </label>
+
+      <label className="flex items-start justify-between gap-4 rounded-md border border-amber-500/30 bg-amber-500/5 p-3">
+        <span className="space-y-1">
+          <span className="block text-sm font-medium text-foreground">
+            {t("settings.codexGlobalConfig.guardianV2Label")}
+          </span>
+          <span className="block text-xs leading-relaxed text-muted-foreground">
+            {t("settings.codexGlobalConfig.guardianV2Description")}
+          </span>
+        </span>
+        <input
+          aria-label={t("settings.codexGlobalConfig.guardianV2Label")}
+          type="checkbox"
+          checked={isCodexGuardianV2Disabled(value)}
+          onChange={(event) =>
+            setValue((current) =>
+              setCodexGuardianV2Disabled(current, event.target.checked),
+            )
+          }
+          className="mt-0.5 h-4 w-4 rounded border-border-default text-amber-600 focus:ring-amber-500"
         />
       </label>
 

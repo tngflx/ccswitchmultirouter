@@ -45,7 +45,6 @@
     "runningClose": "探測進行中",
     "close": "關閉"
   },
-
   "app": {
     "title": "CCSwitchMulti",
     "description": "Claude Code / Codex / Gemini CLI 全方位輔助工具"
@@ -988,7 +987,9 @@
       "goalModeLabel": "啟用 Goal mode",
       "goalModeDescription": "寫入共享 Codex TOML；不再要求在每一個 Provider 配置頁重複設定。",
       "editorLabel": "Codex 全域性 TOML",
-      "save": "儲存 Codex 全域性配置"
+      "save": "儲存 Codex 全域性配置",
+      "guardianV2Label": "停用 Guardian v2 相容模式",
+      "guardianV2Description": "寫入 `features.guardianv2 = false` 標量覆寫，以避免 Desktop 與 app-server 的配置模式不相容。Codex 版本一致後可重新啟用。"
     }
   },
   "apps": {

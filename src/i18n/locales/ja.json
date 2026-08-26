@@ -45,7 +45,6 @@
     "runningClose": "検査中",
     "close": "閉じる"
   },
-
   "app": {
     "title": "CCSwitchMulti",
     "description": "Claude Code・Codex・Gemini CLI のためのオールインワンアシスタント"
@@ -988,7 +987,9 @@
       "goalModeLabel": "Goal mode を有効化",
       "goalModeDescription": "共有 Codex TOML に書き込まれます。各 Provider 設定ページでの繰り返し設定は不要になります。",
       "editorLabel": "Codex グローバル TOML",
-      "save": "Codex グローバル設定を保存"
+      "save": "Codex グローバル設定を保存",
+      "guardianV2Label": "Guardian v2 互換モードを無効化",
+      "guardianV2Description": "`features.guardianv2 = false` を書き込み、Desktop と app-server の設定スキーマ不一致を回避します。Codex のバージョンを揃えたら再度有効化できます。"
     }
   },
   "apps": {
