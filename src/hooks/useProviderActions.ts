@@ -354,7 +354,8 @@ export function useProviderActions(
         return { ok: true, result };
       } catch (error) {
         // 错误提示由 mutation 处理
-        const detail = extractErrorMessage(error) || "切换供应商失败";
+        const detail =
+          extractErrorMessage(error) || t("notifications.switchProviderFailed");
         return {
           ok: false,
           error: error instanceof Error ? error : new Error(detail),

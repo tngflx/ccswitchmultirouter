@@ -10,7 +10,7 @@ export type SettingsFormState = Omit<Settings, "language"> & {
 };
 
 const normalizeLanguage = (lang?: string | null): Language => {
-  if (!lang) return "zh";
+  if (!lang) return "en";
   const normalized = lang.toLowerCase().replace(/_/g, "-");
 
   if (normalized === "zh") {
@@ -34,7 +34,7 @@ const normalizeLanguage = (lang?: string | null): Language => {
     return "zh";
   }
 
-  return "zh";
+  return "en";
 };
 
 const isSupportedLanguage = (lang?: string | null): boolean => {
@@ -77,7 +77,7 @@ export function useSettingsForm(): UseSettingsFormResult {
     null,
   );
 
-  const initialLanguageRef = useRef<Language>("zh");
+  const initialLanguageRef = useRef<Language>("en");
 
   const readPersistedLanguage = useCallback((): Language => {
     if (typeof window !== "undefined") {
