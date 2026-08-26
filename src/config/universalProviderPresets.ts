@@ -18,6 +18,8 @@ import { deepClone } from "@/utils/deepClone";
 export interface UniversalProviderPreset {
   /** 预设名称 */
   name: string;
+  /** i18n key for localized display name */
+  nameKey?: string;
   /** 供应商类型标识 */
   providerType: string;
   /** 默认启用的应用 */
@@ -32,6 +34,8 @@ export interface UniversalProviderPreset {
   iconColor?: string;
   /** 描述 */
   description?: string;
+  /** i18n key for localized description */
+  descriptionKey?: string;
   /** 是否为自定义模板（允许用户完全自定义） */
   isCustomTemplate?: boolean;
 }
@@ -71,11 +75,13 @@ export const universalProviderPresets: UniversalProviderPreset[] = [
     websiteUrl: "https://www.newapi.pro",
     icon: "newapi",
     iconColor: "#00A67E",
+    descriptionKey: "universalProvider.presets.newapiDescription",
     description:
       "NewAPI 是一个可自部署的 API 网关，支持 Anthropic、OpenAI、Gemini 等多种协议",
   },
   {
     name: "自定义网关",
+    nameKey: "universalProvider.presets.customGatewayName",
     providerType: "custom_gateway",
     defaultApps: {
       claude: true,
@@ -85,6 +91,7 @@ export const universalProviderPresets: UniversalProviderPreset[] = [
     defaultModels: NEWAPI_DEFAULT_MODELS,
     icon: "openai",
     iconColor: "#6366F1",
+    descriptionKey: "universalProvider.presets.customGatewayDescription",
     description: "自定义配置的 API 网关",
     isCustomTemplate: true,
   },

@@ -1132,7 +1132,10 @@
       "qiniu": "Qiniu",
       "openrouter": "OpenRouter",
       "deepseek": "DeepSeek",
-      "together": "Together AI"
+      "together": "Together AI",
+      "volcengineAgentplan": "Volcengine Agent Plan",
+      "volcengineCodingplan": "Volcengine Coding Plan",
+      "custom": "カスタム"
     },
     "parameterConfig": "パラメーター設定 - {{name}} *",
     "mainModel": "メインモデル（任意）",
@@ -1950,7 +1953,12 @@
     "fieldExtra": "• extra: String。自由記述の追加テキスト",
     "tip1": "• 変数 {{apiKey}} と {{baseUrl}} は自動で置換されます",
     "tip2": "• 抽出関数はサンドボックスで実行され、ES2020+ の構文を使えます",
-    "tip3": "• 全体を () で囲み、オブジェクトリテラル式にしてください"
+    "tip3": "• 全体を () で囲み、オブジェクトリテラル式にしてください",
+    "codingPlan": {
+      "zhipu": "Zhipu GLM",
+      "zhipuTeam": "Zhipu GLM Team",
+      "volcengine": "Volcengine Ark (火山方舟)"
+    }
   },
   "dbUpgrade": {
     "title": "データベースのバージョンが新しすぎます",
@@ -3038,7 +3046,12 @@
     "savedAndSynced": "すべてのアプリに保存・同期されました",
     "saveAndSyncError": "保存と同期に失敗しました",
     "configJsonPreview": "設定 JSON プレビュー",
-    "configJsonPreviewHint": "以下は各アプリに同期される設定内容です（表示されているフィールドのみ上書きされ、他のカスタム設定は保持されます）"
+    "configJsonPreviewHint": "以下は各アプリに同期される設定内容です（表示されているフィールドのみ上書きされ、他のカスタム設定は保持されます）",
+    "presets": {
+      "newapiDescription": "NewAPI はセルフホスト可能な API ゲートウェイで、Anthropic・OpenAI・Gemini など複数のプロトコルに対応しています",
+      "customGatewayName": "カスタムゲートウェイ",
+      "customGatewayDescription": "カスタム設定の API ゲートウェイ"
+    }
   },
   "omo": {
     "editProfile": "OMO 設定を編集",
@@ -5037,5 +5050,17 @@
       "textOnly": "テキストのみ",
       "textAndImage": "テキストと画像"
     }
+  },
+  "providerConfig": {
+    "field": {
+      "config": "設定",
+      "commonSnippet": "共通設定スニペット"
+    },
+    "notJsonObject": "{{field}}は JSON オブジェクトである必要があります",
+    "invalidJsonSyntax": "{{field}}の JSON 形式が正しくありません。構文を確認してください",
+    "parseFailedCommonConfig": "設定 JSON の解析に失敗したため、共通設定を適用できません"
+  },
+  "update": {
+    "checkFailed": "アップデートの確認に失敗しました"
   }
 }

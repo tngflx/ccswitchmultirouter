@@ -1132,7 +1132,10 @@
       "qiniu": "七牛云",
       "openrouter": "OpenRouter",
       "deepseek": "DeepSeek",
-      "together": "Together AI"
+      "together": "Together AI",
+      "volcengineAgentplan": "火山 Agent Plan",
+      "volcengineCodingplan": "火山 Coding Plan",
+      "custom": "自定义"
     },
     "parameterConfig": "参数配置 - {{name}} *",
     "mainModel": "主模型 (可选)",
@@ -1950,7 +1953,12 @@
     "fieldExtra": "• extra: 字符串，扩展字段，可自由补充需要展示的文本",
     "tip1": "• 变量 {{apiKey}} 和 {{baseUrl}} 会自动替换",
     "tip2": "• extractor 函数在沙箱环境中执行，支持 ES2020+ 语法",
-    "tip3": "• 整个配置必须用 () 包裹，形成对象字面量表达式"
+    "tip3": "• 整个配置必须用 () 包裹，形成对象字面量表达式",
+    "codingPlan": {
+      "zhipu": "Zhipu GLM (智谱)",
+      "zhipuTeam": "Zhipu GLM Team (智谱团队)",
+      "volcengine": "火山方舟 (Volcengine)"
+    }
   },
   "dbUpgrade": {
     "title": "数据库版本过新",
@@ -3038,7 +3046,12 @@
     "savedAndSynced": "已保存并同步到所有应用",
     "saveAndSyncError": "保存并同步失败",
     "configJsonPreview": "配置 JSON 预览",
-    "configJsonPreviewHint": "以下是将要同步到各应用的配置内容（仅覆盖显示的字段，保留其他自定义配置）"
+    "configJsonPreviewHint": "以下是将要同步到各应用的配置内容（仅覆盖显示的字段，保留其他自定义配置）",
+    "presets": {
+      "newapiDescription": "NewAPI 是一个可自部署的 API 网关，支持 Anthropic、OpenAI、Gemini 等多种协议",
+      "customGatewayName": "自定义网关",
+      "customGatewayDescription": "自定义配置的 API 网关"
+    }
   },
   "omo": {
     "editProfile": "编辑 OMO 配置",
@@ -5037,5 +5050,17 @@
       "textOnly": "仅文本",
       "textAndImage": "文本与图像"
     }
+  },
+  "providerConfig": {
+    "field": {
+      "config": "配置",
+      "commonSnippet": "通用配置片段"
+    },
+    "notJsonObject": "{{field}}必须是 JSON 对象",
+    "invalidJsonSyntax": "{{field}}JSON格式错误，请检查语法",
+    "parseFailedCommonConfig": "配置 JSON 解析失败，无法应用通用配置"
+  },
+  "update": {
+    "checkFailed": "检查更新失败"
   }
 }
