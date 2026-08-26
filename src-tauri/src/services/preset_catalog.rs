@@ -1,8 +1,11 @@
-//! 本地预设表（preset-table.json）运行时索引。
+﻿//! 本地预设表（preset-table.json）运行时索引。
 //!
 //! 打包产物由 `preset-table/tools/build_bundle.py` 生成，随 WebDAV 同步分发到
 //! `~/.cc-switch/preset-table.json`。本模块负责加载与解析：
 //!
+// Intentionally unused: helpers preserved for upcoming upstream integration.
+#![allow(dead_code)]
+
 //! - 基线条目（`baseline`）：API 通道事实，来自 models.dev 自动同步。
 //! - plan 条目（`plans`）：审核后的订阅/调用策略薄覆盖，只存与基线的差异，用 `base_model`
 //!   指向基线继承其余字段。
