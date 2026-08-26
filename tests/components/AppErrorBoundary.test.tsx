@@ -1,6 +1,9 @@
 import { render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { AppErrorBoundary } from "@/components/AppErrorBoundary";
+import i18n from "@/i18n";
+
+const tr = (key: string) => i18n.t(`errorBoundary.${key}`);
 
 /** 用于验证根错误边界会接住子树渲染异常的测试组件。 */
 function ThrowDuringRender(): never {
@@ -22,10 +25,10 @@ describe("AppErrorBoundary", () => {
     );
 
     expect(
-      screen.getByRole("heading", { name: "应用界面加载失败" }),
+      screen.getByRole("heading", { name: tr("title") }),
     ).toBeInTheDocument();
     expect(screen.getByText("测试渲染异常")).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "重新加载" })).toBeEnabled();
+    expect(screen.getByRole("button", { name: tr("reload") })).toBeEnabled();
     expect(screen.getByText(/ThrowDuringRender/)).toBeInTheDocument();
     expect(localStorage.getItem("ccswitchmulti.lastRenderError.v1")).toContain(
       "测试渲染异常",

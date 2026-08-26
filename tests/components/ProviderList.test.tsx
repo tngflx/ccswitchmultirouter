@@ -5,6 +5,27 @@ import type { ReactElement } from "react";
 import type { Provider } from "@/types";
 import { ProviderList } from "@/components/providers/ProviderList";
 
+// 组件已接入 i18n；这里用真实 zh 资源驱动 useTranslation，
+// 避免全局测试 setup 用空资源初始化 i18next 导致断言拿到原始 key。
+vi.mock("react-i18next", async () => {
+  const zh = (await import("@/i18n/locales/zh.json")).default;
+  const resolve = (key: string) =>
+    key.split(".").reduce<any>((obj, part) => (obj == null ? obj : obj[part]), zh);
+  return {
+    useTranslation: () => ({
+      t: (key: string, params?: Record<string, unknown>) => {
+        let value: string = resolve(key) ?? key;
+        if (params) {
+          for (const [name, replacement] of Object.entries(params)) {
+            value = value.split("{{" + name + "}}").join(String(replacement));
+          }
+        }
+        return value;
+      },
+    }),
+  };
+});
+
 const useDragSortMock = vi.fn();
 const useSortableMock = vi.fn();
 const providerCardRenderSpy = vi.fn();
@@ -186,7 +207,7 @@ describe("ProviderList Component", () => {
     );
 
     const addButton = screen.getByRole("button", {
-      name: "provider.addProvider",
+      name: "添加供应商",
     });
     fireEvent.click(addButton);
 
@@ -353,7 +374,7 @@ describe("ProviderList Component", () => {
 
     fireEvent.keyDown(window, { key: "f", metaKey: true });
     const searchInput = screen.getByPlaceholderText(
-      "Search name, notes, or URL...",
+      "按名称/备注/网址搜索供应商...",
     );
     // Initially both providers are rendered
     expect(screen.getByTestId("provider-card-alpha")).toBeInTheDocument();
@@ -367,7 +388,7 @@ describe("ProviderList Component", () => {
     expect(screen.queryByTestId("provider-card-alpha")).not.toBeInTheDocument();
     expect(screen.queryByTestId("provider-card-beta")).not.toBeInTheDocument();
     expect(
-      screen.getByText("No providers match your search."),
+      screen.getByText("没有符合搜索条件的供应商。"),
     ).toBeInTheDocument();
   });
 });

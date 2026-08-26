@@ -21,13 +21,13 @@ describe("CodexProviderReadinessSection", () => {
     );
 
     expect(
-      screen.getByRole("heading", { name: "模型与兼容性" }),
+      screen.getByRole("heading", { name: "Models & Compatibility" }),
     ).toBeInTheDocument();
-    expect(screen.getByText("就绪状态")).toBeInTheDocument();
-    expect(screen.getByText("需要同步模型")).toBeInTheDocument();
+    expect(screen.getByText("Readiness")).toBeInTheDocument();
+    expect(screen.getByText("Sync models needed")).toBeInTheDocument();
 
-    fireEvent.click(screen.getByRole("button", { name: "同步模型" }));
-    fireEvent.click(screen.getByRole("button", { name: "验证连接" }));
+    fireEvent.click(screen.getByRole("button", { name: "Sync Models" }));
+    fireEvent.click(screen.getByRole("button", { name: "Verify Connection" }));
 
     expect(onSyncModels).toHaveBeenCalledTimes(1);
     expect(onValidateConnection).toHaveBeenCalledTimes(1);
@@ -47,9 +47,9 @@ describe("CodexProviderReadinessSection", () => {
       />,
     );
 
-    expect(screen.getByText("由 CCSwitchMulti 维护")).toBeInTheDocument();
-    expect(screen.getByText("建议先验证连接")).toBeInTheDocument();
-    expect(screen.queryByText("可加入 MultiRouter")).not.toBeInTheDocument();
+    expect(screen.getByText("Maintained by CCSwitchMulti")).toBeInTheDocument();
+    expect(screen.getByText("Verify connection first")).toBeInTheDocument();
+    expect(screen.queryByText("Can join MultiRouter")).not.toBeInTheDocument();
     expect(screen.getByText("deepseek-v4-flash")).toBeInTheDocument();
     expect(screen.queryByText("请选择上游协议")).not.toBeInTheDocument();
 
@@ -68,7 +68,7 @@ describe("CodexProviderReadinessSection", () => {
       />,
     );
 
-    expect(screen.getByText("可加入 MultiRouter")).toBeInTheDocument();
+    expect(screen.getByText("Can join MultiRouter")).toBeInTheDocument();
   });
 
   it("explains automatic protocol detection for custom providers", () => {
@@ -85,9 +85,66 @@ describe("CodexProviderReadinessSection", () => {
     );
 
     expect(
-      screen.getByText(/验证连接时会自动检测 Chat 与 Responses/),
+      screen.getByText(
+        /Verify Connection automatically tests both Chat and Responses/,
+      ),
     ).toBeInTheDocument();
-    expect(screen.getByText("建议先验证连接")).toBeInTheDocument();
+    expect(screen.getByText("Verify connection first")).toBeInTheDocument();
+  });
+
+  it("renders recommended and custom provider traffic policy summaries", () => {
+    const common = {
+      models: [{ model: "ox-alpha-free" }],
+      defaultModel: "ox-alpha-free",
+      apiFormat: "openai_responses" as const,
+      isMaintainedPreset: false,
+      isSyncingModels: false,
+      isValidatingConnection: false,
+      onSyncModels: vi.fn(),
+      onValidateConnection: vi.fn(),
+    };
+    const { rerender } = render(
+      <CodexProviderReadinessSection
+        {...common}
+        trafficPolicy={{
+          source: "recommended",
+          admissionEnabled: true,
+          maxInFlight: 4,
+          maxQueueWaitMs: 30_000,
+          rateLimitMaxRetries: 5,
+          rejectionRetryMode: "opencode_endpoint_unavailable",
+          rejectionMaxRetries: 2,
+          rejectionInitialDelayMs: 750,
+          rejectionMaxDelayMs: 5_000,
+        }}
+      />,
+    );
+
+    expect(screen.getByText("4 in flight")).toBeInTheDocument();
+    expect(
+      screen.getByText(/Recommended · 429: 5 · rejection: 2/),
+    ).toBeInTheDocument();
+
+    rerender(
+      <CodexProviderReadinessSection
+        {...common}
+        trafficPolicy={{
+          source: "custom",
+          admissionEnabled: true,
+          maxInFlight: 2,
+          maxQueueWaitMs: 10_000,
+          rateLimitMaxRetries: 1,
+          rejectionRetryMode: "disabled",
+          rejectionMaxRetries: 0,
+          rejectionInitialDelayMs: 500,
+          rejectionMaxDelayMs: 2_000,
+        }}
+      />,
+    );
+    expect(screen.getByText("2 in flight")).toBeInTheDocument();
+    expect(
+      screen.getByText(/Custom · 429: 1 · rejection: 0/),
+    ).toBeInTheDocument();
   });
 
   it("uses accessible live regions for validation results", () => {

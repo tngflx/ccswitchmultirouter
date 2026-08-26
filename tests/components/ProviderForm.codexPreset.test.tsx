@@ -80,6 +80,8 @@ vi.mock("@/components/providers/forms/CodexFormFields", () => ({
     allowModelMenuProjectionToggle,
     onApiKeyChange,
     onCatalogModelsChange,
+    codexTrafficPolicy,
+    onCodexTrafficPolicyChange,
   }: {
     codexApiKey: string;
     codexBaseUrl: string;
@@ -94,6 +96,10 @@ vi.mock("@/components/providers/forms/CodexFormFields", () => ({
     onApiKeyChange?: (value: string) => void;
     onCatalogModelsChange?: (
       models: Array<{ model: string; contextWindow?: number | string }>,
+    ) => void;
+    codexTrafficPolicy?: import("@/types").CodexTrafficPolicy;
+    onCodexTrafficPolicyChange?: (
+      policy: import("@/types").CodexTrafficPolicy | undefined,
     ) => void;
   }) => (
     <section aria-label="codex-provider-details">
@@ -121,6 +127,28 @@ vi.mock("@/components/providers/forms/CodexFormFields", () => ({
         }
       >
         mock-set-catalog
+      </button>
+      <div data-testid="codex-traffic-policy">
+        {codexTrafficPolicy
+          ? JSON.stringify(codexTrafficPolicy)
+          : "recommended"}
+      </div>
+      <button
+        type="button"
+        onClick={() =>
+          onCodexTrafficPolicyChange?.({
+            admissionEnabled: true,
+            maxInFlight: 3,
+            maxQueueWaitMs: 12_000,
+            rateLimitMaxRetries: 2,
+            rejectionRetryMode: "disabled",
+            rejectionMaxRetries: 0,
+            rejectionInitialDelayMs: 500,
+            rejectionMaxDelayMs: 2_000,
+          })
+        }
+      >
+        mock-set-traffic-policy
       </button>
       <button type="button" onClick={() => onApiKeyChange?.("sk-test")}>
         mock-set-api-key
@@ -167,6 +195,65 @@ describe("ProviderForm Codex preset selection", () => {
     await waitFor(() => {
       expect(screen.getByTestId("codex-takeover")).toHaveTextContent("enabled");
     });
+  });
+
+  it("persists the exact custom Codex traffic policy", async () => {
+    const onSubmit = vi.fn();
+    renderProviderForm({
+      showButtons: true,
+      submitLabel: "保存",
+      onSubmit,
+      initialData: {
+        name: "Custom provider",
+        category: "custom",
+        settingsConfig: {
+          auth: { OPENAI_API_KEY: "sk-test" },
+          config:
+            'model_provider = "custom"\nmodel = "model-a"\n[model_providers.custom]\nbase_url = "https://custom.example/v1"\nwire_api = "responses"\n',
+        },
+        meta: { apiFormat: "openai_responses" },
+      },
+    });
+
+    fireEvent.click(
+      screen.getByRole("button", { name: "mock-set-traffic-policy" }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "mock-set-api-key" }));
+    fireEvent.click(screen.getByRole("button", { name: "保存" }));
+
+    await waitFor(() => expect(onSubmit).toHaveBeenCalled());
+    expect(onSubmit.mock.calls[0][0].meta.codexTrafficPolicy).toEqual({
+      admissionEnabled: true,
+      maxInFlight: 3,
+      maxQueueWaitMs: 12_000,
+      rateLimitMaxRetries: 2,
+      rejectionRetryMode: "disabled",
+      rejectionMaxRetries: 0,
+      rejectionInitialDelayMs: 500,
+      rejectionMaxDelayMs: 2_000,
+    });
+  });
+
+  it("clears a custom traffic policy when a maintained preset is selected", async () => {
+    const onSubmit = vi.fn();
+    renderProviderForm({ showButtons: true, submitLabel: "保存", onSubmit });
+    fireEvent.click(
+      screen.getByRole("button", { name: "mock-set-traffic-policy" }),
+    );
+    expect(screen.getByTestId("codex-traffic-policy")).not.toHaveTextContent(
+      "recommended",
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: /DeepSeek$/ }));
+    await waitFor(() =>
+      expect(screen.getByTestId("codex-traffic-policy")).toHaveTextContent(
+        "recommended",
+      ),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "mock-set-api-key" }));
+    fireEvent.click(screen.getByRole("button", { name: "保存" }));
+    await waitFor(() => expect(onSubmit).toHaveBeenCalled());
+    expect(onSubmit.mock.calls[0][0].meta.codexTrafficPolicy).toBeUndefined();
   });
 
   it("forces a saved maintained preset back to model menu projection", async () => {

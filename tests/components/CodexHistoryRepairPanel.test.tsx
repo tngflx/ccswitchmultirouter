@@ -3,6 +3,48 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { CodexHistoryRepairPanel } from "@/components/sessions/CodexHistoryRepairPanel";
 import { proxyApi } from "@/lib/api/proxy";
 
+vi.mock("react-i18next", async () => {
+  const zh = (await import("@/i18n/locales/zh.json")).default;
+  const resolve = (key: string): any =>
+    key
+      .split(".")
+      .reduce((obj: any, part: string) => (obj == null ? obj : obj[part]), zh);
+  return {
+    useTranslation: () => ({
+      t: (key: string, params?: Record<string, unknown>) => {
+        let value = resolve(key) ?? key;
+        if (params) {
+          for (const [name, replacement] of Object.entries(params)) {
+            value = value.split("{{" + name + "}}").join(String(replacement));
+          }
+        }
+        return value;
+      },
+    }),
+  };
+});
+
+vi.mock("react-i18next", async () => {
+  const zh = (await import("@/i18n/locales/zh.json")).default;
+  const resolve = (key: string): any =>
+    key
+      .split(".")
+      .reduce((obj: any, part: string) => (obj == null ? obj : obj[part]), zh);
+  return {
+    useTranslation: () => ({
+      t: (key: string, params?: Record<string, unknown>) => {
+        let value = resolve(key) ?? key;
+        if (params) {
+          for (const [name, replacement] of Object.entries(params)) {
+            value = value.split("{{" + name + "}}").join(String(replacement));
+          }
+        }
+        return value;
+      },
+    }),
+  };
+});
+
 vi.mock("@/lib/api/proxy", () => ({
   proxyApi: {
     unlockCodexModelPicker: vi.fn(),

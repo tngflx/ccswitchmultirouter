@@ -9,6 +9,7 @@ import {
 } from "@testing-library/react";
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { providersApi } from "@/lib/api/providers";
+import i18n from "@/i18n";
 import {
   resetProviderState,
   setCurrentProviderId,
@@ -497,15 +498,27 @@ describe("App integration with MSW", () => {
 
     fireEvent.click(screen.getByText("open-multirouter-entry"));
 
-    expect(await screen.findByText("配置多路模型")).toBeInTheDocument();
-    expect(screen.getByText("创建新配置")).toBeInTheDocument();
-    expect(screen.getByText("编辑旧配置")).toBeInTheDocument();
     expect(
-      screen.getByText("暂无已有 MultiRouter，请先创建新配置。"),
+      await screen.findByText(i18n.t("codexMultiRouter.entryChoice.title")),
     ).toBeInTheDocument();
-    expect(screen.getByText("直接打开工作台")).toBeInTheDocument();
+    expect(
+      screen.getByText(i18n.t("codexMultiRouter.entryChoice.createTitle")),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText(i18n.t("codexMultiRouter.entryChoice.editTitle")),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText(i18n.t("codexMultiRouter.entryChoice.empty")),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText(
+        i18n.t("codexMultiRouter.entryChoice.openWorkspaceButton"),
+      ),
+    ).toBeInTheDocument();
 
-    fireEvent.click(screen.getByText("创建新配置"));
+    fireEvent.click(
+      screen.getByText(i18n.t("codexMultiRouter.entryChoice.createTitle")),
+    );
 
     const wizard = await screen.findByTestId("codex-multirouter-wizard");
     expect(wizard).toHaveAttribute("data-mode", "create");
@@ -581,7 +594,11 @@ describe("App integration with MSW", () => {
     );
 
     fireEvent.click(screen.getByText("open-multirouter-entry"));
-    fireEvent.click(await screen.findByText("直接打开工作台"));
+    fireEvent.click(
+      await screen.findByText(
+        i18n.t("codexMultiRouter.entryChoice.openWorkspaceButton"),
+      ),
+    );
 
     await waitFor(() =>
       expect(screen.getByTestId("codex-router-workspace")).toBeInTheDocument(),
@@ -607,7 +624,7 @@ describe("App integration with MSW", () => {
       ),
     );
 
-    fireEvent.click(screen.getByTitle("Codex 用量与重置额度"));
+    fireEvent.click(screen.getByTitle(i18n.t("codexUsage.title")));
 
     await waitFor(() =>
       expect(screen.getByTestId("codex-usage-page")).toBeInTheDocument(),

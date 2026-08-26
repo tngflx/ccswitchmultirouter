@@ -104,6 +104,18 @@ describe("useSettingsForm Hook", () => {
     expect(changeLanguageSpy).toHaveBeenCalledWith("zh-TW");
   });
 
+  it("should default unknown languages to English", () => {
+    useSettingsQueryMock.mockReturnValue({
+      data: null,
+      isLoading: false,
+    });
+    (i18n as any).language = "pt-BR";
+
+    const { result } = renderHook(() => useSettingsForm());
+
+    expect(result.current.readPersistedLanguage()).toBe("en");
+  });
+
   it("should prioritize reading language from local storage in readPersistedLanguage", () => {
     useSettingsQueryMock.mockReturnValue({
       data: null,
