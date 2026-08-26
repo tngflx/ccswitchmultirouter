@@ -25,8 +25,11 @@ use super::{
     log_codes::fwd as log_fwd,
     provider_router::ProviderRouter,
     providers::{
-        codex_chat_history::CodexChatHistoryStore, gemini_shadow::GeminiShadowStore, get_adapter,
-        streaming_retry::StreamReconnector, AuthInfo, AuthStrategy, ProviderAdapter, ProviderType,
+        codex_chat_history::CodexChatHistoryStore,
+        gemini_shadow::GeminiShadowStore,
+        get_adapter,
+        streaming_retry::{StreamReconnector, RESPONSES_STREAM_MAX_RETRIES},
+        AuthInfo, AuthStrategy, ProviderAdapter, ProviderType,
     },
     thinking_budget_rectifier::{rectify_thinking_budget, should_rectify_thinking_budget},
     thinking_rectifier::{
@@ -70,7 +73,6 @@ const CODEX_RESPONSES_LITE_FALLBACK_TTL: Duration = Duration::from_secs(24 * 60 
 const UPSTREAM_TRANSPORT_RETRY_LIMIT: usize = 5;
 /// 真实上游在尚未建立成功响应时明确返回 429，等价于拒绝接收本次采样请求，
 /// 因而可以安全重放同一份 headers/body。次数与 Codex 默认流恢复预算对齐。
-const CODEX_RATE_LIMIT_RETRY_LIMIT: usize = 5;
 const CODEX_RATE_LIMIT_MAX_SINGLE_DELAY: Duration = Duration::from_secs(60);
 const CODEX_RATE_LIMIT_TOTAL_DELAY_BUDGET: Duration = Duration::from_secs(180);
 
@@ -177,6 +179,9 @@ pub struct ForwardResult {
     /// 活跃连接 RAII guard：随响应一起流转到 response_processor / handle_claude_transform，
     /// 最终被 move 进流式 body future（或非流式响应作用域），覆盖整个响应生命周期。
     pub(crate) connection_guard: Option<ActiveConnectionGuard>,
+    /// Per-route admission permit. The public wrapper moves this into
+    /// `ActiveConnectionGuard`, which is retained for the full streamed response.
+    route_admission_permit: Option<tokio::sync::OwnedSemaphorePermit>,
     /// 流式 Responses 请求的上游重连工厂：下游转换层在流中断且尚未向客户端
     /// 转发实质内容时用它做有界自动重连（见 providers::streaming_retry）。
     pub(crate) stream_reconnect: Option<StreamReconnector>,
@@ -199,6 +204,7 @@ pub struct ForwardError {
 /// 不需要每条出口路径都手动调用。
 pub(crate) struct ActiveConnectionGuard {
     status: Arc<RwLock<ProxyStatus>>,
+    route_admission_permit: Option<tokio::sync::OwnedSemaphorePermit>,
 }
 
 impl ActiveConnectionGuard {
@@ -207,7 +213,10 @@ impl ActiveConnectionGuard {
             let mut s = status.write().await;
             s.active_connections = s.active_connections.saturating_add(1);
         }
-        Self { status }
+        Self {
+            status,
+            route_admission_permit: None,
+        }
     }
 }
 
@@ -353,6 +362,9 @@ fn classify_codex_pool_attempt(error: &ProxyError) -> CodexPoolAttemptOutcome {
 }
 
 fn retryable_failure_affects_provider_health(provider: &Provider, error: &ProxyError) -> bool {
+    if matches!(error, ProxyError::AdmissionQueueTimeout { .. }) {
+        return false;
+    }
     provider_codex_pool_account(provider).is_none()
         || matches!(
             classify_codex_pool_attempt(error),
@@ -918,6 +930,8 @@ impl RequestForwarder {
         // 在流式 body 的 future 内才真正 drop。
         // Err 路径：guard 在函数 scope 内随返回值落地时自动 drop。
         result.map(|mut fr| {
+            let mut guard = guard;
+            guard.route_admission_permit = fr.route_admission_permit.take();
             fr.connection_guard = Some(guard);
             fr
         })
@@ -953,6 +967,8 @@ impl RequestForwarder {
             )
             .await;
         result.map(|mut fr| {
+            let mut guard = guard;
+            guard.route_admission_permit = fr.route_admission_permit.take();
             fr.connection_guard = Some(guard);
             fr
         })
@@ -992,7 +1008,6 @@ impl RequestForwarder {
         let attempt_providers = self
             .expand_codex_account_pool(app_type, &headers, attempt_providers)
             .await;
-        let bypass_circuit_breaker = attempt_providers.len() == 1;
         let mut last_error = None;
         let mut last_provider = None;
         let mut attempted_providers = 0usize;
@@ -1007,18 +1022,38 @@ impl RequestForwarder {
                 super::providers::codex_route_persistent_provider(provider);
             let persistent_provider_id = persistent_provider_id.to_string();
             let persistent_provider_name = persistent_provider_name.to_string();
-            let (allowed, used_half_open_permit) = if bypass_circuit_breaker {
-                (true, false)
-            } else {
-                let permit = self
-                    .router
-                    .allow_provider_request(&provider.id, app_type_str)
-                    .await;
-                (permit.allowed, permit.used_half_open_permit)
-            };
+            let permit = self
+                .router
+                .allow_provider_request(&provider.id, app_type_str)
+                .await;
+            let (allowed, used_half_open_permit) = (permit.allowed, permit.used_half_open_permit);
             if !allowed {
                 continue;
             }
+            let route_admission_permit = match self
+                .router
+                .acquire_codex_route_admission(provider, app_type_str)
+                .await
+            {
+                Ok(permit) => permit,
+                Err(timeout) => {
+                    attempted_providers += 1;
+                    self.router
+                        .release_permit_neutral(&provider.id, app_type_str, used_half_open_permit)
+                        .await;
+                    let error = ProxyError::AdmissionQueueTimeout {
+                        provider_id: timeout.provider_id,
+                        max_in_flight: timeout.max_in_flight,
+                        waited_ms: timeout.waited_ms,
+                    };
+                    log::warn!(
+                        "[{app_type_str}] Codex admission queue timed out before any upstream send: {error}"
+                    );
+                    last_error = Some(error);
+                    last_provider = Some(provider.clone());
+                    continue;
+                }
+            };
             attempted_providers += 1;
 
             {
@@ -1091,6 +1126,7 @@ impl RequestForwarder {
                         claude_api_format: None,
                         outbound_model,
                         connection_guard: None,
+                        route_admission_permit,
                         stream_reconnect: None,
                     });
                 }
@@ -1239,9 +1275,6 @@ impl RequestForwarder {
         let mut last_provider = None;
         let mut attempted_providers = 0usize;
 
-        // 单 Provider 场景下跳过熔断器检查（故障转移关闭时）
-        let bypass_circuit_breaker = attempt_providers.len() == 1;
-
         // 依次尝试每个供应商
         for provider in attempt_providers.iter() {
             let attempt_provider_id = provider.id.clone();
@@ -1267,21 +1300,41 @@ impl RequestForwarder {
                 break;
             }
 
-            // 发起请求前先获取熔断器放行许可（HalfOpen 会占用探测名额）
-            // 单 Provider 场景下跳过此检查，避免熔断器阻塞所有请求
-            let (allowed, used_half_open_permit) = if bypass_circuit_breaker {
-                (true, false)
-            } else {
-                let permit = self
-                    .router
-                    .allow_provider_request(&provider.id, app_type_str)
-                    .await;
-                (permit.allowed, permit.used_half_open_permit)
-            };
+            // 发起请求前获取熔断器放行许可（HalfOpen 会占用探测名额）。
+            // 单 Provider 也必须经过这里，否则一个故障 route 会被所有会话持续轰炸。
+            let permit = self
+                .router
+                .allow_provider_request(&provider.id, app_type_str)
+                .await;
+            let (allowed, used_half_open_permit) = (permit.allowed, permit.used_half_open_permit);
 
             if !allowed {
                 continue;
             }
+            let route_admission_permit = match self
+                .router
+                .acquire_codex_route_admission(provider, app_type_str)
+                .await
+            {
+                Ok(permit) => permit,
+                Err(timeout) => {
+                    attempted_providers += 1;
+                    self.router
+                        .release_permit_neutral(&provider.id, app_type_str, used_half_open_permit)
+                        .await;
+                    let error = ProxyError::AdmissionQueueTimeout {
+                        provider_id: timeout.provider_id,
+                        max_in_flight: timeout.max_in_flight,
+                        waited_ms: timeout.waited_ms,
+                    };
+                    log::warn!(
+                        "[{app_type_str}] Codex admission queue timed out before any upstream send: {error}"
+                    );
+                    last_error = Some(error);
+                    last_provider = Some(provider.clone());
+                    continue;
+                }
+            };
 
             // PRE-SEND 优化器：每个 provider 独立决定是否优化
             // clone body 以避免 Bedrock 优化字段泄漏到非 Bedrock provider（failover 场景）
@@ -1392,6 +1445,7 @@ impl RequestForwarder {
                         claude_api_format,
                         outbound_model,
                         connection_guard: None,
+                        route_admission_permit,
                         stream_reconnect,
                     });
                 }
@@ -1506,6 +1560,7 @@ impl RequestForwarder {
                                         claude_api_format,
                                         outbound_model,
                                         connection_guard: None,
+                                        route_admission_permit,
                                         stream_reconnect,
                                     });
                                 }
@@ -1666,6 +1721,7 @@ impl RequestForwarder {
                                             claude_api_format,
                                             outbound_model,
                                             connection_guard: None,
+                                            route_admission_permit,
                                             stream_reconnect,
                                         });
                                     }
@@ -1837,6 +1893,7 @@ impl RequestForwarder {
                                         claude_api_format,
                                         outbound_model,
                                         connection_guard: None,
+                                        route_admission_permit,
                                         stream_reconnect,
                                     });
                                 }
@@ -2766,12 +2823,23 @@ impl RequestForwarder {
                     request_body,
                     codex_responses_lite_requested,
                 );
-            // 第三方原生 Responses 上游（DeepSeek 等）要求 reasoning 历史以
-            // reasoning_text content 回传；official 的 summary/encrypted_content
-            // 回放字段必须在这里转成可读 content 或丢弃，否则上游 400。
-            super::providers::openai_compat::normalize_third_party_responses_reasoning_items(
-                normalized,
-            )
+            // 第三方原生 Responses 上游中，只有 DeepSeek 要求 reasoning 历史以
+            // reasoning_text content 回传。其他第三方（Sublyx、xAI、vLLM 等）
+            // 走严格 OpenAI Responses schema：reasoning item 的 content 必须为空，
+            // 注入 content 数组会被上游 400（array too long, expected max 0）。
+            // 因此这里只对 DeepSeek 上游做该归一化，其他 provider 保持透传。
+            match super::providers::resolve_reasoning_content_mode(provider) {
+                super::providers::ReasoningContentMode::InjectContent => {
+                    super::providers::openai_compat::normalize_third_party_responses_reasoning_items(
+                        normalized,
+                    )
+                }
+                super::providers::ReasoningContentMode::Passthrough => {
+                    super::providers::openai_compat::normalize_third_party_responses_reasoning_content_for_strict_schema(
+                        normalized,
+                    )
+                }
+            }
         } else {
             request_body
         };
@@ -2935,6 +3003,19 @@ impl RequestForwarder {
                 fields.push(("hosted_tool_projection", projection.clone()));
             }
             super::codex_router_log::append_event("request_prepared", &fields);
+            if codex_responses_to_chat {
+                let projection = summarize_codex_chat_tool_projection(&filtered_body);
+                super::codex_router_log::append_event(
+                    "codex_chat_tools_projected",
+                    &[
+                        ("trace", trace_id.to_string()),
+                        ("session", self.session_id.clone()),
+                        ("model", request_model_for_log.clone()),
+                        ("provider", provider.id.clone()),
+                        ("projection", projection),
+                    ],
+                );
+            }
         }
 
         // Codex OAuth 需要注入的 ChatGPT-Account-Id（在动态 token 获取期间填充）
@@ -2947,7 +3028,12 @@ impl RequestForwarder {
         // 获取认证头（提前准备，用于内联替换），同时保留仅用于日志脱敏的
         // 精确认证材料。实际日志永远不输出这些值。
         let mut log_secrets: Vec<String> = Vec::new();
-        let mut auth_headers = if let Some(mut auth) = adapter.extract_auth(provider) {
+        let mut auth_headers = if let Some(mut auth) = adapter.extract_auth_for_model(
+            provider,
+            outbound_model
+                .as_deref()
+                .or(Some(request_model_for_log.as_str())),
+        ) {
             // GitHub Copilot 特殊处理：从 CopilotAuthManager 获取真实 token
             if auth.strategy == AuthStrategy::GitHubCopilot {
                 if let Some(app_handle) = &self.app_handle {
@@ -3645,13 +3731,16 @@ impl RequestForwarder {
 
         // 流式 Responses 请求提交给下游后，上游仍可能中途掐断 SSE。
         // 在 headers/body 被移动之前捕获一份重放工厂，交给下游转换层做
-        // 有界重连（见 providers::streaming_retry）。工厂只是重放同一
-        // HTTP 请求；是否重试、重试多少次由转换层根据下游状态决定。
+        // 安全重连（见 providers::streaming_retry）。重连始终有界：开启时允许
+        // 默认 5 次恢复，关闭时不重放。无限重试会让 Codex 永久显示 thinking，
+        // 也会在上游不可用时放大并发压力。工厂只重放同一 HTTP 请求。
+        let stream_retry_enabled = crate::settings::get_settings().enable_stream_retry;
         let stream_reconnect = if should_create_responses_stream_reconnector(
             app_type,
             endpoint,
             request_is_streaming,
             resolved_claude_api_format.as_deref(),
+            codex_responses_to_chat,
         ) {
             let first_byte_timeout = if self.streaming_first_byte_timeout.is_zero() {
                 timeout
@@ -3721,7 +3810,12 @@ impl RequestForwarder {
                         })
                     })
                 };
-            Some(StreamReconnector::new(connect, first_byte_timeout))
+            let max_retries = if stream_retry_enabled {
+                RESPONSES_STREAM_MAX_RETRIES
+            } else {
+                0
+            };
+            Some(StreamReconnector::new(connect, first_byte_timeout).with_max_retries(max_retries))
         } else {
             None
         };
@@ -3782,7 +3876,12 @@ impl RequestForwarder {
             })
         };
         let mut response = if matches!(app_type, AppType::Codex) {
-            send_codex_request_with_rate_limit_retry(adapter.name(), send_once).await
+            send_codex_request_with_explicit_rejection_retry(
+                adapter.name(),
+                super::codex_traffic_policy::resolve_codex_traffic_policy(provider),
+                send_once,
+            )
+            .await
         } else {
             send_once().await
         }
@@ -4437,7 +4536,9 @@ impl RequestForwarder {
         if codex_official_auth_passthrough {
             validate_codex_official_authorization(headers)?;
         }
-        let mut auth_headers = if let Some(mut auth) = adapter.extract_auth(provider) {
+        let mut auth_headers = if let Some(mut auth) =
+            adapter.extract_auth_for_model(provider, Some(request_model_for_log.as_str()))
+        {
             if auth.strategy == AuthStrategy::CodexOAuth {
                 if let Some(app_handle) = &self.app_handle {
                     let codex_state = app_handle.state::<CodexOAuthState>();
@@ -4787,7 +4888,9 @@ impl RequestForwarder {
         if codex_official_auth_passthrough {
             validate_codex_official_authorization(headers)?;
         }
-        let mut auth_headers = if let Some(mut auth) = adapter.extract_auth(&provider) {
+        let mut auth_headers = if let Some(mut auth) =
+            adapter.extract_auth_for_model(&provider, Some(request_model_for_log.as_str()))
+        {
             if auth.strategy == AuthStrategy::CodexOAuth {
                 if let Some(app_handle) = &self.app_handle {
                     let codex_state = app_handle.state::<CodexOAuthState>();
@@ -5389,6 +5492,8 @@ impl RequestForwarder {
         }
 
         match error {
+            // 本地 admission 队列已满时，请求尚未发往该上游；可安全切换候选。
+            ProxyError::AdmissionQueueTimeout { .. } => ErrorCategory::Retryable,
             // 网络和上游错误：都应该尝试下一个供应商
             ProxyError::Timeout(_) => ErrorCategory::Retryable,
             ProxyError::ResponsePending(_) => ErrorCategory::NonRetryable,
@@ -5499,6 +5604,13 @@ fn summarize_proxy_error(error: &ProxyError) -> String {
                 None => format!("上游 HTTP {status}"),
             }
         }
+        ProxyError::AdmissionQueueTimeout {
+            provider_id,
+            max_in_flight,
+            waited_ms,
+        } => format!(
+            "本地并发队列等待超时: provider={provider_id}, limit={max_in_flight}, waited_ms={waited_ms}"
+        ),
         ProxyError::Timeout(message) => {
             format!("请求超时: {}", summarize_text_for_log(message, 180))
         }
@@ -6597,11 +6709,14 @@ fn should_create_responses_stream_reconnector(
     endpoint: &str,
     request_is_streaming: bool,
     resolved_claude_api_format: Option<&str>,
+    upstream_is_chat: bool,
 ) -> bool {
     request_is_streaming
         && (resolved_claude_api_format == Some("openai_responses")
-            || (matches!(app_type, AppType::Codex)
-                && super::providers::is_codex_responses_endpoint(endpoint)))
+            || (matches!(app_type, AppType::Codex | AppType::GrokBuild)
+                && (upstream_is_chat
+                    || super::providers::is_codex_responses_endpoint(endpoint)
+                    || super::providers::is_codex_chat_completions_endpoint(endpoint))))
 }
 
 /// 生成 Codex Responses-Lite fallback 的能力缓存 key。
@@ -6774,48 +6889,99 @@ where
     }
 }
 
-/// 对真实上游 HTTP 429 做有界、可等待的同请求重放。
+/// Apply the provider's bounded policy for explicit HTTP 429 and recognized pre-inference rejection responses.
 ///
 /// 这里与 `ResponsePending` 严格分离：只有已经拿到上游明确 HTTP 429 的请求才会
 /// 进入本循环；请求是否到达上游仍不确定的 send/header/body timeout 继续禁止重放。
 /// HTTP 429 表示服务端拒绝处理当前请求，因此复用完全相同的 headers/body 不会重复
 /// 已开始的模型采样或工具调用。明确的订阅/余额耗尽则立即交回外层账号池或路由降级，
 /// 避免在同一账号上等待和空转。
-async fn send_codex_request_with_rate_limit_retry<F, Fut>(
+async fn send_codex_request_with_explicit_rejection_retry<F, Fut>(
     app_tag: &str,
+    traffic_policy: super::codex_traffic_policy::ResolvedCodexTrafficPolicy,
     mut send: F,
 ) -> Result<ProxyResponse, ProxyError>
 where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = Result<ProxyResponse, ProxyError>>,
 {
-    let mut retry_count = 0usize;
-    let mut total_delay = Duration::ZERO;
+    let mut rate_limit_retry_count = 0usize;
+    let mut rate_limit_total_delay = Duration::ZERO;
+    let mut admission_retry_count = 0usize;
 
     loop {
         let response = send().await?;
-        if response.status() != http::StatusCode::TOO_MANY_REQUESTS {
+        let status = response.status();
+        let retryable_status = status == http::StatusCode::TOO_MANY_REQUESTS
+            || (traffic_policy.rejection_retry_mode
+                == crate::provider::CodexRejectionRetryMode::OpencodeEndpointUnavailable
+                && status == http::StatusCode::SERVICE_UNAVAILABLE);
+        if !retryable_status {
             return Ok(response);
         }
 
         let mut response_headers = response.headers().clone();
         let retry_after = parse_retry_after_delay(&response_headers);
         let body_text = read_decoded_error_body(response).await?;
-        let terminal_quota = is_terminal_codex_quota_429(body_text.as_deref());
 
-        if terminal_quota || retry_count >= CODEX_RATE_LIMIT_RETRY_LIMIT {
+        if status == http::StatusCode::SERVICE_UNAVAILABLE {
+            let recognizable_rejection = is_retryable_opencode_admission_503(body_text.as_deref());
+            if !recognizable_rejection
+                || admission_retry_count >= traffic_policy.rejection_max_retries
+            {
+                return Ok(rebuild_consumed_error_response(
+                    status,
+                    &mut response_headers,
+                    body_text,
+                ));
+            }
+
+            let delay = retry_after
+                .unwrap_or_else(|| traffic_policy.rejection_backoff(admission_retry_count))
+                .min(traffic_policy.rejection_max_delay);
+            super::codex_router_log::append_event(
+                "upstream_rejection_retry",
+                &[
+                    (
+                        "provider_policy",
+                        "opencode_endpoint_unavailable".to_string(),
+                    ),
+                    ("attempt", (admission_retry_count + 1).to_string()),
+                    (
+                        "max_retries",
+                        traffic_policy.rejection_max_retries.to_string(),
+                    ),
+                    ("status", status.as_u16().to_string()),
+                    ("delay_ms", delay.as_millis().to_string()),
+                ],
+            );
+            log::warn!(
+                "[{app_tag}] Provider matched the configured OpenCode endpoint-unavailable rejection signature; replaying the same Codex request {}/{} after {}ms",
+                admission_retry_count + 1,
+                traffic_policy.rejection_max_retries,
+                delay.as_millis()
+            );
+            tokio::time::sleep(delay).await;
+            admission_retry_count += 1;
+            continue;
+        }
+
+        let terminal_quota = is_terminal_codex_quota_429(body_text.as_deref());
+        if terminal_quota || rate_limit_retry_count >= traffic_policy.rate_limit_max_retries {
             return Ok(rebuild_consumed_error_response(
-                http::StatusCode::TOO_MANY_REQUESTS,
+                status,
                 &mut response_headers,
                 body_text,
             ));
         }
 
-        let requested_delay = retry_after.unwrap_or_else(|| codex_rate_limit_backoff(retry_count));
-        let remaining_budget = CODEX_RATE_LIMIT_TOTAL_DELAY_BUDGET.saturating_sub(total_delay);
+        let requested_delay =
+            retry_after.unwrap_or_else(|| codex_rate_limit_backoff(rate_limit_retry_count));
+        let remaining_budget =
+            CODEX_RATE_LIMIT_TOTAL_DELAY_BUDGET.saturating_sub(rate_limit_total_delay);
         if remaining_budget.is_zero() {
             return Ok(rebuild_consumed_error_response(
-                http::StatusCode::TOO_MANY_REQUESTS,
+                status,
                 &mut response_headers,
                 body_text,
             ));
@@ -6823,19 +6989,39 @@ where
         let delay = requested_delay
             .min(CODEX_RATE_LIMIT_MAX_SINGLE_DELAY)
             .min(remaining_budget);
+        super::codex_router_log::append_event(
+            "upstream_rate_limit_retry",
+            &[
+                ("status", status.as_u16().to_string()),
+                ("attempt", (rate_limit_retry_count + 1).to_string()),
+                (
+                    "max_retries",
+                    traffic_policy.rate_limit_max_retries.to_string(),
+                ),
+                ("delay_ms", delay.as_millis().to_string()),
+            ],
+        );
         log::warn!(
             "[{app_tag}] 上游明确返回 HTTP 429，CCSM 将重发同一 Codex 请求 {}/{}（等待 {}ms，Retry-After={}）",
-            retry_count + 1,
-            CODEX_RATE_LIMIT_RETRY_LIMIT,
+            rate_limit_retry_count + 1,
+            traffic_policy.rate_limit_max_retries,
             delay.as_millis(),
             retry_after
                 .map(|value| format!("{}ms", value.as_millis()))
                 .unwrap_or_else(|| "missing".to_string())
         );
         tokio::time::sleep(delay).await;
-        total_delay += delay;
-        retry_count += 1;
+        rate_limit_total_delay += delay;
+        rate_limit_retry_count += 1;
     }
+}
+
+fn is_retryable_opencode_admission_503(body: Option<&str>) -> bool {
+    let Some(body) = body else {
+        return false;
+    };
+    let normalized = body.to_ascii_lowercase();
+    normalized.contains("upstream request failed") && normalized.contains("endpoint is unavailable")
 }
 
 fn parse_retry_after_delay(headers: &http::HeaderMap) -> Option<Duration> {
@@ -7470,6 +7656,35 @@ fn summarize_hosted_chat_tool_projection(body: &Value) -> String {
     format!(
         "hosted_tools=[{}];hosted_tool_choice={}",
         hosted_names.join(","),
+        body.get("tool_choice")
+            .map(value_for_shape_log)
+            .unwrap_or_else(|| "absent".to_string())
+    )
+}
+
+fn summarize_codex_chat_tool_projection(body: &Value) -> String {
+    let mut names = body
+        .get("tools")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|tool| {
+            tool.pointer("/function/name")
+                .and_then(Value::as_str)
+                .or_else(|| tool.get("name").and_then(Value::as_str))
+        })
+        .filter(|name| !name.trim().is_empty())
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    names.sort_unstable();
+    names.dedup();
+    format!(
+        "tools={};tool_names=[{}];tool_choice={}",
+        body.get("tools")
+            .and_then(Value::as_array)
+            .map(|tools| tools.len())
+            .unwrap_or(0),
+        names.join(","),
         body.get("tool_choice")
             .map(value_for_shape_log)
             .unwrap_or_else(|| "absent".to_string())
@@ -8143,6 +8358,63 @@ mod tests {
     use http::StatusCode;
     use serde_json::json;
 
+    fn test_codex_traffic_policy(
+        retry_opencode_admission_503: bool,
+    ) -> super::super::codex_traffic_policy::ResolvedCodexTrafficPolicy {
+        let base_url = if retry_opencode_admission_503 {
+            "https://opencode.ai/zen/go/v1"
+        } else {
+            "https://example.test/v1"
+        };
+        let provider = Provider::with_id(
+            "traffic-policy-test".to_string(),
+            "traffic-policy-test".to_string(),
+            json!({"base_url": base_url}),
+            None,
+        );
+        super::super::codex_traffic_policy::resolve_codex_traffic_policy(&provider)
+    }
+
+    #[tokio::test]
+    async fn active_connection_guard_holds_route_admission_until_response_finishes() {
+        let status = Arc::new(RwLock::new(ProxyStatus::default()));
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(1));
+        let permit = semaphore
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("initial admission permit");
+
+        let mut guard = ActiveConnectionGuard::acquire(status.clone()).await;
+        guard.route_admission_permit = Some(permit);
+        assert_eq!(status.read().await.active_connections, 1);
+
+        assert!(
+            semaphore.clone().try_acquire_owned().is_err(),
+            "the route slot must remain occupied while the response guard is alive"
+        );
+
+        drop(guard);
+        let released = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            semaphore.clone().acquire_owned(),
+        )
+        .await
+        .expect("dropping the response guard must release the route slot")
+        .expect("route semaphore should remain open");
+        drop(released);
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if status.read().await.active_connections == 0 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("dropping the response guard must decrement active connections");
+    }
     fn test_provider_with_type(provider_type: Option<&str>) -> Provider {
         Provider {
             id: "provider-1".to_string(),
@@ -8620,24 +8892,42 @@ mod tests {
             "/v1/responses",
             true,
             None,
+            false,
         ));
         assert!(should_create_responses_stream_reconnector(
             &AppType::Claude,
             "/v1/messages",
             true,
             Some("openai_responses"),
+            false,
+        ));
+        assert!(should_create_responses_stream_reconnector(
+            &AppType::Codex,
+            "/v1/responses",
+            true,
+            None,
+            true,
+        ));
+        assert!(should_create_responses_stream_reconnector(
+            &AppType::Codex,
+            "/v1/chat/completions",
+            true,
+            None,
+            false,
         ));
         assert!(!should_create_responses_stream_reconnector(
             &AppType::Codex,
             "/v1/responses",
             false,
             None,
+            true,
         ));
         assert!(!should_create_responses_stream_reconnector(
             &AppType::Codex,
             "/v1/models",
             true,
             None,
+            false,
         ));
     }
 
@@ -12428,27 +12718,31 @@ mod tests {
         let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let attempts_for_send = attempts.clone();
 
-        let result = send_codex_request_with_rate_limit_retry("test", || {
-            let attempts = attempts_for_send.clone();
-            async move {
-                let attempt = attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                if attempt == 0 {
-                    Ok(ProxyResponse::buffered(
+        let result = send_codex_request_with_explicit_rejection_retry(
+            "test",
+            test_codex_traffic_policy(false),
+            || {
+                let attempts = attempts_for_send.clone();
+                async move {
+                    let attempt = attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    if attempt == 0 {
+                        Ok(ProxyResponse::buffered(
                         http::StatusCode::TOO_MANY_REQUESTS,
                         http::HeaderMap::new(),
                         Bytes::from_static(
                             br#"{"error":{"type":"rate_limit_exceeded","message":"slow down"}}"#,
                         ),
                     ))
-                } else {
-                    Ok(ProxyResponse::buffered(
-                        http::StatusCode::OK,
-                        http::HeaderMap::new(),
-                        Bytes::new(),
-                    ))
+                    } else {
+                        Ok(ProxyResponse::buffered(
+                            http::StatusCode::OK,
+                            http::HeaderMap::new(),
+                            Bytes::new(),
+                        ))
+                    }
                 }
-            }
-        })
+            },
+        )
         .await;
 
         assert!(result.is_ok());
@@ -12461,27 +12755,31 @@ mod tests {
         let attempts_for_send = attempts.clone();
         let started_at = tokio::time::Instant::now();
 
-        let result = send_codex_request_with_rate_limit_retry("test", || {
-            let attempts = attempts_for_send.clone();
-            async move {
-                let attempt = attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                if attempt == 0 {
-                    let mut headers = http::HeaderMap::new();
-                    headers.insert(http::header::RETRY_AFTER, "17".parse().unwrap());
-                    Ok(ProxyResponse::buffered(
-                        http::StatusCode::TOO_MANY_REQUESTS,
-                        headers,
-                        Bytes::from_static(br#"{"error":{"type":"rate_limit_exceeded"}}"#),
-                    ))
-                } else {
-                    Ok(ProxyResponse::buffered(
-                        http::StatusCode::OK,
-                        http::HeaderMap::new(),
-                        Bytes::new(),
-                    ))
+        let result = send_codex_request_with_explicit_rejection_retry(
+            "test",
+            test_codex_traffic_policy(false),
+            || {
+                let attempts = attempts_for_send.clone();
+                async move {
+                    let attempt = attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    if attempt == 0 {
+                        let mut headers = http::HeaderMap::new();
+                        headers.insert(http::header::RETRY_AFTER, "17".parse().unwrap());
+                        Ok(ProxyResponse::buffered(
+                            http::StatusCode::TOO_MANY_REQUESTS,
+                            headers,
+                            Bytes::from_static(br#"{"error":{"type":"rate_limit_exceeded"}}"#),
+                        ))
+                    } else {
+                        Ok(ProxyResponse::buffered(
+                            http::StatusCode::OK,
+                            http::HeaderMap::new(),
+                            Bytes::new(),
+                        ))
+                    }
                 }
-            }
-        })
+            },
+        )
         .await;
 
         assert!(result.is_ok());
@@ -12492,11 +12790,121 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn opencode_admission_retry_recovers_after_explicit_503_rejection() {
+        let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let attempts_for_send = attempts.clone();
+        let started_at = tokio::time::Instant::now();
+
+        let response = send_codex_request_with_explicit_rejection_retry(
+            "test",
+            test_codex_traffic_policy(true),
+            || {
+            let attempts = attempts_for_send.clone();
+            async move {
+                if attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                    Ok(ProxyResponse::buffered(
+                        http::StatusCode::SERVICE_UNAVAILABLE,
+                        http::HeaderMap::new(),
+                        Bytes::from_static(
+                            b"Error from provider (Console Go): Upstream request failed: Endpoint is unavailable.",
+                        ),
+                    ))
+                } else {
+                    Ok(ProxyResponse::buffered(
+                        http::StatusCode::OK,
+                        http::HeaderMap::new(),
+                        Bytes::new(),
+                    ))
+                }
+            }
+        })
+        .await
+        .expect("recognized OpenCode admission retry should complete");
+
+        assert_eq!(response.status(), http::StatusCode::OK);
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert_eq!(
+            tokio::time::Instant::now() - started_at,
+            Duration::from_millis(750)
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn opencode_admission_retry_is_strictly_bounded() {
+        let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let attempts_for_send = attempts.clone();
+        let started_at = tokio::time::Instant::now();
+
+        let response = send_codex_request_with_explicit_rejection_retry(
+            "test",
+            test_codex_traffic_policy(true),
+            || {
+            let attempts = attempts_for_send.clone();
+            async move {
+                attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(ProxyResponse::buffered(
+                    http::StatusCode::SERVICE_UNAVAILABLE,
+                    http::HeaderMap::new(),
+                    Bytes::from_static(
+                        b"Error from provider (Console Go): Upstream request failed: Endpoint is unavailable.",
+                    ),
+                ))
+            }
+        })
+        .await
+        .expect("bounded retry should return the final upstream response");
+
+        assert_eq!(response.status(), http::StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 3);
+        assert_eq!(
+            tokio::time::Instant::now() - started_at,
+            Duration::from_millis(2250)
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn opencode_admission_retry_rejects_ambiguous_or_non_opencode_503s() {
+        for (is_opencode, body) in [
+            (true, "generic maintenance outage"),
+            (
+                false,
+                "Error from provider: Upstream request failed: Endpoint is unavailable.",
+            ),
+        ] {
+            let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let attempts_for_send = attempts.clone();
+            let response = send_codex_request_with_explicit_rejection_retry(
+                "test",
+                test_codex_traffic_policy(is_opencode),
+                || {
+                    let attempts = attempts_for_send.clone();
+                    async move {
+                        attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        Ok(ProxyResponse::buffered(
+                            http::StatusCode::SERVICE_UNAVAILABLE,
+                            http::HeaderMap::new(),
+                            Bytes::copy_from_slice(body.as_bytes()),
+                        ))
+                    }
+                },
+            )
+            .await
+            .expect("non-retryable 503 should be returned intact");
+
+            assert_eq!(response.status(), http::StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 1);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn codex_rate_limit_retry_does_not_spin_on_usage_limit_reached() {
         let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let attempts_for_send = attempts.clone();
 
-        let result = send_codex_request_with_rate_limit_retry("test", || {
+        let result = send_codex_request_with_explicit_rejection_retry(
+            "test",
+            test_codex_traffic_policy(false),
+            || {
             let attempts = attempts_for_send.clone();
             async move {
                 attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);

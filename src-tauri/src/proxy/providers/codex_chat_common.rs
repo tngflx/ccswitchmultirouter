@@ -1,7 +1,6 @@
 use serde_json::{json, Map, Value};
 
-const THINK_OPEN_TAG: &str = "<think>";
-const THINK_CLOSE_TAG: &str = "</think>";
+const THINK_TAG_PAIRS: [(&str, &str); 2] = [("<think>", "</think>"), ("<thinking>", "</thinking>")];
 
 // 穷举上游可能的 reasoning 回传字段，优先级：reasoning_content > reasoning(字符串/对象) > reasoning_details。
 // 不依赖 provider meta 的 outputFormat 声明，因此对各家 Chat 兼容接口都能兜底提取。
@@ -211,14 +210,13 @@ pub(crate) fn is_empty_value(value: &Value) -> bool {
 pub(crate) fn split_leading_think_block(text: &str) -> Option<(String, String)> {
     let leading_ws_len = text.len() - text.trim_start().len();
     let after_ws = &text[leading_ws_len..];
-    if !after_ws.starts_with(THINK_OPEN_TAG) {
-        return None;
-    }
-
-    let body_start = leading_ws_len + THINK_OPEN_TAG.len();
-    let close_relative = text[body_start..].find(THINK_CLOSE_TAG)?;
+    let (open_tag, close_tag) = THINK_TAG_PAIRS
+        .iter()
+        .find(|(open, _)| after_ws.starts_with(*open))?;
+    let body_start = leading_ws_len + open_tag.len();
+    let close_relative = text[body_start..].find(close_tag)?;
     let close_start = body_start + close_relative;
-    let answer_start = close_start + THINK_CLOSE_TAG.len();
+    let answer_start = close_start + close_tag.len();
 
     Some((
         text[body_start..close_start].trim().to_string(),
@@ -229,9 +227,22 @@ pub(crate) fn split_leading_think_block(text: &str) -> Option<(String, String)> 
 pub(crate) fn strip_leading_think_open_tag(text: &str) -> Option<String> {
     let leading_ws_len = text.len() - text.trim_start().len();
     let after_ws = &text[leading_ws_len..];
-    after_ws
-        .strip_prefix(THINK_OPEN_TAG)
+    THINK_TAG_PAIRS
+        .iter()
+        .find_map(|(open, _)| after_ws.strip_prefix(open))
         .map(|value| value.trim().to_string())
+}
+
+pub(crate) fn is_think_open_prefix(text: &str) -> bool {
+    THINK_TAG_PAIRS
+        .iter()
+        .any(|(open, _)| open.starts_with(text))
+}
+
+pub(crate) fn starts_with_think_open(text: &str) -> bool {
+    THINK_TAG_PAIRS
+        .iter()
+        .any(|(open, _)| text.starts_with(open))
 }
 
 fn strip_think_answer_separator(text: &str) -> &str {

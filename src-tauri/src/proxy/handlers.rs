@@ -33,7 +33,7 @@ use super::{
             responses_sse_events_from_anthropic_message,
         },
         streaming_codex_chat::{
-            create_responses_sse_stream_from_chat_with_context_and_projection,
+            create_responses_sse_stream_from_chat_with_context_and_projection_and_diagnostics,
             HOSTED_TOOL_STREAM_RESPONSE_HEADER,
         },
         streaming_gemini::create_anthropic_sse_stream_from_gemini,
@@ -3421,6 +3421,7 @@ async fn handle_codex_responses_namespace_restore(
         })
 }
 
+#[allow(dead_code)]
 fn create_codex_chat_sse_stream_from_verified_profile<E: std::error::Error + Send + 'static>(
     stream: impl futures::Stream<Item = Result<Bytes, E>> + Send + 'static,
     tool_context: transform_codex_chat::CodexToolContext,
@@ -3429,6 +3430,30 @@ fn create_codex_chat_sse_stream_from_verified_profile<E: std::error::Error + Sen
     upstream_model: &str,
     db: std::sync::Arc<crate::database::Database>,
     now: i64,
+) -> impl futures::Stream<Item = Result<Bytes, std::io::Error>> + Send {
+    create_codex_chat_sse_stream_from_verified_profile_with_diagnostics(
+        stream,
+        tool_context,
+        provider,
+        public_model,
+        upstream_model,
+        db,
+        now,
+        None,
+    )
+}
+
+fn create_codex_chat_sse_stream_from_verified_profile_with_diagnostics<
+    E: std::error::Error + Send + 'static,
+>(
+    stream: impl futures::Stream<Item = Result<Bytes, E>> + Send + 'static,
+    tool_context: transform_codex_chat::CodexToolContext,
+    provider: &crate::provider::Provider,
+    public_model: &str,
+    upstream_model: &str,
+    db: std::sync::Arc<crate::database::Database>,
+    now: i64,
+    diagnostic_context: Option<super::providers::streaming_codex_chat::HostedToolDiagnosticContext>,
 ) -> impl futures::Stream<Item = Result<Bytes, std::io::Error>> + Send {
     let reasoning_projection = super::providers::resolve_codex_chat_reasoning_projection(
         provider,
@@ -3445,10 +3470,11 @@ fn create_codex_chat_sse_stream_from_verified_profile<E: std::error::Error + Sen
             observe_and_expire_protocol_profile(db.as_ref(), &target, &profile, &observed, now);
         }
     });
-    create_responses_sse_stream_from_chat_with_context_and_projection(
+    create_responses_sse_stream_from_chat_with_context_and_projection_and_diagnostics(
         stream,
         tool_context,
         reasoning_projection,
+        diagnostic_context,
     )
 }
 
@@ -3729,7 +3755,7 @@ async fn handle_codex_chat_to_responses_transform(
 
     if (is_stream || response.is_sse()) && !hosted_tool_loop_response {
         let stream = response.bytes_stream();
-        let sse_stream = create_codex_chat_sse_stream_from_verified_profile(
+        let sse_stream = create_codex_chat_sse_stream_from_verified_profile_with_diagnostics(
             stream,
             tool_context,
             &ctx.provider,
@@ -3737,6 +3763,15 @@ async fn handle_codex_chat_to_responses_transform(
             upstream_model,
             state.db.clone(),
             projection_now,
+            Some(
+                super::providers::streaming_codex_chat::HostedToolDiagnosticContext {
+                    trace_id: None,
+                    session_id: ctx.session_id.clone(),
+                    model: ctx.request_model.clone(),
+                    provider: ctx.provider.id.clone(),
+                    tool: None,
+                },
+            ),
         );
         let sse_stream = record_responses_sse_stream(sse_stream, state.codex_chat_history.clone());
 
@@ -4844,6 +4879,7 @@ fn codex_proxy_error_json(
 fn codex_proxy_error_code(error: &ProxyError) -> &'static str {
     match error {
         ProxyError::ForwardFailed(_) => "cc_switch_forward_failed",
+        ProxyError::AdmissionQueueTimeout { .. } => "cc_switch_admission_queue_timeout",
         ProxyError::Timeout(_) | ProxyError::StreamIdleTimeout(_) => "cc_switch_timeout",
         ProxyError::ResponsePending(_) => "cc_switch_response_pending",
         ProxyError::NoAvailableProvider => "cc_switch_no_available_provider",
@@ -5726,7 +5762,7 @@ async fn log_usage(
     };
 
     let dedup_scope = super::usage::parser::dedup_scope_for_app(app_type, provider_id);
-    let request_id = usage.dedup_request_id(dedup_scope);
+    let request_id = usage.dedup_request_id_with_session(dedup_scope, session_id.as_deref());
 
     if let Err(e) = logger.log_with_calculation(
         request_id,

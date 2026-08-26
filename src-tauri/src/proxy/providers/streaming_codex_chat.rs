@@ -1,9 +1,12 @@
+#![allow(dead_code)]
+
 //! OpenAI Chat Completions SSE → OpenAI Responses SSE conversion.
 
 use super::codex_responses_sse as sse;
 use super::{
     codex_chat_common::{
-        extract_reasoning_field_text, split_leading_think_block, strip_leading_think_open_tag,
+        extract_reasoning_field_text, is_think_open_prefix, split_leading_think_block,
+        starts_with_think_open, strip_leading_think_open_tag,
     },
     codex_terminal::{classify_chat_terminal, ChatTerminalEvidence, TerminalDisposition},
     transform_codex_chat::{
@@ -93,6 +96,52 @@ pub(crate) struct HostedToolDiagnosticContext {
     pub(crate) tool: Option<&'static str>,
 }
 
+fn log_chat_tool_result(
+    state: &ChatToResponsesState,
+    diagnostic_context: Option<&HostedToolDiagnosticContext>,
+) {
+    let Some(context) = diagnostic_context else {
+        return;
+    };
+    let mut names = state
+        .completed_tool_calls()
+        .into_iter()
+        .map(|call| call.name)
+        .collect::<Vec<_>>();
+    names.sort_unstable();
+    names.dedup();
+    let unrecognized = state
+        .unrecognized_tool_fields
+        .iter()
+        .map(|(field, count)| format!("{field}:{count}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    crate::proxy::codex_router_log::append_event(
+        "codex_chat_tool_result",
+        &[
+            ("trace", context.trace_id.clone().unwrap_or_default()),
+            ("session", context.session_id.clone()),
+            ("model", context.model.clone()),
+            ("provider", context.provider.clone()),
+            ("tool_calls", names.len().to_string()),
+            ("tool_names", names.join(",")),
+            (
+                "finish_reason",
+                state.finish_reason.clone().unwrap_or_default(),
+            ),
+            ("dropped_tool_calls", state.dropped_tool_calls.to_string()),
+            (
+                "text_only",
+                (names.is_empty()
+                    && state.dropped_tool_calls == 0
+                    && state.unrecognized_tool_fields.is_empty())
+                .to_string(),
+            ),
+            ("unrecognized_tool_fields", unrecognized),
+        ],
+    );
+}
+
 fn should_log_hosted_tool_not_called(
     state: &ChatToResponsesState,
     diagnostic_context: Option<&HostedToolDiagnosticContext>,
@@ -124,6 +173,7 @@ struct ChatToResponsesState {
     reasoning_projection: ReasoningProjection,
     /// 本回合因缺少合法函数名而被丢弃的工具调用数（见 `finalize_tools`）。
     dropped_tool_calls: usize,
+    unrecognized_tool_fields: BTreeMap<String, usize>,
     response_identity_locked: bool,
 }
 
@@ -147,6 +197,7 @@ impl Default for ChatToResponsesState {
             tool_context: CodexToolContext::default(),
             reasoning_projection: ReasoningProjection::ReasoningSummary,
             dropped_tool_calls: 0,
+            unrecognized_tool_fields: BTreeMap::new(),
             response_identity_locked: false,
         }
     }
@@ -309,6 +360,15 @@ impl ChatToResponsesState {
                     events.extend(
                         self.push_tool_call_delta(tool_call, reasoning_for_tool_call.as_deref()),
                     );
+                }
+            } else if let Some(object) = delta.as_object() {
+                for field in ["function_call", "tool_call", "tool_use", "output_tool_call"] {
+                    if object.contains_key(field) {
+                        *self
+                            .unrecognized_tool_fields
+                            .entry(field.to_string())
+                            .or_default() += 1;
+                    }
                 }
             }
         }
@@ -981,11 +1041,11 @@ fn leading_think_prefix_decision(buffer: &str) -> ThinkPrefixDecision {
         return ThinkPrefixDecision::NeedMore;
     }
 
-    if trimmed.starts_with("<think>") {
+    if starts_with_think_open(trimmed) {
         return ThinkPrefixDecision::Reasoning;
     }
 
-    if "<think>".starts_with(trimmed) {
+    if is_think_open_prefix(trimmed) {
         return ThinkPrefixDecision::NeedMore;
     }
 
@@ -1020,6 +1080,22 @@ pub fn create_responses_sse_stream_from_chat_with_context_and_projection<
     stream: impl Stream<Item = Result<Bytes, E>> + Send + 'static,
     tool_context: CodexToolContext,
     reasoning_projection: ReasoningProjection,
+) -> impl Stream<Item = Result<Bytes, std::io::Error>> + Send {
+    create_responses_sse_stream_from_chat_with_context_and_projection_and_diagnostics(
+        stream,
+        tool_context,
+        reasoning_projection,
+        None,
+    )
+}
+
+pub(crate) fn create_responses_sse_stream_from_chat_with_context_and_projection_and_diagnostics<
+    E: std::error::Error + Send + 'static,
+>(
+    stream: impl Stream<Item = Result<Bytes, E>> + Send + 'static,
+    tool_context: CodexToolContext,
+    reasoning_projection: ReasoningProjection,
+    diagnostic_context: Option<HostedToolDiagnosticContext>,
 ) -> impl Stream<Item = Result<Bytes, std::io::Error>> + Send {
     async_stream::stream! {
         let mut buffer = String::new();
@@ -1112,6 +1188,7 @@ pub fn create_responses_sse_stream_from_chat_with_context_and_projection<
                     Some("stream_truncated".to_string()),
                 ));
             }
+            log_chat_tool_result(&state, diagnostic_context.as_ref());
         }
     }
 }
@@ -1272,6 +1349,8 @@ where
                     );
                 }
             }
+
+            log_chat_tool_result(&state, diagnostic_context.as_ref());
 
             if stream_failed || state.completed {
                 break;
@@ -1666,14 +1745,15 @@ mod tests {
         assert!(reasoning_pos < message_pos);
     }
 
-    #[tokio::test]
-    async fn converts_inline_think_chat_sse_to_reasoning_without_leaking_tags() {
-        let output = collect(vec![
-            "data: {\"id\":\"chatcmpl_minimax\",\"created\":123,\"model\":\"MiniMax-M2.7\",\"choices\":[{\"delta\":{\"role\":\"assistant\",\"content\":\"<think>\\nNeed\"}}]}\n\n",
-            "data: {\"id\":\"chatcmpl_minimax\",\"created\":123,\"model\":\"MiniMax-M2.7\",\"choices\":[{\"delta\":{\"content\":\" context.</think>\\n\\npong\"},\"finish_reason\":\"stop\"}]}\n\n",
-            "data: {\"id\":\"chatcmpl_minimax\",\"created\":123,\"model\":\"MiniMax-M2.7\",\"choices\":[],\"usage\":{\"prompt_tokens\":4,\"completion_tokens\":6,\"total_tokens\":10,\"completion_tokens_details\":{\"reasoning_tokens\":3}}}\n\n",
-        ])
-        .await;
+    async fn assert_inline_think_tag_is_projected(open_tag: &str, close_tag: &str) {
+        let first = format!(
+            "data: {{\"id\":\"chatcmpl_minimax\",\"created\":123,\"model\":\"MiniMax-M2.7\",\"choices\":[{{\"delta\":{{\"role\":\"assistant\",\"content\":\"{open_tag}\\nNeed\"}}}}]}}\n\n"
+        );
+        let second = format!(
+            "data: {{\"id\":\"chatcmpl_minimax\",\"created\":123,\"model\":\"MiniMax-M2.7\",\"choices\":[{{\"delta\":{{\"content\":\" context.{close_tag}\\n\\npong\"}},\"finish_reason\":\"stop\"}}]}}\n\n"
+        );
+        let usage = "data: {\"id\":\"chatcmpl_minimax\",\"created\":123,\"model\":\"MiniMax-M2.7\",\"choices\":[],\"usage\":{\"prompt_tokens\":4,\"completion_tokens\":6,\"total_tokens\":10,\"completion_tokens_details\":{\"reasoning_tokens\":3}}}\n\n";
+        let output = collect(vec![&first, &second, usage]).await;
 
         assert!(output.contains("event: response.reasoning_summary_text.delta"));
         assert!(output.contains("event: response.reasoning_summary_text.done"));
@@ -1681,9 +1761,19 @@ mod tests {
         assert!(output.contains("Need context."));
         assert!(output.contains("\"text\":\"pong\""));
         assert!(output.contains("\"reasoning_tokens\":3"));
-        assert!(!output.contains("<think>"));
-        assert!(!output.contains("</think>"));
+        assert!(!output.contains(open_tag));
+        assert!(!output.contains(close_tag));
         assert!(output.contains("event: response.completed"));
+    }
+
+    #[tokio::test]
+    async fn converts_inline_think_chat_sse_to_reasoning_without_leaking_tags() {
+        assert_inline_think_tag_is_projected("<think>", "</think>").await;
+    }
+
+    #[tokio::test]
+    async fn converts_inline_thinking_chat_sse_to_reasoning_without_leaking_tags() {
+        assert_inline_think_tag_is_projected("<thinking>", "</thinking>").await;
     }
 
     #[tokio::test]

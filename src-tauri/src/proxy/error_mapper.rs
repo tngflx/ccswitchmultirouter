@@ -25,6 +25,9 @@ pub fn map_proxy_error_to_status(error: &ProxyError) -> u16 {
         // 上游错误：使用实际状态码
         ProxyError::UpstreamError { status, .. } => *status,
 
+        // 本地 admission 队列耗尽：请求尚未发往上游，明确返回 503。
+        ProxyError::AdmissionQueueTimeout { .. } => 503,
+
         // 超时错误：504 Gateway Timeout
         ProxyError::Timeout(_) | ProxyError::StreamIdleTimeout(_) => 504,
 
@@ -76,6 +79,13 @@ pub fn get_error_message(error: &ProxyError) -> String {
                 format!("上游错误 ({status})")
             }
         }
+        ProxyError::AdmissionQueueTimeout {
+            provider_id,
+            max_in_flight,
+            waited_ms,
+        } => format!(
+            "本地并发队列等待超时: Provider {provider_id} 的 {max_in_flight} 个槽在 {waited_ms}ms 内均未释放；请求未发送到该上游"
+        ),
         ProxyError::Timeout(msg) => format!("请求超时: {msg}"),
         ProxyError::ResponsePending(msg) => format!("上游请求可能仍在处理中: {msg}"),
         ProxyError::ForwardFailed(msg) => format!("转发失败: {msg}"),

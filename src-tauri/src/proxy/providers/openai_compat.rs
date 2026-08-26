@@ -289,6 +289,47 @@ pub(crate) fn normalize_codex_responses_passthrough_request_for_transport(
 /// - 可读文本优先级：`content`（字符串或带 text 的 parts）> `summary`；
 ///   两者都无可读文本（只剩不透明密文）时直接丢弃该 item——密文对任何第三方
 ///   都不可用，保留只会招致拒绝。
+///
+/// Remove raw `reasoning.content` for strict third-party Responses upstreams.
+///
+/// Sublyx and other strict OpenAI Responses gateways accept at most an empty
+/// `content` array on reasoning input items. Codex replay history can carry a
+/// readable `reasoning_text` part there, so preserve that text as `summary`
+/// before removing `content`.
+pub(crate) fn normalize_third_party_responses_reasoning_content_for_strict_schema(
+    request_body: Value,
+) -> Value {
+    let Value::Object(mut body) = request_body else {
+        return request_body;
+    };
+
+    let Some(items) = body.get_mut("input").and_then(Value::as_array_mut) else {
+        return Value::Object(body);
+    };
+
+    for item in items.iter_mut() {
+        let Value::Object(object) = item else {
+            continue;
+        };
+        if object.get("type").and_then(Value::as_str) != Some("reasoning") {
+            continue;
+        }
+
+        let removed_content = object.remove("content");
+        if !codex_oauth_reasoning_summary_has_text(object.get("summary")) {
+            if let Some(summary) = removed_content
+                .as_ref()
+                .and_then(codex_oauth_reasoning_content_to_summary)
+            {
+                object.insert("summary".to_string(), summary);
+            }
+        }
+        object.remove("internal_chat_message_metadata_passthrough");
+    }
+
+    Value::Object(body)
+}
+
 pub(crate) fn normalize_third_party_responses_reasoning_items(request_body: Value) -> Value {
     let Value::Object(mut body) = request_body else {
         return request_body;
@@ -2637,6 +2678,67 @@ mod tests {
         assert_eq!(input.len(), 1);
         assert_eq!(input[0]["role"], "user");
         assert_eq!(input[0]["content"][0]["text"], "continue");
+    }
+
+    #[test]
+    fn strict_third_party_responses_reasoning_content_moves_to_summary() {
+        // Sublyx rejects reasoning.content with:
+        // "array too long. Expected an array with maximum length 0".
+        // Preserve readable text as summary, then remove the forbidden field.
+        let body = json!({
+            "model": "gpt-5.6-sol",
+            "input": [
+                {
+                    "type": "reasoning",
+                    "id": "rs_sublyx",
+                    "content": [{ "type": "reasoning_text", "text": "Check the route first." }],
+                    "internal_chat_message_metadata_passthrough": { "kind": "desktop" }
+                },
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{ "type": "input_text", "text": "continue" }]
+                }
+            ]
+        });
+
+        let normalized = normalize_third_party_responses_reasoning_content_for_strict_schema(body);
+        let item = &normalized["input"][0];
+
+        assert!(item.get("content").is_none());
+        assert_eq!(
+            item["summary"],
+            json!([{ "type": "summary_text", "text": "Check the route first." }])
+        );
+        assert!(item
+            .get("internal_chat_message_metadata_passthrough")
+            .is_none());
+        assert_eq!(normalized["input"][1]["role"], "user");
+    }
+
+    #[test]
+    fn strict_third_party_responses_reasoning_preserves_existing_summary_and_encryption() {
+        let encrypted = "gAAAAA".to_string() + &"a".repeat(64);
+        let body = json!({
+            "model": "gpt-5.6-sol",
+            "input": [{
+                "type": "reasoning",
+                "id": "rs_sublyx",
+                "summary": [{ "type": "summary_text", "text": "Already summarized." }],
+                "content": [{ "type": "reasoning_text", "text": "Raw reasoning." }],
+                "encrypted_content": encrypted
+            }]
+        });
+
+        let normalized = normalize_third_party_responses_reasoning_content_for_strict_schema(body);
+        let item = &normalized["input"][0];
+
+        assert!(item.get("content").is_none());
+        assert_eq!(
+            item["summary"],
+            json!([{ "type": "summary_text", "text": "Already summarized." }])
+        );
+        assert_eq!(item["encrypted_content"], encrypted);
     }
 
     #[test]

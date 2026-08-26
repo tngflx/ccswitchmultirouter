@@ -64,6 +64,13 @@ pub enum ProxyError {
     #[error("无效的请求: {0}")]
     InvalidRequest(String),
 
+    #[error("本地并发队列等待超时: Provider {provider_id} 的 {max_in_flight} 个并发槽在 {waited_ms}ms 内均未释放")]
+    AdmissionQueueTimeout {
+        provider_id: String,
+        max_in_flight: usize,
+        waited_ms: u64,
+    },
+
     #[error("超时: {0}")]
     Timeout(String),
 
@@ -157,6 +164,9 @@ impl IntoResponse for ProxyError {
                         (StatusCode::UNPROCESSABLE_ENTITY, self.to_string())
                     }
                     ProxyError::InvalidRequest(_) => (StatusCode::BAD_REQUEST, self.to_string()),
+                    ProxyError::AdmissionQueueTimeout { .. } => {
+                        (StatusCode::SERVICE_UNAVAILABLE, self.to_string())
+                    }
                     ProxyError::Timeout(_) => (StatusCode::GATEWAY_TIMEOUT, self.to_string()),
                     ProxyError::ResponsePending(_) => {
                         (StatusCode::FAILED_DEPENDENCY, self.to_string())
@@ -200,7 +210,10 @@ impl ProxyError {
     ///
     /// `ResponsePending` 的结果未知，不能用 `Retry-After` 暗示客户端自动重放。
     pub fn retry_after_secs(&self) -> Option<u64> {
-        None
+        match self {
+            Self::AdmissionQueueTimeout { .. } => Some(1),
+            _ => None,
+        }
     }
 }
 
