@@ -5,6 +5,8 @@ import {
   extractCodexModelName,
   hasCommonConfigSnippet,
   isCodexRemoteCompactionEnabled,
+  isCodexGuardianV2Disabled,
+  setCodexGuardianV2Disabled,
   setCodexModelName,
   setCodexRemoteCompaction,
   updateCommonConfigSnippet,
@@ -247,5 +249,44 @@ describe("common config snippet prototype-pollution guards", () => {
 
     expect(result.error).toBeUndefined();
     expect(({} as Record<string, unknown>).polluted).toBe("YES");
+  });
+});
+
+describe("Codex Guardian v2 compatibility helpers", () => {
+  it("adds and removes the scalar override while preserving features", () => {
+    const input = `[features]\ngoals = true\n`;
+    const disabled = setCodexGuardianV2Disabled(input, true);
+    expect(disabled).toContain("goals = true");
+    expect(disabled).toContain("guardianv2 = false");
+    expect(isCodexGuardianV2Disabled(disabled)).toBe(true);
+    const restored = setCodexGuardianV2Disabled(disabled, false);
+    expect(restored).toContain("goals = true");
+    expect(restored).not.toContain("guardianv2");
+  });
+
+  it("replaces a structured guardian value without leaving child fields", () => {
+    const input = `[features]\nguardianv2 = {\n  enabled = true,\n  review_scope = { computer_use_only = true }\n}\nother = true\n`;
+    const disabled = setCodexGuardianV2Disabled(input, true);
+    expect(disabled).toContain("guardianv2 = false");
+    expect(disabled).not.toContain("review_scope");
+    expect(disabled).toContain("other = true");
+    expect(isCodexGuardianV2Disabled(disabled)).toBe(true);
+  });
+
+  it("replaces a nested guardian table without creating a scalar/table conflict", () => {
+    const input = `[features.guardianv2]\nenabled = true\nreview_scope = { computer_use_only = true }\n\n[features]\ngoals = true\n`;
+    const disabled = setCodexGuardianV2Disabled(input, true);
+    expect(disabled).toContain("[features]");
+    expect(disabled).toContain("guardianv2 = false");
+    expect(disabled).not.toContain("[features.guardianv2]");
+    expect(disabled).not.toContain("review_scope");
+  });
+
+  it("fails closed for structured Guardian values", () => {
+    expect(
+      isCodexGuardianV2Disabled(
+        "[features]\nguardianv2 = { enabled = true }\n",
+      ),
+    ).toBe(false);
   });
 });
