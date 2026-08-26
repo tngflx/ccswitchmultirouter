@@ -1,4 +1,4 @@
-/**
+﻿/**
  * Codex 预设供应商配置模板
  */
 import { ProviderCategory } from "../types";
@@ -481,13 +481,13 @@ requires_openai_auth = true`,
   },
   {
     name: "RunAPI",
-    websiteUrl: "https://runapi.co",
-    apiKeyUrl: "https://runapi.co/register?aff=iOKB",
+    websiteUrl: "https://runapi.host",
+    apiKeyUrl: "https://runapi.host/register?aff=iOKB",
     category: "aggregator",
     auth: generateThirdPartyAuth(""),
     config: generateThirdPartyConfig(
       "runapi",
-      "https://runapi.co/v1",
+      "https://runapi.host/v1",
       "gpt-5.6-sol",
     ),
     isPartner: true,
@@ -623,17 +623,20 @@ requires_openai_auth = true`,
   },
   {
     name: "TeamoRouter",
-    websiteUrl: "https://teamorouter.com",
+    websiteUrl: "https://teamorouter.cn",
     apiKeyUrl:
-      "https://teamorouter.com/?utm_source=cc_switch&utm_medium=referral&utm_campaign=ai_directory",
+      "https://teamorouter.cn/?utm_source=cc_switch&utm_medium=referral&utm_campaign=ai_directory",
     category: "aggregator",
     auth: generateThirdPartyAuth(""),
     config: generateThirdPartyConfig(
       "teamorouter",
-      "https://api.teamorouter.com/v1",
+      "https://api.teamorouter.cn/v1",
       "gpt-5.6-sol",
     ),
-    endpointCandidates: ["https://api.teamorouter.com/v1"],
+    endpointCandidates: [
+      "https://api.teamorouter.cn/v1",
+      "https://api.teamorouter.com/v1",
+    ],
     isPartner: true,
     partnerPromotionKey: "teamorouter",
     icon: "teamorouter",
@@ -1136,8 +1139,7 @@ wire_api = "responses"`,
         supportsImage: false,
         reasoning: deepSeekV4Reasoning,
       },
-      // 官方预计 2026-08 初开通 pro 的 Codex 集成（官方 models.json 已含该条目），
-      // 在那之前切到 pro 会上游报错
+      // pro 已于 2026-08 开通 Responses/Codex 集成（官方 catalog 条目与 flash 仅差 priority）
       {
         model: "deepseek-v4-pro",
         displayName: "DeepSeek V4 Pro",
@@ -1951,13 +1953,13 @@ requires_openai_auth = true`,
   },
   {
     name: "RunAPI",
-    websiteUrl: "https://runapi.co",
-    apiKeyUrl: "https://runapi.co",
+    websiteUrl: "https://runapi.host",
+    apiKeyUrl: "https://runapi.host/register?aff=iOKB",
     category: "aggregator",
     auth: generateThirdPartyAuth(""),
     config: generateThirdPartyConfig(
       "runapi",
-      "https://runapi.co/v1",
+      "https://runapi.host/v1",
       "gpt-5.5",
     ),
     isPartner: true,
@@ -2047,5 +2049,79 @@ base_url = "https://cc-api.pipellm.ai/v1"`,
     ),
     endpointCandidates: ["https://api.therouter.ai/v1"],
     category: "aggregator",
+  },
+  {
+    name: "PPIO",
+    websiteUrl: "https://ppio.com",
+    apiKeyUrl: "https://ppio.com/settings/key-management",
+    auth: generateThirdPartyAuth(""),
+    config: generateThirdPartyConfig(
+      "ppio",
+      "https://api.ppio.com/openai/v1",
+      "deepseek/deepseek-v4-flash-0731",
+    ),
+    endpointCandidates: ["https://api.ppio.com/openai/v1"],
+    apiFormat: "openai_chat",
+    modelCatalog: modelCatalog([
+      {
+        model: "deepseek/deepseek-v4-flash-0731",
+        displayName: "Deepseek V4 Flash 0731",
+        contextWindow: 1048576,
+        inputModalities: ["text"],
+      },
+    ]),
+    codexChatReasoning: {
+      supportsThinking: true,
+      supportsEffort: false,
+      thinkingParam: "thinking",
+      effortParam: "none",
+      outputFormat: "reasoning_content",
+    },
+    category: "aggregator",
+    icon: "ppio",
+    iconColor: "#2874FF",
+  },
+  {
+    name: "JieKou AI",
+    websiteUrl: "https://jiekou.ai/#model-library",
+    apiKeyUrl: "https://jiekou.ai/settings/key-management",
+    auth: generateThirdPartyAuth(""),
+    config: generateThirdPartyConfig(
+      "jiekou",
+      "https://api.jiekou.ai/openai/v1",
+      "claude-fable-5",
+    ),
+    endpointCandidates: ["https://api.jiekou.ai/openai/v1"],
+    apiFormat: "openai_chat",
+    modelCatalog: modelCatalog([
+      {
+        model: "claude-fable-5",
+        displayName: "Claude Fable 5",
+        contextWindow: 1000000,
+        inputModalities: ["text", "image"],
+      },
+    ]),
+    category: "aggregator",
+    icon: "jiekou",
+    iconColor: "#000000",
+  },
+  {
+    name: "XycAi",
+    websiteUrl: "https://xycai.us",
+    apiKeyUrl: "https://xycai.us/register?aff=Uhu9",
+    category: "aggregator",
+    auth: generateThirdPartyAuth(""),
+    config: generateThirdPartyConfig(
+      "xycai",
+      "https://apicdn.xycai.us/v1",
+      "gpt-5.6-sol",
+    ),
+    endpointCandidates: [
+      "https://apicdn.xycai.us/v1",
+      "https://apicdn.xyc.ai/v1",
+    ],
+    isPartner: true,
+    partnerPromotionKey: "xycai",
+    icon: "xycai",
   },
 ];
