@@ -16,6 +16,8 @@ const CDP_CONNECT_TIMEOUT: Duration = Duration::from_secs(4);
 const CDP_COMMAND_TIMEOUT: Duration = Duration::from_secs(4);
 const MODEL_PICKER_PATCH_KEY: &str = "__ccSwitchCodexAppCompatibilityV5";
 const REMEMBERED_CODEX_DESKTOP_EXECUTABLE_FILENAME: &str = "codex-desktop-executable.json";
+const CODEX_MODEL_PICKER_CORE_SCRIPT: &str = include_str!("resources/codex_model_picker_core.js");
+const CODEX_APP_COMPAT_TEMPLATE: &str = include_str!("resources/codex_app_compat_template.js");
 #[cfg(any(target_os = "macos", test))]
 const CODEX_DESKTOP_BUNDLE_IDENTIFIER: &str = "com.openai.codex";
 /// Codex App 历史目录与模型兼容层安装命令的执行结果。
@@ -300,7 +302,6 @@ fn codex_model_entries_from_catalog_value(catalog: &Value) -> (Vec<String>, Vec<
     };
 
     let mut seen = BTreeSet::new();
-    let mut names = Vec::new();
     let mut projected = Vec::new();
 
     for entry in entries {
@@ -310,11 +311,45 @@ fn codex_model_entries_from_catalog_value(catalog: &Value) -> (Vec<String>, Vec<
         if !seen.insert(model_name.clone()) {
             continue;
         }
-        names.push(model_name.clone());
-        projected.push(project_codex_model_descriptor(entry, &model_name));
+        let descriptor = project_codex_model_descriptor(entry, &model_name);
+        projected.push((model_name, descriptor));
     }
 
-    (names, projected)
+    let has_explicit_order = projected.iter().any(|(_, model)| {
+        model
+            .get("sortIndex")
+            .or_else(|| model.get("sort_index"))
+            .and_then(Value::as_u64)
+            .is_some()
+    });
+    let has_provider_metadata = projected
+        .iter()
+        .any(|(_, model)| !provider_name_from_entry(model).is_empty());
+    if !has_explicit_order && has_provider_metadata {
+        // Codex's picker is a flat list. Keep providers contiguous and sort models within
+        // each provider so the provider prefix acts as a predictable visual divider.
+        projected.sort_by(|(left_name, left), (right_name, right)| {
+            provider_name_from_entry(left)
+                .to_ascii_lowercase()
+                .cmp(&provider_name_from_entry(right).to_ascii_lowercase())
+                .then_with(|| {
+                    display_name_from_entry(left)
+                        .to_ascii_lowercase()
+                        .cmp(&display_name_from_entry(right).to_ascii_lowercase())
+                })
+                .then_with(|| left_name.cmp(right_name))
+        });
+    }
+
+    let names = projected
+        .iter()
+        .map(|(name, _)| name.clone())
+        .collect::<Vec<_>>();
+    let models = projected
+        .into_iter()
+        .map(|(_, model)| model)
+        .collect::<Vec<_>>();
+    (names, models)
 }
 
 /// 从单个 catalog 条目中提取稳定模型名，兼容官方/旧版字段别名。
@@ -335,28 +370,85 @@ fn project_codex_model_descriptor(entry: &Value, model_name: &str) -> Value {
     for key in ["model", "slug", "id", "name"] {
         object.insert(key.to_string(), Value::String(model_name.to_string()));
     }
-    if !object.contains_key("displayName") {
-        let display = object
-            .get("display_name")
-            .and_then(Value::as_str)
-            .unwrap_or(model_name);
-        object.insert(
-            "displayName".to_string(),
-            Value::String(display.to_string()),
-        );
-    }
+    let provider_name = provider_name_from_entry(&Value::Object(object.clone()));
+    let display = object
+        .get("displayName")
+        .and_then(Value::as_str)
+        .or_else(|| object.get("display_name").and_then(Value::as_str))
+        .unwrap_or(model_name);
+    object.insert(
+        "displayName".to_string(),
+        Value::String(provider_labelled_display_name(&provider_name, display)),
+    );
     if !object.contains_key("display_name") {
-        let display = object
-            .get("displayName")
-            .and_then(Value::as_str)
-            .unwrap_or(model_name);
         object.insert(
             "display_name".to_string(),
-            Value::String(display.to_string()),
+            object
+                .get("displayName")
+                .cloned()
+                .unwrap_or_else(|| Value::String(model_name.to_string())),
         );
+    }
+    if !provider_name.is_empty() {
+        object.insert("providerName".to_string(), Value::String(provider_name));
     }
     object.insert("hidden".to_string(), Value::Bool(false));
     Value::Object(object)
+}
+
+fn provider_name_from_entry(entry: &Value) -> String {
+    [
+        "providerName",
+        "provider_name",
+        "targetProviderName",
+        "target_provider_name",
+    ]
+    .into_iter()
+    .find_map(|key| {
+        entry
+            .get(key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string)
+    })
+    .or_else(|| {
+        entry.get("provider").and_then(|provider| {
+            provider
+                .as_str()
+                .or_else(|| provider.get("name").and_then(Value::as_str))
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToString::to_string)
+        })
+    })
+    .unwrap_or_default()
+}
+
+fn display_name_from_entry(entry: &Value) -> String {
+    entry
+        .get("displayName")
+        .and_then(Value::as_str)
+        .or_else(|| entry.get("display_name").and_then(Value::as_str))
+        .or_else(|| entry.get("model").and_then(Value::as_str))
+        .unwrap_or_default()
+        .trim()
+        .to_string()
+}
+
+fn provider_labelled_display_name(provider_name: &str, display_name: &str) -> String {
+    if provider_name.is_empty() || display_name.is_empty() {
+        return display_name.to_string();
+    }
+    let prefix = format!("[{provider_name}]");
+    if display_name
+        .get(..prefix.len())
+        .is_some_and(|candidate| candidate.eq_ignore_ascii_case(&prefix))
+    {
+        display_name.to_string()
+    } else {
+        format!("{prefix} {display_name}")
+    }
 }
 
 /// 读取当前 Codex 默认模型，用于 renderer 动态配置的 default_model。
@@ -645,352 +737,22 @@ fn cdp_command_result(response: Value, method: &str) -> Result<Value, String> {
 /// 先通过明确的模型门特征；不能把 React Fiber、Intl context 或普通 API 对象当成模型
 /// 容器遍历和改写。
 fn model_picker_patch_core_script() -> &'static str {
-    r#"
-  const currentPayload = () => state.payload || {};
-  const modelNames = () => {
-    const payload = currentPayload();
-    return Array.from(new Set([payload.defaultModel, ...(payload.modelNames || [])].filter((name) => typeof name === "string" && name.trim()).map((name) => name.trim())));
-  };
-  const descriptorFor = (name) => {
-    const payload = currentPayload();
-    const existing = (payload.models || []).find((model) => model && model.model === name);
-    return {
-      model: name,
-      id: name,
-      slug: name,
-      name,
-      displayName: name,
-      hidden: false,
-      ...(existing || {}),
-      hidden: false,
-    };
-  };
-  const stringArray = (value) => Array.isArray(value) && value.every((item) => typeof item === "string");
-  const modelArray = (value, allowEmpty = false) => Array.isArray(value) && (allowEmpty || value.length > 0) && value.every((item) => item && typeof item === "object" && typeof item.model === "string");
-  const patchModelNameArray = (models) => {
-    if (!stringArray(models)) return false;
-    let changed = false;
-    for (const name of modelNames()) {
-      if (!models.includes(name)) {
-        models.push(name);
-        changed = true;
-      }
-    }
-    return changed;
-  };
-  const patchModelArray = (models, allowEmpty = false) => {
-    if (!modelArray(models, allowEmpty)) return false;
-    const names = modelNames();
-    const existing = new Map(models.map((model) => [model.model, model]));
-    let changed = false;
-    for (const model of models) {
-      if (names.includes(model.model) && model.hidden !== false) {
-        model.hidden = false;
-        changed = true;
-      }
-    }
-    for (const name of names) {
-      if (!existing.has(name)) {
-        models.push(descriptorFor(name));
-        changed = true;
-      }
-    }
-    return changed;
-  };
-  const removeHiddenNames = (container, key) => {
-    if (!Array.isArray(container?.[key])) return false;
-    const names = new Set(modelNames());
-    const before = container[key].length;
-    container[key] = container[key].filter((name) => !names.has(name));
-    return before !== container[key].length;
-  };
-  const patchNameSet = (setLike) => {
-    if (!(setLike instanceof Set)) return false;
-    let changed = false;
-    for (const name of modelNames()) {
-      if (!setLike.has(name)) {
-        setLike.add(name);
-        changed = true;
-      }
-    }
-    return changed;
-  };
-  const patchModelContainer = (value) => {
-    if (!value || typeof value !== "object") return false;
-    const looksLikeModelGate = "availableModels" in value || "available_models" in value || "useHiddenModels" in value || "use_hidden_models" in value || "defaultModel" in value || "default_model" in value;
-    if (!looksLikeModelGate) return false;
-
-    let changed = false;
-    if (patchModelArray(value.models, "defaultModel" in value || "availableModels" in value || "available_models" in value)) changed = true;
-    if (patchModelNameArray(value.models)) changed = true;
-    if (patchModelArray(value.data)) changed = true;
-    if (patchModelArray(value.result)) changed = true;
-    if (patchModelArray(value.pages?.[0]?.data)) changed = true;
-    if (patchModelArray(value.result?.data)) changed = true;
-    if (patchModelArray(value.result?.models)) changed = true;
-    if (patchModelArray(value.message?.result?.data)) changed = true;
-    if (patchModelArray(value.message?.result?.models)) changed = true;
-    if (patchNameSet(value.availableModels)) changed = true;
-    if (patchNameSet(value.available_models)) changed = true;
-    if (patchModelNameArray(value.availableModels)) changed = true;
-    if (patchModelNameArray(value.available_models)) changed = true;
-    if (removeHiddenNames(value, "hiddenModels")) changed = true;
-    if (removeHiddenNames(value, "hidden_models")) changed = true;
-    if ("useHiddenModels" in value && value.useHiddenModels !== false) {
-      value.useHiddenModels = false;
-      changed = true;
-    }
-    if ("use_hidden_models" in value && value.use_hidden_models !== false) {
-      value.use_hidden_models = false;
-      changed = true;
-    }
-    if ("default_model" in value && typeof value.default_model === "string" && modelNames().length && !modelNames().includes(value.default_model)) {
-      value.default_model = modelNames()[0];
-      changed = true;
-    }
-    if ("defaultModel" in value && value.defaultModel == null && modelNames().length > 0) {
-      value.defaultModel = descriptorFor(modelNames()[0]);
-      changed = true;
-    }
-    return changed;
-  };
-"#
+    CODEX_MODEL_PICKER_CORE_SCRIPT
 }
 
 /// 构造 renderer 注入脚本：触发新版本地历史目录同步，并修复模型白名单和缓存。
+///
+/// JavaScript lives beside this file so the browser payload and QuickJS regression
+/// use the exact same source without Rust raw-string/format escaping.
 fn build_model_picker_unlock_script(catalog: &CodexModelCatalogProjection) -> String {
     let payload = serde_json::to_string(catalog).unwrap_or_else(|_| "{}".to_string());
-    let model_patch_core = model_picker_patch_core_script();
-    format!(
-        r#"
-(async () => {{
-  const payload = {payload};
-  const patchKey = "{MODEL_PICKER_PATCH_KEY}";
-  const state = window[patchKey] || {{}};
-  state.payload = payload;
-  state.requestIds = state.requestIds || new Set();
-  state.modulePromises = state.modulePromises || new Map();
-  state.failures = state.failures || [];
-  window[patchKey] = state;
-{model_patch_core}
-  const patchStatsigConfig = (config) => {{
-    const value = config?.value;
-    if (!value || typeof value !== "object") return config;
-    const available = Array.isArray(value.available_models) ? [...value.available_models] : [];
-    let changed = false;
-    for (const name of modelNames()) {{
-      if (!available.includes(name)) {{
-        available.push(name);
-        changed = true;
-      }}
-    }}
-    const nextValue = {{ ...value, available_models: available, use_hidden_models: false, default_model: modelNames()[0] || value.default_model }};
-    if (changed || nextValue.default_model !== value.default_model || value.use_hidden_models !== false) {{
-      try {{
-        config.value = nextValue;
-      }} catch {{
-        return {{ ...config, value: nextValue }};
-      }}
-    }}
-    return config;
-  }};
-  const statsigClients = () => {{
-    const root = window.__STATSIG__ || globalThis.__STATSIG__;
-    if (!root || typeof root !== "object") return [];
-    const clients = [root.firstInstance, typeof root.instance === "function" ? root.instance() : null];
-    if (root.instances && typeof root.instances === "object") clients.push(...Object.values(root.instances));
-    return clients.filter((client, index, array) => client && typeof client === "object" && array.indexOf(client) === index);
-  }};
-  const patchStatsig = () => {{
-    for (const client of statsigClients()) {{
-      if (typeof client.getDynamicConfig !== "function") continue;
-      if (!client.__ccSwitchModelWhitelistPatched) {{
-        const original = client.getDynamicConfig.bind(client);
-        client.getDynamicConfig = (name, options) => patchStatsigConfig(original(name, options));
-        client.__ccSwitchModelWhitelistPatched = true;
-      }}
-      try {{ patchStatsigConfig(client.getDynamicConfig("107580212", {{ disableExposureLog: true }})); }} catch {{}}
-    }}
-  }};
-  const assetUrl = (namePart) => {{
-    const urls = [
-      ...Array.from(document.scripts || []).map((script) => script.src),
-      ...Array.from(document.querySelectorAll("link[href]") || []).map((link) => link.href),
-      ...performance.getEntriesByType("resource").map((entry) => entry.name),
-    ].filter(Boolean);
-    return urls.find((url) => url.includes("/assets/") && url.includes(namePart) && url.split("?")[0].endsWith(".js")) || "";
-  }};
-  const loadAppModule = async (namePart) => {{
-    if (!state.modulePromises.has(namePart)) {{
-      state.modulePromises.set(namePart, Promise.resolve().then(async () => {{
-        const url = assetUrl(namePart);
-        if (!url) throw new Error(`Codex App asset not found: ${{namePart}}`);
-        return await import(url);
-      }}).catch((error) => {{
-        state.modulePromises.delete(namePart);
-        throw error;
-      }}));
-    }}
-    return await state.modulePromises.get(namePart);
-  }};
-  // 新版 Codex/ChatGPT App 用 localThreadCatalog 保存统一侧边栏目录。这里只调用
-  // App 自己的 RPC 同步服务，不直接改 codex-dev.db 或历史 provider 元数据。
-  const triggerLocalThreadCatalogSync = async () => {{
-    if (state.historySyncPromise) return await state.historySyncPromise;
-    state.historySyncPromise = Promise.resolve().then(async () => {{
-      const module = await loadAppModule("rpc-");
-      const roots = Object.values(module).filter((item) => item && (typeof item === "object" || typeof item === "function"));
-      for (const root of roots) {{
-        try {{
-          const catalog = root.localThreadCatalog;
-          if (!catalog || typeof catalog.requestStartupSync !== "function") continue;
-          const before = typeof catalog.readSnapshot === "function" ? await catalog.readSnapshot() : null;
-          await catalog.requestStartupSync();
-          const after = typeof catalog.readSnapshot === "function" ? await catalog.readSnapshot() : null;
-          state.historySync = {{
-            requested: true,
-            beforeCount: Array.isArray(before?.entries) ? before.entries.length : null,
-            afterCount: Array.isArray(after?.entries) ? after.entries.length : null,
-            complete: after?.isComplete ?? null,
-          }};
-          if (after?.isComplete !== true) {{
-            setTimeout(() => {{ state.historySyncPromise = null; }}, 10000);
-          }}
-          return state.historySync;
-        }} catch (error) {{
-          state.failures.push(String(error?.message || error));
-        }}
-      }}
-      throw new Error("Codex App localThreadCatalog RPC service was not found");
-    }}).catch((error) => {{
-      state.historySync = {{ requested: false, error: String(error?.message || error) }};
-      state.failures.push(state.historySync.error);
-      state.historySyncPromise = null;
-      return state.historySync;
-    }});
-    return await state.historySyncPromise;
-  }};
-  const appServerMethod = (method, params) => method === "send-cli-request-for-host" && params?.method ? String(params.method) : String(method || "");
-  const isModelListMethod = (method) => method === "list-models-for-host" || method === "model/list";
-  const patchModelListResult = (result) => {{
-    if (result == null) return false;
-    let changed = false;
-    if (Array.isArray(result) && patchModelArray(result, true)) changed = true;
-    if (Array.isArray(result?.data) && patchModelArray(result.data, true)) changed = true;
-    if (Array.isArray(result?.models) && patchModelArray(result.models, true)) changed = true;
-    if (Array.isArray(result?.result) && patchModelArray(result.result, true)) changed = true;
-    if (Array.isArray(result?.result?.data) && patchModelArray(result.result.data, true)) changed = true;
-    if (Array.isArray(result?.result?.models) && patchModelArray(result.result.models, true)) changed = true;
-    if (Array.isArray(result?.pages?.[0]?.data) && patchModelArray(result.pages[0].data, true)) changed = true;
-    if (Array.isArray(result?.message?.result?.data) && patchModelArray(result.message.result.data, true)) changed = true;
-    if (Array.isArray(result?.message?.result?.models) && patchModelArray(result.message.result.models, true)) changed = true;
-    if (patchModelContainer(result)) changed = true;
-    return changed;
-  }};
-  const patchAppServerResult = (method, result) => {{
-    if (!isModelListMethod(method)) return result;
-    patchModelListResult(result);
-    return result;
-  }};
-  const patchRequestClient = (client) => {{
-    if (!client || typeof client.sendRequest !== "function") return false;
-    if (client.__ccSwitchModelRequestPatch === "2") return true;
-    const original = client.__ccSwitchOriginalSendRequest || client.sendRequest.bind(client);
-    client.__ccSwitchOriginalSendRequest = original;
-    client.sendRequest = async function ccSwitchPatchedSendRequest(method, params, options) {{
-      const result = await original(method, params, options);
-      return patchAppServerResult(appServerMethod(method, params), result);
-    }};
-    client.__ccSwitchModelRequestPatch = "2";
-    return true;
-  }};
-  const installAppServerPatch = async () => {{
-    try {{
-      const module = await loadAppModule("app-server-manager-signals-");
-      for (const candidate of Object.values(module).filter((item) => item && typeof item === "object")) {{
-        patchRequestClient(candidate);
-        if (typeof candidate.sendRequest !== "function" && typeof candidate.get === "function") {{
-          try {{ patchRequestClient(candidate.get()); }} catch {{}}
-        }}
-      }}
-    }} catch (error) {{
-      state.failures.push(String(error?.message || error));
-    }}
-  }};
-  const patchMcpModelResponseData = (data) => {{
-    if (data?.type !== "mcp-response") return false;
-    const message = data.message || data.response;
-    const requestId = message?.id != null ? String(message.id) : "";
-    if (!requestId || !state.requestIds.has(requestId)) return false;
-    state.requestIds.delete(requestId);
-    return patchModelListResult(message?.result) || patchModelListResult(message?.result?.data);
-  }};
-  const installMessagePatch = () => {{
-    if (state.messagePatchInstalled) return;
-    state.messagePatchInstalled = true;
-    const originalDispatchEvent = window.dispatchEvent;
-    window.dispatchEvent = function ccSwitchPatchedDispatchEvent(event) {{
-      try {{
-        const detail = event?.detail;
-        const request = detail?.request;
-        if (event?.type === "codex-message-from-view" && detail?.type === "mcp-request" && request?.method === "model/list") {{
-          request.params = {{ ...(request.params || {{}}), includeHidden: true }};
-          if (request.id != null) state.requestIds.add(String(request.id));
-        }}
-        if (event?.type === "message") patchMcpModelResponseData(event.data);
-      }} catch (error) {{
-        state.failures.push(String(error?.message || error));
-      }}
-      return originalDispatchEvent.call(this, event);
-    }};
-    window.addEventListener("message", (event) => {{
-      try {{ patchMcpModelResponseData(event?.data); }} catch (error) {{ state.failures.push(String(error?.message || error)); }}
-    }}, true);
-  }};
-  const reactFiberKeys = (element) => Object.keys(element || {{}}).filter((key) => key.startsWith("__reactFiber") || key.startsWith("__reactInternalInstance") || key.startsWith("__reactProps"));
-  // Codex app-server 会根据 requires_openai_auth 暴露 OAuth 状态；旧配置或缓存状态
-  // 可能把 renderer 留在非 chatgpt 模式，这里只修复前端 context，不改请求路由。
-  const authContextValueFrom = (element) => {{
-    for (const key of reactFiberKeys(element)) {{
-      for (let fiber = element?.[key]; fiber; fiber = fiber.return) {{
-        for (const value of [fiber.memoizedProps?.value, fiber.pendingProps?.value]) {{
-          if (value && typeof value === "object" && typeof value.setAuthMethod === "function" && "authMethod" in value) return value;
-        }}
-      }}
-    }}
-    return null;
-  }};
-  const spoofChatGPTAuthMethod = (element) => {{
-    const auth = authContextValueFrom(element);
-    if (!auth || auth.authMethod === "chatgpt") return false;
-    try {{
-      auth.setAuthMethod("chatgpt");
-      return true;
-    }} catch (error) {{
-      state.failures.push(String(error?.message || error));
-      return false;
-    }}
-  }};
-  const patchReactState = () => {{
-    const nodes = [document.body, ...document.querySelectorAll("button, [role='menu'], [role='dialog'], [data-radix-popper-content-wrapper]")].filter(Boolean);
-    for (const node of nodes.slice(0, 220)) {{
-      spoofChatGPTAuthMethod(node);
-    }}
-  }};
-  const run = async () => {{
-    installMessagePatch();
-    await installAppServerPatch();
-    void triggerLocalThreadCatalogSync();
-    patchStatsig();
-    patchReactState();
-  }};
-  await run();
-  if (!state.interval) state.interval = setInterval(() => {{ void run(); }}, 1500);
-  const historySync = await triggerLocalThreadCatalogSync();
-  return {{ status: "ok", modelCount: modelNames().length, available_models: modelNames(), historySync, patchKey }};
-}})()
-"#
-    )
+    CODEX_APP_COMPAT_TEMPLATE
+        .replace("__CODEX_PAYLOAD_JSON__", &payload)
+        .replace("__CODEX_PATCH_KEY__", MODEL_PICKER_PATCH_KEY)
+        .replace(
+            "__CODEX_MODEL_PICKER_CORE__",
+            model_picker_patch_core_script(),
+        )
 }
 
 /// 启动 Codex Desktop，并传入 remote debugging 参数。
@@ -1981,6 +1743,25 @@ mod tests {
     }
 
     #[test]
+    fn catalog_projection_labels_and_groups_provider_models_without_changing_ids() {
+        let value = json!({
+            "models": [
+                { "model": "qwen-z", "displayName": "Zeta", "provider_name": "Qwen" },
+                { "model": "deepseek-b", "displayName": "Beta", "providerName": "DeepSeek" },
+                { "model": "qwen-a", "displayName": "Alpha", "provider": { "name": "Qwen" } }
+            ]
+        });
+
+        let (names, models) = codex_model_entries_from_catalog_value(&value);
+        assert_eq!(names, vec!["deepseek-b", "qwen-a", "qwen-z"]);
+        assert_eq!(models[0]["displayName"], "[DeepSeek] Beta");
+        assert_eq!(models[1]["displayName"], "[Qwen] Alpha");
+        assert_eq!(models[2]["displayName"], "[Qwen] Zeta");
+        assert_eq!(models[1]["model"], "qwen-a");
+        assert_eq!(models[1]["providerName"], "Qwen");
+    }
+
+    #[test]
     /// 主目录为空时，投影 helper 应允许调用方继续使用 models cache 或内联目录回退。
     fn catalog_projection_skips_empty_source_and_accepts_fallback_source() {
         let empty = json!({ "models": [] });
@@ -2004,6 +1785,16 @@ mod tests {
             vec!["gpt-5.6-sol".to_string(), "qwen3.6".to_string()]
         );
         assert_eq!(projection.default_model.as_deref(), Some("qwen3.6"));
+    }
+
+    #[test]
+    fn codex_app_compat_template_fully_renders() {
+        let script = build_model_picker_unlock_script(&CodexModelCatalogProjection::empty());
+
+        assert!(!script.contains("__CODEX_"));
+        assert!(script.contains("const payload = {"));
+        assert!(script.contains(MODEL_PICKER_PATCH_KEY));
+        assert!(script.contains("const currentPayload"));
     }
 
     fn run_model_picker_patch_core_probe(probe: &str) -> serde_json::Value {
@@ -2058,6 +1849,72 @@ JSON.stringify({
 
         assert_eq!(result["hasDefault"], false);
         assert_eq!(result["hasEfforts"], false);
+    }
+
+    #[test]
+    fn model_picker_patch_core_updates_existing_labels_and_provider_group_order() {
+        let result = run_model_picker_patch_core_probe_with_payload(
+            json!({
+                "defaultModel": "qwen3.8",
+                "modelNames": ["deepseek-v4", "qwen3.8"],
+                "models": [
+                    {
+                        "model": "deepseek-v4",
+                        "displayName": "[DeepSeek] DeepSeek V4",
+                        "providerName": "DeepSeek",
+                        "hidden": false
+                    },
+                    {
+                        "model": "qwen3.8",
+                        "displayName": "[Qwen] Qwen 3.8",
+                        "providerName": "Qwen",
+                        "hidden": false
+                    }
+                ]
+            }),
+            r#"
+const models = [
+  {model: "qwen3.8", displayName: "qwen3.8", hidden: true},
+  {model: "native-codex", displayName: "Native Codex", hidden: false},
+  {model: "deepseek-v4", displayName: "deepseek-v4", hidden: true},
+];
+const changed = patchModelArray(models);
+JSON.stringify({
+  changed,
+  models: models.map((model) => ({
+    model: model.model,
+    displayName: model.displayName,
+    providerName: model.providerName || null,
+    hidden: model.hidden,
+  })),
+});
+"#,
+        );
+
+        assert_eq!(result["changed"], true);
+        assert_eq!(
+            result["models"],
+            json!([
+                {
+                    "model": "deepseek-v4",
+                    "displayName": "[DeepSeek] DeepSeek V4",
+                    "providerName": "DeepSeek",
+                    "hidden": false
+                },
+                {
+                    "model": "qwen3.8",
+                    "displayName": "[Qwen] Qwen 3.8",
+                    "providerName": "Qwen",
+                    "hidden": false
+                },
+                {
+                    "model": "native-codex",
+                    "displayName": "Native Codex",
+                    "providerName": null,
+                    "hidden": false
+                }
+            ])
+        );
     }
 
     /// 回归：模型解锁器不能再给 React Intl 的 formats/defaultFormats/formatters

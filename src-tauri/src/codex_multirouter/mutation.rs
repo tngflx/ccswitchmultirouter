@@ -584,7 +584,7 @@ mod tests {
         let model = published_model
             .into_inner()
             .expect("active router projection model");
-        assert_eq!(model["displayName"], "Qwen 3.8 Updated");
+        assert_eq!(model["displayName"], "[Qwen] Qwen 3.8 Updated");
         assert_eq!(model["contextWindow"], 524_288);
         assert_eq!(model["inputModalities"], json!(["text", "image"]));
         assert_eq!(

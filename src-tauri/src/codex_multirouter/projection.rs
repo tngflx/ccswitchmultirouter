@@ -370,6 +370,21 @@ fn projected_model_entries(compiled: &CompiledCodexRoutingPlan) -> Vec<Value> {
         .collect::<Vec<_>>();
     if has_source_custom_order {
         indexed.sort_by_key(|(index, model)| (model.sort_index.unwrap_or(usize::MAX), *index));
+    } else {
+        // Codex exposes a flat model picker with no section/header field. Keep models from the
+        // same API provider contiguous and alphabetic, while retaining stable IDs for routing.
+        indexed.sort_by(|(left_index, left), (right_index, right)| {
+            left.target_provider_name
+                .to_ascii_lowercase()
+                .cmp(&right.target_provider_name.to_ascii_lowercase())
+                .then_with(|| {
+                    left.display_name
+                        .to_ascii_lowercase()
+                        .cmp(&right.display_name.to_ascii_lowercase())
+                })
+                .then_with(|| left.visible_model.cmp(&right.visible_model))
+                .then_with(|| left_index.cmp(right_index))
+        });
     }
 
     indexed
@@ -394,9 +409,16 @@ fn projected_model_entry(model: &CompiledCodexModel, sort_index: Option<usize>) 
         "upstreamModel".to_string(),
         Value::String(model.upstream_model.clone()),
     );
+    let provider_name = model.target_provider_name.trim();
+    let display_name = model.display_name.trim();
+    let grouped_display_name = provider_labelled_display_name(provider_name, display_name);
     entry.insert(
         "displayName".to_string(),
-        Value::String(model.display_name.clone()),
+        Value::String(grouped_display_name),
+    );
+    entry.insert(
+        "providerName".to_string(),
+        Value::String(model.target_provider_name.clone()),
     );
     entry.insert(
         "apiFormat".to_string(),
@@ -435,6 +457,24 @@ fn projected_model_entry(model: &CompiledCodexModel, sort_index: Option<usize>) 
         entry.insert("codexUltra".to_string(), codex_ultra);
     }
     Value::Object(entry)
+}
+
+/// Add a provider prefix to a model label exactly once. Source catalogs may already
+/// include a provider prefix, so avoid producing labels such as `[Qwen] [Qwen] ...`.
+fn provider_labelled_display_name(provider_name: &str, display_name: &str) -> String {
+    if provider_name.is_empty() || display_name.is_empty() {
+        return display_name.to_string();
+    }
+
+    let prefix = format!("[{provider_name}]");
+    let has_prefix = display_name
+        .get(..prefix.len())
+        .is_some_and(|candidate| candidate.eq_ignore_ascii_case(&prefix));
+    if has_prefix {
+        display_name.to_string()
+    } else {
+        format!("{prefix} {display_name}")
+    }
 }
 
 fn projection_status(
@@ -981,7 +1021,8 @@ mod tests {
         let models = artifact.projection_settings["modelCatalog"]["models"]
             .as_array()
             .expect("projected models");
-        assert_eq!(models[0]["displayName"].as_str(), Some("Qwen 3.8"));
+        assert_eq!(models[0]["displayName"].as_str(), Some("[Qwen] Qwen 3.8"));
+        assert_eq!(models[0]["providerName"].as_str(), Some("Qwen"));
         assert_eq!(models[0]["contextWindow"].as_u64(), Some(262_144));
         assert_eq!(models[0]["inputModalities"], json!(["text"]));
         assert_eq!(models[0]["reasoning"]["defaultEffort"], "high");
@@ -989,6 +1030,80 @@ mod tests {
         assert_eq!(models[0]["supportsParallelToolCalls"], true);
         assert_eq!(models[0]["baseInstructions"], "Use Qwen tools.");
         assert_eq!(models[0]["codexUltra"]["providerEffort"], "high");
+    }
+
+    #[test]
+    fn projected_models_group_by_provider_then_model_without_changing_route_ids() {
+        let model = |visible: &str, display: &str, provider: &str| CompiledCodexModel {
+            visible_model: visible.to_string(),
+            canonical_model: visible.to_string(),
+            upstream_model: format!("upstream-{visible}"),
+            display_name: display.to_string(),
+            target_provider_id: provider.to_ascii_lowercase(),
+            target_provider_name: provider.to_string(),
+            route_id: format!("{}-route", provider.to_ascii_lowercase()),
+            api_format: "openai_responses".to_string(),
+            api_format_source: "provider".to_string(),
+            sort_index: None,
+            capability_summary: Default::default(),
+        };
+        let compiled = CompiledCodexRoutingPlan {
+            routes: Vec::new(),
+            visible_models: vec![
+                "zeta-qwen".to_string(),
+                "beta-deepseek".to_string(),
+                "alpha-qwen".to_string(),
+                "alpha-deepseek".to_string(),
+            ],
+            model_catalog: vec![
+                model("zeta-qwen", "Zeta", "Qwen"),
+                model("beta-deepseek", "Beta", "DeepSeek"),
+                model("alpha-qwen", "Alpha", "Qwen"),
+                model("alpha-deepseek", "Alpha", "DeepSeek"),
+            ],
+            spawn_agent_models: Vec::new(),
+            dependency_fingerprint: "test".to_string(),
+            warnings: Vec::new(),
+        };
+
+        let entries = projected_model_entries(&compiled);
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry["model"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            vec!["alpha-deepseek", "beta-deepseek", "alpha-qwen", "zeta-qwen"]
+        );
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry["displayName"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            vec![
+                "[DeepSeek] Alpha",
+                "[DeepSeek] Beta",
+                "[Qwen] Alpha",
+                "[Qwen] Zeta"
+            ]
+        );
+        assert_eq!(entries[0]["upstreamModel"], "upstream-alpha-deepseek");
+        assert_eq!(entries[0]["providerName"], "DeepSeek");
+    }
+
+    #[test]
+    fn projected_model_provider_label_is_not_duplicated() {
+        assert_eq!(
+            provider_labelled_display_name("Qwen", "Qwen 3.8"),
+            "[Qwen] Qwen 3.8"
+        );
+        assert_eq!(
+            provider_labelled_display_name("Qwen", "[Qwen] Qwen 3.8"),
+            "[Qwen] Qwen 3.8"
+        );
+        assert_eq!(
+            provider_labelled_display_name("Qwen", "[qwen] Qwen 3.8"),
+            "[qwen] Qwen 3.8"
+        );
     }
 
     #[test]
