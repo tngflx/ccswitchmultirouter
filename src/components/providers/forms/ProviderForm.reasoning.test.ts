@@ -1,5 +1,7 @@
-import { describe, expect, it } from "vitest";
+import { beforeAll, describe, expect, it } from "vitest";
 import type { CodexModelReasoningCapability } from "@/types";
+import i18n from "@/i18n";
+import zh from "@/i18n/locales/zh.json";
 
 import { normalizeCodexCatalogModelsForSave } from "./ProviderForm";
 import {
@@ -7,6 +9,14 @@ import {
   validateCodexReasoningCapabilityDraft,
 } from "./CodexFormFields";
 import { completeCodexReasoningEffortMap } from "./codexReasoningCapability";
+
+// normalizeCodexCatalogModelsForSave 通过 i18n 单例产出错误文案；
+// 全局 setup 用空资源初始化 i18next，这里补挂真实 zh 资源。
+beforeAll(async () => {
+  // 全局 setup 已注册空 zh bundle，必须强制合并真实资源
+  i18n.addResourceBundle("zh", "translation", zh, true, true);
+  await i18n.changeLanguage("zh");
+});
 
 describe("Codex catalog reasoning capability persistence", () => {
   it("separates automatic, maintained and manual capability sources", () => {

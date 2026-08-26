@@ -1,3 +1,5 @@
+import i18n from "@/i18n";
+
 import { useEffect, useMemo, useState, useCallback, useRef } from "react";
 import { useForm } from "react-hook-form";
 import { zodResolver } from "@hookform/resolvers/zod";
@@ -28,9 +30,11 @@ import type {
   CodexModelCatalogConfig,
   CodexRoutingConfig,
   CodexChatReasoning,
+  CodexTrafficPolicy,
   CodexReasoningEffort,
   PromptCacheRoutingMode,
   ClaudeApiKeyField,
+  CodexApiKeyGroup,
 } from "@/types";
 import {
   providerPresets,
@@ -233,14 +237,18 @@ export const normalizeCodexCatalogModelsForSave = (
       reasoning?.defaultEffort &&
       !reasoning.supportedEfforts.includes(reasoning.defaultEffort)
     ) {
-      throw new Error(`${model}：默认推理强度必须包含在该模型支持的推理强度中`);
+      throw new Error(
+        i18n.t("providerForm.reasoningErrors.defaultNotSupported", { model }),
+      );
     }
     if (
       reasoning &&
       !reasoning.disableAllowed &&
       reasoning.supportedEfforts.includes("none")
     ) {
-      throw new Error(`${model}：包含“关闭推理”档时，必须允许关闭推理`);
+      throw new Error(
+        i18n.t("providerForm.reasoningErrors.noneRequiresDisable", { model }),
+      );
     }
     if (
       reasoning &&
@@ -253,7 +261,12 @@ export const normalizeCodexCatalogModelsForSave = (
     ) {
       for (const effort of reasoning.supportedEfforts) {
         if (!reasoning.upstream.effortMap?.[effort]) {
-          throw new Error(`${model}：推理强度映射缺少 ${effort} 档`);
+          throw new Error(
+            i18n.t("providerForm.reasoningErrors.missingMap", {
+              model,
+              efforts: effort,
+            }),
+          );
         }
       }
       // 与后端 CodexModelReasoningCapability::validate 对齐：
@@ -269,7 +282,11 @@ export const normalizeCodexCatalogModelsForSave = (
             !reasoning.supportedEfforts.includes(target as CodexReasoningEffort)
           ) {
             throw new Error(
-              `${model}：${source} 档映射到的 ${target} 不在该模型支持的推理强度中`,
+              i18n.t("providerForm.reasoningErrors.mapTargetInvalid", {
+                model,
+                source,
+                target,
+              }),
             );
           }
         }
@@ -277,7 +294,7 @@ export const normalizeCodexCatalogModelsForSave = (
     }
     if (item.codexUltra?.enabled && !item.codexUltra.providerEffort) {
       throw new Error(
-        `${model}：解锁 Ultra 档后，必须选择对应的供应商推理强度`,
+        i18n.t("providerForm.reasoningErrors.ultraRequiresEffort", { model }),
       );
     }
 
@@ -795,6 +812,9 @@ function ProviderFormFull({
   const [codexFastMode, setCodexFastMode] = useState<boolean>(
     () => initialData?.meta?.codexFastMode ?? false,
   );
+  const [codexTrafficPolicy, setCodexTrafficPolicy] = useState<
+    CodexTrafficPolicy | undefined
+  >(() => initialData?.meta?.codexTrafficPolicy);
   const [codexProviderSplit, setCodexProviderSplit] =
     useState<CodexProviderSplitSuggestion | null>(null);
   const [codexChatReasoning, setCodexChatReasoning] =
@@ -842,6 +862,32 @@ function ProviderFormFull({
     handleCodexConfigChange: originalHandleCodexConfigChange,
     resetCodexConfig,
   } = useCodexConfigState({ initialData });
+  const [codexApiKeyGroups, setCodexApiKeyGroups] = useState<
+    CodexApiKeyGroup[]
+  >(() => {
+    const value = initialData?.settingsConfig?.codexApiKeyGroups;
+    return Array.isArray(value)
+      ? value.filter((group): group is CodexApiKeyGroup =>
+          Boolean(
+            group && typeof group === "object" && Array.isArray(group.apiKeys),
+          ),
+        )
+      : [];
+  });
+  useEffect(() => {
+    const value = initialData?.settingsConfig?.codexApiKeyGroups;
+    setCodexApiKeyGroups(
+      Array.isArray(value)
+        ? value.filter((group): group is CodexApiKeyGroup =>
+            Boolean(
+              group &&
+                typeof group === "object" &&
+                Array.isArray(group.apiKeys),
+            ),
+          )
+        : [],
+    );
+  }, [initialData]);
 
   const initialCodexApiFormat: CodexApiFormat =
     initialData?.meta?.apiFormat === "openai_chat"
@@ -1599,7 +1645,10 @@ function ProviderFormFull({
             }),
           );
         }
-        if (!isXaiOauthProvider && !codexApiKey.trim()) {
+        const hasGroupedCodexKey = codexApiKeyGroups.some((group) =>
+          group.apiKeys.some((key) => key.trim()),
+        );
+        if (!isXaiOauthProvider && !codexApiKey.trim() && !hasGroupedCodexKey) {
           issues.push(
             t("providerForm.apiKeyRequired", {
               defaultValue: "非官方供应商请填写 API Key",
@@ -1716,6 +1765,7 @@ function ProviderFormFull({
           config: string;
           modelCatalog?: CodexModelCatalogConfig;
           codexRouting?: CodexRoutingConfig;
+          codexApiKeyGroups?: CodexApiKeyGroup[];
         };
         if (normalizedCatalogModels.length > 0) {
           configObj.modelCatalog = {
@@ -1728,10 +1778,25 @@ function ProviderFormFull({
         if (shouldPersistCodexLocalConfig && hasCodexRouting) {
           configObj.codexRouting = codexRouting;
         }
+        const normalizedApiKeyGroups = codexApiKeyGroups
+          .map((group) => ({
+            ...group,
+            apiKeys: group.apiKeys.map((key) => key.trim()).filter(Boolean),
+            models: group.models?.map((model) => model.trim()).filter(Boolean),
+            prefixes: group.prefixes
+              ?.map((prefix) => prefix.trim())
+              .filter(Boolean),
+          }))
+          .filter((group) => group.apiKeys.length > 0);
+        if (normalizedApiKeyGroups.length > 0) {
+          configObj.codexApiKeyGroups = normalizedApiKeyGroups;
+        }
         settingsConfig = JSON.stringify(configObj);
       } catch (err) {
         if (err instanceof Error && err.message.includes("reasoning")) {
-          toast.error(`Codex 推理能力配置无效：${err.message}`);
+          toast.error(
+            t("providerForm.invalidReasoningConfig", { message: err.message }),
+          );
           return;
         }
         settingsConfig = values.settingsConfig.trim();
@@ -1797,8 +1862,10 @@ function ProviderFormFull({
         const message = detail.includes(
           "unknown_reasoning_capability_requires_declaration",
         )
-          ? "Codex 子 Agent 配置未完成：存在已启用且可路由的模型没有声明推理能力，请先在模型目录中配置后再保存。"
-          : `Codex 子 Agent 配置校验失败：${detail || "请检查模型目录和 Sub-Agent 配置。"}`;
+          ? t("providerForm.subagentIncomplete")
+          : t("providerForm.subagentValidationFailed", {
+              detail: detail || t("providerForm.subagentValidationFallback"),
+            });
         toast.error(message);
         return;
       }
@@ -1941,6 +2008,10 @@ function ProviderFormFull({
           ? selectedGitHubAccountId
           : undefined,
       codexFastMode: isCodexOauthProvider ? codexFastMode : undefined,
+      codexTrafficPolicy:
+        appId === "codex" && category !== "official"
+          ? codexTrafficPolicy
+          : undefined,
       codexChatReasoning:
         appId === "codex" &&
         category !== "official" &&
@@ -2212,6 +2283,7 @@ function ProviderFormFull({
       setCodexChatReasoning(preset.codexChatReasoning ?? {});
       setCodexRouting({ enabled: false, defaultRouteId: "", routes: [] });
       setPromptCacheRouting(preset.promptCacheRouting ?? "auto");
+      setCodexTrafficPolicy(undefined);
       setLocalCodexApiFormat(
         preset.apiFormat ??
           codexApiFormatFromWireApi(extractCodexWireApi(config)) ??
@@ -2713,6 +2785,8 @@ function ProviderFormFull({
                 onXaiAccountSelect={setSelectedXaiAccountId}
                 codexApiKey={codexApiKey}
                 onApiKeyChange={handleCodexApiKeyChange}
+                apiKeyGroups={codexApiKeyGroups}
+                onApiKeyGroupsChange={setCodexApiKeyGroups}
                 category={category}
                 shouldShowApiKeyLink={shouldShowCodexApiKeyLink}
                 websiteUrl={codexWebsiteUrl}
@@ -2753,6 +2827,8 @@ function ProviderFormFull({
                 onCodexChatReasoningChange={setCodexChatReasoning}
                 promptCacheRouting={promptCacheRouting}
                 onPromptCacheRoutingChange={setPromptCacheRouting}
+                codexTrafficPolicy={codexTrafficPolicy}
+                onCodexTrafficPolicyChange={setCodexTrafficPolicy}
                 catalogModels={codexCatalogModels}
                 presetCatalogModels={codexPresetBaseline}
                 onCatalogModelsChange={setCodexCatalogModels}

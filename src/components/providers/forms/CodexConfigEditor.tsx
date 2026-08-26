@@ -73,13 +73,12 @@ const CodexConfigEditor: React.FC<CodexConfigEditorProps> = ({
           ) : (
             <ChevronRight className="h-4 w-4" />
           )}
-          专家配置
+          {t("codexConfig.expertConfigTitle")}
         </Button>
       </CollapsibleTrigger>
       {!isExpertOpen && (
         <p className="mt-1 ml-1 text-xs text-muted-foreground">
-          手工编辑 auth.json、config.toml、远程压缩和 Provider
-          级通用配置应用；正常接入无需展开。
+          {t("codexConfig.expertConfigDescription")}
         </p>
       )}
       <CollapsibleContent className="space-y-6 pt-4">

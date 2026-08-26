@@ -2,6 +2,28 @@ import { fireEvent, render, screen, within } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 import type { CodexModelReasoningCapability } from "@/types";
 
+// Component uses i18n; resolve via real zh resources so assertions get text, not raw keys.
+vi.mock("react-i18next", async () => {
+  const zh = (await import("@/i18n/locales/zh.json")).default;
+  const resolve = (key: string) =>
+    key
+      .split(".")
+      .reduce<any>((obj, part) => (obj == null ? obj : obj[part]), zh);
+  const t = (key: string, params?: Record<string, unknown>) => {
+    let value: string = resolve(key) ?? key;
+    if (params) {
+      for (const [name, replacement] of Object.entries(params)) {
+        value = value.split("{{" + name + "}}").join(String(replacement));
+      }
+    }
+    return value;
+  };
+  return {
+    getI18n: () => ({ language: "zh", t }),
+    useTranslation: () => ({ t }),
+  };
+});
+
 import { CodexModelReasoningEditor } from "./CodexModelReasoningEditor";
 
 const qwenCapability: CodexModelReasoningCapability = {
