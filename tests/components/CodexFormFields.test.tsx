@@ -40,9 +40,12 @@ vi.mock("@/lib/api/codexSubagentV2", () => ({
 }));
 
 vi.mock("react-i18next", () => ({
+  initReactI18next: { type: "3" },
   useTranslation: () => ({
-    t: (_key: string, options?: { defaultValue?: string }) =>
-      options?.defaultValue ?? _key,
+    t: (_key: string, options?: { defaultValue?: string; count?: number }) => {
+      const value = options?.defaultValue ?? _key;
+      return value.replace(/\{\{count\}\}/g, String(options?.count ?? ""));
+    },
   }),
 }));
 
@@ -214,6 +217,58 @@ function renderRoutingHarness(
     ...render(<Harness />),
     onRoutingChange,
     latestRouting: () => latestRouting,
+  };
+}
+
+function renderTrafficPolicyHarness(baseUrl = "https://opencode.ai/zen/go/v1") {
+  const onPolicyChange = vi.fn();
+  let latestPolicy: import("@/types").CodexTrafficPolicy | undefined;
+
+  function Harness() {
+    const [policy, setPolicy] = useState<
+      import("@/types").CodexTrafficPolicy | undefined
+    >();
+    return (
+      <CodexFormFields
+        codexApiKey="sk-test"
+        onApiKeyChange={vi.fn()}
+        category="custom"
+        shouldShowApiKeyLink={false}
+        websiteUrl=""
+        shouldShowSpeedTest={false}
+        codexBaseUrl={baseUrl}
+        onBaseUrlChange={vi.fn()}
+        isFullUrl={false}
+        onFullUrlChange={vi.fn()}
+        isEndpointModalOpen={false}
+        onEndpointModalToggle={vi.fn()}
+        autoSelect={false}
+        onAutoSelectChange={vi.fn()}
+        takeoverEnabled
+        onTakeoverEnabledChange={vi.fn()}
+        apiFormat="openai_responses"
+        onApiFormatChange={vi.fn()}
+        codexTrafficPolicy={policy}
+        onCodexTrafficPolicyChange={(next) => {
+          latestPolicy = next;
+          onPolicyChange(next);
+          setPolicy(next);
+        }}
+        speedTestEndpoints={[]}
+        customUserAgent=""
+        onCustomUserAgentChange={vi.fn()}
+        localProxyHeadersOverride=""
+        onLocalProxyHeadersOverrideChange={vi.fn()}
+        localProxyBodyOverride=""
+        onLocalProxyBodyOverrideChange={vi.fn()}
+      />
+    );
+  }
+
+  return {
+    ...render(<Harness />),
+    onPolicyChange,
+    latestPolicy: () => latestPolicy,
   };
 }
 
@@ -834,7 +889,7 @@ describe("CodexFormFields local model routing", () => {
       onProviderSplitSuggestionChange,
     } = renderAutoSplitHarness();
 
-    fireEvent.click(screen.getByRole("button", { name: "同步模型" }));
+    fireEvent.click(screen.getByRole("button", { name: "Sync Models" }));
 
     expect(await screen.findByText("检测到混合协议模型")).toBeInTheDocument();
     expect(screen.getByText("Relay-responses")).toBeInTheDocument();
@@ -874,7 +929,7 @@ describe("CodexFormFields local model routing", () => {
       onProviderSplitSuggestionChange,
     } = renderAutoSplitHarness();
 
-    fireEvent.click(screen.getByRole("button", { name: "同步模型" }));
+    fireEvent.click(screen.getByRole("button", { name: "Sync Models" }));
 
     expect(await screen.findByText("检测到混合协议模型")).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "暂不拆分" }));
@@ -928,7 +983,7 @@ describe("CodexFormFields local model routing", () => {
       { shouldShowSpeedTest: true },
     );
 
-    fireEvent.click(screen.getByRole("button", { name: "验证连接" }));
+    fireEvent.click(screen.getByRole("button", { name: "Verify Connection" }));
     expect(screen.getByText("确认测试 Chat / Responses")).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "确认测试" }));
 
@@ -961,17 +1016,21 @@ describe("CodexFormFields local model routing", () => {
     const { updateIdentity } = renderReadinessIdentityHarness();
 
     const validateCurrentIdentity = async () => {
-      fireEvent.click(screen.getByRole("button", { name: "验证连接" }));
+      fireEvent.click(
+        screen.getByRole("button", { name: "Verify Connection" }),
+      );
       fireEvent.click(screen.getByRole("button", { name: "确认测试" }));
-      expect(await screen.findByText("可加入 MultiRouter")).toBeInTheDocument();
+      expect(
+        await screen.findByText("Can join MultiRouter"),
+      ).toBeInTheDocument();
     };
     const expectInvalidated = async () => {
       await waitFor(() => {
         expect(
-          screen.queryByText("可加入 MultiRouter"),
+          screen.queryByText("Can join MultiRouter"),
         ).not.toBeInTheDocument();
       });
-      expect(screen.getByText("建议先验证连接")).toBeInTheDocument();
+      expect(screen.getByText("Verify connection first")).toBeInTheDocument();
     };
 
     await validateCurrentIdentity();
@@ -1018,7 +1077,7 @@ describe("CodexFormFields local model routing", () => {
     );
     const { updateIdentity } = renderReadinessIdentityHarness();
 
-    fireEvent.click(screen.getByRole("button", { name: "验证连接" }));
+    fireEvent.click(screen.getByRole("button", { name: "Verify Connection" }));
     fireEvent.click(screen.getByRole("button", { name: "确认测试" }));
     await waitFor(() => {
       expect(probeCodexResponsesForConfig).toHaveBeenCalledWith(
@@ -1032,9 +1091,11 @@ describe("CodexFormFields local model routing", () => {
 
     updateIdentity({ baseUrl: "https://new.example/v1" });
     await waitFor(() =>
-      expect(screen.getByRole("button", { name: "验证连接" })).toBeEnabled(),
+      expect(
+        screen.getByRole("button", { name: "Verify Connection" }),
+      ).toBeEnabled(),
     );
-    fireEvent.click(screen.getByRole("button", { name: "验证连接" }));
+    fireEvent.click(screen.getByRole("button", { name: "Verify Connection" }));
     fireEvent.click(screen.getByRole("button", { name: "确认测试" }));
 
     await act(async () => {
@@ -1042,7 +1103,7 @@ describe("CodexFormFields local model routing", () => {
       newChat.resolve(createProbeResult("model-a", "new chat ok"));
       await Promise.resolve();
     });
-    expect(await screen.findByText("可加入 MultiRouter")).toBeInTheDocument();
+    expect(await screen.findByText("Can join MultiRouter")).toBeInTheDocument();
 
     await act(async () => {
       oldResponses.resolve(createProbeFailure("model-a", "old credentials"));
@@ -1051,7 +1112,7 @@ describe("CodexFormFields local model routing", () => {
     });
 
     await waitFor(() => {
-      expect(screen.getByText("可加入 MultiRouter")).toBeInTheDocument();
+      expect(screen.getByText("Can join MultiRouter")).toBeInTheDocument();
       expect(screen.queryByRole("alert")).not.toBeInTheDocument();
     });
   });
@@ -1115,7 +1176,7 @@ describe("CodexFormFields local model routing", () => {
       },
     );
 
-    fireEvent.click(screen.getByRole("button", { name: "验证连接" }));
+    fireEvent.click(screen.getByRole("button", { name: "Verify Connection" }));
     fireEvent.click(screen.getByRole("button", { name: "确认测试" }));
 
     await waitFor(() => {
@@ -1180,7 +1241,7 @@ describe("CodexFormFields local model routing", () => {
       { shouldShowSpeedTest: true },
     );
 
-    fireEvent.click(screen.getByRole("button", { name: "验证连接" }));
+    fireEvent.click(screen.getByRole("button", { name: "Verify Connection" }));
     fireEvent.click(screen.getByRole("button", { name: "确认测试" }));
 
     await waitFor(() => {
@@ -1222,7 +1283,7 @@ describe("CodexFormFields local model routing", () => {
     });
 
     fireEvent.click(screen.getByRole("button", { name: "高级选项" }));
-    fireEvent.click(screen.getByRole("button", { name: "验证连接" }));
+    fireEvent.click(screen.getByRole("button", { name: "Verify Connection" }));
 
     expect(
       screen.getByText("已打开验证确认框；如果没有看到弹窗，请按 Esc 后重试。"),
@@ -1241,10 +1302,10 @@ describe("CodexFormFields local model routing", () => {
     fireEvent.click(screen.getByRole("button", { name: "高级选项" }));
 
     const fetchButton = screen.getByRole("button", {
-      name: "同步模型",
+      name: "Sync Models",
     });
     const probeButton = screen.getByRole("button", {
-      name: "验证连接",
+      name: "Verify Connection",
     });
 
     expect(fetchButton).toBeVisible();
@@ -1272,7 +1333,7 @@ describe("CodexFormFields local model routing", () => {
       takeoverEnabled: false,
     });
 
-    fireEvent.click(screen.getByRole("button", { name: "同步模型" }));
+    fireEvent.click(screen.getByRole("button", { name: "Sync Models" }));
 
     await waitFor(() => {
       expect(latestCatalog()).toEqual([
@@ -1286,7 +1347,7 @@ describe("CodexFormFields local model routing", () => {
     });
   });
 
-  it("preserves fetched image support and updates existing rows to explicit text-only capabilities", async () => {
+  it("preserves existing capability choices while hydrating missing catalog rows", async () => {
     vi.mocked(fetchModelsForConfig).mockResolvedValueOnce([
       {
         id: "vision-model",
@@ -1311,7 +1372,7 @@ describe("CodexFormFields local model routing", () => {
       },
     ]);
 
-    fireEvent.click(screen.getByRole("button", { name: "同步模型" }));
+    fireEvent.click(screen.getByRole("button", { name: "Fill Missing" }));
 
     await waitFor(() => {
       expect(latestCatalog()).toEqual([
@@ -1320,16 +1381,9 @@ describe("CodexFormFields local model routing", () => {
           upstreamModel: "text-model",
           displayName: "Existing text model",
           contextWindow: "",
-          inputModalities: ["text"],
-          supportsImage: false,
-        },
-        {
-          model: "vision-model",
-          upstreamModel: "vision-model",
-          displayName: "vision-model",
-          contextWindow: "",
           inputModalities: ["text", "image"],
           supportsImage: true,
+          textOnly: false,
         },
       ]);
     });
@@ -1338,14 +1392,14 @@ describe("CodexFormFields local model routing", () => {
   it("points users to fetch models when protocol probing has no catalog", async () => {
     renderCatalogHarness([], { shouldShowSpeedTest: true });
 
-    fireEvent.click(screen.getByRole("button", { name: "验证连接" }));
+    fireEvent.click(screen.getByRole("button", { name: "Verify Connection" }));
     fireEvent.click(screen.getByRole("button", { name: "确认测试" }));
 
     expect(await screen.findByRole("status")).toHaveTextContent(
       "请先在“模型与兼容性”同步模型，或在高级设置中手动添加至少一个模型后再验证。",
     );
     const fetchButton = screen.getByRole("button", {
-      name: "同步模型",
+      name: "Sync Models",
     });
     expect(fetchButton).toHaveClass("border-blue-500");
     await waitFor(() =>
@@ -1363,13 +1417,15 @@ describe("CodexFormFields local model routing", () => {
       shouldShowSpeedTest: true,
     });
 
-    fireEvent.click(screen.getByRole("button", { name: "验证连接" }));
+    fireEvent.click(screen.getByRole("button", { name: "Verify Connection" }));
     fireEvent.click(screen.getByRole("button", { name: "确认测试" }));
 
     expect(await screen.findByRole("alert")).toHaveTextContent(
       "协议测试中断：backend timeout",
     );
-    expect(screen.getByRole("button", { name: "验证连接" })).toBeEnabled();
+    expect(
+      screen.getByRole("button", { name: "Verify Connection" }),
+    ).toBeEnabled();
   });
 
   it("merges fetched models by upstream model without overwriting a visible alias", async () => {
@@ -1384,7 +1440,7 @@ describe("CodexFormFields local model routing", () => {
       },
     ]);
 
-    fireEvent.click(screen.getByRole("button", { name: "同步模型" }));
+    fireEvent.click(screen.getByRole("button", { name: "Sync Models" }));
 
     await waitFor(() => {
       expect(latestCatalog()).toEqual([
@@ -1412,7 +1468,7 @@ describe("CodexFormFields local model routing", () => {
       },
     );
 
-    fireEvent.click(screen.getByRole("button", { name: "同步模型" }));
+    fireEvent.click(screen.getByRole("button", { name: "Sync Models" }));
 
     await waitFor(() => {
       expect(fetchModelsForConfig).toHaveBeenCalledWith(
@@ -1441,7 +1497,7 @@ describe("CodexFormFields local model routing", () => {
       },
     );
 
-    fireEvent.click(screen.getByRole("button", { name: "同步模型" }));
+    fireEvent.click(screen.getByRole("button", { name: "Sync Models" }));
 
     expect(fetchModelsForConfig).not.toHaveBeenCalled();
     expect(latestCatalog()).toEqual([
@@ -1464,7 +1520,7 @@ describe("CodexFormFields local model routing", () => {
       },
     );
 
-    fireEvent.click(screen.getByRole("button", { name: "同步模型" }));
+    fireEvent.click(screen.getByRole("button", { name: "Sync Models" }));
 
     await waitFor(() => {
       expect(fetchModelsForConfig).toHaveBeenCalledWith(
@@ -1493,22 +1549,39 @@ describe("CodexFormFields local model routing", () => {
       { model: "model-c", upstreamModel: "model-c" },
     ]);
 
-    fireEvent.click(screen.getByLabelText("保留 model-b"));
+    fireEvent.click(screen.getByLabelText("Include model-b"));
 
     await waitFor(() => {
-      expect(latestCatalog().map((model) => model.model)).toEqual([
+      const models = latestCatalog();
+      expect(models.map((model) => model.model)).toEqual([
         "model-a",
+        "model-b",
         "model-c",
       ]);
+      expect(models.find((model) => model.model === "model-b")?.enabled).toBe(
+        false,
+      );
     });
+
+    // Excluded rows stay in the draft as persistent tombstones. Switch to the
+    // included-only view before reordering the retained catalog.
+    fireEvent.click(screen.getByRole("button", { name: "Included 2" }));
+    expect(screen.getAllByTitle("上移")).toHaveLength(2);
 
     fireEvent.click(screen.getAllByTitle("上移")[1]);
 
     await waitFor(() => {
-      expect(latestCatalog().map((model) => model.model)).toEqual([
-        "model-c",
+      const models = latestCatalog();
+      expect(models.map((model) => model.model)).toEqual([
         "model-a",
+        "model-c",
+        "model-b",
       ]);
+      expect(
+        models
+          .filter((model) => model.enabled !== false)
+          .map((model) => model.model),
+      ).toEqual(["model-a", "model-c"]);
     });
   });
 
@@ -1541,6 +1614,50 @@ describe("CodexFormFields local model routing", () => {
       defaultRouteId: "deepseek",
       routes: [{ id: "deepseek" }],
     });
+  });
+
+  it("shows Zen recommendations, creates a custom policy, clamps edits, and restores recommendations", () => {
+    const { latestPolicy } = renderTrafficPolicyHarness();
+    fireEvent.click(screen.getByRole("button", { name: "高级选项" }));
+
+    expect(
+      screen.getByText(/OpenCode Zen recommendation: 4 in flight/),
+    ).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Customize" }));
+    expect(latestPolicy()).toMatchObject({
+      admissionEnabled: true,
+      maxInFlight: 4,
+      maxQueueWaitMs: 30_000,
+      rateLimitMaxRetries: 5,
+      rejectionRetryMode: "opencode_endpoint_unavailable",
+      rejectionMaxRetries: 2,
+    });
+
+    fireEvent.change(document.getElementById("codex-max-in-flight")!, {
+      target: { value: "999" },
+    });
+    expect(latestPolicy()?.maxInFlight).toBe(64);
+    fireEvent.change(document.getElementById("codex-max-queue-wait")!, {
+      target: { value: "1" },
+    });
+    expect(latestPolicy()?.maxQueueWaitMs).toBe(100);
+    fireEvent.change(document.getElementById("codex-rate-limit-retries")!, {
+      target: { value: "99" },
+    });
+    expect(latestPolicy()?.rateLimitMaxRetries).toBe(5);
+
+    fireEvent.click(screen.getByRole("button", { name: "Use recommendation" }));
+    expect(latestPolicy()).toBeUndefined();
+  });
+
+  it("shows unknown capacity and keeps rejection controls disabled by default", () => {
+    renderTrafficPolicyHarness("https://unknown.example/v1");
+    fireEvent.click(screen.getByRole("button", { name: "高级选项" }));
+    expect(screen.getByText(/No capacity claim is known/)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Customize" }));
+    expect(document.getElementById("codex-rejection-retries")).toBeDisabled();
+    expect(document.getElementById("codex-rejection-delay")).toBeDisabled();
+    expect(document.getElementById("codex-rejection-max-delay")).toBeDisabled();
   });
 
   it("places the explained custom menu projection control last in advanced options", () => {

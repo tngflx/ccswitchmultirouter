@@ -233,8 +233,8 @@ describe("Codex Chat provider presets", () => {
         {
           contextWindows: {
             "deepseek-v4-flash": 1048576,
-            "deepseek-v4-flash-vision-exp": 1048576,
             "deepseek-v4-pro": 1048576,
+            "deepseek-v4-flash-vision-exp": 1048576,
           },
         },
       ],

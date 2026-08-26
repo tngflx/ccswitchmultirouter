@@ -1,6 +1,7 @@
 import type { ReactNode } from "react";
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
+import i18n from "@/i18n";
 import CodexConfigEditor from "@/components/providers/forms/CodexConfigEditor";
 import GeminiConfigEditor from "@/components/providers/forms/GeminiConfigEditor";
 
@@ -47,7 +48,8 @@ vi.mock("@/components/JsonEditor", () => ({
 }));
 
 describe("Common config modals", () => {
-  it("keeps raw Codex files inside a collapsed expert section", () => {
+  it("keeps raw Codex files inside a collapsed expert section", async () => {
+    await i18n.changeLanguage("zh");
     render(
       <CodexConfigEditor
         authValue="{}"
@@ -62,7 +64,7 @@ describe("Common config modals", () => {
       />,
     );
 
-    expect(screen.getByRole("button", { name: "专家配置" })).toHaveAttribute(
+    expect(screen.getByRole("button", { name: i18n.t("codexConfig.expertConfigTitle") })).toHaveAttribute(
       "aria-expanded",
       "false",
     );
@@ -76,7 +78,7 @@ describe("Common config modals", () => {
       }),
     ).not.toBeInTheDocument();
 
-    fireEvent.click(screen.getByRole("button", { name: "专家配置" }));
+    fireEvent.click(screen.getByRole("button", { name: i18n.t("codexConfig.expertConfigTitle") }));
 
     expect(screen.getByText("codexConfig.authJson")).toBeInTheDocument();
     expect(screen.getByText("codexConfig.configToml")).toBeInTheDocument();

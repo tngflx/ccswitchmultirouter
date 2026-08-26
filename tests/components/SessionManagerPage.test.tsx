@@ -19,6 +19,27 @@ const toastErrorMock = vi.fn();
 const GROUP_EXPANSION_STORAGE_KEY =
   "cc-switch.sessionManager.groupExpansionState";
 
+vi.mock("react-i18next", async () => {
+  const zh = (await import("@/i18n/locales/zh.json")).default;
+  const resolve = (key: string): any =>
+    key
+      .split(".")
+      .reduce((obj: any, part: string) => (obj == null ? obj : obj[part]), zh);
+  return {
+    useTranslation: () => ({
+      t: (key: string, params?: Record<string, unknown>) => {
+        let value = resolve(key) ?? key;
+        if (params) {
+          for (const [name, replacement] of Object.entries(params)) {
+            value = value.split("{{" + name + "}}").join(String(replacement));
+          }
+        }
+        return value;
+      },
+    }),
+  };
+});
+
 vi.mock("sonner", () => ({
   toast: {
     success: (...args: unknown[]) => toastSuccessMock(...args),
@@ -176,12 +197,12 @@ const collapseAllGroups = () => {
 const expandDirectoryGroup = (provider: string, directory: string) => {
   fireEvent.click(
     screen.getByRole("button", {
-      name: new RegExp(`展开或折叠 ${provider} 供应商分组`),
+      name: new RegExp(`展开或折叠 ${provider} 供应商分组`, "i"),
     }),
   );
   fireEvent.click(
     screen.getByRole("button", {
-      name: new RegExp(`展开或折叠 ${directory} 目录分组`),
+      name: new RegExp(`展开或折叠 ${directory} 目录分组`, "i"),
     }),
   );
 };
@@ -316,12 +337,8 @@ describe("SessionManagerPage", () => {
       expect(screen.queryByText("Alpha Session")).not.toBeInTheDocument(),
     );
 
-    expect(
-      screen.getByText("sessionManager.selectSession"),
-    ).toBeInTheDocument();
-    expect(
-      screen.queryByText("sessionManager.emptySession"),
-    ).not.toBeInTheDocument();
+    expect(screen.getByText("请选择会话查看详情")).toBeInTheDocument();
+    expect(screen.queryByText("该会话暂无可展示内容")).not.toBeInTheDocument();
     expect(toastErrorMock).not.toHaveBeenCalled();
     expect(toastSuccessMock).toHaveBeenCalled();
   });
@@ -491,9 +508,7 @@ describe("SessionManagerPage", () => {
 
     // 等待 SessionManagerPage 渲染；不应出现 Codex 历史修复 UI
     await waitFor(() => {
-      expect(
-        screen.getByText("sessionManager.sessionList"),
-      ).toBeInTheDocument();
+      expect(screen.getByText("会话列表")).toBeInTheDocument();
     });
 
     expect(screen.queryByText("Codex 历史修复")).not.toBeInTheDocument();
@@ -516,12 +531,12 @@ describe("SessionManagerPage", () => {
     ).toBeInTheDocument();
     expect(
       screen.getByRole("button", {
-        name: /展开或折叠 codex 供应商分组/,
+        name: /展开或折叠 codex 供应商分组/i,
       }),
     ).toBeInTheDocument();
     expect(
       screen.getByRole("button", {
-        name: /展开或折叠 claude 供应商分组/,
+        name: /展开或折叠 claude 供应商分组/i,
       }),
     ).toBeInTheDocument();
     expect(
@@ -596,7 +611,7 @@ describe("SessionManagerPage", () => {
     ).toBeInTheDocument();
     expect(
       screen.getByRole("button", {
-        name: /展开或折叠 claude 供应商分组/,
+        name: /展开或折叠 claude 供应商分组/i,
       }),
     ).toBeInTheDocument();
     expect(
@@ -655,10 +670,10 @@ describe("SessionManagerPage", () => {
     await enterGroupedBatchMode();
 
     const codexProviderCheckbox = screen.getByRole("checkbox", {
-      name: /选择 codex 供应商分组内会话/,
+      name: /选择 codex 供应商分组内会话/i,
     });
     const claudeProviderCheckbox = screen.getByRole("checkbox", {
-      name: /选择 claude 供应商分组内会话/,
+      name: /选择 claude 供应商分组内会话/i,
     });
 
     fireEvent.click(codexProviderCheckbox);
@@ -686,7 +701,7 @@ describe("SessionManagerPage", () => {
     expandDirectoryGroup("codex", "codex");
 
     const providerCheckbox = screen.getByRole("checkbox", {
-      name: /选择 codex 供应商分组内会话/,
+      name: /选择 codex 供应商分组内会话/i,
     });
     const codexDirectoryCheckbox = screen.getByRole("checkbox", {
       name: /选择 codex 目录分组内会话/,
@@ -715,7 +730,7 @@ describe("SessionManagerPage", () => {
 
     expect(
       screen.getByRole("checkbox", {
-        name: /选择 codex 供应商分组内会话/,
+        name: /选择 codex 供应商分组内会话/i,
       }),
     ).toHaveAttribute("aria-checked", "mixed");
     expect(

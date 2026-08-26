@@ -700,7 +700,7 @@ describe("codexMultiRouterWizard helpers", () => {
       {
         providerId: "empty-relay",
         providerName: "Empty Relay",
-        reason: "缺少 Base URL/API Key，且当前没有可用 modelCatalog。",
+        reason: "codexWizard.lib.issueNoBaseUrl",
       },
     ]);
   });
@@ -897,8 +897,7 @@ describe("codexMultiRouterWizard helpers", () => {
       {
         providerId: "ark-agentplan",
         providerName: "火山Agentplan",
-        reason:
-          "当前 Plan 缺少推理 API Key 或专用模型列表凭据，且没有可用 modelCatalog。",
+        reason: "codexWizard.lib.issueNoInferenceCreds",
       },
     ]);
   });
