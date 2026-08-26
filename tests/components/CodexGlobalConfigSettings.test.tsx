@@ -12,6 +12,7 @@ vi.mock("react-i18next", async () => {
   const resolve = (key: string) =>
     key.split(".").reduce<any>((obj, part) => (obj == null ? obj : obj[part]), zh);
   return {
+    initReactI18next: { type: "3rdParty", init: () => {} },
     useTranslation: () => ({
       t: (key: string, params?: Record<string, unknown>) => {
         let value: string = resolve(key) ?? key;
@@ -128,3 +129,4 @@ describe("CodexGlobalConfigSettings", () => {
     expect(configApi.getCommonConfigSnippet).toHaveBeenCalledTimes(2);
   });
 });
+

@@ -26,6 +26,7 @@ vi.mock("react-i18next", async () => {
       .split(".")
       .reduce((obj: any, part: string) => (obj == null ? obj : obj[part]), zh);
   return {
+    initReactI18next: { type: "3rdParty", init: () => {} },
     useTranslation: () => ({
       t: (key: string, params?: Record<string, unknown>) => {
         let value = resolve(key) ?? key;
@@ -784,3 +785,4 @@ describe("SessionManagerPage", () => {
     expect(toastSuccessMock).toHaveBeenCalled();
   });
 });
+
