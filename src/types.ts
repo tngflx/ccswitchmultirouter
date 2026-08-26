@@ -32,6 +32,16 @@ export interface Provider {
   inFailoverQueue?: boolean;
 }
 
+export interface CodexApiKeyGroup {
+  id: string;
+  label?: string;
+  apiKeys: string[];
+  models?: string[];
+  prefixes?: string[];
+  enabled?: boolean;
+  strategy?: "round_robin" | "random";
+}
+
 export interface AppConfig {
   providers: Record<string, Provider>;
   current: string;
@@ -191,6 +201,22 @@ export interface LocalProxyRequestOverrides {
   body?: Record<string, unknown>;
 }
 
+export type CodexRejectionRetryMode =
+  | "disabled"
+  | "opencode_endpoint_unavailable";
+
+/** Provider-specific local admission and safe explicit-rejection retry policy. */
+export interface CodexTrafficPolicy {
+  admissionEnabled?: boolean;
+  maxInFlight?: number;
+  maxQueueWaitMs?: number;
+  rateLimitMaxRetries?: number;
+  rejectionRetryMode?: CodexRejectionRetryMode;
+  rejectionMaxRetries?: number;
+  rejectionInitialDelayMs?: number;
+  rejectionMaxDelayMs?: number;
+}
+
 // 供应商元数据（字段名与后端一致，保持 snake_case）
 export interface ProviderMeta {
   // 自定义端点：以 URL 为键，值为端点信息
@@ -244,6 +270,8 @@ export interface ProviderMeta {
   codexCache?: CodexCacheConfig;
   // Codex OAuth FAST mode: injects service_tier="priority" on ChatGPT Codex requests
   codexFastMode?: boolean;
+  // Provider-specific Codex admission and explicit-rejection retry policy.
+  codexTrafficPolicy?: CodexTrafficPolicy;
   // Codex Responses -> Chat Completions reasoning capability metadata
   codexChatReasoning?: CodexChatReasoning;
   // Stable CCSwitchMulti preset identity used to resolve maintained model capabilities.
@@ -391,6 +419,8 @@ export interface CodexCatalogModel {
   baseInstructions?: string;
   base_instructions?: string;
   reasoning?: CodexModelReasoningCapability;
+  reasoningLevels?: string[];
+  defaultReasoningLevel?: string;
   /** Codex 产品层设置，不属于 Provider capability 或其来源。 */
   codexUltra?: {
     enabled: boolean;
@@ -609,6 +639,7 @@ export interface Settings {
   launchCodexDesktopWithCcswitch?: boolean;
   // 静默启动（程序启动时不显示主窗口）
   silentStartup?: boolean;
+  enableStreamRetry?: boolean;
   // 是否启用主页面本地代理功能（默认关闭）
   enableLocalProxy?: boolean;
   // User has confirmed the local proxy first-run notice
@@ -636,7 +667,7 @@ export interface Settings {
   autoSyncConfirmed?: boolean;
   // User has confirmed the common config first-run notice
   commonConfigConfirmed?: boolean;
-  // 首选语言（可选，默认中文）
+  // Preferred UI language (optional; fresh installs default to English)
   language?: "en" | "zh" | "zh-TW" | "ja";
 
   // 主页面显示的应用（默认全部显示）

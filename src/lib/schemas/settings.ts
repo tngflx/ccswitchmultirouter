@@ -1,9 +1,10 @@
 import { z } from "zod";
+import i18n from "@/i18n";
 
 const directorySchema = z
   .string()
   .trim()
-  .min(1, "路径不能为空")
+  .min(1, i18n.t("validation.pathRequired"))
   .optional()
   .or(z.literal(""));
 
