@@ -270,10 +270,13 @@ export function ProviderList({
       const { migratedJsonlFiles, migratedStateRows, skippedReason } =
         outcome.history;
       if (skippedReason) {
-        toast.success("已切回 OpenAI 官方；历史修复暂未执行。");
+        toast.success(t("notifications.codexOfficialRestoredNoRepair"));
       } else {
         toast.success(
-          `已切回 OpenAI 官方，修复 ${migratedJsonlFiles} 个会话文件、${migratedStateRows} 条历史记录`,
+          t("notifications.codexOfficialRestoredWithRepair", {
+            files: migratedJsonlFiles,
+            rows: migratedStateRows,
+          }),
         );
       }
       outcome.switchWarnings.forEach((warning) => toast.warning(warning));
@@ -412,12 +415,11 @@ export function ProviderList({
             ) : (
               <RotateCcw className="mr-2 h-4 w-4" />
             )}
-            切回 OpenAI 官方
+            {t("notifications.codexOfficialButton")}
           </Button>
         </div>
         <p className="text-center text-xs text-muted-foreground">
-          会先退出本地代理并切回官方；历史修复需要 Codex/ChatGPT App
-          已完全退出。
+          {t("notifications.codexOfficialHint")}
         </p>
       </div>
     );

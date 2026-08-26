@@ -512,10 +512,10 @@ export function SettingsPage({
                             <Code2 className="h-5 w-5 text-violet-500" />
                             <div className="text-left">
                               <h3 className="text-base font-semibold">
-                                Codex 全局配置
+                                {t("settings.codexGlobalConfig.title")}
                               </h3>
                               <p className="text-sm font-normal text-muted-foreground">
-                                管理 Goal mode 和跨 Provider 共享的 Codex TOML
+                                {t("settings.codexGlobalConfig.description")}
                               </p>
                             </div>
                           </div>
