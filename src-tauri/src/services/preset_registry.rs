@@ -1,8 +1,11 @@
-//! 可更新 Provider 预设注册表 —— 传输 + 配置 + manifest 校验地基。
+﻿//! 可更新 Provider 预设注册表 —— 传输 + 配置 + manifest 校验地基。
 //!
 //! 本模块是 WebDAV 同步与预设注册表联调的可验证地基（见
 //! `docs/superpowers/plans/2026-08-23-webdav-preset-registry-integration.md`）：
 //! - 预设源（[`PresetSource`]）可跑在用户已有的 WebDAV/S3 上，复用 [`super::webdav`] 原语。
+// Intentionally unused: helpers preserved for upcoming upstream integration.
+#![allow(dead_code)]
+
 //! - manifest 必须通过 size / SHA-256 / 过期 / 版本不回退 / Ed25519 签名校验才接受。
 //! - 安全红线：没有受信源 + 签名验证前，不得做裸 URL 下载更新（`pinned-key` 源必须带签名）。
 //!
