@@ -33,7 +33,8 @@ use super::{
             responses_sse_events_from_anthropic_message,
         },
         streaming_codex_chat::{
-            create_responses_sse_stream_from_chat_with_context_and_projection,`n    create_responses_sse_stream_from_chat_with_context_and_projection_and_diagnostics,
+            create_responses_sse_stream_from_chat_with_context_and_projection,
+            create_responses_sse_stream_from_chat_with_context_and_projection_and_diagnostics,
             HOSTED_TOOL_STREAM_RESPONSE_HEADER,
         },
         streaming_gemini::create_anthropic_sse_stream_from_gemini,
@@ -4897,7 +4898,8 @@ fn codex_proxy_error_code(error: &ProxyError) -> &'static str {
         | ProxyError::BindFailed(_)
         | ProxyError::StopTimeout
         | ProxyError::StopFailed(_)
-        | ProxyError::ResponseBodyTooLarge(_) => "cc_switch_proxy_error",
+        | ProxyError::ResponseBodyTooLarge(_)
+        | ProxyError::AdmissionQueueTimeout { .. } => "cc_switch_proxy_error",
     }
 }
 
@@ -8337,6 +8339,7 @@ data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_deepseek\",\"
         }
     }
 }
+
 
 
 
