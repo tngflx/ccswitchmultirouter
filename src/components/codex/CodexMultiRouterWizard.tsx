@@ -403,8 +403,16 @@ function modelSourceStatusDetails(t: TFunction, provider: Provider): string[] {
 // 生成模型目录对比签名；只比较会影响路由、展示、上下文和多模态能力的字段。
 function modelCatalogSignature(model: CodexCatalogModel): string {
   const displayName = model.displayName?.trim() || model.model;
+  const upstreamModel =
+    (typeof model.upstreamModel === "string" && model.upstreamModel.trim()
+      ? model.upstreamModel.trim()
+      : "") ||
+    (typeof model.upstream_model === "string" && model.upstream_model.trim()
+      ? model.upstream_model.trim()
+      : "") ||
+    model.model;
   return JSON.stringify({
-    upstreamModel: model.upstreamModel ?? model.upstream_model ?? model.model,
+    upstreamModel,
     displayName,
     contextWindow:
       model.contextWindow === undefined ? null : String(model.contextWindow),
@@ -421,23 +429,24 @@ function diffWizardModelCatalog(
   afterModels: CodexCatalogModel[],
 ): ModelFetchDiff {
   const beforeByModel = new Map(
-    beforeModels.map((model) => [model.model, modelCatalogSignature(model)]),
+    beforeModels.map((model) => [model.model.trim().toLowerCase(), modelCatalogSignature(model)]),
   );
   const afterByModel = new Map(
-    afterModels.map((model) => [model.model, modelCatalogSignature(model)]),
+    afterModels.map((model) => [model.model.trim().toLowerCase(), modelCatalogSignature(model)]),
   );
   const added = afterModels
     .map((model) => model.model)
-    .filter((model) => !beforeByModel.has(model));
+    .filter((model) => !beforeByModel.has(model.trim().toLowerCase()));
   const removed = beforeModels
     .map((model) => model.model)
-    .filter((model) => !afterByModel.has(model));
+    .filter((model) => !afterByModel.has(model.trim().toLowerCase()));
   const changed = afterModels
     .map((model) => model.model)
     .filter(
       (model) =>
-        beforeByModel.has(model) &&
-        beforeByModel.get(model) !== afterByModel.get(model),
+        beforeByModel.has(model.trim().toLowerCase()) &&
+        beforeByModel.get(model.trim().toLowerCase()) !==
+          afterByModel.get(model.trim().toLowerCase()),
     );
   return { added, removed, changed };
 }
@@ -1220,7 +1229,7 @@ export function CodexMultiRouterWizard({
             const afterModels = readWizardModelCatalog(nextProvider);
             const diff = diffWizardModelCatalog(beforeModels, afterModels);
             const hasDiff = hasModelFetchDiff(diff);
-            await providersApi.update(nextProvider, "codex");
+            await providersApi.update(nextProvider, "codex", undefined, true);
             nextSources.push(nextProvider);
             successCount += 1;
             setModelFetchCards((current) => ({
@@ -1252,7 +1261,12 @@ export function CodexMultiRouterWizard({
                 const afterModels = readWizardModelCatalog(nextProvider);
                 const diff = diffWizardModelCatalog(beforeModels, afterModels);
                 const hasDiff = hasModelFetchDiff(diff);
-                await providersApi.update(nextProvider, "codex");
+                await providersApi.update(
+                  nextProvider,
+                  "codex",
+                  undefined,
+                  true,
+                );
                 nextSources.push(nextProvider);
                 successCount += 1;
                 recordWizardIssue({
@@ -1374,12 +1388,11 @@ export function CodexMultiRouterWizard({
           const nextProvider = mergeFetchedModelsIntoWizardProvider(
             provider,
             fetchedModels,
-            { preserveExistingSelection: true },
           );
           const afterModels = readWizardModelCatalog(nextProvider);
           const diff = diffWizardModelCatalog(beforeModels, afterModels);
           const hasDiff = hasModelFetchDiff(diff);
-          await providersApi.update(nextProvider, "codex");
+          await providersApi.update(nextProvider, "codex", undefined, true);
           nextSources.push(nextProvider);
           successCount += 1;
           setModelFetchCards((current) => ({
@@ -1626,14 +1639,14 @@ export function CodexMultiRouterWizard({
             JSON.stringify(draftSource.settingsConfig?.modelCatalog ?? null) !==
               JSON.stringify(source.settingsConfig?.modelCatalog ?? null)
           ) {
-            await providersApi.update(source, "codex");
+            await providersApi.update(source, "codex", undefined, true);
           }
         }
         let savedProvider = result.plan;
         if (activePlan) {
-          await providersApi.update(result.plan, "codex");
+          await providersApi.update(result.plan, "codex", undefined, true);
         } else {
-          await providersApi.add(result.plan, "codex", false);
+          await providersApi.add(result.plan, "codex", false, true);
           savedProvider = await codexSubagentV2Api.initializeProviderConfig(
             result.plan.id,
           );

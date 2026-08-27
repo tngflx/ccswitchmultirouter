@@ -1693,6 +1693,7 @@ describe("Codex Sub-Agent V2 new-plan capability defaults", () => {
         }),
         app: "codex",
         originalId: undefined,
+        skipAutomaticProbe: true,
       },
     ]);
     const savedProvider = (

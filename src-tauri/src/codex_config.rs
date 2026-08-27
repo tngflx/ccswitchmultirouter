@@ -6410,7 +6410,13 @@ fn read_back_codex_multirouter_projection_impl(
         });
     let cache_verified = read_json_file_if_exists(&get_codex_models_cache_path())?
         .as_ref()
-        .is_some_and(codex_models_cache_is_cc_switch_owned);
+        .is_none_or(|cache| {
+            codex_models_cache_is_cc_switch_owned(cache)
+                || cache
+                    .get("client_version")
+                    .and_then(Value::as_str)
+                    .is_none()
+        });
     let agent_files_verified =
         verify_codex_subagent_role_files(projection_settings, provider_context)?
             .iter()
@@ -7257,6 +7263,65 @@ fn set_codex_experimental_bearer_token(config_text: &str, token: &str) -> Result
     Ok(doc.to_string())
 }
 
+/// Keep Codex 0.149's login UX aligned with the auth file retained during a
+/// third-party switch. Only provider tables that carry a provider-scoped
+/// bearer or `env_key` are eligible: keyless header-auth tables must not be
+/// stamped with `requires_openai_auth`, or Codex may route their requests via
+/// the preserved ChatGPT login.
+fn align_codex_requires_openai_auth_with_login_preservation(
+    config_text: &str,
+    preserve_official_login: bool,
+) -> Result<String, AppError> {
+    if config_text.trim().is_empty() || !config_text.contains("model_providers") {
+        return Ok(config_text.to_string());
+    }
+    let mut doc = config_text
+        .parse::<DocumentMut>()
+        .map_err(|e| AppError::Message(format!("Invalid Codex config.toml: {e}")))?;
+    let Some(provider_id) = active_codex_model_provider_id(&doc) else {
+        return Ok(config_text.to_string());
+    };
+    if !is_custom_codex_model_provider_id(&provider_id) {
+        return Ok(config_text.to_string());
+    }
+    let Some(provider_table) = doc
+        .get_mut("model_providers")
+        .and_then(|item| item.as_table_like_mut())
+        .and_then(|table| table.get_mut(provider_id.as_str()))
+        .and_then(|item| item.as_table_like_mut())
+    else {
+        return Ok(config_text.to_string());
+    };
+    // MultiRouter takeover uses a synthetic bearer as a Desktop-facing
+    // facade. Its `requires_openai_auth` bit is deliberately kept true so
+    // the login/account surface remains available; this is not a normal
+    // third-party provider switch.
+    if provider_table
+        .get("experimental_bearer_token")
+        .and_then(|item| item.as_str())
+        .is_some_and(|token| token == CODEX_PROXY_AUTH_PLACEHOLDER)
+    {
+        return Ok(config_text.to_string());
+    }
+    if provider_table.get("experimental_bearer_token").is_none()
+        && provider_table.get("env_key").is_none()
+    {
+        return Ok(config_text.to_string());
+    }
+    if provider_table
+        .get("requires_openai_auth")
+        .and_then(|item| item.as_bool())
+        == Some(preserve_official_login)
+    {
+        return Ok(config_text.to_string());
+    }
+    provider_table.insert(
+        "requires_openai_auth",
+        toml_edit::value(preserve_official_login),
+    );
+    Ok(doc.to_string())
+}
+
 pub fn remove_codex_experimental_bearer_token_if(
     config_text: &str,
     predicate: impl Fn(&str) -> bool,
@@ -7763,7 +7828,14 @@ pub fn write_codex_live_for_provider(
                 .map(|provider_config| merge_codex_provider_config_texts(live, provider_config))
                 .transpose()?
                 .unwrap_or_else(|| live.to_string());
-            prepare_codex_provider_live_config(auth, &merged)
+            let prepared = prepare_codex_provider_live_config(auth, &merged)?;
+            if category == Some("official") {
+                return Ok(prepared);
+            }
+            align_codex_requires_openai_auth_with_login_preservation(
+                &prepared,
+                crate::settings::preserve_codex_official_auth_on_switch(),
+            )
         })
         .map(|_| ())
     }
@@ -11425,6 +11497,31 @@ base_url = "https://single.example.com/v1"
             err.to_string().contains("config.toml"),
             "error should explain missing config.toml, got: {err}"
         );
+    }
+
+    #[test]
+    fn requires_openai_auth_alignment_follows_preserved_login_only_for_keyed_tables() {
+        let config = r#"model_provider = "relay"
+
+[model_providers.relay]
+base_url = "https://relay.example/v1"
+experimental_bearer_token = "sk-test"
+requires_openai_auth = true
+"#;
+        let output = align_codex_requires_openai_auth_with_login_preservation(config, false)
+            .expect("align third-party provider");
+        assert!(output.contains("requires_openai_auth = false"));
+        assert!(!output.contains("requires_openai_auth = true"));
+
+        let header_auth = r#"model_provider = "header"
+
+[model_providers.header]
+base_url = "https://header.example/v1"
+http_headers = { Authorization = "Bearer static" }
+"#;
+        let output = align_codex_requires_openai_auth_with_login_preservation(header_auth, true)
+            .expect("leave keyless header provider unchanged");
+        assert!(!output.contains("requires_openai_auth"));
     }
 
     #[test]
@@ -16594,6 +16691,35 @@ wire_api = "responses"
             catalog["ccSwitchRoutingDependencyFingerprint"],
             "fingerprint-v2"
         );
+    }
+
+    #[test]
+    #[serial]
+    fn multirouter_projection_readback_allows_an_unversioned_optional_models_cache() {
+        let _guard = TestHomeGuard::new();
+        write_codex_live_config_atomic(Some(
+            r#"model_provider = "codex_model_router_v2"
+
+[model_providers.codex_model_router_v2]
+base_url = "http://127.0.0.1:15721/v1"
+wire_api = "responses"
+"#,
+        ))
+        .expect("seed live config");
+        write_json_file(&get_codex_models_cache_path(), &json!({"models": []}))
+            .expect("seed unversioned cache");
+        let settings = json!({
+            "modelCatalog": {"models": [{"model": "qwen3.8"}]},
+            "codexRouting": {"schemaVersion": 2, "enabled": true, "routes": []},
+            "codexRoutingProjection": {"dependencyFingerprint": "unversioned-cache"}
+        });
+
+        let read_back = publish_codex_multirouter_projection(&settings)
+            .expect("publish projection with optional cache skipped");
+
+        assert!(read_back.catalog_verified);
+        assert!(read_back.config_verified);
+        assert!(read_back.cache_verified);
     }
 
     #[test]

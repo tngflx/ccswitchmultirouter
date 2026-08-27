@@ -29,6 +29,10 @@ function catalogModelIds(models: CodexCatalogModel[]): string[] {
     .filter((model): model is string => Boolean(model));
 }
 
+function modelIdentity(value: string): string {
+  return value.trim().toLowerCase();
+}
+
 // 规整 spawn_agent 候选顺序：先保留已配置且仍存在的模型，再用 catalog 顺序补满前五个。
 export function normalizeCodexSpawnAgentModels(
   selectedModels: string[],
@@ -36,21 +40,23 @@ export function normalizeCodexSpawnAgentModels(
   limit = CODEX_SPAWN_AGENT_VISIBLE_MODEL_LIMIT,
 ): string[] {
   const availableModels = catalogModelIds(catalogModels);
-  const available = new Set(availableModels);
+  const available = new Set(availableModels.map(modelIdentity));
   const seen = new Set<string>();
   const normalized: string[] = [];
 
   for (const item of selectedModels) {
     const model = item.trim();
-    if (!model || seen.has(model) || !available.has(model)) continue;
-    seen.add(model);
+    const identity = modelIdentity(model);
+    if (!model || seen.has(identity) || !available.has(identity)) continue;
+    seen.add(identity);
     normalized.push(model);
     if (normalized.length >= limit) return normalized;
   }
 
   for (const model of availableModels) {
-    if (seen.has(model)) continue;
-    seen.add(model);
+    const identity = modelIdentity(model);
+    if (seen.has(identity)) continue;
+    seen.add(identity);
     normalized.push(model);
     if (normalized.length >= limit) break;
   }
@@ -108,14 +114,15 @@ export function normalizeSpawnAgentCandidateSelection(
   catalogModels: CodexCatalogModel[],
   limit = CODEX_SPAWN_AGENT_VISIBLE_MODEL_LIMIT,
 ): string[] {
-  const available = new Set(catalogModelIds(catalogModels));
+  const available = new Set(catalogModelIds(catalogModels).map(modelIdentity));
   const seen = new Set<string>();
   const normalized: string[] = [];
 
   for (const item of selectedModels) {
     const model = item.trim();
-    if (!model || seen.has(model) || !available.has(model)) continue;
-    seen.add(model);
+    const identity = modelIdentity(model);
+    if (!model || seen.has(identity) || !available.has(identity)) continue;
+    seen.add(identity);
     normalized.push(model);
     if (normalized.length >= limit) break;
   }
@@ -151,19 +158,25 @@ export function validateSpawnAgentCandidates(
 ): SpawnAgentCandidateValidation {
   const catalogModels = new Set(
     catalog.models
+      .filter((model) => model.enabled !== false)
       .map((model) => model.model?.trim())
       .filter((model): model is string => Boolean(model)),
   );
   const visible = visibleModels.slice(0, limit).filter(Boolean);
-  const visibleSet = new Set(visible);
+  const visibleSet = new Set(visible.map(modelIdentity));
+  const catalogIdentities = new Set(Array.from(catalogModels, modelIdentity));
 
   return {
     visibleModels: visible,
     missingSelectedModels: catalog.spawnAgentModels.filter(
-      (model) => catalogModels.has(model) && !visibleSet.has(model),
+      (model) =>
+        catalogIdentities.has(modelIdentity(model)) &&
+        !visibleSet.has(modelIdentity(model)),
     ),
     missingPriorityModels: priorityModels.filter(
-      (model) => catalogModels.has(model) && !visibleSet.has(model),
+      (model) =>
+        catalogIdentities.has(modelIdentity(model)) &&
+        !visibleSet.has(modelIdentity(model)),
     ),
     tooManySelected: catalog.spawnAgentModels.length > limit,
   };

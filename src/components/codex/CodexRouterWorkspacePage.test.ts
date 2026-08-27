@@ -18,6 +18,7 @@ import {
   buildMultiRouterRuntimeStatus,
   buildCodexProxyBaseUrl,
   buildModelCatalogForRoutes,
+  collectRoutedCatalogModels,
   codexCatalogProviderName,
   formatCodexCatalogModelLabel,
   sortCodexCatalogModels,
@@ -1340,6 +1341,154 @@ describe("Codex MultiRouter workspace route persistence helpers", () => {
     expect(fetchCodexOauthModels).not.toHaveBeenCalledWith("account-disabled");
   });
 
+  it("refreshes fallback and enabled grouped API keys while ignoring disabled groups", async () => {
+    vi.mocked(fetchModelsForConfig).mockImplementation(
+      async (_baseUrl, apiKey) => {
+        if (apiKey === "fallback-key") {
+          return [{ id: "fallback-model", ownedBy: "fallback" }];
+        }
+        if (apiKey === "grouped-key") {
+          return [{ id: "grouped-model", ownedBy: "grouped" }];
+        }
+        throw new Error(`unexpected API key: ${apiKey}`);
+      },
+    );
+    const provider: Provider = {
+      id: "codex-grouped-refresh-source",
+      name: "Grouped Refresh Source",
+      category: "custom",
+      settingsConfig: {
+        baseUrl: "https://grouped-refresh.example/v1",
+        auth: { OPENAI_API_KEY: "fallback-key" },
+        codexApiKeyGroups: [
+          { id: "enabled", enabled: true, apiKeys: ["grouped-key"] },
+          {
+            id: "disabled",
+            enabled: false,
+            apiKeys: ["disabled-group-key"],
+          },
+        ],
+        modelCatalog: { models: [] },
+      },
+    };
+    const plan = withEnabledProviderRoute(
+      createDraftRoutingPlan([provider], [provider]),
+      provider,
+    );
+
+    renderWorkspace(
+      React.createElement(CodexRouterWorkspacePage, {
+        providers: [provider, plan],
+        isProxyRunning: true,
+        isCodexTakeoverActive: true,
+        activeProviderId: plan.id,
+        initialProviderId: plan.id,
+        initialTab: "routes",
+        onEditProvider: vi.fn(),
+        onDeletePlan: vi.fn(),
+        onCreateProvider: vi.fn(),
+      }),
+    );
+
+    await waitFor(() => expect(fetchModelsForConfig).toHaveBeenCalledTimes(2));
+    expect(fetchModelsForConfig).toHaveBeenCalledWith(
+      "https://grouped-refresh.example/v1",
+      "fallback-key",
+      false,
+      undefined,
+      undefined,
+      undefined,
+    );
+    expect(fetchModelsForConfig).toHaveBeenCalledWith(
+      "https://grouped-refresh.example/v1",
+      "grouped-key",
+      false,
+      undefined,
+      undefined,
+      undefined,
+    );
+    expect(fetchModelsForConfig).not.toHaveBeenCalledWith(
+      "https://grouped-refresh.example/v1",
+      "disabled-group-key",
+      expect.anything(),
+      expect.anything(),
+      expect.anything(),
+      expect.anything(),
+    );
+
+    await waitFor(() => {
+      const savedProvider = vi
+        .mocked(providersApi.update)
+        .mock.calls.map(([updated]) => updated)
+        .find((updated) => updated.id === provider.id);
+      expect(savedProvider).toBeDefined();
+      expect(
+        savedProvider?.settingsConfig?.modelCatalog?.models.map(
+          (model: { model: string }) => model.model,
+        ),
+      ).toEqual(["fallback-model", "grouped-model"]);
+    });
+  });
+
+  it("refreshes a provider that has only enabled grouped API keys", async () => {
+    vi.mocked(fetchModelsForConfig).mockResolvedValueOnce([
+      { id: "grouped-only-model", ownedBy: "grouped" },
+    ]);
+    const provider: Provider = {
+      id: "codex-grouped-only-refresh-source",
+      name: "Grouped Only Refresh Source",
+      category: "custom",
+      settingsConfig: {
+        baseUrl: "https://grouped-only-refresh.example/v1",
+        auth: {},
+        codexApiKeyGroups: [
+          { id: "enabled", enabled: true, apiKeys: ["grouped-only-key"] },
+        ],
+        modelCatalog: { models: [] },
+      },
+    };
+    const plan = withEnabledProviderRoute(
+      createDraftRoutingPlan([provider], [provider]),
+      provider,
+    );
+
+    renderWorkspace(
+      React.createElement(CodexRouterWorkspacePage, {
+        providers: [provider, plan],
+        isProxyRunning: true,
+        isCodexTakeoverActive: true,
+        activeProviderId: plan.id,
+        initialProviderId: plan.id,
+        initialTab: "routes",
+        onEditProvider: vi.fn(),
+        onDeletePlan: vi.fn(),
+        onCreateProvider: vi.fn(),
+      }),
+    );
+
+    await waitFor(() =>
+      expect(fetchModelsForConfig).toHaveBeenCalledWith(
+        "https://grouped-only-refresh.example/v1",
+        "grouped-only-key",
+        false,
+        undefined,
+        undefined,
+        undefined,
+      ),
+    );
+    await waitFor(() => {
+      const savedProvider = vi
+        .mocked(providersApi.update)
+        .mock.calls.map(([updated]) => updated)
+        .find((updated) => updated.id === provider.id);
+      expect(
+        savedProvider?.settingsConfig?.modelCatalog?.models.map(
+          (model: { model: string }) => model.model,
+        ),
+      ).toEqual(["grouped-only-model"]);
+    });
+  });
+
   it("clears disabled provider refresh state and refreshes again after re-enabling", async () => {
     vi.mocked(fetchModelsForConfig).mockImplementation(
       () => new Promise(() => {}),
@@ -1640,6 +1789,14 @@ describe("Codex MultiRouter workspace route persistence helpers", () => {
           .mock.calls.some(([provider]) => provider.id === providerA.id),
       ).toBe(true),
     );
+    expect(
+      vi
+        .mocked(providersApi.update)
+        .mock.calls.find(([provider]) => provider.id === providerA.id)?.[0]
+        .settingsConfig?.modelCatalog?.models.map(
+          (model: { model?: string }) => model.model,
+        ),
+    ).toEqual(["old-a", "model-a"]);
 
     secondRefresh.resolve([{ id: "model-b", ownedBy: null }]);
     await waitFor(() =>
@@ -1649,8 +1806,16 @@ describe("Codex MultiRouter workspace route persistence helpers", () => {
           .mock.calls.some(([provider]) => provider.id === providerB.id),
       ).toBe(true),
     );
+    expect(
+      vi
+        .mocked(providersApi.update)
+        .mock.calls.find(([provider]) => provider.id === providerB.id)?.[0]
+        .settingsConfig?.modelCatalog?.models.map(
+          (model: { model?: string }) => model.model,
+        ),
+    ).toEqual(["old-b", "model-b"]);
     await waitFor(() =>
-      expect(screen.getAllByText("已读取并更新 1 个模型。")).toHaveLength(2),
+      expect(screen.getAllByText("已读取并更新 2 个模型。")).toHaveLength(2),
     );
   });
 
@@ -2104,9 +2269,10 @@ describe("Codex MultiRouter workspace route persistence helpers", () => {
       savedProvider.settingsConfig.modelCatalog.models.map(
         (model: { model: string }) => model.model,
       ),
-    ).toEqual(["kept-model"]);
+    ).toEqual(["kept-model", "removed-model"]);
     expect(savedProvider.settingsConfig.modelCatalog.spawnAgentModels).toEqual([
       "kept-model",
+      "removed-model",
     ]);
 
     expect(
@@ -3326,6 +3492,107 @@ describe("Codex MultiRouter workspace route persistence helpers", () => {
     expect(
       catalog.models.find((model) => model.model === "gpt-5.5-longnows-gpt"),
     ).toBeUndefined();
+  });
+
+  it("keeps disabled catalog rows out of route projection and routed candidates", () => {
+    const provider: Provider = {
+      id: "relay",
+      name: "Relay",
+      category: "custom",
+      settingsConfig: {
+        modelCatalog: {
+          models: [
+            { model: "free-enabled", enabled: true },
+            { model: "free-disabled", enabled: false },
+          ],
+        },
+      },
+    };
+    const plan = createDraftRoutingPlan([provider], [provider]);
+    const route = normalizeCodexRouteForSave(
+      {
+        targetProviderId: provider.id,
+        modelSelection: { mode: "all" },
+        match: { models: ["free-disabled"], prefixes: [] },
+      },
+      0,
+      new Set<string>(),
+    );
+
+    const projected = buildModelCatalogForRoutes(
+      plan,
+      [route],
+      new Map([[provider.id, provider]]),
+    );
+    expect(projected.models.map((model) => model.model)).toEqual([
+      "free-enabled",
+    ]);
+    expect(projected.models.map((model) => model.model)).not.toContain(
+      "free-disabled",
+    );
+
+    const routeEntry = [{ provider, route, index: 0 }];
+    expect(collectRoutedCatalogModels(routeEntry, projected.models)).toEqual([
+      "free-enabled",
+    ]);
+  });
+
+  it("preserves catalog model casing in projected spawn-agent candidates", () => {
+    const provider: Provider = {
+      id: "relay",
+      name: "Relay",
+      category: "custom",
+      settingsConfig: {
+        modelCatalog: {
+          models: [{ model: "Free-Model", enabled: true }],
+        },
+      },
+    };
+    const plan = createDraftRoutingPlan([provider], [provider]);
+    const route = normalizeCodexRouteForSave(
+      {
+        targetProviderId: provider.id,
+        modelSelection: { mode: "include", models: ["free-model"] },
+        match: { models: ["free-model"], prefixes: [] },
+      },
+      0,
+      new Set<string>(),
+    );
+
+    const projected = buildModelCatalogForRoutes(
+      plan,
+      [route],
+      new Map([[provider.id, provider]]),
+    );
+
+    expect(projected.models.map((model) => model.model)).toEqual([
+      "Free-Model",
+    ]);
+    expect(projected.spawnAgentModels).toEqual(["Free-Model"]);
+  });
+
+  it("matches route model identities case-insensitively in routed candidates", () => {
+    const provider: Provider = {
+      id: "relay",
+      name: "Relay",
+      category: "custom",
+      settingsConfig: { modelCatalog: { models: [{ model: "Free-Model" }] } },
+    };
+    const route = normalizeCodexRouteForSave(
+      {
+        targetProviderId: provider.id,
+        modelSelection: { mode: "all" },
+        match: { models: ["free-model"], prefixes: [] },
+      },
+      0,
+      new Set<string>(),
+    );
+    expect(
+      collectRoutedCatalogModels(
+        [{ provider, route, index: 0 }],
+        [{ model: "FREE-MODEL" }],
+      ),
+    ).toEqual(["FREE-MODEL"]);
   });
 
   it("reads legacy array codexRouting without clearing routes", () => {

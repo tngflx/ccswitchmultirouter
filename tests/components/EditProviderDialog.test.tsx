@@ -221,4 +221,79 @@ describe("EditProviderDialog", () => {
       JSON.parse(screen.getByTestId("settings-config").textContent ?? "{}"),
     ).toEqual(provider.settingsConfig);
   });
+
+  it("使用 live bearer 覆盖共享 auth key，但保留数据库私有字段", async () => {
+    const provider: Provider = {
+      id: "relay",
+      name: "Relay",
+      category: "custom",
+      settingsConfig: {
+        auth: { OPENAI_API_KEY: "provider-key" },
+        config:
+          'model_provider = "relay"\n[model_providers.relay]\nbase_url = "https://relay.example/v1"\n',
+      },
+    };
+    apiMocks.getCurrent.mockResolvedValue(provider.id);
+    apiMocks.getLiveProviderSettings.mockResolvedValue({
+      auth: { OPENAI_API_KEY: "stale-shared-key" },
+      config:
+        'model_provider = "relay"\n[model_providers.relay]\nbase_url = "https://relay.example/v1"\nexperimental_bearer_token = "live-provider-key"\n',
+    });
+
+    render(
+      <EditProviderDialog
+        open
+        provider={provider}
+        onOpenChange={vi.fn()}
+        onSubmit={vi.fn()}
+        appId="codex"
+      />,
+    );
+
+    await waitFor(() => {
+      const settings = JSON.parse(
+        screen.getByTestId("settings-config").textContent ?? "{}",
+      );
+      expect(settings.auth.OPENAI_API_KEY).toBe("live-provider-key");
+      expect(settings.config).toContain(
+        'experimental_bearer_token = "live-provider-key"',
+      );
+    });
+  });
+
+  it("不会把 OAuth-only 数据库模板改写成 API key", async () => {
+    const provider: Provider = {
+      id: "relay-oauth",
+      name: "Relay OAuth",
+      category: "custom",
+      settingsConfig: {
+        auth: { tokens: { access_token: "oauth-token" } },
+        config:
+          'model_provider = "relay-oauth"\n[model_providers.relay-oauth]\nbase_url = "https://relay.example/v1"\n',
+      },
+    };
+    apiMocks.getCurrent.mockResolvedValue(provider.id);
+    apiMocks.getLiveProviderSettings.mockResolvedValue({
+      auth: { OPENAI_API_KEY: "stale-shared-key" },
+      config:
+        'model_provider = "relay-oauth"\n[model_providers.relay-oauth]\nbase_url = "https://relay.example/v1"\nexperimental_bearer_token = "live-provider-key"\n',
+    });
+
+    render(
+      <EditProviderDialog
+        open
+        provider={provider}
+        onOpenChange={vi.fn()}
+        onSubmit={vi.fn()}
+        appId="codex"
+      />,
+    );
+
+    await waitFor(() => {
+      const settings = JSON.parse(
+        screen.getByTestId("settings-config").textContent ?? "{}",
+      );
+      expect(settings.auth).toEqual({ OPENAI_API_KEY: "stale-shared-key" });
+    });
+  });
 });

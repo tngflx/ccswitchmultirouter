@@ -16,6 +16,7 @@ interface CodexProviderReadinessSectionProps {
   trafficPolicy?: ResolvedCodexTrafficPolicy;
   isMaintainedPreset: boolean;
   isSyncingModels: boolean;
+  isRefreshingModels?: boolean;
   isValidatingConnection: boolean;
   validationSummary?: string;
   validationTone?: ValidationTone;
@@ -55,6 +56,7 @@ export function CodexProviderReadinessSection({
   },
   isMaintainedPreset,
   isSyncingModels,
+  isRefreshingModels = false,
   isValidatingConnection,
   validationSummary = "",
   validationTone = "muted",
@@ -83,6 +85,7 @@ export function CodexProviderReadinessSection({
   const hasModels = normalizedModels.length > 0;
   const validationPassed = validationTone === "success";
   const ready = hasModels && validationPassed;
+  const isCatalogActionRunning = isSyncingModels || isRefreshingModels;
   const readinessLabel = !hasModels
     ? tr("syncNeeded", "Sync models needed")
     : ready
@@ -118,7 +121,7 @@ export function CodexProviderReadinessSection({
             type="button"
             size="sm"
             onClick={() => onSyncModels()}
-            disabled={isSyncingModels}
+            disabled={isCatalogActionRunning}
             className={cn(
               "h-8 gap-1 border border-blue-700 bg-blue-600 px-3 text-white shadow-sm hover:bg-blue-700 dark:border-blue-400 dark:bg-blue-500 dark:hover:bg-blue-600",
               highlightSync &&
@@ -139,18 +142,18 @@ export function CodexProviderReadinessSection({
               size="sm"
               className="h-8 gap-1"
               onClick={onFillMissingFields}
-              disabled={isSyncingModels}
+              disabled={isCatalogActionRunning}
               title={tr(
                 "fillMissingTitle",
-                "Fill missing fields on existing models only; no new models, no overwrites",
+                "Refresh provider metadata for existing models without adding, renaming, reordering, or re-enabling models",
               )}
             >
-              {isSyncingModels ? (
+              {isRefreshingModels ? (
                 <Loader2 className="h-3.5 w-3.5 animate-spin" />
               ) : (
                 <Download className="h-3.5 w-3.5" />
               )}
-              {tr("fillMissing", "Fill Missing")}
+              {tr("fillMissing", "Refresh Existing")}
             </Button>
           )}
           <Button

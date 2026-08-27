@@ -399,6 +399,35 @@ export interface MergeFetchedWizardModelsOptions {
   preserveExistingSelection?: boolean;
 }
 
+function normalizedWizardModelId(value: unknown): string {
+  return typeof value === "string" ? value.trim().toLowerCase() : "";
+}
+
+function nonEmptyWizardModelField(...values: unknown[]): string {
+  for (const value of values) {
+    if (typeof value === "string" && value.trim()) return value.trim();
+  }
+  return "";
+}
+
+function wizardModelUpstream(model: CodexCatalogModel): string {
+  return nonEmptyWizardModelField(
+    model.upstreamModel,
+    model.upstream_model,
+    model.model,
+  );
+}
+
+function wizardModelIdentities(model: CodexCatalogModel): string[] {
+  return Array.from(
+    new Set(
+      [model.model, model.upstreamModel, model.upstream_model]
+        .map(normalizedWizardModelId)
+        .filter(Boolean),
+    ),
+  );
+}
+
 // 把 /models 返回值合并进 provider modelCatalog；可选择把已有目录当作用户保留列表，只刷新元数据不追加已删除模型。
 export function mergeFetchedModelsIntoWizardProvider(
   provider: Provider,
@@ -410,17 +439,17 @@ export function mergeFetchedModelsIntoWizardProvider(
   const byFetchedModel = new Map<string, string>();
   for (const model of existingModels) {
     byModel.set(model.model, model);
-    const visibleModel = model.model?.trim();
+    const visibleModel = nonEmptyWizardModelField(model.model);
     if (visibleModel) {
-      byFetchedModel.set(visibleModel, model.model);
+      byFetchedModel.set(normalizedWizardModelId(visibleModel), model.model);
     }
-    const upstreamModel = (
-      model.upstreamModel ??
-      model.upstream_model ??
-      model.model
-    )?.trim();
+    const upstreamModel = nonEmptyWizardModelField(
+      model.upstreamModel,
+      model.upstream_model,
+      model.model,
+    );
     if (upstreamModel) {
-      byFetchedModel.set(upstreamModel, model.model);
+      byFetchedModel.set(normalizedWizardModelId(upstreamModel), model.model);
     }
   }
   const shouldAppendFetchedModels =
@@ -428,14 +457,18 @@ export function mergeFetchedModelsIntoWizardProvider(
   for (const fetched of fetchedModels) {
     const modelId = fetched.id.trim();
     if (!modelId) continue;
-    const visibleModelId = byFetchedModel.get(modelId) ?? modelId;
+    const fetchedIdentity = normalizedWizardModelId(modelId);
+    const visibleModelId = byFetchedModel.get(fetchedIdentity) ?? modelId;
     const existing = byModel.get(visibleModelId);
     if (!existing && !shouldAppendFetchedModels) continue;
-    byModel.set(visibleModelId, {
+    const nextModel = {
       ...(existing ?? {}),
       model: visibleModelId,
-      upstreamModel:
-        existing?.upstreamModel ?? existing?.upstream_model ?? modelId,
+      upstreamModel: nonEmptyWizardModelField(
+        existing?.upstreamModel,
+        existing?.upstream_model,
+        modelId,
+      ),
       displayName: existing?.displayName ?? visibleModelId,
       ...(fetched.contextWindow
         ? { contextWindow: fetched.contextWindow }
@@ -454,7 +487,13 @@ export function mergeFetchedModelsIntoWizardProvider(
             supports_image: fetched.supportsImage,
           }
         : {}),
-    });
+    };
+    byModel.set(visibleModelId, nextModel);
+    // Index every fetched identity as it is inserted so case-variant rows in
+    // one response cannot create duplicate visible catalog entries.
+    for (const identity of wizardModelIdentities(nextModel)) {
+      byFetchedModel.set(identity, visibleModelId);
+    }
   }
   const models = Array.from(byModel.values());
   const allowedModels = new Set(models.map((model) => model.model));
@@ -495,12 +534,12 @@ export function collectWizardModelNameCollisions(
     for (const model of readWizardModelCatalog(provider).filter(
       isWizardModelEnabled,
     )) {
-      const upstream =
-        model.upstreamModel ?? model.upstream_model ?? model.model;
+      const upstream = wizardModelUpstream(model);
       if (!upstream) continue;
-      const owners = ownersByUpstream.get(upstream) ?? [];
+      const key = normalizedWizardModelId(upstream);
+      const owners = ownersByUpstream.get(key) ?? [];
       owners.push(provider);
-      ownersByUpstream.set(upstream, owners);
+      ownersByUpstream.set(key, owners);
     }
   }
   return Array.from(ownersByUpstream.entries())
@@ -521,14 +560,20 @@ function providerNameSuffix(provider: Provider): string {
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, "-")
     .replace(/^-+|-+$/g, "");
-  if (cleanedName) return cleanedName;
-  return (
+  const fallback =
     provider.id
       .trim()
       .toLowerCase()
       .replace(/[^a-z0-9]+/g, "-")
-      .replace(/^-+|-+$/g, "") || "provider"
-  );
+      .replace(/^-+|-+$/g, "") || "provider";
+  const compact = (cleanedName || fallback)
+    .split("-")
+    .filter(Boolean)
+    .slice(0, 3)
+    .join("-")
+    .slice(0, 32)
+    .replace(/-+$/g, "");
+  return compact || "provider";
 }
 
 // 为非官方重名模型生成稳定别名，保留 upstreamModel 指向真实上游模型名。
@@ -542,13 +587,10 @@ function buildWizardRouteModelMap(
   provider: Provider,
 ): Record<string, string> | undefined {
   const entries = readWizardModelCatalog(provider)
+    .filter(isWizardModelEnabled)
     .map((model) => {
       const visibleModel = model.model?.trim();
-      const upstreamModel = (
-        model.upstreamModel ??
-        model.upstream_model ??
-        model.model
-      )?.trim();
+      const upstreamModel = wizardModelUpstream(model);
       return visibleModel && upstreamModel && visibleModel !== upstreamModel
         ? [visibleModel, upstreamModel]
         : null;
@@ -560,17 +602,12 @@ function buildWizardRouteModelMap(
 // 判断模型目录是否主要是 OpenAI 官方 GPT/O 系列；这些模型应优先保持 Responses 原生链路。
 function hasOpenAiResponsesNativeModels(provider: Provider): boolean {
   if (!isOfficialCodexSource(provider)) return false;
-  return readWizardModelCatalog(provider).some((model) => {
-    const upstream = (
-      model.upstreamModel ??
-      model.upstream_model ??
-      model.model ??
-      ""
-    )
-      .trim()
-      .toLowerCase();
-    return upstream.startsWith("gpt-") || /^o\d/.test(upstream);
-  });
+  return readWizardModelCatalog(provider)
+    .filter(isWizardModelEnabled)
+    .some((model) => {
+      const upstream = normalizedWizardModelId(wizardModelUpstream(model));
+      return upstream.startsWith("gpt-") || /^o\d/.test(upstream);
+    });
 }
 
 // 检测多个 provider 暴露的同名模型；官方保留原名，第三方/中转站自动生成可见别名。
@@ -579,21 +616,23 @@ export function resolveWizardModelNameCollisions(
 ): Provider[] {
   const ownersByUpstream = new Map<string, Provider[]>();
   for (const provider of providers) {
-    for (const model of readWizardModelCatalog(provider)) {
-      const upstream =
-        model.upstreamModel ?? model.upstream_model ?? model.model;
+    for (const model of readWizardModelCatalog(provider).filter(
+      isWizardModelEnabled,
+    )) {
+      const upstream = wizardModelUpstream(model);
       if (!upstream) continue;
-      const owners = ownersByUpstream.get(upstream) ?? [];
+      const owners =
+        ownersByUpstream.get(normalizedWizardModelId(upstream)) ?? [];
       owners.push(provider);
-      ownersByUpstream.set(upstream, owners);
+      ownersByUpstream.set(normalizedWizardModelId(upstream), owners);
     }
   }
 
   return providers.map((provider) => {
     const nextModels = readWizardModelCatalog(provider).map((model) => {
-      const upstream =
-        model.upstreamModel ?? model.upstream_model ?? model.model;
-      const owners = ownersByUpstream.get(upstream) ?? [];
+      const upstream = wizardModelUpstream(model);
+      const owners =
+        ownersByUpstream.get(normalizedWizardModelId(upstream)) ?? [];
       if (owners.length <= 1 || isCanonicalModelSource(provider)) {
         return { ...model, upstreamModel: upstream };
       }
@@ -658,9 +697,7 @@ export function inferWizardCacheConfig(provider: Provider): CodexCacheConfig {
     provider.meta?.providerType ?? ""
   }`.toLowerCase();
   const models = readWizardModelCatalog(provider).map((model) =>
-    String(model.upstreamModel ?? model.upstream_model ?? model.model)
-      .trim()
-      .toLowerCase(),
+    normalizedWizardModelId(wizardModelUpstream(model)),
   );
   const hasModel = (needle: string) =>
     models.some((model) => model.includes(needle));
@@ -718,6 +755,7 @@ export function getWizardConnectivityProbeModels(provider: Provider): string[] {
   return Array.from(
     new Set(
       readWizardModelCatalog(provider)
+        .filter(isWizardModelEnabled)
         .map((model) => model.model?.trim())
         .filter((model): model is string => Boolean(model)),
     ),
@@ -871,15 +909,17 @@ export function applyWizardConnectivityApiFormatOverrides(
       const format =
         result.recommendedApiFormat ??
         (result.status === "pass" ? "openai_responses" : undefined);
-      if (format) formatByCanonicalModel.set(result.model, format);
+      if (format) {
+        const key = normalizedWizardModelId(result.model);
+        if (key) formatByCanonicalModel.set(key, format);
+      }
     }
     if (formatByCanonicalModel.size === 0) return provider;
     const models = readWizardModelCatalog(provider).map((model) => {
-      const canonicalModel =
-        model.upstreamModel ?? model.upstream_model ?? model.model;
+      const canonicalModel = wizardModelUpstream(model);
       const apiFormat =
-        formatByCanonicalModel.get(canonicalModel) ??
-        formatByCanonicalModel.get(model.model);
+        formatByCanonicalModel.get(normalizedWizardModelId(canonicalModel)) ??
+        formatByCanonicalModel.get(normalizedWizardModelId(model.model));
       return apiFormat ? { ...model, apiFormat } : model;
     });
     return {
@@ -902,17 +942,32 @@ export function filterWizardProvidersByModelOrder(
 ): Provider[] {
   if (!modelOrder) return providers;
   const enabledModels = new Set(
-    modelOrder.map((model) => model.trim()).filter(Boolean),
+    modelOrder.map(normalizedWizardModelId).filter(Boolean),
   );
-  const orderIndex = new Map(modelOrder.map((model, index) => [model, index]));
+  const orderIndex = new Map(
+    modelOrder
+      .map((model, index) => [normalizedWizardModelId(model), index] as const)
+      .filter(([model]) => Boolean(model)),
+  );
   return providers
     .map((provider) => {
       const models = readWizardModelCatalog(provider)
-        .filter((model) => enabledModels.has(model.model))
+        .filter(isWizardModelEnabled)
+        .filter((model) =>
+          wizardModelIdentities(model).some((id) => enabledModels.has(id)),
+        )
         .sort(
           (left, right) =>
-            (orderIndex.get(left.model) ?? Number.MAX_SAFE_INTEGER) -
-            (orderIndex.get(right.model) ?? Number.MAX_SAFE_INTEGER),
+            Math.min(
+              ...wizardModelIdentities(left).map(
+                (id) => orderIndex.get(id) ?? Number.MAX_SAFE_INTEGER,
+              ),
+            ) -
+            Math.min(
+              ...wizardModelIdentities(right).map(
+                (id) => orderIndex.get(id) ?? Number.MAX_SAFE_INTEGER,
+              ),
+            ),
         );
       return {
         ...provider,
@@ -933,9 +988,7 @@ function canonicalWizardModelIds(provider: Provider): string[] {
     new Set(
       readWizardModelCatalog(provider)
         .filter(isWizardModelEnabled)
-        .map((model) =>
-          (model.upstreamModel ?? model.upstream_model ?? model.model).trim(),
-        )
+        .map((model) => wizardModelUpstream(model))
         .filter(Boolean),
     ),
   );
@@ -1091,21 +1144,24 @@ export function buildWizardModelCatalog(
     for (const model of readWizardModelCatalog(provider).filter(
       isWizardModelEnabled,
     )) {
-      if (!byModel.has(model.model)) {
-        byModel.set(model.model, model);
+      const key = normalizedWizardModelId(model.model);
+      if (key && !byModel.has(key)) {
+        byModel.set(key, model);
       }
     }
   }
   const baseModels = Array.from(byModel.values());
   const models = options.catalogModelOrder
     ? options.catalogModelOrder
-        .map((model) => byModel.get(model))
+        .map((model) => byModel.get(normalizedWizardModelId(model)))
         .filter((model): model is CodexCatalogModel => Boolean(model))
     : baseModels;
-  const modelSet = new Set(models.map((model) => model.model));
+  const modelSet = new Set(
+    models.map((model) => normalizedWizardModelId(model.model)),
+  );
   const spawnAgentModels = (options.spawnAgentModels ?? [])
     .map((model) => model.trim())
-    .filter((model) => modelSet.has(model))
+    .filter((model) => modelSet.has(normalizedWizardModelId(model)))
     .slice(0, 5);
   return {
     models,
@@ -1231,7 +1287,9 @@ export function initialWizardCatalogModelOrder(
             ),
           )
         : null;
-    for (const model of readWizardModelCatalog(source)) {
+    for (const model of readWizardModelCatalog(source).filter(
+      isWizardModelEnabled,
+    )) {
       const identities = [
         model.model,
         model.upstreamModel,
@@ -1242,7 +1300,15 @@ export function initialWizardCatalogModelOrder(
       if (selected && !identities.some((identity) => selected.has(identity))) {
         continue;
       }
-      if (!ordered.includes(model.model)) ordered.push(model.model);
+      if (
+        !ordered.some(
+          (existing) =>
+            normalizedWizardModelId(existing) ===
+            normalizedWizardModelId(model.model),
+        )
+      ) {
+        ordered.push(model.model);
+      }
     }
   }
   return ordered;
@@ -1271,11 +1337,11 @@ export function buildCodexMultiRouterWizardPlan(
     .map((provider) => {
       const selected = selectedCanonicalByProvider.get(provider.id);
       if (!selected) return provider;
-      const models = readWizardModelCatalog(provider).filter((model) =>
-        selected.has(
-          (model.upstreamModel ?? model.upstream_model ?? model.model).trim(),
-        ),
-      );
+      const models = readWizardModelCatalog(provider)
+        .filter(isWizardModelEnabled)
+        .filter((model) =>
+          selected.has(normalizedWizardModelId(wizardModelUpstream(model))),
+        );
       return {
         ...provider,
         settingsConfig: {
@@ -1331,7 +1397,9 @@ export function buildCodexMultiRouterWizardPlan(
   });
   const selectedVisibleModels = new Set(
     resolvedSources.flatMap((provider) =>
-      readWizardModelCatalog(provider).map((model) => model.model),
+      readWizardModelCatalog(provider).map((model) =>
+        normalizedWizardModelId(model.model),
+      ),
     ),
   );
   const requestedSpawnAgentModels: string[] =
@@ -1351,7 +1419,7 @@ export function buildCodexMultiRouterWizardPlan(
     subagentVersion,
     subagentV2: existingRouting?.subagentV2,
     spawnAgentModels: requestedSpawnAgentModels.filter((model) =>
-      selectedVisibleModels.has(model),
+      selectedVisibleModels.has(normalizedWizardModelId(model)),
     ),
     routes,
   };

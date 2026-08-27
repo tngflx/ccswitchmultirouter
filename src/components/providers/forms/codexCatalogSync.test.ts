@@ -103,4 +103,57 @@ describe("reconcileFetchedCodexCatalogRows", () => {
     expect(result.rows[0].enabled).toBe(true);
     expect(result.rows[1].enabled).toBe(false);
   });
+
+  it("refreshes stale provider metadata without changing user-owned catalog fields", () => {
+    const initial: CodexCatalogRowLike[] = [
+      {
+        model: "friendly-gpt",
+        upstreamModel: "gpt-5.5",
+        displayName: "My GPT",
+        contextWindow: "128000",
+        inputModalities: ["text"],
+        supportsImage: false,
+        textOnly: true,
+        enabled: false,
+        sortIndex: 7,
+        reasoning: {
+          schemaVersion: 2,
+          supportStatus: "unknown",
+          controlKind: "none",
+          supportedEfforts: [],
+          disableAllowed: true,
+          upstream: { format: "none", parameter: "none" },
+          source: "user",
+        },
+      },
+    ];
+
+    const result = reconcileFetchedCodexCatalogRows(
+      initial,
+      [
+        {
+          id: "gpt-5.5",
+          contextWindow: 272000,
+          inputModalities: ["text", "image"],
+          supportsImage: true,
+        },
+      ],
+      source,
+      { appendNew: false, createRow, existingMetadataMode: "refresh" },
+    );
+
+    expect(result.hydrated).toBe(1);
+    expect(result.rows[0]).toMatchObject({
+      model: "friendly-gpt",
+      upstreamModel: "gpt-5.5",
+      displayName: "My GPT",
+      contextWindow: "272000",
+      inputModalities: ["text", "image"],
+      supportsImage: true,
+      textOnly: false,
+      enabled: false,
+      sortIndex: 7,
+    });
+    expect(result.rows[0].reasoning?.source).toBe("user");
+  });
 });
