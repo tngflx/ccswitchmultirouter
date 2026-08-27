@@ -808,6 +808,8 @@ async fn query_opencode_go(api_key: &str) -> Result<SubscriptionQuota, String> {
             success: false,
             tiers: vec![],
             extra_usage: None,
+            reset_credits: None,
+            reset_credits_error: None,
             error: Some(format!("Authentication failed (HTTP {status})")),
             queried_at: Some(now_millis()),
         });
@@ -840,6 +842,8 @@ async fn query_opencode_go(api_key: &str) -> Result<SubscriptionQuota, String> {
         success: true,
         tiers,
         extra_usage: None,
+        reset_credits: None,
+        reset_credits_error: None,
         error: None,
         queried_at: Some(now_millis()),
     })
