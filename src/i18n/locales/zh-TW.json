@@ -3433,10 +3433,24 @@
     "selectedAccountUnavailable": "已綁定的帳號不存在或需要重新登入，請重新選擇帳號"
   },
   "streamRetry": {
+    "compactLabel": "重試",
+    "title": "回合恢復",
+    "description": "選擇如何恢復中斷的 Codex 回合。",
+    "mode": {
+      "off": "關閉",
+      "safe": "安全",
+      "aggressive": "積極"
+    },
+    "maxAttempts": "繼續嘗試次數",
+    "help": {
+      "off": "不進行透明代理重新連線或桌面端繼續。",
+      "safe": "在語意輸出前最多重新連線 5 次；可見故障仍由 Codex 處理。",
+      "aggressive": "同樣先安全重新連線 5 次，然後 Codex 桌面端會為可恢復的中斷回合提交字面量「continue」，最多達到所選次數。"
+    },
     "label": "持續重試",
     "tooltip": {
-      "enabled": "持續重試已啟用。符合條件的上游 SSE 斷流會持續重試到重新連線成功，但僅限尚未向用戶端傳遞語義輸出時。",
-      "disabled": "持續重試已關閉。一般的有限恢復仍然有效，最多重新連線 5 次。"
+      "enabled": "已為符合條件的語意輸出前斷流啟用安全代理重新連線。",
+      "disabled": "代理重新連線和桌面端繼續均已關閉。"
     }
   },
   "errorBoundary": {

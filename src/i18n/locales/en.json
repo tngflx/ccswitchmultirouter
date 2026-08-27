@@ -3433,10 +3433,24 @@
     "selectedAccountUnavailable": "The linked account is missing or needs you to sign in again. Select another account."
   },
   "streamRetry": {
+    "compactLabel": "Retry",
+    "title": "Turn recovery",
+    "description": "Choose how interrupted Codex turns recover.",
+    "mode": {
+      "off": "Off",
+      "safe": "Safe",
+      "aggressive": "Aggressive"
+    },
+    "maxAttempts": "Continue attempts",
+    "help": {
+      "off": "No transparent proxy reconnect or Desktop continuation.",
+      "safe": "Reconnects up to 5 times before semantic output. Visible failures remain Codex-owned.",
+      "aggressive": "Same 5 safe reconnects, then Codex Desktop submits literal “continue” for recoverable interrupted turns up to this limit."
+    },
     "label": "Stream Retry",
     "tooltip": {
-      "enabled": "Stream retry is enabled. Eligible upstream SSE drops are retried up to 5 times before a terminal error is returned.",
-      "disabled": "Stream retry is disabled. A dropped stream is reported immediately."
+      "enabled": "Safe proxy reconnect is enabled for eligible pre-semantic stream drops.",
+      "disabled": "Proxy reconnect and Desktop continuation are disabled."
     }
   },
   "errorBoundary": {

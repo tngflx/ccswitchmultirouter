@@ -540,6 +540,175 @@ pub(crate) async fn try_inject_on_candidate_ports(
     None
 }
 
+/// Result of attempting to submit a continuation in Codex Desktop.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct CodexContinuationResult {
+    pub submitted: bool,
+    pub debug_port: Option<u16>,
+    pub target_id: Option<String>,
+    pub message: String,
+}
+
+/// Find a Codex Desktop renderer and submit a literal `continue` message.
+///
+/// The script deliberately uses user-visible DOM affordances rather than React
+/// internals. It refuses to submit while another turn is generating and returns
+/// an explicit diagnostic when the composer cannot be identified.
+pub(crate) async fn submit_codex_continuation() -> Result<CodexContinuationResult, String> {
+    let attempted_ports = candidate_debug_ports(DEFAULT_CODEX_DEBUG_PORT);
+    let script = r#"(async () => {
+      const visible = (el) => {
+        if (!el) return false;
+        const s = getComputedStyle(el);
+        const r = el.getBoundingClientRect();
+        return s.visibility !== 'hidden' && s.display !== 'none' && r.width > 0 && r.height > 0;
+      };
+      const busy = () => [...document.querySelectorAll('button,[role="button"]')].some((el) => {
+        const label = `${el.getAttribute('aria-label') || ''} ${el.getAttribute('title') || ''}`.trim();
+        const text = `${el.textContent || ''}`.trim();
+        return visible(el) && (/^(stop|cancel|interrupt)( generating| response)?$/i.test(label)
+          || /^(stop|cancel|interrupt)$/i.test(text));
+      });
+      if (busy()) return { submitted:false, reason:'Codex is still generating' };
+      const composer = [...document.querySelectorAll('textarea,[contenteditable="true"],[role="textbox"]')]
+        .filter(visible)
+        .find((el) => !el.matches('[disabled],[readonly]'));
+      if (!composer) return { submitted:false, reason:'Codex composer was not found' };
+      composer.focus();
+      if (composer instanceof HTMLTextAreaElement || composer instanceof HTMLInputElement) {
+        const prototype = composer instanceof HTMLTextAreaElement
+          ? HTMLTextAreaElement.prototype
+          : HTMLInputElement.prototype;
+        const setter = Object.getOwnPropertyDescriptor(prototype, 'value')?.set;
+        if (setter) setter.call(composer, 'continue'); else composer.value = 'continue';
+        composer.dispatchEvent(new InputEvent('input', {bubbles:true, inputType:'insertText', data:'continue'}));
+        composer.dispatchEvent(new Event('change', {bubbles:true}));
+      } else {
+        composer.textContent = 'continue';
+        composer.dispatchEvent(new InputEvent('input', {bubbles:true, inputType:'insertText', data:'continue'}));
+      }
+      const form = composer.closest('form');
+      const submit = form?.querySelector('button[type="submit"],button[aria-label*="send" i],button[aria-label*="submit" i]')
+        || [...document.querySelectorAll('button')].find((el) => visible(el) && /(send|submit)/i.test(`${el.getAttribute('aria-label') || ''} ${el.textContent || ''}`));
+      let method = 'enter';
+      if (submit && !submit.disabled) {
+        submit.click();
+        method = 'button';
+      } else {
+        composer.dispatchEvent(new KeyboardEvent('keydown', {key:'Enter', code:'Enter', bubbles:true, cancelable:true}));
+        composer.dispatchEvent(new KeyboardEvent('keyup', {key:'Enter', code:'Enter', bubbles:true, cancelable:true}));
+      }
+      await new Promise((resolve) => setTimeout(resolve, 750));
+      const value = composer instanceof HTMLTextAreaElement || composer instanceof HTMLInputElement
+        ? composer.value
+        : composer.textContent;
+      const accepted = `${value || ''}`.trim().toLowerCase() !== 'continue' || busy();
+      return accepted
+        ? {submitted:true, method}
+        : {submitted:false, reason:'Codex did not accept the continuation'};
+    })()"#;
+    let mut diagnostics = Vec::new();
+    for port in attempted_ports.iter().copied() {
+        let targets = match list_cdp_targets(port).await {
+            Ok(value) => value,
+            Err(error) => {
+                diagnostics.push(format!("port {port}: {error}"));
+                continue;
+            }
+        };
+        let targets = match pick_codex_page_targets(&targets, port) {
+            Ok(value) => value,
+            Err(error) => {
+                diagnostics.push(format!("port {port}: {error}"));
+                continue;
+            }
+        };
+        for target in targets {
+            let Some(ws) = target.web_socket_debugger_url.as_deref() else {
+                continue;
+            };
+            let (socket, _) =
+                match tokio::time::timeout(CDP_CONNECT_TIMEOUT, connect_async(ws)).await {
+                    Ok(Ok(value)) => value,
+                    Ok(Err(error)) => {
+                        diagnostics.push(format!(
+                            "target {}: failed to connect Codex Desktop CDP: {error}",
+                            target.id
+                        ));
+                        continue;
+                    }
+                    Err(_) => {
+                        diagnostics.push(format!(
+                            "target {}: timed out connecting Codex Desktop CDP",
+                            target.id
+                        ));
+                        continue;
+                    }
+                };
+            let mut session = CdpSession::new(socket);
+            let evaluation = match session
+                .send_command(
+                    1,
+                    "Runtime.evaluate",
+                    json!({
+                        "expression": script, "awaitPromise": true, "returnByValue": true,
+                        "allowUnsafeEvalBlockedByCSP": true
+                    }),
+                )
+                .await
+            {
+                Ok(value) => value,
+                Err(error) => {
+                    diagnostics.push(format!("target {}: {error}", target.id));
+                    continue;
+                }
+            };
+            if let Some(exception) = evaluation
+                .get("result")
+                .and_then(|result| result.get("exceptionDetails"))
+            {
+                diagnostics.push(format!(
+                    "target {}: CDP evaluation failed: {exception}",
+                    target.id
+                ));
+                continue;
+            }
+            let value = evaluation
+                .pointer("/result/result/value")
+                .cloned()
+                .unwrap_or(Value::Null);
+            let submitted = value
+                .get("submitted")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let message = value
+                .get("reason")
+                .and_then(Value::as_str)
+                .unwrap_or(if submitted {
+                    "Continuation submitted"
+                } else {
+                    "Continuation was not submitted"
+                })
+                .to_string();
+            if submitted {
+                return Ok(CodexContinuationResult {
+                    submitted,
+                    debug_port: Some(port),
+                    target_id: Some(target.id),
+                    message,
+                });
+            }
+            diagnostics.push(format!("target {}: {message}", target.id));
+        }
+    }
+    Err(if diagnostics.is_empty() {
+        "No Codex Desktop CDP target was found".to_string()
+    } else {
+        diagnostics.join("; ")
+    })
+}
+
 /// 生成去重后的 CDP 端口探测列表。
 pub(crate) fn candidate_debug_ports(preferred: u16) -> Vec<u16> {
     let mut ports = vec![preferred, DEFAULT_CODEX_DEBUG_PORT, 9222, 9223, 9230, 9231];

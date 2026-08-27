@@ -3433,10 +3433,24 @@
     "selectedAccountUnavailable": "已绑定账号不存在或需要重新登录，请重新选择账号"
   },
   "streamRetry": {
+    "compactLabel": "重试",
+    "title": "回合恢复",
+    "description": "选择如何恢复中断的 Codex 回合。",
+    "mode": {
+      "off": "关闭",
+      "safe": "安全",
+      "aggressive": "激进"
+    },
+    "maxAttempts": "继续尝试次数",
+    "help": {
+      "off": "不进行透明代理重连或桌面端继续。",
+      "safe": "在语义输出前最多重连 5 次；可见故障仍由 Codex 处理。",
+      "aggressive": "同样先安全重连 5 次，然后 Codex 桌面端会为可恢复的中断回合提交字面量“continue”，最多达到所选次数。"
+    },
     "label": "持续重试",
     "tooltip": {
-      "enabled": "持续重试已启用。符合条件的上游 SSE 断流会一直重试到重新连接成功，但仅限尚未向客户端传递语义输出时。",
-      "disabled": "持续重试已关闭。普通的有限恢复仍然有效，最多重新连接 5 次。"
+      "enabled": "已为符合条件的语义输出前断流启用安全代理重连。",
+      "disabled": "代理重连和桌面端继续均已关闭。"
     }
   },
   "errorBoundary": {

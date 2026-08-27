@@ -3734,7 +3734,8 @@ impl RequestForwarder {
         // 安全重连（见 providers::streaming_retry）。重连始终有界：开启时允许
         // 默认 5 次恢复，关闭时不重放。无限重试会让 Codex 永久显示 thinking，
         // 也会在上游不可用时放大并发压力。工厂只重放同一 HTTP 请求。
-        let stream_retry_enabled = crate::settings::get_settings().enable_stream_retry;
+        let stream_retry_budget =
+            crate::settings::get_settings().stream_retry_budget(RESPONSES_STREAM_MAX_RETRIES);
         let stream_reconnect = if should_create_responses_stream_reconnector(
             app_type,
             endpoint,
@@ -3810,12 +3811,10 @@ impl RequestForwarder {
                         })
                     })
                 };
-            let max_retries = if stream_retry_enabled {
-                RESPONSES_STREAM_MAX_RETRIES
-            } else {
-                0
-            };
-            Some(StreamReconnector::new(connect, first_byte_timeout).with_max_retries(max_retries))
+            Some(
+                StreamReconnector::new(connect, first_byte_timeout)
+                    .with_max_retries(stream_retry_budget),
+            )
         } else {
             None
         };

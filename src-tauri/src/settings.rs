@@ -22,6 +22,22 @@ fn default_true() -> bool {
     true
 }
 
+fn default_stream_retry_max_attempts() -> u32 {
+    3
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum StreamRetryMode {
+    Off,
+    Safe,
+    Aggressive,
+}
+
+fn default_stream_retry_mode() -> StreamRetryMode {
+    StreamRetryMode::Safe
+}
+
 /// 主页面显示的应用配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -453,9 +469,15 @@ pub struct AppSettings {
     /// Whether to show the failover toggle independently on the main page
     #[serde(default)]
     pub enable_failover_toggle: bool,
-    /// Whether to auto-retry dropped upstream SSE connections (default: true)
+    /// Legacy compatibility switch. New UI writes `stream_retry_mode`; false maps to Off.
     #[serde(default = "default_true")]
     pub enable_stream_retry: bool,
+    /// Proxy stream recovery policy: off, safe, or aggressive.
+    #[serde(default = "default_stream_retry_mode")]
+    pub stream_retry_mode: StreamRetryMode,
+    /// Maximum aggressive recovery attempts after the original request (1..=3).
+    #[serde(default = "default_stream_retry_max_attempts")]
+    pub stream_retry_max_attempts: u32,
     /// Whether to show the project profile switcher on the main page header
     #[serde(default = "default_show_profile_switcher")]
     pub show_profile_switcher: bool,
@@ -609,6 +631,8 @@ impl Default for AppSettings {
             usage_dashboard_refresh_interval_ms: None,
             enable_failover_toggle: false,
             enable_stream_retry: true,
+            stream_retry_mode: StreamRetryMode::Safe,
+            stream_retry_max_attempts: 3,
             show_profile_switcher: true,
             preserve_codex_official_auth_on_switch: false,
             unify_codex_session_history: false,
@@ -649,6 +673,34 @@ impl Default for AppSettings {
 }
 
 impl AppSettings {
+    /// Effective policy after accounting for settings written by pre-tier versions.
+    pub fn stream_retry_mode_effective(&self) -> StreamRetryMode {
+        if !self.enable_stream_retry && self.stream_retry_mode == StreamRetryMode::Safe {
+            StreamRetryMode::Off
+        } else {
+            self.stream_retry_mode
+        }
+    }
+
+    /// Transparent proxy reconnect budget. This is deliberately separate from the
+    /// logical continuation budget: both Safe and Aggressive keep the normal
+    /// pre-semantic reconnect protection.
+    pub fn stream_retry_budget(&self, safe_budget: u32) -> u32 {
+        match self.stream_retry_mode_effective() {
+            StreamRetryMode::Off => 0,
+            StreamRetryMode::Safe | StreamRetryMode::Aggressive => safe_budget,
+        }
+    }
+
+    /// Number of post-semantic logical turn recoveries. Only Aggressive may type
+    /// and submit a continuation through Codex Desktop.
+    pub fn stream_recovery_budget(&self) -> u32 {
+        match self.stream_retry_mode_effective() {
+            StreamRetryMode::Aggressive => self.stream_retry_max_attempts.clamp(1, 3),
+            StreamRetryMode::Off | StreamRetryMode::Safe => 0,
+        }
+    }
+
     fn settings_path() -> Option<PathBuf> {
         // settings.json 保留用于旧版本迁移和无数据库场景
         Some(
@@ -1377,5 +1429,42 @@ mod tests {
             !decoded.launch_codex_desktop_with_ccswitch,
             "enabling CCSwitchMulti auto-launch must not implicitly start Codex Desktop"
         );
+    }
+
+    #[test]
+    fn stream_retry_defaults_to_safe_with_five_proxy_reconnects() {
+        let settings = AppSettings::default();
+        assert_eq!(
+            settings.stream_retry_mode_effective(),
+            StreamRetryMode::Safe
+        );
+        assert_eq!(settings.stream_retry_budget(5), 5);
+        assert_eq!(settings.stream_recovery_budget(), 0);
+    }
+
+    #[test]
+    fn legacy_disabled_stream_retry_maps_the_default_safe_tier_to_off() {
+        let settings: AppSettings = serde_json::from_value(serde_json::json!({
+            "enableStreamRetry": false
+        }))
+        .expect("legacy settings remain readable");
+
+        assert_eq!(settings.stream_retry_mode_effective(), StreamRetryMode::Off);
+        assert_eq!(settings.stream_retry_budget(5), 0);
+        assert_eq!(settings.stream_recovery_budget(), 0);
+    }
+
+    #[test]
+    fn aggressive_retry_keeps_safe_reconnects_and_clamps_continuations() {
+        for (configured, expected) in [(0, 1), (1, 1), (2, 2), (3, 3), (99, 3)] {
+            let settings = AppSettings {
+                enable_stream_retry: true,
+                stream_retry_mode: StreamRetryMode::Aggressive,
+                stream_retry_max_attempts: configured,
+                ..AppSettings::default()
+            };
+            assert_eq!(settings.stream_retry_budget(5), 5);
+            assert_eq!(settings.stream_recovery_budget(), expected);
+        }
     }
 }

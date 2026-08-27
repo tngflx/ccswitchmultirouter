@@ -246,6 +246,10 @@ Pre-push checklist: `cargo check` + full `cargo test` + `pnpm typecheck` + full
     - `codex_traffic_policy` module
     - `codexCatalogSync` module
 
+### Additional Documentation
+
+- [Retry Architecture](docs/architecture/retry-model.md) — Consolidated two-layer resilience model (proxy reconnect + Codex client retry)
+
 ## AGENT MEMORY PROTOCOL
 
 28. **Maintain `docs/memory/journal.md`** (newest first, dated entries) per the rules in `docs/memory/README.md`. Log only significant events: root causes of non-obvious bugs, deliberate design decisions + rationale, upstream cherry-pick/merge verdicts, release evidence.
