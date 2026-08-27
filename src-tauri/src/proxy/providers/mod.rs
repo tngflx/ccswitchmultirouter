@@ -565,5 +565,3 @@ mod tests {
         assert_eq!(adapter.name(), "Gemini");
     }
 }
-
-

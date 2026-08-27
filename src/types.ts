@@ -1047,4 +1047,3 @@ export interface HermesMemoryLimits {
   memoryEnabled: boolean;
   userEnabled: boolean;
 }
-
