@@ -766,8 +766,15 @@ mod tests {
             "models": [{"model": "stale-qwen"}],
             "spawnAgentModels": ["stale-qwen"]
         });
+        updated_router.settings_config["codexRouting"]["modelDisplayStyle"] =
+            json!("model-provider");
+        let published_style = RefCell::new(None);
 
         apply_codex_provider_mutation_with_publisher(&db, updated_router, |artifact| {
+            *published_style.borrow_mut() = artifact
+                .projection_settings
+                .pointer("/modelCatalog/displayNameStyle")
+                .cloned();
             Ok(ProjectionReadBack::verified(
                 artifact.dependency_fingerprint.clone(),
             ))
@@ -780,6 +787,13 @@ mod tests {
             .expect("router exists");
         assert!(saved.settings_config.get("modelCatalog").is_none());
         assert!(saved.settings_config.get("model_catalog").is_none());
+        assert_eq!(
+            saved
+                .settings_config
+                .pointer("/codexRouting/modelDisplayStyle"),
+            Some(&json!("model-provider"))
+        );
+        assert_eq!(*published_style.borrow(), Some(json!("model-provider")));
     }
 
     #[test]

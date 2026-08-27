@@ -97,6 +97,7 @@ import {
   readHostedToolsConfig,
   writeHostedToolsConfig,
 } from "@/lib/hostedTools";
+import { applyCodexCatalogModelOrder } from "@/lib/codexModelCatalogOrder";
 import { usageApi } from "@/lib/api/usage";
 import {
   usageKeys,
@@ -247,6 +248,7 @@ type CodexRouting = {
   schemaVersion?: 2;
   enabled?: boolean;
   defaultRouteId?: string;
+  modelDisplayStyle?: CodexModelDisplayStyle;
   officialAuth?: CodexOfficialAuthConfig;
   subagentVersion?: CodexSubagentVersion;
   subagentV2?: CodexRoutingConfigV2["subagentV2"];
@@ -601,6 +603,8 @@ type CodexCatalogModelDraft = {
   upstream_model?: string;
   displayName?: string;
   display_name?: string;
+  providerName?: string;
+  provider_name?: string;
   contextWindow?: string | number;
   context_window?: string | number;
   inputModalities?: string[];
@@ -639,6 +643,7 @@ function catalogDraftUpstreamModel(model: {
 }
 
 type CodexModelCatalogDraft = {
+  displayNameStyle?: CodexModelDisplayStyle;
   models: CodexCatalogModelDraft[];
   spawnAgentModels?: string[];
 };
@@ -2241,8 +2246,14 @@ export function buildModelCatalogForRoutes(
       modelIds.filter((model) => !existingSpawnAgentModels.includes(model)),
     )
     .slice(0, 5);
+  const models = applyCodexCatalogModelOrder(
+    Array.from(byModel.values()),
+    existingCatalog?.models ?? [],
+  );
   return {
-    models: Array.from(byModel.values()),
+    displayNameStyle:
+      routing?.modelDisplayStyle ?? existingCatalog?.displayNameStyle,
+    models,
     spawnAgentModels,
   };
 }
@@ -4587,6 +4598,73 @@ function SubagentsTab({
   );
 }
 
+export type CodexModelDisplayStyle =
+  | "model"
+  | "model-provider"
+  | "provider-model";
+export type CodexModelSortMode =
+  | "custom"
+  | "model"
+  | "provider"
+  | "provider-model";
+
+export function codexCatalogProviderName(
+  model: Pick<CodexCatalogModel, "providerName" | "provider_name">,
+): string {
+  return (model.providerName ?? model.provider_name ?? "").trim();
+}
+
+export function formatCodexCatalogModelLabel(
+  model: CodexCatalogModel,
+  style: CodexModelDisplayStyle = "model",
+): string {
+  const id = model.model?.trim() ?? "";
+  const provider = codexCatalogProviderName(model);
+  const rawDisplay =
+    (model.displayName ?? model.display_name ?? id).trim() || id;
+  const display = provider
+    ? rawDisplay.replace(
+        new RegExp(
+          `^\\[${provider.replace(/[.*+?^${}()|[\\]\\]/g, "\\$&")}\\]\\s*`,
+          "i",
+        ),
+        "",
+      )
+    : rawDisplay;
+  if (!provider || style === "model") return display;
+  return style === "provider-model"
+    ? `${provider} · ${display}`
+    : `${display} · ${provider}`;
+}
+
+export function sortCodexCatalogModels(
+  models: CodexCatalogModel[],
+  mode: CodexModelSortMode,
+): CodexCatalogModel[] {
+  if (mode === "custom") return models.slice();
+  return models.slice().sort((left, right) => {
+    const leftModel = (left.model ?? "").trim();
+    const rightModel = (right.model ?? "").trim();
+    const leftProvider = codexCatalogProviderName(left).toLocaleLowerCase();
+    const rightProvider = codexCatalogProviderName(right).toLocaleLowerCase();
+    const by = (a: string, b: string) =>
+      a.localeCompare(b, undefined, { sensitivity: "base" });
+    if (mode === "provider" || mode === "provider-model") {
+      const providerResult = by(leftProvider, rightProvider);
+      if (providerResult) return providerResult;
+    }
+    // "provider" groups by provider but preserves the current model order
+    // inside each group. "provider-model" also sorts models alphabetically.
+    if (mode === "provider-model" || mode === "model") {
+      const modelResult = by(
+        leftModel.toLocaleLowerCase(),
+        rightModel.toLocaleLowerCase(),
+      );
+      if (modelResult) return modelResult;
+    }
+    return 0;
+  });
+}
 function ModelOrderTab({
   selectedPlan,
   catalog,
@@ -4605,31 +4683,64 @@ function ModelOrderTab({
   const [isSaving, setIsSaving] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [displayStyle, setDisplayStyle] =
+    useState<CodexModelDisplayStyle>("model");
+  const [sortMode, setSortMode] = useState<CodexModelSortMode>("custom");
   const sensors = useSensors(
     useSensor(PointerSensor),
     useSensor(KeyboardSensor, {
       coordinateGetter: sortableKeyboardCoordinates,
     }),
   );
-  const catalogKey = catalog.models
-    .map((model) => `${model.model ?? ""}:${model.sortIndex ?? ""}`)
-    .join("\n");
+  const catalogKey = [
+    catalog.displayNameStyle ?? "",
+    ...catalog.models.map(
+      (model) => `${model.model ?? ""}:${model.sortIndex ?? ""}`,
+    ),
+  ].join("\n");
   const hasCustomOrder = catalog.models.some(
     (model) => model.sortIndex !== undefined,
   );
+  const modelsWithProvider = draftModels.map((model) => {
+    if (codexCatalogProviderName(model)) return model;
+    const modelId = model.model?.trim();
+    const route = selectedRoutes.find(({ route: candidate }) => {
+      if (candidate.enabled === false) return false;
+      const provider = providersById.get(
+        routeTargetProviderId(candidate) ?? "",
+      );
+      if (!provider || !modelId) return false;
+      return readCodexModelCatalog(provider).models.some((source) =>
+        [source.model, source.upstreamModel, source.upstream_model].some(
+          (value) => value?.trim() === modelId,
+        ),
+      );
+    });
+    const provider = route
+      ? providersById.get(routeTargetProviderId(route.route) ?? "")
+      : undefined;
+    return provider?.name ? { ...model, providerName: provider.name } : model;
+  });
+  const visibleDraftModels = sortCodexCatalogModels(
+    modelsWithProvider,
+    sortMode,
+  );
+  const styleDirty = displayStyle !== (catalog.displayNameStyle ?? "model");
   const hasChanges =
-    draftModels.map((model) => model.model).join("\n") !==
-    catalog.models
-      .slice()
-      .sort(
-        (left, right) =>
-          (left.sortIndex ?? Number.MAX_SAFE_INTEGER) -
-          (right.sortIndex ?? Number.MAX_SAFE_INTEGER),
-      )
-      .map((model) => model.model)
-      .join("\n");
+    styleDirty ||
+    visibleDraftModels.map((model) => model.model).join("\n") !==
+      catalog.models
+        .slice()
+        .sort(
+          (left, right) =>
+            (left.sortIndex ?? Number.MAX_SAFE_INTEGER) -
+            (right.sortIndex ?? Number.MAX_SAFE_INTEGER),
+        )
+        .map((model) => model.model)
+        .join("\n");
 
   useEffect(() => {
+    setDisplayStyle(catalog.displayNameStyle ?? "model");
     setDraftModels(
       catalog.models
         .slice()
@@ -4647,15 +4758,18 @@ function ModelOrderTab({
     const activeModel = String(event.active.id);
     const overModel = event.over ? String(event.over.id) : "";
     if (!overModel || activeModel === overModel) return;
-    setDraftModels((current) => {
-      const activeIndex = current.findIndex(
+    // A manual drag is an explicit custom order. Switching back to custom here
+    // prevents the selected alphabetical/provider sort from immediately undoing it.
+    setSortMode("custom");
+    setDraftModels(() => {
+      const activeIndex = visibleDraftModels.findIndex(
         (model) => model.model?.trim() === activeModel,
       );
-      const overIndex = current.findIndex(
+      const overIndex = visibleDraftModels.findIndex(
         (model) => model.model?.trim() === overModel,
       );
-      if (activeIndex < 0 || overIndex < 0) return current;
-      const next = [...current];
+      if (activeIndex < 0 || overIndex < 0) return draftModels;
+      const next = [...visibleDraftModels];
       const [moved] = next.splice(activeIndex, 1);
       next.splice(overIndex, 0, moved);
       return next;
@@ -4670,60 +4784,103 @@ function ModelOrderTab({
     setMessage(null);
     setError(null);
     try {
-      const models = (reset ? catalog.models : draftModels).map(
-        (model, index) => {
-          const rest = { ...model };
-          delete rest.sortIndex;
-          return reset ? rest : { ...rest, sortIndex: index };
-        },
-      );
+      const orderedModels = reset
+        ? catalog.models.slice()
+        : sortCodexCatalogModels(draftModels, sortMode);
+      const currentOrderedIds = catalog.models
+        .slice()
+        .sort(
+          (left, right) =>
+            (left.sortIndex ?? Number.MAX_SAFE_INTEGER) -
+            (right.sortIndex ?? Number.MAX_SAFE_INTEGER),
+        )
+        .map((model) => model.model);
+      const nextOrderedIds = orderedModels.map((model) => model.model);
+      const orderChanged =
+        nextOrderedIds.join("\n") !== currentOrderedIds.join("\n");
+      // A display-style-only change must not unexpectedly rewrite provider sort
+      // indexes. Re-number models only when the user explicitly reset or changed
+      // the order; the style is persisted independently on the routing document.
+      const persistOrder = reset || orderChanged;
+      const models = reset
+        ? orderedModels.map((model) => {
+            const rest = { ...model };
+            delete rest.sortIndex;
+            return rest;
+          })
+        : persistOrder
+          ? orderedModels.map((model, index) => ({
+              ...model,
+              sortIndex: index,
+            }))
+          : orderedModels;
       const updates = new Map<string, Provider>();
-      for (const [sortIndex, projectedModel] of models.entries()) {
-        const visibleModel = projectedModel.model?.trim();
-        if (!visibleModel) continue;
-        for (const { route } of selectedRoutes) {
-          if (route.enabled === false) continue;
-          const targetProviderId = routeTargetProviderId(route);
-          if (!targetProviderId) continue;
-          const aliases = route.aliases ?? route.upstream?.modelMap ?? {};
-          const canonicalModel = aliases[visibleModel] ?? visibleModel;
-          if (
-            route.modelSelection?.mode === "include" &&
-            !route.modelSelection.models.includes(canonicalModel)
-          ) {
-            continue;
+      if (persistOrder) {
+        for (const [sortIndex, projectedModel] of models.entries()) {
+          const visibleModel = projectedModel.model?.trim();
+          if (!visibleModel) continue;
+          for (const { route } of selectedRoutes) {
+            if (route.enabled === false) continue;
+            const targetProviderId = routeTargetProviderId(route);
+            if (!targetProviderId) continue;
+            const aliases = route.aliases ?? route.upstream?.modelMap ?? {};
+            const canonicalModel = aliases[visibleModel] ?? visibleModel;
+            if (
+              route.modelSelection?.mode === "include" &&
+              !route.modelSelection.models.includes(canonicalModel)
+            ) {
+              continue;
+            }
+            const source =
+              updates.get(targetProviderId) ??
+              providersById.get(targetProviderId);
+            if (!source) continue;
+            const sourceModels = readCodexModelCatalog(source).models;
+            const sourceIndex = sourceModels.findIndex(
+              (model) =>
+                model.model?.trim() === canonicalModel ||
+                model.upstreamModel?.trim() === canonicalModel ||
+                model.upstream_model?.trim() === canonicalModel,
+            );
+            if (sourceIndex < 0) continue;
+            const nextModels = sourceModels.map((model, index) => {
+              if (index !== sourceIndex) return model;
+              const next = { ...model };
+              if (reset) delete next.sortIndex;
+              else next.sortIndex = sortIndex;
+              return next;
+            });
+            updates.set(targetProviderId, {
+              ...source,
+              settingsConfig: {
+                ...source.settingsConfig,
+                modelCatalog: {
+                  ...(source.settingsConfig?.modelCatalog ?? {}),
+                  models: nextModels,
+                },
+              },
+            });
+            break;
           }
-          const source =
-            updates.get(targetProviderId) ??
-            providersById.get(targetProviderId);
-          if (!source) continue;
-          const sourceModels = readCodexModelCatalog(source).models;
-          const sourceIndex = sourceModels.findIndex(
-            (model) =>
-              model.model?.trim() === canonicalModel ||
-              model.upstreamModel?.trim() === canonicalModel ||
-              model.upstream_model?.trim() === canonicalModel,
-          );
-          if (sourceIndex < 0) continue;
-          const nextModels = sourceModels.map((model, index) => {
-            if (index !== sourceIndex) return model;
-            const next = { ...model };
-            if (reset) delete next.sortIndex;
-            else next.sortIndex = sortIndex;
-            return next;
-          });
-          updates.set(targetProviderId, {
-            ...source,
+        }
+      }
+      // Schema-v2 modelCatalog is derived and removed by the backend mutation
+      // layer. Persist a changed preference in the owned routing document first;
+      // subsequent provider updates then reconcile against this newest router.
+      if (styleDirty) {
+        await providersApi.update(
+          {
+            ...selectedPlan,
             settingsConfig: {
-              ...source.settingsConfig,
-              modelCatalog: {
-                ...(source.settingsConfig?.modelCatalog ?? {}),
-                models: nextModels,
+              ...selectedPlan.settingsConfig,
+              codexRouting: {
+                ...(selectedPlan.settingsConfig?.codexRouting ?? {}),
+                modelDisplayStyle: displayStyle,
               },
             },
-          });
-          break;
-        }
+          },
+          "codex",
+        );
       }
       for (const provider of updates.values()) {
         await providersApi.update(provider, "codex");
@@ -4827,23 +4984,92 @@ function ModelOrderTab({
         }
       />
 
+      <div className="mt-4 flex flex-wrap items-end gap-3 rounded-md border border-blue-200/70 bg-background/60 p-3 dark:border-blue-800/50 dark:bg-slate-950/30">
+        <label className="grid gap-1 text-xs font-medium text-muted-foreground">
+          <span>
+            {tr("codexRouterWorkspace.modelDisplayStyle", {
+              defaultValue: "Model display",
+            })}
+          </span>
+          <select
+            value={displayStyle}
+            onChange={(event) =>
+              setDisplayStyle(event.target.value as CodexModelDisplayStyle)
+            }
+            className="h-8 rounded border border-input bg-background px-2 text-sm text-foreground"
+          >
+            <option value="model">
+              {tr("codexRouterWorkspace.modelOnly", {
+                defaultValue: "Model only",
+              })}
+            </option>
+            <option value="model-provider">
+              {tr("codexRouterWorkspace.modelThenProvider", {
+                defaultValue: "Model · Provider",
+              })}
+            </option>
+            <option value="provider-model">
+              {tr("codexRouterWorkspace.providerThenModel", {
+                defaultValue: "Provider · Model",
+              })}
+            </option>
+          </select>
+        </label>
+        <label className="grid gap-1 text-xs font-medium text-muted-foreground">
+          <span>
+            {tr("codexRouterWorkspace.modelSort", {
+              defaultValue: "Sort models",
+            })}
+          </span>
+          <select
+            value={sortMode}
+            onChange={(event) =>
+              setSortMode(event.target.value as CodexModelSortMode)
+            }
+            className="h-8 rounded border border-input bg-background px-2 text-sm text-foreground"
+          >
+            <option value="custom">
+              {tr("codexRouterWorkspace.currentOrder", {
+                defaultValue: "Current order (drag)",
+              })}
+            </option>
+            <option value="model">
+              {tr("codexRouterWorkspace.sortByModel", {
+                defaultValue: "Model name",
+              })}
+            </option>
+            <option value="provider">
+              {tr("codexRouterWorkspace.sortByProvider", {
+                defaultValue: "Provider",
+              })}
+            </option>
+            <option value="provider-model">
+              {tr("codexRouterWorkspace.sortByProviderModel", {
+                defaultValue: "Provider, then model",
+              })}
+            </option>
+          </select>
+        </label>
+      </div>
+
       <DndContext
         sensors={sensors}
         collisionDetection={closestCenter}
         onDragEnd={handleDragEnd}
       >
         <SortableContext
-          items={draftModels
+          items={visibleDraftModels
             .map((model) => model.model?.trim())
             .filter((model): model is string => Boolean(model))}
           strategy={verticalListSortingStrategy}
         >
           <div className="mt-4 space-y-2">
-            {draftModels.map((model, index) => (
+            {visibleDraftModels.map((model, index) => (
               <SortableCatalogModel
                 key={model.model}
                 model={model}
                 index={index}
+                displayStyle={displayStyle}
               />
             ))}
           </div>
@@ -10021,9 +10247,11 @@ function SortableSpawnAgentCandidate({
 function SortableCatalogModel({
   model,
   index,
+  displayStyle = "model",
 }: {
   model: CodexCatalogModel;
   index: number;
+  displayStyle?: CodexModelDisplayStyle;
 }) {
   const modelId = model.model?.trim() ?? "";
   const {
@@ -10065,10 +10293,16 @@ function SortableCatalogModel({
       <div className="min-w-0 flex-1">
         <div
           className="truncate text-sm font-medium text-foreground dark:text-slate-100"
-          title={catalogModelLabel(model)}
+          title={`${formatCodexCatalogModelLabel(model, displayStyle)} (${modelId})`}
         >
-          {catalogModelLabel(model)}
+          {formatCodexCatalogModelLabel(model, displayStyle)}
         </div>
+        {modelId &&
+        formatCodexCatalogModelLabel(model, displayStyle) !== modelId ? (
+          <div className="mt-0.5 truncate font-mono text-xs text-muted-foreground dark:text-slate-400">
+            {modelId}
+          </div>
+        ) : null}
         {model.upstreamModel || model.upstream_model ? (
           <div className="mt-0.5 truncate font-mono text-xs text-muted-foreground dark:text-slate-400">
             {model.upstreamModel ?? model.upstream_model}

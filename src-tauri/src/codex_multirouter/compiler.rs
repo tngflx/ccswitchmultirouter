@@ -787,6 +787,7 @@ fn dependency_fingerprint(
         "schemaVersion": plan.schema_version,
         "enabled": plan.enabled,
         "defaultRouteId": plan.default_route_id,
+        "modelDisplayStyle": plan.extensions.get("modelDisplayStyle"),
         "routes": plan.routes,
     });
     let effective_models =

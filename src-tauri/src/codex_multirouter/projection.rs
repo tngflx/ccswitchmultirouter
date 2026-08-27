@@ -337,10 +337,25 @@ pub(crate) fn effective_settings_for_candidate(
 fn projection_settings(router: &Provider, compiled: &CompiledCodexRoutingPlan) -> Value {
     let mut settings = router.settings_config.clone();
     let models = projected_model_entries(compiled);
-    settings["modelCatalog"] = json!({
+    let display_name_style = router
+        .settings_config
+        .pointer("/codexRouting/modelDisplayStyle")
+        .cloned()
+        .or_else(|| {
+            router
+                .settings_config
+                .get("modelCatalog")
+                .and_then(|catalog| catalog.get("displayNameStyle"))
+                .cloned()
+        });
+    let mut model_catalog = json!({
         "models": models,
         "spawnAgentModels": compiled.spawn_agent_models
     });
+    if let Some(style) = display_name_style {
+        model_catalog["displayNameStyle"] = style;
+    }
+    settings["modelCatalog"] = model_catalog;
     settings["codexRoutingProjection"] = json!({
         "dependencyFingerprint": compiled.dependency_fingerprint
     });

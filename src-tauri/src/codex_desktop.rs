@@ -311,7 +311,11 @@ fn codex_model_entries_from_catalog_value(catalog: &Value) -> (Vec<String>, Vec<
         if !seen.insert(model_name.clone()) {
             continue;
         }
-        let descriptor = project_codex_model_descriptor(entry, &model_name);
+        let descriptor = project_codex_model_descriptor(
+            entry,
+            &model_name,
+            catalog.get("displayNameStyle").and_then(Value::as_str),
+        );
         projected.push((model_name, descriptor));
     }
 
@@ -365,7 +369,11 @@ fn codex_model_name(entry: &Value) -> Option<String> {
 }
 
 /// 将 catalog 条目补齐成 renderer 可直接消费的模型描述。
-fn project_codex_model_descriptor(entry: &Value, model_name: &str) -> Value {
+fn project_codex_model_descriptor(
+    entry: &Value,
+    model_name: &str,
+    display_style: Option<&str>,
+) -> Value {
     let mut object = entry.as_object().cloned().unwrap_or_default();
     for key in ["model", "slug", "id", "name"] {
         object.insert(key.to_string(), Value::String(model_name.to_string()));
@@ -376,19 +384,30 @@ fn project_codex_model_descriptor(entry: &Value, model_name: &str) -> Value {
         .and_then(Value::as_str)
         .or_else(|| object.get("display_name").and_then(Value::as_str))
         .unwrap_or(model_name);
+    let compact_display = strip_provider_prefix(display, &provider_name);
+    let rendered_display = match display_style.unwrap_or("model") {
+        "model" => compact_display.to_string(),
+        "model-provider" => {
+            if provider_name.is_empty() {
+                compact_display.to_string()
+            } else {
+                format!("{compact_display} · {provider_name}")
+            }
+        }
+        "provider-model" => {
+            if provider_name.is_empty() {
+                compact_display.to_string()
+            } else {
+                format!("{provider_name} · {compact_display}")
+            }
+        }
+        _ => compact_display.to_string(),
+    };
     object.insert(
         "displayName".to_string(),
-        Value::String(provider_labelled_display_name(&provider_name, display)),
+        Value::String(rendered_display.clone()),
     );
-    if !object.contains_key("display_name") {
-        object.insert(
-            "display_name".to_string(),
-            object
-                .get("displayName")
-                .cloned()
-                .unwrap_or_else(|| Value::String(model_name.to_string())),
-        );
-    }
+    object.insert("display_name".to_string(), Value::String(rendered_display));
     if !provider_name.is_empty() {
         object.insert("providerName".to_string(), Value::String(provider_name));
     }
@@ -436,19 +455,21 @@ fn display_name_from_entry(entry: &Value) -> String {
         .to_string()
 }
 
-fn provider_labelled_display_name(provider_name: &str, display_name: &str) -> String {
-    if provider_name.is_empty() || display_name.is_empty() {
-        return display_name.to_string();
+fn strip_provider_prefix<'a>(display_name: &'a str, provider_name: &str) -> &'a str {
+    if provider_name.is_empty() {
+        return display_name;
     }
     let prefix = format!("[{provider_name}]");
-    if display_name
-        .get(..prefix.len())
-        .is_some_and(|candidate| candidate.eq_ignore_ascii_case(&prefix))
-    {
-        display_name.to_string()
-    } else {
-        format!("{prefix} {display_name}")
-    }
+    display_name
+        .strip_prefix(&prefix)
+        .or_else(|| {
+            display_name
+                .get(..prefix.len())
+                .filter(|candidate| candidate.eq_ignore_ascii_case(&prefix))
+                .map(|_| &display_name[prefix.len()..])
+        })
+        .map(str::trim_start)
+        .unwrap_or(display_name)
 }
 
 /// 读取当前 Codex 默认模型，用于 renderer 动态配置的 default_model。
@@ -1754,11 +1775,24 @@ mod tests {
 
         let (names, models) = codex_model_entries_from_catalog_value(&value);
         assert_eq!(names, vec!["deepseek-b", "qwen-a", "qwen-z"]);
-        assert_eq!(models[0]["displayName"], "[DeepSeek] Beta");
-        assert_eq!(models[1]["displayName"], "[Qwen] Alpha");
-        assert_eq!(models[2]["displayName"], "[Qwen] Zeta");
+        assert_eq!(models[0]["displayName"], "Beta");
+        assert_eq!(models[1]["displayName"], "Alpha");
+        assert_eq!(models[2]["displayName"], "Zeta");
         assert_eq!(models[1]["model"], "qwen-a");
         assert_eq!(models[1]["providerName"], "Qwen");
+
+        let provider_first = json!({
+            "displayNameStyle": "provider-model",
+            "models": [{
+                "model": "qwen-a",
+                "displayName": "[Qwen] Alpha",
+                "providerName": "Qwen"
+            }]
+        });
+        let (styled_names, styled_models) = codex_model_entries_from_catalog_value(&provider_first);
+        assert_eq!(styled_names, vec!["qwen-a"]);
+        assert_eq!(styled_models[0]["displayName"], "Qwen · Alpha");
+        assert_eq!(styled_models[0]["model"], "qwen-a");
     }
 
     #[test]

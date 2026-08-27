@@ -18,6 +18,9 @@ import {
   buildMultiRouterRuntimeStatus,
   buildCodexProxyBaseUrl,
   buildModelCatalogForRoutes,
+  codexCatalogProviderName,
+  formatCodexCatalogModelLabel,
+  sortCodexCatalogModels,
   CodexRouterWorkspacePage,
   createRoutePolicyDraft,
   createDraftRoutingPlan,
@@ -343,6 +346,65 @@ it("没有 MultiRouter 方案时打开工作台不会读取 null settingsConfig"
     ),
   ).not.toThrow();
   expect(screen.getByText("Codex 多模型路由工作台")).toBeInTheDocument();
+});
+
+describe("Codex model display and sorting", () => {
+  const models = [
+    { model: "zeta", displayName: "Zeta", providerName: "Beta" },
+    { model: "alpha", displayName: "Alpha", providerName: "Alpha" },
+    { model: "beta", displayName: "Beta", providerName: "Beta" },
+  ];
+
+  it("keeps model ids visible while supporting compact display styles", () => {
+    expect(codexCatalogProviderName(models[0])).toBe("Beta");
+    expect(formatCodexCatalogModelLabel(models[0], "model")).toBe("Zeta");
+    expect(formatCodexCatalogModelLabel(models[0], "model-provider")).toBe(
+      "Zeta · Beta",
+    );
+    expect(formatCodexCatalogModelLabel(models[0], "provider-model")).toBe(
+      "Beta · Zeta",
+    );
+    expect(
+      formatCodexCatalogModelLabel(
+        {
+          model: "zeta",
+          displayName: "[Beta] Zeta",
+          providerName: "Beta",
+        },
+        "model-provider",
+      ),
+    ).toBe("Zeta · Beta");
+    expect(models[0].model).toBe("zeta");
+  });
+
+  it("sorts deterministically by provider and model without mutating input", () => {
+    const sorted = sortCodexCatalogModels(models, "provider-model");
+    expect(sorted.map((model) => model.model)).toEqual([
+      "alpha",
+      "beta",
+      "zeta",
+    ]);
+    expect(models.map((model) => model.model)).toEqual([
+      "zeta",
+      "alpha",
+      "beta",
+    ]);
+    expect(sortCodexCatalogModels(models, "custom")).toEqual(models);
+
+    const grouped = sortCodexCatalogModels(
+      [
+        { model: "zeta", providerName: "Alpha" },
+        { model: "alpha", providerName: "Beta" },
+        { model: "beta", providerName: "Alpha" },
+      ],
+      "provider",
+    );
+    expect(grouped.map((model) => model.model)).toEqual([
+      "zeta",
+      "beta",
+      "alpha",
+    ]);
+  });
 });
 
 describe("Codex MultiRouter workspace route persistence helpers", () => {
@@ -2500,6 +2562,49 @@ describe("Codex MultiRouter workspace route persistence helpers", () => {
     expect(await screen.findByText("Sub-Agent 设置")).toBeInTheDocument();
   });
 
+  it("exposes model-first display and provider sorting controls in the model-order tab", async () => {
+    const { source, plan } = createSubagentWorkspaceFixture();
+    renderSubagentWorkspace(source, plan);
+
+    const user = userEvent.setup();
+    await user.click(screen.getByRole("tab", { name: "模型排序" }));
+
+    const selectors = screen.getAllByRole("combobox");
+    expect(selectors).toHaveLength(2);
+    expect(selectors[0]).toHaveValue("model");
+    expect(selectors[1]).toHaveValue("custom");
+
+    await user.selectOptions(selectors[0], "model-provider");
+    await user.selectOptions(selectors[1], "provider-model");
+
+    expect(selectors[0]).toHaveValue("model-provider");
+    expect(selectors[1]).toHaveValue("provider-model");
+    expect(screen.getAllByText(/deepseek-v4-flash/).length).toBeGreaterThan(0);
+  });
+
+  it("persists a display-only change without rewriting provider model order", async () => {
+    const { source, plan } = createSubagentWorkspaceFixture();
+    renderSubagentWorkspace(source, plan);
+
+    const user = userEvent.setup();
+    await user.click(screen.getByRole("tab", { name: "模型排序" }));
+    await user.selectOptions(
+      screen.getAllByRole("combobox")[0],
+      "model-provider",
+    );
+    await user.click(screen.getByRole("button", { name: "保存顺序" }));
+
+    await waitFor(() => expect(providersApi.update).toHaveBeenCalledOnce());
+    const [savedProvider, appType] = vi.mocked(providersApi.update).mock
+      .calls[0];
+    expect(appType).toBe("codex");
+    expect(savedProvider.id).toBe(plan.id);
+    expect(savedProvider.id).not.toBe(source.id);
+    expect(savedProvider.settingsConfig?.codexRouting).toMatchObject({
+      modelDisplayStyle: "model-provider",
+    });
+  });
+
   it("renders the active protocol as disabled and the inactive protocol as actionable", async () => {
     const { source, plan } = createSubagentWorkspaceFixture();
     const existingRoutes = plan.settingsConfig?.codexRouting?.routes ?? [];
@@ -3693,8 +3798,8 @@ describe("Codex MultiRouter workspace route persistence helpers", () => {
     );
 
     expect(rebuilt.models).toEqual([
-      { model: "model-a", sortIndex: 0 },
-      { model: "model-b", sortIndex: 1 },
+      { model: "model-b", sortIndex: 0 },
+      { model: "model-a", sortIndex: 1 },
     ]);
     expect(rebuilt.spawnAgentModels).toEqual(["model-b", "model-a"]);
   });
