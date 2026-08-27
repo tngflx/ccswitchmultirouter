@@ -46,7 +46,7 @@ describe("application update checks", () => {
       availableVersion: "4 commits behind",
       commitsBehind: 4,
       compareUrl:
-        "https://github.com/BigStrongSun/ccswitchmulti/compare/base...main",
+        "https://github.com/tngflx/ccswitchmultirouter/compare/base...main",
     });
 
     await expect(checkForUpdate()).resolves.toEqual({
@@ -63,3 +63,4 @@ describe("application update checks", () => {
     expect(invoke).toHaveBeenNthCalledWith(2, "check_github_commits_behind");
   });
 });
+

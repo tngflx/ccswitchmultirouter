@@ -376,7 +376,7 @@ pub async fn check_github_commits_behind() -> Result<Option<AppUpdateInfo>, Stri
         return Ok(None);
     }
     let url =
-        format!("https://api.github.com/repos/BigStrongSun/ccswitchmulti/compare/{current}...main");
+        format!("https://api.github.com/repos/tngflx/ccswitchmultirouter/compare/{current}...main");
     // Reuse the app-wide proxy-aware HTTP client so GitHub checks work behind
     // the same proxy used for model traffic and release downloads.
     let client = crate::proxy::http_client::get();
@@ -408,7 +408,7 @@ pub async fn check_github_commits_behind() -> Result<Option<AppUpdateInfo>, Stri
         commits_behind: Some(compare.behind_by),
         compare_url: compare.html_url.or_else(|| {
             Some(format!(
-                "https://github.com/BigStrongSun/ccswitchmulti/compare/{current}...main"
+                "https://github.com/tngflx/ccswitchmultirouter/compare/{current}...main"
             ))
         }),
     }))
@@ -906,3 +906,4 @@ pub async fn open_log_dir(app: AppHandle) -> Result<bool, String> {
 
     Ok(true)
 }
+
