@@ -8,6 +8,7 @@
 //! - Claude 的格式转换逻辑保留在此文件（用于 OpenRouter 旧接口回退）
 
 use super::{
+    codex_turn_recovery::{begin_turn, observe_responses_turn_stream, TurnRecoveryContext},
     content_encoding::{decompress_body, get_content_encoding, is_supported_content_encoding},
     error_mapper::{get_error_message, map_proxy_error_to_status},
     external_openai_api::{
@@ -33,14 +34,14 @@ use super::{
             responses_sse_events_from_anthropic_message,
         },
         streaming_codex_chat::{
-            create_responses_sse_stream_from_chat_with_context_and_projection,
             create_responses_sse_stream_from_chat_with_context_and_projection_and_diagnostics,
             HOSTED_TOOL_STREAM_RESPONSE_HEADER,
         },
         streaming_gemini::create_anthropic_sse_stream_from_gemini,
         streaming_retry::{
             create_resilient_anthropic_sse_stream_from_responses,
-            create_resilient_responses_sse_stream_with_context, StreamLogContext,
+            create_resilient_chat_sse_stream_with_context,
+            create_resilient_responses_sse_stream_with_context, ByteStream, StreamLogContext,
             StreamReconnector,
         },
         transform, transform_codex_anthropic, transform_codex_chat,
@@ -571,6 +572,73 @@ fn should_handle_as_codex_client(headers: &HeaderMap) -> bool {
     !headers.contains_key(FORCE_EXTERNAL_OPENAI_API_HEADER)
         && !external_openai_api::has_external_api_key(headers)
         && (is_codex_model_catalog_client(headers) || has_codex_client_fingerprint(headers))
+}
+
+/// Aggressive recovery drives the Desktop composer through CDP. Generic Codex
+/// fingerprints are not sufficient because CLI and VS Code share this endpoint.
+fn is_codex_desktop_request(headers: &HeaderMap) -> bool {
+    fn is_desktop_identity(value: &str) -> bool {
+        let value = value.trim().to_ascii_lowercase();
+        value == "codex desktop"
+            || value == "codex_chatgpt_desktop"
+            || value.starts_with("codex desktop/")
+            || value.starts_with("codex_chatgpt_desktop/")
+    }
+
+    headers
+        .get_all("originator")
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .any(is_desktop_identity)
+        || headers
+            .get(axum::http::header::USER_AGENT)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(is_desktop_identity)
+}
+
+fn is_verified_codex_desktop_request(headers: &HeaderMap) -> bool {
+    should_handle_as_codex_client(headers) && is_codex_desktop_request(headers)
+}
+
+/// Observe the exact Responses SSE form returned to Codex Desktop. The stream
+/// may have passed through a provider adapter first, so recovery belongs here
+/// at the final client-facing boundary rather than in an upstream converter.
+fn observe_aggressive_recovery(
+    stream: impl futures::Stream<Item = Result<Bytes, std::io::Error>> + Send + 'static,
+    recovery_context: Option<TurnRecoveryContext>,
+) -> ByteStream {
+    match recovery_context {
+        Some(context) if context.max_recoveries > 0 => {
+            Box::pin(observe_responses_turn_stream(stream, context))
+        }
+        _ => Box::pin(stream),
+    }
+}
+
+/// Match only the literal recovery turn CCSM injects. Prompts that merely
+/// contain the word "continue", tool results, and mixed-media messages do not
+/// preserve the existing recovery budget.
+fn request_is_literal_continue(body: &Value) -> bool {
+    let Some(item) = body
+        .get("input")
+        .and_then(Value::as_array)
+        .and_then(|items| items.last())
+    else {
+        return false;
+    };
+    if item.get("role").and_then(Value::as_str) != Some("user") {
+        return false;
+    }
+
+    match item.get("content") {
+        Some(Value::String(text)) => text == "continue",
+        Some(Value::Array(parts)) if parts.len() == 1 => {
+            let part = &parts[0];
+            part.get("type").and_then(Value::as_str) == Some("input_text")
+                && part.get("text").and_then(Value::as_str) == Some("continue")
+        }
+        _ => false,
+    }
 }
 
 fn has_codex_client_fingerprint(headers: &HeaderMap) -> bool {
@@ -2908,6 +2976,9 @@ async fn handle_responses_for_app(
     let body: Value = serde_json::from_slice(&body_bytes)
         .map_err(|e| ProxyError::Internal(format!("Failed to parse request body: {e}")))?;
     let request_body_for_history = body.clone();
+    let desktop_recovery_eligible =
+        app_type == AppType::Codex && is_verified_codex_desktop_request(&headers);
+    let is_recovery_continuation = request_is_literal_continue(&body);
 
     let endpoint = endpoint_with_query(&uri, "/responses");
     let mut ctx = if app_type == AppType::Codex && !should_handle_as_codex_client(&headers) {
@@ -2941,6 +3012,9 @@ async fn handle_responses_for_app(
     } else {
         RequestContext::new(&state, &body, &headers, app_type.clone(), tag, app_type_str).await?
     };
+    if desktop_recovery_eligible {
+        begin_turn(&ctx.session_id, is_recovery_continuation);
+    }
 
     let is_stream = body
         .get("stream")
@@ -2980,6 +3054,16 @@ async fn handle_responses_for_app(
     ctx.outbound_model = result.outbound_model.take();
     ctx.provider = result.provider;
     let response = result.response;
+    let recovery_context = (desktop_recovery_eligible && is_stream).then(|| TurnRecoveryContext {
+        session_id: ctx.session_id.clone(),
+        model: ctx
+            .outbound_model
+            .clone()
+            .unwrap_or_else(|| ctx.request_model.clone()),
+        provider_id: ctx.provider.id.clone(),
+        desktop_eligible: true,
+        max_recoveries: crate::settings::get_settings().stream_recovery_budget(),
+    });
 
     if super::providers::should_convert_codex_responses_to_anthropic(&ctx.provider, &endpoint) {
         return handle_codex_anthropic_to_responses_transform(
@@ -2989,6 +3073,7 @@ async fn handle_responses_for_app(
             is_stream,
             connection_guard,
             codex_tool_context,
+            recovery_context,
         )
         .await;
     }
@@ -3002,6 +3087,7 @@ async fn handle_responses_for_app(
                 state.codex_chat_history.clone(),
                 request_body_for_history,
             );
+            let stream = observe_aggressive_recovery(stream, recovery_context);
             super::hyper_client::ProxyResponse::streamed(status, response_headers, stream)
         } else {
             let (response_headers, status, body_bytes) =
@@ -3033,6 +3119,8 @@ async fn handle_responses_for_app(
             is_codex_v2_compaction,
             connection_guard,
             codex_tool_context,
+            stream_reconnect,
+            recovery_context,
         )
         .await;
     }
@@ -3051,6 +3139,7 @@ async fn handle_responses_for_app(
             &state,
             connection_guard,
             namespace_restore_map,
+            recovery_context,
         )
         .await;
     }
@@ -3065,22 +3154,20 @@ async fn handle_responses_for_app(
     let response = if should_wrap_native_codex_responses_stream(is_stream, &response) {
         let status = response.status();
         let response_headers = response.headers().clone();
-        super::hyper_client::ProxyResponse::streamed(
-            status,
-            response_headers,
-            create_resilient_responses_sse_stream_with_context(
-                Box::pin(response.bytes_stream()),
-                stream_reconnect,
-                Some(StreamLogContext {
-                    session_id: ctx.session_id.clone(),
-                    model: ctx
-                        .outbound_model
-                        .clone()
-                        .unwrap_or_else(|| ctx.request_model.clone()),
-                    provider_id: ctx.provider.id.clone(),
-                }),
-            ),
-        )
+        let stream = create_resilient_responses_sse_stream_with_context(
+            Box::pin(response.bytes_stream()),
+            stream_reconnect,
+            Some(StreamLogContext {
+                session_id: ctx.session_id.clone(),
+                model: ctx
+                    .outbound_model
+                    .clone()
+                    .unwrap_or_else(|| ctx.request_model.clone()),
+                provider_id: ctx.provider.id.clone(),
+            }),
+        );
+        let stream = observe_aggressive_recovery(stream, recovery_context);
+        super::hyper_client::ProxyResponse::streamed(status, response_headers, stream)
     } else {
         response
     };
@@ -3195,6 +3282,7 @@ async fn handle_responses_compact_for_app(
             is_stream,
             connection_guard,
             codex_tool_context,
+            None,
         )
         .await;
     }
@@ -3239,6 +3327,8 @@ async fn handle_responses_compact_for_app(
             is_codex_v2_compaction,
             connection_guard,
             codex_tool_context,
+            None,
+            None,
         )
         .await;
     }
@@ -3252,6 +3342,7 @@ async fn handle_responses_compact_for_app(
             &state,
             connection_guard,
             namespace_restore_map,
+            None,
         )
         .await;
     }
@@ -3288,6 +3379,7 @@ async fn handle_codex_responses_namespace_restore(
         String,
         transform_codex_responses_namespace::NamespacedName,
     >,
+    recovery_context: Option<TurnRecoveryContext>,
 ) -> Result<axum::response::Response, ProxyError> {
     let status = response.status();
 
@@ -3313,6 +3405,7 @@ async fn handle_codex_responses_namespace_restore(
                 response.bytes_stream(),
                 restore_map,
             );
+        let restore_stream = observe_aggressive_recovery(restore_stream, recovery_context);
         let usage_collector =
             create_usage_collector(ctx, state, status.as_u16(), &CODEX_PARSER_CONFIG);
         let logged_stream = create_logged_passthrough_stream(
@@ -3422,6 +3515,7 @@ async fn handle_codex_responses_namespace_restore(
         })
 }
 
+#[cfg(test)]
 fn create_codex_chat_sse_stream_from_verified_profile<E: std::error::Error + Send + 'static>(
     stream: impl futures::Stream<Item = Result<Bytes, E>> + Send + 'static,
     tool_context: transform_codex_chat::CodexToolContext,
@@ -3557,6 +3651,8 @@ async fn handle_codex_chat_to_responses_transform(
     is_compaction: bool,
     connection_guard: Option<ActiveConnectionGuard>,
     tool_context: transform_codex_chat::CodexToolContext,
+    stream_reconnect: Option<StreamReconnector>,
+    recovery_context: Option<TurnRecoveryContext>,
 ) -> Result<axum::response::Response, ProxyError> {
     let status = response.status();
     let hosted_tool_loop_response = response.headers().contains_key(HOSTED_TOOL_LOOP_HEADER);
@@ -3588,6 +3684,7 @@ async fn handle_codex_chat_to_responses_transform(
         );
         let stream =
             record_responses_sse_stream(response.bytes_stream(), state.codex_chat_history.clone());
+        let stream = observe_aggressive_recovery(stream, recovery_context);
         let usage_collector = if usage_logging_enabled(state) {
             let state = state.clone();
             let provider_id = ctx.provider.id.clone();
@@ -3754,7 +3851,15 @@ async fn handle_codex_chat_to_responses_transform(
     let projection_now = chrono::Utc::now().timestamp();
 
     if (is_stream || response.is_sse()) && !hosted_tool_loop_response {
-        let stream = response.bytes_stream();
+        let stream = create_resilient_chat_sse_stream_with_context(
+            Box::pin(response.bytes_stream()),
+            stream_reconnect,
+            Some(StreamLogContext {
+                session_id: ctx.session_id.clone(),
+                model: upstream_model.to_string(),
+                provider_id: ctx.provider.id.clone(),
+            }),
+        );
         let sse_stream = create_codex_chat_sse_stream_from_verified_profile_with_diagnostics(
             stream,
             tool_context,
@@ -3774,6 +3879,7 @@ async fn handle_codex_chat_to_responses_transform(
             ),
         );
         let sse_stream = record_responses_sse_stream(sse_stream, state.codex_chat_history.clone());
+        let sse_stream = observe_aggressive_recovery(sse_stream, recovery_context);
 
         let usage_collector = if usage_logging_enabled(state) {
             let state = state.clone();
@@ -4022,6 +4128,7 @@ async fn handle_codex_anthropic_to_responses_transform(
     is_stream: bool,
     connection_guard: Option<ActiveConnectionGuard>,
     codex_tool_context: transform_codex_chat::CodexToolContext,
+    recovery_context: Option<TurnRecoveryContext>,
 ) -> Result<axum::response::Response, ProxyError> {
     let status = response.status();
 
@@ -4042,6 +4149,7 @@ async fn handle_codex_anthropic_to_responses_transform(
             state,
             status,
             connection_guard,
+            recovery_context,
         );
     }
 
@@ -4090,6 +4198,7 @@ async fn handle_codex_anthropic_to_responses_transform(
             state,
             status,
             connection_guard,
+            recovery_context,
         );
     }
 
@@ -4177,7 +4286,9 @@ fn build_codex_anthropic_sse_response(
     state: &ProxyState,
     status: StatusCode,
     connection_guard: Option<ActiveConnectionGuard>,
+    recovery_context: Option<TurnRecoveryContext>,
 ) -> Result<axum::response::Response, ProxyError> {
+    let sse_stream = observe_aggressive_recovery(sse_stream, recovery_context);
     let usage_collector = if usage_logging_enabled(state) {
         let state = state.clone();
         let provider_id = ctx.provider.id.clone();
@@ -5792,14 +5903,15 @@ mod tests {
         classify_body_for_diagnostics, codex_catalog_models_response, codex_proxy_error_json,
         codex_proxy_error_status, codex_request_classification_fields,
         create_codex_chat_sse_stream_from_verified_profile, external_openai_api_models_response,
-        external_openai_api_unsupported_response, mark_external_openai_headers,
-        resolve_codex_image_generation_provider, resolve_external_codex_router_raw_target,
-        resolve_external_codex_router_target, resolve_forward_error_provider_for_logging,
-        resolve_forward_error_route_provider, responses_response_to_compaction_sse,
-        responses_response_to_completed_sse, responses_response_to_full_sse,
-        responses_sse_to_response_value, should_handle_as_codex_client,
-        should_use_claude_transform_streaming, should_wrap_native_codex_responses_stream,
-        transform, upstream_body_parse_error,
+        external_openai_api_unsupported_response, is_codex_desktop_request,
+        is_verified_codex_desktop_request, mark_external_openai_headers,
+        request_is_literal_continue, resolve_codex_image_generation_provider,
+        resolve_external_codex_router_raw_target, resolve_external_codex_router_target,
+        resolve_forward_error_provider_for_logging, resolve_forward_error_route_provider,
+        responses_response_to_compaction_sse, responses_response_to_completed_sse,
+        responses_response_to_full_sse, responses_sse_to_response_value,
+        should_handle_as_codex_client, should_use_claude_transform_streaming,
+        should_wrap_native_codex_responses_stream, transform, upstream_body_parse_error,
     };
     use crate::{
         app_config::AppType,
@@ -6867,6 +6979,95 @@ data: [DONE]\n\n";
     #[test]
     fn missing_identity_headers_still_require_external_api_auth() {
         assert!(!should_handle_as_codex_client(&HeaderMap::new()));
+    }
+
+    #[test]
+    fn aggressive_recovery_accepts_only_explicit_desktop_identities() {
+        for (header, identity) in [
+            ("originator", "Codex Desktop"),
+            ("originator", "codex_chatgpt_desktop"),
+            ("user-agent", "Codex Desktop/0.144.2"),
+            ("user-agent", "codex_chatgpt_desktop/0.144.2"),
+        ] {
+            let mut headers = HeaderMap::new();
+            headers.insert(header, HeaderValue::from_str(identity).unwrap());
+            assert!(
+                is_codex_desktop_request(&headers),
+                "expected Desktop identity {identity} to be eligible"
+            );
+        }
+
+        for identity in [
+            "codex_vscode/0.144.2",
+            "codex_cli_rs/0.144.2",
+            "codex/0.144.2",
+            "my-codex-desktop-wrapper/1.0",
+        ] {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                axum::http::header::USER_AGENT,
+                HeaderValue::from_str(identity).unwrap(),
+            );
+            assert!(
+                !is_codex_desktop_request(&headers),
+                "expected non-Desktop identity {identity} to be ineligible"
+            );
+        }
+    }
+
+    #[test]
+    fn aggressive_recovery_rejects_external_api_requests_with_spoofed_desktop_identity() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "originator",
+            HeaderValue::from_static("codex_chatgpt_desktop"),
+        );
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer ccsw_test"),
+        );
+
+        assert!(is_codex_desktop_request(&headers));
+        assert!(!is_verified_codex_desktop_request(&headers));
+    }
+
+    #[test]
+    fn recovery_continuation_match_is_exact_and_final_user_only() {
+        assert!(request_is_literal_continue(&json!({
+            "input": [{"role": "user", "content": "continue"}]
+        })));
+        assert!(request_is_literal_continue(&json!({
+            "input": [{"role": "user", "content": [{"type": "input_text", "text": "continue"}]}]
+        })));
+        assert!(request_is_literal_continue(&json!({
+            "input": [
+                {"role": "user", "content": "old prompt"},
+                {"role": "assistant", "content": "partial answer"},
+                {"role": "user", "content": "continue"}
+            ]
+        })));
+
+        for body in [
+            json!({"input": [{"role": "user", "content": "please continue"}]}),
+            json!({"input": [{"role": "user", "content": " continue "}]}),
+            json!({"input": [{"role": "user", "content": "Continue"}]}),
+            json!({"input": [{"role": "assistant", "content": "continue"}]}),
+            json!({"input": [{"role": "user", "content": [{"type": "text", "text": "continue"}]}]}),
+            json!({"input": [{"role": "user", "content": [
+                {"type": "input_text", "text": "continue"},
+                {"type": "input_image", "image_url": "data:image/png;base64,AA=="}
+            ]}]}),
+            json!({"input": [{"type": "function_call_output", "call_id": "call_1", "output": "continue"}]}),
+            json!({"input": [
+                {"role": "user", "content": "continue"},
+                {"type": "function_call_output", "call_id": "call_1", "output": "done"}
+            ]}),
+        ] {
+            assert!(
+                !request_is_literal_continue(&body),
+                "unexpected match: {body}"
+            );
+        }
     }
 
     #[test]
@@ -8339,8 +8540,3 @@ data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_deepseek\",\"
         }
     }
 }
-
-
-
-
-

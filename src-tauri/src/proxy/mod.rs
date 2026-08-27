@@ -7,6 +7,7 @@ pub mod cache_injector;
 pub mod circuit_breaker;
 pub(crate) mod codex_router_log;
 pub(crate) mod codex_traffic_policy;
+pub(crate) mod codex_turn_recovery;
 pub(crate) mod content_encoding;
 pub mod copilot_optimizer;
 pub mod error;
