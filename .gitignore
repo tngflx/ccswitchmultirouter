@@ -19,6 +19,10 @@ GEMINI.md
 vitest-report.json
 nul
 
+# Tauri updater signing keys (NEVER commit the private key)
+tauri-signing.key
+tauri-signing.key.pub
+
 # Flatpak build artifacts
 flatpak/cc-switch.deb
 flatpak-build/

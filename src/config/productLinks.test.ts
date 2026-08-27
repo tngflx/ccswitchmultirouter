@@ -7,10 +7,11 @@ import {
 describe("CCSwitchMulti product links", () => {
   it("keeps every public product destination on the Multi repository", () => {
     expect(CCSWITCHMULTI_REPOSITORY_URL).toBe(
-      "https://github.com/BigStrongSun/ccswitchmulti",
+      "https://github.com/tngflx/ccswitchmultirouter",
     );
     expect(CCSWITCHMULTI_RELEASES_URL).toBe(
-      "https://github.com/BigStrongSun/ccswitchmulti/releases",
+      "https://github.com/tngflx/ccswitchmultirouter/releases",
     );
   });
 });
+
