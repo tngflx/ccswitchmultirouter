@@ -40,9 +40,26 @@ describe("application update checks", () => {
     });
   });
 
-  it("maps an empty backend result to up-to-date", async () => {
+  it("returns commit-behind metadata when no release update exists", async () => {
+    vi.mocked(invoke).mockResolvedValueOnce(null).mockResolvedValueOnce({
+      currentVersion: "3.19.2-18",
+      availableVersion: "4 commits behind",
+      commitsBehind: 4,
+      compareUrl:
+        "https://github.com/BigStrongSun/ccswitchmulti/compare/base...main",
+    });
+
+    await expect(checkForUpdate()).resolves.toEqual({
+      status: "available",
+      info: expect.objectContaining({ commitsBehind: 4 }),
+    });
+  });
+
+  it("maps empty release and source results to up-to-date", async () => {
     vi.mocked(invoke).mockResolvedValue(null);
 
     await expect(checkForUpdate()).resolves.toEqual({ status: "up-to-date" });
+    expect(invoke).toHaveBeenNthCalledWith(1, "check_app_update");
+    expect(invoke).toHaveBeenNthCalledWith(2, "check_github_commits_behind");
   });
 });

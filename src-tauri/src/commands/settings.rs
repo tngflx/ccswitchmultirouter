@@ -1,5 +1,6 @@
 #![allow(non_snake_case)]
 
+use serde::Deserialize;
 use tauri::{AppHandle, Emitter};
 use tauri_plugin_opener::OpenerExt;
 use tauri_plugin_updater::UpdaterExt;
@@ -34,6 +35,10 @@ struct UpdateDownloadProgress {
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AppUpdateInfo {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub commits_behind: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compare_url: Option<String>,
     pub current_version: String,
     pub available_version: String,
     pub notes: Option<String>,
@@ -47,6 +52,8 @@ fn build_app_update_info(
     pub_date: Option<String>,
 ) -> AppUpdateInfo {
     AppUpdateInfo {
+        commits_behind: None,
+        compare_url: None,
         current_version,
         available_version,
         notes,
@@ -346,6 +353,64 @@ pub async fn check_app_update(app: AppHandle) -> Result<Option<AppUpdateInfo>, S
             update.body,
             update.date.map(|date| date.to_string()),
         )
+    }))
+}
+
+#[derive(Debug, Deserialize)]
+struct GithubCompareResponse {
+    behind_by: u32,
+    html_url: Option<String>,
+}
+
+/// Compare the embedded source commit with the fork's GitHub main branch.
+/// This is intentionally independent from release artifacts: it lets developers
+/// know exactly how many commits they are behind and opens a cherry-pick target.
+#[tauri::command]
+pub async fn check_github_commits_behind() -> Result<Option<AppUpdateInfo>, String> {
+    let Some(current) =
+        option_env!("CCSWITCHMULTI_GIT_BASE").or(option_env!("CCSWITCHMULTI_GIT_COMMIT"))
+    else {
+        return Ok(None);
+    };
+    if current.is_empty() {
+        return Ok(None);
+    }
+    let url =
+        format!("https://api.github.com/repos/BigStrongSun/ccswitchmulti/compare/{current}...main");
+    // Reuse the app-wide proxy-aware HTTP client so GitHub checks work behind
+    // the same proxy used for model traffic and release downloads.
+    let client = crate::proxy::http_client::get();
+    let response = client
+        .get(url)
+        .header(reqwest::header::USER_AGENT, "CCSwitchMulti-update-check")
+        .timeout(std::time::Duration::from_secs(15))
+        .send()
+        .await
+        .map_err(|e| format!("GitHub 提交检查失败: {e}"))?;
+    if !response.status().is_success() {
+        return Err(format!("GitHub 提交检查返回 HTTP {}", response.status()));
+    }
+    let compare: GithubCompareResponse = response
+        .json()
+        .await
+        .map_err(|e| format!("解析 GitHub 响应失败: {e}"))?;
+    if compare.behind_by == 0 {
+        return Ok(None);
+    }
+    Ok(Some(AppUpdateInfo {
+        current_version: env!("CARGO_PKG_VERSION").to_string(),
+        available_version: format!("{} commits behind", compare.behind_by),
+        notes: Some(format!(
+            "The upstream repository has {} newer commit(s). Cherry-pick them from GitHub.",
+            compare.behind_by
+        )),
+        pub_date: None,
+        commits_behind: Some(compare.behind_by),
+        compare_url: compare.html_url.or_else(|| {
+            Some(format!(
+                "https://github.com/BigStrongSun/ccswitchmulti/compare/{current}...main"
+            ))
+        }),
     }))
 }
 

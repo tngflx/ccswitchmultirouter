@@ -454,6 +454,12 @@ export function AboutSection({ isPortable }: AboutSectionProps) {
 
   const handleCheckUpdate = useCallback(async () => {
     if (hasUpdate) {
+      // Source-only updates are informational: open GitHub compare so maintainers
+      // can cherry-pick the exact commits instead of attempting a release install.
+      if (updateInfo?.commitsBehind && updateInfo.compareUrl) {
+        await settingsApi.openExternal(updateInfo.compareUrl);
+        return;
+      }
       if (isPortable) {
         try {
           await settingsApi.checkUpdates();
@@ -939,9 +945,15 @@ export function AboutSection({ isPortable }: AboutSectionProps) {
             className="rounded-lg bg-primary/10 border border-primary/20 px-4 py-3 text-sm"
           >
             <p className="font-medium text-primary mb-1">
-              {t("settings.updateAvailable", {
-                version: updateInfo.availableVersion,
-              })}
+              {updateInfo.commitsBehind
+                ? t("settings.commitsBehind", {
+                    count: updateInfo.commitsBehind,
+                    defaultValue:
+                      "{{count}} upstream commit(s) behind — cherry-pick available",
+                  })
+                : t("settings.updateAvailable", {
+                    version: updateInfo.availableVersion,
+                  })}
             </p>
             {updateInfo.notes && (
               <p className="text-muted-foreground line-clamp-3 leading-relaxed">

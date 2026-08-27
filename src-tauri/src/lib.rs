@@ -1530,6 +1530,7 @@ pub fn run() {
             commands::restart_app,
             commands::install_update_and_restart,
             commands::check_app_update,
+            commands::check_github_commits_behind,
             commands::check_app_update_available,
             commands::check_for_updates,
             commands::is_portable_mode,
