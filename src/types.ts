@@ -404,6 +404,8 @@ export interface CodexCatalogModel {
   upstream_model?: string;
   displayName?: string;
   display_name?: string;
+  providerName?: string;
+  provider_name?: string;
   contextWindow?: string | number;
   context_window?: string | number;
   inputModalities?: string[];
@@ -456,6 +458,8 @@ export interface CodexCacheConfig {
 }
 
 export interface CodexModelCatalogConfig {
+  /** Picker label style: model, model-provider, or provider-model. */
+  displayNameStyle?: "model" | "model-provider" | "provider-model";
   models: CodexCatalogModel[];
   spawnAgentModels?: string[];
 }
@@ -540,6 +544,7 @@ export interface CodexRoutingConfigV2 {
   schemaVersion: 2;
   enabled?: boolean;
   defaultRouteId?: string;
+  modelDisplayStyle?: "model" | "model-provider" | "provider-model";
   subagentVersion?: CodexSubagentVersion;
   subagentV2?: CodexSubagentV2Config;
   spawnAgentModels?: string[];
