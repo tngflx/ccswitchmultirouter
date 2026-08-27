@@ -4,6 +4,7 @@ import {
   render,
   screen,
   waitFor,
+  within,
 } from "@testing-library/react";
 import { useState, type ReactNode } from "react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
@@ -12,7 +13,10 @@ import {
   CodexFormFields,
   splitFetchedModelsByLikelyCodexProtocol,
 } from "@/components/providers/forms/CodexFormFields";
-import { fetchModelsForConfig } from "@/lib/api/model-fetch";
+import {
+  fetchModelsForConfig,
+  fetchXaiOauthModels,
+} from "@/lib/api/model-fetch";
 import {
   preflightCodexProviderProtocolCompatibility,
   type CodexProtocolCompatibilityRecord,
@@ -23,6 +27,7 @@ import {
 import type {
   CodexApiFormat,
   CodexCatalogModel,
+  CodexApiKeyGroup,
   CodexRoutingConfig,
 } from "@/types";
 import type {
@@ -59,6 +64,7 @@ vi.mock("react-i18next", () => ({
 
 vi.mock("@/lib/api/model-fetch", () => ({
   fetchModelsForConfig: vi.fn(),
+  fetchXaiOauthModels: vi.fn(),
   showFetchModelsError: vi.fn(),
 }));
 
@@ -78,9 +84,14 @@ vi.mock("@/components/ui/form", () => ({
   ),
 }));
 
+vi.mock("@/components/providers/forms/XaiOAuthSection", () => ({
+  XaiOAuthSection: () => <div data-testid="xai-oauth-section" />,
+}));
+
 beforeEach(() => {
   vi.useRealTimers();
   vi.mocked(fetchModelsForConfig).mockReset();
+  vi.mocked(fetchXaiOauthModels).mockReset();
   vi.mocked(preflightCodexProviderProtocolCompatibility).mockReset();
   Object.defineProperty(HTMLElement.prototype, "scrollIntoView", {
     configurable: true,
@@ -367,14 +378,23 @@ function renderCatalogHarness(
     openAdvancedOptions?: boolean;
     presetCatalogModels?: CodexCatalogModel[];
     onProviderSplitSuggestionChange?: ReturnType<typeof vi.fn>;
+    initialApiKeyGroups?: CodexApiKeyGroup[];
+    isXaiOauthPreset?: boolean;
+    isXaiOauthAuthenticated?: boolean;
+    selectedXaiAccountId?: string;
   } = {},
 ) {
   const onCatalogChange = vi.fn();
   const onApiFormatChange = vi.fn();
+  const onApiKeyGroupsChange = vi.fn();
   let latestCatalog = initialCatalog;
+  let latestApiKeyGroups = options.initialApiKeyGroups ?? [];
 
   function Harness() {
     const [catalog, setCatalog] = useState<CodexCatalogModel[]>(initialCatalog);
+    const [apiKeyGroups, setApiKeyGroups] = useState<CodexApiKeyGroup[]>(
+      options.initialApiKeyGroups ?? [],
+    );
 
     // 测试壳模拟 ProviderForm 对 modelCatalog 的受控回写。
     const handleCatalogChange = (next: CodexCatalogModel[]) => {
@@ -382,13 +402,23 @@ function renderCatalogHarness(
       onCatalogChange(next);
       setCatalog(next);
     };
+    const handleApiKeyGroupsChange = (next: CodexApiKeyGroup[]) => {
+      latestApiKeyGroups = next;
+      onApiKeyGroupsChange(next);
+      setApiKeyGroups(next);
+    };
 
     return (
       <CodexFormFields
         providerId="codex-thirdparty"
         providerName={options.providerName}
+        isXaiOauthPreset={options.isXaiOauthPreset}
+        isXaiOauthAuthenticated={options.isXaiOauthAuthenticated}
+        selectedXaiAccountId={options.selectedXaiAccountId}
         codexApiKey={options.apiKey ?? "sk-test"}
         onApiKeyChange={vi.fn()}
+        apiKeyGroups={apiKeyGroups}
+        onApiKeyGroupsChange={handleApiKeyGroupsChange}
         category="custom"
         shouldShowApiKeyLink={false}
         websiteUrl=""
@@ -440,7 +470,9 @@ function renderCatalogHarness(
     ...renderResult,
     onCatalogChange,
     onApiFormatChange,
+    onApiKeyGroupsChange,
     latestCatalog: () => latestCatalog,
+    latestApiKeyGroups: () => latestApiKeyGroups,
   };
 }
 
@@ -1174,6 +1206,26 @@ describe("CodexFormFields local model routing", () => {
             inputModalities: ["text", "image"],
             supportsImage: true,
           },
+          {
+            model: "model-b",
+            upstreamModel: "model-b",
+            enabled: true,
+          },
+        ],
+      },
+      {
+        catalog: [
+          {
+            model: "model-a",
+            upstreamModel: "model-a",
+            inputModalities: ["text", "image"],
+            supportsImage: true,
+          },
+          {
+            model: "model-b",
+            upstreamModel: "model-b",
+            enabled: false,
+          },
         ],
       },
     ];
@@ -1365,6 +1417,412 @@ describe("CodexFormFields local model routing", () => {
         },
       ]);
     });
+  });
+
+  it("refreshes existing model metadata from the provider without overwriting the alias", async () => {
+    vi.mocked(fetchModelsForConfig).mockResolvedValueOnce([
+      {
+        id: "gpt-5.5",
+        ownedBy: null,
+        contextWindow: 272000,
+        inputModalities: ["text", "image"],
+        supportsImage: true,
+      },
+    ]);
+    const { latestCatalog } = renderCatalogHarness([
+      {
+        model: "my-gpt",
+        upstreamModel: "gpt-5.5",
+        displayName: "My GPT",
+        contextWindow: "128000",
+        inputModalities: ["text"],
+        supportsImage: false,
+        enabled: false,
+      },
+    ]);
+
+    fireEvent.click(screen.getByRole("button", { name: "Refresh Existing" }));
+
+    await waitFor(() => {
+      expect(latestCatalog()[0]).toMatchObject({
+        model: "my-gpt",
+        displayName: "My GPT",
+        contextWindow: "272000",
+        inputModalities: ["text", "image"],
+        supportsImage: true,
+        textOnly: false,
+        enabled: false,
+      });
+    });
+  });
+
+  it("does not fetch models from the provider when the catalog filter changes", () => {
+    const { latestCatalog } = renderCatalogHarness([
+      { model: "free-model", upstreamModel: "free-model" },
+      { model: "paid-model", upstreamModel: "paid-model" },
+    ]);
+
+    fireEvent.change(screen.getByLabelText("Filter model catalog"), {
+      target: { value: "free" },
+    });
+
+    expect(fetchModelsForConfig).not.toHaveBeenCalled();
+    expect(latestCatalog()).toHaveLength(2);
+    expect(screen.getByLabelText("Include free-model")).toBeInTheDocument();
+    expect(
+      screen.queryByLabelText("Include paid-model"),
+    ).not.toBeInTheDocument();
+  });
+
+  it("discards an in-flight fetch when grouped credentials change", async () => {
+    const pending = deferred<{ id: string; ownedBy: null }[]>();
+    vi.mocked(fetchModelsForConfig).mockReturnValueOnce(pending.promise);
+    const { latestCatalog } = renderCatalogHarness([]);
+
+    fireEvent.click(screen.getByRole("button", { name: "Sync Models" }));
+    await waitFor(() => {
+      expect(fetchModelsForConfig).toHaveBeenCalledTimes(1);
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "Add key group" }));
+    fireEvent.change(screen.getByPlaceholderText("API key"), {
+      target: { value: "sk-new-group" },
+    });
+
+    pending.resolve([{ id: "stale-model", ownedBy: null }]);
+    await Promise.resolve();
+
+    expect(latestCatalog()).toEqual([]);
+  });
+
+  it("matches free case-insensitively across model, display name, and upstream id", async () => {
+    const { latestCatalog } = renderCatalogHarness([
+      {
+        model: "alias",
+        displayName: "My Free Alias",
+        upstreamModel: "upstream-paid",
+        enabled: false,
+      },
+      {
+        model: "plain",
+        displayName: "Plain",
+        upstreamModel: "provider-free-id",
+        enabled: false,
+      },
+      {
+        model: "some-FREE-model",
+        upstreamModel: "some-FREE-model",
+        enabled: false,
+      },
+      {
+        model: "paid-only",
+        upstreamModel: "paid-only",
+        enabled: false,
+      },
+    ]);
+
+    fireEvent.change(screen.getByLabelText("Filter model catalog"), {
+      target: { value: "free" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Include Filtered" }));
+
+    await waitFor(() => {
+      expect(
+        latestCatalog()
+          .filter((model) => model.enabled === true)
+          .map((model) => model.model),
+      ).toEqual(["alias", "plain", "some-FREE-model"]);
+    });
+    expect(
+      latestCatalog().find((model) => model.model === "paid-only")?.enabled,
+    ).toBe(false);
+  });
+
+  it("syncs all remote models as included by default and narrows to only free models", async () => {
+    vi.mocked(fetchModelsForConfig).mockResolvedValueOnce([
+      { id: "free-model", ownedBy: null },
+      { id: "paid-model", ownedBy: null },
+    ]);
+    const { latestCatalog } = renderCatalogHarness([]);
+
+    fireEvent.click(screen.getByRole("button", { name: "Sync Models" }));
+
+    await waitFor(() => {
+      expect(latestCatalog().map((model) => model.model)).toEqual([
+        "free-model",
+        "paid-model",
+      ]);
+      expect(latestCatalog().every((model) => model.enabled !== false)).toBe(
+        true,
+      );
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "Exclude Filtered" }));
+    await waitFor(() => {
+      expect(latestCatalog().every((model) => model.enabled === false)).toBe(
+        true,
+      );
+    });
+
+    fireEvent.change(screen.getByLabelText("Filter model catalog"), {
+      target: { value: "free" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Include Filtered" }));
+
+    await waitFor(() => {
+      expect(
+        latestCatalog().find((model) => model.model === "free-model")?.enabled,
+      ).toBe(true);
+      expect(
+        latestCatalog().find((model) => model.model === "paid-model")?.enabled,
+      ).toBe(false);
+    });
+  });
+
+  it("persists xAI OAuth models so the local free filter can find them", async () => {
+    vi.mocked(fetchXaiOauthModels).mockResolvedValueOnce([
+      { id: "grok-free", ownedBy: "xai" },
+      { id: "grok-paid", ownedBy: "xai" },
+    ]);
+    const { latestCatalog } = renderCatalogHarness([], {
+      isXaiOauthPreset: true,
+      isXaiOauthAuthenticated: true,
+      selectedXaiAccountId: "xai-account",
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "Sync Models" }));
+
+    await waitFor(() => {
+      expect(latestCatalog().map((model) => model.model)).toEqual([
+        "grok-free",
+        "grok-paid",
+      ]);
+    });
+    expect(fetchXaiOauthModels).toHaveBeenCalledWith("xai-account");
+
+    fireEvent.change(screen.getByLabelText("Filter model catalog"), {
+      target: { value: "free" },
+    });
+    expect(screen.getByLabelText("Include grok-free")).toBeInTheDocument();
+    expect(screen.queryByLabelText("Include grok-paid")).not.toBeInTheDocument();
+  });
+
+  it("accumulates included rows across successive filters", async () => {
+    const { latestCatalog } = renderCatalogHarness([
+      { model: "free-a", upstreamModel: "free-a", enabled: false },
+      { model: "free-b", upstreamModel: "free-b", enabled: false },
+      { model: "paid-c", upstreamModel: "paid-c", enabled: false },
+    ]);
+
+    fireEvent.change(screen.getByLabelText("Filter model catalog"), {
+      target: { value: "free" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Include Filtered" }));
+
+    await waitFor(() => {
+      expect(
+        latestCatalog()
+          .filter((model) => model.enabled === true)
+          .map((model) => model.model),
+      ).toEqual(["free-a", "free-b"]);
+    });
+
+    fireEvent.change(screen.getByLabelText("Filter model catalog"), {
+      target: { value: "paid" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Include Filtered" }));
+
+    await waitFor(() => {
+      expect(latestCatalog().every((model) => model.enabled === true)).toBe(
+        true,
+      );
+    });
+  });
+
+  it("adds a key group directly while keeping the fallback API key visible", () => {
+    const { latestApiKeyGroups } = renderCatalogHarness([]);
+
+    expect(document.getElementById("codexApiKey")).toBeInTheDocument();
+    expect(
+      screen.getByText(/No model-specific groups\. The fallback API key/),
+    ).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Add key group" }));
+
+    expect(latestApiKeyGroups()).toHaveLength(1);
+    expect(latestApiKeyGroups()[0]).toMatchObject({
+      apiKeys: [""],
+      models: [],
+      prefixes: [],
+      enabled: true,
+      strategy: "round_robin",
+    });
+    expect(document.getElementById("codexApiKey")).toBeInTheDocument();
+    expect(screen.getByPlaceholderText("Group label")).toBeInTheDocument();
+  });
+
+  it("edits and removes a model-specific API key group through the canonical form controls", async () => {
+    const { latestApiKeyGroups } = renderCatalogHarness([], {
+      initialApiKeyGroups: [
+        {
+          id: "priority-models",
+          label: "Priority",
+          apiKeys: ["sk-priority"],
+          models: ["gpt-5.5"],
+          prefixes: ["gpt-5"],
+          enabled: true,
+          strategy: "round_robin",
+        },
+      ],
+    });
+
+    fireEvent.change(screen.getByPlaceholderText("Group label"), {
+      target: { value: "Premium" },
+    });
+    fireEvent.change(screen.getByPlaceholderText("API key"), {
+      target: { value: "sk-premium" },
+    });
+    fireEvent.click(screen.getByRole("switch", { name: "Enabled" }));
+    fireEvent.click(screen.getByRole("combobox", { name: "Rotation" }));
+    fireEvent.click(await screen.findByRole("option", { name: "Random" }));
+    fireEvent.click(screen.getByRole("button", { name: "Add key" }));
+    fireEvent.change(screen.getAllByPlaceholderText("API key")[1], {
+      target: { value: "sk-premium-backup" },
+    });
+    fireEvent.change(
+      screen.getByPlaceholderText("Exact models, comma separated"),
+      { target: { value: "gpt-5.5, gpt-5.6" } },
+    );
+    fireEvent.change(
+      screen.getByPlaceholderText("Model prefixes, comma separated"),
+      { target: { value: "gpt-5, o4-" } },
+    );
+
+    expect(latestApiKeyGroups()[0]).toMatchObject({
+      label: "Premium",
+      apiKeys: ["sk-premium", "sk-premium-backup"],
+      models: ["gpt-5.5", "gpt-5.6"],
+      prefixes: ["gpt-5", "o4-"],
+      enabled: false,
+      strategy: "random",
+    });
+
+    const groupEditor = screen
+      .getByPlaceholderText("Group label")
+      .closest("div.space-y-3");
+    expect(groupEditor).not.toBeNull();
+    fireEvent.click(
+      within(groupEditor as HTMLElement).getAllByRole("button", {
+        name: "Delete",
+      })[2],
+    );
+    expect(latestApiKeyGroups()[0].apiKeys).toEqual(["sk-premium"]);
+    fireEvent.click(
+      within(groupEditor as HTMLElement).getAllByRole("button", {
+        name: "Delete",
+      })[0],
+    );
+
+    expect(latestApiKeyGroups()).toEqual([]);
+    expect(
+      screen.getByText(/No model-specific groups\. The fallback API key/),
+    ).toBeInTheDocument();
+  });
+
+  it("syncs models with the fallback key and every enabled grouped key", async () => {
+    vi.mocked(fetchModelsForConfig).mockResolvedValue([]);
+    renderCatalogHarness([], {
+      apiKey: "sk-fallback",
+      initialApiKeyGroups: [
+        {
+          id: "enabled",
+          apiKeys: ["sk-enabled", "sk-enabled"],
+          enabled: true,
+        },
+        {
+          id: "disabled",
+          apiKeys: ["sk-disabled"],
+          enabled: false,
+        },
+      ],
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "Sync Models" }));
+
+    await waitFor(() => {
+      expect(fetchModelsForConfig).toHaveBeenCalledTimes(2);
+    });
+    expect(fetchModelsForConfig).toHaveBeenNthCalledWith(
+      1,
+      "https://api.thirdparty.example/v1",
+      "sk-fallback",
+      false,
+      undefined,
+      "",
+      undefined,
+    );
+    expect(fetchModelsForConfig).toHaveBeenNthCalledWith(
+      2,
+      "https://api.thirdparty.example/v1",
+      "sk-enabled",
+      false,
+      undefined,
+      "",
+      undefined,
+    );
+    expect(
+      vi.mocked(fetchModelsForConfig).mock.calls.map((call) => call[1]),
+    ).toEqual(["sk-fallback", "sk-enabled"]);
+  });
+
+  it("accumulates successive model syncs without duplicating or re-enabling rows", async () => {
+    vi.mocked(fetchModelsForConfig)
+      .mockResolvedValueOnce([
+        { id: "alpha-free", ownedBy: null },
+        { id: "beta-paid", ownedBy: null },
+      ])
+      .mockResolvedValueOnce([
+        { id: "beta-paid", ownedBy: null },
+        { id: "gamma-free", ownedBy: null },
+      ]);
+    const { latestCatalog } = renderCatalogHarness([]);
+
+    fireEvent.click(screen.getByRole("button", { name: "Sync Models" }));
+    await waitFor(() => {
+      expect(latestCatalog().map((model) => model.model)).toEqual([
+        "alpha-free",
+        "beta-paid",
+      ]);
+    });
+
+    fireEvent.change(screen.getByLabelText("Filter model catalog"), {
+      target: { value: "alpha-free" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Exclude Filtered" }));
+    await waitFor(() => {
+      expect(
+        latestCatalog().find((model) => model.model === "alpha-free")?.enabled,
+      ).toBe(false);
+    });
+
+    fireEvent.change(screen.getByLabelText("Filter model catalog"), {
+      target: { value: "" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Sync Models" }));
+
+    await waitFor(() => {
+      expect(latestCatalog().map((model) => model.model)).toEqual([
+        "alpha-free",
+        "beta-paid",
+        "gamma-free",
+      ]);
+    });
+    expect(
+      latestCatalog().find((model) => model.model === "alpha-free")?.enabled,
+    ).toBe(false);
+    expect(
+      latestCatalog().filter((model) => model.model === "beta-paid"),
+    ).toHaveLength(1);
   });
 
   it("falls back to data-plane models when AgentPlan AK/SK is missing but API Key exists", async () => {

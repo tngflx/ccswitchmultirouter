@@ -4,7 +4,7 @@
 
 1. **NEVER use `--theirs` or `--ours` blindly during merge conflicts.** Read EVERY conflict hunk. Understand what each side changed and WHY before resolving.
 
-2. **NEVER skip running tests after any merge, cherry-pick, or code change.** Full test suite (frontend + backend) must pass before declaring success.
+2. **NEVER skip relevant tests after a merge, cherry-pick, or code change.** During active development, run targeted tests for the changed behavior plus tests for plausible dependents and shared contracts. Do not run the full frontend and backend suites after every incremental edit. Run the full suites only for final verification as defined in rule 9.
 
 3. **NEVER claim something is "done" or "verified" without actually running the verification command and reading its output.**
 
@@ -20,16 +20,28 @@
 
 8. **After ANY cherry-pick:** run `cargo check` AND `pnpm typecheck` immediately. Then run the specific tests related to the changed files.
 
-9. **Before pushing to origin:** run the full test suite one final time. Do not push if any previously-passing test now fails.
+9. **Run the full frontend and backend test suites only at a final verification boundary:** when the user says the current feature/coding batch is finished, before pushing to origin, before a release, or before declaring a merge/cherry-pick batch ready for delivery. Do not infer that every assistant response is the end of the coding session. Do not push if any previously-passing test now fails.
 
 10. **When reporting status:** list exactly what passed, what failed, and what was not tested. Never round up or omit failures.
+
+10-A. **Before changing code or interpreting a failing suite, check for concurrent work.** Inspect `git status --short`, `git diff --name-only`, and the active Codex task/agent list when available. Treat files with recent or unexplained edits, running build/test processes, and failures in those files as potentially owned by another session. Do not re-fix, revert, or reformat another session's work. If a failure is in a concurrently edited area, stop the failing run, record it as **blocked by concurrent edits**, and ask the user or wait for a stable worktree before rerunning. A test failure may be reported as a product regression only after it reproduces against a stable tree or an isolated commit.
+
+10-B. **Use isolated verification for a moving worktree.** Prefer targeted tests for files owned by this task. For repository-wide suites, capture the exact start state (`git diff --name-only` and relevant commit) and note any concurrent edits or process contention. If another session edits during the run, do not attribute the result to this task; report the command as interrupted or inconclusive and rerun after the worktree is stable.
+
+10-C. **Treat unexplained dirty files as owned until proven otherwise.** Before editing, record the task-owned paths in the user update or task notes. Do not overwrite, revert, format, or “repair” an unstaged change unless this task made it or the user explicitly assigns it to this task. If a test failure points into an unowned dirty file, leave that file untouched and report the failure as blocked/inconclusive. Do not kill another session's test, build, dev server, or application process; stop only processes started by this task.
+
+10-D. **A “continue” message does not establish a stable worktree.** Resume by rechecking `git status`, changed paths, running processes, and available task/agent state. Other Codex windows may not appear in the local agent list; unexplained edits or long-running commands are sufficient evidence to pause broad verification and ask for a stable handoff.
+
+10-E. **User-reported concurrent editing is authoritative.** When the user says another session is actively editing or fixing a failing area, immediately classify broad-suite failures in that area as **inconclusive**, do not patch the implicated files, and do not rerun the broad suite until the user confirms the other work has settled. Continue only with checks isolated to this task's owned files.
+
+10-F. **Use `docs/coordination/active/` for cross-session scope.** Before editing or starting a broad test, read `docs/coordination/README.md` and every active session manifest. Create or update only this task's own manifest at `docs/coordination/active/<session-id>.md`, naming owned paths, watch paths, out-of-scope paths, and long-running commands. Remove the manifest at handoff after moving any durable rationale and verification evidence to `docs/memory/journal.md`. Active manifests take precedence over guesses based on file timestamps; overlap requires explicit coordination or a blocked status.
 
 ## MERGE PROTOCOL
 
 11. Before merging, list ALL files changed between HEAD and the remote.
 12. For each conflicting file, show the diff hunk to yourself and explain why you chose each resolution.
 13. After resolving conflicts, `cargo check` + `pnpm typecheck` BEFORE committing the merge.
-14. After committing the merge, run FULL test suite before pushing.
+14. After resolving or committing a merge, run compile/type checks and targeted tests for the merged areas immediately. Run the full suites once at the final verification boundary in rule 9, before pushing or final delivery.
 
 ## HONESTY
 
@@ -187,8 +199,15 @@ pnpm test:unit             # vitest run
 cargo test --manifest-path src-tauri/Cargo.toml   # backend + integration tests
 ```
 
-Pre-push checklist: `cargo check` + full `cargo test` + `pnpm typecheck` + full
-`pnpm test:unit` (rules 2/9).
+During active development, use the narrowest meaningful verification set:
+
+1. Run the direct unit/component tests for the changed behavior.
+2. Run tests for code that consumes the changed API, state, schema, or shared helper.
+3. Run `pnpm typecheck` for frontend contract changes and `cargo check` for Rust contract changes.
+4. Expand the test scope when a shared boundary or integration path is affected, but do not default to both full suites.
+
+Final verification checklist (only at the boundary in rule 9): `cargo check` + full
+`cargo test` + `pnpm typecheck` + full `pnpm test:unit`.
 
 ### Testing
 
@@ -259,6 +278,3 @@ Pre-push checklist: `cargo check` + full `cargo test` + `pnpm typecheck` + full
 30. **Before reverting or "cleaning up" anything unusual, search `docs/memory/` first** — the oddity may be a deliberate, documented decision.
 
 31. **Deep investigations** that exceed one entry go to `docs/memory/incidents/YYYY-MM-DD-<topic>.md`, linked from the journal entry.
-
-
-

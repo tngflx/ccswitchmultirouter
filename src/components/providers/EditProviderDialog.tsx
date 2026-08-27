@@ -9,6 +9,7 @@ import {
   type ProviderFormValues,
 } from "@/components/providers/forms/ProviderForm";
 import { openclawApi, providersApi, vscodeApi, type AppId } from "@/lib/api";
+import { extractCodexExperimentalBearerToken } from "@/utils/providerConfigUtils";
 
 interface EditProviderDialogProps {
   open: boolean;
@@ -21,6 +22,52 @@ interface EditProviderDialogProps {
   appId: AppId;
   isProxyTakeover?: boolean; // 代理接管模式下不读取 live（避免显示被接管后的代理配置）
 }
+
+const asRecord = (value: unknown): Record<string, unknown> | null =>
+  typeof value === "object" && value !== null && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : null;
+
+const hasAuthMaterial = (value: unknown): boolean => {
+  if (value === null || value === undefined) return false;
+  if (typeof value === "string") return value.trim().length > 0;
+  if (Array.isArray(value)) return value.length > 0;
+  if (typeof value === "object") return Object.keys(value).length > 0;
+  return true;
+};
+
+/**
+ * A Codex provider-scoped bearer is authoritative for the active route. The
+ * shared auth.json may contain another provider's key, so reconcile only live
+ * snapshots and leave stored OAuth-only templates untouched.
+ */
+const reconcileCodexLiveAuth = (
+  liveSettings: Record<string, unknown>,
+  storedSettings: Record<string, unknown> | null,
+  category: string | undefined,
+): Record<string, unknown> => {
+  if (category === "official") return liveSettings;
+  const configText =
+    typeof liveSettings.config === "string" ? liveSettings.config : "";
+  const bearer = extractCodexExperimentalBearerToken(configText);
+  if (!bearer) return liveSettings;
+
+  const storedAuth = asRecord(storedSettings?.auth);
+  const authTemplate = storedAuth ?? asRecord(liveSettings.auth) ?? {};
+  const hasProviderApiKey =
+    typeof authTemplate.OPENAI_API_KEY === "string" &&
+    authTemplate.OPENAI_API_KEY.trim().length > 0;
+  const hasOauthLogin = Object.entries(authTemplate).some(
+    ([key, value]) =>
+      key !== "auth_mode" && key !== "OPENAI_API_KEY" && hasAuthMaterial(value),
+  );
+  if (hasOauthLogin && !hasProviderApiKey) return liveSettings;
+
+  return {
+    ...liveSettings,
+    auth: { ...authTemplate, OPENAI_API_KEY: bearer },
+  };
+};
 
 export function EditProviderDialog({
   open,
@@ -132,10 +179,15 @@ export function EditProviderDialog({
   }, [open, provider?.id, appId, hasLoadedLive, isProxyTakeover]); // 只依赖 provider.id，不依赖整个 provider 对象
 
   const initialSettingsConfig = useMemo(() => {
-    const base = (liveSettings ?? provider?.settingsConfig ?? {}) as Record<
-      string,
-      unknown
-    >;
+    const storedSettings = asRecord(provider?.settingsConfig);
+    const base =
+      appId === "codex" && liveSettings
+        ? reconcileCodexLiveAuth(
+            liveSettings,
+            storedSettings,
+            provider?.category,
+          )
+        : (liveSettings ?? storedSettings ?? {});
 
     // Codex 的 modelCatalog 是 cc-switch 私有字段，SSOT 在数据库。Live 的 config.toml
     // 仅在写入时投影出 model_catalog_json 指针；Codex.app 改写配置、代理接管/恢复周期、
@@ -162,7 +214,7 @@ export function EditProviderDialog({
     }
 
     return base;
-  }, [liveSettings, provider?.settingsConfig, appId]); // 只依赖 settingsConfig，不依赖整个 provider
+  }, [liveSettings, provider?.settingsConfig, provider?.category, appId]);
 
   // 固定 initialData，防止 provider 对象更新时重置表单
   const initialData = useMemo(() => {

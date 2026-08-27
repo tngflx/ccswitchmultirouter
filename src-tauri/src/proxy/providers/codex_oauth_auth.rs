@@ -1674,6 +1674,17 @@ fn parse_jwt_claims(token: &str) -> Option<IdTokenClaims> {
     if parts.len() != 3 {
         return None;
     }
+    // A three-segment string is not sufficient evidence that this is an
+    // OAuth JWT. Validate the protected header before trusting claims from
+    // the payload; malformed test/provider strings must not become account
+    // identities or workspace bindings.
+    let header = URL_SAFE_NO_PAD.decode(parts[0]).ok()?;
+    let header: serde_json::Value = serde_json::from_slice(&header).ok()?;
+    header
+        .get("alg")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|alg| !alg.is_empty())?;
     let decoded = URL_SAFE_NO_PAD.decode(parts[1]).ok()?;
     serde_json::from_slice(&decoded).ok()
 }
@@ -1811,6 +1822,15 @@ mod tests {
     fn test_parse_jwt_claims_invalid() {
         assert!(parse_jwt_claims("not-a-jwt").is_none());
         assert!(parse_jwt_claims("only.two").is_none());
+
+        let payload = URL_SAFE_NO_PAD.encode(b"{\"chatgpt_account_id\":\"acc-123\"}");
+        let valid_header = URL_SAFE_NO_PAD.encode(b"{\"alg\":\"none\"}");
+        assert!(parse_jwt_claims(&format!("{valid_header}.{payload}..extra")).is_none());
+        assert!(parse_jwt_claims(&format!("invalid.{payload}.")).is_none());
+        let missing_alg = URL_SAFE_NO_PAD.encode(b"{\"typ\":\"JWT\"}");
+        assert!(parse_jwt_claims(&format!("{missing_alg}.{payload}.")).is_none());
+        let blank_alg = URL_SAFE_NO_PAD.encode(b"{\"alg\":\"   \"}");
+        assert!(parse_jwt_claims(&format!("{blank_alg}.{payload}.")).is_none());
     }
 
     #[test]

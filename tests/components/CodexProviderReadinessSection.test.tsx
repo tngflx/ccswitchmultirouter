@@ -182,4 +182,60 @@ describe("CodexProviderReadinessSection", () => {
 
     expect(screen.getByRole("status")).toHaveTextContent("Chat 验证通过");
   });
+
+  it("shows a spinner only on the catalog action that is running", () => {
+    const common = {
+      models: [{ model: "model-a" }],
+      apiFormat: "openai_chat" as const,
+      isMaintainedPreset: false,
+      isValidatingConnection: false,
+      onSyncModels: vi.fn(),
+      onFillMissingFields: vi.fn(),
+      onValidateConnection: vi.fn(),
+    };
+    const { rerender } = render(
+      <CodexProviderReadinessSection
+        {...common}
+        isSyncingModels
+        isRefreshingModels={false}
+      />,
+    );
+
+    expect(
+      screen
+        .getByRole("button", { name: "Sync Models" })
+        .querySelector(".animate-spin"),
+    ).not.toBeNull();
+    expect(
+      screen
+        .getByRole("button", { name: "Refresh Existing" })
+        .querySelector(".animate-spin"),
+    ).toBeNull();
+    expect(screen.getByRole("button", { name: "Sync Models" })).toBeDisabled();
+    expect(
+      screen.getByRole("button", { name: "Refresh Existing" }),
+    ).toBeDisabled();
+
+    rerender(
+      <CodexProviderReadinessSection
+        {...common}
+        isSyncingModels={false}
+        isRefreshingModels
+      />,
+    );
+    expect(
+      screen
+        .getByRole("button", { name: "Sync Models" })
+        .querySelector(".animate-spin"),
+    ).toBeNull();
+    expect(
+      screen
+        .getByRole("button", { name: "Refresh Existing" })
+        .querySelector(".animate-spin"),
+    ).not.toBeNull();
+    expect(screen.getByRole("button", { name: "Sync Models" })).toBeDisabled();
+    expect(
+      screen.getByRole("button", { name: "Refresh Existing" }),
+    ).toBeDisabled();
+  });
 });

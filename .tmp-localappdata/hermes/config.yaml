@@ -1,0 +1,8 @@
+custom_providers:
+- models:
+    gpt-4o:
+      name: GPT-4o Updated
+  base_url: https://api.hermes.example/v1
+  api_key: test-key
+  name: existing-hermes
+  model: gpt-4o

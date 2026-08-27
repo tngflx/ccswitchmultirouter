@@ -720,7 +720,7 @@ describe("CodexMultiRouterWizard", () => {
     expect(savedProvider.settingsConfig).not.toHaveProperty("modelCatalog");
   });
 
-  it("keeps provider curated models when wizard refresh sees extra upstream models", async () => {
+  it("adds newly fetched upstream models to an existing provider catalog", async () => {
     vi.mocked(fetchModelsForConfig).mockResolvedValueOnce([
       { id: "deepseek-chat", ownedBy: null, contextWindow: 128000 },
       { id: "deepseek-reasoner", ownedBy: null, contextWindow: 64000 },
@@ -760,9 +760,10 @@ describe("CodexMultiRouterWizard", () => {
       savedProvider.settingsConfig.modelCatalog.models.map(
         (model: { model: string }) => model.model,
       ),
-    ).toEqual(["deepseek-chat"]);
+    ).toEqual(["deepseek-chat", "deepseek-reasoner"]);
     expect(savedProvider.settingsConfig.modelCatalog.spawnAgentModels).toEqual([
       "deepseek-chat",
+      "deepseek-reasoner",
     ]);
   });
 
@@ -814,7 +815,7 @@ describe("CodexMultiRouterWizard", () => {
       expect(providersApi.update).toHaveBeenCalledTimes(1);
     });
     expect(
-      await screen.findByText("读取成功，无模型列表更新，仍为 1 个模型。"),
+      await screen.findByText(/新增 1: doubao-seed-1.6/),
     ).toBeInTheDocument();
   });
 
@@ -914,11 +915,11 @@ describe("CodexMultiRouterWizard", () => {
       expect(providersApi.update).toHaveBeenCalledTimes(1);
     });
     expect(
-      await screen.findByText("读取成功，无模型列表更新，仍为 1 个模型。"),
+      await screen.findByText(/新增 1: doubao-seed-1.6/),
     ).toBeInTheDocument();
   });
 
-  it("keeps previous model selections without re-adding newly fetched provider models", async () => {
+  it("keeps previous model selections while adding newly fetched provider models", async () => {
     vi.mocked(fetchModelsForConfig).mockResolvedValueOnce([
       { id: "model-a", ownedBy: null },
       { id: "model-b", ownedBy: null },
@@ -961,13 +962,12 @@ describe("CodexMultiRouterWizard", () => {
       screen.getByRole("button", { name: "自动获取并写入模型列表" }),
     );
 
-    expect(await screen.findByText("无模型列表更新")).toBeInTheDocument();
-    expect(screen.queryByText(/新增 1: model-c/)).not.toBeInTheDocument();
+    expect(await screen.findByText(/新增 1: model-c/)).toBeInTheDocument();
 
     fireEvent.click(screen.getByRole("button", { name: "选择模型并预览路由" }));
     expect(screen.getByLabelText("保留 model-a")).toBeChecked();
     expect(screen.getByLabelText("保留 model-b")).not.toBeChecked();
-    expect(screen.queryByLabelText("保留 model-c")).not.toBeInTheDocument();
+    expect(screen.getByLabelText("保留 model-c")).toBeChecked();
   });
 
   it("opens a provider config page from the model fetch cards", () => {

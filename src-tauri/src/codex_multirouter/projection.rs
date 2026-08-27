@@ -481,14 +481,45 @@ fn provider_labelled_display_name(provider_name: &str, display_name: &str) -> St
         return display_name.to_string();
     }
 
-    let prefix = format!("[{provider_name}]");
-    let has_prefix = display_name
+    let compact_provider = compact_provider_label(provider_name);
+    let prefix = format!("[{compact_provider}]");
+    if display_name
         .get(..prefix.len())
-        .is_some_and(|candidate| candidate.eq_ignore_ascii_case(&prefix));
-    if has_prefix {
-        display_name.to_string()
+        .is_some_and(|candidate| candidate.eq_ignore_ascii_case(&prefix))
+    {
+        return display_name.to_string();
+    }
+    let full_prefix = format!("[{provider_name}]");
+    let label = display_name
+        .get(..full_prefix.len())
+        .filter(|candidate| candidate.eq_ignore_ascii_case(&full_prefix))
+        .map(|_| display_name[full_prefix.len()..].trim_start())
+        .unwrap_or(display_name);
+    if label
+        .get(..prefix.len())
+        .is_some_and(|candidate| candidate.eq_ignore_ascii_case(&prefix))
+    {
+        label.to_string()
     } else {
-        format!("{prefix} {display_name}")
+        format!("{prefix} {label}")
+    }
+}
+
+/// Picker labels must remain scannable even when a provider was imported with
+/// a long URL/account-derived name. Keep the stable providerName field intact.
+fn compact_provider_label(provider_name: &str) -> String {
+    let parts = provider_name
+        .split_whitespace()
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>();
+    if parts.is_empty() {
+        provider_name.chars().take(28).collect()
+    } else {
+        let mut compact = parts.iter().take(4).copied().collect::<Vec<_>>().join(" ");
+        if parts.len() > 4 {
+            compact.push_str("...");
+        }
+        compact.chars().take(28).collect()
     }
 }
 
@@ -1118,6 +1149,13 @@ mod tests {
         assert_eq!(
             provider_labelled_display_name("Qwen", "[qwen] Qwen 3.8"),
             "[qwen] Qwen 3.8"
+        );
+        assert_eq!(
+            provider_labelled_display_name(
+                "A Very Long Provider Name Imported From Account",
+                "[A Very Long Provider Name Imported From Account] model-x"
+            ),
+            "[A Very Long Provider...] model-x"
         );
     }
 

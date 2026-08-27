@@ -19,13 +19,13 @@
     "release:local:skip-build": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/local-release-pipeline.ps1 -SkipBuild",
     "release:hook:install": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/install-local-release-hook.ps1",
     "release:hook:install:sync": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/install-local-release-hook.ps1 -Synchronous",
-    "test:unit": "vitest run",
+    "test:unit": "vitest run --maxWorkers=4 --minWorkers=1",
     "test:unit:watch": "vitest watch"
   },
   "keywords": [],
   "author": "Jason Young",
   "license": "MIT",
-  "packageManager": "pnpm@10.12.3",
+  "packageManager": "pnpm@11.24.0",
   "devDependencies": {
     "@tauri-apps/cli": "2.10.1",
     "@testing-library/jest-dom": "^6.6.3",
@@ -98,4 +98,3 @@
     "zod": "^4.1.12"
   }
 }
-

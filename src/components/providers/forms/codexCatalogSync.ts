@@ -26,17 +26,35 @@ export interface CatalogSyncResult<T extends CodexCatalogRowLike> {
   hydrated: number;
 }
 
+export type ExistingCatalogMetadataMode = "fill-missing" | "refresh";
+
 export function catalogModelIdentity(value: unknown): string {
   if (typeof value !== "string") return "";
   return value.trim().toLowerCase();
 }
 
+function nonEmptyString(value: unknown): string {
+  return typeof value === "string" ? value.trim() : "";
+}
+
+function rowUpstreamModel(row: CodexCatalogRowLike): string {
+  return (
+    nonEmptyString(row.upstreamModel) ||
+    nonEmptyString(row.upstream_model) ||
+    nonEmptyString(row.model)
+  );
+}
+
+function rowExplicitUpstreamModel(row: CodexCatalogRowLike): string {
+  return (
+    nonEmptyString(row.upstreamModel) || nonEmptyString(row.upstream_model)
+  );
+}
+
 function rowIdentities(row: CodexCatalogRowLike): string[] {
   const identities = new Set<string>();
   const visibleModel = catalogModelIdentity(row.model);
-  const upstreamModel = catalogModelIdentity(
-    row.upstreamModel ?? row.upstream_model ?? "",
-  );
+  const upstreamModel = catalogModelIdentity(rowUpstreamModel(row));
   if (visibleModel) identities.add(visibleModel);
   if (upstreamModel) identities.add(upstreamModel);
   return [...identities];
@@ -87,6 +105,36 @@ function missingCapabilityPatch(
   return patch;
 }
 
+function refreshedCapabilityPatch(
+  fetched: FetchedCodexCatalogModel,
+): Partial<CodexCatalogRowLike> {
+  const patch: Partial<CodexCatalogRowLike> = {};
+  const fetchedModalities =
+    Array.isArray(fetched.inputModalities) && fetched.inputModalities.length > 0
+      ? [...fetched.inputModalities]
+      : undefined;
+  const fetchedSupportsImage =
+    typeof fetched.supportsImage === "boolean"
+      ? fetched.supportsImage
+      : fetchedModalities
+        ? fetchedModalities.some(
+            (modality) => modality.toLowerCase() === "image",
+          )
+        : undefined;
+
+  if (fetchedModalities) {
+    patch.inputModalities = fetchedModalities;
+  } else if (fetchedSupportsImage !== undefined) {
+    patch.inputModalities = fetchedSupportsImage ? ["text", "image"] : ["text"];
+  }
+  if (fetchedSupportsImage !== undefined) {
+    patch.supportsImage = fetchedSupportsImage;
+    patch.textOnly = !fetchedSupportsImage;
+  }
+
+  return patch;
+}
+
 /**
  * Reconcile remote /models results without destroying user intent.
  *
@@ -98,7 +146,11 @@ export function reconcileFetchedCodexCatalogRows<T extends CodexCatalogRowLike>(
   rows: T[],
   fetchedModels: FetchedCodexCatalogModel[],
   source: CodexCatalogSyncSource,
-  options: { appendNew: boolean; createRow: (seed: CodexCatalogRowLike) => T },
+  options: {
+    appendNew: boolean;
+    createRow: (seed: CodexCatalogRowLike) => T;
+    existingMetadataMode?: ExistingCatalogMetadataMode;
+  },
 ): CatalogSyncResult<T> {
   const next = [...rows];
   const identityByIndex = new Map<number, string[]>();
@@ -123,18 +175,38 @@ export function reconcileFetchedCodexCatalogRows<T extends CodexCatalogRowLike>(
 
     if (existingIndex !== undefined) {
       const row = next[existingIndex];
+      const refreshExisting = options.existingMetadataMode === "refresh";
       const contextWindow = resolveFetchedCodexModelContextWindow(fetched, {
         ...source,
         existingModels: rows,
       });
       const patch: Partial<CodexCatalogRowLike> = {};
-      if (!hasValue(row.upstreamModel ?? row.upstream_model)) {
+      if (!hasValue(rowExplicitUpstreamModel(row))) {
         patch.upstreamModel = model;
       }
-      if (!hasValue(row.contextWindow ?? row.context_window) && contextWindow) {
+      if (
+        contextWindow &&
+        (refreshExisting ||
+          !hasValue(row.contextWindow ?? row.context_window)) &&
+        String(row.contextWindow ?? row.context_window ?? "") !==
+          String(contextWindow)
+      ) {
         patch.contextWindow = String(contextWindow);
       }
-      Object.assign(patch, missingCapabilityPatch(row, fetched));
+      Object.assign(
+        patch,
+        refreshExisting
+          ? refreshedCapabilityPatch(fetched)
+          : missingCapabilityPatch(row, fetched),
+      );
+
+      const patchRecord = patch as Record<string, unknown>;
+      const rowRecord = row as Record<string, unknown>;
+      for (const [key, value] of Object.entries(patchRecord)) {
+        if (JSON.stringify(rowRecord[key]) === JSON.stringify(value)) {
+          delete patchRecord[key];
+        }
+      }
 
       if (Object.keys(patch).length > 0) {
         next[existingIndex] = { ...row, ...patch };

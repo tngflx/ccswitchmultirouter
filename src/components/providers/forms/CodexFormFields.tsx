@@ -59,7 +59,10 @@ import {
   normalizeCodexTrafficPolicy,
   resolveCodexTrafficPolicy,
 } from "./codexTrafficPolicy";
-import { reconcileFetchedCodexCatalogRows } from "./codexCatalogSync";
+import {
+  catalogModelIdentity,
+  reconcileFetchedCodexCatalogRows,
+} from "./codexCatalogSync";
 import { CodexModelReasoningCard } from "./CodexModelReasoningCard";
 import { CodexModelReasoningEditor } from "./CodexModelReasoningEditor";
 import { CodexModelReasoningSummary } from "./CodexModelReasoningSummary";
@@ -424,7 +427,12 @@ function createCatalogRow(seed?: Partial<CodexCatalogModel>): CodexCatalogRow {
   return {
     rowId: crypto.randomUUID(),
     model: seed?.model ?? "",
-    upstreamModel: seed?.upstreamModel ?? seed?.upstream_model ?? "",
+    upstreamModel:
+      typeof seed?.upstreamModel === "string" && seed.upstreamModel.trim()
+        ? seed.upstreamModel
+        : typeof seed?.upstream_model === "string" && seed.upstream_model.trim()
+          ? seed.upstream_model
+          : "",
     displayName: seed?.displayName ?? "",
     contextWindow: seed?.contextWindow ?? "",
     // Carry native-profile overrides verbatim (not user-editable in the row UI,
@@ -473,7 +481,11 @@ function catalogSupportsImage(model: CodexCatalogModel): boolean {
 function catalogRowUpstreamModel(
   row: Pick<CodexCatalogModel, "model" | "upstreamModel" | "upstream_model">,
 ): string {
-  return (row.upstreamModel ?? row.upstream_model ?? row.model ?? "").trim();
+  const camel =
+    typeof row.upstreamModel === "string" ? row.upstreamModel.trim() : "";
+  const legacy =
+    typeof row.upstream_model === "string" ? row.upstream_model.trim() : "";
+  return camel || legacy || row.model?.trim() || "";
 }
 
 // Compares rows (with rowId) to incoming models (without) by data fields only,
@@ -564,6 +576,7 @@ interface CodexProviderReadinessIdentityInput {
   promptCacheRouting: PromptCacheRoutingMode;
   defaultModel: string;
   catalogModels: CodexCatalogModel[];
+  apiKeyGroupsFingerprint?: string;
 }
 
 // 连接验证结果只属于发起请求时的完整 Provider 身份。这里保留精确凭据值用于
@@ -591,6 +604,7 @@ function buildCodexProviderReadinessIdentity({
   promptCacheRouting,
   defaultModel,
   catalogModels,
+  apiKeyGroupsFingerprint,
 }: CodexProviderReadinessIdentityInput): string {
   return JSON.stringify({
     provider: {
@@ -610,6 +624,7 @@ function buildCodexProviderReadinessIdentity({
       planAccessKeyId: planAccessKeyId ?? null,
       planSecretAccessKey: planSecretAccessKey ?? null,
       anthropicAuthField,
+      apiKeyGroupsFingerprint: apiKeyGroupsFingerprint ?? null,
     },
     requestOverrides: {
       customUserAgent,
@@ -626,6 +641,9 @@ function buildCodexProviderReadinessIdentity({
     defaultModel: defaultModel.trim(),
     catalog: catalogModels.map((model) => ({
       model: model.model.trim(),
+      // Probe requests only include enabled rows, so exclusions are part of
+      // the identity even though they are not sent to the provider.
+      enabled: model.enabled !== false,
       upstreamModel: catalogRowUpstreamModel(model),
       displayName: (model.displayName ?? model.display_name ?? "").trim(),
       contextWindow: String(model.contextWindow ?? model.context_window ?? ""),
@@ -666,11 +684,11 @@ function mergeFetchedModelsIntoCatalogRows(
     { row: CodexCatalogRow; index: number }
   >();
   next.forEach((row, index) => {
-    const upstreamModel = catalogRowUpstreamModel(row);
+    const upstreamModel = catalogModelIdentity(catalogRowUpstreamModel(row));
     if (upstreamModel) {
       rowByFetchedModel.set(upstreamModel, { row, index });
     }
-    const visibleModel = row.model.trim();
+    const visibleModel = catalogModelIdentity(row.model);
     if (visibleModel && !rowByFetchedModel.has(visibleModel)) {
       rowByFetchedModel.set(visibleModel, { row, index });
     }
@@ -679,6 +697,7 @@ function mergeFetchedModelsIntoCatalogRows(
   for (const fetched of fetchedModels) {
     const model = fetched.id.trim();
     if (!model) continue;
+    const modelIdentity = catalogModelIdentity(model);
     const contextWindow = resolveFetchedCodexModelContextWindow(fetched, {
       ...source,
       existingModels: rows,
@@ -692,7 +711,7 @@ function mergeFetchedModelsIntoCatalogRows(
         ? { supportsImage: fetched.supportsImage }
         : {}),
     };
-    const existing = rowByFetchedModel.get(model);
+    const existing = rowByFetchedModel.get(modelIdentity);
     if (existing) {
       const updatedRow = {
         ...existing.row,
@@ -702,7 +721,10 @@ function mergeFetchedModelsIntoCatalogRows(
         ...capabilityPatch,
       };
       next[existing.index] = updatedRow;
-      rowByFetchedModel.set(model, { row: updatedRow, index: existing.index });
+      rowByFetchedModel.set(modelIdentity, {
+        row: updatedRow,
+        index: existing.index,
+      });
       continue;
     }
     const row = createCatalogRow({
@@ -712,7 +734,7 @@ function mergeFetchedModelsIntoCatalogRows(
       ...(contextWindowText ? { contextWindow: contextWindowText } : {}),
       ...capabilityPatch,
     });
-    rowByFetchedModel.set(model, { row, index: next.length });
+    rowByFetchedModel.set(modelIdentity, { row, index: next.length });
     next.push(row);
   }
 
@@ -834,15 +856,22 @@ export function CodexFormFields({
   const { t } = useTranslation();
 
   const [fetchedModels, setFetchedModels] = useState<FetchedModel[]>([]);
-  // Keep grouped keys as a separate mode so the form clearly distinguishes
-  // one shared credential from model-specific credentials.
-  const [useApiKeyGroups, setUseApiKeyGroups] = useState(false);
-  useEffect(() => {
-    if (apiKeyGroups.some((group) => group.apiKeys.some((key) => key.trim()))) {
-      setUseApiKeyGroups(true);
-    }
-  }, [apiKeyGroups]);
-  const [isFetchingModels, setIsFetchingModels] = useState(false);
+  const enabledGroupedApiKeys = useMemo(
+    () =>
+      apiKeyGroups
+        .filter((group) => group.enabled !== false)
+        .flatMap((group) => group.apiKeys)
+        .map((key) => key.trim())
+        .filter(Boolean),
+    [apiKeyGroups],
+  );
+  const apiKeyGroupsFingerprint = useMemo(
+    () => JSON.stringify(apiKeyGroups),
+    [apiKeyGroups],
+  );
+  const [modelCatalogAction, setModelCatalogAction] = useState<
+    "sync" | "refresh-existing" | null
+  >(null);
   const [catalogSearch, setCatalogSearch] = useState("");
   const [catalogVisibility, setCatalogVisibility] = useState<
     "all" | "included" | "excluded"
@@ -882,7 +911,7 @@ export function CodexFormFields({
     useState<PendingCodexProviderSplitRouting | null>(null);
   // takeoverEnabled 现在只表示“Codex 菜单映射”开关；模型目录和上下文元数据可独立编辑。
   // isChatFormat 仅在选了 Chat Completions 上游格式时为真（思考能力是 Chat 专属）。
-  // 拉取请求序号：请求身份（Base URL / 完整地址开关 / API Key / 自定义 UA）
+  // 拉取请求序号：请求身份（端点、所有凭据/凭据组、OAuth 账号、自定义 UA）
   // 一变即自增，清空旧列表并作废在途响应——/models 结果可能按 Key 的模型
   // 授权返回，换号后残留旧列表会误导选择
   const fetchModelsSeqRef = useRef(0);
@@ -890,7 +919,7 @@ export function CodexFormFields({
   useEffect(() => {
     fetchModelsSeqRef.current += 1;
     setFetchedModels((prev) => (prev.length === 0 ? prev : []));
-    setIsFetchingModels(false);
+    setModelCatalogAction(null);
   }, [
     codexBaseUrl,
     isFullUrl,
@@ -899,6 +928,10 @@ export function CodexFormFields({
     isXaiOauthPreset,
     isXaiOauthAuthenticated,
     selectedXaiAccountId,
+    apiKeyGroupsFingerprint,
+    partnerPromotionKey,
+    planAccessKeyId,
+    planSecretAccessKey,
   ]);
   // 思考能力随 Chat 格式显示（仅 Chat Completions 转换路径用得上）；模型映射常驻
   //（填了才生成 catalog）。两者都已与「路由接管」概念解耦。
@@ -997,8 +1030,10 @@ export function CodexFormFields({
         if (!query) return true;
         return [
           row.model,
-          row.upstreamModel ?? row.upstream_model,
-          row.displayName ?? row.display_name,
+          row.upstreamModel,
+          row.upstream_model,
+          row.displayName,
+          row.display_name,
         ]
           .filter(Boolean)
           .some((value) => String(value).toLowerCase().includes(query));
@@ -1086,6 +1121,7 @@ export function CodexFormFields({
         promptCacheRouting,
         defaultModel: codexModel,
         catalogModels: nextCatalogModels,
+        apiKeyGroupsFingerprint,
       }),
     [
       anthropicAuthField,
@@ -1108,6 +1144,7 @@ export function CodexFormFields({
       providerId,
       providerName,
       selectedXaiAccountId,
+      apiKeyGroupsFingerprint,
     ],
   );
   const readinessIdentity = useMemo(
@@ -1243,7 +1280,7 @@ export function CodexFormFields({
   );
 
   const handleFetchModels = useCallback(
-    (fetchMode: "sync" | "fill-missing" = "sync") => {
+    (fetchMode: "sync" | "refresh-existing" = "sync") => {
       // xAI OAuth 托管预设不使用表单里的 Base URL 与 API Key。
       if (isXaiOauthPreset) {
         if (!isXaiOauthAuthenticated) {
@@ -1255,11 +1292,55 @@ export function CodexFormFields({
           return;
         }
         const seq = ++fetchModelsSeqRef.current;
-        setIsFetchingModels(true);
+        setModelCatalogAction(fetchMode);
         fetchXaiOauthModels(selectedXaiAccountId ?? null)
           .then((models) => {
             if (seq !== fetchModelsSeqRef.current) return;
             setFetchedModels(models);
+            let nextCatalogRows = catalogRowsRef.current;
+            if (
+              fetchMode === "sync" &&
+              onCatalogModelsChange &&
+              models.length > 0
+            ) {
+              nextCatalogRows = mergeFetchedModelsIntoCatalogRows(
+                catalogRowsRef.current,
+                models,
+                { providerId, providerName, websiteUrl },
+              );
+              catalogRowsRef.current = nextCatalogRows;
+              setCatalogRows(nextCatalogRows);
+            }
+            if (
+              fetchMode === "refresh-existing" &&
+              onCatalogModelsChange &&
+              models.length > 0
+            ) {
+              const result = reconcileFetchedCodexCatalogRows(
+                catalogRowsRef.current,
+                models,
+                { providerId, providerName, websiteUrl },
+                {
+                  appendNew: false,
+                  createRow: (seed) => createCatalogRow(seed),
+                  existingMetadataMode: "refresh",
+                },
+              );
+              catalogRowsRef.current = result.rows;
+              nextCatalogRows = result.rows;
+              setCatalogRows(result.rows);
+              const persistedRows = result.rows.map(
+                ({ rowId: _rowId, ...row }) => row,
+              );
+              lastSentModelsRef.current = persistedRows;
+              onCatalogModelsChange(persistedRows);
+              toast.info(
+                t("providerForm.fillMissingFieldsResult", {
+                  checked: models.length,
+                  updated: result.hydrated,
+                }),
+              );
+            }
             if (models.length === 0) {
               toast.info(t("providerForm.fetchModelsEmpty"));
             } else {
@@ -1274,7 +1355,7 @@ export function CodexFormFields({
             showFetchModelsError(err, t);
           })
           .finally(() => {
-            if (seq === fetchModelsSeqRef.current) setIsFetchingModels(false);
+            if (seq === fetchModelsSeqRef.current) setModelCatalogAction(null);
           });
         return;
       }
@@ -1306,27 +1387,26 @@ export function CodexFormFields({
         return;
       }
 
-      const groupedKeys = useApiKeyGroups
-        ? apiKeyGroups
-            .flatMap((group) => group.apiKeys)
+      const keysToFetch = Array.from(
+        new Set(
+          [codexApiKey, ...enabledGroupedApiKeys]
             .map((key) => key.trim())
-            .filter(Boolean)
-        : [];
-      if (
-        !codexBaseUrl ||
-        (groupedKeys.length === 0 && !codexApiKey && !planModelListAction)
-      ) {
+            .filter(Boolean),
+        ),
+      );
+      if (!codexBaseUrl || (keysToFetch.length === 0 && !planModelListAction)) {
         showFetchModelsError(null, t, {
-          hasApiKey: groupedKeys.length > 0 || !!codexApiKey,
+          hasApiKey: keysToFetch.length > 0,
           hasBaseUrl: !!codexBaseUrl,
         });
         return;
       }
       const seq = ++fetchModelsSeqRef.current;
-      setIsFetchingModels(true);
-      const keysToFetch = groupedKeys.length > 0 ? groupedKeys : [codexApiKey];
+      setModelCatalogAction(fetchMode);
+      const credentialKeys =
+        keysToFetch.length > 0 ? keysToFetch : [codexApiKey];
       Promise.allSettled(
-        keysToFetch.map((key) =>
+        credentialKeys.map((key) =>
           fetchModelsForConfig(
             codexBaseUrl,
             key,
@@ -1357,9 +1437,13 @@ export function CodexFormFields({
             throw results.find((result) => result.status === "rejected")
               ?.reason;
           }
-          const models = Array.from(
-            new Map(successfulLists.map((model) => [model.id, model])).values(),
-          );
+          const modelsByIdentity = new Map<string, FetchedModel>();
+          for (const model of successfulLists) {
+            const identity = catalogModelIdentity(model.id);
+            if (!identity || modelsByIdentity.has(identity)) continue;
+            modelsByIdentity.set(identity, model);
+          }
+          const models = Array.from(modelsByIdentity.values());
           if (seq !== fetchModelsSeqRef.current) return;
           setFetchedModels(models);
           let splitCatalogRows = catalogRowsRef.current;
@@ -1403,7 +1487,7 @@ export function CodexFormFields({
             toast.success(
               t("providerForm.fetchModelsSuccess", { count: models.length }),
             );
-            if (fetchMode === "fill-missing" && onCatalogModelsChange) {
+            if (fetchMode === "refresh-existing" && onCatalogModelsChange) {
               const result = reconcileFetchedCodexCatalogRows(
                 catalogRowsRef.current,
                 models,
@@ -1416,6 +1500,7 @@ export function CodexFormFields({
                 {
                   appendNew: false,
                   createRow: (seed) => createCatalogRow(seed),
+                  existingMetadataMode: "refresh",
                 },
               );
               catalogRowsRef.current = result.rows;
@@ -1428,7 +1513,7 @@ export function CodexFormFields({
               toast.info(
                 t("providerForm.fillMissingFieldsResult", {
                   checked: models.length,
-                  hydrated: result.hydrated,
+                  updated: result.hydrated,
                 }),
               );
             }
@@ -1440,7 +1525,7 @@ export function CodexFormFields({
           showFetchModelsError(err, t);
         })
         .finally(() => {
-          if (seq === fetchModelsSeqRef.current) setIsFetchingModels(false);
+          if (seq === fetchModelsSeqRef.current) setModelCatalogAction(null);
         });
     },
     [
@@ -1449,8 +1534,7 @@ export function CodexFormFields({
       buildReadinessIdentityFor,
       codexBaseUrl,
       codexApiKey,
-      apiKeyGroups,
-      useApiKeyGroups,
+      enabledGroupedApiKeys,
       isFullUrl,
       customUserAgent,
       providerId,
@@ -1469,9 +1553,10 @@ export function CodexFormFields({
   );
 
   const handleProtocolProbe = useCallback(async () => {
-    if (!codexBaseUrl || !codexApiKey) {
+    const probeApiKey = codexApiKey.trim() || enabledGroupedApiKeys[0] || "";
+    if (!codexBaseUrl || !probeApiKey) {
       showFetchModelsError(null, t, {
-        hasApiKey: !!codexApiKey,
+        hasApiKey: !!probeApiKey,
         hasBaseUrl: !!codexBaseUrl,
       });
       return;
@@ -1533,7 +1618,7 @@ export function CodexFormFields({
         id: providerId ?? "codex-draft",
         name: providerName?.trim() || "Codex provider",
         settingsConfig: {
-          auth: { OPENAI_API_KEY: codexApiKey },
+          auth: { OPENAI_API_KEY: probeApiKey },
           config: [
             `model = ${JSON.stringify(defaultModel)}`,
             'model_provider = "ccswitch_probe"',
@@ -1543,6 +1628,9 @@ export function CodexFormFields({
           ].join("\n"),
           apiFormat,
           modelCatalog: { models: probeModels },
+          ...(apiKeyGroups.length > 0
+            ? { codexApiKeyGroups: apiKeyGroups }
+            : {}),
         },
         websiteUrl: websiteUrl || undefined,
         category,
@@ -1688,6 +1776,8 @@ export function CodexFormFields({
     buildReadinessIdentityFor,
     codexBaseUrl,
     codexApiKey,
+    enabledGroupedApiKeys,
+    apiKeyGroups,
     codexModel,
     apiFormat,
     category,
@@ -1703,7 +1793,7 @@ export function CodexFormFields({
   ]);
 
   const handleFillMissingModelFields = useCallback(
-    () => handleFetchModels("fill-missing"),
+    () => handleFetchModels("refresh-existing"),
     [handleFetchModels],
   );
 
@@ -1990,54 +2080,17 @@ export function CodexFormFields({
         />
       )}
 
-      {/* Authentication mode: one shared key or model-specific key groups. */}
-      {!isXaiOauthPreset && category !== "official" && onApiKeyGroupsChange && (
-        <div className="mb-2 flex items-center justify-between rounded-md border bg-muted/20 px-3 py-2">
-          <div>
-            <FormLabel>
-              {t("codexConfig.apiKeyMode", { defaultValue: "API key mode" })}
-            </FormLabel>
-            <p className="text-xs text-muted-foreground">
-              {useApiKeyGroups
-                ? t("codexConfig.apiKeyModeGroupedHint", {
-                    defaultValue: "Use different keys for different models.",
-                  })
-                : t("codexConfig.apiKeyModeSingleHint", {
-                    defaultValue: "Use one API key for all models.",
-                  })}
-            </p>
-          </div>
-          <Switch
-            checked={useApiKeyGroups}
-            onCheckedChange={(checked) => {
-              setUseApiKeyGroups(checked);
-              // Switching to grouped mode clears the shared key so it cannot
-              // accidentally be persisted or used as a fallback credential.
-              if (checked) onApiKeyChange("");
-              // Disabling grouped mode removes grouped credentials from the
-              // persisted config so the single-key mode is unambiguous.
-              if (!checked && onApiKeyGroupsChange) onApiKeyGroupsChange([]);
-              else if (
-                checked &&
-                onApiKeyGroupsChange &&
-                apiKeyGroups.length > 0
-              )
-                onApiKeyGroupsChange(
-                  apiKeyGroups.map((group) => ({ ...group, enabled: true })),
-                );
-            }}
-            aria-label={t("codexConfig.apiKeyMode", {
-              defaultValue: "API key mode",
-            })}
-          />
-        </div>
-      )}
-
       {/* Codex API Key 输入框（托管 OAuth 预设无需 Key） */}
-      {!isXaiOauthPreset && !useApiKeyGroups && (
+      {!isXaiOauthPreset && (
         <ApiKeySection
           id="codexApiKey"
-          label="API Key"
+          label={
+            apiKeyGroups.length > 0
+              ? t("codexConfig.apiKeyFallbackLabel", {
+                  defaultValue: "Fallback API key",
+                })
+              : "API Key"
+          }
           value={codexApiKey}
           onChange={onApiKeyChange}
           category={category}
@@ -2056,106 +2109,95 @@ export function CodexFormFields({
         />
       )}
 
-      {!isXaiOauthPreset &&
-        category !== "official" &&
-        onApiKeyGroupsChange &&
-        useApiKeyGroups && (
-          <div className="space-y-2 rounded-md border p-3">
-            <div className="flex items-center justify-between gap-2">
-              <div>
-                <FormLabel>
-                  {t("codexConfig.apiKeyGroupsTitle", {
-                    defaultValue: "Model API key groups",
-                  })}
-                </FormLabel>
-                <p className="text-xs text-muted-foreground">
-                  {t("codexConfig.apiKeyGroupsHint", {
-                    defaultValue:
-                      "Match exact models first, then prefixes. Keys rotate within each group.",
-                  })}
-                </p>
-              </div>
-              <Button
-                type="button"
-                variant="outline"
-                size="sm"
-                onClick={() =>
-                  onApiKeyGroupsChange([
-                    ...apiKeyGroups,
-                    {
-                      id: crypto.randomUUID(),
-                      label: "",
-                      apiKeys: [""],
-                      models: [],
-                      prefixes: [],
-                      enabled: true,
-                      strategy: "round_robin",
-                    },
-                  ])
-                }
-              >
-                <Plus className="mr-1 h-3.5 w-3.5" />
-                {t("codexConfig.apiKeyGroupsAdd", {
-                  defaultValue: "Add group",
+      {!isXaiOauthPreset && category !== "official" && onApiKeyGroupsChange && (
+        <section className="mt-4 border-t border-border-default pt-4">
+          <div className="flex flex-wrap items-start justify-between gap-3">
+            <div>
+              <FormLabel className="text-sm font-semibold">
+                {t("codexConfig.apiKeyGroupsTitle", {
+                  defaultValue: "Model-specific API key groups",
                 })}
-              </Button>
+              </FormLabel>
+              <p className="text-xs text-muted-foreground">
+                {t("codexConfig.apiKeyGroupsHint", {
+                  defaultValue:
+                    "Groups override the fallback key. Exact model matches take priority, then prefixes.",
+                })}
+              </p>
             </div>
-            {apiKeyGroups.map((group, groupIndex) => (
-              <div key={group.id} className="space-y-2 rounded border p-2">
-                <div className="flex gap-2">
-                  <Input
-                    value={group.label ?? ""}
-                    placeholder={t("codexConfig.apiKeyGroupLabel", {
-                      defaultValue: "Group label",
-                    })}
-                    onChange={(event) =>
-                      onApiKeyGroupsChange(
-                        apiKeyGroups.map((item, index) =>
-                          index === groupIndex
-                            ? { ...item, label: event.target.value }
-                            : item,
-                        ),
-                      )
-                    }
-                  />
-                  <Button
-                    type="button"
-                    variant="ghost"
-                    size="icon"
-                    onClick={() =>
-                      onApiKeyGroupsChange(
-                        apiKeyGroups.filter((_, index) => index !== groupIndex),
-                      )
-                    }
-                    aria-label={t("common.delete", { defaultValue: "Delete" })}
-                  >
-                    <Trash2 className="h-4 w-4" />
-                  </Button>
-                </div>
-                <div className="flex items-center justify-between gap-3 text-sm">
-                  <label className="flex items-center gap-2 text-muted-foreground">
-                    <Switch
-                      checked={group.enabled !== false}
-                      onCheckedChange={(checked) =>
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              onClick={() =>
+                onApiKeyGroupsChange([
+                  ...apiKeyGroups,
+                  {
+                    id: crypto.randomUUID(),
+                    label: "",
+                    apiKeys: [""],
+                    models: [],
+                    prefixes: [],
+                    enabled: true,
+                    strategy: "round_robin",
+                  },
+                ])
+              }
+            >
+              <Plus className="mr-1 h-3.5 w-3.5" />
+              {t("codexConfig.apiKeyGroupsAdd", {
+                defaultValue: "Add key group",
+              })}
+            </Button>
+          </div>
+          {apiKeyGroups.length === 0 ? (
+            <p className="mt-3 text-xs text-muted-foreground">
+              {t("codexConfig.apiKeyGroupsEmpty", {
+                defaultValue:
+                  "No model-specific groups. The fallback API key is used for every model.",
+              })}
+            </p>
+          ) : (
+            <div className="mt-3 space-y-3">
+              {apiKeyGroups.map((group, groupIndex) => (
+                <div
+                  key={group.id}
+                  className="space-y-3 rounded-md border border-border-default bg-muted/10 p-3"
+                >
+                  <div className="flex flex-wrap items-center gap-2">
+                    <Input
+                      className="min-w-44 flex-1"
+                      value={group.label ?? ""}
+                      placeholder={t("codexConfig.apiKeyGroupLabel", {
+                        defaultValue: "Group label",
+                      })}
+                      onChange={(event) =>
                         onApiKeyGroupsChange(
                           apiKeyGroups.map((item, index) =>
                             index === groupIndex
-                              ? { ...item, enabled: checked }
+                              ? { ...item, label: event.target.value }
                               : item,
                           ),
                         )
                       }
                     />
-                    {t("codexConfig.apiKeyGroupEnabled", {
-                      defaultValue: "Enabled",
-                    })}
-                  </label>
-                  <div className="flex items-center gap-2">
-                    <span className="text-xs text-muted-foreground">
-                      {t("codexConfig.apiKeyGroupStrategy", {
-                        defaultValue: "Rotation",
+                    <label className="flex items-center gap-2 text-sm text-muted-foreground">
+                      <Switch
+                        checked={group.enabled !== false}
+                        onCheckedChange={(checked) =>
+                          onApiKeyGroupsChange(
+                            apiKeyGroups.map((item, index) =>
+                              index === groupIndex
+                                ? { ...item, enabled: checked }
+                                : item,
+                            ),
+                          )
+                        }
+                      />
+                      {t("codexConfig.apiKeyGroupEnabled", {
+                        defaultValue: "Enabled",
                       })}
-                    </span>
+                    </label>
                     <Select
                       value={group.strategy ?? "round_robin"}
                       onValueChange={(value: "round_robin" | "random") =>
@@ -2168,7 +2210,12 @@ export function CodexFormFields({
                         )
                       }
                     >
-                      <SelectTrigger className="h-8 w-36">
+                      <SelectTrigger
+                        className="h-9 w-36"
+                        aria-label={t("codexConfig.apiKeyGroupStrategy", {
+                          defaultValue: "Rotation",
+                        })}
+                      >
                         <SelectValue />
                       </SelectTrigger>
                       <SelectContent>
@@ -2184,133 +2231,153 @@ export function CodexFormFields({
                         </SelectItem>
                       </SelectContent>
                     </Select>
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="icon"
+                      onClick={() =>
+                        onApiKeyGroupsChange(
+                          apiKeyGroups.filter(
+                            (_, index) => index !== groupIndex,
+                          ),
+                        )
+                      }
+                      aria-label={t("common.delete", {
+                        defaultValue: "Delete",
+                      })}
+                    >
+                      <Trash2 className="h-4 w-4" />
+                    </Button>
+                  </div>
+                  <div className="space-y-2">
+                    {(group.apiKeys.length > 0 ? group.apiKeys : [""]).map(
+                      (key, keyIndex) => (
+                        <div
+                          key={`${group.id}-key-${keyIndex}`}
+                          className="flex gap-2"
+                        >
+                          <Input
+                            type="password"
+                            value={key}
+                            placeholder={t("codexConfig.apiKeyGroupKey", {
+                              defaultValue: "API key",
+                            })}
+                            onChange={(event) =>
+                              onApiKeyGroupsChange(
+                                apiKeyGroups.map((item, index) =>
+                                  index === groupIndex
+                                    ? {
+                                        ...item,
+                                        apiKeys: item.apiKeys.map(
+                                          (value, current) =>
+                                            current === keyIndex
+                                              ? event.target.value
+                                              : value,
+                                        ),
+                                      }
+                                    : item,
+                                ),
+                              )
+                            }
+                          />
+                          <Button
+                            type="button"
+                            variant="ghost"
+                            size="icon"
+                            disabled={group.apiKeys.length <= 1}
+                            onClick={() =>
+                              onApiKeyGroupsChange(
+                                apiKeyGroups.map((item, index) =>
+                                  index === groupIndex
+                                    ? {
+                                        ...item,
+                                        apiKeys: item.apiKeys.filter(
+                                          (_, current) => current !== keyIndex,
+                                        ),
+                                      }
+                                    : item,
+                                ),
+                              )
+                            }
+                            aria-label={t("common.delete", {
+                              defaultValue: "Delete",
+                            })}
+                          >
+                            <Trash2 className="h-4 w-4" />
+                          </Button>
+                        </div>
+                      ),
+                    )}
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="sm"
+                      onClick={() =>
+                        onApiKeyGroupsChange(
+                          apiKeyGroups.map((item, index) =>
+                            index === groupIndex
+                              ? { ...item, apiKeys: [...item.apiKeys, ""] }
+                              : item,
+                          ),
+                        )
+                      }
+                    >
+                      <Plus className="mr-1 h-3.5 w-3.5" />
+                      {t("codexConfig.apiKeyGroupAddKey", {
+                        defaultValue: "Add key",
+                      })}
+                    </Button>
+                  </div>
+                  <div className="grid gap-2 md:grid-cols-2">
+                    <Input
+                      value={(group.models ?? []).join(", ")}
+                      placeholder={t("codexConfig.apiKeyGroupModels", {
+                        defaultValue: "Exact models, comma separated",
+                      })}
+                      onChange={(event) =>
+                        onApiKeyGroupsChange(
+                          apiKeyGroups.map((item, index) =>
+                            index === groupIndex
+                              ? {
+                                  ...item,
+                                  models: event.target.value
+                                    .split(",")
+                                    .map((value) => value.trim())
+                                    .filter(Boolean),
+                                }
+                              : item,
+                          ),
+                        )
+                      }
+                    />
+                    <Input
+                      value={(group.prefixes ?? []).join(", ")}
+                      placeholder={t("codexConfig.apiKeyGroupPrefixes", {
+                        defaultValue: "Model prefixes, comma separated",
+                      })}
+                      onChange={(event) =>
+                        onApiKeyGroupsChange(
+                          apiKeyGroups.map((item, index) =>
+                            index === groupIndex
+                              ? {
+                                  ...item,
+                                  prefixes: event.target.value
+                                    .split(",")
+                                    .map((value) => value.trim())
+                                    .filter(Boolean),
+                                }
+                              : item,
+                          ),
+                        )
+                      }
+                    />
                   </div>
                 </div>
-                <div className="space-y-1">
-                  {(group.apiKeys.length > 0 ? group.apiKeys : [""]).map(
-                    (key, keyIndex) => (
-                      <div
-                        key={`${group.id}-key-${keyIndex}`}
-                        className="flex gap-2"
-                      >
-                        <Input
-                          type="password"
-                          value={key}
-                          placeholder={t("codexConfig.apiKeyGroupKey", {
-                            defaultValue: "API key",
-                          })}
-                          onChange={(event) =>
-                            onApiKeyGroupsChange(
-                              apiKeyGroups.map((item, index) =>
-                                index === groupIndex
-                                  ? {
-                                      ...item,
-                                      apiKeys: item.apiKeys.map(
-                                        (value, current) =>
-                                          current === keyIndex
-                                            ? event.target.value
-                                            : value,
-                                      ),
-                                    }
-                                  : item,
-                              ),
-                            )
-                          }
-                        />
-                        <Button
-                          type="button"
-                          variant="ghost"
-                          size="icon"
-                          disabled={group.apiKeys.length <= 1}
-                          onClick={() =>
-                            onApiKeyGroupsChange(
-                              apiKeyGroups.map((item, index) =>
-                                index === groupIndex
-                                  ? {
-                                      ...item,
-                                      apiKeys: item.apiKeys.filter(
-                                        (_, current) => current !== keyIndex,
-                                      ),
-                                    }
-                                  : item,
-                              ),
-                            )
-                          }
-                          aria-label={t("common.delete", {
-                            defaultValue: "Delete",
-                          })}
-                        >
-                          <Trash2 className="h-4 w-4" />
-                        </Button>
-                      </div>
-                    ),
-                  )}
-                  <Button
-                    type="button"
-                    variant="ghost"
-                    size="sm"
-                    onClick={() =>
-                      onApiKeyGroupsChange(
-                        apiKeyGroups.map((item, index) =>
-                          index === groupIndex
-                            ? { ...item, apiKeys: [...item.apiKeys, ""] }
-                            : item,
-                        ),
-                      )
-                    }
-                  >
-                    <Plus className="mr-1 h-3.5 w-3.5" />
-                    {t("codexConfig.apiKeyGroupAddKey", {
-                      defaultValue: "Add key",
-                    })}
-                  </Button>
-                </div>
-                <Input
-                  value={(group.models ?? []).join(", ")}
-                  placeholder={t("codexConfig.apiKeyGroupModels", {
-                    defaultValue: "Exact models, comma separated",
-                  })}
-                  onChange={(event) =>
-                    onApiKeyGroupsChange(
-                      apiKeyGroups.map((item, index) =>
-                        index === groupIndex
-                          ? {
-                              ...item,
-                              models: event.target.value
-                                .split(",")
-                                .map((value) => value.trim())
-                                .filter(Boolean),
-                            }
-                          : item,
-                      ),
-                    )
-                  }
-                />
-                <Input
-                  value={(group.prefixes ?? []).join(", ")}
-                  placeholder={t("codexConfig.apiKeyGroupPrefixes", {
-                    defaultValue: "Model prefixes, comma separated",
-                  })}
-                  onChange={(event) =>
-                    onApiKeyGroupsChange(
-                      apiKeyGroups.map((item, index) =>
-                        index === groupIndex
-                          ? {
-                              ...item,
-                              prefixes: event.target.value
-                                .split(",")
-                                .map((value) => value.trim())
-                                .filter(Boolean),
-                            }
-                          : item,
-                      ),
-                    )
-                  }
-                />
-              </div>
-            ))}
-          </div>
-        )}
+              ))}
+            </div>
+          )}
+        </section>
+      )}
 
       {/* Codex Base URL 输入框（托管 OAuth 端点由 adapter 硬定向，不展示） */}
       {shouldShowSpeedTest && !isXaiOauthPreset && (
@@ -2444,7 +2511,8 @@ export function CodexFormFields({
           apiFormat={apiFormat}
           trafficPolicy={resolvedTrafficPolicy}
           isMaintainedPreset={isMaintainedPreset}
-          isSyncingModels={isFetchingModels}
+          isSyncingModels={modelCatalogAction === "sync"}
+          isRefreshingModels={modelCatalogAction === "refresh-existing"}
           isValidatingConnection={
             isProbingProtocol && isProtocolProbeStateCurrent
           }
@@ -3638,9 +3706,7 @@ export function CodexFormFields({
                           <div className="space-y-1">
                             <div className="flex gap-1">
                               <Input
-                                value={
-                                  row.upstreamModel ?? row.upstream_model ?? ""
-                                }
+                                  value={catalogRowUpstreamModel(row)}
                                 onChange={(event) =>
                                   handleUpdateCatalogRow(index, {
                                     upstreamModel: event.target.value,

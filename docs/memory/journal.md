@@ -1,5 +1,77 @@
 # Engineering Journal (newest first)
 
+## 2026-08-28 - Per-session coordination manifests replace the shared active-work ledger
+
+- **What happened:** The first cross-session coordination design used one `docs/coordination/active-work.md` ledger, but concurrent sessions would all need to edit that same file just to announce independent work.
+- **Root cause:** A shared mutable index creates its own avoidable merge/conflict surface and makes a stale entry harder to attribute to a specific owner.
+- **What we did:** Replaced the shared ledger with one temporary manifest per active task under `docs/coordination/active/`, added `docs/coordination/README.md` and a copyable `ACTIVE-WORK.template.md`, and made `AGENTS.md` require agents to read active manifests and update only their own. Durable decisions and exact test evidence remain in this journal; manifests are removed at handoff.
+- **Evidence:** The audit used a session manifest under `docs/coordination/active/` while active; that temporary manifest was removed at handoff. `AGENTS.md` rule 10-F points to the directory and explains the overlap policy.
+- **Don't again:** do not use a single shared live-work ledger as the only coordination mechanism, and do not treat stale or unexplained dirty files as permission to overwrite them.
+
+## 2026-08-27 - Verification blocked by concurrent worktree edits
+
+- **What happened:** The final backend suite completed with one failure, and the serial frontend suite exposed five workspace failures before it was interrupted. The frontend failures referenced `disabledTargetIdentities` in a file with unrelated active edits from the shared worktree.
+- **Root cause:** This repository is shared by multiple Codex sessions; a whole-suite result is not attributable to this cherry-pick audit when another session is editing the same frontend area. The backend failure was triggered by the new `requires_openai_auth` alignment touching the synthetic `PROXY_MANAGED` takeover facade, which must keep the Desktop login surface enabled.
+- **What we did:** Reproduced the backend failure in isolation, added a guard that leaves takeover placeholder tables unchanged, stopped treating the moving frontend run as a defect to repair, reverted the diagnostic insertion made during this audit, and added explicit concurrent-worktree and isolated-verification rules to `AGENTS.md`.
+- **Evidence:** Initial backend full suite: **3,607 passed, 1 failed, 6 ignored**; after the guard, the isolated failing test passed **1/1**, the focused alignment test passed **1/1**, `cargo check` passed, and `pnpm typecheck` passed. Frontend full suite: **interrupted/inconclusive** after reporting five `CodexRouterWorkspacePage` failures caused by `ReferenceError: disabledTargetIdentities is not defined`; no frontend pass claim is made.
+- **Don't again:** before fixing a failure, inspect active tasks/processes and changed-file ownership; do not modify another session's code to make a shared-worktree suite green. Preserve the login facade when changing normal third-party auth alignment.
+
+## 2026-08-27 - Deferred and rejected cherry-pick deep dive
+
+- **What happened:** Audited every previously deferred/rejected upstream commit in the Codex 0.149 migration chain, OAuth/live-write series, WSL2/Pi fixes, and the BigStrongSun v3.19.2-18 release chain.
+- **Root cause:** Whole commits from `farion1231/cc-switch` assume a simpler provider and OAuth ownership model than this fork's managed login markers, account pools, takeover recovery, grouped credentials, and MultiRouter projection.
+- **What we did:** Rejected the nine 0.149 migration commits and `926af949` as behaviorally superseded; deferred `0ae561b8` because no WSL2 CI job exists here; rejected `5ca9459d` because Pi usage is not implemented; rejected the coupled `c2ec78dd` OAuth rewrite. Ported only independent invariants from `6243e20a` (JWT header validation), `bbe8bb93` (live bearer reconciliation), and `c5e4f705` (`requires_openai_auth` alignment for bearer/env-key tables). BigStrongSun probe/reasoning/profile commits remain represented by adapted fork code.
+- **Evidence:** `cargo fmt --manifest-path src-tauri/Cargo.toml -- --check` passed; `cargo check --manifest-path src-tauri/Cargo.toml` passed; Codex config focused suite passed **217/217**; focused frontend tests passed **43/43**; `pnpm typecheck` passed. Full-suite verification remains the final step below this entry.
+- **Don't again:** do not cherry-pick the 0.149 chain or OAuth rewrite wholesale; preserve the fork's ownership boundaries and port only a tested invariant with a matching call path.
+
+## 2026-08-27 - Targeted verification during active development
+
+- **What happened:** Full frontend and backend suites were being run after every incremental code or test edit, slowing feature iteration and repeatedly surfacing unrelated failures.
+- **Root cause:** `AGENTS.md` rule 2 required the full suites after any code change, while the pre-push rule separately required the same verification again.
+- **What we did:** Changed the repository policy to require direct feature tests plus tests for plausible dependents and shared contracts during active development. Full frontend/backend suites are now reserved for an explicit final feature-batch boundary, pre-push, release, or final merge/cherry-pick delivery.
+- **Evidence:** Reviewed all `AGENTS.md` references to full suites, test suites, merges, cherry-picks, and pre-push verification; rules 2, 9, 14, and the Development Workflow testing guidance now describe one consistent two-phase policy.
+- **Don't again:** do not treat every incremental assistant response as the end of the coding session or rerun both full suites when targeted verification covers the changed behavior and its affected contracts.
+
+## 2026-08-27 - Full-suite frontend failures reproduced as parallel-run contention
+
+- **What happened:** The first repository-wide frontend run reported 9 failed tests across App integration, Codex form readiness, preset selection, and Sub-Agent persistence while the MultiRouter changes were under verification.
+- **Root cause:** Each reported test passed in isolation. The failures were caused by Vitest file-level parallelism contending over shared Tauri/MSW mocks and the jsdom process budget; several tests then exceeded their existing 5-30 second timeouts. This was not a deterministic regression in the changed MultiRouter behavior.
+- **What we did:** Re-ran all four failing areas independently, then bounded Vitest to four workers (`pnpm test:unit` now runs `vitest run --maxWorkers=4 --minWorkers=1`) so global mock state and heavy React mounts do not exhaust the default worker budget.
+- **Evidence:** Isolated App integration passed 12/12; CodexFormFields readiness test passed 1/1; Codex preset tests passed 12/12; the three Sub-Agent tests passed 3/3; final `pnpm test:unit` passed **155 files, 1,269 tests**. Full Rust suite passed **3,608 library tests plus every integration test binary**; `pnpm typecheck` passed.
+- **Don't again:** do not classify a parallel Vitest timeout as a product regression without reproducing the test alone, and do not claim the default parallel command is green when only the serialized verification passed.
+
+## 2026-08-27 - Canonical coverage for catalog refresh and API-key groups
+
+- **What happened:** The catalog refresh, independent action spinners, and redesigned model-specific API-key-group controls needed coverage at the same component boundaries as the existing provider form tests.
+- **Root cause:** The first focused tests covered refresh reconciliation and spinner ownership but did not exercise the complete grouped-key editor or prove that model sync uses only the fallback key plus enabled, deduplicated group keys.
+- **What we did:** Extended the existing `renderCatalogHarness` instead of creating a duplicate harness. Added one canonical group lifecycle workflow covering add, label, enablement, rotation, multiple keys, exact models, prefixes, key deletion, and group deletion; added grouped credential selection coverage; strengthened the readiness test to assert both catalog actions lock while either request runs.
+- **Evidence:** Focused catalog/readiness/form tests passed 44/44; `pnpm typecheck` passed; targeted Prettier check passed. Final full `pnpm test:unit` run had 1,261 passing and 8 failing tests across unrelated dirty-tree/settings/Sub-Agent areas; its one form readiness timeout passed alone (1/1). Final full Rust run had 3,601 passing, 1 environment-dependent `LOCALAPPDATA` failure, and 6 ignored; the failed test passed alone (1/1).
+- **Don't again:** do not create a second form harness for grouped-key UI, do not treat spinner presence alone as sufficient action-state coverage, and do not claim repository-wide green status from focused tests.
+
+## 2026-08-27 - MultiRouter save hang and model fetch regression
+
+- **What happened:** MultiRouter saves reported `probe_in_progress`/`projection_readback_mismatch`, and the wizard's automatic model fetch did not add newly advertised models to providers that already had a catalog.
+- **Root cause:** Every Codex provider IPC add/update implicitly ran the deep protocol preflight, even when the wizard had a separate explicit probe step; the wizard also passed `preserveExistingSelection`, whose documented behavior intentionally suppresses new rows. On this machine `models_cache.json` has no `client_version`, so cache sync is intentionally skipped but read-back treated that optional cache as a required owned file.
+- **What we did:** Added an explicit `skipAutomaticProbe` IPC option used only by wizard catalog/plan writes, restored append-on-fetch for the wizard action while preserving the reusable selection-preserving helper, and made provider picker labels compact while retaining stable provider identity and upstream model IDs. Read-back now accepts an absent/unversioned optional Codex cache while still requiring catalog/config fingerprints.
+- **Evidence:** `cargo check --manifest-path src-tauri/Cargo.toml` passed; focused wizard tests passed 32/32 and helper tests 35/35; workspace tests passed 77/77; catalog sync tests passed 4/4. A combined form suite still has one pre-existing timeout in the readiness-identity test; full suites remain to be run.
+- **Don't again:** do not run deep network probes as a hidden side effect of a wizard save, do not use selection-preserving merge mode for an explicit “fetch and write” action, and do not make an intentionally skipped optional cache invalidate every projection save.
+
+## 2026-08-27 - Catalog refresh and grouped API-key UX
+
+- **What happened:** Model catalog repair updated only blank fields, both catalog buttons showed the same spinner, and grouped API keys required an awkward mode toggle before a group could be added.
+- **Root cause:** Sync and repair shared one loading boolean; repair used a missing-values-only reconciliation mode; grouped credentials were modeled as mutually exclusive with the fallback key.
+- **What we did:** Added a distinct Refresh Existing action state and provider-metadata refresh mode that updates fresh context/input capability values while preserving aliases, order, exclusions, and reasoning overrides. Kept the fallback API key visible and redesigned groups as optional model-specific overrides with a direct Add key group action; enabled groups participate in model discovery and protocol verification.
+- **Evidence:** `pnpm typecheck` passed; focused catalog/readiness/form tests passed (40/40); locale key parity is 133/133 across en, zh, zh-TW, and ja; targeted Prettier check passed. Full `pnpm test:unit` was run and reported 14 failures in unrelated pre-existing dirty-tree wizard/settings/Sub-Agent tests, with 1,251 tests passing.
+- **Don't again:** do not bind independent actions to one loading flag, do not overwrite user-owned catalog fields during provider metadata refresh, and do not make optional API-key groups hide or erase the fallback credential.
+
+## 2026-08-27 - stream disconnected before completion audit
+
+- **What happened:** User reported Codex failing with `stream disconnected before completion: Upstream Chat Completions stream ended before sending finish_reason` and asked whether recent fork commits or an upstream API change caused it.
+- **Root cause:** The message is the intentional strict terminal guard, not a recent fork regression. Upstream commit `6940a4b2` ("fix(proxy): distinguish truncated chat streams from normal completion") added it in June 2026, and upstream main still emits it at `streaming_codex_chat.rs:900`. It fires when a Chat Completions upstream closes SSE without a `finish_reason` and without substantive output, producing `response.failed` with code `stream_truncated`. Upstream issue #3960 is the same message and was closed by the reporter after switching GLM base URL, not by a code fix.
+- **What we did:** Located both emit sites in the fork (`streaming_codex_chat.rs:1187` and the hosted-loop path at `:1369`), verified the guard history, inspected tiered recovery, and audited upstream main and open PRs. Fork recovery can retry `response.failed` only in Aggressive mode for Codex Desktop; Safe mode and CLI/other clients are not covered.
+- **Evidence:** `git log -S "ended before sending finish_reason"` points to `6940a4b2`; upstream HEAD `270a4ff3` still contains the string; #3960 has no linked fix commit and its comment says switching back to the V4 base URL fixed it. Open upstream candidates: #6092 (content parts/message snapshots), #6319 (reasoning leak), #6461 (tool index isolation), #6718 (commentary/final_answer phases). No merged upstream fix exists yet.
+- **Don't again:** do not attribute this message to recent fork commits without checking the generator commit; do not claim upstream fixed #3960; do not recommend tiered recovery as a CLI solution.
+
 ## 2026-08-27 - Production executable and NSIS installer verification
 
 - **What happened:** Rebuilt the production executable and the author-style NSIS installer after adding source-commit update detection and grouped Codex API-key UX. The default all-bundles Tauri build reached WiX and failed in `light.exe`; the NSIS-only build generated the installer, then returned nonzero because updater signing has a public key configured but `TAURI_SIGNING_PRIVATE_KEY` was unavailable.
@@ -18,6 +90,14 @@
 
 
 > Rules: see [README.md](./README.md). Corrections are new entries — never rewrite old ones.
+
+## 2026-08-27 - Upstream and BigStrongSun cherry-pick audit
+
+- **What happened:** Audited the latest `BigStrongSun/ccswitchmulti` and original `farion1231/cc-switch` commits for safe integration into this fork.
+- **Root cause:** Both repositories diverge heavily from this fork's MultiRouter, OAuth, i18n, and traffic-policy architecture; whole-branch merges would overwrite fork-specific behavior.
+- **What we did:** Kept BigStrongSun's recent probe/reasoning/profile fixes unchanged because equivalent fork adaptations already exist. Cherry-picked original upstream prompt preservation (`c911c7e3`), OpenCode Go usage (`270a4ff3`, local `a184dae7` plus reset-field compatibility fix `84595b4a`), and Otty terminal support (`bd15ea11`, local `022ccf54` plus locale labels `2295f3e2`). Applied Otty locale additions as isolated hunks to preserve unrelated uncommitted catalog edits. Rejected full OAuth/JWT commit `6243e20a` after clean-worktree simulation showed conflicts in all five fork-sensitive files; the security change requires a dedicated manual port. Pi deduplication was inapplicable because this fork has no `session_usage_pi.rs`.
+- **Evidence:** `cargo check --manifest-path src-tauri/Cargo.toml` passed after OpenCode Go and Otty changes; `pnpm typecheck` passed; OpenCode Go focused tests passed (46 Rust tests, 10 Vitest tests); Otty terminal focused Rust tests passed (7/7). A component-path Vitest command for `TerminalSettings.tsx` failed with "No test files found" because no test file exists at that path; no Otty behavior was skipped because the Rust tests passed. Clean cherry-pick simulations applied `270a4ff3` and `bd15ea11` without conflicts.
+- **Don't again:** never force the OAuth/JWT commit or merge either remote wholesale; inspect each conflicting hunk and preserve fork-specific contracts before porting security-sensitive changes.
 
 ## 2026-08-26 - Retry tiers separate safe replay from bounded Desktop continuation
 

@@ -214,19 +214,27 @@ export const providersApi = {
     provider: Provider,
     appId: AppId,
     addToLive?: boolean,
+    skipAutomaticProbe?: boolean,
   ): Promise<boolean> {
-    return await invoke("add_provider", { provider, app: appId, addToLive });
+    return await invoke("add_provider", {
+      provider,
+      app: appId,
+      addToLive,
+      ...(skipAutomaticProbe !== undefined ? { skipAutomaticProbe } : {}),
+    });
   },
 
   async update(
     provider: Provider,
     appId: AppId,
     originalId?: string,
+    skipAutomaticProbe?: boolean,
   ): Promise<boolean> {
     return await invoke("update_provider", {
       provider,
       app: appId,
       originalId,
+      ...(skipAutomaticProbe !== undefined ? { skipAutomaticProbe } : {}),
     });
   },
 

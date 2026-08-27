@@ -575,6 +575,7 @@ type ProviderModelRefreshResult =
 type ProviderModelFetchConfig = {
   baseUrl: string;
   apiKey: string;
+  apiKeys?: string[];
   isFullUrl: boolean;
   customUserAgent?: string;
   volcengineModelListAction?: string;
@@ -635,9 +636,13 @@ function catalogDraftUpstreamModel(model: {
   upstream_model?: string;
 }): string {
   return (
-    model.upstreamModel ??
-    model.upstream_model ??
-    model.model ??
+    (typeof model.upstreamModel === "string" && model.upstreamModel.trim()
+      ? model.upstreamModel
+      : "") ||
+    (typeof model.upstream_model === "string" && model.upstream_model.trim()
+      ? model.upstream_model
+      : "") ||
+    model.model ||
     ""
   ).trim();
 }
@@ -661,6 +666,7 @@ function buildProviderModelRefreshAttemptKey(
     providerId,
     fetchConfig.baseUrl,
     hashSensitiveAttemptPart(fetchConfig.apiKey),
+    hashSensitiveAttemptPart((fetchConfig.apiKeys ?? []).join("\u0000")),
     fetchConfig.isFullUrl,
     fetchConfig.customUserAgent ?? "",
     fetchConfig.volcengineModelListAction ?? "",
@@ -764,20 +770,43 @@ async function fetchProviderModelsWithFallback(
   onlineErrorMessage?: string;
 }> {
   if (!fetchConfig.useCodexOAuth) {
+    const credentialKeys =
+      fetchConfig.apiKeys && fetchConfig.apiKeys.length > 0
+        ? fetchConfig.apiKeys
+        : [fetchConfig.apiKey];
+    const results = await Promise.allSettled(
+      credentialKeys.map((apiKey) =>
+        fetchModelsForConfig(
+          fetchConfig.baseUrl,
+          apiKey,
+          fetchConfig.isFullUrl,
+          undefined,
+          fetchConfig.customUserAgent,
+          fetchConfig.volcengineModelListAction
+            ? {
+                action: fetchConfig.volcengineModelListAction,
+                accessKeyId: fetchConfig.volcengineAccessKeyId ?? "",
+                secretAccessKey: fetchConfig.volcengineSecretAccessKey ?? "",
+              }
+            : undefined,
+        ),
+      ),
+    );
+    const fulfilledLists = results.filter(
+      (result): result is PromiseFulfilledResult<FetchedModel[]> =>
+        result.status === "fulfilled",
+    );
+    const successfulLists = fulfilledLists.flatMap((result) => result.value);
+    if (fulfilledLists.length === 0) {
+      throw results.find((result) => result.status === "rejected")?.reason;
+    }
     return {
-      models: await fetchModelsForConfig(
-        fetchConfig.baseUrl,
-        fetchConfig.apiKey,
-        fetchConfig.isFullUrl,
-        undefined,
-        fetchConfig.customUserAgent,
-        fetchConfig.volcengineModelListAction
-          ? {
-              action: fetchConfig.volcengineModelListAction,
-              accessKeyId: fetchConfig.volcengineAccessKeyId ?? "",
-              secretAccessKey: fetchConfig.volcengineSecretAccessKey ?? "",
-            }
-          : undefined,
+      models: Array.from(
+        new Map(
+          successfulLists
+            .filter((model) => model.id.trim())
+            .map((model) => [model.id.trim().toLowerCase(), model]),
+        ).values(),
       ),
       usedCodexCache: false,
     };
@@ -825,6 +854,31 @@ function getProviderModelFetchConfig(
       extractCodexExperimentalBearerToken(configText) ??
       "",
   ).trim();
+  const groupedKeys = ["codexApiKeyGroups", "codex_api_key_groups"]
+    .map((field) => settings[field])
+    .find((value) => Array.isArray(value));
+  const apiKeys = Array.from(
+    new Set(
+      [
+        apiKey,
+        ...(Array.isArray(groupedKeys)
+          ? groupedKeys.flatMap((group) => {
+              if (!group || typeof group !== "object") return [];
+              const record = group as Record<string, unknown>;
+              if (record.enabled === false) return [];
+              const values = record.apiKeys ?? record.api_keys;
+              return Array.isArray(values)
+                ? values
+                    .filter((value): value is string => typeof value === "string")
+                    .map((value) => value.trim())
+                : [];
+            })
+          : []),
+      ]
+        .map((key) => key.trim())
+        .filter(Boolean),
+    ),
+  );
   const planFetchSource = {
     baseUrl,
     partnerPromotionKey: provider.meta?.partnerPromotionKey,
@@ -841,6 +895,7 @@ function getProviderModelFetchConfig(
     return {
       baseUrl,
       apiKey,
+      apiKeys,
       isFullUrl: false,
       useCodexOAuth: true,
       codexOAuthAccountId: readWizardCodexOAuthAccountId(provider),
@@ -870,7 +925,7 @@ function getProviderModelFetchConfig(
       ),
     };
   }
-  if (!apiKey && !planModelListAction) {
+  if (apiKeys.length === 0 && !planModelListAction) {
     return {
       baseUrl,
       apiKey,
@@ -884,6 +939,7 @@ function getProviderModelFetchConfig(
   return {
     baseUrl,
     apiKey,
+    apiKeys,
     isFullUrl: Boolean(provider.meta?.isFullUrl ?? settings.isFullUrl),
     customUserAgent:
       typeof provider.meta?.customUserAgent === "string"
@@ -901,7 +957,7 @@ function getProviderModelFetchConfig(
   };
 }
 
-/// 将远端模型结果写回 provider 的 modelCatalog；普通源保留用户筛选，OAuth 源则追加官方新发布模型。
+/// 将远端模型结果写回 provider 的 modelCatalog；保留用户筛选，同时追加远端新模型。
 function providerWithFetchedModelCatalog(
   provider: Provider,
   fetchedModels: FetchedModel[],
@@ -911,33 +967,8 @@ function providerWithFetchedModelCatalog(
   const models = currentCatalog.models.map((model) => {
     const id = model.model?.trim();
     return {
+      ...model,
       model: id ?? "",
-      ...(model.upstreamModel ? { upstreamModel: model.upstreamModel } : {}),
-      ...(model.upstream_model ? { upstream_model: model.upstream_model } : {}),
-      ...(model.displayName ? { displayName: model.displayName } : {}),
-      ...(model.display_name ? { display_name: model.display_name } : {}),
-      ...(model.contextWindow ? { contextWindow: model.contextWindow } : {}),
-      ...(model.context_window ? { context_window: model.context_window } : {}),
-      ...(model.inputModalities
-        ? { inputModalities: model.inputModalities }
-        : {}),
-      ...(model.input_modalities
-        ? { input_modalities: model.input_modalities }
-        : {}),
-      ...(model.textOnly !== undefined ? { textOnly: model.textOnly } : {}),
-      ...(model.text_only !== undefined ? { text_only: model.text_only } : {}),
-      ...(model.supportsImage !== undefined
-        ? { supportsImage: model.supportsImage }
-        : {}),
-      ...(model.supports_image !== undefined
-        ? { supports_image: model.supports_image }
-        : {}),
-      ...(model.vision !== undefined ? { vision: model.vision } : {}),
-      ...(model.sortIndex !== undefined ? { sortIndex: model.sortIndex } : {}),
-      // 模型目录刷新必须保留已有 reasoning 声明（用户手动声明的档位/能力）。
-      // 否则 /models 拉取重建会把声明清空，导致档位消失（K3/Qwen 均受影响）。
-      ...(model.reasoning ? { reasoning: model.reasoning } : {}),
-      ...(model.codexUltra ? { codexUltra: model.codexUltra } : {}),
     } satisfies CodexCatalogModelDraft;
   });
   const byFetchedModel = new Map<string, number>();
@@ -947,19 +978,25 @@ function providerWithFetchedModelCatalog(
     if (!id) continue;
     const index = models.findIndex((item) => item.model === id);
     if (index < 0) continue;
-    byVisibleModel.set(id, index);
+    const identity = id.toLowerCase();
+    byVisibleModel.set(identity, index);
     const upstreamModel = catalogDraftUpstreamModel(models[index]);
     if (upstreamModel) {
-      byFetchedModel.set(upstreamModel, index);
+      byFetchedModel.set(upstreamModel.toLowerCase(), index);
     }
   }
-  const shouldAppendFetchedModels =
-    currentCatalog.models.length === 0 || isWizardCodexOAuthSource(provider);
+  // Refreshes are also catalog syncs: a later upstream response may publish a
+  // model that was absent from the previous catalog. Existing disabled rows
+  // still win through the identity maps above, so they remain tombstones rather
+  // than being re-added or re-enabled.
+  const shouldAppendFetchedModels = true;
 
   for (const fetched of fetchedModels) {
     const id = fetched.id.trim();
     if (!id) continue;
-    const existingIndex = byFetchedModel.get(id) ?? byVisibleModel.get(id);
+    const identity = id.toLowerCase();
+    const existingIndex =
+      byFetchedModel.get(identity) ?? byVisibleModel.get(identity);
     const contextWindow = resolveFetchedCodexModelContextWindow(fetched, {
       providerId: provider.id,
       providerName: provider.name,
@@ -1005,8 +1042,8 @@ function providerWithFetchedModelCatalog(
           }
         : {}),
     };
-    byFetchedModel.set(id, models.length);
-    byVisibleModel.set(id, models.length);
+    byFetchedModel.set(identity, models.length);
+    byVisibleModel.set(identity, models.length);
     models.push(nextModel);
   }
 
@@ -1428,7 +1465,8 @@ function uniqueRouteId(preferredId: string, usedIds: Set<string>): string {
 /// 从真实模型目录里推断精确模型名；没有目录时只读取显式单模型字段，不能伪造 OAuth 模型权限。
 function collectProviderModelIds(provider: Provider): string[] {
   const catalogModels = readCodexModelCatalog(provider)
-    .models.map((model) => model.model?.trim())
+    .models.filter((model) => model.enabled !== false)
+    .map((model) => model.model?.trim())
     .filter((model): model is string => Boolean(model));
   const singleModelFields = [
     provider.settingsConfig?.model,
@@ -1446,14 +1484,10 @@ function buildRouteModelMapFromProvider(
   provider: Provider,
 ): Record<string, string> | undefined {
   const entries = readCodexModelCatalog(provider)
-    .models.map((model) => {
+    .models.filter((model) => model.enabled !== false)
+    .map((model) => {
       const visibleModel = model.model?.trim();
-      const upstreamModel = (
-        model.upstreamModel ??
-        model.upstream_model ??
-        model.model ??
-        ""
-      ).trim();
+      const upstreamModel = catalogDraftUpstreamModel(model);
       return visibleModel && upstreamModel && visibleModel !== upstreamModel
         ? [visibleModel, upstreamModel]
         : null;
@@ -1603,7 +1637,13 @@ function catalogDraftFromSourceModel(
 ): CodexCatalogModelDraft {
   const settings = provider?.settingsConfig;
   const displayName = source?.displayName ?? source?.display_name;
-  const upstreamModel = source?.upstreamModel ?? source?.upstream_model;
+  const upstreamModel =
+    (typeof source?.upstreamModel === "string" && source.upstreamModel.trim()
+      ? source.upstreamModel.trim()
+      : "") ||
+    (typeof source?.upstream_model === "string" && source.upstream_model.trim()
+      ? source.upstream_model.trim()
+      : "");
   const contextWindow =
     source?.contextWindow ??
     source?.context_window ??
@@ -1685,16 +1725,20 @@ function buildModelCatalogDraftFromSources(
 
   for (const provider of modelSources) {
     const sourceCatalogModels = readCodexModelCatalog(provider).models;
-    for (const catalogModel of sourceCatalogModels) {
+    for (const catalogModel of sourceCatalogModels.filter(
+      (model) => model.enabled !== false,
+    )) {
       const id = catalogModel.model?.trim();
-      if (!id || byModel.has(id)) continue;
-      byModel.set(id, catalogDraftFromSourceModel(id, catalogModel, provider));
+      const key = id?.toLowerCase();
+      if (!id || !key || byModel.has(key)) continue;
+      byModel.set(key, catalogDraftFromSourceModel(id, catalogModel, provider));
     }
 
     for (const model of collectProviderModelIds(provider)) {
       const id = model.trim();
-      if (!id || byModel.has(id)) continue;
-      byModel.set(id, { model: id });
+      const key = id.toLowerCase();
+      if (!id || byModel.has(key)) continue;
+      byModel.set(key, { model: id });
     }
   }
 
@@ -2019,7 +2063,7 @@ function buildExistingCatalogByModel(
   const existingModelById = new Map<string, CodexCatalogModelDraft>();
   for (const model of existingModels) {
     const id = model.model?.trim();
-    if (id) existingModelById.set(id, model);
+    if (id) existingModelById.set(id.toLowerCase(), model);
   }
   return existingModelById;
 }
@@ -2030,11 +2074,10 @@ function routeModelUpstreamForAliasRepair(
   visibleModel: string,
   existingModelById: Map<string, CodexCatalogModelDraft>,
 ): string {
-  const catalogModel = existingModelById.get(visibleModel);
+  const catalogModel = existingModelById.get(visibleModel.toLowerCase());
   return (
     route.upstream?.modelMap?.[visibleModel] ??
-    catalogModel?.upstreamModel ??
-    catalogModel?.upstream_model ??
+    (catalogModel ? catalogDraftUpstreamModel(catalogModel) : undefined) ??
     visibleModel
   ).trim();
 }
@@ -2056,7 +2099,9 @@ export function normalizeCodexRoutesForVisibleModelAliases(
   return routes.map((route) => {
     const targetProvider = routeTargetProvider(route, providersById);
     const targetCatalogModels = targetProvider
-      ? readCodexModelCatalog(targetProvider).models
+      ? readCodexModelCatalog(targetProvider).models.filter(
+          (model) => model.enabled !== false,
+        )
       : [];
     if (!targetProvider || targetCatalogModels.length === 0) return route;
 
@@ -2071,10 +2116,10 @@ export function normalizeCodexRoutesForVisibleModelAliases(
     for (const model of targetCatalogModels) {
       const visible = model.model?.trim();
       if (!visible) continue;
-      targetModelByVisible.set(visible, model);
+      targetModelByVisible.set(visible.toLowerCase(), model);
       const upstream = catalogDraftUpstreamModel(model);
-      if (upstream && !targetModelByUpstream.has(upstream)) {
-        targetModelByUpstream.set(upstream, model);
+      if (upstream && !targetModelByUpstream.has(upstream.toLowerCase())) {
+        targetModelByUpstream.set(upstream.toLowerCase(), model);
       }
     }
 
@@ -2088,8 +2133,8 @@ export function normalizeCodexRoutesForVisibleModelAliases(
         legacyModelById,
       );
       const targetModel =
-        targetModelByUpstream.get(upstream) ??
-        targetModelByVisible.get(trimmedVisible);
+        targetModelByUpstream.get(upstream.toLowerCase()) ??
+        targetModelByVisible.get(trimmedVisible.toLowerCase());
       const nextVisible = targetModel?.model?.trim() ?? trimmedVisible;
       if (nextVisible && !nextModels.includes(nextVisible)) {
         nextModels.push(nextVisible);
@@ -2098,7 +2143,7 @@ export function normalizeCodexRoutesForVisibleModelAliases(
 
     const nextModelMapEntries = nextModels
       .map((visibleModel) => {
-        const targetModel = targetModelByVisible.get(visibleModel);
+        const targetModel = targetModelByVisible.get(visibleModel.toLowerCase());
         const upstream = targetModel
           ? catalogDraftUpstreamModel(targetModel)
           : routeModelUpstreamForAliasRepair(
@@ -2199,6 +2244,17 @@ export function buildModelCatalogForRoutes(
     const targetCatalogModels = targetProvider
       ? readCodexModelCatalog(targetProvider).models
       : [];
+    const disabledTargetIdentities = new Set(
+      targetCatalogModels
+        .filter((catalogModel) => catalogModel.enabled === false)
+        .flatMap((catalogModel) => [
+          catalogModel.model,
+          catalogModel.upstreamModel,
+          catalogModel.upstream_model,
+        ])
+        .map((value) => value?.trim().toLowerCase())
+        .filter((value): value is string => Boolean(value)),
+    );
     const routableCatalogModels =
       route.modelSelection?.mode === "all"
         ? targetCatalogModels.filter(
@@ -2211,9 +2267,10 @@ export function buildModelCatalogForRoutes(
           );
     for (const catalogModel of routableCatalogModels) {
       const id = catalogModel.model?.trim();
-      if (!id || byModel.has(id)) continue;
+      const key = id?.toLowerCase() ?? "";
+      if (!id || !key || byModel.has(key)) continue;
       byModel.set(
-        id,
+        key,
         applyRouteCapabilitiesToCatalogModel(
           catalogDraftFromSourceModel(id, catalogModel, targetProvider),
           route,
@@ -2222,11 +2279,17 @@ export function buildModelCatalogForRoutes(
     }
     for (const model of route.match?.models ?? []) {
       const id = model.trim();
-      if (!id || byModel.has(id)) continue;
+      if (
+        !id ||
+        byModel.has(id.toLowerCase()) ||
+        disabledTargetIdentities.has(id.toLowerCase())
+      ) {
+        continue;
+      }
       byModel.set(
-        id,
+        id.toLowerCase(),
         applyRouteCapabilitiesToCatalogModel(
-          legacyModelById.get(id) ?? { model: id },
+          legacyModelById.get(id.toLowerCase()) ?? { model: id },
           route,
         ),
       );
@@ -2239,11 +2302,18 @@ export function buildModelCatalogForRoutes(
     : !isSchemaV2 && Array.isArray(existingCatalog?.spawnAgentModels)
       ? (existingCatalog.spawnAgentModels as string[])
       : [];
-  const modelIds = Array.from(byModel.keys());
+  const modelIds = Array.from(byModel.values())
+    .map((model) => model.model.trim())
+    .filter(Boolean);
   const spawnAgentModels = existingSpawnAgentModels
-    .filter((model) => byModel.has(model))
+    .filter((model) => byModel.has(model.trim().toLowerCase()))
     .concat(
-      modelIds.filter((model) => !existingSpawnAgentModels.includes(model)),
+      modelIds.filter(
+        (model) =>
+          !existingSpawnAgentModels.some(
+            (existing) => existing.trim().toLowerCase() === model.toLowerCase(),
+          ),
+      ),
     )
     .slice(0, 5);
   const models = applyCodexCatalogModelOrder(
@@ -2585,7 +2655,9 @@ export function collectRoutedCatalogModels(
 
   for (const { route, provider } of routes) {
     if (route.modelSelection?.mode === "all") {
-      for (const model of readCodexModelCatalog(provider).models) {
+      for (const model of readCodexModelCatalog(provider).models.filter(
+        (model) => model.enabled !== false,
+      )) {
         const normalized = model.model?.trim();
         if (normalized) exactModels.add(normalized);
       }
@@ -2601,12 +2673,17 @@ export function collectRoutedCatalogModels(
   }
 
   const routed = catalogModels
+    .filter((model) => model.enabled !== false)
     .map((model) => model.model?.trim())
     .filter((model): model is string => Boolean(model))
     .filter(
       (model) =>
-        exactModels.has(model) ||
-        prefixes.some((prefix) => model.startsWith(prefix)),
+        Array.from(exactModels).some(
+          (candidate) => candidate.toLowerCase() === model.toLowerCase(),
+        ) ||
+        prefixes.some((prefix) =>
+          model.toLowerCase().startsWith(prefix.toLowerCase()),
+        ),
     );
 
   return Array.from(new Set(routed));
@@ -2616,11 +2693,15 @@ export function collectRoutedCatalogModels(
 function routeMatchesModel(route: CodexRoute, model: string): boolean {
   const normalized = model.trim();
   if (!normalized) return false;
+  const lowerModel = normalized.toLowerCase();
   const models = route.match?.models ?? [];
   const prefixes = route.match?.prefixes ?? [];
   return (
-    models.includes(normalized) ||
-    prefixes.some((prefix) => normalized.startsWith(prefix))
+    models.some((candidate) => candidate.trim().toLowerCase() === lowerModel) ||
+    prefixes.some((prefix) => {
+      const normalizedPrefix = prefix.trim().toLowerCase();
+      return normalizedPrefix && lowerModel.startsWith(normalizedPrefix);
+    })
   );
 }
 
@@ -3718,17 +3799,15 @@ export function CodexRouterWorkspacePage({
         return true;
       }
       const target = routeTargetProvider(route, providersById);
-      return readCodexModelCatalog(target ?? null).models.some(
-        (catalogModel) => {
+      return readCodexModelCatalog(target ?? null)
+        .models.filter((catalogModel) => catalogModel.enabled !== false)
+        .some((catalogModel) => {
           const candidate = catalogModel.model?.trim();
-          const upstream = (
-            catalogModel.upstreamModel ?? catalogModel.upstream_model
-          )?.trim();
+          const upstream = catalogDraftUpstreamModel(catalogModel);
           return [candidate, upstream].some(
             (value) => value?.toLowerCase() === model.toLowerCase(),
           );
-        },
-      );
+        });
     });
 
     if (matched) {
@@ -4838,9 +4917,12 @@ function ModelOrderTab({
             const sourceModels = readCodexModelCatalog(source).models;
             const sourceIndex = sourceModels.findIndex(
               (model) =>
-                model.model?.trim() === canonicalModel ||
-                model.upstreamModel?.trim() === canonicalModel ||
-                model.upstream_model?.trim() === canonicalModel,
+                model.enabled !== false &&
+                [model.model, model.upstreamModel, model.upstream_model].some(
+                  (value) =>
+                    value?.trim().toLowerCase() ===
+                    canonicalModel.toLowerCase(),
+                ),
             );
             if (sourceIndex < 0) continue;
             const nextModels = sourceModels.map((model, index) => {
@@ -7020,17 +7102,19 @@ function SpawnAgentCandidatesPanel({
   const selectedCatalogByModel = new Map(
     selectedCatalog.models
       .filter((model) => model.model?.trim())
-      .map((model) => [model.model!.trim(), model]),
+      .map((model) => [model.model!.trim().toLowerCase(), model]),
   );
   const spawnAgentVisibleLimit =
     diagnostics?.liveConfig.spawnAgentVisibleModelLimit ?? 5;
   const configuredSpawnAgentModels = selectedCatalog.spawnAgentModels
-    .map((model) => selectedCatalogByModel.get(model) ?? { model })
+    .map((model) => selectedCatalogByModel.get(model.trim().toLowerCase()))
+    .filter((model): model is CodexCatalogModel => Boolean(model))
     .slice(0, spawnAgentVisibleLimit);
   const generatedVisibleModels =
     diagnostics?.liveConfig.modelCatalogFirstModels
       ?.slice(0, spawnAgentVisibleLimit)
-      .map((model) => selectedCatalogByModel.get(model) ?? { model }) ?? [];
+      .map((model) => selectedCatalogByModel.get(model.trim().toLowerCase()))
+      .filter((model): model is CodexCatalogModel => Boolean(model)) ?? [];
   const previewVisibleModels =
     generatedVisibleModels.length > 0
       ? generatedVisibleModels
@@ -7041,9 +7125,9 @@ function SpawnAgentCandidatesPanel({
     () => collectRoutedCatalogModels(selectedRoutes, selectedCatalog.models),
     [selectedRoutes, selectedCatalog.models],
   );
-  const draftVisibleModels = draftSpawnAgentModels.map(
-    (model) => selectedCatalogByModel.get(model) ?? { model },
-  );
+  const draftVisibleModels = draftSpawnAgentModels
+    .map((model) => selectedCatalogByModel.get(model.trim().toLowerCase()))
+    .filter((model): model is CodexCatalogModel => Boolean(model));
   const candidateCatalog = {
     ...selectedCatalog,
     spawnAgentModels: draftSpawnAgentModels,
@@ -10303,9 +10387,9 @@ function SortableCatalogModel({
             {modelId}
           </div>
         ) : null}
-        {model.upstreamModel || model.upstream_model ? (
+        {catalogDraftUpstreamModel(model) !== modelId ? (
           <div className="mt-0.5 truncate font-mono text-xs text-muted-foreground dark:text-slate-400">
-            {model.upstreamModel ?? model.upstream_model}
+            {catalogDraftUpstreamModel(model)}
           </div>
         ) : null}
       </div>

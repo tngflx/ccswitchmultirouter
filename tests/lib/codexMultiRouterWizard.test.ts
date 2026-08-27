@@ -9,8 +9,10 @@ import {
   collectWizardModelNameCollisions,
   collectWizardRouteAliasSelectionIssues,
   defaultWizardModelSources,
+  filterWizardProvidersByModelOrder,
   getWizardConfigIssues,
   getWizardModelFetchConfig,
+  getWizardConnectivityProbeModels,
   inferCodexOfficialAuth,
   inferWizardApiFormat,
   inferWizardCacheConfig,
@@ -80,6 +82,69 @@ describe("codexMultiRouterWizard helpers", () => {
     expect(readWizardModelCatalog(source)).toEqual([
       { model: "deepseek-chat" },
     ]);
+  });
+
+  it("does not probe catalog models explicitly excluded by the user", () => {
+    const source = provider({
+      settingsConfig: {
+        modelCatalog: {
+          models: [
+            { model: "free-model", enabled: true },
+            { model: "paid-model", enabled: false },
+            { model: "implicit-model" },
+          ],
+        },
+      },
+    });
+
+    expect(getWizardConnectivityProbeModels(source)).toEqual([
+      "free-model",
+      "implicit-model",
+    ]);
+  });
+
+  it("ignores excluded models when reconstructing collisions and model order", () => {
+    const official = provider({
+      id: "official",
+      name: "Official",
+      category: "official",
+      settingsConfig: {
+        modelCatalog: {
+          models: [
+            { model: "gpt-5", upstreamModel: "gpt-5", enabled: false },
+            { model: "gpt-4.1", upstreamModel: "gpt-4.1" },
+          ],
+        },
+      },
+    });
+    const relay = provider({
+      id: "relay",
+      name: "Relay",
+      settingsConfig: {
+        modelCatalog: {
+          models: [{ model: "gpt-5", upstreamModel: "GPT-5" }],
+        },
+      },
+    });
+    expect(collectWizardModelNameCollisions([official, relay])).toEqual([]);
+    const plan = provider({
+      id: "router",
+      settingsConfig: {
+        codexRouting: {
+          schemaVersion: 2,
+          enabled: true,
+          routes: [
+            {
+              id: "official-route",
+              enabled: true,
+              targetProviderId: official.id,
+              modelSelection: { mode: "include", models: ["gpt-5"] },
+            },
+          ],
+        },
+      },
+    });
+    expect(initialWizardCatalogModelOrder(plan, [official])).toEqual([]);
   });
 
   it("deduplicates default Codex OAuth sources while keeping the best catalog source", () => {
@@ -244,6 +309,66 @@ describe("codexMultiRouterWizard helpers", () => {
         supports_image: true,
       },
     ]);
+  });
+
+  it("merges fetched models case-insensitively and preserves aliases and legacy upstream fields", () => {
+    const source = provider({
+      settingsConfig: {
+        modelCatalog: {
+          models: [
+            {
+              model: "Friendly GPT",
+              upstreamModel: "",
+              upstream_model: "GPT-5",
+              displayName: "My GPT",
+            },
+          ],
+        },
+      },
+    });
+
+    const refreshed = mergeFetchedModelsIntoWizardProvider(source, [
+      { id: "gpt-5", ownedBy: null, contextWindow: 128000 },
+      { id: "GPT-5", ownedBy: null, contextWindow: 256000 },
+    ]);
+
+    expect(refreshed.settingsConfig.modelCatalog.models).toHaveLength(1);
+    expect(refreshed.settingsConfig.modelCatalog.models[0]).toMatchObject({
+      model: "Friendly GPT",
+      upstreamModel: "GPT-5",
+      displayName: "My GPT",
+      contextWindow: 256000,
+    });
+  });
+
+  it("matches model order by visible or upstream identity without re-enabling excluded rows", () => {
+    const source = provider({
+      id: "relay",
+      settingsConfig: {
+        modelCatalog: {
+          models: [
+            { model: "Friendly Free", upstreamModel: "free-model" },
+            { model: "Paid", upstreamModel: "paid-model", enabled: false },
+            { model: "Other", upstream_model: "OTHER-MODEL" },
+          ],
+        },
+      },
+    });
+
+    const [filtered] = filterWizardProvidersByModelOrder(
+      source ? [source] : [],
+      ["OTHER-MODEL", "FREE-MODEL", "PAID-MODEL"],
+    );
+    expect(filtered).toBeDefined();
+
+    expect(
+      (
+        filtered!.settingsConfig.modelCatalog.models as Array<{ model: string }>
+      ).map((model) => model.model),
+    ).toEqual(["Other", "Friendly Free"]);
+    expect(filtered!.settingsConfig.modelCatalog.models).not.toContainEqual(
+      expect.objectContaining({ model: "Paid" }),
+    );
   });
 
   it("aliases third-party duplicate models while preserving upstreamModel", () => {

@@ -52,8 +52,19 @@ pub async fn add_provider(
     app: String,
     provider: Provider,
     #[allow(non_snake_case)] addToLive: Option<bool>,
+    #[allow(non_snake_case)] skipAutomaticProbe: Option<bool>,
 ) -> Result<bool, String> {
     let app_type = AppType::from_str(&app).map_err(|e| e.to_string())?;
+    if skipAutomaticProbe.unwrap_or(false) && app_type == AppType::Codex {
+        return ProviderService::add_with_protocol_profiles(
+            state.inner(),
+            app_type,
+            provider,
+            addToLive.unwrap_or(true),
+            &[],
+        )
+        .map_err(|e| e.to_string());
+    }
     add_provider_internal(state.inner(), app_type, provider, addToLive.unwrap_or(true))
         .await
         .map_err(|e| e.to_string())
@@ -65,8 +76,19 @@ pub async fn update_provider(
     app: String,
     provider: Provider,
     #[allow(non_snake_case)] originalId: Option<String>,
+    #[allow(non_snake_case)] skipAutomaticProbe: Option<bool>,
 ) -> Result<bool, String> {
     let app_type = AppType::from_str(&app).map_err(|e| e.to_string())?;
+    if skipAutomaticProbe.unwrap_or(false) && app_type == AppType::Codex {
+        return ProviderService::update_with_protocol_profiles(
+            state.inner(),
+            app_type,
+            originalId.as_deref(),
+            provider,
+            &[],
+        )
+        .map_err(|e| e.to_string());
+    }
     update_provider_internal(state.inner(), app_type, originalId.as_deref(), provider)
         .await
         .map_err(|e| e.to_string())
