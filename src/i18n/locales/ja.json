@@ -1623,7 +1623,10 @@
     "apiKeyGroupRoundRobin": "ラウンドロビン",
     "apiKeyGroupRandom": "ランダム",
     "catalogOrderColumn": "並び順",
-    "catalogUpstreamModelPlaceholder": "空欄の場合は候補モデル名を使用"
+    "catalogUpstreamModelPlaceholder": "空欄の場合は候補モデル名を使用",
+    "apiKeyMode": "APIキー モード",
+    "apiKeyModeGroupedHint": "モデルごとに異なるキーを使用します。",
+    "apiKeyModeSingleHint": "すべてのモデルで同じAPIキーを使用します。"
   },
   "geminiConfig": {
     "envFile": "環境変数 (.env)",
