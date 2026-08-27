@@ -1623,7 +1623,10 @@
     "apiKeyGroupRoundRobin": "轮询",
     "apiKeyGroupRandom": "随机",
     "catalogOrderColumn": "顺序",
-    "catalogUpstreamModelPlaceholder": "留空则使用候选模型名"
+    "catalogUpstreamModelPlaceholder": "留空则使用候选模型名",
+    "apiKeyMode": "API Key 模式",
+    "apiKeyModeGroupedHint": "为不同模型使用不同的 Key。",
+    "apiKeyModeSingleHint": "所有模型使用同一个 API Key。"
   },
   "geminiConfig": {
     "envFile": "环境变量 (.env)",

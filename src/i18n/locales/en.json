@@ -1623,7 +1623,10 @@
     "apiKeyGroupRoundRobin": "Round robin",
     "apiKeyGroupRandom": "Random",
     "catalogOrderColumn": "Order",
-    "catalogUpstreamModelPlaceholder": "Leave blank to use the candidate model name"
+    "catalogUpstreamModelPlaceholder": "Leave blank to use the candidate model name",
+    "apiKeyMode": "API key mode",
+    "apiKeyModeGroupedHint": "Use different keys for different models.",
+    "apiKeyModeSingleHint": "Use one API key for all models."
   },
   "geminiConfig": {
     "envFile": "Environment Variables (.env)",

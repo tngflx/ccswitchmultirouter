@@ -834,6 +834,14 @@ export function CodexFormFields({
   const { t } = useTranslation();
 
   const [fetchedModels, setFetchedModels] = useState<FetchedModel[]>([]);
+  // Keep grouped keys as a separate mode so the form clearly distinguishes
+  // one shared credential from model-specific credentials.
+  const [useApiKeyGroups, setUseApiKeyGroups] = useState(false);
+  useEffect(() => {
+    if (apiKeyGroups.some((group) => group.apiKeys.some((key) => key.trim()))) {
+      setUseApiKeyGroups(true);
+    }
+  }, [apiKeyGroups]);
   const [isFetchingModels, setIsFetchingModels] = useState(false);
   const [catalogSearch, setCatalogSearch] = useState("");
   const [catalogVisibility, setCatalogVisibility] = useState<
@@ -1298,30 +1306,60 @@ export function CodexFormFields({
         return;
       }
 
-      if (!codexBaseUrl || (!codexApiKey && !planModelListAction)) {
+      const groupedKeys = useApiKeyGroups
+        ? apiKeyGroups
+            .flatMap((group) => group.apiKeys)
+            .map((key) => key.trim())
+            .filter(Boolean)
+        : [];
+      if (
+        !codexBaseUrl ||
+        (groupedKeys.length === 0 && !codexApiKey && !planModelListAction)
+      ) {
         showFetchModelsError(null, t, {
-          hasApiKey: !!codexApiKey,
+          hasApiKey: groupedKeys.length > 0 || !!codexApiKey,
           hasBaseUrl: !!codexBaseUrl,
         });
         return;
       }
       const seq = ++fetchModelsSeqRef.current;
       setIsFetchingModels(true);
-      fetchModelsForConfig(
-        codexBaseUrl,
-        codexApiKey,
-        isFullUrl,
-        undefined,
-        customUserAgent,
-        planModelListAction
-          ? {
-              action: planModelListAction,
-              accessKeyId: planAccessKeyId ?? "",
-              secretAccessKey: planSecretAccessKey ?? "",
-            }
-          : undefined,
+      const keysToFetch = groupedKeys.length > 0 ? groupedKeys : [codexApiKey];
+      Promise.allSettled(
+        keysToFetch.map((key) =>
+          fetchModelsForConfig(
+            codexBaseUrl,
+            key,
+            isFullUrl,
+            undefined,
+            customUserAgent,
+            planModelListAction
+              ? {
+                  action: planModelListAction,
+                  accessKeyId: planAccessKeyId ?? "",
+                  secretAccessKey: planSecretAccessKey ?? "",
+                }
+              : undefined,
+          ),
+        ),
       )
-        .then((models) => {
+        .then((results) => {
+          const successfulLists = results
+            .filter(
+              (result): result is PromiseFulfilledResult<FetchedModel[]> =>
+                result.status === "fulfilled",
+            )
+            .flatMap((result) => result.value);
+          const failedCount = results.filter(
+            (result) => result.status === "rejected",
+          ).length;
+          if (failedCount > 0 && successfulLists.length === 0) {
+            throw results.find((result) => result.status === "rejected")
+              ?.reason;
+          }
+          const models = Array.from(
+            new Map(successfulLists.map((model) => [model.id, model])).values(),
+          );
           if (seq !== fetchModelsSeqRef.current) return;
           setFetchedModels(models);
           let splitCatalogRows = catalogRowsRef.current;
@@ -1411,6 +1449,8 @@ export function CodexFormFields({
       buildReadinessIdentityFor,
       codexBaseUrl,
       codexApiKey,
+      apiKeyGroups,
+      useApiKeyGroups,
       isFullUrl,
       customUserAgent,
       providerId,
@@ -1950,8 +1990,51 @@ export function CodexFormFields({
         />
       )}
 
+      {/* Authentication mode: one shared key or model-specific key groups. */}
+      {!isXaiOauthPreset && category !== "official" && onApiKeyGroupsChange && (
+        <div className="mb-2 flex items-center justify-between rounded-md border bg-muted/20 px-3 py-2">
+          <div>
+            <FormLabel>
+              {t("codexConfig.apiKeyMode", { defaultValue: "API key mode" })}
+            </FormLabel>
+            <p className="text-xs text-muted-foreground">
+              {useApiKeyGroups
+                ? t("codexConfig.apiKeyModeGroupedHint", {
+                    defaultValue: "Use different keys for different models.",
+                  })
+                : t("codexConfig.apiKeyModeSingleHint", {
+                    defaultValue: "Use one API key for all models.",
+                  })}
+            </p>
+          </div>
+          <Switch
+            checked={useApiKeyGroups}
+            onCheckedChange={(checked) => {
+              setUseApiKeyGroups(checked);
+              // Switching to grouped mode clears the shared key so it cannot
+              // accidentally be persisted or used as a fallback credential.
+              if (checked) onApiKeyChange("");
+              // Disabling grouped mode removes grouped credentials from the
+              // persisted config so the single-key mode is unambiguous.
+              if (!checked && onApiKeyGroupsChange) onApiKeyGroupsChange([]);
+              else if (
+                checked &&
+                onApiKeyGroupsChange &&
+                apiKeyGroups.length > 0
+              )
+                onApiKeyGroupsChange(
+                  apiKeyGroups.map((group) => ({ ...group, enabled: true })),
+                );
+            }}
+            aria-label={t("codexConfig.apiKeyMode", {
+              defaultValue: "API key mode",
+            })}
+          />
+        </div>
+      )}
+
       {/* Codex API Key 输入框（托管 OAuth 预设无需 Key） */}
-      {!isXaiOauthPreset && (
+      {!isXaiOauthPreset && !useApiKeyGroups && (
         <ApiKeySection
           id="codexApiKey"
           label="API Key"
@@ -1973,256 +2056,261 @@ export function CodexFormFields({
         />
       )}
 
-      {!isXaiOauthPreset && category !== "official" && onApiKeyGroupsChange && (
-        <div className="space-y-2 rounded-md border p-3">
-          <div className="flex items-center justify-between gap-2">
-            <div>
-              <FormLabel>
-                {t("codexConfig.apiKeyGroupsTitle", {
-                  defaultValue: "Model API key groups",
-                })}
-              </FormLabel>
-              <p className="text-xs text-muted-foreground">
-                {t("codexConfig.apiKeyGroupsHint", {
-                  defaultValue:
-                    "Match exact models first, then prefixes. Keys rotate within each group.",
-                })}
-              </p>
-            </div>
-            <Button
-              type="button"
-              variant="outline"
-              size="sm"
-              onClick={() =>
-                onApiKeyGroupsChange([
-                  ...apiKeyGroups,
-                  {
-                    id: crypto.randomUUID(),
-                    label: "",
-                    apiKeys: [""],
-                    models: [],
-                    prefixes: [],
-                    enabled: true,
-                    strategy: "round_robin",
-                  },
-                ])
-              }
-            >
-              <Plus className="mr-1 h-3.5 w-3.5" />
-              {t("codexConfig.apiKeyGroupsAdd", { defaultValue: "Add group" })}
-            </Button>
-          </div>
-          {apiKeyGroups.map((group, groupIndex) => (
-            <div key={group.id} className="space-y-2 rounded border p-2">
-              <div className="flex gap-2">
-                <Input
-                  value={group.label ?? ""}
-                  placeholder={t("codexConfig.apiKeyGroupLabel", {
-                    defaultValue: "Group label",
+      {!isXaiOauthPreset &&
+        category !== "official" &&
+        onApiKeyGroupsChange &&
+        useApiKeyGroups && (
+          <div className="space-y-2 rounded-md border p-3">
+            <div className="flex items-center justify-between gap-2">
+              <div>
+                <FormLabel>
+                  {t("codexConfig.apiKeyGroupsTitle", {
+                    defaultValue: "Model API key groups",
                   })}
-                  onChange={(event) =>
-                    onApiKeyGroupsChange(
-                      apiKeyGroups.map((item, index) =>
-                        index === groupIndex
-                          ? { ...item, label: event.target.value }
-                          : item,
-                      ),
-                    )
-                  }
-                />
-                <Button
-                  type="button"
-                  variant="ghost"
-                  size="icon"
-                  onClick={() =>
-                    onApiKeyGroupsChange(
-                      apiKeyGroups.filter((_, index) => index !== groupIndex),
-                    )
-                  }
-                  aria-label={t("common.delete", { defaultValue: "Delete" })}
-                >
-                  <Trash2 className="h-4 w-4" />
-                </Button>
+                </FormLabel>
+                <p className="text-xs text-muted-foreground">
+                  {t("codexConfig.apiKeyGroupsHint", {
+                    defaultValue:
+                      "Match exact models first, then prefixes. Keys rotate within each group.",
+                  })}
+                </p>
               </div>
-              <div className="flex items-center justify-between gap-3 text-sm">
-                <label className="flex items-center gap-2 text-muted-foreground">
-                  <Switch
-                    checked={group.enabled !== false}
-                    onCheckedChange={(checked) =>
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                onClick={() =>
+                  onApiKeyGroupsChange([
+                    ...apiKeyGroups,
+                    {
+                      id: crypto.randomUUID(),
+                      label: "",
+                      apiKeys: [""],
+                      models: [],
+                      prefixes: [],
+                      enabled: true,
+                      strategy: "round_robin",
+                    },
+                  ])
+                }
+              >
+                <Plus className="mr-1 h-3.5 w-3.5" />
+                {t("codexConfig.apiKeyGroupsAdd", {
+                  defaultValue: "Add group",
+                })}
+              </Button>
+            </div>
+            {apiKeyGroups.map((group, groupIndex) => (
+              <div key={group.id} className="space-y-2 rounded border p-2">
+                <div className="flex gap-2">
+                  <Input
+                    value={group.label ?? ""}
+                    placeholder={t("codexConfig.apiKeyGroupLabel", {
+                      defaultValue: "Group label",
+                    })}
+                    onChange={(event) =>
                       onApiKeyGroupsChange(
                         apiKeyGroups.map((item, index) =>
                           index === groupIndex
-                            ? { ...item, enabled: checked }
+                            ? { ...item, label: event.target.value }
                             : item,
                         ),
                       )
                     }
                   />
-                  {t("codexConfig.apiKeyGroupEnabled", {
-                    defaultValue: "Enabled",
-                  })}
-                </label>
-                <div className="flex items-center gap-2">
-                  <span className="text-xs text-muted-foreground">
-                    {t("codexConfig.apiKeyGroupStrategy", {
-                      defaultValue: "Rotation",
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="icon"
+                    onClick={() =>
+                      onApiKeyGroupsChange(
+                        apiKeyGroups.filter((_, index) => index !== groupIndex),
+                      )
+                    }
+                    aria-label={t("common.delete", { defaultValue: "Delete" })}
+                  >
+                    <Trash2 className="h-4 w-4" />
+                  </Button>
+                </div>
+                <div className="flex items-center justify-between gap-3 text-sm">
+                  <label className="flex items-center gap-2 text-muted-foreground">
+                    <Switch
+                      checked={group.enabled !== false}
+                      onCheckedChange={(checked) =>
+                        onApiKeyGroupsChange(
+                          apiKeyGroups.map((item, index) =>
+                            index === groupIndex
+                              ? { ...item, enabled: checked }
+                              : item,
+                          ),
+                        )
+                      }
+                    />
+                    {t("codexConfig.apiKeyGroupEnabled", {
+                      defaultValue: "Enabled",
                     })}
-                  </span>
-                  <Select
-                    value={group.strategy ?? "round_robin"}
-                    onValueChange={(value: "round_robin" | "random") =>
+                  </label>
+                  <div className="flex items-center gap-2">
+                    <span className="text-xs text-muted-foreground">
+                      {t("codexConfig.apiKeyGroupStrategy", {
+                        defaultValue: "Rotation",
+                      })}
+                    </span>
+                    <Select
+                      value={group.strategy ?? "round_robin"}
+                      onValueChange={(value: "round_robin" | "random") =>
+                        onApiKeyGroupsChange(
+                          apiKeyGroups.map((item, index) =>
+                            index === groupIndex
+                              ? { ...item, strategy: value }
+                              : item,
+                          ),
+                        )
+                      }
+                    >
+                      <SelectTrigger className="h-8 w-36">
+                        <SelectValue />
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="round_robin">
+                          {t("codexConfig.apiKeyGroupRoundRobin", {
+                            defaultValue: "Round robin",
+                          })}
+                        </SelectItem>
+                        <SelectItem value="random">
+                          {t("codexConfig.apiKeyGroupRandom", {
+                            defaultValue: "Random",
+                          })}
+                        </SelectItem>
+                      </SelectContent>
+                    </Select>
+                  </div>
+                </div>
+                <div className="space-y-1">
+                  {(group.apiKeys.length > 0 ? group.apiKeys : [""]).map(
+                    (key, keyIndex) => (
+                      <div
+                        key={`${group.id}-key-${keyIndex}`}
+                        className="flex gap-2"
+                      >
+                        <Input
+                          type="password"
+                          value={key}
+                          placeholder={t("codexConfig.apiKeyGroupKey", {
+                            defaultValue: "API key",
+                          })}
+                          onChange={(event) =>
+                            onApiKeyGroupsChange(
+                              apiKeyGroups.map((item, index) =>
+                                index === groupIndex
+                                  ? {
+                                      ...item,
+                                      apiKeys: item.apiKeys.map(
+                                        (value, current) =>
+                                          current === keyIndex
+                                            ? event.target.value
+                                            : value,
+                                      ),
+                                    }
+                                  : item,
+                              ),
+                            )
+                          }
+                        />
+                        <Button
+                          type="button"
+                          variant="ghost"
+                          size="icon"
+                          disabled={group.apiKeys.length <= 1}
+                          onClick={() =>
+                            onApiKeyGroupsChange(
+                              apiKeyGroups.map((item, index) =>
+                                index === groupIndex
+                                  ? {
+                                      ...item,
+                                      apiKeys: item.apiKeys.filter(
+                                        (_, current) => current !== keyIndex,
+                                      ),
+                                    }
+                                  : item,
+                              ),
+                            )
+                          }
+                          aria-label={t("common.delete", {
+                            defaultValue: "Delete",
+                          })}
+                        >
+                          <Trash2 className="h-4 w-4" />
+                        </Button>
+                      </div>
+                    ),
+                  )}
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="sm"
+                    onClick={() =>
                       onApiKeyGroupsChange(
                         apiKeyGroups.map((item, index) =>
                           index === groupIndex
-                            ? { ...item, strategy: value }
+                            ? { ...item, apiKeys: [...item.apiKeys, ""] }
                             : item,
                         ),
                       )
                     }
                   >
-                    <SelectTrigger className="h-8 w-36">
-                      <SelectValue />
-                    </SelectTrigger>
-                    <SelectContent>
-                      <SelectItem value="round_robin">
-                        {t("codexConfig.apiKeyGroupRoundRobin", {
-                          defaultValue: "Round robin",
-                        })}
-                      </SelectItem>
-                      <SelectItem value="random">
-                        {t("codexConfig.apiKeyGroupRandom", {
-                          defaultValue: "Random",
-                        })}
-                      </SelectItem>
-                    </SelectContent>
-                  </Select>
+                    <Plus className="mr-1 h-3.5 w-3.5" />
+                    {t("codexConfig.apiKeyGroupAddKey", {
+                      defaultValue: "Add key",
+                    })}
+                  </Button>
                 </div>
-              </div>
-              <div className="space-y-1">
-                {(group.apiKeys.length > 0 ? group.apiKeys : [""]).map(
-                  (key, keyIndex) => (
-                    <div
-                      key={`${group.id}-key-${keyIndex}`}
-                      className="flex gap-2"
-                    >
-                      <Input
-                        type="password"
-                        value={key}
-                        placeholder={t("codexConfig.apiKeyGroupKey", {
-                          defaultValue: "API key",
-                        })}
-                        onChange={(event) =>
-                          onApiKeyGroupsChange(
-                            apiKeyGroups.map((item, index) =>
-                              index === groupIndex
-                                ? {
-                                    ...item,
-                                    apiKeys: item.apiKeys.map(
-                                      (value, current) =>
-                                        current === keyIndex
-                                          ? event.target.value
-                                          : value,
-                                    ),
-                                  }
-                                : item,
-                            ),
-                          )
-                        }
-                      />
-                      <Button
-                        type="button"
-                        variant="ghost"
-                        size="icon"
-                        disabled={group.apiKeys.length <= 1}
-                        onClick={() =>
-                          onApiKeyGroupsChange(
-                            apiKeyGroups.map((item, index) =>
-                              index === groupIndex
-                                ? {
-                                    ...item,
-                                    apiKeys: item.apiKeys.filter(
-                                      (_, current) => current !== keyIndex,
-                                    ),
-                                  }
-                                : item,
-                            ),
-                          )
-                        }
-                        aria-label={t("common.delete", {
-                          defaultValue: "Delete",
-                        })}
-                      >
-                        <Trash2 className="h-4 w-4" />
-                      </Button>
-                    </div>
-                  ),
-                )}
-                <Button
-                  type="button"
-                  variant="ghost"
-                  size="sm"
-                  onClick={() =>
+                <Input
+                  value={(group.models ?? []).join(", ")}
+                  placeholder={t("codexConfig.apiKeyGroupModels", {
+                    defaultValue: "Exact models, comma separated",
+                  })}
+                  onChange={(event) =>
                     onApiKeyGroupsChange(
                       apiKeyGroups.map((item, index) =>
                         index === groupIndex
-                          ? { ...item, apiKeys: [...item.apiKeys, ""] }
+                          ? {
+                              ...item,
+                              models: event.target.value
+                                .split(",")
+                                .map((value) => value.trim())
+                                .filter(Boolean),
+                            }
                           : item,
                       ),
                     )
                   }
-                >
-                  <Plus className="mr-1 h-3.5 w-3.5" />
-                  {t("codexConfig.apiKeyGroupAddKey", {
-                    defaultValue: "Add key",
+                />
+                <Input
+                  value={(group.prefixes ?? []).join(", ")}
+                  placeholder={t("codexConfig.apiKeyGroupPrefixes", {
+                    defaultValue: "Model prefixes, comma separated",
                   })}
-                </Button>
+                  onChange={(event) =>
+                    onApiKeyGroupsChange(
+                      apiKeyGroups.map((item, index) =>
+                        index === groupIndex
+                          ? {
+                              ...item,
+                              prefixes: event.target.value
+                                .split(",")
+                                .map((value) => value.trim())
+                                .filter(Boolean),
+                            }
+                          : item,
+                      ),
+                    )
+                  }
+                />
               </div>
-              <Input
-                value={(group.models ?? []).join(", ")}
-                placeholder={t("codexConfig.apiKeyGroupModels", {
-                  defaultValue: "Exact models, comma separated",
-                })}
-                onChange={(event) =>
-                  onApiKeyGroupsChange(
-                    apiKeyGroups.map((item, index) =>
-                      index === groupIndex
-                        ? {
-                            ...item,
-                            models: event.target.value
-                              .split(",")
-                              .map((value) => value.trim())
-                              .filter(Boolean),
-                          }
-                        : item,
-                    ),
-                  )
-                }
-              />
-              <Input
-                value={(group.prefixes ?? []).join(", ")}
-                placeholder={t("codexConfig.apiKeyGroupPrefixes", {
-                  defaultValue: "Model prefixes, comma separated",
-                })}
-                onChange={(event) =>
-                  onApiKeyGroupsChange(
-                    apiKeyGroups.map((item, index) =>
-                      index === groupIndex
-                        ? {
-                            ...item,
-                            prefixes: event.target.value
-                              .split(",")
-                              .map((value) => value.trim())
-                              .filter(Boolean),
-                          }
-                        : item,
-                    ),
-                  )
-                }
-              />
-            </div>
-          ))}
-        </div>
-      )}
+            ))}
+          </div>
+        )}
 
       {/* Codex Base URL 输入框（托管 OAuth 端点由 adapter 硬定向，不展示） */}
       {shouldShowSpeedTest && !isXaiOauthPreset && (
