@@ -990,7 +990,8 @@
       "save": "Save Codex global configuration",
       "guardianV2Label": "Disable Guardian v2 compatibility mode",
       "guardianV2Description": "Writes the scalar `features.guardianv2 = false` override to avoid Desktop/app-server schema mismatches. Re-enable it after Codex versions are aligned."
-    }
+    },
+    "commitsBehind": "{{count}} upstream commit(s) behind — cherry-pick available"
   },
   "apps": {
     "claude": "Claude",

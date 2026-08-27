@@ -990,7 +990,8 @@
       "save": "Codex グローバル設定を保存",
       "guardianV2Label": "Guardian v2 互換モードを無効化",
       "guardianV2Description": "`features.guardianv2 = false` を書き込み、Desktop と app-server の設定スキーマ不一致を回避します。Codex のバージョンを揃えたら再度有効化できます。"
-    }
+    },
+    "commitsBehind": "上流より{{count}}コミット遅れています（cherry-pick可能）"
   },
   "apps": {
     "claude": "Claude",

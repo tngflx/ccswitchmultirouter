@@ -7,8 +7,35 @@ fn main() {
     println!("cargo:rerun-if-changed=icons/128x128.png");
     println!("cargo:rerun-if-changed=icons/128x128@2x.png");
     println!("cargo:rerun-if-changed=tauri.conf.json");
+    println!("cargo:rerun-if-changed=../.git/HEAD");
 
     tauri_build::build();
+
+    // Embed the source commit so the app can compare itself with the upstream fork.
+    if let Ok(output) = std::process::Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .output()
+    {
+        if output.status.success() {
+            let commit = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            println!("cargo:rustc-env=CCSWITCHMULTI_GIT_COMMIT={commit}");
+            // Compare from the nearest upstream ancestor when local commits are
+            // fork-only (GitHub cannot resolve those hashes in its repository).
+            if let Ok(base_output) = std::process::Command::new("git")
+                .args(["merge-base", "HEAD", "upstream/main"])
+                .output()
+            {
+                if base_output.status.success() {
+                    let base = String::from_utf8_lossy(&base_output.stdout)
+                        .trim()
+                        .to_string();
+                    if !base.is_empty() {
+                        println!("cargo:rustc-env=CCSWITCHMULTI_GIT_BASE={base}");
+                    }
+                }
+            }
+        }
+    }
 
     // Windows: Embed Common Controls v6 manifest for test binaries
     //
