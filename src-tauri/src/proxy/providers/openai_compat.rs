@@ -118,6 +118,8 @@ pub(crate) fn normalize_codex_oauth_responses_request(
     normalize_codex_oauth_responses_input(&mut body);
     if !use_responses_lite {
         ensure_codex_oauth_responses_instructions(&mut body);
+    } else {
+        ensure_codex_responses_lite_reasoning_context(&mut body);
     }
     ensure_codex_oauth_reasoning_include(&mut body);
 
@@ -152,6 +154,21 @@ pub(crate) fn normalize_codex_oauth_responses_request(
     let mut normalized = Value::Object(body);
     super::transform_codex_chat::normalize_replayed_item_ids_for_openai(&mut normalized);
     normalized
+}
+
+/// Responses-Lite requires the full conversation context mode for every
+/// request, including compaction requests emitted by newer Codex clients.
+/// Preserve any other reasoning settings supplied by the client.
+fn ensure_codex_responses_lite_reasoning_context(body: &mut Map<String, Value>) {
+    let reasoning = body
+        .entry("reasoning".to_string())
+        .or_insert_with(|| Value::Object(Map::new()));
+    if !reasoning.is_object() {
+        *reasoning = Value::Object(Map::new());
+    }
+    if let Some(object) = reasoning.as_object_mut() {
+        object.insert("context".to_string(), Value::String("all_turns".to_string()));
+    }
 }
 
 /// Remove the private encrypted marker from non-reserved `agents.*` V2 messages.
@@ -2432,6 +2449,25 @@ mod tests {
         assert_eq!(input[2]["type"], "agent_message");
         assert!(input[2].get("content").is_some());
         assert!(input[3].get("content").is_none());
+    }
+
+    #[test]
+    fn codex_oauth_responses_lite_forces_all_turns_reasoning_context() {
+        let normalized = normalize_codex_oauth_responses_request(
+            json!({
+                "model": "gpt-5.6-sol",
+                "input": [{
+                    "type": "message",
+                    "role": "user",
+                    "content": [{ "type": "input_text", "text": "compact" }]
+                }],
+                "reasoning": { "effort": "high", "context": "last_turn" }
+            }),
+            true,
+        );
+
+        assert_eq!(normalized["reasoning"]["effort"], "high");
+        assert_eq!(normalized["reasoning"]["context"], "all_turns");
     }
 
     #[test]

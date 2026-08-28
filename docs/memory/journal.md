@@ -175,3 +175,10 @@
 - **Root cause of errors found:** wrote docs from memory instead of verifying — three claims were wrong: (1) `codex_traffic_policy.rs` is admission/rejection retry policy, NOT official-vs-third-party routing; (2) `official_first`/`third_party_first` is the Sub-Agent V2 selection policy (`types/codexSubagentV2.ts`, `forwarder.rs`); (3) `CodexApiKeyGroup` backend logic lives in `proxy/providers/codex.rs` (settings key `codexApiKeyGroups`), not `provider.rs`.
 - **Evidence:** validator 44/44 PASS after fixes.
 - **Don't again:** never document a module's purpose from its name alone — read the module header first; and always run the validator after editing AGENTS.md.
+# 2026-08-28 - Responses-Lite compaction rejection and curated catalog refresh
+
+- **What happened:** Codex compaction requests routed through Sublyx repeatedly failed with HTTP 400: `X-OpenAI-Internal-Codex-Responses-Lite requires reasoning.context to be all_turns`; model refresh also reintroduced remotely fetched models into manually curated provider catalogs.
+- **Root cause:** the Lite request normalizer preserved the client `reasoning` object without enforcing the upstream-required `context`, while the catalog refresh path always appended fetched models when a catalog already existed.
+- **What we did:** Lite normalization now preserves existing reasoning fields and forces `reasoning.context = "all_turns"`; refresh merges only metadata for existing catalog identities and appends fetched models only when the catalog is empty. Updated focused wizard tests to assert curated catalogs stay unchanged.
+- **Evidence:** live `~/.cc-switch/logs/codex-router.log` showed repeated `codex_request_kind=compaction` 400s through `https://api.sublyx.org/v1/chat/completions`; targeted Rust test passed (`1 passed`), `cargo check` passed, focused Vitest passed (`3 files, 159 tests`). `pnpm typecheck` passed earlier in this turn.
+- **What NOT to do again:** do not treat a complete `/models` response as permission to add models to an existing user-curated catalog; do not send Responses-Lite without the required `reasoning.context=all_turns` field.

@@ -98,7 +98,6 @@ import {
   writeHostedToolsConfig,
 } from "@/lib/hostedTools";
 import { applyCodexCatalogModelOrder } from "@/lib/codexModelCatalogOrder";
-import { pruneMissingRemoteCodexCatalogRows } from "@/lib/codexCatalogReconciliation";
 import { usageApi } from "@/lib/api/usage";
 import {
   usageKeys,
@@ -966,11 +965,10 @@ function getProviderModelFetchConfig(
   };
 }
 
-/// 将远端模型结果写回 provider 的 modelCatalog；保留用户筛选，同时追加远端新模型。
+/// 将远端模型结果写回 provider 的 modelCatalog；空目录用于初始化，已有目录只刷新保留模型的元数据。
 function providerWithFetchedModelCatalog(
   provider: Provider,
   fetchedModels: FetchedModel[],
-  removeMissingRemote = false,
 ): Provider {
   const currentCatalog = readCodexModelCatalog(provider);
   const fetchConfig = getProviderModelFetchConfig(provider);
@@ -995,11 +993,7 @@ function providerWithFetchedModelCatalog(
       byFetchedModel.set(upstreamModel.toLowerCase(), index);
     }
   }
-  // Refreshes are also catalog syncs: a later upstream response may publish a
-  // model that was absent from the previous catalog. Existing disabled rows
-  // still win through the identity maps above, so they remain tombstones rather
-  // than being re-added or re-enabled.
-  const shouldAppendFetchedModels = true;
+  const shouldAppendFetchedModels = currentCatalog.models.length === 0;
 
   for (const fetched of fetchedModels) {
     const id = fetched.id.trim();
@@ -1057,18 +1051,15 @@ function providerWithFetchedModelCatalog(
     models.push(nextModel);
   }
 
-  const reconciledModels = removeMissingRemote
-    ? pruneMissingRemoteCodexCatalogRows(models, fetchedModels).rows
-    : models;
   return {
     ...provider,
     settingsConfig: {
       ...provider.settingsConfig,
       modelCatalog: {
-        models: reconciledModels,
+        models,
         spawnAgentModels: normalizeCodexSpawnAgentModels(
           currentCatalog.spawnAgentModels,
-          reconciledModels,
+          models,
         ),
       },
     },
@@ -2337,7 +2328,9 @@ export function buildModelCatalogForRoutes(
   );
   return {
     displayNameStyle:
-      routing?.modelDisplayStyle ?? existingCatalog?.displayNameStyle,
+      routing?.modelDisplayStyle ??
+      existingCatalog?.displayNameStyle ??
+      DEFAULT_CODEX_MODEL_DISPLAY_STYLE,
     models,
     spawnAgentModels,
   };
@@ -2384,6 +2377,7 @@ export function createDraftRoutingPlan(
       codexRouting: {
         schemaVersion: 2,
         enabled: true,
+        modelDisplayStyle: DEFAULT_CODEX_MODEL_DISPLAY_STYLE,
         subagentVersion: "v2",
         spawnAgentModels: Array.from(new Set(sourceModels)).slice(0, 5),
         routes: [],
@@ -3284,11 +3278,7 @@ export function CodexRouterWorkspacePage({
           };
         }
 
-        const nextProvider = providerWithFetchedModelCatalog(
-          provider,
-          models,
-          authoritative,
-        );
+        const nextProvider = providerWithFetchedModelCatalog(provider, models);
         setProviderModelRefreshStates((current) => ({
           ...current,
           [provider.id]: {
@@ -4721,6 +4711,9 @@ export type CodexModelSortMode =
   | "provider"
   | "provider-model";
 
+const DEFAULT_CODEX_MODEL_DISPLAY_STYLE: CodexModelDisplayStyle =
+  "provider-model";
+
 export function codexCatalogProviderName(
   model: Pick<CodexCatalogModel, "providerName" | "provider_name">,
 ): string {
@@ -4729,7 +4722,7 @@ export function codexCatalogProviderName(
 
 export function formatCodexCatalogModelLabel(
   model: CodexCatalogModel,
-  style: CodexModelDisplayStyle = "model",
+  style: CodexModelDisplayStyle = DEFAULT_CODEX_MODEL_DISPLAY_STYLE,
 ): string {
   const id = model.model?.trim() ?? "";
   const provider = codexCatalogProviderName(model);
@@ -4746,7 +4739,7 @@ export function formatCodexCatalogModelLabel(
     : rawDisplay;
   if (!provider || style === "model") return display;
   return style === "provider-model"
-    ? `${provider} · ${display}`
+    ? `[${provider}] ${display}`
     : `${display} · ${provider}`;
 }
 
@@ -4796,8 +4789,9 @@ function ModelOrderTab({
   const [isSaving, setIsSaving] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [displayStyle, setDisplayStyle] =
-    useState<CodexModelDisplayStyle>("model");
+  const [displayStyle, setDisplayStyle] = useState<CodexModelDisplayStyle>(
+    DEFAULT_CODEX_MODEL_DISPLAY_STYLE,
+  );
   const [sortMode, setSortMode] = useState<CodexModelSortMode>("custom");
   const sensors = useSensors(
     useSensor(PointerSensor),
@@ -4838,7 +4832,9 @@ function ModelOrderTab({
     modelsWithProvider,
     sortMode,
   );
-  const styleDirty = displayStyle !== (catalog.displayNameStyle ?? "model");
+  const styleDirty =
+    displayStyle !==
+    (catalog.displayNameStyle ?? DEFAULT_CODEX_MODEL_DISPLAY_STYLE);
   const hasChanges =
     styleDirty ||
     visibleDraftModels.map((model) => model.model).join("\n") !==
@@ -4853,7 +4849,9 @@ function ModelOrderTab({
         .join("\n");
 
   useEffect(() => {
-    setDisplayStyle(catalog.displayNameStyle ?? "model");
+    setDisplayStyle(
+      catalog.displayNameStyle ?? DEFAULT_CODEX_MODEL_DISPLAY_STYLE,
+    );
     setDraftModels(
       catalog.models
         .slice()
