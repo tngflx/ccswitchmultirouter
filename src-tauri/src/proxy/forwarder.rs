@@ -76,6 +76,7 @@ const UPSTREAM_TRANSPORT_RETRY_LIMIT: usize = 5;
 const CODEX_RATE_LIMIT_MAX_SINGLE_DELAY: Duration = Duration::from_secs(60);
 const CODEX_RATE_LIMIT_TOTAL_DELAY_BUDGET: Duration = Duration::from_secs(180);
 
+#[allow(clippy::too_many_arguments)]
 fn create_hosted_codex_chat_sse_stream_from_verified_profile<F, Fut>(
     initial_stream: ChatSseStream,
     tool_context: CodexToolContext,
@@ -4184,7 +4185,7 @@ impl RequestForwarder {
                             Ok(Some(Box::pin(
                                 response
                                     .bytes_stream()
-                                    .map(|item| item.map_err(|error| std::io::Error::other(error))),
+                                    .map(|item| item.map_err(std::io::Error::other)),
                             ) as ChatSseStream))
                         }
                     };
@@ -6547,6 +6548,7 @@ fn source_codex_oauth_credentials(
 ///
 /// 副作用:
 /// - 可能调用 OpenAI hosted tools，并可能向同一第三方 Chat 上游追加多轮请求。
+#[allow(clippy::too_many_arguments)]
 async fn run_hosted_tool_chat_loop<F, Fut>(
     mut response: ProxyResponse,
     chat_request: &mut Value,

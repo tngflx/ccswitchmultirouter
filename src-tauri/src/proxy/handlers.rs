@@ -3537,6 +3537,7 @@ fn create_codex_chat_sse_stream_from_verified_profile<E: std::error::Error + Sen
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn create_codex_chat_sse_stream_from_verified_profile_with_diagnostics<
     E: std::error::Error + Send + 'static,
 >(
@@ -3643,6 +3644,7 @@ fn observe_codex_chat_json_profile(
     observe_and_expire_protocol_profile(db, &target, &profile, &observed, now);
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_codex_chat_to_responses_transform(
     response: super::hyper_client::ProxyResponse,
     ctx: &RequestContext,

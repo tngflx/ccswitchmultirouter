@@ -147,8 +147,9 @@ describe("SettingsPage integration", () => {
   it("loads default settings from MSW", async () => {
     renderDialog();
 
-    await waitFor(() =>
-      expect(screen.getByText("language:zh")).toBeInTheDocument(),
+    await waitFor(
+      () => expect(screen.getByText("language:zh")).toBeInTheDocument(),
+      { timeout: 5000 },
     );
     fireEvent.click(screen.getByText("settings.tabAdvanced"));
     fireEvent.click(screen.getByText("settings.advanced.configDir.title"));

@@ -63,4 +63,3 @@ describe("application update checks", () => {
     expect(invoke).toHaveBeenNthCalledWith(2, "check_github_commits_behind");
   });
 });
-

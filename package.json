@@ -1,6 +1,6 @@
 {
   "name": "cc-switch-multi",
-  "version": "3.19.2-19",
+  "version": "3.19.2-20",
   "description": "All-in-One Assistant for Claude Code, Codex & Gemini CLI",
   "type": "module",
   "scripts": {
@@ -25,7 +25,11 @@
   "keywords": [],
   "author": "Jason Young",
   "license": "MIT",
-  "packageManager": "pnpm@10.12.3",
+  "packageManager": "pnpm@11.24.0",
+  "engines": {
+    "node": ">=22.13.0",
+    "pnpm": ">=11.24.0 <12"
+  },
   "devDependencies": {
     "@tauri-apps/cli": "2.10.1",
     "@testing-library/jest-dom": "^6.6.3",
@@ -98,5 +102,3 @@
     "zod": "^4.1.12"
   }
 }
-
-

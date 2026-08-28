@@ -108,7 +108,7 @@ pub fn parse_bundle_bytes(bytes: &[u8]) -> Option<PresetTableBundle> {
         );
         return None;
     }
-    let bundle: PresetTableBundle = serde_json::from_slice(&bytes).ok()?;
+    let bundle: PresetTableBundle = serde_json::from_slice(bytes).ok()?;
     if !matches!(
         bundle.schema_version,
         PRESET_TABLE_LEGACY_SCHEMA_VERSION | PRESET_TABLE_SCHEMA_VERSION

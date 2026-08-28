@@ -1311,9 +1311,7 @@ where
         .and_then(JsonValue::as_str)
         .map(str::trim)
         .filter(|id| !id.is_empty())?;
-    if target.route_id.is_none() {
-        return None;
-    }
+    target.route_id.as_ref()?;
 
     let mut standalone_target = target.clone();
     standalone_target.provider_id = target_provider_id.to_string();
@@ -1342,32 +1340,24 @@ pub(crate) fn resolve_codex_chat_protocol_target(
             .get(CODEX_ROUTER_PARENT_PROVIDER_ID)
             .is_some();
     let (provider_id, route_id) = if is_routed {
-        let Some(parent_provider_id) = provider
+        let parent_provider_id = provider
             .settings_config
             .get(CODEX_ROUTER_PARENT_PROVIDER_ID)
             .and_then(JsonValue::as_str)
             .map(str::trim)
-            .filter(|id| !id.is_empty())
-        else {
-            return None;
-        };
-        let Some(route_id) = provider
+            .filter(|id| !id.is_empty())?;
+        let route_id = provider
             .settings_config
             .get("codexResolvedRouteId")
             .and_then(JsonValue::as_str)
             .map(str::trim)
-            .filter(|id| !id.is_empty())
-        else {
-            return None;
-        };
+            .filter(|id| !id.is_empty())?;
         (parent_provider_id, Some(route_id))
     } else {
         (provider.id.as_str(), None)
     };
 
-    let Some(base_url) = provider_codex_base_url(provider) else {
-        return None;
-    };
+    let base_url = provider_codex_base_url(provider)?;
     let is_full_url = provider
         .meta
         .as_ref()
