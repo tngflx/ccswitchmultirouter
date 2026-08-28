@@ -53,12 +53,9 @@
 
 18. **NEVER use plain `cargo build --release` for production.** Without `--features tauri/custom-protocol`, the binary embeds `devUrl` (localhost:3000) instead of the built frontend assets. This causes the "This site can't be reached / localhost refused to connect" error.
 
-19. **Correct production build commands (use one of these):**
-    - Full Tauri bundle: `pnpm build` (runs `pnpm tauri build`)
-    - Raw exe only: `pnpm build:exe` (runs `pnpm build:renderer && cargo build --manifest-path src-tauri/Cargo.toml --bin cc-switch --release --features tauri/custom-protocol`)
-    - Full release pipeline with artifacts: `pnpm release:local`
+19. **Production and release artifacts MUST be built entirely by GitHub Actions.** Agents must never run `pnpm build`, `pnpm build:exe`, `pnpm release:local`, `pnpm tauri build`, or any release-mode Cargo build on a developer workstation for a release. This prohibition includes binaries, installers, bundles, signatures, checksums, and updater artifacts. Local `cargo check`, `cargo test`, frontend type checks, and frontend tests remain allowed because they do not produce release artifacts. Trigger the repository's release workflow and use only artifacts produced by that GitHub Actions run.
 
-20. **Before declaring a production build successful, verify the binary embeds frontend assets:**
+20. **Before declaring a GitHub Actions production build successful, download or inspect the workflow-produced binary and verify that it embeds frontend assets:**
     ```powershell
     $bytes = [System.IO.File]::ReadAllBytes("src-tauri\target\release\cc-switch.exe")
     $text = [System.Text.Encoding]::ASCII.GetString($bytes)
@@ -190,9 +187,7 @@ Backend (Rust, Tauri 2.8, rusqlite)
 pnpm install               # deps
 pnpm dev                   # tauri dev (hot reload)
 pnpm dev:renderer          # Vite only, no Tauri shell
-pnpm build                 # production Tauri bundle
-pnpm build:exe             # renderer build + cargo release with custom-protocol (see rule 18)
-pnpm release:local         # full local release pipeline (artifacts + checksums)
+# Production/release builds are GitHub Actions-only (see rule 19).
 pnpm typecheck             # tsc --noEmit (strict)
 pnpm format:check          # prettier check
 pnpm test:unit             # vitest run
@@ -242,6 +237,7 @@ Final verification checklist (only at the boundary in rule 9): `cargo check` + f
 - Don't add IPC fields without `rename_all = "camelCase"`.
 - Don't add an i18n key to only one locale file — CI won't catch it; users will.
 - Don't use plain `cargo build --release` for production (rule 18).
+- Don't build, package, sign, checksum, or upload release artifacts from a developer workstation (rule 19).
 
 ## COMMIT GUIDELINES
 
