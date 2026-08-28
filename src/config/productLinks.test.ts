@@ -14,4 +14,3 @@ describe("CCSwitchMulti product links", () => {
     );
   });
 });
-

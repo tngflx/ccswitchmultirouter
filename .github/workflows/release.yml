@@ -3,7 +3,7 @@ name: Release
 on:
   push:
     tags:
-      - 'v*'
+      - "v*"
 
 permissions:
   contents: write
@@ -38,7 +38,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v6
         with:
-          node-version: '20'
+          node-version-file: ".node-version"
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
@@ -138,7 +138,7 @@ jobs:
         if: runner.os != 'Windows' || runner.arch != 'ARM64'
         uses: pnpm/action-setup@v6
         with:
-          version: 10.12.3
+          version: 11.24.0
           run_install: false
 
       - name: Setup pnpm (Windows ARM64)
@@ -215,7 +215,7 @@ jobs:
             echo "请检查 GitHub 仓库 Settings > Secrets and variables > Actions" >&2
             exit 1
           fi
-          
+
           RAW="${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}"
           # 目标：提供正确的私钥“文件路径”给 Tauri CLI，避免内容解码歧义
           KEY_PATH="$RUNNER_TEMP/tauri_signing.key"
@@ -842,12 +842,23 @@ jobs:
         run: |
           set -euo pipefail
           TAG="${GITHUB_REF_NAME}"
-          NOTE_PATH="docs/release-notes/${TAG}-zh.md"
           {
-            if [ -f "$NOTE_PATH" ]; then
-              cat "$NOTE_PATH"
-            else
-              echo "# CCSwitchMulti ${TAG}"
+            echo "# CCSwitchMulti ${TAG}"
+            echo
+            FOUND_NOTES=0
+            for LANG in en zh ja; do
+              NOTE_PATH="docs/release-notes/${TAG}-${LANG}.md"
+              if [ -f "$NOTE_PATH" ]; then
+                if [ "$FOUND_NOTES" -gt 0 ]; then
+                  echo
+                  echo "---"
+                  echo
+                fi
+                cat "$NOTE_PATH"
+                FOUND_NOTES=$((FOUND_NOTES + 1))
+              fi
+            done
+            if [ "$FOUND_NOTES" -eq 0 ]; then
               echo
               echo "本版本由 GitHub Release workflow 自动发布。"
             fi

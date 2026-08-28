@@ -906,4 +906,3 @@ pub async fn open_log_dir(app: AppHandle) -> Result<bool, String> {
 
     Ok(true)
 }
-

@@ -389,7 +389,8 @@ wire_api = "responses"`;
                 </button>
               ))}
             </div>
-            {(selectedPreset?.descriptionKey || selectedPreset?.description) && (
+            {(selectedPreset?.descriptionKey ||
+              selectedPreset?.description) && (
               <p className="text-xs text-muted-foreground">
                 {selectedPreset.descriptionKey
                   ? t(selectedPreset.descriptionKey)

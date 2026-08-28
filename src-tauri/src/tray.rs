@@ -1537,4 +1537,3 @@ mod tests {
         assert!(format_script_summary(&r).is_none());
     }
 }
-
