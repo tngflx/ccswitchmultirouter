@@ -842,41 +842,26 @@ jobs:
         run: |
           set -euo pipefail
           TAG="${GITHUB_REF_NAME}"
+          NOTE_PATH="docs/release-notes/${TAG}-en.md"
           {
             echo "# CCSwitchMulti ${TAG}"
             echo
-            FOUND_NOTES=0
-            for LANG in en zh ja; do
-              NOTE_PATH="docs/release-notes/${TAG}-${LANG}.md"
-              if [ -f "$NOTE_PATH" ]; then
-                if [ "$FOUND_NOTES" -gt 0 ]; then
-                  echo
-                  echo "---"
-                  echo
-                fi
-                cat "$NOTE_PATH"
-                FOUND_NOTES=$((FOUND_NOTES + 1))
-              fi
-            done
-            if [ "$FOUND_NOTES" -eq 0 ]; then
-              echo
-              echo "本版本由 GitHub Release workflow 自动发布。"
+            if [ -f "$NOTE_PATH" ]; then
+              cat "$NOTE_PATH"
+            else
+              echo "- Maintenance release with stability and compatibility improvements."
             fi
             cat <<EOF
 
-          ## 下载
+          ## Downloads
 
-          - **macOS**: \`CCSwitchMulti-${TAG}-macOS.dmg\`（未配置 Apple 签名时为未签名版）或 \`CCSwitchMulti-${TAG}-macOS.zip\`（解压即用）
-          - **Windows (x86_64)**: \`CCSwitchMulti-${TAG}-Windows-Setup.exe\`（安装版）或 \`CCSwitchMulti-${TAG}-Windows-Portable.zip\`（绿色版）
-          - **Windows (ARM64)**: \`CCSwitchMulti-${TAG}-Windows-arm64-Setup.exe\`（安装版）或 \`CCSwitchMulti-${TAG}-Windows-arm64-Portable.zip\`（绿色版）
-          - **Linux (x86_64)**: \`CCSwitchMulti-${TAG}-Linux-x86_64.AppImage\` / \`.deb\` / \`.rpm\`
-          - **Linux (ARM64)**: \`CCSwitchMulti-${TAG}-Linux-arm64.AppImage\` / \`.deb\` / \`.rpm\`
-
-          > \`.tar.gz\` 为 Tauri updater 自动更新专用，无需手动下载。
-
-          ---
-
-          macOS DMG 在仓库配置 Apple 签名和公证密钥时会签名并公证；未配置时发布 Tauri 生成的未签名 DMG、updater tarball 和 app zip。
+          - **macOS:** \`CCSwitchMulti-${TAG}-macOS.dmg\` or \`CCSwitchMulti-${TAG}-macOS.zip\`
+          - **Windows (x86_64):** \`CCSwitchMulti-${TAG}-Windows-Setup.exe\` or \`CCSwitchMulti-${TAG}-Windows-Portable.zip\`
+          - **Windows (ARM64):** \`CCSwitchMulti-${TAG}-Windows-arm64-Setup.exe\` or \`CCSwitchMulti-${TAG}-Windows-arm64-Portable.zip\`
+          - **Linux (x86_64):** \`CCSwitchMulti-${TAG}-Linux-x86_64.AppImage\`, \`.deb\`, or \`.rpm\`
+          - **Linux (ARM64):** \`CCSwitchMulti-${TAG}-Linux-arm64.AppImage\`, \`.deb\`, or \`.rpm\`
+          - \`.tar.gz\` files are updater artifacts and are not intended for manual installation.
+          - macOS artifacts are signed and notarized when Apple credentials are configured; otherwise the workflow publishes unsigned Tauri artifacts.
           EOF
           } > release-body.md
           cat release-body.md
