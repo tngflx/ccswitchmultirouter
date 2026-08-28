@@ -16,8 +16,7 @@ Node 22.23.2 with pnpm 11.24.0.
 
 - Complete/partial catalog reconciliation shared by the Provider form,
   MultiRouter wizard, OAuth sync, and route workspace.
-- Full English, Simplified Chinese, and Japanese GitHub release notes including
-  upstream cherry-pick and manual-adaptation records.
+- Concise English-only GitHub release notes generated from a single source file.
 
 ### Changed
 
