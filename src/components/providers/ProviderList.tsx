@@ -400,7 +400,7 @@ export function ProviderList({
             onClick={onStartCodexMultiRouterWizard}
           >
             <Wand2 className="mr-2 h-4 w-4" />
-            配置多路模型
+            {t("codexMultiRouter.entryChoice.title")}
           </Button>
           <Button
             type="button"

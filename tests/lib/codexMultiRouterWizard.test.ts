@@ -248,6 +248,37 @@ describe("codexMultiRouterWizard helpers", () => {
     ]);
   });
 
+  it("removes missing remote-bound models on an authoritative wizard refresh", () => {
+    const source = provider({
+      settingsConfig: {
+        modelCatalog: {
+          models: [
+            { model: "friendly", upstreamModel: "remote-kept" },
+            { model: "remote-stale", upstreamModel: "remote-stale" },
+            { model: "manual-entry" },
+          ],
+          spawnAgentModels: ["friendly", "remote-stale", "manual-entry"],
+        },
+      },
+    });
+
+    const refreshed = mergeFetchedModelsIntoWizardProvider(
+      source,
+      [{ id: "remote-kept", ownedBy: null }],
+      { removeMissingRemote: true },
+    );
+
+    expect(
+      refreshed.settingsConfig.modelCatalog.models.map(
+        (model: { model: string }) => model.model,
+      ),
+    ).toEqual(["friendly", "manual-entry"]);
+    expect(refreshed.settingsConfig.modelCatalog.spawnAgentModels).toEqual([
+      "friendly",
+      "manual-entry",
+    ]);
+  });
+
   it("initializes an empty provider catalog from fetched models", () => {
     const source = provider({
       id: "empty-source",
@@ -973,6 +1004,28 @@ describe("codexMultiRouterWizard helpers", () => {
       apiKey: "sk-volc",
     });
     expect(getWizardConfigIssues([agentPlan])).toEqual([]);
+  });
+
+  it("returns the fallback and every enabled grouped key for wizard model sync", () => {
+    const source = provider({
+      settingsConfig: {
+        baseUrl: "https://grouped.example/v1",
+        auth: { OPENAI_API_KEY: "sk-fallback" },
+        codexApiKeyGroups: [
+          {
+            id: "enabled",
+            enabled: true,
+            apiKeys: ["sk-group", "sk-group"],
+          },
+          { id: "disabled", enabled: false, apiKeys: ["sk-disabled"] },
+        ],
+      },
+    });
+
+    expect(getWizardModelFetchConfig(source)).toMatchObject({
+      apiKey: "sk-fallback",
+      apiKeys: ["sk-fallback", "sk-group"],
+    });
   });
 
   it("adds Volcengine OpenAPI model list action when AgentPlan AK/SK exists", () => {

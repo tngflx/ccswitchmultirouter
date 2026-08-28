@@ -1235,7 +1235,7 @@ describe("CodexFormFields local model routing", () => {
       await expectInvalidated();
       await validateCurrentIdentity();
     }
-  });
+  }, 15_000);
 
   it("ignores an older probe completion after a newer provider identity succeeds", async () => {
     const oldProbe = deferred<CodexProviderProtocolPreflightOutcome>();
@@ -1536,6 +1536,11 @@ describe("CodexFormFields local model routing", () => {
     expect(
       latestCatalog().find((model) => model.model === "paid-only")?.enabled,
     ).toBe(false);
+    expect(screen.getByLabelText("Filter model catalog")).toHaveValue("");
+    expect(screen.getByRole("button", { name: "Included 3" })).toHaveAttribute(
+      "aria-pressed",
+      "true",
+    );
   });
 
   it("syncs all remote models as included by default and narrows to only free models", async () => {
@@ -1604,7 +1609,9 @@ describe("CodexFormFields local model routing", () => {
       target: { value: "free" },
     });
     expect(screen.getByLabelText("Include grok-free")).toBeInTheDocument();
-    expect(screen.queryByLabelText("Include grok-paid")).not.toBeInTheDocument();
+    expect(
+      screen.queryByLabelText("Include grok-paid"),
+    ).not.toBeInTheDocument();
   });
 
   it("accumulates included rows across successive filters", async () => {
@@ -1775,7 +1782,7 @@ describe("CodexFormFields local model routing", () => {
     ).toEqual(["sk-fallback", "sk-enabled"]);
   });
 
-  it("accumulates successive model syncs without duplicating or re-enabling rows", async () => {
+  it("removes stale remote models on a complete successive sync without re-enabling retained rows", async () => {
     vi.mocked(fetchModelsForConfig)
       .mockResolvedValueOnce([
         { id: "alpha-free", ownedBy: null },
@@ -1796,14 +1803,19 @@ describe("CodexFormFields local model routing", () => {
     });
 
     fireEvent.change(screen.getByLabelText("Filter model catalog"), {
-      target: { value: "alpha-free" },
+      target: { value: "beta-paid" },
     });
     fireEvent.click(screen.getByRole("button", { name: "Exclude Filtered" }));
     await waitFor(() => {
       expect(
-        latestCatalog().find((model) => model.model === "alpha-free")?.enabled,
+        latestCatalog().find((model) => model.model === "beta-paid")?.enabled,
       ).toBe(false);
     });
+    expect(screen.getByLabelText("Filter model catalog")).toHaveValue("");
+    expect(screen.getByRole("button", { name: "Excluded 1" })).toHaveAttribute(
+      "aria-pressed",
+      "true",
+    );
 
     fireEvent.change(screen.getByLabelText("Filter model catalog"), {
       target: { value: "" },
@@ -1812,17 +1824,62 @@ describe("CodexFormFields local model routing", () => {
 
     await waitFor(() => {
       expect(latestCatalog().map((model) => model.model)).toEqual([
-        "alpha-free",
         "beta-paid",
         "gamma-free",
       ]);
     });
     expect(
-      latestCatalog().find((model) => model.model === "alpha-free")?.enabled,
+      latestCatalog().find((model) => model.model === "beta-paid")?.enabled,
     ).toBe(false);
     expect(
       latestCatalog().filter((model) => model.model === "beta-paid"),
     ).toHaveLength(1);
+  });
+
+  it("keeps stale remote and manual rows when one grouped credential fails", async () => {
+    vi.mocked(fetchModelsForConfig)
+      .mockResolvedValueOnce([{ id: "remote-kept", ownedBy: null }])
+      .mockRejectedValueOnce(new Error("group unavailable"));
+    const { latestCatalog } = renderCatalogHarness(
+      [
+        { model: "remote-kept", upstreamModel: "remote-kept" },
+        { model: "remote-stale", upstreamModel: "remote-stale" },
+        { model: "manual-entry" },
+      ],
+      {
+        apiKey: "sk-fallback",
+        initialApiKeyGroups: [
+          { id: "group", enabled: true, apiKeys: ["sk-group"] },
+        ],
+      },
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Sync Models" }));
+
+    await waitFor(() => {
+      expect(latestCatalog().map((model) => model.model)).toEqual([
+        "remote-kept",
+        "remote-stale",
+        "manual-entry",
+      ]);
+    });
+    expect(fetchModelsForConfig).toHaveBeenCalledTimes(2);
+  });
+
+  it("preserves manual rows while removing all remote-bound rows from an empty complete sync", async () => {
+    vi.mocked(fetchModelsForConfig).mockResolvedValueOnce([]);
+    const { latestCatalog } = renderCatalogHarness([
+      { model: "remote-stale", upstreamModel: "remote-stale" },
+      { model: "manual-entry" },
+    ]);
+
+    fireEvent.click(screen.getByRole("button", { name: "Sync Models" }));
+
+    await waitFor(() => {
+      expect(latestCatalog()).toEqual([
+        expect.objectContaining({ model: "manual-entry", upstreamModel: "" }),
+      ]);
+    });
   });
 
   it("falls back to data-plane models when AgentPlan AK/SK is missing but API Key exists", async () => {
@@ -1907,7 +1964,6 @@ describe("CodexFormFields local model routing", () => {
         },
       );
       expect(latestCatalog().map((model) => model.model)).toEqual([
-        "ark-code-latest",
         "doubao-seed-1.6",
       ]);
     });

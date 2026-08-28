@@ -1282,6 +1282,7 @@
     "fetchModelsSuccess": "Found {{count}} models",
     "fetchModelsFailed": "Failed to fetch models",
     "fetchModelsEmpty": "No models found",
+    "fetchModelsPartial": "Found {{count}} models, but {{failed}} credential request(s) failed. Existing unmatched models were kept because this sync was incomplete.",
     "fillMissingFieldsResult": "Checked {{checked}} models, refreshed {{updated}} existing rows",
     "fetchModelsNeedApiKey": "Please fill in API Key first",
     "fetchModelsNeedEndpoint": "Please fill in API endpoint first",
@@ -1450,6 +1451,8 @@
     "pricingModelSourceHint": "Choose whether to match pricing by request model or response model"
   },
   "codexConfig": {
+    "expertConfigTitle": "Advanced configuration",
+    "expertConfigDescription": "Edit raw Codex auth.json and config.toml settings.",
     "authJson": "auth.json (JSON) *",
     "authJsonPlaceholder": "{\n  \"OPENAI_API_KEY\": \"sk-your-api-key-here\"\n}",
     "authJsonHint": "Codex auth.json configuration content",
@@ -3487,7 +3490,19 @@
       "empty": "No existing MultiRouter. Create a new configuration first.",
       "laterButton": "Not now",
       "openWorkspaceButton": "Open workspace"
-    }
+    },
+    "addSource": "Add model source",
+    "createTitle": "Create MultiRouter",
+    "guideTitle": "MultiRouter setup path",
+    "guideStepSelect": "1. Select or connect model sources.",
+    "guideStepSync": "2. Sync to generate Codex-ready configuration.",
+    "guideStepRules": "3. Adjust model routing in the route rules.",
+    "singleSourceTab": "Connect one model source",
+    "sourceTab": "Select model sources",
+    "sourcePanelDescription": "Select existing model sources and sync them to Codex, or add a new universal provider. MultiRouter will use these connected sources when configuring routing rules.",
+    "sourcePickerLabel": "Select model source",
+    "sourcePickerHint": "Choose a model source first. Its preset fills the endpoint, protocol, and model catalog automatically; use a custom source only when no preset matches your service.",
+    "customSource": "Custom model source"
   },
   "codexLocalRouting": {
     "noticeTitle": "Codex local routing is enabled",
@@ -3555,6 +3570,7 @@
     "s058": "Read {{arg0}} models, writing back to local config...",
     "s059": "OAuth online read failed; updated {{arg0}} models from the local Codex cache. Online error: {{arg1}}",
     "s060": "Read and updated {{arg0}} models.",
+    "modelRefreshPartial": "Merged {{arg0}} models, but {{arg1}} credential request(s) failed; existing unmatched models were kept.",
     "s061": "Failed to fetch model list; check the current provider config: {{arg0}}",
     "s062": "A new multi-router has been created. Select candidate routers to attach.",
     "s063": "Multi-router settings saved. Takeover config continues to be maintained automatically.",
@@ -4467,6 +4483,7 @@
         "reading": "Reading {{summary}}",
         "updated": "Fetched successfully; wrote {{modelCount}} models.",
         "unchanged": "Fetched successfully; no changes, still {{modelCount}} models.",
+        "partialCredentials": "Fetched {{modelCount}} models, but {{failedCount}} credential request(s) failed. Existing unmatched models were kept.",
         "fetchFailed": "Failed to fetch the model list; check this provider's configuration: {{message}}"
       }
     },
@@ -4507,6 +4524,10 @@
       "fetchFailed": {
         "title": "Model list fetch failed",
         "detail": "Failed to fetch the model list; check this provider's configuration: {{message}}"
+      },
+      "partialCredentialFetch": {
+        "title": "Model list sync was incomplete",
+        "detail": "{{failedCount}} credential request(s) failed. Successful results were merged, but unmatched existing models were kept to avoid deleting models visible only to the failed credentials."
       },
       "fetchAborted": {
         "title": "Model list refresh interrupted"

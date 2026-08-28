@@ -61,6 +61,7 @@ import {
 } from "./codexTrafficPolicy";
 import {
   catalogModelIdentity,
+  pruneMissingRemoteCodexCatalogRows,
   reconcileFetchedCodexCatalogRows,
 } from "./codexCatalogSync";
 import { CodexModelReasoningCard } from "./CodexModelReasoningCard";
@@ -677,6 +678,7 @@ function mergeFetchedModelsIntoCatalogRows(
     baseUrl?: string;
     websiteUrl?: string;
   } = {},
+  removeMissingRemote = false,
 ): CodexCatalogRow[] {
   const next = [...rows];
   const rowByFetchedModel = new Map<
@@ -738,7 +740,9 @@ function mergeFetchedModelsIntoCatalogRows(
     next.push(row);
   }
 
-  return next;
+  return removeMissingRemote
+    ? pruneMissingRemoteCodexCatalogRows(next, fetchedModels).rows
+    : next;
 }
 
 // 判断模型名是否大概率属于支持 Responses 的 OpenAI/GPT 系列。
@@ -1022,8 +1026,9 @@ export function CodexFormFields({
       .filter(({ row }) => {
         const isIncluded = row.enabled !== false;
         if (
-          (catalogVisibility === "included" && !isIncluded) ||
-          (catalogVisibility === "excluded" && isIncluded)
+          !query &&
+          ((catalogVisibility === "included" && !isIncluded) ||
+            (catalogVisibility === "excluded" && isIncluded))
         ) {
           return false;
         }
@@ -1298,15 +1303,12 @@ export function CodexFormFields({
             if (seq !== fetchModelsSeqRef.current) return;
             setFetchedModels(models);
             let nextCatalogRows = catalogRowsRef.current;
-            if (
-              fetchMode === "sync" &&
-              onCatalogModelsChange &&
-              models.length > 0
-            ) {
+            if (fetchMode === "sync" && onCatalogModelsChange) {
               nextCatalogRows = mergeFetchedModelsIntoCatalogRows(
                 catalogRowsRef.current,
                 models,
                 { providerId, providerName, websiteUrl },
+                true,
               );
               catalogRowsRef.current = nextCatalogRows;
               setCatalogRows(nextCatalogRows);
@@ -1447,11 +1449,7 @@ export function CodexFormFields({
           if (seq !== fetchModelsSeqRef.current) return;
           setFetchedModels(models);
           let splitCatalogRows = catalogRowsRef.current;
-          if (
-            fetchMode === "sync" &&
-            onCatalogModelsChange &&
-            models.length > 0
-          ) {
+          if (fetchMode === "sync" && onCatalogModelsChange) {
             const mergedRows = mergeFetchedModelsIntoCatalogRows(
               catalogRowsRef.current,
               models,
@@ -1461,6 +1459,7 @@ export function CodexFormFields({
                 baseUrl: codexBaseUrl,
                 websiteUrl,
               },
+              failedCount === 0,
             );
             catalogRowsRef.current = mergedRows;
             splitCatalogRows = mergedRows;
@@ -1481,7 +1480,14 @@ export function CodexFormFields({
               );
             }
           }
-          if (models.length === 0) {
+          if (failedCount > 0) {
+            toast.warning(
+              t("providerForm.fetchModelsPartial", {
+                count: models.length,
+                failed: failedCount,
+              }),
+            );
+          } else if (models.length === 0) {
             toast.info(t("providerForm.fetchModelsEmpty"));
           } else {
             toast.success(
@@ -1811,6 +1817,18 @@ export function CodexFormFields({
       );
     },
     [],
+  );
+
+  const applyVisibleCatalogRowsEnabled = useCallback(
+    (enabled: boolean) => {
+      setCatalogRowsEnabled(
+        visibleCatalogRows.map(({ index }) => index),
+        enabled,
+      );
+      setCatalogSearch("");
+      setCatalogVisibility(enabled ? "included" : "excluded");
+    },
+    [setCatalogRowsEnabled, visibleCatalogRows],
   );
 
   const handleUpdateCatalogRow = useCallback(
@@ -3555,12 +3573,7 @@ export function CodexFormFields({
                             size="sm"
                             variant="outline"
                             disabled={visibleCatalogRows.length === 0}
-                            onClick={() =>
-                              setCatalogRowsEnabled(
-                                visibleCatalogRows.map(({ index }) => index),
-                                true,
-                              )
-                            }
+                            onClick={() => applyVisibleCatalogRowsEnabled(true)}
                           >
                             {t("codexConfig.catalogIncludeFiltered", {
                               defaultValue: "Include Filtered",
@@ -3572,10 +3585,7 @@ export function CodexFormFields({
                             variant="outline"
                             disabled={visibleCatalogRows.length === 0}
                             onClick={() =>
-                              setCatalogRowsEnabled(
-                                visibleCatalogRows.map(({ index }) => index),
-                                false,
-                              )
+                              applyVisibleCatalogRowsEnabled(false)
                             }
                           >
                             {t("codexConfig.catalogExcludeFiltered", {
@@ -3706,7 +3716,7 @@ export function CodexFormFields({
                           <div className="space-y-1">
                             <div className="flex gap-1">
                               <Input
-                                  value={catalogRowUpstreamModel(row)}
+                                value={catalogRowUpstreamModel(row)}
                                 onChange={(event) =>
                                   handleUpdateCatalogRow(index, {
                                     upstreamModel: event.target.value,

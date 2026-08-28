@@ -1282,6 +1282,7 @@
     "fetchModelsSuccess": "{{count}}件のモデルを取得",
     "fetchModelsFailed": "モデル一覧の取得に失敗しました",
     "fetchModelsEmpty": "モデルが見つかりません",
+    "fetchModelsPartial": "{{count}}件のモデルを取得しましたが、{{failed}}件の認証情報リクエストが失敗しました。同期が不完全なため、一致しない既存モデルは保持されました。",
     "fillMissingFieldsResult": "{{checked}}個のモデルを確認し、{{updated}}行の既存メタデータを更新しました",
     "fetchModelsNeedApiKey": "先に API Key を入力してください",
     "fetchModelsNeedEndpoint": "先に API エンドポイントを入力してください",
@@ -1450,6 +1451,8 @@
     "pricingModelSourceHint": "リクエストモデルまたはレスポンスモデルで価格を照合するかを選択"
   },
   "codexConfig": {
+    "expertConfigTitle": "詳細設定",
+    "expertConfigDescription": "Codex の auth.json と config.toml の生設定を編集します。",
     "authJson": "auth.json (JSON) *",
     "authJsonPlaceholder": "{\n  \"OPENAI_API_KEY\": \"sk-your-api-key-here\"\n}",
     "authJsonHint": "Codex の auth.json 設定内容",
@@ -3487,7 +3490,19 @@
       "empty": "既存の MultiRouter はありません。先に新しい設定を作成してください。",
       "laterButton": "後で設定",
       "openWorkspaceButton": "ワークスペースを開く"
-    }
+    },
+    "addSource": "モデルソースを追加",
+    "createTitle": "MultiRouter を作成",
+    "guideTitle": "MultiRouter の設定手順",
+    "guideStepSelect": "1. モデルソースを選択または接続します。",
+    "guideStepSync": "2. 同期して Codex 用の設定を自動生成します。",
+    "guideStepRules": "3. ルートルールでモデルの振り分けを調整します。",
+    "singleSourceTab": "モデルソースを個別接続",
+    "sourceTab": "モデルソースを選択",
+    "sourcePanelDescription": "既存のモデルソースを選択して Codex に同期するか、新しいユニバーサルプロバイダーを追加します。MultiRouter は接続済みのソースを使ってルーティングルールを設定します。",
+    "sourcePickerLabel": "モデルソースを選択",
+    "sourcePickerHint": "最初にモデルソースを選択してください。プリセットがエンドポイント、プロトコル、モデルカタログを自動入力します。該当するプリセットがない場合のみカスタムソースを使用してください。",
+    "customSource": "カスタムモデルソース"
   },
   "codexLocalRouting": {
     "noticeTitle": "Codex ローカルルーティングが有効です",
@@ -3555,6 +3570,7 @@
     "s058": "{{arg0}} モデルを読み込み、ローカル設定に書き戻しています...",
     "s059": "OAuth オンライン読取に失敗。ローカル Codex キャッシュで {{arg0}} モデルを更新しました。オンラインエラー: {{arg1}}",
     "s060": "{{arg0}} モデルを読み込み、更新しました。",
+    "modelRefreshPartial": "{{arg0}}件のモデルを統合しましたが、{{arg1}}件の認証情報リクエストが失敗しました。一致しない既存モデルは保持されました。",
     "s061": "モデルリストの取得に失敗しました。現在のプロバイダー設定を確認してください: {{arg0}}",
     "s062": "新しいマルチルーターを作成しました。接続する候補 router を選択してください。",
     "s063": "マルチルーター設定を保存しました。テイクオーバー設定は引き続き自動保守されます。",
@@ -4467,6 +4483,7 @@
         "reading": "{{summary}} を読み込み中",
         "updated": "取得に成功し、{{modelCount}} 個のモデルを書き込みました。",
         "unchanged": "取得に成功。変更はなく {{modelCount}} 個のままです。",
+        "partialCredentials": "{{modelCount}}件のモデルを取得しましたが、{{failedCount}}件の認証情報リクエストが失敗しました。一致しない既存モデルは保持されました。",
         "fetchFailed": "モデルリストの取得に失敗しました。この provider の設定を確認してください：{{message}}"
       }
     },
@@ -4507,6 +4524,10 @@
       "fetchFailed": {
         "title": "モデルリストの取得に失敗",
         "detail": "モデルリストの取得に失敗しました。この provider の設定を確認してください：{{message}}"
+      },
+      "partialCredentialFetch": {
+        "title": "モデルリストの同期が不完全です",
+        "detail": "{{failedCount}}件の認証情報リクエストが失敗しました。成功した結果は統合されましたが、失敗した認証情報でのみ表示されるモデルを削除しないよう、一致しない既存モデルは保持されました。"
       },
       "fetchAborted": {
         "title": "モデルリストの更新が中断されました"
