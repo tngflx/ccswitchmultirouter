@@ -248,7 +248,7 @@ describe("codexMultiRouterWizard helpers", () => {
     ]);
   });
 
-  it("removes missing remote-bound models on an authoritative wizard refresh", () => {
+  it("never removes saved provider models during a wizard metadata refresh", () => {
     const source = provider({
       settingsConfig: {
         modelCatalog: {
@@ -265,16 +265,17 @@ describe("codexMultiRouterWizard helpers", () => {
     const refreshed = mergeFetchedModelsIntoWizardProvider(
       source,
       [{ id: "remote-kept", ownedBy: null }],
-      { removeMissingRemote: true },
+      { preserveExistingSelection: true },
     );
 
     expect(
       refreshed.settingsConfig.modelCatalog.models.map(
         (model: { model: string }) => model.model,
       ),
-    ).toEqual(["friendly", "manual-entry"]);
+    ).toEqual(["friendly", "remote-stale", "manual-entry"]);
     expect(refreshed.settingsConfig.modelCatalog.spawnAgentModels).toEqual([
       "friendly",
+      "remote-stale",
       "manual-entry",
     ]);
   });

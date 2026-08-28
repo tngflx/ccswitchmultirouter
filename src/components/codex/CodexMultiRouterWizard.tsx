@@ -1232,7 +1232,7 @@ export function CodexMultiRouterWizard({
             const nextProvider = mergeFetchedModelsIntoWizardProvider(
               provider,
               fetchedModels,
-              { removeMissingRemote: true },
+              { preserveExistingSelection: true },
             );
             const afterModels = readWizardModelCatalog(nextProvider);
             const diff = diffWizardModelCatalog(beforeModels, afterModels);
@@ -1422,7 +1422,7 @@ export function CodexMultiRouterWizard({
           const nextProvider = mergeFetchedModelsIntoWizardProvider(
             provider,
             fetchedModels,
-            { removeMissingRemote: failedCredentialCount === 0 },
+            { preserveExistingSelection: true },
           );
           const afterModels = readWizardModelCatalog(nextProvider);
           const diff = diffWizardModelCatalog(beforeModels, afterModels);
