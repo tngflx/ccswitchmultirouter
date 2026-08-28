@@ -547,6 +547,104 @@ describe("CodexMultiRouterWizard", () => {
     expect(providersApi.update).toHaveBeenCalledTimes(1);
   });
 
+  it("fetches every enabled grouped credential and removes stale remote models only after a complete wizard sync", async () => {
+    vi.mocked(fetchModelsForConfig)
+      .mockResolvedValueOnce([{ id: "fallback-model", ownedBy: null }])
+      .mockResolvedValueOnce([{ id: "group-model", ownedBy: null }]);
+    vi.mocked(providersApi.update).mockResolvedValueOnce(true);
+    const source = provider({
+      settingsConfig: {
+        baseUrl: "https://grouped.example/v1",
+        auth: { OPENAI_API_KEY: "sk-fallback" },
+        codexApiKeyGroups: [
+          { id: "enabled", enabled: true, apiKeys: ["sk-group"] },
+          { id: "disabled", enabled: false, apiKeys: ["sk-disabled"] },
+        ],
+        modelCatalog: {
+          models: [
+            { model: "fallback-model", upstreamModel: "fallback-model" },
+            { model: "stale-model", upstreamModel: "stale-model" },
+          ],
+          spawnAgentModels: ["fallback-model", "stale-model"],
+        },
+      },
+    });
+
+    renderWithQueryClient(
+      <CodexMultiRouterWizard
+        open
+        providers={[source]}
+        onOpenChange={vi.fn()}
+        onCreateProvider={vi.fn()}
+        onOpenWorkspace={vi.fn()}
+        onEnablePlan={vi.fn()}
+      />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "自动准备与验证" }));
+    fireEvent.click(
+      screen.getByRole("button", { name: "自动获取并写入模型列表" }),
+    );
+
+    await waitFor(() => expect(fetchModelsForConfig).toHaveBeenCalledTimes(2));
+    expect(
+      vi.mocked(fetchModelsForConfig).mock.calls.map((call) => call[1]),
+    ).toEqual(["sk-fallback", "sk-group"]);
+    await waitFor(() => expect(providersApi.update).toHaveBeenCalledTimes(1));
+    const saved = vi.mocked(providersApi.update).mock.calls[0][0];
+    expect(
+      saved.settingsConfig.modelCatalog.models.map(
+        (model: { model: string }) => model.model,
+      ),
+    ).toEqual(["fallback-model", "group-model"]);
+    expect(saved.settingsConfig.modelCatalog.spawnAgentModels).toEqual([
+      "fallback-model",
+    ]);
+  });
+
+  it("keeps unmatched models when a wizard grouped-credential sync is partial", async () => {
+    vi.mocked(fetchModelsForConfig)
+      .mockResolvedValueOnce([{ id: "fallback-model", ownedBy: null }])
+      .mockRejectedValueOnce(new Error("group unavailable"));
+    const source = provider({
+      settingsConfig: {
+        baseUrl: "https://grouped.example/v1",
+        auth: { OPENAI_API_KEY: "sk-fallback" },
+        codexApiKeyGroups: [
+          { id: "enabled", enabled: true, apiKeys: ["sk-group"] },
+        ],
+        modelCatalog: {
+          models: [
+            { model: "fallback-model", upstreamModel: "fallback-model" },
+            { model: "group-only-model", upstreamModel: "group-only-model" },
+          ],
+        },
+      },
+    });
+
+    renderWithQueryClient(
+      <CodexMultiRouterWizard
+        open
+        providers={[source]}
+        onOpenChange={vi.fn()}
+        onCreateProvider={vi.fn()}
+        onOpenWorkspace={vi.fn()}
+        onEnablePlan={vi.fn()}
+      />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "自动准备与验证" }));
+    fireEvent.click(
+      screen.getByRole("button", { name: "自动获取并写入模型列表" }),
+    );
+
+    expect(await screen.findByText("模型列表同步不完整")).toBeVisible();
+    const saved = vi.mocked(providersApi.update).mock.calls[0][0];
+    expect(
+      saved.settingsConfig.modelCatalog.models.map(
+        (model: { model: string }) => model.model,
+      ),
+    ).toEqual(["fallback-model", "group-only-model"]);
+  });
+
   it("refreshes an official OAuth catalog with its bound account and appends new models", async () => {
     vi.mocked(fetchCodexOauthModels).mockResolvedValueOnce([
       { id: "gpt-5.5", ownedBy: "openai", contextWindow: 272000 },

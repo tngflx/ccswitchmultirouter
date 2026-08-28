@@ -53,6 +53,7 @@ import {
   fetchModelsForConfig,
   probeCodexChatForConfig,
   probeCodexResponsesForConfig,
+  type FetchedModel,
 } from "@/lib/api/model-fetch";
 import {
   CODEX_MULTI_ROUTER_DEFAULT_NAME,
@@ -429,10 +430,16 @@ function diffWizardModelCatalog(
   afterModels: CodexCatalogModel[],
 ): ModelFetchDiff {
   const beforeByModel = new Map(
-    beforeModels.map((model) => [model.model.trim().toLowerCase(), modelCatalogSignature(model)]),
+    beforeModels.map((model) => [
+      model.model.trim().toLowerCase(),
+      modelCatalogSignature(model),
+    ]),
   );
   const afterByModel = new Map(
-    afterModels.map((model) => [model.model.trim().toLowerCase(), modelCatalogSignature(model)]),
+    afterModels.map((model) => [
+      model.model.trim().toLowerCase(),
+      modelCatalogSignature(model),
+    ]),
   );
   const added = afterModels
     .map((model) => model.model)
@@ -1225,6 +1232,7 @@ export function CodexMultiRouterWizard({
             const nextProvider = mergeFetchedModelsIntoWizardProvider(
               provider,
               fetchedModels,
+              { removeMissingRemote: true },
             );
             const afterModels = readWizardModelCatalog(nextProvider);
             const diff = diffWizardModelCatalog(beforeModels, afterModels);
@@ -1371,23 +1379,50 @@ export function CodexMultiRouterWizard({
           },
         }));
         try {
-          const fetchedModels = await fetchModelsForConfig(
-            config.baseUrl,
-            config.apiKey,
-            config.isFullUrl,
-            config.modelsUrl,
-            config.customUserAgent,
-            config.volcengineModelListAction
-              ? {
-                  action: config.volcengineModelListAction,
-                  accessKeyId: config.volcengineAccessKeyId ?? "",
-                  secretAccessKey: config.volcengineSecretAccessKey ?? "",
-                }
-              : undefined,
+          const credentialKeys =
+            config.apiKeys && config.apiKeys.length > 0
+              ? config.apiKeys
+              : [config.apiKey];
+          const fetchResults = await Promise.allSettled(
+            credentialKeys.map((apiKey) =>
+              fetchModelsForConfig(
+                config.baseUrl,
+                apiKey,
+                config.isFullUrl,
+                config.modelsUrl,
+                config.customUserAgent,
+                config.volcengineModelListAction
+                  ? {
+                      action: config.volcengineModelListAction,
+                      accessKeyId: config.volcengineAccessKeyId ?? "",
+                      secretAccessKey: config.volcengineSecretAccessKey ?? "",
+                    }
+                  : undefined,
+              ),
+            ),
           );
+          const fulfilledResults = fetchResults.filter(
+            (result): result is PromiseFulfilledResult<FetchedModel[]> =>
+              result.status === "fulfilled",
+          );
+          if (fulfilledResults.length === 0) {
+            throw fetchResults.find((result) => result.status === "rejected")
+              ?.reason;
+          }
+          const fetchedModels = Array.from(
+            new Map(
+              fulfilledResults
+                .flatMap((result) => result.value)
+                .filter((model) => model.id.trim())
+                .map((model) => [model.id.trim().toLowerCase(), model]),
+            ).values(),
+          );
+          const failedCredentialCount =
+            fetchResults.length - fulfilledResults.length;
           const nextProvider = mergeFetchedModelsIntoWizardProvider(
             provider,
             fetchedModels,
+            { removeMissingRemote: failedCredentialCount === 0 },
           );
           const afterModels = readWizardModelCatalog(nextProvider);
           const diff = diffWizardModelCatalog(beforeModels, afterModels);
@@ -1399,17 +1434,35 @@ export function CodexMultiRouterWizard({
             ...current,
             [provider.id]: {
               status: hasDiff ? "updated" : "unchanged",
-              message: hasDiff
-                ? t("codexWizard.fetch.card.updated", {
-                    modelCount: afterModels.length,
-                  })
-                : t("codexWizard.fetch.card.unchanged", {
-                    modelCount: afterModels.length,
-                  }),
+              message:
+                failedCredentialCount > 0
+                  ? t("codexWizard.fetch.card.partialCredentials", {
+                      modelCount: afterModels.length,
+                      failedCount: failedCredentialCount,
+                    })
+                  : hasDiff
+                    ? t("codexWizard.fetch.card.updated", {
+                        modelCount: afterModels.length,
+                      })
+                    : t("codexWizard.fetch.card.unchanged", {
+                        modelCount: afterModels.length,
+                      }),
               modelCount: afterModels.length,
               diff,
             },
           }));
+          if (failedCredentialCount > 0) {
+            recordWizardIssue({
+              stage: "prepare",
+              severity: "warning",
+              title: t("codexWizard.issues.partialCredentialFetch.title"),
+              detail: t("codexWizard.issues.partialCredentialFetch.detail", {
+                failedCount: failedCredentialCount,
+              }),
+              canContinue: true,
+              providerName: provider.name,
+            });
+          }
         } catch (error) {
           console.error("[CodexMultiRouterWizard] fetch models failed", error);
           const message = formatWizardError(error);
@@ -1754,9 +1807,9 @@ export function CodexMultiRouterWizard({
         aria-modal="true"
         aria-labelledby="codex-multirouter-wizard-title"
         data-testid="codex-multirouter-wizard-shell"
-        className="flex max-h-full w-[min(96vw,1280px)] min-h-0 flex-col overflow-hidden rounded-2xl border border-border/60 bg-background shadow-2xl"
+        className="flex max-h-full min-h-0 w-full flex-col overflow-hidden rounded-xl border border-border/60 bg-background shadow-2xl sm:w-[min(96vw,1280px)] sm:rounded-2xl"
       >
-        <div className="flex shrink-0 items-start justify-between border-b border-border/60 bg-gradient-to-r from-blue-500/10 via-background to-violet-500/10 px-5 py-4">
+        <div className="flex shrink-0 items-start justify-between border-b border-border/60 bg-gradient-to-r from-blue-500/10 via-background to-violet-500/10 px-4 py-3 sm:px-5 sm:py-4">
           <div className="flex items-start gap-3">
             <div className="rounded-md bg-primary/10 p-2 text-primary">
               <CurrentStepIcon className="h-5 w-5" />
@@ -1770,7 +1823,7 @@ export function CodexMultiRouterWizard({
               </div>
               <h2
                 id="codex-multirouter-wizard-title"
-                className="text-xl font-semibold"
+                className="text-lg font-semibold sm:text-xl"
               >
                 {t(currentStep.title)}
               </h2>
@@ -1791,16 +1844,16 @@ export function CodexMultiRouterWizard({
 
         <div
           data-testid="codex-multirouter-wizard-body"
-          className="grid min-h-0 flex-1 grid-cols-[15rem_minmax(0,1fr)] overflow-hidden"
+          className="flex min-h-0 flex-1 flex-col overflow-hidden sm:grid sm:grid-cols-[15rem_minmax(0,1fr)]"
         >
-          <div className="space-y-1 overflow-y-auto border-r border-border/60 bg-gradient-to-b from-blue-500/8 via-muted/25 to-violet-500/8 p-3">
+          <div className="grid shrink-0 grid-cols-2 gap-1 border-b border-border/60 bg-gradient-to-b from-blue-500/8 via-muted/25 to-violet-500/8 p-2 sm:block sm:space-y-1 sm:overflow-y-auto sm:border-b-0 sm:border-r sm:p-3">
             {STEPS.map((step, index) => {
               const StepIcon = step.icon;
               return (
                 <button
                   key={step.key}
                   type="button"
-                  className={`flex w-full items-center gap-2 rounded-md px-3 py-2 text-left text-sm ${
+                  className={`flex min-w-0 items-center gap-2 rounded-md px-3 py-2 text-left text-sm sm:w-full ${
                     index === stepIndex
                       ? "bg-primary text-primary-foreground"
                       : "text-muted-foreground hover:bg-muted"
@@ -1816,7 +1869,7 @@ export function CodexMultiRouterWizard({
             })}
           </div>
 
-          <div className="min-h-0 overflow-y-auto p-5">
+          <div className="min-h-0 flex-1 overflow-y-auto p-3 sm:p-5">
             <div
               role="status"
               aria-atomic="true"
@@ -2661,7 +2714,7 @@ export function CodexMultiRouterWizard({
           </DialogContent>
         </Dialog>
 
-        <div className="flex shrink-0 items-center justify-between border-t px-5 py-4">
+        <div className="flex shrink-0 items-center justify-between border-t px-3 py-3 sm:px-5 sm:py-4">
           <Button variant="ghost" onClick={() => closeWizard(true)}>
             {t("codexWizard.footer.skip")}
           </Button>

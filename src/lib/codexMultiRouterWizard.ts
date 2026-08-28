@@ -19,6 +19,7 @@ import {
   type HostedToolsConfig,
 } from "./hostedTools";
 import type { FetchedModel } from "@/lib/api/model-fetch";
+import { pruneMissingRemoteCodexCatalogRows } from "@/lib/codexCatalogReconciliation";
 import { extractCodexBaseUrl } from "@/utils/providerConfigUtils";
 import {
   codexPlanModelListAction,
@@ -36,6 +37,7 @@ export const CODEX_MULTI_ROUTER_PROXY_BASE_URL = "http://127.0.0.1:15721/v1";
 export interface WizardModelFetchConfig {
   baseUrl: string;
   apiKey: string;
+  apiKeys?: string[];
   isFullUrl?: boolean;
   modelsUrl?: string;
   customUserAgent?: string;
@@ -299,6 +301,29 @@ function readWizardProviderApiKey(provider: Provider): string {
   ).trim();
 }
 
+function readWizardProviderApiKeys(provider: Provider): string[] {
+  const config = provider.settingsConfig ?? {};
+  const groups = config.codexApiKeyGroups ?? config.codex_api_key_groups;
+  const groupedKeys = Array.isArray(groups)
+    ? groups.flatMap((group) => {
+        if (!group || typeof group !== "object") return [];
+        const record = group as Record<string, unknown>;
+        if (record.enabled === false) return [];
+        const keys = record.apiKeys ?? record.api_keys;
+        return Array.isArray(keys)
+          ? keys.filter((key): key is string => typeof key === "string")
+          : [];
+      })
+    : [];
+  return Array.from(
+    new Set(
+      [readWizardProviderApiKey(provider), ...groupedKeys]
+        .map((key) => key.trim())
+        .filter(Boolean),
+    ),
+  );
+}
+
 // 从 provider 配置里提取可调用 /models 的参数；官方 OAuth provider 没有普通 Base URL 时会被跳过。
 export function getWizardModelFetchConfig(
   provider: Provider,
@@ -308,19 +333,23 @@ export function getWizardModelFetchConfig(
   const baseUrl = readWizardProviderBaseUrl(provider);
   const accessKeyId = provider.meta?.usage_script?.accessKeyId;
   const secretAccessKey = provider.meta?.usage_script?.secretAccessKey;
-  const apiKey = readWizardProviderApiKey(provider);
+  const fallbackApiKey = readWizardProviderApiKey(provider);
+  const apiKeys = readWizardProviderApiKeys(provider);
   const volcengineModelListAction = codexPlanModelListAction({
     baseUrl,
     partnerPromotionKey: provider.meta?.partnerPromotionKey,
     providerName: provider.name,
-    apiKey,
+    apiKey: fallbackApiKey,
     accessKeyId,
     secretAccessKey,
   });
-  if (!baseUrl || (!apiKey && !volcengineModelListAction)) return null;
+  if (!baseUrl || (apiKeys.length === 0 && !volcengineModelListAction)) {
+    return null;
+  }
   return {
     baseUrl,
-    apiKey,
+    apiKey: apiKeys[0] ?? fallbackApiKey,
+    apiKeys,
     isFullUrl: Boolean(provider.meta?.isFullUrl ?? config.isFullUrl),
     modelsUrl:
       typeof config.modelsUrl === "string" ? config.modelsUrl : undefined,
@@ -397,6 +426,7 @@ export function getWizardConfigIssues(
 
 export interface MergeFetchedWizardModelsOptions {
   preserveExistingSelection?: boolean;
+  removeMissingRemote?: boolean;
 }
 
 function normalizedWizardModelId(value: unknown): string {
@@ -495,7 +525,10 @@ export function mergeFetchedModelsIntoWizardProvider(
       byFetchedModel.set(identity, visibleModelId);
     }
   }
-  const models = Array.from(byModel.values());
+  const mergedModels = Array.from(byModel.values());
+  const models = options.removeMissingRemote
+    ? pruneMissingRemoteCodexCatalogRows(mergedModels, fetchedModels).rows
+    : mergedModels;
   const allowedModels = new Set(models.map((model) => model.model));
   const rawSpawnAgentModels =
     provider.settingsConfig?.modelCatalog?.spawnAgentModels;

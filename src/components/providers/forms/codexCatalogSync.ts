@@ -1,5 +1,8 @@
 import type { CodexCatalogModel } from "@/types";
+import { pruneMissingRemoteCodexCatalogRows } from "@/lib/codexCatalogReconciliation";
 import { resolveFetchedCodexModelContextWindow } from "@/utils/codexModelContext";
+
+export { pruneMissingRemoteCodexCatalogRows } from "@/lib/codexCatalogReconciliation";
 
 export type CodexCatalogRowLike = CodexCatalogModel & { rowId?: string };
 
@@ -24,6 +27,7 @@ export interface CatalogSyncResult<T extends CodexCatalogRowLike> {
   rows: T[];
   added: number;
   hydrated: number;
+  removed: number;
 }
 
 export type ExistingCatalogMetadataMode = "fill-missing" | "refresh";
@@ -150,6 +154,7 @@ export function reconcileFetchedCodexCatalogRows<T extends CodexCatalogRowLike>(
     appendNew: boolean;
     createRow: (seed: CodexCatalogRowLike) => T;
     existingMetadataMode?: ExistingCatalogMetadataMode;
+    removeMissingRemote?: boolean;
   },
 ): CatalogSyncResult<T> {
   const next = [...rows];
@@ -248,5 +253,13 @@ export function reconcileFetchedCodexCatalogRows<T extends CodexCatalogRowLike>(
     }
   }
 
-  return { rows: next, added, hydrated };
+  const authoritativeResult = options.removeMissingRemote
+    ? pruneMissingRemoteCodexCatalogRows(next, fetchedModels)
+    : { rows: next, removed: 0 };
+  return {
+    rows: authoritativeResult.rows,
+    added,
+    hydrated,
+    removed: authoritativeResult.removed,
+  };
 }

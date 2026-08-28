@@ -1282,6 +1282,7 @@
     "fetchModelsSuccess": "取得 {{count}} 個模型",
     "fetchModelsFailed": "取得模型清單失敗",
     "fetchModelsEmpty": "未找到可用模型",
+    "fetchModelsPartial": "取得 {{count}} 個模型，但有 {{failed}} 個憑據請求失敗。由於本次同步不完整，未匹配的現有模型已保留。",
     "fillMissingFieldsResult": "已檢查 {{checked}} 個模型，更新 {{updated}} 行現有記錄",
     "fetchModelsNeedApiKey": "請先填寫 API Key",
     "fetchModelsNeedEndpoint": "請先填寫 API 端點",
@@ -1450,6 +1451,8 @@
     "pricingModelSourceHint": "選擇依請求模型還是回傳模型進行定價比對"
   },
   "codexConfig": {
+    "expertConfigTitle": "進階設定",
+    "expertConfigDescription": "編輯 Codex auth.json 與 config.toml 原始設定。",
     "authJson": "auth.json (JSON) *",
     "authJsonPlaceholder": "{\n    \"OPENAI_API_KEY\": \"sk-your-api-key-here\"\n}",
     "authJsonHint": "Codex auth.json 設定內容",
@@ -3487,7 +3490,19 @@
       "empty": "尚無已有 MultiRouter，請先建立新設定。",
       "laterButton": "暫不設定",
       "openWorkspaceButton": "直接開啟工作台"
-    }
+    },
+    "addSource": "新增模型來源",
+    "createTitle": "建立多路路由",
+    "guideTitle": "多路路由建立方式",
+    "guideStepSelect": "1. 先選擇或接入模型來源。",
+    "guideStepSync": "2. 同步後自動產生 Codex 可用設定。",
+    "guideStepRules": "3. 再到路由規則調整模型分流。",
+    "singleSourceTab": "單獨接入模型來源",
+    "sourceTab": "選擇模型來源",
+    "sourcePanelDescription": "選擇既有模型來源並同步到 Codex，或新增統一供應商。多路路由會根據這些已接入的模型來源繼續設定分流規則。",
+    "sourcePickerLabel": "選擇模型來源",
+    "sourcePickerHint": "先選擇模型來源，預設會自動填入端點、協定和模型目錄；只有沒有符合服務的預設時才使用自訂模型來源。",
+    "customSource": "自訂模型來源"
   },
   "codexLocalRouting": {
     "noticeTitle": "Codex 本地路由已開啟",
@@ -3555,6 +3570,7 @@
     "s058": "已讀取 {{arg0}} 個模型，正在寫回本機設定...",
     "s059": "OAuth 線上讀取失敗，已使用本機 Codex 模型快取更新 {{arg0}} 個模型。線上錯誤：{{arg1}}",
     "s060": "已讀取並更新 {{arg0}} 個模型。",
+    "modelRefreshPartial": "已合併 {{arg0}} 個模型，但 {{arg1}} 個憑據請求失敗；未匹配的現有模型已保留。",
     "s061": "取得模型列表失敗，請檢查目前供應商設定：{{arg0}}",
     "s062": "已建立新的多路路由，請選擇要接入的候選 router。",
     "s063": "多路路由設定已儲存，接管設定由系統繼續自動維護。",
@@ -4467,6 +4483,7 @@
         "reading": "正在讀取 {{summary}}",
         "updated": "讀取成功，已寫入 {{modelCount}} 個模型。",
         "unchanged": "讀取成功，無模型清單更新，仍為 {{modelCount}} 個模型。",
+        "partialCredentials": "取得 {{modelCount}} 個模型，但有 {{failedCount}} 個憑據請求失敗。未匹配的現有模型已保留。",
         "fetchFailed": "取得模型清單失敗，請檢查目前 provider 設定：{{message}}"
       }
     },
@@ -4507,6 +4524,10 @@
       "fetchFailed": {
         "title": "模型清單取得失敗",
         "detail": "取得模型清單失敗，請檢查目前 provider 設定：{{message}}"
+      },
+      "partialCredentialFetch": {
+        "title": "模型清單同步不完整",
+        "detail": "有 {{failedCount}} 個憑據請求失敗。成功結果已合併，但為避免刪除僅失敗憑據可見的模型，未匹配的現有模型已保留。"
       },
       "fetchAborted": {
         "title": "模型清單更新中斷"

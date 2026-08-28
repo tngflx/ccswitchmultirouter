@@ -4,6 +4,8 @@ import userEvent from "@testing-library/user-event";
 import React from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { providersApi } from "@/lib/api";
+import i18n from "@/i18n";
+import en from "@/i18n/locales/en.json";
 import {
   fetchCodexOauthModels,
   fetchModelsForConfig,
@@ -325,6 +327,43 @@ beforeEach(() => {
 
 afterEach(() => {
   vi.useRealTimers();
+});
+
+it("renders the MultiRouter main page in English without Chinese fallback text", async () => {
+  const previousLanguage = i18n.language;
+  const previousEnglishResources = i18n.getResourceBundle("en", "translation");
+  i18n.addResourceBundle("en", "translation", en, true, true);
+  await i18n.changeLanguage("en");
+  try {
+    renderWorkspace(
+      React.createElement(CodexRouterWorkspacePage, {
+        providers: [],
+        isProxyRunning: false,
+        isCodexTakeoverActive: false,
+        activeProviderId: undefined,
+        onEditProvider: vi.fn(),
+        onDeletePlan: vi.fn(),
+        onCreateProvider: vi.fn(),
+      }),
+    );
+
+    expect(
+      screen.getByText("Codex multi-model routing workbench"),
+    ).toBeVisible();
+    expect(document.body.textContent).not.toMatch(/[\u4e00-\u9fff]/);
+  } finally {
+    i18n.removeResourceBundle("en", "translation");
+    if (previousEnglishResources) {
+      i18n.addResourceBundle(
+        "en",
+        "translation",
+        previousEnglishResources,
+        true,
+        true,
+      );
+    }
+    await i18n.changeLanguage(previousLanguage || "zh");
+  }
 });
 
 it("没有 MultiRouter 方案时打开工作台不会读取 null settingsConfig", () => {
@@ -1368,7 +1407,10 @@ describe("Codex MultiRouter workspace route persistence helpers", () => {
             apiKeys: ["disabled-group-key"],
           },
         ],
-        modelCatalog: { models: [] },
+        modelCatalog: {
+          models: [{ model: "stale-model", upstreamModel: "stale-model" }],
+          spawnAgentModels: ["stale-model"],
+        },
       },
     };
     const plan = withEnabledProviderRoute(
@@ -1427,7 +1469,73 @@ describe("Codex MultiRouter workspace route persistence helpers", () => {
           (model: { model: string }) => model.model,
         ),
       ).toEqual(["fallback-model", "grouped-model"]);
+      expect(
+        savedProvider?.settingsConfig?.modelCatalog?.spawnAgentModels,
+      ).toEqual(["fallback-model", "grouped-model"]);
     });
+  });
+
+  it("keeps unmatched route-source models when one grouped credential refresh fails", async () => {
+    vi.mocked(fetchModelsForConfig).mockImplementation(
+      async (_baseUrl, apiKey) => {
+        if (apiKey === "fallback-key") {
+          return [{ id: "fallback-model", ownedBy: "fallback" }];
+        }
+        throw new Error("group unavailable");
+      },
+    );
+    const provider: Provider = {
+      id: "codex-partial-grouped-source",
+      name: "Partial Grouped Source",
+      category: "custom",
+      settingsConfig: {
+        baseUrl: "https://partial-grouped.example/v1",
+        auth: { OPENAI_API_KEY: "fallback-key" },
+        codexApiKeyGroups: [
+          { id: "enabled", enabled: true, apiKeys: ["grouped-key"] },
+        ],
+        modelCatalog: {
+          models: [
+            { model: "fallback-model", upstreamModel: "fallback-model" },
+            { model: "group-only-model", upstreamModel: "group-only-model" },
+          ],
+        },
+      },
+    };
+    const plan = withEnabledProviderRoute(
+      createDraftRoutingPlan([provider], [provider]),
+      provider,
+    );
+
+    renderWorkspace(
+      React.createElement(CodexRouterWorkspacePage, {
+        providers: [provider, plan],
+        isProxyRunning: true,
+        isCodexTakeoverActive: true,
+        activeProviderId: plan.id,
+        initialProviderId: plan.id,
+        initialTab: "routes",
+        onEditProvider: vi.fn(),
+        onDeletePlan: vi.fn(),
+        onCreateProvider: vi.fn(),
+      }),
+    );
+
+    await waitFor(() => expect(fetchModelsForConfig).toHaveBeenCalledTimes(2));
+    await waitFor(() => {
+      const savedProvider = vi
+        .mocked(providersApi.update)
+        .mock.calls.map(([updated]) => updated)
+        .find((updated) => updated.id === provider.id);
+      expect(
+        savedProvider?.settingsConfig?.modelCatalog?.models.map(
+          (model: { model: string }) => model.model,
+        ),
+      ).toEqual(["fallback-model", "group-only-model"]);
+    });
+    expect(
+      await screen.findByText(/凭据请求失败；未匹配的现有模型已保留/),
+    ).toBeVisible();
   });
 
   it("refreshes a provider that has only enabled grouped API keys", async () => {

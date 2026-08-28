@@ -24,7 +24,7 @@ import {
 import { CSS } from "@dnd-kit/utilities";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useTranslation } from "react-i18next";
-import { getI18n } from "react-i18next";
+import i18n from "@/i18n";
 import {
   Activity,
   AlertTriangle,
@@ -98,6 +98,7 @@ import {
   writeHostedToolsConfig,
 } from "@/lib/hostedTools";
 import { applyCodexCatalogModelOrder } from "@/lib/codexModelCatalogOrder";
+import { pruneMissingRemoteCodexCatalogRows } from "@/lib/codexCatalogReconciliation";
 import { usageApi } from "@/lib/api/usage";
 import {
   usageKeys,
@@ -158,10 +159,8 @@ function tr(
   key: string,
   options?: { defaultValue?: string } & Record<string, unknown>,
 ): string {
-  const instance = getI18n();
-  if (!instance) return options?.defaultValue ?? key;
   const result = (
-    instance.t as (k: string, o?: Record<string, unknown>) => unknown
+    i18n.t as (k: string, o?: Record<string, unknown>) => unknown
   )(key, options);
   return typeof result === "string" && result.length > 0
     ? result
@@ -570,6 +569,8 @@ type ProviderModelRefreshResult =
       nextProvider: Provider;
       usedCodexCache?: boolean;
       onlineErrorMessage?: string;
+      authoritative: boolean;
+      failedCredentialCount?: number;
     };
 
 type ProviderModelFetchConfig = {
@@ -768,6 +769,8 @@ async function fetchProviderModelsWithFallback(
   models: FetchedModel[];
   usedCodexCache: boolean;
   onlineErrorMessage?: string;
+  authoritative: boolean;
+  failedCredentialCount?: number;
 }> {
   if (!fetchConfig.useCodexOAuth) {
     const credentialKeys =
@@ -809,6 +812,8 @@ async function fetchProviderModelsWithFallback(
         ).values(),
       ),
       usedCodexCache: false,
+      authoritative: fulfilledLists.length === results.length,
+      failedCredentialCount: results.length - fulfilledLists.length,
     };
   }
 
@@ -816,6 +821,7 @@ async function fetchProviderModelsWithFallback(
     return {
       models: await fetchCodexOauthModels(fetchConfig.codexOAuthAccountId),
       usedCodexCache: false,
+      authoritative: true,
     };
   } catch (error) {
     const onlineErrorMessage = workspaceErrorMessage(error);
@@ -824,6 +830,7 @@ async function fetchProviderModelsWithFallback(
       models: cachedModels,
       usedCodexCache: cachedModels.length > 0,
       onlineErrorMessage,
+      authoritative: false,
     };
   }
 }
@@ -869,7 +876,9 @@ function getProviderModelFetchConfig(
               const values = record.apiKeys ?? record.api_keys;
               return Array.isArray(values)
                 ? values
-                    .filter((value): value is string => typeof value === "string")
+                    .filter(
+                      (value): value is string => typeof value === "string",
+                    )
                     .map((value) => value.trim())
                 : [];
             })
@@ -961,6 +970,7 @@ function getProviderModelFetchConfig(
 function providerWithFetchedModelCatalog(
   provider: Provider,
   fetchedModels: FetchedModel[],
+  removeMissingRemote = false,
 ): Provider {
   const currentCatalog = readCodexModelCatalog(provider);
   const fetchConfig = getProviderModelFetchConfig(provider);
@@ -1047,15 +1057,18 @@ function providerWithFetchedModelCatalog(
     models.push(nextModel);
   }
 
+  const reconciledModels = removeMissingRemote
+    ? pruneMissingRemoteCodexCatalogRows(models, fetchedModels).rows
+    : models;
   return {
     ...provider,
     settingsConfig: {
       ...provider.settingsConfig,
       modelCatalog: {
-        models,
+        models: reconciledModels,
         spawnAgentModels: normalizeCodexSpawnAgentModels(
           currentCatalog.spawnAgentModels,
-          models,
+          reconciledModels,
         ),
       },
     },
@@ -2143,7 +2156,9 @@ export function normalizeCodexRoutesForVisibleModelAliases(
 
     const nextModelMapEntries = nextModels
       .map((visibleModel) => {
-        const targetModel = targetModelByVisible.get(visibleModel.toLowerCase());
+        const targetModel = targetModelByVisible.get(
+          visibleModel.toLowerCase(),
+        );
         const upstream = targetModel
           ? catalogDraftUpstreamModel(targetModel)
           : routeModelUpstreamForAliasRepair(
@@ -3243,8 +3258,13 @@ export function CodexRouterWorkspacePage({
       // 将模型目录读取、provider catalog 写回、受影响路由方案重建视为一个事务；
       // 任何阶段卡住都必须让刷新卡片落到终态，不能只保护最前面的网络请求。
       const refreshTask = (async (): Promise<ProviderModelRefreshResult> => {
-        const { models, usedCodexCache, onlineErrorMessage } =
-          await fetchProviderModelsWithFallback(fetchConfig);
+        const {
+          models,
+          usedCodexCache,
+          onlineErrorMessage,
+          authoritative,
+          failedCredentialCount,
+        } = await fetchProviderModelsWithFallback(fetchConfig);
         if (!isCurrentAttempt()) {
           return { status: "stale" };
         }
@@ -3264,7 +3284,11 @@ export function CodexRouterWorkspacePage({
           };
         }
 
-        const nextProvider = providerWithFetchedModelCatalog(provider, models);
+        const nextProvider = providerWithFetchedModelCatalog(
+          provider,
+          models,
+          authoritative,
+        );
         setProviderModelRefreshStates((current) => ({
           ...current,
           [provider.id]: {
@@ -3294,6 +3318,8 @@ export function CodexRouterWorkspacePage({
           nextProvider,
           usedCodexCache,
           onlineErrorMessage,
+          authoritative,
+          failedCredentialCount,
         };
       })();
 
@@ -3343,11 +3369,19 @@ export function CodexRouterWorkspacePage({
                       .length,
                     arg1: result.onlineErrorMessage,
                   })
-                : tr("codexRouterWorkspace.s060", {
-                    defaultValue: "已读取并更新 {{arg0}} 个模型。",
-                    arg0: readCodexModelCatalog(result.nextProvider).models
-                      .length,
-                  }),
+                : !result.authoritative
+                  ? tr("codexRouterWorkspace.modelRefreshPartial", {
+                      defaultValue:
+                        "已合并 {{arg0}} 个模型，但 {{arg1}} 个凭据请求失败；未匹配的现有模型已保留。",
+                      arg0: readCodexModelCatalog(result.nextProvider).models
+                        .length,
+                      arg1: result.failedCredentialCount ?? 0,
+                    })
+                  : tr("codexRouterWorkspace.s060", {
+                      defaultValue: "已读取并更新 {{arg0}} 个模型。",
+                      arg0: readCodexModelCatalog(result.nextProvider).models
+                        .length,
+                    }),
               modelCount: readCodexModelCatalog(result.nextProvider).models
                 .length,
             },
