@@ -3652,7 +3652,7 @@
     "modelDisplayStyle": "Model display",
     "modelOnly": "Model only",
     "modelThenProvider": "Model · Provider",
-    "providerThenModel": "Provider · Model",
+    "providerThenModel": "[Provider] Model",
     "modelSort": "Sort models",
     "currentOrder": "Current order (drag)",
     "sortByModel": "Model name",

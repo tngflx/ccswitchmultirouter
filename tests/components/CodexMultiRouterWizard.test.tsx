@@ -547,7 +547,7 @@ describe("CodexMultiRouterWizard", () => {
     expect(providersApi.update).toHaveBeenCalledTimes(1);
   });
 
-  it("fetches every enabled grouped credential and removes stale remote models only after a complete wizard sync", async () => {
+  it("fetches every enabled grouped credential without replacing the saved provider catalog", async () => {
     vi.mocked(fetchModelsForConfig)
       .mockResolvedValueOnce([{ id: "fallback-model", ownedBy: null }])
       .mockResolvedValueOnce([{ id: "group-model", ownedBy: null }]);
@@ -595,9 +595,10 @@ describe("CodexMultiRouterWizard", () => {
       saved.settingsConfig.modelCatalog.models.map(
         (model: { model: string }) => model.model,
       ),
-    ).toEqual(["fallback-model", "group-model"]);
+    ).toEqual(["fallback-model", "stale-model"]);
     expect(saved.settingsConfig.modelCatalog.spawnAgentModels).toEqual([
       "fallback-model",
+      "stale-model",
     ]);
   });
 
@@ -645,7 +646,7 @@ describe("CodexMultiRouterWizard", () => {
     ).toEqual(["fallback-model", "group-only-model"]);
   });
 
-  it("refreshes an official OAuth catalog with its bound account and appends new models", async () => {
+  it("refreshes saved official OAuth models without appending excluded models", async () => {
     vi.mocked(fetchCodexOauthModels).mockResolvedValueOnce([
       { id: "gpt-5.5", ownedBy: "openai", contextWindow: 272000 },
       { id: "gpt-5.6-sol", ownedBy: "openai", contextWindow: 372000 },
@@ -692,7 +693,7 @@ describe("CodexMultiRouterWizard", () => {
       savedProvider.settingsConfig.modelCatalog.models.map(
         (model: { model: string }) => model.model,
       ),
-    ).toEqual(["gpt-5.5", "gpt-5.6-sol"]);
+    ).toEqual(["gpt-5.5"]);
     expect(fetchModelsForConfig).not.toHaveBeenCalled();
   });
 
@@ -818,7 +819,7 @@ describe("CodexMultiRouterWizard", () => {
     expect(savedProvider.settingsConfig).not.toHaveProperty("modelCatalog");
   });
 
-  it("adds newly fetched upstream models to an existing provider catalog", async () => {
+  it("keeps an existing provider catalog curated during refresh", async () => {
     vi.mocked(fetchModelsForConfig).mockResolvedValueOnce([
       { id: "deepseek-chat", ownedBy: null, contextWindow: 128000 },
       { id: "deepseek-reasoner", ownedBy: null, contextWindow: 64000 },
@@ -858,10 +859,9 @@ describe("CodexMultiRouterWizard", () => {
       savedProvider.settingsConfig.modelCatalog.models.map(
         (model: { model: string }) => model.model,
       ),
-    ).toEqual(["deepseek-chat", "deepseek-reasoner"]);
+    ).toEqual(["deepseek-chat"]);
     expect(savedProvider.settingsConfig.modelCatalog.spawnAgentModels).toEqual([
       "deepseek-chat",
-      "deepseek-reasoner",
     ]);
   });
 
@@ -912,9 +912,7 @@ describe("CodexMultiRouterWizard", () => {
       );
       expect(providersApi.update).toHaveBeenCalledTimes(1);
     });
-    expect(
-      await screen.findByText(/新增 1: doubao-seed-1.6/),
-    ).toBeInTheDocument();
+    expect(screen.queryByText(/新增/)).not.toBeInTheDocument();
   });
 
   it("skips AgentPlan model fetch when both inference key and AK/SK are missing", async () => {
@@ -1012,12 +1010,10 @@ describe("CodexMultiRouterWizard", () => {
       );
       expect(providersApi.update).toHaveBeenCalledTimes(1);
     });
-    expect(
-      await screen.findByText(/新增 1: doubao-seed-1.6/),
-    ).toBeInTheDocument();
+    expect(screen.queryByText(/新增/)).not.toBeInTheDocument();
   });
 
-  it("keeps previous model selections while adding newly fetched provider models", async () => {
+  it("keeps previous model selections without adding fetched models", async () => {
     vi.mocked(fetchModelsForConfig).mockResolvedValueOnce([
       { id: "model-a", ownedBy: null },
       { id: "model-b", ownedBy: null },
@@ -1060,12 +1056,12 @@ describe("CodexMultiRouterWizard", () => {
       screen.getByRole("button", { name: "自动获取并写入模型列表" }),
     );
 
-    expect(await screen.findByText(/新增 1: model-c/)).toBeInTheDocument();
+    expect(screen.queryByText(/新增/)).not.toBeInTheDocument();
 
     fireEvent.click(screen.getByRole("button", { name: "选择模型并预览路由" }));
     expect(screen.getByLabelText("保留 model-a")).toBeChecked();
     expect(screen.getByLabelText("保留 model-b")).not.toBeChecked();
-    expect(screen.getByLabelText("保留 model-c")).toBeChecked();
+    expect(screen.queryByLabelText("保留 model-c")).not.toBeInTheDocument();
   });
 
   it("opens a provider config page from the model fetch cards", () => {

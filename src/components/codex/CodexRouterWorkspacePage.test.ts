@@ -402,8 +402,9 @@ describe("Codex model display and sorting", () => {
       "Zeta · Beta",
     );
     expect(formatCodexCatalogModelLabel(models[0], "provider-model")).toBe(
-      "Beta · Zeta",
+      "[Beta] Zeta",
     );
+    expect(formatCodexCatalogModelLabel(models[0])).toBe("[Beta] Zeta");
     expect(
       formatCodexCatalogModelLabel(
         {
@@ -1285,7 +1286,7 @@ describe("Codex MultiRouter workspace route persistence helpers", () => {
         savedProvider?.settingsConfig?.modelCatalog?.models.map(
           (model: { model: string }) => model.model,
         ),
-      ).toEqual(["gpt-5.5", "gpt-5.6-sol"]);
+      ).toEqual(["gpt-5.5"]);
 
       expect(
         vi
@@ -1380,7 +1381,7 @@ describe("Codex MultiRouter workspace route persistence helpers", () => {
     expect(fetchCodexOauthModels).not.toHaveBeenCalledWith("account-disabled");
   });
 
-  it("refreshes fallback and enabled grouped API keys while ignoring disabled groups", async () => {
+  it("refreshes grouped credentials without replacing the provider catalog", async () => {
     vi.mocked(fetchModelsForConfig).mockImplementation(
       async (_baseUrl, apiKey) => {
         if (apiKey === "fallback-key") {
@@ -1468,10 +1469,10 @@ describe("Codex MultiRouter workspace route persistence helpers", () => {
         savedProvider?.settingsConfig?.modelCatalog?.models.map(
           (model: { model: string }) => model.model,
         ),
-      ).toEqual(["fallback-model", "grouped-model"]);
+      ).toEqual(["stale-model"]);
       expect(
         savedProvider?.settingsConfig?.modelCatalog?.spawnAgentModels,
-      ).toEqual(["fallback-model", "grouped-model"]);
+      ).toEqual(["stale-model"]);
     });
   });
 
@@ -1904,7 +1905,7 @@ describe("Codex MultiRouter workspace route persistence helpers", () => {
         .settingsConfig?.modelCatalog?.models.map(
           (model: { model?: string }) => model.model,
         ),
-    ).toEqual(["old-a", "model-a"]);
+    ).toEqual(["old-a"]);
 
     secondRefresh.resolve([{ id: "model-b", ownedBy: null }]);
     await waitFor(() =>
@@ -1921,9 +1922,9 @@ describe("Codex MultiRouter workspace route persistence helpers", () => {
         .settingsConfig?.modelCatalog?.models.map(
           (model: { model?: string }) => model.model,
         ),
-    ).toEqual(["old-b", "model-b"]);
+    ).toEqual(["old-b"]);
     await waitFor(() =>
-      expect(screen.getAllByText("已读取并更新 2 个模型。")).toHaveLength(2),
+      expect(screen.getAllByText("已读取并更新 1 个模型。")).toHaveLength(2),
     );
   });
 
@@ -2377,10 +2378,9 @@ describe("Codex MultiRouter workspace route persistence helpers", () => {
       savedProvider.settingsConfig.modelCatalog.models.map(
         (model: { model: string }) => model.model,
       ),
-    ).toEqual(["kept-model", "removed-model"]);
+    ).toEqual(["kept-model"]);
     expect(savedProvider.settingsConfig.modelCatalog.spawnAgentModels).toEqual([
       "kept-model",
-      "removed-model",
     ]);
 
     expect(
@@ -2836,7 +2836,7 @@ describe("Codex MultiRouter workspace route persistence helpers", () => {
     expect(await screen.findByText("Sub-Agent 设置")).toBeInTheDocument();
   });
 
-  it("exposes model-first display and provider sorting controls in the model-order tab", async () => {
+  it("defaults to provider-first display and exposes provider sorting controls", async () => {
     const { source, plan } = createSubagentWorkspaceFixture();
     renderSubagentWorkspace(source, plan);
 
@@ -2845,7 +2845,7 @@ describe("Codex MultiRouter workspace route persistence helpers", () => {
 
     const selectors = screen.getAllByRole("combobox");
     expect(selectors).toHaveLength(2);
-    expect(selectors[0]).toHaveValue("model");
+    expect(selectors[0]).toHaveValue("provider-model");
     expect(selectors[1]).toHaveValue("custom");
 
     await user.selectOptions(selectors[0], "model-provider");
@@ -3155,6 +3155,7 @@ describe("Codex MultiRouter workspace route persistence helpers", () => {
     expect(plan.settingsConfig).not.toHaveProperty("modelCatalog");
     expect(plan.settingsConfig.codexRouting).toMatchObject({
       schemaVersion: 2,
+      modelDisplayStyle: "provider-model",
       spawnAgentModels: ["gpt-5.4-mini", "qwen3.6"],
     });
   });
