@@ -3652,7 +3652,7 @@
     "modelDisplayStyle": "モデル表示",
     "modelOnly": "モデル名のみ",
     "modelThenProvider": "モデル · プロバイダー",
-    "providerThenModel": "プロバイダー · モデル",
+    "providerThenModel": "[プロバイダー] モデル",
     "modelSort": "モデルの並べ替え",
     "currentOrder": "現在の順序（ドラッグ可能）",
     "sortByModel": "モデル名",

@@ -385,7 +385,7 @@ fn project_codex_model_descriptor(
         .or_else(|| object.get("display_name").and_then(Value::as_str))
         .unwrap_or(model_name);
     let compact_display = strip_provider_prefix(display, &provider_name);
-    let rendered_display = match display_style.unwrap_or("model") {
+    let rendered_display = match display_style.unwrap_or("provider-model") {
         "model" => compact_display.to_string(),
         "model-provider" => {
             if provider_name.is_empty() {
@@ -398,7 +398,7 @@ fn project_codex_model_descriptor(
             if provider_name.is_empty() {
                 compact_display.to_string()
             } else {
-                format!("{provider_name} · {compact_display}")
+                format!("[{provider_name}] {compact_display}")
             }
         }
         _ => compact_display.to_string(),
@@ -1944,9 +1944,9 @@ mod tests {
 
         let (names, models) = codex_model_entries_from_catalog_value(&value);
         assert_eq!(names, vec!["deepseek-b", "qwen-a", "qwen-z"]);
-        assert_eq!(models[0]["displayName"], "Beta");
-        assert_eq!(models[1]["displayName"], "Alpha");
-        assert_eq!(models[2]["displayName"], "Zeta");
+        assert_eq!(models[0]["displayName"], "[DeepSeek] Beta");
+        assert_eq!(models[1]["displayName"], "[Qwen] Alpha");
+        assert_eq!(models[2]["displayName"], "[Qwen] Zeta");
         assert_eq!(models[1]["model"], "qwen-a");
         assert_eq!(models[1]["providerName"], "Qwen");
 
@@ -1960,7 +1960,7 @@ mod tests {
         });
         let (styled_names, styled_models) = codex_model_entries_from_catalog_value(&provider_first);
         assert_eq!(styled_names, vec!["qwen-a"]);
-        assert_eq!(styled_models[0]["displayName"], "Qwen · Alpha");
+        assert_eq!(styled_models[0]["displayName"], "[Qwen] Alpha");
         assert_eq!(styled_models[0]["model"], "qwen-a");
     }
 

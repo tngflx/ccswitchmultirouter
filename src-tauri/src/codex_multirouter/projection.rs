@@ -347,14 +347,13 @@ fn projection_settings(router: &Provider, compiled: &CompiledCodexRoutingPlan) -
                 .get("modelCatalog")
                 .and_then(|catalog| catalog.get("displayNameStyle"))
                 .cloned()
-        });
+        })
+        .unwrap_or_else(|| json!("provider-model"));
     let mut model_catalog = json!({
         "models": models,
         "spawnAgentModels": compiled.spawn_agent_models
     });
-    if let Some(style) = display_name_style {
-        model_catalog["displayNameStyle"] = style;
-    }
+    model_catalog["displayNameStyle"] = display_name_style;
     settings["modelCatalog"] = model_catalog;
     settings["codexRoutingProjection"] = json!({
         "dependencyFingerprint": compiled.dependency_fingerprint

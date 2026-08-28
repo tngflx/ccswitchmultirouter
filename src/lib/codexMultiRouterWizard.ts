@@ -19,7 +19,6 @@ import {
   type HostedToolsConfig,
 } from "./hostedTools";
 import type { FetchedModel } from "@/lib/api/model-fetch";
-import { pruneMissingRemoteCodexCatalogRows } from "@/lib/codexCatalogReconciliation";
 import { extractCodexBaseUrl } from "@/utils/providerConfigUtils";
 import {
   codexPlanModelListAction,
@@ -426,7 +425,6 @@ export function getWizardConfigIssues(
 
 export interface MergeFetchedWizardModelsOptions {
   preserveExistingSelection?: boolean;
-  removeMissingRemote?: boolean;
 }
 
 function normalizedWizardModelId(value: unknown): string {
@@ -525,10 +523,7 @@ export function mergeFetchedModelsIntoWizardProvider(
       byFetchedModel.set(identity, visibleModelId);
     }
   }
-  const mergedModels = Array.from(byModel.values());
-  const models = options.removeMissingRemote
-    ? pruneMissingRemoteCodexCatalogRows(mergedModels, fetchedModels).rows
-    : mergedModels;
+  const models = Array.from(byModel.values());
   const allowedModels = new Set(models.map((model) => model.model));
   const rawSpawnAgentModels =
     provider.settingsConfig?.modelCatalog?.spawnAgentModels;
@@ -1449,6 +1444,7 @@ export function buildCodexMultiRouterWizardPlan(
     ...(existingRoutingV2 ?? {}),
     schemaVersion: 2,
     enabled: true,
+    modelDisplayStyle: existingRoutingV2?.modelDisplayStyle ?? "provider-model",
     subagentVersion,
     subagentV2: existingRouting?.subagentV2,
     spawnAgentModels: requestedSpawnAgentModels.filter((model) =>
