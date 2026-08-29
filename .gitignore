@@ -28,6 +28,7 @@ flatpak/cc-switch.deb
 flatpak-build/
 flatpak-repo/
 .worktrees/
+.codex-work/active/
 .spec-workflow/
 copilot-api
 .history
@@ -43,3 +44,8 @@ mainWindow.js
 
 # Generated release-build cache used for a one-off release audit
 /src-tauri/target-release-audit/
+
+# Regenerable local outputs (paged-guide PDFs, design QA evidence, test fixtures)
+/output/
+/artifacts/
+/.tmp-localappdata/

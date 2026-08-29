@@ -1149,25 +1149,18 @@ function App() {
     return switchProvider(provider);
   };
 
-  // 历史修复写入完成后，先提示重启 Codex，再征求点赞并用默认浏览器打开 CCSwitchMulti 仓库。
-  const handleCodexHistoryRepairCompleted = async () => {
-    toast.success(t("codexHistoryRepair.completedToast"), {
+  // 历史修复完成只显示非阻塞通知；仓库链接保留为可选 toast action，不再弹系统确认框。
+  const handleCodexHistoryRepairCompleted = () => {
+    toast.success(t("codexHistoryRepair.completedRestartPrompt"), {
       closeButton: true,
       duration: 10000,
+      description: t("codexHistoryRepair.completedToast"),
+      action: {
+        label: t("codexHistoryRepair.openRepoAction"),
+        onClick: () =>
+          void settingsApi.openExternal(CCSWITCHMULTI_REPOSITORY_URL),
+      },
     });
-    const shouldOpenHome = window.confirm(
-      [
-        t("codexHistoryRepair.completedRestartPrompt"),
-        "",
-        t("codexHistoryRepair.starAsk"),
-        t("codexHistoryRepair.openRepoHint"),
-      ].join("\n"),
-    );
-    if (shouldOpenHome) {
-      await settingsApi.openExternal(
-        "https://github.com/tngflx/ccswitchmultirouter",
-      );
-    }
   };
 
   const notifyWindowControlError = (error: unknown) => {
