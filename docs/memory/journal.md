@@ -1,5 +1,13 @@
 # Engineering Journal (newest first)
 
+## 2026-08-29 - Purged `docs/list of stupid bugs.docx` from entire git history
+
+- **What happened:** A zero-byte `docs/list of stupid bugs.docx` was tracked at `main`/`v3.19.2-20` (re-added in `719b2d24`; the path had also existed across most of the fork's early history before a later deletion), and had been pushed to origin.
+- **Root cause:** Local notes files were never excluded by `.gitignore`, so a personal notes docx got swept into feature commits.
+- **What we did:** `git filter-repo --invert-paths --path 'docs/list of stupid bugs.docx' --force` rewrote all 4657 commits in 18.3s; force-pushed 171 refs to origin (`main`, every tag, 2 dependabot branches). Old-vs-new `main` diff is exactly the one docx deletion (rule 25); `v3.19.2-19` and spot-checked deep commits are content-identical old→new; added `docs/list of stupid bugs.docx` to `.gitignore`.
+- **Evidence:** post-rewrite `rev-list --objects --all` contains zero `.docx` paths (re-verified after `reflog expire` + `gc --prune=now`; old head `c97be873` object pruned). ls-remote origin: `main`=`1a67003489ccca418d861e739be25aed20df53db`, `v3.19.2-19`=`0efbad81f21eacfd41b3e4a953d510670ca4045d`, `v3.19.2-20`=`a2cfcbfe9c5a675b333f98f71f0199ffd8f2ea78`. Full pre-purge backup: `D:\repos\ccswitchmulti-pre-docx-purge-c97be873.bundle` (167 MiB, verified) + `D:\repos\docx-purge-backup\`.
+- **Don't again:** do not commit local notes/docx files — the gitignore guard now blocks this exact path. OPEN ITEM: `BigStrongSun/ccswitchmulti` still carries the old docx-bearing history (push denied: 403 for `tngflx`); ready-made push plan at `.git/push-plan-bigstrongsun.txt` + ref-map for whoever holds that account. GitHub may serve cached old SHAs until its server-side GC; contact GitHub Support for a guaranteed scrub if that matters.
+
 ## 2026-08-28 - MultiRouter route workspace preserves provider model catalogs
 
 - **What happened:** Opening Configure Multi-Model Routing automatically called provider model-list endpoints and wrote the results back to Provider records, so merely visiting the routes page could alter model catalogs curated in the Provider form.

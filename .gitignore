@@ -48,4 +48,8 @@ mainWindow.js
 # Regenerable local outputs (paged-guide PDFs, design QA evidence, test fixtures)
 /output/
 /artifacts/
+ /.tmp-localappdata/
+
+# Local notes files that must never be committed (purged from history 2026-08-29)
+docs/list of stupid bugs.docx
 /.tmp-localappdata/
