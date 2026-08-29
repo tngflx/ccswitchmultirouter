@@ -612,6 +612,8 @@ describe("useProviderActions", () => {
         },
       },
       "claude",
+      undefined,
+      true,
     );
     expect(invalidateSpy).toHaveBeenCalledWith({
       queryKey: ["providers", "claude"],

@@ -392,14 +392,15 @@ export function useProviderActions(
           },
         };
 
-        await providersApi.update(updatedProvider, activeApp);
+        await providersApi.update(updatedProvider, activeApp, undefined, true);
         await queryClient.invalidateQueries({
           queryKey: ["providers", activeApp],
         });
         // 🔧 保存用量脚本后，也应该失效该 provider 的用量查询缓存
         // 这样主页列表会使用新配置重新查询，而不是使用测试时的缓存
-        await queryClient.invalidateQueries({
+        queryClient.invalidateQueries({
           queryKey: usageKeys.script(provider.id, activeApp),
+          refetchType: "none",
         });
         await queryClient.invalidateQueries({
           queryKey: ["subscription", "quota", activeApp],

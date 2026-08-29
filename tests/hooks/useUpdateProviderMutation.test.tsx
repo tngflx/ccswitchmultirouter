@@ -113,6 +113,7 @@ describe("useUpdateProviderMutation", () => {
     });
     expect(invalidateSpy).toHaveBeenCalledWith({
       queryKey: usageKeys.script("provider-b", "codex"),
+      refetchType: "none",
     });
     expect(invalidateSpy).not.toHaveBeenCalledWith({
       queryKey: usageKeys.all,
@@ -192,9 +193,11 @@ describe("useUpdateProviderMutation", () => {
     );
     expect(invalidateSpy).toHaveBeenCalledWith({
       queryKey: usageKeys.script("provider-new", "openclaw"),
+      refetchType: "none",
     });
     expect(invalidateSpy).toHaveBeenCalledWith({
       queryKey: usageKeys.script("provider-old", "openclaw"),
+      refetchType: "none",
     });
     expect(invalidateSpy).not.toHaveBeenCalledWith({
       queryKey: usageKeys.all,
