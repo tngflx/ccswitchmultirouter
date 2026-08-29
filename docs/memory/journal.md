@@ -1,5 +1,13 @@
 # Engineering Journal (newest first)
 
+## 2026-08-28 - MultiRouter route workspace preserves provider model catalogs
+
+- **What happened:** Opening Configure Multi-Model Routing automatically called provider model-list endpoints and wrote the results back to Provider records, so merely visiting the routes page could alter model catalogs curated in the Provider form.
+- **Root cause:** The routes workspace had gained a mount-driven refresh transaction that treated entering the routes tab as permission to fetch `/models` and call `providersApi.update`. That duplicated the explicit `自动获取并写入模型列表` action in the wizard and violated the Provider form catalog's ownership boundary.
+- **What we did:** Disabled model fetching and Provider writes on route-page entry, retained the explicit wizard synchronization button, and preserved the existing default catalog label format `[Provider] model`.
+- **Evidence:** `src/components/codex/CodexRouterWorkspacePage.test.ts` passed 67/67; focused route-open preservation and explicit wizard synchronization tests passed 2/2; `pnpm typecheck`, targeted TypeScript Prettier, `git diff --check`, and `cargo check --manifest-path src-tauri/Cargo.toml` passed. Full frontend verification finished with 1,287 passing and 2 failing tests, both reproducible in the unrelated `CodexSubagentV2ProfileEditor.test.tsx` file. Full Rust tests could not complete because Windows first reported paging-file error 1455 while mapping `libcc_switch_lib.rlib`, then could not replace the currently running `src-tauri/target/debug/cc-switch.exe`; that process was deliberately left running. The journal-wide Prettier check remains red on pre-existing historical formatting outside this entry.
+- **Don't again:** do not couple navigation into MultiRouter configuration with remote model discovery or persistence; model-list writes require an explicit user action.
+
 ## 2026-08-28 - v3.19.2-20 release notes, updater ownership, and toolchain alignment
 
 - **What happened:** GitHub Release `v3.19.2-19` showed only the generic automatic-publication sentence even though the repository contained detailed audits and engineering history. The tag was built from two release-only commits outside `main`: updater ownership/signing changes plus a pnpm 10 workaround for Node 20. Meanwhile `main` already required pnpm 11.24.0, `.node-version` was below pnpm 11.24.0's actual Node requirement, and CI/release workflows mixed Node 20 with pnpm 9/10/11.

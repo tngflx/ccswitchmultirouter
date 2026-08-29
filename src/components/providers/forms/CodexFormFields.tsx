@@ -32,8 +32,10 @@ import {
   ChevronRight,
   ArrowDown,
   ArrowUp,
+  ArrowLeftRight,
   Plus,
   Trash2,
+  X,
 } from "lucide-react";
 import EndpointSpeedTest from "./EndpointSpeedTest";
 import { ApiKeySection, EndpointField, ModelDropdown } from "./shared";
@@ -877,9 +879,9 @@ export function CodexFormFields({
     "sync" | "refresh-existing" | null
   >(null);
   const [catalogSearch, setCatalogSearch] = useState("");
-  const [catalogVisibility, setCatalogVisibility] = useState<
-    "all" | "included" | "excluded"
-  >("all");
+  const [selectedCatalogRowIds, setSelectedCatalogRowIds] = useState<
+    Set<string>
+  >(() => new Set());
   const [reasoningResolutions, setReasoningResolutions] = useState<
     Record<string, CodexModelReasoningResolution>
   >({});
@@ -1024,14 +1026,6 @@ export function CodexFormFields({
     return catalogRows
       .map((row, index) => ({ row, index }))
       .filter(({ row }) => {
-        const isIncluded = row.enabled !== false;
-        if (
-          !query &&
-          ((catalogVisibility === "included" && !isIncluded) ||
-            (catalogVisibility === "excluded" && isIncluded))
-        ) {
-          return false;
-        }
         if (!query) return true;
         return [
           row.model,
@@ -1043,7 +1037,14 @@ export function CodexFormFields({
           .filter(Boolean)
           .some((value) => String(value).toLowerCase().includes(query));
       });
-  }, [catalogRows, catalogSearch, catalogVisibility]);
+  }, [catalogRows, catalogSearch]);
+
+  const allVisibleCatalogRowsSelected =
+    visibleCatalogRows.length > 0 &&
+    visibleCatalogRows.every(({ row }) => selectedCatalogRowIds.has(row.rowId));
+  const someVisibleCatalogRowsSelected =
+    !allVisibleCatalogRowsSelected &&
+    visibleCatalogRows.some(({ row }) => selectedCatalogRowIds.has(row.rowId));
 
   useEffect(() => {
     const models = catalogRows
@@ -1099,6 +1100,16 @@ export function CodexFormFields({
   // 保留最新的模型映射行给异步刷新回调用，避免点击“获取模型列表”时合并到旧闭包里的 catalogRows。
   useEffect(() => {
     catalogRowsRef.current = catalogRows;
+  }, [catalogRows]);
+
+  useEffect(() => {
+    const validRowIds = new Set(catalogRows.map((row) => row.rowId));
+    setSelectedCatalogRowIds((current) => {
+      const next = new Set(
+        [...current].filter((rowId) => validRowIds.has(rowId)),
+      );
+      return next.size === current.size ? current : next;
+    });
   }, [catalogRows]);
 
   const buildReadinessIdentityFor = useCallback(
@@ -1819,17 +1830,104 @@ export function CodexFormFields({
     [],
   );
 
-  const applyVisibleCatalogRowsEnabled = useCallback(
+  const applySelectedCatalogRowsEnabled = useCallback(
     (enabled: boolean) => {
+      const affectedCount = selectedCatalogRowIds.size;
+      if (affectedCount === 0) return;
       setCatalogRowsEnabled(
-        visibleCatalogRows.map(({ index }) => index),
+        catalogRows
+          .map((row, index) =>
+            selectedCatalogRowIds.has(row.rowId) ? index : -1,
+          )
+          .filter((index) => index >= 0),
         enabled,
       );
-      setCatalogSearch("");
-      setCatalogVisibility(enabled ? "included" : "excluded");
+      setSelectedCatalogRowIds(new Set());
+      toast.success(
+        t(
+          enabled
+            ? "codexConfig.catalogIncludedFeedback"
+            : "codexConfig.catalogExcludedFeedback",
+          {
+            count: affectedCount,
+            defaultValue: enabled
+              ? "Included {{count}} models"
+              : "Excluded {{count}} models",
+          },
+        ),
+      );
     },
-    [setCatalogRowsEnabled, visibleCatalogRows],
+    [catalogRows, selectedCatalogRowIds, setCatalogRowsEnabled, t],
   );
+
+  const toggleCatalogRowSelected = useCallback(
+    (rowId: string, selected: boolean) => {
+      setSelectedCatalogRowIds((current) => {
+        const next = new Set(current);
+        if (selected) next.add(rowId);
+        else next.delete(rowId);
+        return next;
+      });
+    },
+    [],
+  );
+
+  const updateCatalogSelection = useCallback(
+    (mode: "shown" | "invert" | "clear") => {
+      setSelectedCatalogRowIds((current) => {
+        if (mode === "clear") return new Set();
+        const visibleIds = visibleCatalogRows.map(({ row }) => row.rowId);
+        if (mode === "invert") {
+          const next = new Set(current);
+          visibleIds.forEach((id) =>
+            next.has(id) ? next.delete(id) : next.add(id),
+          );
+          return next;
+        }
+        const next = new Set(current);
+        const allVisibleSelected =
+          visibleIds.length > 0 && visibleIds.every((id) => next.has(id));
+        visibleIds.forEach((id) =>
+          allVisibleSelected ? next.delete(id) : next.add(id),
+        );
+        return next;
+      });
+    },
+    [visibleCatalogRows],
+  );
+
+  const useOnlySelectedCatalogRows = useCallback(() => {
+    const selectedCount = selectedCatalogRowIds.size;
+    if (selectedCount === 0) return;
+    setCatalogRows((current) =>
+      current.map((row) => ({
+        ...row,
+        enabled: selectedCatalogRowIds.has(row.rowId),
+      })),
+    );
+    setSelectedCatalogRowIds(new Set());
+    toast.success(
+      t("codexConfig.catalogUseOnlyFeedback", {
+        count: selectedCount,
+        defaultValue: "Using only {{count}} selected models in MultiRouter",
+      }),
+    );
+  }, [selectedCatalogRowIds, t]);
+
+  const removeSelectedCatalogRows = useCallback(() => {
+    const removedCount = selectedCatalogRowIds.size;
+    if (removedCount === 0) return;
+    setCatalogRows((current) =>
+      current.filter((row) => !selectedCatalogRowIds.has(row.rowId)),
+    );
+    setSelectedCatalogRowIds(new Set());
+    toast.success(
+      t("codexConfig.catalogRemovedFeedback", {
+        count: removedCount,
+        defaultValue: "Removed {{count}} models",
+      }),
+    );
+  }, [selectedCatalogRowIds, t]);
 
   const handleUpdateCatalogRow = useCallback(
     (index: number, patch: Partial<CodexCatalogModel>) => {
@@ -3505,95 +3603,156 @@ export function CodexFormFields({
                   {catalogRows.length > 0 && (
                     <div className="space-y-2">
                       <div className="flex flex-col gap-2 rounded-md border border-border-default bg-background/60 p-2 sm:flex-row sm:items-center">
-                        <Input
-                          value={catalogSearch}
-                          onChange={(event) =>
-                            setCatalogSearch(event.target.value)
-                          }
-                          placeholder={t(
-                            "codexConfig.catalogSearchPlaceholder",
-                            {
-                              defaultValue: "Search models",
-                            },
-                          )}
-                          className="h-8 sm:max-w-xs"
-                          aria-label={t("codexConfig.catalogSearchLabel", {
-                            defaultValue: "Filter model catalog",
-                          })}
-                        />
-                        <div
-                          className="inline-flex overflow-hidden rounded-md border"
-                          role="group"
-                          aria-label={t(
-                            "codexConfig.catalogStatusFilterLabel",
-                            {
-                              defaultValue: "Filter by inclusion status",
-                            },
-                          )}
-                        >
-                          {(["all", "included", "excluded"] as const).map(
-                            (value) => (
-                              <Button
-                                key={value}
-                                type="button"
-                                size="sm"
-                                variant={
-                                  catalogVisibility === value
-                                    ? "default"
-                                    : "ghost"
-                                }
-                                aria-pressed={catalogVisibility === value}
-                                onClick={() => setCatalogVisibility(value)}
-                              >
-                                {value === "all"
-                                  ? t("codexConfig.catalogFilterAll", {
-                                      count: catalogRows.length,
-                                      defaultValue: "All {{count}}",
-                                    })
-                                  : value === "included"
-                                    ? t("codexConfig.catalogFilterIncluded", {
-                                        count: catalogRows.filter(
-                                          (row) => row.enabled !== false,
-                                        ).length,
-                                        defaultValue: "Included {{count}}",
-                                      })
-                                    : t("codexConfig.catalogFilterExcluded", {
-                                        count: catalogRows.filter(
-                                          (row) => row.enabled === false,
-                                        ).length,
-                                        defaultValue: "Excluded {{count}}",
-                                      })}
-                              </Button>
-                            ),
+                        <div className="relative w-full sm:w-96">
+                          <Input
+                            value={catalogSearch}
+                            onChange={(event) =>
+                              setCatalogSearch(event.target.value)
+                            }
+                            placeholder={t(
+                              "codexConfig.catalogSearchPlaceholder",
+                              {
+                                defaultValue: "Search models",
+                              },
+                            )}
+                            className="h-8 pr-8"
+                            aria-label={t("codexConfig.catalogSearchLabel", {
+                              defaultValue: "Filter model catalog",
+                            })}
+                          />
+                          {catalogSearch && (
+                            <Button
+                              type="button"
+                              size="icon"
+                              variant="ghost"
+                              className="absolute right-0 top-0 h-8 w-8 text-muted-foreground hover:text-foreground"
+                              onClick={() => setCatalogSearch("")}
+                              title={t("codexConfig.catalogClearSearch", {
+                                defaultValue: "Clear model search",
+                              })}
+                              aria-label={t("codexConfig.catalogClearSearch", {
+                                defaultValue: "Clear model search",
+                              })}
+                            >
+                              <X className="h-4 w-4" />
+                            </Button>
                           )}
                         </div>
-                        <div className="flex flex-wrap gap-1 sm:ml-auto">
+                        <div className="flex items-center gap-1 sm:ml-auto">
+                          <label className="flex h-8 cursor-pointer items-center gap-2 rounded-md border px-2 text-xs font-medium">
+                            <input
+                              type="checkbox"
+                              className="h-4 w-4 rounded border-border-default"
+                              checked={allVisibleCatalogRowsSelected}
+                              ref={(element) => {
+                                if (element) {
+                                  element.indeterminate =
+                                    someVisibleCatalogRowsSelected;
+                                }
+                              }}
+                              onChange={() => updateCatalogSelection("shown")}
+                              aria-label={t(
+                                "codexConfig.catalogSelectFiltered",
+                                { defaultValue: "Select shown" },
+                              )}
+                            />
+                            {t("codexConfig.catalogShownSummary", {
+                              count: visibleCatalogRows.length,
+                              defaultValue: "{{count}} shown",
+                            })}
+                          </label>
                           <Button
                             type="button"
-                            size="sm"
-                            variant="outline"
+                            size="icon"
+                            variant="ghost"
+                            className="h-8 w-8"
                             disabled={visibleCatalogRows.length === 0}
-                            onClick={() => applyVisibleCatalogRowsEnabled(true)}
-                          >
-                            {t("codexConfig.catalogIncludeFiltered", {
-                              defaultValue: "Include Filtered",
+                            onClick={() => updateCatalogSelection("invert")}
+                            title={t("codexConfig.catalogInvertSelection", {
+                              defaultValue: "Invert shown selection",
                             })}
-                          </Button>
-                          <Button
-                            type="button"
-                            size="sm"
-                            variant="outline"
-                            disabled={visibleCatalogRows.length === 0}
-                            onClick={() =>
-                              applyVisibleCatalogRowsEnabled(false)
-                            }
+                            aria-label={t(
+                              "codexConfig.catalogInvertSelection",
+                              { defaultValue: "Invert shown selection" },
+                            )}
                           >
-                            {t("codexConfig.catalogExcludeFiltered", {
-                              defaultValue: "Exclude Filtered",
-                            })}
+                            <ArrowLeftRight className="h-4 w-4" />
                           </Button>
                         </div>
                       </div>
+                      {selectedCatalogRowIds.size > 0 && (
+                        <div className="flex flex-wrap items-center gap-2 rounded-md border border-primary/30 bg-primary/5 px-3 py-2">
+                          <span className="mr-auto text-sm font-medium">
+                            {t("codexConfig.catalogSelectionSummary", {
+                              selected: selectedCatalogRowIds.size,
+                              defaultValue: "{{selected}} selected",
+                            })}
+                          </span>
+                          <Button
+                            type="button"
+                            size="sm"
+                            variant="outline"
+                            onClick={() =>
+                              applySelectedCatalogRowsEnabled(true)
+                            }
+                          >
+                            {t("codexConfig.catalogUseSelected", {
+                              defaultValue: "Use selected",
+                            })}
+                          </Button>
+                          <Button
+                            type="button"
+                            size="sm"
+                            variant="outline"
+                            onClick={() =>
+                              applySelectedCatalogRowsEnabled(false)
+                            }
+                          >
+                            {t("codexConfig.catalogExcludeSelected", {
+                              defaultValue: "Don't use",
+                            })}
+                          </Button>
+                          <Button
+                            type="button"
+                            size="sm"
+                            onClick={useOnlySelectedCatalogRows}
+                          >
+                            {t("codexConfig.catalogUseOnlySelected", {
+                              defaultValue: "Use only these",
+                            })}
+                          </Button>
+                          <Button
+                            type="button"
+                            size="icon"
+                            variant="ghost"
+                            className="h-8 w-8 text-destructive hover:text-destructive"
+                            onClick={removeSelectedCatalogRows}
+                            title={t("codexConfig.catalogRemoveSelected", {
+                              defaultValue: "Remove selected models",
+                            })}
+                            aria-label={t("codexConfig.catalogRemoveSelected", {
+                              defaultValue: "Remove selected models",
+                            })}
+                          >
+                            <Trash2 className="h-4 w-4" />
+                          </Button>
+                          <Button
+                            type="button"
+                            size="icon"
+                            variant="ghost"
+                            className="h-8 w-8"
+                            onClick={() => updateCatalogSelection("clear")}
+                            title={t("codexConfig.catalogClearSelection", {
+                              defaultValue: "Clear selection",
+                            })}
+                            aria-label={t("codexConfig.catalogClearSelection", {
+                              defaultValue: "Clear selection",
+                            })}
+                          >
+                            <X className="h-4 w-4" />
+                          </Button>
+                        </div>
+                      )}
                     </div>
                   )}
                 </div>
@@ -3601,10 +3760,15 @@ export function CodexFormFields({
                 {catalogRows.length > 0 && (
                   <div className="space-y-2">
                     {/* 列头：md+ 显示 */}
-                    <div className="hidden grid-cols-[88px_1fr_1fr_1fr_132px_76px_36px] gap-2 px-1 text-xs font-medium text-muted-foreground md:grid">
+                    <div className="hidden grid-cols-[36px_88px_1fr_1fr_1fr_132px_76px_36px] gap-2 px-1 text-xs font-medium text-muted-foreground md:grid">
+                      <span>
+                        {t("codexConfig.catalogSelectColumn", {
+                          defaultValue: "Select",
+                        })}
+                      </span>
                       <span>
                         {t("codexConfig.keepCatalogModelColumn", {
-                          defaultValue: "Included",
+                          defaultValue: "Use in MultiRouter",
                         })}
                       </span>
                       <span>
@@ -3655,30 +3819,48 @@ export function CodexFormFields({
                       return (
                         <div
                           key={row.rowId}
-                          className="grid grid-cols-1 gap-2 rounded-md border border-transparent p-1 md:grid-cols-[88px_1fr_1fr_1fr_132px_76px_36px]"
+                          className={cn(
+                            "grid grid-cols-1 gap-2 rounded-md border p-1 md:grid-cols-[36px_88px_1fr_1fr_1fr_132px_76px_36px]",
+                            selectedCatalogRowIds.has(row.rowId)
+                              ? "border-primary/50 bg-primary/5"
+                              : "border-transparent",
+                          )}
                         >
-                          <label className="flex h-9 items-center gap-2 text-xs text-muted-foreground">
+                          <label className="flex h-9 items-center justify-center">
                             <input
                               type="checkbox"
                               className="h-4 w-4 rounded border-border-default"
-                              checked={row.enabled !== false}
+                              checked={selectedCatalogRowIds.has(row.rowId)}
                               onChange={(event) =>
-                                setCatalogRowsEnabled(
-                                  [index],
+                                toggleCatalogRowSelected(
+                                  row.rowId,
                                   event.target.checked,
                                 )
                               }
-                              aria-label={t("codexConfig.keepCatalogModel", {
+                              aria-label={t("codexConfig.catalogSelectModel", {
                                 model: row.model || row.displayName || "model",
-                                defaultValue: `Include ${row.model || row.displayName || "model"}`,
+                                defaultValue: `Select ${row.model || row.displayName || "model"}`,
                               })}
                             />
-                            <span className="md:hidden">
-                              {t("codexConfig.keepCatalogModelColumn", {
-                                defaultValue: "Included",
-                              })}
-                            </span>
                           </label>
+                          <div className="flex h-9 items-center">
+                            <span
+                              className={cn(
+                                "inline-flex rounded px-2 py-1 text-xs font-medium",
+                                row.enabled !== false
+                                  ? "bg-emerald-500/10 text-emerald-700 dark:text-emerald-300"
+                                  : "bg-muted text-muted-foreground",
+                              )}
+                            >
+                              {row.enabled !== false
+                                ? t("codexConfig.catalogUsedStatus", {
+                                    defaultValue: "Used",
+                                  })
+                                : t("codexConfig.catalogNotUsedStatus", {
+                                    defaultValue: "Not used",
+                                  })}
+                            </span>
+                          </div>
                           <Input
                             value={row.displayName ?? ""}
                             onChange={(event) =>

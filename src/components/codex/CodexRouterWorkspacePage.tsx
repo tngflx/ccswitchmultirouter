@@ -656,6 +656,7 @@ type CodexModelCatalogDraft = {
 const DEFAULT_CODEX_PROXY_LISTEN_ADDRESS = "127.0.0.1";
 const DEFAULT_CODEX_PROXY_LISTEN_PORT = 15721;
 const MODEL_REFRESH_TIMEOUT_MS = 30_000;
+const AUTO_REFRESH_PROVIDER_MODELS_ON_ROUTE_OPEN = false;
 
 /// 生成候选 provider /models 刷新的去重键；API Key 用短哈希参与比较，避免换 key 后仍复用旧请求。
 function buildProviderModelRefreshAttemptKey(
@@ -3205,9 +3206,10 @@ export function CodexRouterWorkspacePage({
     invalidateModelRefreshesOutside(enabledModelSourceIdsForRefresh);
   }, [enabledModelSourceIdsForRefresh]);
 
-  // 进入路由页时只刷新当前方案已启用的模型源；停用候选不能借刷新副作用
-  // 重新进入聚合 catalog，OAuth 与普通 /models 仍共用后续写回事务。
+  // Provider 表单中保存的 modelCatalog 是路由工作台的权威输入。
+  // 打开路由页不得隐式读取 /models 或写回 Provider；模型同步只能由用户显式触发。
   useEffect(() => {
+    if (!AUTO_REFRESH_PROVIDER_MODELS_ON_ROUTE_OPEN) return;
     if (activeTab !== "routes") return;
     if (enabledModelSourceIdsForRefresh.size === 0) return;
 

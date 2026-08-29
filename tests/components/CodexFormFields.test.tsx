@@ -1468,10 +1468,33 @@ describe("CodexFormFields local model routing", () => {
 
     expect(fetchModelsForConfig).not.toHaveBeenCalled();
     expect(latestCatalog()).toHaveLength(2);
-    expect(screen.getByLabelText("Include free-model")).toBeInTheDocument();
+    expect(screen.getByLabelText("Select free-model")).toBeInTheDocument();
     expect(
-      screen.queryByLabelText("Include paid-model"),
+      screen.queryByLabelText("Select paid-model"),
     ).not.toBeInTheDocument();
+  });
+
+  it("clears the model catalog search from the input clear button", () => {
+    renderCatalogHarness([
+      { model: "free-model", upstreamModel: "free-model" },
+      { model: "paid-model", upstreamModel: "paid-model" },
+    ]);
+
+    const searchInput = screen.getByLabelText("Filter model catalog");
+    fireEvent.change(searchInput, { target: { value: "free" } });
+
+    expect(screen.getByLabelText("Clear model search")).toBeInTheDocument();
+    expect(
+      screen.queryByLabelText("Select paid-model"),
+    ).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByLabelText("Clear model search"));
+
+    expect(searchInput).toHaveValue("");
+    expect(
+      screen.queryByLabelText("Clear model search"),
+    ).not.toBeInTheDocument();
+    expect(screen.getByLabelText("Select paid-model")).toBeInTheDocument();
   });
 
   it("discards an in-flight fetch when grouped credentials change", async () => {
@@ -1524,7 +1547,8 @@ describe("CodexFormFields local model routing", () => {
     fireEvent.change(screen.getByLabelText("Filter model catalog"), {
       target: { value: "free" },
     });
-    fireEvent.click(screen.getByRole("button", { name: "Include Filtered" }));
+    fireEvent.click(screen.getByLabelText("Select shown"));
+    fireEvent.click(screen.getByRole("button", { name: "Use selected" }));
 
     await waitFor(() => {
       expect(
@@ -1536,14 +1560,10 @@ describe("CodexFormFields local model routing", () => {
     expect(
       latestCatalog().find((model) => model.model === "paid-only")?.enabled,
     ).toBe(false);
-    expect(screen.getByLabelText("Filter model catalog")).toHaveValue("");
-    expect(screen.getByRole("button", { name: "Included 3" })).toHaveAttribute(
-      "aria-pressed",
-      "true",
-    );
+    expect(screen.getByLabelText("Filter model catalog")).toHaveValue("free");
   });
 
-  it("syncs all remote models as included by default and narrows to only free models", async () => {
+  it("uses only the searched models after selecting all shown rows", async () => {
     vi.mocked(fetchModelsForConfig).mockResolvedValueOnce([
       { id: "free-model", ownedBy: null },
       { id: "paid-model", ownedBy: null },
@@ -1562,17 +1582,11 @@ describe("CodexFormFields local model routing", () => {
       );
     });
 
-    fireEvent.click(screen.getByRole("button", { name: "Exclude Filtered" }));
-    await waitFor(() => {
-      expect(latestCatalog().every((model) => model.enabled === false)).toBe(
-        true,
-      );
-    });
-
     fireEvent.change(screen.getByLabelText("Filter model catalog"), {
       target: { value: "free" },
     });
-    fireEvent.click(screen.getByRole("button", { name: "Include Filtered" }));
+    fireEvent.click(screen.getByLabelText("Select shown"));
+    fireEvent.click(screen.getByRole("button", { name: "Use only these" }));
 
     await waitFor(() => {
       expect(
@@ -1608,10 +1622,8 @@ describe("CodexFormFields local model routing", () => {
     fireEvent.change(screen.getByLabelText("Filter model catalog"), {
       target: { value: "free" },
     });
-    expect(screen.getByLabelText("Include grok-free")).toBeInTheDocument();
-    expect(
-      screen.queryByLabelText("Include grok-paid"),
-    ).not.toBeInTheDocument();
+    expect(screen.getByLabelText("Select grok-free")).toBeInTheDocument();
+    expect(screen.queryByLabelText("Select grok-paid")).not.toBeInTheDocument();
   });
 
   it("accumulates included rows across successive filters", async () => {
@@ -1624,7 +1636,8 @@ describe("CodexFormFields local model routing", () => {
     fireEvent.change(screen.getByLabelText("Filter model catalog"), {
       target: { value: "free" },
     });
-    fireEvent.click(screen.getByRole("button", { name: "Include Filtered" }));
+    fireEvent.click(screen.getByLabelText("Select shown"));
+    fireEvent.click(screen.getByRole("button", { name: "Use selected" }));
 
     await waitFor(() => {
       expect(
@@ -1637,13 +1650,39 @@ describe("CodexFormFields local model routing", () => {
     fireEvent.change(screen.getByLabelText("Filter model catalog"), {
       target: { value: "paid" },
     });
-    fireEvent.click(screen.getByRole("button", { name: "Include Filtered" }));
+    fireEvent.click(screen.getByLabelText("Select shown"));
+    fireEvent.click(screen.getByRole("button", { name: "Use selected" }));
 
     await waitFor(() => {
       expect(latestCatalog().every((model) => model.enabled === true)).toBe(
         true,
       );
     });
+  });
+
+  it("selects filtered rows and removes only the selected catalog models", async () => {
+    const { latestCatalog } = renderCatalogHarness([
+      { model: "free-a", upstreamModel: "free-a", enabled: true },
+      { model: "free-b", upstreamModel: "free-b", enabled: false },
+      { model: "paid-c", upstreamModel: "paid-c", enabled: true },
+    ]);
+
+    fireEvent.change(screen.getByLabelText("Filter model catalog"), {
+      target: { value: "free" },
+    });
+    fireEvent.click(screen.getByLabelText("Select shown"));
+
+    expect(screen.getByLabelText("Select free-a")).toBeChecked();
+    expect(screen.getByLabelText("Select free-b")).toBeChecked();
+    expect(screen.getByLabelText("Remove selected models")).toBeEnabled();
+
+    fireEvent.click(screen.getByLabelText("Remove selected models"));
+
+    await waitFor(() => {
+      expect(latestCatalog().map((model) => model.model)).toEqual(["paid-c"]);
+    });
+    expect(screen.queryByLabelText("Select free-a")).not.toBeInTheDocument();
+    expect(screen.queryByLabelText("Select free-b")).not.toBeInTheDocument();
   });
 
   it("adds a key group directly while keeping the fallback API key visible", () => {
@@ -1805,16 +1844,15 @@ describe("CodexFormFields local model routing", () => {
     fireEvent.change(screen.getByLabelText("Filter model catalog"), {
       target: { value: "beta-paid" },
     });
-    fireEvent.click(screen.getByRole("button", { name: "Exclude Filtered" }));
+    fireEvent.click(screen.getByLabelText("Select shown"));
+    fireEvent.click(screen.getByRole("button", { name: "Don't use" }));
     await waitFor(() => {
       expect(
         latestCatalog().find((model) => model.model === "beta-paid")?.enabled,
       ).toBe(false);
     });
-    expect(screen.getByLabelText("Filter model catalog")).toHaveValue("");
-    expect(screen.getByRole("button", { name: "Excluded 1" })).toHaveAttribute(
-      "aria-pressed",
-      "true",
+    expect(screen.getByLabelText("Filter model catalog")).toHaveValue(
+      "beta-paid",
     );
 
     fireEvent.change(screen.getByLabelText("Filter model catalog"), {
@@ -1976,7 +2014,8 @@ describe("CodexFormFields local model routing", () => {
       { model: "model-c", upstreamModel: "model-c" },
     ]);
 
-    fireEvent.click(screen.getByLabelText("Include model-b"));
+    fireEvent.click(screen.getByLabelText("Select model-b"));
+    fireEvent.click(screen.getByRole("button", { name: "Don't use" }));
 
     await waitFor(() => {
       const models = latestCatalog();
@@ -1990,12 +2029,10 @@ describe("CodexFormFields local model routing", () => {
       );
     });
 
-    // Excluded rows stay in the draft as persistent tombstones. Switch to the
-    // included-only view before reordering the retained catalog.
-    fireEvent.click(screen.getByRole("button", { name: "Included 2" }));
-    expect(screen.getAllByTitle("上移")).toHaveLength(2);
+    // Unused rows remain visible and saved as persistent catalog metadata.
+    expect(screen.getAllByTitle("上移")).toHaveLength(3);
 
-    fireEvent.click(screen.getAllByTitle("上移")[1]);
+    fireEvent.click(screen.getAllByTitle("上移")[2]);
 
     await waitFor(() => {
       const models = latestCatalog();
