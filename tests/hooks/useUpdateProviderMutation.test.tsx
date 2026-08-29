@@ -102,7 +102,12 @@ describe("useUpdateProviderMutation", () => {
       await result.current.mutateAsync({ provider });
     });
 
-    expect(apiMocks.update).toHaveBeenCalledWith(provider, "codex", undefined);
+    expect(apiMocks.update).toHaveBeenCalledWith(
+      provider,
+      "codex",
+      undefined,
+      true,
+    );
     expect(invalidateSpy).toHaveBeenCalledWith({
       queryKey: ["providers", "codex"],
     });
@@ -132,7 +137,12 @@ describe("useUpdateProviderMutation", () => {
 
     expect(apiMocks.getAll).not.toHaveBeenCalled();
     expect(apiMocks.update).toHaveBeenCalledTimes(1);
-    expect(apiMocks.update).toHaveBeenCalledWith(provider, "codex", undefined);
+    expect(apiMocks.update).toHaveBeenCalledWith(
+      provider,
+      "codex",
+      undefined,
+      true,
+    );
   });
 
   it("warns immediately when the active MultiRouter projection is pending after save", async () => {
@@ -178,6 +188,7 @@ describe("useUpdateProviderMutation", () => {
       provider,
       "openclaw",
       "provider-old",
+      undefined,
     );
     expect(invalidateSpy).toHaveBeenCalledWith({
       queryKey: usageKeys.script("provider-new", "openclaw"),

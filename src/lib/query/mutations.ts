@@ -240,7 +240,18 @@ export const useUpdateProviderMutation = (appId: AppId) => {
       provider: Provider;
       originalId?: string;
     }) => {
-      await providersApi.update(provider, appId, originalId);
+      // A normal ProviderForm save is persistence, not a connectivity test.
+      // The Codex backend's automatic preflight can issue up to eight remote
+      // requests per catalog model and processes models serially, so awaiting
+      // it here can leave Save spinning for minutes. Explicit protocol-probe
+      // actions still run the deep verification; this path keeps all local
+      // backend validation, mutation, projection, and live-sync guarantees.
+      await providersApi.update(
+        provider,
+        appId,
+        originalId,
+        appId === "codex" ? true : undefined,
+      );
       return { provider };
     },
     onSuccess: async (result, variables) => {
