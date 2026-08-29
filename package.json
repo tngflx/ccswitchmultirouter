@@ -5,6 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "pnpm tauri dev",
+    "dev:delayed": "node scripts/dev-tauri-delayed.mjs",
     "build": "pnpm tauri build",
     "tauri": "tauri",
     "dev:renderer": "vite",
