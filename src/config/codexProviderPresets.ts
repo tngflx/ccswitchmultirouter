@@ -45,7 +45,7 @@ export interface CodexProviderPreset {
   modelCatalog?: CodexCatalogModel[];
   // Codex Responses -> Chat Completions reasoning capability defaults
   codexChatReasoning?: CodexChatReasoning;
-  // Session-based prompt-cache routing override for Chat Completions upstreams
+  // Session-based prompt-cache routing override for native Responses and Chat upstreams
   promptCacheRouting?: PromptCacheRoutingMode;
 }
 
