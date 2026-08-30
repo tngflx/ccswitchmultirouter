@@ -8,6 +8,35 @@
   state.failures = state.failures || [];
   window[patchKey] = state;
 __CODEX_MODEL_PICKER_CORE__
+  const installModelPickerSpacingFix = () => {
+    const styleId = `${patchKey}-model-picker-spacing`;
+    let style = document.getElementById(styleId);
+    if (!style) {
+      style = document.createElement("style");
+      style.id = styleId;
+      style.textContent = `
+        [data-radix-popper-content-wrapper][data-ccswitch-model-picker="true"] [role="menuitem"],
+        [data-radix-popper-content-wrapper]:has([data-model-selected]) [role="menuitem"] {
+          flex-shrink: 0 !important;
+        }
+      `;
+      (document.head || document.documentElement).appendChild(style);
+    }
+    const names = new Set(modelNames());
+    for (const wrapper of document.querySelectorAll("[data-radix-popper-content-wrapper]")) {
+      if (wrapper.querySelector("[data-model-selected]")) {
+        wrapper.setAttribute("data-ccswitch-model-picker", "true");
+        continue;
+      }
+      const items = Array.from(wrapper.querySelectorAll('[role="menuitem"]'));
+      if (items.some((item) => {
+        const text = String(item.textContent || "").trim();
+        return text && Array.from(names).some((name) => text.includes(name));
+      })) {
+        wrapper.setAttribute("data-ccswitch-model-picker", "true");
+      }
+    }
+  };
   const patchStatsigConfig = (config) => {
     const value = config?.value;
     if (!value || typeof value !== "object") return config;
@@ -218,8 +247,13 @@ __CODEX_MODEL_PICKER_CORE__
     void triggerLocalThreadCatalogSync();
     patchStatsig();
     patchReactState();
+    installModelPickerSpacingFix();
   };
   await run();
+  if (!state.modelPickerObserver && typeof MutationObserver === "function") {
+    state.modelPickerObserver = new MutationObserver(() => installModelPickerSpacingFix());
+    state.modelPickerObserver.observe(document.documentElement, { childList: true, subtree: true });
+  }
   if (!state.interval) state.interval = setInterval(() => { void run(); }, 1500);
   const historySync = await triggerLocalThreadCatalogSync();
   return { status: "ok", modelCount: modelNames().length, available_models: modelNames(), historySync, patchKey };

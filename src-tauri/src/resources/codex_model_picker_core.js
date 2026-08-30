@@ -5,7 +5,7 @@ const currentPayload = () => state.payload || {};
   };
   const descriptorFor = (name) => {
     const payload = currentPayload();
-    const existing = (payload.models || []).find((model) => model && model.model === name);
+    const existing = (payload.models || []).find((model) => model && modelIdentity(model) === name);
     return {
       model: name,
       id: name,
@@ -18,7 +18,17 @@ const currentPayload = () => state.payload || {};
     };
   };
   const stringArray = (value) => Array.isArray(value) && value.every((item) => typeof item === "string");
-  const modelArray = (value, allowEmpty = false) => Array.isArray(value) && (allowEmpty || value.length > 0) && value.every((item) => item && typeof item === "object" && typeof item.model === "string");
+  const modelIdentity = (item) => {
+    if (!item || typeof item !== "object") return null;
+    for (const key of ["model", "id", "slug", "name"]) {
+      if (typeof item[key] === "string" && item[key].trim()) return item[key].trim();
+    }
+    return null;
+  };
+  const modelArray = (value, allowEmpty = false) =>
+    Array.isArray(value) &&
+    (allowEmpty || value.length > 0) &&
+    value.every((item) => modelIdentity(item) !== null);
   const patchModelNameArray = (models) => {
     if (!stringArray(models)) return false;
     let changed = false;
@@ -33,7 +43,12 @@ const currentPayload = () => state.payload || {};
   const patchModelArray = (models, allowEmpty = false) => {
     if (!modelArray(models, allowEmpty)) return false;
     const names = modelNames();
-    const existing = new Map(models.map((model) => [model.model, model]));
+    const existing = new Map();
+    for (const model of models) {
+      const identity = modelIdentity(model);
+      if (identity && typeof model.model !== "string") model.model = identity;
+      if (identity) existing.set(identity, model);
+    }
     let changed = false;
     for (const name of names) {
       const descriptor = descriptorFor(name);
@@ -55,7 +70,7 @@ const currentPayload = () => state.payload || {};
     // unrelated Codex entries after them. Mutate the original array so renderer references live.
     const routed = names.map((name) => existing.get(name)).filter(Boolean);
     const routedNames = new Set(names);
-    const untouched = models.filter((model) => !routedNames.has(model.model));
+    const untouched = models.filter((model) => !routedNames.has(modelIdentity(model)));
     const ordered = [...routed, ...untouched];
     if (models.length !== ordered.length || models.some((model, index) => model !== ordered[index])) {
       models.splice(0, models.length, ...ordered);

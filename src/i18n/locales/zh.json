@@ -3667,7 +3667,7 @@
     "modelDisplayStyle": "模型显示方式",
     "modelOnly": "仅模型名",
     "modelThenProvider": "模型 · 提供商",
-    "providerThenModel": "[提供商] 模型",
+    "providerThenModel": "提供商 · 模型",
     "modelSort": "模型排序",
     "currentOrder": "当前顺序（可拖动）",
     "sortByModel": "模型名称",

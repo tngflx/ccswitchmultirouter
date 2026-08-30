@@ -4720,27 +4720,65 @@ export function codexCatalogProviderName(
   return (model.providerName ?? model.provider_name ?? "").trim();
 }
 
+export function compactCodexProviderLabel(providerName: string): string {
+  const trimmed = providerName.trim();
+  const alphanumeric = Array.from(trimmed)
+    .filter((character) => /[\p{L}\p{N}]/u.test(character))
+    .join("");
+  if (alphanumeric.toLocaleLowerCase() === "openrouter") return "ORter";
+  if (alphanumeric.toLocaleLowerCase() === "opencodezen") return "OCzen";
+  if (Array.from(alphanumeric).length <= 5) return alphanumeric;
+
+  const words = trimmed
+    .replace(/([\p{Ll}\p{N}])(\p{Lu})/gu, "$1 $2")
+    .split(/[^\p{L}\p{N}]+/u)
+    .filter(Boolean);
+  if (words.length < 2) return Array.from(alphanumeric).slice(0, 5).join("");
+  if (words.length >= 5) {
+    return words
+      .slice(0, 5)
+      .map((word) => Array.from(word)[0]?.toLocaleUpperCase() ?? "")
+      .join("");
+  }
+
+  const prefixCount = Math.min(words.length - 1, 4);
+  const prefix = words
+    .slice(0, prefixCount)
+    .map((word) => Array.from(word)[0]?.toLocaleUpperCase() ?? "")
+    .join("");
+  const suffixBudget = Math.max(0, 5 - Array.from(prefix).length);
+  const suffix = Array.from(words.at(-1) ?? "")
+    .slice(-suffixBudget)
+    .join("");
+  return `${prefix}${suffix}`;
+}
+
 export function formatCodexCatalogModelLabel(
   model: CodexCatalogModel,
   style: CodexModelDisplayStyle = DEFAULT_CODEX_MODEL_DISPLAY_STYLE,
 ): string {
   const id = model.model?.trim() ?? "";
   const provider = codexCatalogProviderName(model);
+  const compactProvider = compactCodexProviderLabel(provider);
   const rawDisplay =
     (model.displayName ?? model.display_name ?? id).trim() || id;
   const display = provider
-    ? rawDisplay.replace(
-        new RegExp(
-          `^\\[${provider.replace(/[.*+?^${}()|[\\]\\]/g, "\\$&")}\\]\\s*`,
-          "i",
-        ),
-        "",
+    ? [provider, compactProvider].reduce(
+        (label, candidate) =>
+          label.replace(
+            new RegExp(
+              `^\\[${candidate.replace(/[.*+?^${}()|[\\]\\]/g, "\\$&")}\\]\\s*`,
+              "i",
+            ),
+            "",
+          ),
+        rawDisplay,
       )
     : rawDisplay;
   if (!provider || style === "model") return display;
   return style === "provider-model"
-    ? `[${provider}] ${display}`
-    : `${display} · ${provider}`;
+    ? `[${compactProvider}] ${display}`
+    : `${display} · ${compactProvider}`;
 }
 
 export function sortCodexCatalogModels(

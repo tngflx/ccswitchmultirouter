@@ -22,6 +22,7 @@ import {
   buildModelCatalogForRoutes,
   collectRoutedCatalogModels,
   codexCatalogProviderName,
+  compactCodexProviderLabel,
   formatCodexCatalogModelLabel,
   sortCodexCatalogModels,
   CodexRouterWorkspacePage,
@@ -416,6 +417,17 @@ describe("Codex model display and sorting", () => {
       ),
     ).toBe("Zeta · Beta");
     expect(models[0].model).toBe("zeta");
+    expect(compactCodexProviderLabel("OpenRouter")).toBe("ORter");
+    expect(compactCodexProviderLabel("OpenCode Zen")).toBe("OCzen");
+    expect(compactCodexProviderLabel("DeepSeek")).toBe("DSeek");
+    expect(compactCodexProviderLabel("Qwen")).toBe("Qwen");
+    expect(
+      formatCodexCatalogModelLabel({
+        model: "long-model-name",
+        displayName: "[ORter] Long Model Name",
+        providerName: "OpenRouter",
+      }),
+    ).toBe("[ORter] Long Model Name");
   });
 
   it("sorts deterministically by provider and model without mutating input", () => {

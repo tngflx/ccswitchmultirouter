@@ -480,7 +480,7 @@ fn provider_labelled_display_name(provider_name: &str, display_name: &str) -> St
         return display_name.to_string();
     }
 
-    let compact_provider = compact_provider_label(provider_name);
+    let compact_provider = super::compact_codex_provider_label(provider_name);
     let prefix = format!("[{compact_provider}]");
     if display_name
         .get(..prefix.len())
@@ -501,24 +501,6 @@ fn provider_labelled_display_name(provider_name: &str, display_name: &str) -> St
         label.to_string()
     } else {
         format!("{prefix} {label}")
-    }
-}
-
-/// Picker labels must remain scannable even when a provider was imported with
-/// a long URL/account-derived name. Keep the stable providerName field intact.
-fn compact_provider_label(provider_name: &str) -> String {
-    let parts = provider_name
-        .split_whitespace()
-        .filter(|part| !part.is_empty())
-        .collect::<Vec<_>>();
-    if parts.is_empty() {
-        provider_name.chars().take(28).collect()
-    } else {
-        let mut compact = parts.iter().take(4).copied().collect::<Vec<_>>().join(" ");
-        if parts.len() > 4 {
-            compact.push_str("...");
-        }
-        compact.chars().take(28).collect()
     }
 }
 
@@ -1125,8 +1107,8 @@ mod tests {
                 .map(|entry| entry["displayName"].as_str().unwrap())
                 .collect::<Vec<_>>(),
             vec![
-                "[DeepSeek] Alpha",
-                "[DeepSeek] Beta",
+                "[DSeek] Alpha",
+                "[DSeek] Beta",
                 "[Qwen] Alpha",
                 "[Qwen] Zeta"
             ]
@@ -1154,7 +1136,15 @@ mod tests {
                 "A Very Long Provider Name Imported From Account",
                 "[A Very Long Provider Name Imported From Account] model-x"
             ),
-            "[A Very Long Provider...] model-x"
+            "[AVLPN] model-x"
+        );
+        assert_eq!(
+            provider_labelled_display_name("OpenRouter", "Model X"),
+            "[ORter] Model X"
+        );
+        assert_eq!(
+            provider_labelled_display_name("OpenCode Zen", "Model Y"),
+            "[OCzen] Model Y"
         );
     }
 

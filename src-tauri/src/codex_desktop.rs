@@ -14,7 +14,7 @@ pub(crate) const DEFAULT_CODEX_DEBUG_PORT: u16 = 9229;
 pub(crate) const CDP_HTTP_TIMEOUT: Duration = Duration::from_secs(2);
 const CDP_CONNECT_TIMEOUT: Duration = Duration::from_secs(4);
 const CDP_COMMAND_TIMEOUT: Duration = Duration::from_secs(4);
-const MODEL_PICKER_PATCH_KEY: &str = "__ccSwitchCodexAppCompatibilityV5";
+const MODEL_PICKER_PATCH_KEY: &str = "__ccSwitchCodexAppCompat";
 const REMEMBERED_CODEX_DESKTOP_EXECUTABLE_FILENAME: &str = "codex-desktop-executable.json";
 const CODEX_MODEL_PICKER_CORE_SCRIPT: &str = include_str!("resources/codex_model_picker_core.js");
 const CODEX_APP_COMPAT_TEMPLATE: &str = include_str!("resources/codex_app_compat_template.js");
@@ -379,26 +379,28 @@ fn project_codex_model_descriptor(
         object.insert(key.to_string(), Value::String(model_name.to_string()));
     }
     let provider_name = provider_name_from_entry(&Value::Object(object.clone()));
+    let compact_provider =
+        crate::codex_multirouter::compact_codex_provider_label(&provider_name);
     let display = object
         .get("displayName")
         .and_then(Value::as_str)
         .or_else(|| object.get("display_name").and_then(Value::as_str))
         .unwrap_or(model_name);
-    let compact_display = strip_provider_prefix(display, &provider_name);
+    let compact_display = strip_provider_prefix(display, &provider_name, &compact_provider);
     let rendered_display = match display_style.unwrap_or("provider-model") {
         "model" => compact_display.to_string(),
         "model-provider" => {
             if provider_name.is_empty() {
                 compact_display.to_string()
             } else {
-                format!("{compact_display} · {provider_name}")
+                format!("{compact_display} · {compact_provider}")
             }
         }
         "provider-model" => {
             if provider_name.is_empty() {
                 compact_display.to_string()
             } else {
-                format!("[{provider_name}] {compact_display}")
+                format!("[{compact_provider}] {compact_display}")
             }
         }
         _ => compact_display.to_string(),
@@ -455,20 +457,23 @@ fn display_name_from_entry(entry: &Value) -> String {
         .to_string()
 }
 
-fn strip_provider_prefix<'a>(display_name: &'a str, provider_name: &str) -> &'a str {
+fn strip_provider_prefix<'a>(
+    display_name: &'a str,
+    provider_name: &str,
+    compact_provider: &str,
+) -> &'a str {
     if provider_name.is_empty() {
         return display_name;
     }
-    let prefix = format!("[{provider_name}]");
-    display_name
-        .strip_prefix(&prefix)
-        .or_else(|| {
+    [provider_name, compact_provider]
+        .into_iter()
+        .find_map(|label| {
+            let prefix = format!("[{label}]");
             display_name
                 .get(..prefix.len())
                 .filter(|candidate| candidate.eq_ignore_ascii_case(&prefix))
-                .map(|_| &display_name[prefix.len()..])
+                .map(|_| display_name[prefix.len()..].trim_start())
         })
-        .map(str::trim_start)
         .unwrap_or(display_name)
 }
 
@@ -1944,7 +1949,7 @@ mod tests {
 
         let (names, models) = codex_model_entries_from_catalog_value(&value);
         assert_eq!(names, vec!["deepseek-b", "qwen-a", "qwen-z"]);
-        assert_eq!(models[0]["displayName"], "[DeepSeek] Beta");
+        assert_eq!(models[0]["displayName"], "[DSeek] Beta");
         assert_eq!(models[1]["displayName"], "[Qwen] Alpha");
         assert_eq!(models[2]["displayName"], "[Qwen] Zeta");
         assert_eq!(models[1]["model"], "qwen-a");
@@ -1962,6 +1967,25 @@ mod tests {
         assert_eq!(styled_names, vec!["qwen-a"]);
         assert_eq!(styled_models[0]["displayName"], "[Qwen] Alpha");
         assert_eq!(styled_models[0]["model"], "qwen-a");
+
+        let compact_providers = json!({
+            "models": [
+                {
+                    "model": "openrouter-model",
+                    "displayName": "[ORter] Long Model Name",
+                    "providerName": "OpenRouter"
+                },
+                {
+                    "model": "opencode-model",
+                    "displayName": "Longer Model Name",
+                    "providerName": "OpenCode Zen"
+                }
+            ]
+        });
+        let (_, compact_models) = codex_model_entries_from_catalog_value(&compact_providers);
+        assert_eq!(compact_models[0]["displayName"], "[OCzen] Longer Model Name");
+        assert_eq!(compact_models[1]["displayName"], "[ORter] Long Model Name");
+        assert_eq!(compact_models[1]["providerName"], "OpenRouter");
     }
 
     #[test]
@@ -1998,6 +2022,9 @@ mod tests {
         assert!(script.contains("const payload = {"));
         assert!(script.contains(MODEL_PICKER_PATCH_KEY));
         assert!(script.contains("const currentPayload"));
+        assert!(script.contains("flex-shrink: 0 !important"));
+        assert!(script.contains("data-ccswitch-model-picker"));
+        assert!(script.contains("MutationObserver"));
     }
 
     fn run_model_picker_patch_core_probe(probe: &str) -> serde_json::Value {
@@ -2227,7 +2254,7 @@ JSON.stringify({
         assert!(script.contains("isModelListMethod(method)"));
         assert!(script.contains("await installAppServerPatch()"));
         assert!(script.contains("!state.requestIds.has(requestId)"));
-        assert!(script.contains("__ccSwitchCodexAppCompatibilityV5"));
+        assert!(script.contains("__ccSwitchCodexAppCompat"));
         assert!(script.contains("__ccSwitchModelRequestPatch === \"2\""));
         assert!(script.contains("auth.setAuthMethod(\"chatgpt\")"));
     }
