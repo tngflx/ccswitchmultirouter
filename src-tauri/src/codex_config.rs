@@ -3027,6 +3027,7 @@ fn apply_codex_multi_agent_transport_policy(catalog: &mut Value, settings: &Valu
                 "supported_reasoning_levels",
                 "supported_reasoning_efforts",
                 "supportedReasoningEfforts",
+                "supportedReasoningLevels",
             ] {
                 if let Some(levels) = model.get_mut(field).and_then(Value::as_array_mut) {
                     levels.retain(|level| {
@@ -3043,6 +3044,7 @@ fn apply_codex_multi_agent_transport_policy(catalog: &mut Value, settings: &Valu
                 "supported_reasoning_levels",
                 "supported_reasoning_efforts",
                 "supportedReasoningEfforts",
+                "supportedReasoningLevels",
             ]
             .iter()
             .find_map(|field| model.get(*field).and_then(Value::as_array))
