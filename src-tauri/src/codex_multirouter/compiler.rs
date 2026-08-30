@@ -578,7 +578,13 @@ fn unique_visible_model(
 
 fn effective_api_format(provider: &Provider, model_entry: &Value) -> (String, String) {
     if let Some(format) = string_field(model_entry, &["apiFormat", "api_format"]) {
-        return (normalize_api_format(format), "provider_model".to_string());
+        let normalized = normalize_api_format(format);
+        let source = string_field(model_entry, &["apiFormatSource", "api_format_source"])
+            .unwrap_or("provider_model");
+        return (
+            conservative_openrouter_api_format(provider, normalized, source),
+            source.to_string(),
+        );
     }
     if let Some(format) = provider
         .meta
@@ -586,9 +592,38 @@ fn effective_api_format(provider: &Provider, model_entry: &Value) -> (String, St
         .and_then(|meta| meta.api_format.as_deref())
         .or_else(|| string_field(&provider.settings_config, &["apiFormat", "api_format"]))
     {
-        return (normalize_api_format(format), "provider".to_string());
+        let normalized = normalize_api_format(format);
+        let source = string_field(
+            &provider.settings_config,
+            &["apiFormatSource", "api_format_source"],
+        )
+        .unwrap_or("provider");
+        return (
+            conservative_openrouter_api_format(provider, normalized, source),
+            source.to_string(),
+        );
     }
     ("openai_chat".to_string(), "default".to_string())
+}
+
+fn conservative_openrouter_api_format(provider: &Provider, format: String, source: &str) -> String {
+    if format == "openai_responses"
+        && is_openrouter_provider(provider)
+        && source.eq_ignore_ascii_case("inferred")
+    {
+        return "openai_chat".to_string();
+    }
+    format
+}
+
+fn is_openrouter_provider(provider: &Provider) -> bool {
+    provider.name.to_ascii_lowercase().contains("openrouter")
+        || provider
+            .settings_config
+            .get("config")
+            .and_then(Value::as_str)
+            .map(|config| config.to_ascii_lowercase().contains("openrouter.ai"))
+            .unwrap_or(false)
 }
 
 fn normalize_api_format(value: &str) -> String {
@@ -620,16 +655,9 @@ fn effective_capability_summary(
     );
     let provider_reasoning = value_field(
         &provider.settings_config,
-        &["reasoning", "codexChatReasoning", "codex_chat_reasoning"],
+        &["reasoning"],
     )
-    .cloned()
-    .or_else(|| {
-        provider
-            .meta
-            .as_ref()
-            .and_then(|meta| meta.codex_chat_reasoning.as_ref())
-            .and_then(|reasoning| serde_json::to_value(reasoning).ok())
-    });
+    .cloned();
     let (reasoning, reasoning_source) = value_with_source(
         value_field(model_entry, &["reasoning"]).cloned(),
         provider_reasoning,
@@ -939,6 +967,81 @@ mod tests {
 
         assert_eq!(compiled.model_catalog[0].api_format, "openai_responses");
         assert_eq!(compiled.model_catalog[0].api_format_source, "provider");
+    }
+
+    #[test]
+    fn openrouter_inferred_responses_format_falls_back_to_chat() {
+        let mut provider = provider(
+            "openrouter",
+            "OpenRouter",
+            "openai_responses",
+            json!([{"model": "openrouter/free"}]),
+        );
+        provider.settings_config["apiFormatSource"] = json!("inferred");
+
+        let compiled = compile(
+            &plan(vec![route(
+                "router-openrouter",
+                "openrouter",
+                CodexModelSelection::All,
+            )]),
+            [provider],
+        );
+
+        assert_eq!(compiled.model_catalog[0].api_format, "openai_chat");
+        assert_eq!(compiled.model_catalog[0].api_format_source, "inferred");
+    }
+
+    #[test]
+    fn openrouter_manual_model_responses_override_is_preserved() {
+        let provider = provider(
+            "openrouter",
+            "OpenRouter",
+            "openai_chat",
+            json!([{
+                "model": "verified-responses-model",
+                "apiFormat": "openai_responses",
+                "apiFormatSource": "manual"
+            }]),
+        );
+
+        let compiled = compile(
+            &plan(vec![route(
+                "router-openrouter",
+                "openrouter",
+                CodexModelSelection::All,
+            )]),
+            [provider],
+        );
+
+        assert_eq!(compiled.model_catalog[0].api_format, "openai_responses");
+        assert_eq!(compiled.model_catalog[0].api_format_source, "manual");
+    }
+
+    #[test]
+    fn openrouter_probe_responses_selection_is_honored_per_model() {
+        let provider = provider(
+            "openrouter",
+            "OpenRouter",
+            "openai_chat",
+            json!([{
+                "model": "probed-responses-model",
+                "apiFormat": "openai_responses",
+                "apiFormatSource": "probe"
+            }]),
+        );
+
+        let compiled = compile(
+            &plan(vec![route(
+                "router-openrouter",
+                "openrouter",
+                CodexModelSelection::All,
+            )]),
+            [provider],
+        );
+
+        assert_eq!(compiled.model_catalog[0].api_format, "openai_responses");
+        assert_eq!(compiled.model_catalog[0].api_format_source, "probe");
     }
 
     #[test]
@@ -1292,6 +1395,37 @@ mod tests {
                 .as_ref()
                 .and_then(|value| value.get("providerEffort")),
             Some(&json!("high"))
+        );
+    }
+
+    #[test]
+    fn chat_adapter_reasoning_is_not_projected_as_model_capability() {
+        let mut provider = provider(
+            "qwen",
+            "Qwen",
+            "openai_chat",
+            json!([{"model": "qwen3.8"}]),
+        );
+        provider.settings_config["codexChatReasoning"] = json!({
+            "supportsThinking": true,
+            "supportsEffort": true,
+            "effortParam": "reasoning_effort"
+        });
+
+        let compiled = compile(
+            &plan(vec![route("router-qwen", "qwen", CodexModelSelection::All)]),
+            [provider],
+        );
+
+        assert!(compiled.model_catalog[0]
+            .capability_summary
+            .reasoning
+            .is_none());
+        assert_eq!(
+            compiled.model_catalog[0]
+                .capability_summary
+                .reasoning_source,
+            "unknown"
         );
     }
 

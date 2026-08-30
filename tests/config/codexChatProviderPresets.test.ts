@@ -147,6 +147,21 @@ describe("Codex Chat provider presets", () => {
     expect(preset?.promptCacheRouting).toBe("enabled");
   });
 
+  it("routes OpenRouter Codex traffic to Chat Completions upstream", () => {
+    const preset = codexProviderPresets.find(
+      (item) => item.name === "OpenRouter",
+    );
+
+    expect(preset).toBeDefined();
+    expect(preset?.apiFormat).toBe("openai_chat");
+    expect(extractCodexBaseUrl(preset?.config)).toBe(
+      "https://openrouter.ai/api/v1",
+    );
+    // `wire_api` is the local Codex -> CCSwitch interface; apiFormat controls
+    // the CCSwitch -> OpenRouter upstream protocol.
+    expect(extractCodexWireApi(preset?.config)).toBe("responses");
+  });
+
   it("marks migrated Chat Completions presets for local routing", () => {
     for (const [name, expected] of expectedChatPresets) {
       const preset = codexProviderPresets.find((item) => item.name === name);

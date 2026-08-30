@@ -2,6 +2,31 @@ import { describe, expect, it } from "vitest";
 import { extractCodexRoutingConfig } from "@/components/providers/forms/hooks/useCodexConfigState";
 
 describe("extractCodexRoutingConfig", () => {
+  it("preserves the legacy Chat default when a route has no format", () => {
+    const routing = extractCodexRoutingConfig({
+      codexRouting: [
+        {
+          id: "legacy-route",
+          baseUrl: "https://api.example.com/v1",
+        },
+      ],
+    });
+
+    expect(routing.routes?.[0].upstream.apiFormat).toBe("openai_chat");
+  });
+
+  it("preserves explicit Chat and Anthropic legacy formats", () => {
+    const routing = extractCodexRoutingConfig({
+      codexRouting: [
+        { id: "chat-route", wire_api: "chat" },
+        { id: "anthropic-route", apiFormat: "anthropic" },
+      ],
+    });
+
+    expect(routing.routes?.[0].upstream.apiFormat).toBe("openai_chat");
+    expect(routing.routes?.[1].upstream.apiFormat).toBe("anthropic");
+  });
+
   it("migrates legacy array codexRouting into the object schema", () => {
     const routing = extractCodexRoutingConfig({
       codexRouting: [

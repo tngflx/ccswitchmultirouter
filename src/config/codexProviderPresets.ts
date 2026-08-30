@@ -2036,6 +2036,9 @@ base_url = "https://cc-api.pipellm.ai/v1"`,
       "https://openrouter.ai/api/v1",
       "gpt-5.6-sol",
     ),
+    // Codex speaks Responses to the local proxy, but OpenRouter's documented
+    // normalized/tool-calling contract is Chat Completions.
+    apiFormat: "openai_chat",
     category: "aggregator",
     icon: "openrouter",
     iconColor: "#6566F1",
