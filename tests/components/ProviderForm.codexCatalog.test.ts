@@ -154,16 +154,13 @@ describe("ProviderForm Codex catalog helpers", () => {
     ]);
   });
 
-  it("keeps disabled catalog rows instead of dropping their enabled:false marker", () => {
+  it("persists only models included in the provider catalog", () => {
     expect(
       normalizeCodexCatalogModelsForSave([
         { model: "enabled-model" },
         { model: "disabled-model", enabled: false },
       ]),
-    ).toEqual([
-      { model: "enabled-model" },
-      { model: "disabled-model", enabled: false },
-    ]);
+    ).toEqual([{ model: "enabled-model" }]);
   });
 
   it("round-trips model transport, cache, and ordering metadata through provider editing", () => {

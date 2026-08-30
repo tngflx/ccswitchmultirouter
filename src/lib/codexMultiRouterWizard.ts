@@ -210,7 +210,8 @@ export function readWizardModelCatalog(
       typeof model === "object" &&
       model !== null &&
       typeof (model as CodexCatalogModel).model === "string" &&
-      Boolean((model as CodexCatalogModel).model.trim()),
+      Boolean((model as CodexCatalogModel).model.trim()) &&
+      (model as CodexCatalogModel).enabled !== false,
   );
 }
 

@@ -520,6 +520,34 @@ describe("CodexMultiRouterWizard", () => {
     expect(screen.queryByText("需补全配置")).not.toBeInTheDocument();
   });
 
+  it("passes only included provider models into routing configuration", () => {
+    renderWithQueryClient(
+      <CodexMultiRouterWizard
+        open
+        providers={[
+          provider({
+            settingsConfig: {
+              modelCatalog: {
+                models: [
+                  { model: "included-model" },
+                  { model: "excluded-model", enabled: false },
+                ],
+              },
+            },
+          }),
+        ]}
+        onOpenChange={vi.fn()}
+        onCreateProvider={vi.fn()}
+        onOpenWorkspace={vi.fn()}
+        onEnablePlan={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByText("1 个模型")).toBeInTheDocument();
+    expect(screen.queryByText("excluded-model")).not.toBeInTheDocument();
+    expect(fetchModelsForConfig).not.toHaveBeenCalled();
+  });
+
   it("refreshes providers that already have modelCatalog and marks unchanged lists", async () => {
     vi.mocked(fetchModelsForConfig).mockResolvedValueOnce([
       { id: "deepseek-chat", ownedBy: null },

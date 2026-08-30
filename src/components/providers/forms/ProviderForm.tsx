@@ -191,6 +191,10 @@ export const normalizeCodexCatalogModelsForSave = (
   const normalized: CodexCatalogModel[] = [];
 
   for (const item of models) {
+    // `enabled: false` is a form-only exclusion state. Persisting excluded
+    // discovery rows makes downstream consumers mistake the provider's full
+    // remote inventory for its curated model catalog.
+    if (item.enabled === false) continue;
     const model = item.model.trim();
     if (!model || seen.has(model)) continue;
     seen.add(model);
@@ -300,7 +304,6 @@ export const normalizeCodexCatalogModelsForSave = (
 
     normalized.push({
       model,
-      ...(item.enabled === false ? { enabled: false } : {}),
       ...(upstreamModel && upstreamModel !== model ? { upstreamModel } : {}),
       ...(displayName ? { displayName } : {}),
       ...(contextWindow && contextWindow > 0 ? { contextWindow } : {}),
