@@ -3,6 +3,11 @@ import { parse as parseToml } from "smol-toml";
 import { getCodexCustomTemplate } from "@/config/codexTemplates";
 
 describe("Codex custom templates", () => {
+  it("defaults gpt-5.6-sol to medium reasoning effort", () => {
+    const template = getCodexCustomTemplate();
+    expect(template.config).toContain('model_reasoning_effort = "medium"');
+  });
+
   it("does not force Codex Goal mode in the custom provider template", () => {
     const template = getCodexCustomTemplate();
     const parsed = parseToml(template.config) as {

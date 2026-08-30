@@ -118,6 +118,16 @@ const expectedChatPresets = new Map<
 ]);
 
 describe("Codex Chat provider presets", () => {
+  it("defaults gpt-5.6-sol generated configs to medium reasoning effort", () => {
+    const config = generateThirdPartyConfig(
+      "Sublyx",
+      "https://api.sublyx.org/v1",
+      "gpt-5.6-sol",
+    );
+
+    expect(config).toContain('model_reasoning_effort = "medium"');
+  });
+
   it("keeps generated third-party bearer configs independent from OpenAI OAuth", () => {
     const config = generateThirdPartyConfig(
       "Remote CCSwitch",

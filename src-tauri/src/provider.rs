@@ -1020,7 +1020,13 @@ impl UniversalProvider {
             .unwrap_or_else(|| "gpt-4o".to_string());
         let reasoning_effort = models
             .and_then(|m| m.reasoning_effort.clone())
-            .unwrap_or_else(|| "high".to_string());
+            .unwrap_or_else(|| {
+                if model.eq_ignore_ascii_case("gpt-5.6-sol") {
+                    "medium".to_string()
+                } else {
+                    "high".to_string()
+                }
+            });
 
         // Codex/OpenAI 的 base_url 既可能是纯 origin（需要补 /v1），也可能包含自定义前缀（不应强行补版本）
         let base_trimmed = self.base_url.trim_end_matches('/');
@@ -1622,6 +1628,29 @@ mod tests {
             .expect("config should be a toml string");
 
         assert!(toml.contains("base_url = \"https://api.openai.com/v1\""));
+    }
+
+    #[test]
+    fn universal_codex_provider_defaults_gpt_5_6_sol_to_medium_reasoning() {
+        let mut p = UniversalProvider::new(
+            "id".to_string(),
+            "Sublyx".to_string(),
+            "custom".to_string(),
+            "https://api.sublyx.org/v1".to_string(),
+            "sk-test".to_string(),
+        );
+        p.apps.codex = true;
+        p.models.codex = Some(CodexModelConfig {
+            model: Some("gpt-5.6-sol".to_string()),
+            reasoning_effort: None,
+        });
+
+        let provider = p.to_codex_provider().expect("should build codex provider");
+        let toml = provider.settings_config["config"]
+            .as_str()
+            .expect("config should be a toml string");
+
+        assert!(toml.contains("model_reasoning_effort = \"medium\""));
     }
 
     #[test]

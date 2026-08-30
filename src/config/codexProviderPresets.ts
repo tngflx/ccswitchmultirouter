@@ -67,10 +67,12 @@ export function generateThirdPartyConfig(
   modelName = "gpt-5.6-sol",
 ): string {
   const tomlString = (value: string) => JSON.stringify(value);
+  const defaultReasoningEffort =
+    modelName.trim().toLowerCase() === "gpt-5.6-sol" ? "medium" : "high";
 
   return `model_provider = "custom"
 model = ${tomlString(modelName)}
-model_reasoning_effort = "high"
+model_reasoning_effort = ${tomlString(defaultReasoningEffort)}
 disable_response_storage = true
 
 [model_providers.custom]
