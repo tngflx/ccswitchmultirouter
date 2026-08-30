@@ -21,6 +21,7 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { Switch } from "@/components/ui/switch";
+import { Badge } from "@/components/ui/badge";
 import {
   Collapsible,
   CollapsibleContent,
@@ -47,7 +48,9 @@ import {
   type FetchedModel,
 } from "@/lib/api/model-fetch";
 import {
+  cancelCodexProviderProtocolProbe,
   preflightCodexProviderProtocolCompatibility,
+  type CodexProtocolProbeMode,
   type CodexProtocolCompatibilityRecord,
   type CodexProtocolProbeProgressEvent,
   type CodexProviderProtocolPreflightOutcome,
@@ -892,6 +895,9 @@ export function CodexFormFields({
   const [isProtocolProbeConfirmOpen, setIsProtocolProbeConfirmOpen] =
     useState(false);
   const [isProbingProtocol, setIsProbingProtocol] = useState(false);
+  const [isStoppingProtocolProbe, setIsStoppingProtocolProbe] = useState(false);
+  const [protocolProbeMode, setProtocolProbeMode] =
+    useState<CodexProtocolProbeMode>("deep");
   const [protocolProbeSummary, setProtocolProbeSummary] = useState("");
   const [protocolProbeTone, setProtocolProbeTone] = useState<
     "muted" | "success" | "warning" | "error"
@@ -911,6 +917,7 @@ export function CodexFormFields({
   >(null);
   const protocolProbeIdentityRef = useRef<string | null>(null);
   const protocolProbeSeqRef = useRef(0);
+  const activeProtocolProbeIdRef = useRef<string | null>(null);
   const [shouldHighlightFetchModels, setShouldHighlightFetchModels] =
     useState(false);
   const [pendingSplitRoutingState, setPendingSplitRoutingState] =
@@ -1185,9 +1192,15 @@ export function CodexFormFields({
   useEffect(() => {
     if (protocolProbeIdentityRef.current !== readinessIdentity) {
       protocolProbeSeqRef.current += 1;
+      const activeProbeId = activeProtocolProbeIdRef.current;
+      activeProtocolProbeIdRef.current = null;
+      if (activeProbeId) {
+        void cancelCodexProviderProtocolProbe(activeProbeId);
+      }
       protocolProbeIdentityRef.current = null;
       setProtocolProbeIdentity(null);
       setIsProbingProtocol(false);
+      setIsStoppingProtocolProbe(false);
       setIsProtocolProbeConfirmOpen(false);
       setProtocolProbeTone("muted");
       setProtocolProbeSummary("");
@@ -1607,6 +1620,8 @@ export function CodexFormFields({
 
     const probeIdentity = readinessIdentity;
     const probeSeq = ++protocolProbeSeqRef.current;
+    const probeId = `provider-probe-${Date.now()}-${probeSeq}`;
+    activeProtocolProbeIdRef.current = probeId;
     const ownsCurrentIdentity = () =>
       probeSeq === protocolProbeSeqRef.current &&
       readinessIdentityRef.current === probeIdentity;
@@ -1614,17 +1629,25 @@ export function CodexFormFields({
     setIsProtocolProbeConfirmOpen(false);
     setIsProtocolProbeProgressOpen(true);
     setIsProbingProtocol(true);
+    setIsStoppingProtocolProbe(false);
     setProtocolProbeTone("muted");
     setProtocolProbeEvents([]);
     setProtocolProbeExpectedModels(probeModels.map((model) => model.model));
     setProtocolProbeOutcome(null);
     setProtocolProbeError("");
     setProtocolProbeSummary(
-      i18n.t("codexForm.deepProbeStarted", {
-        defaultValue:
-          "正在深度测试 {{count}} 个模型的 Responses / Chat、SSE、思考内容、工具调用和工具续轮。",
-        count: probeModels.length,
-      }),
+      i18n.t(
+        protocolProbeMode === "light"
+          ? "codexForm.lightProbeStarted"
+          : "codexForm.deepProbeStarted",
+        {
+          defaultValue:
+            protocolProbeMode === "light"
+              ? "正在轻量测试 {{count}} 个模型能否通过 Responses / Chat 返回最小响应。"
+              : "正在深度测试 {{count}} 个模型的 Responses / Chat、SSE、思考内容、工具调用和工具续轮。",
+          count: probeModels.length,
+        },
+      ),
     );
     try {
       const defaultModel =
@@ -1656,6 +1679,8 @@ export function CodexFormFields({
       };
       const outcome = await preflightCodexProviderProtocolCompatibility(
         providerDraft,
+        probeId,
+        protocolProbeMode,
         (event) => {
           if (!ownsCurrentIdentity()) return;
           setProtocolProbeEvents((current) => [...current, event]);
@@ -1663,18 +1688,6 @@ export function CodexFormFields({
       );
       if (!ownsCurrentIdentity()) return;
       setProtocolProbeOutcome(outcome);
-      const splitSuggestion = buildSplitCodexProviderSuggestionForProbeRecords({
-        providerName,
-        records: outcome.records,
-      });
-      const canApplySplitSuggestion = Boolean(
-        splitSuggestion && onProviderSplitSuggestionChange,
-      );
-      if (splitSuggestion && onProviderSplitSuggestionChange) {
-        bindPendingSplitRouting(splitSuggestion, probeIdentity);
-        onProviderSplitSuggestionChange(null);
-      }
-
       const selected = outcome.records.map(
         (record) => record.result.selected_transport,
       );
@@ -1698,6 +1711,37 @@ export function CodexFormFields({
         partial,
         failed,
       });
+
+      if (protocolProbeMode === "light") {
+        bindProtocolProbeIdentity(probeIdentity);
+        const summary = i18n.t("codexForm.lightProbeSummary", {
+          defaultValue:
+            "Light probe complete: {{available}} models responded, {{failed}} failed. Configuration was not changed.",
+          available: verified + partial,
+          failed,
+        });
+        const tone = failed > 0 ? "warning" : "success";
+        setProtocolProbeTone(tone);
+        setProtocolProbeSummary(summary);
+        if (tone === "warning") {
+          toast.warning(summary, { closeButton: true });
+        } else {
+          toast.success(summary, { closeButton: true });
+        }
+        return;
+      }
+
+      const splitSuggestion = buildSplitCodexProviderSuggestionForProbeRecords({
+        providerName,
+        records: outcome.records,
+      });
+      const canApplySplitSuggestion = Boolean(
+        splitSuggestion && onProviderSplitSuggestionChange,
+      );
+      if (splitSuggestion && onProviderSplitSuggestionChange) {
+        bindPendingSplitRouting(splitSuggestion, probeIdentity);
+        onProviderSplitSuggestionChange(null);
+      }
 
       if (allResponses) {
         const resultIdentity = buildReadinessIdentityFor(
@@ -1773,6 +1817,17 @@ export function CodexFormFields({
     } catch (error) {
       if (!ownsCurrentIdentity()) return;
       const message = error instanceof Error ? error.message : String(error);
+      if (message.includes("probe_cancelled")) {
+        bindProtocolProbeIdentity(probeIdentity);
+        setProtocolProbeTone("muted");
+        setProtocolProbeSummary(
+          i18n.t("codexForm.probeStopped", {
+            defaultValue: "Probe stopped. Partial results were discarded.",
+          }),
+        );
+        setProtocolProbeError("");
+        return;
+      }
       const summary = i18n.t("codexForm.probeInterrupted", {
         defaultValue: "协议测试中断：{{message}}",
         message,
@@ -1784,7 +1839,9 @@ export function CodexFormFields({
       toast.error(summary, { closeButton: true });
     } finally {
       if (probeSeq === protocolProbeSeqRef.current) {
+        activeProtocolProbeIdRef.current = null;
         setIsProbingProtocol(false);
+        setIsStoppingProtocolProbe(false);
       }
     }
   }, [
@@ -1803,11 +1860,22 @@ export function CodexFormFields({
     onProviderSplitSuggestionChange,
     providerName,
     providerId,
+    protocolProbeMode,
     readinessIdentity,
     revealModelCatalogFetchAction,
     t,
     websiteUrl,
   ]);
+
+  const handleStopProtocolProbe = useCallback(() => {
+    const probeId = activeProtocolProbeIdRef.current;
+    if (!probeId || isStoppingProtocolProbe) return;
+    setIsStoppingProtocolProbe(true);
+    void cancelCodexProviderProtocolProbe(probeId).catch((error) => {
+      setIsStoppingProtocolProbe(false);
+      toast.error(String(error), { closeButton: true });
+    });
+  }, [isStoppingProtocolProbe]);
 
   const handleFillMissingModelFields = useCallback(
     () => handleFetchModels("refresh-existing"),
@@ -2157,6 +2225,36 @@ export function CodexFormFields({
               </span>
             </DialogDescription>
           </DialogHeader>
+          <div className="grid grid-cols-2 gap-1 rounded-md border bg-muted/30 p-1">
+            {(["light", "deep"] as const).map((mode) => (
+              <Button
+                key={mode}
+                type="button"
+                size="sm"
+                variant={protocolProbeMode === mode ? "secondary" : "ghost"}
+                onClick={() => setProtocolProbeMode(mode)}
+              >
+                {mode === "light"
+                  ? i18n.t("codexForm.probeModeLight", {
+                      defaultValue: "Light",
+                    })
+                  : i18n.t("codexForm.probeModeDeep", {
+                      defaultValue: "Deep",
+                    })}
+              </Button>
+            ))}
+          </div>
+          <p className="text-sm text-muted-foreground">
+            {protocolProbeMode === "light"
+              ? i18n.t("codexForm.probeModeLightDescription", {
+                  defaultValue:
+                    "Light sends one minimal request to Responses and Chat per model. It checks basic model availability only.",
+                })
+              : i18n.t("codexForm.probeModeDeepDescription", {
+                  defaultValue:
+                    "Deep also verifies streaming, reasoning, tool calls, and tool continuation.",
+                })}
+          </p>
           <DialogFooter>
             <Button
               type="button"
@@ -2182,6 +2280,8 @@ export function CodexFormFields({
         outcome={protocolProbeOutcome}
         error={protocolProbeError}
         onOpenChange={setIsProtocolProbeProgressOpen}
+        onStop={handleStopProtocolProbe}
+        stopping={isStoppingProtocolProbe}
         onRetry={() => {
           setIsProtocolProbeProgressOpen(false);
           setIsProtocolProbeConfirmOpen(true);
@@ -3378,19 +3478,48 @@ export function CodexFormFields({
                     </SelectTrigger>
                     <SelectContent>
                       <SelectItem value="openai_chat">
-                        {t("codexConfig.upstreamFormatChat", {
-                          defaultValue: "Chat Completions（需本地代理转换）",
-                        })}
+                        <span className="flex items-center gap-2">
+                          <span>
+                            {t("codexConfig.upstreamFormatChat", {
+                              defaultValue:
+                                "Chat Completions (routing required)",
+                            })}
+                          </span>
+                          <Badge variant="outline" className="text-[10px]">
+                            {t("codexConfig.upstreamFormatChatBadge", {
+                              defaultValue: "Conversion",
+                            })}
+                          </Badge>
+                        </span>
                       </SelectItem>
                       <SelectItem value="openai_responses">
-                        {t("codexConfig.upstreamFormatResponses", {
-                          defaultValue: "Responses（原生）",
-                        })}
+                        <span className="flex items-center gap-2">
+                          <span>
+                            {t("codexConfig.upstreamFormatResponses", {
+                              defaultValue: "Responses (native)",
+                            })}
+                          </span>
+                          <Badge variant="secondary" className="text-[10px]">
+                            {t("codexConfig.upstreamFormatResponsesBadge", {
+                              defaultValue: "Native / recommended",
+                            })}
+                          </Badge>
+                        </span>
                       </SelectItem>
                       <SelectItem value="anthropic">
-                        {t("codexConfig.upstreamFormatAnthropic", {
-                          defaultValue: "Anthropic Messages（需开启路由）",
-                        })}
+                        <span className="flex items-center gap-2">
+                          <span>
+                            {t("codexConfig.upstreamFormatAnthropic", {
+                              defaultValue:
+                                "Anthropic Messages (routing required)",
+                            })}
+                          </span>
+                          <Badge variant="outline" className="text-[10px]">
+                            {t("codexConfig.upstreamFormatAnthropicBadge", {
+                              defaultValue: "Conversion",
+                            })}
+                          </Badge>
+                        </span>
                       </SelectItem>
                     </SelectContent>
                   </Select>

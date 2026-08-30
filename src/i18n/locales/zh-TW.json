@@ -42,6 +42,8 @@
     "transportResponses": "Responses",
     "transportChat": "Chat Completions",
     "retry": "重新探測",
+    "stop": "停止探測",
+    "stopping": "正在停止…",
     "runningClose": "探測進行中",
     "close": "關閉"
   },
@@ -4052,6 +4054,9 @@
     "s517": "未設定"
   },
   "codexForm": {
+    "lightProbeStarted": "正在輕量測試 {{count}} 個模型能否透過 Responses / Chat 返回最小回應。",
+    "lightProbeSummary": "輕量探測完成：{{available}} 個模型有回應，{{failed}} 個失敗。設定未變更。",
+    "probeStopped": "探測已停止，部分結果已捨棄。",
     "deepProbeStarted": "正在深度測試 {{count}} 個模型的 Responses / Chat、SSE、思考內容、工具呼叫和工具續輪。",
     "deepProbeResultCounts": "Verified {{verified}}，Partial {{partial}}，Failed {{failed}}",
     "deepProbeAllResponsesSummary": "深度探測完成：全部模型選擇 Responses；{{resultCounts}}。",
@@ -4111,6 +4116,10 @@
     "textOnlyAria": "{{model}} 僅文字",
     "restorePresetAria": "還原 {{model}} 的 CCSM 輸入能力預設",
     "confirmProbeTitle": "確認測試 Chat / Responses",
+    "probeModeLight": "輕量",
+    "probeModeDeep": "深度",
+    "probeModeLightDescription": "輕量模式只為每個模型向 Responses 和 Chat 各發送一個最小請求，僅檢查模型是否基本可用。",
+    "probeModeDeepDescription": "深度模式還會驗證串流輸出、思考內容、工具呼叫和工具續輪。",
     "probeDialogIntro": "這個測試會幫助判斷目前 provider 應該選擇 Responses 還是 Chat Completions。它會對目前模型目錄裡的模型發送真實請求，可能產生少量額度或流量消耗，也可能觸發限流。",
     "probeDialogNoCatalog": "如果還沒有模型目錄，請先到上方「模型目錄與上下文」點擊「取得模型列表」，或手動新增至少一個模型。",
     "probeDialogPerModel": "每個模型會分別測試對應的 Responses 和 Chat Completions endpoint，輸出上限為 1024。都不通時通常不是協議問題，而是 API Key、Base URL、模型權限、額度、網絡或上游故障。",

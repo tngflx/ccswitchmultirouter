@@ -31,10 +31,12 @@ pub use selection::{ProbeStageStatus, TransportProbeAssessment};
 
 mod runner;
 #[cfg(test)]
+pub use runner::run_protocol_compatibility_probe_with_reporter;
+#[cfg(test)]
 pub(crate) use runner::ProbeProgressStage;
 pub use runner::{
-    run_protocol_compatibility_probe, run_protocol_compatibility_probe_with_reporter,
-    ProtocolCompatibilityProbeResult, ProtocolProbeProgressEvent,
+    run_protocol_compatibility_probe, run_protocol_compatibility_probe_in_mode,
+    ProtocolCompatibilityProbeResult, ProtocolProbeMode, ProtocolProbeProgressEvent,
 };
 
 mod provider;

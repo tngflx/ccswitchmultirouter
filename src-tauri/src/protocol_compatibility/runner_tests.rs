@@ -14,10 +14,11 @@ use serde_json::{json, Value};
 use tokio::{net::TcpListener, task::JoinHandle};
 
 use super::{
-    run_protocol_compatibility_probe, run_protocol_compatibility_probe_with_reporter,
-    PreToolVisibleContent, ProbeCandidate, ProbeProgressStage, ProbeReadiness, ProbeStageStatus,
-    ProbeTargetKey, ProtocolCompatibilityRecord, ProtocolProbeProgressEvent, ReasoningProjection,
-    ReasoningSemantic, ReasoningSource, TransportKind,
+    run_protocol_compatibility_probe, run_protocol_compatibility_probe_in_mode,
+    run_protocol_compatibility_probe_with_reporter, PreToolVisibleContent, ProbeCandidate,
+    ProbeProgressStage, ProbeReadiness, ProbeStageStatus, ProbeTargetKey,
+    ProtocolCompatibilityRecord, ProtocolProbeMode, ProtocolProbeProgressEvent,
+    ReasoningProjection, ReasoningSemantic, ReasoningSource, TransportKind,
 };
 use crate::proxy::providers::{
     streaming_codex_chat::create_responses_sse_stream_from_chat_with_context_and_projection,
@@ -36,6 +37,27 @@ enum ResponsesMode {
     InvalidSuccessfulJson,
     IncompleteContinuation,
     MarkerMismatch,
+}
+
+#[tokio::test]
+async fn light_probe_sends_only_one_baseline_request_per_transport() {
+    let fixture = spawn_fixture(ResponsesMode::Complete).await;
+    let result = run_protocol_compatibility_probe_in_mode(
+        candidate(&fixture.base_url, TransportKind::OpenAiResponses),
+        &reqwest::Client::new(),
+        ProtocolProbeMode::Light,
+        |_| {},
+    )
+    .await;
+
+    assert_eq!(result.readiness, ProbeReadiness::Partial);
+    assert!(result.branches.iter().all(|branch| {
+        branch.assessment.baseline == ProbeStageStatus::Passed
+            && branch.assessment.streaming == ProbeStageStatus::Skipped
+            && branch.assessment.forced_tool == ProbeStageStatus::Skipped
+            && branch.assessment.continuation == ProbeStageStatus::Skipped
+    }));
+    assert_eq!(fixture.requests.lock().unwrap().len(), 2);
 }
 
 #[derive(Clone)]

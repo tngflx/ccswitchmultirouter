@@ -5,6 +5,7 @@ import {
   Circle,
   Loader2,
   MinusCircle,
+  Square,
   XCircle,
 } from "lucide-react";
 
@@ -57,6 +58,8 @@ interface CodexProtocolProbeProgressDialogProps {
   outcome: CodexProviderProtocolPreflightOutcome | null;
   error: string;
   onOpenChange: (open: boolean) => void;
+  onStop?: () => void;
+  stopping?: boolean;
   onRetry?: () => void;
 }
 
@@ -337,6 +340,8 @@ export function CodexProtocolProbeProgressDialog({
   outcome,
   error,
   onOpenChange,
+  onStop,
+  stopping = false,
   onRetry,
 }: CodexProtocolProbeProgressDialogProps) {
   const { t } = useTranslation();
@@ -518,6 +523,23 @@ export function CodexProtocolProbeProgressDialog({
         </div>
 
         <DialogFooter>
+          {running && onStop && (
+            <Button
+              type="button"
+              variant="destructive"
+              onClick={onStop}
+              disabled={stopping}
+            >
+              {stopping ? (
+                <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+              ) : (
+                <Square className="mr-2 h-4 w-4" />
+              )}
+              {stopping
+                ? t("codexProbe.stopping", { defaultValue: "Stopping…" })
+                : t("codexProbe.stop", { defaultValue: "Stop probe" })}
+            </Button>
+          )}
           {!running && onRetry && (
             <Button type="button" variant="outline" onClick={onRetry}>
               {t("codexProbe.retry", { defaultValue: "重新探测" })}

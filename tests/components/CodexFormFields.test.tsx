@@ -18,6 +18,7 @@ import {
   fetchXaiOauthModels,
 } from "@/lib/api/model-fetch";
 import {
+  cancelCodexProviderProtocolProbe,
   preflightCodexProviderProtocolCompatibility,
   type CodexProtocolCompatibilityRecord,
   type CodexProtocolProbeProgressEvent,
@@ -74,6 +75,7 @@ vi.mock("@/lib/api/protocol-compatibility", async () => {
   >("@/lib/api/protocol-compatibility");
   return {
     ...actual,
+    cancelCodexProviderProtocolProbe: vi.fn(),
     preflightCodexProviderProtocolCompatibility: vi.fn(),
   };
 });
@@ -93,6 +95,8 @@ beforeEach(() => {
   vi.mocked(fetchModelsForConfig).mockReset();
   vi.mocked(fetchXaiOauthModels).mockReset();
   vi.mocked(preflightCodexProviderProtocolCompatibility).mockReset();
+  vi.mocked(cancelCodexProviderProtocolProbe).mockReset();
+  vi.mocked(cancelCodexProviderProtocolProbe).mockResolvedValue(true);
   Object.defineProperty(HTMLElement.prototype, "scrollIntoView", {
     configurable: true,
     writable: true,
@@ -1079,7 +1083,7 @@ describe("CodexFormFields local model routing", () => {
     const records = [createDeepProbeRecord("gpt-5.5", "open_ai_responses")];
     vi.mocked(
       preflightCodexProviderProtocolCompatibility,
-    ).mockImplementationOnce(async (_provider, onProgress) => {
+    ).mockImplementationOnce(async (_provider, _probeId, _mode, onProgress) => {
       emitFinishedProgress(records, onProgress);
       return createDeepProbeOutcome(records);
     });
@@ -1109,7 +1113,61 @@ describe("CodexFormFields local model routing", () => {
           },
         }),
       }),
+      expect.stringMatching(/^provider-probe-/),
+      "deep",
       expect.any(Function),
+    );
+  });
+
+  it("runs a light availability probe without changing the provider protocol", async () => {
+    const records = [
+      createDeepProbeRecord("gpt-5.5", "open_ai_responses", "partial"),
+    ];
+    vi.mocked(
+      preflightCodexProviderProtocolCompatibility,
+    ).mockImplementationOnce(async (_provider, _probeId, mode, onProgress) => {
+      expect(mode).toBe("light");
+      emitFinishedProgress(records, onProgress);
+      return createDeepProbeOutcome(records);
+    });
+    const { onApiFormatChange } = renderCatalogHarness(
+      [{ model: "gpt-5.5", upstreamModel: "gpt-5.5" }],
+      { shouldShowSpeedTest: true },
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Verify Connection" }));
+    fireEvent.click(screen.getByRole("button", { name: "Light" }));
+    fireEvent.click(screen.getByRole("button", { name: "确认测试" }));
+
+    expect(
+      await screen.findByText(/Light probe complete: 1 models responded/),
+    ).toBeInTheDocument();
+    expect(onApiFormatChange).not.toHaveBeenCalled();
+    expect(preflightCodexProviderProtocolCompatibility).toHaveBeenCalledWith(
+      expect.any(Object),
+      expect.stringMatching(/^provider-probe-/),
+      "light",
+      expect.any(Function),
+    );
+  });
+
+  it("cancels the active backend probe from the progress dialog", async () => {
+    const probe = deferred<CodexProviderProtocolPreflightOutcome>();
+    vi.mocked(preflightCodexProviderProtocolCompatibility).mockReturnValueOnce(
+      probe.promise,
+    );
+    renderCatalogHarness([{ model: "gpt-5.5", upstreamModel: "gpt-5.5" }], {
+      shouldShowSpeedTest: true,
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "Verify Connection" }));
+    fireEvent.click(screen.getByRole("button", { name: "确认测试" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Stop probe" }));
+
+    await waitFor(() =>
+      expect(cancelCodexProviderProtocolProbe).toHaveBeenCalledWith(
+        expect.stringMatching(/^provider-probe-/),
+      ),
     );
   });
 
@@ -1119,7 +1177,7 @@ describe("CodexFormFields local model routing", () => {
     ];
     vi.mocked(
       preflightCodexProviderProtocolCompatibility,
-    ).mockImplementationOnce(async (_provider, onProgress) => {
+    ).mockImplementationOnce(async (_provider, _probeId, _mode, onProgress) => {
       emitFinishedProgress(records, onProgress);
       return createDeepProbeOutcome(records);
     });
@@ -1153,7 +1211,7 @@ describe("CodexFormFields local model routing", () => {
   });
   it("invalidates successful readiness for every routing and catalog identity input", async () => {
     vi.mocked(preflightCodexProviderProtocolCompatibility).mockImplementation(
-      async (provider, onProgress) => {
+      async (provider, _probeId, _mode, onProgress) => {
         const models = provider.settingsConfig.modelCatalog.models.map(
           (model: { model: string }) => model.model,
         );
@@ -1298,7 +1356,7 @@ describe("CodexFormFields local model routing", () => {
     ];
     vi.mocked(
       preflightCodexProviderProtocolCompatibility,
-    ).mockImplementationOnce(async (_provider, onProgress) => {
+    ).mockImplementationOnce(async (_provider, _probeId, _mode, onProgress) => {
       emitFinishedProgress(records, onProgress);
       return createDeepProbeOutcome(records);
     });

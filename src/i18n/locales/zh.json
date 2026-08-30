@@ -42,6 +42,8 @@
     "transportResponses": "Responses",
     "transportChat": "Chat Completions",
     "retry": "重新探测",
+    "stop": "停止探测",
+    "stopping": "正在停止…",
     "runningClose": "探测进行中",
     "close": "关闭"
   },
@@ -4052,6 +4054,9 @@
     "s517": "未配置"
   },
   "codexForm": {
+    "lightProbeStarted": "正在轻量测试 {{count}} 个模型能否通过 Responses / Chat 返回最小响应。",
+    "lightProbeSummary": "轻量探测完成：{{available}} 个模型有响应，{{failed}} 个失败。配置未更改。",
+    "probeStopped": "探测已停止，部分结果已丢弃。",
     "deepProbeStarted": "正在深度测试 {{count}} 个模型的 Responses / Chat、SSE、思考内容、工具调用和工具续轮。",
     "deepProbeResultCounts": "Verified {{verified}}，Partial {{partial}}，Failed {{failed}}",
     "deepProbeAllResponsesSummary": "深度探测完成：全部模型选择 Responses；{{resultCounts}}。",
@@ -4111,6 +4116,10 @@
     "textOnlyAria": "{{model}} 仅文本",
     "restorePresetAria": "{{model}} 恢复 CCSM 输入能力预设",
     "confirmProbeTitle": "确认测试 Chat / Responses",
+    "probeModeLight": "轻量",
+    "probeModeDeep": "深度",
+    "probeModeLightDescription": "轻量模式只为每个模型向 Responses 和 Chat 各发送一个最小请求，仅检查模型是否基本可用。",
+    "probeModeDeepDescription": "深度模式还会验证流式输出、思考内容、工具调用和工具续轮。",
     "probeDialogIntro": "这个测试会帮助判断当前 provider 应该选择 Responses 还是 Chat Completions。它会对当前模型目录里的模型发送真实请求，可能产生少量额度或流量消耗，也可能触发限流。",
     "probeDialogNoCatalog": "如果还没有模型目录，请先到上方“模型目录与上下文”点击“获取模型列表”，或手动添加至少一个模型。",
     "probeDialogPerModel": "每个模型会分别测试对应的 Responses 和 Chat Completions endpoint，输出上限为 1024。都不通时通常不是协议问题，而是 API Key、Base URL、模型权限、额度、网络或上游故障。",

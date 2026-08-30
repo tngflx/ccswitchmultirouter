@@ -14,11 +14,11 @@ use crate::{
     protocol_compatibility::{
         apply_probe_selection_to_provider, compile_codex_router_probe_candidates,
         compile_provider_probe_candidates, endpoint::build_probe_url,
-        run_protocol_compatibility_probe, run_protocol_compatibility_probe_with_reporter,
+        run_protocol_compatibility_probe, run_protocol_compatibility_probe_in_mode,
         ManualReasoningOverride, ProbeCandidate, ProbeReadiness, ProbeTargetKey,
-        ProtocolCompatibilityProbeResult, ProtocolCompatibilityRecord, ProtocolProbeProgressEvent,
-        ReasoningManualOverrideRecord, ReasoningProjection, ReasoningSemantic, TransportKind,
-        PROBE_PROFILE_VERSION,
+        ProtocolCompatibilityProbeResult, ProtocolCompatibilityRecord, ProtocolProbeMode,
+        ProtocolProbeProgressEvent, ReasoningManualOverrideRecord, ReasoningProjection,
+        ReasoningSemantic, TransportKind, PROBE_PROFILE_VERSION,
     },
     provider::Provider,
     services::ProviderService,
@@ -83,9 +83,20 @@ struct PendingReasoningOverridePlan {
 
 static REASONING_OVERRIDE_PLANS: OnceLock<Mutex<HashMap<String, PendingReasoningOverridePlan>>> =
     OnceLock::new();
+enum ActivePreflightProbe {
+    Running(tokio::task::AbortHandle),
+    CancelBeforeStart(Instant),
+}
+
+static ACTIVE_PREFLIGHT_PROBES: OnceLock<Mutex<HashMap<String, ActivePreflightProbe>>> =
+    OnceLock::new();
 
 fn reasoning_override_plans() -> &'static Mutex<HashMap<String, PendingReasoningOverridePlan>> {
     REASONING_OVERRIDE_PLANS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn active_preflight_probes() -> &'static Mutex<HashMap<String, ActivePreflightProbe>> {
+    ACTIVE_PREFLIGHT_PROBES.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 #[derive(Deserialize)]
@@ -160,12 +171,89 @@ pub async fn probe_codex_protocol_compatibility(
 pub async fn preflight_codex_provider_protocol_compatibility(
     state: State<'_, AppState>,
     provider: Provider,
+    probe_id: String,
+    mode: Option<ProtocolProbeMode>,
     on_event: Channel<ProtocolProbeProgressEvent>,
 ) -> Result<CodexProviderProtocolPreflightOutcome, String> {
-    run_provider_preflight(state.inner(), provider, move |event| {
-        let _ = on_event.send(event);
-    })
-    .await
+    let probe_id = required("probeId", &probe_id)?.to_string();
+    let state = state.inner().clone();
+    let mode = mode.unwrap_or_default();
+    let task = tokio::spawn(async move {
+        run_provider_preflight(&state, provider, mode, move |event| {
+            let _ = on_event.send(event);
+        })
+        .await
+    });
+    {
+        let mut active = active_preflight_probes()
+            .lock()
+            .map_err(|_| "protocol probe cancellation state is unavailable".to_string())?;
+        active.retain(|_, entry| match entry {
+            ActivePreflightProbe::Running(_) => true,
+            ActivePreflightProbe::CancelBeforeStart(created_at) => {
+                created_at.elapsed() < Duration::from_secs(60)
+            }
+        });
+        match active.remove(&probe_id) {
+            Some(ActivePreflightProbe::CancelBeforeStart(_)) => {
+                task.abort();
+                return Err("probe_cancelled".to_string());
+            }
+            Some(ActivePreflightProbe::Running(existing)) => {
+                active.insert(probe_id, ActivePreflightProbe::Running(existing));
+                task.abort();
+                return Err("probe_id_in_progress".to_string());
+            }
+            None => {}
+        }
+        active.insert(
+            probe_id.clone(),
+            ActivePreflightProbe::Running(task.abort_handle()),
+        );
+    }
+    let result = task.await;
+    if let Ok(mut active) = active_preflight_probes().lock() {
+        active.remove(&probe_id);
+    }
+    match result {
+        Ok(result) => result,
+        Err(error) if error.is_cancelled() => Err("probe_cancelled".to_string()),
+        Err(error) => Err(format!("protocol probe task failed: {error}")),
+    }
+}
+
+#[tauri::command]
+pub fn cancel_codex_provider_protocol_probe(probe_id: String) -> Result<bool, String> {
+    let probe_id = required("probeId", &probe_id)?;
+    let mut active = active_preflight_probes()
+        .lock()
+        .map_err(|_| "protocol probe cancellation state is unavailable".to_string())?;
+    active.retain(|_, entry| match entry {
+        ActivePreflightProbe::Running(_) => true,
+        ActivePreflightProbe::CancelBeforeStart(created_at) => {
+            created_at.elapsed() < Duration::from_secs(60)
+        }
+    });
+    match active.remove(probe_id) {
+        Some(ActivePreflightProbe::Running(handle)) => {
+            handle.abort();
+            Ok(true)
+        }
+        Some(ActivePreflightProbe::CancelBeforeStart(created_at)) => {
+            active.insert(
+                probe_id.to_string(),
+                ActivePreflightProbe::CancelBeforeStart(created_at),
+            );
+            Ok(true)
+        }
+        None => {
+            active.insert(
+                probe_id.to_string(),
+                ActivePreflightProbe::CancelBeforeStart(Instant::now()),
+            );
+            Ok(true)
+        }
+    }
 }
 
 #[tauri::command]
@@ -217,6 +305,7 @@ pub async fn save_codex_provider_with_protocol_preflight(
 async fn run_provider_preflight<F>(
     state: &AppState,
     mut provider: Provider,
+    mode: ProtocolProbeMode,
     reporter: F,
 ) -> Result<CodexProviderProtocolPreflightOutcome, String>
 where
@@ -225,10 +314,11 @@ where
     let candidates = compile_provider_probe_candidates(&provider)?;
     let total = candidates.len();
     let records = run_candidate_batch_with(candidates, |candidate| {
-        run_candidate_result_with_reporter(state, candidate, &reporter)
+        run_candidate_result_with_reporter(state, candidate, mode, &reporter)
     })
     .await?;
-    let protocol_applied = apply_unanimous_probe_selection(&mut provider, &records)?;
+    let protocol_applied = mode == ProtocolProbeMode::Deep
+        && apply_unanimous_probe_selection(&mut provider, &records)?;
     reporter(batch_finished_event(total, &records));
     Ok(CodexProviderProtocolPreflightOutcome {
         provider,
@@ -358,6 +448,7 @@ async fn run_candidate_result(
 async fn run_candidate_result_with_reporter<F>(
     state: &AppState,
     candidate: ProbeCandidate,
+    mode: ProtocolProbeMode,
     reporter: &F,
 ) -> Result<ProtocolCompatibilityProbeResult, String>
 where
@@ -365,7 +456,7 @@ where
 {
     let _lease = state.try_acquire_protocol_probe(&candidate.lease_key())?;
     let client = crate::proxy::http_client::build_protocol_probe_client()?;
-    Ok(run_protocol_compatibility_probe_with_reporter(candidate, &client, reporter).await)
+    Ok(run_protocol_compatibility_probe_in_mode(candidate, &client, mode, reporter).await)
 }
 
 async fn run_automatic_candidate_result(
@@ -708,9 +799,10 @@ fn parse_transport_hint(value: Option<&str>) -> TransportKind {
 mod tests {
     use super::{
         apply_reasoning_override, apply_unanimous_probe_selection, batch_finished_event,
-        clear_reasoning_override, find_cached_candidate_result, inspect_reasoning_compatibility,
-        plan_reasoning_override, run_candidate_batch_with, unanimous_selection_was_applied,
-        ApplyReasoningOverrideRequest, ClearReasoningOverrideRequest, PlanReasoningOverrideRequest,
+        cancel_codex_provider_protocol_probe, clear_reasoning_override,
+        find_cached_candidate_result, inspect_reasoning_compatibility, plan_reasoning_override,
+        run_candidate_batch_with, unanimous_selection_was_applied, ApplyReasoningOverrideRequest,
+        ClearReasoningOverrideRequest, PlanReasoningOverrideRequest,
     };
     use crate::protocol_compatibility::{
         HistoryReplay, ManualReasoningOverride, ProbeCandidate, ProbeReadiness, ProbeTargetKey,
@@ -874,6 +966,26 @@ mod tests {
                 failed: 1,
             }
         );
+    }
+
+    #[tokio::test]
+    async fn cancel_command_aborts_registered_probe_and_is_idempotent() {
+        let probe_id = format!("cancel-test-{}", uuid::Uuid::new_v4());
+        let task = tokio::spawn(std::future::pending::<()>());
+        super::active_preflight_probes()
+            .lock()
+            .expect("active probe registry")
+            .insert(
+                probe_id.clone(),
+                super::ActivePreflightProbe::Running(task.abort_handle()),
+            );
+
+        assert!(cancel_codex_provider_protocol_probe(probe_id.clone()).expect("cancel probe"));
+        assert!(task
+            .await
+            .expect_err("task should be aborted")
+            .is_cancelled());
+        assert!(cancel_codex_provider_protocol_probe(probe_id).expect("repeat cancellation"));
     }
 
     #[tokio::test]

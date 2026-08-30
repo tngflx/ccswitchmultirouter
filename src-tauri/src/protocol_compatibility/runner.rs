@@ -22,6 +22,14 @@ use super::{
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(15);
 const TRANSACTION_TIMEOUT: Duration = Duration::from_secs(120);
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProtocolProbeMode {
+    Light,
+    #[default]
+    Deep,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProbeProgressStage {
@@ -191,8 +199,26 @@ pub async fn run_protocol_compatibility_probe_with_reporter<F>(
 where
     F: Fn(ProtocolProbeProgressEvent) + Send + Sync,
 {
+    run_protocol_compatibility_probe_in_mode(candidate, client, ProtocolProbeMode::Deep, reporter)
+        .await
+}
+
+pub async fn run_protocol_compatibility_probe_in_mode<F>(
+    candidate: ProbeCandidate,
+    client: &Client,
+    mode: ProtocolProbeMode,
+    reporter: F,
+) -> ProtocolCompatibilityProbeResult
+where
+    F: Fn(ProtocolProbeProgressEvent) + Send + Sync,
+{
     let model = candidate.public_model.clone();
-    match tokio::time::timeout(TRANSACTION_TIMEOUT, run_probe(candidate, client, &reporter)).await {
+    match tokio::time::timeout(
+        TRANSACTION_TIMEOUT,
+        run_probe(candidate, client, mode, &reporter),
+    )
+    .await
+    {
         Ok(result) => result,
         Err(_) => {
             reporter(ProtocolProbeProgressEvent::CandidateFinished {
@@ -212,6 +238,7 @@ where
 async fn run_probe<F>(
     candidate: ProbeCandidate,
     client: &Client,
+    mode: ProtocolProbeMode,
     reporter: &F,
 ) -> ProtocolCompatibilityProbeResult
 where
@@ -224,7 +251,7 @@ where
     let mut branches = Vec::with_capacity(2);
 
     for transport in [TransportKind::OpenAiResponses, TransportKind::OpenAiChat] {
-        branches.push(run_branch(&candidate, client, transport, &nonce, reporter).await);
+        branches.push(run_branch(&candidate, client, transport, &nonce, mode, reporter).await);
     }
 
     let candidates = branches
@@ -252,6 +279,7 @@ async fn run_branch<F>(
     client: &Client,
     transport: TransportKind,
     nonce: &str,
+    mode: ProtocolProbeMode,
     reporter: &F,
 ) -> TransportBranchResult
 where
@@ -371,6 +399,19 @@ where
         classify_captured_reasoning_shape(&baseline_exchange),
     );
     evidence.push(baseline_exchange.evidence().clone());
+
+    if mode == ProtocolProbeMode::Light {
+        return finish_branch(
+            reporter,
+            candidate,
+            TransportBranchResult {
+                assessment,
+                reasoning_shape,
+                evidence,
+                failures,
+            },
+        );
+    }
 
     report_stage_started(
         reporter,

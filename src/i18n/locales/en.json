@@ -42,6 +42,8 @@
     "transportResponses": "Responses",
     "transportChat": "Chat Completions",
     "retry": "Retry probe",
+    "stop": "Stop probe",
+    "stopping": "Stopping…",
     "runningClose": "Probing…",
     "close": "Close"
   },
@@ -4052,6 +4054,9 @@
     "s517": "Not configured"
   },
   "codexForm": {
+    "lightProbeStarted": "Light-probing {{count}} models for a minimal Responses / Chat reply.",
+    "lightProbeSummary": "Light probe complete: {{available}} models responded, {{failed}} failed. Configuration was not changed.",
+    "probeStopped": "Probe stopped. Partial results were discarded.",
     "deepProbeStarted": "Deep-probing {{count}} models across Responses / Chat, SSE, reasoning, tool calls, and tool continuation.",
     "deepProbeResultCounts": "Verified {{verified}}, Partial {{partial}}, Failed {{failed}}",
     "deepProbeAllResponsesSummary": "Deep probe complete: all models selected Responses; {{resultCounts}}.",
@@ -4111,6 +4116,10 @@
     "textOnlyAria": "{{model}} text only",
     "restorePresetAria": "Restore CCSM input capability preset for {{model}}",
     "confirmProbeTitle": "Confirm Chat / Responses test",
+    "probeModeLight": "Light",
+    "probeModeDeep": "Deep",
+    "probeModeLightDescription": "Light sends one minimal request to Responses and Chat per model. It checks basic model availability only.",
+    "probeModeDeepDescription": "Deep also verifies streaming, reasoning, tool calls, and tool continuation.",
     "probeDialogIntro": "This test helps decide whether the current provider should use Responses or Chat Completions. It sends real requests to models in the current model catalog, which may consume a small amount of quota or traffic and may trigger rate limits.",
     "probeDialogNoCatalog": "If you do not have a model catalog yet, go to \"Model catalog & context\" above and click \"Fetch model list\", or manually add at least one model.",
     "probeDialogPerModel": "Each model is tested against its matching Responses and Chat Completions endpoint with a 1024 output cap. If both fail, the cause is usually not the protocol but the API key, base URL, model permissions, quota, network, or an upstream outage.",

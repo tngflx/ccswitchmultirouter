@@ -42,6 +42,8 @@
     "transportResponses": "Responses",
     "transportChat": "Chat Completions",
     "retry": "再プローブ",
+    "stop": "プローブを停止",
+    "stopping": "停止中…",
     "runningClose": "検査中",
     "close": "閉じる"
   },
@@ -4052,6 +4054,9 @@
     "s517": "未設定"
   },
   "codexForm": {
+    "lightProbeStarted": "{{count}} モデルで Responses / Chat の最小応答を軽量チェック中。",
+    "lightProbeSummary": "軽量プローブ完了: {{available}} モデルが応答し、{{failed}} モデルが失敗しました。設定は変更されていません。",
+    "probeStopped": "プローブを停止し、途中結果を破棄しました。",
     "deepProbeStarted": "{{count}} モデルを Responses / Chat、SSE、思考内容、ツール呼び出し、ツール継続で深く検査中。",
     "deepProbeResultCounts": "Verified {{verified}}、Partial {{partial}}、Failed {{failed}}",
     "deepProbeAllResponsesSummary": "ディーププローブ完了: 全モデルが Responses を選択。{{resultCounts}}",
@@ -4111,6 +4116,10 @@
     "textOnlyAria": "{{model}} のテキストのみ",
     "restorePresetAria": "{{model}} 的 CCSM 入力機能プリセットを復元",
     "confirmProbeTitle": "Chat / Responses テストの確認",
+    "probeModeLight": "軽量",
+    "probeModeDeep": "詳細",
+    "probeModeLightDescription": "軽量モードは各モデルの Responses と Chat に最小リクエストを 1 回ずつ送り、基本的な利用可否のみ確認します。",
+    "probeModeDeepDescription": "詳細モードではストリーミング、推論内容、ツール呼び出し、ツール継続も検証します。",
     "probeDialogIntro": "このテストは、現在のプロバイダーが Responses と Chat Completions のどちらを選ぶべきかの判断に役立ちます。現在のモデルカタログ内のモデルに実際のリクエストを送信するため、少量のクォータやトラフィックを消費したり、レート制限が発生したりすることがあります。",
     "probeDialogNoCatalog": "まだモデルカタログがない場合は、上の「モデルカタログとコンテキスト」で「モデルリストを取得」をクリックするか、少なくとも 1 つのモデルを手動追加してください。",
     "probeDialogPerModel": "各モデルは対応する Responses と Chat Completions のエンドポイントでそれぞれテストされ、出力上限は 1024 です。両方失敗する場合、通常はプロトコルではなく API キー、Base URL、モデル権限、クォータ、ネットワーク、または上流障害が原因です。",

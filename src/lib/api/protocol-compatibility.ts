@@ -15,6 +15,7 @@ export type CodexProtocolProbeStageStatus =
   | "failed"
   | "skipped";
 export type CodexProtocolProbeReadiness = "verified" | "partial" | "unverified";
+export type CodexProtocolProbeMode = "light" | "deep";
 export type CodexReasoningSemantic = "readable" | "summary" | "opaque" | "none";
 export type CodexReasoningSource =
   | "reasoning_content"
@@ -127,12 +128,20 @@ export interface CodexProviderProtocolPreflightOutcome {
 
 export async function preflightCodexProviderProtocolCompatibility(
   provider: Provider,
+  probeId: string,
+  mode: CodexProtocolProbeMode,
   onProgress: (event: CodexProtocolProbeProgressEvent) => void,
 ): Promise<CodexProviderProtocolPreflightOutcome> {
   const onEvent = new Channel<CodexProtocolProbeProgressEvent>();
   onEvent.onmessage = onProgress;
   return invoke<CodexProviderProtocolPreflightOutcome>(
     "preflight_codex_provider_protocol_compatibility",
-    { provider, onEvent },
+    { provider, probeId, mode, onEvent },
   );
+}
+
+export async function cancelCodexProviderProtocolProbe(
+  probeId: string,
+): Promise<boolean> {
+  return invoke<boolean>("cancel_codex_provider_protocol_probe", { probeId });
 }

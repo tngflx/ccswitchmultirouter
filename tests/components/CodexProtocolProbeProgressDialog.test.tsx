@@ -1,4 +1,4 @@
-import { render, screen, within } from "@testing-library/react";
+import { fireEvent, render, screen, within } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 
 import { CodexProtocolProbeProgressDialog } from "@/components/providers/forms/CodexProtocolProbeProgressDialog";
@@ -67,6 +67,26 @@ function branch(
 }
 
 describe("CodexProtocolProbeProgressDialog", () => {
+  it("lets the user stop a running probe", () => {
+    const onStop = vi.fn();
+    render(
+      <CodexProtocolProbeProgressDialog
+        open
+        running
+        expectedModels={["qwen3.8"]}
+        events={[]}
+        outcome={null}
+        error=""
+        onOpenChange={vi.fn()}
+        onStop={onStop}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Stop probe" }));
+
+    expect(onStop).toHaveBeenCalledTimes(1);
+  });
+
   it("shows the complete model denominator before later models start", () => {
     render(
       <CodexProtocolProbeProgressDialog

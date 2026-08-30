@@ -1619,6 +1619,7 @@ pub fn run() {
             commands::probe_codex_responses_for_config,
             commands::probe_codex_protocol_compatibility,
             commands::preflight_codex_provider_protocol_compatibility,
+            commands::cancel_codex_provider_protocol_probe,
             commands::save_codex_provider_with_protocol_preflight,
             commands::get_codex_protocol_compatibility,
             commands::plan_codex_reasoning_override,
