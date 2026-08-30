@@ -70,7 +70,7 @@ pub use codex::{
     codex_multirouter_needs_plaintext_v2_collaboration, codex_provider_text_only_input,
     codex_provider_upstream_model, codex_provider_uses_chat_completions,
     codex_route_persistent_provider, codex_route_target_provider_id,
-    explain_codex_responses_upstream_protocol, inject_codex_chat_prompt_cache_key,
+    explain_codex_responses_upstream_protocol, inject_codex_prompt_cache_key,
     is_codex_official_provider, materialize_codex_routed_provider_from_target,
     provider_needs_responses_namespace_flatten, resolve_codex_cache_config,
     resolve_codex_catalog_tool_profile, resolve_codex_chat_reasoning_config,

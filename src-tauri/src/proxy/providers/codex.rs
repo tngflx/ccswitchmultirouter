@@ -2236,10 +2236,10 @@ fn codex_route_cache_config(upstream: &JsonValue, route: &JsonValue) -> Option<C
         .map(normalize_codex_cache_config)
 }
 
-/// Whether a converted Codex Responses request may send `prompt_cache_key` to
-/// its Chat Completions upstream. Unknown OpenAI-compatible gateways default to
-/// false because many reject unsupported request fields with HTTP 400.
-pub fn should_send_codex_chat_prompt_cache_key(provider: &Provider) -> bool {
+/// Whether a Codex request may send `prompt_cache_key` to its OpenAI-compatible
+/// upstream. Unknown gateways default to false because many reject unsupported
+/// request fields with HTTP 400.
+pub fn should_send_codex_prompt_cache_key(provider: &Provider) -> bool {
     match provider
         .meta
         .as_ref()
@@ -2282,16 +2282,16 @@ pub fn should_send_codex_chat_prompt_cache_key(provider: &Provider) -> bool {
     }
 }
 
-/// Add a stable cache-routing key after Responses -> Chat conversion. An
-/// explicit client key wins; otherwise only a real client-provided session ID
-/// is eligible. Generated per-request UUIDs must never be used here.
-pub fn inject_codex_chat_prompt_cache_key(
+/// Add a stable cache-routing key to a native Responses or converted Chat body.
+/// An explicit client key wins; otherwise only a real client-provided session
+/// ID is eligible. Generated per-request UUIDs must never be used here.
+pub fn inject_codex_prompt_cache_key(
     provider: &Provider,
-    chat_body: &mut JsonValue,
+    request_body: &mut JsonValue,
     explicit_key: Option<&str>,
     client_session_id: Option<&str>,
 ) -> bool {
-    if !should_send_codex_chat_prompt_cache_key(provider) {
+    if !should_send_codex_prompt_cache_key(provider) {
         return false;
     }
 
@@ -2307,7 +2307,7 @@ pub fn inject_codex_chat_prompt_cache_key(
         return false;
     };
 
-    chat_body["prompt_cache_key"] = JsonValue::String(key.to_string());
+    request_body["prompt_cache_key"] = JsonValue::String(key.to_string());
     true
 }
 
@@ -3873,6 +3873,50 @@ mod tests {
             icon_color: None,
             in_failover_queue: false,
         }
+    }
+
+    #[test]
+    fn prompt_cache_routing_enabled_injects_client_session_for_native_or_chat() {
+        let mut provider = create_provider(json!({
+            "base_url": "https://third-party.example/v1"
+        }));
+        provider.meta = Some(Default::default());
+        provider
+            .meta
+            .as_mut()
+            .expect("provider meta")
+            .prompt_cache_routing = Some("enabled".to_string());
+        let mut body = json!({"model": "gpt-5.6-sol"});
+
+        assert!(inject_codex_prompt_cache_key(
+            &provider,
+            &mut body,
+            None,
+            Some("thread-123")
+        ));
+        assert_eq!(body["prompt_cache_key"], "thread-123");
+    }
+
+    #[test]
+    fn prompt_cache_routing_preserves_explicit_client_key() {
+        let mut provider = create_provider(json!({
+            "base_url": "https://third-party.example/v1"
+        }));
+        provider.meta = Some(Default::default());
+        provider
+            .meta
+            .as_mut()
+            .expect("provider meta")
+            .prompt_cache_routing = Some("enabled".to_string());
+        let mut body = json!({"prompt_cache_key": "client-key"});
+
+        assert!(inject_codex_prompt_cache_key(
+            &provider,
+            &mut body,
+            Some("client-key"),
+            Some("thread-123")
+        ));
+        assert_eq!(body["prompt_cache_key"], "client-key");
     }
 
     #[test]

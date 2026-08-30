@@ -494,7 +494,7 @@ pub struct CodexCacheConfig {
     /// 显式缓存 key；只有在 supportsPromptCacheKey 为 true 时才会被透传。
     #[serde(rename = "promptCacheKey", skip_serializing_if = "Option::is_none")]
     pub prompt_cache_key: Option<String>,
-    /// Session-based prompt-cache routing for Codex Responses -> Chat conversions.
+    /// Session-based prompt-cache routing for Codex native Responses and Chat upstreams.
     #[serde(rename = "promptCacheRouting", skip_serializing_if = "Option::is_none")]
     pub prompt_cache_routing: Option<String>,
     /// OpenAI prompt cache retention，例如 in_memory 或 24h。
@@ -662,7 +662,7 @@ pub struct ProviderMeta {
     /// identity when available; generated session IDs are not sent upstream.
     #[serde(rename = "promptCacheKey", skip_serializing_if = "Option::is_none")]
     pub prompt_cache_key: Option<String>,
-    /// Session-based prompt-cache routing for Codex Responses -> Chat conversions.
+    /// Session-based prompt-cache routing for Codex native Responses and Chat upstreams.
     #[serde(rename = "promptCacheRouting", skip_serializing_if = "Option::is_none")]
     pub prompt_cache_routing: Option<String>,
     /// OpenAI prompt cache retention policy for endpoints that explicitly support it.

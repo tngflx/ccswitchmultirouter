@@ -262,7 +262,7 @@ export interface ProviderMeta {
   isFullUrl?: boolean;
   // Prompt cache key for OpenAI Responses-compatible endpoints (improves cache hit rate)
   promptCacheKey?: string;
-  // Session-based prompt-cache routing for Codex Responses -> Chat conversions.
+  // Session-based prompt-cache routing for Codex native Responses and Chat upstreams.
   promptCacheRouting?: PromptCacheRoutingMode;
   // OpenAI prompt cache retention policy; only used when codexCache declares support.
   promptCacheRetention?: "in_memory" | "24h" | string;

@@ -2653,7 +2653,7 @@ impl RequestForwarder {
                     context,
                 );
             }
-            super::providers::inject_codex_chat_prompt_cache_key(
+            super::providers::inject_codex_prompt_cache_key(
                 provider,
                 &mut chat_body,
                 explicit_prompt_cache_key.as_deref(),
@@ -2854,6 +2854,24 @@ impl RequestForwarder {
                 && !codex_responses_to_anthropic,
             request_body,
         );
+        if matches!(app_type, AppType::Codex)
+            && super::providers::is_codex_responses_endpoint(&effective_endpoint)
+            && !codex_responses_to_chat
+            && !codex_responses_to_messages
+            && !codex_responses_to_anthropic
+        {
+            let explicit_prompt_cache_key = request_body
+                .get("prompt_cache_key")
+                .and_then(Value::as_str)
+                .map(ToString::to_string);
+            super::providers::inject_codex_prompt_cache_key(
+                provider,
+                &mut request_body,
+                explicit_prompt_cache_key.as_deref(),
+                self.session_client_provided
+                    .then_some(self.session_id.as_str()),
+            );
+        }
         if should_make_codex_v2_agents_plaintext(app_type, codex_router_provider) {
             let changed = super::providers::openai_compat::make_codex_v2_agents_messages_plaintext(
                 &mut request_body,
