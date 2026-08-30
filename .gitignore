@@ -29,6 +29,7 @@ flatpak-build/
 flatpak-repo/
 .worktrees/
 .codex-work/active/
+/.codex-work/targets/
 .spec-workflow/
 copilot-api
 .history
