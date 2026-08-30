@@ -1390,11 +1390,18 @@ fn project_codex_desktop_model_fields(
     {
         entry_obj.insert(
             "supported_reasoning_levels".to_string(),
-            supported_reasoning_levels,
+            supported_reasoning_levels.clone(),
         );
         entry_obj.insert(
             "supportedReasoningEfforts".to_string(),
-            supported_reasoning_efforts,
+            supported_reasoning_efforts.clone(),
+        );
+        // Newer Desktop renderer builds consume the direct camelCase
+        // ModelInfo field, while older builds use supportedReasoningEfforts.
+        // Keep both aliases sourced from the same normalized levels.
+        entry_obj.insert(
+            "supportedReasoningLevels".to_string(),
+            supported_reasoning_levels,
         );
     }
     entry_obj.insert("visibility".to_string(), json!("list"));
@@ -2716,6 +2723,13 @@ fn codex_provider_models_toml_array(
             codex_provider_reasoning_efforts_toml_array(
                 supported_reasoning_levels,
                 "reasoningEffort",
+            ),
+        );
+        model.insert(
+            "supportedReasoningLevels",
+            codex_provider_reasoning_efforts_toml_array(
+                supported_reasoning_levels,
+                "effort",
             ),
         );
         if let Some(speed_tiers) = codex_provider_string_toml_array(
@@ -8326,6 +8340,7 @@ mod tests {
             "supported_reasoning_levels",
             "supported_reasoning_efforts",
             "supportedReasoningEfforts",
+            "supportedReasoningLevels",
         ] {
             let values = catalog["models"][0][field]
                 .as_array()
@@ -13542,11 +13557,18 @@ openai_base_url = "http://127.0.0.1:15721/v1"
             .iter()
             .filter_map(|level| level.get("reasoningEffort").and_then(Value::as_str))
             .collect::<Vec<_>>();
+        let model_info_levels = entry["supportedReasoningLevels"]
+            .as_array()
+            .expect("camelCase ModelInfo reasoning levels")
+            .iter()
+            .filter_map(|level| level.get("effort").and_then(Value::as_str))
+            .collect::<Vec<_>>();
 
         assert_eq!(entry["default_reasoning_level"], "high");
         assert_eq!(entry["defaultReasoningEffort"], "high");
         assert_eq!(levels, vec!["low", "high", "max"]);
         assert_eq!(desktop_levels, vec!["low", "high", "max"]);
+        assert_eq!(model_info_levels, vec!["low", "high", "max"]);
         assert!(!levels.contains(&"ultra"));
     }
 
