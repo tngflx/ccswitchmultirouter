@@ -142,7 +142,6 @@ fn windows_file_identity(file: &fs::File) -> Option<(u64, [u8; 16])> {
 #[derive(Debug)]
 struct ParentTokenTimeline {
     events: Vec<TimestampedTokenSignature>,
-    max_timestamp: Option<DateTime<Utc>>,
     has_token_without_timestamp: bool,
 }
 
@@ -155,15 +154,6 @@ impl ParentTokenTimeline {
         if self.has_token_without_timestamp {
             return Err(format!(
                 "父 rollout {} 的 token_count 缺少有效 timestamp",
-                parent_path.display()
-            ));
-        }
-        if self
-            .max_timestamp
-            .is_none_or(|timestamp| timestamp < cutoff)
-        {
-            return Err(format!(
-                "父 rollout {} 尚未写到 child fork 时刻",
                 parent_path.display()
             ));
         }
@@ -389,12 +379,34 @@ fn non_empty_string(value: Option<&serde_json::Value>) -> Option<String> {
         .map(str::to_owned)
 }
 
-fn thread_id_from_filename(path: &Path) -> Option<String> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RolloutFilenameIdentity {
+    thread_id: String,
+    root_meta_id: String,
+}
+
+fn rollout_filename_identity(path: &Path) -> Option<RolloutFilenameIdentity> {
     let stem = path.file_stem()?.to_str()?;
-    let candidate = stem.get(stem.len().checked_sub(36)?..)?;
-    uuid::Uuid::parse_str(candidate)
-        .ok()
-        .map(|value| value.hyphenated().to_string())
+    let thread_start = stem.len().checked_sub(36)?;
+    let thread_id = uuid::Uuid::parse_str(stem.get(thread_start..)?)
+        .ok()?
+        .hyphenated()
+        .to_string();
+    let root_meta_id = stem
+        .get(..thread_start)
+        .and_then(|prefix| prefix.strip_suffix('_'))
+        .and_then(|prefix| prefix.get(prefix.len().checked_sub(36)?..))
+        .and_then(|candidate| uuid::Uuid::parse_str(candidate).ok())
+        .map_or_else(|| thread_id.clone(), |value| value.hyphenated().to_string());
+
+    Some(RolloutFilenameIdentity {
+        thread_id,
+        root_meta_id,
+    })
+}
+
+fn thread_id_from_filename(path: &Path) -> Option<String> {
+    rollout_filename_identity(path).map(|identity| identity.thread_id)
 }
 
 fn explicit_parent_from_meta(payload: &serde_json::Value) -> ParentResolution {
@@ -762,6 +774,14 @@ fn parse_codex_file(
     file_path: &Path,
     root_thread_id: Option<String>,
 ) -> Result<ParsedCodexFile, AppError> {
+    let filename_identity = rollout_filename_identity(file_path).or_else(|| {
+        root_thread_id
+            .as_ref()
+            .map(|thread_id| RolloutFilenameIdentity {
+                thread_id: thread_id.clone(),
+                root_meta_id: thread_id.clone(),
+            })
+    });
     let file =
         fs::File::open(file_path).map_err(|e| AppError::Config(format!("无法打开文件: {e}")))?;
     let reader = BufReader::new(file);
@@ -826,10 +846,11 @@ fn parse_codex_file(
                         .or_else(|| payload.get("thread_id"))
                         .or_else(|| payload.get("threadId")),
                 );
-                if let (Some(filename_id), Some(meta_id)) = (&root_thread_id, meta_thread_id) {
-                    if filename_id != &meta_id {
+                if let (Some(identity), Some(meta_id)) = (&filename_identity, meta_thread_id) {
+                    if identity.root_meta_id != meta_id {
                         parent = ParentResolution::Deferred(format!(
-                            "文件名线程 ID ({filename_id}) 与 root meta ID ({meta_id}) 不一致"
+                            "文件名 root meta ID ({}) 与 root meta ID ({meta_id}) 不一致",
+                            identity.root_meta_id
                         ));
                     }
                 }
@@ -991,7 +1012,6 @@ fn parent_signatures_before(
     }
 
     let mut events = Vec::new();
-    let mut max_timestamp: Option<DateTime<Utc>> = None;
     let mut has_token_without_timestamp = false;
 
     // 必须扫描完整父文件，不能在首个未来时间戳处 break：rollout 写入顺序
@@ -1004,9 +1024,6 @@ fn parent_signatures_before(
             continue;
         };
         let timestamp = parse_timestamp(value.get("timestamp"));
-        if let Some(timestamp) = timestamp {
-            max_timestamp = Some(max_timestamp.map_or(timestamp, |current| current.max(timestamp)));
-        }
         if value.get("type").and_then(serde_json::Value::as_str) != Some("event_msg")
             || value
                 .get("payload")
@@ -1038,7 +1055,6 @@ fn parent_signatures_before(
 
     let timeline = Arc::new(ParentTokenTimeline {
         events,
-        max_timestamp,
         has_token_without_timestamp,
     });
     let result = timeline.signatures_before(parent_path, cutoff);
@@ -1530,6 +1546,12 @@ mod tests {
 
     fn rollout_path(dir: &Path, thread_id: &str) -> PathBuf {
         dir.join(format!("rollout-2026-07-10T03-00-00-{thread_id}.jsonl"))
+    }
+
+    fn forked_rollout_path(dir: &Path, root_meta_id: &str, thread_id: &str) -> PathBuf {
+        dir.join(format!(
+            "rollout-2026-07-10T03-00-00-{root_meta_id}_{thread_id}.jsonl"
+        ))
     }
 
     fn session_meta_at(
@@ -2419,6 +2441,30 @@ mod tests {
         assert_eq!(replay_caches().lock().unwrap().parent_timelines.len(), 1);
     }
 
+    #[test]
+    #[serial_test::serial]
+    fn test_idle_parent_before_fork_cutoff_is_a_complete_timeline() {
+        clear_codex_replay_caches();
+        let temp = tempdir().unwrap();
+        let parent = rollout_path(temp.path(), PARENT_ID);
+        write_jsonl(
+            &parent,
+            &[
+                session_meta(PARENT_ID),
+                token_count_at(100, 50, 10, "2026-07-10T03:00:01Z"),
+                turn_context_at("2026-07-10T03:00:02Z"),
+            ],
+        );
+
+        let later_fork = "2026-07-10T03:10:00Z".parse::<DateTime<Utc>>().unwrap();
+        assert_eq!(
+            parent_signatures_before(&parent, later_fork)
+                .expect("an idle parent need not emit an event at the fork instant")
+                .len(),
+            1
+        );
+    }
+
     #[cfg(any(unix, windows))]
     #[test]
     fn test_parent_file_stamp_distinguishes_same_size_same_mtime_files() {
@@ -2680,6 +2726,42 @@ mod tests {
                 format!("{CODEX_THREAD_REQUEST_ID_PREFIX}:{CHILD_A_ID}:1"),
                 format!("{CODEX_THREAD_REQUEST_ID_PREFIX}:{CHILD_B_ID}:1")
             ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_forked_filename_keeps_root_meta_and_child_thread_id_distinct() -> Result<(), AppError> {
+        clear_codex_replay_caches();
+        let db = Database::memory()?;
+        let temp = tempdir().unwrap();
+        let child = forked_rollout_path(temp.path(), PARENT_ID, CHILD_A_ID);
+        write_jsonl(
+            &child,
+            &[
+                session_meta(PARENT_ID),
+                turn_context(),
+                token_count(100, 50, 10),
+            ],
+        );
+
+        let identity = rollout_filename_identity(&child).expect("forked rollout identity");
+        assert_eq!(identity.root_meta_id, PARENT_ID);
+        assert_eq!(identity.thread_id, CHILD_A_ID);
+
+        let result = sync_test_file(&db, &child, &[&child])?;
+        assert_eq!((result.imported, result.deferred), (1, false));
+
+        let conn = lock_conn!(db.conn);
+        let request_id: String = conn.query_row(
+            "SELECT request_id FROM proxy_request_logs WHERE data_source = 'codex_session'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(
+            request_id,
+            format!("{CODEX_THREAD_REQUEST_ID_PREFIX}:{CHILD_A_ID}:1")
         );
         Ok(())
     }
