@@ -14,6 +14,8 @@
 
 6. **NEVER hallucinate results.** If you did not run a command, do not say you did. If a test failed, say it failed. If you are unsure, say so.
 
+6-A. **Fix root causes before symptoms.** For every bug, error, warning storm, retry loop, or recovery failure, trace the producing path to the violated invariant and fix that invariant at its owning layer. Do not merely suppress logs, increase retries/timeouts, clear persisted state, special-case one observed input, or add UI masking while the producer remains wrong. A containment measure is allowed only when the root cause is external or cannot yet be fixed safely; label it as containment, preserve diagnostic evidence, document the unresolved cause, and add a regression test for the closest owned boundary.
+
 ## ALWAYS RECHECK
 
 7. **After ANY upstream merge:** grep for every function/field/import that our custom code depends on (`resolve_reasoning_content_mode`, `ReasoningContentMode`, `normalize_third_party_responses_reasoning_content_for_strict_schema`, `reasoning_content_mode` on ProviderMeta, LanguageSwitcher, etc.). Upstream may silently remove or rename them.
@@ -24,7 +26,7 @@
 
 10. **When reporting status:** list exactly what passed, what failed, and what was not tested. Never round up or omit failures.
 
-10-A. **Concurrent work is authoritative.** Before editing or starting broad verification, inspect `git status --short`, `git diff --name-only`, running processes, active Codex tasks when available, and `.codex-work/active/`. Claim exact paths in your own compact lease as described in `.codex-work/README.md`; read legacy `docs/coordination/active/*.md` until those leases are retired. Treat unexplained dirty files, active leases, and failures in those areas as owned: do not overwrite, format, revert, attribute, or stop them. Overlap requires explicit coordination or a blocked status; use targeted verification on a moving tree and report broad results as inconclusive. A user-confirmed abandonment releases the lease after checking for no matching process. Delete your lease at handoff and record only durable findings in `docs/memory/journal.md`.
+10-A. **Concurrent work is authoritative.** Before editing or starting broad verification, inspect `git status --short`, `git diff --name-only`, running processes, active Codex tasks when available, and `.codex-work/active/`. Claim exact paths in your own compact lease as described in `.codex-work/README.md`. Treat unexplained dirty files, active leases, and failures in those areas as owned: do not overwrite, format, revert, attribute, or stop them. Overlap requires explicit cross-task coordination or a blocked status; use targeted verification on a moving tree and report broad results as inconclusive. A user-confirmed abandonment releases the lease after checking for no matching process. Delete your lease at handoff and record only durable findings in `docs/memory/journal.md`.
 
 ## MERGE PROTOCOL
 

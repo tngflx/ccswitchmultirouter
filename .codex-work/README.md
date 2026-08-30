@@ -12,8 +12,9 @@ owned processes change. Remove it at handoff, cancellation, or confirmed
 abandonment. Never remove another lease merely because it is old: check for a
 matching process and ask the user before releasing it.
 
-Legacy Markdown manifests under `docs/coordination/active/` remain readable
-during migration. Do not create new manifests there.
+When leases overlap, use Codex cross-task messaging to negotiate ownership with
+the task named by the lease. The JSON lease remains authoritative because
+messages are transient and not every editor or process can receive them.
 
 Lease shape:
 
