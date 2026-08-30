@@ -7071,6 +7071,8 @@ fn is_terminal_codex_quota_429(body: Option<&str>) -> bool {
     let normalized = body.to_ascii_lowercase();
     [
         "usage_limit_reached",
+        "daily_limit_exceeded",
+        "daily_usage_limit_exceeded",
         "insufficient_quota",
         "billing_hard_limit_reached",
         "the usage limit has been reached",
@@ -12948,31 +12950,37 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn codex_rate_limit_retry_does_not_spin_on_usage_limit_reached() {
-        let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let attempts_for_send = attempts.clone();
+        for body in [
+            br#"{"error":{"type":"usage_limit_reached","message":"The usage limit has been reached"}}"#
+                .as_slice(),
+            br#"{"error":{"code":429,"reason":"DAILY_LIMIT_EXCEEDED","message":"daily_usage_limit_exceeded"}}"#
+                .as_slice(),
+        ] {
+            let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let attempts_for_send = attempts.clone();
 
-        let result = send_codex_request_with_explicit_rejection_retry(
-            "test",
-            test_codex_traffic_policy(false),
-            || {
-            let attempts = attempts_for_send.clone();
-            async move {
-                attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                Ok(ProxyResponse::buffered(
-                    http::StatusCode::TOO_MANY_REQUESTS,
-                    http::HeaderMap::new(),
-                    Bytes::from_static(
-                        br#"{"error":{"type":"usage_limit_reached","message":"The usage limit has been reached"}}"#,
-                    ),
-                ))
-            }
-        })
-        .await;
+            let result = send_codex_request_with_explicit_rejection_retry(
+                "test",
+                test_codex_traffic_policy(false),
+                || {
+                    let attempts = attempts_for_send.clone();
+                    async move {
+                        attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        Ok(ProxyResponse::buffered(
+                            http::StatusCode::TOO_MANY_REQUESTS,
+                            http::HeaderMap::new(),
+                            Bytes::copy_from_slice(body),
+                        ))
+                    }
+                },
+            )
+            .await;
 
-        assert_eq!(
-            result.unwrap().status(),
-            http::StatusCode::TOO_MANY_REQUESTS
-        );
-        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 1);
+            assert_eq!(
+                result.unwrap().status(),
+                http::StatusCode::TOO_MANY_REQUESTS
+            );
+            assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 1);
+        }
     }
 }
