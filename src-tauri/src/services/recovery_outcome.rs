@@ -117,6 +117,7 @@ pub fn begin_generation() -> Result<u64, String> {
         .lock()
         .map_err(|_| "恢复结果存储锁已损坏".to_string())?;
     let mut store = read_store_unlocked()?;
+    retire_marker_only_recovery_warnings(&mut store.outcomes);
     store.generation = store.generation.saturating_add(1).max(1);
     write_store_unlocked(&store)?;
     CURRENT_GENERATION.store(store.generation, Ordering::SeqCst);
@@ -159,11 +160,38 @@ pub fn get_pending_recovery_outcomes() -> Result<Vec<RecoveryOutcome>, String> {
     let _guard = store_lock()
         .lock()
         .map_err(|_| "恢复结果存储锁已损坏".to_string())?;
-    let mut pending = read_store_unlocked()?
-        .outcomes
+    let outcomes = read_store_unlocked()?.outcomes;
+    let latest_success_by_app = outcomes
+        .iter()
+        .filter(|outcome| {
+            (outcome.operation == "startup_takeover_restore"
+                && outcome.kind == RecoveryOutcomeKind::StartupTakeoverRestored)
+                || (outcome.operation == "startup_crash_recovery"
+                    && outcome.kind == RecoveryOutcomeKind::HealthyBackupRestored)
+        })
+        .filter_map(|outcome| {
+            outcome
+                .app_type
+                .as_deref()
+                .map(|app| (app.to_string(), outcome.timestamp.clone()))
+        })
+        .collect::<std::collections::HashMap<_, _>>();
+    let mut pending = outcomes
         .into_iter()
         .filter(|outcome| {
-            outcome.acknowledged_at.is_none() && !matches!(outcome.severity, RecoverySeverity::Info)
+            let superseded_by_success = outcome
+                .app_type
+                .as_deref()
+                .and_then(|app| latest_success_by_app.get(app))
+                .is_some_and(|success_timestamp| success_timestamp > &outcome.timestamp)
+                || (outcome.operation == "live_config_recovery"
+                    && outcome.kind == RecoveryOutcomeKind::LivePreservedProviderRepaired
+                    && latest_success_by_app
+                        .get("all")
+                        .is_some_and(|success_timestamp| success_timestamp > &outcome.timestamp));
+            outcome.acknowledged_at.is_none()
+                && !matches!(outcome.severity, RecoverySeverity::Info)
+                && !superseded_by_success
         })
         .collect::<Vec<_>>();
     pending.sort_by(|left, right| {
@@ -198,6 +226,40 @@ pub fn acknowledge_recovery_outcomes(generation: u64, ids: &[String]) -> Result<
     Ok(changed)
 }
 
+/// Clear stale Codex startup/port errors once a later takeover has succeeded.
+pub fn acknowledge_superseded_codex_takeover_outcomes() -> Result<usize, String> {
+    let _guard = store_lock()
+        .lock()
+        .map_err(|_| "恢复结果存储锁已损坏".to_string())?;
+    let mut store = read_store_unlocked()?;
+    let acknowledged_at = now_timestamp();
+    let mut changed = 0usize;
+    for outcome in &mut store.outcomes {
+        let relevant_operation = matches!(
+            outcome.operation.as_str(),
+            "startup_takeover_restore" | "proxy_listener_ownership"
+        );
+        let relevant_kind = matches!(
+            outcome.kind,
+            RecoveryOutcomeKind::StartupTakeoverFailed
+                | RecoveryOutcomeKind::PortOwnedByUnknownOwner
+                | RecoveryOutcomeKind::PortOwnedByCompatibleInstance
+        );
+        if outcome.app_type.as_deref() == Some("codex")
+            && relevant_operation
+            && relevant_kind
+            && outcome.acknowledged_at.is_none()
+        {
+            outcome.acknowledged_at = Some(acknowledged_at.clone());
+            changed += 1;
+        }
+    }
+    if changed > 0 {
+        write_store_unlocked(&store)?;
+    }
+    Ok(changed)
+}
+
 fn trim_outcomes(outcomes: &mut Vec<RecoveryOutcome>) {
     while outcomes.len() > MAX_OUTCOMES {
         let remove_at = outcomes
@@ -214,6 +276,21 @@ fn trim_outcomes(outcomes: &mut Vec<RecoveryOutcome>) {
             .map(|(index, _)| index)
             .unwrap_or(0);
         outcomes.remove(remove_at);
+    }
+}
+
+fn retire_marker_only_recovery_warnings(outcomes: &mut [RecoveryOutcome]) {
+    let acknowledged_at = now_timestamp();
+    for outcome in outcomes {
+        if outcome.operation == "startup_classification"
+            && outcome.kind == RecoveryOutcomeKind::UncleanExit
+        {
+            outcome.severity = RecoverySeverity::Info;
+            outcome.next_step = Some("none".to_string());
+            if outcome.acknowledged_at.is_none() {
+                outcome.acknowledged_at = Some(acknowledged_at.clone());
+            }
+        }
     }
 }
 
@@ -355,6 +432,35 @@ mod tests {
     }
 
     #[test]
+    fn marker_only_exit_is_retired_without_hiding_real_recovery_failures() {
+        let mut marker_only = outcome(
+            1,
+            "ccsm",
+            RecoverySeverity::Warning,
+            RecoveryOutcomeKind::UncleanExit,
+        );
+        marker_only.operation = "startup_classification".to_string();
+        marker_only.next_step = Some("reviewRecoveryResults".to_string());
+        let failure = outcome(
+            1,
+            "codex",
+            RecoverySeverity::Error,
+            RecoveryOutcomeKind::StartupTakeoverFailed,
+        );
+        let failure_id = failure.id.clone();
+        let mut outcomes = vec![marker_only, failure];
+
+        retire_marker_only_recovery_warnings(&mut outcomes);
+
+        assert_eq!(outcomes[0].severity, RecoverySeverity::Info);
+        assert_eq!(outcomes[0].next_step.as_deref(), Some("none"));
+        assert!(outcomes[0].acknowledged_at.is_some());
+        assert_eq!(outcomes[1].id, failure_id);
+        assert_eq!(outcomes[1].severity, RecoverySeverity::Error);
+        assert!(outcomes[1].acknowledged_at.is_none());
+    }
+
+    #[test]
     #[serial]
     fn acknowledgment_is_scoped_to_the_observed_generation() {
         let _home = TempHome::new();
@@ -406,5 +512,64 @@ mod tests {
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].id, failure.id);
         assert_eq!(pending[0].app_type.as_deref(), Some("codex"));
+    }
+
+    #[test]
+    #[serial]
+    fn successful_codex_takeover_acknowledges_superseded_startup_errors() {
+        let _home = TempHome::new();
+        let mut failure = outcome(
+            20,
+            "codex",
+            RecoverySeverity::Error,
+            RecoveryOutcomeKind::StartupTakeoverFailed,
+        );
+        failure.operation = "startup_takeover_restore".to_string();
+        record_recovery_outcome(failure).expect("record failure");
+
+        let mut port_failure = outcome(
+            20,
+            "codex",
+            RecoverySeverity::Error,
+            RecoveryOutcomeKind::PortOwnedByUnknownOwner,
+        );
+        port_failure.operation = "proxy_listener_ownership".to_string();
+        record_recovery_outcome(port_failure).expect("record port failure");
+
+        assert_eq!(
+            acknowledge_superseded_codex_takeover_outcomes().expect("acknowledge stale errors"),
+            2
+        );
+        assert!(get_pending_recovery_outcomes()
+            .expect("read pending")
+            .is_empty());
+    }
+
+    #[test]
+    #[serial]
+    fn pending_errors_are_hidden_after_a_later_successful_takeover() {
+        let _home = TempHome::new();
+        let mut failure = outcome(
+            20,
+            "codex",
+            RecoverySeverity::Error,
+            RecoveryOutcomeKind::StartupTakeoverFailed,
+        );
+        failure.operation = "startup_takeover_restore".to_string();
+        failure.timestamp = "2026-08-30T10:00:00+08:00".to_string();
+        record_recovery_outcome(failure.clone()).expect("record failure");
+
+        let mut success = outcome(
+            21,
+            "codex",
+            RecoverySeverity::Info,
+            RecoveryOutcomeKind::StartupTakeoverRestored,
+        );
+        success.operation = "startup_takeover_restore".to_string();
+        success.timestamp = "2026-08-30T11:00:00+08:00".to_string();
+        record_recovery_outcome(success).expect("record success");
+
+        let pending = get_pending_recovery_outcomes().expect("read pending");
+        assert!(pending.iter().all(|item| item.id != failure.id));
     }
 }

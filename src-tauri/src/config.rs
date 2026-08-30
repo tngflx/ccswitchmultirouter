@@ -541,6 +541,14 @@ pub fn atomic_write(path: &Path, data: &[u8]) -> Result<(), AppError> {
                 source,
             });
         }
+        if let Err(source) = fs::remove_file(&backup) {
+            if source.kind() != std::io::ErrorKind::NotFound {
+                log::warn!(
+                    "原子替换已完成，但清理临时备份失败: {}: {source}",
+                    backup.display()
+                );
+            }
+        }
     }
 
     #[cfg(not(windows))]
@@ -581,6 +589,23 @@ mod tests {
         drop(held_file);
         assert_eq!(std::fs::read(&path).unwrap(), b"old contents");
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn atomic_write_removes_windows_replace_backup_after_success() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::write(&path, b"old contents").unwrap();
+
+        atomic_write(&path, b"new contents").unwrap();
+
+        assert_eq!(std::fs::read(&path).unwrap(), b"new contents");
+        let remaining = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        assert_eq!(remaining, vec![path.file_name().unwrap()]);
     }
 
     #[test]

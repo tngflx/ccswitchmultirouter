@@ -382,6 +382,13 @@ pub fn run() {
         // 拦截窗口关闭：根据设置决定是否最小化到托盘
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                if consume_dev_shutdown_request() {
+                    api.prevent_close();
+                    crate::app_exit_monitor::record_clean_exit("dev_launcher_restart", 0);
+                    window.app_handle().exit(0);
+                    return;
+                }
+
                 // 数据库版本过新的恢复模式下没有托盘可唤回，关闭即退出，避免应用隐身后台
                 let in_db_recovery = crate::init_status::get_init_error()
                     .map(|p| p.kind.as_deref() == Some("db_version_too_new"))
@@ -508,14 +515,27 @@ pub fn run() {
             }
 
             let startup_recovery = app_exit_monitor::record_startup_report();
+            start_dev_shutdown_monitor(app.handle().clone());
             if let Some(previous) = startup_recovery.previous.as_ref() {
-                log::warn!(
+                let startup_marker_summary = format!(
                     "检测到上次运行 marker: classification={:?}, started_at={}, pid={}, crash_log_modified_at={:?}",
                     startup_recovery.classification,
                     previous.marker.started_at,
                     previous.marker.pid,
                     previous.crash_log_modified_at
                 );
+                match startup_recovery.classification {
+                    app_exit_monitor::PreviousRunClassification::ActivePreviousInstance
+                    | app_exit_monitor::PreviousRunClassification::ConfirmedCrash => {
+                        log::warn!("{startup_marker_summary}");
+                    }
+                    app_exit_monitor::PreviousRunClassification::PlannedRestartOrUpdate
+                    | app_exit_monitor::PreviousRunClassification::CleanExit
+                    | app_exit_monitor::PreviousRunClassification::UncleanExit
+                    | app_exit_monitor::PreviousRunClassification::NoPreviousRun => {
+                        log::info!("{startup_marker_summary}");
+                    }
+                }
                 use services::recovery_outcome::{
                     record_best_effort, RecoveryOutcome, RecoveryOutcomeKind, RecoverySeverity,
                 };
@@ -532,14 +552,15 @@ pub fn run() {
                     )),
                     app_exit_monitor::PreviousRunClassification::UncleanExit => Some((
                         RecoveryOutcomeKind::UncleanExit,
-                        RecoverySeverity::Warning,
-                        "reviewRecoveryResults",
+                        RecoverySeverity::Info,
+                        "none",
                     )),
                     app_exit_monitor::PreviousRunClassification::PlannedRestartOrUpdate => Some((
                         RecoveryOutcomeKind::PlannedRestartOrUpdate,
                         RecoverySeverity::Info,
                         "none",
                     )),
+                    app_exit_monitor::PreviousRunClassification::CleanExit => None,
                     app_exit_monitor::PreviousRunClassification::NoPreviousRun => None,
                 };
                 if let Some((kind, severity, next_step)) = mapped {
@@ -716,6 +737,9 @@ pub fn run() {
 
             // 设置 AppHandle 用于代理故障转移时的 UI 更新
             app_state.proxy_service.set_app_handle(app.handle().clone());
+            // Keep the Codex renderer repair lifecycle alive across CCSwitch restarts.
+            // The guardian is inert when Codex is absent and never terminates a running process.
+            app_state.proxy_service.ensure_codex_guardian_started();
 
             // ============================================================
             // 按表独立判断的导入逻辑（各类数据独立检查，互不影响）
@@ -2020,6 +2044,68 @@ pub fn run() {
     });
 }
 
+#[cfg(debug_assertions)]
+fn consume_dev_shutdown_request() -> bool {
+    let Ok(marker_path) = std::env::var("CCSWITCH_DEV_SHUTDOWN_MARKER") else {
+        return false;
+    };
+    let Ok(expected_token) = std::env::var("CCSWITCH_DEV_SHUTDOWN_TOKEN") else {
+        return false;
+    };
+    consume_dev_shutdown_marker(std::path::Path::new(&marker_path), &expected_token)
+}
+
+#[cfg(not(debug_assertions))]
+fn consume_dev_shutdown_request() -> bool {
+    false
+}
+
+#[cfg(debug_assertions)]
+fn consume_dev_shutdown_marker(marker_path: &std::path::Path, expected_token: &str) -> bool {
+    let Ok(actual_token) = std::fs::read_to_string(marker_path) else {
+        return false;
+    };
+    if actual_token != expected_token {
+        return false;
+    }
+    static CONSUMED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if CONSUMED
+        .compare_exchange(
+            false,
+            true,
+            std::sync::atomic::Ordering::SeqCst,
+            std::sync::atomic::Ordering::SeqCst,
+        )
+        .is_err()
+    {
+        return false;
+    }
+    let _ = std::fs::remove_file(marker_path);
+    true
+}
+
+#[cfg(debug_assertions)]
+fn start_dev_shutdown_monitor(app_handle: tauri::AppHandle) {
+    if std::env::var_os("CCSWITCH_DEV_SHUTDOWN_MARKER").is_none()
+        || std::env::var_os("CCSWITCH_DEV_SHUTDOWN_TOKEN").is_none()
+    {
+        return;
+    }
+    tauri::async_runtime::spawn(async move {
+        loop {
+            if consume_dev_shutdown_request() {
+                crate::app_exit_monitor::record_clean_exit("dev_launcher_restart", 0);
+                app_handle.exit(0);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    });
+}
+
+#[cfg(not(debug_assertions))]
+fn start_dev_shutdown_monitor(_app_handle: tauri::AppHandle) {}
+
 // ============================================================
 // 应用退出清理
 // ============================================================
@@ -2148,13 +2234,36 @@ async fn restore_proxy_state_on_startup(state: &store::AppState) {
 
     // 逐个恢复接管状态
     for app_type in apps_to_restore {
-        match state
-            .proxy_service
-            .set_takeover_for_app(app_type, true)
-            .await
-        {
+        let mut takeover_result = Err(String::new());
+        for attempt in 1..=12 {
+            takeover_result = state
+                .proxy_service
+                .set_takeover_for_app(app_type, true)
+                .await;
+            if takeover_result.is_ok() {
+                break;
+            }
+            if attempt < 12 {
+                log::warn!(
+                    "恢复 {app_type} 代理接管第 {attempt}/12 次失败，将在 500ms 后重试: {}",
+                    takeover_result.as_ref().unwrap_err()
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            }
+        }
+        match takeover_result {
             Ok(()) => {
                 log::info!("✓ 已恢复 {app_type} 的代理接管状态");
+                if app_type == "codex" {
+                    match services::recovery_outcome::acknowledge_superseded_codex_takeover_outcomes(
+                    ) {
+                        Ok(count) if count > 0 => {
+                            log::info!("已确认 {count} 条已被成功接管取代的 Codex 恢复错误")
+                        }
+                        Ok(_) => {}
+                        Err(error) => log::warn!("确认已解决的 Codex 恢复错误失败: {error}"),
+                    }
+                }
                 let mut outcome = services::recovery_outcome::RecoveryOutcome::for_app(
                     "startup_takeover_restore",
                     services::recovery_outcome::RecoveryOutcomeKind::StartupTakeoverRestored,
@@ -2175,14 +2284,9 @@ async fn restore_proxy_state_on_startup(state: &store::AppState) {
                 outcome.lost_fields = vec!["takeover".to_string()];
                 outcome.next_step = Some("openLogsOrRetryTakeover".to_string());
                 services::recovery_outcome::record_best_effort(outcome);
-                // 失败时清除该应用的状态，避免下次启动再次尝试
-                if let Err(clear_err) = state
-                    .proxy_service
-                    .set_takeover_for_app(app_type, false)
-                    .await
-                {
-                    log::error!("清除 {app_type} 代理状态失败: {clear_err}");
-                }
+                log::error!(
+                    "保留 {app_type} 的持久化接管开关为 enabled，后续 CCSwitch 启动将继续重试"
+                );
             }
         }
     }
@@ -2474,9 +2578,9 @@ pub fn restart_process(app_handle: &tauri::AppHandle) -> ! {
 #[cfg(test)]
 mod tests {
     use super::{
-        classify_exit_request, enabled_proxy_apps_on_startup, redact_url_for_log,
-        redact_url_for_log_with_secrets, redact_url_origin_for_log, runtime_log_level_allows,
-        ExitRequestAction,
+        classify_exit_request, consume_dev_shutdown_marker, enabled_proxy_apps_on_startup,
+        redact_url_for_log, redact_url_for_log_with_secrets, redact_url_origin_for_log,
+        runtime_log_level_allows, ExitRequestAction,
     };
     use crate::database::Database;
 
@@ -2559,6 +2663,27 @@ mod tests {
             log::Level::Debug,
             log::LevelFilter::Info
         ));
+    }
+
+    #[test]
+    fn dev_shutdown_marker_requires_the_exact_token_and_is_consumed() {
+        let marker_path = std::env::temp_dir().join(format!(
+            "ccswitch-dev-shutdown-test-{}-{}.token",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock")
+                .as_nanos()
+        ));
+        std::fs::write(&marker_path, "expected-token").expect("write marker");
+
+        assert!(!consume_dev_shutdown_marker(
+            &marker_path,
+            "different-token"
+        ));
+        assert!(marker_path.exists());
+        assert!(consume_dev_shutdown_marker(&marker_path, "expected-token"));
+        assert!(!marker_path.exists());
     }
 
     #[test]

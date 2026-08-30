@@ -992,26 +992,13 @@ impl ProxyService {
                     match probe_proxy_port(listen_port).await {
                         PortOwnership::CompatibleInstance => {
                             log::warn!(
-                                "端口 {listen_port} 已由同配置作用域、同运行协议的 CCSwitchMulti 实例占用；本实例仅复用该监听，不会终止其进程"
+                                "端口 {listen_port} 已由同配置作用域、同运行协议的 CCSwitchMulti 实例占用；等待该实例退出后再由本实例接管"
                             );
-                            let mut outcome = crate::services::recovery_outcome::RecoveryOutcome::for_app(
-                                "proxy_listener_ownership",
-                                crate::services::recovery_outcome::RecoveryOutcomeKind::PortOwnedByCompatibleInstance,
-                                crate::services::recovery_outcome::RecoverySeverity::Info,
-                                app_type_str,
-                            );
-                            outcome.kept_fields = vec!["listener".to_string()];
-                            crate::services::recovery_outcome::record_best_effort(outcome);
+                            return Err(format!(
+                                "{PORT_OWNERSHIP_GUARD_PREFIX}: 代理端口 {listen_port} 仍由另一 CCSwitchMulti 实例监听；等待旧实例退出后将自动重试"
+                            ));
                         }
                         PortOwnership::UnknownOwner | PortOwnership::Unreachable => {
-                            let mut outcome = crate::services::recovery_outcome::RecoveryOutcome::for_app(
-                                "proxy_listener_ownership",
-                                crate::services::recovery_outcome::RecoveryOutcomeKind::PortOwnedByUnknownOwner,
-                                crate::services::recovery_outcome::RecoverySeverity::Error,
-                                app_type_str,
-                            );
-                            outcome.next_step = Some("changeProxyPortOrInspectOwner".to_string());
-                            crate::services::recovery_outcome::record_best_effort(outcome);
                             return Err(format!(
                                 "{PORT_OWNERSHIP_GUARD_PREFIX}: 代理端口 {listen_port} 的监听进程身份无法完整验证；CCSwitchMulti 不会结束或接管该进程（原始错误: {start_error}）"
                             ));
@@ -1069,7 +1056,9 @@ impl ProxyService {
 
             // 3) 备份 Live 配置（严格：目标 app 不存在则报错）
             if restore_existing_backup_before_takeover {
-                self.restore_live_config_for_app_inner(&app).await?;
+                self.restore_live_config_for_app_with_fallback_inner(&app)
+                    .await?;
+                self.ensure_clean_live_backup_for_app_locked(&app).await?;
             } else {
                 self.backup_live_config_strict(&app).await?;
 
@@ -1083,7 +1072,10 @@ impl ProxyService {
             // 5) 写入接管配置（仅当前 app）
             if let Err(e) = self.takeover_live_config_strict(&app).await {
                 log::error!("{app_type_str} 接管 Live 配置失败，尝试恢复: {e}");
-                match self.restore_live_config_for_app_inner(&app).await {
+                match self
+                    .restore_live_config_for_app_with_fallback_inner(&app)
+                    .await
+                {
                     Ok(()) => {
                         // 恢复成功才清理备份，避免失败场景下丢失唯一可回滚来源
                         let _ = self.db.delete_live_backup(app_type_str).await;
@@ -1323,7 +1315,10 @@ impl ProxyService {
 
         if !current_config.enabled || !has_backup || !live_matches_current_proxy {
             if has_backup {
-                self.restore_live_config_for_app_inner(app_type).await?;
+                self.restore_live_config_for_app_with_fallback_inner(app_type)
+                    .await?;
+                self.ensure_clean_live_backup_for_app_locked(app_type)
+                    .await?;
             } else {
                 self.backup_live_config_strict(app_type).await?;
                 if let Err(e) = self.sync_live_to_provider(app_type).await {
@@ -1344,7 +1339,9 @@ impl ProxyService {
                 let _ = self.db.set_current_provider(app_type_str, previous_id);
                 let _ = crate::settings::set_current_provider(app_type, Some(previous_id));
             }
-            let _ = self.restore_live_config_for_app_inner(app_type).await;
+            let _ = self
+                .restore_live_config_for_app_with_fallback_inner(app_type)
+                .await;
             return Err(e);
         }
         let provider = self
@@ -1385,7 +1382,9 @@ impl ProxyService {
                 config.enabled = false;
                 let _ = self.db.update_proxy_config_for_app(config).await;
             }
-            let _ = self.restore_live_config_for_app_inner(app_type).await;
+            let _ = self
+                .restore_live_config_for_app_with_fallback_inner(app_type)
+                .await;
             return Err(e);
         }
 
@@ -1831,11 +1830,40 @@ impl ProxyService {
             let _ = self.db.update_proxy_config(config).await;
         }
 
-        // 4. 删除备份（Live 配置已恢复，备份不再需要）
-        self.db
-            .delete_all_live_backups()
-            .await
-            .map_err(|e| format!("删除备份失败: {e}"))?;
+        // 4. 仍启用接管的应用保留一份干净备份，供下次启动恢复；只有已禁用的应用
+        //    才删除备份，避免无期限保存不再需要的凭据。
+        for (app_type_str, app_type) in [
+            ("claude", AppType::Claude),
+            ("codex", AppType::Codex),
+            ("gemini", AppType::Gemini),
+            ("grokbuild", AppType::GrokBuild),
+        ] {
+            let enabled = self
+                .db
+                .get_proxy_config_for_app(app_type_str)
+                .await
+                .map(|config| config.enabled)
+                .unwrap_or(false);
+            if enabled {
+                match self.ensure_clean_live_backup_for_app(&app_type).await {
+                    Ok(_) => {
+                        log::info!("已保留 {app_type_str} 干净 Live 备份（下次启动自动接管）");
+                    }
+                    Err(error) => {
+                        log::error!(
+                            "退出时重建 {app_type_str} Live 备份失败，将停用该应用的自动接管，并保留现有备份: {error}"
+                        );
+                        if let Ok(mut config) = self.db.get_proxy_config_for_app(app_type_str).await
+                        {
+                            config.enabled = false;
+                            let _ = self.db.update_proxy_config_for_app(config).await;
+                        }
+                    }
+                }
+            } else if let Err(error) = self.db.delete_live_backup(app_type_str).await {
+                log::warn!("删除 {app_type_str} Live 备份失败: {error}");
+            }
+        }
 
         // 5. 重置健康状态
         self.db
@@ -1926,10 +1954,11 @@ impl ProxyService {
         // 跳过已被代理接管的 Live：避免把代理占位符当作"原始 Live"存进备份槽
         // （见 backup_live_configs 中的注释）。
         if Self::live_has_proxy_placeholder_for_app(app_type, &config) {
-            log::warn!(
-                "{app_type_str} Live 已被代理接管，不备份（避免把代理配置固化进备份槽）；下次 stop 会从 SSOT 重建 Live"
-            );
-            return Ok(());
+            log::warn!("{app_type_str} Live 已被代理接管；保留现有干净备份，缺失时从供应商重建");
+            return self
+                .ensure_clean_live_backup_for_app_locked(app_type)
+                .await
+                .map(|_| ());
         }
 
         let json_str = serde_json::to_string(&config)
@@ -1940,6 +1969,74 @@ impl ProxyService {
             .map_err(|e| format!("备份 {app_type_str} 配置失败: {e}"))?;
 
         Ok(())
+    }
+
+    async fn ensure_clean_live_backup_for_app(&self, app_type: &AppType) -> Result<bool, String> {
+        let _guard = self.switch_locks.lock_for_app(app_type.as_str()).await;
+        self.ensure_clean_live_backup_for_app_locked(app_type).await
+    }
+
+    /// The caller must hold the per-app switch lock.
+    async fn ensure_clean_live_backup_for_app_locked(
+        &self,
+        app_type: &AppType,
+    ) -> Result<bool, String> {
+        let app_type_str = app_type.as_str();
+
+        if let Some(backup) = self
+            .db
+            .get_live_backup(app_type_str)
+            .await
+            .map_err(|e| format!("读取 {app_type_str} Live 备份失败: {e}"))?
+        {
+            if let Ok(config) = serde_json::from_str::<Value>(&backup.original_config) {
+                if !Self::live_has_proxy_placeholder_for_app(app_type, &config) {
+                    return Ok(false);
+                }
+            }
+        }
+
+        if let Ok(config) = self.read_live_config_for_app(app_type) {
+            if !Self::live_has_proxy_placeholder_for_app(app_type, &config) {
+                let json_str = serde_json::to_string(&config)
+                    .map_err(|e| format!("序列化 {app_type_str} 配置失败: {e}"))?;
+                self.db
+                    .save_live_backup(app_type_str, &json_str)
+                    .await
+                    .map_err(|e| format!("备份 {app_type_str} 配置失败: {e}"))?;
+                return Ok(true);
+            }
+        }
+
+        let provider = self.require_current_provider_for_app(app_type)?;
+        self.update_live_backup_from_provider_inner(app_type_str, &provider)
+            .await?;
+
+        let Some(backup) = self
+            .db
+            .get_live_backup(app_type_str)
+            .await
+            .map_err(|e| format!("读取重建后的 {app_type_str} 备份失败: {e}"))?
+        else {
+            return Err(format!("{app_type_str} Live 备份重建后仍不存在"));
+        };
+        let config: Value = serde_json::from_str(&backup.original_config)
+            .map_err(|e| format!("解析重建后的 {app_type_str} 备份失败: {e}"))?;
+        if Self::live_has_proxy_placeholder_for_app(app_type, &config) {
+            return Err(format!("{app_type_str} Live 备份重建后仍包含代理占位符"));
+        }
+
+        Ok(true)
+    }
+
+    fn read_live_config_for_app(&self, app_type: &AppType) -> Result<Value, String> {
+        match app_type {
+            AppType::Claude => self.read_claude_live(),
+            AppType::Codex => self.read_codex_live(),
+            AppType::Gemini => self.read_gemini_live(),
+            AppType::GrokBuild => self.read_grok_live(),
+            _ => Err("该应用不支持代理功能".to_string()),
+        }
     }
 
     /// 构造写入 Live 的代理地址（处理 0.0.0.0 / IPv6 等特殊情况）
@@ -2256,49 +2353,6 @@ impl ProxyService {
                             "Grok Build Live 处于官方登录态（无自定义模型表），跳过代理接管"
                         );
                     }
-                }
-            }
-            _ => {}
-        }
-
-        Ok(())
-    }
-
-    async fn restore_live_config_for_app_inner(&self, app_type: &AppType) -> Result<(), String> {
-        match app_type {
-            AppType::Claude => {
-                if let Ok(Some(backup)) = self.db.get_live_backup("claude").await {
-                    let config: Value = serde_json::from_str(&backup.original_config)
-                        .map_err(|e| format!("解析 Claude 备份失败: {e}"))?;
-                    self.write_claude_live(&config)?;
-                    log::info!("Claude Live 配置已恢复");
-                }
-            }
-            AppType::Codex => {
-                if let Ok(Some(backup)) = self.db.get_live_backup("codex").await {
-                    let mut config: Value = serde_json::from_str(&backup.original_config)
-                        .map_err(|e| format!("解析 Codex 备份失败: {e}"))?;
-                    // 与 with_fallback 版共用同一保护：半接管重建与接管失败
-                    // 回滚也不得用快照覆盖 live 的官方 ChatGPT 登录（#6277）。
-                    self.preserve_codex_oauth_login_on_restore(&mut config);
-                    self.write_codex_live(&config)?;
-                    log::info!("Codex Live 配置已恢复");
-                }
-            }
-            AppType::Gemini => {
-                if let Ok(Some(backup)) = self.db.get_live_backup("gemini").await {
-                    let config: Value = serde_json::from_str(&backup.original_config)
-                        .map_err(|e| format!("解析 Gemini 备份失败: {e}"))?;
-                    self.write_gemini_live(&config)?;
-                    log::info!("Gemini Live 配置已恢复");
-                }
-            }
-            AppType::GrokBuild => {
-                if let Ok(Some(backup)) = self.db.get_live_backup("grokbuild").await {
-                    let config: Value = serde_json::from_str(&backup.original_config)
-                        .map_err(|e| format!("解析 Grok Build 备份失败: {e}"))?;
-                    self.write_grok_live(&config)?;
-                    log::info!("Grok Build Live 配置已恢复");
                 }
             }
             _ => {}
@@ -3040,18 +3094,40 @@ impl ProxyService {
                 .get_live_backup(app_type)
                 .await
                 .map_err(|e| format!("读取 {app_type} 现有备份失败: {e}"))?
-                .map(|backup| {
-                    serde_json::from_str::<Value>(&backup.original_config)
-                        .map_err(|e| format!("解析 {app_type} 现有备份失败: {e}"))
-                })
-                .transpose()?;
+                .and_then(
+                    |backup| match serde_json::from_str::<Value>(&backup.original_config) {
+                        Ok(value)
+                            if !Self::live_has_proxy_placeholder_for_app(
+                                &app_type_enum,
+                                &value,
+                            ) =>
+                        {
+                            Some(value)
+                        }
+                        Ok(_) => {
+                            log::warn!(
+                                "{app_type} 现有备份包含代理占位符，不作为供应商备份重建的保留来源"
+                            );
+                            None
+                        }
+                        Err(error) => {
+                            log::warn!(
+                            "解析 {app_type} 现有备份失败，不作为供应商备份重建的保留来源: {error}"
+                        );
+                            None
+                        }
+                    },
+                );
             // A stale takeover marker can survive without its DB backup (for
             // example after a partial cleanup). In that abnormal state the live
             // auth file is still the only copy of the user's login, so use it as
             // the preservation source instead of replacing it with the empty
             // official seed snapshot.
-            let existing_backup_value =
-                existing_backup_value.or_else(|| self.read_codex_live().ok());
+            let existing_backup_value = existing_backup_value.or_else(|| {
+                self.read_codex_live().ok().filter(|value| {
+                    !Self::live_has_proxy_placeholder_for_app(&app_type_enum, value)
+                })
+            });
 
             if let Some(existing_value) = existing_backup_value.as_ref() {
                 Self::preserve_codex_user_config_from_existing_config(
@@ -3080,12 +3156,35 @@ impl ProxyService {
                 .get_live_backup(app_type)
                 .await
                 .map_err(|e| format!("读取 {app_type} 现有备份失败: {e}"))?
-                .map(|backup| {
-                    serde_json::from_str::<Value>(&backup.original_config)
-                        .map_err(|e| format!("解析 {app_type} 现有备份失败: {e}"))
-                })
-                .transpose()?
-                .or_else(|| self.read_grok_live().ok());
+                .and_then(
+                    |backup| match serde_json::from_str::<Value>(&backup.original_config) {
+                        Ok(value)
+                            if !Self::live_has_proxy_placeholder_for_app(
+                                &app_type_enum,
+                                &value,
+                            ) =>
+                        {
+                            Some(value)
+                        }
+                        Ok(_) => {
+                            log::warn!(
+                                "{app_type} 现有备份包含代理占位符，不作为供应商备份重建的保留来源"
+                            );
+                            None
+                        }
+                        Err(error) => {
+                            log::warn!(
+                            "解析 {app_type} 现有备份失败，不作为供应商备份重建的保留来源: {error}"
+                        );
+                            None
+                        }
+                    },
+                )
+                .or_else(|| {
+                    self.read_grok_live().ok().filter(|value| {
+                        !Self::live_has_proxy_placeholder_for_app(&app_type_enum, value)
+                    })
+                });
             if let Some(existing_value) = existing_value.as_ref() {
                 Self::preserve_toml_mcp_servers_from_existing_config(
                     &mut effective_settings,
@@ -4245,7 +4344,7 @@ impl ProxyService {
         self.try_repair_codex_model_picker_after_takeover();
     }
 
-    fn ensure_codex_guardian_started(&self) {
+    pub(crate) fn ensure_codex_guardian_started(&self) {
         let handle_arc = self.codex_guardian.clone();
         let status_arc = self.codex_guardian_status.clone();
         tauri::async_runtime::spawn(async move {
@@ -10422,59 +10521,206 @@ base_url = "https://third.example/v1"
         );
     }
 
-    /// The simple restore path (`restore_live_config_for_app_inner`, used by
-    /// takeover rebuild and takeover-failure rollback) must apply the same
-    /// OAuth-login protection as the with_fallback path.
+    const USER_CODEX_CONFIG_WITH_USER_FIELDS: &str = r#"model_provider = "custom"
+model = "gpt-5.4"
+approval_policy = "untrusted"
+
+[model_providers.custom]
+name = "Test Provider"
+base_url = "https://provider.example/v1"
+wire_api = "responses"
+requires_openai_auth = true
+
+[mcp_servers.demo]
+command = "demo-command"
+"#;
+
+    const TAKEOVER_CODEX_CONFIG: &str = r#"model_provider = "custom"
+model = "gpt-5.4"
+
+[model_providers.custom]
+name = "Test Provider"
+base_url = "http://127.0.0.1:15721/v1"
+wire_api = "responses"
+requires_openai_auth = true
+"#;
+
     #[tokio::test]
     #[serial]
-    async fn simple_restore_path_keeps_codex_oauth_login() {
+    async fn stop_keep_state_preserves_backup_for_apps_that_keep_takeover_enabled() {
         let _home = TempHome::new();
         crate::settings::reload_settings().expect("reload settings");
 
         let db = Arc::new(Database::memory().expect("init db"));
-        let service = ProxyService::new(db.clone());
+        let state = crate::store::AppState::new(db.clone());
+        let user_live = json!({
+            "auth": { "OPENAI_API_KEY": "user-key" },
+            "config": USER_CODEX_CONFIG_WITH_USER_FIELDS,
+        });
+        state
+            .proxy_service
+            .write_codex_live_verbatim(&user_live)
+            .expect("seed user live config");
+        let backup_text = serde_json::to_string(&user_live).expect("serialize backup");
+        db.save_live_backup("codex", &backup_text)
+            .await
+            .expect("seed clean backup");
+        state
+            .proxy_service
+            .write_codex_live_verbatim(&json!({
+                "auth": { "OPENAI_API_KEY": PROXY_TOKEN_PLACEHOLDER },
+                "config": TAKEOVER_CODEX_CONFIG,
+            }))
+            .expect("seed taken-over live");
 
+        let mut app_config = db
+            .get_proxy_config_for_app("codex")
+            .await
+            .expect("read codex config");
+        app_config.enabled = true;
+        db.update_proxy_config_for_app(app_config)
+            .await
+            .expect("enable codex takeover");
+
+        state
+            .proxy_service
+            .stop_with_restore_keep_state()
+            .await
+            .expect("keep-state stop should restore live and keep backup");
+
+        let backup = db
+            .get_live_backup("codex")
+            .await
+            .expect("read backup")
+            .expect("enabled takeover must retain a clean backup");
+        assert_eq!(backup.original_config, backup_text);
+
+        let restored = state
+            .proxy_service
+            .read_codex_live()
+            .expect("read restored live");
+        assert_eq!(
+            restored
+                .get("auth")
+                .and_then(|auth| auth.get("OPENAI_API_KEY"))
+                .and_then(Value::as_str),
+            Some("user-key")
+        );
+        let restored_config = restored
+            .get("config")
+            .and_then(Value::as_str)
+            .expect("restored config");
+        assert!(restored_config.contains("approval_policy = \"untrusted\""));
+        assert!(restored_config.contains("[mcp_servers.demo]"));
+        assert!(
+            db.get_proxy_config_for_app("codex")
+                .await
+                .expect("read enabled state")
+                .enabled
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn stop_keep_state_deletes_backup_when_takeover_is_disabled() {
+        let _home = TempHome::new();
+        crate::settings::reload_settings().expect("reload settings");
+
+        let db = Arc::new(Database::memory().expect("init db"));
+        let state = crate::store::AppState::new(db.clone());
+        let user_live = json!({
+            "auth": { "OPENAI_API_KEY": "user-key" },
+            "config": USER_CODEX_CONFIG_WITH_USER_FIELDS,
+        });
+        state
+            .proxy_service
+            .write_codex_live_verbatim(&user_live)
+            .expect("seed user live config");
         db.save_live_backup(
             "codex",
-            &serde_json::to_string(&json!({
-                "auth": { "OPENAI_API_KEY": "sk-third-party" },
-                "config": "model_provider = \"any\"\n"
-            }))
-            .expect("serialize backup"),
+            &serde_json::to_string(&user_live).expect("serialize backup"),
         )
         .await
-        .expect("seed live backup");
+        .expect("seed backup");
 
-        crate::codex_config::write_codex_live_atomic(
-            &json!({
-                "auth_mode": "chatgpt",
-                "OPENAI_API_KEY": null,
-                "tokens": { "refresh_token": "rt" }
-            }),
-            Some("model_provider = \"any\"\n"),
-        )
-        .expect("seed live codex files");
-
-        service
-            .restore_live_config_for_app_inner(&AppType::Codex)
+        state
+            .proxy_service
+            .stop_with_restore_keep_state()
             .await
-            .expect("restore codex via simple path");
+            .expect("keep-state stop with disabled takeover");
 
-        let live = service.read_codex_live().expect("read live");
-        assert_eq!(
-            live.get("auth")
-                .and_then(|auth| auth.get("tokens"))
-                .and_then(|t| t.get("refresh_token"))
-                .and_then(|v| v.as_str()),
-            Some("rt"),
-            "takeover rebuild / rollback restore must not wipe the ChatGPT login"
+        assert!(db
+            .get_live_backup("codex")
+            .await
+            .expect("read backup")
+            .is_none());
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn ensure_clean_live_backup_rebuilds_without_preserving_proxy_placeholder() {
+        let _home = TempHome::new();
+        crate::settings::reload_settings().expect("reload settings");
+
+        let db = Arc::new(Database::memory().expect("init db"));
+        let state = crate::store::AppState::new(db.clone());
+        let provider = Provider::with_id(
+            "p1".to_string(),
+            "Test Provider".to_string(),
+            json!({
+                "auth": { "OPENAI_API_KEY": "provider-key" },
+                "config": USER_CODEX_CONFIG_WITH_USER_FIELDS,
+            }),
+            None,
         );
+        db.save_provider("codex", &provider).expect("save provider");
+        db.set_current_provider("codex", "p1")
+            .expect("set current provider");
+        crate::settings::set_current_provider(&AppType::Codex, Some("p1"))
+            .expect("set local current provider");
+
+        let placeholder = json!({
+            "auth": { "OPENAI_API_KEY": PROXY_TOKEN_PLACEHOLDER },
+            "config": TAKEOVER_CODEX_CONFIG,
+        });
+        state
+            .proxy_service
+            .write_codex_live_verbatim(&placeholder)
+            .expect("seed taken-over live");
+        db.save_live_backup(
+            "codex",
+            &serde_json::to_string(&placeholder).expect("serialize placeholder backup"),
+        )
+        .await
+        .expect("seed placeholder backup");
+
+        assert!(state
+            .proxy_service
+            .ensure_clean_live_backup_for_app_locked(&AppType::Codex)
+            .await
+            .expect("rebuild clean backup"));
+
+        let backup = db
+            .get_live_backup("codex")
+            .await
+            .expect("read backup")
+            .expect("rebuilt backup exists");
+        let stored: Value = serde_json::from_str(&backup.original_config).expect("parse backup");
         assert!(
-            live.get("config")
-                .and_then(|v| v.as_str())
-                .is_some_and(|cfg| cfg.contains("sk-third-party")),
-            "backup API key must be demoted into config.toml on the simple path too"
+            !ProxyService::live_has_proxy_placeholder_for_app(&AppType::Codex, &stored),
+            "rebuilt backup must not preserve proxy takeover fields"
         );
+        assert_eq!(
+            stored
+                .get("auth")
+                .and_then(|auth| auth.get("OPENAI_API_KEY"))
+                .and_then(Value::as_str),
+            Some("provider-key")
+        );
+        assert!(stored
+            .get("config")
+            .and_then(Value::as_str)
+            .is_some_and(|config| config.contains("[mcp_servers.demo]")));
     }
 
     /// Regression: when Live is already a proxy placeholder (a corrupted state
