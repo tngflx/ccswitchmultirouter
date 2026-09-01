@@ -156,7 +156,7 @@ describe("CodexMultiRouterWizard", () => {
     expect(screen.getByText("这里只选择模型源")).toBeInTheDocument();
     expect(screen.getByText(/都在各自 Provider 页面维护/)).toBeInTheDocument();
     expect(
-      screen.getByRole("button", { name: "配置 DeepSeek" }),
+      screen.getByRole("checkbox", { name: "使用 DeepSeek 作为模型源" }),
     ).toBeInTheDocument();
     expect(screen.queryByText("子 Agent 候选")).not.toBeInTheDocument();
     expect(screen.queryByText(/这套向导会帮你完成/)).not.toBeInTheDocument();
@@ -1147,7 +1147,9 @@ describe("CodexMultiRouterWizard", () => {
       screen.queryByText(/API 格式：Responses API（向导推断/),
     ).not.toBeInTheDocument();
     expect(
-      screen.getByRole("button", { name: "配置 OpenAI Official Backup" }),
+      screen.getByRole("checkbox", {
+        name: "使用 OpenAI Official Backup 作为模型源",
+      }),
     ).toBeInTheDocument();
   });
 

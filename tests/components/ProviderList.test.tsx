@@ -10,7 +10,9 @@ import { ProviderList } from "@/components/providers/ProviderList";
 vi.mock("react-i18next", async () => {
   const zh = (await import("@/i18n/locales/zh.json")).default;
   const resolve = (key: string) =>
-    key.split(".").reduce<any>((obj, part) => (obj == null ? obj : obj[part]), zh);
+    key
+      .split(".")
+      .reduce<any>((obj, part) => (obj == null ? obj : obj[part]), zh);
   return {
     useTranslation: () => ({
       t: (key: string, params?: Record<string, unknown>) => {
@@ -236,7 +238,7 @@ describe("ProviderList Component", () => {
       />,
     );
 
-    fireEvent.click(screen.getByRole("button", { name: "配置多路模型" }));
+    fireEvent.click(screen.getByRole("button", { name: "MultiRouter 控制台" }));
 
     expect(handleStartWizard).toHaveBeenCalledTimes(1);
     expect(
@@ -270,7 +272,7 @@ describe("ProviderList Component", () => {
     expect(
       screen.getByTestId("provider-card-codex-openai"),
     ).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: "配置多路模型" }));
+    fireEvent.click(screen.getByRole("button", { name: "MultiRouter 控制台" }));
 
     expect(handleStartWizard).toHaveBeenCalledTimes(1);
     expect(
@@ -373,9 +375,8 @@ describe("ProviderList Component", () => {
     );
 
     fireEvent.keyDown(window, { key: "f", metaKey: true });
-    const searchInput = screen.getByPlaceholderText(
-      "按名称/备注/网址搜索供应商...",
-    );
+    const searchInput =
+      screen.getByPlaceholderText("按名称/备注/网址搜索供应商...");
     // Initially both providers are rendered
     expect(screen.getByTestId("provider-card-alpha")).toBeInTheDocument();
     expect(screen.getByTestId("provider-card-beta")).toBeInTheDocument();
@@ -387,8 +388,6 @@ describe("ProviderList Component", () => {
     fireEvent.change(searchInput, { target: { value: "gamma" } });
     expect(screen.queryByTestId("provider-card-alpha")).not.toBeInTheDocument();
     expect(screen.queryByTestId("provider-card-beta")).not.toBeInTheDocument();
-    expect(
-      screen.getByText("没有符合搜索条件的供应商。"),
-    ).toBeInTheDocument();
+    expect(screen.getByText("没有符合搜索条件的供应商。")).toBeInTheDocument();
   });
 });

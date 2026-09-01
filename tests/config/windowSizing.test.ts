@@ -8,8 +8,8 @@ describe("main window sizing", () => {
 
     expect(mainWindow.width).toBe(1180);
     expect(mainWindow.height).toBe(760);
-    expect(mainWindow.minWidth).toBe(900);
-    expect(mainWindow.minHeight).toBe(600);
+    expect(mainWindow.minWidth).toBe(1020);
+    expect(mainWindow.minHeight).toBe(820);
   });
 
   it("allows the renderer to apply the shared WebView zoom", () => {

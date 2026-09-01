@@ -198,37 +198,39 @@ describe("ProviderForm Codex preset selection", () => {
   });
 
   it("resets provider-local protocol and account state when editing a new record", async () => {
-    const first: NonNullable<ComponentProps<typeof ProviderForm>["initialData"]> =
-      {
-        name: "First",
-        category: "custom",
-        settingsConfig: {
-          auth: { OPENAI_API_KEY: "first-key" },
-          config:
-            'model_provider = "first"\nmodel = "first-model"\n[model_providers.first]\nbase_url = "https://first.example/v1"\nwire_api = "responses"\n',
-        },
-        meta: {
-          apiFormat: "anthropic",
-          apiKeyField: "ANTHROPIC_API_KEY",
-          impersonateClaudeCode: true,
-          maxOutputTokens: 4096,
-          codexFastMode: true,
-        },
-      };
-    const second: NonNullable<ComponentProps<typeof ProviderForm>["initialData"]> =
-      {
-        ...first,
-        name: "Second",
-        settingsConfig: {
-          auth: { OPENAI_API_KEY: "second-key" },
-          config:
-            'model_provider = "second"\nmodel = "second-model"\n[model_providers.second]\nbase_url = "https://second.example/v1"\nwire_api = "responses"\n',
-        },
-        meta: {
-          apiFormat: "openai_responses",
-          codexFastMode: false,
-        },
-      };
+    const first: NonNullable<
+      ComponentProps<typeof ProviderForm>["initialData"]
+    > = {
+      name: "First",
+      category: "custom",
+      settingsConfig: {
+        auth: { OPENAI_API_KEY: "first-key" },
+        config:
+          'model_provider = "first"\nmodel = "first-model"\n[model_providers.first]\nbase_url = "https://first.example/v1"\nwire_api = "responses"\n',
+      },
+      meta: {
+        apiFormat: "anthropic",
+        apiKeyField: "ANTHROPIC_API_KEY",
+        impersonateClaudeCode: true,
+        maxOutputTokens: 4096,
+        codexFastMode: true,
+      },
+    };
+    const second: NonNullable<
+      ComponentProps<typeof ProviderForm>["initialData"]
+    > = {
+      ...first,
+      name: "Second",
+      settingsConfig: {
+        auth: { OPENAI_API_KEY: "second-key" },
+        config:
+          'model_provider = "second"\nmodel = "second-model"\n[model_providers.second]\nbase_url = "https://second.example/v1"\nwire_api = "responses"\n',
+      },
+      meta: {
+        apiFormat: "openai_responses",
+        codexFastMode: false,
+      },
+    };
     const { rerender } = renderProviderForm({ initialData: first });
     await waitFor(() =>
       expect(screen.getByTestId("codex-base-url")).toHaveTextContent(
@@ -240,7 +242,10 @@ describe("ProviderForm Codex preset selection", () => {
       <QueryClientProvider
         client={
           new QueryClient({
-            defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+            defaultOptions: {
+              queries: { retry: false },
+              mutations: { retry: false },
+            },
           })
         }
       >
@@ -652,7 +657,7 @@ describe("ProviderForm Codex preset selection", () => {
     await waitFor(() => {
       expect(screen.getByTestId("codex-catalog")).toHaveTextContent("glm-5.2");
     });
-    fireEvent.click(screen.getByRole("button", { name: "自定义模型源" }));
+    fireEvent.click(screen.getByRole("button", { name: "Custom provider" }));
     expect(screen.getByTestId("codex-takeover")).toHaveTextContent("enabled");
     expect(
       screen.getByTestId("codex-menu-projection-editability"),

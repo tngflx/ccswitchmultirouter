@@ -365,16 +365,14 @@ describe("SettingsPage Component", () => {
     expect(scrollContainer!.scrollTop).toBe(0);
   });
 
-  it("places request health under the advanced request processing accordion", () => {
+  it("keeps request health out of the settings advanced tab", () => {
     renderSettingsPage();
 
     fireEvent.click(screen.getByText("settings.tabAdvanced"));
 
+    expect(screen.queryByText("Request Health")).not.toBeInTheDocument();
     expect(
-      screen.getByText("settings.advanced.requestProcessing.title"),
-    ).toBeInTheDocument();
-    expect(
-      screen.queryByRole("button", { name: "Request Health" }),
+      screen.queryByText("settings.advanced.requestProcessing.title"),
     ).not.toBeInTheDocument();
   });
 
