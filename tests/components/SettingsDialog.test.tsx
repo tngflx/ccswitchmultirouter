@@ -365,6 +365,19 @@ describe("SettingsPage Component", () => {
     expect(scrollContainer!.scrollTop).toBe(0);
   });
 
+  it("places request health under the advanced request processing accordion", () => {
+    renderSettingsPage();
+
+    fireEvent.click(screen.getByText("settings.tabAdvanced"));
+
+    expect(
+      screen.getByText("settings.advanced.requestProcessing.title"),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "Request Health" }),
+    ).not.toBeInTheDocument();
+  });
+
   it("should pass onImportSuccess callback to useImportExport hook", async () => {
     const onImportSuccess = vi.fn();
 
@@ -472,5 +485,3 @@ describe("SettingsPage Component", () => {
     expect(settingsMock.updateAppConfigDir).toHaveBeenCalledWith("/app/new");
   });
 });
-
-

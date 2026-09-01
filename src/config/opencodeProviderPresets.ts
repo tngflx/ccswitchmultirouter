@@ -1894,6 +1894,43 @@ export const opencodeProviderPresets: OpenCodeProviderPreset[] = [
     },
   },
   {
+    name: "OpenCode Zen",
+    websiteUrl: "https://opencode.ai/zen",
+    apiKeyUrl: "https://opencode.ai/zen",
+    settingsConfig: {
+      npm: "@ai-sdk/openai-compatible",
+      name: "OpenCode Zen",
+      options: {
+        baseURL: "https://opencode.ai/zen/v1",
+        apiKey: "",
+        setCacheKey: true,
+      },
+      models: {
+        "big-pickle": { name: "Big Pickle (Free)" },
+        "deepseek-v4-flash-free": { name: "DeepSeek V4 Flash (Free)" },
+        "muse-spark-1.2-contributor-free": {
+          name: "Muse Spark 1.2 Contributor (Free)",
+        },
+        "mimo-v2.5-free": { name: "MiMo V2.5 (Free)" },
+        "ling-3.0-flash-fin-free": { name: "Ling 3.0 Flash Fin (Free)" },
+        "nemotron-3-ultra-free": { name: "Nemotron 3 Ultra (Free)" },
+        "nemotron-3.5-lightning-free": {
+          name: "Nemotron 3.5 Lightning (Free)",
+        },
+      },
+    },
+    category: "third_party",
+    icon: "opencode",
+    iconColor: "#211E1E",
+    templateValues: {
+      apiKey: {
+        label: "API Key",
+        placeholder: "",
+        editorValue: "",
+      },
+    },
+  },
+  {
     name: "AiHubMix",
     websiteUrl: "https://aihubmix.com",
     apiKeyUrl: "https://aihubmix.com",

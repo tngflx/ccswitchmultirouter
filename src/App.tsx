@@ -1098,13 +1098,14 @@ function App() {
     setIsCodexMultiRouterWizardOpen(true);
   };
 
-  // 用户选择跳过引导时直接进入 MultiRouter 状态页；没有已保存方案时打开工作台空状态。
+  // Dashboard owns ongoing plan management; the entry dialog only chooses an existing
+  // dashboard context or starts a genuinely new plan.
   const handleOpenCodexMultiRouterWorkspaceDirectly = () => {
     const existingPlan = Object.values(providers).find((provider) =>
       isRoutingPlan(provider),
     );
     setIsCodexMultiRouterEntryChoiceOpen(false);
-    openCodexRouterWorkspace(existingPlan ?? null, "status");
+    openCodexRouterWorkspace(existingPlan ?? null, "overview");
   };
 
   // 目标 Provider 的 switch 路径会在同一个后端切换锁内启动代理并完成接管；
@@ -1245,7 +1246,7 @@ function App() {
               initialTab={codexRouterWorkspaceTarget.tab}
               onEditProvider={(provider) => {
                 if (isRoutingPlan(provider)) {
-                  openCodexRouterWorkspace(provider, "routes");
+                  handleEditCodexMultiRouter(provider);
                   return;
                 }
                 setEditingProvider(provider);
@@ -1349,7 +1350,7 @@ function App() {
                       onSwitch={handleSwitchProviderFromList}
                       onEdit={(provider) => {
                         if (activeApp === "codex" && isRoutingPlan(provider)) {
-                          openCodexRouterWorkspace(provider, "routes");
+                          handleEditCodexMultiRouter(provider);
                           return;
                         }
                         setEditingProvider(provider);
@@ -2018,7 +2019,12 @@ function App() {
         </div>
       </header>
 
-      <main className="flex-1 min-h-0 flex flex-col overflow-y-auto animate-fade-in">
+      <main
+        className={cn(
+          "flex-1 min-h-0 flex flex-col animate-fade-in",
+          currentView === "sessions" ? "overflow-hidden" : "overflow-y-auto",
+        )}
+      >
         {isOpenClawView && openclawHealthWarnings.length > 0 && (
           <OpenClawHealthBanner warnings={openclawHealthWarnings} />
         )}
@@ -2051,36 +2057,20 @@ function App() {
           </DialogHeader>
 
           <div className="grid gap-3 px-6 py-4">
-            <button
-              type="button"
-              onClick={handleCreateCodexMultiRouter}
-              className="rounded-xl border border-blue-500/25 bg-gradient-to-r from-blue-500/10 via-background to-cyan-500/10 p-4 text-left shadow-sm transition-colors hover:border-blue-500/45 hover:from-blue-500/15"
-            >
-              <div className="flex items-center gap-2 font-medium">
-                <Plus className="h-4 w-4 text-blue-500" />
-                {t("codexMultiRouter.entryChoice.createTitle")}
-              </div>
-              <p className="mt-2 text-sm leading-6 text-muted-foreground">
-                {t("codexMultiRouter.entryChoice.createDescription")}
-              </p>
-            </button>
-
-            <div className="rounded-xl border border-violet-500/25 bg-gradient-to-r from-violet-500/10 via-background to-fuchsia-500/10 p-4 shadow-sm">
-              <div className="flex items-center gap-2 font-medium">
-                <Wrench className="h-4 w-4 text-violet-500" />
-                {t("codexMultiRouter.entryChoice.editTitle")}
-              </div>
-              <p className="mt-2 text-sm leading-6 text-muted-foreground">
-                {t("codexMultiRouter.entryChoice.editDescription")}
-              </p>
-              <div className="mt-3 max-h-40 space-y-2 overflow-y-auto pr-1">
-                {codexRoutingPlans.length > 0 ? (
-                  codexRoutingPlans.map((plan) => (
-                    <button
+            {codexRoutingPlans.length > 0 ? (
+              <div className="rounded-lg border border-border/70 bg-muted/20 p-3">
+                <div className="flex items-center gap-2 text-sm font-medium">
+                  <LayoutDashboard className="h-4 w-4 text-primary" />
+                  {t("codexMultiRouter.entryChoice.existingTitle")}
+                </div>
+                <p className="mt-1 text-xs leading-5 text-muted-foreground">
+                  {t("codexMultiRouter.entryChoice.existingDescription")}
+                </p>
+                <div className="mt-3 max-h-48 space-y-2 overflow-y-auto pr-1">
+                  {codexRoutingPlans.map((plan) => (
+                    <div
                       key={plan.id}
-                      type="button"
-                      onClick={() => handleEditCodexMultiRouter(plan)}
-                      className="flex w-full items-center justify-between gap-3 rounded-lg border border-border/60 bg-background/65 px-3 py-2 text-left transition hover:border-violet-500/40 hover:bg-violet-500/10"
+                      className="flex items-center gap-3 rounded-md border border-border/60 bg-background px-3 py-2 transition hover:border-primary/40 hover:bg-primary/5"
                     >
                       <span className="min-w-0">
                         <span className="block truncate text-sm font-medium">
@@ -2090,18 +2080,52 @@ function App() {
                           {plan.id}
                         </span>
                       </span>
-                      <span className="shrink-0 text-xs text-violet-600 dark:text-violet-300">
-                        {t("codexMultiRouter.entryChoice.editAction")}
-                      </span>
-                    </button>
-                  ))
-                ) : (
-                  <div className="rounded-lg border border-dashed border-border/70 px-3 py-3 text-xs text-muted-foreground">
-                    {t("codexMultiRouter.entryChoice.empty")}
-                  </div>
-                )}
+                      <div className="ml-auto flex shrink-0 items-center gap-1">
+                        <Button
+                          type="button"
+                          size="sm"
+                          variant="ghost"
+                          className="h-7 px-2 text-xs"
+                          onClick={() => handleEditCodexMultiRouter(plan)}
+                        >
+                          {t("codexMultiRouter.entryChoice.editAction")}
+                        </Button>
+                        <Button
+                          type="button"
+                          size="sm"
+                          variant="outline"
+                          className="h-7 px-2 text-xs"
+                          onClick={() => {
+                            setIsCodexMultiRouterEntryChoiceOpen(false);
+                            openCodexRouterWorkspace(plan, "overview");
+                          }}
+                        >
+                          {t("codexMultiRouter.entryChoice.openAction")}
+                        </Button>
+                      </div>
+                    </div>
+                  ))}
+                </div>
               </div>
-            </div>
+            ) : (
+              <div className="rounded-lg border border-dashed border-border/70 px-3 py-4 text-sm text-muted-foreground">
+                {t("codexMultiRouter.entryChoice.empty")}
+              </div>
+            )}
+
+            <button
+              type="button"
+              onClick={handleCreateCodexMultiRouter}
+              className="rounded-lg border border-dashed border-blue-500/35 bg-blue-500/5 p-3 text-left transition-colors hover:border-blue-500/55 hover:bg-blue-500/10"
+            >
+              <div className="flex items-center gap-2 text-sm font-medium">
+                <Plus className="h-4 w-4 text-blue-500" />
+                {t("codexMultiRouter.entryChoice.createTitle")}
+              </div>
+              <p className="mt-1 text-xs leading-5 text-muted-foreground">
+                {t("codexMultiRouter.entryChoice.createDescription")}
+              </p>
+            </button>
           </div>
 
           <DialogFooter>
@@ -2112,7 +2136,7 @@ function App() {
               {t("codexMultiRouter.entryChoice.laterButton")}
             </Button>
             <Button
-              variant="outline"
+              className="gap-2"
               onClick={handleOpenCodexMultiRouterWorkspaceDirectly}
             >
               <LayoutDashboard className="mr-2 h-4 w-4" />

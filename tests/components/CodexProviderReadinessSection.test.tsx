@@ -92,6 +92,30 @@ describe("CodexProviderReadinessSection", () => {
     expect(screen.getByText("Verify connection first")).toBeInTheDocument();
   });
 
+  it("shows Responses and Chat as subgroups of one mixed provider", () => {
+    render(
+      <CodexProviderReadinessSection
+        models={[
+          { model: "gpt-5.5", apiFormat: "openai_responses" },
+          { model: "gpt-5.4-mini", apiFormat: "openai_responses" },
+          { model: "qwen3.6", apiFormat: "openai_chat" },
+        ]}
+        apiFormat="openai_responses"
+        isMaintainedPreset={false}
+        isSyncingModels={false}
+        isValidatingConnection={false}
+        onSyncModels={vi.fn()}
+        onValidateConnection={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByText("Protocol groups")).toBeInTheDocument();
+    expect(screen.getByText("Mixed (per model)")).toBeInTheDocument();
+    expect(screen.getByText("Responses: 2 models")).toBeInTheDocument();
+    expect(screen.getByText("Chat Completions: 1 models")).toBeInTheDocument();
+    expect(screen.getByText("Automatic per-model routing")).toBeInTheDocument();
+  });
+
   it("renders recommended and custom provider traffic policy summaries", () => {
     const common = {
       models: [{ model: "ox-alpha-free" }],

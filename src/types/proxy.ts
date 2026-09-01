@@ -56,6 +56,64 @@ export interface ProxyTakeoverStatus {
 
 export type CodexDiagnosticStatus = "pass" | "warn" | "fail" | "info";
 
+export type RequestOptimizationMode = "off" | "diagnose" | "safe";
+
+export interface RequestHealthConfig {
+  enabled: boolean;
+  optimizationMode: RequestOptimizationMode;
+  largeRequestThresholdBytes: number;
+  maxCodexInputTokens: number;
+}
+
+export interface RequestHealthBreakdown {
+  category: string;
+  itemCount: number;
+  bytes: number;
+}
+
+export interface RequestHealthFinding {
+  code: string;
+  severity: "info" | "warning" | "error" | string;
+  count: number;
+  detail: string;
+}
+
+export interface RequestHealthDiagnostic {
+  generatedAt: string;
+  traceId: string | null;
+  sessionId: string;
+  appType: string;
+  providerId: string;
+  providerName: string;
+  model: string;
+  endpoint: string;
+  clientRequestBytes?: number;
+  originalBytes: number;
+  optimizedBytes: number;
+  bytesRemoved: number;
+  thresholdBytes: number;
+  thresholdExceeded: boolean;
+  estimatedInputTokens: number;
+  maxInputTokens: number;
+  tokenLimitExceeded: boolean;
+  blocked: boolean;
+  itemCount: number;
+  largestItemBytes: number;
+  largestItemCategory: string | null;
+  optimizationMode: RequestOptimizationMode;
+  optimizationApplied: boolean;
+  compactionRequest: boolean;
+  compactionRecommended: boolean;
+  sessionClientProvided: boolean;
+  findings: RequestHealthFinding[];
+  breakdown: RequestHealthBreakdown[];
+}
+
+export interface RequestHealthSnapshot {
+  config: RequestHealthConfig;
+  diagnostics: RequestHealthDiagnostic[];
+}
+
 export interface CodexDiagnosticCheck {
   id: string;
   label: string;
@@ -159,6 +217,8 @@ export interface CodexModelPickerUnlockResult {
   targetTitle: string | null;
   targetUrl: string | null;
   modelCount: number;
+  reasoningModelCount: number;
+  modelsWithoutReasoningCount: number;
   modelNames: string[];
   injected: boolean;
   launched: boolean;

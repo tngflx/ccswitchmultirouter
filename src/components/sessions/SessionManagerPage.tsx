@@ -82,6 +82,13 @@ const SESSION_LIST_VIEW_MODE_STORAGE_KEY =
 const SESSION_GROUP_EXPANSION_STORAGE_KEY =
   "cc-switch.sessionManager.groupExpansionState";
 
+const isArchivedCodexSession = (session: SessionMeta) =>
+  session.providerId === "codex" &&
+  session.sourcePath
+    ?.replace(/\\/g, "/")
+    .split("/")
+    .includes("archived_sessions");
+
 type ProviderFilter =
   | "all"
   | "codex"
@@ -361,6 +368,10 @@ export function SessionManagerPage({
     );
   const deleteSessionMutation = useDeleteSessionMutation();
   const isDeleting = deleteSessionMutation.isPending || isBatchDeleting;
+  const archivedCodexSessionCount = useMemo(
+    () => sessions.filter(isArchivedCodexSession).length,
+    [sessions],
+  );
 
   const virtualizer = useVirtualizer({
     count: messages.length,
@@ -824,15 +835,14 @@ export function SessionManagerPage({
   return (
     <TooltipProvider>
       <div
-        className="mx-auto px-4 sm:px-6 flex flex-col h-full min-h-0"
+        className="mx-auto w-full max-w-[1800px] px-3 pb-3 sm:px-5 lg:px-6 flex flex-col h-full min-h-0"
         onWheel={(e) => e.stopPropagation()}
       >
-        <div className="flex-1 overflow-hidden flex flex-col gap-4">
-          {/* 主内容区域 - 左右分栏 */}
-          <div className="flex-1 overflow-hidden grid gap-4 md:grid-cols-[320px_1fr]">
+        <div className="flex-1 min-h-0 flex flex-col gap-3">
+          <div className="flex-1 min-h-0 overflow-hidden grid gap-3 md:grid-cols-[minmax(280px,340px)_minmax(0,1fr)]">
             {/* 左侧会话列表 */}
-            <Card className="flex flex-col flex-1 min-h-0 overflow-hidden">
-              <CardHeader className="py-2 px-3 border-b">
+            <Card className="flex flex-col min-h-0 overflow-hidden rounded-xl border-border/70 bg-card/95 shadow-sm">
+              <CardHeader className="py-3 px-3.5 border-b border-border/70 bg-muted/15">
                 {isSearchOpen ? (
                   <div className="flex items-center gap-2">
                     <div className="relative flex-1">
@@ -946,6 +956,43 @@ export function SessionManagerPage({
                                 : t("sessionManager.manageBatchTooltip", {
                                     defaultValue: "批量管理",
                                   })}
+                            </TooltipContent>
+                          </Tooltip>
+                        )}
+                        {isCodexManager && archivedCodexSessionCount > 0 && (
+                          <Tooltip>
+                            <TooltipTrigger asChild>
+                              <Button
+                                variant="ghost"
+                                size="icon"
+                                className="size-7 text-destructive hover:bg-destructive/10 hover:text-destructive"
+                                aria-label={t(
+                                  "sessionManager.selectArchivedTooltip",
+                                  {
+                                    defaultValue:
+                                      "Select all archived Codex sessions",
+                                  },
+                                )}
+                                disabled={isDeleting}
+                                onClick={() => {
+                                  setSelectionMode(true);
+                                  setSelectedSessionKeys(
+                                    new Set(
+                                      sessions
+                                        .filter(isArchivedCodexSession)
+                                        .map(getSessionKey),
+                                    ),
+                                  );
+                                }}
+                              >
+                                <Trash2 className="size-3.5" />
+                              </Button>
+                            </TooltipTrigger>
+                            <TooltipContent>
+                              {t("sessionManager.selectArchivedTooltip", {
+                                defaultValue:
+                                  "Select all archived Codex sessions",
+                              })}
                             </TooltipContent>
                           </Tooltip>
                         )}
@@ -1289,7 +1336,7 @@ export function SessionManagerPage({
                   </div>
                 )}
               </CardHeader>
-              <CardContent className="flex-1 min-h-0 p-0">
+              <CardContent className="flex-1 min-h-0 p-0 bg-background/30">
                 <ScrollArea className="h-full">
                   <div className="p-2">
                     {isLoading ? (
@@ -1489,7 +1536,7 @@ export function SessionManagerPage({
               </div>
             ) : (
               <Card
-                className="flex flex-col overflow-hidden min-h-0"
+                className="flex min-w-0 flex-col overflow-hidden min-h-0 rounded-xl border-border/70 bg-card/95 shadow-sm"
                 ref={detailRef}
               >
                 {!selectedSession ? (

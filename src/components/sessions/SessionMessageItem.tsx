@@ -50,7 +50,7 @@ export const SessionMessageItem = memo(function SessionMessageItem({
   return (
     <div
       className={cn(
-        "rounded-lg border px-3 py-2.5 relative group transition-shadow min-w-0",
+        "rounded-xl border px-4 py-3.5 relative group transition-shadow min-w-0 shadow-sm",
         message.role.toLowerCase() === "user"
           ? "bg-primary/5 border-primary/20 ml-8"
           : message.role.toLowerCase() === "assistant"
@@ -86,7 +86,7 @@ export const SessionMessageItem = memo(function SessionMessageItem({
           </span>
         )}
       </div>
-      <div className="whitespace-pre-wrap break-words [overflow-wrap:anywhere] text-sm leading-relaxed min-w-0">
+      <div className="whitespace-pre-wrap break-words [overflow-wrap:anywhere] text-[13px] leading-6 min-w-0">
         {searchQuery
           ? highlightText(displayContent, searchQuery)
           : displayContent}

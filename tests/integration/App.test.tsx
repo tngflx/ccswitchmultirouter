@@ -6,6 +6,7 @@ import {
   screen,
   waitFor,
   fireEvent,
+  within,
 } from "@testing-library/react";
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { providersApi } from "@/lib/api/providers";
@@ -398,7 +399,7 @@ describe("App integration with MSW", () => {
     );
   });
 
-  it("opens Codex MultiRouter provider edits in the router workspace", async () => {
+  it("opens Codex MultiRouter provider edits directly in the edit wizard", async () => {
     setProviders("codex", {
       "codex-router": {
         id: "codex-router",
@@ -436,14 +437,10 @@ describe("App integration with MSW", () => {
 
     fireEvent.click(screen.getByText("edit"));
 
-    await waitFor(() =>
-      expect(screen.getByTestId("codex-router-workspace")).toBeInTheDocument(),
-    );
+    const wizard = await screen.findByTestId("codex-multirouter-wizard");
+    expect(wizard).toHaveAttribute("data-mode", "edit");
+    expect(wizard).toHaveAttribute("data-plan-id", "codex-router");
     expect(screen.queryByTestId("edit-provider-dialog")).toBeNull();
-    expect(screen.getByTestId("codex-router-target").textContent).toBe(
-      "codex-router",
-    );
-    expect(screen.getByTestId("codex-router-tab").textContent).toBe("routes");
   });
 
   it("opens explicit migration instead of directly enabling a schema v1 MultiRouter", async () => {
@@ -505,9 +502,6 @@ describe("App integration with MSW", () => {
       screen.getByText(i18n.t("codexMultiRouter.entryChoice.createTitle")),
     ).toBeInTheDocument();
     expect(
-      screen.getByText(i18n.t("codexMultiRouter.entryChoice.editTitle")),
-    ).toBeInTheDocument();
-    expect(
       screen.getByText(i18n.t("codexMultiRouter.entryChoice.empty")),
     ).toBeInTheDocument();
     expect(
@@ -558,7 +552,13 @@ describe("App integration with MSW", () => {
     fireEvent.click(screen.getByText("open-multirouter-entry"));
     expect(await screen.findByText("主路由")).toBeInTheDocument();
     expect(screen.getByText("实验路由")).toBeInTheDocument();
-    fireEvent.click(screen.getByText("实验路由"));
+    const planRow = screen.getByText("实验路由").closest("div");
+    expect(planRow).not.toBeNull();
+    fireEvent.click(
+      within(planRow as HTMLElement).getByRole("button", {
+        name: i18n.t("codexMultiRouter.entryChoice.editAction"),
+      }),
+    );
 
     const wizard = await screen.findByTestId("codex-multirouter-wizard");
     expect(wizard).toHaveAttribute("data-mode", "edit");
@@ -606,7 +606,7 @@ describe("App integration with MSW", () => {
     expect(screen.getByTestId("codex-router-target").textContent).toBe(
       "codex-router",
     );
-    expect(screen.getByTestId("codex-router-tab").textContent).toBe("status");
+    expect(screen.getByTestId("codex-router-tab").textContent).toBe("overview");
     expect(screen.getByTestId("codex-router-workspace")).toHaveAttribute(
       "data-runtime-ready-wired",
       "false",

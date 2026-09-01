@@ -82,7 +82,7 @@ import {
   fetchModelsForConfig,
   type FetchedModel,
 } from "@/lib/api/model-fetch";
-import type { CodexGuardianStatus } from "@/types/proxy";
+import type { CodexGuardianStatus, RequestHealthSnapshot } from "@/types/proxy";
 import { proxyApi } from "@/lib/api/proxy";
 import {
   codexOfficialAuthRouteBinding,
@@ -130,6 +130,7 @@ import { normalizeCodexSubagentVersion } from "@/utils/codexSubagentVersion";
 import { useCodexOauth } from "@/components/providers/forms/hooks/useCodexOauth";
 import { HostedToolsSwitchPanel } from "./HostedToolsSwitchPanel";
 import { CodexSubagentProfileEditor } from "./CodexSubagentProfileEditor";
+import { RequestHealthPanel } from "@/components/settings/RequestHealthPanel";
 import type {
   CodexOfficialAuthConfig,
   CodexOfficialAuthMode,
@@ -175,7 +176,13 @@ export type WorkspaceTab =
   | "status"
   | "test";
 
-type StatusView = "link" | "protocol" | "debug" | "providers" | "traffic";
+type StatusView =
+  | "link"
+  | "protocol"
+  | "debug"
+  | "providers"
+  | "traffic"
+  | "request-health";
 
 type SpawnAgentCandidateView = "selected" | "routed" | "priority" | "all";
 
@@ -621,6 +628,8 @@ type CodexCatalogModelDraft = {
   base_instructions?: string;
   apiFormat?: CodexCatalogModel["apiFormat"];
   api_format?: CodexCatalogModel["api_format"];
+  apiFormatSource?: CodexCatalogModel["apiFormatSource"];
+  api_format_source?: CodexCatalogModel["api_format_source"];
   codexCache?: CodexCatalogModel["codexCache"];
   codex_cache?: CodexCatalogModel["codex_cache"];
   sortIndex?: number;
@@ -1641,6 +1650,9 @@ function catalogDraftFromSourceModel(
 ): CodexCatalogModelDraft {
   const settings = provider?.settingsConfig;
   const displayName = source?.displayName ?? source?.display_name;
+  const providerName =
+    (source?.providerName ?? source?.provider_name ?? provider?.name)?.trim() ??
+    "";
   const upstreamModel =
     (typeof source?.upstreamModel === "string" && source.upstreamModel.trim()
       ? source.upstreamModel.trim()
@@ -1677,6 +1689,15 @@ function catalogDraftFromSourceModel(
     provider?.meta?.apiFormat ??
     settings?.apiFormat ??
     settings?.api_format;
+  const apiFormatSource =
+    source?.apiFormatSource ??
+    source?.api_format_source ??
+    ((source?.apiFormat ?? source?.api_format)
+      ? "provider_model"
+      : (provider?.meta?.apiFormatSource ??
+        settings?.apiFormatSource ??
+        settings?.api_format_source ??
+        (apiFormat ? "provider" : undefined)));
   const effectiveSource = {
     ...(source ?? {}),
     model: id,
@@ -1691,6 +1712,7 @@ function catalogDraftFromSourceModel(
     model: id,
     ...(upstreamModel && upstreamModel !== id ? { upstreamModel } : {}),
     ...(displayName ? { displayName } : {}),
+    ...(providerName ? { providerName } : {}),
     ...(contextWindow ? { contextWindow } : {}),
     ...(reasoning ? { reasoning } : {}),
     ...(inputModalities ? { inputModalities } : {}),
@@ -1714,6 +1736,7 @@ function catalogDraftFromSourceModel(
         ? { baseInstructions: source.base_instructions }
         : {}),
     ...(apiFormat ? { apiFormat } : {}),
+    ...(apiFormatSource ? { apiFormatSource } : {}),
     ...(codexCache ? { codexCache } : {}),
     ...(source?.codexUltra ? { codexUltra: source.codexUltra } : {}),
     ...(source?.sortIndex !== undefined ? { sortIndex: source.sortIndex } : {}),
@@ -2295,7 +2318,11 @@ export function buildModelCatalogForRoutes(
       byModel.set(
         id.toLowerCase(),
         applyRouteCapabilitiesToCatalogModel(
-          legacyModelById.get(id.toLowerCase()) ?? { model: id },
+          catalogDraftFromSourceModel(
+            id,
+            legacyModelById.get(id.toLowerCase()),
+            targetProvider,
+          ),
           route,
         ),
       );
@@ -4720,6 +4747,17 @@ export function codexCatalogProviderName(
   return (model.providerName ?? model.provider_name ?? "").trim();
 }
 
+export function isCodexProtocolFallback(model: CodexCatalogModel): boolean {
+  const source = model.apiFormatSource ?? model.api_format_source;
+  return !source || source === "provider" || source === "default";
+}
+
+function stripBracketedProviderPrefix(label: string): string {
+  if (!label.startsWith("[")) return label;
+  const closeIndex = label.indexOf("]");
+  return closeIndex < 0 ? label : label.slice(closeIndex + 1).trimStart();
+}
+
 export function compactCodexProviderLabel(providerName: string): string {
   const trimmed = providerName.trim();
   const alphanumeric = Array.from(trimmed)
@@ -4740,7 +4778,6 @@ export function compactCodexProviderLabel(providerName: string): string {
       .map((word) => Array.from(word)[0]?.toLocaleUpperCase() ?? "")
       .join("");
   }
-
   const prefixCount = Math.min(words.length - 1, 4);
   const prefix = words
     .slice(0, prefixCount)
@@ -4759,22 +4796,22 @@ export function formatCodexCatalogModelLabel(
 ): string {
   const id = model.model?.trim() ?? "";
   const provider = codexCatalogProviderName(model);
-  const compactProvider = compactCodexProviderLabel(provider);
   const rawDisplay =
     (model.displayName ?? model.display_name ?? id).trim() || id;
+  const compactProvider = compactCodexProviderLabel(provider);
   const display = provider
     ? [provider, compactProvider].reduce(
         (label, candidate) =>
           label.replace(
             new RegExp(
-              `^\\[${candidate.replace(/[.*+?^${}()|[\\]\\]/g, "\\$&")}\\]\\s*`,
+              `^\\[${candidate.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\]\\s*`,
               "i",
             ),
             "",
           ),
         rawDisplay,
       )
-    : rawDisplay;
+    : stripBracketedProviderPrefix(rawDisplay);
   if (!provider || style === "model") return display;
   return style === "provider-model"
     ? `[${compactProvider}] ${display}`
@@ -4870,6 +4907,9 @@ function ModelOrderTab({
     modelsWithProvider,
     sortMode,
   );
+  const fallbackProtocolCount = visibleDraftModels.filter(
+    isCodexProtocolFallback,
+  ).length;
   const styleDirty =
     displayStyle !==
     (catalog.displayNameStyle ?? DEFAULT_CODEX_MODEL_DISPLAY_STYLE);
@@ -5203,6 +5243,19 @@ function ModelOrderTab({
           </select>
         </label>
       </div>
+
+      {fallbackProtocolCount > 0 ? (
+        <div className="mt-3 flex items-start gap-2 rounded-md border border-amber-500/35 bg-amber-500/10 px-3 py-2 text-xs text-amber-800 dark:text-amber-100">
+          <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
+          <span>
+            {tr("codexRouterWorkspace.protocolFallbackWarning", {
+              defaultValue:
+                "{{count}} models still inherit the provider fallback protocol. Re-run protocol detection on their model source before relying on automatic per-model routing.",
+              count: fallbackProtocolCount,
+            })}
+          </span>
+        </div>
+      ) : null}
 
       <DndContext
         sensors={sensors}
@@ -8094,14 +8147,20 @@ function CodexProjectionStatusPanel({
               route.routeId,
               route.targetProviderName,
             );
+            const routeProviderLabel =
+              routeLabel.localeCompare(route.targetProviderName, undefined, {
+                sensitivity: "base",
+              }) === 0
+                ? routeLabel
+                : `${routeLabel} / ${route.targetProviderName}`;
             return (
               <div
                 key={`${route.routeId}:${route.visibleModel}`}
                 title={`Route ID: ${route.routeId}; Provider ID: ${route.targetProviderId}`}
                 className="font-mono text-[11px]"
               >
-                {routeLabel} / {route.targetProviderName}: {route.visibleModel}{" "}
-                → {route.upstreamModel}
+                {routeProviderLabel}: {route.visibleModel} →{" "}
+                {route.upstreamModel}
               </div>
             );
           })}
@@ -8193,6 +8252,15 @@ function StatusTab({
   >(null);
   const [isUnlockingModelPicker, setIsUnlockingModelPicker] = useState(false);
   const [statusView, setStatusView] = useState<StatusView>("link");
+  const {
+    data: requestHealth,
+    refetch: refetchRequestHealth,
+    isFetching: isRefreshingRequestHealth,
+  } = useQuery<RequestHealthSnapshot>({
+    queryKey: ["requestHealthDiagnostics"],
+    queryFn: () => proxyApi.getRequestHealthDiagnostics(),
+    refetchInterval: statusView === "request-health" ? 5_000 : false,
+  });
   const [isRefreshingValidation, setIsRefreshingValidation] = useState(false);
   const [validationRefreshMessage, setValidationRefreshMessage] = useState<
     string | null
@@ -8841,6 +8909,12 @@ function StatusTab({
                 {modelPickerUnlockResult.debugPort ?? "-"} launched=
                 {String(modelPickerUnlockResult.launched)}
               </div>
+              <div className="mt-1 font-mono text-[11px] opacity-80">
+                reasoning=
+                {modelPickerUnlockResult.reasoningModelCount}/
+                {modelPickerUnlockResult.modelCount} without-effort=
+                {modelPickerUnlockResult.modelsWithoutReasoningCount}
+              </div>
               {modelPickerUnlockResult.codexExecutable ? (
                 <div className="mt-2 rounded-md border border-current/20 bg-white/40 p-2 text-[11px] leading-5 dark:bg-black/10">
                   {tr("codexRouterWorkspace.s358", {
@@ -8904,6 +8978,15 @@ function StatusTab({
           isLoading={isDiagnosing}
           error={diagnoseError}
           onRun={() => runDiagnostics("debug")}
+        />
+      )}
+
+      {statusView === "request-health" && (
+        <RequestHealthPanel
+          snapshot={requestHealth}
+          isRefreshing={isRefreshingRequestHealth}
+          onRefresh={() => void refetchRequestHealth()}
+          onSaved={() => void refetchRequestHealth()}
         />
       )}
 
@@ -9593,11 +9676,21 @@ function StatusViewSwitcher({
         arg0: trafficCount,
       }),
     },
+    {
+      value: "request-health",
+      icon: Activity,
+      label: tr("codexRouterWorkspace.requestHealth.title", {
+        defaultValue: "Request health",
+      }),
+      detail: tr("codexRouterWorkspace.requestHealth.description", {
+        defaultValue: "Size, compaction, and continuation",
+      }),
+    },
   ];
 
   return (
     <div className="rounded-lg border border-border bg-card p-2 dark:border-slate-700 dark:bg-slate-950/40">
-      <div className="grid gap-2 md:grid-cols-5">
+      <div className="grid gap-2 md:grid-cols-3 xl:grid-cols-6">
         {items.map((item) => {
           const Icon = item.icon;
           const active = value === item.value;
@@ -10408,6 +10501,28 @@ function SortableCatalogModel({
   displayStyle?: CodexModelDisplayStyle;
 }) {
   const modelId = model.model?.trim() ?? "";
+  const apiFormat = model.apiFormat ?? model.api_format;
+  const apiFormatSource = model.apiFormatSource ?? model.api_format_source;
+  const protocolLabel =
+    apiFormat === "openai_responses"
+      ? tr("codexRouterWorkspace.protocolResponses", {
+          defaultValue: "Responses",
+        })
+      : apiFormat === "openai_chat"
+        ? tr("codexRouterWorkspace.protocolChat", {
+            defaultValue: "Chat",
+          })
+        : null;
+  const protocolSourceLabel =
+    apiFormatSource === "provider" ||
+    apiFormatSource === "default" ||
+    !apiFormatSource
+      ? tr("codexRouterWorkspace.protocolDefault", {
+          defaultValue: "fallback",
+        })
+      : tr("codexRouterWorkspace.protocolPerModel", {
+          defaultValue: "per model",
+        });
   const {
     attributes,
     listeners,
@@ -10445,11 +10560,25 @@ function SortableCatalogModel({
         {index + 1}
       </span>
       <div className="min-w-0 flex-1">
-        <div
-          className="truncate text-sm font-medium text-foreground dark:text-slate-100"
-          title={`${formatCodexCatalogModelLabel(model, displayStyle)} (${modelId})`}
-        >
-          {formatCodexCatalogModelLabel(model, displayStyle)}
+        <div className="flex min-w-0 items-center gap-2">
+          <div
+            className="min-w-0 truncate text-sm font-medium text-foreground dark:text-slate-100"
+            title={`${formatCodexCatalogModelLabel(model, displayStyle)} (${modelId})`}
+          >
+            {formatCodexCatalogModelLabel(model, displayStyle)}
+          </div>
+          {protocolLabel ? (
+            <Badge
+              className={cn(
+                "shrink-0 border px-1.5 py-0 text-[10px] font-medium",
+                apiFormat === "openai_responses"
+                  ? "border-emerald-500/30 bg-emerald-500/10 text-emerald-700 dark:text-emerald-200"
+                  : "border-sky-500/30 bg-sky-500/10 text-sky-700 dark:text-sky-200",
+              )}
+            >
+              {protocolLabel} · {protocolSourceLabel}
+            </Badge>
+          ) : null}
         </div>
         {modelId &&
         formatCodexCatalogModelLabel(model, displayStyle) !== modelId ? (

@@ -94,6 +94,7 @@ import {
   type CodexProviderSplitSuggestion,
 } from "./CodexFormFields";
 import { completeCodexReasoningEffortMap } from "./codexReasoningCapability";
+import { normalizeCodexInputCapability } from "./codexInputCapability";
 import { GrokBuildProviderForm } from "./GrokBuildProviderForm";
 import { GeminiFormFields } from "./GeminiFormFields";
 import { OmoFormFields } from "./OmoFormFields";
@@ -127,6 +128,7 @@ import {
 } from "./hooks";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { useSettingsQuery } from "@/lib/query";
+import { useProvidersQuery } from "@/lib/query/queries";
 import {
   CLAUDE_DEFAULT_CONFIG,
   CODEX_DEFAULT_CONFIG,
@@ -190,7 +192,8 @@ export const normalizeCodexCatalogModelsForSave = (
   const seen = new Set<string>();
   const normalized: CodexCatalogModel[] = [];
 
-  for (const item of models) {
+  for (const rawItem of models) {
+    const item = normalizeCodexInputCapability(rawItem);
     // `enabled: false` is a form-only exclusion state. Persisting excluded
     // discovery rows makes downstream consumers mistake the provider's full
     // remote inventory for its curated model catalog.
@@ -946,6 +949,66 @@ function ProviderFormFull({
         : "",
     );
 
+  // Provider dialogs can reuse this component while switching records. Keep
+  // local controls tied to the new provider instead of leaking the previous
+  // provider's protocol/auth settings into the next edit.
+  useEffect(() => {
+    setLocalApiKeyField(
+      appId === "claude" && initialData?.meta?.apiKeyField
+        ? initialData.meta.apiKeyField
+        : "ANTHROPIC_AUTH_TOKEN",
+    );
+    setLocalApiFormat(
+      appId === "claude"
+        ? normalizeClaudeApiFormat(initialData?.meta?.apiFormat) ??
+          "anthropic"
+        : "anthropic",
+    );
+    setSelectedGitHubAccountId(
+      resolveManagedAccountId(initialData?.meta, "github_copilot"),
+    );
+    setSelectedCodexAccountId(
+      resolveManagedAccountId(initialData?.meta, "codex_oauth"),
+    );
+    setSelectedXaiAccountId(
+      resolveManagedAccountId(initialData?.meta, "xai_oauth"),
+    );
+    setCodexFastMode(initialData?.meta?.codexFastMode ?? false);
+    setLocalCodexApiFormat(
+      initialData?.meta?.apiFormat === "openai_chat"
+        ? "openai_chat"
+        : initialData?.meta?.apiFormat === "anthropic"
+          ? "anthropic"
+          : initialData?.meta?.apiFormat === "openai_responses"
+            ? "openai_responses"
+            : (codexApiFormatFromWireApi(
+                  extractCodexWireApi(
+                    typeof initialData?.settingsConfig?.config === "string"
+                      ? initialData.settingsConfig.config
+                      : "",
+                  ),
+                ) ?? "openai_responses"),
+    );
+    setLocalCodexAnthropicAuthField(
+      initialData?.meta?.apiKeyField === "ANTHROPIC_API_KEY"
+        ? "ANTHROPIC_API_KEY"
+        : "ANTHROPIC_AUTH_TOKEN",
+    );
+    setLocalCodexImpersonateClaudeCode(
+      initialData?.meta?.impersonateClaudeCode === true,
+    );
+    setLocalCodexMaxOutputTokens(
+      typeof initialData?.meta?.maxOutputTokens === "number" &&
+        initialData.meta.maxOutputTokens > 0
+        ? String(initialData.meta.maxOutputTokens)
+        : "",
+    );
+    setCodexProviderSplit(null);
+    setSoftIssues(null);
+    setPendingFormValues(null);
+    setPendingLocalProxyRequestOverridesResult(null);
+  }, [appId, initialData]);
+
   const { configError: codexConfigError, debouncedValidate } =
     useCodexTomlValidation();
 
@@ -1076,6 +1139,28 @@ function ProviderFormFull({
   const isMaintainedCodexPreset = Boolean(maintainedCodexPreset);
   const effectiveCodexMenuProjection =
     isMaintainedCodexPreset || codexTakeoverEnabled;
+
+  const { data: codexProvidersData } = useProvidersQuery("codex");
+  const codexCapabilityProviders =
+    appId === "codex" ? (codexProvidersData?.providers ?? {}) : {};
+  const knownCodexCatalogModels = useMemo(() => {
+    if (appId !== "codex") return [];
+    const maintainedModels = codexProviderPresets.flatMap(
+      (preset) => preset.modelCatalog ?? [],
+    );
+    const savedModels = Object.values(codexCapabilityProviders).flatMap(
+      (provider) => {
+        const settings = provider.settingsConfig as
+          | Record<string, unknown>
+          | undefined;
+        const catalog = settings?.modelCatalog;
+        if (!catalog || typeof catalog !== "object") return [];
+        const models = (catalog as { models?: unknown }).models;
+        return Array.isArray(models) ? (models as CodexCatalogModel[]) : [];
+      },
+    );
+    return [...maintainedModels, ...savedModels];
+  }, [appId, codexCapabilityProviders]);
 
   const {
     templateValues,
@@ -2834,6 +2919,7 @@ function ProviderFormFull({
                 onCodexTrafficPolicyChange={setCodexTrafficPolicy}
                 catalogModels={codexCatalogModels}
                 presetCatalogModels={codexPresetBaseline}
+                knownCatalogModels={knownCodexCatalogModels}
                 onCatalogModelsChange={setCodexCatalogModels}
                 spawnAgentModels={codexSpawnAgentModels}
                 onSpawnAgentModelsChange={setCodexSpawnAgentModels}

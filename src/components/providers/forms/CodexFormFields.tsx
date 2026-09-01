@@ -34,6 +34,7 @@ import {
   ArrowDown,
   ArrowUp,
   ArrowLeftRight,
+  Route as RouteIcon,
   Plus,
   Trash2,
   X,
@@ -69,6 +70,13 @@ import {
   pruneMissingRemoteCodexCatalogRows,
   reconcileFetchedCodexCatalogRows,
 } from "./codexCatalogSync";
+import {
+  buildCodexInputCapabilityReferenceMap,
+  codexInputCapabilityPatch,
+  codexInputCapabilityState,
+  hydrateCodexInputCapabilities,
+  type CodexInputCapabilityState,
+} from "./codexInputCapability";
 import { CodexModelReasoningCard } from "./CodexModelReasoningCard";
 import { CodexModelReasoningEditor } from "./CodexModelReasoningEditor";
 import { CodexModelReasoningSummary } from "./CodexModelReasoningSummary";
@@ -275,6 +283,7 @@ function buildSplitCodexProviderSuggestionForProbeRecords({
     providerName: providerName?.trim() || "provider",
     responsesModels,
     chatModels,
+    apiFormatSource: "probe",
   };
 }
 interface CodexFormFieldsProps {
@@ -342,6 +351,7 @@ interface CodexFormFieldsProps {
   catalogModels?: CodexCatalogModel[];
   // Current maintained preset baseline, used only for explicit override/restore.
   presetCatalogModels?: CodexCatalogModel[];
+  knownCatalogModels?: CodexCatalogModel[];
   onCatalogModelsChange?: (models: CodexCatalogModel[]) => void;
   spawnAgentModels?: string[];
   onSpawnAgentModelsChange?: (models: string[]) => void;
@@ -419,12 +429,50 @@ export interface CodexProviderSplitSuggestion {
   providerName: string;
   responsesModels: string[];
   chatModels: string[];
+  apiFormatSource: "probe" | "inferred";
+}
+
+export function applyCodexProtocolGroups<T extends CodexCatalogModel>(
+  rows: T[],
+  responsesModels: string[],
+  chatModels: string[],
+  apiFormatSource: "probe" | "inferred",
+): T[] {
+  const responses = new Set(responsesModels.map(catalogModelIdentity));
+  const chat = new Set(chatModels.map(catalogModelIdentity));
+  return rows.map((row) => {
+    const key = catalogModelIdentity(catalogRowUpstreamModel(row));
+    const apiFormat = responses.has(key)
+      ? "openai_responses"
+      : chat.has(key)
+        ? "openai_chat"
+        : undefined;
+    if (apiFormat) {
+      return {
+        ...row,
+        apiFormat,
+        apiFormatSource,
+        api_format: apiFormat,
+        api_format_source: apiFormatSource,
+      } as T;
+    }
+    const {
+      apiFormat: _apiFormat,
+      api_format: _legacyApiFormat,
+      apiFormatSource: _apiFormatSource,
+      api_format_source: _legacySource,
+      ...withoutProtocol
+    } = row;
+    return withoutProtocol as T;
+  });
 }
 
 interface PendingCodexProviderSplitRouting {
   identity: string;
   suggestion: CodexProviderSplitSuggestion;
 }
+
+const EMPTY_CODEX_CATALOG_MODELS: CodexCatalogModel[] = [];
 
 function createCatalogRow(seed?: Partial<CodexCatalogModel>): CodexCatalogRow {
   const inputModalities = seed?.inputModalities ?? seed?.input_modalities;
@@ -450,37 +498,36 @@ function createCatalogRow(seed?: Partial<CodexCatalogModel>): CodexCatalogRow {
       ? { inputModalities: [...inputModalities] }
       : {}),
     ...(supportsImage !== undefined ? { supportsImage } : {}),
-    ...(seed?.textOnly !== undefined ? { textOnly: seed.textOnly } : {}),
+    ...((seed?.textOnly ?? seed?.text_only) !== undefined
+      ? { textOnly: seed?.textOnly ?? seed?.text_only }
+      : {}),
     ...(seed?.baseInstructions
       ? { baseInstructions: seed.baseInstructions }
       : {}),
     ...(seed?.reasoning ? { reasoning: seed.reasoning } : {}),
     ...(seed?.codexUltra ? { codexUltra: seed.codexUltra } : {}),
-    ...(seed?.apiFormat ? { apiFormat: seed.apiFormat } : {}),
+    ...((seed?.apiFormat ?? seed?.api_format)
+      ? { apiFormat: seed.apiFormat ?? seed.api_format }
+      : {}),
+    ...(seed?.apiFormatSource
+      ? { apiFormatSource: seed.apiFormatSource }
+      : seed?.api_format_source
+        ? { apiFormatSource: seed.api_format_source }
+        : {}),
     ...(seed?.codexCache ? { codexCache: seed.codexCache } : {}),
     ...(seed?.enabled !== undefined ? { enabled: seed.enabled } : {}),
     ...(seed?.sortIndex !== undefined ? { sortIndex: seed.sortIndex } : {}),
   };
 }
 
-function catalogInputCapabilityPatch(
-  supportsImage: boolean,
-): Pick<CodexCatalogModel, "inputModalities" | "supportsImage" | "textOnly"> {
-  return {
-    inputModalities: supportsImage ? ["text", "image"] : ["text"],
-    supportsImage,
-    textOnly: !supportsImage,
-  };
+export function catalogInputCapabilityState(
+  model: CodexCatalogModel,
+): CodexInputCapabilityState {
+  return codexInputCapabilityState(model);
 }
 
 function catalogSupportsImage(model: CodexCatalogModel): boolean {
-  const modalities = model.inputModalities ?? model.input_modalities ?? [];
-  return (
-    model.supportsImage === true ||
-    model.supports_image === true ||
-    model.vision === true ||
-    modalities.some((modality) => modality.toLowerCase() === "image")
-  );
+  return catalogInputCapabilityState(model) === "text_image";
 }
 
 // 读取 catalog 行的真实上游模型名；为空时回退到可见模型名，兼容旧配置。
@@ -516,6 +563,7 @@ function catalogRowsMatchModels(
       | "reasoning"
       | "codexUltra"
       | "apiFormat"
+      | "apiFormatSource"
       | "codexCache"
       | "sortIndex"
     >
@@ -552,6 +600,8 @@ function catalogRowsMatchModels(
         JSON.stringify(incoming.codexUltra ?? null) &&
       (row.apiFormat ?? null) ===
         (incoming.apiFormat ?? incoming.api_format ?? null) &&
+      (row.apiFormatSource ?? null) ===
+        (incoming.apiFormatSource ?? incoming.api_format_source ?? null) &&
       JSON.stringify(row.codexCache ?? null) ===
         JSON.stringify(incoming.codexCache ?? incoming.codex_cache ?? null) &&
       (row.sortIndex ?? null) === (incoming.sortIndex ?? null)
@@ -666,6 +716,7 @@ function buildCodexProviderReadinessIdentity({
       reasoning: model.reasoning ?? null,
       codexUltra: model.codexUltra ?? null,
       apiFormat: model.apiFormat ?? model.api_format ?? null,
+      apiFormatSource: model.apiFormatSource ?? model.api_format_source ?? null,
       codexCache: model.codexCache ?? model.codex_cache ?? null,
       sortIndex: model.sortIndex ?? null,
     })),
@@ -782,7 +833,7 @@ export function splitFetchedModelsByLikelyCodexProtocol(
   return { responses, chat };
 }
 
-// 为同一个中转 provider 生成“拆成两个 provider”的建议；GPT-like 走 Responses，非 GPT-like 走 Chat 转换。
+// 为同一个中转 provider 生成模型协议分组；GPT-like 走 Responses，非 GPT-like 走 Chat 转换。
 export function buildSplitCodexProviderSuggestionForFetchedModels({
   providerName,
   models,
@@ -798,6 +849,7 @@ export function buildSplitCodexProviderSuggestionForFetchedModels({
     providerName: labelBase,
     responsesModels: split.responses,
     chatModels: split.chat,
+    apiFormatSource: "inferred",
   };
 }
 
@@ -850,8 +902,9 @@ export function CodexFormFields({
   onPromptCacheRoutingChange = () => undefined,
   codexTrafficPolicy,
   onCodexTrafficPolicyChange = () => undefined,
-  catalogModels = [],
-  presetCatalogModels = [],
+  catalogModels = EMPTY_CODEX_CATALOG_MODELS,
+  presetCatalogModels = EMPTY_CODEX_CATALOG_MODELS,
+  knownCatalogModels = EMPTY_CODEX_CATALOG_MODELS,
   onCatalogModelsChange,
   onProviderSplitSuggestionChange,
   speedTestEndpoints,
@@ -1005,12 +1058,29 @@ export function CodexFormFields({
     }
   }, [hasAnyAdvancedValue, isXaiOauthPreset]);
 
+  const inputCapabilityReferences = useMemo(
+    () =>
+      buildCodexInputCapabilityReferenceMap([
+        presetCatalogModels,
+        knownCatalogModels,
+      ]),
+    [knownCatalogModels, presetCatalogModels],
+  );
   const [catalogRows, setCatalogRows] = useState<CodexCatalogRow[]>(() =>
-    catalogModels.map((m) => createCatalogRow(m)),
+    hydrateCodexInputCapabilities(
+      catalogModels.map((model) => createCatalogRow(model)),
+      inputCapabilityReferences,
+    ),
   );
   const [expandedReasoningRowId, setExpandedReasoningRowId] = useState<
     string | null
   >(null);
+  const reasoningResolutionCacheRef = useRef(
+    new Map<
+      string,
+      CodexModelReasoningResolution | Promise<CodexModelReasoningResolution>
+    >(),
+  );
 
   const reasoningSettingsConfig = useMemo(
     () => ({ modelCatalog: { models: catalogRows } }),
@@ -1054,33 +1124,50 @@ export function CodexFormFields({
     visibleCatalogRows.some(({ row }) => selectedCatalogRowIds.has(row.rowId));
 
   useEffect(() => {
-    const models = catalogRows
-      .map((row) => catalogRowUpstreamModel(row) || row.model.trim())
-      .filter(Boolean);
-    if (models.length === 0) {
+    const rows = catalogRows
+      .map((row) => ({
+        row,
+        model: catalogRowUpstreamModel(row) || row.model.trim(),
+      }))
+      .filter(({ model }) => Boolean(model));
+    if (rows.length === 0) {
       setReasoningResolutions({});
       return;
     }
     const requestId = ++reasoningResolutionRequestRef.current;
     let cancelled = false;
     void Promise.all(
-      models.map(async (model) => {
-        try {
-          return [
-            model,
-            await codexSubagentV2Api.resolveModelReasoningCapability(
-              reasoningSettingsConfig,
-              providerId ?? "codex-draft",
-              model,
-            ),
-          ] as const;
-        } catch (error) {
-          console.warn("[CodexFormFields] reasoning resolution failed", {
-            model,
-            error,
-          });
-          return [model, unknownReasoningResolution(model)] as const;
+      rows.map(async ({ row, model }) => {
+        const cacheKey = [
+          providerId ?? "codex-draft",
+          model,
+          JSON.stringify({
+            reasoning: row.reasoning ?? null,
+            apiFormat: row.apiFormat ?? row.api_format ?? null,
+          }),
+        ].join("|");
+        const cached = reasoningResolutionCacheRef.current.get(cacheKey);
+        if (cached) {
+          return [model, await cached] as const;
         }
+
+        const pending = codexSubagentV2Api
+          .resolveModelReasoningCapability(
+            reasoningSettingsConfig,
+            providerId ?? "codex-draft",
+            model,
+          )
+          .catch((error) => {
+            console.warn("[CodexFormFields] reasoning resolution failed", {
+              model,
+              error,
+            });
+            return unknownReasoningResolution(model);
+          });
+        reasoningResolutionCacheRef.current.set(cacheKey, pending);
+        const resolved = await pending;
+        reasoningResolutionCacheRef.current.set(cacheKey, resolved);
+        return [model, resolved] as const;
       }),
     ).then((results) => {
       if (cancelled || requestId !== reasoningResolutionRequestRef.current) {
@@ -1257,11 +1344,14 @@ export function CodexFormFields({
       if (isExternalCatalogChange) {
         skipCatalogEchoRef.current = true;
       }
-      return catalogModels.map((m) => createCatalogRow(m));
+      return hydrateCodexInputCapabilities(
+        catalogModels.map((model) => createCatalogRow(model)),
+        inputCapabilityReferences,
+      );
     });
     // 同步更新 ref，避免父组件传入新数据时子→父 effect 误判为本地修改
     lastSentModelsRef.current = catalogModels;
-  }, [catalogModels]);
+  }, [catalogModels, inputCapabilityReferences]);
 
   // 子 → 父：rowId 是视图层概念，不应进入持久化数据；剥离后再回传。
   // 注意：依赖数组不包含 catalogModels，避免父→子更新触发子→父回调形成循环。
@@ -1310,6 +1400,11 @@ export function CodexFormFields({
 
   const handleFetchModels = useCallback(
     (fetchMode: "sync" | "refresh-existing" = "sync") => {
+      if (fetchMode === "refresh-existing") {
+        setPendingSplitRoutingState(null);
+        onProviderSplitSuggestionChange?.(null);
+      }
+
       // xAI OAuth 托管预设不使用表单里的 Base URL 与 API Key。
       if (isXaiOauthPreset) {
         if (!isXaiOauthAuthenticated) {
@@ -1490,7 +1585,7 @@ export function CodexFormFields({
             setCatalogRows(mergedRows);
           }
           const shouldAutoSplitRouting =
-            models.length > 0 && Boolean(onProviderSplitSuggestionChange);
+            fetchMode === "sync" && models.length > 0;
           if (shouldAutoSplitRouting) {
             const splitRouting =
               buildSplitCodexProviderSuggestionForFetchedModels({
@@ -1735,12 +1830,10 @@ export function CodexFormFields({
         providerName,
         records: outcome.records,
       });
-      const canApplySplitSuggestion = Boolean(
-        splitSuggestion && onProviderSplitSuggestionChange,
-      );
-      if (splitSuggestion && onProviderSplitSuggestionChange) {
+      const canApplySplitSuggestion = Boolean(splitSuggestion);
+      if (splitSuggestion) {
         bindPendingSplitRouting(splitSuggestion, probeIdentity);
-        onProviderSplitSuggestionChange(null);
+        onProviderSplitSuggestionChange?.(null);
       }
 
       if (allResponses) {
@@ -1795,7 +1888,8 @@ export function CodexFormFields({
             resultCounts,
             splitHint: canApplySplitSuggestion
               ? i18n.t("codexForm.probeMixedSuggestion", {
-                  defaultValue: "建议拆成 Responses / Chat 两个 provider。",
+                  defaultValue:
+                    "检测到混合协议模型；建议在同一个 provider 内启用按模型自动路由。",
                 })
               : i18n.t("codexForm.deepProbePerModelHint", {
                   defaultValue: "请按模型分别配置路由。",
@@ -2145,17 +2239,29 @@ export function CodexFormFields({
   );
 
   const handleConfirmSplitRouting = useCallback(() => {
-    if (!pendingSplitRouting || !onProviderSplitSuggestionChange) return;
+    if (!pendingSplitRouting) return;
     onTakeoverEnabledChange(true);
-    onProviderSplitSuggestionChange(pendingSplitRouting);
+    const nextRows = applyCodexProtocolGroups(
+      catalogRowsRef.current,
+      pendingSplitRouting.responsesModels,
+      pendingSplitRouting.chatModels,
+      pendingSplitRouting.apiFormatSource,
+    );
+    catalogRowsRef.current = nextRows;
+    setCatalogRows(nextRows);
+    onCatalogModelsChange?.(nextRows);
+    onApiFormatChange("openai_responses");
+    onProviderSplitSuggestionChange?.(null);
     setPendingSplitRoutingState(null);
     toast.info(
-      i18n.t("codexForm.splitProvidersPreview", {
-        defaultValue: "保存时将生成 {{providers}} 两个 provider。",
-        providers: `${pendingSplitRouting.providerName}-responses / ${pendingSplitRouting.providerName}-chat`,
+      i18n.t("codexForm.mixedProviderPreview", {
+        defaultValue:
+          "保存时将创建一个 provider，并按模型自动选择 Responses 或 Chat Completions。",
       }),
     );
   }, [
+    onApiFormatChange,
+    onCatalogModelsChange,
     onTakeoverEnabledChange,
     onProviderSplitSuggestionChange,
     pendingSplitRouting,
@@ -2657,7 +2763,7 @@ export function CodexFormFields({
             <DialogDescription>
               {i18n.t("codexForm.mixedProtocolDesc", {
                 defaultValue:
-                  "当前中转同时返回了 GPT-like 模型和非 GPT-like 模型。建议保存时拆成 Responses 与 Chat 两个 provider，避免把两种协议混在同一个配置里导致后续分不清。 确认后不会立即保存；点击新增时才会创建两个 provider。",
+                  "当前中转同时返回了 GPT-like 模型和非 GPT-like 模型。将它们保留在同一个 provider 中更容易维护；保存时会把协议写入每个模型，并在运行时自动选择 Responses 或 Chat Completions。",
               })}
             </DialogDescription>
           </DialogHeader>
@@ -2665,55 +2771,80 @@ export function CodexFormFields({
           <div className="space-y-3 px-6 pb-2">
             <div className="rounded-md border border-emerald-500/40 bg-emerald-500/10 p-3">
               <div className="flex flex-wrap items-center gap-2 text-sm font-medium">
-                <span>{`${splitRoutingProviderName}-responses`}</span>
+                <span>{`${splitRoutingProviderName} / Responses`}</span>
                 <span className="rounded bg-background/70 px-1.5 py-0.5 text-[11px] text-muted-foreground">
                   OpenAI Responses
                 </span>
                 <span className="rounded bg-background/70 px-1.5 py-0.5 text-[11px] text-muted-foreground">
-                  {i18n.t("codexForm.separateProvider", {
-                    defaultValue: "单独 provider",
+                  {i18n.t("codexForm.protocolGroup", {
+                    defaultValue: "模型分组",
                   })}
                 </span>
+                <span className="rounded bg-background/70 px-1.5 py-0.5 font-mono text-[11px] text-muted-foreground">
+                  {pendingResponsesModels.length}
+                </span>
               </div>
-              <p className="mt-1 text-xs text-muted-foreground">
-                {i18n.t("codexForm.matchingModels", {
-                  defaultValue: "匹配模型：",
-                })}
-                {pendingResponsesModels.join(", ") || "-"}
-              </p>
+              <div className="mt-2 flex max-h-28 flex-wrap gap-1.5 overflow-y-auto pr-1">
+                {pendingResponsesModels.map((model) => (
+                  <span
+                    key={model}
+                    className="max-w-full truncate rounded border border-emerald-500/25 bg-background/65 px-2 py-1 font-mono text-[11px] text-muted-foreground"
+                    title={model}
+                  >
+                    {model}
+                  </span>
+                ))}
+              </div>
             </div>
             <div className="rounded-md border border-sky-500/40 bg-sky-500/10 p-3">
               <div className="flex flex-wrap items-center gap-2 text-sm font-medium">
-                <span>{`${splitRoutingProviderName}-chat`}</span>
+                <span>{`${splitRoutingProviderName} / Chat Completions`}</span>
                 <span className="rounded bg-background/70 px-1.5 py-0.5 text-[11px] text-muted-foreground">
                   OpenAI Chat Completions
                 </span>
                 <span className="rounded bg-background/70 px-1.5 py-0.5 text-[11px] text-muted-foreground">
-                  {i18n.t("codexForm.separateProviderChat", {
-                    defaultValue: "单独 provider",
+                  {i18n.t("codexForm.protocolGroup", {
+                    defaultValue: "模型分组",
                   })}
                 </span>
+                <span className="rounded bg-background/70 px-1.5 py-0.5 font-mono text-[11px] text-muted-foreground">
+                  {pendingChatModels.length}
+                </span>
               </div>
-              <p className="mt-1 text-xs text-muted-foreground">
-                {i18n.t("codexForm.matchingModels", {
-                  defaultValue: "匹配模型：",
-                })}
-                {pendingChatModels.join(", ") || "-"}
-              </p>
+              <div className="mt-2 flex max-h-28 flex-wrap gap-1.5 overflow-y-auto pr-1">
+                {pendingChatModels.map((model) => (
+                  <span
+                    key={model}
+                    className="max-w-full truncate rounded border border-sky-500/25 bg-background/65 px-2 py-1 font-mono text-[11px] text-muted-foreground"
+                    title={model}
+                  >
+                    {model}
+                  </span>
+                ))}
+              </div>
             </div>
           </div>
 
           <DialogFooter>
             <Button
               type="button"
+              variant="ghost"
+              onClick={() => handleFetchModels("refresh-existing")}
+            >
+              {i18n.t("providerForm.fillMissing", {
+                defaultValue: "Refresh Existing",
+              })}
+            </Button>
+            <Button
+              type="button"
               variant="outline"
               onClick={handleCancelSplitRouting}
             >
-              {i18n.t("codexForm.skipSplit", { defaultValue: "暂不拆分" })}
+              {i18n.t("codexForm.skipSplit", { defaultValue: "暂不应用" })}
             </Button>
             <Button type="button" onClick={handleConfirmSplitRouting}>
-              {i18n.t("codexForm.confirmSplitCreate", {
-                defaultValue: "确认生成两个 provider",
+              {i18n.t("codexForm.confirmMixedCreate", {
+                defaultValue: "使用一个 provider，自动路由",
               })}
             </Button>
           </DialogFooter>
@@ -3889,16 +4020,24 @@ export function CodexFormFields({
                 {catalogRows.length > 0 && (
                   <div className="space-y-2">
                     {/* 列头：md+ 显示 */}
-                    <div className="hidden grid-cols-[36px_88px_1fr_1fr_1fr_132px_76px_36px] gap-2 px-1 text-xs font-medium text-muted-foreground md:grid">
+                    <div className="hidden grid-cols-[36px_64px_1fr_1fr_1fr_132px_76px_36px] gap-2 px-1 text-xs font-medium text-muted-foreground md:grid">
                       <span>
                         {t("codexConfig.catalogSelectColumn", {
                           defaultValue: "Select",
                         })}
                       </span>
-                      <span>
-                        {t("codexConfig.keepCatalogModelColumn", {
-                          defaultValue: "Use in MultiRouter",
+                      <span
+                        className="flex justify-center"
+                        title={t("codexRouterWorkspace.s071", {
+                          defaultValue: "Routing rules",
                         })}
+                      >
+                        <RouteIcon className="h-4 w-4" aria-hidden />
+                        <span className="sr-only">
+                          {t("codexRouterWorkspace.s071", {
+                            defaultValue: "Routing rules",
+                          })}
+                        </span>
                       </span>
                       <span>
                         {t("codexConfig.catalogColumnDisplay", {
@@ -3933,7 +4072,17 @@ export function CodexFormFields({
                       const presetCatalogModel =
                         presetCatalogByModel.get(model) ??
                         presetCatalogByModel.get(catalogRowUpstreamModel(row));
-                      const supportsImage = catalogSupportsImage(row);
+                      const savedInputCapability =
+                        catalogInputCapabilityState(row);
+                      const presetInputCapability = presetCatalogModel
+                        ? catalogInputCapabilityState(presetCatalogModel)
+                        : "unknown";
+                      const inputCapability =
+                        savedInputCapability !== "unknown"
+                          ? savedInputCapability
+                          : presetInputCapability;
+                      const supportsImage = inputCapability === "text_image";
+                      const isTextOnly = inputCapability === "text_only";
                       const presetDeclaresInputCapability = Boolean(
                         presetCatalogModel &&
                           (presetCatalogModel.inputModalities !== undefined ||
@@ -3949,7 +4098,7 @@ export function CodexFormFields({
                         <div
                           key={row.rowId}
                           className={cn(
-                            "grid grid-cols-1 gap-2 rounded-md border p-1 md:grid-cols-[36px_88px_1fr_1fr_1fr_132px_76px_36px]",
+                            "grid grid-cols-1 gap-2 rounded-md border p-1 md:grid-cols-[36px_64px_1fr_1fr_1fr_132px_76px_36px]",
                             selectedCatalogRowIds.has(row.rowId)
                               ? "border-primary/50 bg-primary/5"
                               : "border-transparent",
@@ -3972,22 +4121,42 @@ export function CodexFormFields({
                               })}
                             />
                           </label>
-                          <div className="flex h-9 items-center">
+                          <div className="flex h-9 items-center justify-center">
                             <span
-                              className={cn(
-                                "inline-flex rounded px-2 py-1 text-xs font-medium",
+                              role="status"
+                              aria-label={`${row.model || row.displayName || "Model"}: ${
                                 row.enabled !== false
-                                  ? "bg-emerald-500/10 text-emerald-700 dark:text-emerald-300"
-                                  : "bg-muted text-muted-foreground",
+                                  ? t("common.enabled", {
+                                      defaultValue: "Enabled",
+                                    })
+                                  : t("common.disabled", {
+                                      defaultValue: "Disabled",
+                                    })
+                              }`}
+                              title={
+                                row.enabled !== false
+                                  ? t("common.enabled", {
+                                      defaultValue: "Enabled",
+                                    })
+                                  : t("common.disabled", {
+                                      defaultValue: "Disabled",
+                                    })
+                              }
+                              className={cn(
+                                "inline-flex h-5 w-5 items-center justify-center rounded-full border",
+                                row.enabled !== false
+                                  ? "border-emerald-400/40 bg-emerald-500/15"
+                                  : "border-amber-400/45 bg-amber-500/15",
                               )}
                             >
-                              {row.enabled !== false
-                                ? t("codexConfig.catalogUsedStatus", {
-                                    defaultValue: "Used",
-                                  })
-                                : t("codexConfig.catalogNotUsedStatus", {
-                                    defaultValue: "Not used",
-                                  })}
+                              <span
+                                className={cn(
+                                  "h-2.5 w-2.5 rounded-full shadow-sm",
+                                  row.enabled !== false
+                                    ? "bg-emerald-400 shadow-emerald-500/40"
+                                    : "bg-amber-400 shadow-amber-500/40",
+                                )}
+                              />
                             </span>
                           </div>
                           <Input
@@ -4142,6 +4311,38 @@ export function CodexFormFields({
                                 defaultValue: "输入能力",
                               })}
                             </legend>
+                            <span
+                              className={cn(
+                                "inline-flex items-center gap-1.5 rounded-full border px-2 py-1 font-medium",
+                                inputCapability === "text_image"
+                                  ? "border-emerald-500/30 bg-emerald-500/10 text-emerald-700 dark:text-emerald-200"
+                                  : inputCapability === "text_only"
+                                    ? "border-sky-500/30 bg-sky-500/10 text-sky-700 dark:text-sky-200"
+                                    : "border-amber-500/35 bg-amber-500/10 text-amber-700 dark:text-amber-200",
+                              )}
+                            >
+                              <span
+                                className={cn(
+                                  "h-2 w-2 rounded-full",
+                                  inputCapability === "text_image"
+                                    ? "bg-emerald-400"
+                                    : inputCapability === "text_only"
+                                      ? "bg-sky-400"
+                                      : "bg-amber-400",
+                                )}
+                              />
+                              {inputCapability === "text_image"
+                                ? i18n.t("codexForm.textAndImageLabel", {
+                                    defaultValue: "Text & image",
+                                  })
+                                : inputCapability === "text_only"
+                                  ? i18n.t("codexForm.textOnlyLabel", {
+                                      defaultValue: "Text only",
+                                    })
+                                  : i18n.t("common.unknown", {
+                                      defaultValue: "Unknown",
+                                    })}
+                            </span>
                             <div
                               className="inline-flex overflow-hidden rounded-md border"
                               role="radiogroup"
@@ -4174,7 +4375,7 @@ export function CodexFormFields({
                                 onClick={() =>
                                   handleUpdateCatalogRow(
                                     index,
-                                    catalogInputCapabilityPatch(true),
+                                    codexInputCapabilityPatch("text_image"),
                                   )
                                 }
                               >
@@ -4185,9 +4386,9 @@ export function CodexFormFields({
                               <Button
                                 type="button"
                                 size="sm"
-                                variant={!supportsImage ? "default" : "ghost"}
+                                variant={isTextOnly ? "default" : "ghost"}
                                 className="rounded-none border-l"
-                                aria-pressed={!supportsImage}
+                                aria-pressed={isTextOnly}
                                 aria-label={i18n.t("codexForm.textOnlyAria", {
                                   defaultValue: "{{model}} 仅文本",
                                   model:
@@ -4199,7 +4400,7 @@ export function CodexFormFields({
                                 onClick={() =>
                                   handleUpdateCatalogRow(
                                     index,
-                                    catalogInputCapabilityPatch(false),
+                                    codexInputCapabilityPatch("text_only"),
                                   )
                                 }
                               >
@@ -4208,12 +4409,6 @@ export function CodexFormFields({
                                 })}
                               </Button>
                             </div>
-                            <span className="text-muted-foreground">
-                              {i18n.t("codexForm.presetOverrideHint", {
-                                defaultValue:
-                                  "保存后覆盖当前 Provider 的预设，不需要等待发布。",
-                              })}
-                            </span>
                             {presetDeclaresInputCapability &&
                             presetCatalogModel ? (
                               <Button
@@ -4235,8 +4430,10 @@ export function CodexFormFields({
                                 onClick={() =>
                                   handleUpdateCatalogRow(
                                     index,
-                                    catalogInputCapabilityPatch(
-                                      catalogSupportsImage(presetCatalogModel),
+                                    codexInputCapabilityPatch(
+                                      catalogSupportsImage(presetCatalogModel)
+                                        ? "text_image"
+                                        : "text_only",
                                     ),
                                   )
                                 }

@@ -92,4 +92,26 @@ describe("AWS Bedrock OpenCode Provider Presets", () => {
       });
     }
   });
+
+  it("includes the separate OpenCode Zen preset with documented free models", () => {
+    const preset = opencodeProviderPresets.find(
+      (entry) => entry.name === "OpenCode Zen",
+    );
+
+    expect(preset).toBeDefined();
+    expect(preset!.settingsConfig.options.baseURL).toBe(
+      "https://opencode.ai/zen/v1",
+    );
+    expect(Object.keys(preset!.settingsConfig.models)).toEqual(
+      expect.arrayContaining([
+        "big-pickle",
+        "deepseek-v4-flash-free",
+        "mimo-v2.5-free",
+        "ling-3.0-flash-fin-free",
+        "nemotron-3-ultra-free",
+        "nemotron-3.5-lightning-free",
+        "muse-spark-1.2-contributor-free",
+      ]),
+    );
+  });
 });

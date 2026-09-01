@@ -246,7 +246,7 @@ export function ProviderPresetSelector({
     if (isCodexRouterSourceMode) {
       return t("codexMultiRouter.sourcePickerHint", {
         defaultValue:
-          "先选择一个模型源，预设会自动填充端点、协议和模型目录；只有预设不覆盖你的服务时才使用自定义模型源。",
+          "Choose a provider preset to create one reusable model source. OpenCode Go and Zen are provider presets, not MultiRouter modes; credentials and protocol groups are configured below.",
       });
     }
 
@@ -352,7 +352,7 @@ export function ProviderPresetSelector({
         <FormLabel>
           {isCodexRouterSourceMode
             ? t("codexMultiRouter.sourcePickerLabel", {
-                defaultValue: "选择模型源",
+                defaultValue: "Provider preset",
               })
             : t("providerPreset.label")}
         </FormLabel>
@@ -444,7 +444,7 @@ export function ProviderPresetSelector({
           <span className="truncate">
             {isCodexRouterSourceMode
               ? t("codexMultiRouter.customSource", {
-                  defaultValue: "自定义模型源",
+                  defaultValue: "Custom provider",
                 })
               : t("providerPreset.custom")}
           </span>

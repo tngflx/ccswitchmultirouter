@@ -17,6 +17,7 @@ import {
   HardDriveDownload,
   FlaskConical,
   Code2,
+  Puzzle,
 } from "lucide-react";
 import { toast } from "sonner";
 import {
@@ -54,6 +55,7 @@ import { LogConfigPanel } from "@/components/settings/LogConfigPanel";
 import { AuthCenterPanel } from "@/components/settings/AuthCenterPanel";
 import { CodexAuthSettings } from "@/components/settings/CodexAuthSettings";
 import { CodexGlobalConfigSettings } from "@/components/settings/CodexGlobalConfigSettings";
+import { CodexPluginHealthPanel } from "@/components/settings/CodexPluginHealthPanel";
 import { useInstalledSkills } from "@/hooks/useSkills";
 import { useSettings } from "@/hooks/useSettings";
 import { useImportExport } from "@/hooks/useImportExport";
@@ -500,6 +502,30 @@ export function SettingsPage({
                         </AccordionTrigger>
                         <AccordionContent className="px-6 pb-6 pt-4 border-t border-border/50">
                           <LogConfigPanel />
+                        </AccordionContent>
+                      </AccordionItem>
+
+                      <AccordionItem
+                        value="codexPluginHealth"
+                        className="rounded-xl glass-card overflow-hidden"
+                      >
+                        <AccordionTrigger className="px-6 py-4 hover:no-underline hover:bg-muted/50 data-[state=open]:bg-muted/50">
+                          <div className="flex items-center gap-3">
+                            <Puzzle className="h-5 w-5 text-emerald-500" />
+                            <div className="text-left">
+                              <h3 className="text-base font-semibold">
+                                {t("settings.advanced.codexPluginHealth.title")}
+                              </h3>
+                              <p className="text-sm font-normal text-muted-foreground">
+                                {t(
+                                  "settings.advanced.codexPluginHealth.description",
+                                )}
+                              </p>
+                            </div>
+                          </div>
+                        </AccordionTrigger>
+                        <AccordionContent className="border-t border-border/50 px-6 pt-4 pb-6">
+                          <CodexPluginHealthPanel />
                         </AccordionContent>
                       </AccordionItem>
 

@@ -15,6 +15,12 @@ function presetModel(providerName: string, modelName: string) {
 }
 
 describe("Codex preset reasoning capabilities", () => {
+  it("keeps top-level provider names unique", () => {
+    const names = codexProviderPresets.map((preset) => preset.name);
+
+    expect(new Set(names).size).toBe(names.length);
+  });
+
   it("declares a conservative capability for every maintained catalog model", () => {
     for (const provider of codexProviderPresets) {
       for (const model of provider.modelCatalog ?? []) {
@@ -149,6 +155,30 @@ describe("Codex preset reasoning capabilities", () => {
       expect.objectContaining({
         supportedEfforts: ["low", "high"],
       }),
+    );
+  });
+
+  it("exposes the separate OpenCode Zen preset with its free model catalog", () => {
+    const preset = codexProviderPresets.find(
+      (candidate) => candidate.name === "OpenCode Zen",
+    );
+
+    expect(preset).toBeDefined();
+    expect(preset!.presetKey).toBe("opencode-zen");
+    expect(preset!.endpointCandidates).toEqual([
+      "https://opencode.ai/zen/v1",
+    ]);
+    expect(preset!.apiFormat).toBe("openai_chat");
+    expect(preset!.modelCatalog?.map((model) => model.model)).toEqual(
+      expect.arrayContaining([
+        "big-pickle",
+        "deepseek-v4-flash-free",
+        "muse-spark-1.2-contributor-free",
+        "mimo-v2.5-free",
+        "ling-3.0-flash-fin-free",
+        "nemotron-3-ultra-free",
+        "nemotron-3.5-lightning-free",
+      ]),
     );
   });
 });

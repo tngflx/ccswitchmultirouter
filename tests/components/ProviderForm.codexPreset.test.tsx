@@ -197,6 +197,71 @@ describe("ProviderForm Codex preset selection", () => {
     });
   });
 
+  it("resets provider-local protocol and account state when editing a new record", async () => {
+    const first: NonNullable<ComponentProps<typeof ProviderForm>["initialData"]> =
+      {
+        name: "First",
+        category: "custom",
+        settingsConfig: {
+          auth: { OPENAI_API_KEY: "first-key" },
+          config:
+            'model_provider = "first"\nmodel = "first-model"\n[model_providers.first]\nbase_url = "https://first.example/v1"\nwire_api = "responses"\n',
+        },
+        meta: {
+          apiFormat: "anthropic",
+          apiKeyField: "ANTHROPIC_API_KEY",
+          impersonateClaudeCode: true,
+          maxOutputTokens: 4096,
+          codexFastMode: true,
+        },
+      };
+    const second: NonNullable<ComponentProps<typeof ProviderForm>["initialData"]> =
+      {
+        ...first,
+        name: "Second",
+        settingsConfig: {
+          auth: { OPENAI_API_KEY: "second-key" },
+          config:
+            'model_provider = "second"\nmodel = "second-model"\n[model_providers.second]\nbase_url = "https://second.example/v1"\nwire_api = "responses"\n',
+        },
+        meta: {
+          apiFormat: "openai_responses",
+          codexFastMode: false,
+        },
+      };
+    const { rerender } = renderProviderForm({ initialData: first });
+    await waitFor(() =>
+      expect(screen.getByTestId("codex-base-url")).toHaveTextContent(
+        "https://first.example/v1",
+      ),
+    );
+
+    rerender(
+      <QueryClientProvider
+        client={
+          new QueryClient({
+            defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+          })
+        }
+      >
+        <ProviderForm
+          appId="codex"
+          submitLabel="保存"
+          onSubmit={vi.fn()}
+          onCancel={vi.fn()}
+          showButtons={false}
+          initialData={second}
+        />
+      </QueryClientProvider>,
+    );
+
+    await waitFor(() => {
+      expect(screen.getByTestId("codex-base-url")).toHaveTextContent(
+        "https://second.example/v1",
+      );
+    });
+  });
+
   it("persists the exact custom Codex traffic policy", async () => {
     const onSubmit = vi.fn();
     renderProviderForm({

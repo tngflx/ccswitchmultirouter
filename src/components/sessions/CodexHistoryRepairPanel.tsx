@@ -538,8 +538,8 @@ export function CodexHistoryRepairPanel({
         />
       </div>
 
-      <div className="grid min-h-0 flex-1 xl:grid-cols-[400px_minmax(0,1fr)]">
-        <div className="flex min-h-0 flex-col border-r">
+      <div className="grid min-h-0 flex-1 grid-rows-[minmax(300px,1fr)_minmax(280px,1fr)] xl:grid-cols-[400px_minmax(0,1fr)] xl:grid-rows-1">
+        <div className="flex min-h-0 flex-col border-b xl:border-b-0 xl:border-r">
           <div className="border-b px-3 py-3">
             <div className="flex items-center justify-between gap-2">
               <div className="flex items-center gap-2 text-sm font-semibold">

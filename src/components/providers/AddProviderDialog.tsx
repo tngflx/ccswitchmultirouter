@@ -18,10 +18,7 @@ import { providerPresets } from "@/config/claudeProviderPresets";
 import { codexProviderPresets } from "@/config/codexProviderPresets";
 import { geminiProviderPresets } from "@/config/geminiProviderPresets";
 import { claudeDesktopProviderPresets } from "@/config/claudeDesktopProviderPresets";
-import {
-  extractCodexBaseUrl,
-  setCodexModelName,
-} from "@/utils/providerConfigUtils";
+import { extractCodexBaseUrl } from "@/utils/providerConfigUtils";
 import { extractGrokBuildBaseUrl } from "@/utils/grokBuildConfig";
 import { GROKBUILD_OFFICIAL_PROVIDER_ID } from "@/utils/providerCapabilities";
 import type { OpenClawSuggestedDefaults } from "@/config/openclawProviderPresets";
@@ -44,62 +41,68 @@ interface AddProviderDialogProps {
   ) => Promise<void> | void;
 }
 
-// 读取目录条目的真实上游模型名；拆分 provider 时必须按 upstreamModel 匹配，避免别名模型被漏分组。
+// 读取目录条目的真实上游模型名；协议分组必须按 upstreamModel 匹配，避免别名模型被漏分组。
 function getCodexCatalogModelKey(model: Record<string, unknown>): string {
   return String(
     model.upstreamModel ?? model.upstream_model ?? model.model ?? "",
-  ).trim();
+  )
+    .trim()
+    .toLocaleLowerCase();
 }
 
-// 将一个混合协议 Codex provider 拆成 Responses/Chat 两份保存数据，保留各自模型目录但不复制路由配置。
-export function buildSplitCodexProviderData(
+// 将混合协议模型保留在一个 provider 中；每个 catalog row 携带自己的传输协议。
+export function buildMixedCodexProviderData(
   providerData: Omit<Provider, "id">,
   split: CodexProviderSplitSuggestion,
-  kind: "responses" | "chat",
 ): Omit<Provider, "id"> {
-  const modelSet = new Set(
-    (kind === "responses" ? split.responsesModels : split.chatModels).map(
-      (model) => model.trim(),
-    ),
+  const responses = new Set(
+    split.responsesModels.map((model) => model.trim().toLocaleLowerCase()),
+  );
+  const chat = new Set(
+    split.chatModels.map((model) => model.trim().toLocaleLowerCase()),
   );
   const settingsConfig = structuredClone(providerData.settingsConfig ?? {});
   const rawCatalog = settingsConfig.modelCatalog as
     | { models?: Array<Record<string, unknown>>; spawnAgentModels?: string[] }
     | undefined;
-  const filteredModels =
-    rawCatalog?.models?.filter((model) =>
-      modelSet.has(getCodexCatalogModelKey(model)),
-    ) ??
-    Array.from(modelSet).map((model) => ({
-      model,
-      upstreamModel: model,
-      displayName: model,
-    }));
-
-  delete settingsConfig.codexRouting;
+  const models = rawCatalog?.models ?? [];
+  const mixedModels = models.map((model) => {
+    const key = getCodexCatalogModelKey(model);
+    const apiFormat = responses.has(key)
+      ? "openai_responses"
+      : chat.has(key)
+        ? "openai_chat"
+        : undefined;
+    if (!apiFormat) {
+      const {
+        apiFormat: _apiFormat,
+        api_format: _legacyApiFormat,
+        apiFormatSource: _apiFormatSource,
+        api_format_source: _legacySource,
+        ...withoutProtocol
+      } = model;
+      return withoutProtocol;
+    }
+    return {
+      ...model,
+      apiFormat,
+      api_format: apiFormat,
+      apiFormatSource: split.apiFormatSource,
+      api_format_source: split.apiFormatSource,
+    };
+  });
   settingsConfig.modelCatalog = {
     ...(rawCatalog ?? {}),
-    models: filteredModels,
-    spawnAgentModels: rawCatalog?.spawnAgentModels?.filter((model) =>
-      modelSet.has(model),
-    ),
+    models: mixedModels,
   };
-
-  const firstModel = String(filteredModels[0]?.model ?? "").trim();
-  if (firstModel && typeof settingsConfig.config === "string") {
-    settingsConfig.config = setCodexModelName(
-      settingsConfig.config,
-      firstModel,
-    );
-  }
-
   return {
     ...providerData,
-    name: `${split.providerName}-${kind}`,
     settingsConfig,
     meta: {
       ...(providerData.meta ?? {}),
-      apiFormat: kind === "responses" ? "openai_responses" : "openai_chat",
+      // Keep the provider-level value as a legacy fallback; catalog rows are authoritative.
+      apiFormat: providerData.meta?.apiFormat ?? "openai_responses",
+      apiFormatSource: split.apiFormatSource,
     },
   };
 }
@@ -388,18 +391,12 @@ export function AddProviderDialog({
       const codexProviderSplit = values.codexProviderSplit;
       if (appId === "codex" && codexProviderSplit) {
         await onSubmit(
-          buildSplitCodexProviderData(
-            providerData,
-            codexProviderSplit,
-            "responses",
-          ),
-        );
-        await onSubmit(
-          buildSplitCodexProviderData(providerData, codexProviderSplit, "chat"),
+          buildMixedCodexProviderData(providerData, codexProviderSplit),
         );
         toast.success(
           t("codexConfig.splitProvidersCreated", {
-            defaultValue: "已生成 Responses / Chat 两个 provider",
+            defaultValue:
+              "已创建一个混合协议 provider（Responses / Chat 自动路由）",
           }),
         );
       } else {
@@ -448,8 +445,8 @@ export function AddProviderDialog({
         >
           <Plus className="h-4 w-4 mr-2" />
           {isCodexRouterEntry
-            ? t("codexMultiRouter.addSource", {
-                defaultValue: "添加模型源",
+            ? t("codexMultiRouter.addSourceAction", {
+                defaultValue: "Add model source",
               })
             : t("universalProvider.add")}
         </Button>
@@ -461,8 +458,8 @@ export function AddProviderDialog({
       isOpen={open}
       title={
         isCodexRouterEntry
-          ? t("codexMultiRouter.createTitle", {
-              defaultValue: "创建多路路由",
+          ? t("codexMultiRouter.addSourceTitle", {
+              defaultValue: "Add Codex model source",
             })
           : t("provider.addNewProvider")
       }
@@ -472,29 +469,18 @@ export function AddProviderDialog({
       contentClassName="pt-3"
     >
       {isCodexRouterEntry && (
-        <div className="rounded-lg border border-primary/20 bg-primary/5 p-4 text-sm text-muted-foreground">
+        <div className="rounded-md border border-primary/20 bg-primary/5 p-3 text-sm text-muted-foreground">
           <div className="font-medium text-foreground">
-            {t("codexMultiRouter.guideTitle", {
-              defaultValue: "多路路由创建方式",
+            {t("codexMultiRouter.addSourceNoticeTitle", {
+              defaultValue: "This creates a reusable provider",
             })}
           </div>
-          <div className="mt-2 grid gap-2 md:grid-cols-3">
-            <div>
-              {t("codexMultiRouter.guideStepSelect", {
-                defaultValue: "1. 先选择或接入模型源。",
-              })}
-            </div>
-            <div>
-              {t("codexMultiRouter.guideStepSync", {
-                defaultValue: "2. 同步后自动生成 Codex 可用配置。",
-              })}
-            </div>
-            <div>
-              {t("codexMultiRouter.guideStepRules", {
-                defaultValue: "3. 再到路由规则里调整模型分流。",
-              })}
-            </div>
-          </div>
+          <p className="mt-1 text-xs leading-5">
+            {t("codexMultiRouter.addSourceNoticeDescription", {
+              defaultValue:
+                "Choose a provider preset, configure credentials, models, and protocol groups here, then return to the MultiRouter wizard to select this source.",
+            })}
+          </p>
         </div>
       )}
 
@@ -506,15 +492,15 @@ export function AddProviderDialog({
           <TabsList className="grid w-full grid-cols-2 mb-6">
             <TabsTrigger value="app-specific">
               {isCodexRouterEntry
-                ? t("codexMultiRouter.singleSourceTab", {
-                    defaultValue: "单独接入模型源",
+                ? t("codexMultiRouter.codexProviderTab", {
+                    defaultValue: "New Codex provider",
                   })
                 : `${t(`apps.${appId}`)} ${t("provider.tabProvider")}`}
             </TabsTrigger>
             <TabsTrigger value="universal">
               {isCodexRouterEntry
-                ? t("codexMultiRouter.sourceTab", {
-                    defaultValue: "选择模型源",
+                ? t("codexMultiRouter.universalProviderTab", {
+                    defaultValue: "Universal providers",
                   })
                 : t("provider.tabUniversal")}
             </TabsTrigger>

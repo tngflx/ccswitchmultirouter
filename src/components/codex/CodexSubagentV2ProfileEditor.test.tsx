@@ -38,6 +38,7 @@ vi.mock("react-i18next", async () => {
 });
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { StrictMode } from "react";
 import {
   getDefaultNormalizer,
   render,
@@ -54,6 +55,7 @@ import type { Provider } from "@/types";
 import type {
   CodexSubagentProfilePreview,
   CodexSubagentReasoningCapability,
+  CodexSubagentV2Config,
   CodexSubagentV2Profile,
 } from "@/types/codexSubagentV2";
 import { CodexMultiRouterWizard } from "./CodexMultiRouterWizard";
@@ -609,6 +611,21 @@ function provider(): Provider {
   };
 }
 
+function projectedCatalog() {
+  const source = provider();
+  return {
+    ...source.settingsConfig.modelCatalog,
+    models: source.settingsConfig.modelCatalog.models.map(
+      (model: Record<string, unknown>) => ({
+        ...model,
+        providerName: source.name,
+      }),
+    ),
+    spawnAgentModels: ["deepseek-v4-flash", "deepseek-v4-pro"],
+    displayNameStyle: "provider-model",
+  };
+}
+
 function officialProvider(): Provider {
   return {
     id: "codex-official",
@@ -697,13 +714,15 @@ function createQueryClient() {
   });
 }
 
-async function mountWorkspaceFromPersistedPlan(): Promise<
-  RenderResult & { selectedPlan: Provider }
-> {
+async function mountWorkspaceFromPersistedPlan({
+  strictMode = false,
+}: {
+  strictMode?: boolean;
+} = {}): Promise<RenderResult & { selectedPlan: Provider }> {
   const loaded = await providersApi.getAll("codex");
   const selectedPlan = loaded.router;
   const queryClient = createQueryClient();
-  const result = render(
+  const workspace = (
     <QueryClientProvider client={queryClient}>
       <CodexRouterWorkspacePage
         providers={Object.values(loaded)}
@@ -716,7 +735,10 @@ async function mountWorkspaceFromPersistedPlan(): Promise<
         onDeletePlan={vi.fn()}
         onCreateProvider={vi.fn()}
       />
-    </QueryClientProvider>,
+    </QueryClientProvider>
+  );
+  const result = render(
+    strictMode ? <StrictMode>{workspace}</StrictMode> : workspace,
   );
   await screen.findByRole("tab", { name: "子 Agent" });
   if (selectedPlan.settingsConfig.codexRouting.subagentV2) {
@@ -1402,7 +1424,7 @@ describe("Codex Sub-Agent V2 review round 1 regressions", () => {
     ).toBeVisible();
     expect(flash.getByText("repository-scout：generated")).toBeVisible();
     expect(
-      flash.getByText(previewFixture.tomlPreview, {
+      await flash.findByText(previewFixture.tomlPreview, {
         normalizer: getDefaultNormalizer({
           trim: false,
           collapseWhitespace: false,
@@ -1415,7 +1437,7 @@ describe("Codex Sub-Agent V2 review round 1 regressions", () => {
     ).toBeGreaterThan(0);
     expect(pro.getByText("offline-writer：unroutable")).toBeVisible();
     expect(
-      pro.getByText(proPreviewFixture.tomlPreview, {
+      await pro.findByText(proPreviewFixture.tomlPreview, {
         normalizer: getDefaultNormalizer({
           trim: false,
           collapseWhitespace: false,
@@ -1571,6 +1593,21 @@ describe("Codex Sub-Agent V2 new-plan capability defaults", () => {
   });
 
   it("creates an official-only workspace plan without phantom profiles and adopts backend initialization", async () => {
+    ipcState.statusResponse = {
+      generationSource: "configured_profiles",
+      warnings: [],
+      profiles: [
+        {
+          profileKey: "gpt-5.6-sol",
+          model: "gpt-5.6-sol",
+          providerKind: "official",
+          enabled: false,
+          routable: true,
+          status: "disabled",
+          warnings: [],
+        },
+      ],
+    };
     ipcState.nextInitializedProvider = {
       id: "backend-will-adopt-persisted-id",
       name: "Backend Initialized Official Plan",
@@ -1619,7 +1656,9 @@ describe("Codex Sub-Agent V2 new-plan capability defaults", () => {
       }),
     );
     await user.click(screen.getByRole("tab", { name: "子 Agent" }));
-    await user.click(screen.getByRole("button", { name: /官方模型（高级）/ }));
+    await user.click(
+      await screen.findByRole("button", { name: /官方模型（高级）/ }),
+    );
     expect(await openProfile(user, "gpt-5.6-sol")).toBeInTheDocument();
     expect(
       screen.queryByRole("region", {
@@ -3206,6 +3245,94 @@ describe("Codex Sub-Agent V2 persisted interactions", () => {
     );
   });
 
+  it("coalesces Strict Mode diagnostics into one backend batch", async () => {
+    seedPersistedPlan(true);
+    await mountWorkspaceFromPersistedPlan({ strictMode: true });
+
+    await waitFor(() => {
+      const commands = vi.mocked(invoke).mock.calls.map(([command]) => command);
+      expect(
+        commands.filter(
+          (command) => command === "get_codex_subagent_reasoning_capabilities",
+        ),
+      ).toHaveLength(1);
+      expect(
+        commands.filter(
+          (command) => command === "get_codex_subagent_profile_statuses",
+        ),
+      ).toHaveLength(1);
+      expect(
+        commands.filter(
+          (command) => command === "preview_codex_subagent_profile",
+        ),
+      ).toHaveLength(1);
+    });
+  });
+
+  it("previews only the open profile instead of fanning out across the catalog", async () => {
+    seedPersistedPlan(true);
+    const persisted = ipcState.providers.router.settingsConfig.codexRouting
+      .subagentV2 as CodexSubagentV2Config;
+    for (let index = 0; index < 120; index += 1) {
+      persisted.profiles[`bulk-profile-${index}`] = {
+        ...preservedValidProfile(),
+        model: `bulk-model-${index}`,
+        enabled: false,
+      };
+    }
+
+    await mountWorkspaceFromPersistedPlan();
+
+    await waitFor(() =>
+      expect(
+        vi
+          .mocked(invoke)
+          .mock.calls.filter(
+            ([command]) => command === "preview_codex_subagent_profile",
+          ),
+      ).toHaveLength(1),
+    );
+    expect(
+      screen.getByRole("button", { name: "加载更多 40 个档案" }),
+    ).toBeInTheDocument();
+  });
+
+  it("does not reload catalog reasoning capabilities for profile-only edits", async () => {
+    const user = userEvent.setup();
+    await renderWorkspace();
+    await waitFor(() =>
+      expect(
+        vi
+          .mocked(invoke)
+          .mock.calls.filter(
+            ([command]) =>
+              command === "get_codex_subagent_reasoning_capabilities",
+          ),
+      ).toHaveLength(1),
+    );
+
+    const flash = within(await openAdvancedFields(user));
+    await chooseOption(user, flash.getByLabelText("模型推理强度"), "high");
+
+    await waitFor(() =>
+      expect(
+        vi
+          .mocked(invoke)
+          .mock.calls.filter(
+            ([command]) => command === "get_codex_subagent_profile_statuses",
+          ),
+      ).toHaveLength(2),
+    );
+    expect(
+      vi
+        .mocked(invoke)
+        .mock.calls.filter(
+          ([command]) =>
+            command === "get_codex_subagent_reasoning_capabilities",
+        ),
+    ).toHaveLength(1);
+  });
+
   it("uses backend capability evidence to restrict DeepSeek fixed effort choices", async () => {
     const user = userEvent.setup();
     await renderWorkspace();
@@ -3567,15 +3694,11 @@ describe("Codex Sub-Agent V2 preview visible output", () => {
 
   it("requests preview with exact settingsConfig, model, and profile", async () => {
     const { selectedPlan } = await renderWorkspace();
-    const projectedModelCatalog = {
-      ...provider().settingsConfig.modelCatalog,
-      spawnAgentModels: ["deepseek-v4-flash", "deepseek-v4-pro"],
-    };
     await waitFor(() =>
       expect(invoke).toHaveBeenCalledWith("preview_codex_subagent_profile", {
         settingsConfig: {
           ...selectedPlan.settingsConfig,
-          modelCatalog: projectedModelCatalog,
+          modelCatalog: projectedCatalog(),
         },
         model: "deepseek-v4-flash",
         profile: {
@@ -3649,17 +3772,13 @@ describe("Codex Sub-Agent V2 authoritative status visible output", () => {
 
   it("requests authoritative statuses with the exact settingsConfig-only payload", async () => {
     const { selectedPlan } = await renderWorkspace();
-    const projectedModelCatalog = {
-      ...provider().settingsConfig.modelCatalog,
-      spawnAgentModels: ["deepseek-v4-flash", "deepseek-v4-pro"],
-    };
     await waitFor(() =>
       expect(invoke).toHaveBeenCalledWith(
         "get_codex_subagent_profile_statuses",
         {
           settingsConfig: {
             ...selectedPlan.settingsConfig,
-            modelCatalog: projectedModelCatalog,
+            modelCatalog: projectedCatalog(),
           },
         },
       ),

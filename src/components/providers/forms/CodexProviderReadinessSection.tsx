@@ -83,6 +83,14 @@ export function CodexProviderReadinessSection({
     normalizedModels[0]?.model.trim() ||
     tr("notSelected", "Not selected");
   const hasModels = normalizedModels.length > 0;
+  const responsesModels = normalizedModels.filter(
+    (model) => (model.apiFormat ?? model.api_format) === "openai_responses",
+  );
+  const chatModels = normalizedModels.filter(
+    (model) => (model.apiFormat ?? model.api_format) === "openai_chat",
+  );
+  const responsesCount = responsesModels.length;
+  const chatCount = chatModels.length;
   const validationPassed = validationTone === "success";
   const ready = hasModels && validationPassed;
   const isCatalogActionRunning = isSyncingModels || isRefreshingModels;
@@ -209,7 +217,9 @@ export function CodexProviderReadinessSection({
             {tr("upstreamProtocol", "Upstream Protocol")}
           </p>
           <p className="mt-1 text-sm font-medium text-foreground">
-            {apiFormatLabel(apiFormat)}
+            {responsesCount > 0 && chatCount > 0
+              ? tr("mixedProtocol", "Mixed (per model)")
+              : apiFormatLabel(apiFormat)}
           </p>
         </div>
         <div className="rounded-md border border-border-default bg-background/70 p-3">
@@ -240,6 +250,54 @@ export function CodexProviderReadinessSection({
             )}
           </p>
         </div>
+        {responsesCount > 0 && chatCount > 0 && (
+          <div className="rounded-md border border-border-default bg-background/70 p-3 sm:col-span-2 lg:col-span-4">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <p className="text-xs text-muted-foreground">
+                {tr("protocolGroups", "Protocol groups")}
+              </p>
+              <span className="text-xs text-muted-foreground">
+                {tr("automaticRouting", "Automatic per-model routing")}
+              </span>
+            </div>
+            <div className="mt-2 grid gap-2 sm:grid-cols-2">
+              <div className="min-w-0 rounded border border-emerald-500/30 bg-emerald-500/10 px-3 py-2">
+                <p className="text-sm font-medium text-foreground">
+                  {tr("responsesGroup", "Responses: {{count}} models", {
+                    count: responsesCount,
+                  })}
+                </p>
+                <p
+                  className="mt-1 truncate font-mono text-[11px] text-muted-foreground"
+                  title={responsesModels.map((model) => model.model).join(", ")}
+                >
+                  {responsesModels
+                    .slice(0, 4)
+                    .map((model) => model.model)
+                    .join(", ")}
+                  {responsesCount > 4 ? ` +${responsesCount - 4}` : ""}
+                </p>
+              </div>
+              <div className="min-w-0 rounded border border-sky-500/30 bg-sky-500/10 px-3 py-2">
+                <p className="text-sm font-medium text-foreground">
+                  {tr("chatGroup", "Chat Completions: {{count}} models", {
+                    count: chatCount,
+                  })}
+                </p>
+                <p
+                  className="mt-1 truncate font-mono text-[11px] text-muted-foreground"
+                  title={chatModels.map((model) => model.model).join(", ")}
+                >
+                  {chatModels
+                    .slice(0, 4)
+                    .map((model) => model.model)
+                    .join(", ")}
+                  {chatCount > 4 ? ` +${chatCount - 4}` : ""}
+                </p>
+              </div>
+            </div>
+          </div>
+        )}
       </div>
 
       <div className="rounded-md border border-border-default bg-background/70 p-3">

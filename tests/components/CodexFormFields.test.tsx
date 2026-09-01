@@ -9,7 +9,9 @@ import {
 import { useState, type ReactNode } from "react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  applyCodexProtocolGroups,
   buildSplitCodexProviderSuggestionForFetchedModels,
+  catalogInputCapabilityState,
   CodexFormFields,
   splitFetchedModelsByLikelyCodexProtocol,
 } from "@/components/providers/forms/CodexFormFields";
@@ -381,6 +383,7 @@ function renderCatalogHarness(
     allowModelMenuProjectionToggle?: boolean;
     openAdvancedOptions?: boolean;
     presetCatalogModels?: CodexCatalogModel[];
+    knownCatalogModels?: CodexCatalogModel[];
     onProviderSplitSuggestionChange?: ReturnType<typeof vi.fn>;
     initialApiKeyGroups?: CodexApiKeyGroup[];
     isXaiOauthPreset?: boolean;
@@ -447,6 +450,7 @@ function renderCatalogHarness(
         onApiFormatChange={onApiFormatChange}
         catalogModels={catalog}
         presetCatalogModels={options.presetCatalogModels}
+        knownCatalogModels={options.knownCatalogModels}
         onCatalogModelsChange={handleCatalogChange}
         spawnAgentModels={[]}
         onSpawnAgentModelsChange={vi.fn()}
@@ -592,6 +596,7 @@ function renderAutoSplitHarness() {
     defaultRouteId: "",
     routes: [],
   };
+  let latestCatalog: CodexCatalogModel[] = [];
 
   function Harness() {
     const [catalog, setCatalog] = useState<CodexCatalogModel[]>([]);
@@ -599,6 +604,7 @@ function renderAutoSplitHarness() {
 
     /// 测试壳同时接住 catalog 和 routing 回写，模拟第一次配置 provider 时的受控状态。
     const handleCatalogChange = (next: CodexCatalogModel[]) => {
+      latestCatalog = next;
       onCatalogChange(next);
       setCatalog(next);
     };
@@ -654,6 +660,7 @@ function renderAutoSplitHarness() {
   return {
     ...renderResult,
     latestRouting: () => latestRouting,
+    latestCatalog: () => latestCatalog,
     onCatalogChange,
     onRoutingChange,
     onTakeoverEnabledChange,
@@ -663,6 +670,43 @@ function renderAutoSplitHarness() {
 }
 
 describe("CodexFormFields local model routing", () => {
+  it("does not represent missing input capability metadata as text-only", () => {
+    expect(catalogInputCapabilityState({ model: "unknown-model" })).toBe(
+      "unknown",
+    );
+    renderCatalogHarness([{ model: "unknown-model" }]);
+
+    expect(screen.getByText("Unknown")).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", {
+        name: "unknown-model 文本与图像",
+      }),
+    ).toHaveAttribute("aria-pressed", "false");
+    expect(
+      screen.getByRole("button", {
+        name: "unknown-model 仅文本",
+      }),
+    ).toHaveAttribute("aria-pressed", "false");
+  });
+
+  it("renders route availability as an accessible status light", () => {
+    renderCatalogHarness([
+      { model: "routable-model" },
+      { model: "excluded-model", enabled: false },
+    ]);
+
+    expect(
+      screen.getByRole("status", {
+        name: "routable-model: Enabled",
+      }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("status", {
+        name: "excluded-model: Disabled",
+      }),
+    ).toBeInTheDocument();
+  });
+
   it("keeps the model catalog in normal settings before model reasoning", () => {
     renderCatalogHarness([{ model: "qwen3.8" }], {
       openAdvancedOptions: false,
@@ -732,6 +776,86 @@ describe("CodexFormFields local model routing", () => {
         }),
       );
     });
+  });
+
+  it("hydrates missing aggregator capabilities from trusted provider catalogs", async () => {
+    const { latestCatalog } = renderCatalogHarness(
+      [
+        { model: "gpt-5.6-luna", contextWindow: 272000 },
+        { model: "MiniMax-M3", contextWindow: 1000000 },
+        { model: "unreported-model" },
+      ],
+      {
+        knownCatalogModels: [
+          {
+            model: "gpt-5.6-luna",
+            inputModalities: ["text", "image"],
+            supportsImage: true,
+          },
+          {
+            model: "MiniMax-M3",
+            inputModalities: ["text", "image"],
+            supportsImage: true,
+          },
+        ],
+      },
+    );
+
+    expect(
+      screen.getByRole("button", { name: "gpt-5.6-luna 文本与图像" }),
+    ).toHaveAttribute("aria-pressed", "true");
+    expect(
+      screen.getByRole("button", { name: "MiniMax-M3 文本与图像" }),
+    ).toHaveAttribute("aria-pressed", "true");
+    expect(screen.getByText("Unknown")).toBeInTheDocument();
+
+    await waitFor(() => {
+      expect(latestCatalog()[0]).toEqual(
+        expect.objectContaining({
+          inputModalities: ["text", "image"],
+          supportsImage: true,
+          textOnly: false,
+        }),
+      );
+      expect(latestCatalog()[1]).toEqual(
+        expect.objectContaining({
+          inputModalities: ["text", "image"],
+          supportsImage: true,
+          textOnly: false,
+        }),
+      );
+      expect(catalogInputCapabilityState(latestCatalog()[2])).toBe("unknown");
+    });
+  });
+
+  it("does not guess when trusted catalogs disagree about a model", () => {
+    renderCatalogHarness([{ model: "ambiguous-model" }], {
+      knownCatalogModels: [
+        { model: "ambiguous-model", supportsImage: true },
+        { model: "ambiguous-model", supportsImage: false },
+      ],
+    });
+
+    expect(screen.getByText("Unknown")).toBeInTheDocument();
+  });
+
+  it("uses maintained preset capability when the saved row has no capability metadata", () => {
+    const preset: CodexCatalogModel = {
+      model: "preset-vision-model",
+      inputModalities: ["text", "image"],
+      supportsImage: true,
+      textOnly: false,
+    };
+    renderCatalogHarness([{ model: "preset-vision-model" }], {
+      presetCatalogModels: [preset],
+    });
+
+    expect(screen.getAllByText("文本与图像").length).toBeGreaterThan(0);
+    expect(
+      screen.getByRole("button", {
+        name: "preset-vision-model 文本与图像",
+      }),
+    ).toHaveAttribute("aria-pressed", "true");
   });
 
   it("keeps Ultra independent from automatic reasoning discovery", async () => {
@@ -989,7 +1113,63 @@ describe("CodexFormFields local model routing", () => {
       providerName: "Relay",
       responsesModels: ["gpt-5.5"],
       chatModels: ["qwen3.6"],
+      apiFormatSource: "inferred",
     });
+  });
+
+  it("applies detected protocol groups and replaces stale row protocol metadata", () => {
+    expect(
+      applyCodexProtocolGroups(
+        [
+          {
+            model: "gpt-alias",
+            upstreamModel: "gpt-5.5",
+            apiFormat: "openai_chat",
+          },
+          {
+            model: "qwen-alias",
+            upstreamModel: "qwen3.6",
+            apiFormat: "openai_responses",
+          },
+        ],
+        ["gpt-5.5"],
+        ["qwen3.6"],
+        "probe",
+      ),
+    ).toMatchObject([
+      {
+        model: "gpt-alias",
+        apiFormat: "openai_responses",
+        apiFormatSource: "probe",
+      },
+      {
+        model: "qwen-alias",
+        apiFormat: "openai_chat",
+        apiFormatSource: "probe",
+      },
+    ]);
+  });
+
+  it("clears protocol metadata for rows absent from a fresh detection", () => {
+    const [row] = applyCodexProtocolGroups(
+      [
+        {
+          model: "legacy",
+          upstreamModel: "legacy",
+          apiFormat: "openai_chat",
+          api_format: "openai_chat",
+          apiFormatSource: "probe",
+          api_format_source: "probe",
+        },
+      ],
+      [],
+      [],
+      "probe",
+    );
+    expect(row).not.toHaveProperty("apiFormat");
+    expect(row).not.toHaveProperty("api_format");
+    expect(row).not.toHaveProperty("apiFormatSource");
+    expect(row).not.toHaveProperty("api_format_source");
   });
 
   it("prompts before preparing split providers after fetching mixed relay models", async () => {
@@ -999,6 +1179,7 @@ describe("CodexFormFields local model routing", () => {
     ]);
     const {
       latestRouting,
+      latestCatalog,
       onRoutingChange,
       onTakeoverEnabledChange,
       onApiFormatChange,
@@ -1008,28 +1189,34 @@ describe("CodexFormFields local model routing", () => {
     fireEvent.click(screen.getByRole("button", { name: "Sync Models" }));
 
     expect(await screen.findByText("检测到混合协议模型")).toBeInTheDocument();
-    expect(screen.getByText("Relay-responses")).toBeInTheDocument();
-    expect(screen.getByText("Relay-chat")).toBeInTheDocument();
+    expect(screen.getByText("Relay / Responses")).toBeInTheDocument();
+    expect(screen.getByText("Relay / Chat Completions")).toBeInTheDocument();
     expect(onRoutingChange).not.toHaveBeenCalled();
     expect(latestRouting().routes).toHaveLength(0);
 
     fireEvent.click(
-      screen.getByRole("button", { name: "确认生成两个 provider" }),
+      screen.getByRole("button", { name: "使用一个 provider，自动路由" }),
     );
 
     await waitFor(() => {
-      expect(onProviderSplitSuggestionChange).toHaveBeenCalledWith(
-        expect.objectContaining({
-          providerName: "Relay",
-          responsesModels: ["gpt-5.5"],
-          chatModels: ["qwen3.6"],
-        }),
-      );
+      expect(latestCatalog()).toMatchObject([
+        {
+          model: "gpt-5.5",
+          apiFormat: "openai_responses",
+          apiFormatSource: "inferred",
+        },
+        {
+          model: "qwen3.6",
+          apiFormat: "openai_chat",
+          apiFormatSource: "inferred",
+        },
+      ]);
     });
+    expect(onProviderSplitSuggestionChange).toHaveBeenLastCalledWith(null);
     expect(onRoutingChange).not.toHaveBeenCalled();
     expect(latestRouting().routes).toHaveLength(0);
     expect(onTakeoverEnabledChange).toHaveBeenCalledWith(true);
-    expect(onApiFormatChange).not.toHaveBeenCalled();
+    expect(onApiFormatChange).toHaveBeenCalledWith("openai_responses");
   });
 
   it("keeps routing and provider split untouched when mixed relay split prompt is cancelled", async () => {
@@ -1048,7 +1235,7 @@ describe("CodexFormFields local model routing", () => {
     fireEvent.click(screen.getByRole("button", { name: "Sync Models" }));
 
     expect(await screen.findByText("检测到混合协议模型")).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: "暂不拆分" }));
+    fireEvent.click(screen.getByRole("button", { name: "暂不应用" }));
 
     await waitFor(() => {
       expect(screen.queryByText("检测到混合协议模型")).not.toBeInTheDocument();
@@ -1361,7 +1548,7 @@ describe("CodexFormFields local model routing", () => {
       return createDeepProbeOutcome(records);
     });
     const onProviderSplitSuggestionChange = vi.fn();
-    const { onApiFormatChange } = renderCatalogHarness(
+    const { latestCatalog, onApiFormatChange } = renderCatalogHarness(
       [
         { model: "gpt-5.5", upstreamModel: "gpt-5.5" },
         { model: "qwen3.6", upstreamModel: "qwen3.6" },
@@ -1390,13 +1577,25 @@ describe("CodexFormFields local model routing", () => {
     ).toHaveTextContent("Failed");
 
     fireEvent.click(
-      screen.getByRole("button", { name: "确认生成两个 provider" }),
+      screen.getByRole("button", { name: "使用一个 provider，自动路由" }),
     );
-    expect(onProviderSplitSuggestionChange).toHaveBeenCalledWith({
-      providerName: "Relay",
-      responsesModels: ["gpt-5.5"],
-      chatModels: ["qwen3.6"],
+    await waitFor(() => {
+      expect(latestCatalog()).toMatchObject([
+        {
+          model: "gpt-5.5",
+          apiFormat: "openai_responses",
+          apiFormatSource: "probe",
+        },
+        {
+          model: "qwen3.6",
+          apiFormat: "openai_chat",
+          apiFormatSource: "probe",
+        },
+        { model: "glm-4.5" },
+      ]);
     });
+    expect(onProviderSplitSuggestionChange).toHaveBeenLastCalledWith(null);
+    expect(onApiFormatChange).toHaveBeenCalledWith("openai_responses");
   });
 
   it("opens the protocol probe confirmation above the full screen provider panel", () => {
@@ -1495,11 +1694,24 @@ describe("CodexFormFields local model routing", () => {
         contextWindow: "128000",
         inputModalities: ["text"],
         supportsImage: false,
+        apiFormat: "openai_responses",
+        apiFormatSource: "probe",
         enabled: false,
+      },
+      {
+        model: "my-qwen",
+        upstreamModel: "qwen3.6",
+        apiFormat: "openai_chat",
+        apiFormatSource: "probe",
       },
     ]);
 
-    fireEvent.click(screen.getByRole("button", { name: "Refresh Existing" }));
+    const refreshButton = screen
+      .getAllByText("Refresh Existing")
+      .map((node) => node.closest("button"))
+      .find((node): node is HTMLButtonElement => node !== null);
+    expect(refreshButton).toBeDefined();
+    fireEvent.click(refreshButton!);
 
     await waitFor(() => {
       expect(latestCatalog()[0]).toMatchObject({
@@ -1511,6 +1723,77 @@ describe("CodexFormFields local model routing", () => {
         textOnly: false,
         enabled: false,
       });
+    });
+    expect(screen.queryByText("检测到混合协议模型")).not.toBeInTheDocument();
+    expect(latestCatalog()).toMatchObject([
+      {
+        model: "my-gpt",
+        apiFormat: "openai_responses",
+        apiFormatSource: "probe",
+      },
+      {
+        model: "my-qwen",
+        apiFormat: "openai_chat",
+        apiFormatSource: "probe",
+      },
+    ]);
+  });
+
+  it("dismisses a stale mixed-protocol suggestion when refreshing existing models", async () => {
+    vi.mocked(fetchModelsForConfig)
+      .mockResolvedValueOnce([
+        { id: "gpt-5.5", ownedBy: null, contextWindow: 272000 },
+        { id: "qwen3.6", ownedBy: null, contextWindow: 128000 },
+      ])
+      .mockResolvedValueOnce([
+        {
+          id: "gpt-5.5",
+          ownedBy: null,
+          contextWindow: 300000,
+          inputModalities: ["text", "image"],
+          supportsImage: true,
+        },
+        { id: "qwen3.6", ownedBy: null, contextWindow: 160000 },
+      ]);
+    const { latestCatalog } = renderCatalogHarness([
+      {
+        model: "my-gpt",
+        upstreamModel: "gpt-5.5",
+        apiFormat: "openai_responses",
+        apiFormatSource: "probe",
+      },
+      {
+        model: "my-qwen",
+        upstreamModel: "qwen3.6",
+        apiFormat: "openai_chat",
+        apiFormatSource: "probe",
+      },
+    ]);
+
+    fireEvent.click(screen.getByRole("button", { name: "Sync Models" }));
+    expect(await screen.findByText("检测到混合协议模型")).toBeInTheDocument();
+
+    const dialog = screen.getByRole("dialog");
+    fireEvent.click(
+      within(dialog).getByRole("button", {
+        name: /Refresh Existing|刷新现有模型/i,
+      }),
+    );
+
+    await waitFor(() => {
+      expect(screen.queryByText("检测到混合协议模型")).not.toBeInTheDocument();
+      expect(latestCatalog()[0]).toMatchObject({
+        model: "my-gpt",
+        contextWindow: "300000",
+        apiFormat: "openai_responses",
+        apiFormatSource: "probe",
+      });
+    });
+    expect(latestCatalog()[1]).toMatchObject({
+      model: "my-qwen",
+      contextWindow: "160000",
+      apiFormat: "openai_chat",
+      apiFormatSource: "probe",
     });
   });
 

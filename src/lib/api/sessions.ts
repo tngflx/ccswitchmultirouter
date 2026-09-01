@@ -12,6 +12,14 @@ export interface DeleteSessionResult extends DeleteSessionOptions {
   error?: string;
 }
 
+export interface PurgeArchivedSessionsResult {
+  attempted: number;
+  deleted: number;
+  failed: number;
+  indexCleanupWarnings: number;
+  errors: string[];
+}
+
 export const sessionsApi = {
   async list(): Promise<SessionMeta[]> {
     return await invoke("list_sessions");
@@ -37,6 +45,12 @@ export const sessionsApi = {
     items: DeleteSessionOptions[],
   ): Promise<DeleteSessionResult[]> {
     return await invoke("delete_sessions", { items });
+  },
+
+  async purgeArchived(
+    providerId: string,
+  ): Promise<PurgeArchivedSessionsResult> {
+    return await invoke("purge_archived_sessions", { providerId });
   },
 
   async launchTerminal(options: {

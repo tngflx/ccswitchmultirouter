@@ -13,7 +13,10 @@ import {
 } from "@/lib/api/model-fetch";
 import type { CodexRoutingProjectionStatus } from "@/lib/api/providers";
 import { proxyApi } from "@/lib/api/proxy";
+import { settingsApi } from "@/lib/api/settings";
 import type { Provider } from "@/types";
+import type { RequestHealthSnapshot } from "@/types/proxy";
+import { RequestHealthPanel } from "@/components/settings/RequestHealthPanel";
 import type { PaginatedLogs, RequestLog } from "@/types/usage";
 import {
   applyMultiRouterSettingsDraft,
@@ -22,7 +25,6 @@ import {
   buildModelCatalogForRoutes,
   collectRoutedCatalogModels,
   codexCatalogProviderName,
-  compactCodexProviderLabel,
   formatCodexCatalogModelLabel,
   sortCodexCatalogModels,
   CodexRouterWorkspacePage,
@@ -30,6 +32,7 @@ import {
   createDraftRoutingPlan,
   dedupeCodexRoutesBySemanticProvider,
   isRoutingPlan,
+  isCodexProtocolFallback,
   mergeRoutePickerDraftIds,
   normalizeCodexRouteForSave,
   normalizeCodexRoutesForVisibleModelAliases,
@@ -56,6 +59,14 @@ vi.mock("@/lib/api/proxy", () => ({
     }),
     diagnoseCodexMultiRouter: vi.fn(),
     unlockCodexModelPicker: vi.fn(),
+    getRequestHealthDiagnostics: vi.fn(),
+  },
+}));
+
+vi.mock("@/lib/api/settings", () => ({
+  settingsApi: {
+    get: vi.fn(),
+    save: vi.fn(),
   },
 }));
 
@@ -291,11 +302,68 @@ function createCodexProxyLog(overrides: Partial<RequestLog> = {}): RequestLog {
   };
 }
 
+function createRequestHealthSnapshot(
+  overrides: Partial<RequestHealthSnapshot["diagnostics"][number]> = {},
+): RequestHealthSnapshot {
+  return {
+    config: {
+      enabled: true,
+      optimizationMode: "safe",
+      largeRequestThresholdBytes: 393216,
+      maxCodexInputTokens: 200000,
+    },
+    diagnostics: [
+      {
+        generatedAt: "2026-08-31T00:00:00Z",
+        traceId: "trace-1",
+        sessionId: "thread-1",
+        appType: "codex",
+        providerId: "provider-1",
+        providerName: "Provider One",
+        model: "gpt-test",
+        endpoint: "/responses",
+        originalBytes: 450000,
+        optimizedBytes: 440000,
+        bytesRemoved: 10000,
+        thresholdBytes: 393216,
+        thresholdExceeded: true,
+        estimatedInputTokens: 110000,
+        maxInputTokens: 200000,
+        tokenLimitExceeded: false,
+        blocked: false,
+        itemCount: 12,
+        largestItemBytes: 70000,
+        largestItemCategory: "function_call_output",
+        optimizationMode: "safe",
+        optimizationApplied: true,
+        compactionRequest: false,
+        compactionRecommended: true,
+        sessionClientProvided: true,
+        findings: [],
+        breakdown: [{ category: "message:user", itemCount: 2, bytes: 120000 }],
+        ...overrides,
+      },
+    ],
+  };
+}
+
 beforeEach(() => {
   requestLogsFixture.value = { data: [], isLoading: false };
   vi.mocked(fetchCodexOauthModels).mockReset();
   vi.mocked(fetchModelsForConfig).mockReset();
   vi.mocked(proxyApi.unlockCodexModelPicker).mockReset();
+  vi.mocked(proxyApi.getRequestHealthDiagnostics).mockReset();
+  vi.mocked(proxyApi.getRequestHealthDiagnostics).mockResolvedValue({
+    config: {
+      enabled: true,
+      optimizationMode: "safe",
+      largeRequestThresholdBytes: 393216,
+      maxCodexInputTokens: 200000,
+    },
+    diagnostics: [],
+  });
+  vi.mocked(settingsApi.get).mockReset();
+  vi.mocked(settingsApi.save).mockReset();
   vi.mocked(providersApi.add).mockResolvedValue(true);
   vi.mocked(providersApi.update).mockResolvedValue(true);
   vi.mocked(providersApi.getAll).mockResolvedValue({});
@@ -328,6 +396,79 @@ beforeEach(() => {
 
 afterEach(() => {
   vi.useRealTimers();
+});
+
+describe("Request Health panel", () => {
+  let previousLanguage: string;
+
+  beforeEach(async () => {
+    previousLanguage = i18n.language;
+    i18n.addResourceBundle("en", "translation", en, true, true);
+    await i18n.changeLanguage("en");
+  });
+
+  afterEach(async () => {
+    await i18n.changeLanguage(previousLanguage);
+  });
+
+  it("saves the toggle and threshold through the settings API", async () => {
+    const user = userEvent.setup();
+    vi.mocked(settingsApi.get).mockResolvedValue(
+      {} as Awaited<ReturnType<typeof settingsApi.get>>,
+    );
+    vi.mocked(settingsApi.save).mockResolvedValue(true);
+
+    render(
+      React.createElement(RequestHealthPanel, {
+        snapshot: createRequestHealthSnapshot(),
+        isRefreshing: false,
+        onRefresh: vi.fn(),
+        onSaved: vi.fn(),
+      }),
+    );
+
+    await user.click(screen.getByLabelText("Diagnostics enabled"));
+    await user.clear(screen.getByLabelText("Large request threshold (KB)"));
+    await user.type(
+      screen.getByLabelText("Large request threshold (KB)"),
+      "512",
+    );
+    await user.click(screen.getByRole("button", { name: "Save" }));
+
+    await waitFor(() =>
+      expect(settingsApi.save).toHaveBeenCalledWith(
+        expect.objectContaining({
+          requestHealth: expect.objectContaining({
+            enabled: false,
+            largeRequestThresholdBytes: 512 * 1024,
+          }),
+        }),
+      ),
+    );
+  });
+
+  it("does not expose background compaction or thread deletion controls", () => {
+    render(
+      React.createElement(RequestHealthPanel, {
+        snapshot: createRequestHealthSnapshot(),
+        isRefreshing: false,
+        onRefresh: vi.fn(),
+        onSaved: vi.fn(),
+      }),
+    );
+
+    expect(
+      screen.queryByRole("button", {
+        name: "Compact, continue & remove old",
+      }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByLabelText("Auto-compact idle Codex sessions"),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByLabelText("Block oversized Codex turns"),
+    ).not.toBeInTheDocument();
+  });
 });
 
 it("renders the MultiRouter main page in English without Chinese fallback text", async () => {
@@ -396,7 +537,7 @@ describe("Codex model display and sorting", () => {
     { model: "beta", displayName: "Beta", providerName: "Beta" },
   ];
 
-  it("keeps model ids visible while supporting compact display styles", () => {
+  it("keeps model ids visible while using compact provider display styles", () => {
     expect(codexCatalogProviderName(models[0])).toBe("Beta");
     expect(formatCodexCatalogModelLabel(models[0], "model")).toBe("Zeta");
     expect(formatCodexCatalogModelLabel(models[0], "model-provider")).toBe(
@@ -417,10 +558,6 @@ describe("Codex model display and sorting", () => {
       ),
     ).toBe("Zeta · Beta");
     expect(models[0].model).toBe("zeta");
-    expect(compactCodexProviderLabel("OpenRouter")).toBe("ORter");
-    expect(compactCodexProviderLabel("OpenCode Zen")).toBe("OCzen");
-    expect(compactCodexProviderLabel("DeepSeek")).toBe("DSeek");
-    expect(compactCodexProviderLabel("Qwen")).toBe("Qwen");
     expect(
       formatCodexCatalogModelLabel({
         model: "long-model-name",
@@ -428,6 +565,30 @@ describe("Codex model display and sorting", () => {
         providerName: "OpenRouter",
       }),
     ).toBe("[ORter] Long Model Name");
+    expect(
+      formatCodexCatalogModelLabel({
+        model: "gpt-5.6-sol-zmhub-responses",
+        displayName: "[Znses] gpt-5.6-sol",
+        providerName: "ZMHub Responses",
+      }),
+    ).toBe("[Znses] gpt-5.6-sol");
+  });
+
+  it("distinguishes provider fallback protocols from per-model classifications", () => {
+    expect(
+      isCodexProtocolFallback({
+        model: "legacy",
+        apiFormat: "openai_responses",
+        apiFormatSource: "provider",
+      }),
+    ).toBe(true);
+    expect(
+      isCodexProtocolFallback({
+        model: "classified",
+        apiFormat: "openai_chat",
+        apiFormatSource: "probe",
+      }),
+    ).toBe(false);
   });
 
   it("sorts deterministically by provider and model without mutating input", () => {
@@ -2859,7 +3020,6 @@ describe("Codex MultiRouter workspace route persistence helpers", () => {
     expect(selectors).toHaveLength(2);
     expect(selectors[0]).toHaveValue("provider-model");
     expect(selectors[1]).toHaveValue("custom");
-
     await user.selectOptions(selectors[0], "model-provider");
     await user.selectOptions(selectors[1], "provider-model");
 
@@ -3217,8 +3377,10 @@ describe("Codex MultiRouter workspace route persistence helpers", () => {
         model: "gpt-5.5-thirdparty",
         upstreamModel: "gpt-5.5",
         displayName: "Third-party GPT",
+        providerName: "Third-party GPT",
         contextWindow: 272000,
         apiFormat: "openai_responses",
+        apiFormatSource: "provider",
       },
     ]);
   });
@@ -3391,6 +3553,10 @@ describe("Codex MultiRouter workspace route persistence helpers", () => {
     expect(catalog.models.map((model) => model.model)).toEqual([
       "gpt-5.5",
       "gpt-5.5-relay-gpt",
+    ]);
+    expect(catalog.models.map((model) => model.providerName)).toEqual([
+      "OpenAI Official",
+      "Relay GPT",
     ]);
   });
 
@@ -3881,8 +4047,10 @@ describe("Codex MultiRouter workspace route persistence helpers", () => {
       {
         model: "qwen3.6",
         displayName: "Qwen 3.6",
+        providerName: "Qwen Local",
         contextWindow: 262144,
         apiFormat: "openai_chat",
+        apiFormatSource: "provider",
       },
       {
         model: "deepseek-v4-flash",
@@ -3891,7 +4059,9 @@ describe("Codex MultiRouter workspace route persistence helpers", () => {
         textOnly: true,
         supportsImage: false,
         apiFormat: "openai_chat",
+        apiFormatSource: "provider",
         capabilities: { inputModalities: ["text"], textOnly: true },
+        providerName: "DeepSeek",
       },
     ]);
     expect(savedPlan.settingsConfig.modelCatalog.spawnAgentModels).toEqual([
@@ -4031,6 +4201,7 @@ describe("Codex MultiRouter workspace route persistence helpers", () => {
       {
         model: "qwen3.6",
         displayName: "Qwen 3.6",
+        providerName: "Qwen Local vLLM",
         contextWindow: 262144,
       },
     ]);
@@ -4085,6 +4256,7 @@ describe("Codex MultiRouter workspace route persistence helpers", () => {
 
     expect(rebuilt.models).toContainEqual({
       model: "gpt-5.6-sol",
+      providerName: "OpenAI Official Backup",
       contextWindow: 372000,
     });
   });
@@ -4186,8 +4358,8 @@ describe("Codex MultiRouter workspace route persistence helpers", () => {
     );
 
     expect(rebuilt.models).toEqual([
-      { model: "model-b", sortIndex: 0 },
-      { model: "model-a", sortIndex: 1 },
+      { model: "model-b", providerName: "Sorted Source", sortIndex: 0 },
+      { model: "model-a", providerName: "Sorted Source", sortIndex: 1 },
     ]);
     expect(rebuilt.spawnAgentModels).toEqual(["model-b", "model-a"]);
   });
@@ -4447,7 +4619,7 @@ describe("Codex MultiRouter workspace route persistence helpers", () => {
 
   // 当本地代理、Codex 接管、当前方案路由和最新真实转发都成功时，
   // 状态页应在原地给出完成结果，不再触发 App 进入历史修复。
-  it("shows runtime validation success in the workspace without a post-setup callback", async () => {
+  it("shows runtime validation success with request health in the status workspace", async () => {
     const source: Provider = {
       id: "codex-online-source",
       name: "Online Source",
@@ -4516,6 +4688,15 @@ describe("Codex MultiRouter workspace route persistence helpers", () => {
         screen.getByText("MultiRouter 已通过真实请求验证"),
       ).toBeInTheDocument(),
     );
+
+    const user = userEvent.setup();
+    const requestHealthButton = screen.getByRole("button", {
+      name: /request health/i,
+    });
+    expect(requestHealthButton).toBeVisible();
+
+    await user.click(requestHealthButton);
+    expect(screen.getByDisplayValue("200000")).toBeVisible();
   });
 
   it("shows stale projection details and lets the user resync with readable provider names", async () => {
@@ -4601,9 +4782,10 @@ describe("Codex MultiRouter workspace route persistence helpers", () => {
     await waitFor(() =>
       expect(screen.getByText("当前有效映射")).toBeInTheDocument(),
     );
+    expect(screen.getByText(/DeepSeek Relay: deepseek-v4/)).toBeInTheDocument();
     expect(
-      screen.getByText(/DeepSeek Relay \/ DeepSeek Relay/),
-    ).toBeInTheDocument();
+      screen.queryByText(/DeepSeek Relay \/ DeepSeek Relay/),
+    ).not.toBeInTheDocument();
     expect(
       screen.getByText(/deepseek-v4-flash → deepseek-v4-flash-0731/),
     ).toBeInTheDocument();
@@ -4685,6 +4867,8 @@ describe("Codex MultiRouter workspace route persistence helpers", () => {
       targetTitle: "Codex",
       targetUrl: "app://codex",
       modelCount: 1,
+      reasoningModelCount: 1,
+      modelsWithoutReasoningCount: 0,
       modelNames: ["unlock-model"],
       injected: true,
       launched: false,
@@ -4727,6 +4911,9 @@ describe("Codex MultiRouter workspace route persistence helpers", () => {
     expect(proxyApi.unlockCodexModelPicker).toHaveBeenCalledWith();
     expect(screen.getByText("模型菜单白名单已注入")).toBeInTheDocument();
     expect(
+      screen.getByText("reasoning=1/1 without-effort=0"),
+    ).toBeInTheDocument();
+    expect(
       screen.queryByText(
         "开启或确认 Codex 接管后会自动尝试一次；若当前 Desktop 已普通启动且菜单仍只显示“自定义”，请完全退出 Codex Desktop 后点击“解锁模型菜单”。CLI/app-server 的模型目录修复走 live config、model_catalog_json 和本地 /v1/models，不需要把小写 codex.exe 当 Desktop 启动。",
       ),
@@ -4756,6 +4943,8 @@ describe("Codex MultiRouter workspace route persistence helpers", () => {
         targetTitle: null,
         targetUrl: null,
         modelCount: 1,
+        reasoningModelCount: 0,
+        modelsWithoutReasoningCount: 1,
         modelNames: ["desktop-model"],
         injected: false,
         launched: false,
@@ -4770,6 +4959,8 @@ describe("Codex MultiRouter workspace route persistence helpers", () => {
         targetTitle: "Codex",
         targetUrl: "app://codex",
         modelCount: 1,
+        reasoningModelCount: 1,
+        modelsWithoutReasoningCount: 0,
         modelNames: ["desktop-model"],
         injected: true,
         launched: true,

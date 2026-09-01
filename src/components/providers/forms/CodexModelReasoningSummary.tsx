@@ -37,7 +37,7 @@ export function CodexModelReasoningSummary({
   const [requestedUltraSetup, setRequestedUltraSetup] = useState(false);
 
   return (
-    <div className="grid gap-3 rounded-md border bg-background p-3 text-xs lg:grid-cols-[minmax(10rem,1fr)_minmax(12rem,1.2fr)_minmax(16rem,1.2fr)_auto] lg:items-center">
+    <div className="grid gap-3 text-xs lg:grid-cols-[minmax(10rem,1fr)_minmax(12rem,1.2fr)_minmax(16rem,1.2fr)_auto] lg:items-center">
       <div className="min-w-0">
         <p className="font-medium text-foreground">{displayModel}</p>
       </div>

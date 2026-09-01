@@ -2,7 +2,7 @@ import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
   AddProviderDialog,
-  buildSplitCodexProviderData,
+  buildMixedCodexProviderData,
 } from "@/components/providers/AddProviderDialog";
 import type { Provider } from "@/types";
 import type { ProviderFormValues } from "@/components/providers/forms/ProviderForm";
@@ -132,68 +132,60 @@ describe("AddProviderDialog", () => {
     });
   });
 
-  it("确认 Codex 混合协议拆分后构造两个 provider", () => {
-    const split = {
+  it("keeps mixed Codex protocols under one provider with per-model routing", () => {
+    const providerData: Omit<Provider, "id"> = {
+      name: "Relay",
+      settingsConfig: {
+        modelCatalog: {
+          models: [
+            { model: "gpt-5.5", upstreamModel: "gpt-5.5" },
+            { model: "qwen3.6", upstreamModel: "qwen3.6" },
+          ],
+        },
+      },
+      meta: { apiFormat: "openai_responses" },
+    };
+
+    const mixed = buildMixedCodexProviderData(providerData, {
       providerName: "Relay",
       responsesModels: ["gpt-5.5"],
       chatModels: ["qwen3.6"],
-    };
-    const providerData: Omit<Provider, "id"> = {
-      name: "Relay",
-      websiteUrl: "https://relay.example",
-      settingsConfig: {
-        auth: { OPENAI_API_KEY: "sk-relay" },
-        config: 'model = "gpt-5.5"\nwire_api = "responses"',
-        modelCatalog: {
-          models: [
-            {
-              model: "gpt-5.5",
-              upstreamModel: "gpt-5.5",
-              displayName: "GPT",
-            },
-            {
-              model: "qwen3.6",
-              upstreamModel: "qwen3.6",
-              displayName: "Qwen",
-            },
-          ],
-          spawnAgentModels: ["gpt-5.5", "qwen3.6"],
-        },
-      },
-      meta: { apiFormat: "openai_responses" },
-    };
+      apiFormatSource: "inferred",
+    });
 
-    const responsesProvider = buildSplitCodexProviderData(
-      providerData,
-      split,
-      "responses",
-    );
-    const chatProvider = buildSplitCodexProviderData(
-      providerData,
-      split,
-      "chat",
+    expect(mixed.name).toBe("Relay");
+    expect(mixed.meta).toMatchObject({
+      apiFormat: "openai_responses",
+      apiFormatSource: "inferred",
+    });
+    expect(mixed.settingsConfig.modelCatalog).toMatchObject({
+      models: [
+        {
+          model: "gpt-5.5",
+          apiFormat: "openai_responses",
+          apiFormatSource: "inferred",
+        },
+        {
+          model: "qwen3.6",
+          apiFormat: "openai_chat",
+          apiFormatSource: "inferred",
+        },
+      ],
+    });
+  });
+
+  it("labels the Codex flow as adding a model source rather than creating a router", () => {
+    render(
+      <AddProviderDialog
+        open
+        onOpenChange={vi.fn()}
+        appId="codex"
+        onSubmit={vi.fn()}
+      />,
     );
 
-    expect(responsesProvider).toMatchObject({
-      name: "Relay-responses",
-      meta: { apiFormat: "openai_responses" },
-      settingsConfig: {
-        modelCatalog: {
-          models: [{ model: "gpt-5.5" }],
-          spawnAgentModels: ["gpt-5.5"],
-        },
-      },
-    });
-    expect(chatProvider).toMatchObject({
-      name: "Relay-chat",
-      meta: { apiFormat: "openai_chat" },
-      settingsConfig: {
-        modelCatalog: {
-          models: [{ model: "qwen3.6" }],
-          spawnAgentModels: ["qwen3.6"],
-        },
-      },
-    });
+    expect(screen.getByText("Add Codex model source")).toBeInTheDocument();
+    expect(screen.queryByText("Create MultiRouter")).not.toBeInTheDocument();
   });
 
   it("新建 Grok Build 自定义供应商时不补默认 Grok 图标", async () => {

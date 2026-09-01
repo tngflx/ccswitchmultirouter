@@ -379,6 +379,53 @@ describe("SessionManagerPage", () => {
     deleteManySpy.mockRestore();
   });
 
+  it("preselects archived Codex sessions for the normal batch delete flow", async () => {
+    setSessionFixtures(
+      [
+        {
+          providerId: "codex",
+          sessionId: "archived-session-1",
+          title: "Archived Session",
+          projectDir: "/mock/codex",
+          sourcePath:
+            "C:\\Users\\test\\.codex\\archived_sessions\\archived-session-1.jsonl",
+          resumeCommand: "codex resume archived-session-1",
+        },
+      ],
+      {},
+    );
+    const deleteSpy = vi.spyOn(sessionsApi, "delete").mockResolvedValue(true);
+
+    renderPage();
+
+    const purgeButton = await screen.findByRole("button", {
+      name: /选择所有已归档的 Codex 会话/i,
+    });
+    fireEvent.click(purgeButton);
+
+    expect(
+      screen.getByRole("button", { name: /批量删除/i }),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/已选 1 项/)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: /批量删除/i }));
+
+    const dialog = screen.getByTestId("confirm-dialog");
+    fireEvent.click(within(dialog).getByRole("button", { name: /删除会话/i }));
+
+    await waitFor(() =>
+      expect(deleteSpy).toHaveBeenCalledWith({
+        providerId: "codex",
+        sessionId: "archived-session-1",
+        sourcePath:
+          "C:\\Users\\test\\.codex\\archived_sessions\\archived-session-1.jsonl",
+      }),
+    );
+    expect(toastSuccessMock).toHaveBeenCalled();
+    expect(toastErrorMock).not.toHaveBeenCalled();
+
+    deleteSpy.mockRestore();
+  });
+
   it("keeps the exit batch mode button visible when search hides all sessions", async () => {
     renderPage();
 
@@ -785,4 +832,3 @@ describe("SessionManagerPage", () => {
     expect(toastSuccessMock).toHaveBeenCalled();
   });
 });
-

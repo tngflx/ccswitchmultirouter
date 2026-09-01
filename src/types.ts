@@ -432,6 +432,8 @@ export interface CodexCatalogModel {
   // Provider defaults remain authoritative when these fields are absent.
   apiFormat?: CodexApiFormat;
   api_format?: CodexApiFormat;
+  apiFormatSource?: "manual" | "probe" | "inferred" | string;
+  api_format_source?: "manual" | "probe" | "inferred" | string;
   codexCache?: CodexCacheConfig;
   codex_cache?: CodexCacheConfig;
   // User-defined picker order. Lower values appear first in Codex.
@@ -647,6 +649,12 @@ export interface Settings {
   enableStreamRetry?: boolean;
   streamRetryMode?: "off" | "safe" | "aggressive";
   streamRetryMaxAttempts?: number;
+  requestHealth?: {
+    enabled: boolean;
+    optimizationMode: "off" | "diagnose" | "safe";
+    largeRequestThresholdBytes: number;
+    maxCodexInputTokens: number;
+  };
   // 是否启用主页面本地代理功能（默认关闭）
   enableLocalProxy?: boolean;
   // User has confirmed the local proxy first-run notice

@@ -56,6 +56,9 @@ const TASK_STRENGTHS: Array<{ value: CodexSubagentTaskStrength }> = [
 type ProfileFilter = "enabled" | "draft" | "unroutable" | "all";
 type ProfileTone = "enabled-routable" | "draft" | "unroutable";
 
+const DIAGNOSTIC_DEBOUNCE_MS = 150;
+const PROFILE_PAGE_SIZE = 40;
+
 const PROFILE_FILTERS: Array<{ value: ProfileFilter }> = [
   { value: "enabled" },
   { value: "draft" },
@@ -471,6 +474,15 @@ function settingsForDiagnostics(
     : settings;
 }
 
+function settingsForReasoningCapabilities(
+  settings: Record<string, unknown>,
+): Record<string, unknown> {
+  if (!isRecord(settings.codexRouting)) return settings;
+  const codexRouting = { ...settings.codexRouting };
+  delete codexRouting.subagentV2;
+  return { ...settings, codexRouting };
+}
+
 function parseNicknames(value: string): string[] {
   return value
     .split(",")
@@ -543,6 +555,9 @@ export function CodexSubagentProfileEditor({
   const [statuses, setStatuses] = useState<CodexSubagentProfileStatuses | null>(
     null,
   );
+  const [resolvedStatusSettingsKey, setResolvedStatusSettingsKey] = useState<
+    string | null
+  >(null);
   const [statusError, setStatusError] = useState<string | null>(null);
   const [reasoningCapabilities, setReasoningCapabilities] =
     useState<CodexSubagentReasoningCapabilities>({});
@@ -559,6 +574,8 @@ export function CodexSubagentProfileEditor({
   const [profileFilter, setProfileFilter] = useState<ProfileFilter>("all");
   const [showOfficialProfiles, setShowOfficialProfiles] = useState(false);
   const [openProfileKey, setOpenProfileKey] = useState("");
+  const [visibleProfileLimit, setVisibleProfileLimit] =
+    useState(PROFILE_PAGE_SIZE);
   const backendAdoptedPersistedKey = useRef<{
     providerId: string;
     persistedKey: string;
@@ -597,6 +614,10 @@ export function CodexSubagentProfileEditor({
   }, [provider.id, usableProfileKeySignature, defaultOpenProfileKey]);
 
   useEffect(() => {
+    setVisibleProfileLimit(PROFILE_PAGE_SIZE);
+  }, [provider.id, profileSearch, profileFilter, showOfficialProfiles]);
+
+  useEffect(() => {
     const adopted = backendAdoptedPersistedKey.current;
     const isBackendAdoptedRefresh =
       adopted?.providerId === provider.id &&
@@ -617,95 +638,112 @@ export function CodexSubagentProfileEditor({
       ? { ...provider.settingsConfig, modelCatalog }
       : provider.settingsConfig;
   const diagnosticSettingsKey = JSON.stringify(diagnosticSettings);
+  const reasoningCapabilitySettings =
+    settingsForReasoningCapabilities(diagnosticSettings);
+  const reasoningCapabilitySettingsKey = JSON.stringify(
+    reasoningCapabilitySettings,
+  );
 
   useEffect(() => {
     if (!draft) {
       setReasoningCapabilities({});
       return;
     }
+
     let ignore = false;
-    codexSubagentV2Api
-      .getReasoningCapabilities(diagnosticSettings)
-      .then((result) => {
-        if (!ignore) setReasoningCapabilities(result);
-      })
-      .catch(() => {
-        if (!ignore) setReasoningCapabilities({});
-      });
+    const timer = window.setTimeout(() => {
+      void codexSubagentV2Api
+        .getReasoningCapabilities(reasoningCapabilitySettings)
+        .then((result) => {
+          if (!ignore) setReasoningCapabilities(result);
+        })
+        .catch(() => {
+          if (!ignore) setReasoningCapabilities({});
+        });
+    }, DIAGNOSTIC_DEBOUNCE_MS);
+
     return () => {
       ignore = true;
+      window.clearTimeout(timer);
     };
-  }, [diagnosticSettingsKey]);
+  }, [reasoningCapabilitySettingsKey]);
 
   useEffect(() => {
     if (!draft) {
       setStatuses(null);
+      setResolvedStatusSettingsKey(null);
       setStatusError(null);
-      return;
-    }
-    let ignore = false;
-    setStatusError(null);
-    codexSubagentV2Api
-      .getProfileStatuses(diagnosticSettings)
-      .then((result) => {
-        if (!ignore) setStatuses(result);
-      })
-      .catch((error) => {
-        if (!ignore) {
-          setStatuses(null);
-          setStatusError(
-            error instanceof Error ? error.message : String(error),
-          );
-        }
-      });
-    return () => {
-      ignore = true;
-    };
-  }, [diagnosticSettingsKey]);
-
-  useEffect(() => {
-    if (!draft) {
       setPreviews({});
       setPreviewErrors({});
       return;
     }
+
     let ignore = false;
-    const entries = Object.entries(readRawProfiles(draft)).filter(
-      (entry): entry is [string, CodexSubagentV2Profile] =>
-        isUsableProfile(entry[1]),
-    );
-    Promise.all(
-      entries.map(async ([profileKey, profile]) => {
-        try {
-          const preview = await codexSubagentV2Api.previewProfile(
-            diagnosticSettings,
-            profile.model,
-            profile,
-          );
-          return { profileKey, preview } as const;
-        } catch (error) {
-          return {
-            profileKey,
-            error: error instanceof Error ? error.message : String(error),
-          } as const;
-        }
-      }),
-    ).then((results) => {
-      if (ignore) return;
-      const nextPreviews: Record<string, CodexSubagentProfilePreview> = {};
-      const nextErrors: Record<string, string> = {};
-      for (const result of results) {
-        if ("preview" in result && result.preview)
-          nextPreviews[result.profileKey] = result.preview;
-        else nextErrors[result.profileKey] = result.error;
-      }
-      setPreviews(nextPreviews);
-      setPreviewErrors(nextErrors);
-    });
+    setStatusError(null);
+    setResolvedStatusSettingsKey(null);
+    setPreviews({});
+    setPreviewErrors({});
+    const timer = window.setTimeout(() => {
+      void codexSubagentV2Api
+        .getProfileStatuses(diagnosticSettings)
+        .then((result) => {
+          if (!ignore) {
+            setStatuses(result);
+            setResolvedStatusSettingsKey(diagnosticSettingsKey);
+          }
+        })
+        .catch((error) => {
+          if (!ignore) {
+            setStatuses(null);
+            setResolvedStatusSettingsKey(null);
+            setStatusError(
+              error instanceof Error ? error.message : String(error),
+            );
+          }
+        });
+    }, DIAGNOSTIC_DEBOUNCE_MS);
+
     return () => {
       ignore = true;
+      window.clearTimeout(timer);
     };
   }, [diagnosticSettingsKey]);
+
+  useEffect(() => {
+    if (
+      !draft ||
+      !openProfileKey ||
+      resolvedStatusSettingsKey !== diagnosticSettingsKey
+    ) {
+      return;
+    }
+    const profile = readRawProfiles(draft)[openProfileKey];
+    if (!isUsableProfile(profile)) return;
+
+    let ignore = false;
+    const timer = window.setTimeout(() => {
+      void codexSubagentV2Api
+        .previewProfile(diagnosticSettings, profile.model, profile)
+        .then((preview) => {
+          if (ignore) return;
+          setPreviews({ [openProfileKey]: preview });
+          setPreviewErrors({});
+        })
+        .catch((error) => {
+          if (ignore) return;
+          setPreviews({});
+          setPreviewErrors({
+            [openProfileKey]:
+              error instanceof Error ? error.message : String(error),
+          });
+        });
+    }, DIAGNOSTIC_DEBOUNCE_MS);
+
+    return () => {
+      ignore = true;
+      window.clearTimeout(timer);
+    };
+  }, [diagnosticSettingsKey, resolvedStatusSettingsKey, openProfileKey]);
 
   async function adoptBackendProvider(
     nextProvider: CodexSubagentV2MutationProvider,
@@ -1060,6 +1098,12 @@ export function CodexSubagentProfileEditor({
         .toLocaleLowerCase();
       return haystack.includes(profileSearch.trim().toLocaleLowerCase());
     });
+  const renderedProfileEntries = visibleProfileEntries.slice(
+    0,
+    visibleProfileLimit,
+  );
+  const remainingProfileCount =
+    visibleProfileEntries.length - renderedProfileEntries.length;
 
   const saveState = saveError ? "error" : isDirty ? "dirty" : "saved";
 
@@ -1284,7 +1328,7 @@ export function CodexSubagentProfileEditor({
             onValueChange={setOpenProfileKey}
             className="space-y-2"
           >
-            {visibleProfileEntries.map(
+            {renderedProfileEntries.map(
               ([profileKey, profile], profileIndex) => {
                 const preview = previews[profileKey];
                 const status = statusByProfileKey.get(profileKey);
@@ -1344,11 +1388,7 @@ export function CodexSubagentProfileEditor({
                 );
                 const nicknameValue =
                   nicknameDrafts[profileKey] ??
-                  (
-                    overrides.nicknameCandidates ??
-                    preview?.nicknameCandidates ??
-                    []
-                  ).join(", ");
+                  (overrides.nicknameCandidates ?? []).join(", ");
                 return (
                   <AccordionItem
                     key={profileKey}
@@ -1719,11 +1759,8 @@ export function CodexSubagentProfileEditor({
                             label={t("subagentEditor.roleNameLabel", {
                               defaultValue: "角色名称",
                             })}
-                            value={
-                              overrides.roleName ??
-                              preview?.requestedRoleName ??
-                              ""
-                            }
+                            value={overrides.roleName ?? ""}
+                            automaticValue={preview?.requestedRoleName}
                             automatic={overrides.roleName === undefined}
                             restoreLabel={t("subagentEditor.restoreRoleName", {
                               defaultValue: "恢复角色名称自动值",
@@ -1740,11 +1777,8 @@ export function CodexSubagentProfileEditor({
                             label={t("subagentEditor.descriptionLabel", {
                               defaultValue: "角色描述",
                             })}
-                            value={
-                              overrides.description ??
-                              preview?.description ??
-                              ""
-                            }
+                            value={overrides.description ?? ""}
+                            automaticValue={preview?.description}
                             automatic={overrides.description === undefined}
                             restoreLabel={t(
                               "subagentEditor.restoreDescription",
@@ -1768,11 +1802,8 @@ export function CodexSubagentProfileEditor({
                                 defaultValue: "开发者指令",
                               },
                             )}
-                            value={
-                              overrides.developerInstructions ??
-                              preview?.developerInstructions ??
-                              ""
-                            }
+                            value={overrides.developerInstructions ?? ""}
+                            automaticValue={preview?.developerInstructions}
                             automatic={
                               overrides.developerInstructions === undefined
                             }
@@ -1803,6 +1834,9 @@ export function CodexSubagentProfileEditor({
                               defaultValue: "昵称候选",
                             })}
                             value={nicknameValue}
+                            automaticValue={preview?.nicknameCandidates.join(
+                              ", ",
+                            )}
                             automatic={
                               overrides.nicknameCandidates === undefined
                             }
@@ -1955,6 +1989,27 @@ export function CodexSubagentProfileEditor({
             </Button>
           </div>
         )}
+        {remainingProfileCount > 0 ? (
+          <div className="flex justify-center">
+            <Button
+              type="button"
+              variant="outline"
+              onClick={() =>
+                setVisibleProfileLimit((current) =>
+                  Math.min(
+                    current + PROFILE_PAGE_SIZE,
+                    visibleProfileEntries.length,
+                  ),
+                )
+              }
+            >
+              {t("subagentEditor.loadMoreProfiles", {
+                defaultValue: "Load {{count}} more profiles",
+                count: Math.min(PROFILE_PAGE_SIZE, remainingProfileCount),
+              })}
+            </Button>
+          </div>
+        ) : null}
 
         {invalidProfileEntries.length > 0 ? (
           <section
@@ -2627,6 +2682,7 @@ function OverrideField({
   id,
   label,
   value,
+  automaticValue,
   automatic,
   restoreLabel,
   multiline = false,
@@ -2636,6 +2692,7 @@ function OverrideField({
   id: string;
   label: string;
   value: string;
+  automaticValue?: string;
   automatic: boolean;
   restoreLabel: string;
   multiline?: boolean;
@@ -2648,6 +2705,7 @@ function OverrideField({
       id={id}
       className="min-h-24 min-w-0 flex-1 rounded-md border bg-background px-3 py-2"
       value={value}
+      placeholder={automatic ? automaticValue : undefined}
       onChange={(event) => onChange(event.target.value)}
     />
   ) : (
@@ -2655,6 +2713,7 @@ function OverrideField({
       id={id}
       className="min-w-0 flex-1 rounded-md border bg-background px-3 py-2"
       value={value}
+      placeholder={automatic ? automaticValue : undefined}
       onChange={(event) => onChange(event.target.value)}
     />
   );

@@ -37,6 +37,38 @@ export interface RecoveryOutcome {
   acknowledgedAt?: string;
 }
 
+export type CodexPluginRepairAction = "registerMarketplace";
+
+export interface RepairableCodexPlugin {
+  id: string;
+  name: string;
+  version: string;
+  manifestPath: string;
+  sourcePath: string;
+  repairAction: CodexPluginRepairAction;
+}
+
+export interface CodexBrowserIntegrationHealth {
+  pluginInstalled: boolean;
+  pluginEnabled: boolean;
+  browserFamily?: string;
+  browserName?: string;
+  browserInstalled: boolean;
+  browserRunning: boolean;
+  extensionInstalled: boolean;
+  extensionEnabled: boolean;
+  nativeHostCorrect: boolean;
+  storeUrl?: string;
+  extensionManagementUrl?: string;
+  problems: string[];
+}
+
+export interface CodexPluginHealthReport {
+  repairablePlugins: RepairableCodexPlugin[];
+  browser: CodexBrowserIntegrationHealth;
+  diagnosticsError?: string;
+}
+
 export interface ConfigTransferResult {
   success: boolean;
   message: string;
@@ -333,6 +365,16 @@ export const settingsApi = {
   /** 打开包含运行日志、异常退出记录和路由诊断的本地日志目录。 */
   async openLogDir(): Promise<boolean> {
     return await invoke("open_log_dir");
+  },
+
+  async inspectCodexPluginHealth(): Promise<CodexPluginHealthReport> {
+    return await invoke("inspect_codex_plugin_health");
+  },
+
+  async repairCodexPluginRegistration(
+    pluginId: string,
+  ): Promise<RepairableCodexPlugin> {
+    return await invoke("repair_codex_plugin_registration", { pluginId });
   },
 
   async getPendingRecoveryOutcomes(): Promise<RecoveryOutcome[]> {

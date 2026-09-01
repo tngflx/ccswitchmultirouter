@@ -357,6 +357,119 @@ function modelSourceSummary(t: TFunction, provider: Provider): string {
   });
 }
 
+function modelSourceProtocolSummary(t: TFunction, provider: Provider): string {
+  const models = readWizardModelCatalog(provider);
+  const providerFormat = inferWizardApiFormat(provider);
+  const formats = models.map(
+    (model) => model.apiFormat ?? model.api_format ?? providerFormat,
+  );
+  const responsesCount = formats.filter(
+    (format) => format === "openai_responses",
+  ).length;
+  const chatCount = formats.filter((format) => format === "openai_chat").length;
+  if (responsesCount > 0 && chatCount > 0) {
+    return t("codexWizard.sources.protocolMixed", {
+      responses: responsesCount,
+      chat: chatCount,
+    });
+  }
+  const protocol =
+    providerFormat === "openai_responses"
+      ? t("codexWizard.sources.protocolResponses")
+      : t("codexWizard.sources.protocolChat");
+  const fallbackCount = models.filter(
+    (model) => !(model.apiFormat ?? model.api_format),
+  ).length;
+  return fallbackCount > 0
+    ? t("codexWizard.sources.protocolFallback", {
+        protocol,
+        count: fallbackCount,
+      })
+    : t("codexWizard.sources.protocolPerModel", { protocol });
+}
+
+function modelSourceEndpoint(provider: Provider): string {
+  const baseUrl = readWizardProviderBaseUrl(provider);
+  if (!baseUrl) return "";
+  try {
+    return new URL(baseUrl).host;
+  } catch {
+    return baseUrl;
+  }
+}
+
+function WizardSourceCard({
+  provider,
+  selected,
+  onToggle,
+  onConfigure,
+  t,
+}: {
+  provider: Provider;
+  selected: boolean;
+  onToggle: (checked: boolean) => void;
+  onConfigure?: () => void;
+  t: TFunction;
+}) {
+  const endpoint = modelSourceEndpoint(provider);
+  return (
+    <div
+      className={`rounded-lg border p-3 transition ${
+        selected
+          ? "border-primary/45 bg-primary/5 shadow-sm"
+          : "border-border/60 bg-card/70"
+      }`}
+    >
+      <label className="flex cursor-pointer items-start gap-3">
+        <input
+          type="checkbox"
+          className="mt-1 h-4 w-4"
+          checked={selected}
+          onChange={(event) => onToggle(event.target.checked)}
+          aria-label={t("codexWizard.sources.useAsSourceAria", {
+            name: provider.name,
+          })}
+        />
+        <span className="min-w-0 flex-1">
+          <span className="flex min-w-0 items-center gap-2">
+            <span className="truncate font-medium">{provider.name}</span>
+            <Badge variant={selected ? "default" : "outline"}>
+              {selected
+                ? t("codexWizard.sources.selectedBadge")
+                : t("codexWizard.sources.availableBadge")}
+            </Badge>
+          </span>
+          {endpoint ? (
+            <span className="mt-1 block truncate text-xs text-muted-foreground">
+              {endpoint}
+            </span>
+          ) : null}
+        </span>
+      </label>
+      <div className="mt-3 flex flex-wrap items-center gap-2">
+        <Badge variant="outline">{modelSourceSummary(t, provider)}</Badge>
+        <Badge variant="outline">
+          {modelSourceProtocolSummary(t, provider)}
+        </Badge>
+        {onConfigure ? (
+          <Button
+            type="button"
+            size="sm"
+            variant="ghost"
+            className="ml-auto h-7 px-2 text-xs"
+            aria-label={t("codexWizard.sources.configureAria", {
+              name: provider.name,
+            })}
+            onClick={onConfigure}
+          >
+            {t("codexWizard.sources.configureProvider")}
+          </Button>
+        ) : null}
+      </div>
+    </div>
+  );
+}
+
 function modelSourceStatusDetails(t: TFunction, provider: Provider): string[] {
   const models = readWizardModelCatalog(provider);
   const fetchConfig = getWizardModelFetchConfig(provider);
@@ -779,6 +892,20 @@ export function CodexMultiRouterWizard({
   const selectedSourceIdSet = useMemo(
     () => new Set(selectedSourceIds),
     [selectedSourceIds],
+  );
+  const selectedModelSources = useMemo(
+    () =>
+      providerModelSources.filter((provider) =>
+        selectedSourceIdSet.has(provider.id),
+      ),
+    [providerModelSources, selectedSourceIdSet],
+  );
+  const availableModelSources = useMemo(
+    () =>
+      providerModelSources.filter(
+        (provider) => !selectedSourceIdSet.has(provider.id),
+      ),
+    [providerModelSources, selectedSourceIdSet],
   );
   const hasUnauthenticatedCodexOAuthSources =
     hasCodexOAuthSources && !isCodexOauthStatusLoading && !hasCodexOauthAccount;
@@ -1988,59 +2115,63 @@ export function CodexMultiRouterWizard({
                     {t("codexWizard.sources.addProvider")}
                   </Button>
                 </div>
-                <div className="max-h-[min(42vh,28rem)] overflow-y-auto pr-2">
-                  <div className="grid gap-3 md:grid-cols-2">
-                    {providerModelSources.map((provider) => (
-                      <div
-                        key={provider.id}
-                        className="rounded-xl border border-border/60 bg-card/70 p-3 shadow-sm"
-                      >
-                        <label className="flex cursor-pointer items-start gap-3">
-                          <input
-                            type="checkbox"
-                            className="mt-1 h-4 w-4"
-                            checked={selectedSourceIdSet.has(provider.id)}
-                            onChange={(event) =>
-                              toggleSourceProvider(
-                                provider,
-                                event.target.checked,
-                              )
-                            }
-                            aria-label={t(
-                              "codexWizard.sources.useAsSourceAria",
-                              {
-                                name: provider.name,
-                              },
-                            )}
-                          />
-                          <span className="min-w-0">
-                            <span className="block font-medium">
-                              {provider.name}
-                            </span>
-                            <span className="mt-1 block text-xs text-muted-foreground">
-                              {provider.id}
-                            </span>
-                          </span>
-                        </label>
-                        <div className="mt-3 flex items-center justify-between gap-3">
-                          <Badge variant="outline">
-                            {modelSourceSummary(t, provider)}
-                          </Badge>
-                          <Button
-                            type="button"
-                            size="sm"
-                            variant="outline"
-                            aria-label={t("codexWizard.sources.configureAria", {
-                              name: provider.name,
-                            })}
-                            onClick={() => onOpenProviderConfig?.(provider)}
-                          >
-                            {t("codexWizard.sources.configureProvider")}
-                          </Button>
-                        </div>
+                <div className="rounded-md border border-border/60 bg-muted/20 px-3 py-2 text-xs leading-5 text-muted-foreground">
+                  {t("codexWizard.sources.savedProvidersOnly")}
+                </div>
+                <div className="max-h-[min(46vh,32rem)] space-y-4 overflow-y-auto pr-2">
+                  {selectedModelSources.length > 0 ? (
+                    <section>
+                      <div className="mb-2 flex items-center justify-between text-xs font-medium text-muted-foreground">
+                        <span>{t("codexWizard.sources.selectedTitle")}</span>
+                        <span>{selectedModelSources.length}</span>
                       </div>
-                    ))}
-                  </div>
+                      <div className="grid gap-3 md:grid-cols-2">
+                        {selectedModelSources.map((provider) => (
+                          <WizardSourceCard
+                            key={provider.id}
+                            provider={provider}
+                            selected
+                            t={t}
+                            onToggle={(checked) =>
+                              toggleSourceProvider(provider, checked)
+                            }
+                            onConfigure={
+                              onOpenProviderConfig
+                                ? () => onOpenProviderConfig(provider)
+                                : undefined
+                            }
+                          />
+                        ))}
+                      </div>
+                    </section>
+                  ) : null}
+
+                  {availableModelSources.length > 0 ? (
+                    <section>
+                      <div className="mb-2 flex items-center justify-between text-xs font-medium text-muted-foreground">
+                        <span>{t("codexWizard.sources.availableTitle")}</span>
+                        <span>{availableModelSources.length}</span>
+                      </div>
+                      <div className="grid gap-3 md:grid-cols-2">
+                        {availableModelSources.map((provider) => (
+                          <WizardSourceCard
+                            key={provider.id}
+                            provider={provider}
+                            selected={false}
+                            t={t}
+                            onToggle={(checked) =>
+                              toggleSourceProvider(provider, checked)
+                            }
+                            onConfigure={
+                              onOpenProviderConfig
+                                ? () => onOpenProviderConfig(provider)
+                                : undefined
+                            }
+                          />
+                        ))}
+                      </div>
+                    </section>
+                  ) : null}
                 </div>
                 {draftSources.length === 0 && (
                   <div className="rounded-lg border border-dashed p-4 text-sm text-muted-foreground">

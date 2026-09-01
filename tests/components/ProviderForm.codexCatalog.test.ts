@@ -4,6 +4,7 @@ import {
   normalizeCodexChatReasoningForSave,
 } from "@/components/providers/forms/ProviderForm";
 import { extractCodexCatalogModels } from "@/components/providers/forms/hooks/useCodexConfigState";
+import { codexInputCapabilityState } from "@/components/providers/forms/codexInputCapability";
 
 describe("ProviderForm Codex catalog helpers", () => {
   it("normalizes catalog rows and removes empty or duplicate models", () => {
@@ -136,6 +137,8 @@ describe("ProviderForm Codex catalog helpers", () => {
         contextWindow: 1000000,
         supportsParallelToolCalls: true,
         inputModalities: ["text", "image"],
+        supportsImage: true,
+        textOnly: false,
         baseInstructions: "You are Codex, a coding agent based on MiniMax-M3.",
       },
       { model: "mimo-v2.5-pro", supportsParallelToolCalls: false },
@@ -149,9 +152,30 @@ describe("ProviderForm Codex catalog helpers", () => {
         { model: "text-explicit", supportsImage: false },
       ]),
     ).toEqual([
-      { model: "vision-explicit", supportsImage: true },
-      { model: "text-explicit", supportsImage: false },
+      {
+        model: "vision-explicit",
+        inputModalities: ["text", "image"],
+        supportsImage: true,
+        textOnly: false,
+      },
+      {
+        model: "text-explicit",
+        inputModalities: ["text"],
+        supportsImage: false,
+        textOnly: true,
+      },
     ]);
+  });
+
+  it("does not treat contradictory capability metadata as a fact", () => {
+    expect(
+      codexInputCapabilityState({
+        model: "contradictory-model",
+        inputModalities: ["text", "image"],
+        supportsImage: false,
+        textOnly: true,
+      }),
+    ).toBe("unknown");
   });
 
   it("persists only models included in the provider catalog", () => {

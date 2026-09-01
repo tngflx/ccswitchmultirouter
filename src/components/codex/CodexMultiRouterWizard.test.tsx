@@ -306,6 +306,9 @@ describe("CodexMultiRouterWizard", () => {
         name: "使用 Unused source 作为模型源",
       }),
     ).not.toBeChecked();
+    expect(screen.getByText("已选择模型源")).toBeVisible();
+    expect(screen.getByText("可用模型源")).toBeVisible();
+    expect(screen.getByText(/这里只显示已保存的 Codex Provider/)).toBeVisible();
   });
 
   it("requires an explicit redacted migration preview before editing a v1 plan", async () => {
