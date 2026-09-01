@@ -20,6 +20,7 @@ import { geminiProviderPresets } from "@/config/geminiProviderPresets";
 import { claudeDesktopProviderPresets } from "@/config/claudeDesktopProviderPresets";
 import { extractCodexBaseUrl } from "@/utils/providerConfigUtils";
 import { extractGrokBuildBaseUrl } from "@/utils/grokBuildConfig";
+import { inferProviderIconFromConfig } from "@/utils/providerIcon";
 import { GROKBUILD_OFFICIAL_PROVIDER_ID } from "@/utils/providerCapabilities";
 import type { OpenClawSuggestedDefaults } from "@/config/openclawProviderPresets";
 import type { UniversalProviderPreset } from "@/config/universalProviderPresets";
@@ -203,7 +204,14 @@ export function AddProviderDialog({
         notes: values.notes?.trim() || undefined,
         websiteUrl: values.websiteUrl?.trim() || undefined,
         settingsConfig: parsedConfig,
-        icon: values.icon?.trim() || undefined,
+        icon:
+          appId === "grokbuild"
+            ? values.icon?.trim() || undefined
+            : inferProviderIconFromConfig(
+                values.icon,
+                parsedConfig,
+                values.websiteUrl,
+              ) || undefined,
         iconColor: values.iconColor?.trim() || undefined,
         ...(values.presetCategory ? { category: values.presetCategory } : {}),
         ...(values.meta ? { meta: values.meta } : {}),

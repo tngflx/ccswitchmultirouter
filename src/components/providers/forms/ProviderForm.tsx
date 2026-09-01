@@ -142,6 +142,10 @@ import { resolveManagedAccountId } from "@/lib/authBinding";
 import { useOpenClawLiveProviderIds } from "@/hooks/useOpenClaw";
 import { useHermesLiveProviderIds } from "@/hooks/useHermes";
 import { extractErrorMessage } from "@/utils/errorUtils";
+import {
+  inferProviderIcon,
+  inferProviderIconFromConfig,
+} from "@/utils/providerIcon";
 
 type PresetEntry = {
   id: string;
@@ -667,7 +671,12 @@ function ProviderFormFull({
                 : appId === "hermes"
                   ? HERMES_DEFAULT_CONFIG
                   : CLAUDE_DEFAULT_CONFIG,
-      icon: initialData?.icon ?? "",
+      icon:
+        inferProviderIconFromConfig(
+          initialData?.icon,
+          initialData?.settingsConfig,
+          initialData?.websiteUrl,
+        ) ?? "",
       iconColor: initialData?.iconColor ?? "",
     }),
     [initialData, appId],
@@ -960,8 +969,8 @@ function ProviderFormFull({
     );
     setLocalApiFormat(
       appId === "claude"
-        ? normalizeClaudeApiFormat(initialData?.meta?.apiFormat) ??
-          "anthropic"
+        ? (normalizeClaudeApiFormat(initialData?.meta?.apiFormat) ??
+            "anthropic")
         : "anthropic",
     );
     setSelectedGitHubAccountId(
@@ -982,12 +991,12 @@ function ProviderFormFull({
           : initialData?.meta?.apiFormat === "openai_responses"
             ? "openai_responses"
             : (codexApiFormatFromWireApi(
-                  extractCodexWireApi(
-                    typeof initialData?.settingsConfig?.config === "string"
-                      ? initialData.settingsConfig.config
-                      : "",
-                  ),
-                ) ?? "openai_responses"),
+                extractCodexWireApi(
+                  typeof initialData?.settingsConfig?.config === "string"
+                    ? initialData.settingsConfig.config
+                    : "",
+                ),
+              ) ?? "openai_responses"),
     );
     setLocalCodexAnthropicAuthField(
       initialData?.meta?.apiKeyField === "ANTHROPIC_API_KEY"
@@ -1963,6 +1972,23 @@ function ProviderFormFull({
       ...values,
       name: values.name.trim(),
       websiteUrl: values.websiteUrl?.trim() ?? "",
+      icon: inferProviderIcon(
+        values.icon,
+        appId === "codex"
+          ? codexBaseUrl
+          : appId === "claude"
+            ? baseUrl
+            : appId === "gemini"
+              ? geminiBaseUrl
+              : appId === "opencode"
+                ? opencodeForm.opencodeBaseUrl
+                : appId === "openclaw"
+                  ? openclawForm.openclawBaseUrl
+                  : appId === "hermes"
+                    ? hermesForm.hermesBaseUrl
+                    : undefined,
+        values.websiteUrl,
+      ),
       settingsConfig,
     };
 

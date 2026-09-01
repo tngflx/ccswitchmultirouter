@@ -10,6 +10,7 @@ import {
 } from "@/components/providers/forms/ProviderForm";
 import { openclawApi, providersApi, vscodeApi, type AppId } from "@/lib/api";
 import { extractCodexExperimentalBearerToken } from "@/utils/providerConfigUtils";
+import { inferProviderIconFromConfig } from "@/utils/providerIcon";
 
 interface EditProviderDialogProps {
   open: boolean;
@@ -259,7 +260,12 @@ export function EditProviderDialog({
         notes: values.notes?.trim() || undefined,
         websiteUrl: values.websiteUrl?.trim() || undefined,
         settingsConfig: parsedConfig,
-        icon: values.icon?.trim() || undefined,
+        icon:
+          inferProviderIconFromConfig(
+            values.icon,
+            values.settingsConfig,
+            values.websiteUrl,
+          ) || undefined,
         iconColor: values.iconColor?.trim() || undefined,
         ...(values.presetCategory ? { category: values.presetCategory } : {}),
         // 保留或更新 meta 字段

@@ -28,6 +28,7 @@ import {
   type UniversalProviderPreset,
 } from "@/config/universalProviderPresets";
 import { ProviderIcon } from "@/components/ProviderIcon";
+import { inferProviderIcon } from "@/utils/providerIcon";
 
 type PresetTranslator = (key: string) => unknown;
 
@@ -292,10 +293,17 @@ export function ProviderPresetSelector({
   };
 
   const renderPresetIcon = (preset: AnyPreset) => {
-    if (preset.icon) {
+    const inferredIcon = inferProviderIcon(
+      preset.icon,
+      "baseUrl" in preset && typeof preset.baseUrl === "string"
+        ? preset.baseUrl
+        : undefined,
+      preset.websiteUrl,
+    );
+    if (inferredIcon) {
       return (
         <ProviderIcon
-          icon={preset.icon}
+          icon={inferredIcon}
           name={preset.name}
           color={preset.iconColor}
           size={16}
@@ -538,7 +546,11 @@ export function ProviderPresetSelector({
               })}
             >
               <ProviderIcon
-                icon={preset.icon}
+                icon={inferProviderIcon(
+                  preset.icon,
+                  undefined,
+                  preset.websiteUrl,
+                )}
                 name={preset.name}
                 size={14}
                 className="flex-shrink-0"

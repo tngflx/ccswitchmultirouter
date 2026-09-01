@@ -40,3 +40,70 @@ export function providerFaviconUrl(apiUrl?: string): string | undefined {
     return undefined;
   }
 }
+
+/** Resolve a persisted icon value from an explicit choice or provider URLs. */
+export function inferProviderIcon(
+  explicitIcon?: string,
+  apiUrl?: string,
+  websiteUrl?: string,
+): string | undefined {
+  const explicit = explicitIcon?.trim();
+  if (explicit) return explicit;
+
+  const source = apiUrl?.trim() || websiteUrl?.trim();
+  if (!source) return undefined;
+
+  try {
+    const parsed = new URL(source);
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+      return undefined;
+    }
+    if (parsed.hostname.toLowerCase().endsWith("sublyx.org")) {
+      return "https://sublyx.org/favicon.ico";
+    }
+    return providerFaviconUrl(parsed.origin);
+  } catch {
+    return undefined;
+  }
+}
+
+export function inferProviderIconFromConfig(
+  explicitIcon: string | undefined,
+  settingsConfig: unknown,
+  websiteUrl?: string,
+): string | undefined {
+  if (typeof settingsConfig === "string") {
+    try {
+      return inferProviderIconFromConfig(
+        explicitIcon,
+        JSON.parse(settingsConfig),
+        websiteUrl,
+      );
+    } catch {
+      return inferProviderIcon(explicitIcon, undefined, websiteUrl);
+    }
+  }
+  const urls: string[] = [];
+  const visit = (value: unknown, key = "") => {
+    if (typeof value === "string") {
+      if (/(base.?url|api.?url|endpoint)/i.test(key)) {
+        if (/^https?:\/\//i.test(value.trim())) urls.push(value);
+      } else if (key === "config") {
+        const match = value.match(/base_url\s*=\s*"([^"]+)"/i);
+        if (match?.[1]) urls.push(match[1]);
+      }
+      return;
+    }
+    if (Array.isArray(value)) {
+      value.forEach((item) => visit(item, key));
+      return;
+    }
+    if (value && typeof value === "object") {
+      Object.entries(value as Record<string, unknown>).forEach(
+        ([childKey, childValue]) => visit(childValue, childKey),
+      );
+    }
+  };
+  visit(settingsConfig);
+  return inferProviderIcon(explicitIcon, urls[0], websiteUrl);
+}

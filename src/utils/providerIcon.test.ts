@@ -1,5 +1,9 @@
 import { describe, expect, it } from "vitest";
-import { resolveProviderIcon } from "./providerIcon";
+import {
+  inferProviderIcon,
+  inferProviderIconFromConfig,
+  resolveProviderIcon,
+} from "./providerIcon";
 import { providerFaviconUrl } from "./providerIcon";
 
 describe("resolveProviderIcon", () => {
@@ -33,5 +37,24 @@ describe("resolveProviderIcon", () => {
   it("ignores non-web API endpoints", () => {
     expect(providerFaviconUrl("not-a-url")).toBeUndefined();
     expect(providerFaviconUrl("file:///tmp/provider")).toBeUndefined();
+  });
+
+  it("uses the Sublyx website favicon for Sublyx API origins", () => {
+    expect(
+      inferProviderIcon(
+        undefined,
+        "https://api.sublyx.org/v1",
+        "https://sublyx.org",
+      ),
+    ).toBe("https://sublyx.org/favicon.ico");
+  });
+
+  it("extracts and persists an API icon from nested provider config", () => {
+    expect(
+      inferProviderIconFromConfig(undefined, {
+        config:
+          '[model_providers.custom]\nbase_url = "https://api.sublyx.org/v1"',
+      }),
+    ).toBe("https://sublyx.org/favicon.ico");
   });
 });
