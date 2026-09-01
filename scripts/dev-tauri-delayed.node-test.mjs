@@ -1,8 +1,10 @@
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
+import path from "node:path";
 import test from "node:test";
 
 import {
+  assertNormalCargoTargetDirectory,
   createBackendContentTracker,
   createBackendRebuildGate,
   createChangeEventBatcher,
@@ -11,9 +13,14 @@ import {
   isPathInside,
   isTauriAppStartedOutput,
   parseDelayMs,
+  parseNoRebuild,
   parsePort,
   parseWindowsListeners,
+  resolveRepoRootBackendInput,
+  resolveTauriRootBackendInput,
+  runCargoTargetMaintenance,
   sameWindowsProcess,
+  snapshotBackendFileFingerprints,
   stopVerifiedWindowsApp,
   waitForChildExit,
   waitForWindowsListenersReleased,
@@ -23,7 +30,7 @@ import {
 } from "./dev-tauri-delayed.mjs";
 
 test("parseDelayMs uses the default and supports environment and CLI overrides", () => {
-  assert.equal(parseDelayMs([], {}), 50_000);
+  assert.equal(parseDelayMs([], {}), 3_600_000);
   assert.equal(
     parseDelayMs([], { TAURI_DEV_REBUILD_DELAY_MS: "15000" }),
     15_000,
@@ -69,12 +76,93 @@ test("parseDelayMs rejects invalid values", () => {
   assert.throws(() => parseDelayMs(["--wat", "10"], {}), /Unknown argument/);
 });
 
+test("parseNoRebuild supports the CLI flag and environment override", () => {
+  assert.equal(parseNoRebuild([], {}), false);
+  assert.equal(parseNoRebuild(["--no-rebuild"], {}), true);
+  assert.equal(parseNoRebuild([], { TAURI_DEV_NO_REBUILD: "true" }), true);
+  assert.equal(parseNoRebuild([], { TAURI_DEV_NO_REBUILD: "0" }), false);
+  assert.throws(
+    () => parseNoRebuild(["--no-rebuild", "--no-rebuild"], {}),
+    /only be specified once/,
+  );
+  assert.throws(
+    () => parseNoRebuild([], { TAURI_DEV_NO_REBUILD: "sometimes" }),
+    /Invalid TAURI_DEV_NO_REBUILD/,
+  );
+});
+
 test("parsePort supports isolated development sessions", () => {
   assert.equal(parsePort({}), 3000);
   assert.equal(parsePort({ TAURI_DEV_PORT: "3410" }), 3410);
   assert.throws(
     () => parsePort({ TAURI_DEV_PORT: "0" }),
     /Invalid development port/,
+  );
+});
+
+test("development requires the repository Cargo target directory", () => {
+  const tauriDirectory = path.join("workspace", "src-tauri");
+  assert.doesNotThrow(() =>
+    assertNormalCargoTargetDirectory(
+      path.join(tauriDirectory, "target"),
+      {},
+      tauriDirectory,
+    ),
+  );
+  assert.throws(
+    () =>
+      assertNormalCargoTargetDirectory(
+        path.join(tauriDirectory, "target"),
+        { CARGO_TARGET_DIR: path.join("..", "custom-target") },
+        tauriDirectory,
+      ),
+    /CARGO_TARGET_DIR is not supported/,
+  );
+  assert.throws(
+    () =>
+      assertNormalCargoTargetDirectory(
+        path.join("workspace", "custom-target"),
+        {},
+        tauriDirectory,
+      ),
+    /Remove custom target-dir configuration/,
+  );
+});
+
+test("development runs guarded Cargo target maintenance before launch", () => {
+  const calls = [];
+  runCargoTargetMaintenance({
+    executable: "node",
+    scriptPath: "prune-cargo-target.mjs",
+    cwd: "workspace",
+    environment: { TEST_ENV: "1" },
+    run: (command, args, options) => {
+      calls.push({ command, args, options });
+      return { status: 0, stdout: "", stderr: "" };
+    },
+  });
+
+  assert.deepEqual(calls, [
+    {
+      command: "node",
+      args: ["prune-cargo-target.mjs"],
+      options: {
+        cwd: "workspace",
+        env: { TEST_ENV: "1" },
+        encoding: "utf8",
+        windowsHide: true,
+      },
+    },
+  ]);
+});
+
+test("development stops when Cargo target maintenance fails", () => {
+  assert.throws(
+    () =>
+      runCargoTargetMaintenance({
+        run: () => ({ status: 3, stdout: "", stderr: "" }),
+      }),
+    /exited with status 3/,
   );
 });
 
@@ -248,17 +336,24 @@ test("backend content tracker starts each rebuild from the latest source baselin
 test("undefined watcher filenames are ignored instead of becoming fake edits", () => {
   const resolveDirectoryEvent = (filename) =>
     filename ? `src/${filename.toString()}` : null;
-  const resolveRootEvent = (filename) => {
-    if (!filename) return null;
-    return new Set(["Cargo.lock", "Cargo.toml"]).has(filename.toString())
-      ? filename.toString()
-      : null;
-  };
 
   assert.equal(resolveDirectoryEvent(undefined), null);
-  assert.equal(resolveRootEvent(undefined), null);
-  assert.equal(resolveRootEvent("target"), null);
-  assert.equal(resolveRootEvent("Cargo.lock"), "Cargo.lock");
+  assert.equal(resolveTauriRootBackendInput(undefined), null);
+  assert.equal(resolveTauriRootBackendInput("target"), null);
+  assert.equal(resolveTauriRootBackendInput("Cargo.lock"), "Cargo.lock");
+  assert.equal(resolveRepoRootBackendInput(undefined), null);
+  assert.equal(resolveRepoRootBackendInput("package.json"), null);
+  assert.equal(
+    resolveRepoRootBackendInput("rust-toolchain.toml"),
+    path.join("..", "rust-toolchain.toml"),
+  );
+});
+
+test("backend build baseline includes the repository Rust toolchain file", () => {
+  const trackedPaths = new Set(
+    snapshotBackendFileFingerprints().map(([trackedPath]) => trackedPath),
+  );
+  assert.equal(trackedPaths.has(path.join("..", "rust-toolchain.toml")), true);
 });
 
 test("backend rebuild gate recovers from a failed build and later edits", async () => {
@@ -392,7 +487,7 @@ test("Windows shutdown selects only the owned Tauri development chain", () => {
   );
 });
 
-test("Windows shutdown never traverses through Codex into matching helper names", () => {
+test("Windows shutdown roots the tree kill at the verified app", () => {
   const repoRoot = "H:\\repos\\ccswitchmulti-fork";
   const processes = [
     {
@@ -473,7 +568,7 @@ test("Windows shutdown blocks unverified same-name app descendants", () => {
   );
 });
 
-test("Windows shutdown supports a custom Cargo target directory", () => {
+test("Windows shutdown rejects apps outside the repository Cargo target directory", () => {
   const descendants = windowsDevDescendants(
     [
       {
@@ -492,12 +587,11 @@ test("Windows shutdown supports a custom Cargo target directory", () => {
     ],
     10,
     "H:\\repos\\ccswitchmulti-fork",
-    { CARGO_TARGET_DIR: "..\\custom-target" },
   );
   assert.deepEqual(
     descendants.map(({ ProcessId, kind }) => ({ ProcessId, kind })),
     [
-      { ProcessId: 30, kind: "app" },
+      { ProcessId: 30, kind: "unverified-app" },
       { ProcessId: 20, kind: "cargo" },
     ],
   );
@@ -520,7 +614,7 @@ test("Windows listener parsing supports zero, one, or multiple endpoints", () =>
   );
 });
 
-test("verified Windows app waits for authenticated self-shutdown without taskkill", async () => {
+test("verified Windows app force-terminates its verified tree before rebuild", async () => {
   const app = {
     ProcessId: 30,
     Name: "cc-switch.exe",
@@ -532,15 +626,11 @@ test("verified Windows app waits for authenticated self-shutdown without taskkil
   const events = [];
 
   await stopVerifiedWindowsApp(app, {
-    queryProcesses: () => [],
+    queryProcesses: () => [app],
     queryListeners: () => [{ address: "127.0.0.1", port: 15721 }],
-    prepareGracefulShutdown: () => {
-      events.push("shutdown-armed");
-      return () => events.push("shutdown-disarmed");
-    },
-    terminate: (processId, force) => {
-      events.push(force ? "forced-terminate" : "unexpected-terminate");
-      terminations.push({ processId, force });
+    terminate: (processId, force, tree) => {
+      events.push("terminate");
+      terminations.push({ processId, force, tree });
       return { status: 0 };
     },
     waitForProcessExit: async () => {
@@ -552,16 +642,15 @@ test("verified Windows app waits for authenticated self-shutdown without taskkil
     log: () => {},
   });
 
-  assert.deepEqual(terminations, []);
+  assert.deepEqual(terminations, [{ processId: 30, force: true, tree: true }]);
   assert.deepEqual(events, [
-    "shutdown-armed",
+    "terminate",
     "process-exited",
-    "shutdown-disarmed",
     "listeners-released",
   ]);
 });
 
-test("verified Windows app shutdown force-kills only after graceful timeout", async () => {
+test("verified Windows app waits for forced tree termination", async () => {
   const app = {
     ProcessId: 30,
     Name: "cc-switch.exe",
@@ -571,31 +660,56 @@ test("verified Windows app shutdown force-kills only after graceful timeout", as
   };
   const terminations = [];
   const waitTimeouts = [];
-  let exitWait = 0;
 
   await stopVerifiedWindowsApp(app, {
     queryProcesses: () => [app],
     queryListeners: () => [],
-    terminate: (processId, force) => {
-      terminations.push({ processId, force });
+    terminate: (processId, force, tree) => {
+      terminations.push({ processId, force, tree });
       return { status: 0 };
     },
     waitForProcessExit: async (_processInfo, _query, timeoutMs) => {
       waitTimeouts.push(timeoutMs);
-      exitWait += 1;
-      if (exitWait === 1) {
-        throw new Error("graceful timeout");
-      }
     },
-    gracefulTimeoutMs: 10_000,
     forcedTimeoutMs: 2_000,
     log: () => {},
   });
 
-  assert.deepEqual(terminations, [
-    { processId: 30, force: true },
-  ]);
-  assert.deepEqual(waitTimeouts, [10_000, 2_000]);
+  assert.deepEqual(terminations, [{ processId: 30, force: true, tree: true }]);
+  assert.deepEqual(waitTimeouts, [2_000]);
+});
+
+test("verified Windows app forced fallback reports a stuck owned tree", async () => {
+  const app = {
+    ProcessId: 30,
+    Name: "cc-switch.exe",
+    ExecutablePath:
+      "H:\\repos\\ccswitchmulti-fork\\src-tauri\\target\\debug\\cc-switch.exe",
+    CreationDate: "20260830210502.000000+480",
+  };
+  const terminations = [];
+  const waitTimeouts = [];
+
+  await assert.rejects(
+    stopVerifiedWindowsApp(app, {
+      queryProcesses: () => [app],
+      queryListeners: () => [],
+      terminate: (processId, force, tree) => {
+        terminations.push({ processId, force, tree });
+        return { status: 0, stderr: "still running" };
+      },
+      waitForProcessExit: async (_processInfo, _query, timeoutMs) => {
+        waitTimeouts.push(timeoutMs);
+        throw new Error("forced timeout");
+      },
+      forcedTimeoutMs: 2_000,
+      log: () => {},
+    }),
+    /Could not stop owned cc-switch\.exe process tree.*still running/,
+  );
+
+  assert.deepEqual(terminations, [{ processId: 30, force: true, tree: true }]);
+  assert.deepEqual(waitTimeouts, [2_000]);
 });
 
 test("Windows listener release barrier waits until every endpoint is bindable", async () => {

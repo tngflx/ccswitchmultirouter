@@ -21,7 +21,18 @@ function Test-CcsmGuardianSamePath {
 }
 
 function ConvertTo-CcsmGuardianUtc {
-    param([Parameter(Mandatory = $true)][string]$Value)
+    param([Parameter(Mandatory = $true)]$Value)
+
+    if ($Value -is [datetimeoffset]) {
+        return ([datetimeoffset]$Value).ToUniversalTime()
+    }
+    if ($Value -is [datetime]) {
+        $date = [datetime]$Value
+        if ($date.Kind -eq [System.DateTimeKind]::Unspecified) {
+            $date = [datetime]::SpecifyKind($date, [System.DateTimeKind]::Utc)
+        }
+        return [datetimeoffset]::new($date.ToUniversalTime())
+    }
 
     $parsed = [datetimeoffset]::MinValue
     $styles = [System.Globalization.DateTimeStyles]::AssumeUniversal -bor
@@ -92,7 +103,7 @@ function Test-CcsmMaintenanceLeaseRecord {
             [string]::IsNullOrWhiteSpace([string]$Lease.expiresAtUtc)) {
             return $false
         }
-        $expiresAt = ConvertTo-CcsmGuardianUtc -Value ([string]$Lease.expiresAtUtc)
+        $expiresAt = ConvertTo-CcsmGuardianUtc -Value $Lease.expiresAtUtc
         if ($expiresAt -le [datetimeoffset]$NowUtc.ToUniversalTime()) { return $false }
 
         $owner = & $GetProcessIdentity ([int]$Lease.ownerPid)
@@ -100,8 +111,8 @@ function Test-CcsmMaintenanceLeaseRecord {
         if (-not (Test-CcsmGuardianSamePath -Left ([string]$owner.Path) -Right ([string]$Lease.ownerExecutablePath))) {
             return $false
         }
-        $expectedStart = ConvertTo-CcsmGuardianUtc -Value ([string]$Lease.ownerStartTimeUtc)
-        $actualStart = ConvertTo-CcsmGuardianUtc -Value ([string]$owner.StartTimeUtc)
+        $expectedStart = ConvertTo-CcsmGuardianUtc -Value $Lease.ownerStartTimeUtc
+        $actualStart = ConvertTo-CcsmGuardianUtc -Value $owner.StartTimeUtc
         return $expectedStart.UtcTicks -eq $actualStart.UtcTicks
     } catch {
         return $false

@@ -1,29 +1,29 @@
 import { spawn, spawnSync } from "node:child_process";
-import { createHash, randomBytes } from "node:crypto";
+import { createHash } from "node:crypto";
 import {
   existsSync,
   readFileSync,
   readdirSync,
-  rmSync,
   statSync,
   watch,
-  writeFileSync,
 } from "node:fs";
 import net from "node:net";
-import { tmpdir } from "node:os";
 import path from "node:path";
 import process from "node:process";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
-const DEFAULT_DELAY_MS = 50_000;
+const DEFAULT_DELAY_MS = 3_600_000;
 const DEFAULT_FRONTEND_PORT = 3000;
 const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(SCRIPT_DIR, "..");
 const TAURI_DIR = path.join(REPO_ROOT, "src-tauri");
+const CARGO_TARGET_MAINTENANCE_SCRIPT = path.join(
+  SCRIPT_DIR,
+  "prune-cargo-target.mjs",
+);
 const WATCH_EVENT_BATCH_MS = 100;
 const CHILD_EXIT_TIMEOUT_MS = 10_000;
 const WINDOWS_PROCESS_EXIT_TIMEOUT_MS = 2_000;
-const WINDOWS_GRACEFUL_APP_EXIT_TIMEOUT_MS = 10_000;
 const WINDOWS_LISTENER_RELEASE_TIMEOUT_MS = 60_000;
 const BACKEND_WATCH_DIRECTORIES = [
   "src",
@@ -41,6 +41,7 @@ const BACKEND_ROOT_FILES = new Set([
   "common-controls.manifest",
   "Info.plist",
 ]);
+const BACKEND_REPO_ROOT_FILES = new Set(["rust-toolchain.toml"]);
 
 export function parseDelayMs(args, environment = process.env) {
   let unsupportedArgument;
@@ -48,6 +49,9 @@ export function parseDelayMs(args, environment = process.env) {
     const argument = args[index];
     if (argument === "--delay" || argument === "-d") {
       index += 1;
+      continue;
+    }
+    if (argument === "--no-rebuild") {
       continue;
     }
     if (argument !== "--help" && argument !== "-h") {
@@ -100,6 +104,33 @@ export function parseDelayMs(args, environment = process.env) {
   return delayMs;
 }
 
+export function parseNoRebuild(args, environment = process.env) {
+  const flagCount = args.filter(
+    (argument) => argument === "--no-rebuild",
+  ).length;
+  if (flagCount > 1) {
+    throw new Error("The --no-rebuild flag may only be specified once.");
+  }
+  if (flagCount > 0) {
+    return true;
+  }
+
+  const rawValue = environment.TAURI_DEV_NO_REBUILD;
+  if (rawValue === undefined) {
+    return false;
+  }
+  const normalized = String(rawValue).trim().toLowerCase();
+  if (["1", "true", "yes", "on"].includes(normalized)) {
+    return true;
+  }
+  if (["0", "false", "no", "off"].includes(normalized)) {
+    return false;
+  }
+  throw new Error(
+    `Invalid TAURI_DEV_NO_REBUILD value "${rawValue}". Use 1/true or 0/false.`,
+  );
+}
+
 export function parsePort(environment = process.env) {
   const rawPort = environment.TAURI_DEV_PORT ?? DEFAULT_FRONTEND_PORT;
   const port = Number(rawPort);
@@ -107,6 +138,27 @@ export function parsePort(environment = process.env) {
     throw new Error(`Invalid development port "${rawPort}".`);
   }
   return port;
+}
+
+export function assertNormalCargoTargetDirectory(
+  actualTargetDirectory,
+  environment = process.env,
+  tauriDirectory = TAURI_DIR,
+) {
+  if (environment.CARGO_TARGET_DIR !== undefined) {
+    throw new Error(
+      "CARGO_TARGET_DIR is not supported for development. Use the repository's normal src-tauri/target directory.",
+    );
+  }
+  const expected = path.resolve(tauriDirectory, "target");
+  const actual = path.resolve(String(actualTargetDirectory ?? ""));
+  const normalize = (value) =>
+    process.platform === "win32" ? value.toLowerCase() : value;
+  if (normalize(actual) !== normalize(expected)) {
+    throw new Error(
+      `Cargo target directory must be ${expected}, but Cargo resolved ${actual}. Remove custom target-dir configuration before starting development.`,
+    );
+  }
 }
 
 export function createQuietPeriodScheduler(delayMs, callback) {
@@ -270,14 +322,14 @@ function fingerprintBackendFile(filePath) {
   }
 }
 
-function snapshotBackendFileFingerprints() {
+export function snapshotBackendFileFingerprints() {
   const entries = [];
-  const addFile = (relativePath) => {
-    const fingerprint = fingerprintBackendFile(
-      path.join(TAURI_DIR, relativePath),
-    );
+  const addFile = (relativePath, baseDirectory = TAURI_DIR) => {
+    const absolutePath = path.join(baseDirectory, relativePath);
+    const trackedPath = path.relative(TAURI_DIR, absolutePath);
+    const fingerprint = fingerprintBackendFile(absolutePath);
     if (fingerprint !== null) {
-      entries.push([relativePath, fingerprint]);
+      entries.push([trackedPath, fingerprint]);
     }
   };
   const addDirectory = (relativeDirectory) => {
@@ -310,7 +362,28 @@ function snapshotBackendFileFingerprints() {
   for (const relativePath of BACKEND_ROOT_FILES) {
     addFile(relativePath);
   }
+  for (const relativePath of BACKEND_REPO_ROOT_FILES) {
+    addFile(relativePath, REPO_ROOT);
+  }
   return entries;
+}
+
+export function resolveTauriRootBackendInput(filename) {
+  if (!filename) {
+    return null;
+  }
+  const relativePath = filename.toString();
+  return BACKEND_ROOT_FILES.has(relativePath) ? relativePath : null;
+}
+
+export function resolveRepoRootBackendInput(filename) {
+  if (!filename) {
+    return null;
+  }
+  const relativePath = filename.toString();
+  return BACKEND_REPO_ROOT_FILES.has(relativePath)
+    ? path.join("..", relativePath)
+    : null;
 }
 
 export function createBackendContentTracker(
@@ -408,12 +481,9 @@ export function windowsDevDescendants(
   processes,
   rootPid,
   repoRoot = REPO_ROOT,
-  environment = process.env,
 ) {
   const tauriRoot = path.join(path.resolve(repoRoot), "src-tauri");
-  const targetRoot = environment.CARGO_TARGET_DIR
-    ? path.resolve(tauriRoot, environment.CARGO_TARGET_DIR)
-    : path.join(tauriRoot, "target");
+  const targetRoot = path.join(tauriRoot, "target");
   const byParent = new Map();
   for (const candidate of processes) {
     const parentPid = Number(candidate.ParentProcessId);
@@ -713,10 +783,15 @@ export async function waitForWindowsListenersReleased(
   }
 }
 
-function runTaskkill(processId, force) {
+function runTaskkill(processId, force, tree = false) {
   return spawnSync(
     "taskkill",
-    ["/PID", String(processId), ...(force ? ["/F"] : [])],
+    [
+      "/PID",
+      String(processId),
+      ...(tree ? ["/T"] : []),
+      ...(force ? ["/F"] : []),
+    ],
     {
       encoding: "utf8",
       windowsHide: true,
@@ -732,59 +807,36 @@ export async function stopVerifiedWindowsApp(
     terminate = runTaskkill,
     waitForProcessExit = waitForWindowsProcessExit,
     waitForListenersReleased = waitForWindowsListenersReleased,
-    prepareGracefulShutdown = () => undefined,
-    gracefulTimeoutMs = WINDOWS_GRACEFUL_APP_EXIT_TIMEOUT_MS,
     forcedTimeoutMs = WINDOWS_PROCESS_EXIT_TIMEOUT_MS,
     log = console.log,
   } = {},
 ) {
   const listeners = queryListeners(processInfo);
-  const clearGracefulShutdownRequest = prepareGracefulShutdown();
-  try {
-    log(
-      `[dev] Waiting for authenticated self-shutdown of ${processInfo.Name} PID ${processInfo.ProcessId}.`,
+  const current = queryProcesses().find(
+    (candidate) =>
+      Number(candidate.ProcessId) === Number(processInfo.ProcessId),
+  );
+  if (current && !sameWindowsProcess(processInfo, current)) {
+    throw new Error(
+      `PID ${processInfo.ProcessId} was reused before ${processInfo.Name} shutdown.`,
     );
-    try {
-      await waitForProcessExit(processInfo, queryProcesses, gracefulTimeoutMs);
-      log(
-        `[dev] ${processInfo.Name} PID ${processInfo.ProcessId} exited gracefully.`,
-      );
-    } catch (gracefulError) {
-      const current = queryProcesses().find(
-        (candidate) =>
-          Number(candidate.ProcessId) === Number(processInfo.ProcessId),
-      );
-      if (sameWindowsProcess(processInfo, current)) {
-        log(
-          `[dev] Authenticated self-shutdown timed out for ${processInfo.Name} PID ${processInfo.ProcessId}; using verified forced fallback.`,
-        );
-        const forcedResult = terminate(processInfo.ProcessId, true);
-        if (forcedResult?.error) {
-          throw forcedResult.error;
-        }
-        try {
-          await waitForProcessExit(
-            processInfo,
-            queryProcesses,
-            forcedTimeoutMs,
-          );
-        } catch (error) {
-          throw new Error(
-            `Could not stop owned ${processInfo.Name} PID ${processInfo.ProcessId}: ${String(forcedResult?.stderr ?? "").trim() || error.message}`,
-          );
-        }
-      } else if (current) {
-        throw new Error(
-          `PID ${processInfo.ProcessId} was reused while waiting for ${processInfo.Name} to exit.`,
-        );
-      } else {
-        log(
-          `[dev] ${processInfo.Name} PID ${processInfo.ProcessId} exited while graceful shutdown was being checked.`,
-        );
-      }
+  }
+
+  if (current) {
+    log(
+      `[dev] Force-terminating verified ${processInfo.Name} PID ${processInfo.ProcessId} process tree before rebuild.`,
+    );
+    const forcedResult = terminate(processInfo.ProcessId, true, true);
+    if (forcedResult?.error) {
+      throw forcedResult.error;
     }
-  } finally {
-    clearGracefulShutdownRequest?.();
+    try {
+      await waitForProcessExit(processInfo, queryProcesses, forcedTimeoutMs);
+    } catch (error) {
+      throw new Error(
+        `Could not stop owned ${processInfo.Name} process tree at PID ${processInfo.ProcessId}: ${String(forcedResult?.stderr ?? "").trim() || error.message}`,
+      );
+    }
   }
 
   if (listeners.length > 0) {
@@ -804,7 +856,6 @@ async function stopWindowsProcess(
     terminate = runTaskkill,
     waitForProcessExit = waitForWindowsProcessExit,
     waitForListenersReleased = waitForWindowsListenersReleased,
-    prepareGracefulShutdown = () => undefined,
     log = console.log,
   } = {},
 ) {
@@ -837,7 +888,6 @@ async function stopWindowsProcess(
         terminate,
         waitForProcessExit,
         waitForListenersReleased,
-        prepareGracefulShutdown,
         log,
       });
       continue;
@@ -855,8 +905,6 @@ async function stopWindowsProcess(
     }
   }
 
-  // Never use taskkill /T: the debug app may have launched Codex Desktop,
-  // which is an independent user application despite its inherited parent.
   if (child.exitCode === null && child.signalCode === null) {
     try {
       child.kill();
@@ -929,46 +977,100 @@ async function waitForPort(port, child, timeoutMs = 30_000) {
   throw new Error(`Vite did not open port ${port} within ${timeoutMs}ms.`);
 }
 
+function queryCargoTargetDirectory() {
+  const result = spawnSync(
+    "cargo",
+    [
+      "metadata",
+      "--manifest-path",
+      path.join(TAURI_DIR, "Cargo.toml"),
+      "--no-deps",
+      "--format-version",
+      "1",
+    ],
+    {
+      cwd: REPO_ROOT,
+      env: process.env,
+      encoding: "utf8",
+      windowsHide: true,
+    },
+  );
+  if (result.error) {
+    throw result.error;
+  }
+  if (result.status !== 0) {
+    throw new Error(
+      String(result.stderr ?? "").trim() ||
+        `cargo metadata exited with status ${result.status}.`,
+    );
+  }
+  const metadata = JSON.parse(result.stdout);
+  return metadata.target_directory;
+}
+
+export function runCargoTargetMaintenance({
+  executable = process.execPath,
+  scriptPath = CARGO_TARGET_MAINTENANCE_SCRIPT,
+  cwd = REPO_ROOT,
+  environment = process.env,
+  run = spawnSync,
+} = {}) {
+  const result = run(executable, [scriptPath], {
+    cwd,
+    env: environment,
+    encoding: "utf8",
+    windowsHide: true,
+  });
+  if (result.stdout) {
+    process.stdout.write(result.stdout);
+  }
+  if (result.stderr) {
+    process.stderr.write(result.stderr);
+  }
+  if (result.error) {
+    throw result.error;
+  }
+  if (result.status !== 0) {
+    throw new Error(
+      `Cargo target maintenance exited with status ${result.status}.`,
+    );
+  }
+}
+
 async function run() {
   const args = process.argv.slice(2);
   if (args.includes("--help") || args.includes("-h")) {
-    console.log(`Usage: pnpm dev:delayed -- [--delay milliseconds]
+    console.log(`Usage: pnpm dev:delayed -- [--delay milliseconds] [--no-rebuild]
 
 Runs Vite with immediate frontend HMR and rebuilds the Tauri backend only after
 backend files have remained unchanged for the configured quiet period.
 
 Options:
-  -d, --delay <ms>  Quiet period before a backend rebuild (default: 50000)
+  -d, --delay <ms>  Quiet period before a backend rebuild (default: 3600000 / 1 hour)
+  --no-rebuild      Detect and log backend edits, but never rebuild/restart Tauri
 
 Environment:
   TAURI_DEV_REBUILD_DELAY_MS  Same setting as --delay; CLI option takes priority
+  TAURI_DEV_NO_REBUILD         Same setting as --no-rebuild (1/true or 0/false)
 
-Use "pnpm dev:immediate" for Tauri's native backend watcher.`);
+Use "pnpm dev:immediate" for the same verified lifecycle with no quiet delay.`);
     return;
   }
 
   const delayMs = parseDelayMs(args);
+  const noRebuild = parseNoRebuild(args);
   const frontendPort = parsePort();
-  const devShutdownToken = randomBytes(32).toString("hex");
-  const devShutdownMarker = path.join(
-    tmpdir(),
-    `ccswitch-dev-shutdown-${process.pid}-${randomBytes(8).toString("hex")}.token`,
-  );
-  const prepareGracefulShutdown = () => {
-    writeFileSync(devShutdownMarker, devShutdownToken, {
-      encoding: "utf8",
-      flag: "w",
-    });
-    return () => rmSync(devShutdownMarker, { force: true });
-  };
+  assertNormalCargoTargetDirectory(path.join(TAURI_DIR, "target"));
+  assertNormalCargoTargetDirectory(queryCargoTargetDirectory(), {});
   if (await isPortOpen(frontendPort)) {
     throw new Error(
       `Port ${frontendPort} is already in use. Stop the existing dev session before running pnpm dev:delayed.`,
     );
   }
+  runCargoTargetMaintenance();
 
   console.log(
-    `[dev] Frontend HMR is immediate; backend rebuilds after ${delayMs}ms without changes.`,
+    `[dev] Frontend HMR is immediate; backend ${noRebuild ? "rebuilds are disabled (--no-rebuild)" : `rebuilds after ${delayMs}ms without changes`}.`,
   );
 
   const vite = startProcess(process.execPath, [
@@ -983,19 +1085,28 @@ Use "pnpm dev:immediate" for Tauri's native backend watcher.`);
   let shutdownPromise;
   const expectedTauriExits = createExpectedExitRegistry();
   const backendContentTracker = createBackendContentTracker();
+  let lastBackendEditAt;
+  let lastBackendEditPaths = [];
+
+  const logBackendEvent = (message) => {
+    console.log(`[dev ${new Date().toISOString()}] ${message}`);
+  };
 
   const reportScheduledRebuild = (changedPaths, scheduleResult) => {
     const displayedPaths = changedPaths.slice(0, 3).join(", ");
     const extraCount = changedPaths.length - 3;
     const summary = `${displayedPaths}${extraCount > 0 ? ` (+${extraCount} more)` : ""}`;
+    const lastEdit = lastBackendEditAt
+      ? `; last edit detected at ${lastBackendEditAt}`
+      : "";
     if (scheduleResult === "deferred") {
-      console.log(
-        `[dev] Backend changed while building: ${summary}; one follow-up rebuild will run after this build settles.`,
+      logBackendEvent(
+        `Backend changed while building: ${summary}; one follow-up rebuild will run after this build settles${lastEdit}.`,
       );
       return;
     }
-    console.log(
-      `[dev] Backend changed: ${summary}; rebuilding after ${delayMs}ms without further backend edits.`,
+    logBackendEvent(
+      `Backend changed: ${summary}; rebuilding after ${delayMs}ms without further backend edits${lastEdit}.`,
     );
   };
 
@@ -1023,6 +1134,24 @@ Use "pnpm dev:immediate" for Tauri's native backend watcher.`);
       const dirtyPaths = backendContentTracker.dirtyPaths();
       if (dirtyPaths.length === 0) {
         rebuildGate.clearChange();
+        logBackendEvent(
+          "Backend edit reverted to the current build baseline; pending rebuild cancelled.",
+        );
+        lastBackendEditAt = new Date().toISOString();
+        lastBackendEditPaths = [];
+        return;
+      }
+      lastBackendEditAt = new Date().toISOString();
+      lastBackendEditPaths = dirtyPaths;
+      const displayedPaths = dirtyPaths.slice(0, 8).join(", ");
+      const extraCount = dirtyPaths.length - 8;
+      logBackendEvent(
+        `Backend edit detected: ${displayedPaths}${extraCount > 0 ? ` (+${extraCount} more)` : ""}.`,
+      );
+      if (noRebuild) {
+        logBackendEvent(
+          `Backend rebuild suppressed; latest detected edit is ${lastBackendEditAt}.`,
+        );
         return;
       }
       reportScheduledRebuild(dirtyPaths, rebuildGate.scheduleChange());
@@ -1081,13 +1210,8 @@ Use "pnpm dev:immediate" for Tauri's native backend watcher.`);
       );
     }
 
-    addWatcher(TAURI_DIR, { recursive: false }, (filename) => {
-      if (!filename) {
-        return null;
-      }
-      const relativePath = filename.toString();
-      return BACKEND_ROOT_FILES.has(relativePath) ? relativePath : null;
-    });
+    addWatcher(TAURI_DIR, { recursive: false }, resolveTauriRootBackendInput);
+    addWatcher(REPO_ROOT, { recursive: false }, resolveRepoRootBackendInput);
     console.log("[dev] Backend watcher armed.");
   };
 
@@ -1112,8 +1236,7 @@ Use "pnpm dev:immediate" for Tauri's native backend watcher.`);
         stdio: ["inherit", "pipe", "pipe"],
         env: {
           ...process.env,
-          CCSWITCH_DEV_SHUTDOWN_MARKER: devShutdownMarker,
-          CCSWITCH_DEV_SHUTDOWN_TOKEN: devShutdownToken,
+          CARGO_INCREMENTAL: "0",
         },
       },
     );
@@ -1168,17 +1291,21 @@ Use "pnpm dev:immediate" for Tauri's native backend watcher.`);
   };
 
   const restartTauri = async () => {
+    const rebuildStartedAt = new Date().toISOString();
+    const triggeringPaths = lastBackendEditPaths;
+    const triggeringSummary = triggeringPaths.slice(0, 8).join(", ");
+    const extraCount = triggeringPaths.length - 8;
     rebuildGate.markBuilding();
     backendContentTracker.beginBuild(snapshotBackendFileFingerprints());
-    console.log(`[dev] Backend quiet for ${delayMs}ms; rebuilding once.`);
+    logBackendEvent(
+      `Backend rebuild triggered at ${rebuildStartedAt}; last edit detected at ${lastBackendEditAt ?? "unknown"}; paths: ${triggeringSummary || "unknown"}${extraCount > 0 ? ` (+${extraCount} more)` : ""}.`,
+    );
     const previousTauri = tauri;
     try {
       if (previousTauri) {
         expectedTauriExits.mark(previousTauri);
       }
-      await stopProcessTree(previousTauri, windowsDevDescendants, {
-        prepareGracefulShutdown,
-      });
+      await stopProcessTree(previousTauri, windowsDevDescendants);
       // Detach only after verified cleanup. Until then shutdown must retain
       // the handle so it can retry cleanup after an intermediate failure.
       if (tauri === previousTauri) {
@@ -1212,9 +1339,7 @@ Use "pnpm dev:immediate" for Tauri's native backend watcher.`);
     closeBackendWatchers();
     process.exitCode = exitCode;
     shutdownPromise = Promise.allSettled([
-      stopProcessTree(tauri, windowsDevDescendants, {
-        prepareGracefulShutdown,
-      }),
+      stopProcessTree(tauri, windowsDevDescendants),
       stopProcessTree(vite, windowsFrontendDescendants),
     ]).then((results) => {
       const failures = results

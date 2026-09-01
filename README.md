@@ -9,11 +9,12 @@
 [![Built with Tauri](https://img.shields.io/badge/built%20with-Tauri%202-orange.svg)](https://tauri.app/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-English | [中文](README_ZH.md) | [日本語](README_JA.md) | [Deutsch](README_DE.md) | [Changelog](CHANGELOG.md)
+English | [Changelog](CHANGELOG.md)
 
 > **CC Switch MultiRouter** is a feature-rich fork of [ccswitchmulti](https://github.com/BigStrongSun/ccswitchmulti) by [BigStrongSun](https://github.com/BigStrongSun), which is itself a fork of [cc-switch](https://github.com/farion1231/cc-switch) by [Jason Young (farion1231)](https://github.com/farion1231).
 >
 > Key fork additions:
+>
 > - **Codex MultiRouter V2** — multi-provider routing with verified protocol profiles
 > - **Sub-Agent V2** profile editor with selection policy (`official_first` / `third_party_first`)
 > - **Deep protocol probe** — backend-driven Responses/Chat verification with stage events
@@ -30,16 +31,17 @@ English | [中文](README_ZH.md) | [日本語](README_JA.md) | [Deutsch](README_
 
 This project stands on the shoulders of two excellent upstream projects:
 
-| Project | Author | Contribution |
-|---------|--------|--------------|
-| [cc-switch](https://github.com/farion1231/cc-switch) | [Jason Young (farion1231)](https://github.com/farion1231) | Original creator — built the entire foundation: provider management architecture, proxy system, MCP/Prompts/Skills panel, SQLite database layer, and the Tauri desktop app framework |
-| [ccswitchmulti](https://github.com/BigStrongSun/ccswitchmulti) | [BigStrongSun](https://github.com/BigStrongSun) | Added Codex MultiRouter concept, session manager enhancements, and extended tool support (OpenCode, OpenClaw, Hermes) |
+| Project                                                        | Author                                                    | Contribution                                                                                                                                                                         |
+| -------------------------------------------------------------- | --------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| [cc-switch](https://github.com/farion1231/cc-switch)           | [Jason Young (farion1231)](https://github.com/farion1231) | Original creator — built the entire foundation: provider management architecture, proxy system, MCP/Prompts/Skills panel, SQLite database layer, and the Tauri desktop app framework |
+| [ccswitchmulti](https://github.com/BigStrongSun/ccswitchmulti) | [BigStrongSun](https://github.com/BigStrongSun)           | Added Codex MultiRouter concept, session manager enhancements, and extended tool support (OpenCode, OpenClaw, Hermes)                                                                |
 
 We are deeply grateful for their work. Without cc-switch, none of this would exist.
 
 Please consider starring both upstream projects if you find this fork useful.
 
 ---
+
 ## Why CC Switch?
 
 Modern AI-powered coding relies on tools like Claude Code, Claude Desktop, Codex, Gemini CLI, Grok Build, OpenCode, OpenClaw, and Hermes — but each has its own configuration format. Switching API providers means manually editing JSON, TOML, or `.env` files, and there is no unified way to manage MCP and Skills across multiple tools.
@@ -75,7 +77,6 @@ Modern AI-powered coding relies on tools like Claude Code, Claude Desktop, Codex
 - **Local proxy with hot-switching** — Format conversion, auto-failover, circuit breaker, provider health monitoring, and request rectifier
 - **App-level takeover** — Independently proxy Claude, Codex, Gemini, or Grok Build, down to individual providers
 
-
 ### Codex MultiRouter & Advanced Routing (fork additions)
 
 - **MultiRouter V2** — Multi-provider routing with verified protocol profiles, route rules, and live model catalog
@@ -86,6 +87,7 @@ Modern AI-powered coding relies on tools like Claude Code, Claude Desktop, Codex
 - **Sub-Agent V2** — Profile editor with `official_first` / `third_party_first` selection policy
 - **Stream retry** — Transparent proxy-side SSE reconnect before semantic output reaches the client
 - **Language switcher** — Header-level instant locale change (en/zh/zh-TW/ja), English default
+
 ### MCP, Prompts & Skills
 
 - **Unified MCP panel** — Manage MCP servers across Claude, Codex, Gemini, Grok Build, OpenCode, and Hermes with bidirectional sync and Deep Link import
@@ -308,8 +310,14 @@ Download the latest Linux build from the [Releases](../../releases) page:
 # Install dependencies
 pnpm install
 
-# Dev mode (hot reload)
+# Dev mode (frontend HMR + delayed backend rebuild)
 pnpm dev
+
+# Keep the current Tauri backend binary; still log detected backend edits
+pnpm dev -- --no-rebuild
+
+# Optional: change the quiet period before a backend rebuild
+pnpm dev -- --delay 300000
 
 # Type check
 pnpm typecheck
@@ -332,6 +340,18 @@ pnpm build
 # Build debug version
 pnpm tauri build --debug
 ```
+
+`pnpm dev` waits for five quiet minutes before rebuilding the backend. It logs
+the UTC time of every content-changing backend edit and the exact time and
+paths that triggered each rebuild. Set
+`TAURI_DEV_NO_REBUILD=1` instead of passing `--no-rebuild` when you want the
+backend to stay fixed for an entire session. Local dev and test profiles disable
+Rust incremental state and debug symbols because this crate can otherwise
+produce multi-gigabyte cache generations on Windows. Before starting Tauri,
+the dev launcher runs a guarded `cargo clean` only when the normal target
+directory exceeds 12 GB and no matching Cargo, rustc, or app process is active.
+Set `CCSM_CARGO_TARGET_MAX_GB=0` to disable automatic cleanup, or run
+`pnpm clean:rust-cache` manually while the development app is stopped.
 
 ### Rust Backend Development
 

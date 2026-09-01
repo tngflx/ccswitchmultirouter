@@ -61,6 +61,24 @@ Describe "CCSwitchMulti guardian maintenance lease" {
             -NowUtc ([datetime]"2026-08-24T05:05:00Z") -GetProcessIdentity $getIdentity | Should Be $true
     }
 
+    It "preserves sub-second process identity after PowerShell JSON date conversion" {
+        $start = "2026-08-24T05:00:00.3194887Z"
+        $lease = (New-TestLease -OwnerStartTimeUtc $start) |
+            ConvertTo-Json -Depth 4 |
+            ConvertFrom-Json
+        $getIdentity = {
+            param($ProcessId)
+            return [pscustomobject]@{
+                ProcessId = $ProcessId
+                Path = "C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"
+                StartTimeUtc = $start
+            }
+        }
+
+        Test-CcsmMaintenanceLeaseRecord -Lease $lease `
+            -NowUtc ([datetime]"2026-08-24T05:05:00Z") -GetProcessIdentity $getIdentity | Should Be $true
+    }
+
     It "rejects an expired lease even while the recorded PID remains alive" {
         Write-TestLease -Path $script:markerPath -Lease (New-TestLease -ExpiresAtUtc ([datetime]"2026-08-24T05:04:59Z"))
         $getIdentity = {

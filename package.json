@@ -6,7 +6,9 @@
   "scripts": {
     "dev": "node scripts/dev-tauri-delayed.mjs",
     "dev:delayed": "node scripts/dev-tauri-delayed.mjs",
-    "dev:immediate": "pnpm tauri dev",
+    "dev:immediate": "node scripts/dev-tauri-delayed.mjs --delay 0",
+    "clean:rust-cache": "node scripts/prune-cargo-target.mjs --force",
+    "clean:rust-cache:check": "node scripts/prune-cargo-target.mjs --dry-run",
     "build": "pnpm tauri build",
     "tauri": "tauri",
     "dev:renderer": "vite",
