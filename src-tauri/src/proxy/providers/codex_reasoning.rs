@@ -198,6 +198,11 @@ pub struct CodexModelReasoningCapability {
     #[serde(default)]
     pub supported_efforts: Vec<String>,
     pub default_effort: Option<String>,
+    /// Legacy capability declarations omitted this field; absence means the
+    /// provider did not explicitly advertise a reasoning-disable contract.
+    /// Keep reads backward-compatible while validation still rejects `none`
+    /// unless the field is explicitly true in newly written data.
+    #[serde(default)]
     pub disable_allowed: bool,
     pub upstream: CodexModelReasoningUpstream,
     pub output_format: Option<String>,
@@ -1353,6 +1358,23 @@ mod tests {
             legacy_false.effective_control_kind(),
             ReasoningControlKind::None
         );
+    }
+
+    #[test]
+    fn legacy_declaration_without_disable_allowed_is_backward_compatible() {
+        let capability: CodexModelReasoningCapability = serde_json::from_value(json!({
+            "supported": true,
+            "supportedEfforts": ["low", "high"],
+            "defaultEffort": "high",
+            "upstream": {"format": "string", "parameter": "reasoning_effort"}
+        }))
+        .expect("legacy declarations may omit disableAllowed");
+        assert!(!capability.disable_allowed);
+        assert_eq!(
+            capability.effective_support_status(),
+            ReasoningSupportStatus::ConfirmedSupported
+        );
+        assert!(capability.validate().is_ok());
     }
 
     #[test]

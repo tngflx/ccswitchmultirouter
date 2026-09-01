@@ -635,6 +635,9 @@ pub struct ProviderMeta {
     /// - "openai_responses": OpenAI Responses API 格式，需要转换
     #[serde(rename = "apiFormat", skip_serializing_if = "Option::is_none")]
     pub api_format: Option<String>,
+    /// Records whether the provider protocol was selected manually or inferred/probed.
+    #[serde(rename = "apiFormatSource", skip_serializing_if = "Option::is_none")]
+    pub api_format_source: Option<String>,
     /// Codex third-party protocol selection policy. Missing means automatic probing.
     #[serde(rename = "codexProtocolMode", skip_serializing_if = "Option::is_none")]
     pub codex_protocol_mode: Option<CodexProtocolMode>,
@@ -683,6 +686,9 @@ pub struct ProviderMeta {
     /// Codex Responses -> Chat Completions reasoning capability metadata.
     #[serde(rename = "codexChatReasoning", skip_serializing_if = "Option::is_none")]
     pub codex_chat_reasoning: Option<CodexChatReasoningConfig>,
+    /// Stable preset identity used to resolve maintained Codex model capabilities.
+    #[serde(rename = "codexPresetId", skip_serializing_if = "Option::is_none")]
+    pub codex_preset_id: Option<String>,
     /// Codex 单供应商模型目录是否投射为 `/model` 菜单映射。
     ///
     /// `modelCatalog` 本身还承担模型目录、上下文窗口、多路路由候选等元数据职责；
@@ -1287,6 +1293,26 @@ mod tests {
         let decoded: ProviderMeta =
             serde_json::from_value(value).expect("deserialize ProviderMeta");
         assert_eq!(decoded.codex_local_model_mapping, Some(false));
+    }
+
+    #[test]
+    fn provider_meta_roundtrips_frontend_identity_fields() {
+        let meta = ProviderMeta {
+            codex_preset_id: Some("opencode-zen".to_string()),
+            api_format_source: Some("manual".to_string()),
+            ..ProviderMeta::default()
+        };
+
+        let value = serde_json::to_value(&meta).expect("serialize ProviderMeta");
+        assert_eq!(value["codexPresetId"], "opencode-zen");
+        assert_eq!(value["apiFormatSource"], "manual");
+        assert!(value.get("codex_preset_id").is_none());
+        assert!(value.get("api_format_source").is_none());
+
+        let decoded: ProviderMeta =
+            serde_json::from_value(value).expect("deserialize ProviderMeta");
+        assert_eq!(decoded.codex_preset_id.as_deref(), Some("opencode-zen"));
+        assert_eq!(decoded.api_format_source.as_deref(), Some("manual"));
     }
 
     #[test]

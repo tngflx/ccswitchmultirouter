@@ -74,6 +74,8 @@ const CREATE_NO_WINDOW: u32 = 0x08000000;
 static CODEX_MODEL_CATALOG_TEMPLATE_CACHE: OnceCell<Value> = OnceCell::new();
 #[cfg(not(test))]
 static CODEX_BUNDLED_MODELS_CACHE: OnceCell<Option<Vec<Value>>> = OnceCell::new();
+#[cfg(not(test))]
+static CODEX_CLI_VERSION_CACHE: OnceCell<Option<String>> = OnceCell::new();
 
 /// Top-level `config.toml` key that controls Codex's built-in web-search tool.
 pub(crate) const CODEX_WEB_SEARCH_FIELD: &str = "web_search";
@@ -2184,10 +2186,18 @@ fn push_env_codex_cli_candidates(candidates: &mut Vec<PathBuf>, seen: &mut HashS
                 push_existing_codex_cli_candidate(candidates, seen, npm_dir.join(name));
             }
         }
+        if let Some(local_appdata) = std::env::var_os("LOCALAPPDATA") {
+            push_codex_cli_candidates_from_version_dirs(
+                candidates,
+                seen,
+                PathBuf::from(local_appdata).join("OpenAI/Codex/bin"),
+                &["codex.exe"],
+            );
+        }
     }
 }
 
-fn codex_cli_candidates() -> Vec<PathBuf> {
+pub(crate) fn codex_cli_candidates() -> Vec<PathBuf> {
     let mut candidates = Vec::new();
     let mut seen = HashSet::new();
 
@@ -2217,6 +2227,72 @@ fn codex_bundled_models_command(candidate: &Path) -> Command {
     }
 
     command
+}
+
+#[cfg(not(test))]
+fn codex_version_command(candidate: &Path) -> Command {
+    let mut command = Command::new(candidate);
+    command.arg("--version").stdin(Stdio::null());
+
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+
+    command
+}
+
+fn parse_codex_cli_version(output: &str) -> Option<String> {
+    output
+        .split_whitespace()
+        .rev()
+        .find(|part| {
+            let mut components = part.split('.');
+            components
+                .next()
+                .is_some_and(|value| value.chars().all(|ch| ch.is_ascii_digit()))
+                && components
+                    .next()
+                    .is_some_and(|value| value.chars().all(|ch| ch.is_ascii_digit()))
+                && components
+                    .next()
+                    .is_some_and(|value| value.chars().all(|ch| ch.is_ascii_digit()))
+        })
+        .map(|version| version.trim().to_string())
+}
+
+#[cfg(not(test))]
+fn discover_codex_cli_version_uncached() -> Option<String> {
+    for candidate in codex_cli_candidates() {
+        let candidate_label = candidate.to_string_lossy();
+        let output = match codex_version_command(&candidate).output() {
+            Ok(output) => output,
+            Err(err) => {
+                log::debug!("failed to run `{candidate_label} --version`: {err}");
+                continue;
+            }
+        };
+        if !output.status.success() {
+            continue;
+        }
+        if let Some(version) = parse_codex_cli_version(&String::from_utf8_lossy(&output.stdout)) {
+            return Some(version);
+        }
+    }
+    None
+}
+
+#[cfg(not(test))]
+fn discover_codex_cli_version() -> Option<String> {
+    CODEX_CLI_VERSION_CACHE
+        .get_or_init(discover_codex_cli_version_uncached)
+        .clone()
+}
+
+#[cfg(test)]
+fn discover_codex_cli_version() -> Option<String> {
+    None
 }
 
 #[cfg(not(test))]
@@ -2624,7 +2700,9 @@ fn codex_model_catalog_from_settings(
             .enumerate()
             .map(|(index, spec)| codex_vendor_catalog_model_entry(&vendor_models, spec, index))
             .collect();
-        return Ok(Some(json!({ "models": entries })));
+        let mut catalog = json!({ "models": entries });
+        project_codex_catalog_provider_metadata(settings, &mut catalog);
+        return Ok(Some(catalog));
     }
 
     let default_context_window =
@@ -2639,12 +2717,54 @@ fn codex_model_catalog_from_settings(
         }
         CodexCatalogToolProfile::ProxyChat => load_codex_model_catalog_template()?,
     };
-    Ok(Some(codex_model_catalog_from_specs(
-        &specs,
-        &template,
-        profile,
-        default_context_window,
-    )))
+    let mut catalog =
+        codex_model_catalog_from_specs(&specs, &template, profile, default_context_window);
+    project_codex_catalog_provider_metadata(settings, &mut catalog);
+    Ok(Some(catalog))
+}
+
+fn project_codex_catalog_provider_metadata(settings: &Value, catalog: &mut Value) {
+    let source_models = settings
+        .get("modelCatalog")
+        .and_then(|value| value.get("models"))
+        .and_then(Value::as_array);
+    let Some(target_models) = catalog.get_mut("models").and_then(Value::as_array_mut) else {
+        return;
+    };
+
+    let provider_names = source_models
+        .into_iter()
+        .flatten()
+        .filter_map(|model| {
+            let id = codex_model_stable_id(model)?;
+            let provider_name = codex_catalog_provider_name(model)?;
+            Some((id, provider_name.to_string()))
+        })
+        .collect::<HashMap<_, _>>();
+
+    for model in target_models {
+        let Some(object) = model.as_object_mut() else {
+            continue;
+        };
+        let provider_name = codex_model_stable_id(&Value::Object(object.clone()))
+            .and_then(|id| provider_names.get(&id));
+        match provider_name {
+            Some(provider_name) => {
+                object.insert(
+                    "providerName".to_string(),
+                    Value::String(provider_name.clone()),
+                );
+                object.insert(
+                    "provider_name".to_string(),
+                    Value::String(provider_name.clone()),
+                );
+            }
+            None => {
+                object.remove("providerName");
+                object.remove("provider_name");
+            }
+        }
+    }
 }
 
 /// 为当前活动 custom provider 生成 Codex Desktop 可枚举的内联模型数组。
@@ -2689,6 +2809,10 @@ fn codex_provider_models_toml_array(
             model.insert("upstreamModel", upstream_model.as_str().into());
             model.insert("upstream_model", upstream_model.as_str().into());
         }
+        if let Some(provider_name) = catalog_entry.and_then(codex_catalog_provider_name) {
+            model.insert("providerName", provider_name.into());
+            model.insert("provider_name", provider_name.into());
+        }
         model.insert("display_name", display_name.into());
         model.insert("displayName", display_name.into());
         model.insert("description", display_name.into());
@@ -2727,10 +2851,7 @@ fn codex_provider_models_toml_array(
         );
         model.insert(
             "supportedReasoningLevels",
-            codex_provider_reasoning_efforts_toml_array(
-                supported_reasoning_levels,
-                "effort",
-            ),
+            codex_provider_reasoning_efforts_toml_array(supported_reasoning_levels, "effort"),
         );
         if let Some(speed_tiers) = codex_provider_string_toml_array(
             catalog_entry.and_then(|entry| entry.get("additional_speed_tiers")),
@@ -5913,6 +6034,14 @@ fn codex_model_stable_id(model: &Value) -> Option<String> {
     })
 }
 
+fn codex_catalog_provider_name(model: &Value) -> Option<&str> {
+    ["providerName", "provider_name"]
+        .into_iter()
+        .find_map(|field| model.get(field).and_then(Value::as_str))
+        .map(str::trim)
+        .filter(|provider_name| !provider_name.is_empty())
+}
+
 /// 合并同一模型的官方元数据和 CCSM 路由表示。
 ///
 /// 路由字段继续覆盖模型标识、显式上下文和路由能力；官方模型已有的协议、工具、
@@ -6119,18 +6248,22 @@ fn sync_codex_models_cache_with_cc_switch_catalog(catalog: &Value) -> Result<(),
     // 官方同 slug 元数据优先来自接管前 backup；backup 为空时使用 Codex 自带
     // bundled 官方目录，因此新模型不会被旧缓存/空 backup 卡住。
     let official_models = codex_official_models_cache().unwrap_or_default();
-    let client_version = existing_cache
+    let existing_client_version = existing_cache
         .as_ref()
         .and_then(|cache| cache.get("client_version"))
         .and_then(|version| version.as_str())
         .map(ToString::to_string);
+    let client_version = resolve_codex_models_cache_client_version(
+        existing_client_version,
+        discover_codex_cli_version(),
+    );
 
     // Codex 0.140+ 的 custom provider 不会主动请求 /models，只会读取新鲜 cache。
     // 因此这里复用已有 client_version 写入同格式 cache，让模型菜单立刻看到
     // cc-switch 生成的完整 catalog，同时用 etag 标记所有权便于恢复 official。
     let Some(client_version) = client_version else {
-        log::warn!(
-            "skip Codex models_cache sync: existing cache has no client_version, path={}",
+        log::debug!(
+            "skip Codex models_cache sync: no existing or installed Codex client version, path={}",
             cache_path.display()
         );
         return Ok(());
@@ -6200,6 +6333,15 @@ fn sync_codex_models_cache_with_cc_switch_catalog(catalog: &Value) -> Result<(),
     cache_object.insert("client_version".to_string(), Value::String(client_version));
     cache_object.insert("models".to_string(), Value::Array(merged_models));
     write_json_file(&cache_path, &cache)
+}
+
+fn resolve_codex_models_cache_client_version(
+    existing: Option<String>,
+    discovered: Option<String>,
+) -> Option<String> {
+    existing
+        .filter(|version| !version.trim().is_empty())
+        .or_else(|| discovered.filter(|version| !version.trim().is_empty()))
 }
 
 /// 在退出 MultiRouter 或清空模型目录时恢复 Codex 原始模型缓存。
@@ -6628,6 +6770,10 @@ fn build_simplified_catalog_from_texts(config_text: &str, catalog_text: &str) ->
             .filter(|s| !s.is_empty() && *s != model)
         {
             obj.insert("displayName".to_string(), json!(display_name));
+        }
+
+        if let Some(provider_name) = codex_catalog_provider_name(entry) {
+            obj.insert("providerName".to_string(), json!(provider_name));
         }
 
         if let Some(context_window) = entry
@@ -7284,7 +7430,7 @@ fn set_codex_experimental_bearer_token(config_text: &str, token: &str) -> Result
 /// bearer or `env_key` are eligible: keyless header-auth tables must not be
 /// stamped with `requires_openai_auth`, or Codex may route their requests via
 /// the preserved ChatGPT login.
-fn align_codex_requires_openai_auth_with_login_preservation(
+pub(crate) fn align_codex_requires_openai_auth_with_login_preservation(
     config_text: &str,
     preserve_official_login: bool,
 ) -> Result<String, AppError> {
@@ -7308,17 +7454,6 @@ fn align_codex_requires_openai_auth_with_login_preservation(
     else {
         return Ok(config_text.to_string());
     };
-    // MultiRouter takeover uses a synthetic bearer as a Desktop-facing
-    // facade. Its `requires_openai_auth` bit is deliberately kept true so
-    // the login/account surface remains available; this is not a normal
-    // third-party provider switch.
-    if provider_table
-        .get("experimental_bearer_token")
-        .and_then(|item| item.as_str())
-        .is_some_and(|token| token == CODEX_PROXY_AUTH_PLACEHOLDER)
-    {
-        return Ok(config_text.to_string());
-    }
     if provider_table.get("experimental_bearer_token").is_none()
         && provider_table.get("env_key").is_none()
     {
@@ -7336,6 +7471,20 @@ fn align_codex_requires_openai_auth_with_login_preservation(
         toml_edit::value(preserve_official_login),
     );
     Ok(doc.to_string())
+}
+
+/// Decide whether the live Codex config may advertise official ChatGPT auth.
+///
+/// The preference is only a request to preserve login material; it is not
+/// proof that `auth.json` still contains an OAuth login. API-key-only auth
+/// (including a provider's `OPENAI_API_KEY`) must not be paired with
+/// `requires_openai_auth = true`, or Codex Desktop repeatedly probes
+/// chatgpt.com without a token.
+pub fn codex_live_requires_openai_auth(preserve_requested: bool) -> bool {
+    preserve_requested
+        && read_json_file(&get_codex_auth_path())
+            .ok()
+            .is_some_and(|auth| codex_auth_has_credential_login_material(&auth))
 }
 
 pub fn remove_codex_experimental_bearer_token_if(
@@ -7850,7 +7999,9 @@ pub fn write_codex_live_for_provider(
             }
             align_codex_requires_openai_auth_with_login_preservation(
                 &prepared,
-                crate::settings::preserve_codex_official_auth_on_switch(),
+                codex_live_requires_openai_auth(
+                    crate::settings::preserve_codex_official_auth_on_switch(),
+                ),
             )
         })
         .map(|_| ())
@@ -11543,6 +11694,42 @@ http_headers = { Authorization = "Bearer static" }
 
     #[test]
     #[serial]
+    fn live_requires_openai_auth_never_claims_api_key_as_chatgpt_login() {
+        let _home = TestHomeGuard::new();
+
+        write_json_file(
+            &get_codex_auth_path(),
+            &json!({"OPENAI_API_KEY": "sk-third-party"}),
+        )
+        .expect("seed API-key auth");
+        assert!(
+            !codex_live_requires_openai_auth(true),
+            "API-key-only auth must not enable official ChatGPT probes"
+        );
+
+        write_json_file(
+            &get_codex_auth_path(),
+            &json!({
+                "auth_mode": "chatgpt",
+                "tokens": {
+                    "access_token": "oauth-access",
+                    "refresh_token": "oauth-refresh"
+                }
+            }),
+        )
+        .expect("seed OAuth auth");
+        assert!(
+            codex_live_requires_openai_auth(true),
+            "preservation may enable official auth only with OAuth material"
+        );
+        assert!(
+            !codex_live_requires_openai_auth(false),
+            "disabled preservation must never enable official auth"
+        );
+    }
+
+    #[test]
+    #[serial]
     fn third_party_live_write_preserves_existing_codex_oauth_auth() {
         let _home = TestHomeGuard::new();
         let live_oauth = json!({
@@ -14026,6 +14213,35 @@ base_url = "http://127.0.0.1:15721/v1"
     }
 
     #[test]
+    fn generated_catalog_keeps_canonical_provider_metadata() {
+        let settings = json!({
+            "modelCatalog": {
+                "models": [{
+                    "model": "gpt-5.6-sol-zmhub-responses",
+                    "providerName": "ZMHub Responses"
+                }]
+            }
+        });
+        let mut catalog = json!({
+            "models": [{
+                "slug": "gpt-5.6-sol-zmhub-responses",
+                "providerName": "stale-provider"
+            }]
+        });
+
+        project_codex_catalog_provider_metadata(&settings, &mut catalog);
+
+        assert_eq!(
+            catalog["models"][0]["providerName"],
+            Value::String("ZMHub Responses".to_string())
+        );
+        assert_eq!(
+            catalog["models"][0]["provider_name"],
+            Value::String("ZMHub Responses".to_string())
+        );
+    }
+
+    #[test]
     /// 活动 custom provider 的内联模型也必须使用 enriched catalog 的官方推理档位。
     fn codex_provider_inline_models_use_enriched_reasoning_levels() {
         let specs = vec![CodexCatalogModelSpec {
@@ -14047,6 +14263,7 @@ base_url = "http://127.0.0.1:15721/v1"
             "models": [{
                 "slug": "gpt-5.6-sol",
                 "display_name": "GPT-5.6-Sol",
+                "providerName": "ZMHub Responses",
                 "default_reasoning_level": "medium",
                 "supported_reasoning_levels": [
                     { "effort": "low", "description": "Low" },
@@ -14090,6 +14307,14 @@ base_url = "http://127.0.0.1:15721/v1"
         assert_eq!(
             model.get("display_name").and_then(|value| value.as_str()),
             Some("GPT-5.6-Sol")
+        );
+        assert_eq!(
+            model.get("providerName").and_then(|value| value.as_str()),
+            Some("ZMHub Responses")
+        );
+        assert_eq!(
+            model.get("provider_name").and_then(|value| value.as_str()),
+            Some("ZMHub Responses")
         );
         assert_eq!(
             efforts,
@@ -16744,6 +16969,36 @@ wire_api = "responses"
         assert!(read_back.catalog_verified);
         assert!(read_back.config_verified);
         assert!(read_back.cache_verified);
+    }
+
+    #[test]
+    fn codex_models_cache_version_prefers_existing_then_installed_cli() {
+        assert_eq!(
+            parse_codex_cli_version("codex-cli 0.150.1\r\n").as_deref(),
+            Some("0.150.1")
+        );
+        assert_eq!(
+            resolve_codex_models_cache_client_version(
+                Some("0.149.0".to_string()),
+                Some("0.150.1".to_string()),
+            )
+            .as_deref(),
+            Some("0.149.0"),
+            "the writer that created the existing cache remains authoritative"
+        );
+        assert_eq!(
+            resolve_codex_models_cache_client_version(None, Some("0.150.1".to_string())).as_deref(),
+            Some("0.150.1"),
+            "an unversioned cache should use the installed Codex CLI version"
+        );
+        assert_eq!(
+            resolve_codex_models_cache_client_version(
+                Some("  ".to_string()),
+                Some("0.150.1".to_string()),
+            )
+            .as_deref(),
+            Some("0.150.1")
+        );
     }
 
     #[test]

@@ -38,6 +38,53 @@ fn default_stream_retry_mode() -> StreamRetryMode {
     StreamRetryMode::Safe
 }
 
+fn default_large_request_threshold_bytes() -> u32 {
+    384 * 1024
+}
+
+fn default_max_codex_input_tokens() -> u32 {
+    200_000
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RequestOptimizationMode {
+    Off,
+    Diagnose,
+    Safe,
+}
+
+impl Default for RequestOptimizationMode {
+    fn default() -> Self {
+        Self::Safe
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RequestHealthConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub optimization_mode: RequestOptimizationMode,
+    #[serde(default = "default_large_request_threshold_bytes")]
+    pub large_request_threshold_bytes: u32,
+    /// Conservative preflight ceiling used before a Codex request is sent upstream.
+    #[serde(default = "default_max_codex_input_tokens")]
+    pub max_codex_input_tokens: u32,
+}
+
+impl Default for RequestHealthConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            optimization_mode: RequestOptimizationMode::Safe,
+            large_request_threshold_bytes: default_large_request_threshold_bytes(),
+            max_codex_input_tokens: default_max_codex_input_tokens(),
+        }
+    }
+}
+
 /// 主页面显示的应用配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -478,6 +525,9 @@ pub struct AppSettings {
     /// Maximum aggressive recovery attempts after the original request (1..=3).
     #[serde(default = "default_stream_retry_max_attempts")]
     pub stream_retry_max_attempts: u32,
+    /// Provider-neutral request size diagnostics and conservative JSON cleanup.
+    #[serde(default)]
+    pub request_health: RequestHealthConfig,
     /// Whether to show the project profile switcher on the main page header
     #[serde(default = "default_show_profile_switcher")]
     pub show_profile_switcher: bool,
@@ -633,6 +683,7 @@ impl Default for AppSettings {
             enable_stream_retry: true,
             stream_retry_mode: StreamRetryMode::Safe,
             stream_retry_max_attempts: 3,
+            request_health: RequestHealthConfig::default(),
             show_profile_switcher: true,
             preserve_codex_official_auth_on_switch: false,
             unify_codex_session_history: false,

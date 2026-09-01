@@ -463,6 +463,21 @@ fn strip_codex_common_config_provider_fields(doc: &mut DocumentMut) {
         doc.as_table_mut().remove(key);
     }
     doc.as_table_mut().remove("model_providers");
+
+    // Guardian v2 is versioned by Codex itself and its representation changed
+    // between releases (scalar, inline object, and nested table forms). It is
+    // not safe to replay from a shared snippet into a different Codex build:
+    // an otherwise valid config then fails with `FeatureToml` at startup.
+    // Leave this feature to the live Codex config/version instead.
+    if let Some(features) = doc
+        .get_mut("features")
+        .and_then(|item| item.as_table_like_mut())
+    {
+        features.remove("guardianv2");
+        if features.is_empty() {
+            doc.as_table_mut().remove("features");
+        }
+    }
 }
 
 // 解析并净化 Codex common config，调用方再决定是 merge、remove 还是 subset 检测。
@@ -2769,6 +2784,32 @@ base_url = "https://a.example/v1"
             removed.contains("notifications = false"),
             "user-modified value must survive removal, got: {removed}"
         );
+    }
+
+    #[test]
+    fn codex_common_config_drops_versioned_guardianv2_shapes() {
+        let settings = json!({
+            "auth": {},
+            "config": "model = \"gpt-5\"\n"
+        });
+        let snippet = r#"[features]
+guardianv2 = { enabled = true, review_scope = { computer_use_only = true } }
+goals = true
+"#;
+
+        let applied = apply_common_config_to_settings(&AppType::Codex, &settings, snippet).unwrap();
+        let config = applied["config"].as_str().unwrap();
+        assert!(config.contains("goals = true"));
+        assert!(!config.contains("guardianv2"));
+
+        let extracted = parse_codex_common_config_snippet(snippet).unwrap();
+        assert!(extracted.to_string().contains("goals = true"));
+        assert!(!extracted.to_string().contains("guardianv2"));
+
+        let nested = "[features]\ngoals = true\n[features.guardianv2]\nenabled = true\n";
+        let nested_extracted = parse_codex_common_config_snippet(nested).unwrap();
+        assert!(nested_extracted.to_string().contains("goals = true"));
+        assert!(!nested_extracted.to_string().contains("guardianv2"));
     }
 
     #[test]

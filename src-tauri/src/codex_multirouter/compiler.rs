@@ -653,11 +653,7 @@ fn effective_capability_summary(
             &["inputModalities", "input_modalities"],
         ),
     );
-    let provider_reasoning = value_field(
-        &provider.settings_config,
-        &["reasoning"],
-    )
-    .cloned();
+    let provider_reasoning = value_field(&provider.settings_config, &["reasoning"]).cloned();
     let (reasoning, reasoning_source) = value_with_source(
         value_field(model_entry, &["reasoning"]).cloned(),
         provider_reasoning,
@@ -1400,12 +1396,7 @@ mod tests {
 
     #[test]
     fn chat_adapter_reasoning_is_not_projected_as_model_capability() {
-        let mut provider = provider(
-            "qwen",
-            "Qwen",
-            "openai_chat",
-            json!([{"model": "qwen3.8"}]),
-        );
+        let mut provider = provider("qwen", "Qwen", "openai_chat", json!([{"model": "qwen3.8"}]));
         provider.settings_config["codexChatReasoning"] = json!({
             "supportsThinking": true,
             "supportsEffort": true,

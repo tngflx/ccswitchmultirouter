@@ -2091,6 +2091,7 @@ impl RequestForwarder {
         ),
         ProxyError,
     > {
+        let client_request_bytes = serde_json::to_vec(body).map_or(0, |bytes| bytes.len());
         // enforce 只约束经过本机代理的 Codex 请求；未接入 CCSwitchMulti 的原生
         // 客户端无法被本地进程拦截，不能把该策略误描述为账号级强制控制。
         if matches!(app_type, AppType::Codex) {
@@ -2940,6 +2941,76 @@ impl RequestForwarder {
             .filter(|m| !m.is_empty())
         {
             outbound_model = Some(m.to_string());
+        }
+        let request_health_config = crate::settings::get_settings().request_health;
+        let request_health_app_type = format!("{app_type:?}").to_ascii_lowercase();
+        let request_health_diagnostic = super::request_health::inspect_and_optimize(
+            &mut filtered_body,
+            &request_health_config,
+            super::request_health::RequestHealthContext {
+                trace_id: codex_trace_id.as_deref(),
+                session_id: &self.session_id,
+                app_type: &request_health_app_type,
+                provider_id: &provider.id,
+                provider_name: &provider.name,
+                model: outbound_model
+                    .as_deref()
+                    .unwrap_or(request_model_for_log.as_str()),
+                endpoint: &effective_endpoint,
+                client_request_bytes,
+                compaction_request: codex_request_metadata.request_kind == "compaction",
+                session_client_provided: self.session_client_provided,
+            },
+        );
+        if let (Some(trace_id), Some(diagnostic)) = (
+            codex_trace_id.as_deref(),
+            request_health_diagnostic.as_ref(),
+        ) {
+            super::codex_router_log::append_event(
+                "request_health",
+                &[
+                    ("trace", trace_id.to_string()),
+                    ("session", self.session_id.clone()),
+                    ("model", diagnostic.model.clone()),
+                    ("provider", provider.id.clone()),
+                    ("endpoint", effective_endpoint.clone()),
+                    (
+                        "client_request_bytes",
+                        diagnostic.client_request_bytes.to_string(),
+                    ),
+                    ("request_bytes", diagnostic.optimized_bytes.to_string()),
+                    (
+                        "proxy_size_delta_bytes",
+                        (diagnostic.optimized_bytes as i128
+                            - diagnostic.client_request_bytes as i128)
+                            .to_string(),
+                    ),
+                    ("original_bytes", diagnostic.original_bytes.to_string()),
+                    ("bytes_removed", diagnostic.bytes_removed.to_string()),
+                    ("item_count", diagnostic.item_count.to_string()),
+                    (
+                        "largest_item_bytes",
+                        diagnostic.largest_item_bytes.to_string(),
+                    ),
+                    (
+                        "threshold_exceeded",
+                        diagnostic.threshold_exceeded.to_string(),
+                    ),
+                    (
+                        "orphaned_tool_outputs",
+                        diagnostic
+                            .findings
+                            .iter()
+                            .find(|finding| finding.code == "orphaned_tool_output")
+                            .map_or(0, |finding| finding.count)
+                            .to_string(),
+                    ),
+                    (
+                        "compaction_recommended",
+                        diagnostic.compaction_recommended.to_string(),
+                    ),
+                ],
+            );
         }
         log_prompt_cache_trace(
             app_type,

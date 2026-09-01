@@ -6179,6 +6179,20 @@ impl ProviderService {
         // Remove entire model_providers table (provider-specific configuration)
         root.remove("model_providers");
 
+        // Guardian v2 is Codex-versioned and has changed TOML shape across
+        // releases. Never persist it in the cross-provider common snippet:
+        // replaying an object/table into a build expecting another variant
+        // causes the startup `FeatureToml` deserialization error.
+        if let Some(features) = root
+            .get_mut("features")
+            .and_then(|item| item.as_table_like_mut())
+        {
+            features.remove("guardianv2");
+            if features.is_empty() {
+                root.remove("features");
+            }
+        }
+
         // MCP 服务器归 DB mcp_servers 表所有：进了共享片段会绕过按应用的
         // 启用状态被合并进所有勾选通用配置的供应商，且在通用配置编辑框里
         // 显示为一份"重复"的 MCP 配置。

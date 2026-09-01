@@ -55,6 +55,16 @@ pub struct DeleteSessionOutcome {
     pub error: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PurgeArchivedSessionsOutcome {
+    pub attempted: usize,
+    pub deleted: usize,
+    pub failed: usize,
+    pub index_cleanup_warnings: usize,
+    pub errors: Vec<String>,
+}
+
 pub fn scan_sessions() -> Vec<SessionMeta> {
     let (r1, r2, r3, r4, r5, r6, r7) = std::thread::scope(|s| {
         let h1 = s.spawn(codex::scan_sessions);
@@ -160,7 +170,7 @@ fn delete_session_with_roots(
         let validated_root = canonicalize_existing_path(root, "session root")?;
         if validated_source.starts_with(&validated_root) {
             return match provider_id {
-                "codex" => codex::delete_session(&validated_root, &validated_source, session_id),
+                "codex" => delete_codex_session(&validated_root, &validated_source, session_id),
                 "claude" => claude::delete_session(&validated_root, &validated_source, session_id),
                 "opencode" => {
                     opencode::delete_session(&validated_root, &validated_source, session_id)
@@ -192,6 +202,124 @@ fn delete_session_with_roots(
         "Session source path is outside provider roots: {}",
         source_path.display()
     ))
+}
+
+fn delete_codex_session(root: &Path, path: &Path, session_id: &str) -> Result<bool, String> {
+    codex::validate_session_id(path, session_id)?;
+    // The rollout file is the recoverable source of truth. Remove it first so a
+    // failed app-server cleanup can never make a still-present conversation
+    // disappear from Codex's persisted thread catalog.
+    codex::delete_session(root, path, session_id)?;
+    let rpc_result =
+        crate::codex_session_coordination::delete_threads_blocking(&[session_id.to_string()])
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| Err("Codex app-server did not attempt thread deletion".to_string()));
+
+    if let Err(error) = rpc_result {
+        log::warn!(
+            "Codex thread/delete failed for {session_id} after local rollout removal {}: {error}",
+            path.display()
+        );
+    }
+    Ok(true)
+}
+
+pub fn purge_archived_sessions(provider_id: &str) -> Result<PurgeArchivedSessionsOutcome, String> {
+    if provider_id != "codex" {
+        return Err(format!(
+            "Archived-session purge is not supported for provider {provider_id}"
+        ));
+    }
+
+    let files = codex::archived_session_files();
+    Ok(purge_codex_archived_files_with(&files, |thread_ids| {
+        crate::codex_session_coordination::delete_threads_blocking(thread_ids)
+    }))
+}
+
+fn purge_codex_archived_files_with<F>(
+    files: &[PathBuf],
+    mut delete_threads: F,
+) -> PurgeArchivedSessionsOutcome
+where
+    F: FnMut(&[String]) -> Vec<Result<(), String>>,
+{
+    let thread_ids = files
+        .iter()
+        .filter_map(|path| codex::session_id_for_delete(path))
+        .collect::<Vec<_>>();
+    let mut rpc_results = delete_threads(&thread_ids).into_iter();
+    let mut deleted = 0;
+    let mut failed = 0;
+    let mut index_cleanup_warnings = 0;
+    let mut errors = Vec::new();
+
+    for path in files {
+        let thread_id = codex::session_id_for_delete(path);
+        let rpc_result = thread_id.as_ref().map(|thread_id| {
+            (
+                thread_id,
+                rpc_results.next().unwrap_or_else(|| {
+                    Err("Codex app-server omitted a thread/delete result".to_string())
+                }),
+            )
+        });
+
+        let local_result = if path.exists() {
+            std::fs::remove_file(path).map_err(|error| {
+                format!(
+                    "Failed to delete archived Codex session {}: {error}",
+                    path.display()
+                )
+            })
+        } else {
+            Ok(())
+        };
+
+        match local_result {
+            Ok(()) => {
+                deleted += 1;
+                match rpc_result {
+                    Some((thread_id, Err(error))) => {
+                        index_cleanup_warnings += 1;
+                        log::warn!(
+                            "Codex thread/delete failed for archived thread {thread_id}; local rollout was removed: {error}"
+                        );
+                    }
+                    None => {
+                        index_cleanup_warnings += 1;
+                        log::warn!(
+                            "Archived Codex rollout {} had no readable thread id; removed the local file without app-server index cleanup",
+                            path.display()
+                        );
+                    }
+                    Some((_, Ok(()))) => {}
+                }
+            }
+            Err(local_error) => {
+                failed += 1;
+                let error = match rpc_result {
+                    Some((thread_id, Err(rpc_error))) => format!(
+                        "{local_error}; Codex thread/delete also failed for {thread_id}: {rpc_error}"
+                    ),
+                    Some((thread_id, Ok(()))) => format!(
+                        "{local_error}; Codex thread/delete reported success for {thread_id}"
+                    ),
+                    None => local_error,
+                };
+                errors.push(error);
+            }
+        }
+    }
+
+    PurgeArchivedSessionsOutcome {
+        attempted: files.len(),
+        deleted,
+        failed,
+        index_cleanup_warnings,
+        errors,
+    }
 }
 
 fn provider_roots(provider_id: &str) -> Result<Vec<PathBuf>, String> {
@@ -355,5 +483,47 @@ mod tests {
             outcomes[2].error.as_deref(),
             Some("Session was not deleted")
         );
+    }
+
+    #[test]
+    fn archived_purge_attempts_every_file_and_falls_back_after_rpc_errors() {
+        let root = tempdir().expect("archive root");
+        let first = root
+            .path()
+            .join("rollout-2026-08-31T00-00-00-00000000-0000-0000-0000-000000000001.jsonl");
+        let second = root
+            .path()
+            .join("rollout-2026-08-31T00-00-00-00000000-0000-0000-0000-000000000002.jsonl");
+        write_codex_session(&first, "00000000-0000-0000-0000-000000000001");
+        write_codex_session(&second, "00000000-0000-0000-0000-000000000002");
+
+        let outcome =
+            purge_codex_archived_files_with(&[first.clone(), second.clone()], |thread_ids| {
+                assert_eq!(thread_ids.len(), 2);
+                vec![Err("index locked".to_string()), Ok(())]
+            });
+
+        assert_eq!(outcome.attempted, 2);
+        assert_eq!(outcome.deleted, 2);
+        assert_eq!(outcome.failed, 0);
+        assert_eq!(outcome.index_cleanup_warnings, 1);
+        assert!(!first.exists());
+        assert!(!second.exists());
+    }
+
+    #[test]
+    fn archived_purge_removes_malformed_rollouts_without_stopping() {
+        let root = tempdir().expect("archive root");
+        let malformed = root.path().join("malformed.jsonl");
+        std::fs::write(&malformed, "not-json\n").expect("write malformed rollout");
+
+        let outcome = purge_codex_archived_files_with(&[malformed.clone()], |thread_ids| {
+            assert!(thread_ids.is_empty());
+            Vec::new()
+        });
+
+        assert_eq!(outcome.deleted, 1);
+        assert_eq!(outcome.index_cleanup_warnings, 1);
+        assert!(!malformed.exists());
     }
 }

@@ -28,8 +28,8 @@ pub(crate) fn compact_codex_provider_label(provider_name: &str) -> String {
     }
 
     let mut words = Vec::<String>::new();
-    let mut current = String::new();
     let chars = trimmed.chars().collect::<Vec<_>>();
+    let mut current = String::new();
     for (index, character) in chars.iter().copied().enumerate() {
         if !character.is_alphanumeric() {
             if !current.is_empty() {

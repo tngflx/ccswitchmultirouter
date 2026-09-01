@@ -20,15 +20,21 @@ doctest = false
 [[bin]]
 name = "cc-switch"
 path = "src/main.rs"
+test = false
+bench = false
 
 [[bin]]
 name = "codex-history-repairer"
 path = "src/bin/codex-history-repairer.rs"
 required-features = ["history-repairer"]
+test = false
+bench = false
 
 [[bin]]
 name = "ccsm"
 path = "src/bin/ccsm.rs"
+test = false
+bench = false
 
 [features]
 default = []
@@ -138,15 +144,16 @@ rquickjs = { version = "0.8", features = ["bindgen"] }
 objc2 = "0.5"
 objc2-app-kit = { version = "0.2", features = ["NSColor"] }
 
-# Keep fast incremental development builds while limiting Windows debug-symbol
-# volume. Release builds retain their dedicated profile below.
+# This crate is large enough that Windows incremental state and PDB generations
+# grow by multiple gigabytes per build. Prefer bounded disk use for local
+# development; opt into symbols temporarily with CARGO_PROFILE_DEV_DEBUG=1.
 [profile.dev]
-incremental = true
-debug = 1
+incremental = false
+debug = 0
 
 [profile.test]
-incremental = true
-debug = 1
+incremental = false
+debug = 0
 
 # Optimize release binary size to help reduce AppImage footprint
 [profile.release]
@@ -167,4 +174,3 @@ tokio = { version = "1", features = ["test-util"] }
 # leaving the Win32 message loop alive with an already-Destroyed runner. Keep the
 # 0.34.6 fixes while routing session shutdown through WM_QUIT in our audited copy.
 tao = { path = "vendor/tao" }
-

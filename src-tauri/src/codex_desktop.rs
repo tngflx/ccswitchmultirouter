@@ -30,6 +30,8 @@ pub struct CodexModelPickerUnlockResult {
     pub target_title: Option<String>,
     pub target_url: Option<String>,
     pub model_count: usize,
+    pub reasoning_model_count: usize,
+    pub models_without_reasoning_count: usize,
     pub model_names: Vec<String>,
     pub injected: bool,
     pub launched: bool,
@@ -72,6 +74,18 @@ impl CodexModelCatalogProjection {
         let payload = serde_json::to_vec(self).unwrap_or_default();
         format!("{:x}", Sha256::digest(payload))
     }
+
+    fn reasoning_model_count(&self) -> usize {
+        self.models
+            .iter()
+            .filter(|model| {
+                model
+                    .get("supportedReasoningEfforts")
+                    .and_then(Value::as_array)
+                    .is_some_and(|efforts| !efforts.is_empty())
+            })
+            .count()
+    }
 }
 
 /// Chrome DevTools Protocol `/json` 返回的页面 target 摘要。
@@ -112,6 +126,11 @@ pub async fn unlock_codex_model_picker() -> Result<CodexModelPickerUnlockResult,
             target_title: None,
             target_url: None,
             model_count: catalog.model_names.len(),
+            reasoning_model_count: catalog.reasoning_model_count(),
+            models_without_reasoning_count: catalog
+                .model_names
+                .len()
+                .saturating_sub(catalog.reasoning_model_count()),
             model_names: catalog.model_names,
             injected: false,
             launched: false,
@@ -151,6 +170,11 @@ pub async fn unlock_codex_model_picker() -> Result<CodexModelPickerUnlockResult,
             target_title: None,
             target_url: None,
             model_count: catalog.model_names.len(),
+            reasoning_model_count: catalog.reasoning_model_count(),
+            models_without_reasoning_count: catalog
+                .model_names
+                .len()
+                .saturating_sub(catalog.reasoning_model_count()),
             model_names: catalog.model_names.clone(),
             injected: false,
             launched: true,
@@ -171,6 +195,11 @@ pub async fn unlock_codex_model_picker() -> Result<CodexModelPickerUnlockResult,
         target_title: None,
         target_url: None,
         model_count: catalog.model_names.len(),
+        reasoning_model_count: catalog.reasoning_model_count(),
+        models_without_reasoning_count: catalog
+            .model_names
+            .len()
+            .saturating_sub(catalog.reasoning_model_count()),
         model_names: catalog.model_names,
         injected: false,
         launched: true,
@@ -241,9 +270,8 @@ pub(crate) fn load_cc_switch_model_catalog_projection(
         candidates.push(inline_catalog);
     }
 
-    for candidate in &candidates {
-        if let Some(projection) =
-            codex_model_catalog_projection_from_value(candidate, default_model.clone())
+    if let Some(merged) = merge_codex_model_catalog_values(&candidates) {
+        if let Some(projection) = codex_model_catalog_projection_from_value(&merged, default_model)
         {
             return Ok(projection);
         }
@@ -253,6 +281,67 @@ pub(crate) fn load_cc_switch_model_catalog_projection(
         "No routed models were found in {}, the CCSwitchMulti models cache, or the active provider inline catalog",
         catalog_path.display()
     ))
+}
+
+/// Merge catalog sources without letting a stale non-empty file hide newer models.
+///
+/// The generated catalog is the ordering source, while cache/inline projections can contain
+/// rows written by a newer takeover cycle. Existing rows keep their first-seen position;
+/// later sources only fill/refresh descriptor fields and append genuinely new model ids.
+fn merge_codex_model_catalog_values(candidates: &[Value]) -> Option<Value> {
+    let mut merged_models: Vec<Value> = Vec::new();
+    let mut indexes = HashMap::<String, usize>::new();
+    let mut display_name_style: Option<Value> = None;
+
+    for candidate in candidates {
+        if display_name_style.is_none() {
+            display_name_style = candidate.get("displayNameStyle").cloned();
+        }
+        let Some(entries) = candidate
+            .get("models")
+            .and_then(Value::as_array)
+            .or_else(|| candidate.as_array())
+        else {
+            continue;
+        };
+        for entry in entries {
+            let Some(model_name) = codex_model_name(entry) else {
+                continue;
+            };
+            let key = model_name.to_ascii_lowercase();
+            if let Some(index) = indexes.get(&key).copied() {
+                let (Some(existing), Some(incoming)) =
+                    (merged_models[index].as_object_mut(), entry.as_object())
+                else {
+                    continue;
+                };
+                for (field, value) in incoming {
+                    if matches!(field.as_str(), "sortIndex" | "sort_index")
+                        && (existing.contains_key("sortIndex")
+                            || existing.contains_key("sort_index"))
+                    {
+                        continue;
+                    }
+                    if !value.is_null() {
+                        existing.insert(field.clone(), value.clone());
+                    }
+                }
+            } else {
+                indexes.insert(key, merged_models.len());
+                merged_models.push(entry.clone());
+            }
+        }
+    }
+
+    if merged_models.is_empty() {
+        return None;
+    }
+    let mut merged = serde_json::Map::new();
+    merged.insert("models".to_string(), Value::Array(merged_models));
+    if let Some(style) = display_name_style {
+        merged.insert("displayNameStyle".to_string(), style);
+    }
+    Some(Value::Object(merged))
 }
 
 /// 从单个目录值构造 renderer 投影；空目录返回 `None` 以便调用方继续尝试回退源。
@@ -326,23 +415,18 @@ fn codex_model_entries_from_catalog_value(catalog: &Value) -> (Vec<String>, Vec<
             .and_then(Value::as_u64)
             .is_some()
     });
-    let has_provider_metadata = projected
-        .iter()
-        .any(|(_, model)| !provider_name_from_entry(model).is_empty());
-    if !has_explicit_order && has_provider_metadata {
-        // Codex's picker is a flat list. Keep providers contiguous and sort models within
-        // each provider so the provider prefix acts as a predictable visual divider.
-        projected.sort_by(|(left_name, left), (right_name, right)| {
-            provider_name_from_entry(left)
-                .to_ascii_lowercase()
-                .cmp(&provider_name_from_entry(right).to_ascii_lowercase())
-                .then_with(|| {
-                    display_name_from_entry(left)
-                        .to_ascii_lowercase()
-                        .cmp(&display_name_from_entry(right).to_ascii_lowercase())
-                })
-                .then_with(|| left_name.cmp(right_name))
+    if has_explicit_order {
+        projected.sort_by_key(|(_, model)| {
+            model
+                .get("sortIndex")
+                .or_else(|| model.get("sort_index"))
+                .and_then(Value::as_u64)
+                .unwrap_or(u64::MAX)
         });
+    } else {
+        // With no explicit indexes, the catalog array itself is the user's current order.
+        // Never replace it with a provider/alphabetical sort: the model-ordering workspace
+        // intentionally allows models from different providers to be interleaved.
     }
 
     let names = projected
@@ -379,42 +463,117 @@ fn project_codex_model_descriptor(
         object.insert(key.to_string(), Value::String(model_name.to_string()));
     }
     let provider_name = provider_name_from_entry(&Value::Object(object.clone()));
-    let compact_provider =
-        crate::codex_multirouter::compact_codex_provider_label(&provider_name);
+    let compact_provider = crate::codex_multirouter::compact_codex_provider_label(&provider_name);
     let display = object
         .get("displayName")
         .and_then(Value::as_str)
         .or_else(|| object.get("display_name").and_then(Value::as_str))
         .unwrap_or(model_name);
-    let compact_display = strip_provider_prefix(display, &provider_name, &compact_provider);
+    let model_display = strip_provider_prefix(display, &provider_name, &compact_provider);
     let rendered_display = match display_style.unwrap_or("provider-model") {
-        "model" => compact_display.to_string(),
+        "model" => model_display.to_string(),
         "model-provider" => {
             if provider_name.is_empty() {
-                compact_display.to_string()
+                model_display.to_string()
             } else {
-                format!("{compact_display} · {compact_provider}")
+                format!("{model_display} · {compact_provider}")
             }
         }
         "provider-model" => {
             if provider_name.is_empty() {
-                compact_display.to_string()
+                model_display.to_string()
             } else {
-                format!("[{compact_provider}] {compact_display}")
+                format!("[{compact_provider}] {model_display}")
             }
         }
-        _ => compact_display.to_string(),
+        _ => model_display.to_string(),
     };
     object.insert(
         "displayName".to_string(),
         Value::String(rendered_display.clone()),
     );
     object.insert("display_name".to_string(), Value::String(rendered_display));
+    project_reasoning_picker_aliases(&mut object);
     if !provider_name.is_empty() {
         object.insert("providerName".to_string(), Value::String(provider_name));
     }
     object.insert("hidden".to_string(), Value::Bool(false));
     Value::Object(object)
+}
+
+fn project_reasoning_picker_aliases(object: &mut serde_json::Map<String, Value>) {
+    let default_effort = [
+        "defaultReasoningEffort",
+        "default_reasoning_level",
+        "default_reasoning_effort",
+    ]
+    .into_iter()
+    .find_map(|key| {
+        object
+            .get(key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string)
+    });
+    if let Some(default_effort) = default_effort {
+        object.insert(
+            "defaultReasoningEffort".to_string(),
+            Value::String(default_effort),
+        );
+    }
+
+    let Some(levels) = [
+        "supportedReasoningEfforts",
+        "supportedReasoningLevels",
+        "supported_reasoning_levels",
+        "supported_reasoning_efforts",
+    ]
+    .into_iter()
+    .find_map(|key| object.get(key).and_then(Value::as_array)) else {
+        return;
+    };
+
+    let normalized = levels
+        .iter()
+        .filter_map(|level| {
+            let effort = level
+                .as_str()
+                .or_else(|| level.get("reasoningEffort").and_then(Value::as_str))
+                .or_else(|| level.get("reasoning_effort").and_then(Value::as_str))
+                .or_else(|| level.get("effort").and_then(Value::as_str))
+                .map(str::trim)
+                .filter(|value| !value.is_empty())?;
+            let description = level
+                .get("description")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .unwrap_or(effort);
+            Some((effort.to_string(), description.to_string()))
+        })
+        .collect::<Vec<_>>();
+
+    object.insert(
+        "supportedReasoningEfforts".to_string(),
+        Value::Array(
+            normalized
+                .iter()
+                .map(|(effort, description)| {
+                    json!({"reasoningEffort": effort, "description": description})
+                })
+                .collect(),
+        ),
+    );
+    object.insert(
+        "supportedReasoningLevels".to_string(),
+        Value::Array(
+            normalized
+                .into_iter()
+                .map(|(effort, description)| json!({"effort": effort, "description": description}))
+                .collect(),
+        ),
+    );
 }
 
 fn provider_name_from_entry(entry: &Value) -> String {
@@ -444,17 +603,6 @@ fn provider_name_from_entry(entry: &Value) -> String {
         })
     })
     .unwrap_or_default()
-}
-
-fn display_name_from_entry(entry: &Value) -> String {
-    entry
-        .get("displayName")
-        .and_then(Value::as_str)
-        .or_else(|| entry.get("display_name").and_then(Value::as_str))
-        .or_else(|| entry.get("model").and_then(Value::as_str))
-        .unwrap_or_default()
-        .trim()
-        .to_string()
 }
 
 fn strip_provider_prefix<'a>(
@@ -527,6 +675,11 @@ pub(crate) async fn try_inject_on_candidate_ports(
             target_title: Some(target.title),
             target_url: Some(target.url),
             model_count: catalog.model_names.len(),
+            reasoning_model_count: catalog.reasoning_model_count(),
+            models_without_reasoning_count: catalog
+                .model_names
+                .len()
+                .saturating_sub(catalog.reasoning_model_count()),
             model_names: catalog.model_names.clone(),
             injected: true,
             launched: false,
@@ -1938,6 +2091,53 @@ mod tests {
     }
 
     #[test]
+    fn catalog_projection_normalizes_reasoning_schema_aliases() {
+        let value = json!({
+            "models": [{
+                "id": "mixed-case-model",
+                "displayName": "Mixed Case",
+                "default_reasoning_effort": "high",
+                "supportedReasoningLevels": [
+                    {"effort": "low", "description": "Low"},
+                    {"reasoning_effort": "high", "description": "High"}
+                ]
+            }]
+        });
+
+        let (_, models) = codex_model_entries_from_catalog_value(&value);
+
+        assert_eq!(models[0]["defaultReasoningEffort"], "high");
+        assert_eq!(
+            models[0]["supportedReasoningEfforts"],
+            json!([
+                {"reasoningEffort": "low", "description": "Low"},
+                {"reasoningEffort": "high", "description": "High"}
+            ])
+        );
+        assert_eq!(
+            models[0]["supportedReasoningLevels"],
+            json!([
+                {"effort": "low", "description": "Low"},
+                {"effort": "high", "description": "High"}
+            ])
+        );
+    }
+
+    #[test]
+    fn catalog_projection_counts_models_with_reasoning_choices() {
+        let projection = CodexModelCatalogProjection {
+            default_model: None,
+            model_names: vec!["reasoning".to_string(), "plain".to_string()],
+            models: vec![
+                json!({"supportedReasoningEfforts": [{"reasoningEffort": "high"}]}),
+                json!({"supportedReasoningEfforts": []}),
+            ],
+        };
+
+        assert_eq!(projection.reasoning_model_count(), 1);
+    }
+
+    #[test]
     fn catalog_projection_labels_and_groups_provider_models_without_changing_ids() {
         let value = json!({
             "models": [
@@ -1948,12 +2148,12 @@ mod tests {
         });
 
         let (names, models) = codex_model_entries_from_catalog_value(&value);
-        assert_eq!(names, vec!["deepseek-b", "qwen-a", "qwen-z"]);
-        assert_eq!(models[0]["displayName"], "[DSeek] Beta");
-        assert_eq!(models[1]["displayName"], "[Qwen] Alpha");
-        assert_eq!(models[2]["displayName"], "[Qwen] Zeta");
-        assert_eq!(models[1]["model"], "qwen-a");
-        assert_eq!(models[1]["providerName"], "Qwen");
+        assert_eq!(names, vec!["qwen-z", "deepseek-b", "qwen-a"]);
+        assert_eq!(models[0]["displayName"], "[Qwen] Zeta");
+        assert_eq!(models[1]["displayName"], "[DSeek] Beta");
+        assert_eq!(models[2]["displayName"], "[Qwen] Alpha");
+        assert_eq!(models[2]["model"], "qwen-a");
+        assert_eq!(models[2]["providerName"], "Qwen");
 
         let provider_first = json!({
             "displayNameStyle": "provider-model",
@@ -1968,7 +2168,7 @@ mod tests {
         assert_eq!(styled_models[0]["displayName"], "[Qwen] Alpha");
         assert_eq!(styled_models[0]["model"], "qwen-a");
 
-        let compact_providers = json!({
+        let canonical_providers = json!({
             "models": [
                 {
                     "model": "openrouter-model",
@@ -1982,10 +2182,16 @@ mod tests {
                 }
             ]
         });
-        let (_, compact_models) = codex_model_entries_from_catalog_value(&compact_providers);
-        assert_eq!(compact_models[0]["displayName"], "[OCzen] Longer Model Name");
-        assert_eq!(compact_models[1]["displayName"], "[ORter] Long Model Name");
-        assert_eq!(compact_models[1]["providerName"], "OpenRouter");
+        let (_, canonical_models) = codex_model_entries_from_catalog_value(&canonical_providers);
+        assert_eq!(
+            canonical_models[0]["displayName"],
+            "[ORter] Long Model Name"
+        );
+        assert_eq!(
+            canonical_models[1]["displayName"],
+            "[OCzen] Longer Model Name"
+        );
+        assert_eq!(canonical_models[1]["providerName"], "OpenCode Zen");
     }
 
     #[test]
@@ -2012,6 +2218,31 @@ mod tests {
             vec!["gpt-5.6-sol".to_string(), "qwen3.6".to_string()]
         );
         assert_eq!(projection.default_model.as_deref(), Some("qwen3.6"));
+    }
+
+    #[test]
+    fn catalog_projection_merges_stale_primary_with_newer_fallback_rows() {
+        let merged = merge_codex_model_catalog_values(&[
+            json!({
+                "displayNameStyle": "provider-model",
+                "models": [
+                    {"model": "qwen3.6", "displayName": "[Qwen] Old", "sortIndex": 0}
+                ]
+            }),
+            json!({
+                "models": [
+                    {"model": "qwen3.6", "displayName": "[Qwen] New", "contextWindow": 1048576},
+                    {"model": "deepseek-v4-flash", "displayName": "DeepSeek V4 Flash"}
+                ]
+            }),
+        ])
+        .expect("merged catalog");
+
+        let (names, models) = codex_model_entries_from_catalog_value(&merged);
+        assert_eq!(names, vec!["qwen3.6", "deepseek-v4-flash"]);
+        assert_eq!(models[0]["displayName"], "[Qwen] New");
+        assert_eq!(models[0]["contextWindow"], 1048576);
+        assert_eq!(models[1]["displayName"], "DeepSeek V4 Flash");
     }
 
     #[test]
@@ -2079,6 +2310,39 @@ JSON.stringify({
 
         assert_eq!(result["hasDefault"], false);
         assert_eq!(result["hasEfforts"], false);
+    }
+
+    #[test]
+    fn model_picker_patch_normalizes_reasoning_aliases_case_insensitively() {
+        let result = run_model_picker_patch_core_probe_with_payload(
+            json!({
+                "defaultModel": "Mixed-Case-Model",
+                "modelNames": ["Mixed-Case-Model"],
+                "models": [{
+                    "id": "Mixed-Case-Model",
+                    "default_reasoning_level": "high",
+                    "supportedReasoningLevels": [
+                        {"effort": "low"},
+                        {"effort": "high"}
+                    ]
+                }]
+            }),
+            r#"
+const models = [{id: "mixed-case-model", displayName: "Mixed Case"}];
+patchModelArray(models);
+JSON.stringify({
+  model: models[0].model,
+  defaultEffort: models[0].defaultReasoningEffort,
+  efforts: models[0].supportedReasoningEfforts.map((item) => item.reasoningEffort),
+  levels: models[0].supportedReasoningLevels.map((item) => item.effort),
+});
+"#,
+        );
+
+        assert_eq!(result["model"], "Mixed-Case-Model");
+        assert_eq!(result["defaultEffort"], "high");
+        assert_eq!(result["efforts"], json!(["low", "high"]));
+        assert_eq!(result["levels"], json!(["low", "high"]));
     }
 
     #[test]

@@ -28,9 +28,9 @@ const PORT_OWNERSHIP_GUARD_PREFIX: &str = "PORT_OWNERSHIP_GUARD";
 /// Codex 接管时暴露给官方客户端的本地代理入口名称。
 const CODEX_LOCAL_PROXY_PROVIDER_NAME: &str = "CCSwitch MultiRouter";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum PortOwnership {
-    CompatibleInstance,
+    CompatibleInstance(crate::process_identity::ProcessIdentity),
     UnknownOwner,
     Unreachable,
 }
@@ -139,7 +139,7 @@ pub(crate) async fn probe_proxy_port(port: u16) -> PortOwnership {
         &process_after,
         &expected_config_scope,
     ) {
-        PortOwnership::CompatibleInstance
+        PortOwnership::CompatibleInstance(process_after)
     } else {
         PortOwnership::UnknownOwner
     }
@@ -990,13 +990,55 @@ impl ProxyService {
                         .map_err(|e| format!("获取代理端口失败: {e}"))?
                         .listen_port;
                     match probe_proxy_port(listen_port).await {
-                        PortOwnership::CompatibleInstance => {
+                        PortOwnership::CompatibleInstance(owner) => {
+                            // Reaching this branch requires the listener PID, executable identity,
+                            // start time, config scope, and runtime protocol to match.
                             log::warn!(
-                                "端口 {listen_port} 已由同配置作用域、同运行协议的 CCSwitchMulti 实例占用；等待该实例退出后再由本实例接管"
+                                "端口 {listen_port} 已由同配置作用域、同运行协议的 CCSwitchMulti 实例 PID {} 占用；正在强制结束该实例的完整进程树",
+                                owner.pid
                             );
-                            return Err(format!(
-                                "{PORT_OWNERSHIP_GUARD_PREFIX}: 代理端口 {listen_port} 仍由另一 CCSwitchMulti 实例监听；等待旧实例退出后将自动重试"
-                            ));
+                            let owner_pid = owner.pid;
+                            tokio::task::spawn_blocking(move || {
+                                crate::process_identity::terminate_verified_process_tree(&owner)
+                            })
+                            .await
+                            .map_err(|join_error| {
+                                format!(
+                                    "{PORT_OWNERSHIP_GUARD_PREFIX}: 结束旧 CCSwitchMulti PID {owner_pid} 的进程树任务失败: {join_error}"
+                                )
+                            })?
+                            .map_err(|terminate_error| {
+                                format!(
+                                    "{PORT_OWNERSHIP_GUARD_PREFIX}: 无法结束旧 CCSwitchMulti PID {owner_pid} 的进程树: {terminate_error}"
+                                )
+                            })?;
+
+                            let mut restart_error = start_error;
+                            for attempt in 1..=20 {
+                                match self.start().await {
+                                    Ok(_) => {
+                                        log::info!(
+                                            "旧 CCSwitchMulti PID {owner_pid} 的进程树已结束，代理端口 {listen_port} 已由当前实例接管"
+                                        );
+                                        restart_error.clear();
+                                        break;
+                                    }
+                                    Err(error) => {
+                                        restart_error = error;
+                                        if attempt < 20 {
+                                            tokio::time::sleep(std::time::Duration::from_millis(
+                                                100,
+                                            ))
+                                            .await;
+                                        }
+                                    }
+                                }
+                            }
+                            if !restart_error.is_empty() {
+                                return Err(format!(
+                                    "{PORT_OWNERSHIP_GUARD_PREFIX}: 已结束旧 CCSwitchMulti PID {owner_pid} 的进程树，但代理端口 {listen_port} 仍无法接管: {restart_error}"
+                                ));
+                            }
                         }
                         PortOwnership::UnknownOwner | PortOwnership::Unreachable => {
                             return Err(format!(
@@ -4236,6 +4278,14 @@ impl ProxyService {
                     config_str,
                     profile,
                     &provider_context,
+                )
+                .map_err(|e| format!("写入 Codex 配置失败: {e}"))?;
+            let prepared_config =
+                crate::codex_config::align_codex_requires_openai_auth_with_login_preservation(
+                    &prepared_config,
+                    crate::codex_config::codex_live_requires_openai_auth(
+                        crate::settings::preserve_codex_official_auth_on_switch(),
+                    ),
                 )
                 .map_err(|e| format!("写入 Codex 配置失败: {e}"))?;
             crate::codex_config::write_codex_live_config_atomic(Some(&prepared_config))

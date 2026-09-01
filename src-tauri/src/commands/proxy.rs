@@ -193,6 +193,17 @@ pub struct CodexMultiRouterDiagnostics {
     pub router_log: CodexRouterLogDiagnostics,
     pub route_plan: CodexRoutePlanDiagnostics,
 }
+
+/// Return the latest provider-neutral request diagnostics. The snapshot contains
+/// structural metadata only; raw prompt and tool content are never retained.
+#[tauri::command]
+pub async fn get_request_health_diagnostics(
+) -> Result<crate::proxy::request_health::RequestHealthSnapshot, String> {
+    Ok(crate::proxy::request_health::snapshot(
+        crate::settings::get_settings().request_health,
+    ))
+}
+
 use std::str::FromStr;
 
 /// 启动代理服务器（仅启动服务，不接管 Live 配置）

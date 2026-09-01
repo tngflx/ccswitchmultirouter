@@ -10,6 +10,7 @@ mod codex_desktop;
 mod codex_guardian;
 pub mod codex_history_migration;
 pub mod codex_multirouter;
+pub mod codex_session_coordination;
 mod codex_state_db;
 pub(crate) mod codex_subagent_profiles;
 mod commands;
@@ -382,20 +383,13 @@ pub fn run() {
         // 拦截窗口关闭：根据设置决定是否最小化到托盘
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
-                if consume_dev_shutdown_request() {
-                    api.prevent_close();
-                    crate::app_exit_monitor::record_clean_exit("dev_launcher_restart", 0);
-                    window.app_handle().exit(0);
-                    return;
-                }
-
                 // 数据库版本过新的恢复模式下没有托盘可唤回，关闭即退出，避免应用隐身后台
                 let in_db_recovery = crate::init_status::get_init_error()
                     .map(|p| p.kind.as_deref() == Some("db_version_too_new"))
                     .unwrap_or(false);
                 if in_db_recovery {
                     api.prevent_close();
-                    crate::app_exit_monitor::record_clean_exit("window_close_during_db_recovery", 0);
+                    set_requested_exit_reason(RequestedExitReason::WindowCloseDuringDbRecovery);
                     window.app_handle().exit(0);
                     return;
                 }
@@ -415,7 +409,7 @@ pub fn run() {
                     }
                 } else {
                     api.prevent_close();
-                    crate::app_exit_monitor::record_clean_exit("window_close_exit", 0);
+                    set_requested_exit_reason(RequestedExitReason::WindowCloseExit);
                     window.app_handle().exit(0);
                 }
             }
@@ -515,7 +509,6 @@ pub fn run() {
             }
 
             let startup_recovery = app_exit_monitor::record_startup_report();
-            start_dev_shutdown_monitor(app.handle().clone());
             if let Some(previous) = startup_recovery.previous.as_ref() {
                 let startup_marker_summary = format!(
                     "检测到上次运行 marker: classification={:?}, started_at={}, pid={}, crash_log_modified_at={:?}",
@@ -1525,9 +1518,12 @@ pub fn run() {
             commands::get_claude_common_config_snippet,
             commands::set_claude_common_config_snippet,
             commands::get_common_config_snippet,
+            commands::update_toml_common_config_snippet,
             commands::set_common_config_snippet,
             commands::extract_common_config_snippet,
             commands::read_live_provider_settings,
+            commands::inspect_codex_plugin_health,
+            commands::repair_codex_plugin_registration,
             commands::get_settings,
             codex_config::get_codex_subagent_reasoning_capabilities,
             codex_config::resolve_codex_model_reasoning_capability,
@@ -1711,6 +1707,7 @@ pub fn run() {
             commands::set_proxy_takeover_for_app,
             commands::get_proxy_status,
             commands::diagnose_codex_multirouter,
+            commands::get_request_health_diagnostics,
             commands::unlock_codex_model_picker,
             commands::get_codex_guardian_status,
             commands::sync_codex_history_to_multirouter,
@@ -1783,6 +1780,7 @@ pub fn run() {
             commands::get_session_messages,
             commands::delete_session,
             commands::delete_sessions,
+            commands::purge_archived_sessions,
             commands::launch_session_terminal,
             commands::get_tool_versions,
             commands::run_tool_lifecycle_action,
@@ -1923,11 +1921,12 @@ pub fn run() {
             log::info!("收到用户主动退出请求 (code={code:?})，开始清理...");
             api.prevent_exit();
 
+            let clean_exit_reason = take_requested_exit_reason();
             let app_handle = app_handle.clone();
             tauri::async_runtime::spawn(async move {
                 save_window_state_before_exit(&app_handle);
                 cleanup_before_exit(&app_handle).await;
-                app_exit_monitor::record_clean_exit("user_requested_exit", 0);
+                app_exit_monitor::record_clean_exit(clean_exit_reason, 0);
                 // 先于 std::process::exit 显式移除托盘图标。
                 // 进程直接退出时 Tauri 运行时不走正常 Drop 流程，
                 // 不会向 Windows Shell 发送 NIM_DELETE，导致已退出的进程
@@ -2045,67 +2044,49 @@ pub fn run() {
     });
 }
 
-#[cfg(debug_assertions)]
-fn consume_dev_shutdown_request() -> bool {
-    let Ok(marker_path) = std::env::var("CCSWITCH_DEV_SHUTDOWN_MARKER") else {
-        return false;
-    };
-    let Ok(expected_token) = std::env::var("CCSWITCH_DEV_SHUTDOWN_TOKEN") else {
-        return false;
-    };
-    consume_dev_shutdown_marker(std::path::Path::new(&marker_path), &expected_token)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+enum RequestedExitReason {
+    UserRequested = 0,
+    WindowCloseDuringDbRecovery = 1,
+    WindowCloseExit = 2,
 }
 
-#[cfg(not(debug_assertions))]
-fn consume_dev_shutdown_request() -> bool {
-    false
+fn requested_exit_reason_name(reason: RequestedExitReason) -> &'static str {
+    match reason {
+        RequestedExitReason::UserRequested => "user_requested_exit",
+        RequestedExitReason::WindowCloseDuringDbRecovery => "window_close_during_db_recovery",
+        RequestedExitReason::WindowCloseExit => "window_close_exit",
+    }
 }
 
-#[cfg(debug_assertions)]
-fn consume_dev_shutdown_marker(marker_path: &std::path::Path, expected_token: &str) -> bool {
-    let Ok(actual_token) = std::fs::read_to_string(marker_path) else {
-        return false;
-    };
-    if actual_token != expected_token {
-        return false;
-    }
-    static CONSUMED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-    if CONSUMED
-        .compare_exchange(
-            false,
-            true,
-            std::sync::atomic::Ordering::SeqCst,
-            std::sync::atomic::Ordering::SeqCst,
-        )
-        .is_err()
-    {
-        return false;
-    }
-    let _ = std::fs::remove_file(marker_path);
-    true
+static REQUESTED_EXIT_REASON: std::sync::atomic::AtomicU8 =
+    std::sync::atomic::AtomicU8::new(RequestedExitReason::UserRequested as u8);
+
+fn set_requested_exit_reason(reason: RequestedExitReason) {
+    let _ = REQUESTED_EXIT_REASON.compare_exchange(
+        RequestedExitReason::UserRequested as u8,
+        reason as u8,
+        std::sync::atomic::Ordering::SeqCst,
+        std::sync::atomic::Ordering::SeqCst,
+    );
 }
 
-#[cfg(debug_assertions)]
-fn start_dev_shutdown_monitor(app_handle: tauri::AppHandle) {
-    if std::env::var_os("CCSWITCH_DEV_SHUTDOWN_MARKER").is_none()
-        || std::env::var_os("CCSWITCH_DEV_SHUTDOWN_TOKEN").is_none()
-    {
-        return;
-    }
-    tauri::async_runtime::spawn(async move {
-        loop {
-            if consume_dev_shutdown_request() {
-                crate::app_exit_monitor::record_clean_exit("dev_launcher_restart", 0);
-                app_handle.exit(0);
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+fn take_requested_exit_reason() -> &'static str {
+    let reason = match REQUESTED_EXIT_REASON.swap(
+        RequestedExitReason::UserRequested as u8,
+        std::sync::atomic::Ordering::SeqCst,
+    ) {
+        value if value == RequestedExitReason::WindowCloseDuringDbRecovery as u8 => {
+            RequestedExitReason::WindowCloseDuringDbRecovery
         }
-    });
+        value if value == RequestedExitReason::WindowCloseExit as u8 => {
+            RequestedExitReason::WindowCloseExit
+        }
+        _ => RequestedExitReason::UserRequested,
+    };
+    requested_exit_reason_name(reason)
 }
-
-#[cfg(not(debug_assertions))]
-fn start_dev_shutdown_monitor(_app_handle: tauri::AppHandle) {}
 
 // ============================================================
 // 应用退出清理
@@ -2579,9 +2560,9 @@ pub fn restart_process(app_handle: &tauri::AppHandle) -> ! {
 #[cfg(test)]
 mod tests {
     use super::{
-        classify_exit_request, consume_dev_shutdown_marker, enabled_proxy_apps_on_startup,
-        redact_url_for_log, redact_url_for_log_with_secrets, redact_url_origin_for_log,
-        runtime_log_level_allows, ExitRequestAction,
+        classify_exit_request, enabled_proxy_apps_on_startup, redact_url_for_log,
+        redact_url_for_log_with_secrets, redact_url_origin_for_log, requested_exit_reason_name,
+        runtime_log_level_allows, ExitRequestAction, RequestedExitReason,
     };
     use crate::database::Database;
 
@@ -2667,24 +2648,19 @@ mod tests {
     }
 
     #[test]
-    fn dev_shutdown_marker_requires_the_exact_token_and_is_consumed() {
-        let marker_path = std::env::temp_dir().join(format!(
-            "ccswitch-dev-shutdown-test-{}-{}.token",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("system clock")
-                .as_nanos()
-        ));
-        std::fs::write(&marker_path, "expected-token").expect("write marker");
-
-        assert!(!consume_dev_shutdown_marker(
-            &marker_path,
-            "different-token"
-        ));
-        assert!(marker_path.exists());
-        assert!(consume_dev_shutdown_marker(&marker_path, "expected-token"));
-        assert!(!marker_path.exists());
+    fn requested_exit_reasons_are_recorded_only_after_shared_cleanup() {
+        assert_eq!(
+            requested_exit_reason_name(RequestedExitReason::UserRequested),
+            "user_requested_exit"
+        );
+        assert_eq!(
+            requested_exit_reason_name(RequestedExitReason::WindowCloseDuringDbRecovery),
+            "window_close_during_db_recovery"
+        );
+        assert_eq!(
+            requested_exit_reason_name(RequestedExitReason::WindowCloseExit),
+            "window_close_exit"
+        );
     }
 
     #[test]

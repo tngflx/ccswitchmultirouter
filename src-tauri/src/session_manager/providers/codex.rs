@@ -48,6 +48,49 @@ pub fn session_roots() -> Vec<PathBuf> {
     ]
 }
 
+pub(crate) fn archived_session_files() -> Vec<PathBuf> {
+    let archived_root = get_codex_config_dir().join("archived_sessions");
+    let mut files = Vec::new();
+    collect_jsonl_files(&archived_root, &mut files);
+    files.sort();
+    files
+}
+
+pub(crate) fn session_id_for_delete(path: &Path) -> Option<String> {
+    let (head, _) = read_head_tail_lines(path, 20, 0).ok()?;
+    for line in head {
+        let Ok(value) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        if value.get("type").and_then(Value::as_str) != Some("session_meta") {
+            continue;
+        }
+        if let Some(session_id) = value
+            .pointer("/payload/id")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+        {
+            return Some(session_id.to_string());
+        }
+    }
+    infer_session_id_from_filename(path)
+}
+
+pub(crate) fn validate_session_id(path: &Path, session_id: &str) -> Result<(), String> {
+    let actual_session_id = session_id_for_delete(path).ok_or_else(|| {
+        format!(
+            "Failed to read Codex session ID from archived file {}",
+            path.display()
+        )
+    })?;
+    if actual_session_id != session_id {
+        return Err(format!(
+            "Codex session ID mismatch: expected {session_id}, found {actual_session_id}"
+        ));
+    }
+    Ok(())
+}
+
 fn scan_sessions_in_roots(roots: &[PathBuf]) -> Vec<SessionMeta> {
     let thread_titles = load_thread_titles();
     scan_sessions_in_roots_with_titles(roots, &thread_titles)
@@ -292,15 +335,7 @@ pub fn load_messages(path: &Path) -> Result<Vec<SessionMessage>, String> {
 }
 
 pub fn delete_session(_root: &Path, path: &Path, session_id: &str) -> Result<bool, String> {
-    let meta = parse_session(path)
-        .ok_or_else(|| format!("Failed to parse Codex session metadata: {}", path.display()))?;
-
-    if meta.session_id != session_id {
-        return Err(format!(
-            "Codex session ID mismatch: expected {session_id}, found {}",
-            meta.session_id
-        ));
-    }
+    validate_session_id(path, session_id)?;
 
     std::fs::remove_file(path).map_err(|e| {
         format!(
@@ -312,6 +347,7 @@ pub fn delete_session(_root: &Path, path: &Path, session_id: &str) -> Result<boo
     Ok(true)
 }
 
+#[cfg(test)]
 fn parse_session(path: &Path) -> Option<SessionMeta> {
     parse_session_with_titles(path, &HashMap::new())
 }

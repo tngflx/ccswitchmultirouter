@@ -41,6 +41,76 @@ pub(crate) fn executable_fingerprint(path: &str) -> String {
     format!("{:x}", hasher.finalize())[..16].to_string()
 }
 
+#[cfg(target_os = "windows")]
+fn taskkill_tree_args(pid: u32) -> [String; 4] {
+    [
+        "/PID".to_string(),
+        pid.to_string(),
+        "/T".to_string(),
+        "/F".to_string(),
+    ]
+}
+
+#[cfg(target_os = "windows")]
+pub(crate) fn terminate_verified_process_tree(expected: &ProcessIdentity) -> Result<(), String> {
+    use std::os::windows::process::CommandExt;
+
+    if expected.pid == std::process::id() {
+        return Err("refusing to terminate the current CCSwitch process tree".to_string());
+    }
+
+    let Some(current) = process_identity(expected.pid) else {
+        return Ok(());
+    };
+    if !expected.matches(&current) {
+        return Err(format!(
+            "refusing to terminate PID {} because its process identity changed",
+            expected.pid
+        ));
+    }
+
+    let output = std::process::Command::new("taskkill")
+        .args(taskkill_tree_args(expected.pid))
+        .creation_flags(0x0800_0000)
+        .output()
+        .map_err(|error| {
+            format!(
+                "failed to run taskkill for verified CCSwitch PID {}: {error}",
+                expected.pid
+            )
+        })?;
+    if !output.status.success() {
+        let detail = crate::decode_command_output(&output.stderr);
+        let fallback = crate::decode_command_output(&output.stdout);
+        return Err(format!(
+            "taskkill failed for verified CCSwitch PID {}: {}",
+            expected.pid,
+            if detail.trim().is_empty() {
+                fallback.trim()
+            } else {
+                detail.trim()
+            }
+        ));
+    }
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while process_identity(expected.pid).is_some_and(|current| expected.matches(&current)) {
+        if std::time::Instant::now() >= deadline {
+            return Err(format!(
+                "verified CCSwitch PID {} remained alive after taskkill /T /F",
+                expected.pid
+            ));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "windows"))]
+pub(crate) fn terminate_verified_process_tree(_expected: &ProcessIdentity) -> Result<(), String> {
+    Err("verified CCSwitch process-tree termination is only supported on Windows".to_string())
+}
+
 pub(crate) fn config_scope_fingerprint() -> String {
     use sha2::{Digest, Sha256};
 
@@ -297,6 +367,20 @@ mod tests {
         assert_eq!(identity.pid, std::process::id());
         assert!(identity.started_at_ticks > 0);
         assert!(!identity.executable_path.trim().is_empty());
+    }
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn taskkill_tree_arguments_force_the_entire_verified_tree() {
+        assert_eq!(
+            taskkill_tree_args(42),
+            [
+                "/PID".to_string(),
+                "42".to_string(),
+                "/T".to_string(),
+                "/F".to_string(),
+            ]
+        );
     }
 
     #[test]

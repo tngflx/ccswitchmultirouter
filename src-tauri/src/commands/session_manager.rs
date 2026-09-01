@@ -117,3 +117,14 @@ pub async fn delete_sessions(
         .await
         .map_err(|e| format!("Failed to delete sessions: {e}"))
 }
+
+#[tauri::command]
+pub async fn purge_archived_sessions(
+    providerId: String,
+) -> Result<session_manager::PurgeArchivedSessionsOutcome, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        session_manager::purge_archived_sessions(&providerId)
+    })
+    .await
+    .map_err(|e| format!("Failed to purge archived sessions: {e}"))?
+}

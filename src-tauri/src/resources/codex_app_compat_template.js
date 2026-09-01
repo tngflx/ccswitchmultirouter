@@ -15,14 +15,33 @@ __CODEX_MODEL_PICKER_CORE__
       style = document.createElement("style");
       style.id = styleId;
       style.textContent = `
+        [data-radix-popper-content-wrapper][data-ccswitch-model-picker="true"],
+        [data-radix-popper-content-wrapper]:has([data-model-selected]) {
+          max-width: min(92vw, 420px) !important;
+          min-width: 280px !important;
+        }
         [data-radix-popper-content-wrapper][data-ccswitch-model-picker="true"] [role="menuitem"],
         [data-radix-popper-content-wrapper]:has([data-model-selected]) [role="menuitem"] {
+          min-height: 32px !important;
+          padding-block: 6px !important;
+          white-space: nowrap !important;
           flex-shrink: 0 !important;
+        }
+        [data-radix-popper-content-wrapper][data-ccswitch-model-picker="true"] [role="menuitem"] > *,
+        [data-radix-popper-content-wrapper]:has([data-model-selected]) [role="menuitem"] > * {
+          min-width: 0 !important;
         }
       `;
       (document.head || document.documentElement).appendChild(style);
     }
-    const names = new Set(modelNames());
+    const labels = new Set([
+      ...modelNames(),
+      ...(currentPayload().models || []).flatMap((model) => [
+        model?.displayName,
+        model?.display_name,
+        model?.name,
+      ]),
+    ].filter((value) => typeof value === "string" && value.trim()).map((value) => value.trim()));
     for (const wrapper of document.querySelectorAll("[data-radix-popper-content-wrapper]")) {
       if (wrapper.querySelector("[data-model-selected]")) {
         wrapper.setAttribute("data-ccswitch-model-picker", "true");
@@ -31,7 +50,7 @@ __CODEX_MODEL_PICKER_CORE__
       const items = Array.from(wrapper.querySelectorAll('[role="menuitem"]'));
       if (items.some((item) => {
         const text = String(item.textContent || "").trim();
-        return text && Array.from(names).some((name) => text.includes(name));
+        return text && Array.from(labels).some((label) => text.includes(label));
       })) {
         wrapper.setAttribute("data-ccswitch-model-picker", "true");
       }
@@ -48,7 +67,12 @@ __CODEX_MODEL_PICKER_CORE__
         changed = true;
       }
     }
-    const nextValue = { ...value, available_models: available, use_hidden_models: false, default_model: modelNames()[0] || value.default_model };
+    const routed = modelNames().filter((name) => available.includes(name));
+    const routedSet = new Set(modelNames());
+    const untouched = available.filter((name) => !routedSet.has(name));
+    const ordered = [...routed, ...untouched];
+    if (available.some((name, index) => name !== ordered[index])) changed = true;
+    const nextValue = { ...value, available_models: ordered, use_hidden_models: false, default_model: modelNames()[0] || value.default_model };
     if (changed || nextValue.default_model !== value.default_model || value.use_hidden_models !== false) {
       try {
         config.value = nextValue;

@@ -15,6 +15,7 @@ use crate::proxy::{
 use bytes::Bytes;
 use futures::stream::{Stream, StreamExt};
 use serde_json::{json, Map, Value};
+use std::collections::HashSet;
 
 /// 将 OpenAI Chat Completions 请求转换为 ChatGPT Codex 后端接受的 Responses 请求。
 ///
@@ -167,7 +168,10 @@ fn ensure_codex_responses_lite_reasoning_context(body: &mut Map<String, Value>) 
         *reasoning = Value::Object(Map::new());
     }
     if let Some(object) = reasoning.as_object_mut() {
-        object.insert("context".to_string(), Value::String("all_turns".to_string()));
+        object.insert(
+            "context".to_string(),
+            Value::String("all_turns".to_string()),
+        );
     }
 }
 
@@ -463,8 +467,91 @@ fn normalize_codex_responses_passthrough_items(request_body: Value) -> Value {
     };
 
     normalize_codex_responses_function_call_arguments(&mut body);
+    repair_orphaned_codex_app_delegations(&mut body);
 
     Value::Object(body)
+}
+
+/// Preserve standalone Codex Desktop task-coordination updates without sending
+/// an invalid tool dependency to Responses upstreams.
+///
+/// Codex Desktop can persist `codex_app.send_message_to_thread` deliveries as a
+/// `function_call_output` with an `fco_*` identity but no preceding call item.
+/// Strict Responses gateways reject that replay. This repair is deliberately
+/// limited to that known producer and converts its payload into ordinary user
+/// context; every other unmatched output remains untouched for diagnostics.
+fn repair_orphaned_codex_app_delegations(body: &mut Map<String, Value>) -> usize {
+    let Some(Value::Array(items)) = body.get_mut("input") else {
+        return 0;
+    };
+
+    let call_ids = items
+        .iter()
+        .filter_map(Value::as_object)
+        .filter(|item| {
+            matches!(
+                item.get("type").and_then(Value::as_str),
+                Some(
+                    "function_call"
+                        | "custom_tool_call"
+                        | "mcp_tool_call"
+                        | "tool_search_call"
+                        | "local_shell_call"
+                        | "computer_call"
+                )
+            )
+        })
+        .filter_map(codex_responses_structural_id)
+        .map(str::to_string)
+        .collect::<HashSet<_>>();
+
+    let mut repaired = 0;
+    for item in items {
+        let Some(object) = item.as_object() else {
+            continue;
+        };
+        if object.get("type").and_then(Value::as_str) != Some("function_call_output")
+            || object.get("namespace").and_then(Value::as_str) != Some("codex_app")
+            || object.get("name").and_then(Value::as_str) != Some("send_message_to_thread")
+        {
+            continue;
+        }
+        let Some(output_id) = codex_responses_structural_id(object) else {
+            continue;
+        };
+        if call_ids.contains(output_id) || !output_id.starts_with("fco_") {
+            continue;
+        }
+        let Some(output) = object.get("output") else {
+            continue;
+        };
+        let text = match output {
+            Value::String(text) => text.clone(),
+            Value::Null => continue,
+            other => canonical_json_string(other),
+        };
+        if text.trim().is_empty() {
+            continue;
+        }
+
+        *item = json!({
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": text}]
+        });
+        repaired += 1;
+    }
+
+    repaired
+}
+
+fn codex_responses_structural_id(object: &Map<String, Value>) -> Option<&str> {
+    object
+        .get("call_id")
+        .or_else(|| object.get("tool_call_id"))
+        .or_else(|| object.get("id"))
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
 }
 
 /// 把 Responses-Lite 请求体降级为标准 Responses 请求体。
@@ -2958,6 +3045,55 @@ mod tests {
         assert_eq!(input[0]["arguments"], "{}");
         assert_eq!(input[2]["arguments"], r#"{"raw_arguments":"{"}"#);
         assert_eq!(input[3]["role"], "user");
+    }
+
+    #[test]
+    fn codex_responses_passthrough_repairs_only_orphaned_codex_app_delegations() {
+        let body = json!({
+            "input": [
+                {
+                    "type": "function_call",
+                    "call_id": "call_matched",
+                    "name": "send_message_to_thread",
+                    "arguments": "{}"
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_matched",
+                    "name": "send_message_to_thread",
+                    "namespace": "codex_app",
+                    "output": "matched output"
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "fco_01a0538f-5150-70b0-8ca5-75edbe7fe7c1",
+                    "name": "send_message_to_thread",
+                    "namespace": "codex_app",
+                    "output": "<codex_delegation>preserve me</codex_delegation>"
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_unknown",
+                    "name": "exec_command",
+                    "namespace": "unified_exec",
+                    "output": "leave diagnosed"
+                }
+            ]
+        });
+
+        let normalized = normalize_codex_responses_passthrough_request(body);
+        let input = normalized["input"].as_array().expect("input array");
+
+        assert_eq!(input[1]["type"], "function_call_output");
+        assert_eq!(input[1]["call_id"], "call_matched");
+        assert_eq!(input[2]["type"], "message");
+        assert_eq!(input[2]["role"], "user");
+        assert_eq!(
+            input[2]["content"][0]["text"],
+            "<codex_delegation>preserve me</codex_delegation>"
+        );
+        assert_eq!(input[3]["type"], "function_call_output");
+        assert_eq!(input[3]["call_id"], "call_unknown");
     }
 
     #[test]

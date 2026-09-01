@@ -385,20 +385,8 @@ fn projected_model_entries(compiled: &CompiledCodexRoutingPlan) -> Vec<Value> {
     if has_source_custom_order {
         indexed.sort_by_key(|(index, model)| (model.sort_index.unwrap_or(usize::MAX), *index));
     } else {
-        // Codex exposes a flat model picker with no section/header field. Keep models from the
-        // same API provider contiguous and alphabetic, while retaining stable IDs for routing.
-        indexed.sort_by(|(left_index, left), (right_index, right)| {
-            left.target_provider_name
-                .to_ascii_lowercase()
-                .cmp(&right.target_provider_name.to_ascii_lowercase())
-                .then_with(|| {
-                    left.display_name
-                        .to_ascii_lowercase()
-                        .cmp(&right.display_name.to_ascii_lowercase())
-                })
-                .then_with(|| left.visible_model.cmp(&right.visible_model))
-                .then_with(|| left_index.cmp(right_index))
-        });
+        // Without explicit indexes, compiled route/catalog order is the user's current order.
+        // Keep it intact; providers may be intentionally interleaved in the picker.
     }
 
     indexed
@@ -437,6 +425,10 @@ fn projected_model_entry(model: &CompiledCodexModel, sort_index: Option<usize>) 
     entry.insert(
         "apiFormat".to_string(),
         Value::String(model.api_format.clone()),
+    );
+    entry.insert(
+        "apiFormatSource".to_string(),
+        Value::String(model.api_format_source.clone()),
     );
     if let Some(context_window) = model.capability_summary.context_window {
         entry.insert("contextWindow".to_string(), Value::from(context_window));
@@ -488,20 +480,18 @@ fn provider_labelled_display_name(provider_name: &str, display_name: &str) -> St
     {
         return display_name.to_string();
     }
-    let full_prefix = format!("[{provider_name}]");
-    let label = display_name
-        .get(..full_prefix.len())
-        .filter(|candidate| candidate.eq_ignore_ascii_case(&full_prefix))
-        .map(|_| display_name[full_prefix.len()..].trim_start())
-        .unwrap_or(display_name);
-    if label
-        .get(..prefix.len())
-        .is_some_and(|candidate| candidate.eq_ignore_ascii_case(&prefix))
-    {
-        label.to_string()
-    } else {
-        format!("{prefix} {label}")
+    let label = strip_bracketed_provider_prefix(display_name);
+    format!("[{compact_provider}] {label}")
+}
+
+fn strip_bracketed_provider_prefix(display_name: &str) -> &str {
+    let Some(close_index) = display_name.find(']') else {
+        return display_name;
+    };
+    if !display_name.starts_with('[') {
+        return display_name;
     }
+    display_name[close_index + 1..].trim_start()
 }
 
 fn projection_status(
@@ -1050,6 +1040,8 @@ mod tests {
             .expect("projected models");
         assert_eq!(models[0]["displayName"].as_str(), Some("[Qwen] Qwen 3.8"));
         assert_eq!(models[0]["providerName"].as_str(), Some("Qwen"));
+        assert_eq!(models[0]["apiFormat"].as_str(), Some("openai_responses"));
+        assert_eq!(models[0]["apiFormatSource"].as_str(), Some("provider"));
         assert_eq!(models[0]["contextWindow"].as_u64(), Some(262_144));
         assert_eq!(models[0]["inputModalities"], json!(["text"]));
         assert_eq!(models[0]["reasoning"]["defaultEffort"], "high");
@@ -1099,7 +1091,7 @@ mod tests {
                 .iter()
                 .map(|entry| entry["model"].as_str().unwrap())
                 .collect::<Vec<_>>(),
-            vec!["alpha-deepseek", "beta-deepseek", "alpha-qwen", "zeta-qwen"]
+            vec!["zeta-qwen", "beta-deepseek", "alpha-qwen", "alpha-deepseek"]
         );
         assert_eq!(
             entries
@@ -1107,14 +1099,14 @@ mod tests {
                 .map(|entry| entry["displayName"].as_str().unwrap())
                 .collect::<Vec<_>>(),
             vec![
-                "[DSeek] Alpha",
+                "[Qwen] Zeta",
                 "[DSeek] Beta",
                 "[Qwen] Alpha",
-                "[Qwen] Zeta"
+                "[DSeek] Alpha"
             ]
         );
-        assert_eq!(entries[0]["upstreamModel"], "upstream-alpha-deepseek");
-        assert_eq!(entries[0]["providerName"], "DeepSeek");
+        assert_eq!(entries[0]["upstreamModel"], "upstream-zeta-qwen");
+        assert_eq!(entries[0]["providerName"], "Qwen");
     }
 
     #[test]
@@ -1139,8 +1131,8 @@ mod tests {
             "[AVLPN] model-x"
         );
         assert_eq!(
-            provider_labelled_display_name("OpenRouter", "Model X"),
-            "[ORter] Model X"
+            provider_labelled_display_name("ZMHub Responses", "[Znses] gpt-5.6-sol"),
+            "[Znses] gpt-5.6-sol"
         );
         assert_eq!(
             provider_labelled_display_name("OpenCode Zen", "Model Y"),
