@@ -22,7 +22,6 @@ import {
   ExternalLink,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
-import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { settingsApi } from "@/lib/api";
@@ -874,9 +873,6 @@ const QuotaCollaborationPanel: React.FC<{
   const queryClient = useQueryClient();
   const { data: settings } = useSettingsQuery();
   const [deviceName, setDeviceName] = useState("");
-  const [mode, setMode] = useState<"observe" | "enforce">("observe");
-  const [threshold, setThreshold] = useState(20);
-  const [confirmEnforceOpen, setConfirmEnforceOpen] = useState(false);
   const [isSaving, setIsSaving] = useState(false);
 
   /** 以持久化配置为准同步编辑控件，避免概览缓存短暂落后时覆盖用户输入。 */
@@ -884,16 +880,10 @@ const QuotaCollaborationPanel: React.FC<{
     if (!settings?.quotaCollaboration) return;
     const config = settings.quotaCollaboration;
     setDeviceName(config.deviceName ?? "");
-    setMode(config.mode ?? "observe");
-    setThreshold(
-      Math.min(90, Math.max(1, config.enforceRemainingPercent ?? 20)),
-    );
   }, [settings?.quotaCollaboration]);
 
   /** 保存本机协作配置，并让页面同时刷新设置和远端报告缓存。 */
-  const saveCollaborationSettings = async (
-    nextMode: "observe" | "enforce" = mode,
-  ) => {
+  const saveCollaborationSettings = async () => {
     if (!settings) {
       toast.error(
         i18n.t("codexUsagePage.settingsNotReady", {
@@ -910,13 +900,12 @@ const QuotaCollaborationPanel: React.FC<{
         quotaCollaboration: {
           deviceId: current?.deviceId ?? overview?.deviceId ?? "",
           deviceName: deviceName.trim(),
-          mode: nextMode,
-          enforceRemainingPercent: Math.min(90, Math.max(1, threshold)),
+          mode: "observe",
+          enforceRemainingPercent: current?.enforceRemainingPercent ?? 20,
           latestWindowUtilization: current?.latestWindowUtilization ?? {},
           latestWindowCapturedAt: current?.latestWindowCapturedAt ?? null,
         },
       });
-      setMode(nextMode);
       await Promise.all([
         queryClient.invalidateQueries({ queryKey: ["settings"] }),
         queryClient.invalidateQueries({
@@ -945,12 +934,6 @@ const QuotaCollaborationPanel: React.FC<{
     }
   };
 
-  /** 在用户确认边界后才写入 enforce，防止误以为它能控制旁路流量。 */
-  const confirmEnforce = () => {
-    setConfirmEnforceOpen(false);
-    void saveCollaborationSettings("enforce");
-  };
-
   if (isLoading && !overview) {
     return (
       <section className={`rounded-lg border p-5 ${USAGE_PAGE_COLORS.card}`}>
@@ -973,7 +956,7 @@ const QuotaCollaborationPanel: React.FC<{
     (sum, report) => sum + report.sevenDayTokens,
     0,
   );
-  const isEnforcing = overview?.mode === "enforce";
+  const isEnforcing = false;
   return (
     <section className={`rounded-lg border p-5 ${USAGE_PAGE_COLORS.card}`}>
       <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
@@ -1060,7 +1043,7 @@ const QuotaCollaborationPanel: React.FC<{
             <ExternalLink className="h-4 w-4" />
           </Button>
         </div>
-        <div className="mt-3 grid gap-3 md:grid-cols-[minmax(0,1fr)_auto]">
+        <div className="mt-3">
           <div className="space-y-1.5">
             <Label htmlFor="quota-collaboration-device-name">
               {i18n.t("codexUsagePage.deviceNameLabel", {
@@ -1077,72 +1060,7 @@ const QuotaCollaborationPanel: React.FC<{
               onChange={(event) => setDeviceName(event.target.value)}
             />
           </div>
-          <div className="space-y-1.5">
-            <Label>
-              {i18n.t("codexUsagePage.collabModeLabel", {
-                defaultValue: "协作模式",
-              })}
-            </Label>
-            <div className="flex rounded-md border p-1">
-              <Button
-                type="button"
-                size="sm"
-                variant={mode === "observe" ? "default" : "ghost"}
-                onClick={() => setMode("observe")}
-              >
-                {i18n.t("codexUsagePage.modeShortObserve", {
-                  defaultValue: "观测",
-                })}
-              </Button>
-              <Button
-                type="button"
-                size="sm"
-                variant={mode === "enforce" ? "default" : "ghost"}
-                onClick={() => {
-                  if (mode !== "enforce") setConfirmEnforceOpen(true);
-                }}
-              >
-                {i18n.t("codexUsagePage.modeShortEnforce", {
-                  defaultValue: "约束",
-                })}
-              </Button>
-            </div>
-          </div>
         </div>
-        {mode === "enforce" ? (
-          <div className="mt-3 grid gap-2 md:grid-cols-[minmax(0,1fr)_96px] md:items-end">
-            <div className="space-y-1.5">
-              <Label htmlFor="quota-collaboration-threshold">
-                {i18n.t("codexUsagePage.windowThresholdLabel", {
-                  defaultValue: "窗口剩余阈值",
-                })}
-              </Label>
-              <input
-                id="quota-collaboration-threshold"
-                className="h-2 w-full cursor-pointer accent-amber-600"
-                type="range"
-                min="1"
-                max="90"
-                value={threshold}
-                onChange={(event) => setThreshold(Number(event.target.value))}
-              />
-            </div>
-            <Input
-              aria-label={i18n.t("codexUsagePage.enforceThresholdAria", {
-                defaultValue: "窗口剩余阈值百分比",
-              })}
-              type="number"
-              min="1"
-              max="90"
-              value={threshold}
-              onChange={(event) =>
-                setThreshold(
-                  Math.min(90, Math.max(1, Number(event.target.value) || 1)),
-                )
-              }
-            />
-          </div>
-        ) : null}
         <div className="mt-3 flex flex-wrap items-center gap-2">
           <Button
             type="button"
@@ -1300,38 +1218,13 @@ const QuotaCollaborationPanel: React.FC<{
         </>
       )}
       <div
-        className={`mt-4 rounded-md border px-3 py-2.5 text-xs leading-5 ${isEnforcing ? USAGE_PAGE_COLORS.warning : USAGE_PAGE_COLORS.inset}`}
+        className={`mt-4 rounded-md border px-3 py-2.5 text-xs leading-5 ${USAGE_PAGE_COLORS.inset}`}
       >
-        {isEnforcing
-          ? i18n.t("codexUsagePage.enforceModeDescription", {
-              defaultValue:
-                "窗口剩余不高于 {{percent}}% 时，本机网关会拒绝继续转发 Codex 请求。未经过 CCSwitchMulti 的原生 Codex App 仍不受此策略控制。",
-              percent: Math.round(overview?.enforceRemainingPercent ?? 20),
-            })
-          : i18n.t("codexUsagePage.observeModeNote", {
-              defaultValue:
-                "观测模式不会拦截请求。约束模式只对经过 CCSwitchMulti 网关的实例生效。",
-            })}
-      </div>
-      <ConfirmDialog
-        isOpen={confirmEnforceOpen}
-        title={i18n.t("codexUsagePage.enableEnforceTitle", {
-          defaultValue: "启用约束模式？",
-        })}
-        message={i18n.t("codexUsagePage.enforceConfirmMessage", {
+        {i18n.t("codexUsagePage.observeModeNote", {
           defaultValue:
-            "当官方窗口剩余不高于阈值时，本机 CCSwitchMulti 网关会拒绝继续转发 Codex 请求。\n\n直接使用原生 Codex App、CLI 或其它未经过 CCSwitchMulti 网关的请求不受此策略控制，仍会消耗同一账号额度。",
+            "Open mode only: this dashboard observes device reports and never blocks requests.",
         })}
-        confirmText={i18n.t("codexUsagePage.confirmEnableEnforce", {
-          defaultValue: "我了解，启用约束",
-        })}
-        cancelText={i18n.t("codexUsagePage.stayObserve", {
-          defaultValue: "保持观测",
-        })}
-        variant="info"
-        onConfirm={confirmEnforce}
-        onCancel={() => setConfirmEnforceOpen(false)}
-      />
+      </div>
     </section>
   );
 };

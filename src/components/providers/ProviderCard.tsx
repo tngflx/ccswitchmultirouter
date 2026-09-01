@@ -29,7 +29,7 @@ import {
 } from "@/utils/providerCapabilities";
 import { useProviderHealth } from "@/lib/query/failover";
 import { useUsageQuery } from "@/lib/query/queries";
-import { resolveProviderIcon } from "@/utils/providerIcon";
+import { providerFaviconUrl, resolveProviderIcon } from "@/utils/providerIcon";
 
 interface DragHandleProps {
   attributes: DraggableAttributes;
@@ -202,6 +202,36 @@ const extractApiUrl = (provider: Provider, fallbackText: string) => {
   return fallbackText;
 };
 
+const extractProviderFaviconSource = (
+  provider: Provider,
+): string | undefined => {
+  const config = provider.settingsConfig;
+  if (!config || typeof config !== "object") return provider.websiteUrl;
+
+  const candidates = [
+    (config as Record<string, any>).baseUrl,
+    (config as Record<string, any>).baseURL,
+    (config as Record<string, any>).apiUrl,
+    (config as Record<string, any>).api_url,
+    (config as Record<string, any>).env?.ANTHROPIC_BASE_URL,
+    (config as Record<string, any>).env?.GOOGLE_GEMINI_BASE_URL,
+    (config as Record<string, any>).env?.OPENAI_BASE_URL,
+  ];
+  const direct = candidates.find(
+    (value): value is string =>
+      typeof value === "string" && /^https?:\/\//i.test(value.trim()),
+  );
+  if (direct) return direct;
+
+  const configText = (config as Record<string, any>).config;
+  if (typeof configText === "string" && configText.includes("base_url")) {
+    const extracted = extractCodexBaseUrl(configText);
+    if (extracted) return extracted;
+  }
+
+  return provider.websiteUrl;
+};
+
 export function ProviderCard({
   provider,
   isCurrent,
@@ -249,6 +279,13 @@ export function ProviderCard({
   const displayUrl = useMemo(() => {
     return extractApiUrl(provider, fallbackUrlText);
   }, [provider, fallbackUrlText]);
+
+  const providerIcon = useMemo(
+    () =>
+      resolveProviderIcon(appId, provider.icon, provider.iconColor) ??
+      providerFaviconUrl(extractProviderFaviconSource(provider)),
+    [appId, provider, displayUrl, fallbackUrlText],
+  );
 
   const isClickableUrl = useMemo(() => {
     if (provider.notes?.trim()) {
@@ -415,11 +452,7 @@ export function ProviderCard({
 
           <div className="h-8 w-8 flex-shrink-0 rounded-lg bg-muted flex items-center justify-center border border-border group-hover:scale-105 transition-transform duration-300">
             <ProviderIcon
-              icon={resolveProviderIcon(
-                appId,
-                provider.icon,
-                provider.iconColor,
-              )}
+              icon={providerIcon}
               name={provider.name}
               color={provider.iconColor}
               size={20}

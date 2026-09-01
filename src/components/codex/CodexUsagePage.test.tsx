@@ -266,7 +266,7 @@ describe("CodexUsagePage", () => {
     expect(screen.getByText(/按当前节奏可能提前耗尽/)).toBeInTheDocument();
   });
 
-  it("guides an unconfigured device and saves enforce only after acknowledgement", async () => {
+  it("keeps the collaboration dashboard in open mode", async () => {
     const user = userEvent.setup();
     mockedSettingsApi.save.mockResolvedValue(true);
     mockQuotaResult({
@@ -291,19 +291,20 @@ describe("CodexUsagePage", () => {
       screen.getByText("1. 每台设备启用相同的 WebDAV 或 S3"),
     ).toBeInTheDocument();
 
-    await user.click(screen.getByRole("button", { name: "约束" }));
-    expect(screen.getByText("启用约束模式？")).toBeInTheDocument();
     expect(
-      screen.getByText(/未经过 CCSwitchMulti 网关的请求不受此策略控制/),
-    ).toBeInTheDocument();
-    await user.click(screen.getByRole("button", { name: "我了解，启用约束" }));
+      screen.queryByRole("button", { name: "约束" }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "Enforce" }),
+    ).not.toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "保存协作设置" }));
 
     await waitFor(() => {
       expect(mockedSettingsApi.save).toHaveBeenCalledWith(
         expect.objectContaining({
           quotaCollaboration: expect.objectContaining({
             deviceName: "测试设备",
-            mode: "enforce",
+            mode: "observe",
             enforceRemainingPercent: 20,
           }),
         }),

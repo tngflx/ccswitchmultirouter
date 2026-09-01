@@ -24,3 +24,19 @@ export function resolveProviderIcon(
 
   return normalizedIcon;
 }
+
+/** Build a stable remote favicon URL from a provider API endpoint. */
+export function providerFaviconUrl(apiUrl?: string): string | undefined {
+  if (!apiUrl?.trim()) return undefined;
+  try {
+    const parsed = new URL(apiUrl.trim());
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+      return undefined;
+    }
+    return `https://www.google.com/s2/favicons?domain_url=${encodeURIComponent(
+      parsed.origin,
+    )}&sz=64`;
+  } catch {
+    return undefined;
+  }
+}

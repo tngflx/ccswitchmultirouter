@@ -38,6 +38,9 @@ export const ProviderIcon: React.FC<ProviderIconProps> = ({
     if (icon && isUrlIcon(icon)) {
       return getIconUrl(icon);
     }
+    if (icon && /^https?:\/\//i.test(icon.trim())) {
+      return icon.trim();
+    }
     return "";
   }, [icon]);
 
