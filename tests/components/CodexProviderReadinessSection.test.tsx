@@ -10,7 +10,7 @@ describe("CodexProviderReadinessSection", () => {
 
     render(
       <CodexProviderReadinessSection
-        models={[]}
+        models={[{ model: "gpt-5.5", apiFormat: "openai_chat" }]}
         apiFormat="openai_chat"
         isMaintainedPreset={false}
         isSyncingModels={false}
@@ -24,7 +24,11 @@ describe("CodexProviderReadinessSection", () => {
       screen.getByRole("heading", { name: "Models & Compatibility" }),
     ).toBeInTheDocument();
     expect(screen.getByText("Readiness")).toBeInTheDocument();
-    expect(screen.getByText("Sync models needed")).toBeInTheDocument();
+    expect(
+      screen.getByText(
+        "Sync the models available from this source and verify that Codex and MultiRouter can use them correctly.",
+      ),
+    ).toBeInTheDocument();
 
     fireEvent.click(screen.getByRole("button", { name: "Sync Models" }));
     fireEvent.click(screen.getByRole("button", { name: "Verify Connection" }));
@@ -109,7 +113,7 @@ describe("CodexProviderReadinessSection", () => {
       />,
     );
 
-    expect(screen.getByText("Protocol groups")).toBeInTheDocument();
+    expect(screen.getAllByText("Protocol groups")).toHaveLength(2);
     expect(screen.getByText("Mixed (per model)")).toBeInTheDocument();
     expect(screen.getByText("Responses: 2 models")).toBeInTheDocument();
     expect(screen.getByText("Chat Completions: 1 models")).toBeInTheDocument();

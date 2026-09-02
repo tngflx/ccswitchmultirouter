@@ -484,6 +484,14 @@ function renderCatalogHarness(
   };
 }
 
+function prepareAndOpenProtocolProbe() {
+  const verify = screen.getByRole("button", { name: "Verify Connection" });
+  if (verify.hasAttribute("disabled")) {
+    fireEvent.click(screen.getByRole("button", { name: "Protocol groups" }));
+  }
+  fireEvent.click(screen.getByRole("button", { name: "Verify Connection" }));
+}
+
 interface ReadinessIdentityState {
   baseUrl: string;
   apiKey: string;
@@ -1279,7 +1287,7 @@ describe("CodexFormFields local model routing", () => {
       { shouldShowSpeedTest: true },
     );
 
-    fireEvent.click(screen.getByRole("button", { name: "Verify Connection" }));
+    prepareAndOpenProtocolProbe();
     expect(screen.getByText("确认测试 Chat / Responses")).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "确认测试" }));
 
@@ -1322,8 +1330,8 @@ describe("CodexFormFields local model routing", () => {
       { shouldShowSpeedTest: true },
     );
 
-    fireEvent.click(screen.getByRole("button", { name: "Verify Connection" }));
     fireEvent.click(screen.getByRole("button", { name: "Light" }));
+    prepareAndOpenProtocolProbe();
     fireEvent.click(screen.getByRole("button", { name: "确认测试" }));
 
     expect(
@@ -1347,7 +1355,7 @@ describe("CodexFormFields local model routing", () => {
       shouldShowSpeedTest: true,
     });
 
-    fireEvent.click(screen.getByRole("button", { name: "Verify Connection" }));
+    prepareAndOpenProtocolProbe();
     fireEvent.click(screen.getByRole("button", { name: "确认测试" }));
     fireEvent.click(await screen.findByRole("button", { name: "Stop probe" }));
 
@@ -1384,7 +1392,7 @@ describe("CodexFormFields local model routing", () => {
       { shouldShowSpeedTest: true },
     );
 
-    fireEvent.click(screen.getByRole("button", { name: "Verify Connection" }));
+    prepareAndOpenProtocolProbe();
     fireEvent.click(screen.getByRole("button", { name: "确认测试" }));
 
     await waitFor(() => {
@@ -1416,9 +1424,7 @@ describe("CodexFormFields local model routing", () => {
     const { updateIdentity } = renderReadinessIdentityHarness();
 
     const validateCurrentIdentity = async () => {
-      fireEvent.click(
-        screen.getByRole("button", { name: "Verify Connection" }),
-      );
+      prepareAndOpenProtocolProbe();
       fireEvent.click(screen.getByRole("button", { name: "确认测试" }));
       expect(
         await screen.findByText("Can join MultiRouter"),
@@ -1493,7 +1499,7 @@ describe("CodexFormFields local model routing", () => {
     );
     const { updateIdentity } = renderReadinessIdentityHarness();
 
-    fireEvent.click(screen.getByRole("button", { name: "Verify Connection" }));
+    prepareAndOpenProtocolProbe();
     fireEvent.click(screen.getByRole("button", { name: "确认测试" }));
     await waitFor(() => {
       expect(preflightCodexProviderProtocolCompatibility).toHaveBeenCalledTimes(
@@ -1507,7 +1513,7 @@ describe("CodexFormFields local model routing", () => {
         screen.getByRole("button", { name: "Verify Connection" }),
       ).toBeEnabled(),
     );
-    fireEvent.click(screen.getByRole("button", { name: "Verify Connection" }));
+    prepareAndOpenProtocolProbe();
     fireEvent.click(screen.getByRole("button", { name: "确认测试" }));
 
     await act(async () => {
@@ -1561,7 +1567,7 @@ describe("CodexFormFields local model routing", () => {
       },
     );
 
-    fireEvent.click(screen.getByRole("button", { name: "Verify Connection" }));
+    prepareAndOpenProtocolProbe();
     fireEvent.click(screen.getByRole("button", { name: "确认测试" }));
 
     expect(await screen.findByText("检测到混合协议模型")).toBeInTheDocument();
@@ -1605,7 +1611,7 @@ describe("CodexFormFields local model routing", () => {
     });
 
     fireEvent.click(screen.getByRole("button", { name: "高级选项" }));
-    fireEvent.click(screen.getByRole("button", { name: "Verify Connection" }));
+    prepareAndOpenProtocolProbe();
 
     expect(
       screen.getByText("已打开验证确认框；如果没有看到弹窗，请按 Esc 后重试。"),
@@ -1614,20 +1620,15 @@ describe("CodexFormFields local model routing", () => {
     expect(screen.getByText("确认测试 Chat / Responses")).toBeInTheDocument();
   });
 
-  it("points users to fetch models when protocol probing has no catalog", async () => {
+  it("blocks protocol probing until a model catalog exists", () => {
     renderCatalogHarness([], { shouldShowSpeedTest: true });
 
-    fireEvent.click(screen.getByRole("button", { name: "Verify Connection" }));
-    fireEvent.click(screen.getByRole("button", { name: "确认测试" }));
-
-    expect(await screen.findByRole("status")).toHaveTextContent(
-      "请先在“模型与兼容性”同步模型，或在高级设置中手动添加至少一个模型后再验证。",
-    );
-    const fetchButton = screen.getByRole("button", { name: "Sync Models" });
-    expect(fetchButton).toHaveClass("border-blue-500");
-    await waitFor(() =>
-      expect(HTMLElement.prototype.scrollIntoView).toHaveBeenCalled(),
-    );
+    expect(
+      screen.getByRole("button", { name: "Protocol groups" }),
+    ).toBeDisabled();
+    expect(
+      screen.getByRole("button", { name: "Verify Connection" }),
+    ).toBeDisabled();
     expect(preflightCodexProviderProtocolCompatibility).not.toHaveBeenCalled();
   });
 
@@ -1639,7 +1640,7 @@ describe("CodexFormFields local model routing", () => {
       shouldShowSpeedTest: true,
     });
 
-    fireEvent.click(screen.getByRole("button", { name: "Verify Connection" }));
+    prepareAndOpenProtocolProbe();
     fireEvent.click(screen.getByRole("button", { name: "确认测试" }));
 
     expect(await screen.findByRole("alert")).toHaveTextContent(

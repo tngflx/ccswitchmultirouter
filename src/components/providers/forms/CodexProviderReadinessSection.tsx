@@ -5,6 +5,7 @@ import { useTranslation } from "react-i18next";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 import type { CodexApiFormat, CodexCatalogModel } from "@/types";
+import type { CodexProtocolProbeMode } from "@/lib/api/protocol-compatibility";
 import type { ResolvedCodexTrafficPolicy } from "./codexTrafficPolicy";
 
 type ValidationTone = "muted" | "success" | "warning" | "error";
@@ -18,6 +19,7 @@ interface CodexProviderReadinessSectionProps {
   isSyncingModels: boolean;
   isRefreshingModels?: boolean;
   isValidatingConnection: boolean;
+  protocolProbeMode?: CodexProtocolProbeMode;
   validationSummary?: string;
   validationTone?: ValidationTone;
   highlightSync?: boolean;
@@ -25,6 +27,8 @@ interface CodexProviderReadinessSectionProps {
   sectionRef?: Ref<HTMLElement>;
   onSyncModels: () => void;
   onFillMissingFields?: () => void;
+  onCreateProtocolGroups?: () => void;
+  onProtocolProbeModeChange?: (mode: CodexProtocolProbeMode) => void;
   onValidateConnection: () => void;
 }
 
@@ -58,6 +62,7 @@ export function CodexProviderReadinessSection({
   isSyncingModels,
   isRefreshingModels = false,
   isValidatingConnection,
+  protocolProbeMode = "deep",
   validationSummary = "",
   validationTone = "muted",
   highlightSync = false,
@@ -65,6 +70,8 @@ export function CodexProviderReadinessSection({
   sectionRef,
   onSyncModels,
   onFillMissingFields,
+  onCreateProtocolGroups,
+  onProtocolProbeModeChange,
   onValidateConnection,
 }: CodexProviderReadinessSectionProps) {
   const { t } = useTranslation();
@@ -91,6 +98,16 @@ export function CodexProviderReadinessSection({
   );
   const responsesCount = responsesModels.length;
   const chatCount = chatModels.length;
+  const assignedCount = responsesCount + chatCount;
+  const unassignedCount = normalizedModels.filter(
+    (model) =>
+      model.enabled !== false &&
+      !["openai_responses", "openai_chat"].includes(
+        model.apiFormat ?? model.api_format ?? "",
+      ),
+  ).length;
+  const hasCompleteProtocolGroups =
+    hasModels && (unassignedCount === 0 || !onCreateProtocolGroups);
   const validationPassed = validationTone === "success";
   const ready = hasModels && validationPassed;
   const isCatalogActionRunning = isSyncingModels || isRefreshingModels;
@@ -169,7 +186,20 @@ export function CodexProviderReadinessSection({
             variant="outline"
             size="sm"
             className="h-8 gap-1"
-            disabled={isValidatingConnection}
+            onClick={onCreateProtocolGroups}
+            disabled={
+              !hasModels || isValidatingConnection || !onCreateProtocolGroups
+            }
+          >
+            <Route className="h-3.5 w-3.5" />
+            {tr("protocolGroups", "Protocol groups")}
+          </Button>
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            className="h-8 gap-1"
+            disabled={isValidatingConnection || !hasCompleteProtocolGroups}
             onClick={onValidateConnection}
           >
             {isValidatingConnection ? (
@@ -250,57 +280,80 @@ export function CodexProviderReadinessSection({
             )}
           </p>
         </div>
-        {responsesCount > 0 && chatCount > 0 && (
+        {assignedCount > 0 && (
           <div className="rounded-md border border-border-default bg-background/70 p-3 sm:col-span-2 lg:col-span-4">
             <div className="flex flex-wrap items-center justify-between gap-2">
               <p className="text-xs text-muted-foreground">
                 {tr("protocolGroups", "Protocol groups")}
               </p>
               <span className="text-xs text-muted-foreground">
-                {tr("automaticRouting", "Automatic per-model routing")}
+                {unassignedCount > 0
+                  ? `${unassignedCount} ${tr("notSelected", "Not selected")}`
+                  : tr("automaticRouting", "Automatic per-model routing")}
               </span>
             </div>
             <div className="mt-2 grid gap-2 sm:grid-cols-2">
-              <div className="min-w-0 rounded border border-emerald-500/30 bg-emerald-500/10 px-3 py-2">
-                <p className="text-sm font-medium text-foreground">
-                  {tr("responsesGroup", "Responses: {{count}} models", {
-                    count: responsesCount,
-                  })}
-                </p>
-                <p
-                  className="mt-1 truncate font-mono text-[11px] text-muted-foreground"
-                  title={responsesModels.map((model) => model.model).join(", ")}
-                >
-                  {responsesModels
-                    .slice(0, 4)
-                    .map((model) => model.model)
-                    .join(", ")}
-                  {responsesCount > 4 ? ` +${responsesCount - 4}` : ""}
-                </p>
-              </div>
-              <div className="min-w-0 rounded border border-sky-500/30 bg-sky-500/10 px-3 py-2">
-                <p className="text-sm font-medium text-foreground">
-                  {tr("chatGroup", "Chat Completions: {{count}} models", {
-                    count: chatCount,
-                  })}
-                </p>
-                <p
-                  className="mt-1 truncate font-mono text-[11px] text-muted-foreground"
-                  title={chatModels.map((model) => model.model).join(", ")}
-                >
-                  {chatModels
-                    .slice(0, 4)
-                    .map((model) => model.model)
-                    .join(", ")}
-                  {chatCount > 4 ? ` +${chatCount - 4}` : ""}
-                </p>
-              </div>
+              {responsesCount > 0 && (
+                <div className="min-w-0 rounded border border-emerald-500/30 bg-emerald-500/10 px-3 py-2">
+                  <p className="text-sm font-medium text-foreground">
+                    {tr("responsesGroup", "Responses: {{count}} models", {
+                      count: responsesCount,
+                    })}
+                  </p>
+                  <p
+                    className="mt-1 truncate font-mono text-[11px] text-muted-foreground"
+                    title={responsesModels
+                      .map((model) => model.model)
+                      .join(", ")}
+                  >
+                    {responsesModels
+                      .slice(0, 4)
+                      .map((model) => model.model)
+                      .join(", ")}
+                    {responsesCount > 4 ? ` +${responsesCount - 4}` : ""}
+                  </p>
+                </div>
+              )}
+              {chatCount > 0 && (
+                <div className="min-w-0 rounded border border-sky-500/30 bg-sky-500/10 px-3 py-2">
+                  <p className="text-sm font-medium text-foreground">
+                    {tr("chatGroup", "Chat Completions: {{count}} models", {
+                      count: chatCount,
+                    })}
+                  </p>
+                  <p
+                    className="mt-1 truncate font-mono text-[11px] text-muted-foreground"
+                    title={chatModels.map((model) => model.model).join(", ")}
+                  >
+                    {chatModels
+                      .slice(0, 4)
+                      .map((model) => model.model)
+                      .join(", ")}
+                    {chatCount > 4 ? ` +${chatCount - 4}` : ""}
+                  </p>
+                </div>
+              )}
             </div>
           </div>
         )}
       </div>
 
       <div className="rounded-md border border-border-default bg-background/70 p-3">
+        <div className="mb-3 grid grid-cols-2 gap-1 rounded-md border bg-muted/30 p-1">
+          {(["light", "deep"] as const).map((mode) => (
+            <Button
+              key={mode}
+              type="button"
+              size="sm"
+              variant={protocolProbeMode === mode ? "secondary" : "ghost"}
+              onClick={() => onProtocolProbeModeChange?.(mode)}
+            >
+              {mode === "light"
+                ? t("codexForm.probeModeLight", { defaultValue: "Light" })
+                : t("codexForm.probeModeDeep", { defaultValue: "Deep" })}
+            </Button>
+          ))}
+        </div>
         <div className="flex flex-wrap items-center justify-between gap-2">
           <div className="space-y-1">
             <p className="text-xs font-medium text-foreground">

@@ -467,6 +467,42 @@ export function applyCodexProtocolGroups<T extends CodexCatalogModel>(
   });
 }
 
+export function applyDefaultCodexProtocolGroups<T extends CodexCatalogModel>(
+  rows: T[],
+  fallbackApiFormat: CodexApiFormat,
+): T[] {
+  const apiFormat =
+    fallbackApiFormat === "openai_chat" ? "openai_chat" : "openai_responses";
+  return rows.map((row) => {
+    if (row.enabled === false || !catalogRowUpstreamModel(row)) return row;
+    const existing = row.apiFormat ?? row.api_format;
+    if (existing === "openai_chat" || existing === "openai_responses") {
+      return row;
+    }
+    return {
+      ...row,
+      apiFormat,
+      apiFormatSource: "inferred",
+      api_format: apiFormat,
+      api_format_source: "inferred",
+    } as T;
+  });
+}
+
+function hasCompleteCodexProtocolGroups(rows: CodexCatalogModel[]): boolean {
+  const enabled = rows.filter(
+    (row) => row.enabled !== false && Boolean(catalogRowUpstreamModel(row)),
+  );
+  return (
+    enabled.length > 0 &&
+    enabled.every((row) =>
+      ["openai_chat", "openai_responses"].includes(
+        row.apiFormat ?? row.api_format ?? "",
+      ),
+    )
+  );
+}
+
 interface PendingCodexProviderSplitRouting {
   identity: string;
   suggestion: CodexProviderSplitSuggestion;
@@ -1712,6 +1748,16 @@ export function CodexFormFields({
       revealModelCatalogFetchAction();
       return;
     }
+    if (!hasCompleteCodexProtocolGroups(probeModels)) {
+      setIsProtocolProbeConfirmOpen(false);
+      setProtocolProbeTone("warning");
+      setProtocolProbeSummary(
+        i18n.t("codexConfig.providerReadiness.verifyFirst", {
+          defaultValue: "Verify connection first",
+        }),
+      );
+      return;
+    }
 
     const probeIdentity = readinessIdentity;
     const probeSeq = ++protocolProbeSeqRef.current;
@@ -2331,25 +2377,6 @@ export function CodexFormFields({
               </span>
             </DialogDescription>
           </DialogHeader>
-          <div className="grid grid-cols-2 gap-1 rounded-md border bg-muted/30 p-1">
-            {(["light", "deep"] as const).map((mode) => (
-              <Button
-                key={mode}
-                type="button"
-                size="sm"
-                variant={protocolProbeMode === mode ? "secondary" : "ghost"}
-                onClick={() => setProtocolProbeMode(mode)}
-              >
-                {mode === "light"
-                  ? i18n.t("codexForm.probeModeLight", {
-                      defaultValue: "Light",
-                    })
-                  : i18n.t("codexForm.probeModeDeep", {
-                      defaultValue: "Deep",
-                    })}
-              </Button>
-            ))}
-          </div>
           <p className="text-sm text-muted-foreground">
             {protocolProbeMode === "light"
               ? i18n.t("codexForm.probeModeLightDescription", {
@@ -2863,6 +2890,7 @@ export function CodexFormFields({
           isValidatingConnection={
             isProbingProtocol && isProtocolProbeStateCurrent
           }
+          protocolProbeMode={protocolProbeMode}
           validationSummary={
             isProtocolProbeStateCurrent ? protocolProbeSummary : ""
           }
@@ -2874,6 +2902,16 @@ export function CodexFormFields({
           sectionRef={modelMappingSectionRef}
           onSyncModels={handleFetchModels}
           onFillMissingFields={handleFillMissingModelFields}
+          onCreateProtocolGroups={() => {
+            const nextRows = applyDefaultCodexProtocolGroups(
+              catalogRowsRef.current,
+              apiFormat,
+            );
+            catalogRowsRef.current = nextRows;
+            setCatalogRows(nextRows);
+            onCatalogModelsChange?.(nextRows);
+          }}
+          onProtocolProbeModeChange={setProtocolProbeMode}
           onValidateConnection={() => {
             bindProtocolProbeIdentity(readinessIdentity);
             setProtocolProbeTone("muted");

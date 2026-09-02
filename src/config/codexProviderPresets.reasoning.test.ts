@@ -180,5 +180,10 @@ describe("Codex preset reasoning capabilities", () => {
         "nemotron-3.5-lightning-free",
       ]),
     );
+    expect(
+      preset!.modelCatalog?.find(
+        (model) => model.model === "muse-spark-1.2-contributor-free",
+      )?.apiFormat,
+    ).toBe("openai_responses");
   });
 });

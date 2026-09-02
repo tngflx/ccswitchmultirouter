@@ -166,6 +166,8 @@ function modelCatalog(
         // backend: confirmed text-only models stay text-only; everything else
         // defaults to text+image.
         supportsParallelToolCalls?: boolean;
+        apiFormat?: CodexApiFormat;
+        apiFormatSource?: "manual" | "probe" | "inferred" | string;
         // Vendor's OFFICIAL base_instructions; omit to inherit the neutral
         // template default. Required by Codex, so the backend always emits one.
         baseInstructions?: string;
@@ -191,6 +193,12 @@ function modelCatalog(
           ...(entry.vision !== undefined ? { vision: entry.vision } : {}),
           ...(entry.supportsParallelToolCalls !== undefined
             ? { supportsParallelToolCalls: entry.supportsParallelToolCalls }
+            : {}),
+          ...(entry.apiFormat !== undefined
+            ? { apiFormat: entry.apiFormat }
+            : {}),
+          ...(entry.apiFormatSource !== undefined
+            ? { apiFormatSource: entry.apiFormatSource }
             : {}),
           ...(entry.baseInstructions !== undefined
             ? { baseInstructions: entry.baseInstructions }
@@ -1799,6 +1807,7 @@ wire_api = "responses"`,
       {
         model: "muse-spark-1.2-contributor-free",
         displayName: "Muse Spark 1.2 Contributor (Free)",
+        apiFormat: "openai_responses",
       },
       { model: "mimo-v2.5-free", displayName: "MiMo V2.5 (Free)" },
       {
