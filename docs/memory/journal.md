@@ -168,6 +168,14 @@
 - **Evidence:** `cargo check --manifest-path src-tauri/Cargo.toml` passed; focused Request Health tests passed **8/8**; focused proxy error-mapping tests passed **8/8**; `pnpm typecheck` passed; focused Request Health/workspace frontend tests passed **89/89**; Rustfmt, targeted Prettier, and `git diff --check` passed. The live WinRT display/activation path was not tested because the running development binary predates this source and runtime proof requires a normal rebuild plus a deliberately armed session.
 - **What NOT to do again:** Do not put request-release authority in a renderer toast, infer current-request control from post-response usage, release an unbound or reusable approval, treat notification failure as permission to send, or claim native activation is runtime-verified without testing the rebuilt binary.
 
+## 2026-09-03 - Selective BigStrongSun and original cc-switch integration audit
+
+- **What happened:** Refreshed BigStrongSun main and open PRs plus original cc-switch main, then audited the new commits against this fork's recent squashed integrations and active dirty work.
+- **Root cause:** Patch ancestry overstated the useful delta: several upstream fixes already existed under local SHAs, while other candidates depended on older probe, routing, or UI ownership models. The primary checkout also gained concurrent uncommitted changes in `runner.rs` and related backend files during the audit.
+- **What we did:** Built an isolated integration branch with BigStrongSun's Sub-Agent V2 alias rekey and terminal Responses tool-item fix, plus original cc-switch's Hermes release detection and stable resumed-rollout usage identity. Deferred the environment-injection, model hide/restore, and xAI series to dedicated adaptations. Full verdicts are in [the incident report](incidents/2026-09-03-upstream-cherry-pick-audit.md).
+- **Evidence:** `cargo check` and `pnpm typecheck` passed; focused tests passed 8/8, 1/1, 3/3, 1/1, and 1/1. Final frontend was **160 files passed, 1 failed; 1,352 passed, 1 failed** on an unchanged baseline placeholder test. Final backend was **3,670 passed, 4 failed, 6 ignored** on unchanged baseline tests outside the integrated files.
+- **What NOT to do again:** Do not equate remote ahead counts with missing behavior, resolve PR #75 or the xAI series by taking a whole side, or land the isolated branch over the moving `runner.rs` checkout without explicit coordination.
+
 ## 2026-09-02 - Request Health now distinguishes cached history from sustained fresh-input growth
 
 - **What happened:** Request Health could only compare finalized JSON bytes with a `bytes / 4` estimate. It warned about every large request but could not tell whether a long Codex history was receiving useful upstream cache hits or repeatedly charging fresh input.
