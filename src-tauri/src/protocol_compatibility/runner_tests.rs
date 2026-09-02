@@ -37,6 +37,7 @@ enum ResponsesMode {
     InvalidSuccessfulJson,
     IncompleteContinuation,
     MarkerMismatch,
+    ResponsesToolAddedBeforeDone,
 }
 
 #[tokio::test]
@@ -204,8 +205,28 @@ async fn upstream(
     if is_forced_tool && is_stream {
         let nonce = extract_nonce(&body).unwrap();
         if is_responses {
+            let added = if matches!(
+                state.responses_mode,
+                ResponsesMode::ResponsesToolAddedBeforeDone
+            ) {
+                format!(
+                    "event: response.output_item.added\ndata: {}\n\n",
+                    json!({
+                        "item": {
+                            "id": "fc_fixture",
+                            "type": "function_call",
+                            "call_id": "call_responses",
+                            "name": "ccsm_protocol_compatibility_probe",
+                            "arguments": "",
+                            "status": "in_progress"
+                        }
+                    })
+                )
+            } else {
+                String::new()
+            };
             return sse(format!(
-                "event: response.output_item.done\ndata: {}\n\nevent: response.output_item.done\ndata: {}\n\nevent: response.completed\ndata: {{\"response\":{{\"status\":\"completed\"}}}}\n\n",
+                "{added}event: response.output_item.done\ndata: {}\n\nevent: response.output_item.done\ndata: {}\n\nevent: response.completed\ndata: {{\"response\":{{\"status\":\"completed\"}}}}\n\n",
                 json!({
                     "item": {
                         "id": "rs_fixture",
@@ -568,6 +589,24 @@ async fn incomplete_success_json_does_not_pass_responses_continuation() {
         .find(|branch| branch.assessment.transport == TransportKind::OpenAiResponses)
         .unwrap();
     assert_eq!(responses.assessment.continuation, ProbeStageStatus::Failed);
+}
+
+#[tokio::test]
+async fn responses_tool_extraction_waits_for_done_after_in_progress_added() {
+    let fixture = spawn_fixture(ResponsesMode::ResponsesToolAddedBeforeDone).await;
+    let result = run_protocol_compatibility_probe(
+        candidate(&fixture.base_url, TransportKind::OpenAiResponses),
+        &reqwest::Client::new(),
+    )
+    .await;
+
+    let responses = result
+        .branches
+        .iter()
+        .find(|branch| branch.assessment.transport == TransportKind::OpenAiResponses)
+        .unwrap();
+    assert_eq!(responses.assessment.forced_tool, ProbeStageStatus::Passed);
+    assert_eq!(responses.assessment.continuation, ProbeStageStatus::Passed);
 }
 
 #[tokio::test]
