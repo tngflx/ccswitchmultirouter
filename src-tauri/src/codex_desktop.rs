@@ -870,8 +870,8 @@ pub(crate) async fn submit_codex_continuation() -> Result<CodexContinuationResul
 /// 生成去重后的 CDP 端口探测列表。
 pub(crate) fn candidate_debug_ports(preferred: u16) -> Vec<u16> {
     let mut ports = vec![preferred, DEFAULT_CODEX_DEBUG_PORT, 9222, 9223, 9230, 9231];
-    ports.sort_unstable();
-    ports.dedup();
+    let mut seen = BTreeSet::new();
+    ports.retain(|port| seen.insert(*port));
     ports
 }
 
@@ -2532,7 +2532,32 @@ JSON.stringify({
         assert!(script.contains("requestStartupSync"));
         assert!(script.contains("readSnapshot"));
         assert!(script.contains("const historySync = await triggerLocalThreadCatalogSync()"));
+        assert!(script.contains("state.appServerClients"));
         assert!(!script.contains("modelProviders: []"));
+    }
+
+    #[test]
+    fn compatibility_script_discovers_current_conversation_runtime() {
+        let script = build_model_picker_unlock_script(&CodexModelCatalogProjection::empty());
+
+        assert!(script.contains("findConversationRuntime"));
+        assert!(script.contains(r#"names.has("getConversation")"#));
+        assert!(script.contains(r#"names.has("getStreamRole")"#));
+        assert!(script.contains(r#"names.has("waitForPendingThreadSettingsUpdate")"#));
+        assert!(script.contains("fiber.updateQueue?.memoCache?.data"));
+        assert!(script.contains("state.appServerClients"));
+    }
+
+    #[test]
+    fn preferred_cdp_port_is_probed_first_without_duplicates() {
+        assert_eq!(
+            candidate_debug_ports(DEFAULT_CODEX_DEBUG_PORT),
+            vec![9229, 9222, 9223, 9230, 9231]
+        );
+        assert_eq!(
+            candidate_debug_ports(9231),
+            vec![9231, 9229, 9222, 9223, 9230]
+        );
     }
 
     /// 验证 CDP 返回值能准确区分“脚本已安装”和“原生历史同步已请求”。

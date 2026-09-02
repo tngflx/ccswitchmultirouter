@@ -4440,7 +4440,7 @@ impl ProxyService {
         config: &Value,
         merge_existing_config: bool,
     ) -> Result<(), String> {
-        use crate::codex_config::{get_codex_auth_path, get_codex_config_path};
+        use crate::codex_config::get_codex_auth_path;
 
         let auth = config.get("auth");
         let config_str = config.get("config").and_then(|v| v.as_str());
@@ -4506,8 +4506,7 @@ impl ProxyService {
                     } else {
                         cfg.to_string()
                     };
-                    let config_path = get_codex_config_path();
-                    crate::config::write_text_file(&config_path, &cfg)
+                    crate::codex_config::write_codex_live_config_atomic(Some(&cfg))
                         .map_err(|e| format!("写入 Codex config 失败: {e}"))?;
                     return Ok(());
                 }
@@ -4517,8 +4516,7 @@ impl ProxyService {
                     // Codex login. This is especially important when takeover
                     // switches from an API-key-backed official session to the
                     // built-in empty `codex-official` seed.
-                    let config_path = get_codex_config_path();
-                    crate::config::write_text_file(&config_path, cfg)
+                    crate::codex_config::write_codex_live_config_atomic(Some(cfg))
                         .map_err(|e| format!("写入 Codex config 失败: {e}"))?;
                 } else {
                     crate::codex_config::write_codex_live_atomic(auth, Some(cfg))
@@ -4534,8 +4532,7 @@ impl ProxyService {
                     .map_err(|e| format!("写入 Codex auth 失败: {e}"))?;
             }
             (None, Some(cfg)) => {
-                let config_path = get_codex_config_path();
-                crate::config::write_text_file(&config_path, cfg)
+                crate::codex_config::write_codex_live_config_atomic(Some(cfg))
                     .map_err(|e| format!("写入 Codex config 失败: {e}"))?;
             }
             (None, None) => {}
@@ -10111,6 +10108,49 @@ wire_api = "responses"
             parsed["projects"][r"C:\Users\sunda\Documents\LLMservice"]["trust_level"].as_str(),
             Some("trusted")
         );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn codex_restore_normalizes_non_boolean_guardian_v2_from_backup() {
+        let _home = TempHome::new();
+        crate::settings::reload_settings().expect("reload settings");
+
+        let db = Arc::new(Database::memory().expect("init db"));
+        let service = ProxyService::new(db.clone());
+        let codex_dir = crate::codex_config::get_codex_config_dir();
+        std::fs::create_dir_all(&codex_dir).expect("create codex dir");
+        std::fs::write(
+            crate::codex_config::get_codex_config_path(),
+            "model_provider = \"codex_model_router_v2\"\n",
+        )
+        .expect("seed taken-over live config");
+
+        let backup_json = serde_json::to_string(&json!({
+            "auth": {},
+            "config": concat!(
+                "model_provider = \"openai\"\n",
+                "[features]\n",
+                "guardianv2 = { enabled = true, review_scope = { computer_use_only = true } }\n",
+                "goals = true\n",
+            )
+        }))
+        .expect("serialize backup");
+        db.save_live_backup("codex", &backup_json)
+            .await
+            .expect("seed live backup");
+
+        service
+            .restore_live_config_for_app_with_fallback(&AppType::Codex)
+            .await
+            .expect("restore should normalize Guardian v2");
+
+        let restored = std::fs::read_to_string(crate::codex_config::get_codex_config_path())
+            .expect("read restored config");
+        let parsed: toml::Value = toml::from_str(&restored).expect("restored config must parse");
+        assert_eq!(parsed["features"]["guardianv2"].as_bool(), Some(false));
+        assert_eq!(parsed["features"]["goals"].as_bool(), Some(true));
+        assert!(!restored.contains("review_scope"));
     }
 
     /// 回归：Codex Desktop 会把编辑器和通知偏好写进用户自有 TOML 表。

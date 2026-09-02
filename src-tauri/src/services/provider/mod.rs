@@ -5443,10 +5443,7 @@ impl ProviderService {
                 (!original_current_provider.is_empty())
                     .then_some(original_current_provider.as_str()),
             )?;
-            crate::config::write_text_file(
-                &crate::codex_config::get_codex_config_path(),
-                &original_live,
-            )
+            crate::codex_config::write_codex_live_config_atomic(Some(&original_live))
         };
 
         let mut repaired_provider = original_provider.clone();

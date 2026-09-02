@@ -1142,7 +1142,6 @@ impl LiveSnapshot {
             }
             LiveSnapshot::Codex { auth, config } => {
                 let auth_path = get_codex_auth_path();
-                let config_path = get_codex_config_path();
                 if should_preserve_live_codex_oauth_for_snapshot_restore() {
                     log::info!(
                         "Codex LiveSnapshot restore preserved existing OAuth auth.json and only restored config.toml"
@@ -1154,9 +1153,12 @@ impl LiveSnapshot {
                 }
 
                 if let Some(text) = config {
-                    crate::config::write_text_file(&config_path, text)?;
-                } else if config_path.exists() {
-                    delete_file(&config_path)?;
+                    crate::codex_config::write_codex_live_config_atomic(Some(text))?;
+                } else {
+                    let config_path = get_codex_config_path();
+                    if config_path.exists() {
+                        delete_file(&config_path)?;
+                    }
                 }
             }
             LiveSnapshot::Gemini { env, .. } => {

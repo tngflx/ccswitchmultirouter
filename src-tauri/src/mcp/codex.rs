@@ -492,8 +492,7 @@ pub fn sync_enabled_to_codex(config: &MultiAppConfig) -> Result<(), AppError> {
 
     // 6) 写回（仅改 TOML，不触碰 auth.json）；toml_edit 会尽量保留未改区域的注释/空白/顺序
     let new_text = doc.to_string();
-    let path = crate::codex_config::get_codex_config_path();
-    crate::config::write_text_file(&path, &new_text)?;
+    crate::codex_config::write_codex_live_config_atomic(Some(&new_text))?;
     Ok(())
 }
 
@@ -578,7 +577,6 @@ pub fn sync_single_server_to_codex(
 
     // 读取现有的 config.toml
     let config_path = crate::codex_config::get_codex_config_path();
-
     let mut doc = if config_path.exists() {
         let content =
             std::fs::read_to_string(&config_path).map_err(|e| AppError::io(&config_path, e))?;
@@ -611,7 +609,7 @@ pub fn sync_single_server_to_codex(
 
     // 写回文件
     let new_text = doc.to_string();
-    crate::config::write_text_file(&config_path, &new_text)?;
+    crate::codex_config::write_codex_live_config_atomic(Some(&new_text))?;
 
     Ok(())
 }
@@ -644,7 +642,7 @@ pub fn remove_server_from_codex(id: &str) -> Result<(), AppError> {
 
     // 写回文件
     let new_text = doc.to_string();
-    crate::config::write_text_file(&config_path, &new_text)?;
+    crate::codex_config::write_codex_live_config_atomic(Some(&new_text))?;
 
     Ok(())
 }

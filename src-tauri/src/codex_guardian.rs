@@ -10,6 +10,7 @@ use crate::codex_desktop::{
 };
 
 const GUARDIAN_CHECK_INTERVAL: Duration = Duration::from_secs(3);
+const GUARDIAN_CONFIG_CHECK_INTERVAL: Duration = Duration::from_millis(250);
 
 /// 守护上报给前端的即时状态。
 #[derive(Debug, Clone, Serialize)]
@@ -66,9 +67,33 @@ pub(crate) fn start_codex_guardian() -> GuardianHandle {
         guardian_loop(s, i, shutdown_rx).await;
     });
 
+    let config_shutdown_rx = shutdown_tx.subscribe();
+    tokio::spawn(async move {
+        guardian_config_compatibility_loop(config_shutdown_rx).await;
+    });
+
     GuardianHandle {
         shutdown_tx,
         status,
+    }
+}
+
+async fn guardian_config_compatibility_loop(mut shutdown: watch::Receiver<bool>) {
+    loop {
+        if *shutdown.borrow() {
+            return;
+        }
+
+        if let Err(error) = crate::codex_config::enforce_codex_guardian_v2_live_compatibility() {
+            log::warn!(
+                "Codex guardian could not enforce Guardian v2 config compatibility: {error}"
+            );
+        }
+
+        tokio::select! {
+            _ = tokio::time::sleep(GUARDIAN_CONFIG_CHECK_INTERVAL) => {}
+            _ = shutdown.changed() => return,
+        }
     }
 }
 

@@ -426,6 +426,62 @@ fn looks_like_windows_path(value: &str) -> bool {
     bytes.len() >= 3 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' && bytes[2] == b'\\'
 }
 
+fn normalize_codex_guardian_v2_feature(text: &str) -> Result<String, AppError> {
+    if text.trim().is_empty() {
+        return Ok(text.to_string());
+    }
+
+    let mut doc = text
+        .parse::<DocumentMut>()
+        .map_err(|error| AppError::Message(format!("Invalid Codex config.toml: {error}")))?;
+    let Some(features) = doc
+        .get_mut("features")
+        .and_then(|item| item.as_table_like_mut())
+    else {
+        return Ok(text.to_string());
+    };
+    let Some(guardian_v2) = features.get("guardianv2") else {
+        return Ok(text.to_string());
+    };
+    if guardian_v2.as_bool().is_some() {
+        return Ok(text.to_string());
+    }
+
+    features.insert("guardianv2", toml_edit::value(false));
+    log::warn!(
+        "Normalized non-boolean features.guardianv2 to false before writing Codex config.toml"
+    );
+    Ok(doc.to_string())
+}
+
+fn enforce_codex_guardian_v2_compatibility(text: &str) -> Result<String, AppError> {
+    if text.trim().is_empty() {
+        return Ok("[features]\nguardianv2 = false\n".to_string());
+    }
+
+    let mut doc = text
+        .parse::<DocumentMut>()
+        .map_err(|error| AppError::Message(format!("Invalid Codex config.toml: {error}")))?;
+    if doc.get("features").is_none() {
+        doc["features"] = toml_edit::table();
+    }
+    let features = doc
+        .get_mut("features")
+        .and_then(|item| item.as_table_like_mut())
+        .ok_or_else(|| {
+            AppError::Config(
+                "Invalid Codex config.toml: features must be a table for Guardian v2 compatibility"
+                    .to_string(),
+            )
+        })?;
+    if features.get("guardianv2").and_then(Item::as_bool) == Some(false) {
+        return Ok(text.to_string());
+    }
+
+    features.insert("guardianv2", toml_edit::value(false));
+    Ok(doc.to_string())
+}
+
 /// Codex Desktop 的 Windows Computer Use 初始化器曾生成过裸反斜杠的根级
 /// `notify = ["C:\Users\...", ...]`。在 TOML basic string 中 `\U` 会被解释为
 /// 8 位 Unicode 转义并使整个 Live 配置不可解析。这里只在原文本确实无效时，
@@ -433,7 +489,7 @@ fn looks_like_windows_path(value: &str) -> bool {
 /// 的其他 TOML、说明文字和已经合法的双反斜杠保持逐字不变。
 fn normalize_codex_config_text_for_live_read(text: &str) -> Result<String, AppError> {
     if validate_config_toml(text).is_ok() {
-        return Ok(text.to_string());
+        return normalize_codex_guardian_v2_feature(text);
     }
 
     let mut output = String::with_capacity(text.len() + 16);
@@ -484,7 +540,7 @@ fn normalize_codex_config_text_for_live_read(text: &str) -> Result<String, AppEr
     if repaired {
         validate_config_toml(&output)?;
         log::warn!("Normalized an invalid unescaped Windows path in Codex Live configuration");
-        return Ok(output);
+        return normalize_codex_guardian_v2_feature(&output);
     }
 
     validate_config_toml(text)?;
@@ -591,6 +647,25 @@ where
         .lock()
         .map_err(|_| AppError::Config("Codex live config write lock is poisoned".to_string()))?;
     reconcile_codex_live_config_atomic_locked(&mut build)
+}
+
+/// Keep Codex Desktop and its app-server on the shared scalar Guardian v2
+/// schema. Desktop builds that omit the scalar can later initialize a
+/// structured table which older app-server/CLI builds cannot deserialize.
+///
+/// Returns `true` only when the live file required repair.
+pub(crate) fn enforce_codex_guardian_v2_live_compatibility() -> Result<bool, AppError> {
+    let current = read_codex_config_text()?;
+    let compatible = enforce_codex_guardian_v2_compatibility(&current)?;
+    if compatible == current {
+        return Ok(false);
+    }
+
+    reconcile_codex_live_config_atomic(enforce_codex_guardian_v2_compatibility)?;
+    log::warn!(
+        "Enforced features.guardianv2 = false after detecting a missing or incompatible live value"
+    );
+    Ok(true)
 }
 
 fn reconcile_codex_live_config_atomic_locked<F>(build: &mut F) -> Result<String, AppError>
@@ -10535,6 +10610,89 @@ mod tests {
                 .expect("valid config should pass through"),
             already_valid
         );
+    }
+
+    #[test]
+    fn codex_live_read_normalizes_non_boolean_guardian_v2_shapes() {
+        for config in [
+            concat!(
+                "[features]\n",
+                "guardianv2 = { enabled = true, review_scope = { computer_use_only = true } }\n",
+                "goals = true\n",
+            ),
+            concat!(
+                "[features]\n",
+                "goals = true\n",
+                "[features.guardianv2]\n",
+                "enabled = true\n",
+                "review_scope = { computer_use_only = true }\n",
+            ),
+        ] {
+            let normalized = normalize_codex_config_text_for_live_read(config)
+                .expect("structured Guardian v2 config should be recoverable");
+            let parsed: toml::Value =
+                toml::from_str(&normalized).expect("normalized Guardian config must parse");
+            assert_eq!(parsed["features"]["guardianv2"].as_bool(), Some(false));
+            assert_eq!(parsed["features"]["goals"].as_bool(), Some(true));
+            assert!(!normalized.contains("review_scope"));
+        }
+
+        for scalar in ["true", "false"] {
+            let config = format!("[features]\nguardianv2 = {scalar}\n");
+            assert_eq!(
+                normalize_codex_config_text_for_live_read(&config)
+                    .expect("boolean Guardian v2 config should pass through"),
+                config
+            );
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn codex_atomic_write_normalizes_non_boolean_guardian_v2() {
+        let _home = TestHomeGuard::new();
+        let config = concat!(
+            "[features]\n",
+            "guardianv2 = { enabled = true, review_scope = { computer_use_only = true } }\n",
+            "goals = true\n",
+        );
+
+        write_codex_live_config_atomic(Some(config))
+            .expect("config-only write should normalize Guardian v2");
+        let written = read_codex_config_text().expect("read normalized config");
+        let parsed: toml::Value = toml::from_str(&written).expect("written config must parse");
+        assert_eq!(parsed["features"]["guardianv2"].as_bool(), Some(false));
+        assert_eq!(parsed["features"]["goals"].as_bool(), Some(true));
+    }
+
+    #[test]
+    #[serial]
+    fn guardian_v2_live_compatibility_pins_missing_and_structured_values_to_false() {
+        let _home = TestHomeGuard::new();
+
+        write_codex_live_config_atomic(Some("model = \"gpt-5.6-sol\"\n"))
+            .expect("seed config without Guardian v2");
+        assert!(
+            enforce_codex_guardian_v2_live_compatibility().expect("pin missing Guardian v2 value")
+        );
+        let pinned = read_codex_config_text().expect("read pinned config");
+        let parsed: toml::Value = toml::from_str(&pinned).expect("parse pinned config");
+        assert_eq!(parsed["features"]["guardianv2"].as_bool(), Some(false));
+        assert_eq!(parsed["model"].as_str(), Some("gpt-5.6-sol"));
+
+        std::fs::write(
+            get_codex_config_path(),
+            "[features]\nguardianv2 = { enabled = true }\ngoals = true\n",
+        )
+        .expect("simulate Desktop structured rewrite");
+        assert!(enforce_codex_guardian_v2_live_compatibility()
+            .expect("repair structured Guardian v2 value"));
+        let repaired = read_codex_config_text().expect("read repaired config");
+        let parsed: toml::Value = toml::from_str(&repaired).expect("parse repaired config");
+        assert_eq!(parsed["features"]["guardianv2"].as_bool(), Some(false));
+        assert_eq!(parsed["features"]["goals"].as_bool(), Some(true));
+        assert!(!enforce_codex_guardian_v2_live_compatibility()
+            .expect("compatible scalar should be idempotent"));
     }
 
     #[test]
