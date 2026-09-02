@@ -163,7 +163,11 @@ impl CodexChatHistoryStore {
         let mut enriched = 0usize;
         let mut new_items = Vec::new();
 
-        if !has_tool_output {
+        // `exchange_items` is a fallback for the Responses shorthand where a
+        // follow-up contains only tool outputs. If the client already supplied
+        // any context item, replaying the cached exchange would duplicate the
+        // conversation (and can make tool-call history grow every turn).
+        if !has_tool_output && !has_context_items {
             let exchange_items = lookup.restore_exchange();
             if !exchange_items.is_empty() {
                 restored += exchange_items.len();
@@ -932,6 +936,55 @@ mod tests {
         assert_eq!(input[1]["call_id"], "call_search");
         assert_eq!(input[2]["type"], "custom_tool_call_output");
         assert_eq!(input[3]["type"], "tool_search_output");
+    }
+
+    #[tokio::test]
+    async fn does_not_prepend_cached_exchange_when_client_supplies_context() {
+        let history = CodexChatHistoryStore::default();
+        history
+            .record_exchange(
+                &json!({
+                    "input": [
+                        {
+                            "type": "message",
+                            "role": "user",
+                            "content": [{"type": "input_text", "text": "original"}]
+                        }
+                    ]
+                }),
+                &json!({
+                    "id": "resp_context",
+                    "output": [
+                        {
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [{"type": "output_text", "text": "first answer"}]
+                        }
+                    ]
+                }),
+            )
+            .await;
+
+        let mut request = json!({
+            "previous_response_id": "resp_context",
+            "input": [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "next question"}]
+                }
+            ]
+        });
+
+        assert_eq!(history.enrich_request(&mut request).await, 0);
+        assert_eq!(
+            request["input"],
+            json!([{
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "next question"}]
+            }])
+        );
     }
 
     #[tokio::test]

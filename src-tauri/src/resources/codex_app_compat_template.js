@@ -180,10 +180,18 @@ __CODEX_MODEL_PICKER_CORE__
     patchModelListResult(result);
     return result;
   };
-  const patchRequestClient = (client) => {
+  const rememberRequestClient = (client) => {
     if (!client || typeof client.sendRequest !== "function") return false;
+    state.appServerClients = state.appServerClients || [];
+    if (!state.appServerClients.includes(client)) state.appServerClients.push(client);
+    return true;
+  };
+  const patchRequestClient = (client) => {
+    if (!rememberRequestClient(client)) return false;
     if (client.__ccSwitchModelRequestPatch === "2") return true;
-    const original = client.__ccSwitchOriginalSendRequest || client.sendRequest.bind(client);
+    const original = typeof client.__ccSwitchOriginalSendRequest === "function"
+      ? client.__ccSwitchOriginalSendRequest
+      : client.sendRequest.bind(client);
     client.__ccSwitchOriginalSendRequest = original;
     client.sendRequest = async function ccSwitchPatchedSendRequest(method, params, options) {
       const result = await original(method, params, options);
@@ -192,18 +200,76 @@ __CODEX_MODEL_PICKER_CORE__
     client.__ccSwitchModelRequestPatch = "2";
     return true;
   };
+  const objectMethodNames = (object) => {
+    const names = new Set();
+    for (let current = object, level = 0; current && level < 4; level++, current = Object.getPrototypeOf(current)) {
+      for (const name of Object.getOwnPropertyNames(current)) names.add(name);
+    }
+    return names;
+  };
+  const isConversationRuntime = (candidate) => {
+    if (!candidate || (typeof candidate !== "object" && typeof candidate !== "function")) return false;
+    let names;
+    try { names = objectMethodNames(candidate); } catch { return false; }
+    return names.has("sendRequest")
+      && names.has("getConversation")
+      && names.has("getStreamRole")
+      && names.has("waitForPendingThreadSettingsUpdate");
+  };
+  const findConversationRuntime = () => {
+    if (isConversationRuntime(state.conversationRuntime)) return state.conversationRuntime;
+    const seenFibers = new WeakSet();
+    const seenValues = new WeakSet();
+    const inspect = (value, depth = 0) => {
+      if (!value || (typeof value !== "object" && typeof value !== "function") || seenValues.has(value)) return null;
+      seenValues.add(value);
+      if (isConversationRuntime(value)) return value;
+      if (depth >= 3) return null;
+      let descriptors;
+      try { descriptors = Object.getOwnPropertyDescriptors(value); } catch { return null; }
+      for (const [key, descriptor] of Object.entries(descriptors)) {
+        if (!("value" in descriptor) || key === "return" || key === "child" || key === "sibling") continue;
+        const found = inspect(descriptor.value, depth + 1);
+        if (found) return found;
+      }
+      return null;
+    };
+    for (const element of document.querySelectorAll("*")) {
+      for (const key of reactFiberKeys(element)) {
+        for (let fiber = element[key]; fiber && !seenFibers.has(fiber); fiber = fiber.return) {
+          seenFibers.add(fiber);
+          const roots = [
+            fiber.updateQueue?.memoCache?.data,
+            fiber.memoizedProps,
+            fiber.memoizedState,
+          ];
+          for (const root of roots) {
+            const found = inspect(root);
+            if (!found) continue;
+            state.conversationRuntime = found;
+            return found;
+          }
+        }
+      }
+    }
+    return null;
+  };
   const installAppServerPatch = async () => {
+    let discovered = rememberRequestClient(findConversationRuntime());
     try {
       const module = await loadAppModule("app-server-manager-signals-");
       for (const candidate of Object.values(module).filter((item) => item && typeof item === "object")) {
-        patchRequestClient(candidate);
+        if (patchRequestClient(candidate)) discovered = true;
         if (typeof candidate.sendRequest !== "function" && typeof candidate.get === "function") {
-          try { patchRequestClient(candidate.get()); } catch {}
+          try {
+            if (patchRequestClient(candidate.get())) discovered = true;
+          } catch {}
         }
       }
     } catch (error) {
       state.failures.push(String(error?.message || error));
     }
+    return discovered;
   };
   const patchMcpModelResponseData = (data) => {
     if (data?.type !== "mcp-response") return false;

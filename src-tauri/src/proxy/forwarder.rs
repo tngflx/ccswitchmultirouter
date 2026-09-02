@@ -3730,6 +3730,10 @@ impl RequestForwarder {
                 ))
             })?;
         }
+        // Capture the final JSON payload after all provider-specific rewrites,
+        // but before optional wire compression. This is the meaningful
+        // transformed size for comparing against the original client body.
+        let transformed_request_bytes_len = body_bytes.len();
 
         let zstd_compress_codex_official_upstream = should_zstd_compress_codex_official_upstream(
             app_type,
@@ -3920,6 +3924,14 @@ impl RequestForwarder {
                     ("provider", provider.id.clone()),
                     ("transport", transport_for_log.to_string()),
                     ("request_bytes", request_bytes_len.to_string()),
+                    (
+                        "client_request_bytes",
+                        client_request_bytes.to_string(),
+                    ),
+                    (
+                        "transformed_request_bytes",
+                        transformed_request_bytes_len.to_string(),
+                    ),
                     ("header_count", ordered_headers.len().to_string()),
                     ("streaming", request_is_streaming.to_string()),
                     ("timeout_ms", timeout.as_millis().to_string()),

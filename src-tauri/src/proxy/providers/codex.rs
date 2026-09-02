@@ -1387,6 +1387,22 @@ pub(crate) fn apply_detected_codex_transport_to_effective_provider(
     db: &Database,
     now: i64,
 ) -> bool {
+    // Schema-v2 model protocol groups are compiled from the selected catalog row and
+    // materialized onto this request-local provider. They are authoritative for this
+    // model; a stale/equivalent probe record must not replace the per-model assignment.
+    if provider
+        .settings_config
+        .get("codexResolvedApiFormat")
+        .and_then(JsonValue::as_str)
+        .is_some_and(|format| {
+            matches!(
+                format.trim().to_ascii_lowercase().as_str(),
+                "openai_chat" | "openai_responses"
+            )
+        })
+    {
+        return false;
+    }
     if provider.uses_manual_codex_protocol()
         || public_model.trim().is_empty()
         || upstream_model.trim().is_empty()
@@ -8080,6 +8096,35 @@ wire_api = "responses"
             150,
         ));
         assert!(codex_provider_uses_chat_completions(&provider));
+    }
+
+    #[test]
+    fn explicit_v2_model_protocol_group_blocks_detected_transport_override() {
+        let db = Database::memory().expect("memory database");
+        let mut provider = create_provider(json!({
+            "config": "model = \"qwen-visible\"\nbase_url = \"https://qwen.example/v1\"\nwire_api = \"responses\"\n",
+            "codexResolvedRouteId": "qwen-route",
+            "codexResolvedApiFormat": "openai_chat"
+        }));
+        provider.meta = Some(ProviderMeta {
+            api_format: Some("openai_chat".to_string()),
+            ..ProviderMeta::default()
+        });
+
+        assert!(!apply_detected_codex_transport_to_effective_provider(
+            &mut provider,
+            "qwen-visible",
+            "Qwen/Qwen3.8",
+            &db,
+            150,
+        ));
+        assert_eq!(
+            provider
+                .meta
+                .as_ref()
+                .and_then(|meta| meta.api_format.as_deref()),
+            Some("openai_chat")
+        );
     }
 
     #[test]

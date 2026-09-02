@@ -140,8 +140,9 @@ pub(crate) fn inspect_and_optimize(
     let estimated_input_tokens = optimized_bytes.div_ceil(ESTIMATED_BYTES_PER_TOKEN);
     let max_input_tokens = config.max_codex_input_tokens.max(1) as usize;
     let token_limit_exceeded = estimated_input_tokens > max_input_tokens;
-    // Request Health is diagnostic-only. Rejecting a normal turn here can
-    // prevent Codex from reaching its own visible compaction boundary.
+    // Keep this module diagnostic-only. A byte heuristic is not a tokenizer:
+    // JSON syntax, tool schemas, and provider-specific transformations make
+    // `bytes / 4` unsuitable for rejecting a live Codex turn.
     let blocked = false;
 
     let mut findings = Vec::new();
@@ -458,7 +459,7 @@ mod tests {
     }
 
     #[test]
-    fn oversized_turns_are_diagnostic_only_and_never_blocked() {
+    fn oversized_codex_turns_are_diagnostic_only() {
         let config = RequestHealthConfig::default();
         let mut oversized_context = context();
         oversized_context.session_id = "session-oversized-diagnostic-only";

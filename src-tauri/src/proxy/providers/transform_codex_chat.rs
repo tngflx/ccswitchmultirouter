@@ -225,6 +225,7 @@ const CUSTOM_TOOL_INPUT_FIELD: &str = "input";
 const CHAT_TOOL_NAME_MAX_LEN: usize = 64;
 const CUSTOM_TOOL_INPUT_DESCRIPTION: &str = "Raw string input for the original custom tool. Preserve formatting exactly and follow the original tool definition embedded in the description.";
 const CUSTOM_TOOL_PRESERVED_METADATA_HEADING: &str = "Original tool definition:";
+const CUSTOM_TOOL_DESCRIPTION_MAX_BYTES: usize = 8 * 1024;
 const TOOL_RESULT_MEDIA_OMITTED_MARKER: &str =
     "[cc-switch: tool result media omitted for text-only model]";
 
@@ -968,7 +969,12 @@ fn apply_reasoning_options(
         // 顶层 reasoning_effort 平台的枚举不含 none，仍走上方 thinking 关闭路径、不发 effort。
         // 注意：完全不带 reasoning 字段时 reasoning_requested 返回 None 已提前 return，
         // 不会走到这里，故只有上游「显式」表达关闭才透传 none。
-        if effort_param == "reasoning.effort" {
+        // OpenRouter's inferred platform shape is shared by models with different
+        // reasoning policies. `none` is only a valid outbound disable signal when
+        // the provider/model explicitly declared that disabling is supported.
+        // Mandatory-reasoning models reject `reasoning.effort=none` with HTTP 400;
+        // omitting the field lets the upstream enforce its mandatory/default policy.
+        if effort_param == "reasoning.effort" && config.disable_contract {
             result["reasoning"] = json!({ "effort": "none" });
         }
         return Ok(());
@@ -2051,7 +2057,19 @@ fn serialize_tool_definition_for_description(tool: &Value) -> String {
     // Keep the embedded definition compact to reduce tool-description token
     // overhead for chat-only upstreams, while remaining stable across map
     // storage order.
-    canonical_json_string(tool)
+    let serialized = canonical_json_string(tool);
+    if serialized.len() <= CUSTOM_TOOL_DESCRIPTION_MAX_BYTES {
+        return serialized;
+    }
+
+    let mut end = CUSTOM_TOOL_DESCRIPTION_MAX_BYTES;
+    while end > 0 && !serialized.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!(
+        "{}\n... original definition truncated by proxy ...",
+        &serialized[..end]
+    )
 }
 
 /// Normalize a function's `parameters` JSON Schema so `type` is always `"object"`.
@@ -3985,6 +4003,25 @@ mod tests {
     }
 
     #[test]
+    fn custom_tool_description_is_bounded() {
+        let input = json!({
+            "model": "gpt-5.4",
+            "tools": [{
+                "type": "custom",
+                "name": "large_tool",
+                "description": "x".repeat(20_000)
+            }]
+        });
+
+        let result = responses_to_chat_completions(input).unwrap();
+        let description = result["tools"][0]["function"]["description"]
+            .as_str()
+            .unwrap();
+        assert!(description.len() <= CUSTOM_TOOL_DESCRIPTION_MAX_BYTES + 128);
+        assert!(description.contains("truncated by proxy"));
+    }
+
+    #[test]
     fn responses_request_to_chat_uses_provider_reasoning_effort_for_deepseek_model() {
         let input = json!({
             "model": "deepseek-v4-pro",
@@ -4098,10 +4135,10 @@ mod tests {
     }
 
     #[test]
-    fn responses_request_to_chat_passes_explicit_none_through_for_openrouter() {
-        // OpenRouter 原生 reasoning 对象支持显式关闭：effort=none 应忠实转发为
-        // {"reasoning":{"effort":"none"}}，而非被吞掉——否则默认开思考的模型无法关闭，
-        // 带来行为与成本偏差。
+    fn responses_request_to_chat_omits_openrouter_none_without_disable_contract() {
+        // OpenRouter model metadata can mark reasoning as mandatory. The shared
+        // platform inference must not emit {"reasoning":{"effort":"none"}} for
+        // those models because OpenRouter rejects that request.
         let config = CodexChatReasoningConfig {
             supports_thinking: Some(false),
             supports_effort: Some(true),
@@ -4121,10 +4158,34 @@ mod tests {
         });
         let result = responses_to_chat_completions_with_reasoning(input, Some(&config)).unwrap();
 
-        assert_eq!(result["reasoning"]["effort"], "none");
-        // none 不是 OpenAI 顶层 reasoning_effort 的合法枚举，不写顶层别名；也不写 thinking。
+        assert!(result.get("reasoning").is_none());
+        // none 不是 OpenAI 顶层 reasoning_effort 的合法枚举；也不写 thinking。
         assert!(result.get("reasoning_effort").is_none());
         assert!(result.get("thinking").is_none());
+    }
+
+    #[test]
+    fn responses_request_to_chat_passes_openrouter_none_with_explicit_disable_contract() {
+        let config = CodexChatReasoningConfig {
+            supports_thinking: Some(false),
+            supports_effort: Some(true),
+            thinking_param: Some("none".to_string()),
+            effort_param: Some("reasoning.effort".to_string()),
+            effort_value_mode: Some("openrouter".to_string()),
+            min_output_tokens: None,
+            default_output_tokens: None,
+            output_format: Some("auto".to_string()),
+            disable_contract: true,
+        };
+
+        let input = json!({
+            "model": "openai/gpt-5",
+            "input": "hello",
+            "reasoning": {"effort": "none"}
+        });
+        let result = responses_to_chat_completions_with_reasoning(input, Some(&config)).unwrap();
+
+        assert_eq!(result["reasoning"]["effort"], "none");
     }
 
     #[test]

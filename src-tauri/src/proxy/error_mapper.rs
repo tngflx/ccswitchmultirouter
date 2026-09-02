@@ -27,7 +27,6 @@ pub fn map_proxy_error_to_status(error: &ProxyError) -> u16 {
 
         // 本地 admission 队列耗尽：请求尚未发往上游，明确返回 503。
         ProxyError::AdmissionQueueTimeout { .. } => 503,
-
         // 超时错误：504 Gateway Timeout
         ProxyError::Timeout(_) | ProxyError::StreamIdleTimeout(_) => 504,
 
