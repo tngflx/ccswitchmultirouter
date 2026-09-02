@@ -40,7 +40,7 @@ enum ResponsesMode {
 }
 
 #[tokio::test]
-async fn light_probe_sends_only_one_baseline_request_per_transport() {
+async fn light_probe_sends_one_baseline_request_for_the_assigned_transport() {
     let fixture = spawn_fixture(ResponsesMode::Complete).await;
     let result = run_protocol_compatibility_probe_in_mode(
         candidate(&fixture.base_url, TransportKind::OpenAiResponses),
@@ -57,7 +57,29 @@ async fn light_probe_sends_only_one_baseline_request_per_transport() {
             && branch.assessment.forced_tool == ProbeStageStatus::Skipped
             && branch.assessment.continuation == ProbeStageStatus::Skipped
     }));
-    assert_eq!(fixture.requests.lock().unwrap().len(), 2);
+    let requests = fixture.requests.lock().unwrap();
+    assert_eq!(requests.len(), 1);
+    assert!(requests[0].0.ends_with("/responses"));
+}
+
+#[tokio::test]
+async fn deep_live_probe_uses_only_the_assigned_transport() {
+    let fixture = spawn_fixture(ResponsesMode::Complete).await;
+    let result = run_protocol_compatibility_probe_in_mode(
+        candidate(&fixture.base_url, TransportKind::OpenAiChat),
+        &reqwest::Client::new(),
+        ProtocolProbeMode::Deep,
+        |_| {},
+    )
+    .await;
+
+    assert_eq!(result.selected_transport, Some(TransportKind::OpenAiChat));
+    assert_eq!(result.readiness, ProbeReadiness::Verified);
+    let requests = fixture.requests.lock().unwrap();
+    assert_eq!(requests.len(), 4);
+    assert!(requests
+        .iter()
+        .all(|(path, _)| path.ends_with("/chat/completions")));
 }
 
 #[derive(Clone)]

@@ -317,6 +317,19 @@ where
         run_candidate_result_with_reporter(state, candidate, mode, &reporter)
     })
     .await?;
+    if state
+        .db
+        .get_provider_by_id(&provider.id, AppType::Codex.as_str())
+        .map_err(|error| error.to_string())?
+        .is_some()
+    {
+        for record in &records {
+            state
+                .db
+                .save_protocol_compatibility_result(record)
+                .map_err(|error| error.to_string())?;
+        }
+    }
     let protocol_applied = mode == ProtocolProbeMode::Deep
         && apply_unanimous_probe_selection(&mut provider, &records)?;
     reporter(batch_finished_event(total, &records));

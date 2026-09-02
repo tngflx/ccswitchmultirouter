@@ -102,6 +102,28 @@ wire_api = "responses"
 }
 
 #[test]
+fn compiles_each_catalog_model_with_its_protocol_group() {
+    let mut provider = codex_provider(
+        r#"model = "responses-model"
+model_provider = "mixed"
+[model_providers.mixed]
+base_url = "https://mixed.example/v1"
+wire_api = "responses"
+"#,
+        "openai_responses",
+    );
+    provider.settings_config["modelCatalog"] = json!({"models": [
+        {"model": "responses-model", "apiFormat": "openai_responses"},
+        {"model": "chat-model", "apiFormat": "openai_chat"}
+    ]});
+
+    let candidates = compile_provider_probe_candidates(&provider).expect("compile candidates");
+
+    assert_eq!(candidates[0].transport, TransportKind::OpenAiResponses);
+    assert_eq!(candidates[1].transport, TransportKind::OpenAiChat);
+}
+
+#[test]
 fn compiles_an_effective_router_target_with_the_parent_and_route_identity() {
     let mut provider = codex_provider(
         r#"model = "qwen-visible"

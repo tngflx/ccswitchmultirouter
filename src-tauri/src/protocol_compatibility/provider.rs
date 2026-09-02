@@ -32,7 +32,7 @@ pub fn compile_provider_probe_candidate(provider: &Provider) -> Result<ProbeCand
     let configured_model = codex_provider_upstream_model(provider)
         .ok_or_else(|| "Codex provider has no configured model".to_string())?;
     let (public_model, upstream_model) = resolve_primary_model(provider, &configured_model);
-    compile_provider_probe_candidate_for_model(provider, public_model, upstream_model)
+    compile_provider_probe_candidate_for_model(provider, public_model, upstream_model, None)
 }
 
 pub fn compile_provider_probe_candidates(
@@ -59,10 +59,12 @@ pub fn compile_provider_probe_candidates(
         };
         let upstream_model =
             string_field(model, &["upstreamModel", "upstream_model"]).unwrap_or(public_model);
+        let transport = model_transport(model)?;
         candidates.push(compile_provider_probe_candidate_for_model(
             provider,
             public_model.to_string(),
             upstream_model.to_string(),
+            transport,
         )?);
     }
 
@@ -76,6 +78,7 @@ fn compile_provider_probe_candidate_for_model(
     provider: &Provider,
     public_model: String,
     upstream_model: String,
+    model_transport: Option<TransportKind>,
 ) -> Result<ProbeCandidate, String> {
     if provider.uses_managed_account_auth() {
         return Err("managed or official providers do not use third-party protocol probing".into());
@@ -89,14 +92,16 @@ fn compile_provider_probe_candidate_for_model(
         return Err("Codex provider has no API key".to_string());
     }
 
-    let transport = match explain_codex_responses_upstream_protocol(provider)
-        .protocol
-        .api_format()
+    let transport = model_transport.unwrap_or(match explain_codex_responses_upstream_protocol(
+        provider,
+    )
+    .protocol
+    .api_format()
     {
         "openai_chat" => TransportKind::OpenAiChat,
         "openai_responses" => TransportKind::OpenAiResponses,
         _ => return Err("provider is not an OpenAI Chat/Responses protocol candidate".to_string()),
-    };
+    });
     let is_full_url = provider
         .meta
         .as_ref()
@@ -120,6 +125,19 @@ fn compile_provider_probe_candidate_for_model(
     .with_full_url(is_full_url)
     .with_bearer_token(&api_key)
     .map_err(|_| "Codex provider API key cannot be represented as an HTTP header".to_string())
+}
+
+fn model_transport(model: &Value) -> Result<Option<TransportKind>, String> {
+    let Some(format) = string_field(model, &["apiFormat", "api_format"]) else {
+        return Ok(None);
+    };
+    match format {
+        "openai_chat" | "chat" => Ok(Some(TransportKind::OpenAiChat)),
+        "openai_responses" | "responses" => Ok(Some(TransportKind::OpenAiResponses)),
+        _ => Err(format!(
+            "catalog model has unsupported protocol group `{format}`"
+        )),
+    }
 }
 
 pub fn compile_codex_router_probe_candidates(

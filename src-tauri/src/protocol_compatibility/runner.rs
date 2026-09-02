@@ -199,8 +199,14 @@ pub async fn run_protocol_compatibility_probe_with_reporter<F>(
 where
     F: Fn(ProtocolProbeProgressEvent) + Send + Sync,
 {
-    run_protocol_compatibility_probe_in_mode(candidate, client, ProtocolProbeMode::Deep, reporter)
-        .await
+    run_protocol_compatibility_probe_with_scope(
+        candidate,
+        client,
+        ProtocolProbeMode::Deep,
+        true,
+        reporter,
+    )
+    .await
 }
 
 pub async fn run_protocol_compatibility_probe_in_mode<F>(
@@ -212,10 +218,29 @@ pub async fn run_protocol_compatibility_probe_in_mode<F>(
 where
     F: Fn(ProtocolProbeProgressEvent) + Send + Sync,
 {
+    run_protocol_compatibility_probe_with_scope(candidate, client, mode, false, reporter).await
+}
+
+async fn run_protocol_compatibility_probe_with_scope<F>(
+    candidate: ProbeCandidate,
+    client: &Client,
+    mode: ProtocolProbeMode,
+    probe_all_transports: bool,
+    reporter: F,
+) -> ProtocolCompatibilityProbeResult
+where
+    F: Fn(ProtocolProbeProgressEvent) + Send + Sync,
+{
     let model = candidate.public_model.clone();
     match tokio::time::timeout(
         TRANSACTION_TIMEOUT,
-        run_probe(candidate, client, mode, &reporter),
+        run_probe(
+            candidate,
+            client,
+            mode,
+            probe_all_transports,
+            &reporter,
+        ),
     )
     .await
     {
@@ -239,6 +264,7 @@ async fn run_probe<F>(
     candidate: ProbeCandidate,
     client: &Client,
     mode: ProtocolProbeMode,
+    probe_all_transports: bool,
     reporter: &F,
 ) -> ProtocolCompatibilityProbeResult
 where
@@ -250,7 +276,12 @@ where
     let nonce = Uuid::new_v4().simple().to_string();
     let mut branches = Vec::with_capacity(2);
 
-    for transport in [TransportKind::OpenAiResponses, TransportKind::OpenAiChat] {
+    let transports = if probe_all_transports {
+        vec![TransportKind::OpenAiResponses, TransportKind::OpenAiChat]
+    } else {
+        vec![candidate.transport]
+    };
+    for transport in transports {
         branches.push(run_branch(&candidate, client, transport, &nonce, mode, reporter).await);
     }
 
