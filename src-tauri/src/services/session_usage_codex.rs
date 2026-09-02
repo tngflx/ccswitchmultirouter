@@ -202,6 +202,7 @@ enum ParentResolution {
 #[derive(Debug)]
 struct ParsedCodexFile {
     root_thread_id: Option<String>,
+    root_meta_thread_id: Option<String>,
     root_meta_seen: bool,
     root_timestamp: Option<DateTime<Utc>>,
     parent: ParentResolution,
@@ -798,6 +799,7 @@ fn parse_codex_file(
         fs::File::open(file_path).map_err(|e| AppError::Config(format!("无法打开文件: {e}")))?;
     let reader = BufReader::new(file);
     let mut root_meta_seen = false;
+    let mut root_meta_thread_id = None;
     let mut root_timestamp = None;
     let mut parent = ParentResolution::None;
     let mut current_model = "unknown".to_string();
@@ -852,14 +854,21 @@ fn parse_codex_file(
                 let payload = value.get("payload").unwrap_or(&serde_json::Value::Null);
                 parent = explicit_parent_from_meta(payload);
 
-                let meta_thread_id = non_empty_string(
+                root_meta_thread_id = non_empty_string(
                     payload
                         .get("id")
                         .or_else(|| payload.get("thread_id"))
                         .or_else(|| payload.get("threadId")),
-                );
-                if let (Some(identity), Some(meta_id)) = (&filename_identity, meta_thread_id) {
-                    if identity.root_meta_id != meta_id {
+                )
+                .map(|id| {
+                    uuid::Uuid::parse_str(&id)
+                        .map(|value| value.hyphenated().to_string())
+                        .unwrap_or(id)
+                });
+                if let (Some(identity), Some(meta_id)) =
+                    (&filename_identity, root_meta_thread_id.as_ref())
+                {
+                    if identity.root_meta_id.as_str() != meta_id {
                         parent = ParentResolution::Deferred(format!(
                             "文件名 root meta ID ({}) 与 root meta ID ({meta_id}) 不一致",
                             identity.root_meta_id
@@ -994,6 +1003,7 @@ fn parse_codex_file(
 
     Ok(ParsedCodexFile {
         root_thread_id,
+        root_meta_thread_id,
         root_meta_seen,
         root_timestamp,
         parent,
@@ -1337,6 +1347,10 @@ fn sync_single_codex_file(
     // journal 建立/fsync/删除）是全量重导的最大耗时项。批内单条插入失败
     // 沿用旧行为跳过该条继续；某批 commit 失败则该批整体回滚且游标不推进，
     // 下一 pass 重扫时由 request_id 主键 + 指纹去重兜底，不会双算。
+    let session_thread_id = parsed
+        .root_meta_thread_id
+        .as_deref()
+        .unwrap_or(root_thread_id);
     let batch_count = to_insert.len().div_ceil(CODEX_INSERT_BATCH_SIZE);
     for (batch_index, batch) in to_insert.chunks(CODEX_INSERT_BATCH_SIZE).enumerate() {
         let is_last_batch = batch_index + 1 == batch_count;
@@ -1356,7 +1370,7 @@ fn sync_single_codex_file(
                 &request_id,
                 &event.delta,
                 &event.model,
-                Some(root_thread_id),
+                Some(session_thread_id),
                 event.timestamp.as_deref(),
                 &mut batch_suspected,
                 &mut pass.pricing,
@@ -2775,15 +2789,18 @@ mod tests {
         assert_eq!((result.imported, result.deferred), (1, false));
 
         let conn = lock_conn!(db.conn);
-        let request_id: String = conn.query_row(
-            "SELECT request_id FROM proxy_request_logs WHERE data_source = 'codex_session'",
+        let (request_id, session_id): (String, String) = conn.query_row(
+            "SELECT request_id, session_id
+             FROM proxy_request_logs
+             WHERE data_source = 'codex_session'",
             [],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
         assert_eq!(
             request_id,
             format!("{CODEX_THREAD_REQUEST_ID_PREFIX}:{CHILD_A_ID}:1")
         );
+        assert_eq!(session_id, PARENT_ID);
         Ok(())
     }
 
