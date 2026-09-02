@@ -16,6 +16,18 @@
 
 6-A. **Fix root causes before symptoms.** For every bug, error, warning storm, retry loop, or recovery failure, trace the producing path to the violated invariant and fix that invariant at its owning layer. Do not merely suppress logs, increase retries/timeouts, clear persisted state, special-case one observed input, or add UI masking while the producer remains wrong. A containment measure is allowed only when the root cause is external or cannot yet be fixed safely; label it as containment, preserve diagnostic evidence, document the unresolved cause, and add a regression test for the closest owned boundary.
 
+6-B. **Request-size growth requires a four-point accounting audit.** For any suspected
+request inflation, measure and compare the client body, the post-transformation body,
+the exact retry/replay body, and the upstream wire body. Trace every append/restore/
+conversion boundary and identify the producer of each added byte or semantic item.
+Do not “fix” growth by truncating context, suppressing retries, clearing history,
+or adding a size cap unless the owning invariant is proven and the containment is
+explicitly documented. Retries of one logical request must reuse an immutable,
+already-finalized payload; history restoration must be idempotent; and any
+client-versus-proxy growth must have a regression test at the owning boundary.
+When no proxy inflation exists, state that clearly and preserve the evidence rather
+than changing unrelated request logic.
+
 ## ALWAYS RECHECK
 
 7. **After ANY upstream merge:** grep for every function/field/import that our custom code depends on (`resolve_reasoning_content_mode`, `ReasoningContentMode`, `normalize_third_party_responses_reasoning_content_for_strict_schema`, `reasoning_content_mode` on ProviderMeta, LanguageSwitcher, etc.). Upstream may silently remove or rename them.
@@ -26,7 +38,29 @@
 
 10. **When reporting status:** list exactly what passed, what failed, and what was not tested. Never round up or omit failures.
 
-10-A. **Concurrent work is authoritative.** Before editing or starting broad verification, inspect `git status --short`, `git diff --name-only`, running processes, active Codex tasks when available, and `.codex-work/active/`. Claim exact paths in your own compact lease as described in `.codex-work/README.md`. Treat unexplained dirty files, active leases, and failures in those areas as owned: do not overwrite, format, revert, attribute, or stop them. Overlap requires explicit cross-task coordination or a blocked status; use targeted verification on a moving tree and report broad results as inconclusive. A user-confirmed abandonment releases the lease after checking for no matching process. Delete your lease at handoff and record only durable findings in `docs/memory/journal.md`.
+10-A. **Concurrent work uses Git boundaries, not local lease files.** Before editing or
+starting broad verification, inspect `git status --short` and `git diff --name-only`.
+Use a separate Codex task/worktree or branch for parallel work. Do not edit the same
+checkout concurrently unless the other task has explicitly agreed to the overlap.
+Treat unexplained dirty files as user or another-task work: do not overwrite,
+format, revert, or attribute them. If a shared checkout is unavoidable, coordinate
+in the task conversation and verify against the moving tree; do not create
+local lease files, lock files, or ad-hoc coordination artifacts.
+
+10-B. **NEVER create an isolated or alternate build target directory.** Do not set
+`CARGO_TARGET_DIR`, `RUSTFLAGS`-based output roots, custom `target-dir` values, or
+equivalent per-task build/cache paths to work around a lock or live `pnpm dev`
+process. Use the repository's normal target directory only. If the normal target
+is locked, report the exact lock/error and continue with source-level checks or
+wait for the existing development process; never create a second build tree.
+
+10-C. **Ask for a user rebuild when the normal development process must load a
+source fix.** If a live `cc-switch.exe` predates the changed source, the normal
+target is locked, or runtime verification requires a rebuilt process, state the
+exact rebuild action needed and ask the user to perform it. Pause runtime
+verification until they confirm the rebuild completed; do not kill their process,
+create an alternate build target, or present an older binary as evidence for the
+new source.
 
 ## MERGE PROTOCOL
 
@@ -59,6 +93,12 @@
 21. **NEVER kill a running `cc-switch.exe` or `cc-switch2.exe` process without explicit user permission.** The coding agent may be using it as an active proxy. Always ask first.
 
 22. **The `localhost:3000` string appearing in a production binary is normal** — it is the compiled-in `devUrl` from `tauri.conf.json` used only by `tauri dev`. Its presence does NOT indicate a broken build. What matters is whether the Vite asset hashes are also embedded.
+
+22-A. **Desktop UI inspection must be non-disruptive by default.** Do not call `SetForegroundWindow`, restore/minimize/maximize a user window, move the cursor, send foreground keystrokes, or perform coordinate clicks merely to inspect or test a running desktop application. Prefer this capture order: locate the Tauri WebView renderer child without activation, capture that child with `PrintWindow`, then fall back to top-level `PrintWindow` only if the child is unavailable. A localhost renderer in a separate browser is not the live Tauri window and must never be reported as such.
+
+22-B. **Desktop automation has a strict attempt budget.** Make one primary non-disruptive attempt. One evidence-based recovery is allowed only for a concrete transient condition such as a stale WebView handle or hot reload. If the target state is still missing, wrong, blank, or unreachable, stop immediately and ask the user to open the exact screen manually. Never loop coordinate guesses, repeatedly enumerate or click renderer handles, or navigate through speculative intermediate screens. After the user confirms that the target screen is open, perform exactly one read-only capture and do not manipulate it again unless the user explicitly asks.
+
+22-C. **Escalate before disruption.** If verification truly requires focus changes, visible navigation, window-state changes, or foreground input, explain the exact action and ask for permission immediately before doing it. A failed stealth attempt does not grant permission to become disruptive.
 
 ## CODEBASE STRUCTURE
 
@@ -186,15 +226,12 @@ pnpm test:unit             # vitest run
 cargo test --manifest-path src-tauri/Cargo.toml   # backend + integration tests
 ```
 
-During active development, use the narrowest meaningful verification set:
+Verification scope and reporting are governed by rules 2, 8, 9, and 10. In practice:
 
-1. Run the direct unit/component tests for the changed behavior.
-2. Run tests for code that consumes the changed API, state, schema, or shared helper.
-3. Run `pnpm typecheck` for frontend contract changes and `cargo check` for Rust contract changes.
-4. Expand the test scope when a shared boundary or integration path is affected, but do not default to both full suites.
-
-Final verification checklist (only at the boundary in rule 9): `cargo check` + full
-`cargo test` + `pnpm typecheck` + full `pnpm test:unit`.
+- Frontend changes: direct tests, plausible consumer tests, then `pnpm typecheck`.
+- Rust changes: direct tests, plausible consumer tests, then `cargo check`.
+- Cross-layer contracts: verify both affected sides and the serialization or IPC boundary.
+- Final boundary only: `cargo check`, full `cargo test`, `pnpm typecheck`, and full `pnpm test:unit`.
 
 ### Testing
 
@@ -228,8 +265,7 @@ Final verification checklist (only at the boundary in rule 9): `cargo check` + f
 - Don't mutate live CLI config files outside the dedicated writer modules.
 - Don't add IPC fields without `rename_all = "camelCase"`.
 - Don't add an i18n key to only one locale file — CI won't catch it; users will.
-- Don't use plain `cargo build --release` for production (rule 18).
-- Don't build, package, sign, checksum, or upload release artifacts from a developer workstation (rule 19).
+- Follow production and release rules 18-22; do not restate or weaken them in local workflow notes.
 
 ## COMMIT GUIDELINES
 
@@ -256,6 +292,19 @@ Final verification checklist (only at the boundary in rule 9): `cargo check` + f
 ### Additional Documentation
 
 - [Retry Architecture](docs/architecture/retry-model.md) — Consolidated two-layer resilience model (proxy reconnect + Codex client retry)
+- [Codex config schema troubleshooting](docs/guides/codex-config-schema-troubleshooting.md) — Fast diagnosis for `FeatureToml`/`features.guardianv2` resume failures, including backup-replay evidence and required writer boundaries.
+
+### Codex Config Schema Incident Shortcut
+
+When Codex reports `FeatureToml` in `features.guardianv2`, read
+`docs/guides/codex-config-schema-troubleshooting.md` before changing the live
+file. Check both `codex --version` and CCSwitch's `cc-switch.log`: a Codex
+Desktop/CLI schema mismatch is the likely trigger, while repeated CCSwitch
+`UncleanExit` plus `codex Live config restored from backup` lines explain why
+the error recurs intermittently. Every CCSwitch write or restore of
+`~/.codex/config.toml` must use
+`codex_config::write_codex_live_config_atomic`; do not add a raw
+`write_text_file` call for that file.
 
 ## AGENT MEMORY PROTOCOL
 

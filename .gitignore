@@ -28,8 +28,7 @@ flatpak/cc-switch.deb
 flatpak-build/
 flatpak-repo/
 .worktrees/
-.codex-work/active/
-/.codex-work/targets/
+/.codex-work/
 .spec-workflow/
 copilot-api
 .history
