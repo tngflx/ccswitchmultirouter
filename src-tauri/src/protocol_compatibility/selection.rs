@@ -55,6 +55,14 @@ impl TransportProbeAssessment {
     }
 }
 
+fn reasoning_fidelity_rank(semantic: ReasoningSemantic) -> u8 {
+    match semantic {
+        ReasoningSemantic::Readable => 3,
+        ReasoningSemantic::Summary => 2,
+        ReasoningSemantic::Opaque | ReasoningSemantic::None => 1,
+    }
+}
+
 #[cfg(test)]
 pub fn select_preferred_transport(
     assessments: &[TransportProbeAssessment],
@@ -78,13 +86,14 @@ pub fn select_transport_outcome_with_reasoning(
 ) -> Option<TransportSelection> {
     candidates
         .iter()
-        .filter_map(|(assessment, _semantic)| {
+        .filter_map(|(assessment, semantic)| {
             assessment.capability_score().map(|capability| {
                 (
                     (
                         capability.0,
                         capability.1,
                         capability.2,
+                        reasoning_fidelity_rank(*semantic),
                         assessment.transport == TransportKind::OpenAiResponses,
                     ),
                     *assessment,

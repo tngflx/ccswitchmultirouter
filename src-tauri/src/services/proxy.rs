@@ -3937,6 +3937,11 @@ impl ProxyService {
         };
 
         doc["model_provider"] = toml_edit::value(proxy_provider_id);
+        if is_multirouter {
+            // Fresh threads use this default; an explicit per-thread picker
+            // selection can still override it.
+            doc["model_reasoning_effort"] = toml_edit::value("medium");
+        }
         doc.as_table_mut().remove("base_url");
         doc.as_table_mut().remove("openai_base_url");
         doc.as_table_mut().remove("wire_api");
@@ -4164,7 +4169,10 @@ impl ProxyService {
 
     fn write_claude_live(&self, config: &Value) -> Result<(), String> {
         let path = get_claude_settings_path();
-        let settings = crate::services::provider::sanitize_claude_settings_for_live(config);
+        let mut settings = crate::services::provider::sanitize_claude_settings_for_live(config);
+        if let Err(error) = crate::env_injection::inject_owned_into_claude_live(&mut settings) {
+            log::warn!("Claude environment injection could not be reapplied: {error}");
+        }
         write_json_file(&path, &settings).map_err(|e| format!("写入 Claude 配置失败: {e}"))
     }
 
@@ -4177,6 +4185,7 @@ impl ProxyService {
         self.write_codex_live_verbatim(config)
     }
 
+    #[cfg(test)]
     fn write_codex_live_for_provider(
         &self,
         config: &Value,
@@ -4255,45 +4264,28 @@ impl ProxyService {
         // 否则 Codex Desktop 会失去原始 ChatGPT OAuth 登录材料，表现为切换
         // MultiRouter/本地代理后要求重新登录。这里不再依赖兼容设置开关：只要是
         // 接管写入的占位符，就固定写入 config.toml 的 bearer token 并保留 auth.json。
-        if config
-            .get("auth")
-            .filter(|auth| Self::codex_auth_has_proxy_placeholder(auth))
-            .is_some()
-        {
-            let config_for_projection =
-                Self::codex_settings_for_model_catalog_projection(config, provider);
-            let config_str = config_for_projection
-                .get("config")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            let profile = crate::codex_config::CodexCatalogToolProfile::from_api_format(
-                provider.and_then(|p| p.meta.as_ref()?.api_format.as_deref()),
-            );
-            let provider_context =
-                crate::codex_config::codex_provider_classification_context(self.db.as_ref())
-                    .map_err(|e| format!("读取 Codex Provider 分类上下文失败: {e}"))?;
-            let prepared_config =
-                crate::codex_config::prepare_codex_live_config_text_with_optional_catalog_and_provider_context(
-                    &config_for_projection,
-                    config_str,
-                    profile,
-                    &provider_context,
-                )
-                .map_err(|e| format!("写入 Codex 配置失败: {e}"))?;
-            let prepared_config =
-                crate::codex_config::align_codex_requires_openai_auth_with_login_preservation(
-                    &prepared_config,
-                    crate::codex_config::codex_live_requires_openai_auth(
-                        crate::settings::preserve_codex_official_auth_on_switch(),
-                    ),
-                )
-                .map_err(|e| format!("写入 Codex 配置失败: {e}"))?;
-            crate::codex_config::write_codex_live_config_atomic(Some(&prepared_config))
-                .map_err(|e| format!("写入 Codex 配置失败: {e}"))?;
-            return Ok(());
-        }
-
-        self.write_codex_live_for_provider(config, provider)
+        let config_for_projection =
+            Self::codex_settings_for_model_catalog_projection(config, provider);
+        let config_str = config_for_projection
+            .get("config")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let profile = crate::codex_config::CodexCatalogToolProfile::from_api_format(
+            provider.and_then(|p| p.meta.as_ref()?.api_format.as_deref()),
+        );
+        let provider_context =
+            crate::codex_config::codex_provider_classification_context(self.db.as_ref())
+                .map_err(|e| format!("读取 Codex Provider 分类上下文失败: {e}"))?;
+        let prepared_config =
+            crate::codex_config::prepare_codex_live_config_text_with_optional_catalog_and_provider_context(
+                &config_for_projection,
+                config_str,
+                profile,
+                &provider_context,
+            )
+            .map_err(|e| format!("写入 Codex 配置失败: {e}"))?;
+        crate::codex_config::write_codex_live_config_atomic(Some(&prepared_config))
+            .map_err(|e| format!("写入 Codex 配置失败: {e}"))
     }
 
     /// V2 MultiRouter 的 live catalog 与依赖指纹必须来自当前 Provider 目录重新编译的投影。
@@ -7336,6 +7328,7 @@ supports_websockets = true
             parsed["model_provider"].as_str(),
             Some(crate::codex_config::CC_SWITCH_CODEX_ROUTER_MODEL_PROVIDER_ID)
         );
+        assert_eq!(parsed["model_reasoning_effort"].as_str(), Some("medium"));
         assert_eq!(route["name"].as_str(), Some("OpenAI"));
         assert_eq!(route["requires_openai_auth"].as_bool(), Some(true));
         assert_eq!(route["wire_api"].as_str(), Some("responses"));
@@ -7575,7 +7568,7 @@ supports_websockets = false
             .expect("read managed live");
         assert!(
             managed_live.contains("requires_openai_auth = true"),
-            "fully managed routes still need the Desktop login facade"
+            "fully managed routes still need the Desktop login facade, got:\n{managed_live}"
         );
         assert!(managed_live.contains("experimental_bearer_token = \"PROXY_MANAGED\""));
         assert_eq!(

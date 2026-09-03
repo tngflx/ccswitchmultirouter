@@ -165,9 +165,7 @@ describe("Codex preset reasoning capabilities", () => {
 
     expect(preset).toBeDefined();
     expect(preset!.presetKey).toBe("opencode-zen");
-    expect(preset!.endpointCandidates).toEqual([
-      "https://opencode.ai/zen/v1",
-    ]);
+    expect(preset!.endpointCandidates).toEqual(["https://opencode.ai/zen/v1"]);
     expect(preset!.apiFormat).toBe("openai_chat");
     expect(preset!.modelCatalog?.map((model) => model.model)).toEqual(
       expect.arrayContaining([

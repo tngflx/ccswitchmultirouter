@@ -27,6 +27,8 @@ pub fn map_proxy_error_to_status(error: &ProxyError) -> u16 {
 
         // 本地 admission 队列耗尽：请求尚未发往上游，明确返回 503。
         ProxyError::AdmissionQueueTimeout { .. } => 503,
+        // Native Request Health review rejected or timed out before dispatch.
+        ProxyError::RequestHealthBlocked(_) => 409,
         // 超时错误：504 Gateway Timeout
         ProxyError::Timeout(_) | ProxyError::StreamIdleTimeout(_) => 504,
 
@@ -85,6 +87,9 @@ pub fn get_error_message(error: &ProxyError) -> String {
         } => format!(
             "本地并发队列等待超时: Provider {provider_id} 的 {max_in_flight} 个槽在 {waited_ms}ms 内均未释放；请求未发送到该上游"
         ),
+        ProxyError::RequestHealthBlocked(message) => {
+            format!("Request Health 已在上游发送前阻止请求: {message}")
+        }
         ProxyError::Timeout(msg) => format!("请求超时: {msg}"),
         ProxyError::ResponsePending(msg) => format!("上游请求可能仍在处理中: {msg}"),
         ProxyError::ForwardFailed(msg) => format!("转发失败: {msg}"),
@@ -123,6 +128,14 @@ mod tests {
         let error = ProxyError::ResponsePending("model is still reasoning".to_string());
         assert_eq!(map_proxy_error_to_status(&error), 424);
         assert_eq!(error.retry_after_secs(), None);
+    }
+
+    #[test]
+    fn test_map_request_health_blocked_error() {
+        let error = ProxyError::RequestHealthBlocked("user selected Block".to_string());
+        assert_eq!(map_proxy_error_to_status(&error), 409);
+        assert_eq!(error.retry_after_secs(), None);
+        assert!(get_error_message(&error).contains("上游发送前"));
     }
 
     #[test]

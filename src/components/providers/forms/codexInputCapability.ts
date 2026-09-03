@@ -19,9 +19,9 @@ export function codexInputCapabilityState(
   const modalityState =
     Array.isArray(modalities) && modalities.length > 0
       ? modalities.some(
-      (modality) =>
-        typeof modality === "string" &&
-        modality.trim().toLowerCase() === "image",
+          (modality) =>
+            typeof modality === "string" &&
+            modality.trim().toLowerCase() === "image",
         )
         ? "text_image"
         : "text_only"
@@ -37,8 +37,9 @@ export function codexInputCapabilityState(
         : "text_only",
     modalityState,
     textOnlyState,
-  ].filter((state): state is Exclude<CodexInputCapabilityState, "unknown"> =>
-    state !== undefined,
+  ].filter(
+    (state): state is Exclude<CodexInputCapabilityState, "unknown"> =>
+      state !== undefined,
   );
   if (declaredStates.length === 0) return "unknown";
   const first = declaredStates[0];

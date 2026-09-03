@@ -102,6 +102,13 @@ fn merge_settings_for_save(
     incoming
 }
 
+fn validate_settings_for_save(settings: &crate::settings::AppSettings) -> Result<(), String> {
+    settings
+        .env_injection
+        .validate()
+        .map_err(|error| error.to_string())
+}
+
 /// 获取设置
 #[tauri::command]
 pub async fn get_settings() -> Result<crate::settings::AppSettings, String> {
@@ -113,9 +120,11 @@ pub async fn get_settings() -> Result<crate::settings::AppSettings, String> {
 pub async fn save_settings(
     state: tauri::State<'_, crate::store::AppState>,
     settings: crate::settings::AppSettings,
-) -> Result<bool, String> {
+) -> Result<SettingsSaveResult, String> {
     let existing = crate::settings::get_settings();
     let merged = merge_settings_for_save(settings, &existing);
+    validate_settings_for_save(&merged)?;
+    let env_injection = merged.env_injection.clone();
     let unify_codex_changed =
         merged.unify_codex_session_history != existing.unify_codex_session_history;
     let unify_codex_enabled = merged.unify_codex_session_history;
@@ -174,7 +183,36 @@ pub async fn save_settings(
             }
         }
     }
-    Ok(true)
+    let env_report = crate::env_injection::sync_to_live_configs(&env_injection);
+    Ok(SettingsSaveResult {
+        settings_saved: true,
+        env_injection: env_report,
+    })
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SettingsSaveResult {
+    pub settings_saved: bool,
+    pub env_injection: crate::env_injection::EnvInjectionSyncReport,
+}
+
+#[tauri::command]
+pub async fn inspect_env_injection_status(
+) -> Result<crate::env_injection::EnvInjectionSyncReport, String> {
+    let settings = crate::settings::get_settings();
+    Ok(crate::env_injection::inspect_status(
+        &settings.env_injection,
+    ))
+}
+
+#[tauri::command]
+pub async fn retry_env_injection_sync(
+) -> Result<crate::env_injection::EnvInjectionSyncReport, String> {
+    let settings = crate::settings::get_settings();
+    Ok(crate::env_injection::sync_to_live_configs(
+        &settings.env_injection,
+    ))
 }
 
 #[derive(serde::Serialize)]
@@ -444,7 +482,7 @@ pub async fn set_auto_launch(enabled: bool) -> Result<bool, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_app_update_info, merge_settings_for_save};
+    use super::{build_app_update_info, merge_settings_for_save, validate_settings_for_save};
     use crate::settings::{
         AppSettings, CodexOfficialHistoryUnifyMigration, CodexProviderTemplateMigration,
         CodexThirdPartyHistoryProviderBucketMigration, LocalMigrations, S3SyncSettings,
@@ -787,6 +825,21 @@ mod tests {
         let merged = merge_settings_for_save(incoming, &existing);
 
         assert!(merged.local_migrations.is_none());
+    }
+
+    #[test]
+    fn save_settings_rejects_invalid_environment_variable_names_before_persistence() {
+        let mut settings = AppSettings::default();
+        settings
+            .env_injection
+            .variables
+            .insert("BAD=KEY".to_string(), "value".to_string());
+
+        let error = validate_settings_for_save(&settings)
+            .expect_err("invalid environment variable name must reject the save");
+
+        assert!(error.contains("invalid environment variable name"));
+        assert!(error.contains("BAD=KEY"));
     }
 }
 

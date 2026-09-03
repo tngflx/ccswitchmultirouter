@@ -21,6 +21,9 @@ function snapshot(): RequestHealthSnapshot {
       optimizationMode: "safe",
       largeRequestThresholdBytes: 393_216,
       maxCodexInputTokens: 200_000,
+      reviewTimeoutSeconds: 60,
+      reviewMode: "first_large_request",
+      compactAndRestartEnabled: true,
     },
     diagnostics: [
       {
@@ -74,7 +77,7 @@ describe("RequestHealthPanel", () => {
     ).toBeInTheDocument();
   });
 
-  it("keeps oversized requests diagnostic-only", () => {
+  it("exposes first-request review and compact-new-session controls", () => {
     render(
       <RequestHealthPanel
         snapshot={snapshot()}
@@ -84,12 +87,44 @@ describe("RequestHealthPanel", () => {
       />,
     );
 
-    expect(screen.getByText("357,500 / 200,000")).toBeInTheDocument();
+    expect(screen.getByText("1396.5 KB / 384.0 KB")).toBeInTheDocument();
     expect(
-      screen.queryByText("codexRouterWorkspace.requestHealth.blockedNotice"),
-    ).not.toBeInTheDocument();
+      screen.getByText("codexRouterWorkspace.requestHealth.reviewMode"),
+    ).toBeInTheDocument();
     expect(
-      screen.queryByText("codexRouterWorkspace.requestHealth.handoffNow"),
-    ).not.toBeInTheDocument();
+      screen.getByText(
+        "codexRouterWorkspace.requestHealth.compactAndRestartEnabled",
+      ),
+    ).toBeInTheDocument();
+  });
+
+  it("shows authoritative cache usage and sustained-growth anomalies", () => {
+    const health = snapshot();
+    health.diagnostics[0] = {
+      ...health.diagnostics[0],
+      actualInputTokens: 120_000,
+      cachedInputTokens: 10_000,
+      freshInputTokens: 110_000,
+      cacheHitRatio: 10_000 / 120_000,
+      anomaly: {
+        code: "sustained_uncached_input_growth",
+        severity: "warning",
+        count: 3,
+        detail: "Fresh input kept growing while cache hits stayed low.",
+      },
+    };
+
+    render(
+      <RequestHealthPanel
+        snapshot={health}
+        isRefreshing={false}
+        onRefresh={() => {}}
+        onSaved={() => {}}
+      />,
+    );
+
+    expect(
+      screen.getByText(/Fresh input kept growing while cache hits stayed low/),
+    ).toBeInTheDocument();
   });
 });

@@ -345,7 +345,13 @@ export function CodexProviderReadinessSection({
               key={mode}
               type="button"
               size="sm"
-              variant={protocolProbeMode === mode ? "secondary" : "ghost"}
+              variant="ghost"
+              aria-pressed={protocolProbeMode === mode}
+              className={cn(
+                "border border-transparent text-gray-700 dark:text-gray-200",
+                protocolProbeMode === mode &&
+                  "border-blue-600 bg-blue-600 text-white shadow-sm hover:bg-blue-700 dark:border-blue-400 dark:bg-blue-500 dark:text-white dark:hover:bg-blue-600",
+              )}
               onClick={() => onProtocolProbeModeChange?.(mode)}
             >
               {mode === "light"

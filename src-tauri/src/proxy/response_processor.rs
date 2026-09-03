@@ -523,6 +523,7 @@ pub(crate) fn create_usage_collector(
     let stream_parser = parser_config.stream_parser;
     let model_extractor = parser_config.model_extractor;
     let session_id = ctx.session_id.clone();
+    let request_health_trace = ctx.request_health_trace.clone();
 
     Some(SseUsageCollector::new(
         start_time,
@@ -531,6 +532,7 @@ pub(crate) fn create_usage_collector(
             if let Some(usage) = stream_parser(&events) {
                 let model = model_extractor(&events, &fallback_model);
                 let latency_ms = start_time.elapsed().as_millis() as u64;
+                record_request_health_usage(&state, app_type_str, &request_health_trace, &usage);
 
                 let state = state.clone();
                 let provider_id = provider_id.clone();
@@ -603,6 +605,7 @@ fn spawn_log_usage(
             return;
         }
     }
+    record_request_health_usage(state, ctx.app_type_str, &ctx.request_health_trace, &usage);
 
     let state = state.clone();
     let provider_id = ctx.provider.id.clone();
@@ -634,6 +637,19 @@ fn spawn_log_usage(
         )
         .await;
     });
+}
+
+fn record_request_health_usage(
+    _state: &ProxyState,
+    app_type: &str,
+    trace_id: &str,
+    usage: &TokenUsage,
+) {
+    if app_type != "codex" {
+        return;
+    }
+    let _ =
+        super::request_health::record_usage(trace_id, usage.input_tokens, usage.cache_read_tokens);
 }
 
 pub(crate) fn usage_logging_enabled(state: &ProxyState) -> bool {

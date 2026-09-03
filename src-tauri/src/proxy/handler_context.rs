@@ -64,6 +64,8 @@ pub struct RequestContext {
     pub session_id: String,
     /// Session ID 是否由客户端提供。生成的 UUID 不能作为上游缓存 key，否则每个请求都会换 key。
     pub session_client_provided: bool,
+    /// Stable per-request correlation id shared by request health and response usage.
+    pub request_health_trace: String,
     /// 是否允许保留客户端提供的官方 Codex originator。
     ///
     /// 只有本地 Codex 应用入口可以保留；External API 临时 provider 和其他协议转换
@@ -176,6 +178,7 @@ impl RequestContext {
             app_type,
             session_id,
             session_client_provided: session_result.client_provided,
+            request_health_trace: uuid::Uuid::new_v4().to_string(),
             preserve_codex_client_originator,
             rectifier_config,
             optimizer_config,
@@ -237,6 +240,7 @@ impl RequestContext {
             app_type,
             session_id,
             session_client_provided: session_result.client_provided,
+            request_health_trace: uuid::Uuid::new_v4().to_string(),
             preserve_codex_client_originator: false,
             rectifier_config,
             optimizer_config,
@@ -290,6 +294,7 @@ impl RequestContext {
             self.current_provider_id.clone(),
             self.session_id.clone(),
             self.session_client_provided,
+            self.request_health_trace.clone(),
             self.preserve_codex_client_originator,
             first_byte_timeout,
             idle_timeout,

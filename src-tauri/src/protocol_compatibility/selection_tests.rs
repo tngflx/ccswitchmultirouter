@@ -26,7 +26,7 @@ fn chooses_native_responses_when_both_protocols_complete_the_full_transaction() 
 }
 
 #[test]
-fn chooses_native_responses_when_equally_capable_even_if_its_reasoning_is_opaque() {
+fn chooses_readable_chat_when_equally_capable_responses_reasoning_is_opaque() {
     let selection = select_transport_outcome_with_reasoning(&[
         (
             verified(TransportKind::OpenAiResponses),
@@ -40,12 +40,12 @@ fn chooses_native_responses_when_equally_capable_even_if_its_reasoning_is_opaque
 
     assert_eq!(
         selection.map(|selection| selection.transport),
-        Some(TransportKind::OpenAiResponses)
+        Some(TransportKind::OpenAiChat)
     );
 }
 
 #[test]
-fn chooses_native_responses_when_equally_capable_even_if_chat_has_raw_reasoning() {
+fn chooses_readable_chat_when_equally_capable_responses_reasoning_is_summary() {
     let selection = select_transport_outcome_with_reasoning(&[
         (
             verified(TransportKind::OpenAiResponses),
@@ -59,7 +59,7 @@ fn chooses_native_responses_when_equally_capable_even_if_chat_has_raw_reasoning(
 
     assert_eq!(
         selection.map(|selection| selection.transport),
-        Some(TransportKind::OpenAiResponses)
+        Some(TransportKind::OpenAiChat)
     );
 }
 

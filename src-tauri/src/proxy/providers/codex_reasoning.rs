@@ -1362,17 +1362,25 @@ mod tests {
 
     #[test]
     fn legacy_declaration_without_disable_allowed_is_backward_compatible() {
-        let capability: CodexModelReasoningCapability = serde_json::from_value(json!({
+        let legacy: CodexModelReasoningCapability = serde_json::from_value(json!({
             "supported": true,
             "supportedEfforts": ["low", "high"],
             "defaultEffort": "high",
             "upstream": {"format": "string", "parameter": "reasoning_effort"}
         }))
         .expect("legacy declarations may omit disableAllowed");
+        let capability = legacy.complete_identity_effort_map_for_read();
         assert!(!capability.disable_allowed);
         assert_eq!(
             capability.effective_support_status(),
             ReasoningSupportStatus::ConfirmedSupported
+        );
+        assert_eq!(
+            capability.upstream.effort_map,
+            HashMap::from([
+                ("low".to_string(), "low".to_string()),
+                ("high".to_string(), "high".to_string()),
+            ])
         );
         assert!(capability.validate().is_ok());
     }

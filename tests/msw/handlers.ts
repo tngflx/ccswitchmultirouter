@@ -342,8 +342,75 @@ export const handlers = [
   http.post(`${TAURI_ENDPOINT}/save_settings`, async ({ request }) => {
     const { settings } = await withJson<{ settings: Settings }>(request);
     setSettings(settings);
-    return success(true);
+    const target = {
+      state: "disabled",
+      managedKeys: [],
+      addedKeys: [],
+      updatedKeys: [],
+      removedKeys: [],
+      relinquishedKeys: [],
+      conflictedKeys: [],
+    };
+    return success({
+      settingsSaved: true,
+      envInjection: {
+        state: "disabled",
+        claude: target,
+        codex: target,
+        codexIncludeAllowlist: false,
+      },
+    });
   }),
+
+  http.post(`${TAURI_ENDPOINT}/inspect_env_injection_status`, () =>
+    success({
+      state: "disabled",
+      claude: {
+        state: "disabled",
+        managedKeys: [],
+        addedKeys: [],
+        updatedKeys: [],
+        removedKeys: [],
+        relinquishedKeys: [],
+        conflictedKeys: [],
+      },
+      codex: {
+        state: "disabled",
+        managedKeys: [],
+        addedKeys: [],
+        updatedKeys: [],
+        removedKeys: [],
+        relinquishedKeys: [],
+        conflictedKeys: [],
+      },
+      codexIncludeAllowlist: false,
+    }),
+  ),
+
+  http.post(`${TAURI_ENDPOINT}/retry_env_injection_sync`, () =>
+    success({
+      state: "disabled",
+      claude: {
+        state: "disabled",
+        managedKeys: [],
+        addedKeys: [],
+        updatedKeys: [],
+        removedKeys: [],
+        relinquishedKeys: [],
+        conflictedKeys: [],
+      },
+      codex: {
+        state: "disabled",
+        managedKeys: [],
+        addedKeys: [],
+        updatedKeys: [],
+        removedKeys: [],
+        relinquishedKeys: [],
+        conflictedKeys: [],
+      },
+      codexIncludeAllowlist: false,
+    }),
+  ),
 
   http.post(
     `${TAURI_ENDPOINT}/set_app_config_dir_override`,

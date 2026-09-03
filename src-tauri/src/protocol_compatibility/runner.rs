@@ -234,13 +234,7 @@ where
     let model = candidate.public_model.clone();
     match tokio::time::timeout(
         TRANSACTION_TIMEOUT,
-        run_probe(
-            candidate,
-            client,
-            mode,
-            probe_all_transports,
-            &reporter,
-        ),
+        run_probe(candidate, client, mode, probe_all_transports, &reporter),
     )
     .await
     {

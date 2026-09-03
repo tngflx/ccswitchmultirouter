@@ -34,9 +34,11 @@ import {
   ArrowDown,
   ArrowUp,
   ArrowLeftRight,
-  Route as RouteIcon,
+  CircleHelp,
+  ImageIcon,
   Plus,
   Trash2,
+  Type,
   X,
 } from "lucide-react";
 import EndpointSpeedTest from "./EndpointSpeedTest";
@@ -2377,6 +2379,44 @@ export function CodexFormFields({
               </span>
             </DialogDescription>
           </DialogHeader>
+          <div
+            className="space-y-2 rounded-md border border-border-default bg-muted/30 p-2"
+            role="group"
+            aria-label={i18n.t("codexForm.probeModeLabel", {
+              defaultValue: "Probe mode",
+            })}
+          >
+            <p className="text-xs font-medium text-foreground">
+              {i18n.t("codexForm.probeModeLabel", {
+                defaultValue: "Probe mode",
+              })}
+            </p>
+            <div className="grid grid-cols-2 gap-1">
+              {(["light", "deep"] as const).map((mode) => (
+                <Button
+                  key={mode}
+                  type="button"
+                  size="sm"
+                  variant="ghost"
+                  aria-pressed={protocolProbeMode === mode}
+                  className={cn(
+                    "border border-transparent text-gray-700 dark:text-gray-200",
+                    protocolProbeMode === mode &&
+                      "border-blue-600 bg-blue-600 text-white shadow-sm hover:bg-blue-700 dark:border-blue-400 dark:bg-blue-500 dark:text-white dark:hover:bg-blue-600",
+                  )}
+                  onClick={() => setProtocolProbeMode(mode)}
+                >
+                  {mode === "light"
+                    ? i18n.t("codexForm.probeModeLight", {
+                        defaultValue: "Light",
+                      })
+                    : i18n.t("codexForm.probeModeDeep", {
+                        defaultValue: "Deep",
+                      })}
+                </Button>
+              ))}
+            </div>
+          </div>
           <p className="text-sm text-muted-foreground">
             {protocolProbeMode === "light"
               ? i18n.t("codexForm.probeModeLightDescription", {
@@ -4064,18 +4104,10 @@ export function CodexFormFields({
                           defaultValue: "Select",
                         })}
                       </span>
-                      <span
-                        className="flex justify-center"
-                        title={t("codexRouterWorkspace.s071", {
-                          defaultValue: "Routing rules",
+                      <span className="flex justify-center">
+                        {t("codexConfig.catalogUsedStatus", {
+                          defaultValue: "Used",
                         })}
-                      >
-                        <RouteIcon className="h-4 w-4" aria-hidden />
-                        <span className="sr-only">
-                          {t("codexRouterWorkspace.s071", {
-                            defaultValue: "Routing rules",
-                          })}
-                        </span>
                       </span>
                       <span>
                         {t("codexConfig.catalogColumnDisplay", {
@@ -4164,27 +4196,27 @@ export function CodexFormFields({
                               role="status"
                               aria-label={`${row.model || row.displayName || "Model"}: ${
                                 row.enabled !== false
-                                  ? t("common.enabled", {
-                                      defaultValue: "Enabled",
+                                  ? t("codexConfig.catalogUsedStatus", {
+                                      defaultValue: "Used",
                                     })
-                                  : t("common.disabled", {
-                                      defaultValue: "Disabled",
+                                  : t("codexConfig.catalogNotUsedStatus", {
+                                      defaultValue: "Not used",
                                     })
                               }`}
                               title={
                                 row.enabled !== false
-                                  ? t("common.enabled", {
-                                      defaultValue: "Enabled",
+                                  ? t("codexConfig.catalogUsedStatus", {
+                                      defaultValue: "Used",
                                     })
-                                  : t("common.disabled", {
-                                      defaultValue: "Disabled",
+                                  : t("codexConfig.catalogNotUsedStatus", {
+                                      defaultValue: "Not used",
                                     })
                               }
                               className={cn(
                                 "inline-flex h-5 w-5 items-center justify-center rounded-full border",
                                 row.enabled !== false
                                   ? "border-emerald-400/40 bg-emerald-500/15"
-                                  : "border-amber-400/45 bg-amber-500/15",
+                                  : "border-destructive/45 bg-destructive/15",
                               )}
                             >
                               <span
@@ -4192,7 +4224,7 @@ export function CodexFormFields({
                                   "h-2.5 w-2.5 rounded-full shadow-sm",
                                   row.enabled !== false
                                     ? "bg-emerald-400 shadow-emerald-500/40"
-                                    : "bg-amber-400 shadow-amber-500/40",
+                                    : "bg-destructive shadow-destructive/40",
                                 )}
                               />
                             </span>
@@ -4331,7 +4363,7 @@ export function CodexFormFields({
                             <Trash2 className="h-4 w-4" />
                           </Button>
                           <fieldset
-                            className="col-span-full flex flex-wrap items-center gap-2 border-t border-border-default pt-2 text-xs"
+                            className="col-span-full flex flex-wrap items-center gap-1 border-t border-border-default pt-2 text-xs"
                             aria-label={i18n.t(
                               "codexForm.inputCapabilityAria",
                               {
@@ -4344,43 +4376,6 @@ export function CodexFormFields({
                               },
                             )}
                           >
-                            <legend className="mr-1 font-medium">
-                              {i18n.t("codexForm.inputCapabilityLabel", {
-                                defaultValue: "输入能力",
-                              })}
-                            </legend>
-                            <span
-                              className={cn(
-                                "inline-flex items-center gap-1.5 rounded-full border px-2 py-1 font-medium",
-                                inputCapability === "text_image"
-                                  ? "border-emerald-500/30 bg-emerald-500/10 text-emerald-700 dark:text-emerald-200"
-                                  : inputCapability === "text_only"
-                                    ? "border-sky-500/30 bg-sky-500/10 text-sky-700 dark:text-sky-200"
-                                    : "border-amber-500/35 bg-amber-500/10 text-amber-700 dark:text-amber-200",
-                              )}
-                            >
-                              <span
-                                className={cn(
-                                  "h-2 w-2 rounded-full",
-                                  inputCapability === "text_image"
-                                    ? "bg-emerald-400"
-                                    : inputCapability === "text_only"
-                                      ? "bg-sky-400"
-                                      : "bg-amber-400",
-                                )}
-                              />
-                              {inputCapability === "text_image"
-                                ? i18n.t("codexForm.textAndImageLabel", {
-                                    defaultValue: "Text & image",
-                                  })
-                                : inputCapability === "text_only"
-                                  ? i18n.t("codexForm.textOnlyLabel", {
-                                      defaultValue: "Text only",
-                                    })
-                                  : i18n.t("common.unknown", {
-                                      defaultValue: "Unknown",
-                                    })}
-                            </span>
                             <div
                               className="inline-flex overflow-hidden rounded-md border"
                               role="radiogroup"
@@ -4400,7 +4395,7 @@ export function CodexFormFields({
                                 type="button"
                                 size="sm"
                                 variant={supportsImage ? "default" : "ghost"}
-                                className="rounded-none"
+                                className="h-8 gap-1 rounded-none px-2"
                                 aria-pressed={supportsImage}
                                 aria-label={i18n.t("codexForm.textImageAria", {
                                   defaultValue: "{{model}} 文本与图像",
@@ -4416,16 +4411,22 @@ export function CodexFormFields({
                                     codexInputCapabilityPatch("text_image"),
                                   )
                                 }
-                              >
-                                {i18n.t("codexForm.textAndImageLabel", {
-                                  defaultValue: "文本与图像",
+                                title={i18n.t("codexForm.textAndImageLabel", {
+                                  defaultValue: "Text & image",
                                 })}
+                              >
+                                <ImageIcon className="h-4 w-4" />
+                                <span>
+                                  {i18n.t("codexForm.textAndImageLabel", {
+                                    defaultValue: "文本与图像",
+                                  })}
+                                </span>
                               </Button>
                               <Button
                                 type="button"
                                 size="sm"
                                 variant={isTextOnly ? "default" : "ghost"}
-                                className="rounded-none border-l"
+                                className="h-8 gap-1 rounded-none border-l px-2"
                                 aria-pressed={isTextOnly}
                                 aria-label={i18n.t("codexForm.textOnlyAria", {
                                   defaultValue: "{{model}} 仅文本",
@@ -4441,12 +4442,26 @@ export function CodexFormFields({
                                     codexInputCapabilityPatch("text_only"),
                                   )
                                 }
-                              >
-                                {i18n.t("codexForm.textOnlyLabel", {
-                                  defaultValue: "仅文本",
+                                title={i18n.t("codexForm.textOnlyLabel", {
+                                  defaultValue: "Text only",
                                 })}
+                              >
+                                <Type className="h-4 w-4" />
+                                <span>
+                                  {i18n.t("codexForm.textOnlyLabel", {
+                                    defaultValue: "仅文本",
+                                  })}
+                                </span>
                               </Button>
                             </div>
+                            {inputCapability === "unknown" && (
+                              <span className="inline-flex h-8 items-center gap-1 rounded-md border border-amber-500/35 bg-amber-500/10 px-2 font-medium text-amber-700 dark:text-amber-200">
+                                <CircleHelp className="h-4 w-4" />
+                                {i18n.t("common.unknown", {
+                                  defaultValue: "Unknown",
+                                })}
+                              </span>
+                            )}
                             {presetDeclaresInputCapability &&
                             presetCatalogModel ? (
                               <Button

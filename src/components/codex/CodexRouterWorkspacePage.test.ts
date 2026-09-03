@@ -36,6 +36,9 @@ import {
   mergeRoutePickerDraftIds,
   normalizeCodexRouteForSave,
   normalizeCodexRoutesForVisibleModelAliases,
+  providerWithCatalogModelVisibility,
+  providersWithCatalogModelVisibilityForRoutes,
+  providerWithFetchedModelCatalog,
   readCodexRouting,
   resolveCodexRouterAuthFacadeLabel,
   routeSummaryDisplayName,
@@ -311,6 +314,9 @@ function createRequestHealthSnapshot(
       optimizationMode: "safe",
       largeRequestThresholdBytes: 393216,
       maxCodexInputTokens: 200000,
+      reviewTimeoutSeconds: 60,
+      reviewMode: "first_large_request",
+      compactAndRestartEnabled: true,
     },
     diagnostics: [
       {
@@ -359,6 +365,9 @@ beforeEach(() => {
       optimizationMode: "safe",
       largeRequestThresholdBytes: 393216,
       maxCodexInputTokens: 200000,
+      reviewTimeoutSeconds: 60,
+      reviewMode: "first_large_request",
+      compactAndRestartEnabled: true,
     },
     diagnostics: [],
   });
@@ -3824,6 +3833,152 @@ describe("Codex MultiRouter workspace route persistence helpers", () => {
     ]);
   });
 
+  it("hides and restores one provider model without losing its metadata", () => {
+    const provider: Provider = {
+      id: "visibility-source",
+      name: "Visibility Source",
+      category: "custom",
+      settingsConfig: {
+        modelCatalog: {
+          models: [
+            {
+              model: "visible-alias",
+              upstreamModel: "canonical-model",
+              sortIndex: 3,
+              supportsImage: true,
+            },
+          ],
+        },
+      },
+    };
+
+    const hidden = providerWithCatalogModelVisibility(
+      provider,
+      "canonical-model",
+      false,
+    );
+    expect(hidden?.settingsConfig?.modelCatalog?.models).toEqual([
+      expect.objectContaining({
+        model: "visible-alias",
+        upstreamModel: "canonical-model",
+        sortIndex: 3,
+        supportsImage: true,
+        enabled: false,
+      }),
+    ]);
+
+    const restored = providerWithCatalogModelVisibility(
+      hidden as Provider,
+      "visible-alias",
+      true,
+    );
+    expect(restored?.settingsConfig?.modelCatalog?.models).toEqual([
+      {
+        model: "visible-alias",
+        upstreamModel: "canonical-model",
+        sortIndex: 3,
+        supportsImage: true,
+      },
+    ]);
+  });
+
+  it("hides a routed visible model from every matching provider", () => {
+    const first: Provider = {
+      id: "first-visibility-source",
+      name: "First",
+      category: "custom",
+      settingsConfig: {
+        modelCatalog: {
+          models: [{ model: "first-upstream", displayName: "First model" }],
+        },
+      },
+    };
+    const second: Provider = {
+      id: "second-visibility-source",
+      name: "Second",
+      category: "custom",
+      settingsConfig: {
+        modelCatalog: {
+          models: [{ model: "second-upstream", displayName: "Second model" }],
+        },
+      },
+    };
+    const routes = [
+      {
+        provider: first,
+        index: 0,
+        route: normalizeCodexRouteForSave(
+          {
+            targetProviderId: first.id,
+            aliases: { "Visible-Model": "first-upstream" },
+            modelSelection: { mode: "include", models: ["first-upstream"] },
+          },
+          0,
+          new Set<string>(),
+        ),
+      },
+      {
+        provider: second,
+        index: 1,
+        route: normalizeCodexRouteForSave(
+          {
+            targetProviderId: second.id,
+            aliases: { "visible-model": "second-upstream" },
+            modelSelection: { mode: "include", models: ["second-upstream"] },
+          },
+          1,
+          new Set<string>(),
+        ),
+      },
+    ];
+
+    const updates = providersWithCatalogModelVisibilityForRoutes(
+      routes,
+      new Map([
+        [first.id, first],
+        [second.id, second],
+      ]),
+      "VISIBLE-MODEL",
+      false,
+    );
+
+    expect(updates.map((provider) => provider.id)).toEqual([
+      first.id,
+      second.id,
+    ]);
+    expect(
+      updates.every(
+        (provider) =>
+          provider.settingsConfig?.modelCatalog?.models[0]?.enabled === false,
+      ),
+    ).toBe(true);
+  });
+
+  it("preserves hidden state while refreshing model metadata", () => {
+    const provider: Provider = {
+      id: "refresh-hidden-source",
+      name: "Refresh Hidden Source",
+      category: "custom",
+      settingsConfig: {
+        modelCatalog: {
+          models: [{ model: "hidden-model", enabled: false, sortIndex: 3 }],
+        },
+      },
+    };
+
+    const refreshed = providerWithFetchedModelCatalog(provider, [
+      { id: "hidden-model", ownedBy: null, supportsImage: true },
+    ]);
+    expect(refreshed.settingsConfig?.modelCatalog?.models).toContainEqual(
+      expect.objectContaining({
+        model: "hidden-model",
+        enabled: false,
+        sortIndex: 3,
+        supportsImage: true,
+      }),
+    );
+  });
+
   it("preserves catalog model casing in projected spawn-agent candidates", () => {
     const provider: Provider = {
       id: "relay",
@@ -4696,7 +4851,7 @@ describe("Codex MultiRouter workspace route persistence helpers", () => {
     expect(requestHealthButton).toBeVisible();
 
     await user.click(requestHealthButton);
-    expect(screen.getByDisplayValue("200000")).toBeVisible();
+    expect(screen.getByDisplayValue("384")).toBeVisible();
   });
 
   it("shows stale projection details and lets the user resync with readable provider names", async () => {

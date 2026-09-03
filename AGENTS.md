@@ -289,6 +289,8 @@ Verification scope and reporting are governed by rules 2, 8, 9, and 10. In pract
     - `codex_traffic_policy` module
     - `codexCatalogSync` module
 
+27-A. **Before proposing or implementing a new feature or fix, audit both reference repositories for relevant work:** inspect the current `BigStrongSun/ccswitchmulti` upstream and the original `farion1231/cc-switch` repository, including recent commits, open/closed pull requests, and nearby implementation history. Treat them as reference material, not automatic authority: understand the problem, ownership boundary, behavioral tradeoffs, and tests on each side before deciding whether to port, adapt, reject, or defer the change. Record the reference-repo verdict when it materially affects the design.
+
 ### Additional Documentation
 
 - [Retry Architecture](docs/architecture/retry-model.md) — Consolidated two-layer resilience model (proxy reconnect + Codex client retry)

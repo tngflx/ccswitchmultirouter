@@ -337,4 +337,12 @@ Describe "CCSwitchMulti local release build config" {
         $exportScript | Should Not Match "Set-Content[^\r\n]*-Encoding UTF8"
         $exportScript.Contains('Write-Utf8NoBom -Path (Join-Path $Root "latest.json")') | Should Be $true
     }
+
+    It "targets the maintained fork when constructing updater asset URLs" {
+        $repoRoot = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
+        $exportScript = [System.IO.File]::ReadAllText((Join-Path $repoRoot "scripts\export-latest-ccswitchmulti.ps1"))
+
+        $exportScript | Should Match '\$githubRepo = "tngflx/ccswitchmultirouter"'
+        $exportScript | Should Not Match '\$githubRepo = "BigStrongSun/ccswitchmulti"'
+    }
 }

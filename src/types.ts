@@ -629,6 +629,7 @@ export interface RemoteSnapshotInfo {
 // 应用设置类型（用于设置对话框与 Tauri API）
 // 存储在本地 ~/.cc-switch/settings.json，不随数据库同步
 export interface Settings {
+  envInjection?: EnvInjectionSettings;
   // ===== 设备级 UI 设置 =====
   // 是否在系统托盘（macOS 菜单栏）显示图标
   showInTray: boolean;
@@ -654,6 +655,9 @@ export interface Settings {
     optimizationMode: "off" | "diagnose" | "safe";
     largeRequestThresholdBytes: number;
     maxCodexInputTokens: number;
+    reviewTimeoutSeconds: number;
+    reviewMode: "off" | "first_large_request" | "sustained_growth";
+    compactAndRestartEnabled: boolean;
   };
   // 是否启用主页面本地代理功能（默认关闭）
   enableLocalProxy?: boolean;
@@ -752,6 +756,33 @@ export interface Settings {
       migratedStateRows?: number;
     };
   };
+}
+
+export interface EnvInjectionSettings {
+  enabled: boolean;
+  targets: { claude: boolean; codex: boolean };
+  variables: Record<string, string>;
+}
+export interface EnvInjectionTargetSyncStatus {
+  state: "disabled" | "synced" | "conflict" | "pending" | "failed";
+  managedKeys: string[];
+  addedKeys: string[];
+  updatedKeys: string[];
+  removedKeys: string[];
+  relinquishedKeys: string[];
+  conflictedKeys: string[];
+  error?: string;
+  rollbackError?: string;
+}
+export interface EnvInjectionSyncReport {
+  state: "disabled" | "synced" | "warning" | "partial" | "failed";
+  claude: EnvInjectionTargetSyncStatus;
+  codex: EnvInjectionTargetSyncStatus;
+  codexIncludeAllowlist: boolean;
+}
+export interface SettingsSaveResult {
+  settingsSaved: boolean;
+  envInjection: EnvInjectionSyncReport;
 }
 
 /** 多设备额度协作的本机配置，不包含任何 Codex 登录凭据。 */

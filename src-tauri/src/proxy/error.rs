@@ -71,6 +71,9 @@ pub enum ProxyError {
         waited_ms: u64,
     },
 
+    #[error("Request Health blocked the request before upstream dispatch: {0}")]
+    RequestHealthBlocked(String),
+
     #[error("超时: {0}")]
     Timeout(String),
 
@@ -167,6 +170,7 @@ impl IntoResponse for ProxyError {
                     ProxyError::AdmissionQueueTimeout { .. } => {
                         (StatusCode::SERVICE_UNAVAILABLE, self.to_string())
                     }
+                    ProxyError::RequestHealthBlocked(_) => (StatusCode::CONFLICT, self.to_string()),
                     ProxyError::Timeout(_) => (StatusCode::GATEWAY_TIMEOUT, self.to_string()),
                     ProxyError::ResponsePending(_) => {
                         (StatusCode::FAILED_DEPENDENCY, self.to_string())

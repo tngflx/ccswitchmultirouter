@@ -92,16 +92,20 @@ fn compile_provider_probe_candidate_for_model(
         return Err("Codex provider has no API key".to_string());
     }
 
-    let transport = model_transport.unwrap_or(match explain_codex_responses_upstream_protocol(
-        provider,
-    )
-    .protocol
-    .api_format()
-    {
-        "openai_chat" => TransportKind::OpenAiChat,
-        "openai_responses" => TransportKind::OpenAiResponses,
-        _ => return Err("provider is not an OpenAI Chat/Responses protocol candidate".to_string()),
-    });
+    let transport = model_transport.unwrap_or(
+        match explain_codex_responses_upstream_protocol(provider)
+            .protocol
+            .api_format()
+        {
+            "openai_chat" => TransportKind::OpenAiChat,
+            "openai_responses" => TransportKind::OpenAiResponses,
+            _ => {
+                return Err(
+                    "provider is not an OpenAI Chat/Responses protocol candidate".to_string(),
+                )
+            }
+        },
+    );
     let is_full_url = provider
         .meta
         .as_ref()

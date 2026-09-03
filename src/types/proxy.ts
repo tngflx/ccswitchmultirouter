@@ -63,6 +63,9 @@ export interface RequestHealthConfig {
   optimizationMode: RequestOptimizationMode;
   largeRequestThresholdBytes: number;
   maxCodexInputTokens: number;
+  reviewTimeoutSeconds: number;
+  reviewMode: "off" | "first_large_request" | "sustained_growth";
+  compactAndRestartEnabled: boolean;
 }
 
 export interface RequestHealthBreakdown {
@@ -105,6 +108,11 @@ export interface RequestHealthDiagnostic {
   compactionRequest: boolean;
   compactionRecommended: boolean;
   sessionClientProvided: boolean;
+  actualInputTokens?: number;
+  cachedInputTokens?: number;
+  freshInputTokens?: number;
+  cacheHitRatio?: number;
+  anomaly?: RequestHealthFinding;
   findings: RequestHealthFinding[];
   breakdown: RequestHealthBreakdown[];
 }

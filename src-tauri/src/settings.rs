@@ -46,6 +46,10 @@ fn default_max_codex_input_tokens() -> u32 {
     200_000
 }
 
+fn default_request_health_review_timeout_seconds() -> u32 {
+    60
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum RequestOptimizationMode {
@@ -57,6 +61,20 @@ pub enum RequestOptimizationMode {
 impl Default for RequestOptimizationMode {
     fn default() -> Self {
         Self::Safe
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RequestHealthReviewMode {
+    Off,
+    FirstLargeRequest,
+    SustainedGrowth,
+}
+
+impl Default for RequestHealthReviewMode {
+    fn default() -> Self {
+        Self::FirstLargeRequest
     }
 }
 
@@ -72,6 +90,15 @@ pub struct RequestHealthConfig {
     /// Conservative preflight ceiling used before a Codex request is sent upstream.
     #[serde(default = "default_max_codex_input_tokens")]
     pub max_codex_input_tokens: u32,
+    /// Maximum time a Windows notification may hold a request before blocking it.
+    #[serde(default = "default_request_health_review_timeout_seconds")]
+    pub review_timeout_seconds: u32,
+    /// Controls when the pre-dispatch Windows decision notification is shown.
+    #[serde(default)]
+    pub review_mode: RequestHealthReviewMode,
+    /// Offer native compaction followed by a forked Codex session.
+    #[serde(default = "default_true")]
+    pub compact_and_restart_enabled: bool,
 }
 
 impl Default for RequestHealthConfig {
@@ -81,6 +108,9 @@ impl Default for RequestHealthConfig {
             optimization_mode: RequestOptimizationMode::Safe,
             large_request_threshold_bytes: default_large_request_threshold_bytes(),
             max_codex_input_tokens: default_max_codex_input_tokens(),
+            review_timeout_seconds: default_request_health_review_timeout_seconds(),
+            review_mode: RequestHealthReviewMode::FirstLargeRequest,
+            compact_and_restart_enabled: true,
         }
     }
 }
@@ -477,6 +507,9 @@ pub struct CodexOfficialHistoryUnifyMigration {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AppSettings {
+    /// Device-local CLI environment injection settings.
+    #[serde(default)]
+    pub env_injection: crate::env_injection::EnvInjectionSettings,
     // ===== 设备级 UI 设置 =====
     #[serde(default = "default_show_in_tray")]
     pub show_in_tray: bool,
@@ -667,6 +700,7 @@ fn default_show_profile_switcher() -> bool {
 impl Default for AppSettings {
     fn default() -> Self {
         Self {
+            env_injection: crate::env_injection::EnvInjectionSettings::default(),
             show_in_tray: true,
             minimize_to_tray_on_close: true,
             use_app_window_controls: false,
@@ -1517,5 +1551,31 @@ mod tests {
             assert_eq!(settings.stream_retry_budget(5), 5);
             assert_eq!(settings.stream_recovery_budget(), expected);
         }
+    }
+
+    #[test]
+    fn request_health_defaults_to_first_request_review_with_compact_restart() {
+        let settings = AppSettings::default();
+        assert_eq!(
+            settings.request_health.review_mode,
+            RequestHealthReviewMode::FirstLargeRequest
+        );
+        assert!(settings.request_health.compact_and_restart_enabled);
+
+        let legacy: AppSettings = serde_json::from_value(serde_json::json!({
+            "requestHealth": {
+                "enabled": true,
+                "optimizationMode": "safe",
+                "largeRequestThresholdBytes": 393216,
+                "maxCodexInputTokens": 200000,
+                "reviewTimeoutSeconds": 60
+            }
+        }))
+        .expect("legacy request-health settings remain readable");
+        assert_eq!(
+            legacy.request_health.review_mode,
+            RequestHealthReviewMode::FirstLargeRequest
+        );
+        assert!(legacy.request_health.compact_and_restart_enabled);
     }
 }

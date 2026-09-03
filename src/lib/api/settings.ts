@@ -1,6 +1,8 @@
 import { invoke } from "@tauri-apps/api/core";
 import type {
   Settings,
+  SettingsSaveResult,
+  EnvInjectionSyncReport,
   WebDavSyncSettings,
   S3SyncSettings,
   RemoteSnapshotInfo,
@@ -97,8 +99,14 @@ export const settingsApi = {
     return await invoke("get_settings");
   },
 
-  async save(settings: Settings): Promise<boolean> {
+  async save(settings: Settings): Promise<SettingsSaveResult | boolean> {
     return await invoke("save_settings", { settings });
+  },
+  async inspectEnvInjectionStatus(): Promise<EnvInjectionSyncReport> {
+    return await invoke("inspect_env_injection_status");
+  },
+  async retryEnvInjectionSync(): Promise<EnvInjectionSyncReport> {
+    return await invoke("retry_env_injection_sync");
   },
 
   /** 是否存在统一 Codex 会话历史的迁移备份（关闭弹窗据此显示"恢复备份"勾选） */

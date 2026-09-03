@@ -975,7 +975,7 @@ function getProviderModelFetchConfig(
 }
 
 /// 将远端模型结果写回 provider 的 modelCatalog；空目录用于初始化，已有目录只刷新保留模型的元数据。
-function providerWithFetchedModelCatalog(
+export function providerWithFetchedModelCatalog(
   provider: Provider,
   fetchedModels: FetchedModel[],
 ): Provider {
@@ -1073,6 +1073,80 @@ function providerWithFetchedModelCatalog(
       },
     },
   };
+}
+
+export function providerWithCatalogModelVisibility(
+  provider: Provider,
+  modelId: string,
+  enabled: boolean,
+): Provider | null {
+  const target = modelId.trim().toLowerCase();
+  if (!target) return null;
+  const models = readCodexModelCatalog(provider).models;
+  const index = models.findIndex((model) =>
+    [model.model, model.upstreamModel, model.upstream_model].some(
+      (value) => value?.trim().toLowerCase() === target,
+    ),
+  );
+  if (index < 0) return null;
+  return {
+    ...provider,
+    settingsConfig: {
+      ...provider.settingsConfig,
+      modelCatalog: {
+        ...(provider.settingsConfig?.modelCatalog ?? {}),
+        models: models.map((model, modelIndex) => {
+          if (modelIndex !== index) return model;
+          const next = { ...model };
+          if (enabled) delete next.enabled;
+          else next.enabled = false;
+          return next;
+        }),
+      },
+    },
+  };
+}
+
+export function providersWithCatalogModelVisibilityForRoutes(
+  selectedRoutes: RouteEntry[],
+  providersById: Map<string, Provider>,
+  visibleModel: string,
+  enabled: boolean,
+): Provider[] {
+  const target = visibleModel.trim();
+  if (!target) return [];
+  const targetIdentity = target.toLowerCase();
+  const updates = new Map<string, Provider>();
+
+  for (const { route } of selectedRoutes) {
+    if (route.enabled === false) continue;
+    const providerId = routeTargetProviderId(route);
+    if (!providerId) continue;
+    const provider = updates.get(providerId) ?? providersById.get(providerId);
+    if (!provider) continue;
+    const aliases = route.aliases ?? route.upstream?.modelMap ?? {};
+    const canonicalModel =
+      Object.entries(aliases).find(
+        ([alias]) => alias.trim().toLowerCase() === targetIdentity,
+      )?.[1] ?? target;
+    if (
+      route.modelSelection?.mode === "include" &&
+      !route.modelSelection.models.some(
+        (model) =>
+          model.trim().toLowerCase() === canonicalModel.trim().toLowerCase(),
+      )
+    ) {
+      continue;
+    }
+    const nextProvider = providerWithCatalogModelVisibility(
+      provider,
+      canonicalModel,
+      enabled,
+    );
+    if (nextProvider) updates.set(providerId, nextProvider);
+  }
+
+  return [...updates.values()];
 }
 
 /// 把监听地址转换成客户端可连接的 host；0.0.0.0/:: 只能绑定，不能直接作为 Codex base_url。
@@ -4907,6 +4981,34 @@ function ModelOrderTab({
     modelsWithProvider,
     sortMode,
   );
+  const hiddenCatalogModels = useMemo(() => {
+    const hidden: Array<{
+      model: string;
+      upstream?: string;
+      providerId: string;
+      providerName: string;
+    }> = [];
+    const seen = new Set<string>();
+    for (const { route } of selectedRoutes) {
+      if (route.enabled === false) continue;
+      const providerId = routeTargetProviderId(route);
+      if (!providerId || seen.has(providerId)) continue;
+      seen.add(providerId);
+      const provider = providersById.get(providerId);
+      if (!provider) continue;
+      for (const model of readCodexModelCatalog(provider).models) {
+        if (model.enabled === false && model.model?.trim()) {
+          hidden.push({
+            model: model.model.trim(),
+            upstream: model.upstreamModel ?? model.upstream_model,
+            providerId,
+            providerName: provider.name,
+          });
+        }
+      }
+    }
+    return hidden;
+  }, [selectedRoutes, providersById]);
   const fallbackProtocolCount = visibleDraftModels.filter(
     isCodexProtocolFallback,
   ).length;
@@ -5103,6 +5205,98 @@ function ModelOrderTab({
     }
   }
 
+  async function hideModel(modelId: string) {
+    const target = modelId.trim();
+    if (
+      !target ||
+      !window.confirm(
+        tr("codexRouterWorkspace.hideModelConfirm", {
+          defaultValue:
+            "Remove {{model}} from the Codex model picker and routing?",
+          model: target,
+        }),
+      )
+    )
+      return;
+    setIsSaving(true);
+    setMessage(null);
+    setError(null);
+    try {
+      const updates = providersWithCatalogModelVisibilityForRoutes(
+        selectedRoutes,
+        providersById,
+        target,
+        false,
+      );
+      if (updates.length > 0) {
+        for (const nextProvider of updates) {
+          await providersApi.update(nextProvider, "codex");
+        }
+        setMessage(
+          tr("codexRouterWorkspace.hideModelSuccess", {
+            defaultValue: "Hidden {{model}}; it can be restored below.",
+            model: target,
+          }),
+        );
+        await queryClient.invalidateQueries({
+          queryKey: ["providers", "codex"],
+        });
+        return;
+      }
+      setError(
+        tr("codexRouterWorkspace.hideModelNotFound", {
+          defaultValue: "No matching model entry found for {{model}}.",
+          model: target,
+        }),
+      );
+    } catch (saveError) {
+      setError(
+        tr("codexRouterWorkspace.hideModelFailed", {
+          defaultValue: "Failed to hide model: {{error}}",
+          error: workspaceErrorMessage(saveError),
+        }),
+      );
+    } finally {
+      setIsSaving(false);
+    }
+  }
+
+  async function restoreHiddenModel(target: {
+    model: string;
+    providerId: string;
+  }) {
+    const provider = providersById.get(target.providerId);
+    if (!provider) return;
+    setIsSaving(true);
+    setMessage(null);
+    setError(null);
+    try {
+      const nextProvider = providerWithCatalogModelVisibility(
+        provider,
+        target.model,
+        true,
+      );
+      if (!nextProvider) return;
+      await providersApi.update(nextProvider, "codex");
+      setMessage(
+        tr("codexRouterWorkspace.restoreModelSuccess", {
+          defaultValue: "Restored {{model}}.",
+          model: target.model,
+        }),
+      );
+      await queryClient.invalidateQueries({ queryKey: ["providers", "codex"] });
+    } catch (saveError) {
+      setError(
+        tr("codexRouterWorkspace.restoreModelFailed", {
+          defaultValue: "Failed to restore model: {{error}}",
+          error: workspaceErrorMessage(saveError),
+        }),
+      );
+    } finally {
+      setIsSaving(false);
+    }
+  }
+
   if (!selectedPlan) {
     return (
       <EmptyState
@@ -5122,7 +5316,7 @@ function ModelOrderTab({
     );
   }
 
-  if (catalog.models.length === 0) {
+  if (catalog.models.length === 0 && hiddenCatalogModels.length === 0) {
     return (
       <EmptyState
         icon={GripVertical}
@@ -5275,11 +5469,51 @@ function ModelOrderTab({
                 model={model}
                 index={index}
                 displayStyle={displayStyle}
+                onDelete={(modelId) => void hideModel(modelId)}
               />
             ))}
           </div>
         </SortableContext>
       </DndContext>
+
+      {hiddenCatalogModels.length > 0 ? (
+        <details
+          className="mt-4 rounded-md border border-border p-3"
+          open={visibleDraftModels.length === 0}
+        >
+          <summary className="cursor-pointer text-xs font-medium">
+            {tr("codexRouterWorkspace.hiddenModels", {
+              defaultValue: "Hidden models ({{count}})",
+              count: hiddenCatalogModels.length,
+            })}
+          </summary>
+          <div className="mt-2 space-y-2">
+            {hiddenCatalogModels.map((hidden) => (
+              <div
+                key={`${hidden.providerId}:${hidden.model}`}
+                className="flex items-center justify-between gap-2 text-xs"
+              >
+                <span className="truncate">
+                  {hidden.model}
+                  {hidden.upstream ? ` (${hidden.upstream})` : ""} ·{" "}
+                  {hidden.providerName}
+                </span>
+                <Button
+                  type="button"
+                  size="sm"
+                  variant="outline"
+                  disabled={isSaving}
+                  onClick={() => void restoreHiddenModel(hidden)}
+                >
+                  {tr("codexRouterWorkspace.restoreModel", {
+                    defaultValue: "Restore",
+                  })}
+                </Button>
+              </div>
+            ))}
+          </div>
+        </details>
+      ) : null}
 
       {message ? (
         <p className="mt-3 text-xs text-emerald-700 dark:text-emerald-200">
@@ -10495,10 +10729,12 @@ function SortableCatalogModel({
   model,
   index,
   displayStyle = "model",
+  onDelete,
 }: {
   model: CodexCatalogModel;
   index: number;
   displayStyle?: CodexModelDisplayStyle;
+  onDelete?: (modelId: string) => void;
 }) {
   const modelId = model.model?.trim() ?? "";
   const apiFormat = model.apiFormat ?? model.api_format;
@@ -10592,6 +10828,26 @@ function SortableCatalogModel({
           </div>
         ) : null}
       </div>
+      {onDelete ? (
+        <Button
+          type="button"
+          size="sm"
+          variant="ghost"
+          aria-label={tr("codexRouterWorkspace.hideModel", {
+            defaultValue: "Hide {{model}}",
+            model: modelId,
+          })}
+          title={tr("codexRouterWorkspace.hideModelHint", {
+            defaultValue:
+              "Remove from the Codex picker and routing; the model can be restored on this page.",
+          })}
+          disabled={!modelId}
+          onClick={() => onDelete(modelId)}
+          className="h-7 w-7 shrink-0 p-0 text-rose-700 hover:bg-rose-50 dark:text-rose-200 dark:hover:bg-rose-500/15"
+        >
+          <Trash2 className="h-4 w-4" />
+        </Button>
+      ) : null}
     </div>
   );
 }

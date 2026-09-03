@@ -17,6 +17,7 @@ mod commands;
 mod config;
 mod database;
 mod deeplink;
+mod env_injection;
 mod error;
 mod gemini_config;
 mod gemini_mcp;
@@ -569,21 +570,6 @@ pub fn run() {
                 log::warn!(
                     "开机自启状态对账失败: desired={launch_on_startup}, error={error}"
                 );
-            }
-
-            // Codex Desktop 的启动是独立的显式设置，绝不能从系统自启设置推导。
-            // 启动失败只记录原因，不能阻断 CCSwitchMulti 自身启动。
-            let launch_codex_desktop_with_ccswitch = crate::settings::get_settings()
-                .launch_codex_desktop_with_ccswitch;
-            match crate::codex_desktop::launch_codex_desktop_with_ccswitch(
-                launch_codex_desktop_with_ccswitch,
-            ) {
-                Ok(true) => log::info!("已按独立设置启动 Codex Desktop"),
-                Ok(false) if launch_codex_desktop_with_ccswitch => {
-                    log::info!("Codex Desktop 已在运行，跳过独立启动")
-                }
-                Ok(false) => {}
-                Err(error) => log::warn!("按独立设置启动 Codex Desktop 失败: {error}"),
             }
 
             // 初始化数据库
@@ -1352,13 +1338,45 @@ pub fn run() {
 
                 initialize_common_config_snippets(&state);
 
-                // 检查 settings 表中的代理状态，自动恢复代理服务
-                if startup_recovery_classification.allows_proxy_startup() {
-                    restore_proxy_state_on_startup(&state).await;
+                // Restore the listener and live takeover before launching Codex.
+                // The app-server freezes request-local provider/feature state at startup;
+                // launching it against an unrecovered config creates a stale runtime even
+                // when the disk is repaired moments later.
+                let codex_takeover_ready = if startup_recovery_classification
+                    .allows_proxy_startup()
+                {
+                    restore_proxy_state_on_startup(&state).await
                 } else {
                     log::warn!(
                         "检测到身份完全匹配的旧 CCSwitchMulti 实例仍在运行；本实例跳过代理恢复与监听接管"
                     );
+                    false
+                };
+
+                let launch_codex_desktop_with_ccswitch = crate::settings::get_settings()
+                    .launch_codex_desktop_with_ccswitch;
+                if launch_codex_desktop_with_ccswitch && !codex_takeover_ready {
+                    log::error!(
+                        "Codex 启动门禁未通过：代理接管或 Live 配置恢复未完成，已阻止自动启动 Codex Desktop"
+                    );
+                } else if launch_codex_desktop_with_ccswitch {
+                    match crate::codex_config::enforce_codex_guardian_v2_live_compatibility() {
+                        Ok(_) => match crate::codex_desktop::launch_codex_desktop_with_ccswitch(true)
+                        {
+                            Ok(true) => {
+                                log::info!("Codex 配置与代理接管验证通过，已启动 Codex Desktop")
+                            }
+                            Ok(false) => {
+                                log::info!("Codex Desktop 已在运行，跳过启动门禁事务")
+                            }
+                            Err(error) => {
+                                log::warn!("验证后启动 Codex Desktop 失败: {error}")
+                            }
+                        },
+                        Err(error) => log::error!(
+                            "Codex 启动门禁未通过：Guardian V2 配置兼容性检查失败，已阻止自动启动: {error}"
+                        ),
+                    }
                 }
 
                 // Periodic backup check (on startup)
@@ -1536,6 +1554,8 @@ pub fn run() {
             codex_config::get_codex_subagent_profile_statuses,
             codex_config::preview_codex_subagent_profile,
             commands::save_settings,
+            commands::inspect_env_injection_status,
+            commands::retry_env_injection_sync,
             commands::has_codex_unify_history_backup,
             commands::restore_codex_unified_history,
             commands::get_rectifier_config,
@@ -2178,7 +2198,8 @@ async fn enabled_proxy_apps_on_startup(db: &database::Database) -> Vec<&'static 
     apps
 }
 
-async fn restore_proxy_state_on_startup(state: &store::AppState) {
+async fn restore_proxy_state_on_startup(state: &store::AppState) -> bool {
+    let mut codex_ready = true;
     match state
         .proxy_service
         .reconcile_codex_owned_projection_on_startup()
@@ -2186,7 +2207,10 @@ async fn restore_proxy_state_on_startup(state: &store::AppState) {
     {
         Ok(true) => log::info!("✓ 已对账 CCSwitchMulti 自有 Codex 模型目录"),
         Ok(false) => log::debug!("Codex 未使用 CCSwitchMulti 自有模型目录，跳过启动对账"),
-        Err(e) => log::warn!("启动时对账 Codex 模型目录失败: {e}"),
+        Err(e) => {
+            codex_ready = false;
+            log::warn!("启动时对账 Codex 模型目录失败: {e}");
+        }
     }
 
     match crate::proxy::external_openai_api::load_profile(&state.db) {
@@ -2209,7 +2233,7 @@ async fn restore_proxy_state_on_startup(state: &store::AppState) {
 
     if apps_to_restore.is_empty() {
         log::debug!("启动时没有需要恢复的 app takeover");
-        return;
+        return codex_ready;
     }
 
     log::info!("检测到上次代理状态需要恢复，应用列表: {apps_to_restore:?}");
@@ -2256,6 +2280,9 @@ async fn restore_proxy_state_on_startup(state: &store::AppState) {
                 services::recovery_outcome::record_best_effort(outcome);
             }
             Err(e) => {
+                if app_type == "codex" {
+                    codex_ready = false;
+                }
                 log::error!("✗ 恢复 {app_type} 的代理接管状态失败: {e}");
                 let mut outcome = services::recovery_outcome::RecoveryOutcome::for_app(
                     "startup_takeover_restore",
@@ -2272,6 +2299,7 @@ async fn restore_proxy_state_on_startup(state: &store::AppState) {
             }
         }
     }
+    codex_ready
 }
 
 fn initialize_common_config_snippets(state: &store::AppState) {

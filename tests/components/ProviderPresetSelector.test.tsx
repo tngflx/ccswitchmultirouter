@@ -452,13 +452,13 @@ describe("ProviderPresetSelector", () => {
     expect(icon?.getAttribute("data-color")).toBe("#D4915D");
   });
 
-  it("preset 无 icon 且无 theme.icon 时,按钮内仍渲染占位元素保持文字对齐", () => {
+  it("preset 无可用图标时,按钮内仍渲染占位元素保持文字对齐", () => {
     const entriesWithoutIcon = [
       {
         id: "no-icon",
         preset: {
           name: "No Icon",
-          websiteUrl: "https://noicon.example.com",
+          websiteUrl: "not-a-url",
           settingsConfig: {},
           category: "official" as ProviderCategory,
         },

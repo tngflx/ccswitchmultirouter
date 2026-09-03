@@ -697,7 +697,7 @@ describe("CodexFormFields local model routing", () => {
     ).toHaveAttribute("aria-pressed", "false");
   });
 
-  it("renders route availability as an accessible status light", () => {
+  it("renders provider catalog inclusion as an accessible status light", () => {
     renderCatalogHarness([
       { model: "routable-model" },
       { model: "excluded-model", enabled: false },
@@ -705,14 +705,14 @@ describe("CodexFormFields local model routing", () => {
 
     expect(
       screen.getByRole("status", {
-        name: "routable-model: Enabled",
+        name: "routable-model: Used",
       }),
     ).toBeInTheDocument();
     expect(
       screen.getByRole("status", {
-        name: "excluded-model: Disabled",
+        name: "excluded-model: Not used",
       }),
-    ).toBeInTheDocument();
+    ).toHaveClass("bg-destructive/15");
   });
 
   it("keeps the model catalog in normal settings before model reasoning", () => {
@@ -858,7 +858,8 @@ describe("CodexFormFields local model routing", () => {
       presetCatalogModels: [preset],
     });
 
-    expect(screen.getAllByText("文本与图像").length).toBeGreaterThan(0);
+    expect(screen.getByText("文本与图像")).toBeInTheDocument();
+    expect(screen.getByText("仅文本")).toBeInTheDocument();
     expect(
       screen.getByRole("button", {
         name: "preset-vision-model 文本与图像",
@@ -1618,6 +1619,40 @@ describe("CodexFormFields local model routing", () => {
     ).toBeVisible();
     expect(screen.getByRole("dialog")).toHaveClass("z-[200]");
     expect(screen.getByText("确认测试 Chat / Responses")).toBeInTheDocument();
+  });
+
+  it("keeps Light and Deep mode selection visible and distinct in the confirmation modal", () => {
+    renderCatalogHarness([{ model: "gpt-5.5", upstreamModel: "gpt-5.5" }], {
+      shouldShowSpeedTest: true,
+      openAdvancedOptions: false,
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "高级选项" }));
+    prepareAndOpenProtocolProbe();
+
+    const dialog = screen.getByRole("dialog");
+    const light = within(dialog).getByRole("button", { name: "Light" });
+    const deep = within(dialog).getByRole("button", { name: "Deep" });
+
+    expect(light).toHaveAttribute("aria-pressed", "false");
+    expect(deep).toHaveAttribute("aria-pressed", "true");
+    expect(deep.className).toContain("dark:bg-blue-500");
+    expect(deep.className).toContain("dark:text-white");
+    expect(
+      within(dialog).getByText(
+        "Deep also verifies streaming, reasoning, tool calls, and tool continuation.",
+      ),
+    ).toBeInTheDocument();
+
+    fireEvent.click(light);
+
+    expect(light).toHaveAttribute("aria-pressed", "true");
+    expect(deep).toHaveAttribute("aria-pressed", "false");
+    expect(
+      within(dialog).getByText(
+        "Light sends one minimal request to Responses and Chat per model. It checks basic model availability only.",
+      ),
+    ).toBeInTheDocument();
   });
 
   it("blocks protocol probing until a model catalog exists", () => {

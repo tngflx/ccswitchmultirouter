@@ -867,6 +867,217 @@ pub(crate) async fn submit_codex_continuation() -> Result<CodexContinuationResul
     })
 }
 
+/// Result of asking the live Codex Desktop renderer to compact a thread and
+/// fork the compacted state into a new persisted session.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct CodexCompactRestartResult {
+    pub completed: bool,
+    pub new_thread_id: String,
+    pub debug_port: u16,
+    pub target_id: String,
+}
+
+/// Compact and fork through the request client owned by Codex Desktop.
+///
+/// This deliberately refuses to launch a second app-server or manipulate
+/// rollout files. The renderer waits for the native compaction item before
+/// forking, so the new session begins from the compacted server-owned state.
+pub(crate) async fn compact_and_restart_codex_session(
+    thread_id: &str,
+) -> Result<CodexCompactRestartResult, String> {
+    if thread_id.trim().is_empty() {
+        return Err("A Codex thread id is required".to_string());
+    }
+    let thread_id_json =
+        serde_json::to_string(thread_id).map_err(|error| format!("Invalid thread id: {error}"))?;
+    let start_script = format!(
+        r#"(() => {{
+          const state = window[{patch_key:?}];
+          if (!state || typeof state.startCompactAndRestartSession !== 'function') {{
+            return {{started:false, reason:'CCSwitchMulti Codex Desktop compatibility layer is not ready'}};
+          }}
+          try {{
+            return state.startCompactAndRestartSession({thread_id_json});
+          }} catch (error) {{
+            return {{started:false, reason:String(error?.message || error)}};
+          }}
+        }})()"#,
+        patch_key = MODEL_PICKER_PATCH_KEY,
+    );
+    let attempted_ports = candidate_debug_ports(DEFAULT_CODEX_DEBUG_PORT);
+    let mut diagnostics = Vec::new();
+    for port in attempted_ports.iter().copied() {
+        let targets = match list_cdp_targets(port).await {
+            Ok(value) => value,
+            Err(error) => {
+                diagnostics.push(format!("port {port}: {error}"));
+                continue;
+            }
+        };
+        let targets = match pick_codex_page_targets(&targets, port) {
+            Ok(value) => value,
+            Err(error) => {
+                diagnostics.push(format!("port {port}: {error}"));
+                continue;
+            }
+        };
+        for target in targets {
+            let Some(ws) = target.web_socket_debugger_url.clone() else {
+                continue;
+            };
+            let (socket, _) =
+                match tokio::time::timeout(CDP_CONNECT_TIMEOUT, connect_async(&ws)).await {
+                    Ok(Ok(value)) => value,
+                    Ok(Err(error)) => {
+                        diagnostics.push(format!(
+                            "target {}: failed to connect Codex Desktop CDP: {error}",
+                            target.id
+                        ));
+                        continue;
+                    }
+                    Err(_) => {
+                        diagnostics.push(format!(
+                            "target {}: timed out connecting Codex Desktop CDP",
+                            target.id
+                        ));
+                        continue;
+                    }
+                };
+            let mut session = CdpSession::new(socket);
+            let evaluation = match session
+                .send_command(
+                    1,
+                    "Runtime.evaluate",
+                    json!({
+                        "expression": start_script,
+                        "awaitPromise": false,
+                        "returnByValue": true,
+                        "allowUnsafeEvalBlockedByCSP": true
+                    }),
+                )
+                .await
+            {
+                Ok(value) => value,
+                Err(error) => {
+                    diagnostics.push(format!("target {}: {error}", target.id));
+                    continue;
+                }
+            };
+            if let Some(exception) = evaluation
+                .get("result")
+                .and_then(|result| result.get("exceptionDetails"))
+            {
+                diagnostics.push(format!(
+                    "target {}: CDP evaluation failed: {exception}",
+                    target.id
+                ));
+                continue;
+            }
+            let value = evaluation
+                .pointer("/result/result/value")
+                .cloned()
+                .unwrap_or(Value::Null);
+            let started = value
+                .get("started")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let job_id = value
+                .get("jobId")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            if !started || job_id.is_empty() {
+                let reason = value
+                    .get("reason")
+                    .and_then(Value::as_str)
+                    .unwrap_or("Codex Desktop did not start compaction");
+                diagnostics.push(format!("target {}: {reason}", target.id));
+                continue;
+            }
+
+            let job_id_json = serde_json::to_string(&job_id)
+                .map_err(|error| format!("Invalid compact job id: {error}"))?;
+            let poll_script = format!(
+                r#"(() => {{
+                  const state = window[{patch_key:?}];
+                  if (!state || typeof state.readCompactRestartJob !== 'function') return null;
+                  return state.readCompactRestartJob({job_id_json});
+                }})()"#,
+                patch_key = MODEL_PICKER_PATCH_KEY,
+            );
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(100);
+            let mut command_id = 2;
+            loop {
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(format!(
+                        "target {}: timed out waiting for native Codex compaction job",
+                        target.id
+                    ));
+                }
+                tokio::time::sleep(Duration::from_millis(750)).await;
+                let evaluation = match session
+                    .send_command(
+                        command_id,
+                        "Runtime.evaluate",
+                        json!({
+                            "expression": poll_script,
+                            "awaitPromise": false,
+                            "returnByValue": true,
+                            "allowUnsafeEvalBlockedByCSP": true
+                        }),
+                    )
+                    .await
+                {
+                    Ok(value) => value,
+                    Err(error) => {
+                        return Err(format!("target {}: {error}", target.id));
+                    }
+                };
+                command_id += 1;
+                let value = evaluation
+                    .pointer("/result/result/value")
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                match value.get("status").and_then(Value::as_str) {
+                    Some("completed") => {
+                        let new_thread_id = value
+                            .pointer("/result/newThreadId")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_string();
+                        if new_thread_id.is_empty() {
+                            return Err(format!(
+                                "target {}: Codex completed compaction without a new session id",
+                                target.id
+                            ));
+                        }
+                        return Ok(CodexCompactRestartResult {
+                            completed: true,
+                            new_thread_id,
+                            debug_port: port,
+                            target_id: target.id,
+                        });
+                    }
+                    Some("failed") => {
+                        let reason = value
+                            .get("reason")
+                            .and_then(Value::as_str)
+                            .unwrap_or("Codex Desktop compaction job failed");
+                        return Err(format!("target {}: {reason}", target.id));
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    Err(if diagnostics.is_empty() {
+        "No Codex Desktop CDP target was found".to_string()
+    } else {
+        diagnostics.join("; ")
+    })
+}
+
 /// 生成去重后的 CDP 端口探测列表。
 pub(crate) fn candidate_debug_ports(preferred: u16) -> Vec<u16> {
     let mut ports = vec![preferred, DEFAULT_CODEX_DEBUG_PORT, 9222, 9223, 9230, 9231];
@@ -1088,6 +1299,100 @@ fn model_picker_patch_core_script() -> &'static str {
     CODEX_MODEL_PICKER_CORE_SCRIPT
 }
 
+/// Keep model-whitelist projection out of unrelated Statsig configs and repair
+/// request-local Guardian V2 overrides produced by older renderer wrappers.
+fn guardian_v2_compatibility_patch_core_script() -> &'static str {
+    r#"
+  const guardianV2DynamicConfigName = "2553103476";
+  const guardianV2FlatFeatureKey = "features.guardianv2";
+  const statsigModelWhitelistConfigName = "107580212";
+  const legacyModelWhitelistFields = ["available_models", "use_hidden_models", "default_model"];
+  const guardianV2Enabled = (value) => value?.enabled === true;
+  const isGuardianV2StructuredValue = (value) => Boolean(value) && typeof value === "object" && !Array.isArray(value);
+  const stripLegacyModelWhitelistPollution = (config) => {
+    const value = config?.value;
+    if (!isGuardianV2StructuredValue(value) || !legacyModelWhitelistFields.some((key) => Object.prototype.hasOwnProperty.call(value, key))) return config;
+    const nextValue = { ...value };
+    for (const key of legacyModelWhitelistFields) delete nextValue[key];
+    return { ...config, value: nextValue };
+  };
+  const patchGuardianV2DynamicConfig = (name, config) => {
+    if (String(name || "") !== guardianV2DynamicConfigName) return config;
+    return stripLegacyModelWhitelistPollution(config);
+  };
+  const prepareStatsigDynamicConfig = (name, config, repairLegacyPollution = false) => {
+    const normalizedName = String(name || "");
+    config = patchGuardianV2DynamicConfig(normalizedName, config);
+    if (normalizedName === statsigModelWhitelistConfigName) {
+      return { config, patchModelWhitelist: true };
+    }
+    return {
+      config: repairLegacyPollution ? stripLegacyModelWhitelistPollution(config) : config,
+      patchModelWhitelist: false,
+    };
+  };
+  const isGuardianV2FeatureTomlError = (error) => {
+    const message = String(error?.message || error || "");
+    return message.includes("FeatureToml") && message.includes("features.guardianv2");
+  };
+  const downgradeGuardianV2Config = (config) => {
+    if (!config || typeof config !== "object" || Array.isArray(config)) return config;
+    let next = config;
+    let changed = false;
+    const flat = config[guardianV2FlatFeatureKey];
+    if (isGuardianV2StructuredValue(flat)) {
+      next = { ...next, [guardianV2FlatFeatureKey]: guardianV2Enabled(flat) };
+      changed = true;
+    }
+    const features = config.features;
+    if (isGuardianV2StructuredValue(features) && isGuardianV2StructuredValue(features.guardianv2)) {
+      if (!changed) next = { ...next };
+      next.features = { ...features, guardianv2: guardianV2Enabled(features.guardianv2) };
+      changed = true;
+    }
+    return changed ? next : config;
+  };
+  const guardianV2FallbackRequestParams = (method, params) => {
+    const wrapped = method === "send-cli-request-for-host" && params?.params && typeof params.params === "object";
+    const requestParams = wrapped ? params.params : params;
+    if (!requestParams || typeof requestParams !== "object" || Array.isArray(requestParams)) return params;
+    const nextConfig = downgradeGuardianV2Config(requestParams.config);
+    if (nextConfig === requestParams.config) return params;
+    const nextRequestParams = { ...requestParams, config: nextConfig };
+    return wrapped ? { ...params, params: nextRequestParams } : nextRequestParams;
+  };
+"#
+}
+
+/// Count native compaction items by their structured item type. Thread payloads
+/// may contain arbitrary user/tool text, so serialized substring matching is
+/// not a valid completion signal.
+fn codex_compaction_item_core_script() -> &'static str {
+    r#"
+  const isNativeCompactionItem = (value) =>
+    Boolean(value) &&
+    typeof value === "object" &&
+    !Array.isArray(value) &&
+    (value.type === "contextCompaction" || value.type === "context_compaction");
+  const countCompactionItems = (root) => {
+    const seen = new WeakSet();
+    let count = 0;
+    const visit = (value) => {
+      if (!value || typeof value !== "object" || seen.has(value)) return;
+      seen.add(value);
+      if (isNativeCompactionItem(value)) count += 1;
+      if (Array.isArray(value)) {
+        for (const item of value) visit(item);
+        return;
+      }
+      for (const item of Object.values(value)) visit(item);
+    };
+    visit(root);
+    return count;
+  };
+"#
+}
+
 /// 构造 renderer 注入脚本：触发新版本地历史目录同步，并修复模型白名单和缓存。
 ///
 /// JavaScript lives beside this file so the browser payload and QuickJS regression
@@ -1100,6 +1405,14 @@ fn build_model_picker_unlock_script(catalog: &CodexModelCatalogProjection) -> St
         .replace(
             "__CODEX_MODEL_PICKER_CORE__",
             model_picker_patch_core_script(),
+        )
+        .replace(
+            "__CODEX_GUARDIAN_V2_COMPAT_CORE__",
+            guardian_v2_compatibility_patch_core_script(),
+        )
+        .replace(
+            "__CODEX_COMPACTION_ITEM_CORE__",
+            codex_compaction_item_core_script(),
         )
 }
 
@@ -2258,6 +2571,21 @@ mod tests {
         assert!(script.contains("MutationObserver"));
     }
 
+    #[test]
+    fn generated_codex_app_compat_script_has_valid_javascript_syntax() {
+        let runtime = rquickjs::Runtime::new().expect("create JavaScript runtime");
+        let context = rquickjs::Context::full(&runtime).expect("create JavaScript context");
+        let script = build_model_picker_unlock_script(&CodexModelCatalogProjection::empty());
+        let script_json = serde_json::to_string(&script).expect("serialize compatibility script");
+
+        context.with(|ctx| {
+            let parsed: bool = ctx
+                .eval(format!("new Function({script_json}); true"))
+                .expect("generated compatibility script should parse");
+            assert!(parsed);
+        });
+    }
+
     fn run_model_picker_patch_core_probe(probe: &str) -> serde_json::Value {
         run_model_picker_patch_core_probe_with_payload(
             json!({
@@ -2289,6 +2617,171 @@ mod tests {
             let json_text: String = ctx.eval(script).expect("execute model picker patch core");
             serde_json::from_str(&json_text).expect("parse model picker patch probe result")
         })
+    }
+
+    fn run_guardian_v2_compatibility_probe(probe: &str) -> serde_json::Value {
+        let runtime = rquickjs::Runtime::new().expect("create JavaScript runtime");
+        let context = rquickjs::Context::full(&runtime).expect("create JavaScript context");
+        let script = format!(
+            "{}\n{}",
+            guardian_v2_compatibility_patch_core_script(),
+            probe
+        );
+
+        context.with(|ctx| {
+            let json_text: String = ctx
+                .eval(script)
+                .expect("execute Guardian V2 compatibility core");
+            serde_json::from_str(&json_text).expect("parse Guardian V2 compatibility result")
+        })
+    }
+
+    fn run_compaction_item_probe(probe: &str) -> serde_json::Value {
+        let runtime = rquickjs::Runtime::new().expect("create JavaScript runtime");
+        let context = rquickjs::Context::full(&runtime).expect("create JavaScript context");
+        let script = format!("{}\n{}", codex_compaction_item_core_script(), probe);
+
+        context.with(|ctx| {
+            let json_text: String = ctx
+                .eval(script)
+                .expect("execute native compaction item detector");
+            serde_json::from_str(&json_text).expect("parse compaction item detector result")
+        })
+    }
+
+    #[test]
+    fn guardian_v2_compatibility_downgrades_only_the_rejected_request_override() {
+        let result = run_guardian_v2_compatibility_probe(
+            r#"
+const direct = {
+  threadId: "thread-1",
+  config: {
+    "features.guardianv2": { enabled: true, future_field: "unsupported" },
+    "features.memories": true,
+  },
+};
+const wrapped = {
+  method: "thread/resume",
+  params: {
+    threadId: "thread-2",
+    config: { features: { guardianv2: { enabled: false, future_field: 1 }, goals: true } },
+  },
+};
+const directFallback = guardianV2FallbackRequestParams("thread/resume", direct);
+const wrappedFallback = guardianV2FallbackRequestParams("send-cli-request-for-host", wrapped);
+JSON.stringify({
+  directValue: directFallback.config["features.guardianv2"],
+  directMemories: directFallback.config["features.memories"],
+  directOriginalStillObject: typeof direct.config["features.guardianv2"] === "object",
+  wrappedValue: wrappedFallback.params.config.features.guardianv2,
+  wrappedGoals: wrappedFallback.params.config.features.goals,
+  wrappedOriginalStillObject: typeof wrapped.params.config.features.guardianv2 === "object",
+  unrelatedIdentityPreserved: guardianV2FallbackRequestParams("thread/resume", {config: {"features.memories": true}}).config["features.memories"],
+});
+"#,
+        );
+
+        assert_eq!(result["directValue"], true);
+        assert_eq!(result["directMemories"], true);
+        assert_eq!(result["directOriginalStillObject"], true);
+        assert_eq!(result["wrappedValue"], false);
+        assert_eq!(result["wrappedGoals"], true);
+        assert_eq!(result["wrappedOriginalStillObject"], true);
+        assert_eq!(result["unrelatedIdentityPreserved"], true);
+    }
+
+    #[test]
+    fn guardian_v2_compatibility_retries_only_the_exact_feature_schema_failure() {
+        let result = run_guardian_v2_compatibility_probe(
+            r#"
+JSON.stringify({
+  exact: isGuardianV2FeatureTomlError({message: "failed to load configuration: data did not match any variant of untagged enum FeatureToml\nin `features.guardianv2`"}),
+  otherFeature: isGuardianV2FeatureTomlError({message: "FeatureToml in `features.memories`"}),
+  network: isGuardianV2FeatureTomlError({message: "connection reset"}),
+});
+"#,
+        );
+
+        assert_eq!(result["exact"], true);
+        assert_eq!(result["otherFeature"], false);
+        assert_eq!(result["network"], false);
+    }
+
+    #[test]
+    fn guardian_v2_statsig_config_removes_only_legacy_model_whitelist_pollution() {
+        let result = run_guardian_v2_compatibility_probe(
+            r#"
+const source = {value: {
+  enabled: true,
+  mode: "future",
+  nested: {unknown: true},
+  available_models: ["qwen3.8"],
+  use_hidden_models: false,
+  default_model: "qwen3.8",
+}};
+const patched = patchGuardianV2DynamicConfig("2553103476", source);
+const unrelated = {value: {enabled: true, mode: "keep"}};
+JSON.stringify({
+  patchedValue: patched.value,
+  sourceValue: source.value,
+  unrelatedIdentity: patchGuardianV2DynamicConfig("other", unrelated) === unrelated,
+});
+"#,
+        );
+
+        assert_eq!(
+            result["patchedValue"],
+            json!({ "enabled": true, "mode": "future", "nested": { "unknown": true } })
+        );
+        assert_eq!(
+            result["sourceValue"],
+            json!({
+                "enabled": true,
+                "mode": "future",
+                "nested": { "unknown": true },
+                "available_models": ["qwen3.8"],
+                "use_hidden_models": false,
+                "default_model": "qwen3.8"
+            })
+        );
+        assert_eq!(result["unrelatedIdentity"], true);
+    }
+
+    #[test]
+    fn statsig_model_whitelist_fields_are_scoped_to_their_dynamic_config() {
+        let result = run_guardian_v2_compatibility_probe(
+            r#"
+const model = {value: {available_models: []}};
+const unrelated = {value: {enabled: true}};
+const legacy = {value: {enabled: true, available_models: ["qwen3.8"], default_model: "qwen3.8", use_hidden_models: false}};
+const modelPrepared = prepareStatsigDynamicConfig("107580212", model, false);
+const unrelatedPrepared = prepareStatsigDynamicConfig("unrelated", unrelated, false);
+const repairedPrepared = prepareStatsigDynamicConfig("unrelated", legacy, true);
+JSON.stringify({
+  modelPatch: modelPrepared.patchModelWhitelist,
+  unrelatedPatch: unrelatedPrepared.patchModelWhitelist,
+  unrelatedIdentity: unrelatedPrepared.config === unrelated,
+  repairedPatch: repairedPrepared.patchModelWhitelist,
+  repairedValue: repairedPrepared.config.value,
+  legacyOriginalKeys: Object.keys(legacy.value).sort(),
+});
+"#,
+        );
+
+        assert_eq!(result["modelPatch"], true);
+        assert_eq!(result["unrelatedPatch"], false);
+        assert_eq!(result["unrelatedIdentity"], true);
+        assert_eq!(result["repairedPatch"], false);
+        assert_eq!(result["repairedValue"], json!({ "enabled": true }));
+        assert_eq!(
+            result["legacyOriginalKeys"],
+            json!([
+                "available_models",
+                "default_model",
+                "enabled",
+                "use_hidden_models"
+            ])
+        );
     }
 
     #[test]
@@ -2519,7 +3012,11 @@ JSON.stringify({
         assert!(script.contains("await installAppServerPatch()"));
         assert!(script.contains("!state.requestIds.has(requestId)"));
         assert!(script.contains("__ccSwitchCodexAppCompat"));
-        assert!(script.contains("__ccSwitchModelRequestPatch === \"2\""));
+        assert!(script.contains("__ccSwitchModelRequestPatch === \"3\""));
+        assert!(script.contains("client.__ccSwitchStatsigPatchVersion !== \"2\""));
+        assert!(script.contains("2553103476"));
+        assert!(script.contains("isGuardianV2FeatureTomlError(error)"));
+        assert!(script.contains("guardianV2FallbackRequestParams"));
         assert!(script.contains("auth.setAuthMethod(\"chatgpt\")"));
     }
 
@@ -2546,6 +3043,54 @@ JSON.stringify({
         assert!(script.contains(r#"names.has("waitForPendingThreadSettingsUpdate")"#));
         assert!(script.contains("fiber.updateQueue?.memoCache?.data"));
         assert!(script.contains("state.appServerClients"));
+    }
+
+    #[test]
+    fn compatibility_script_compacts_before_forking_a_new_session() {
+        let script = build_model_picker_unlock_script(&CodexModelCatalogProjection::empty());
+
+        let compact = script
+            .find(r#"client.sendRequest("thread/compact/start""#)
+            .expect("native compaction request");
+        let wait_for_item = script
+            .find("countCompactionItems(current) > beforeCompactions")
+            .expect("native compaction completion wait");
+        let fork = script
+            .find(r#"client.sendRequest("thread/fork""#)
+            .expect("fork request");
+        assert!(compact < wait_for_item);
+        assert!(wait_for_item < fork);
+        assert!(script.contains(r#"config: { model_reasoning_effort: "medium" }"#));
+        assert!(script.contains("state.startCompactAndRestartSession"));
+        assert!(script.contains("state.readCompactRestartJob"));
+        assert!(script.contains("await triggerLocalThreadCatalogSync()"));
+        assert!(!script.contains("thread/delete"));
+        assert!(!script.contains("thread/archive"));
+    }
+
+    #[test]
+    fn compaction_completion_detector_counts_only_structured_native_items() {
+        let result = run_compaction_item_probe(
+            r#"
+const cycle = {type: "message", content: "contextCompaction context_compaction"};
+cycle.self = cycle;
+JSON.stringify({
+  arbitraryText: countCompactionItems(cycle),
+  nativeItems: countCompactionItems({
+    thread: {
+      turns: [
+        {items: [{type: "contextCompaction"}]},
+        {items: [{type: "context_compaction"}]},
+        {items: [{type: "message", content: "contextCompaction"}]},
+      ],
+    },
+  }),
+});
+"#,
+        );
+
+        assert_eq!(result["arbitraryText"], 0);
+        assert_eq!(result["nativeItems"], 2);
     }
 
     #[test]
