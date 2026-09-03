@@ -80,7 +80,7 @@ struct TokenUsageSignature {
     last: Option<TokenCountersSignature>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct TimestampedTokenSignature {
     timestamp: DateTime<Utc>,
     signature: TokenUsageSignature,
@@ -157,12 +157,16 @@ impl ParentTokenTimeline {
                 parent_path.display()
             ));
         }
-        Ok(self
+        Ok(self.signatures_at(cutoff))
+    }
+
+    fn signatures_at(&self, cutoff: DateTime<Utc>) -> Vec<TokenUsageSignature> {
+        self
             .events
             .iter()
             .filter(|event| event.timestamp <= cutoff)
             .map(|event| event.signature.clone())
-            .collect())
+            .collect()
     }
 }
 
@@ -407,6 +411,12 @@ fn rollout_filename_identity(path: &Path) -> Option<RolloutFilenameIdentity> {
 
 fn thread_id_from_filename(path: &Path) -> Option<String> {
     rollout_filename_identity(path).map(|identity| identity.thread_id)
+}
+
+fn leading_thread_id_from_filename(path: &Path) -> Option<String> {
+    rollout_filename_identity(path).and_then(|identity| {
+        (identity.root_meta_id != identity.thread_id).then_some(identity.root_meta_id)
+    })
 }
 
 fn explicit_parent_from_meta(payload: &serde_json::Value) -> ParentResolution {
@@ -746,6 +756,9 @@ fn build_rollout_index(files: &[PathBuf]) -> RolloutIndex {
         if let Some(thread_id) = thread_id_from_filename(path) {
             index.entry(thread_id).or_default().push(path.clone());
         }
+        if let Some(thread_id) = leading_thread_id_from_filename(path) {
+            index.entry(thread_id).or_default().push(path.clone());
+        }
     }
     for paths in index.values_mut() {
         paths.sort();
@@ -1079,19 +1092,28 @@ fn resolve_parent_signatures(
         return Err(format!("找不到父 rollout: {parent_id}"));
     };
 
-    let mut snapshots = Vec::with_capacity(candidates.len());
-    for candidate in candidates {
-        snapshots.push(parent_signatures_before(candidate, cutoff)?);
+    let mut ordered = candidates.iter().collect::<Vec<_>>();
+    ordered.sort();
+    let mut merged = Vec::new();
+    let mut seen_rollouts: HashMap<String, Vec<TokenUsageSignature>> = HashMap::new();
+    for candidate in ordered {
+        let rollout_id = thread_id_from_filename(candidate).unwrap_or_default();
+        let snapshot = parent_signatures_before(candidate, cutoff)?;
+        if let Some(existing) = seen_rollouts.get(&rollout_id) {
+            if existing != &snapshot {
+                return Err(format!(
+                    "父 rollout UUID {parent_id} 对应多个内容不一致的文件"
+                ));
+            }
+            continue;
+        }
+        seen_rollouts.insert(rollout_id, snapshot.clone());
+        merged.extend(snapshot);
     }
-    let Some(first) = snapshots.first() else {
+    if merged.is_empty() && candidates.is_empty() {
         return Err(format!("找不到父 rollout: {parent_id}"));
-    };
-    if snapshots.iter().skip(1).any(|snapshot| snapshot != first) {
-        return Err(format!(
-            "父 rollout UUID {parent_id} 对应多个内容不一致的文件"
-        ));
     }
-    Ok(first.clone())
+    Ok(merged)
 }
 
 fn matching_replay_prefix(child: &[ParsedTokenEvent], parent: &[TokenUsageSignature]) -> usize {
@@ -2764,6 +2786,20 @@ mod tests {
             format!("{CODEX_THREAD_REQUEST_ID_PREFIX}:{CHILD_A_ID}:1")
         );
         Ok(())
+    }
+
+    #[test]
+    fn test_paginated_filename_is_indexed_under_leading_thread_id() {
+        let page = PathBuf::from(format!(
+            "rollout-2026-09-03T00-00-00-{PARENT_ID}_{CHILD_A_ID}.jsonl"
+        ));
+        let index = build_rollout_index(std::slice::from_ref(&page));
+        assert!(index
+            .get(PARENT_ID)
+            .is_some_and(|paths| paths.contains(&page)));
+        assert!(index
+            .get(CHILD_A_ID)
+            .is_some_and(|paths| paths.contains(&page)));
     }
 
     #[test]
