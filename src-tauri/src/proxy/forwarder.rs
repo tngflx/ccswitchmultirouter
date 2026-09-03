@@ -2321,6 +2321,9 @@ impl RequestForwarder {
 
         // 与 CCH 对齐：请求前不做 thinking 主动改写（仅保留兼容入口）
         let mut mapped_body = normalize_thinking_type(mapped_body);
+        if matches!(app_type, AppType::Codex | AppType::GrokBuild) {
+            mapped_body = sanitize_codex_orphan_function_call_outputs(mapped_body);
+        }
 
         if should_project_codex_agent_messages_for_provider(app_type, provider, endpoint) {
             let projected =
@@ -5957,6 +5960,36 @@ fn extract_json_error_message(body: &Value) -> Option<String> {
         .find_map(|value| value.as_str().map(ToString::to_string))
 }
 
+/// Remove Codex automation outputs that have no matching call id.
+///
+/// Strict Responses providers reject these items, and Chat conversion cannot
+/// produce a valid tool message without a corresponding `tool_call_id`.
+pub(crate) fn sanitize_codex_orphan_function_call_outputs(mut body: Value) -> Value {
+    for key in ["input", "messages", "contents"] {
+        let Some(items) = body.get_mut(key).and_then(Value::as_array_mut) else {
+            continue;
+        };
+        items.retain(|item| {
+            if item.get("type").and_then(Value::as_str) != Some("function_call_output") {
+                return true;
+            }
+            let has_call_id = item
+                .get("call_id")
+                .and_then(Value::as_str)
+                .is_some_and(|call_id| !call_id.trim().is_empty());
+            if !has_call_id {
+                log::debug!(
+                    "[Codex] Dropping function_call_output lacking call_id: id={:?}, name={:?}",
+                    item.get("id"),
+                    item.get("name")
+                );
+            }
+            has_call_id
+        });
+    }
+    body
+}
+
 fn split_endpoint_and_query(endpoint: &str) -> (&str, Option<&str>) {
     endpoint
         .split_once('?')
@@ -8571,6 +8604,22 @@ fn codex_realtime_multipart_field_name(headers: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn sanitize_codex_orphan_function_call_outputs_drops_missing_call_id() {
+        let body = serde_json::json!({
+            "input": [
+                {"type": "message", "role": "user"},
+                {"type": "function_call_output", "id": "fco_orphan", "name": "automation_update"},
+                {"type": "function_call_output", "call_id": "call_valid", "output": "ok"}
+            ]
+        });
+
+        let sanitized = sanitize_codex_orphan_function_call_outputs(body);
+        let input = sanitized["input"].as_array().expect("input array");
+        assert_eq!(input.len(), 2);
+        assert_eq!(input[1]["call_id"], "call_valid");
+    }
+
     use super::*;
     use crate::provider::{LocalProxyRequestOverrides, ProviderMeta};
     use crate::proxy::providers::codex_oauth_auth::CodexAccountPoolEntry;
