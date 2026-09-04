@@ -2,9 +2,10 @@ import { describe, expect, it } from "vitest";
 import {
   inferProviderIcon,
   inferProviderIconFromConfig,
+  resolveProviderDisplayIcon,
   resolveProviderIcon,
 } from "./providerIcon";
-import { providerFaviconUrl } from "./providerIcon";
+import { getIconMetadata, hasIcon, isUrlIcon } from "@/icons/extracted";
 
 describe("resolveProviderIcon", () => {
   it("clears the legacy automatic Grok Build icon", () => {
@@ -26,27 +27,61 @@ describe("resolveProviderIcon", () => {
     expect(resolveProviderIcon("grokbuild", "  ", "")).toBeUndefined();
   });
 
-  it("derives a favicon URL from an API origin", () => {
+  it("leaves unknown providers to the initials fallback", () => {
     expect(
-      providerFaviconUrl("https://api.example.com/v1/chat/completions"),
-    ).toBe(
-      "https://www.google.com/s2/favicons?domain_url=https%3A%2F%2Fapi.example.com&sz=64",
-    );
+      inferProviderIcon(
+        undefined,
+        "https://api.example.com/v1/chat/completions",
+      ),
+    ).toBeUndefined();
+    expect(inferProviderIcon(undefined, "not-a-url")).toBeUndefined();
   });
 
-  it("ignores non-web API endpoints", () => {
-    expect(providerFaviconUrl("not-a-url")).toBeUndefined();
-    expect(providerFaviconUrl("file:///tmp/provider")).toBeUndefined();
-  });
-
-  it("uses the Sublyx website favicon for Sublyx API origins", () => {
+  it("uses the bundled Sublyx vector for Sublyx API origins", () => {
     expect(
       inferProviderIcon(
         undefined,
         "https://api.sublyx.org/v1",
         "https://sublyx.org",
       ),
-    ).toBe("https://sublyx.org/favicon.ico");
+    ).toBe("sublyx");
+  });
+
+  it("registers Sublyx as a bundled vector icon", () => {
+    expect(hasIcon("sublyx")).toBe(true);
+    expect(isUrlIcon("sublyx")).toBe(true);
+    expect(getIconMetadata("sublyx")?.displayName).toBe("Sublyx");
+  });
+
+  it("resolves the bundled icon for a legacy ProviderCard record", () => {
+    expect(
+      resolveProviderDisplayIcon("codex", {
+        name: "Sublyx Legacy",
+        settingsConfig: {
+          config:
+            '[model_providers.sublyx]\nbase_url = "https://api.sublyx.org/v1"',
+        },
+      }),
+    ).toBe("sublyx");
+  });
+
+  it("upgrades a persisted low-resolution Sublyx favicon", () => {
+    expect(inferProviderIcon("https://sublyx.org/favicon.ico")).toBe("sublyx");
+  });
+
+  it("resolves known providers to bundled icons before generic favicons", () => {
+    expect(inferProviderIcon(undefined, "https://api.openrouter.ai/v1")).toBe(
+      "openrouter",
+    );
+    expect(inferProviderIcon(undefined, "https://api.deepseek.com/v1")).toBe(
+      "deepseek",
+    );
+  });
+
+  it("infers a known icon by provider name when legacy config has no URL", () => {
+    expect(
+      inferProviderIconFromConfig(undefined, {}, undefined, "Sublyx Primary"),
+    ).toBe("sublyx");
   });
 
   it("extracts and persists an API icon from nested provider config", () => {
@@ -55,6 +90,6 @@ describe("resolveProviderIcon", () => {
         config:
           '[model_providers.custom]\nbase_url = "https://api.sublyx.org/v1"',
       }),
-    ).toBe("https://sublyx.org/favicon.ico");
+    ).toBe("sublyx");
   });
 });

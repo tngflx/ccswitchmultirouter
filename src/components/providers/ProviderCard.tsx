@@ -29,7 +29,7 @@ import {
 } from "@/utils/providerCapabilities";
 import { useProviderHealth } from "@/lib/query/failover";
 import { useUsageQuery } from "@/lib/query/queries";
-import { providerFaviconUrl, resolveProviderIcon } from "@/utils/providerIcon";
+import { resolveProviderDisplayIcon } from "@/utils/providerIcon";
 
 interface DragHandleProps {
   attributes: DraggableAttributes;
@@ -202,36 +202,6 @@ const extractApiUrl = (provider: Provider, fallbackText: string) => {
   return fallbackText;
 };
 
-const extractProviderFaviconSource = (
-  provider: Provider,
-): string | undefined => {
-  const config = provider.settingsConfig;
-  if (!config || typeof config !== "object") return provider.websiteUrl;
-
-  const candidates = [
-    (config as Record<string, any>).baseUrl,
-    (config as Record<string, any>).baseURL,
-    (config as Record<string, any>).apiUrl,
-    (config as Record<string, any>).api_url,
-    (config as Record<string, any>).env?.ANTHROPIC_BASE_URL,
-    (config as Record<string, any>).env?.GOOGLE_GEMINI_BASE_URL,
-    (config as Record<string, any>).env?.OPENAI_BASE_URL,
-  ];
-  const direct = candidates.find(
-    (value): value is string =>
-      typeof value === "string" && /^https?:\/\//i.test(value.trim()),
-  );
-  if (direct) return direct;
-
-  const configText = (config as Record<string, any>).config;
-  if (typeof configText === "string" && configText.includes("base_url")) {
-    const extracted = extractCodexBaseUrl(configText);
-    if (extracted) return extracted;
-  }
-
-  return provider.websiteUrl;
-};
-
 export function ProviderCard({
   provider,
   isCurrent,
@@ -281,10 +251,8 @@ export function ProviderCard({
   }, [provider, fallbackUrlText]);
 
   const providerIcon = useMemo(
-    () =>
-      resolveProviderIcon(appId, provider.icon, provider.iconColor) ??
-      providerFaviconUrl(extractProviderFaviconSource(provider)),
-    [appId, provider, displayUrl, fallbackUrlText],
+    () => resolveProviderDisplayIcon(appId, provider),
+    [appId, provider],
   );
 
   const isClickableUrl = useMemo(() => {

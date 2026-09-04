@@ -211,6 +211,7 @@ export function AddProviderDialog({
                 values.icon,
                 parsedConfig,
                 values.websiteUrl,
+                values.name,
               ) || undefined,
         iconColor: values.iconColor?.trim() || undefined,
         ...(values.presetCategory ? { category: values.presetCategory } : {}),

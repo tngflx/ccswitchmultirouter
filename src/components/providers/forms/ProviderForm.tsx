@@ -676,6 +676,7 @@ function ProviderFormFull({
           initialData?.icon,
           initialData?.settingsConfig,
           initialData?.websiteUrl,
+          initialData?.name,
         ) ?? "",
       iconColor: initialData?.iconColor ?? "",
     }),
@@ -1988,6 +1989,7 @@ function ProviderFormFull({
                     ? hermesForm.hermesBaseUrl
                     : undefined,
         values.websiteUrl,
+        values.name,
       ),
       settingsConfig,
     };

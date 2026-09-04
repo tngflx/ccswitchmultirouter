@@ -265,6 +265,7 @@ export function EditProviderDialog({
             values.icon,
             values.settingsConfig,
             values.websiteUrl,
+            values.name,
           ) || undefined,
         iconColor: values.iconColor?.trim() || undefined,
         ...(values.presetCategory ? { category: values.presetCategory } : {}),

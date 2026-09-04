@@ -188,6 +188,13 @@ export const iconMetadata: Record<string, IconMetadata> = {
     ],
     defaultColor: "#0D9488",
   },
+  sublyx: {
+    name: "sublyx",
+    displayName: "Sublyx",
+    category: "ai-provider",
+    keywords: ["sublyx", "sublyx.org", "aggregator", "relay", "gateway"],
+    defaultColor: "#1769D2",
+  },
   chatglm: {
     name: "chatglm",
     displayName: "chatglm",
