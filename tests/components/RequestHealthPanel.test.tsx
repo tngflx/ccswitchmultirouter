@@ -23,7 +23,7 @@ function snapshot(): RequestHealthSnapshot {
       maxCodexInputTokens: 200_000,
       reviewTimeoutSeconds: 60,
       reviewMode: "first_large_request",
-      compactAndRestartEnabled: true,
+      summarizeAndRestartEnabled: true,
     },
     diagnostics: [
       {
@@ -93,7 +93,7 @@ describe("RequestHealthPanel", () => {
     ).toBeInTheDocument();
     expect(
       screen.getByText(
-        "codexRouterWorkspace.requestHealth.compactAndRestartEnabled",
+        "codexRouterWorkspace.requestHealth.summarizeAndRestartEnabled",
       ),
     ).toBeInTheDocument();
   });

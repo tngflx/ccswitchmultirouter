@@ -96,9 +96,9 @@ pub struct RequestHealthConfig {
     /// Controls when the pre-dispatch Windows decision notification is shown.
     #[serde(default)]
     pub review_mode: RequestHealthReviewMode,
-    /// Offer native compaction followed by a forked Codex session.
-    #[serde(default = "default_true")]
-    pub compact_and_restart_enabled: bool,
+    /// Offer a native handoff summary transferred into a fresh root Codex session.
+    #[serde(default = "default_true", alias = "compactAndRestartEnabled")]
+    pub summarize_and_restart_enabled: bool,
 }
 
 impl Default for RequestHealthConfig {
@@ -110,7 +110,7 @@ impl Default for RequestHealthConfig {
             max_codex_input_tokens: default_max_codex_input_tokens(),
             review_timeout_seconds: default_request_health_review_timeout_seconds(),
             review_mode: RequestHealthReviewMode::FirstLargeRequest,
-            compact_and_restart_enabled: true,
+            summarize_and_restart_enabled: true,
         }
     }
 }
@@ -1554,13 +1554,13 @@ mod tests {
     }
 
     #[test]
-    fn request_health_defaults_to_first_request_review_with_compact_restart() {
+    fn request_health_defaults_to_first_request_review_with_summary_restart() {
         let settings = AppSettings::default();
         assert_eq!(
             settings.request_health.review_mode,
             RequestHealthReviewMode::FirstLargeRequest
         );
-        assert!(settings.request_health.compact_and_restart_enabled);
+        assert!(settings.request_health.summarize_and_restart_enabled);
 
         let legacy: AppSettings = serde_json::from_value(serde_json::json!({
             "requestHealth": {
@@ -1576,6 +1576,14 @@ mod tests {
             legacy.request_health.review_mode,
             RequestHealthReviewMode::FirstLargeRequest
         );
-        assert!(legacy.request_health.compact_and_restart_enabled);
+        assert!(legacy.request_health.summarize_and_restart_enabled);
+
+        let previous_name: AppSettings = serde_json::from_value(serde_json::json!({
+            "requestHealth": {
+                "compactAndRestartEnabled": false
+            }
+        }))
+        .expect("previous compact action setting remains readable");
+        assert!(!previous_name.request_health.summarize_and_restart_enabled);
     }
 }

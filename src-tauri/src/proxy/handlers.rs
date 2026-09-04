@@ -99,8 +99,7 @@ pub async fn health_check() -> (StatusCode, Json<Value>) {
 
 /// 获取服务状态
 pub async fn get_status(State(state): State<ProxyState>) -> Result<Json<ProxyStatus>, ProxyError> {
-    let status = state.status.read().await.clone();
-    Ok(Json(status))
+    Ok(Json(state.status_snapshot().await))
 }
 
 /// 处理未显式注册的本地代理路径。

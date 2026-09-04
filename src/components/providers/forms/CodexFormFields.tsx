@@ -2924,13 +2924,11 @@ export function CodexFormFields({
           defaultModel={codexModel}
           apiFormat={apiFormat}
           trafficPolicy={resolvedTrafficPolicy}
-          isMaintainedPreset={isMaintainedPreset}
           isSyncingModels={modelCatalogAction === "sync"}
           isRefreshingModels={modelCatalogAction === "refresh-existing"}
           isValidatingConnection={
             isProbingProtocol && isProtocolProbeStateCurrent
           }
-          protocolProbeMode={protocolProbeMode}
           validationSummary={
             isProtocolProbeStateCurrent ? protocolProbeSummary : ""
           }
@@ -2951,7 +2949,6 @@ export function CodexFormFields({
             setCatalogRows(nextRows);
             onCatalogModelsChange?.(nextRows);
           }}
-          onProtocolProbeModeChange={setProtocolProbeMode}
           onValidateConnection={() => {
             bindProtocolProbeIdentity(readinessIdentity);
             setProtocolProbeTone("muted");

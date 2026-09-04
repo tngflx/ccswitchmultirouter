@@ -125,14 +125,14 @@ static APPROVED_PAYLOADS: OnceLock<Mutex<VecDeque<ApprovedPayload>>> = OnceLock:
 enum ReviewDecision {
     ContinueOnce,
     Block,
-    CompactAndRestart,
+    SummarizeAndRestart,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PreflightReviewOutcome {
     NotRequired,
     ContinueOnce,
-    CompactAndRestart,
+    SummarizeAndRestart,
 }
 
 struct PendingReview {
@@ -668,7 +668,7 @@ pub(crate) async fn review_before_upstream(
             body.len(),
             &risk,
             config.review_timeout_seconds,
-            config.compact_and_restart_enabled,
+            config.summarize_and_restart_enabled,
         )
         .map_err(|error| format!("Windows Request Health notification failed: {error}"))?;
 
@@ -676,8 +676,8 @@ pub(crate) async fn review_before_upstream(
             .clamp(MIN_REVIEW_TIMEOUT_SECONDS, MAX_REVIEW_TIMEOUT_SECONDS);
         match tokio::time::timeout(Duration::from_secs(timeout_seconds), receiver).await {
             Ok(Ok(ReviewDecision::ContinueOnce)) => Ok(PreflightReviewOutcome::ContinueOnce),
-            Ok(Ok(ReviewDecision::CompactAndRestart)) => {
-                Ok(PreflightReviewOutcome::CompactAndRestart)
+            Ok(Ok(ReviewDecision::SummarizeAndRestart)) => {
+                Ok(PreflightReviewOutcome::SummarizeAndRestart)
             }
             Ok(Ok(ReviewDecision::Block)) => {
                 Err("Request blocked from the Windows Request Health notification".to_string())
@@ -698,7 +698,7 @@ fn show_windows_review_notification(
     body_bytes: usize,
     risk: &RequestHealthFinding,
     timeout_seconds: u32,
-    compact_and_restart_enabled: bool,
+    summarize_and_restart_enabled: bool,
 ) -> Result<(), String> {
     use tauri_winrt_notification::{Scenario, Toast};
     use winreg::{enums::HKEY_CURRENT_USER, RegKey};
@@ -722,12 +722,12 @@ fn show_windows_review_notification(
     let strings = NativeReviewStrings::for_language(&language);
     let continue_action = format!("continue|{token}|{body_hash}");
     let block_action = format!("block|{token}|{body_hash}");
-    let compact_action = format!("compact|{token}|{body_hash}");
+    let summarize_action = format!("summarize|{token}|{body_hash}");
     let activated_token = token.to_string();
     let activated_hash = body_hash.to_string();
     let expected_continue = continue_action.clone();
     let expected_block = block_action.clone();
-    let expected_compact = compact_action.clone();
+    let expected_summarize = summarize_action.clone();
     let dismissed_token = token.to_string();
     let dismissed_hash = body_hash.to_string();
     let model = truncate_for_notification(model, 80);
@@ -747,7 +747,7 @@ fn show_windows_review_notification(
             let decision = match action.as_deref() {
                 Some(value) if value == expected_continue => ReviewDecision::ContinueOnce,
                 Some(value) if value == expected_block => ReviewDecision::Block,
-                Some(value) if value == expected_compact => ReviewDecision::CompactAndRestart,
+                Some(value) if value == expected_summarize => ReviewDecision::SummarizeAndRestart,
                 _ => ReviewDecision::Block,
             };
             let _ = resolve_pending_review(&activated_token, &activated_hash, decision);
@@ -755,8 +755,8 @@ fn show_windows_review_notification(
         })
         .add_button(strings.continue_once, &continue_action)
         .add_button(strings.block, &block_action);
-    let toast = if compact_and_restart_enabled {
-        toast.add_button(strings.compact_and_restart, &compact_action)
+    let toast = if summarize_and_restart_enabled {
+        toast.add_button(strings.summarize_and_restart, &summarize_action)
     } else {
         toast
     };
@@ -771,7 +771,7 @@ fn show_windows_review_notification(
 }
 
 #[cfg(target_os = "windows")]
-pub(crate) fn show_compact_restart_result_notification(
+pub(crate) fn show_summarize_restart_result_notification(
     session_id: &str,
     new_session_id: Option<&str>,
     error: Option<&str>,
@@ -781,25 +781,28 @@ pub(crate) fn show_compact_restart_result_notification(
     const APP_ID: &str = "com.ccswitchmulti.desktop";
     let (title, detail) = match (new_session_id, error) {
         (Some(new_session), _) => (
-            "Compaction complete",
+            "Summary handoff complete",
             format!(
-                "Codex compacted the source session and forked a new session: {}",
+                "Codex transferred a compact summary into a fresh session: {}",
                 truncate_for_notification(new_session, 80)
             ),
         ),
         (_, Some(reason)) => (
-            "Compaction + new session failed",
+            "Summary + new session failed",
             format!(
-                "The source session was not forked. {}",
+                "No fresh session was created. {}",
                 truncate_for_notification(reason, 180)
             ),
         ),
         _ => (
-            "Compaction + new session finished",
+            "Summary + new session finished",
             "Codex did not return a new session id.".to_string(),
         ),
     };
-    let source = format!("Source session: {}", truncate_for_notification(session_id, 80));
+    let source = format!(
+        "Source session: {}",
+        truncate_for_notification(session_id, 80)
+    );
     let _ = Toast::new(APP_ID)
         .title(title)
         .text1(&detail)
@@ -814,7 +817,7 @@ struct NativeReviewStrings {
     model: &'static str,
     continue_once: &'static str,
     block: &'static str,
-    compact_and_restart: &'static str,
+    summarize_and_restart: &'static str,
 }
 
 #[cfg(target_os = "windows")]
@@ -826,28 +829,28 @@ impl NativeReviewStrings {
                 model: "模型",
                 continue_once: "仅继续这一次",
                 block: "阻止",
-                compact_and_restart: "压缩并开始新会话",
+                summarize_and_restart: "总结并开始新会话",
             },
             "zh-TW" => Self {
                 title: "請求已暫停，等待確認",
                 model: "模型",
                 continue_once: "僅繼續這一次",
                 block: "封鎖",
-                compact_and_restart: "壓縮並開始新工作階段",
+                summarize_and_restart: "摘要並開始新工作階段",
             },
             "ja" => Self {
                 title: "リクエストを一時停止しました",
                 model: "モデル",
                 continue_once: "今回のみ続行",
                 block: "ブロック",
-                compact_and_restart: "圧縮して新しいセッション",
+                summarize_and_restart: "要約して新しいセッション",
             },
             _ => Self {
                 title: "Request paused for approval",
                 model: "Model",
                 continue_once: "Continue once",
                 block: "Block",
-                compact_and_restart: "Compact + new session",
+                summarize_and_restart: "Summarize + new session",
             },
         }
     }
@@ -1273,7 +1276,7 @@ mod tests {
     }
 
     #[test]
-    fn compact_restart_decision_does_not_approve_the_blocked_payload() {
+    fn summarize_restart_decision_does_not_approve_the_blocked_payload() {
         let token = "compact-restart-review-token";
         let trace_id = "compact-restart-review-trace";
         let session_id = "compact-restart-review-session";
@@ -1297,11 +1300,11 @@ mod tests {
         assert!(resolve_pending_review(
             token,
             &body_hash,
-            ReviewDecision::CompactAndRestart,
+            ReviewDecision::SummarizeAndRestart,
         ));
         assert_eq!(
             receiver.blocking_recv().expect("review decision"),
-            ReviewDecision::CompactAndRestart
+            ReviewDecision::SummarizeAndRestart
         );
         assert!(!payload_was_approved(
             trace_id,

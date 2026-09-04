@@ -1,5 +1,37 @@
 # Engineering Journal (newest first)
 
+## 2026-09-04 - Correction: remove the full inline Light/Deep readiness panel
+
+- **What happened:** The initial UI cleanup removed only the explanatory Readiness content but incorrectly left the Light/Deep selector visible in the screenshot area.
+- **Root cause:** I misread the requested focus region as the text/status subsection instead of the entire nested panel.
+- **What we did:** Removed the complete inline Light/Deep panel from `CodexProviderReadinessSection`; probe mode remains available in the confirmation dialog and the live validation summary remains visible.
+- **Evidence:** `pnpm exec vitest run tests/components/CodexProviderReadinessSection.test.tsx --silent --reporter=verbose` passed **7/7**; `pnpm typecheck` passed.
+- **What NOT to do again:** When a user identifies a whole visual section in a screenshot, remove the entire bounded section, not just its copy.
+
+## 2026-09-04 - Codex readiness UI now keeps probe status without redundant guidance
+
+- **What happened:** The Codex provider form repeated connection-readiness guidance and a “Verify connection first” badge below the probe mode selector, while the actual verification action and result were already available above/in the live status region.
+- **Root cause:** The readiness component combined action controls, explanatory copy, and derived status into one panel, duplicating information and making the protocol probe flow look blocked even when per-model protocol metadata was already available.
+- **What we did:** Removed the redundant Readiness explanation/badge, retained Light/Deep probe controls and accessible live probe summaries, and removed the obsolete maintained-preset prop from that component. Audited Codex Desktop model-picker projection and added a regression assertion that per-model `apiFormat` and `apiFormatSource` survive injection, so a provider default of Responses does not erase a probed Chat override.
+- **Evidence:** `pnpm exec vitest run tests/components/CodexProviderReadinessSection.test.tsx tests/components/CodexFormFields.test.tsx --silent --reporter=verbose` passed **63/63**; `pnpm typecheck` passed. Rust targeted test compilation was blocked at link cleanup because `src-tauri/target/debug/cc-switch.exe` was in use (`Access is denied`, OS error 5); no process was terminated.
+- **What NOT to do again:** Do not infer upstream protocol exchangeability from the provider default alone; preserve and inspect per-model catalog `apiFormat` metadata, and do not reintroduce duplicate readiness copy when the probe result is already exposed as a live status.
+
+## 2026-09-03 - HTTP proxy status bypassed live uptime and target projection
+
+- **What happened:** The live `/status` endpoint reported `uptime_seconds: 0` and an empty `active_targets` list even though the takeover listener had been running for hours and was actively routing Codex traffic.
+- **Root cause:** `handlers::get_status` cloned the stored `ProxyStatus` directly. The live uptime calculation and current-provider projection existed only in `ProxyServer::get_status`, so HTTP callers bypassed both derived fields.
+- **What we did:** Moved live status derivation into `ProxyState::status_snapshot` and made both the HTTP handler and `ProxyServer::get_status` use the same path.
+- **Evidence:** Before the fix, live `/status` returned PID `57492`, `running: true`, `total_requests: 463`, but `uptime_seconds: 0` and no active targets. `cargo check --manifest-path src-tauri/Cargo.toml` passed, and `status_snapshot_reports_uptime_and_active_targets` passed **1/1**.
+- **What NOT to do again:** Do not expose a stored status snapshot from one API while another API adds live derived fields; all status consumers must share the same projection.
+
+## 2026-09-03 - Windows Request Health now transfers a summary into a fresh root session
+
+- **What happened:** The Windows action labelled “Compact + new session” still ran native compaction followed by `thread/fork`, so the new task inherited the old session tree and did not provide the input-token reset the user required.
+- **Root cause:** The implementation treated a fork of compacted state as equivalent to an independent session. The app-server exposes these as different ownership contracts: `thread/fork` copies ancestry, while `thread/start` creates a new root. The compacted handoff text is persisted in `compacted.payload.message` even though `thread/read` exposes only a `contextCompaction` marker.
+- **What we did:** Replaced the action with “Summarize + new session.” After the original oversized request is blocked, the renderer waits for the source turn to become idle and runs native compaction. The backend requires a newly persisted handoff summary, then the live Desktop request client creates a root `thread/start`, verifies there is no fork ancestry and that `sessionId == thread.id`, submits only the summary through `turn/start`, and waits for that turn to complete. Added backward-compatible deserialization for the old setting name and documented the workflow.
+- **Evidence:** Official OpenAI App Server documentation and the locally generated Codex 0.153 experimental schema confirmed `thread/start`, `turn/start`, and the root-thread fields. `cargo check` passed; Codex Desktop tests passed **45/45**; Request Health tests passed **11/11**; focused Request Health/workspace frontend tests passed **93/93**; `pnpm typecheck` and JavaScript syntax checking passed. Runtime Windows acceptance still requires the normal development binary to be rebuilt from this source.
+- **What NOT to do again:** Do not label `thread/fork` as a fresh session, reuse an older persisted compaction summary, start compaction while the rejected source turn is still active, or report success before the new handoff turn reaches `completed`.
+
 ## 2026-09-03 - Reference-repository audit rule and Windows review dismissal semantics
 
 - **What happened:** Audited the Windows Request Health notification behavior and checked recent upstream work in both `BigStrongSun/ccswitchmulti` and `farion1231/cc-switch` before considering further feature changes.

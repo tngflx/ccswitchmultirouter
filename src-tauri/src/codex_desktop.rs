@@ -1,4 +1,6 @@
 use std::collections::{BTreeSet, HashMap};
+use std::fs;
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
@@ -867,38 +869,124 @@ pub(crate) async fn submit_codex_continuation() -> Result<CodexContinuationResul
     })
 }
 
-/// Result of asking the live Codex Desktop renderer to compact a thread and
-/// fork the compacted state into a new persisted session.
+/// Result of asking the live Codex Desktop renderer to summarize a thread and
+/// transfer that summary into an independent persisted session.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct CodexCompactRestartResult {
+pub(crate) struct CodexSummarizeRestartResult {
     pub completed: bool,
     pub new_thread_id: String,
+    pub handoff_turn_id: String,
     pub debug_port: u16,
     pub target_id: String,
 }
 
-/// Compact and fork through the request client owned by Codex Desktop.
-///
-/// This deliberately refuses to launch a second app-server or manipulate
-/// rollout files. The renderer waits for the native compaction item before
-/// forking, so the new session begins from the compacted server-owned state.
-pub(crate) async fn compact_and_restart_codex_session(
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PersistedCompactionSummary {
+    marker: String,
+    message: String,
+}
+
+fn collect_codex_rollouts(dir: &Path, depth: usize, files: &mut Vec<PathBuf>) {
+    if depth > 5 {
+        return;
+    }
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_codex_rollouts(&path, depth + 1, files);
+        } else if path.extension().and_then(|value| value.to_str()) == Some("jsonl") {
+            files.push(path);
+        }
+    }
+}
+
+fn latest_codex_compaction_summary_in(
+    codex_dir: &Path,
     thread_id: &str,
-) -> Result<CodexCompactRestartResult, String> {
+) -> Result<Option<PersistedCompactionSummary>, String> {
+    let mut files = Vec::new();
+    collect_codex_rollouts(&codex_dir.join("sessions"), 0, &mut files);
+    collect_codex_rollouts(&codex_dir.join("archived_sessions"), 0, &mut files);
+    let mut latest: Option<(String, u64, PersistedCompactionSummary)> = None;
+    for path in files {
+        if !path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .is_some_and(|name| name.contains(thread_id))
+        {
+            continue;
+        }
+        let file = fs::File::open(&path)
+            .map_err(|error| format!("Failed to open Codex rollout {}: {error}", path.display()))?;
+        for line in BufReader::new(file).lines().map_while(Result::ok) {
+            let Ok(value) = serde_json::from_str::<Value>(&line) else {
+                continue;
+            };
+            if value.get("type").and_then(Value::as_str) != Some("compacted") {
+                continue;
+            }
+            let Some(message) = value
+                .pointer("/payload/message")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|message| !message.is_empty())
+            else {
+                continue;
+            };
+            let timestamp = value
+                .get("timestamp")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let ordinal = value.get("ordinal").and_then(Value::as_u64).unwrap_or(0);
+            let marker = format!("{}|{timestamp}|{ordinal}", path.display());
+            let candidate = PersistedCompactionSummary {
+                marker,
+                message: message.to_string(),
+            };
+            if latest
+                .as_ref()
+                .is_none_or(|(current_timestamp, current_ordinal, _)| {
+                    (timestamp.as_str(), ordinal) > (current_timestamp.as_str(), *current_ordinal)
+                })
+            {
+                latest = Some((timestamp, ordinal, candidate));
+            }
+        }
+    }
+    Ok(latest.map(|(_, _, summary)| summary))
+}
+
+fn latest_codex_compaction_summary(
+    thread_id: &str,
+) -> Result<Option<PersistedCompactionSummary>, String> {
+    latest_codex_compaction_summary_in(&crate::codex_config::get_codex_config_dir(), thread_id)
+}
+
+/// Create a native compaction summary, then transfer only that persisted
+/// summary into a new root thread owned by the live Codex Desktop app-server.
+pub(crate) async fn summarize_and_restart_codex_session(
+    thread_id: &str,
+) -> Result<CodexSummarizeRestartResult, String> {
     if thread_id.trim().is_empty() {
         return Err("A Codex thread id is required".to_string());
     }
     let thread_id_json =
         serde_json::to_string(thread_id).map_err(|error| format!("Invalid thread id: {error}"))?;
+    let previous_summary_marker =
+        latest_codex_compaction_summary(thread_id)?.map(|summary| summary.marker);
     let start_script = format!(
         r#"(() => {{
           const state = window[{patch_key:?}];
-          if (!state || typeof state.startCompactAndRestartSession !== 'function') {{
+          if (!state || typeof state.startSummarizeSession !== 'function') {{
             return {{started:false, reason:'CCSwitchMulti Codex Desktop compatibility layer is not ready'}};
           }}
           try {{
-            return state.startCompactAndRestartSession({thread_id_json});
+            return state.startSummarizeSession({thread_id_json});
           }} catch (error) {{
             return {{started:false, reason:String(error?.message || error)}};
           }}
@@ -997,12 +1085,12 @@ pub(crate) async fn compact_and_restart_codex_session(
             }
 
             let job_id_json = serde_json::to_string(&job_id)
-                .map_err(|error| format!("Invalid compact job id: {error}"))?;
+                .map_err(|error| format!("Invalid summary job id: {error}"))?;
             let poll_script = format!(
                 r#"(() => {{
                   const state = window[{patch_key:?}];
-                  if (!state || typeof state.readCompactRestartJob !== 'function') return null;
-                  return state.readCompactRestartJob({job_id_json});
+                  if (!state || typeof state.readSummarizeJob !== 'function') return null;
+                  return state.readSummarizeJob({job_id_json});
                 }})()"#,
                 patch_key = MODEL_PICKER_PATCH_KEY,
             );
@@ -1011,7 +1099,7 @@ pub(crate) async fn compact_and_restart_codex_session(
             loop {
                 if tokio::time::Instant::now() >= deadline {
                     return Err(format!(
-                        "target {}: timed out waiting for native Codex compaction job",
+                        "target {}: timed out waiting for Codex summary",
                         target.id
                     ));
                 }
@@ -1041,23 +1129,141 @@ pub(crate) async fn compact_and_restart_codex_session(
                     .unwrap_or(Value::Null);
                 match value.get("status").and_then(Value::as_str) {
                     Some("completed") => {
-                        let new_thread_id = value
-                            .pointer("/result/newThreadId")
+                        let summary_deadline =
+                            tokio::time::Instant::now() + Duration::from_secs(10);
+                        let summary = loop {
+                            let current = latest_codex_compaction_summary(thread_id)?;
+                            if current.as_ref().is_some_and(|summary| {
+                                Some(summary.marker.as_str()) != previous_summary_marker.as_deref()
+                            }) {
+                                break current.expect("checked as some");
+                            }
+                            if tokio::time::Instant::now() >= summary_deadline {
+                                return Err(format!(
+                                    "target {}: Codex completed compaction but no new persisted handoff summary was found",
+                                    target.id
+                                ));
+                            }
+                            tokio::time::sleep(Duration::from_millis(250)).await;
+                        };
+                        let summary_json = serde_json::to_string(&summary.message)
+                            .map_err(|error| format!("Invalid handoff summary: {error}"))?;
+                        let fresh_script = format!(
+                            r#"(() => {{
+                              const state = window[{patch_key:?}];
+                              if (!state || typeof state.startFreshSessionFromSummary !== 'function') {{
+                                return {{started:false, reason:'Fresh-session bridge is not ready'}};
+                              }}
+                              try {{
+                                return state.startFreshSessionFromSummary({thread_id_json}, {summary_json});
+                              }} catch (error) {{
+                                return {{started:false, reason:String(error?.message || error)}};
+                              }}
+                            }})()"#,
+                            patch_key = MODEL_PICKER_PATCH_KEY,
+                        );
+                        let evaluation = session
+                            .send_command(
+                                command_id,
+                                "Runtime.evaluate",
+                                json!({
+                                    "expression": fresh_script,
+                                    "awaitPromise": false,
+                                    "returnByValue": true,
+                                    "allowUnsafeEvalBlockedByCSP": true
+                                }),
+                            )
+                            .await?;
+                        command_id += 1;
+                        let fresh_value = evaluation
+                            .pointer("/result/result/value")
+                            .cloned()
+                            .unwrap_or(Value::Null);
+                        let fresh_job_id = fresh_value
+                            .get("jobId")
                             .and_then(Value::as_str)
-                            .unwrap_or_default()
-                            .to_string();
-                        if new_thread_id.is_empty() {
-                            return Err(format!(
-                                "target {}: Codex completed compaction without a new session id",
-                                target.id
-                            ));
+                            .unwrap_or_default();
+                        if !fresh_value
+                            .get("started")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false)
+                            || fresh_job_id.is_empty()
+                        {
+                            return Err(fresh_value
+                                .get("reason")
+                                .and_then(Value::as_str)
+                                .unwrap_or("Codex did not start the fresh-session handoff")
+                                .to_string());
                         }
-                        return Ok(CodexCompactRestartResult {
-                            completed: true,
-                            new_thread_id,
-                            debug_port: port,
-                            target_id: target.id,
-                        });
+                        let fresh_job_json = serde_json::to_string(fresh_job_id)
+                            .map_err(|error| format!("Invalid fresh-session job id: {error}"))?;
+                        let fresh_poll_script = format!(
+                            r#"(() => {{
+                              const state = window[{patch_key:?}];
+                              if (!state || typeof state.readFreshSessionJob !== 'function') return null;
+                              return state.readFreshSessionJob({fresh_job_json});
+                            }})()"#,
+                            patch_key = MODEL_PICKER_PATCH_KEY,
+                        );
+                        let fresh_deadline = tokio::time::Instant::now() + Duration::from_secs(130);
+                        loop {
+                            if tokio::time::Instant::now() >= fresh_deadline {
+                                return Err(format!(
+                                    "target {}: timed out waiting for fresh-session handoff",
+                                    target.id
+                                ));
+                            }
+                            tokio::time::sleep(Duration::from_millis(750)).await;
+                            let evaluation = session
+                                .send_command(
+                                    command_id,
+                                    "Runtime.evaluate",
+                                    json!({
+                                        "expression": fresh_poll_script,
+                                        "awaitPromise": false,
+                                        "returnByValue": true,
+                                        "allowUnsafeEvalBlockedByCSP": true
+                                    }),
+                                )
+                                .await?;
+                            command_id += 1;
+                            let value = evaluation
+                                .pointer("/result/result/value")
+                                .cloned()
+                                .unwrap_or(Value::Null);
+                            match value.get("status").and_then(Value::as_str) {
+                                Some("completed") => {
+                                    let new_thread_id = value
+                                        .pointer("/result/newThreadId")
+                                        .and_then(Value::as_str)
+                                        .unwrap_or_default()
+                                        .to_string();
+                                    let handoff_turn_id = value
+                                        .pointer("/result/turnId")
+                                        .and_then(Value::as_str)
+                                        .unwrap_or_default()
+                                        .to_string();
+                                    if new_thread_id.is_empty() || handoff_turn_id.is_empty() {
+                                        return Err("Fresh-session handoff completed without thread and turn ids".to_string());
+                                    }
+                                    return Ok(CodexSummarizeRestartResult {
+                                        completed: true,
+                                        new_thread_id,
+                                        handoff_turn_id,
+                                        debug_port: port,
+                                        target_id: target.id,
+                                    });
+                                }
+                                Some("failed") => {
+                                    return Err(value
+                                        .get("reason")
+                                        .and_then(Value::as_str)
+                                        .unwrap_or("Fresh-session handoff failed")
+                                        .to_string());
+                                }
+                                _ => {}
+                            }
+                        }
                     }
                     Some("failed") => {
                         let reason = value
@@ -2454,7 +2660,13 @@ mod tests {
     fn catalog_projection_labels_and_groups_provider_models_without_changing_ids() {
         let value = json!({
             "models": [
-                { "model": "qwen-z", "displayName": "Zeta", "provider_name": "Qwen" },
+                {
+                    "model": "qwen-z",
+                    "displayName": "Zeta",
+                    "provider_name": "Qwen",
+                    "apiFormat": "openai_chat",
+                    "apiFormatSource": "probe"
+                },
                 { "model": "deepseek-b", "displayName": "Beta", "providerName": "DeepSeek" },
                 { "model": "qwen-a", "displayName": "Alpha", "provider": { "name": "Qwen" } }
             ]
@@ -2463,6 +2675,8 @@ mod tests {
         let (names, models) = codex_model_entries_from_catalog_value(&value);
         assert_eq!(names, vec!["qwen-z", "deepseek-b", "qwen-a"]);
         assert_eq!(models[0]["displayName"], "[Qwen] Zeta");
+        assert_eq!(models[0]["apiFormat"], "openai_chat");
+        assert_eq!(models[0]["apiFormatSource"], "probe");
         assert_eq!(models[1]["displayName"], "[DSeek] Beta");
         assert_eq!(models[2]["displayName"], "[Qwen] Alpha");
         assert_eq!(models[2]["model"], "qwen-a");
@@ -3046,7 +3260,7 @@ JSON.stringify({
     }
 
     #[test]
-    fn compatibility_script_compacts_before_forking_a_new_session() {
+    fn compatibility_script_summarizes_before_starting_a_fresh_session() {
         let script = build_model_picker_unlock_script(&CodexModelCatalogProjection::empty());
 
         let compact = script
@@ -3055,17 +3269,53 @@ JSON.stringify({
         let wait_for_item = script
             .find("countCompactionItems(current) > beforeCompactions")
             .expect("native compaction completion wait");
-        let fork = script
-            .find(r#"client.sendRequest("thread/fork""#)
-            .expect("fork request");
+        let fresh_thread = script
+            .find(r#"client.sendRequest("thread/start""#)
+            .expect("fresh thread request");
+        let handoff_turn = script
+            .find(r#"client.sendRequest("turn/start""#)
+            .expect("handoff turn request");
         assert!(compact < wait_for_item);
-        assert!(wait_for_item < fork);
+        assert!(wait_for_item < fresh_thread);
+        assert!(fresh_thread < handoff_turn);
         assert!(script.contains(r#"config: { model_reasoning_effort: "medium" }"#));
-        assert!(script.contains("state.startCompactAndRestartSession"));
-        assert!(script.contains("state.readCompactRestartJob"));
+        assert!(script.contains("state.startSummarizeSession"));
+        assert!(script.contains("state.readSummarizeJob"));
+        assert!(script.contains("state.startFreshSessionFromSummary"));
+        assert!(script.contains("state.readFreshSessionJob"));
         assert!(script.contains("await triggerLocalThreadCatalogSync()"));
+        assert!(!script.contains(r#"client.sendRequest("thread/fork""#));
         assert!(!script.contains("thread/delete"));
         assert!(!script.contains("thread/archive"));
+    }
+
+    #[test]
+    fn persisted_compaction_reader_selects_latest_summary_for_source_thread() {
+        let temp = tempfile::tempdir().expect("temp codex dir");
+        let sessions = temp
+            .path()
+            .join("sessions")
+            .join("2026")
+            .join("09")
+            .join("04");
+        fs::create_dir_all(&sessions).expect("create sessions");
+        let thread_id = "01a0676c-8987-7011-9299-a8bb5e3668bc";
+        let rollout = sessions.join(format!("rollout-2026-09-04T00-00-00-{thread_id}.jsonl"));
+        fs::write(
+            &rollout,
+            [
+                r#"{"timestamp":"2026-09-04T00:00:01Z","ordinal":1,"type":"compacted","payload":{"message":"old summary"}}"#,
+                r#"{"timestamp":"2026-09-04T00:00:02Z","ordinal":2,"type":"compacted","payload":{"message":"new summary"}}"#,
+            ]
+            .join("\n"),
+        )
+        .expect("write rollout");
+
+        let summary = latest_codex_compaction_summary_in(temp.path(), thread_id)
+            .expect("read summary")
+            .expect("summary exists");
+        assert_eq!(summary.message, "new summary");
+        assert!(summary.marker.contains("|2026-09-04T00:00:02Z|2"));
     }
 
     #[test]

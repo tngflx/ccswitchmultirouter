@@ -3794,12 +3794,12 @@ impl RequestForwarder {
             }
             if matches!(
                 review_result,
-                Ok(super::request_health::PreflightReviewOutcome::CompactAndRestart)
+                Ok(super::request_health::PreflightReviewOutcome::SummarizeAndRestart)
             ) {
                 if let Some(trace_id) = codex_trace_id.as_deref() {
                     super::request_health::mark_blocked(trace_id);
                     super::codex_router_log::append_event(
-                        "request_health_compact_restart_requested",
+                        "request_health_summarize_restart_requested",
                         &[
                             ("trace", trace_id.to_string()),
                             ("session", self.session_id.clone()),
@@ -3813,26 +3813,28 @@ impl RequestForwarder {
                 }
                 let session_id = self.session_id.clone();
                 tokio::spawn(async move {
-                    match crate::codex_desktop::compact_and_restart_codex_session(&session_id).await
+                    match crate::codex_desktop::summarize_and_restart_codex_session(&session_id)
+                        .await
                     {
                         Ok(result) => {
                             #[cfg(target_os = "windows")]
-                            super::request_health::show_compact_restart_result_notification(
+                            super::request_health::show_summarize_restart_result_notification(
                                 &session_id,
                                 Some(&result.new_thread_id),
                                 None,
                             );
                             log::info!(
-                                "[RequestHealth] Native compaction completed; forked session {} -> {} on CDP port {}",
+                                "[RequestHealth] Summary handoff completed; fresh session {} -> {} on CDP port {}",
                                 session_id,
                                 result.new_thread_id,
                                 result.debug_port
                             );
                             super::codex_router_log::append_event(
-                                "request_health_compact_restart_completed",
+                                "request_health_summarize_restart_completed",
                                 &[
                                     ("session", session_id),
                                     ("new_session", result.new_thread_id),
+                                    ("handoff_turn", result.handoff_turn_id),
                                     ("debug_port", result.debug_port.to_string()),
                                     ("target", result.target_id),
                                 ],
@@ -3840,25 +3842,25 @@ impl RequestForwarder {
                         }
                         Err(error) => {
                             #[cfg(target_os = "windows")]
-                            super::request_health::show_compact_restart_result_notification(
+                            super::request_health::show_summarize_restart_result_notification(
                                 &session_id,
                                 None,
                                 Some(&error),
                             );
                             log::error!(
-                                "[RequestHealth] Native compaction/new-session action failed for {}: {}",
+                                "[RequestHealth] Summary/fresh-session action failed for {}: {}",
                                 session_id,
                                 error
                             );
                             super::codex_router_log::append_event(
-                                "request_health_compact_restart_failed",
+                                "request_health_summarize_restart_failed",
                                 &[("session", session_id), ("reason", error)],
                             );
                         }
                     }
                 });
                 return Err(ProxyError::RequestHealthBlocked(
-                    "The oversized request was blocked; native compaction and a new Codex session were requested"
+                    "The oversized request was blocked; a summary handoff into a fresh Codex session was requested"
                         .to_string(),
                 ));
             }

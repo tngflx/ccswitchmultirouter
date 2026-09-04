@@ -452,7 +452,7 @@
     }
     return discovered;
   };
-  const runCompactAndRestartSession = async (threadId) => {
+  const runSummarizeSession = async (threadId) => {
     const normalizedThreadId = String(threadId || "").trim();
     if (!normalizedThreadId) throw new Error("A Codex thread id is required");
     await installAppServerPatch();
@@ -471,10 +471,26 @@
     let lastError = null;
     for (const client of clients) {
       try {
-        const before = await client.sendRequest("thread/read", {
-          threadId: normalizedThreadId,
-          includeTurns: true,
-        });
+        const idleDeadline = Date.now() + 15000;
+        let before = null;
+        while (Date.now() < idleDeadline) {
+          before = await client.sendRequest("thread/read", {
+            threadId: normalizedThreadId,
+            includeTurns: true,
+          });
+          const status = String(
+            before?.thread?.status?.type || before?.status?.type || "",
+          );
+          if (status !== "active") break;
+          await new Promise((resolve) => setTimeout(resolve, 250));
+        }
+        const sourceStatus = String(
+          before?.thread?.status?.type || before?.status?.type || "",
+        );
+        if (sourceStatus === "active")
+          throw new Error(
+            "Timed out waiting for the blocked source turn to become idle",
+          );
         const beforeCompactions = countCompactionItems(before);
         await client.sendRequest("thread/compact/start", {
           threadId: normalizedThreadId,
@@ -496,40 +512,20 @@
         if (!compacted)
           throw new Error("Timed out waiting for native Codex compaction");
 
-        const forked = await client.sendRequest("thread/fork", {
-          threadId: normalizedThreadId,
-          config: { model_reasoning_effort: "medium" },
-        });
-        const newThreadId = String(
-          forked?.thread?.id ||
-            forked?.threadId ||
-            forked?.thread_id ||
-            forked?.id ||
-            "",
-        ).trim();
-        if (!newThreadId)
-          throw new Error("Codex did not return the new session id");
-        await triggerLocalThreadCatalogSync();
-        state.lastRequestHealthRestart = {
-          sourceThreadId: normalizedThreadId,
-          newThreadId,
-          completedAt: new Date().toISOString(),
-        };
-        return { completed: true, newThreadId };
+        return { completed: true };
       } catch (error) {
         lastError = error;
       }
     }
     throw (
-      lastError ||
-      new Error("Codex Desktop could not compact and restart the session")
+      lastError || new Error("Codex Desktop could not summarize the session")
     );
   };
-  state.compactRestartJobs = state.compactRestartJobs || {};
-  state.startCompactAndRestartSession = (threadId) => {
+  state.summarizeJobs = state.summarizeJobs || {};
+  state.startSummarizeSession = (threadId) => {
     const normalizedThreadId = String(threadId || "").trim();
     if (!normalizedThreadId) throw new Error("A Codex thread id is required");
-    const existing = Object.entries(state.compactRestartJobs).find(
+    const existing = Object.entries(state.summarizeJobs).find(
       ([, job]) =>
         job?.threadId === normalizedThreadId && job?.status === "pending",
     );
@@ -538,23 +534,23 @@
     const jobId = `${normalizedThreadId}:${Date.now()}:${Math.random()
       .toString(16)
       .slice(2)}`;
-    state.compactRestartJobs[jobId] = {
+    state.summarizeJobs[jobId] = {
       status: "pending",
       threadId: normalizedThreadId,
       startedAt: new Date().toISOString(),
     };
-    void runCompactAndRestartSession(normalizedThreadId).then(
+    void runSummarizeSession(normalizedThreadId).then(
       (result) => {
-        state.compactRestartJobs[jobId] = {
-          ...state.compactRestartJobs[jobId],
+        state.summarizeJobs[jobId] = {
+          ...state.summarizeJobs[jobId],
           status: "completed",
           result,
           completedAt: new Date().toISOString(),
         };
       },
       (error) => {
-        state.compactRestartJobs[jobId] = {
-          ...state.compactRestartJobs[jobId],
+        state.summarizeJobs[jobId] = {
+          ...state.summarizeJobs[jobId],
           status: "failed",
           reason: String(error?.message || error),
           completedAt: new Date().toISOString(),
@@ -563,8 +559,147 @@
     );
     return { started: true, jobId };
   };
-  state.readCompactRestartJob = (jobId) =>
-    state.compactRestartJobs[String(jobId || "")] || null;
+  state.readSummarizeJob = (jobId) =>
+    state.summarizeJobs[String(jobId || "")] || null;
+  const runFreshSessionFromSummary = async (sourceThreadId, summary) => {
+    const normalizedSourceThreadId = String(sourceThreadId || "").trim();
+    const normalizedSummary = String(summary || "").trim();
+    if (!normalizedSourceThreadId)
+      throw new Error("A Codex source thread id is required");
+    if (!normalizedSummary)
+      throw new Error("The compacted handoff summary is empty");
+    await installAppServerPatch();
+    const clients = [
+      findConversationRuntime(),
+      ...(state.appServerClients || []),
+    ].filter(
+      (client, index, array) =>
+        client &&
+        typeof client.sendRequest === "function" &&
+        array.indexOf(client) === index,
+    );
+    if (!clients.length)
+      throw new Error("Codex Desktop request client was not found");
+
+    let lastError = null;
+    for (const client of clients) {
+      try {
+        const sourceResponse = await client.sendRequest("thread/read", {
+          threadId: normalizedSourceThreadId,
+          includeTurns: false,
+        });
+        const sourceThread = sourceResponse?.thread || sourceResponse;
+        const startParams = {
+          config: { model_reasoning_effort: "medium" },
+        };
+        for (const key of ["cwd", "model", "modelProvider", "projectId"]) {
+          if (sourceThread?.[key]) startParams[key] = sourceThread[key];
+        }
+        const started = await client.sendRequest("thread/start", startParams);
+        const newThread = started?.thread || started;
+        const newThreadId = String(
+          newThread?.id || started?.threadId || started?.thread_id || "",
+        ).trim();
+        if (!newThreadId)
+          throw new Error("Codex did not return the fresh session id");
+        if (newThread?.forkedFromId || newThread?.forked_from_id)
+          throw new Error(
+            "Codex created a fork instead of a fresh root session",
+          );
+        const newSessionId = String(
+          newThread?.sessionId || newThread?.session_id || "",
+        ).trim();
+        if (newSessionId && newSessionId !== newThreadId)
+          throw new Error("Codex created a non-root session tree");
+
+        const handoffPrompt = [
+          "Fresh-session handoff from an oversized prior task.",
+          "Use the compact summary below as the only prior conversational context.",
+          "Do not fork or recover the old conversation history.",
+          "Acknowledge the handoff briefly, preserve unfinished work, and wait for the user's next instruction unless the summary names an immediately required action.",
+          "",
+          normalizedSummary,
+        ].join("\n");
+        const turnResponse = await client.sendRequest("turn/start", {
+          threadId: newThreadId,
+          input: [{ type: "text", text: handoffPrompt }],
+          effort: "medium",
+        });
+        const turnId = String(
+          turnResponse?.turn?.id ||
+            turnResponse?.turnId ||
+            turnResponse?.turn_id ||
+            "",
+        ).trim();
+        if (!turnId)
+          throw new Error("Codex did not return the handoff turn id");
+
+        const deadline = Date.now() + 120000;
+        while (Date.now() < deadline) {
+          await new Promise((resolve) => setTimeout(resolve, 750));
+          const current = await client.sendRequest("thread/read", {
+            threadId: newThreadId,
+            includeTurns: true,
+          });
+          const turns = current?.thread?.turns || current?.turns || [];
+          const turn = turns.find((candidate) => candidate?.id === turnId);
+          const status = String(turn?.status || "").toLowerCase();
+          if (status === "completed") {
+            await triggerLocalThreadCatalogSync();
+            state.lastRequestHealthRestart = {
+              sourceThreadId: normalizedSourceThreadId,
+              newThreadId,
+              turnId,
+              completedAt: new Date().toISOString(),
+            };
+            return { completed: true, newThreadId, turnId };
+          }
+          if (status === "failed" || status === "interrupted") {
+            throw new Error(`Fresh-session handoff turn ${status}`);
+          }
+        }
+        throw new Error("Timed out waiting for the fresh-session handoff");
+      } catch (error) {
+        lastError = error;
+      }
+    }
+    throw (
+      lastError ||
+      new Error("Codex Desktop could not create the fresh summarized session")
+    );
+  };
+  state.freshSessionJobs = state.freshSessionJobs || {};
+  state.startFreshSessionFromSummary = (sourceThreadId, summary) => {
+    const jobId = `${String(sourceThreadId || "").trim()}:${Date.now()}:${Math.random()
+      .toString(16)
+      .slice(2)}`;
+    state.freshSessionJobs[jobId] = {
+      status: "pending",
+      sourceThreadId: String(sourceThreadId || "").trim(),
+      startedAt: new Date().toISOString(),
+    };
+    void runFreshSessionFromSummary(sourceThreadId, summary).then(
+      (result) => {
+        state.freshSessionJobs[jobId] = {
+          ...state.freshSessionJobs[jobId],
+          status: "completed",
+          result,
+          completedAt: new Date().toISOString(),
+        };
+      },
+      (error) => {
+        state.freshSessionJobs[jobId] = {
+          ...state.freshSessionJobs[jobId],
+          status: "failed",
+          reason: String(error?.message || error),
+          completedAt: new Date().toISOString(),
+        };
+      },
+    );
+    return { started: true, jobId };
+  };
+  state.readFreshSessionJob = (jobId) =>
+    state.freshSessionJobs[String(jobId || "")] || null;
   const patchMcpModelResponseData = (data) => {
     if (data?.type !== "mcp-response") return false;
     const message = data.message || data.response;

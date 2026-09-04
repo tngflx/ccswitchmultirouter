@@ -86,6 +86,7 @@ Modern AI-powered coding relies on tools like Claude Code, Claude Desktop, Codex
 - **Reasoning content mode** — Per-provider control over reasoning text injection with strict schema normalization
 - **Sub-Agent V2** — Profile editor with `official_first` / `third_party_first` selection policy
 - **Stream retry** — Transparent proxy-side SSE reconnect before semantic output reaches the client
+- **Summarize + new session** — Windows Request Health can block an oversized turn, create a native handoff summary, and transfer only that summary into an independent Codex root session without using `/fork`
 - **Language switcher** — Header-level instant locale change (en/zh/zh-TW/ja), English default
 
 ### MCP, Prompts & Skills
@@ -180,6 +181,8 @@ If you launch from a desktop icon, add it to the `.desktop` `Exec=` line (e.g. `
 ## Documentation
 
 For detailed guides on every feature, check out the **[User Manual](docs/user-manual/en/README.md)** — covering provider management, MCP/Prompts/Skills, proxy & failover, and more.
+
+Codex users can also read the **[Summarize + new session guide](docs/guides/codex-summarize-new-session.md)** for the Windows oversized-request handoff workflow.
 
 ## Quick Start
 

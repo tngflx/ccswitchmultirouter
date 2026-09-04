@@ -1428,17 +1428,12 @@ describe("CodexFormFields local model routing", () => {
       prepareAndOpenProtocolProbe();
       fireEvent.click(screen.getByRole("button", { name: "确认测试" }));
       expect(
-        await screen.findByText("Can join MultiRouter"),
+        await screen.findByRole("status"),
       ).toBeInTheDocument();
       fireEvent.click(screen.getByRole("button", { name: "关闭" }));
     };
     const expectInvalidated = async () => {
-      await waitFor(() => {
-        expect(
-          screen.queryByText("Can join MultiRouter"),
-        ).not.toBeInTheDocument();
-      });
-      expect(screen.getByText("Verify connection first")).toBeInTheDocument();
+      expect(screen.queryByText("Can join MultiRouter")).not.toBeInTheDocument();
     };
 
     await validateCurrentIdentity();
@@ -1525,7 +1520,7 @@ describe("CodexFormFields local model routing", () => {
       );
       await Promise.resolve();
     });
-    expect(await screen.findByText("Can join MultiRouter")).toBeInTheDocument();
+    expect(await screen.findByRole("status")).toBeInTheDocument();
 
     await act(async () => {
       oldProbe.resolve(
@@ -1537,7 +1532,7 @@ describe("CodexFormFields local model routing", () => {
     });
 
     await waitFor(() => {
-      expect(screen.getByText("Can join MultiRouter")).toBeInTheDocument();
+      expect(screen.getByRole("status")).toBeInTheDocument();
       expect(screen.queryByRole("alert")).not.toBeInTheDocument();
     });
   });

@@ -1,11 +1,10 @@
 ﻿import type { Ref } from "react";
-import { CheckCircle2, Download, Loader2, Route, Server } from "lucide-react";
+import { Download, Loader2, Route, Server } from "lucide-react";
 import { useTranslation } from "react-i18next";
 
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 import type { CodexApiFormat, CodexCatalogModel } from "@/types";
-import type { CodexProtocolProbeMode } from "@/lib/api/protocol-compatibility";
 import type { ResolvedCodexTrafficPolicy } from "./codexTrafficPolicy";
 
 type ValidationTone = "muted" | "success" | "warning" | "error";
@@ -15,11 +14,9 @@ interface CodexProviderReadinessSectionProps {
   defaultModel?: string;
   apiFormat: CodexApiFormat;
   trafficPolicy?: ResolvedCodexTrafficPolicy;
-  isMaintainedPreset: boolean;
   isSyncingModels: boolean;
   isRefreshingModels?: boolean;
   isValidatingConnection: boolean;
-  protocolProbeMode?: CodexProtocolProbeMode;
   validationSummary?: string;
   validationTone?: ValidationTone;
   highlightSync?: boolean;
@@ -28,7 +25,6 @@ interface CodexProviderReadinessSectionProps {
   onSyncModels: () => void;
   onFillMissingFields?: () => void;
   onCreateProtocolGroups?: () => void;
-  onProtocolProbeModeChange?: (mode: CodexProtocolProbeMode) => void;
   onValidateConnection: () => void;
 }
 
@@ -58,11 +54,9 @@ export function CodexProviderReadinessSection({
     rejectionInitialDelayMs: 750,
     rejectionMaxDelayMs: 5000,
   },
-  isMaintainedPreset,
   isSyncingModels,
   isRefreshingModels = false,
   isValidatingConnection,
-  protocolProbeMode = "deep",
   validationSummary = "",
   validationTone = "muted",
   highlightSync = false,
@@ -71,7 +65,6 @@ export function CodexProviderReadinessSection({
   onSyncModels,
   onFillMissingFields,
   onCreateProtocolGroups,
-  onProtocolProbeModeChange,
   onValidateConnection,
 }: CodexProviderReadinessSectionProps) {
   const { t } = useTranslation();
@@ -108,16 +101,7 @@ export function CodexProviderReadinessSection({
   ).length;
   const hasCompleteProtocolGroups =
     hasModels && (unassignedCount === 0 || !onCreateProtocolGroups);
-  const validationPassed = validationTone === "success";
-  const ready = hasModels && validationPassed;
   const isCatalogActionRunning = isSyncingModels || isRefreshingModels;
-  const readinessLabel = !hasModels
-    ? tr("syncNeeded", "Sync models needed")
-    : ready
-      ? tr("canJoin", "Can join MultiRouter")
-      : validationTone === "error"
-        ? tr("checkFailed", "Connection check failed")
-        : tr("verifyFirst", "Verify connection first");
 
   return (
     <section
@@ -338,81 +322,22 @@ export function CodexProviderReadinessSection({
         )}
       </div>
 
-      <div className="rounded-md border border-border-default bg-background/70 p-3">
-        <div className="mb-3 grid grid-cols-2 gap-1 rounded-md border bg-muted/30 p-1">
-          {(["light", "deep"] as const).map((mode) => (
-            <Button
-              key={mode}
-              type="button"
-              size="sm"
-              variant="ghost"
-              aria-pressed={protocolProbeMode === mode}
-              className={cn(
-                "border border-transparent text-gray-700 dark:text-gray-200",
-                protocolProbeMode === mode &&
-                  "border-blue-600 bg-blue-600 text-white shadow-sm hover:bg-blue-700 dark:border-blue-400 dark:bg-blue-500 dark:text-white dark:hover:bg-blue-600",
-              )}
-              onClick={() => onProtocolProbeModeChange?.(mode)}
-            >
-              {mode === "light"
-                ? t("codexForm.probeModeLight", { defaultValue: "Light" })
-                : t("codexForm.probeModeDeep", { defaultValue: "Deep" })}
-            </Button>
-          ))}
-        </div>
-        <div className="flex flex-wrap items-center justify-between gap-2">
-          <div className="space-y-1">
-            <p className="text-xs font-medium text-foreground">
-              {tr("readiness", "Readiness")}
-            </p>
-            <p className="text-xs leading-relaxed text-muted-foreground">
-              {isMaintainedPreset
-                ? tr(
-                    "maintainedDescription",
-                    "Protocol, context, reasoning tiers, and the /model catalog are maintained by CCSwitchMulti.",
-                  )
-                : tr(
-                    "customDescription",
-                    "Verify Connection automatically tests both Chat and Responses. Use a manual override in Advanced Settings only when automatic detection fails.",
-                  )}
-            </p>
-          </div>
-          <span
-            className={cn(
-              "inline-flex items-center gap-1 rounded-full border px-2.5 py-1 text-xs font-medium",
-              ready
-                ? "border-emerald-500/40 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300"
-                : validationTone === "error"
-                  ? "border-destructive/40 bg-destructive/10 text-destructive"
-                  : "border-amber-500/40 bg-amber-500/10 text-amber-700 dark:text-amber-300",
-            )}
-          >
-            {ready && <CheckCircle2 className="h-3.5 w-3.5" />}
-            {readinessLabel}
-          </span>
-        </div>
-        {isMaintainedPreset && (
-          <p className="mt-2 text-xs font-medium text-blue-700 dark:text-blue-300">
-            {tr("maintainedBy", "Maintained by CCSwitchMulti")}
-          </p>
-        )}
-        {validationSummary && (
-          <p
-            role={validationTone === "error" ? "alert" : "status"}
-            className={cn(
-              "mt-2 text-xs leading-relaxed",
-              validationTone === "success" &&
-                "text-emerald-700 dark:text-emerald-300",
-              validationTone === "warning" &&
-                "text-amber-700 dark:text-amber-300",
-              validationTone === "error" && "text-destructive",
-              validationTone === "muted" && "text-muted-foreground",
-            )}
-          >
-            {validationSummary}
-          </p>
-        )}
-      </div>
+      {validationSummary && (
+        <p
+          role={validationTone === "error" ? "alert" : "status"}
+          className={cn(
+            "text-xs leading-relaxed",
+            validationTone === "success" &&
+              "text-emerald-700 dark:text-emerald-300",
+            validationTone === "warning" &&
+              "text-amber-700 dark:text-amber-300",
+            validationTone === "error" && "text-destructive",
+            validationTone === "muted" && "text-muted-foreground",
+          )}
+        >
+          {validationSummary}
+        </p>
+      )}
     </section>
   );
 }

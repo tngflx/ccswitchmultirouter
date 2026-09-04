@@ -12,7 +12,6 @@ describe("CodexProviderReadinessSection", () => {
       <CodexProviderReadinessSection
         models={[{ model: "gpt-5.5", apiFormat: "openai_chat" }]}
         apiFormat="openai_chat"
-        isMaintainedPreset={false}
         isSyncingModels={false}
         isValidatingConnection={false}
         onSyncModels={onSyncModels}
@@ -23,7 +22,6 @@ describe("CodexProviderReadinessSection", () => {
     expect(
       screen.getByRole("heading", { name: "Models & Compatibility" }),
     ).toBeInTheDocument();
-    expect(screen.getByText("Readiness")).toBeInTheDocument();
     expect(
       screen.getByText(
         "Sync the models available from this source and verify that Codex and MultiRouter can use them correctly.",
@@ -43,7 +41,6 @@ describe("CodexProviderReadinessSection", () => {
         models={[{ model: "deepseek-v4-flash" }, { model: "deepseek-v4-pro" }]}
         defaultModel="deepseek-v4-flash"
         apiFormat="openai_responses"
-        isMaintainedPreset
         isSyncingModels={false}
         isValidatingConnection={false}
         onSyncModels={vi.fn()}
@@ -51,9 +48,6 @@ describe("CodexProviderReadinessSection", () => {
       />,
     );
 
-    expect(screen.getByText("Maintained by CCSwitchMulti")).toBeInTheDocument();
-    expect(screen.getByText("Verify connection first")).toBeInTheDocument();
-    expect(screen.queryByText("Can join MultiRouter")).not.toBeInTheDocument();
     expect(screen.getByText("deepseek-v4-flash")).toBeInTheDocument();
     expect(screen.queryByText("请选择上游协议")).not.toBeInTheDocument();
 
@@ -62,7 +56,6 @@ describe("CodexProviderReadinessSection", () => {
         models={[{ model: "deepseek-v4-flash" }, { model: "deepseek-v4-pro" }]}
         defaultModel="deepseek-v4-flash"
         apiFormat="openai_responses"
-        isMaintainedPreset
         isSyncingModels={false}
         isValidatingConnection={false}
         validationSummary="当前凭据和端点验证通过"
@@ -72,15 +65,14 @@ describe("CodexProviderReadinessSection", () => {
       />,
     );
 
-    expect(screen.getByText("Can join MultiRouter")).toBeInTheDocument();
+    expect(screen.getByText("当前凭据和端点验证通过")).toBeInTheDocument();
   });
 
-  it("explains automatic protocol detection for custom providers", () => {
+  it("removes the redundant readiness explanation while keeping verification controls", () => {
     render(
       <CodexProviderReadinessSection
         models={[{ model: "private-model" }]}
         apiFormat="openai_chat"
-        isMaintainedPreset={false}
         isSyncingModels={false}
         isValidatingConnection={false}
         onSyncModels={vi.fn()}
@@ -88,12 +80,13 @@ describe("CodexProviderReadinessSection", () => {
       />,
     );
 
+    expect(screen.queryByText("Readiness")).not.toBeInTheDocument();
     expect(
-      screen.getByText(
-        /Verify Connection automatically tests both Chat and Responses/,
-      ),
+      screen.queryByText(/Verify Connection automatically tests both Chat and Responses/),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "Verify Connection" }),
     ).toBeInTheDocument();
-    expect(screen.getByText("Verify connection first")).toBeInTheDocument();
   });
 
   it("shows Responses and Chat as subgroups of one mixed provider", () => {
@@ -105,7 +98,6 @@ describe("CodexProviderReadinessSection", () => {
           { model: "qwen3.6", apiFormat: "openai_chat" },
         ]}
         apiFormat="openai_responses"
-        isMaintainedPreset={false}
         isSyncingModels={false}
         isValidatingConnection={false}
         onSyncModels={vi.fn()}
@@ -125,7 +117,6 @@ describe("CodexProviderReadinessSection", () => {
       models: [{ model: "ox-alpha-free" }],
       defaultModel: "ox-alpha-free",
       apiFormat: "openai_responses" as const,
-      isMaintainedPreset: false,
       isSyncingModels: false,
       isValidatingConnection: false,
       onSyncModels: vi.fn(),
@@ -180,7 +171,6 @@ describe("CodexProviderReadinessSection", () => {
       <CodexProviderReadinessSection
         models={[{ model: "private-model" }]}
         apiFormat="openai_chat"
-        isMaintainedPreset={false}
         isSyncingModels={false}
         isValidatingConnection={false}
         validationSummary="Responses 和 Chat 均不可用"
@@ -198,7 +188,6 @@ describe("CodexProviderReadinessSection", () => {
       <CodexProviderReadinessSection
         models={[{ model: "private-model" }]}
         apiFormat="openai_chat"
-        isMaintainedPreset={false}
         isSyncingModels={false}
         isValidatingConnection={false}
         validationSummary="Chat 验证通过"
@@ -215,7 +204,6 @@ describe("CodexProviderReadinessSection", () => {
     const common = {
       models: [{ model: "model-a" }],
       apiFormat: "openai_chat" as const,
-      isMaintainedPreset: false,
       isValidatingConnection: false,
       onSyncModels: vi.fn(),
       onFillMissingFields: vi.fn(),

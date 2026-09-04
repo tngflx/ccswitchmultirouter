@@ -316,7 +316,7 @@ function createRequestHealthSnapshot(
       maxCodexInputTokens: 200000,
       reviewTimeoutSeconds: 60,
       reviewMode: "first_large_request",
-      compactAndRestartEnabled: true,
+      summarizeAndRestartEnabled: true,
     },
     diagnostics: [
       {
@@ -367,7 +367,7 @@ beforeEach(() => {
       maxCodexInputTokens: 200000,
       reviewTimeoutSeconds: 60,
       reviewMode: "first_large_request",
-      compactAndRestartEnabled: true,
+      summarizeAndRestartEnabled: true,
     },
     diagnostics: [],
   });

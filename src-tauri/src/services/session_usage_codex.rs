@@ -161,8 +161,7 @@ impl ParentTokenTimeline {
     }
 
     fn signatures_at(&self, cutoff: DateTime<Utc>) -> Vec<TokenUsageSignature> {
-        self
-            .events
+        self.events
             .iter()
             .filter(|event| event.timestamp <= cutoff)
             .map(|event| event.signature.clone())

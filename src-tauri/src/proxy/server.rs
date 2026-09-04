@@ -50,6 +50,25 @@ pub struct ProxyState {
     pub failover_manager: Arc<FailoverSwitchManager>,
 }
 
+impl ProxyState {
+    pub async fn status_snapshot(&self) -> ProxyStatus {
+        let mut status = self.status.read().await.clone();
+        if let Some(start) = *self.start_time.read().await {
+            status.uptime_seconds = start.elapsed().as_secs();
+        }
+        let current_providers = self.current_providers.read().await;
+        status.active_targets = current_providers
+            .iter()
+            .map(|(app_type, (provider_id, provider_name))| ActiveTarget {
+                app_type: app_type.clone(),
+                provider_id: provider_id.clone(),
+                provider_name: provider_name.clone(),
+            })
+            .collect();
+        status
+    }
+}
+
 /// 代理HTTP服务器
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProxyServerMode {
@@ -307,25 +326,7 @@ impl ProxyServer {
     }
 
     pub async fn get_status(&self) -> ProxyStatus {
-        let mut status = self.state.status.read().await.clone();
-
-        // 计算运行时间
-        if let Some(start) = *self.state.start_time.read().await {
-            status.uptime_seconds = start.elapsed().as_secs();
-        }
-
-        // 从 current_providers HashMap 获取每个应用类型当前正在使用的 provider
-        let current_providers = self.state.current_providers.read().await;
-        status.active_targets = current_providers
-            .iter()
-            .map(|(app_type, (provider_id, provider_name))| ActiveTarget {
-                app_type: app_type.clone(),
-                provider_id: provider_id.clone(),
-                provider_name: provider_name.clone(),
-            })
-            .collect();
-
-        status
+        self.state.status_snapshot().await
     }
 
     /// 更新某个应用类型当前“目标供应商”（用于 UI 展示 active_targets）
@@ -569,6 +570,7 @@ fn format_bind_error(addr: &SocketAddr, error: std::io::Error) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
     use super::*;
     use crate::{
         provider::Provider,
@@ -654,6 +656,27 @@ mod tests {
             ProxyServer::new_external_openai_api(config, db.clone(), None),
             db,
         )
+    }
+
+    #[tokio::test]
+    async fn status_snapshot_reports_uptime_and_active_targets() {
+        let (server, _) = build_test_server();
+        *server.state.start_time.write().await =
+            std::time::Instant::now().checked_sub(std::time::Duration::from_secs(7));
+        server.state.current_providers.write().await.insert(
+            "codex".to_string(),
+            (
+                "codex-multirouter".to_string(),
+                "Codex MultiRouter".to_string(),
+            ),
+        );
+
+        let status = server.state.status_snapshot().await;
+
+        assert!(status.uptime_seconds >= 7);
+        assert_eq!(status.active_targets.len(), 1);
+        assert_eq!(status.active_targets[0].app_type, "codex");
+        assert_eq!(status.active_targets[0].provider_id, "codex-multirouter");
     }
 
     #[test]

@@ -253,16 +253,16 @@ export function RequestHealthPanel({
             <label className="rounded-md border border-border bg-background/70 p-3 text-sm transition-colors hover:border-cyan-300 dark:hover:border-cyan-700">
               <span className="mb-2 block font-medium">
                 {t(
-                  "codexRouterWorkspace.requestHealth.compactAndRestartEnabled",
+                  "codexRouterWorkspace.requestHealth.summarizeAndRestartEnabled",
                 )}
               </span>
               <input
                 type="checkbox"
-                checked={draft.compactAndRestartEnabled}
+                checked={draft.summarizeAndRestartEnabled}
                 onChange={(event) =>
                   setDraft({
                     ...draft,
-                    compactAndRestartEnabled: event.target.checked,
+                    summarizeAndRestartEnabled: event.target.checked,
                   })
                 }
                 className="h-4 w-4"

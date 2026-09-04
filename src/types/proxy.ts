@@ -65,7 +65,7 @@ export interface RequestHealthConfig {
   maxCodexInputTokens: number;
   reviewTimeoutSeconds: number;
   reviewMode: "off" | "first_large_request" | "sustained_growth";
-  compactAndRestartEnabled: boolean;
+  summarizeAndRestartEnabled: boolean;
 }
 
 export interface RequestHealthBreakdown {
