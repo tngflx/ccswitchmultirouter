@@ -2068,9 +2068,11 @@ function App() {
                 </p>
                 <div className="mt-3 max-h-48 space-y-2 overflow-y-auto pr-1">
                   {codexRoutingPlans.map((plan) => (
-                    <div
+                    <button
+                      type="button"
                       key={plan.id}
-                      className="flex items-center gap-3 rounded-md border border-border/60 bg-background px-3 py-2 transition hover:border-primary/40 hover:bg-primary/5"
+                      onClick={() => handleEditCodexMultiRouter(plan)}
+                      className="flex w-full items-center gap-3 rounded-md border border-border/60 bg-background px-3 py-2 text-left transition hover:border-primary/40 hover:bg-primary/5"
                     >
                       <span className="min-w-0">
                         <span className="block truncate text-sm font-medium">
@@ -2080,30 +2082,7 @@ function App() {
                           {plan.id}
                         </span>
                       </span>
-                      <div className="ml-auto flex shrink-0 items-center gap-1">
-                        <Button
-                          type="button"
-                          size="sm"
-                          variant="ghost"
-                          className="h-7 px-2 text-xs"
-                          onClick={() => handleEditCodexMultiRouter(plan)}
-                        >
-                          {t("codexMultiRouter.entryChoice.editAction")}
-                        </Button>
-                        <Button
-                          type="button"
-                          size="sm"
-                          variant="outline"
-                          className="h-7 px-2 text-xs"
-                          onClick={() => {
-                            setIsCodexMultiRouterEntryChoiceOpen(false);
-                            openCodexRouterWorkspace(plan, "overview");
-                          }}
-                        >
-                          {t("codexMultiRouter.entryChoice.openAction")}
-                        </Button>
-                      </div>
-                    </div>
+                    </button>
                   ))}
                 </div>
               </div>

@@ -552,13 +552,19 @@ describe("App integration with MSW", () => {
     fireEvent.click(screen.getByText("open-multirouter-entry"));
     expect(await screen.findByText("主路由")).toBeInTheDocument();
     expect(screen.getByText("实验路由")).toBeInTheDocument();
-    const planRow = screen.getByText("实验路由").closest("div");
+    const planRow = screen.getByText("实验路由").closest("button");
     expect(planRow).not.toBeNull();
-    fireEvent.click(
-      within(planRow as HTMLElement).getByRole("button", {
+    expect(
+      within(planRow as HTMLElement).queryByRole("button", {
         name: i18n.t("codexMultiRouter.entryChoice.editAction"),
       }),
-    );
+    ).not.toBeInTheDocument();
+    expect(
+      within(planRow as HTMLElement).queryByRole("button", {
+        name: i18n.t("codexMultiRouter.entryChoice.openAction"),
+      }),
+    ).not.toBeInTheDocument();
+    fireEvent.click(planRow as HTMLElement);
 
     const wizard = await screen.findByTestId("codex-multirouter-wizard");
     expect(wizard).toHaveAttribute("data-mode", "edit");
