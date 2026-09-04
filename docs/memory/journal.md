@@ -1,5 +1,13 @@
 # Engineering Journal (newest first)
 
+## 2026-09-04 - Reintegration candidate passed the final delivery gate
+
+- **What happened:** Completed the final verification after selecting the integrated-fixes tree and correcting two stale frontend test contracts.
+- **Root cause:** The Light probe test selected its mode before opening the dialog that owns the selector. A separate interaction-heavy Sub-Agent V2 test had a five-second timeout even though it consistently required about 5.1–5.8 seconds on this Windows host and also failed on the old `main`.
+- **What we did:** Moved the Light selection after opening the confirmation dialog and gave only the known long Sub-Agent interaction a 15-second timeout.
+- **Evidence:** `cargo check --manifest-path src-tauri/Cargo.toml` passed; full `cargo test --manifest-path src-tauri/Cargo.toml` passed; `pnpm typecheck` passed; final `pnpm test:unit` passed **162/162 files and 1361/1361 tests**.
+- **What NOT to do again:** Do not encode UI interaction order that contradicts component ownership, and do not use a global timeout increase when one explicitly complex test needs a documented local budget.
+
 ## 2026-09-04 - Promote integrated fixes as the canonical main line
 
 - **What happened:** Audited `main`, `codex/integrated-fixes-2026-09-01`, and `codex/sublyx-responses-review-20260902` before consolidating the repository onto one canonical branch.
