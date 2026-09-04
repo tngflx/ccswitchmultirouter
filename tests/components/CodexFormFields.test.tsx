@@ -1331,8 +1331,8 @@ describe("CodexFormFields local model routing", () => {
       { shouldShowSpeedTest: true },
     );
 
-    fireEvent.click(screen.getByRole("button", { name: "Light" }));
     prepareAndOpenProtocolProbe();
+    fireEvent.click(screen.getByRole("button", { name: "Light" }));
     fireEvent.click(screen.getByRole("button", { name: "确认测试" }));
 
     expect(
