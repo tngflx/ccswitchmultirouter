@@ -1,5 +1,29 @@
 # Engineering Journal (newest first)
 
+## 2026-09-04 - Development builds no longer claim installed-app auto-launch ownership
+
+- **What happened:** Running a development build could reconcile the shared auto-launch setting against its own executable and replace or remove the installed CCSwitchMulti startup registration.
+- **Root cause:** Development and installed builds share the application name and settings file, while reconciliation treated the current executable as authoritative without distinguishing build mode or registry ownership.
+- **What we did:** Debug builds now refuse to enable auto-launch, skip normal startup reconciliation, and remove a stale Run value only when it resolves to that exact development executable. Release reconciliation separately distinguishes an absent Run value from a mismatched executable while continuing to respect an explicit Task Manager disable.
+- **Evidence:** `cargo test --manifest-path src-tauri/Cargo.toml --lib auto_launch` passed **6/6**; `cargo check --manifest-path src-tauri/Cargo.toml` passed; `git diff --check` passed.
+- **What NOT to do again:** Do not let a development executable create or take ownership of an installed application's startup registration, and do not interpret an absent Run value as an owned value that should be deleted.
+
+## 2026-09-04 - Summary handoff now owns and interrupts the blocked Codex turn
+
+- **What happened:** Request Health detected sustained context growth and the user chose "Summarize + new session," but no fresh session was created; the background job timed out waiting for the source thread to become idle.
+- **Root cause:** The handoff started before the blocked HTTP request had finished ending the Codex turn. Codex immediately replayed the identical request, sustained-growth recalculation allowed that duplicate upstream, and the new 15-second passive idle wait expired while the replay kept the source thread active.
+- **What we did:** Added a session-scoped RAII handoff guard that blocks every normal Codex retry until the handoff completes or fails. The renderer now reads the active `inProgress` turn, calls the app-server `turn/interrupt` contract with its exact `threadId` and `turnId`, waits for the source thread to leave `active`, and only then starts native compaction and the fresh-root-session transfer. Neither `BigStrongSun/ccswitchmulti` nor `farion1231/cc-switch` contains this fork-specific handoff; farion PR #5536 addresses Chat-provider compaction wire translation instead.
+- **Evidence:** Live logs showed the first handoff request at `16:26:22.673`, an identical `521502`-byte client replay at `16:26:23.097`, and timeout at `16:26:39.633`; client/post-transform/retry/upstream-wire sizes were `521502/521451/521502/521451`, proving no proxy inflation. Installed Codex `0.153.2` generated schema confirmed `turn/interrupt` requires `threadId` and `turnId`. `cargo test --manifest-path src-tauri/Cargo.toml --lib request_health` passed **15/15**; `cargo test --manifest-path src-tauri/Cargo.toml --lib codex_desktop` passed **45/45**; `cargo check --manifest-path src-tauri/Cargo.toml` passed; generated JavaScript syntax and scoped `git diff --check` passed.
+- **What NOT to do again:** Do not passively wait for a proxy-blocked turn to become idle, let retry-risk recalculation clear a handoff already chosen by the user, or increase the timeout while the retry producer remains active.
+
+## 2026-09-04 - Provider icons use a curated local identity registry
+
+- **What happened:** Sublyx rendered from a low-resolution remote favicon in the provider form, while legacy provider cards on the main page could have no icon at all.
+- **Root cause:** Form save paths and card rendering used separate fallback logic; the generic fallback persisted Google favicon proxy URLs as provider identity, and Sublyx was special-cased to its 80x80-site favicon instead of the shared bundled icon system.
+- **What we did:** Added a bundled Sublyx SVG recreation based on the official 80x80 PNG, registered it in the extracted icon catalog, and centralized explicit-icon, curated-domain, provider-name, and nested-config inference. Main-page cards now resolve legacy records through the same helper; add/edit/form flows persist the stable icon key. Unknown providers fall back to initials instead of third-party favicon URLs. Neither `BigStrongSun/ccswitchmulti` nor `farion1231/cc-switch` had a Sublyx implementation to port; their relevant precedent favors bundled curated brand assets.
+- **Evidence:** The official `https://sublyx.org/logo.png` measured 80x80 pixels and 6,996 bytes with SHA-256 `719AE6E7D2FC705CA05FB3F893A8EDA2D9EFA6F908434E1F7562C6F7A7CC4CA4`. Targeted Vitest passed **6/6 files and 44/44 tests**; `pnpm typecheck` passed; scoped `git diff --check` passed.
+- **What NOT to do again:** Do not persist Google favicon proxy URLs or raw `.ico` files as provider identity, and do not add form-only icon inference without applying the same resolver to legacy card rendering.
+
 ## 2026-09-04 - Reintegration candidate passed the final delivery gate
 
 - **What happened:** Completed the final verification after selecting the integrated-fixes tree and correcting two stale frontend test contracts.
