@@ -570,7 +570,6 @@ fn format_bind_error(addr: &SocketAddr, error: std::io::Error) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
     use super::*;
     use crate::{
         provider::Provider,

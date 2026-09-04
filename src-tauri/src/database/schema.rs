@@ -3853,6 +3853,7 @@ mod tests {
         Ok(())
     }
 
+    #[test]
     fn repair_deepseek_native_responses_splits_legacy_router_idempotently() -> Result<(), AppError>
     {
         let conn = Connection::open_in_memory()?;
