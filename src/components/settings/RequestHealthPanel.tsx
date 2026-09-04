@@ -3,15 +3,21 @@ import {
   Activity,
   AlertTriangle,
   ArrowDown,
+  BrainCircuit,
   Boxes,
   CheckCircle2,
+  CircleHelp,
   CircleGauge,
   DatabaseZap,
+  FileText,
   HardDrive,
+  Image,
+  MessageSquareText,
   RefreshCw,
   Save,
   ShieldCheck,
   Sparkles,
+  Wrench,
 } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import { Badge } from "@/components/ui/badge";
@@ -59,6 +65,22 @@ function MetricTile({
   );
 }
 
+function breakdownIcon(category: string) {
+  const normalized = category.toLowerCase().replace(/[\s-]+/g, "_");
+  if (normalized.includes("tool")) return Wrench;
+  if (normalized.includes("reason")) return BrainCircuit;
+  if (normalized.includes("message") || normalized.includes("input")) {
+    return MessageSquareText;
+  }
+  if (normalized.includes("image") || normalized.includes("vision")) {
+    return Image;
+  }
+  if (normalized.includes("output") || normalized.includes("response")) {
+    return FileText;
+  }
+  return CircleHelp;
+}
+
 export function RequestHealthPanel({
   snapshot,
   isRefreshing,
@@ -103,6 +125,14 @@ export function RequestHealthPanel({
   }
 
   const latest = snapshot?.diagnostics[0];
+  const diagnostics = snapshot?.diagnostics ?? [];
+  const hasWarnings = diagnostics.some(
+    (diagnostic) =>
+      diagnostic.thresholdExceeded ||
+      diagnostic.tokenLimitExceeded ||
+      diagnostic.findings.length > 0 ||
+      Boolean(diagnostic.anomaly),
+  );
   const thresholdRatio = latest
     ? Math.min(1, latest.optimizedBytes / Math.max(1, latest.thresholdBytes))
     : 0;
@@ -305,13 +335,62 @@ export function RequestHealthPanel({
         <div className="text-xs text-muted-foreground">{saveMessage}</div>
       ) : null}
 
-      {latest?.thresholdExceeded && latest.bytesRemoved === 0 && draft ? (
+      {hasWarnings && draft ? (
         <div
           role="status"
           className="flex items-start gap-2 rounded-md border border-amber-300/60 bg-amber-50 px-3 py-3 text-sm text-amber-900 dark:border-amber-700/50 dark:bg-amber-950/20 dark:text-amber-100"
         >
           <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
-          {t("codexRouterWorkspace.requestHealth.detectedOnlyWarning")}
+          {latest?.thresholdExceeded && latest.bytesRemoved === 0
+            ? t("codexRouterWorkspace.requestHealth.detectedOnlyWarning")
+            : t("codexRouterWorkspace.requestHealth.historyWarning")}
+        </div>
+      ) : null}
+
+      {diagnostics.length > 0 ? (
+        <div className="rounded-md border border-border bg-background/50 p-3">
+          <div className="mb-3 flex items-center gap-2 text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+            <Activity className="h-4 w-4 text-cyan-500" />
+            <span>{t("codexRouterWorkspace.requestHealth.timeline")}</span>
+          </div>
+          <div className="space-y-2">
+            {diagnostics.slice(0, 12).map((diagnostic) => (
+              <div
+                key={`${diagnostic.traceId ?? diagnostic.sessionId}-${diagnostic.generatedAt}`}
+                className="flex flex-wrap items-center gap-x-3 gap-y-1 rounded-md border border-border/70 px-3 py-2 text-xs"
+              >
+                <span className="font-mono text-muted-foreground">
+                  {diagnostic.generatedAt}
+                </span>
+                <span className="font-medium">
+                  {diagnostic.providerName} · {diagnostic.model}
+                </span>
+                <span
+                  className={cn(
+                    "rounded-full px-2 py-0.5 font-medium",
+                    diagnostic.reviewAction === "continued"
+                      ? "bg-emerald-500/15 text-emerald-700 dark:text-emerald-300"
+                      : diagnostic.reviewAction?.startsWith("summarize")
+                        ? "bg-violet-500/15 text-violet-700 dark:text-violet-300"
+                        : diagnostic.blocked
+                          ? "bg-amber-500/15 text-amber-700 dark:text-amber-300"
+                          : "bg-muted text-muted-foreground",
+                  )}
+                >
+                  {t(
+                    `codexRouterWorkspace.requestHealth.action.${diagnostic.reviewAction ?? "none"}`,
+                  )}
+                </span>
+                {diagnostic.findings.length > 0 ? (
+                  <span className="text-amber-700 dark:text-amber-300">
+                    {t("codexRouterWorkspace.requestHealth.findingCount", {
+                      count: diagnostic.findings.length,
+                    })}
+                  </span>
+                ) : null}
+              </div>
+            ))}
+          </div>
         </div>
       ) : null}
 
@@ -384,6 +463,51 @@ export function RequestHealthPanel({
               tone={latest.compactionRecommended ? "amber" : "cyan"}
             />
           </div>
+          <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
+            <MetricTile
+              icon={DatabaseZap}
+              label={t(
+                "codexRouterWorkspace.requestHealth.estimatedInputTokens",
+              )}
+              value={latest.estimatedInputTokens.toLocaleString()}
+              tone="violet"
+            />
+            {latest.actualInputTokens !== undefined ? (
+              <MetricTile
+                icon={Activity}
+                label={t(
+                  "codexRouterWorkspace.requestHealth.actualInputTokens",
+                )}
+                value={latest.actualInputTokens.toLocaleString()}
+              />
+            ) : null}
+            {latest.cachedInputTokens !== undefined ? (
+              <MetricTile
+                icon={Boxes}
+                label={t(
+                  "codexRouterWorkspace.requestHealth.cachedInputTokens",
+                )}
+                value={latest.cachedInputTokens.toLocaleString()}
+                tone="emerald"
+              />
+            ) : null}
+            {latest.freshInputTokens !== undefined ? (
+              <MetricTile
+                icon={ArrowDown}
+                label={t("codexRouterWorkspace.requestHealth.freshInputTokens")}
+                value={latest.freshInputTokens.toLocaleString()}
+                tone="amber"
+              />
+            ) : null}
+            {latest.cacheHitRatio !== undefined ? (
+              <MetricTile
+                icon={CircleGauge}
+                label={t("codexRouterWorkspace.requestHealth.cacheHitRatio")}
+                value={`${(latest.cacheHitRatio * 100).toFixed(1)}%`}
+                tone="cyan"
+              />
+            ) : null}
+          </div>
           <div className="rounded-md border border-border bg-background/60 p-3">
             <div className="flex items-center justify-between gap-3 text-xs">
               <span className="flex items-center gap-2 font-medium">
@@ -431,7 +555,15 @@ export function RequestHealthPanel({
                 className="border-t border-border px-3 py-2.5 first:border-t-0"
               >
                 <div className="flex items-center justify-between gap-3 text-xs">
-                  <span className="font-mono">{row.category}</span>
+                  <span className="flex min-w-0 items-center gap-2 font-mono">
+                    {(() => {
+                      const Icon = breakdownIcon(row.category);
+                      return (
+                        <Icon className="h-3.5 w-3.5 shrink-0 text-violet-500" />
+                      );
+                    })()}
+                    <span className="truncate">{row.category}</span>
+                  </span>
                   <span className="text-right text-muted-foreground">
                     {(row.bytes / 1024).toFixed(1)} KB ·{" "}
                     {t("codexRouterWorkspace.requestHealth.itemCount", {

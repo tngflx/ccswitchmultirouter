@@ -3263,6 +3263,9 @@ JSON.stringify({
     fn compatibility_script_summarizes_before_starting_a_fresh_session() {
         let script = build_model_picker_unlock_script(&CodexModelCatalogProjection::empty());
 
+        let interrupt = script
+            .find(r#"client.sendRequest("turn/interrupt""#)
+            .expect("blocked source turn interruption");
         let compact = script
             .find(r#"client.sendRequest("thread/compact/start""#)
             .expect("native compaction request");
@@ -3275,6 +3278,7 @@ JSON.stringify({
         let handoff_turn = script
             .find(r#"client.sendRequest("turn/start""#)
             .expect("handoff turn request");
+        assert!(interrupt < compact);
         assert!(compact < wait_for_item);
         assert!(wait_for_item < fresh_thread);
         assert!(fresh_thread < handoff_turn);
@@ -3284,6 +3288,7 @@ JSON.stringify({
         assert!(script.contains("state.startFreshSessionFromSummary"));
         assert!(script.contains("state.readFreshSessionJob"));
         assert!(script.contains("await triggerLocalThreadCatalogSync()"));
+        assert!(script.contains(r#"String(turn?.status || "") === "inProgress""#));
         assert!(!script.contains(r#"client.sendRequest("thread/fork""#));
         assert!(!script.contains("thread/delete"));
         assert!(!script.contains("thread/archive"));

@@ -3798,6 +3798,10 @@ impl RequestForwarder {
             ) {
                 if let Some(trace_id) = codex_trace_id.as_deref() {
                     super::request_health::mark_blocked(trace_id);
+                    super::request_health::mark_review_action_for_session(
+                        &self.session_id,
+                        "summarize_requested",
+                    );
                     super::codex_router_log::append_event(
                         "request_health_summarize_restart_requested",
                         &[
@@ -3812,11 +3816,24 @@ impl RequestForwarder {
                     );
                 }
                 let session_id = self.session_id.clone();
+                let Some(summary_handoff_guard) =
+                    super::request_health::begin_summary_handoff(&session_id)
+                else {
+                    return Err(ProxyError::RequestHealthBlocked(
+                        "A summary handoff is already in progress for this Codex session"
+                            .to_string(),
+                    ));
+                };
                 tokio::spawn(async move {
+                    let _summary_handoff_guard = summary_handoff_guard;
                     match crate::codex_desktop::summarize_and_restart_codex_session(&session_id)
                         .await
                     {
                         Ok(result) => {
+                            super::request_health::mark_review_action_for_session(
+                                &session_id,
+                                "summarize_completed",
+                            );
                             #[cfg(target_os = "windows")]
                             super::request_health::show_summarize_restart_result_notification(
                                 &session_id,
@@ -3841,6 +3858,10 @@ impl RequestForwarder {
                             );
                         }
                         Err(error) => {
+                            super::request_health::mark_review_action_for_session(
+                                &session_id,
+                                "summarize_failed",
+                            );
                             #[cfg(target_os = "windows")]
                             super::request_health::show_summarize_restart_result_notification(
                                 &session_id,

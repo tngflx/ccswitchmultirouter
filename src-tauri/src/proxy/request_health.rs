@@ -75,6 +75,8 @@ pub struct RequestHealthDiagnostic {
     pub max_input_tokens: usize,
     pub token_limit_exceeded: bool,
     pub blocked: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub review_action: Option<String>,
     pub item_count: usize,
     pub largest_item_bytes: usize,
     pub largest_item_category: Option<String>,
@@ -120,6 +122,7 @@ static SESSION_REVIEW_RISKS: OnceLock<Mutex<HashMap<String, RequestHealthFinding
     OnceLock::new();
 static PENDING_REVIEWS: OnceLock<Mutex<HashMap<String, PendingReview>>> = OnceLock::new();
 static APPROVED_PAYLOADS: OnceLock<Mutex<VecDeque<ApprovedPayload>>> = OnceLock::new();
+static ACTIVE_SUMMARY_HANDOFFS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ReviewDecision {
@@ -176,6 +179,45 @@ fn pending_reviews() -> &'static Mutex<HashMap<String, PendingReview>> {
 
 fn approved_payloads() -> &'static Mutex<VecDeque<ApprovedPayload>> {
     APPROVED_PAYLOADS.get_or_init(|| Mutex::new(VecDeque::with_capacity(MAX_APPROVED_PAYLOADS)))
+}
+
+fn active_summary_handoffs() -> &'static Mutex<HashSet<String>> {
+    ACTIVE_SUMMARY_HANDOFFS.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+pub(crate) struct SummaryHandoffGuard {
+    session_id: String,
+}
+
+impl Drop for SummaryHandoffGuard {
+    fn drop(&mut self) {
+        active_summary_handoffs()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&self.session_id);
+    }
+}
+
+pub(crate) fn begin_summary_handoff(session_id: &str) -> Option<SummaryHandoffGuard> {
+    let session_id = session_id.trim();
+    if session_id.is_empty() {
+        return None;
+    }
+    let mut active = active_summary_handoffs()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    active
+        .insert(session_id.to_string())
+        .then(|| SummaryHandoffGuard {
+            session_id: session_id.to_string(),
+        })
+}
+
+fn summary_handoff_active(session_id: &str) -> bool {
+    active_summary_handoffs()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .contains(session_id)
 }
 
 pub fn snapshot(config: RequestHealthConfig) -> RequestHealthSnapshot {
@@ -318,6 +360,7 @@ pub(crate) fn inspect_and_optimize(
         max_input_tokens,
         token_limit_exceeded,
         blocked,
+        review_action: None,
         item_count: analysis.item_count,
         largest_item_bytes: analysis.largest_item_bytes,
         largest_item_category: analysis.largest_item_category,
@@ -493,6 +536,20 @@ pub(crate) fn mark_blocked(trace_id: &str) {
         .rfind(|diagnostic| diagnostic.trace_id.as_deref() == Some(trace_id))
     {
         diagnostic.blocked = true;
+        diagnostic.review_action = Some("blocked".to_string());
+    }
+}
+
+pub(crate) fn mark_review_action_for_session(session_id: &str, action: &str) {
+    let mut store = diagnostics_store()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(diagnostic) = store
+        .iter_mut()
+        .rev()
+        .find(|diagnostic| diagnostic.session_id == session_id)
+    {
+        diagnostic.review_action = Some(action.to_string());
     }
 }
 
@@ -622,6 +679,10 @@ pub(crate) async fn review_before_upstream(
         return Ok(PreflightReviewOutcome::NotRequired);
     }
 
+    if summary_handoff_active(session_id) {
+        return Err("Request blocked while the session summary handoff is in progress".to_string());
+    }
+
     #[cfg(not(target_os = "windows"))]
     {
         let _ = (model, body, dispatch_scope);
@@ -675,7 +736,19 @@ pub(crate) async fn review_before_upstream(
         let timeout_seconds = u64::from(config.review_timeout_seconds)
             .clamp(MIN_REVIEW_TIMEOUT_SECONDS, MAX_REVIEW_TIMEOUT_SECONDS);
         match tokio::time::timeout(Duration::from_secs(timeout_seconds), receiver).await {
-            Ok(Ok(ReviewDecision::ContinueOnce)) => Ok(PreflightReviewOutcome::ContinueOnce),
+            Ok(Ok(ReviewDecision::ContinueOnce)) => {
+                if let Some(diagnostic) = diagnostics_store()
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .iter_mut()
+                    .rev()
+                    .find(|diagnostic| diagnostic.trace_id.as_deref() == Some(trace_id))
+                {
+                    diagnostic.blocked = false;
+                    diagnostic.review_action = Some("continued".to_string());
+                }
+                Ok(PreflightReviewOutcome::ContinueOnce)
+            }
             Ok(Ok(ReviewDecision::SummarizeAndRestart)) => {
                 Ok(PreflightReviewOutcome::SummarizeAndRestart)
             }
@@ -1312,6 +1385,41 @@ mod tests {
             &body_hash,
             &dispatch_hash
         ));
+    }
+
+    #[test]
+    fn summary_handoff_guard_blocks_retries_until_released() {
+        let session_id = "summary-handoff-retry-session";
+        let guard = begin_summary_handoff(session_id).expect("acquire handoff guard");
+        assert!(summary_handoff_active(session_id));
+        assert!(begin_summary_handoff(session_id).is_none());
+
+        drop(guard);
+
+        assert!(!summary_handoff_active(session_id));
+        assert!(begin_summary_handoff(session_id).is_some());
+    }
+
+    #[tokio::test]
+    async fn active_summary_handoff_rejects_a_codex_retry_before_risk_recalculation() {
+        let session_id = "summary-handoff-preflight-session";
+        let _guard = begin_summary_handoff(session_id).expect("acquire handoff guard");
+        let result = review_before_upstream(
+            &RequestHealthConfig::default(),
+            "retry-trace",
+            session_id,
+            true,
+            "gpt-test",
+            br#"{"input":"same oversized payload"}"#,
+            "provider|POST|https://example.test/responses",
+            false,
+        )
+        .await;
+
+        assert_eq!(
+            result,
+            Err("Request blocked while the session summary handoff is in progress".to_string())
+        );
     }
 
     #[test]

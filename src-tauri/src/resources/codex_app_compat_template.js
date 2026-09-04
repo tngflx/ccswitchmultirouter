@@ -471,17 +471,29 @@
     let lastError = null;
     for (const client of clients) {
       try {
-        const idleDeadline = Date.now() + 15000;
+        const idleDeadline = Date.now() + 30000;
+        const interruptedTurnIds = new Set();
         let before = null;
         while (Date.now() < idleDeadline) {
           before = await client.sendRequest("thread/read", {
             threadId: normalizedThreadId,
             includeTurns: true,
           });
-          const status = String(
-            before?.thread?.status?.type || before?.status?.type || "",
-          );
+          const thread = before?.thread || before;
+          const status = String(thread?.status?.type || "");
           if (status !== "active") break;
+
+          const activeTurn = [...(thread?.turns || [])]
+            .reverse()
+            .find((turn) => String(turn?.status || "") === "inProgress");
+          const activeTurnId = String(activeTurn?.id || "").trim();
+          if (activeTurnId && !interruptedTurnIds.has(activeTurnId)) {
+            interruptedTurnIds.add(activeTurnId);
+            await client.sendRequest("turn/interrupt", {
+              threadId: normalizedThreadId,
+              turnId: activeTurnId,
+            });
+          }
           await new Promise((resolve) => setTimeout(resolve, 250));
         }
         const sourceStatus = String(
@@ -489,7 +501,7 @@
         );
         if (sourceStatus === "active")
           throw new Error(
-            "Timed out waiting for the blocked source turn to become idle",
+            "Timed out interrupting the blocked source turn before compaction",
           );
         const beforeCompactions = countCompactionItems(before);
         await client.sendRequest("thread/compact/start", {

@@ -53,7 +53,11 @@ function snapshot(): RequestHealthSnapshot {
         compactionRecommended: true,
         sessionClientProvided: true,
         findings: [],
-        breakdown: [],
+        breakdown: [
+          { category: "tool_calls", itemCount: 12, bytes: 48_000 },
+          { category: "reasoning", itemCount: 4, bytes: 12_000 },
+        ],
+        reviewAction: "blocked",
       },
     ],
   };
@@ -125,6 +129,38 @@ describe("RequestHealthPanel", () => {
 
     expect(
       screen.getByText(/Fresh input kept growing while cache hits stayed low/),
+    ).toBeInTheDocument();
+  });
+
+  it("adds semantic icons to request breakdown categories", () => {
+    render(
+      <RequestHealthPanel
+        snapshot={snapshot()}
+        isRefreshing={false}
+        onRefresh={() => {}}
+        onSaved={() => {}}
+      />,
+    );
+
+    const toolCalls = screen.getByText("tool_calls");
+    expect(toolCalls.parentElement?.querySelector("svg")).toBeTruthy();
+  });
+
+  it("keeps the incident timeline and action visible", () => {
+    render(
+      <RequestHealthPanel
+        snapshot={snapshot()}
+        isRefreshing={false}
+        onRefresh={() => {}}
+        onSaved={() => {}}
+      />,
+    );
+
+    expect(
+      screen.getByText("codexRouterWorkspace.requestHealth.timeline"),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText("codexRouterWorkspace.requestHealth.action.blocked"),
     ).toBeInTheDocument();
   });
 });

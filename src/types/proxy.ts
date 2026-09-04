@@ -100,6 +100,13 @@ export interface RequestHealthDiagnostic {
   maxInputTokens: number;
   tokenLimitExceeded: boolean;
   blocked: boolean;
+  reviewAction?:
+    | "continued"
+    | "blocked"
+    | "summarize_requested"
+    | "summarize_completed"
+    | "summarize_failed"
+    | string;
   itemCount: number;
   largestItemBytes: number;
   largestItemCategory: string | null;
