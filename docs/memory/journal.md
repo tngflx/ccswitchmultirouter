@@ -1,5 +1,13 @@
 # Engineering Journal (newest first)
 
+## 2026-09-05 - Repository consolidated to a single `main` branch
+
+- **What happened:** Per user directive, the repo now carries exactly one branch (`main`). Deleted local branches `codex/integrated-fixes-2026-09-01` (`2ebc22694`, AGENTS.md-only scratch commit), `codex/pre-consolidation-backup` (`680a09a37`, pre-rewrite backup whose content was verified identical and pushed during the consolidation), and `codex/upstream-integration-2026-09-03` (`63c25e7a9`); fork remote branches including 5 Dependabot refs and the stale pre-consolidation line `codex/sublyx-responses-review-20260902` (`125f971b6`); the duplicate `multirouter` remote (same URL as origin); and stale worktrees (`ccswitchmulti-release-verify-20260829`, plus the pruned `ccswitchmulti-upstream-20260903` registration).
+- **Root cause:** Branch sprawl accumulated from integration audits, a retained history-rewrite backup, Dependabot PR branches, and a second remote mirroring the same GitHub repository under a different name.
+- **What we did:** Cherry-picked the 5 unmerged upstream-integration commits onto origin/main in a detached temp worktree (main worktree checkout was blocked by leased dirty files), resolved the journal conflict by re-inserting the audit entry in chronological position, verified, pushed, then deleted everything else. Every deleted tip SHA is recorded in [the consolidation ledger](incidents/2026-09-05-branch-consolidation-ledger.md).
+- **Evidence:** `cargo check` exit 0; `cargo test --lib -- protocol_compatibility session_usage hermes` = **250 passed, 0 failed, 1 ignored**; `codexMultiRouterWizard.test.ts` **8/8**; `pnpm typecheck` exit 0; push to origin/main succeeded.
+- **What NOT to do again:** Do not keep pre-rewrite backup branches past the verified-push boundary; do not add a second remote for the same URL; record deleted tip SHAs before deletion.
+
 ## 2026-09-04 - Development builds no longer claim installed-app auto-launch ownership
 
 - **What happened:** Running a development build could reconcile the shared auto-launch setting against its own executable and replace or remove the installed CCSwitchMulti startup registration.
