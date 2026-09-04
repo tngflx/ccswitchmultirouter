@@ -90,15 +90,21 @@ mod windows {
 
     pub(super) fn reconciliation_action(
         desired: bool,
+        run_value_present: bool,
         run_matches_current_exe: bool,
         startup_approved: bool,
     ) -> Option<bool> {
-        match (desired, run_matches_current_exe, startup_approved) {
-            (true, false, _) => Some(true),
+        match (
+            desired,
+            run_value_present,
+            run_matches_current_exe,
+            startup_approved,
+        ) {
+            (false, true, _, _) => Some(false),
+            (true, _, false, _) => Some(true),
             // Respect an explicit Windows Task Manager disable when the Run
             // registration itself is otherwise valid.
-            (true, true, false) => None,
-            (false, true, _) => Some(false),
+            (true, _, true, false) => None,
             _ => None,
         }
     }
@@ -166,6 +172,38 @@ mod windows {
         Ok(())
     }
 
+    /// Remove only a registration owned by the current executable.
+    ///
+    /// Development and release builds share the same application name and settings file. A
+    /// development process must therefore never remove a valid installed-app registration while
+    /// cleaning up a stale entry written by an older development build.
+    pub(super) fn cleanup_current_exe_registration() -> Result<(), AppError> {
+        let exe = current_exe()?;
+        let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+        let run_value = match hkcu.open_subkey_with_flags(RUN_REGKEY, KEY_READ) {
+            Ok(key) => match key.get_value::<String, _>(APP_NAME) {
+                Ok(value) => Some(value),
+                Err(error) if error.kind() == ErrorKind::NotFound => None,
+                Err(error) => return Err(registry_error("读取自启 Run 值失败", error)),
+            },
+            Err(error) if error.kind() == ErrorKind::NotFound => None,
+            Err(error) => return Err(registry_error("读取 Run 注册表键失败", error)),
+        };
+
+        if run_value
+            .as_deref()
+            .is_some_and(|value| run_value_matches_exe(value, &exe))
+        {
+            log::warn!(
+                "检测到指向当前开发版可执行文件的开机自启注册，正在清理: {}",
+                exe.display()
+            );
+            disable()?;
+        }
+
+        Ok(())
+    }
+
     pub(super) fn is_enabled() -> Result<bool, AppError> {
         let exe = current_exe()?;
         let hkcu = RegKey::predef(HKEY_CURRENT_USER);
@@ -223,7 +261,7 @@ mod windows {
             Err(error) => return Err(registry_error("读取 StartupApproved 注册表键失败", error)),
         };
 
-        match reconciliation_action(desired, run_matches, startup_approved) {
+        match reconciliation_action(desired, run_value.is_some(), run_matches, startup_approved) {
             Some(true) => enable(),
             Some(false) => disable(),
             None => Ok(()),
@@ -237,6 +275,15 @@ fn auto_launch_reconciliation_action(desired: bool, actual: bool) -> Option<bool
 }
 
 pub fn reconcile_auto_launch(desired: bool) -> Result<(), AppError> {
+    if cfg!(debug_assertions) {
+        #[cfg(target_os = "windows")]
+        {
+            windows::cleanup_current_exe_registration()?;
+        }
+        log::debug!("开发构建跳过开机自启对账");
+        return Ok(());
+    }
+
     #[cfg(target_os = "windows")]
     {
         windows::reconcile(desired)
@@ -254,6 +301,12 @@ pub fn reconcile_auto_launch(desired: bool) -> Result<(), AppError> {
 
 /// 启用开机自启
 pub fn enable_auto_launch() -> Result<(), AppError> {
+    if cfg!(debug_assertions) {
+        return Err(AppError::Message(
+            "开发构建不能注册开机自启；请从已安装的发行版启用此设置".to_string(),
+        ));
+    }
+
     #[cfg(target_os = "windows")]
     {
         windows::enable()
@@ -271,6 +324,15 @@ pub fn enable_auto_launch() -> Result<(), AppError> {
 
 /// 禁用开机自启
 pub fn disable_auto_launch() -> Result<(), AppError> {
+    if cfg!(debug_assertions) {
+        #[cfg(target_os = "windows")]
+        {
+            windows::cleanup_current_exe_registration()?;
+        }
+        log::debug!("开发构建跳过开机自启禁用操作");
+        return Ok(());
+    }
+
     #[cfg(target_os = "windows")]
     {
         windows::disable()
@@ -348,14 +410,32 @@ mod tests {
     #[test]
     fn windows_startup_reconciliation_repairs_missing_run_but_respects_task_manager_disable() {
         assert_eq!(
-            windows::reconciliation_action(true, false, true),
+            windows::reconciliation_action(true, false, false, true),
             Some(true)
         );
-        assert_eq!(windows::reconciliation_action(true, true, false), None);
         assert_eq!(
-            windows::reconciliation_action(false, true, true),
+            windows::reconciliation_action(true, true, true, false),
+            None
+        );
+        assert_eq!(
+            windows::reconciliation_action(false, true, true, true),
             Some(false)
         );
+        assert_eq!(
+            windows::reconciliation_action(false, true, false, false),
+            Some(false)
+        );
+        assert_eq!(
+            windows::reconciliation_action(false, false, false, true),
+            None
+        );
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn development_build_refuses_to_enable_auto_launch() {
+        let error = enable_auto_launch().expect_err("development builds must not register startup");
+        assert!(error.to_string().contains("开发构建不能注册开机自启"));
     }
 
     #[cfg(target_os = "macos")]
