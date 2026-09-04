@@ -3468,7 +3468,7 @@ describe("Codex Sub-Agent V2 persisted interactions", () => {
         "repository-scout"
       ].reasoning,
     ).toEqual({ policy: "fixed", effort: "high" });
-  });
+  }, 15_000);
 
   it("reloads policy, questionnaire, and override from get_providers after save/remount", async () => {
     const user = userEvent.setup();

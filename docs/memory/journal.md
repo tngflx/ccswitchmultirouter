@@ -1,5 +1,13 @@
 # Engineering Journal (newest first)
 
+## 2026-09-04 - Promote integrated fixes as the canonical main line
+
+- **What happened:** Audited `main`, `codex/integrated-fixes-2026-09-01`, and `codex/sublyx-responses-review-20260902` before consolidating the repository onto one canonical branch.
+- **Root cause:** `main` and the integrated branch had independently rewritten histories sharing only the original repository root. The review branch was created from the stale `main` tip and its first patch attempted to restore save-time automatic protocol probing, which the integrated line had deliberately replaced with persistence-only provider saves and explicit verification.
+- **What we did:** Preserved all original tips under dated backup refs; selected the integrated tree as canonical; rejected the stale review-branch patch after reviewing every conflict hunk; fixed the Light-probe test to select its mode inside the confirmation dialog; increased the timeout only for an existing interaction-heavy Sub-Agent V2 test that exceeded five seconds on both old `main` and the integrated candidate.
+- **Evidence:** Before promotion, `cargo check --manifest-path src-tauri/Cargo.toml` passed; full `cargo test --manifest-path src-tauri/Cargo.toml` passed; `pnpm typecheck` passed. The first frontend run passed **1359/1361**, with the Light selector sequencing failure and one load-related App timeout; the App test passed alone in **14.98s**. After the Light test correction, its isolated run passed **1/1**. The Sub-Agent timeout reproduced on both old `main` and the integrated candidate at approximately **5.1s**, proving it was not introduced by the promotion.
+- **What NOT to do again:** Do not merge branches with independently rewritten histories as if they were linear, do not restore automatic network probes to ordinary provider saves, and do not discard a review branch until its unique patches have been audited against the current architecture.
+
 ## 2026-09-04 - Correction: remove the full inline Light/Deep readiness panel
 
 - **What happened:** The initial UI cleanup removed only the explanatory Readiness content but incorrectly left the Light/Deep selector visible in the screenshot area.
