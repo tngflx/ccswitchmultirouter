@@ -1,4 +1,5 @@
 use chrono::Utc;
+use futures::{stream, StreamExt, TryStreamExt};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
@@ -27,6 +28,7 @@ use crate::{
 
 const VERIFIED_TTL_SECONDS: i64 = 30 * 24 * 60 * 60;
 const UNVERIFIED_TTL_SECONDS: i64 = 7 * 24 * 60 * 60;
+const PROBE_MODEL_CONCURRENCY: usize = 3;
 const OVERRIDE_PLAN_TTL: Duration = Duration::from_secs(10 * 60);
 
 #[derive(Debug, Clone, Deserialize)]
@@ -453,7 +455,7 @@ async fn run_candidate_result(
     state: &AppState,
     candidate: ProbeCandidate,
 ) -> Result<ProtocolCompatibilityProbeResult, String> {
-    let _lease = state.try_acquire_protocol_probe(&candidate.lease_key())?;
+    let _lease = state.acquire_protocol_probe(&candidate.lease_key()).await?;
     let client = crate::proxy::http_client::build_protocol_probe_client()?;
     Ok(run_protocol_compatibility_probe(candidate, &client).await)
 }
@@ -467,7 +469,7 @@ async fn run_candidate_result_with_reporter<F>(
 where
     F: Fn(ProtocolProbeProgressEvent) + Send + Sync,
 {
-    let _lease = state.try_acquire_protocol_probe(&candidate.lease_key())?;
+    let _lease = state.acquire_protocol_probe(&candidate.lease_key()).await?;
     let client = crate::proxy::http_client::build_protocol_probe_client()?;
     Ok(run_protocol_compatibility_probe_in_mode(candidate, &client, mode, reporter).await)
 }
@@ -521,17 +523,28 @@ where
     F: FnMut(ProbeCandidate) -> Fut,
     Fut: Future<Output = Result<ProtocolCompatibilityProbeResult, String>>,
 {
-    let mut results_by_target: HashMap<String, ProtocolCompatibilityProbeResult> = HashMap::new();
+    // Deduplicate aliases before scheduling and restore the original order when
+    // building records, so completion order cannot change persisted output.
+    let mut seen = std::collections::BTreeSet::new();
+    let unique_candidates = candidates
+        .iter()
+        .filter(|candidate| seen.insert(candidate.lease_key()))
+        .cloned()
+        .collect::<Vec<_>>();
+    let results_by_target: HashMap<String, ProtocolCompatibilityProbeResult> =
+        stream::iter(unique_candidates)
+            .map(|candidate| {
+                let key = candidate.lease_key();
+                let result = execute(candidate);
+                async move { result.await.map(|result| (key, result)) }
+            })
+            .buffer_unordered(PROBE_MODEL_CONCURRENCY)
+            .try_collect()
+            .await?;
     let mut records = Vec::with_capacity(candidates.len());
     for candidate in candidates {
         let execution_key = candidate.lease_key();
-        let result = if let Some(result) = results_by_target.get(&execution_key) {
-            result.clone()
-        } else {
-            let result = execute(candidate.clone()).await?;
-            results_by_target.insert(execution_key, result.clone());
-            result
-        };
+        let result = results_by_target[&execution_key].clone();
         records.push(build_record_for_result(&candidate, result)?);
     }
     Ok(records)

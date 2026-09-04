@@ -1,5 +1,13 @@
 # Engineering Journal (newest first)
 
+## 2026-09-05 - Probe concurrency WIP ported onto the consolidated main
+
+- **What happened:** The pre-consolidation probe-concurrency WIP (4 files, leased by a stale `/root` session with no running process) blocked the fast-forward of `main`. The user chose to port it rather than discard it.
+- **Root cause:** The WIP was written against `d8a974855`; the incoming consolidation rewrote the same `runner.rs` dispatch region and added `probe_all_transports`, so the branch-dispatch hunks collided on apply.
+- **What we did:** Stashed the WIP, fast-forwarded `main` to `fd28a9002`, re-applied via `git stash apply` (never `pop`), and merged both intents in `runner.rs`: `tokio::join!` runs the two transport branches concurrently when `probe_all_transports` is set, while assigned-transport probing runs directly. The auto-merged command layer (dedupe by lease key + `buffer_unordered(3)`) and store waiter (180s `Notify` queue) needed no changes.
+- **Evidence:** `cargo check` exit 0; `cargo test --lib -- protocol_compatibility store` = **190 passed, 0 failed, 1 ignored**; named runs of the new store waiter tests and `deep_probe_starts_responses_and_chat_before_either_baseline_finishes` passed.
+- **What NOT to do again:** Do not leave WIP leased or stashed across a consolidation of the same files; port with `git stash apply` so the stash entry survives a failed merge.
+
 ## 2026-09-05 - Repository consolidated to a single `main` branch
 
 - **What happened:** Per user directive, the repo now carries exactly one branch (`main`). Deleted local branches `codex/integrated-fixes-2026-09-01` (`2ebc22694`, AGENTS.md-only scratch commit), `codex/pre-consolidation-backup` (`680a09a37`, pre-rewrite backup whose content was verified identical and pushed during the consolidation), and `codex/upstream-integration-2026-09-03` (`63c25e7a9`); fork remote branches including 5 Dependabot refs and the stale pre-consolidation line `codex/sublyx-responses-review-20260902` (`125f971b6`); the duplicate `multirouter` remote (same URL as origin); and stale worktrees (`ccswitchmulti-release-verify-20260829`, plus the pruned `ccswitchmulti-upstream-20260903` registration).

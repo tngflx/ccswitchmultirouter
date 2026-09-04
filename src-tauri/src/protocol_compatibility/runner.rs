@@ -268,16 +268,32 @@ where
         model: candidate.public_model.clone(),
     });
     let nonce = Uuid::new_v4().simple().to_string();
-    let mut branches = Vec::with_capacity(2);
-
-    let transports = if probe_all_transports {
-        vec![TransportKind::OpenAiResponses, TransportKind::OpenAiChat]
+    // The two protocol branches have independent histories. Keep each branch's
+    // dependent stages ordered, but let a slow endpoint avoid stalling the other.
+    // When only the assigned transport is probed, run it directly.
+    let branches = if probe_all_transports {
+        let (responses, chat) = tokio::join!(
+            run_branch(
+                &candidate,
+                client,
+                TransportKind::OpenAiResponses,
+                &nonce,
+                mode,
+                reporter
+            ),
+            run_branch(
+                &candidate,
+                client,
+                TransportKind::OpenAiChat,
+                &nonce,
+                mode,
+                reporter
+            ),
+        );
+        vec![responses, chat]
     } else {
-        vec![candidate.transport]
+        vec![run_branch(&candidate, client, candidate.transport, &nonce, mode, reporter).await]
     };
-    for transport in transports {
-        branches.push(run_branch(&candidate, client, transport, &nonce, mode, reporter).await);
-    }
 
     let candidates = branches
         .iter()

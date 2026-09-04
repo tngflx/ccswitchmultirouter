@@ -83,6 +83,55 @@ async fn deep_live_probe_uses_only_the_assigned_transport() {
         .all(|(path, _)| path.ends_with("/chat/completions")));
 }
 
+#[tokio::test]
+async fn deep_probe_starts_responses_and_chat_before_either_baseline_finishes() {
+    let barrier = Arc::new(tokio::sync::Barrier::new(2));
+    let app = Router::new()
+        .route(
+            "/v1/responses",
+            post({
+                let barrier = barrier.clone();
+                move || {
+                    let barrier = barrier.clone();
+                    async move {
+                        barrier.wait().await;
+                        StatusCode::SERVICE_UNAVAILABLE
+                    }
+                }
+            }),
+        )
+        .route(
+            "/v1/chat/completions",
+            post({
+                let barrier = barrier.clone();
+                move || {
+                    let barrier = barrier.clone();
+                    async move {
+                        barrier.wait().await;
+                        StatusCode::SERVICE_UNAVAILABLE
+                    }
+                }
+            }),
+        );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let task = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        run_protocol_compatibility_probe(
+            candidate(&format!("http://{address}"), TransportKind::OpenAiResponses),
+            &reqwest::Client::new(),
+        ),
+    )
+    .await
+    .expect("both baseline requests must reach the server concurrently");
+    task.abort();
+    assert_eq!(result.branches.len(), 2);
+    assert_eq!(result.readiness, ProbeReadiness::Unverified);
+}
+
 #[derive(Clone)]
 struct FixtureState {
     responses_mode: ResponsesMode,
