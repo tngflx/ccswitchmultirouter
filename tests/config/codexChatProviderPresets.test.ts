@@ -24,20 +24,6 @@ const expectedChatPresets = new Map<
     },
   ],
   [
-    "Zhipu GLM",
-    {
-      baseUrl: "https://open.bigmodel.cn/api/coding/paas/v4",
-      contextWindows: { "glm-5.2": 200000 },
-    },
-  ],
-  [
-    "Zhipu GLM en",
-    {
-      baseUrl: "https://api.z.ai/api/coding/paas/v4",
-      contextWindows: { "glm-5.2": 200000 },
-    },
-  ],
-  [
     "Baidu Qianfan Coding Plan",
     {
       baseUrl: "https://qianfan.baidubce.com/v2/coding",
@@ -209,28 +195,28 @@ describe("Codex Chat provider presets", () => {
     );
   });
 
-  it("declares GLM 5.2 thinking and reasoning effort support", () => {
+  it("declares GLM 5.3 native Responses models", () => {
     for (const name of ["Zhipu GLM", "Zhipu GLM en"]) {
       const preset = codexProviderPresets.find((item) => item.name === name);
 
+      expect(preset?.apiFormat).toBe("openai_responses");
       expect(preset?.modelCatalog).toEqual(
         expect.arrayContaining([
           expect.objectContaining({
-            model: "glm-5.2",
+            model: "glm-5.3",
             inputModalities: ["text"],
-            textOnly: true,
-            supportsImage: false,
+            supportsParallelToolCalls: true,
+            reasoning: expect.objectContaining({
+              supportedEfforts: ["none", "minimal", "low", "medium", "high", "xhigh", "max"],
+              defaultEffort: "max",
+              upstream: expect.objectContaining({
+                format: "reasoning_object",
+                parameter: "reasoning_effort",
+              }),
+            }),
           }),
         ]),
       );
-      expect(preset?.codexChatReasoning).toMatchObject({
-        supportsThinking: true,
-        supportsEffort: true,
-        thinkingParam: "thinking",
-        effortParam: "reasoning_effort",
-        effortValueMode: "deepseek",
-        outputFormat: "reasoning_content",
-      });
     }
   });
 

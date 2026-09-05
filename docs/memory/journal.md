@@ -1,5 +1,13 @@
 # Engineering Journal (newest first)
 
+## 2026-09-05 - Ported catalog and Moonshot compatibility fixes
+
+- **What happened:** Re-evaluated both reference repositories and ported the low-risk parts of original commits `bc4ed66d3`, `db41d7018`, and `e47b5fca1`.
+- **Root cause:** Older Codex builds can reject refreshed catalogs missing `supports_parallel_tool_calls`; Moonshot/Kimi Chat rejects `$ref` siblings; Zhipu's current GLM Coding Plan Responses endpoint is `/api/v1`, not the legacy Chat path.
+- **What we did:** Backfilled the required catalog field, added a host-scoped idempotent `$ref`→`allOf` rewrite only on Responses→Chat Moonshot/Kimi requests, added legacy Zhipu host fallback for native Responses catalog selection, and updated CN/EN GLM presets to GLM-5.3/GLM-5-Turbo on `/api/v1`.
+- **Evidence:** Focused Rust tests passed: 2 catalog tests, 1 catalog-profile test, and 3 Moonshot schema tests. Focused frontend preset tests passed: 9/9. `cargo check` and targeted rustfmt checks passed.
+- **What NOT to do again:** Do not cherry-pick the reference commits wholesale; their provider, catalog, and proxy architectures differ from this fork.
+
 ## 2026-09-05 - Correct clipped model catalog expansion
 
 - **What happened:** The user reported that expanding the redesigned model list showed no usable editor. This corrects the UI acceptance evidence in the earlier "Preserve model modalities and scale provider catalogs" entry.

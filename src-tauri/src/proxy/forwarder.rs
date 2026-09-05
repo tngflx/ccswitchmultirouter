@@ -2668,6 +2668,12 @@ impl RequestForwarder {
                 self.session_client_provided
                     .then_some(self.session_id.as_str()),
             );
+            if super::providers::transform_codex_chat_moonshot_schema::
+                upstream_requires_ref_sibling_all_of(&base_url)
+            {
+                super::providers::transform_codex_chat_moonshot_schema::
+                    wrap_ref_siblings_in_chat_tools(&mut chat_body);
+            }
             chat_body
         } else if codex_responses_to_anthropic {
             let mut mapped_body = mapped_body;

@@ -2596,7 +2596,11 @@ fn codex_vendor_catalog_model_entry(
 /// field ..."). `base_instructions` is the other known required field; the
 /// templates always carry it and `codex_catalog_model_entry` handles it.
 /// When Codex requires a new field, add it here AND to the static templates.
-const CODEX_CATALOG_PARSER_REQUIRED_FIELDS: &[&str] = &["supports_reasoning_summaries"];
+const CODEX_CATALOG_PARSER_REQUIRED_FIELDS: &[&str] = &[
+    "supports_reasoning_summaries",
+    // Older Codex builds reject refreshed catalogs without this field.
+    "supports_parallel_tool_calls",
+];
 
 /// `models_cache.json` is shared by every Codex install on the machine (npm
 /// CLI, desktop-bundled binary, ...), and each version serializes its own
@@ -13098,6 +13102,18 @@ openai_base_url = "http://127.0.0.1:15721/v1"
     }
 
     #[test]
+    fn dynamic_template_backfills_parallel_tool_calls_when_missing() {
+        let mut template = json!({ "slug": "gpt-5.5" });
+        fill_template_fields_from_static(&mut template);
+        assert_eq!(
+            template
+                .get("supports_parallel_tool_calls")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+    }
+
+    #[test]
     fn proxy_chat_catalog_entries_carry_reasoning_summaries_flag() {
         // End to end: a stale dynamic template, once backfilled, must yield
         // catalog entries codex 0.144.5+ can parse.
@@ -13127,6 +13143,12 @@ openai_base_url = "http://127.0.0.1:15721/v1"
         assert_eq!(
             catalog["models"][0]
                 .get("supports_reasoning_summaries")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            catalog["models"][0]
+                .get("supports_parallel_tool_calls")
                 .and_then(Value::as_bool),
             Some(true)
         );

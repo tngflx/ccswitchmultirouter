@@ -2530,9 +2530,36 @@ pub fn resolve_codex_catalog_tool_profile(
     if codex_provider_uses_anthropic(provider) {
         return CodexCatalogToolProfile::Anthropic;
     }
+    if let Some(base_url) = provider_codex_base_url(provider) {
+        let host_matches = url_host_matches_any(&base_url, &["bigmodel.cn", "z.ai"]);
+        let lower = base_url.to_ascii_lowercase();
+        if host_matches
+            && !is_chat_completions_url(&lower)
+            && !lower.contains("/paas/v4")
+            && !lower.contains("/coding/paas/v4")
+        {
+            return CodexCatalogToolProfile::NativeResponses;
+        }
+    }
     CodexCatalogToolProfile::from_api_format(
         provider.meta.as_ref().and_then(|m| m.api_format.as_deref()),
     )
+}
+
+fn url_host_matches_any(value: &str, suffixes: &[&str]) -> bool {
+    let Ok(url) = url::Url::parse(value.trim()) else {
+        return false;
+    };
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    let host = host.to_ascii_lowercase();
+    suffixes.iter().any(|suffix| {
+        host == *suffix
+            || host
+                .strip_suffix(suffix)
+                .is_some_and(|prefix| prefix.ends_with('.'))
+    })
 }
 
 /// Extract the real upstream model configured for a Codex provider.
@@ -6059,6 +6086,31 @@ wire_api = "anthropic"
         let chat = create_provider(json!({ "apiFormat": "openai_chat" }));
         assert_eq!(
             resolve_codex_catalog_tool_profile(&chat),
+            CodexCatalogToolProfile::ProxyChat
+        );
+
+        let mut legacy_glm = create_provider(json!({
+            "apiFormat": "openai_chat",
+            "config": r#"model_provider = "custom"
+model = "glm-5.3"
+
+[model_providers.custom]
+base_url = "https://open.bigmodel.cn/api/v1"
+wire_api = "responses"
+"#
+        }));
+        legacy_glm.meta = None;
+        assert_eq!(
+            resolve_codex_catalog_tool_profile(&legacy_glm),
+            CodexCatalogToolProfile::NativeResponses
+        );
+
+        let legacy_glm_chat = create_provider(json!({
+            "apiFormat": "openai_chat",
+            "base_url": "https://open.bigmodel.cn/api/coding/paas/v4"
+        }));
+        assert_eq!(
+            resolve_codex_catalog_tool_profile(&legacy_glm_chat),
             CodexCatalogToolProfile::ProxyChat
         );
     }
