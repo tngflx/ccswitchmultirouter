@@ -48,10 +48,15 @@ export function codexInputCapabilityState(
 
 export function codexInputCapabilityPatch(
   state: Exclude<CodexInputCapabilityState, "unknown">,
+  model?: CodexCatalogModel,
 ): Pick<CodexCatalogModel, "inputModalities" | "supportsImage" | "textOnly"> {
   const supportsImage = state === "text_image";
+  const retained = (
+    model?.inputModalities ??
+    model?.input_modalities ?? ["text"]
+  ).filter((modality) => modality.toLowerCase() !== "image");
   return {
-    inputModalities: supportsImage ? ["text", "image"] : ["text"],
+    inputModalities: supportsImage ? [...retained, "image"] : retained,
     supportsImage,
     textOnly: !supportsImage,
   };
@@ -65,6 +70,10 @@ export function normalizeCodexInputCapability(
   return {
     ...model,
     ...codexInputCapabilityPatch(state),
+    inputModalities:
+      model.inputModalities ??
+      model.input_modalities ??
+      codexInputCapabilityPatch(state).inputModalities,
   };
 }
 
@@ -83,11 +92,12 @@ function modelIdentities(model: CodexCatalogModel): string[] {
 
 export function buildCodexInputCapabilityReferenceMap(
   catalogs: readonly CodexCatalogModel[][],
-): Map<string, Exclude<CodexInputCapabilityState, "unknown">> {
+): Map<string, CodexCatalogModel> {
   const states = new Map<
     string,
     Set<Exclude<CodexInputCapabilityState, "unknown">>
   >();
+  const candidates = new Map<string, CodexCatalogModel>();
 
   for (const catalog of catalogs) {
     for (const model of catalog) {
@@ -97,26 +107,27 @@ export function buildCodexInputCapabilityReferenceMap(
         const values = states.get(identity) ?? new Set();
         values.add(state);
         states.set(identity, values);
+        const existing = candidates.get(identity);
+        if (
+          !existing ||
+          (!existing.inputModalities && !existing.input_modalities)
+        ) {
+          candidates.set(identity, model);
+        }
       }
     }
   }
 
-  const references = new Map<
-    string,
-    Exclude<CodexInputCapabilityState, "unknown">
-  >();
+  const references = new Map<string, CodexCatalogModel>();
   for (const [identity, values] of states) {
-    if (values.size === 1) references.set(identity, [...values][0]);
+    if (values.size === 1) references.set(identity, candidates.get(identity)!);
   }
   return references;
 }
 
 export function hydrateCodexInputCapabilities<T extends CodexCatalogModel>(
   models: T[],
-  references: ReadonlyMap<
-    string,
-    Exclude<CodexInputCapabilityState, "unknown">
-  >,
+  references: ReadonlyMap<string, CodexCatalogModel>,
 ): T[] {
   return models.map((model) => {
     const explicitState = codexInputCapabilityState(model);
@@ -124,16 +135,33 @@ export function hydrateCodexInputCapabilities<T extends CodexCatalogModel>(
       return normalizeCodexInputCapability(model) as T;
     }
 
-    const state = modelIdentities(model)
+    // Unknown can mean contradictory declarations, not permission to overwrite them.
+    if (
+      [
+        model.inputModalities,
+        model.input_modalities,
+        model.supportsImage,
+        model.supports_image,
+        model.vision,
+        model.textOnly,
+        model.text_only,
+      ].some((value) => value !== undefined && value !== null)
+    )
+      return model;
+
+    const reference = modelIdentities(model)
       .map((identity) => references.get(identity))
       .find(
-        (
-          candidate,
-        ): candidate is Exclude<CodexInputCapabilityState, "unknown"> =>
-          candidate !== undefined,
+        (candidate): candidate is CodexCatalogModel => candidate !== undefined,
       );
-    return state
-      ? ({ ...model, ...codexInputCapabilityPatch(state) } as T)
+    const normalized = reference && normalizeCodexInputCapability(reference);
+    return normalized
+      ? ({
+          ...model,
+          inputModalities: normalized.inputModalities,
+          supportsImage: normalized.supportsImage,
+          textOnly: normalized.textOnly,
+        } as T)
       : model;
   });
 }

@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from "react";
+import React, { useState, useEffect, useCallback } from "react";
 import { useTranslation } from "react-i18next";
 import {
   FileCode,
@@ -20,6 +20,7 @@ import type { LucideIcon } from "lucide-react";
 import { workspaceApi } from "@/lib/api/workspace";
 import WorkspaceFileEditor from "./WorkspaceFileEditor";
 import DailyMemoryPanel from "./DailyMemoryPanel";
+import { useGlobalLoading } from "@/contexts/GlobalLoadingContext";
 
 interface WorkspaceFile {
   filename: string;
@@ -56,25 +57,30 @@ const WorkspaceFilesPanel: React.FC = () => {
   const [editingFile, setEditingFile] = useState<string | null>(null);
   const [fileExists, setFileExists] = useState<Record<string, boolean>>({});
   const [showDailyMemory, setShowDailyMemory] = useState(false);
+  const { runWithLoading } = useGlobalLoading();
 
-  const checkFileExistence = async () => {
-    const results: Record<string, boolean> = {};
-    await Promise.all(
-      WORKSPACE_FILES.map(async (f) => {
-        try {
-          const content = await workspaceApi.readFile(f.filename);
-          results[f.filename] = content !== null;
-        } catch {
-          results[f.filename] = false;
-        }
+  const checkFileExistence = useCallback(
+    () =>
+      runWithLoading(async () => {
+        const results: Record<string, boolean> = {};
+        await Promise.all(
+          WORKSPACE_FILES.map(async (f) => {
+            try {
+              const content = await workspaceApi.readFile(f.filename);
+              results[f.filename] = content !== null;
+            } catch {
+              results[f.filename] = false;
+            }
+          }),
+        );
+        setFileExists(results);
       }),
-    );
-    setFileExists(results);
-  };
+    [runWithLoading],
+  );
 
   useEffect(() => {
     void checkFileExistence();
-  }, []);
+  }, [checkFileExistence]);
 
   const handleEditorClose = () => {
     setEditingFile(null);

@@ -1,8 +1,9 @@
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useMemo } from "react";
 import { useTranslation } from "react-i18next";
 import { FormLabel } from "@/components/ui/form";
 import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
+import { HoverExpandRow } from "./shared/HoverExpandRow";
 import {
   Collapsible,
   CollapsibleContent,
@@ -16,7 +17,15 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { toast } from "sonner";
-import { Download, Plus, Trash2, ChevronRight, Loader2 } from "lucide-react";
+import {
+  ChevronLeft,
+  ChevronRight,
+  Download,
+  Loader2,
+  Plus,
+  Search,
+  Trash2,
+} from "lucide-react";
 import { ApiKeySection, ModelDropdown } from "./shared";
 import {
   fetchModelsForConfig,
@@ -32,6 +41,8 @@ import {
   OPENCODE_HEADER_DRAFT_PREFIX,
 } from "./helpers/opencodeFormUtils";
 import type { ProviderCategory, OpenCodeModel } from "@/types";
+
+const MODEL_PAGE_SIZE = 40;
 
 /**
  * Model ID input with local state to prevent focus loss.
@@ -63,6 +74,34 @@ function ModelIdInput({
         if (localValue !== modelId && localValue.trim()) {
           onChange(localValue);
         }
+      }}
+      placeholder={placeholder}
+      className="flex-1"
+    />
+  );
+}
+
+function ModelNameInput({
+  name,
+  onChange,
+  placeholder,
+}: {
+  name: string;
+  onChange: (name: string) => void;
+  placeholder?: string;
+}) {
+  const [localValue, setLocalValue] = useState(name);
+
+  useEffect(() => {
+    setLocalValue(name);
+  }, [name]);
+
+  return (
+    <Input
+      value={localValue}
+      onChange={(event) => setLocalValue(event.target.value)}
+      onBlur={() => {
+        if (localValue !== name) onChange(localValue);
       }}
       placeholder={placeholder}
       className="flex-1"
@@ -213,6 +252,31 @@ export function OpenCodeFormFields({
   const [extraOptionsOpen, setExtraOptionsOpen] = useState(
     () => Object.keys(extraOptions).length > 0,
   );
+  const [modelSearch, setModelSearch] = useState("");
+  const [modelPage, setModelPage] = useState(0);
+
+  const filteredModelEntries = useMemo(() => {
+    const query = modelSearch.trim().toLocaleLowerCase();
+    const entries = Object.entries(models);
+    if (!query) return entries;
+    return entries.filter(
+      ([key, model]) =>
+        key.toLocaleLowerCase().includes(query) ||
+        model.name.toLocaleLowerCase().includes(query),
+    );
+  }, [modelSearch, models]);
+  const modelPageCount = Math.max(
+    1,
+    Math.ceil(filteredModelEntries.length / MODEL_PAGE_SIZE),
+  );
+  const visibleModelEntries = useMemo(() => {
+    const start = modelPage * MODEL_PAGE_SIZE;
+    return filteredModelEntries.slice(start, start + MODEL_PAGE_SIZE);
+  }, [filteredModelEntries, modelPage]);
+
+  useEffect(() => {
+    setModelPage((current) => Math.min(current, modelPageCount - 1));
+  }, [modelPageCount]);
 
   useEffect(() => {
     if (Object.keys(extraOptions).length > 0) {
@@ -263,6 +327,8 @@ export function OpenCodeFormFields({
   // Add a new model entry
   const handleAddModel = () => {
     const newKey = `model-${Date.now()}`;
+    setModelSearch("");
+    setModelPage(Math.floor(Object.keys(models).length / MODEL_PAGE_SIZE));
     onModelsChange({
       ...models,
       [newKey]: { name: "" },
@@ -836,6 +902,23 @@ export function OpenCodeFormFields({
           </p>
         ) : (
           <div className="space-y-2">
+            <div className="relative max-w-3xl">
+              <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
+              <Input
+                value={modelSearch}
+                onChange={(event) => {
+                  setModelSearch(event.target.value);
+                  setModelPage(0);
+                }}
+                placeholder={t("opencode.searchModels", {
+                  defaultValue: "Search models...",
+                })}
+                aria-label={t("opencode.searchModels", {
+                  defaultValue: "Search models...",
+                })}
+                className="pl-9"
+              />
+            </div>
             <div className="flex items-center gap-2 text-xs text-muted-foreground px-1 mb-1">
               <span className="w-9" />
               <span className="flex-1">
@@ -846,15 +929,23 @@ export function OpenCodeFormFields({
               </span>
               <span className="w-9" />
             </div>
-            {Object.entries(models).map(([key, model]) => (
+            {visibleModelEntries.map(([key, model]) => (
               <div key={key} className="space-y-2">
                 {/* Model row */}
-                <div className="flex items-center gap-2">
+                <HoverExpandRow
+                  className="flex items-center gap-2"
+                  onExpand={() =>
+                    setExpandedModels((prev) =>
+                      prev.has(key) ? prev : new Set([...prev, key]),
+                    )
+                  }
+                >
                   <Button
                     type="button"
                     variant="ghost"
                     size="icon"
                     onClick={() => toggleModelExpand(key)}
+                    aria-expanded={expandedModels.has(key)}
                     aria-label={t("opencode.toggleModelDetails", {
                       defaultValue: "Toggle model details",
                     })}
@@ -882,13 +973,12 @@ export function OpenCodeFormFields({
                       />
                     )}
                   </div>
-                  <Input
-                    value={model.name}
-                    onChange={(e) => handleModelNameChange(key, e.target.value)}
+                  <ModelNameInput
+                    name={model.name}
+                    onChange={(name) => handleModelNameChange(key, name)}
                     placeholder={t("opencode.modelName", {
                       defaultValue: "Display Name",
                     })}
-                    className="flex-1"
                   />
                   <Button
                     type="button"
@@ -899,7 +989,7 @@ export function OpenCodeFormFields({
                   >
                     <Trash2 className="h-4 w-4" />
                   </Button>
-                </div>
+                </HoverExpandRow>
 
                 {/* Expanded model details */}
                 {expandedModels.has(key) && (
@@ -1132,6 +1222,55 @@ export function OpenCodeFormFields({
                 )}
               </div>
             ))}
+            {filteredModelEntries.length === 0 ? (
+              <p className="py-3 text-sm text-muted-foreground">
+                {t("opencode.noMatchingModels", {
+                  defaultValue: "No models match your search.",
+                })}
+              </p>
+            ) : (
+              <div className="flex items-center justify-between gap-3 border-t border-border-default pt-2">
+                <span className="text-xs text-muted-foreground">
+                  {t("opencode.modelRange", {
+                    from: modelPage * MODEL_PAGE_SIZE + 1,
+                    to: Math.min(
+                      (modelPage + 1) * MODEL_PAGE_SIZE,
+                      filteredModelEntries.length,
+                    ),
+                    total: filteredModelEntries.length,
+                    defaultValue: "{{from}}-{{to}} of {{total}} models",
+                  })}
+                </span>
+                <div className="flex gap-1">
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="icon"
+                    className="h-8 w-8"
+                    disabled={modelPage === 0}
+                    onClick={() => setModelPage((current) => current - 1)}
+                    aria-label={t("opencode.previousModels", {
+                      defaultValue: "Previous models",
+                    })}
+                  >
+                    <ChevronLeft className="h-4 w-4" />
+                  </Button>
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="icon"
+                    className="h-8 w-8"
+                    disabled={modelPage >= modelPageCount - 1}
+                    onClick={() => setModelPage((current) => current + 1)}
+                    aria-label={t("opencode.nextModels", {
+                      defaultValue: "Next models",
+                    })}
+                  >
+                    <ChevronRight className="h-4 w-4" />
+                  </Button>
+                </div>
+              </div>
+            )}
           </div>
         )}
 

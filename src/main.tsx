@@ -4,6 +4,7 @@ import App from "./App";
 import { AppErrorBoundary } from "./components/AppErrorBoundary";
 import { DatabaseUpgrade } from "./components/DatabaseUpgrade";
 import { UpdateProvider } from "./contexts/UpdateContext";
+import { GlobalLoadingProvider } from "./contexts/GlobalLoadingContext";
 import "./index.css";
 // 导入国际化配置
 import i18n from "./i18n";
@@ -123,12 +124,14 @@ async function bootstrap() {
       <FrontendErrorBoundary>
         <QueryClientProvider client={queryClient}>
           <ThemeProvider defaultTheme="system" storageKey="cc-switch-theme">
-            <UpdateProvider>
-              <AppErrorBoundary>
-                <App />
-                <Toaster />
-              </AppErrorBoundary>
-            </UpdateProvider>
+            <GlobalLoadingProvider>
+              <UpdateProvider>
+                <AppErrorBoundary>
+                  <App />
+                  <Toaster />
+                </AppErrorBoundary>
+              </UpdateProvider>
+            </GlobalLoadingProvider>
           </ThemeProvider>
         </QueryClientProvider>
       </FrontendErrorBoundary>

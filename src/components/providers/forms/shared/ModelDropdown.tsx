@@ -1,3 +1,4 @@
+import { useMemo, useState } from "react";
 import { ChevronDown } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import {
@@ -17,34 +18,41 @@ export function ModelDropdown({
   models: FetchedModel[];
   onSelect: (id: string) => void;
 }) {
-  const grouped: Record<string, FetchedModel[]> = {};
-  for (const model of models) {
-    const vendor = model.ownedBy || "Other";
-    if (!grouped[vendor]) grouped[vendor] = [];
-    grouped[vendor].push(model);
-  }
+  const [open, setOpen] = useState(false);
+  const grouped = useMemo(() => {
+    if (!open) return {} as Record<string, FetchedModel[]>;
+    const result: Record<string, FetchedModel[]> = {};
+    for (const model of models) {
+      const vendor = model.ownedBy || "Other";
+      if (!result[vendor]) result[vendor] = [];
+      result[vendor].push(model);
+    }
+    return result;
+  }, [models, open]);
   const vendors = Object.keys(grouped).sort();
 
   return (
-    <DropdownMenu>
+    <DropdownMenu open={open} onOpenChange={setOpen}>
       <DropdownMenuTrigger asChild>
         <Button variant="outline" size="icon" className="shrink-0">
           <ChevronDown className="h-4 w-4" />
         </Button>
       </DropdownMenuTrigger>
-      <DropdownMenuContent align="end" className="max-h-64 overflow-y-auto">
-        {vendors.map((vendor, vi) => (
-          <div key={vendor}>
-            {vi > 0 && <DropdownMenuSeparator />}
-            <DropdownMenuLabel>{vendor}</DropdownMenuLabel>
-            {grouped[vendor].map((m) => (
-              <DropdownMenuItem key={m.id} onSelect={() => onSelect(m.id)}>
-                {m.id}
-              </DropdownMenuItem>
-            ))}
-          </div>
-        ))}
-      </DropdownMenuContent>
+      {open && (
+        <DropdownMenuContent align="end" className="max-h-64 overflow-y-auto">
+          {vendors.map((vendor, vi) => (
+            <div key={vendor}>
+              {vi > 0 && <DropdownMenuSeparator />}
+              <DropdownMenuLabel>{vendor}</DropdownMenuLabel>
+              {grouped[vendor].map((m) => (
+                <DropdownMenuItem key={m.id} onSelect={() => onSelect(m.id)}>
+                  {m.id}
+                </DropdownMenuItem>
+              ))}
+            </div>
+          ))}
+        </DropdownMenuContent>
+      )}
     </DropdownMenu>
   );
 }

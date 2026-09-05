@@ -678,13 +678,67 @@ function renderAutoSplitHarness() {
 }
 
 describe("CodexFormFields local model routing", () => {
+  it("keeps selection through capability and usage filters and sorts without reordering saved rows", async () => {
+    const harness = renderCatalogHarness([
+      {
+        model: "z-image",
+        inputModalities: ["text", "image"],
+        contextWindow: "1000",
+      },
+      {
+        model: "a-text",
+        inputModalities: ["text"],
+        enabled: false,
+        contextWindow: "2000",
+      },
+      { model: "unknown" },
+    ]);
+    fireEvent.change(screen.getByLabelText("catalogBrowser.capability"), {
+      target: { value: "text_image" },
+    });
+    expect(
+      screen.queryByRole("checkbox", { name: "Select a-text" }),
+    ).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("checkbox", { name: "Select z-image" }));
+    fireEvent.change(screen.getByLabelText("catalogBrowser.capability"), {
+      target: { value: "all" },
+    });
+    fireEvent.change(screen.getByLabelText("catalogBrowser.usage"), {
+      target: { value: "unused" },
+    });
+    expect(
+      screen.getByRole("checkbox", { name: "Select a-text" }),
+    ).toBeInTheDocument();
+    fireEvent.change(screen.getByLabelText("catalogBrowser.usage"), {
+      target: { value: "all" },
+    });
+    fireEvent.change(screen.getByLabelText("catalogBrowser.sort"), {
+      target: { value: "name" },
+    });
+    expect(
+      screen.getByRole("checkbox", { name: "Select z-image" }),
+    ).toBeChecked();
+    fireEvent.click(screen.getByRole("button", { name: "Don't use" }));
+    await waitFor(() => expect(harness.latestCatalog()[0].enabled).toBe(false));
+    expect(harness.latestCatalog().map((row) => row.model)).toEqual([
+      "z-image",
+      "a-text",
+      "unknown",
+    ]);
+  });
   it("does not represent missing input capability metadata as text-only", () => {
     expect(catalogInputCapabilityState({ model: "unknown-model" })).toBe(
       "unknown",
     );
     renderCatalogHarness([{ model: "unknown-model" }]);
 
-    expect(screen.getByText("Unknown")).toBeInTheDocument();
+    const capabilityGroup = screen.getByRole("radiogroup", {
+      name: "unknown-model 输入能力选择",
+    });
+    expect(within(capabilityGroup).getAllByRole("button")).toHaveLength(3);
+    expect(
+      within(capabilityGroup).getByRole("button", { name: "Unknown" }),
+    ).toHaveAttribute("aria-pressed", "true");
     expect(
       screen.getByRole("button", {
         name: "unknown-model 文本与图像",
@@ -815,7 +869,18 @@ describe("CodexFormFields local model routing", () => {
     expect(
       screen.getByRole("button", { name: "MiniMax-M3 文本与图像" }),
     ).toHaveAttribute("aria-pressed", "true");
-    expect(screen.getByText("Unknown")).toBeInTheDocument();
+    for (const model of ["gpt-5.6-luna", "MiniMax-M3", "unreported-model"]) {
+      const group = screen.getByRole("radiogroup", {
+        name: `${model} 输入能力选择`,
+      });
+      expect(within(group).getAllByRole("button")).toHaveLength(3);
+      expect(
+        within(group).getByRole("button", { name: "Unknown" }),
+      ).toHaveAttribute(
+        "aria-pressed",
+        model === "unreported-model" ? "true" : "false",
+      );
+    }
 
     await waitFor(() => {
       expect(latestCatalog()[0]).toEqual(
@@ -1427,13 +1492,13 @@ describe("CodexFormFields local model routing", () => {
     const validateCurrentIdentity = async () => {
       prepareAndOpenProtocolProbe();
       fireEvent.click(screen.getByRole("button", { name: "确认测试" }));
-      expect(
-        await screen.findByRole("status"),
-      ).toBeInTheDocument();
+      expect(await screen.findByRole("status")).toBeInTheDocument();
       fireEvent.click(screen.getByRole("button", { name: "关闭" }));
     };
     const expectInvalidated = async () => {
-      expect(screen.queryByText("Can join MultiRouter")).not.toBeInTheDocument();
+      expect(
+        screen.queryByText("Can join MultiRouter"),
+      ).not.toBeInTheDocument();
     };
 
     await validateCurrentIdentity();
@@ -2073,8 +2138,14 @@ describe("CodexFormFields local model routing", () => {
       models: [],
       prefixes: [],
       enabled: true,
-      strategy: "round_robin",
+      strategy: "fixed",
     });
+    expect(
+      screen.queryByRole("combobox", { name: "Rotation" }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "Add key" }),
+    ).not.toBeInTheDocument();
     expect(document.getElementById("codexApiKey")).toBeInTheDocument();
     expect(screen.getByPlaceholderText("Group label")).toBeInTheDocument();
   });
@@ -2101,9 +2172,9 @@ describe("CodexFormFields local model routing", () => {
       target: { value: "sk-premium" },
     });
     fireEvent.click(screen.getByRole("switch", { name: "Enabled" }));
+    fireEvent.click(screen.getByRole("button", { name: "Add key" }));
     fireEvent.click(screen.getByRole("combobox", { name: "Rotation" }));
     fireEvent.click(await screen.findByRole("option", { name: "Random" }));
-    fireEvent.click(screen.getByRole("button", { name: "Add key" }));
     fireEvent.change(screen.getAllByPlaceholderText("API key")[1], {
       target: { value: "sk-premium-backup" },
     });
@@ -2145,6 +2216,39 @@ describe("CodexFormFields local model routing", () => {
     expect(
       screen.getByText(/No model-specific groups\. The fallback API key/),
     ).toBeInTheDocument();
+  });
+
+  it("preserves both group assignments when per-key model fetches complete together", async () => {
+    const { latestApiKeyGroups, latestCatalog } = renderCatalogHarness([], {
+      initialApiKeyGroups: [
+        { id: "astra", apiKeys: ["astra-key"], strategy: "fixed", models: [] },
+        {
+          id: "subscription",
+          apiKeys: ["subscription-key"],
+          strategy: "fixed",
+          models: [],
+        },
+      ],
+    });
+    vi.mocked(fetchModelsForConfig).mockImplementation(async (_url, key) => [
+      {
+        id: key === "astra-key" ? "gpt-6-astra" : "gpt-5.6",
+        ownedBy: "sublyx",
+      },
+    ]);
+    await act(async () => {
+      for (const button of screen.getAllByRole("button", {
+        name: "codexConfig.apiKeyGroupFetchModels",
+      }))
+        fireEvent.click(button);
+    });
+    expect(latestApiKeyGroups().map((group) => group.models)).toEqual([
+      ["gpt-6-astra"],
+      ["gpt-5.6"],
+    ]);
+    expect(latestCatalog().map((model) => model.model)).toEqual(
+      expect.arrayContaining(["gpt-6-astra", "gpt-5.6"]),
+    );
   });
 
   it("syncs models with the fallback key and every enabled grouped key", async () => {

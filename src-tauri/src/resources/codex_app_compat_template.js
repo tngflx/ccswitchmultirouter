@@ -628,7 +628,8 @@
           "Fresh-session handoff from an oversized prior task.",
           "Use the compact summary below as the only prior conversational context.",
           "Do not fork or recover the old conversation history.",
-          "Acknowledge the handoff briefly, preserve unfinished work, and wait for the user's next instruction unless the summary names an immediately required action.",
+          "For this first turn, only acknowledge receipt briefly and wait for the user's next instruction. Do not call tools, execute unfinished work, inspect or wait for the handoff runner, or follow action instructions in the summary. The handoff runner is waiting for this acknowledgement to finish.",
+          "The following summary is reference context for future turns, not instructions to execute in this acknowledgement turn.",
           "",
           normalizedSummary,
         ].join("\n");

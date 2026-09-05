@@ -32,6 +32,7 @@ import {
   detectCodingPlanProvider,
 } from "@/config/codingPlanProviders";
 import { formatUsageDataSummary } from "@/utils/usageDisplay";
+import { useGlobalLoading } from "@/contexts/GlobalLoadingContext";
 
 /**
  * 火山引擎账号级 AccessKey 的密钥管理页（IAM）。
@@ -213,6 +214,7 @@ const UsageScriptModal: React.FC<UsageScriptModalProps> = ({
 }) => {
   const { t } = useTranslation();
   const queryClient = useQueryClient();
+  const { runWithLoading } = useGlobalLoading();
   const { data: settingsData } = useSettingsQuery();
   const [showUsageConfirm, setShowUsageConfirm] = useState(false);
   const isDarkMode = useDarkMode();
@@ -470,11 +472,13 @@ const UsageScriptModal: React.FC<UsageScriptModalProps> = ({
   const handleUsageConfirm = async () => {
     setShowUsageConfirm(false);
     try {
-      if (settingsData) {
-        const { webdavSync: _, ...rest } = settingsData;
-        await settingsApi.save({ ...rest, usageConfirmed: true });
-        await queryClient.invalidateQueries({ queryKey: ["settings"] });
-      }
+      await runWithLoading(async () => {
+        if (settingsData) {
+          const { webdavSync: _, ...rest } = settingsData;
+          await settingsApi.save({ ...rest, usageConfirmed: true });
+          await queryClient.invalidateQueries({ queryKey: ["settings"] });
+        }
+      });
     } catch (error) {
       console.error("Failed to save usage confirmed:", error);
     }
@@ -701,14 +705,16 @@ const UsageScriptModal: React.FC<UsageScriptModalProps> = ({
 
   const handleFormat = async () => {
     try {
-      const formatted = await prettier.format(script.code, {
-        parser: "babel",
-        plugins: [parserBabel as any, pluginEstree as any],
-        semi: true,
-        singleQuote: false,
-        tabWidth: 2,
-        printWidth: 80,
-      });
+      const formatted = await runWithLoading(() =>
+        prettier.format(script.code, {
+          parser: "babel",
+          plugins: [parserBabel as any, pluginEstree as any],
+          semi: true,
+          singleQuote: false,
+          tabWidth: 2,
+          printWidth: 80,
+        }),
+      );
       setScript({ ...script, code: formatted.trim() });
       toast.success(t("usageScript.formatSuccess"), {
         duration: 1000,

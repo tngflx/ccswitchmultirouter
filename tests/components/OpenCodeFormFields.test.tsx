@@ -55,6 +55,73 @@ const expandFirstModel = () => {
 };
 
 describe("OpenCodeFormFields", () => {
+  it("opens model parameters on hover and retains click collapse", async () => {
+    renderOpenCodeForm();
+    const toggle = screen.getByRole("button", { name: "Toggle model details" });
+    expect(toggle).toHaveAttribute("aria-expanded", "false");
+    fireEvent(
+      screen.getByDisplayValue("Kimi K2"),
+      Object.assign(new Event("pointerover", { bubbles: true }), {
+        pointerType: "mouse",
+      }),
+    );
+    expect(await screen.findByDisplayValue("1048576")).toBeVisible();
+    expect(screen.getByDisplayValue("131072")).toBeVisible();
+    fireEvent.pointerLeave(screen.getByDisplayValue("Kimi K2"));
+    expect(toggle).toHaveAttribute("aria-expanded", "true");
+    fireEvent.click(toggle);
+    expect(screen.queryByDisplayValue("1048576")).not.toBeInTheDocument();
+    fireEvent.click(toggle);
+    expect(screen.getByDisplayValue("1048576")).toBeVisible();
+  });
+
+  it("bounds large model catalogs and keeps every model searchable", () => {
+    const models = Object.fromEntries(
+      Array.from({ length: 430 }, (_, index) => [
+        `openrouter/model-${index + 1}`,
+        { name: `Model ${index + 1}` },
+      ]),
+    );
+
+    renderOpenCodeForm({ models });
+
+    expect(
+      screen.getAllByRole("button", { name: "Toggle model details" }),
+    ).toHaveLength(40);
+    expect(screen.queryByDisplayValue("openrouter/model-430")).toBeNull();
+
+    fireEvent.change(
+      screen.getByRole("textbox", { name: "Search models..." }),
+      {
+        target: { value: "model-430" },
+      },
+    );
+
+    expect(
+      screen.getByDisplayValue("openrouter/model-430"),
+    ).toBeInTheDocument();
+    expect(
+      screen.getAllByRole("button", { name: "Toggle model details" }),
+    ).toHaveLength(1);
+  });
+
+  it("commits model display-name edits on blur", () => {
+    const onModelsChange = vi.fn();
+    renderOpenCodeForm({ onModelsChange });
+
+    const nameInput = screen.getByDisplayValue("Kimi K2");
+    fireEvent.change(nameInput, { target: { value: "Kimi K2.5" } });
+    expect(onModelsChange).not.toHaveBeenCalled();
+
+    fireEvent.blur(nameInput);
+    expect(onModelsChange).toHaveBeenCalledWith({
+      "kimi-k2": {
+        name: "Kimi K2.5",
+        limit: { context: 1048576, output: 131072 },
+      },
+    });
+  });
+
   it("surfaces existing provider headers", () => {
     renderOpenCodeForm({
       headers: {

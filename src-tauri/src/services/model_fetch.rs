@@ -307,6 +307,7 @@ fn extract_input_modalities(
         "input_modalities",
         "inputModalities",
         "modalities",
+        "architecture",
         "capabilities",
         "metadata",
     ]
@@ -523,10 +524,20 @@ where
             model.context_window = entry_context_window(entry);
         }
         if model.input_modalities.is_none() {
-            model.input_modalities = entry_input_modalities(entry);
+            let modalities = entry_input_modalities(entry);
+            // Never introduce catalog facts that contradict an explicit upstream flag.
+            if model.supports_image.is_none_or(|supports| {
+                modalities
+                    .as_ref()
+                    .is_none_or(|values| values.iter().any(|value| value == "image") == supports)
+            }) {
+                model.input_modalities = modalities;
+            }
         }
         if model.supports_image.is_none() {
-            model.supports_image = entry_input_modalities(entry)
+            model.supports_image = model
+                .input_modalities
+                .as_ref()
                 .map(|modalities| modalities.iter().any(|modality| modality == "image"));
         }
     }
@@ -567,7 +578,11 @@ async fn enrich_models_dev_context_windows(
     endpoint_url: &str,
     models: &mut [FetchedModel],
 ) {
-    if !models.iter().any(|model| model.context_window.is_none()) {
+    if !models.iter().any(|model| {
+        model.context_window.is_none()
+            || model.input_modalities.is_none()
+            || model.supports_image.is_none()
+    }) {
         return;
     }
 
@@ -578,8 +593,8 @@ async fn enrich_models_dev_context_windows(
         return;
     };
 
-    apply_missing_context_windows(models, |model_id| {
-        lookup_models_dev_context(provider_models, model_id)
+    apply_missing_catalog_facts(models, |model_id| {
+        lookup_models_dev_entry(provider_models, model_id)
     });
 }
 
@@ -621,11 +636,18 @@ fn find_models_dev_provider_models<'a>(
         .as_object()?
         .values()
         .filter_map(|provider| provider.as_object())
-        .find(|provider| {
+        .filter(|provider| {
             provider
                 .get("api")
                 .and_then(|value| value.as_str())
                 .is_some_and(|api| endpoint_matches_provider_api(endpoint_url, api))
+        })
+        .max_by_key(|provider| {
+            provider
+                .get("api")
+                .and_then(|value| value.as_str())
+                .map(str::len)
+                .unwrap_or(0)
         })
         .and_then(|provider| provider.get("models"))
         .and_then(|models| models.as_object())
@@ -635,7 +657,12 @@ fn find_models_dev_provider_models<'a>(
 fn endpoint_matches_provider_api(endpoint_url: &str, provider_api: &str) -> bool {
     let endpoint = normalize_url_prefix(endpoint_url);
     let api = normalize_url_prefix(provider_api);
-    !endpoint.is_empty() && !api.is_empty() && endpoint.starts_with(&api)
+    !endpoint.is_empty()
+        && !api.is_empty()
+        && (endpoint == api
+            || endpoint
+                .strip_prefix(&api)
+                .is_some_and(|rest| rest.starts_with('/')))
 }
 
 /// 归一化 URL 前缀：大小写、尾斜杠和最终 `/models` 不影响 provider 匹配。
@@ -648,10 +675,18 @@ fn normalize_url_prefix(value: &str) -> String {
 }
 
 /// 在已匹配 provider 的 models.dev 模型表里查找 context window。
+#[cfg(test)]
 fn lookup_models_dev_context(
     provider_models: &serde_json::Map<String, serde_json::Value>,
     model_id: &str,
 ) -> Option<u64> {
+    lookup_models_dev_entry(provider_models, model_id).and_then(entry_context_window)
+}
+
+fn lookup_models_dev_entry<'a>(
+    provider_models: &'a serde_json::Map<String, serde_json::Value>,
+    model_id: &str,
+) -> Option<&'a serde_json::Value> {
     let fetched = normalize_models_dev_model_id(model_id);
     let mut suffix_matches = Vec::new();
 
@@ -660,14 +695,11 @@ fn lookup_models_dev_context(
             continue;
         };
         let catalog_id = model_obj.get("id").and_then(|id| id.as_str());
-        let Some(context) = extract_models_dev_entry_context(model_obj) else {
-            continue;
-        };
         if models_dev_model_id_matches_exact(&fetched, key, catalog_id) {
-            return Some(context);
+            return Some(value);
         }
         if models_dev_model_id_matches_suffix(&fetched, key, catalog_id) {
-            suffix_matches.push(context);
+            suffix_matches.push(value);
         }
     }
 
@@ -676,18 +708,6 @@ fn lookup_models_dev_context(
     } else {
         None
     }
-}
-
-/// 从 models.dev 单个模型条目中提取正数 `limit.context`。
-fn extract_models_dev_entry_context(
-    model_obj: &serde_json::Map<String, serde_json::Value>,
-) -> Option<u64> {
-    model_obj
-        .get("limit")
-        .and_then(|limit| limit.as_object())
-        .and_then(|limit| limit.get("context"))
-        .and_then(parse_positive_u64)
-        .filter(|context| *context > 0)
 }
 
 /// 判断 `/models` 返回的模型 id 是否精确匹配 models.dev 的 key 或 `id` 字段。
@@ -1336,6 +1356,48 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_openrouter_architecture_preserves_input_capabilities_over_output() {
+        let response: ModelsResponse = serde_json::from_value(serde_json::json!({
+            "data": [
+                {
+                    "id": "openai/gpt-6-astra",
+                    "context_length": 1050000,
+                    "architecture": {
+                        "input_modalities": ["file", "image", "text"],
+                        "output_modalities": ["text"]
+                    }
+                },
+                {
+                    "id": "text-input-model",
+                    "architecture": {
+                        "input_modalities": ["text"],
+                        "output_modalities": ["image"]
+                    }
+                },
+                {
+                    "id": "output-only-declaration",
+                    "architecture": { "output_modalities": ["image"] }
+                }
+            ]
+        }))
+        .unwrap();
+        let models = response.data.unwrap();
+        assert_eq!(extract_context_window(&models[0].extra), Some(1_050_000));
+        assert_eq!(
+            extract_input_modalities(&models[0].extra),
+            Some(vec!["file".into(), "image".into(), "text".into()])
+        );
+        assert_eq!(extract_supports_image(&models[0].extra), Some(true));
+        assert_eq!(
+            extract_input_modalities(&models[1].extra),
+            Some(vec!["text".into()])
+        );
+        assert_eq!(extract_supports_image(&models[1].extra), Some(false));
+        assert_eq!(extract_input_modalities(&models[2].extra), None);
+        assert_eq!(extract_supports_image(&models[2].extra), None);
+    }
+
+    #[test]
     fn test_parse_volcengine_plan_models_from_official_agentplan_shape() {
         let body = serde_json::json!({
             "ResponseMetadata": {
@@ -1625,6 +1687,60 @@ Coding 能力开源 SOTA，从代码生成走向工程交付 | 1M | 128K |
             Some(&["text".to_string(), "image".to_string()][..])
         );
         assert_eq!(models[1].supports_image, Some(true));
+    }
+
+    #[test]
+    fn test_models_dev_enriches_modalities_with_existing_context_and_preserves_upstream() {
+        let catalog = serde_json::json!({
+            "opencode": { "api": "https://opencode.ai/zen/v1", "models": {} },
+            "opencode-go": { "api": "https://opencode.ai/zen/go/v1", "models": {
+                "known": { "modalities": { "input": ["text", "image", "file"] } },
+                "text": { "modalities": { "input": ["text", "image"] } }
+            }}
+        });
+        let entries =
+            find_models_dev_provider_models(&catalog, "https://opencode.ai/zen/go/v1/models")
+                .unwrap();
+        let mut models = vec![
+            FetchedModel {
+                id: "known".into(),
+                owned_by: None,
+                context_window: Some(1000),
+                input_modalities: None,
+                supports_image: None,
+            },
+            FetchedModel {
+                id: "text".into(),
+                owned_by: None,
+                context_window: None,
+                input_modalities: Some(vec!["text".into()]),
+                supports_image: None,
+            },
+            FetchedModel {
+                id: "hy3-preview".into(),
+                owned_by: None,
+                context_window: None,
+                input_modalities: None,
+                supports_image: None,
+            },
+        ];
+        apply_missing_catalog_facts(&mut models, |id| lookup_models_dev_entry(entries, id));
+        assert_eq!(models[0].context_window, Some(1000));
+        assert_eq!(
+            models[0].input_modalities.as_ref().unwrap(),
+            &vec!["text", "image", "file"]
+        );
+        assert_eq!(models[0].supports_image, Some(true));
+        assert_eq!(models[1].supports_image, Some(false));
+        assert_eq!(models[2].input_modalities, None);
+        assert!(!endpoint_matches_provider_api(
+            "https://opencode.ai.evil/zen/v1/models",
+            "https://opencode.ai"
+        ));
+        assert!(!endpoint_matches_provider_api(
+            "https://opencode.ai/zen/v10/models",
+            "https://opencode.ai/zen/v1"
+        ));
     }
 
     #[test]

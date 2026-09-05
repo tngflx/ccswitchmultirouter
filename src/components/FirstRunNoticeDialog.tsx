@@ -12,11 +12,13 @@ import {
 import { Button } from "@/components/ui/button";
 import { useSettingsQuery } from "@/lib/query";
 import { settingsApi } from "@/lib/api";
+import { useGlobalLoading } from "@/contexts/GlobalLoadingContext";
 
 /** 首次运行欢迎提示：仅当后端启动阶段保留 firstRunNoticeConfirmed 为空时弹出。 */
 export function FirstRunNoticeDialog() {
   const { t } = useTranslation();
   const queryClient = useQueryClient();
+  const { runWithLoading } = useGlobalLoading();
   const { data: settings } = useSettingsQuery();
 
   // 后端启动时已经决定好要不要弹：条件不满足的话字段会立即被写成 true，
@@ -26,9 +28,11 @@ export function FirstRunNoticeDialog() {
   const handleAcknowledge = async () => {
     if (!settings) return;
     try {
-      const { webdavSync: _, ...rest } = settings;
-      await settingsApi.save({ ...rest, firstRunNoticeConfirmed: true });
-      await queryClient.invalidateQueries({ queryKey: ["settings"] });
+      await runWithLoading(async () => {
+        const { webdavSync: _, ...rest } = settings;
+        await settingsApi.save({ ...rest, firstRunNoticeConfirmed: true });
+        await queryClient.invalidateQueries({ queryKey: ["settings"] });
+      });
     } catch (error) {
       console.error("Failed to save firstRunNoticeConfirmed:", error);
     }

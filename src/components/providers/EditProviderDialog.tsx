@@ -11,6 +11,7 @@ import {
 import { openclawApi, providersApi, vscodeApi, type AppId } from "@/lib/api";
 import { extractCodexExperimentalBearerToken } from "@/utils/providerConfigUtils";
 import { inferProviderIconFromConfig } from "@/utils/providerIcon";
+import { useGlobalLoading } from "@/contexts/GlobalLoadingContext";
 
 interface EditProviderDialogProps {
   open: boolean;
@@ -80,6 +81,7 @@ export function EditProviderDialog({
 }: EditProviderDialogProps) {
   const { t } = useTranslation();
   const [isFormSubmitting, setIsFormSubmitting] = useState(false);
+  const { runWithLoading } = useGlobalLoading();
 
   // 默认使用传入的 provider.settingsConfig，若当前编辑对象是"当前生效供应商"，则尝试读取实时配置替换初始值
   const [liveSettings, setLiveSettings] = useState<Record<
@@ -273,13 +275,15 @@ export function EditProviderDialog({
         ...(values.meta ? { meta: values.meta } : {}),
       };
 
-      await onSubmit({
-        provider: updatedProvider,
-        originalId: provider.id,
+      await runWithLoading(async () => {
+        await onSubmit({
+          provider: updatedProvider,
+          originalId: provider.id,
+        });
+        onOpenChange(false);
       });
-      onOpenChange(false);
     },
-    [appId, onSubmit, onOpenChange, provider],
+    [appId, onSubmit, onOpenChange, provider, runWithLoading],
   );
 
   if (!provider || !initialData) {

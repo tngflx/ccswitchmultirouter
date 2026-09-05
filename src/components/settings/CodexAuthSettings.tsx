@@ -6,6 +6,7 @@ import type { SettingsFormState } from "@/hooks/useSettings";
 import { ToggleRow } from "@/components/ui/toggle-row";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { settingsApi } from "@/lib/api";
+import { useGlobalLoading } from "@/contexts/GlobalLoadingContext";
 
 interface CodexAuthSettingsProps {
   settings: SettingsFormState;
@@ -23,6 +24,7 @@ export function CodexAuthSettings({
   const [showEnableConfirm, setShowEnableConfirm] = useState(false);
   const [showDisableConfirm, setShowDisableConfirm] = useState(false);
   const [hasUnifyBackup, setHasUnifyBackup] = useState(false);
+  const { runWithLoading } = useGlobalLoading();
 
   const handleUnifyHistoryChange = (checked: boolean) => {
     if (checked) {
@@ -30,8 +32,7 @@ export function CodexAuthSettings({
       return;
     }
     // 先探测有无迁移备份，决定关闭弹窗是否提供"恢复备份"勾选
-    void settingsApi
-      .hasCodexUnifyHistoryBackup()
+    void runWithLoading(() => settingsApi.hasCodexUnifyHistoryBackup())
       .catch(() => false)
       .then((hasBackup) => {
         setHasUnifyBackup(hasBackup);
@@ -41,9 +42,11 @@ export function CodexAuthSettings({
 
   const handleEnableConfirm = (migrateExisting: boolean) => {
     setShowEnableConfirm(false);
-    void onChange({
-      unifyCodexSessionHistory: true,
-      unifyCodexMigrateExisting: migrateExisting,
+    void runWithLoading(async () => {
+      await onChange({
+        unifyCodexSessionHistory: true,
+        unifyCodexMigrateExisting: migrateExisting,
+      });
     });
   };
 
@@ -55,37 +58,39 @@ export function CodexAuthSettings({
 
   const handleDisableConfirm = async (restoreBackup: boolean) => {
     setShowDisableConfirm(false);
-    const saved = await onChange({
-      unifyCodexSessionHistory: false,
-      unifyCodexMigrateExisting: false,
-    });
-    // 关闭保存失败时绝不还原：否则开关仍开着（live 仍统一路由），
-    // 已迁移会话却被翻回 openai 桶，历史被拆成两半。
-    if (saved === false) return;
-    // 不再以探测结果短路：还原命令会在迁移锁上排队，等到迁移落盘后
-    // 拿到完整账本；确实无账本时由 skippedReason 提示。
-    if (!restoreBackup) return;
-    try {
-      const result = await settingsApi.restoreCodexUnifiedHistory();
-      if (result.skippedReason) {
-        // unify_toggle_on：还原排队期间开关被重新开启，后端拒绝还原
-        toast.info(
-          result.skippedReason === "unify_toggle_on"
-            ? t("settings.unifyCodexHistoryRestoreSkippedToggleOn")
-            : t("settings.unifyCodexHistoryRestoreNothing"),
+    await runWithLoading(async () => {
+      const saved = await onChange({
+        unifyCodexSessionHistory: false,
+        unifyCodexMigrateExisting: false,
+      });
+      // 关闭保存失败时绝不还原：否则开关仍开着（live 仍统一路由），
+      // 已迁移会话却被翻回 openai 桶，历史被拆成两半。
+      if (saved === false) return;
+      // 不再以探测结果短路：还原命令会在迁移锁上排队，等到迁移落盘后
+      // 拿到完整账本；确实无账本时由 skippedReason 提示。
+      if (!restoreBackup) return;
+      try {
+        const result = await settingsApi.restoreCodexUnifiedHistory();
+        if (result.skippedReason) {
+          // unify_toggle_on：还原排队期间开关被重新开启，后端拒绝还原
+          toast.info(
+            result.skippedReason === "unify_toggle_on"
+              ? t("settings.unifyCodexHistoryRestoreSkippedToggleOn")
+              : t("settings.unifyCodexHistoryRestoreNothing"),
+          );
+          return;
+        }
+        toast.success(
+          t("settings.unifyCodexHistoryRestoreCompleted", {
+            files: result.restoredJsonlFiles,
+            rows: result.restoredStateRows,
+          }),
         );
-        return;
+      } catch (error) {
+        console.error("Failed to restore codex unified history:", error);
+        toast.error(t("settings.unifyCodexHistoryRestoreFailed"));
       }
-      toast.success(
-        t("settings.unifyCodexHistoryRestoreCompleted", {
-          files: result.restoredJsonlFiles,
-          rows: result.restoredStateRows,
-        }),
-      );
-    } catch (error) {
-      console.error("Failed to restore codex unified history:", error);
-      toast.error(t("settings.unifyCodexHistoryRestoreFailed"));
-    }
+    });
   };
 
   return (

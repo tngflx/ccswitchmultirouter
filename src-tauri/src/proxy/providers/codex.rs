@@ -3570,7 +3570,13 @@ impl CodexAdapter {
                 1_000_000
             } else if prefix_len > 0 {
                 100_000 + prefix_len
-            } else if !has_model_restrictions && !has_prefix_restrictions {
+            } else if !has_model_restrictions
+                && !has_prefix_restrictions
+                && !group
+                    .get("strategy")
+                    .and_then(JsonValue::as_str)
+                    .is_some_and(|strategy| strategy.eq_ignore_ascii_case("fixed"))
+            {
                 1
             } else {
                 0
@@ -3605,7 +3611,9 @@ impl CodexAdapter {
             .get("strategy")
             .and_then(|value| value.as_str())
             .unwrap_or("round_robin");
-        let index = if strategy.eq_ignore_ascii_case("random") {
+        let index = if strategy.eq_ignore_ascii_case("fixed") || keys.len() == 1 {
+            0
+        } else if strategy.eq_ignore_ascii_case("random") {
             (Uuid::new_v4().as_u128() as usize) % keys.len()
         } else {
             let cursor_key = format!("{}:{group_id}", provider.id);
@@ -3933,6 +3941,35 @@ mod tests {
             Some("thread-123")
         ));
         assert_eq!(body["prompt_cache_key"], "client-key");
+    }
+
+    #[test]
+    fn grouped_api_keys_keep_fixed_model_credentials_separate() {
+        let provider = create_provider(json!({
+            "auth": {"OPENAI_API_KEY": "fallback"},
+            "codexApiKeyGroups": [
+                {"id": "unassigned", "strategy": "fixed", "apiKeys": ["unused"]},
+                {"id": "astra", "strategy": "fixed", "apiKeys": ["astra-key", "never-rotate"], "models": ["gpt-6-astra"]},
+                {"id": "subscription", "strategy": "fixed", "apiKeys": ["subscription-key"], "models": ["gpt-5.6-sol", "deepseek-v4-pro"]}
+            ]
+        }));
+        let adapter = CodexAdapter::new();
+        for _ in 0..4 {
+            for (model, key) in [
+                ("gpt-6-astra", "astra-key"),
+                ("gpt-5.6-sol", "subscription-key"),
+                ("deepseek-v4-pro", "subscription-key"),
+                ("other-model", "fallback"),
+            ] {
+                assert_eq!(
+                    adapter
+                        .extract_auth_for_model(&provider, Some(model))
+                        .unwrap()
+                        .api_key,
+                    key
+                );
+            }
+        }
     }
 
     #[test]

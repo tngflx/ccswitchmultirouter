@@ -39,7 +39,7 @@ export interface CodexApiKeyGroup {
   models?: string[];
   prefixes?: string[];
   enabled?: boolean;
-  strategy?: "round_robin" | "random";
+  strategy?: "fixed" | "round_robin" | "random";
 }
 
 export interface AppConfig {

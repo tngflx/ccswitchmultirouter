@@ -7,6 +7,7 @@ import { Trash2, ExternalLink, Plus } from "lucide-react";
 import { settingsApi } from "@/lib/api";
 import { FullScreenPanel } from "@/components/common/FullScreenPanel";
 import type { DiscoverableSkill, SkillRepo } from "@/lib/api/skills";
+import { useGlobalLoading } from "@/contexts/GlobalLoadingContext";
 
 interface RepoManagerPanelProps {
   repos: SkillRepo[];
@@ -27,6 +28,7 @@ export function RepoManagerPanel({
   const [repoUrl, setRepoUrl] = useState("");
   const [branch, setBranch] = useState("");
   const [error, setError] = useState("");
+  const { runWithLoading } = useGlobalLoading();
 
   const getSkillCount = (repo: SkillRepo) =>
     skills.filter(
@@ -61,12 +63,14 @@ export function RepoManagerPanel({
     }
 
     try {
-      await onAdd({
-        owner: parsed.owner,
-        name: parsed.name,
-        branch: branch || "main",
-        enabled: true,
-      });
+      await runWithLoading(() =>
+        onAdd({
+          owner: parsed.owner,
+          name: parsed.name,
+          branch: branch || "main",
+          enabled: true,
+        }),
+      );
 
       setRepoUrl("");
       setBranch("");
@@ -82,6 +86,9 @@ export function RepoManagerPanel({
       console.error("Failed to open URL:", error);
     }
   };
+
+  const handleRemove = (owner: string, name: string) =>
+    runWithLoading(() => onRemove(owner, name));
 
   return (
     <FullScreenPanel
@@ -179,7 +186,7 @@ export function RepoManagerPanel({
                     variant="ghost"
                     size="icon"
                     type="button"
-                    onClick={() => onRemove(repo.owner, repo.name)}
+                    onClick={() => void handleRemove(repo.owner, repo.name)}
                     title={t("common.delete")}
                     className="hover:text-red-500 hover:bg-red-100 dark:hover:text-red-400 dark:hover:bg-red-500/10"
                   >

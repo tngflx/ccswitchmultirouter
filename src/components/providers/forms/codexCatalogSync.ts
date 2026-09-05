@@ -77,6 +77,22 @@ function missingCapabilityPatch(
     row.inputModalities ?? row.input_modalities ?? undefined;
   const existingSupportsImage =
     row.supportsImage ?? row.supports_image ?? row.vision ?? undefined;
+  const textOnly = row.textOnly ?? row.text_only;
+  const declaredImage =
+    typeof existingSupportsImage === "boolean"
+      ? existingSupportsImage
+      : typeof textOnly === "boolean"
+        ? !textOnly
+        : undefined;
+  const fetchedImage = fetched.inputModalities?.length
+    ? fetched.inputModalities.some((value) => value.toLowerCase() === "image")
+    : fetched.supportsImage;
+  if (
+    declaredImage !== undefined &&
+    typeof fetchedImage === "boolean" &&
+    declaredImage !== fetchedImage
+  )
+    return patch;
 
   if (!Array.isArray(existingModalities) || existingModalities.length === 0) {
     if (

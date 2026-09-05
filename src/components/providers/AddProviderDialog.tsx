@@ -25,6 +25,7 @@ import { GROKBUILD_OFFICIAL_PROVIDER_ID } from "@/utils/providerCapabilities";
 import type { OpenClawSuggestedDefaults } from "@/config/openclawProviderPresets";
 import type { UniversalProviderPreset } from "@/config/universalProviderPresets";
 import type { CodexProviderSplitSuggestion } from "@/components/providers/forms/CodexFormFields";
+import { useGlobalLoading } from "@/contexts/GlobalLoadingContext";
 
 interface AddProviderDialogProps {
   open: boolean;
@@ -131,6 +132,7 @@ export function AddProviderDialog({
   const [selectedUniversalPreset, setSelectedUniversalPreset] =
     useState<UniversalProviderPreset | null>(null);
   const [isFormSubmitting, setIsFormSubmitting] = useState(false);
+  const { runWithLoading } = useGlobalLoading();
 
   useEffect(() => {
     // Codex 的添加入口实际是在创建多路路由，默认引导到模型源选择页。
@@ -139,45 +141,47 @@ export function AddProviderDialog({
 
   const handleUniversalProviderSave = useCallback(
     async (provider: UniversalProvider) => {
-      try {
-        await universalProvidersApi.upsert(provider);
-      } catch (error) {
-        console.error(
-          "[AddProviderDialog] Failed to save universal provider",
-          error,
-        );
-        toast.error(
-          t("universalProvider.addFailed", {
-            defaultValue: "统一供应商添加失败",
-          }),
-        );
-        return;
-      }
+      await runWithLoading(async () => {
+        try {
+          await universalProvidersApi.upsert(provider);
+        } catch (error) {
+          console.error(
+            "[AddProviderDialog] Failed to save universal provider",
+            error,
+          );
+          toast.error(
+            t("universalProvider.addFailed", {
+              defaultValue: "统一供应商添加失败",
+            }),
+          );
+          return;
+        }
 
-      try {
-        await universalProvidersApi.sync(provider.id);
-        toast.success(
-          t("universalProvider.addedAndSynced", {
-            defaultValue: "统一供应商已添加并同步",
-          }),
-        );
-      } catch (error) {
-        console.error(
-          "[AddProviderDialog] Provider saved but sync failed",
-          error,
-        );
-        toast.warning(
-          t("universalProvider.addedButSyncFailed", {
-            defaultValue: "统一供应商已添加，但同步失败",
-          }),
-        );
-      }
+        try {
+          await universalProvidersApi.sync(provider.id);
+          toast.success(
+            t("universalProvider.addedAndSynced", {
+              defaultValue: "统一供应商已添加并同步",
+            }),
+          );
+        } catch (error) {
+          console.error(
+            "[AddProviderDialog] Provider saved but sync failed",
+            error,
+          );
+          toast.warning(
+            t("universalProvider.addedButSyncFailed", {
+              defaultValue: "统一供应商已添加，但同步失败",
+            }),
+          );
+        }
 
-      setUniversalFormOpen(false);
-      setSelectedUniversalPreset(null);
-      onOpenChange(false);
+        setUniversalFormOpen(false);
+        setSelectedUniversalPreset(null);
+        onOpenChange(false);
+      });
     },
-    [t, onOpenChange],
+    [t, onOpenChange, runWithLoading],
   );
 
   const handleUniversalFormClose = useCallback(() => {
@@ -398,22 +402,24 @@ export function AddProviderDialog({
       }
 
       const codexProviderSplit = values.codexProviderSplit;
-      if (appId === "codex" && codexProviderSplit) {
-        await onSubmit(
-          buildMixedCodexProviderData(providerData, codexProviderSplit),
-        );
-        toast.success(
-          t("codexConfig.splitProvidersCreated", {
-            defaultValue:
-              "已创建一个混合协议 provider（Responses / Chat 自动路由）",
-          }),
-        );
-      } else {
-        await onSubmit(providerData);
-      }
-      onOpenChange(false);
+      await runWithLoading(async () => {
+        if (appId === "codex" && codexProviderSplit) {
+          await onSubmit(
+            buildMixedCodexProviderData(providerData, codexProviderSplit),
+          );
+          toast.success(
+            t("codexConfig.splitProvidersCreated", {
+              defaultValue:
+                "已创建一个混合协议 provider（Responses / Chat 自动路由）",
+            }),
+          );
+        } else {
+          await onSubmit(providerData);
+        }
+        onOpenChange(false);
+      });
     },
-    [appId, onSubmit, onOpenChange, t],
+    [appId, onSubmit, onOpenChange, runWithLoading, t],
   );
 
   const footer =
