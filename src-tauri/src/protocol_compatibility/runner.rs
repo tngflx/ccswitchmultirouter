@@ -292,7 +292,17 @@ where
         );
         vec![responses, chat]
     } else {
-        vec![run_branch(&candidate, client, candidate.transport, &nonce, mode, reporter).await]
+        vec![
+            run_branch(
+                &candidate,
+                client,
+                candidate.transport,
+                &nonce,
+                mode,
+                reporter,
+            )
+            .await,
+        ]
     };
 
     let candidates = branches
