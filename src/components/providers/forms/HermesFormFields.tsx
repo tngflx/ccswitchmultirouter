@@ -109,7 +109,6 @@ function AdvancedSection({
   children,
 }: AdvancedSectionProps) {
   const { t } = useTranslation();
-  const { runWithLoading } = useGlobalLoading();
   return (
     <Collapsible open={open} onOpenChange={onOpenChange}>
       <CollapsibleTrigger asChild>
@@ -152,6 +151,7 @@ export function HermesFormFields({
   onRateLimitDelayChange,
 }: HermesFormFieldsProps) {
   const { t } = useTranslation();
+  const { runWithLoading } = useGlobalLoading();
   const [expandedModels, setExpandedModels] = useState<Record<number, boolean>>(
     {},
   );
