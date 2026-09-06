@@ -85,6 +85,7 @@ import { CodexModelReasoningCard } from "./CodexModelReasoningCard";
 import { CodexModelReasoningEditor } from "./CodexModelReasoningEditor";
 import { CodexModelReasoningSummary } from "./CodexModelReasoningSummary";
 import { cn } from "@/lib/utils";
+import { pruneOutdatedCodexCatalogModels } from "./codexCatalogVersionPruning";
 import { resolveFetchedCodexModelContextWindow } from "@/utils/codexModelContext";
 import {
   codexPlanModelListAction,
@@ -104,6 +105,7 @@ import type {
   Provider,
   ProviderCategory,
   CodexApiKeyGroup,
+  CodexApiKeyGroupMode,
 } from "@/types";
 import type { AppId } from "@/lib/api";
 import { codexSubagentV2Api } from "@/lib/api/codexSubagentV2";
@@ -306,6 +308,8 @@ interface CodexFormFieldsProps {
   onApiKeyChange: (key: string) => void;
   apiKeyGroups?: CodexApiKeyGroup[];
   onApiKeyGroupsChange?: (groups: CodexApiKeyGroup[]) => void;
+  apiKeyGroupMode?: CodexApiKeyGroupMode;
+  onApiKeyGroupModeChange?: (mode: CodexApiKeyGroupMode) => void;
   category?: ProviderCategory;
   shouldShowApiKeyLink: boolean;
   websiteUrl: string;
@@ -906,6 +910,8 @@ export function CodexFormFields({
   onApiKeyChange,
   apiKeyGroups = [],
   onApiKeyGroupsChange,
+  apiKeyGroupMode = "isolated",
+  onApiKeyGroupModeChange = () => undefined,
   category,
   shouldShowApiKeyLink,
   websiteUrl,
@@ -2175,6 +2181,30 @@ export function CodexFormFields({
     );
   }, [selectedCatalogRowIds, t]);
 
+  const handlePruneOutdated = useCallback(() => {
+    const result = pruneOutdatedCodexCatalogModels(catalogRows);
+    if (!result.pruned.length) {
+      toast.info(
+        t("codexConfig.catalogPruneNone", {
+          defaultValue: "No outdated versions found",
+        }),
+      );
+      return;
+    }
+    const prunedIds = new Set(result.pruned.map((model) => model.model.trim()));
+    setCatalogRows((current) =>
+      current.filter((row) => !prunedIds.has(row.model.trim())),
+    );
+    setSelectedCatalogRowIds(new Set());
+    toast.success(
+      t("codexConfig.catalogPrunedFeedback", {
+        count: result.pruned.length,
+        defaultValue:
+          "Kept latest model versions and removed {{count}} outdated models",
+      }),
+    );
+  }, [catalogRows, t]);
+
   const handleUpdateCatalogRow = useCallback(
     (index: number, patch: Partial<CodexCatalogModel>) => {
       setCatalogRows((current) =>
@@ -2575,6 +2605,38 @@ export function CodexFormFields({
               })}
             </Button>
           </div>
+          <div className="mt-3">
+            <div
+              className="inline-flex rounded-md border border-border-default p-0.5"
+              role="group"
+              aria-label={t("codexConfig.apiKeyGroupMode")}
+            >
+              {(["isolated", "round_robin"] as const).map((mode) => (
+                <Button
+                  key={mode}
+                  type="button"
+                  size="sm"
+                  variant={apiKeyGroupMode === mode ? "secondary" : "ghost"}
+                  className="h-7 rounded px-3"
+                  aria-pressed={apiKeyGroupMode === mode}
+                  onClick={() => onApiKeyGroupModeChange(mode)}
+                >
+                  {t(
+                    mode === "isolated"
+                      ? "codexConfig.apiKeyGroupModeIsolated"
+                      : "codexConfig.apiKeyGroupModeRoundRobin",
+                  )}
+                </Button>
+              ))}
+            </div>
+            <p className="mt-1 text-xs text-muted-foreground">
+              {t(
+                apiKeyGroupMode === "isolated"
+                  ? "codexConfig.apiKeyGroupModeIsolatedHint"
+                  : "codexConfig.apiKeyGroupModeRoundRobinHint",
+              )}
+            </p>
+          </div>
           {apiKeyGroups.length === 0 ? (
             <p className="mt-3 text-xs text-muted-foreground">
               {t("codexConfig.apiKeyGroupsEmpty", {
@@ -2970,6 +3032,7 @@ export function CodexFormFields({
           sectionRef={modelMappingSectionRef}
           onSyncModels={handleFetchModels}
           onFillMissingFields={handleFillMissingModelFields}
+          onPruneOutdated={handlePruneOutdated}
           onCreateProtocolGroups={() => {
             const nextRows = applyDefaultCodexProtocolGroups(
               catalogRowsRef.current,

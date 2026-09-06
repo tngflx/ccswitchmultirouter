@@ -1719,7 +1719,12 @@
       "safetyWarning": "Do not enable the OpenCode rejection signature for unrelated providers unless they guarantee the same pre-inference rejection semantics. Arbitrary 5xx responses are never retried."
     },
     "apiKeyGroupsTitle": "Model-specific API key groups",
-    "apiKeyGroupsHint": "Each subscription group has its own key and models. New groups do not rotate keys. Exact model matches take priority, then prefixes.",
+    "apiKeyGroupsHint": "Choose whether subscription groups appear as isolated model sources or intentionally share matching traffic.",
+    "apiKeyGroupMode": "Subscription group routing",
+    "apiKeyGroupModeIsolated": "Isolated sources",
+    "apiKeyGroupModeRoundRobin": "Round robin pool",
+    "apiKeyGroupModeIsolatedHint": "The ordinary model uses the fallback key. Each enabled group gets separate group-labelled model choices that use only that group's credentials.",
+    "apiKeyGroupModeRoundRobinHint": "The fallback key and all groups with equally specific model matches are combined into one pool and used in round-robin order.",
     "apiKeyGroupFixed": "Fixed key (no rotation)",
     "apiKeyGroupUnassigned": "No models assigned; this group will not receive requests.",
     "apiKeyGroupFetchModels": "Fetch models for this key",

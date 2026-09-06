@@ -42,6 +42,8 @@ export interface CodexApiKeyGroup {
   strategy?: "fixed" | "round_robin" | "random";
 }
 
+export type CodexApiKeyGroupMode = "isolated" | "round_robin";
+
 export interface AppConfig {
   providers: Record<string, Provider>;
   current: string;
@@ -438,6 +440,11 @@ export interface CodexCatalogModel {
   codex_cache?: CodexCacheConfig;
   // User-defined picker order. Lower values appear first in Codex.
   sortIndex?: number;
+  // Generated isolated-key-group projection metadata.
+  apiKeyGroupId?: string;
+  api_key_group_id?: string;
+  apiKeyGroupGenerated?: boolean;
+  api_key_group_generated?: boolean;
 }
 
 export type CodexCacheMode =

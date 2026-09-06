@@ -1719,7 +1719,12 @@
       "safetyWarning": "同じ推論開始前の拒否セマンティクスが保証されない限り、無関係なプロバイダーで OpenCode 拒否シグネチャを有効にしないでください。任意の 5xx 応答は再試行されません。"
     },
     "apiKeyGroupsTitle": "モデル別 API キーグループ",
-    "apiKeyGroupsHint": "各サブスクリプショングループに専用のキーとモデルを設定します。新しいグループはキーをローテーションしません。完全一致、次にプレフィックスで照合します。",
+    "apiKeyGroupsHint": "サブスクリプショングループを分離されたモデルソースとして表示するか、一致するリクエストを意図的に共有するかを選択します。",
+    "apiKeyGroupMode": "サブスクリプショングループのルーティング",
+    "apiKeyGroupModeIsolated": "分離ソース",
+    "apiKeyGroupModeRoundRobin": "ラウンドロビンプール",
+    "apiKeyGroupModeIsolatedHint": "通常モデルはフォールバックキーを使用します。有効な各グループにはグループ名付きの個別モデルが生成され、そのグループの認証情報だけを使用します。",
+    "apiKeyGroupModeRoundRobinHint": "フォールバックキーと同じ優先度でモデルに一致するすべてのグループを1つのキープールにまとめ、ラウンドロビン順で使用します。",
     "apiKeyGroupFixed": "固定キー（ローテーションなし）",
     "apiKeyGroupUnassigned": "モデルが未割り当てのため、このグループにはリクエストが送信されません。",
     "apiKeyGroupFetchModels": "このキーのモデルを取得",

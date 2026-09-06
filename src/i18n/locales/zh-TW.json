@@ -1719,7 +1719,12 @@
       "safetyWarning": "除非其他供應商保證相同的推理前拒絕語意，否則不要啟用 OpenCode 拒絕特徵。任意 5xx 回應永遠不會被重試。"
     },
     "apiKeyGroupsTitle": "依模型設定 API Key 群組",
-    "apiKeyGroupsHint": "每個訂閱群組使用獨立的 Key 和模型。新群組不輪換 Key；優先匹配精確模型，其次匹配前綴。",
+    "apiKeyGroupsHint": "選擇將訂閱群組顯示為彼此隔離的模型來源，或刻意共用相符請求。",
+    "apiKeyGroupMode": "訂閱群組路由",
+    "apiKeyGroupModeIsolated": "隔離來源",
+    "apiKeyGroupModeRoundRobin": "輪詢金鑰池",
+    "apiKeyGroupModeIsolatedHint": "一般模型使用備用 Key；每個已啟用群組會產生帶群組標籤的獨立模型選項，並且只使用該群組的憑證。",
+    "apiKeyGroupModeRoundRobinHint": "備用 Key 與符合精確度相同的所有群組會合併為一個 Key 池，並依輪詢順序使用。",
     "apiKeyGroupFixed": "固定 Key（不輪換）",
     "apiKeyGroupUnassigned": "尚未分配模型，此群組不會接收請求。",
     "apiKeyGroupFetchModels": "取得此 Key 的模型",

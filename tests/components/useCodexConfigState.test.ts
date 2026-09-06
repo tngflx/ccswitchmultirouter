@@ -1,5 +1,27 @@
 import { describe, expect, it } from "vitest";
-import { extractCodexRoutingConfig } from "@/components/providers/forms/hooks/useCodexConfigState";
+import {
+  extractCodexCatalogModels,
+  extractCodexRoutingConfig,
+} from "@/components/providers/forms/hooks/useCodexConfigState";
+
+describe("extractCodexCatalogModels", () => {
+  it("keeps generated isolated group choices out of the editable base catalog", () => {
+    expect(
+      extractCodexCatalogModels({
+        models: [
+          { model: "gpt-5.6-sol", displayName: "GPT-5.6 Sol" },
+          {
+            model: "gpt-5.6-sol--ccg-astra",
+            upstreamModel: "gpt-5.6-sol",
+            displayName: "GPT-5.6 Sol [Astra]",
+            apiKeyGroupId: "astra",
+            apiKeyGroupGenerated: true,
+          },
+        ],
+      }),
+    ).toEqual([{ model: "gpt-5.6-sol", displayName: "GPT-5.6 Sol" }]);
+  });
+});
 
 describe("extractCodexRoutingConfig", () => {
   it("preserves the legacy Chat default when a route has no format", () => {

@@ -3131,11 +3131,10 @@ impl RequestForwarder {
         // 获取认证头（提前准备，用于内联替换），同时保留仅用于日志脱敏的
         // 精确认证材料。实际日志永远不输出这些值。
         let mut log_secrets: Vec<String> = Vec::new();
-        let mut auth_headers = if let Some(mut auth) = adapter.extract_auth_for_model(
+        let mut auth_headers = if let Some(mut auth) = adapter.extract_auth_for_request_model(
             provider,
-            outbound_model
-                .as_deref()
-                .or(Some(request_model_for_log.as_str())),
+            Some(request_model_for_log.as_str()),
+            outbound_model.as_deref(),
         ) {
             // GitHub Copilot 特殊处理：从 CopilotAuthManager 获取真实 token
             if auth.strategy == AuthStrategy::GitHubCopilot {
@@ -4794,9 +4793,11 @@ impl RequestForwarder {
         if codex_official_auth_passthrough {
             validate_codex_official_authorization(headers)?;
         }
-        let mut auth_headers = if let Some(mut auth) =
-            adapter.extract_auth_for_model(provider, Some(request_model_for_log.as_str()))
-        {
+        let mut auth_headers = if let Some(mut auth) = adapter.extract_auth_for_request_model(
+            provider,
+            Some(request_model_for_log.as_str()),
+            Some(request_model_for_log.as_str()),
+        ) {
             if auth.strategy == AuthStrategy::CodexOAuth {
                 if let Some(app_handle) = &self.app_handle {
                     let codex_state = app_handle.state::<CodexOAuthState>();

@@ -3518,125 +3518,73 @@ impl CodexAdapter {
         None
     }
 
-    fn extract_grouped_key(&self, provider: &Provider, model: &str) -> Option<String> {
-        let groups = provider
+    fn grouped_key_mode(provider: &Provider) -> &str {
+        provider
             .settings_config
-            .get("codexApiKeyGroups")
-            .or_else(|| provider.settings_config.get("codex_api_key_groups"))?
-            .as_array()?;
-        let model = model.trim();
-        if model.is_empty() {
-            return None;
-        }
-        let mut selected: Option<(&serde_json::Value, usize)> = None;
-        for group in groups {
-            if group.get("enabled").and_then(|v| v.as_bool()) == Some(false) {
-                continue;
-            }
-            let keys = group
-                .get("apiKeys")
-                .or_else(|| group.get("api_keys"))
-                .and_then(|v| v.as_array())
-                .map(|values| {
-                    values
-                        .iter()
-                        .filter_map(|v| v.as_str())
-                        .map(str::trim)
-                        .filter(|v| !v.is_empty())
-                        .count()
-                })
-                .unwrap_or(0);
-            if keys == 0 {
-                continue;
-            }
-            let exact = group
-                .get("models")
-                .and_then(|v| v.as_array())
-                .is_some_and(|models| {
-                    models.iter().any(|v| {
-                        v.as_str()
-                            .is_some_and(|candidate| candidate.trim().eq_ignore_ascii_case(model))
-                    })
-                });
-            let prefix_len = group
-                .get("prefixes")
-                .and_then(|v| v.as_array())
-                .map(|prefixes| {
-                    prefixes
-                        .iter()
-                        .filter_map(|v| v.as_str())
-                        .map(str::trim)
-                        .filter(|prefix| {
-                            !prefix.is_empty()
-                                && model
-                                    .get(..prefix.len())
-                                    .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
+            .get("codexApiKeyGroupMode")
+            .or_else(|| provider.settings_config.get("codex_api_key_group_mode"))
+            .and_then(JsonValue::as_str)
+            .filter(|mode| mode.eq_ignore_ascii_case("round_robin"))
+            .unwrap_or("isolated")
+    }
+
+    fn catalog_api_key_group_id<'a>(
+        provider: &'a Provider,
+        request_model: &str,
+    ) -> Option<&'a str> {
+        provider
+            .settings_config
+            .get("modelCatalog")
+            .and_then(|catalog| catalog.get("models"))
+            .and_then(JsonValue::as_array)
+            .and_then(|models| {
+                models.iter().find(|model| {
+                    model
+                        .get("model")
+                        .and_then(JsonValue::as_str)
+                        .is_some_and(|candidate| {
+                            candidate.trim().eq_ignore_ascii_case(request_model.trim())
                         })
-                        .map(str::len)
-                        .max()
-                        .unwrap_or(0)
                 })
-                .unwrap_or(0);
-            let has_model_restrictions = group
-                .get("models")
-                .and_then(|value| value.as_array())
-                .is_some_and(|values| {
-                    values
-                        .iter()
-                        .any(|value| value.as_str().is_some_and(|v| !v.trim().is_empty()))
-                });
-            let has_prefix_restrictions = group
-                .get("prefixes")
-                .and_then(|value| value.as_array())
-                .is_some_and(|values| {
-                    values
-                        .iter()
-                        .any(|value| value.as_str().is_some_and(|v| !v.trim().is_empty()))
-                });
-            let specificity = if exact {
-                1_000_000
-            } else if prefix_len > 0 {
-                100_000 + prefix_len
-            } else if !has_model_restrictions
-                && !has_prefix_restrictions
-                && !group
-                    .get("strategy")
-                    .and_then(JsonValue::as_str)
-                    .is_some_and(|strategy| strategy.eq_ignore_ascii_case("fixed"))
-            {
-                1
-            } else {
-                0
-            };
-            if specificity == 0 {
-                continue;
-            }
-            if selected.is_none_or(|(_, current)| specificity > current) {
-                selected = Some((group, specificity));
-            }
-        }
-        let (group, _) = selected?;
-        let keys = group
+            })
+            .and_then(|model| {
+                model
+                    .get("apiKeyGroupId")
+                    .or_else(|| model.get("api_key_group_id"))
+            })
+            .and_then(JsonValue::as_str)
+            .map(str::trim)
+            .filter(|group_id| !group_id.is_empty())
+    }
+
+    fn group_keys(group: &JsonValue) -> Vec<&str> {
+        group
             .get("apiKeys")
             .or_else(|| group.get("api_keys"))
-            .and_then(|v| v.as_array())?;
-        let keys = keys
-            .iter()
-            .filter_map(|v| v.as_str())
-            .map(str::trim)
-            .filter(|v| !v.is_empty())
-            .collect::<Vec<_>>();
-        if keys.is_empty() {
-            return None;
-        }
+            .and_then(JsonValue::as_array)
+            .map(|keys| {
+                keys.iter()
+                    .filter_map(JsonValue::as_str)
+                    .map(str::trim)
+                    .filter(|key| !key.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn select_key_from_group(
+        provider: &Provider,
+        group: &JsonValue,
+        keys: &[&str],
+    ) -> Option<String> {
         let group_id = group
             .get("id")
-            .and_then(|v| v.as_str())
-            .filter(|v| !v.trim().is_empty())
+            .and_then(JsonValue::as_str)
+            .filter(|value| !value.trim().is_empty())
             .unwrap_or("default");
         let strategy = group
             .get("strategy")
-            .and_then(|value| value.as_str())
+            .and_then(JsonValue::as_str)
             .unwrap_or("round_robin");
         let index = if strategy.eq_ignore_ascii_case("fixed") || keys.len() == 1 {
             0
@@ -3650,7 +3598,150 @@ impl CodexAdapter {
             *cursor = cursor.wrapping_add(1);
             index
         };
-        Some(keys[index].to_string())
+        keys.get(index).map(|key| (*key).to_string())
+    }
+
+    fn grouped_match_specificity(group: &JsonValue, model: &str) -> usize {
+        let exact = group
+            .get("models")
+            .and_then(JsonValue::as_array)
+            .is_some_and(|models| {
+                models.iter().any(|value| {
+                    value
+                        .as_str()
+                        .is_some_and(|candidate| candidate.trim().eq_ignore_ascii_case(model))
+                })
+            });
+        if exact {
+            return 1_000_000;
+        }
+        group
+            .get("prefixes")
+            .and_then(JsonValue::as_array)
+            .map(|prefixes| {
+                prefixes
+                    .iter()
+                    .filter_map(JsonValue::as_str)
+                    .map(str::trim)
+                    .filter(|prefix| {
+                        !prefix.is_empty()
+                            && model
+                                .get(..prefix.len())
+                                .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
+                    })
+                    .map(str::len)
+                    .max()
+                    .unwrap_or(0)
+            })
+            .filter(|length| *length > 0)
+            .map(|length| 100_000 + length)
+            .unwrap_or(0)
+    }
+
+    fn extract_grouped_key(
+        &self,
+        provider: &Provider,
+        request_model: &str,
+        outbound_model: &str,
+    ) -> Option<String> {
+        let groups = provider
+            .settings_config
+            .get("codexApiKeyGroups")
+            .or_else(|| provider.settings_config.get("codex_api_key_groups"))?
+            .as_array()?;
+        let request_model = request_model.trim();
+        let outbound_model = outbound_model.trim();
+        if request_model.is_empty() || outbound_model.is_empty() {
+            return None;
+        }
+
+        if Self::grouped_key_mode(provider) == "isolated" {
+            let group_id = Self::catalog_api_key_group_id(provider, request_model)?;
+            let mut matching_groups = groups.iter().filter(|group| {
+                group.get("enabled").and_then(JsonValue::as_bool) != Some(false)
+                    && group
+                        .get("id")
+                        .and_then(JsonValue::as_str)
+                        .is_some_and(|candidate| candidate.trim() == group_id)
+            });
+            let group = matching_groups.next()?;
+            if matching_groups.next().is_some() {
+                log::error!(
+                    "[CodexKeyGroup] duplicate isolated group id rejected: {}",
+                    group_id
+                );
+                return None;
+            }
+            let keys = Self::group_keys(group);
+            log::debug!(
+                "[CodexKeyGroup] isolated model={} selected_group={}",
+                request_model,
+                group_id
+            );
+            return Self::select_key_from_group(provider, group, &keys);
+        }
+
+        let mut selected_specificity = 0;
+        let mut selected_groups = Vec::new();
+        for group in groups {
+            if group.get("enabled").and_then(|v| v.as_bool()) == Some(false) {
+                continue;
+            }
+            if Self::group_keys(group).is_empty() {
+                continue;
+            }
+            let specificity = Self::grouped_match_specificity(group, outbound_model);
+            if specificity == 0 {
+                continue;
+            }
+            if specificity > selected_specificity {
+                selected_specificity = specificity;
+                selected_groups.clear();
+                selected_groups.push(group);
+            } else if specificity == selected_specificity {
+                selected_groups.push(group);
+            }
+        }
+        if selected_groups.is_empty() {
+            return None;
+        }
+        let mut keys = self
+            .extract_key(provider)
+            .into_iter()
+            .collect::<Vec<String>>();
+        keys.extend(
+            selected_groups
+                .iter()
+                .flat_map(|group| Self::group_keys(group))
+                .map(ToString::to_string),
+        );
+        let mut seen_keys = std::collections::HashSet::new();
+        keys.retain(|key| seen_keys.insert(key.clone()));
+        if keys.is_empty() {
+            return None;
+        }
+        let cursor_key = format!(
+            "{}:pooled:{}:{}",
+            provider.id,
+            selected_specificity,
+            outbound_model.to_ascii_lowercase()
+        );
+        let mut cursors = CODEX_API_KEY_GROUP_CURSORS.lock().ok()?;
+        let cursor = cursors.entry(cursor_key).or_insert(0);
+        let index = *cursor % keys.len();
+        *cursor = cursor.wrapping_add(1);
+        drop(cursors);
+        let group_ids = selected_groups
+            .iter()
+            .filter_map(|group| group.get("id").and_then(JsonValue::as_str))
+            .collect::<Vec<_>>()
+            .join(",");
+        log::debug!(
+            "[CodexKeyGroup] pooled model={} selected_groups={}",
+            outbound_model,
+            group_ids
+        );
+        Some(keys[index].clone())
     }
 }
 
@@ -3769,6 +3860,15 @@ impl ProviderAdapter for CodexAdapter {
     }
 
     fn extract_auth_for_model(&self, provider: &Provider, model: Option<&str>) -> Option<AuthInfo> {
+        self.extract_auth_for_request_model(provider, model, model)
+    }
+
+    fn extract_auth_for_request_model(
+        &self,
+        provider: &Provider,
+        request_model: Option<&str>,
+        outbound_model: Option<&str>,
+    ) -> Option<AuthInfo> {
         if provider_uses_native_codex_auth(provider)
             || provider_is_managed_codex_oauth(provider)
             || provider.is_xai_oauth()
@@ -3786,8 +3886,11 @@ impl ProviderAdapter for CodexAdapter {
         } else {
             AuthStrategy::Bearer
         };
-        model
-            .and_then(|model| self.extract_grouped_key(provider, model))
+        request_model
+            .zip(outbound_model.or(request_model))
+            .and_then(|(request_model, outbound_model)| {
+                self.extract_grouped_key(provider, request_model, outbound_model)
+            })
             .map(|key| AuthInfo::new(key, strategy))
             .or_else(|| self.extract_auth(provider))
     }
@@ -3974,23 +4077,37 @@ mod tests {
     fn grouped_api_keys_keep_fixed_model_credentials_separate() {
         let provider = create_provider(json!({
             "auth": {"OPENAI_API_KEY": "fallback"},
+            "codexApiKeyGroupMode": "isolated",
             "codexApiKeyGroups": [
                 {"id": "unassigned", "strategy": "fixed", "apiKeys": ["unused"]},
                 {"id": "astra", "strategy": "fixed", "apiKeys": ["astra-key", "never-rotate"], "models": ["gpt-6-astra"]},
                 {"id": "subscription", "strategy": "fixed", "apiKeys": ["subscription-key"], "models": ["gpt-5.6-sol", "deepseek-v4-pro"]}
-            ]
+            ],
+            "modelCatalog": {"models": [
+                {"model": "gpt-5.6-sol", "upstreamModel": "gpt-5.6-sol"},
+                {"model": "gpt-5.6-sol--ccg-subscription", "upstreamModel": "gpt-5.6-sol", "apiKeyGroupId": "subscription"},
+                {"model": "gpt-6-astra--ccg-astra", "upstreamModel": "gpt-6-astra", "apiKeyGroupId": "astra"}
+            ]}
         }));
         let adapter = CodexAdapter::new();
         for _ in 0..4 {
-            for (model, key) in [
-                ("gpt-6-astra", "astra-key"),
-                ("gpt-5.6-sol", "subscription-key"),
-                ("deepseek-v4-pro", "subscription-key"),
-                ("other-model", "fallback"),
+            for (request_model, outbound_model, key) in [
+                ("gpt-6-astra--ccg-astra", "gpt-6-astra", "astra-key"),
+                (
+                    "gpt-5.6-sol--ccg-subscription",
+                    "gpt-5.6-sol",
+                    "subscription-key",
+                ),
+                ("gpt-5.6-sol", "gpt-5.6-sol", "fallback"),
+                ("other-model", "other-model", "fallback"),
             ] {
                 assert_eq!(
                     adapter
-                        .extract_auth_for_model(&provider, Some(model))
+                        .extract_auth_for_request_model(
+                            &provider,
+                            Some(request_model),
+                            Some(outbound_model),
+                        )
                         .unwrap()
                         .api_key,
                     key
@@ -4002,8 +4119,8 @@ mod tests {
     #[test]
     fn grouped_api_keys_prefer_exact_then_longest_prefix_and_rotate() {
         let provider = create_provider(json!({
+            "codexApiKeyGroupMode": "round_robin",
             "codexApiKeyGroups": [
-                {"id": "generic", "apiKeys": ["generic-key"]},
                 {"id": "deepseek", "apiKeys": ["deep-a", "deep-b"], "prefixes": ["deepseek-"]},
                 {"id": "exact", "apiKeys": ["exact-key"], "models": ["deepseek-v4-flash"]}
             ]
@@ -4030,12 +4147,63 @@ mod tests {
                 .api_key,
             "deep-b"
         );
+    }
+
+    #[test]
+    fn grouped_api_key_round_robin_pool_combines_fallback_and_duplicate_model_groups() {
+        let provider = create_provider(json!({
+            "auth": {"OPENAI_API_KEY": "primary-key"},
+            "codexApiKeyGroupMode": "round_robin",
+            "codexApiKeyGroups": [
+                {"id": "secondary-a", "strategy": "fixed", "apiKeys": ["secondary-a-key"], "models": ["gpt-5.6-sol"]},
+                {"id": "secondary-b", "strategy": "fixed", "apiKeys": ["secondary-b-key"], "models": ["gpt-5.6-sol"]}
+            ]
+        }));
+        let adapter = CodexAdapter::new();
+
         assert_eq!(
             adapter
-                .extract_auth_for_model(&provider, Some("gpt-5.6"))
+                .extract_auth_for_request_model(
+                    &provider,
+                    Some("gpt-5.6-sol"),
+                    Some("gpt-5.6-sol"),
+                )
                 .unwrap()
                 .api_key,
-            "generic-key"
+            "primary-key"
+        );
+        assert_eq!(
+            adapter
+                .extract_auth_for_request_model(
+                    &provider,
+                    Some("gpt-5.6-sol"),
+                    Some("gpt-5.6-sol"),
+                )
+                .unwrap()
+                .api_key,
+            "secondary-a-key"
+        );
+        assert_eq!(
+            adapter
+                .extract_auth_for_request_model(
+                    &provider,
+                    Some("gpt-5.6-sol"),
+                    Some("gpt-5.6-sol"),
+                )
+                .unwrap()
+                .api_key,
+            "secondary-b-key"
+        );
+        assert_eq!(
+            adapter
+                .extract_auth_for_request_model(
+                    &provider,
+                    Some("gpt-5.6-sol"),
+                    Some("gpt-5.6-sol"),
+                )
+                .unwrap()
+                .api_key,
+            "primary-key"
         );
     }
 

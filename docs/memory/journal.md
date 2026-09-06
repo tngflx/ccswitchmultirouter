@@ -1,5 +1,13 @@
 # Engineering Journal (newest first)
 
+## 2026-09-05 - Separate Codex API-key groups from pooled rotation
+
+- **What happened:** A Sublyx `gpt-5.6-sol` request could use a secondary subscription key when primary and secondary groups listed the same model.
+- **Root cause:** Group lookup matched only the final model string and silently chose the first equal-specificity group. Group labels, IDs, and `upstreamModel` were not part of authentication identity.
+- **What we did:** Added an explicit `isolated` (default) versus `round_robin` group mode. Isolated mode generates group-qualified catalog models carrying `apiKeyGroupId`; the proxy authenticates from the visible qualified model and sends the shared upstream model. Round-robin mode intentionally pools the fallback key and equally specific matching group keys with a stable cursor and de-duplication. Legacy configurations default to isolated behavior, and isolated group projection forces the model menu on.
+- **Evidence:** `pnpm typecheck` passed; `cargo check --manifest-path src-tauri/Cargo.toml` passed; focused frontend run passed 4 files / 72 tests; focused Rust grouped-key run passed 3 tests; scoped Prettier and `git diff --check` passed. `cargo fmt --check` still reports the pre-existing module-order change in dirty `src-tauri/src/proxy/providers/mod.rs`; it was not rewritten.
+- **What NOT to do again:** Do not treat a display label or array position as credential ownership, and do not silently first-match duplicate model assignments.
+
 ## 2026-09-05 - Ported catalog and Moonshot compatibility fixes
 
 - **What happened:** Re-evaluated both reference repositories and ported the low-risk parts of original commits `bc4ed66d3`, `db41d7018`, and `e47b5fca1`.

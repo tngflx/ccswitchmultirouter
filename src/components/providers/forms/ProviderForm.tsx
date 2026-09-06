@@ -35,6 +35,7 @@ import type {
   PromptCacheRoutingMode,
   ClaudeApiKeyField,
   CodexApiKeyGroup,
+  CodexApiKeyGroupMode,
 } from "@/types";
 import {
   providerPresets,
@@ -137,6 +138,10 @@ import {
   OPENCLAW_DEFAULT_CONFIG,
   normalizePricingSource,
 } from "./helpers/opencodeFormUtils";
+import {
+  buildCodexApiKeyGroupCatalog,
+  normalizeCodexApiKeyGroupMode,
+} from "./codexApiKeyGroupRouting";
 import { HERMES_DEFAULT_CONFIG } from "./hooks/useHermesFormState";
 import { resolveManagedAccountId } from "@/lib/authBinding";
 import { useOpenClawLiveProviderIds } from "@/hooks/useOpenClaw";
@@ -890,6 +895,12 @@ function ProviderFormFull({
         )
       : [];
   });
+  const [codexApiKeyGroupMode, setCodexApiKeyGroupMode] =
+    useState<CodexApiKeyGroupMode>(() =>
+      normalizeCodexApiKeyGroupMode(
+        initialData?.settingsConfig?.codexApiKeyGroupMode,
+      ),
+    );
   useEffect(() => {
     const value = initialData?.settingsConfig?.codexApiKeyGroups;
     setCodexApiKeyGroups(
@@ -902,6 +913,11 @@ function ProviderFormFull({
             ),
           )
         : [],
+    );
+    setCodexApiKeyGroupMode(
+      normalizeCodexApiKeyGroupMode(
+        initialData?.settingsConfig?.codexApiKeyGroupMode,
+      ),
     );
   }, [initialData]);
 
@@ -1147,8 +1163,18 @@ function ProviderFormFull({
   ]);
   const codexPresetBaseline = maintainedCodexPreset?.modelCatalog ?? [];
   const isMaintainedCodexPreset = Boolean(maintainedCodexPreset);
+  const isolatedGroupsRequireMapping =
+    codexApiKeyGroupMode === "isolated" &&
+    codexApiKeyGroups.some(
+      (group) =>
+        group.enabled !== false &&
+        group.apiKeys.some((key) => key.trim()) &&
+        Boolean(group.models?.length || group.prefixes?.length),
+    );
   const effectiveCodexMenuProjection =
-    isMaintainedCodexPreset || codexTakeoverEnabled;
+    isMaintainedCodexPreset ||
+    isolatedGroupsRequireMapping ||
+    codexTakeoverEnabled;
 
   const { data: codexProvidersData } = useProvidersQuery("codex");
   const codexCapabilityProviders =
@@ -1864,18 +1890,8 @@ function ProviderFormFull({
           modelCatalog?: CodexModelCatalogConfig;
           codexRouting?: CodexRoutingConfig;
           codexApiKeyGroups?: CodexApiKeyGroup[];
+          codexApiKeyGroupMode?: CodexApiKeyGroupMode;
         };
-        if (normalizedCatalogModels.length > 0) {
-          configObj.modelCatalog = {
-            models: normalizedCatalogModels,
-            ...(normalizedSpawnAgentModels.length > 0
-              ? { spawnAgentModels: normalizedSpawnAgentModels }
-              : {}),
-          };
-        }
-        if (shouldPersistCodexLocalConfig && hasCodexRouting) {
-          configObj.codexRouting = codexRouting;
-        }
         const normalizedApiKeyGroups = codexApiKeyGroups
           .map((group) => ({
             ...group,
@@ -1886,8 +1902,25 @@ function ProviderFormFull({
               .filter(Boolean),
           }))
           .filter((group) => group.apiKeys.length > 0);
+        const projectedCatalogModels = buildCodexApiKeyGroupCatalog(
+          normalizedCatalogModels,
+          normalizedApiKeyGroups,
+          codexApiKeyGroupMode,
+        );
+        if (projectedCatalogModels.length > 0) {
+          configObj.modelCatalog = {
+            models: projectedCatalogModels,
+            ...(normalizedSpawnAgentModels.length > 0
+              ? { spawnAgentModels: normalizedSpawnAgentModels }
+              : {}),
+          };
+        }
+        if (shouldPersistCodexLocalConfig && hasCodexRouting) {
+          configObj.codexRouting = codexRouting;
+        }
         if (normalizedApiKeyGroups.length > 0) {
           configObj.codexApiKeyGroups = normalizedApiKeyGroups;
+          configObj.codexApiKeyGroupMode = codexApiKeyGroupMode;
         }
         settingsConfig = JSON.stringify(configObj);
       } catch (err) {
@@ -2903,6 +2936,8 @@ function ProviderFormFull({
                 onApiKeyChange={handleCodexApiKeyChange}
                 apiKeyGroups={codexApiKeyGroups}
                 onApiKeyGroupsChange={setCodexApiKeyGroups}
+                apiKeyGroupMode={codexApiKeyGroupMode}
+                onApiKeyGroupModeChange={setCodexApiKeyGroupMode}
                 category={category}
                 shouldShowApiKeyLink={shouldShowCodexApiKeyLink}
                 websiteUrl={codexWebsiteUrl}
@@ -2926,7 +2961,9 @@ function ProviderFormFull({
                 onAutoSelectChange={setEndpointAutoSelect}
                 takeoverEnabled={effectiveCodexMenuProjection}
                 onTakeoverEnabledChange={setCodexTakeoverEnabled}
-                allowModelMenuProjectionToggle={!isMaintainedCodexPreset}
+                allowModelMenuProjectionToggle={
+                  !isMaintainedCodexPreset && !isolatedGroupsRequireMapping
+                }
                 codexModel={codexModel}
                 onModelChange={handleCodexModelChange}
                 apiFormat={localCodexApiFormat}

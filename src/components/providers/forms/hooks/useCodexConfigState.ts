@@ -14,6 +14,7 @@ import type {
   CodexRoutingConfig,
   CodexRoutingRoute,
 } from "@/types";
+import { baseCodexCatalogModels } from "../codexApiKeyGroupRouting";
 
 interface UseCodexConfigStateProps {
   initialData?: {
@@ -153,115 +154,128 @@ export function extractCodexCatalogModels(
     ? modelCatalog.models
     : [];
 
-  return rawCatalogModels
-    .map((item: any) => {
-      // 原生 Responses profile 的隐藏字段不在行 UI 暴露，但必须 load -> save
-      // 原样保留，避免编辑 MiniMax/MiMo 等 preset 后丢失官方 catalog 能力。
-      const supportsParallelToolCalls =
-        typeof item?.supportsParallelToolCalls === "boolean"
-          ? item.supportsParallelToolCalls
-          : typeof item?.supports_parallel_tool_calls === "boolean"
-            ? item.supports_parallel_tool_calls
-            : undefined;
-      const inputModalities = Array.isArray(item?.inputModalities)
-        ? item.inputModalities
-        : Array.isArray(item?.input_modalities)
-          ? item.input_modalities
-          : undefined;
-      const supportsImage =
-        typeof item?.supportsImage === "boolean"
-          ? item.supportsImage
-          : typeof item?.supports_image === "boolean"
-            ? item.supports_image
-            : typeof item?.vision === "boolean"
-              ? item.vision
+  return baseCodexCatalogModels(
+    rawCatalogModels
+      .map((item: any) => {
+        // 原生 Responses profile 的隐藏字段不在行 UI 暴露，但必须 load -> save
+        // 原样保留，避免编辑 MiniMax/MiMo 等 preset 后丢失官方 catalog 能力。
+        const supportsParallelToolCalls =
+          typeof item?.supportsParallelToolCalls === "boolean"
+            ? item.supportsParallelToolCalls
+            : typeof item?.supports_parallel_tool_calls === "boolean"
+              ? item.supports_parallel_tool_calls
               : undefined;
-      const textOnly =
-        typeof item?.textOnly === "boolean"
-          ? item.textOnly
-          : typeof item?.text_only === "boolean"
-            ? item.text_only
+        const inputModalities = Array.isArray(item?.inputModalities)
+          ? item.inputModalities
+          : Array.isArray(item?.input_modalities)
+            ? item.input_modalities
             : undefined;
-      const baseInstructions =
-        typeof item?.baseInstructions === "string"
-          ? item.baseInstructions
-          : typeof item?.base_instructions === "string"
-            ? item.base_instructions
+        const supportsImage =
+          typeof item?.supportsImage === "boolean"
+            ? item.supportsImage
+            : typeof item?.supports_image === "boolean"
+              ? item.supports_image
+              : typeof item?.vision === "boolean"
+                ? item.vision
+                : undefined;
+        const textOnly =
+          typeof item?.textOnly === "boolean"
+            ? item.textOnly
+            : typeof item?.text_only === "boolean"
+              ? item.text_only
+              : undefined;
+        const baseInstructions =
+          typeof item?.baseInstructions === "string"
+            ? item.baseInstructions
+            : typeof item?.base_instructions === "string"
+              ? item.base_instructions
+              : undefined;
+        const upstreamModel =
+          typeof item?.upstreamModel === "string"
+            ? item.upstreamModel
+            : typeof item?.upstream_model === "string"
+              ? item.upstream_model
+              : undefined;
+        const displayName =
+          typeof item?.displayName === "string"
+            ? item.displayName
+            : typeof item?.display_name === "string"
+              ? item.display_name
+              : undefined;
+        const contextWindow =
+          typeof item?.contextWindow === "string" ||
+          typeof item?.contextWindow === "number"
+            ? item.contextWindow
+            : typeof item?.context_window === "string" ||
+                typeof item?.context_window === "number"
+              ? item.context_window
+              : undefined;
+        const reasoning =
+          item?.reasoning && typeof item.reasoning === "object"
+            ? item.reasoning
             : undefined;
-      const upstreamModel =
-        typeof item?.upstreamModel === "string"
-          ? item.upstreamModel
-          : typeof item?.upstream_model === "string"
-            ? item.upstream_model
+        const enabled =
+          typeof item?.enabled === "boolean" ? item.enabled : undefined;
+        const codexUltra =
+          item?.codexUltra && typeof item.codexUltra === "object"
+            ? item.codexUltra
             : undefined;
-      const displayName =
-        typeof item?.displayName === "string"
-          ? item.displayName
-          : typeof item?.display_name === "string"
-            ? item.display_name
-            : undefined;
-      const contextWindow =
-        typeof item?.contextWindow === "string" ||
-        typeof item?.contextWindow === "number"
-          ? item.contextWindow
-          : typeof item?.context_window === "string" ||
-              typeof item?.context_window === "number"
-            ? item.context_window
-            : undefined;
-      const reasoning =
-        item?.reasoning && typeof item.reasoning === "object"
-          ? item.reasoning
-          : undefined;
-      const enabled =
-        typeof item?.enabled === "boolean" ? item.enabled : undefined;
-      const codexUltra =
-        item?.codexUltra && typeof item.codexUltra === "object"
-          ? item.codexUltra
-          : undefined;
-      const apiFormat =
-        typeof item?.apiFormat === "string"
-          ? item.apiFormat
-          : typeof item?.api_format === "string"
-            ? item.api_format
-            : undefined;
-      const codexCache =
-        item?.codexCache && typeof item.codexCache === "object"
-          ? item.codexCache
-          : item?.codex_cache && typeof item.codex_cache === "object"
-            ? item.codex_cache
-            : undefined;
-      const sortIndex =
-        typeof item?.sortIndex === "number" &&
-        Number.isInteger(item.sortIndex) &&
-        item.sortIndex >= 0
-          ? item.sortIndex
-          : typeof item?.sort_index === "number" &&
-              Number.isInteger(item.sort_index) &&
-              item.sort_index >= 0
-            ? item.sort_index
-            : undefined;
+        const apiFormat =
+          typeof item?.apiFormat === "string"
+            ? item.apiFormat
+            : typeof item?.api_format === "string"
+              ? item.api_format
+              : undefined;
+        const codexCache =
+          item?.codexCache && typeof item.codexCache === "object"
+            ? item.codexCache
+            : item?.codex_cache && typeof item.codex_cache === "object"
+              ? item.codex_cache
+              : undefined;
+        const sortIndex =
+          typeof item?.sortIndex === "number" &&
+          Number.isInteger(item.sortIndex) &&
+          item.sortIndex >= 0
+            ? item.sortIndex
+            : typeof item?.sort_index === "number" &&
+                Number.isInteger(item.sort_index) &&
+                item.sort_index >= 0
+              ? item.sort_index
+              : undefined;
+        const apiKeyGroupId =
+          typeof item?.apiKeyGroupId === "string"
+            ? item.apiKeyGroupId
+            : typeof item?.api_key_group_id === "string"
+              ? item.api_key_group_id
+              : undefined;
+        const apiKeyGroupGenerated =
+          item?.apiKeyGroupGenerated === true ||
+          item?.api_key_group_generated === true;
 
-      return {
-        model: typeof item?.model === "string" ? item.model : "",
-        ...(enabled !== undefined ? { enabled } : {}),
-        ...(upstreamModel ? { upstreamModel } : {}),
-        ...(displayName ? { displayName } : {}),
-        ...(contextWindow ? { contextWindow } : {}),
-        ...(supportsParallelToolCalls !== undefined
-          ? { supportsParallelToolCalls }
-          : {}),
-        ...(inputModalities ? { inputModalities } : {}),
-        ...(supportsImage !== undefined ? { supportsImage } : {}),
-        ...(textOnly !== undefined ? { textOnly } : {}),
-        ...(baseInstructions ? { baseInstructions } : {}),
-        ...(reasoning ? { reasoning } : {}),
-        ...(codexUltra ? { codexUltra } : {}),
-        ...(apiFormat ? { apiFormat } : {}),
-        ...(codexCache ? { codexCache } : {}),
-        ...(sortIndex !== undefined ? { sortIndex } : {}),
-      };
-    })
-    .filter((item: CodexCatalogModel) => item.model.trim());
+        return {
+          model: typeof item?.model === "string" ? item.model : "",
+          ...(enabled !== undefined ? { enabled } : {}),
+          ...(upstreamModel ? { upstreamModel } : {}),
+          ...(displayName ? { displayName } : {}),
+          ...(contextWindow ? { contextWindow } : {}),
+          ...(supportsParallelToolCalls !== undefined
+            ? { supportsParallelToolCalls }
+            : {}),
+          ...(inputModalities ? { inputModalities } : {}),
+          ...(supportsImage !== undefined ? { supportsImage } : {}),
+          ...(textOnly !== undefined ? { textOnly } : {}),
+          ...(baseInstructions ? { baseInstructions } : {}),
+          ...(reasoning ? { reasoning } : {}),
+          ...(codexUltra ? { codexUltra } : {}),
+          ...(apiFormat ? { apiFormat } : {}),
+          ...(codexCache ? { codexCache } : {}),
+          ...(sortIndex !== undefined ? { sortIndex } : {}),
+          ...(apiKeyGroupId ? { apiKeyGroupId } : {}),
+          ...(apiKeyGroupGenerated ? { apiKeyGroupGenerated: true } : {}),
+        };
+      })
+      .filter((item: CodexCatalogModel) => item.model.trim()),
+  );
 }
 
 // 归一化 spawn agent 候选，最多保留 5 个，和保存逻辑保持一致。

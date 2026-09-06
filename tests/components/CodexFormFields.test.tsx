@@ -31,6 +31,7 @@ import type {
   CodexApiFormat,
   CodexCatalogModel,
   CodexApiKeyGroup,
+  CodexApiKeyGroupMode,
   CodexRoutingConfig,
 } from "@/types";
 import type {
@@ -386,6 +387,7 @@ function renderCatalogHarness(
     knownCatalogModels?: CodexCatalogModel[];
     onProviderSplitSuggestionChange?: ReturnType<typeof vi.fn>;
     initialApiKeyGroups?: CodexApiKeyGroup[];
+    initialApiKeyGroupMode?: CodexApiKeyGroupMode;
     isXaiOauthPreset?: boolean;
     isXaiOauthAuthenticated?: boolean;
     selectedXaiAccountId?: string;
@@ -394,14 +396,20 @@ function renderCatalogHarness(
   const onCatalogChange = vi.fn();
   const onApiFormatChange = vi.fn();
   const onApiKeyGroupsChange = vi.fn();
+  const onApiKeyGroupModeChange = vi.fn();
   let latestCatalog = initialCatalog;
   let latestApiKeyGroups = options.initialApiKeyGroups ?? [];
+  let latestApiKeyGroupMode = options.initialApiKeyGroupMode ?? "isolated";
 
   function Harness() {
     const [catalog, setCatalog] = useState<CodexCatalogModel[]>(initialCatalog);
     const [apiKeyGroups, setApiKeyGroups] = useState<CodexApiKeyGroup[]>(
       options.initialApiKeyGroups ?? [],
     );
+    const [apiKeyGroupMode, setApiKeyGroupMode] =
+      useState<CodexApiKeyGroupMode>(
+        options.initialApiKeyGroupMode ?? "isolated",
+      );
 
     // 测试壳模拟 ProviderForm 对 modelCatalog 的受控回写。
     const handleCatalogChange = (next: CodexCatalogModel[]) => {
@@ -413,6 +421,11 @@ function renderCatalogHarness(
       latestApiKeyGroups = next;
       onApiKeyGroupsChange(next);
       setApiKeyGroups(next);
+    };
+    const handleApiKeyGroupModeChange = (next: CodexApiKeyGroupMode) => {
+      latestApiKeyGroupMode = next;
+      onApiKeyGroupModeChange(next);
+      setApiKeyGroupMode(next);
     };
 
     return (
@@ -426,6 +439,8 @@ function renderCatalogHarness(
         onApiKeyChange={vi.fn()}
         apiKeyGroups={apiKeyGroups}
         onApiKeyGroupsChange={handleApiKeyGroupsChange}
+        apiKeyGroupMode={apiKeyGroupMode}
+        onApiKeyGroupModeChange={handleApiKeyGroupModeChange}
         category="custom"
         shouldShowApiKeyLink={false}
         websiteUrl=""
@@ -479,8 +494,10 @@ function renderCatalogHarness(
     onCatalogChange,
     onApiFormatChange,
     onApiKeyGroupsChange,
+    onApiKeyGroupModeChange,
     latestCatalog: () => latestCatalog,
     latestApiKeyGroups: () => latestApiKeyGroups,
+    latestApiKeyGroupMode: () => latestApiKeyGroupMode,
   };
 }
 
@@ -2148,6 +2165,26 @@ describe("CodexFormFields local model routing", () => {
     ).not.toBeInTheDocument();
     expect(document.getElementById("codexApiKey")).toBeInTheDocument();
     expect(screen.getByPlaceholderText("Group label")).toBeInTheDocument();
+  });
+
+  it("switches subscription groups between isolated sources and a round-robin pool", () => {
+    const { latestApiKeyGroupMode, onApiKeyGroupModeChange } =
+      renderCatalogHarness([]);
+
+    const isolated = screen.getByRole("button", {
+      name: "codexConfig.apiKeyGroupModeIsolated",
+    });
+    const pooled = screen.getByRole("button", {
+      name: "codexConfig.apiKeyGroupModeRoundRobin",
+    });
+    expect(isolated).toHaveAttribute("aria-pressed", "true");
+    expect(pooled).toHaveAttribute("aria-pressed", "false");
+
+    fireEvent.click(pooled);
+
+    expect(latestApiKeyGroupMode()).toBe("round_robin");
+    expect(onApiKeyGroupModeChange).toHaveBeenCalledWith("round_robin");
+    expect(pooled).toHaveAttribute("aria-pressed", "true");
   });
 
   it("edits and removes a model-specific API key group through the canonical form controls", async () => {

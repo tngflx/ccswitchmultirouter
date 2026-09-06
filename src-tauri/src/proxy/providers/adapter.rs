@@ -34,6 +34,18 @@ pub trait ProviderAdapter: Send + Sync {
         self.extract_auth(provider)
     }
 
+    /// Extract authentication while preserving both the client-visible model
+    /// identity and the finalized upstream model. Model-source isolation needs
+    /// the former; shared credential pools match against the latter.
+    fn extract_auth_for_request_model(
+        &self,
+        provider: &Provider,
+        request_model: Option<&str>,
+        outbound_model: Option<&str>,
+    ) -> Option<AuthInfo> {
+        self.extract_auth_for_model(provider, outbound_model.or(request_model))
+    }
+
     /// 构建请求 URL
     fn build_url(&self, base_url: &str, endpoint: &str) -> String;
 
