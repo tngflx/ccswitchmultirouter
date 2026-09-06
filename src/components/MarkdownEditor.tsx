@@ -2,7 +2,7 @@ import React, { useRef, useEffect } from "react";
 import { EditorView, basicSetup } from "codemirror";
 import { markdown } from "@codemirror/lang-markdown";
 import { oneDark } from "@codemirror/theme-one-dark";
-import { EditorState } from "@codemirror/state";
+import { Annotation, EditorState } from "@codemirror/state";
 import { placeholder as placeholderExt } from "@codemirror/view";
 
 interface MarkdownEditorProps {
@@ -28,6 +28,9 @@ const MarkdownEditor: React.FC<MarkdownEditorProps> = ({
 }) => {
   const editorRef = useRef<HTMLDivElement>(null);
   const viewRef = useRef<EditorView | null>(null);
+  const onChangeRef = useRef(onChange);
+  onChangeRef.current = onChange;
+  const externalChange = useRef(Annotation.define<boolean>()).current;
 
   useEffect(() => {
     if (!editorRef.current) return;
@@ -69,7 +72,9 @@ const MarkdownEditor: React.FC<MarkdownEditorProps> = ({
         placeholderExt(placeholderText),
         EditorView.updateListener.of((update) => {
           if (update.docChanged && onChange) {
-            onChange(update.state.doc.toString());
+            if (!update.transactions.some((transaction) => transaction.annotation(externalChange))) {
+              onChangeRef.current?.(update.state.doc.toString());
+            }
           }
         }),
       );
@@ -130,7 +135,7 @@ const MarkdownEditor: React.FC<MarkdownEditorProps> = ({
       view.destroy();
       viewRef.current = null;
     };
-  }, [darkMode, readOnly, minHeight, maxHeight, placeholderText]); // 添加 placeholderText 依赖以支持国际化切换
+  }, [darkMode, readOnly, minHeight, maxHeight, placeholderText, externalChange]); // 添加 placeholderText 依赖以支持国际化切换
 
   // 当 value 从外部改变时更新编辑器内容
   useEffect(() => {
@@ -141,10 +146,11 @@ const MarkdownEditor: React.FC<MarkdownEditorProps> = ({
           to: viewRef.current.state.doc.length,
           insert: value,
         },
+        annotations: externalChange.of(true),
       });
       viewRef.current.dispatch(transaction);
     }
-  }, [value]);
+  }, [value, externalChange]);
 
   return (
     <div

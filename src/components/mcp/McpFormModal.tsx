@@ -24,6 +24,7 @@ import { parseSmartMcpJson } from "@/utils/formatters";
 import { useMcpValidation } from "./useMcpValidation";
 import { useUpsertMcpServer } from "@/hooks/useMcp";
 import { FullScreenPanel } from "@/components/common/FullScreenPanel";
+import { useGlobalLoading } from "@/contexts/GlobalLoadingContext";
 
 interface McpFormModalProps {
   editingId?: string;
@@ -49,6 +50,7 @@ const McpFormModal: React.FC<McpFormModalProps> = ({
     useMcpValidation();
 
   const upsertMutation = useUpsertMcpServer();
+  const { runWithLoading } = useGlobalLoading();
 
   const [formId, setFormId] = useState(
     () => editingId || initialData?.id || "",
@@ -405,7 +407,7 @@ const McpFormModal: React.FC<McpFormModalProps> = ({
         delete entry.tags;
       }
 
-      await upsertMutation.mutateAsync(entry);
+      await runWithLoading(() => upsertMutation.mutateAsync(entry));
       toast.success(t("common.success"), { closeButton: true });
       await onSave();
     } catch (error: any) {

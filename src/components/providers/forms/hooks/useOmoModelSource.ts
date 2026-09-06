@@ -1,4 +1,5 @@
 import { useQuery } from "@tanstack/react-query";
+import { useGlobalLoading } from "@/contexts/GlobalLoadingContext";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { toast } from "sonner";
@@ -49,6 +50,7 @@ export function useOmoModelSource({
   providerId,
 }: UseOmoModelSourceParams): OmoModelSourceResult {
   const { t } = useTranslation();
+  const { beginLoading } = useGlobalLoading();
 
   const {
     data: discoveredModels = EMPTY_DISCOVERED_MODELS,
@@ -91,6 +93,8 @@ export function useOmoModelSource({
     setEnabledOpencodeProviderIds(null);
     setOmoLiveIdsLoadFailed(false);
 
+    const finishLoading = beginLoading();
+
     (async () => {
       try {
         const ids = await providersApi.getOpenCodeLiveProviderIds();
@@ -106,13 +110,16 @@ export function useOmoModelSource({
           setOmoLiveIdsLoadFailed(true);
           setEnabledOpencodeProviderIds(null);
         }
+      } finally {
+        finishLoading();
       }
     })();
 
     return () => {
       active = false;
+      finishLoading();
     };
-  }, [isOmoCategory]);
+  }, [isOmoCategory, beginLoading]);
 
   const omoModelBuild = useMemo<OmoModelBuild>(() => {
     const empty: OmoModelBuild = {

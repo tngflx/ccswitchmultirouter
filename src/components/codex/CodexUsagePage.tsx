@@ -28,6 +28,7 @@ import { settingsApi } from "@/lib/api";
 import { useSettingsQuery } from "@/lib/query";
 import { useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
+import { useGlobalLoading } from "@/contexts/GlobalLoadingContext";
 import { useSubscriptionQuota } from "@/lib/query/subscription";
 import {
   useModelStats,
@@ -871,6 +872,7 @@ const QuotaCollaborationPanel: React.FC<{
   isSyncing: boolean;
 }> = ({ overview, isLoading, onSync, isSyncing }) => {
   const queryClient = useQueryClient();
+  const { runWithLoading } = useGlobalLoading();
   const { data: settings } = useSettingsQuery();
   const [deviceName, setDeviceName] = useState("");
   const [isSaving, setIsSaving] = useState(false);
@@ -895,17 +897,19 @@ const QuotaCollaborationPanel: React.FC<{
     setIsSaving(true);
     try {
       const current = settings.quotaCollaboration;
-      await settingsApi.save({
-        ...settings,
-        quotaCollaboration: {
-          deviceId: current?.deviceId ?? overview?.deviceId ?? "",
-          deviceName: deviceName.trim(),
-          mode: "observe",
-          enforceRemainingPercent: current?.enforceRemainingPercent ?? 20,
-          latestWindowUtilization: current?.latestWindowUtilization ?? {},
-          latestWindowCapturedAt: current?.latestWindowCapturedAt ?? null,
-        },
-      });
+      await runWithLoading(() =>
+        settingsApi.save({
+          ...settings,
+          quotaCollaboration: {
+            deviceId: current?.deviceId ?? overview?.deviceId ?? "",
+            deviceName: deviceName.trim(),
+            mode: "observe",
+            enforceRemainingPercent: current?.enforceRemainingPercent ?? 20,
+            latestWindowUtilization: current?.latestWindowUtilization ?? {},
+            latestWindowCapturedAt: current?.latestWindowCapturedAt ?? null,
+          },
+        }),
+      );
       await Promise.all([
         queryClient.invalidateQueries({ queryKey: ["settings"] }),
         queryClient.invalidateQueries({

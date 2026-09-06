@@ -1,4 +1,5 @@
 import { useMemo } from "react";
+import { PagedModelList } from "./shared/PagedModelList";
 import { useTranslation } from "react-i18next";
 import {
   CheckCircle2,
@@ -416,110 +417,115 @@ export function CodexProtocolProbeProgressDialog({
               })}
             </div>
           )}
-          {models.map((model) => (
-            <article
-              key={model.model}
-              aria-label={t("codexProbe.modelAria", {
-                defaultValue: "{{model}} 探测进度",
-                model: model.model,
-              })}
-              className="space-y-3 rounded-lg border border-border-default bg-muted/10 p-4"
-            >
-              <div className="flex flex-wrap items-center justify-between gap-2">
-                <h3 className="font-medium text-foreground">{model.model}</h3>
-                <div className="flex items-center gap-2 text-xs">
-                  {model.selectedTransport && (
-                    <span className="rounded-full border border-sky-500/30 bg-sky-500/10 px-2 py-0.5 text-sky-700 dark:text-sky-300">
-                      {t("codexProbe.selectedTransport", {
-                        defaultValue: "选择 {{transport}}",
-                        transport: transportLabel(model.selectedTransport, t),
-                      })}
-                    </span>
-                  )}
-                  <span className="rounded-full border px-2 py-0.5 text-muted-foreground">
-                    {readinessLabel(model.readiness, t)}
-                  </span>
-                </div>
-              </div>
-
-              <div className="grid gap-3 lg:grid-cols-2">
-                {TRANSPORTS.map((transport) => {
-                  const branch = model.branches[transport];
-                  return (
-                    <section
-                      key={transport}
-                      className="rounded-md border bg-background/70 p-3"
-                    >
-                      <div className="mb-3 flex items-center justify-between gap-2">
-                        <h4 className="text-sm font-medium">
-                          {transportLabel(transport, t)}
-                        </h4>
-                        <span className="text-xs text-muted-foreground">
-                          {readinessLabel(branch.readiness, t)}
-                        </span>
-                      </div>
-                      {!branch.touched ? (
-                        <p className="text-xs text-muted-foreground">
-                          {t("codexProbe.waiting", {
-                            defaultValue: "等待开始",
-                          })}
-                        </p>
-                      ) : (
-                        <div className="space-y-2">
-                          {STAGES.map((stage) => {
-                            const status = statusPresentation(
-                              branch.stages[stage.id],
-                              t,
-                            );
-                            const Icon = status.icon;
-                            return (
-                              <div
-                                key={stage.id}
-                                className="flex items-center justify-between gap-3 text-sm"
-                              >
-                                <span>
-                                  {t(stage.labelKey, {
-                                    defaultValue: stage.label,
-                                  })}
-                                </span>
-                                <span className="flex items-center gap-1.5 text-xs text-muted-foreground">
-                                  {stage.id === "reasoning" && (
-                                    <span>
-                                      {reasoningLabel(
-                                        branch.reasoningSemantic,
-                                        branch.stages.reasoning,
-                                        t,
-                                      )}
-                                    </span>
-                                  )}
-                                  <Icon
-                                    className={cn("h-4 w-4", status.className)}
-                                    aria-hidden
-                                  />
-                                  <span>{status.label}</span>
-                                </span>
-                              </div>
-                            );
-                          })}
-                          {branch.failures.length > 0 && (
-                            <div className="space-y-1 border-t pt-2 text-xs text-destructive">
-                              {branch.failures.map((failure) => (
-                                <p
-                                  key={`${failure.stage}:${failure.kind}:${failure.status_code ?? ""}`}
-                                >
-                                  {failureLabel(failure, t)}
-                                </p>
-                              ))}
-                            </div>
-                          )}
-                        </div>
-                      )}
-                    </section>
-                  );
+          <PagedModelList items={models} searchText={(model) => model.model}>
+            {(model) => (
+              <article
+                key={model.model}
+                aria-label={t("codexProbe.modelAria", {
+                  defaultValue: "{{model}} 探测进度",
+                  model: model.model,
                 })}
-              </div>
-            </article>
-          ))}
+                className="space-y-3 rounded-lg border border-border-default bg-muted/10 p-4"
+              >
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <h3 className="font-medium text-foreground">{model.model}</h3>
+                  <div className="flex items-center gap-2 text-xs">
+                    {model.selectedTransport && (
+                      <span className="rounded-full border border-sky-500/30 bg-sky-500/10 px-2 py-0.5 text-sky-700 dark:text-sky-300">
+                        {t("codexProbe.selectedTransport", {
+                          defaultValue: "选择 {{transport}}",
+                          transport: transportLabel(model.selectedTransport, t),
+                        })}
+                      </span>
+                    )}
+                    <span className="rounded-full border px-2 py-0.5 text-muted-foreground">
+                      {readinessLabel(model.readiness, t)}
+                    </span>
+                  </div>
+                </div>
+
+                <div className="grid gap-3 lg:grid-cols-2">
+                  {TRANSPORTS.map((transport) => {
+                    const branch = model.branches[transport];
+                    return (
+                      <section
+                        key={transport}
+                        className="rounded-md border bg-background/70 p-3"
+                      >
+                        <div className="mb-3 flex items-center justify-between gap-2">
+                          <h4 className="text-sm font-medium">
+                            {transportLabel(transport, t)}
+                          </h4>
+                          <span className="text-xs text-muted-foreground">
+                            {readinessLabel(branch.readiness, t)}
+                          </span>
+                        </div>
+                        {!branch.touched ? (
+                          <p className="text-xs text-muted-foreground">
+                            {t("codexProbe.waiting", {
+                              defaultValue: "等待开始",
+                            })}
+                          </p>
+                        ) : (
+                          <div className="space-y-2">
+                            {STAGES.map((stage) => {
+                              const status = statusPresentation(
+                                branch.stages[stage.id],
+                                t,
+                              );
+                              const Icon = status.icon;
+                              return (
+                                <div
+                                  key={stage.id}
+                                  className="flex items-center justify-between gap-3 text-sm"
+                                >
+                                  <span>
+                                    {t(stage.labelKey, {
+                                      defaultValue: stage.label,
+                                    })}
+                                  </span>
+                                  <span className="flex items-center gap-1.5 text-xs text-muted-foreground">
+                                    {stage.id === "reasoning" && (
+                                      <span>
+                                        {reasoningLabel(
+                                          branch.reasoningSemantic,
+                                          branch.stages.reasoning,
+                                          t,
+                                        )}
+                                      </span>
+                                    )}
+                                    <Icon
+                                      className={cn(
+                                        "h-4 w-4",
+                                        status.className,
+                                      )}
+                                      aria-hidden
+                                    />
+                                    <span>{status.label}</span>
+                                  </span>
+                                </div>
+                              );
+                            })}
+                            {branch.failures.length > 0 && (
+                              <div className="space-y-1 border-t pt-2 text-xs text-destructive">
+                                {branch.failures.map((failure) => (
+                                  <p
+                                    key={`${failure.stage}:${failure.kind}:${failure.status_code ?? ""}`}
+                                  >
+                                    {failureLabel(failure, t)}
+                                  </p>
+                                ))}
+                              </div>
+                            )}
+                          </div>
+                        )}
+                      </section>
+                    );
+                  })}
+                </div>
+              </article>
+            )}
+          </PagedModelList>
         </div>
 
         <DialogFooter>

@@ -22,6 +22,7 @@ import {
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { ModelDropdown } from "@/components/providers/forms/shared/ModelDropdown";
 import {
   Select,
   SelectContent,
@@ -33,6 +34,7 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { proxyApi } from "@/lib/api/proxy";
 import { copyText } from "@/lib/clipboard";
 import { cn } from "@/lib/utils";
+import { useGlobalLoading } from "@/contexts/GlobalLoadingContext";
 import {
   buildBaseUrl,
   buildReachableBaseUrl,
@@ -66,6 +68,7 @@ function getSavedBackendKey(): string {
 export function OpenAICompatibleApiPage() {
   const queryClient = useQueryClient();
   const { t } = useTranslation();
+  const { runWithLoading } = useGlobalLoading();
   const [activeTab, setActiveTab] = useState<ApiTab>("source");
   const [visibleApiKey, setVisibleApiKey] = useState("");
   const [selectedBackendKey, setSelectedBackendKey] =
@@ -171,7 +174,9 @@ export function OpenAICompatibleApiPage() {
 
   /// 新增本地 External API key；新格式 key 会随 profile 返回，后续仍可复制。
   async function handleRegenerateKey() {
-    const result = await proxyApi.regenerateExternalOpenAIAPIKey();
+    const result = await runWithLoading(() =>
+      proxyApi.regenerateExternalOpenAIAPIKey(),
+    );
     setVisibleApiKey(result.apiKey);
     await queryClient.invalidateQueries({
       queryKey: ["externalOpenAIAPIRuntimeStatus"],
@@ -182,7 +187,7 @@ export function OpenAICompatibleApiPage() {
 
   /// 删除指定的本地 External API key；不会影响上游 provider 凭据。
   async function handleDeleteKey(keyId: string, apiKey?: string | null) {
-    await proxyApi.deleteExternalOpenAIAPIKey(keyId);
+    await runWithLoading(() => proxyApi.deleteExternalOpenAIAPIKey(keyId));
     if (apiKey && visibleApiKey === apiKey) {
       setVisibleApiKey("");
     }
@@ -213,7 +218,9 @@ export function OpenAICompatibleApiPage() {
         listenAddress.trim() || "127.0.0.1",
         parsedPort,
       );
-      await proxyApi.updateExternalOpenAIAPIProfile(update);
+      await runWithLoading(() =>
+        proxyApi.updateExternalOpenAIAPIProfile(update),
+      );
       await queryClient.invalidateQueries({
         queryKey: ["externalOpenAIAPIRuntimeStatus"],
       });
@@ -268,7 +275,9 @@ export function OpenAICompatibleApiPage() {
         listenAddress.trim() || "127.0.0.1",
         Number.isInteger(parsedPort) ? parsedPort : 15722,
       );
-      await proxyApi.updateExternalOpenAIAPIProfile(update);
+      await runWithLoading(() =>
+        proxyApi.updateExternalOpenAIAPIProfile(update),
+      );
       await queryClient.invalidateQueries({
         queryKey: ["externalOpenAIAPIRuntimeStatus"],
       });
@@ -293,7 +302,9 @@ export function OpenAICompatibleApiPage() {
     setIsPreparing(true);
     try {
       if (!visibleApiKey && !profile?.hasApiKey) {
-        const result = await proxyApi.regenerateExternalOpenAIAPIKey();
+        const result = await runWithLoading(() =>
+          proxyApi.regenerateExternalOpenAIAPIKey(),
+        );
         setVisibleApiKey(result.apiKey);
       }
       const parsedPort = Number(listenPort);
@@ -304,8 +315,12 @@ export function OpenAICompatibleApiPage() {
         listenAddress.trim() || "127.0.0.1",
         Number.isInteger(parsedPort) ? parsedPort : 15722,
       );
-      await proxyApi.updateExternalOpenAIAPIProfile(update);
-      if (!isRunning) await proxyApi.startExternalOpenAIAPIServer();
+      await runWithLoading(() =>
+        proxyApi.updateExternalOpenAIAPIProfile(update),
+      );
+      if (!isRunning) {
+        await runWithLoading(() => proxyApi.startExternalOpenAIAPIServer());
+      }
       await Promise.all([
         queryClient.invalidateQueries({
           queryKey: ["externalOpenAIAPIServerStatus"],
@@ -697,18 +712,15 @@ function ModelPicker({
         {t("openaiApiPage.defaultModelTitle")}
       </div>
       {availableModels.length > 0 ? (
-        <Select value={defaultModel} onValueChange={onModelChange}>
-          <SelectTrigger className="border-amber-200 bg-background dark:border-amber-700/40 dark:bg-slate-950/60">
-            <SelectValue />
-          </SelectTrigger>
-          <SelectContent>
-            {availableModels.map((model) => (
-              <SelectItem key={model} value={model}>
-                {model}
-              </SelectItem>
-            ))}
-          </SelectContent>
-        </Select>
+        <div className="flex min-w-0 items-center gap-2">
+          <span className="min-w-0 flex-1 break-all text-sm">
+            {selectedModel || defaultModel}
+          </span>
+          <ModelDropdown
+            models={availableModels.map((id) => ({ id, ownedBy: null }))}
+            onSelect={onModelChange}
+          />
+        </div>
       ) : (
         <input
           value={selectedModel || defaultModel}

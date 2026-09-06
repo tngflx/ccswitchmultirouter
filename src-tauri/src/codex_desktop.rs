@@ -874,7 +874,6 @@ pub(crate) async fn submit_codex_continuation() -> Result<CodexContinuationResul
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct CodexSummarizeRestartResult {
-    pub completed: bool,
     pub new_thread_id: String,
     pub handoff_turn_id: String,
     pub debug_port: u16,
@@ -1234,12 +1233,12 @@ pub(crate) async fn summarize_and_restart_codex_session(
                             match value.get("status").and_then(Value::as_str) {
                                 Some("completed") => {
                                     let new_thread_id = value
-                                        .pointer("/result/newThreadId")
+                                        .get("newThreadId")
                                         .and_then(Value::as_str)
                                         .unwrap_or_default()
                                         .to_string();
                                     let handoff_turn_id = value
-                                        .pointer("/result/turnId")
+                                        .get("turnId")
                                         .and_then(Value::as_str)
                                         .unwrap_or_default()
                                         .to_string();
@@ -1247,7 +1246,6 @@ pub(crate) async fn summarize_and_restart_codex_session(
                                         return Err("Fresh-session handoff completed without thread and turn ids".to_string());
                                     }
                                     return Ok(CodexSummarizeRestartResult {
-                                        completed: true,
                                         new_thread_id,
                                         handoff_turn_id,
                                         debug_port: port,

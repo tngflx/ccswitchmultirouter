@@ -16,6 +16,7 @@ import {
 import { useDarkMode } from "@/hooks/useDarkMode";
 import type { HermesMemoryKind } from "@/types";
 import { cn } from "@/lib/utils";
+import { useGlobalLoading } from "@/contexts/GlobalLoadingContext";
 
 interface MemoryTabPaneProps {
   kind: HermesMemoryKind;
@@ -30,6 +31,7 @@ const MemoryTabPane: React.FC<MemoryTabPaneProps> = ({
 }) => {
   const { t } = useTranslation();
   const darkMode = useDarkMode();
+  const { runWithLoading } = useGlobalLoading();
   const { data, isLoading } = useHermesMemory(kind, true);
   const saveMutation = useSaveHermesMemory();
   const toggleMutation = useToggleHermesMemoryEnabled();
@@ -48,7 +50,7 @@ const MemoryTabPane: React.FC<MemoryTabPaneProps> = ({
 
   const handleSave = async () => {
     try {
-      await saveMutation.mutateAsync({ kind, content });
+      await runWithLoading(() => saveMutation.mutateAsync({ kind, content }));
       toast.success(t("hermes.memory.saveSuccess"));
     } catch {
       // useSaveHermesMemory already surfaces a localized error toast.

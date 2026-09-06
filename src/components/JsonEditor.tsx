@@ -3,7 +3,7 @@ import { EditorView, basicSetup } from "codemirror";
 import { json } from "@codemirror/lang-json";
 import { javascript } from "@codemirror/lang-javascript";
 import { oneDark } from "@codemirror/theme-one-dark";
-import { EditorState } from "@codemirror/state";
+import { Annotation, EditorState } from "@codemirror/state";
 import { placeholder } from "@codemirror/view";
 import { linter, Diagnostic } from "@codemirror/lint";
 import { useTranslation } from "react-i18next";
@@ -37,6 +37,9 @@ const JsonEditor: React.FC<JsonEditorProps> = ({
   const { t } = useTranslation();
   const editorRef = useRef<HTMLDivElement>(null);
   const viewRef = useRef<EditorView | null>(null);
+  const onChangeRef = useRef(onChange);
+  onChangeRef.current = onChange;
+  const externalChange = useMemo(() => Annotation.define<boolean>(), []);
 
   // JSON linter 函数
   const jsonLinter = useMemo(
@@ -145,7 +148,9 @@ const JsonEditor: React.FC<JsonEditorProps> = ({
       EditorView.updateListener.of((update) => {
         if (update.docChanged) {
           const newValue = update.state.doc.toString();
-          onChange(newValue);
+          if (!update.transactions.some((transaction) => transaction.annotation(externalChange))) {
+            onChangeRef.current(newValue);
+          }
         }
       }),
     ];
@@ -208,7 +213,7 @@ const JsonEditor: React.FC<JsonEditorProps> = ({
       view.destroy();
       viewRef.current = null;
     };
-  }, [darkMode, rows, height, language, jsonLinter]); // 依赖项中不包含 onChange 和 placeholder，避免不必要的重建
+  }, [darkMode, rows, height, language, jsonLinter, externalChange]); // 依赖项中不包含 onChange 和 placeholder，避免不必要的重建
 
   // 当 value 从外部改变时更新编辑器内容
   useEffect(() => {
@@ -219,10 +224,11 @@ const JsonEditor: React.FC<JsonEditorProps> = ({
           to: viewRef.current.state.doc.length,
           insert: value,
         },
+        annotations: externalChange.of(true),
       });
       viewRef.current.dispatch(transaction);
     }
-  }, [value]);
+  }, [value, externalChange]);
 
   // 格式化处理函数
   const handleFormat = () => {
@@ -233,7 +239,7 @@ const JsonEditor: React.FC<JsonEditorProps> = ({
 
     try {
       const formatted = formatJSON(currentValue);
-      onChange(formatted);
+      onChangeRef.current(formatted);
       toast.success(t("common.formatSuccess", { defaultValue: "格式化成功" }), {
         closeButton: true,
       });

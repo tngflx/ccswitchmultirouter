@@ -764,6 +764,29 @@ pub(crate) async fn review_before_upstream(
 }
 
 #[cfg(target_os = "windows")]
+const REQUEST_HEALTH_NOTIFICATION_APP_ID: &str = "com.ccswitchmulti.desktop";
+
+#[cfg(target_os = "windows")]
+fn ensure_windows_notification_identity() -> Result<(), String> {
+    use winreg::{enums::HKEY_CURRENT_USER, RegKey};
+
+    let current_user = RegKey::predef(HKEY_CURRENT_USER);
+    let (identity, _) = current_user
+        .create_subkey(format!(
+            r"Software\Classes\AppUserModelId\{REQUEST_HEALTH_NOTIFICATION_APP_ID}"
+        ))
+        .map_err(|error| error.to_string())?;
+    identity
+        .set_value("DisplayName", &"CCSwitchMulti")
+        .map_err(|error| error.to_string())?;
+    if let Ok(executable) = std::env::current_exe() {
+        let icon_uri = executable.to_string_lossy().to_string();
+        let _ = identity.set_value("IconUri", &icon_uri);
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
 fn show_windows_review_notification(
     token: &str,
     body_hash: &str,
@@ -774,20 +797,8 @@ fn show_windows_review_notification(
     summarize_and_restart_enabled: bool,
 ) -> Result<(), String> {
     use tauri_winrt_notification::{Scenario, Toast};
-    use winreg::{enums::HKEY_CURRENT_USER, RegKey};
 
-    const APP_ID: &str = "com.ccswitchmulti.desktop";
-    let current_user = RegKey::predef(HKEY_CURRENT_USER);
-    let (identity, _) = current_user
-        .create_subkey(format!(r"Software\Classes\AppUserModelId\{APP_ID}"))
-        .map_err(|error| error.to_string())?;
-    identity
-        .set_value("DisplayName", &"CCSwitchMulti")
-        .map_err(|error| error.to_string())?;
-    if let Ok(executable) = std::env::current_exe() {
-        let icon_uri = executable.to_string_lossy().to_string();
-        let _ = identity.set_value("IconUri", &icon_uri);
-    }
+    ensure_windows_notification_identity()?;
 
     let language = crate::settings::get_settings()
         .language
@@ -811,7 +822,7 @@ fn show_windows_review_notification(
         u64::from(timeout_seconds).clamp(MIN_REVIEW_TIMEOUT_SECONDS, MAX_REVIEW_TIMEOUT_SECONDS)
     );
 
-    let toast = Toast::new(APP_ID)
+    let toast = Toast::new(REQUEST_HEALTH_NOTIFICATION_APP_ID)
         .title(strings.title)
         .text1(&format!("{}: {model}", strings.model))
         .text2(&detail)
@@ -844,44 +855,73 @@ fn show_windows_review_notification(
 }
 
 #[cfg(target_os = "windows")]
-pub(crate) fn show_summarize_restart_result_notification(
+pub(crate) fn notify_summarize_restart_result(
     session_id: &str,
     new_session_id: Option<&str>,
     error: Option<&str>,
 ) {
+    if let Err(notification_error) =
+        show_summarize_restart_result_notification(session_id, new_session_id, error)
+    {
+        log::warn!(
+            "[RequestHealth] Summary handoff result notification failed for {}: {}",
+            session_id,
+            notification_error
+        );
+        super::codex_router_log::append_event(
+            "request_health_summarize_restart_notification_failed",
+            &[
+                ("session", session_id.to_string()),
+                ("reason", notification_error),
+            ],
+        );
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn show_summarize_restart_result_notification(
+    session_id: &str,
+    new_session_id: Option<&str>,
+    error: Option<&str>,
+) -> Result<(), String> {
     use tauri_winrt_notification::{Scenario, Toast};
 
-    const APP_ID: &str = "com.ccswitchmulti.desktop";
+    ensure_windows_notification_identity()?;
+    let language = crate::settings::get_settings()
+        .language
+        .unwrap_or_else(|| "en".to_string());
+    let strings = NativeReviewStrings::for_language(&language);
     let (title, detail) = match (new_session_id, error) {
         (Some(new_session), _) => (
-            "Summary handoff complete",
+            strings.summary_complete,
             format!(
-                "Codex transferred a compact summary into a fresh session: {}",
+                "{}: {}",
+                strings.fresh_session,
                 truncate_for_notification(new_session, 80)
             ),
         ),
         (_, Some(reason)) => (
-            "Summary + new session failed",
+            strings.summary_failed,
             format!(
-                "No fresh session was created. {}",
+                "{} {}",
+                strings.no_fresh_session,
                 truncate_for_notification(reason, 180)
             ),
         ),
-        _ => (
-            "Summary + new session finished",
-            "Codex did not return a new session id.".to_string(),
-        ),
+        _ => (strings.summary_failed, strings.no_session_id.to_string()),
     };
     let source = format!(
-        "Source session: {}",
+        "{}: {}",
+        strings.source_session,
         truncate_for_notification(session_id, 80)
     );
-    let _ = Toast::new(APP_ID)
+    Toast::new(REQUEST_HEALTH_NOTIFICATION_APP_ID)
         .title(title)
         .text1(&detail)
         .text2(&source)
         .scenario(Scenario::Reminder)
-        .show();
+        .show()
+        .map_err(|error| error.to_string())
 }
 
 #[cfg(target_os = "windows")]
@@ -891,6 +931,12 @@ struct NativeReviewStrings {
     continue_once: &'static str,
     block: &'static str,
     summarize_and_restart: &'static str,
+    summary_complete: &'static str,
+    summary_failed: &'static str,
+    fresh_session: &'static str,
+    no_fresh_session: &'static str,
+    no_session_id: &'static str,
+    source_session: &'static str,
 }
 
 #[cfg(target_os = "windows")]
@@ -903,6 +949,12 @@ impl NativeReviewStrings {
                 continue_once: "仅继续这一次",
                 block: "阻止",
                 summarize_and_restart: "总结并开始新会话",
+                summary_complete: "总结移交已完成",
+                summary_failed: "总结并开始新会话失败",
+                fresh_session: "Codex 已将压缩总结移交到新会话",
+                no_fresh_session: "未创建新会话。",
+                no_session_id: "Codex 未返回新会话 ID。",
+                source_session: "来源会话",
             },
             "zh-TW" => Self {
                 title: "請求已暫停，等待確認",
@@ -910,6 +962,12 @@ impl NativeReviewStrings {
                 continue_once: "僅繼續這一次",
                 block: "封鎖",
                 summarize_and_restart: "摘要並開始新工作階段",
+                summary_complete: "摘要移交已完成",
+                summary_failed: "摘要並開始新工作階段失敗",
+                fresh_session: "Codex 已將精簡摘要移交到新工作階段",
+                no_fresh_session: "未建立新工作階段。",
+                no_session_id: "Codex 未傳回新工作階段 ID。",
+                source_session: "來源工作階段",
             },
             "ja" => Self {
                 title: "リクエストを一時停止しました",
@@ -917,6 +975,12 @@ impl NativeReviewStrings {
                 continue_once: "今回のみ続行",
                 block: "ブロック",
                 summarize_and_restart: "要約して新しいセッション",
+                summary_complete: "要約の引き継ぎが完了しました",
+                summary_failed: "要約と新規セッションの作成に失敗しました",
+                fresh_session: "Codex が要約を新しいセッションに引き継ぎました",
+                no_fresh_session: "新しいセッションは作成されませんでした。",
+                no_session_id: "Codex から新しいセッション ID が返されませんでした。",
+                source_session: "元のセッション",
             },
             _ => Self {
                 title: "Request paused for approval",
@@ -924,6 +988,12 @@ impl NativeReviewStrings {
                 continue_once: "Continue once",
                 block: "Block",
                 summarize_and_restart: "Summarize + new session",
+                summary_complete: "Summary handoff complete",
+                summary_failed: "Summary + new session failed",
+                fresh_session: "Codex transferred the compact summary to a fresh session",
+                no_fresh_session: "No fresh session was created.",
+                no_session_id: "Codex did not return a new session id.",
+                source_session: "Source session",
             },
         }
     }

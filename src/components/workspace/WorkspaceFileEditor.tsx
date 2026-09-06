@@ -5,6 +5,7 @@ import { Button } from "@/components/ui/button";
 import MarkdownEditor from "@/components/MarkdownEditor";
 import { FullScreenPanel } from "@/components/common/FullScreenPanel";
 import { workspaceApi } from "@/lib/api/workspace";
+import { LoadingStatus } from "@/components/common/DeferredContent";
 
 interface WorkspaceFileEditorProps {
   filename: string;
@@ -20,6 +21,7 @@ const WorkspaceFileEditor: React.FC<WorkspaceFileEditorProps> = ({
   const { t } = useTranslation();
   const [content, setContent] = useState("");
   const [loading, setLoading] = useState(true);
+  const [loadFailed, setLoadFailed] = useState(false);
   const [saving, setSaving] = useState(false);
   const [isDarkMode, setIsDarkMode] = useState(false);
 
@@ -37,21 +39,32 @@ const WorkspaceFileEditor: React.FC<WorkspaceFileEditorProps> = ({
 
   useEffect(() => {
     if (!isOpen || !filename) return;
-
+    let cancelled = false;
     setLoading(true);
+    setLoadFailed(false);
+    setContent("");
     workspaceApi
       .readFile(filename)
       .then((data) => {
+        if (cancelled) return;
         setContent(data ?? "");
       })
       .catch((err) => {
+        if (cancelled) return;
+        setLoadFailed(true);
         console.error("Failed to read workspace file:", err);
         toast.error(t("workspace.loadFailed"));
       })
-      .finally(() => setLoading(false));
+      .finally(() => {
+        if (!cancelled) setLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
   }, [isOpen, filename, t]);
 
   const handleSave = useCallback(async () => {
+    if (loading || loadFailed || saving) return;
     setSaving(true);
     try {
       await workspaceApi.writeFile(filename, content);
@@ -62,7 +75,7 @@ const WorkspaceFileEditor: React.FC<WorkspaceFileEditorProps> = ({
     } finally {
       setSaving(false);
     }
-  }, [filename, content, t]);
+  }, [filename, content, t, loading, loadFailed, saving]);
 
   return (
     <FullScreenPanel
@@ -70,15 +83,15 @@ const WorkspaceFileEditor: React.FC<WorkspaceFileEditorProps> = ({
       title={t("workspace.editing", { filename })}
       onClose={onClose}
       footer={
-        <Button onClick={handleSave} disabled={saving || loading}>
+        <Button onClick={handleSave} disabled={saving || loading || loadFailed}>
           {saving ? t("common.saving") : t("common.save")}
         </Button>
       }
     >
       {loading ? (
-        <div className="flex items-center justify-center h-64 text-muted-foreground">
-          {t("prompts.loading")}
-        </div>
+        <LoadingStatus />
+      ) : loadFailed ? (
+        <div role="alert">{t("workspace.loadFailed")}</div>
       ) : (
         <MarkdownEditor
           value={content}
@@ -92,4 +105,10 @@ const WorkspaceFileEditor: React.FC<WorkspaceFileEditorProps> = ({
   );
 };
 
-export default WorkspaceFileEditor;
+export default function WorkspaceFileEditorSession(
+  props: WorkspaceFileEditorProps,
+) {
+  return (
+    <WorkspaceFileEditor key={`${props.isOpen}:${props.filename}`} {...props} />
+  );
+}

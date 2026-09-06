@@ -1,5 +1,6 @@
 import { useCallback, useState } from "react";
 import { useTranslation } from "react-i18next";
+import { useGlobalLoading } from "@/contexts/GlobalLoadingContext";
 import { FormLabel } from "@/components/ui/form";
 import { Download, Info, Loader2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
@@ -72,6 +73,7 @@ export function GeminiFormFields({
   speedTestEndpoints,
 }: GeminiFormFieldsProps) {
   const { t } = useTranslation();
+  const { runWithLoading } = useGlobalLoading();
 
   const [fetchedModels, setFetchedModels] = useState<FetchedModel[]>([]);
   const [isFetchingModels, setIsFetchingModels] = useState(false);
@@ -85,7 +87,7 @@ export function GeminiFormFields({
       return;
     }
     setIsFetchingModels(true);
-    fetchModelsForConfig(baseUrl, apiKey)
+    runWithLoading(() => fetchModelsForConfig(baseUrl, apiKey))
       .then((models) => {
         setFetchedModels(models);
         if (models.length === 0) {
@@ -101,7 +103,7 @@ export function GeminiFormFields({
         showFetchModelsError(err, t);
       })
       .finally(() => setIsFetchingModels(false));
-  }, [baseUrl, apiKey, t]);
+  }, [baseUrl, apiKey, t, runWithLoading]);
 
   // 检测是否为 Google 官方（使用 OAuth）
   const isGoogleOfficial =

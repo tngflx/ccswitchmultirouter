@@ -47,6 +47,8 @@ mod store;
 mod tray;
 mod usage_events;
 mod usage_script;
+#[cfg(target_os = "windows")]
+mod windows_window_icon;
 
 pub use app_config::{AppType, InstalledSkill, McpApps, McpServer, MultiAppConfig, SkillApps};
 pub use codex_config::{
@@ -336,6 +338,10 @@ pub fn run() {
     panic_hook::setup_panic_hook();
 
     let mut builder = tauri::Builder::default();
+    #[cfg(target_os = "windows")]
+    {
+        builder = builder.plugin(windows_window_icon::init());
+    }
 
     #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
     {

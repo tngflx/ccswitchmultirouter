@@ -19,6 +19,26 @@ const fresh = template.slice(
   template.indexOf("  const runFreshSessionFromSummary ="),
   template.indexOf("  state.freshSessionJobs ="),
 );
+const summarizeJobs = template.slice(
+  template.indexOf("  state.summarizeJobs ="),
+  template.indexOf("  const runFreshSessionFromSummary ="),
+);
+const freshSessionJobs = template.slice(
+  template.indexOf("  state.freshSessionJobs ="),
+  template.indexOf("  const patchMcpModelResponseData ="),
+);
+
+function jobController(
+  source: string,
+  runnerName: string,
+  runner: (...args: string[]) => Promise<Record<string, unknown>>,
+) {
+  const state: Record<string, unknown> = {};
+  return new Function("state", runnerName, `${source}\nreturn state;`)(
+    state,
+    runner,
+  ) as Record<string, any>;
+}
 
 function runner(sendRequest: ReturnType<typeof vi.fn>, freshSession = false) {
   let now = 0;
@@ -55,6 +75,43 @@ const active = {
 const idle = { thread: { status: { type: "idle" }, turns: [] } };
 
 describe("native summary active-turn handoff", () => {
+  it("publishes one flat completed-job contract for Rust polling", async () => {
+    const state = jobController(
+      freshSessionJobs,
+      "runFreshSessionFromSummary",
+      async () => ({
+        newThreadId: "fresh",
+        turnId: "handoff",
+      }),
+    );
+
+    const started = state.startFreshSessionFromSummary("source", "summary");
+    await vi.waitFor(() => {
+      expect(state.readFreshSessionJob(started.jobId)).toMatchObject({
+        status: "completed",
+        newThreadId: "fresh",
+        turnId: "handoff",
+      });
+    });
+    expect(state.readFreshSessionJob(started.jobId)).not.toHaveProperty(
+      "result",
+    );
+  });
+
+  it("does not duplicate the summarize completion inside a result object", async () => {
+    const state = jobController(
+      summarizeJobs,
+      "runSummarizeSession",
+      async () => ({}),
+    );
+
+    const started = state.startSummarizeSession("source");
+    await vi.waitFor(() => {
+      expect(state.readSummarizeJob(started.jobId).status).toBe("completed");
+    });
+    expect(state.readSummarizeJob(started.jobId)).not.toHaveProperty("result");
+  });
+
   it("interrupts the exact blocked turn once, waits idle, then waits for a native compaction item", async () => {
     let reads = 0;
     const send = vi.fn(async (method: string) => {
@@ -69,7 +126,7 @@ describe("native summary active-turn handoff", () => {
         },
       };
     });
-    await expect(runner(send)("source")).resolves.toEqual({ completed: true });
+    await expect(runner(send)("source")).resolves.toBeUndefined();
     expect(send.mock.calls.map(([method]) => method)).toEqual([
       "thread/read",
       "turn/interrupt",
@@ -129,7 +186,6 @@ describe("native summary active-turn handoff", () => {
     await expect(
       runner(send, true)("source", "Compact summary"),
     ).resolves.toEqual({
-      completed: true,
       newThreadId: "fresh",
       turnId: "handoff",
     });

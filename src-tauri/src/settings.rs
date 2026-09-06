@@ -913,27 +913,7 @@ fn save_settings_file(settings: &AppSettings) -> Result<(), AppError> {
 
     let json = serde_json::to_string_pretty(&normalized)
         .map_err(|e| AppError::JsonSerialize { source: e })?;
-    #[cfg(unix)]
-    {
-        use std::fs::OpenOptions;
-        use std::io::Write;
-        use std::os::unix::fs::OpenOptionsExt;
-
-        let mut file = OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(&path)
-            .map_err(|e| AppError::io(&path, e))?;
-        file.write_all(json.as_bytes())
-            .map_err(|e| AppError::io(&path, e))?;
-    }
-
-    #[cfg(not(unix))]
-    {
-        fs::write(&path, json).map_err(|e| AppError::io(&path, e))?;
-    }
+    crate::config::atomic_write(&path, json.as_bytes())?;
 
     Ok(())
 }
@@ -986,12 +966,11 @@ pub fn get_settings_for_frontend() -> AppSettings {
 
 pub fn update_settings(mut new_settings: AppSettings) -> Result<(), AppError> {
     new_settings.normalize_paths();
-    save_settings_file(&new_settings)?;
-
     let mut guard = settings_store().write().unwrap_or_else(|e| {
         log::warn!("设置锁已毒化，使用恢复值: {e}");
         e.into_inner()
     });
+    save_settings_file(&new_settings)?;
     *guard = new_settings;
     Ok(())
 }

@@ -67,6 +67,7 @@ const DailyMemoryPanel: React.FC<DailyMemoryPanelProps> = ({
   const [searching, setSearching] = useState(false);
   const searchInputRef = useRef<HTMLInputElement>(null);
   const debounceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const contentRequestRef = useRef(0);
 
   // Dark mode
   const [isDarkMode, setIsDarkMode] = useState(false);
@@ -200,17 +201,22 @@ const DailyMemoryPanel: React.FC<DailyMemoryPanelProps> = ({
   // Open file for editing
   const openFile = useCallback(
     async (filename: string) => {
+      const requestId = ++contentRequestRef.current;
       setLoadingContent(true);
       setEditingFile(filename);
       try {
         const data = await workspaceApi.readDailyMemoryFile(filename);
+        if (contentRequestRef.current !== requestId) return;
         setContent(data ?? "");
       } catch (err) {
+        if (contentRequestRef.current !== requestId) return;
         console.error("Failed to read daily memory file:", err);
         toast.error(t("workspace.dailyMemory.loadFailed"));
         setEditingFile(null);
       } finally {
-        setLoadingContent(false);
+        if (contentRequestRef.current === requestId) {
+          setLoadingContent(false);
+        }
       }
     },
     [t],
@@ -279,6 +285,7 @@ const DailyMemoryPanel: React.FC<DailyMemoryPanelProps> = ({
 
   // Back from edit mode to list mode — preserve search state
   const handleBackToList = useCallback(() => {
+    contentRequestRef.current += 1;
     setEditingFile(null);
     setContent("");
     void loadFiles();
@@ -290,6 +297,7 @@ const DailyMemoryPanel: React.FC<DailyMemoryPanelProps> = ({
 
   // Close panel entirely — clear search state
   const handleClose = useCallback(() => {
+    contentRequestRef.current += 1;
     setEditingFile(null);
     setContent("");
     setIsSearchOpen(false);

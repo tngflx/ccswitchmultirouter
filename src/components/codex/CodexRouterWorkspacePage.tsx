@@ -23,8 +23,10 @@ import {
 } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { defaultRangeExtractor, useVirtualizer } from "@tanstack/react-virtual";
 import { useTranslation } from "react-i18next";
 import i18n from "@/i18n";
+import { PagedModelList } from "@/components/providers/forms/shared/PagedModelList";
 import {
   Activity,
   AlertTriangle,
@@ -4920,7 +4922,7 @@ export function sortCodexCatalogModels(
     return 0;
   });
 }
-function ModelOrderTab({
+export function ModelOrderTab({
   selectedPlan,
   catalog,
   selectedRoutes,
@@ -4942,6 +4944,8 @@ function ModelOrderTab({
     DEFAULT_CODEX_MODEL_DISPLAY_STYLE,
   );
   const [sortMode, setSortMode] = useState<CodexModelSortMode>("custom");
+  const catalogScrollRef = useRef<HTMLDivElement>(null);
+  const [draggedModelId, setDraggedModelId] = useState<string | null>(null);
   const sensors = useSensors(
     useSensor(PointerSensor),
     useSensor(KeyboardSensor, {
@@ -4957,30 +4961,57 @@ function ModelOrderTab({
   const hasCustomOrder = catalog.models.some(
     (model) => model.sortIndex !== undefined,
   );
-  const modelsWithProvider = draftModels.map((model) => {
-    if (codexCatalogProviderName(model)) return model;
-    const modelId = model.model?.trim();
-    const route = selectedRoutes.find(({ route: candidate }) => {
-      if (candidate.enabled === false) return false;
-      const provider = providersById.get(
-        routeTargetProviderId(candidate) ?? "",
-      );
-      if (!provider || !modelId) return false;
-      return readCodexModelCatalog(provider).models.some((source) =>
-        [source.model, source.upstreamModel, source.upstream_model].some(
-          (value) => value?.trim() === modelId,
-        ),
-      );
-    });
-    const provider = route
-      ? providersById.get(routeTargetProviderId(route.route) ?? "")
-      : undefined;
-    return provider?.name ? { ...model, providerName: provider.name } : model;
-  });
-  const visibleDraftModels = sortCodexCatalogModels(
-    modelsWithProvider,
-    sortMode,
+  const providerNamesByModel = useMemo(() => {
+    const names = new Map<string, string>();
+    for (const { route } of selectedRoutes) {
+      if (route.enabled === false) continue;
+      const provider = providersById.get(routeTargetProviderId(route) ?? "");
+      if (!provider) continue;
+      for (const source of readCodexModelCatalog(provider).models) {
+        for (const value of [
+          source.model,
+          source.upstreamModel,
+          source.upstream_model,
+        ]) {
+          const id = value?.trim();
+          if (id && !names.has(id)) names.set(id, provider.name);
+        }
+      }
+    }
+    return names;
+  }, [selectedRoutes, providersById]);
+  const visibleDraftModels = useMemo(
+    () =>
+      sortCodexCatalogModels(
+        draftModels.map((model) => {
+          if (codexCatalogProviderName(model)) return model;
+          const providerName = providerNamesByModel.get(
+            model.model?.trim() ?? "",
+          );
+          return providerName ? { ...model, providerName } : model;
+        }),
+        sortMode,
+      ),
+    [draftModels, providerNamesByModel, sortMode],
   );
+  const draggedIndex = visibleDraftModels.findIndex(
+    (model) => model.model?.trim() === draggedModelId,
+  );
+  const catalogVirtualizer = useVirtualizer({
+    count: visibleDraftModels.length,
+    getScrollElement: () => catalogScrollRef.current,
+    estimateSize: () => 64,
+    getItemKey: (index) => visibleDraftModels[index].model ?? index,
+    gap: 8,
+    overscan: 5,
+    // Keep the active sortable mounted when dragging past the viewport.
+    rangeExtractor: (range) => {
+      const indices = defaultRangeExtractor(range);
+      return draggedIndex < 0 || indices.includes(draggedIndex)
+        ? indices
+        : [...indices, draggedIndex].sort((a, b) => a - b);
+    },
+  });
   const hiddenCatalogModels = useMemo(() => {
     const hidden: Array<{
       model: string;
@@ -5046,6 +5077,7 @@ function ModelOrderTab({
   }, [selectedPlan?.id, catalogKey]);
 
   function handleDragEnd(event: DragEndEvent) {
+    setDraggedModelId(null);
     const activeModel = String(event.active.id);
     const overModel = event.over ? String(event.over.id) : "";
     if (!overModel || activeModel === overModel) return;
@@ -5454,6 +5486,8 @@ function ModelOrderTab({
       <DndContext
         sensors={sensors}
         collisionDetection={closestCenter}
+        onDragStart={({ active }) => setDraggedModelId(String(active.id))}
+        onDragCancel={() => setDraggedModelId(null)}
         onDragEnd={handleDragEnd}
       >
         <SortableContext
@@ -5462,16 +5496,39 @@ function ModelOrderTab({
             .filter((model): model is string => Boolean(model))}
           strategy={verticalListSortingStrategy}
         >
-          <div className="mt-4 space-y-2">
-            {visibleDraftModels.map((model, index) => (
-              <SortableCatalogModel
-                key={model.model}
-                model={model}
-                index={index}
-                displayStyle={displayStyle}
-                onDelete={(modelId) => void hideModel(modelId)}
-              />
-            ))}
+          <div
+            ref={catalogScrollRef}
+            className="mt-4 overflow-auto"
+            style={{ maxHeight: 480 }}
+          >
+            <div
+              style={{
+                height: catalogVirtualizer.getTotalSize(),
+                position: "relative",
+              }}
+            >
+              {catalogVirtualizer.getVirtualItems().map((row) => (
+                <div
+                  key={row.key}
+                  data-index={row.index}
+                  ref={catalogVirtualizer.measureElement}
+                  style={{
+                    position: "absolute",
+                    top: 0,
+                    left: 0,
+                    width: "100%",
+                    transform: `translateY(${row.start}px)`,
+                  }}
+                >
+                  <SortableCatalogModel
+                    model={visibleDraftModels[row.index]}
+                    index={row.index}
+                    displayStyle={displayStyle}
+                    onDelete={(modelId) => void hideModel(modelId)}
+                  />
+                </div>
+              ))}
+            </div>
           </div>
         </SortableContext>
       </DndContext>
@@ -5488,29 +5545,34 @@ function ModelOrderTab({
             })}
           </summary>
           <div className="mt-2 space-y-2">
-            {hiddenCatalogModels.map((hidden) => (
-              <div
-                key={`${hidden.providerId}:${hidden.model}`}
-                className="flex items-center justify-between gap-2 text-xs"
-              >
-                <span className="truncate">
-                  {hidden.model}
-                  {hidden.upstream ? ` (${hidden.upstream})` : ""} ·{" "}
-                  {hidden.providerName}
-                </span>
-                <Button
-                  type="button"
-                  size="sm"
-                  variant="outline"
-                  disabled={isSaving}
-                  onClick={() => void restoreHiddenModel(hidden)}
+            <PagedModelList
+              items={hiddenCatalogModels}
+              searchText={(hidden) => `${hidden.model} ${hidden.providerName}`}
+            >
+              {(hidden) => (
+                <div
+                  key={`${hidden.providerId}:${hidden.model}`}
+                  className="flex items-center justify-between gap-2 text-xs"
                 >
-                  {tr("codexRouterWorkspace.restoreModel", {
-                    defaultValue: "Restore",
-                  })}
-                </Button>
-              </div>
-            ))}
+                  <span className="truncate">
+                    {hidden.model}
+                    {hidden.upstream ? ` (${hidden.upstream})` : ""} ·{" "}
+                    {hidden.providerName}
+                  </span>
+                  <Button
+                    type="button"
+                    size="sm"
+                    variant="outline"
+                    disabled={isSaving}
+                    onClick={() => void restoreHiddenModel(hidden)}
+                  >
+                    {tr("codexRouterWorkspace.restoreModel", {
+                      defaultValue: "Restore",
+                    })}
+                  </Button>
+                </div>
+              )}
+            </PagedModelList>
           </div>
         </details>
       ) : null}
@@ -7131,8 +7193,11 @@ function RouteCandidatePicker({
                           candidate.canonicalProvider,
                         )}
                       </div>
-                      <div className="flex flex-wrap gap-2">
-                        {canonicalModels.map((model) => (
+                      <PagedModelList
+                        items={canonicalModels}
+                        searchText={(model) => model}
+                      >
+                        {(model) => (
                           <label
                             key={model}
                             className="flex items-center gap-1.5 rounded-md border border-border bg-muted/50 px-2 py-1 text-xs text-foreground"
@@ -7176,8 +7241,8 @@ function RouteCandidatePicker({
                             />
                             {model}
                           </label>
-                        ))}
-                      </div>
+                        )}
+                      </PagedModelList>
                     </div>
                   ) : null}
 
@@ -8120,58 +8185,66 @@ function SpawnAgentCandidatesPanel({
                     >
                       <div className="max-h-[220px] min-h-[132px] space-y-1.5 overflow-y-auto pr-1 xl:max-h-[260px]">
                         {candidateSourceModels[view].length > 0 ? (
-                          candidateSourceModels[view].map((model) => {
-                            const catalogModel = selectedCatalogByModel.get(
-                              model,
-                            ) ?? { model };
-                            const isSelected = selectedCandidateSet.has(model);
-                            const selectedIndex =
-                              draftSpawnAgentModels.indexOf(model);
-                            return (
-                              <button
-                                key={`${view}-${model}`}
-                                type="button"
-                                onClick={() => toggleSpawnAgentCandidate(model)}
-                                disabled={
-                                  !isSelected &&
-                                  draftSpawnAgentModels.length >=
-                                    spawnAgentVisibleLimit
-                                }
-                                className={cn(
-                                  "flex w-full items-center justify-between gap-2 rounded-md border px-2 py-1.5 text-left text-xs transition",
-                                  isSelected
-                                    ? "border-amber-300 bg-amber-50 text-amber-900 dark:border-amber-400/70 dark:bg-amber-500/15 dark:text-amber-50"
-                                    : "border-border bg-card text-foreground hover:border-violet-300 hover:bg-violet-50 dark:border-slate-700 dark:bg-slate-950/45 dark:text-slate-200 dark:hover:border-violet-500/60 dark:hover:bg-violet-500/10",
-                                  !isSelected &&
+                          <PagedModelList
+                            items={candidateSourceModels[view]}
+                            searchText={(model) => model}
+                          >
+                            {(model) => {
+                              const catalogModel = selectedCatalogByModel.get(
+                                model,
+                              ) ?? { model };
+                              const isSelected =
+                                selectedCandidateSet.has(model);
+                              const selectedIndex =
+                                draftSpawnAgentModels.indexOf(model);
+                              return (
+                                <button
+                                  key={`${view}-${model}`}
+                                  type="button"
+                                  onClick={() =>
+                                    toggleSpawnAgentCandidate(model)
+                                  }
+                                  disabled={
+                                    !isSelected &&
                                     draftSpawnAgentModels.length >=
                                       spawnAgentVisibleLimit
-                                    ? "cursor-not-allowed opacity-45"
-                                    : "",
-                                )}
-                              >
-                                <span className="min-w-0 truncate font-mono">
-                                  {catalogModelLabel(catalogModel)}
-                                </span>
-                                <Badge
+                                  }
                                   className={cn(
-                                    "shrink-0 border text-[10px]",
+                                    "flex w-full items-center justify-between gap-2 rounded-md border px-2 py-1.5 text-left text-xs transition",
                                     isSelected
-                                      ? "border-amber-300 bg-amber-100 text-amber-800 dark:border-amber-300/70 dark:bg-amber-200/10 dark:text-amber-50"
-                                      : "border-border bg-muted text-muted-foreground dark:border-slate-600 dark:bg-slate-800 dark:text-slate-300",
+                                      ? "border-amber-300 bg-amber-50 text-amber-900 dark:border-amber-400/70 dark:bg-amber-500/15 dark:text-amber-50"
+                                      : "border-border bg-card text-foreground hover:border-violet-300 hover:bg-violet-50 dark:border-slate-700 dark:bg-slate-950/45 dark:text-slate-200 dark:hover:border-violet-500/60 dark:hover:bg-violet-500/10",
+                                    !isSelected &&
+                                      draftSpawnAgentModels.length >=
+                                        spawnAgentVisibleLimit
+                                      ? "cursor-not-allowed opacity-45"
+                                      : "",
                                   )}
                                 >
-                                  {isSelected
-                                    ? tr("codexRouterWorkspace.s274", {
-                                        defaultValue: "前五 #{{arg0}}",
-                                        arg0: selectedIndex + 1,
-                                      })
-                                    : tr("codexRouterWorkspace.s275", {
-                                        defaultValue: "添加",
-                                      })}
-                                </Badge>
-                              </button>
-                            );
-                          })
+                                  <span className="min-w-0 truncate font-mono">
+                                    {catalogModelLabel(catalogModel)}
+                                  </span>
+                                  <Badge
+                                    className={cn(
+                                      "shrink-0 border text-[10px]",
+                                      isSelected
+                                        ? "border-amber-300 bg-amber-100 text-amber-800 dark:border-amber-300/70 dark:bg-amber-200/10 dark:text-amber-50"
+                                        : "border-border bg-muted text-muted-foreground dark:border-slate-600 dark:bg-slate-800 dark:text-slate-300",
+                                    )}
+                                  >
+                                    {isSelected
+                                      ? tr("codexRouterWorkspace.s274", {
+                                          defaultValue: "前五 #{{arg0}}",
+                                          arg0: selectedIndex + 1,
+                                        })
+                                      : tr("codexRouterWorkspace.s275", {
+                                          defaultValue: "添加",
+                                        })}
+                                  </Badge>
+                                </button>
+                              );
+                            }}
+                          </PagedModelList>
                         ) : (
                           <div className="rounded-md border border-dashed border-border px-3 py-2 text-xs text-muted-foreground dark:border-slate-700 dark:text-slate-400">
                             {tr("codexRouterWorkspace.s276", {

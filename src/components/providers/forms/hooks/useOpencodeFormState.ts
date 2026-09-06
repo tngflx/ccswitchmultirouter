@@ -1,4 +1,4 @@
-import { useState, useCallback } from "react";
+import { useState, useCallback, useEffect } from "react";
 import type { OpenCodeModel, OpenCodeProviderConfig } from "@/types";
 import {
   OPENCODE_DEFAULT_NPM,
@@ -45,10 +45,11 @@ export function useOpencodeFormState({
   onSettingsConfigChange,
   getSettingsConfig,
 }: UseOpencodeFormStateParams): OpencodeFormState {
-  const initialOpencodeConfig =
+  const [initialOpencodeConfig] = useState(() =>
     appId === "opencode"
       ? parseOpencodeConfig(initialData?.settingsConfig)
-      : null;
+      : null,
+  );
   const initialOpencodeOptions = initialOpencodeConfig?.options || {};
 
   const [opencodeProviderKey, setOpencodeProviderKey] = useState<string>(() => {
@@ -96,6 +97,20 @@ export function useOpencodeFormState({
     if (appId !== "opencode") return {};
     return toOpencodeExtraOptions(initialOpencodeOptions);
   });
+
+  const settingsConfig = getSettingsConfig();
+  useEffect(() => {
+    if (appId !== "opencode") return;
+    try {
+      const parsed = parseOpencodeConfig(JSON.parse(settingsConfig));
+      if (!parsed) return;
+      setOpencodeModels(parsed.models || {});
+      setOpencodeHeaders((parsed.options?.headers as Record<string, string>) || {});
+      setOpencodeExtraOptions(toOpencodeExtraOptions(parsed.options || {}));
+    } catch {
+      // Preserve structured state while raw JSON is temporarily invalid.
+    }
+  }, [appId, settingsConfig]);
 
   const updateOpencodeSettings = useCallback(
     (updater: (config: Record<string, any>) => void) => {

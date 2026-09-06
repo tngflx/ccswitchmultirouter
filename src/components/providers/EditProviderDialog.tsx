@@ -12,6 +12,10 @@ import { openclawApi, providersApi, vscodeApi, type AppId } from "@/lib/api";
 import { extractCodexExperimentalBearerToken } from "@/utils/providerConfigUtils";
 import { inferProviderIconFromConfig } from "@/utils/providerIcon";
 import { useGlobalLoading } from "@/contexts/GlobalLoadingContext";
+import {
+  DeferredContent,
+  LoadingStatus,
+} from "@/components/common/DeferredContent";
 
 interface EditProviderDialogProps {
   open: boolean;
@@ -71,7 +75,16 @@ const reconcileCodexLiveAuth = (
   };
 };
 
-export function EditProviderDialog({
+export function EditProviderDialog(props: EditProviderDialogProps) {
+  return (
+    <EditProviderSession
+      key={`${props.open}:${props.appId}:${props.provider?.id}:${props.isProxyTakeover}`}
+      {...props}
+    />
+  );
+}
+
+function EditProviderSession({
   open,
   provider,
   onOpenChange,
@@ -171,8 +184,10 @@ export function EditProviderDialog({
             setHasLoadedLive(true);
           }
         }
+      } catch {
+        if (!cancelled) setLiveSettings(null);
       } finally {
-        // no-op
+        if (!cancelled) setHasLoadedLive(true);
       }
     };
     void load();
@@ -299,7 +314,7 @@ export function EditProviderDialog({
         <Button
           type="submit"
           form="provider-form"
-          disabled={isFormSubmitting}
+          disabled={isFormSubmitting || !hasLoadedLive}
           className="bg-primary text-primary-foreground hover:bg-primary/90"
         >
           <Save className="h-4 w-4 mr-2" />
@@ -307,17 +322,23 @@ export function EditProviderDialog({
         </Button>
       }
     >
-      <ProviderForm
-        appId={appId}
-        providerId={provider.id}
-        submitLabel={t("common.save")}
-        onSubmit={handleSubmit}
-        onCancel={() => onOpenChange(false)}
-        onSubmittingChange={setIsFormSubmitting}
-        initialData={initialData}
-        showButtons={false}
-        isProxyTakeover={isProxyTakeover}
-      />
+      {!hasLoadedLive ? (
+        <LoadingStatus />
+      ) : (
+        <DeferredContent key={`${appId}:${provider.id}`}>
+          <ProviderForm
+            appId={appId}
+            providerId={provider.id}
+            submitLabel={t("common.save")}
+            onSubmit={handleSubmit}
+            onCancel={() => onOpenChange(false)}
+            onSubmittingChange={setIsFormSubmitting}
+            initialData={initialData}
+            showButtons={false}
+            isProxyTakeover={isProxyTakeover}
+          />
+        </DeferredContent>
+      )}
     </FullScreenPanel>
   );
 }

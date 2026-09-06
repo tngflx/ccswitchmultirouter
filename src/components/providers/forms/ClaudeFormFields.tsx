@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
+import { useGlobalLoading } from "@/contexts/GlobalLoadingContext";
 import { Button } from "@/components/ui/button";
 import {
   Collapsible,
@@ -226,6 +227,7 @@ export function ClaudeFormFields({
   onLocalProxyBodyOverrideChange,
 }: ClaudeFormFieldsProps) {
   const { t } = useTranslation();
+  const { runWithLoading } = useGlobalLoading();
   const hasRequestOverrides = Boolean(
     localProxyHeadersOverride.trim() || localProxyBodyOverride.trim(),
   );
@@ -301,7 +303,7 @@ export function ClaudeFormFields({
     const modelsUrl = matchedPreset?.modelsUrl;
 
     setIsFetchingModels(true);
-    fetchModelsForConfig(baseUrl, apiKey, isFullUrl, modelsUrl, customUserAgent)
+    runWithLoading(() => fetchModelsForConfig(baseUrl, apiKey, isFullUrl, modelsUrl, customUserAgent))
       .then((models) => {
         setFetchedModels(models);
         showModelFetchResult(models.length);
@@ -311,7 +313,7 @@ export function ClaudeFormFields({
         showFetchModelsError(err, t);
       })
       .finally(() => setIsFetchingModels(false));
-  }, [baseUrl, apiKey, isFullUrl, customUserAgent, showModelFetchResult, t]);
+  }, [baseUrl, apiKey, isFullUrl, customUserAgent, showModelFetchResult, t, runWithLoading]);
 
   const handleFetchCopilotModels = useCallback(() => {
     if (!isCopilotAuthenticated) {
@@ -330,7 +332,7 @@ export function ClaudeFormFields({
       ? copilotGetModelsForAccount(selectedGitHubAccountId)
       : copilotGetModels();
 
-    fetchModels
+    runWithLoading(() => fetchModels)
       .then((models) => {
         if (copilotModelsRequestRef.current !== requestId) return;
         setCopilotModels(models);
@@ -355,6 +357,7 @@ export function ClaudeFormFields({
     selectedGitHubAccountId,
     showModelFetchResult,
     t,
+    runWithLoading,
   ]);
 
   const handleFetchCodexOauthModels = useCallback(() => {
@@ -370,7 +373,7 @@ export function ClaudeFormFields({
     const requestId = codexOauthModelsRequestRef.current + 1;
     codexOauthModelsRequestRef.current = requestId;
     setCodexOauthModelsLoading(true);
-    fetchCodexOauthModels(selectedCodexAccountId)
+    runWithLoading(() => fetchCodexOauthModels(selectedCodexAccountId))
       .then((models) => {
         if (codexOauthModelsRequestRef.current !== requestId) return;
         setCodexOauthModels(models);
@@ -391,6 +394,7 @@ export function ClaudeFormFields({
     selectedCodexAccountId,
     showModelFetchResult,
     t,
+    runWithLoading,
   ]);
 
   const handleFetchXaiOauthModels = useCallback(() => {
@@ -406,7 +410,7 @@ export function ClaudeFormFields({
     const requestId = xaiOauthModelsRequestRef.current + 1;
     xaiOauthModelsRequestRef.current = requestId;
     setXaiOauthModelsLoading(true);
-    fetchXaiOauthModels(selectedXaiAccountId)
+    runWithLoading(() => fetchXaiOauthModels(selectedXaiAccountId))
       .then((models) => {
         if (xaiOauthModelsRequestRef.current !== requestId) return;
         setXaiOauthModels(models);
@@ -422,7 +426,7 @@ export function ClaudeFormFields({
           setXaiOauthModelsLoading(false);
         }
       });
-  }, [isXaiOauthAuthenticated, selectedXaiAccountId, showModelFetchResult, t]);
+  }, [isXaiOauthAuthenticated, selectedXaiAccountId, showModelFetchResult, t, runWithLoading]);
 
   useEffect(() => {
     copilotModelsRequestRef.current += 1;

@@ -39,6 +39,7 @@ vi.mock("@/components/providers/forms/ProviderForm", () => ({
     return (
       <form
         id="provider-form"
+        data-testid="provider-form"
         onSubmit={(event) => {
           event.preventDefault();
           onSubmit(mockFormValues);
@@ -78,6 +79,7 @@ describe("AddProviderDialog", () => {
       />,
     );
 
+    await screen.findByTestId("provider-form");
     fireEvent.click(
       screen.getByRole("button", {
         name: "common.add",
@@ -114,6 +116,7 @@ describe("AddProviderDialog", () => {
       />,
     );
 
+    await screen.findByTestId("provider-form");
     fireEvent.click(
       screen.getByRole("button", {
         name: "common.add",
@@ -220,6 +223,7 @@ context_window = 500000
       />,
     );
 
+    await screen.findByTestId("provider-form");
     fireEvent.click(screen.getByRole("button", { name: "common.add" }));
 
     await waitFor(() => expect(handleSubmit).toHaveBeenCalledTimes(1));

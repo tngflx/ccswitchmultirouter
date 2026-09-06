@@ -1,6 +1,16 @@
 import i18n from "@/i18n";
+import {
+  DeferredContent,
+  LoadingStatus,
+} from "@/components/common/DeferredContent";
 
 import { useEffect, useMemo, useState, useCallback, useRef } from "react";
+import { ChevronRight } from "lucide-react";
+import {
+  Collapsible,
+  CollapsibleContent,
+  CollapsibleTrigger,
+} from "@/components/ui/collapsible";
 import { useForm } from "react-hook-form";
 import { zodResolver } from "@hookform/resolvers/zod";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
@@ -580,6 +590,14 @@ function ProviderFormFull({
   const [isEndpointModalOpen, setIsEndpointModalOpen] = useState(false);
   const [isCodexEndpointModalOpen, setIsCodexEndpointModalOpen] =
     useState(false);
+  const [isRawConfigOpen, setIsRawConfigOpen] = useState(() => {
+    const rawModels = initialData?.settingsConfig?.models;
+    if (Array.isArray(rawModels)) return rawModels.length <= 40;
+    if (rawModels && typeof rawModels === "object") {
+      return Object.keys(rawModels).length <= 40;
+    }
+    return true;
+  });
   const codexProviderDetailsRef = useRef<HTMLDivElement | null>(null);
 
   const [draftCustomEndpoints, setDraftCustomEndpoints] = useState<string[]>(
@@ -724,10 +742,6 @@ function ProviderFormFull({
   ] = useState<LocalProxyRequestOverridesBuildResult | null>(null);
   // 确认框走的提交路径绕过了 react-hook-form 的 isSubmitting，单独追踪
   const [isConfirmSubmitting, setIsConfirmSubmitting] = useState(false);
-
-  useEffect(() => {
-    onSubmittingChange?.(isSubmitting || isConfirmSubmitting);
-  }, [isSubmitting, isConfirmSubmitting, onSubmittingChange]);
 
   const {
     apiKey,
@@ -1218,6 +1232,7 @@ function ProviderFormFull({
     handleCommonConfigToggle,
     handleCommonConfigSnippetChange,
     isExtracting: isClaudeExtracting,
+    isLoading: isClaudeCommonConfigLoading,
     handleExtract: handleClaudeExtract,
   } = useCommonConfigSnippet({
     settingsConfig: form.getValues("settingsConfig"),
@@ -1231,6 +1246,7 @@ function ProviderFormFull({
 
   const {
     useCommonConfig: useCodexCommonConfigFlag,
+    isLoading: isCodexCommonConfigLoading,
     commonConfigError: codexCommonConfigError,
     handleCommonConfigToggle: handleCodexCommonConfigToggle,
   } = useCodexCommonConfig({
@@ -1310,6 +1326,7 @@ function ProviderFormFull({
 
   const {
     useCommonConfig: useGeminiCommonConfigFlag,
+    isLoading: isGeminiCommonConfigLoading,
     commonConfigSnippet: geminiCommonConfigSnippet,
     commonConfigError: geminiCommonConfigError,
     handleCommonConfigToggle: handleGeminiCommonConfigToggle,
@@ -1353,6 +1370,15 @@ function ProviderFormFull({
     onSettingsConfigChange: (config) => form.setValue("settingsConfig", config),
     getSettingsConfig: () => form.getValues("settingsConfig"),
   });
+
+  useEffect(() => {
+    if (
+      appId === "opencode" &&
+      Object.keys(opencodeForm.opencodeModels).length > 40
+    ) {
+      setIsRawConfigOpen(false);
+    }
+  }, [appId, opencodeForm.opencodeModels]);
 
   const initialOmoSettings =
     appId === "opencode" &&
@@ -2580,6 +2606,22 @@ function ProviderFormFull({
     }
   }, [appId, initialData, selectedPresetId]);
 
+  const isCommonConfigLoading =
+    (appId === "claude" && isClaudeCommonConfigLoading) ||
+    (appId === "codex" && isCodexCommonConfigLoading) ||
+    (appId === "gemini" && isGeminiCommonConfigLoading);
+
+  useEffect(() => {
+    onSubmittingChange?.(
+      Boolean(isCommonConfigLoading || isSubmitting || isConfirmSubmitting),
+    );
+  }, [
+    isCommonConfigLoading,
+    isSubmitting,
+    isConfirmSubmitting,
+    onSubmittingChange,
+  ]);
+
   const settingsConfigErrorField = (
     <FormField
       control={form.control}
@@ -2591,6 +2633,8 @@ function ProviderFormFull({
       )}
     />
   );
+
+  if (isCommonConfigLoading) return <LoadingStatus />;
 
   return (
     <>
@@ -3175,6 +3219,7 @@ function ProviderFormFull({
                 value={omoDraft.mergedOmoJsonPreview}
                 onChange={() => {}}
                 rows={14}
+                height={280}
                 showValidation={false}
                 language="json"
                 darkMode={isDarkMode}
@@ -3184,14 +3229,33 @@ function ProviderFormFull({
             category !== "omo" &&
             category !== "omo-slim" ? (
             <>
-              <div className="space-y-2">
-                <Label htmlFor="settingsConfig">
-                  {t("provider.configJson")}
-                </Label>
-                <JsonEditor
-                  value={form.getValues("settingsConfig")}
-                  onChange={(config) => form.setValue("settingsConfig", config)}
-                  placeholder={`{
+              <Collapsible
+                open={isRawConfigOpen}
+                onOpenChange={setIsRawConfigOpen}
+                className="space-y-2"
+              >
+                <CollapsibleTrigger asChild>
+                  <button
+                    type="button"
+                    className="flex w-full items-center gap-2 text-left"
+                  >
+                    <ChevronRight
+                      className={`h-4 w-4 transition-transform ${isRawConfigOpen ? "rotate-90" : ""}`}
+                    />
+                    <Label className="cursor-pointer">
+                      {t("provider.configJson")}
+                    </Label>
+                  </button>
+                </CollapsibleTrigger>
+                <CollapsibleContent>
+                  {isRawConfigOpen && (
+                    <DeferredContent>
+                      <JsonEditor
+                        value={form.getValues("settingsConfig")}
+                        onChange={(config) =>
+                          form.setValue("settingsConfig", config)
+                        }
+                        placeholder={`{
   "npm": "@ai-sdk/openai-compatible",
   "options": {
     "baseURL": "https://your-api-endpoint.com",
@@ -3199,12 +3263,16 @@ function ProviderFormFull({
   },
   "models": {}
 }`}
-                  rows={14}
-                  showValidation={true}
-                  language="json"
-                  darkMode={isDarkMode}
-                />
-              </div>
+                        rows={14}
+                        height={280}
+                        showValidation={true}
+                        language="json"
+                        darkMode={isDarkMode}
+                      />
+                    </DeferredContent>
+                  )}
+                </CollapsibleContent>
+              </Collapsible>
               {settingsConfigErrorField}
             </>
           ) : appId === "openclaw" || appId === "hermes" ? (
@@ -3231,6 +3299,7 @@ function ProviderFormFull({
 }`
                   }
                   rows={14}
+                  height={280}
                   showValidation={true}
                   language="json"
                   darkMode={isDarkMode}

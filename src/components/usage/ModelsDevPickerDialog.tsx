@@ -69,7 +69,7 @@ export function ModelsDevPickerDialog({
     }
   }, [open]);
 
-  const { data, isLoading, error, refetch } = useQuery({
+  const { data, isLoading, isFetching, error, refetch } = useQuery({
     queryKey: ["models-dev-pricing"],
     queryFn: fetchModelsDevPricing,
     enabled: open,
@@ -188,7 +188,7 @@ export function ModelsDevPickerDialog({
         </DialogHeader>
 
         <div className="flex flex-1 min-h-0 flex-col gap-3 px-6 py-4">
-          {isLoading ? (
+          {isLoading || (isFetching && !data) ? (
             <div className="flex flex-1 items-center justify-center">
               <Loader2 className="h-6 w-6 animate-spin text-muted-foreground" />
             </div>

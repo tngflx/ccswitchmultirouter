@@ -28,7 +28,7 @@ export function ModelInputWithFetch({
   const { t } = useTranslation();
 
   // 有模型数据: Input + DropdownMenu
-  if (fetchedModels.length > 0) {
+  if (fetchedModels.length > 0 && !isLoading) {
     return (
       <div className="flex gap-1">
         <Input
@@ -58,7 +58,14 @@ export function ModelInputWithFetch({
           autoComplete="off"
           className="flex-1"
         />
-        <Button variant="outline" size="icon" className="shrink-0" disabled>
+        <Button
+          type="button"
+          variant="outline"
+          size="icon"
+          className="shrink-0"
+          disabled
+          aria-label={t("common.loading")}
+        >
           <Loader2 className="h-4 w-4 animate-spin" />
         </Button>
       </div>

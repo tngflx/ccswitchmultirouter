@@ -10,6 +10,7 @@ import {
   QueryClient,
   QueryClientProvider,
   useMutation,
+  useQuery,
 } from "@tanstack/react-query";
 import { expect, it } from "vitest";
 import {
@@ -35,6 +36,26 @@ function renderWithGlobalLoading(children: ReactNode) {
     </QueryClientProvider>,
   );
 }
+
+it("tracks initial observed queries but keeps cached background refreshes quiet", async () => {
+  const initial = deferred<string>();
+  const refresh = deferred<string>();
+  let calls = 0;
+  function Harness() {
+    const query = useQuery({
+      queryKey: ["catalog"],
+      queryFn: () => (++calls === 1 ? initial.promise : refresh.promise),
+    });
+    return <button onClick={() => void query.refetch()}>Refresh</button>;
+  }
+  renderWithGlobalLoading(<Harness />);
+  expect(await screen.findByRole("status")).toBeInTheDocument();
+  await act(async () => initial.resolve("catalog"));
+  await waitFor(() => expect(screen.queryByRole("status")).toBeNull());
+  fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
+  await act(async () => refresh.resolve("updated"));
+  expect(screen.queryByRole("status")).toBeNull();
+});
 
 it("tracks manual async work and clears the indicator in finally", async () => {
   const task = deferred<void>();

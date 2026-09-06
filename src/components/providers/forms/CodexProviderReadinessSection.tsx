@@ -1,5 +1,5 @@
 ﻿import type { Ref } from "react";
-import { Download, Loader2, Route, Server, Sparkles } from "lucide-react";
+import { Download, Loader2, Route, Server } from "lucide-react";
 import { useTranslation } from "react-i18next";
 
 import { Button } from "@/components/ui/button";
@@ -65,7 +65,6 @@ export function CodexProviderReadinessSection({
   sectionRef,
   onSyncModels,
   onFillMissingFields,
-  onPruneOutdated,
   onCreateProtocolGroups,
   onValidateConnection,
 }: CodexProviderReadinessSectionProps) {
@@ -165,12 +164,6 @@ export function CodexProviderReadinessSection({
                 <Download className="h-3.5 w-3.5" />
               )}
               {tr("fillMissing", "Refresh Existing")}
-            </Button>
-          )}
-          {onPruneOutdated && (
-            <Button type="button" variant="outline" size="sm" className="h-8 gap-1" onClick={onPruneOutdated} disabled={isCatalogActionRunning || models.length < 2} title={tr("pruneOutdatedTitle", "Keep the newest model versions and common variants")}>
-              <Sparkles className="h-3.5 w-3.5" />
-              {tr("pruneOutdated", "Keep latest versions")}
             </Button>
           )}
           <Button

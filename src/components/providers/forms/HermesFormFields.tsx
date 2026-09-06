@@ -1,4 +1,5 @@
 import { useTranslation } from "react-i18next";
+import { useGlobalLoading } from "@/contexts/GlobalLoadingContext";
 import {
   useState,
   useRef,
@@ -32,6 +33,7 @@ import {
   Loader2,
 } from "lucide-react";
 import { ApiKeySection, ModelDropdown } from "./shared";
+import { PagedModelList } from "./shared/PagedModelList";
 import {
   fetchModelsForConfig,
   showFetchModelsError,
@@ -107,6 +109,7 @@ function AdvancedSection({
   children,
 }: AdvancedSectionProps) {
   const { t } = useTranslation();
+  const { runWithLoading } = useGlobalLoading();
   return (
     <Collapsible open={open} onOpenChange={onOpenChange}>
       <CollapsibleTrigger asChild>
@@ -205,7 +208,7 @@ export function HermesFormFields({
       return;
     }
     setIsFetchingModels(true);
-    fetchModelsForConfig(baseUrl, apiKey)
+    runWithLoading(() => fetchModelsForConfig(baseUrl, apiKey))
       .then((fetched) => {
         setFetchedModels(fetched);
         if (fetched.length === 0) {
@@ -221,7 +224,7 @@ export function HermesFormFields({
         showFetchModelsError(err, t);
       })
       .finally(() => setIsFetchingModels(false));
-  }, [baseUrl, apiKey, t]);
+  }, [baseUrl, apiKey, t, runWithLoading]);
 
   const handleRemoveModel = (index: number) => {
     modelKeysRef.current.splice(index, 1);
@@ -355,108 +358,117 @@ export function HermesFormFields({
           </p>
         ) : (
           <div className="space-y-4">
-            {models.map((model, index) => (
-              <div
-                key={modelKeys[index]}
-                className="p-3 border border-border/50 rounded-lg space-y-3"
-              >
-                {/* Role badge — first entry is the default written to model.default on switch */}
-                <div className="flex items-center">
-                  <span
-                    className={`text-[10px] font-medium px-1.5 py-0.5 rounded ${
-                      index === 0
-                        ? "bg-blue-500/15 text-blue-600 dark:text-blue-400"
-                        : "bg-muted text-muted-foreground"
-                    }`}
-                  >
-                    {index === 0
-                      ? t("hermes.form.primaryModel", {
-                          defaultValue: "默认模型",
-                        })
-                      : t("hermes.form.fallbackModel", {
-                          defaultValue: "备选模型",
-                        })}
-                  </span>
-                </div>
-
-                <div className="flex items-center gap-2">
-                  <div className="flex-1 space-y-1">
-                    <label className="text-xs text-muted-foreground">
-                      {t("hermes.form.modelId", { defaultValue: "模型 ID" })}
-                    </label>
-                    <div className="flex gap-1">
-                      <Input
-                        value={model.id}
-                        onChange={(e) =>
-                          handleModelChange(index, "id", e.target.value)
-                        }
-                        placeholder={t("hermes.form.modelIdPlaceholder", {
-                          defaultValue: "anthropic/claude-opus-5",
-                        })}
-                        className="flex-1"
-                      />
-                      {fetchedModels.length > 0 && (
-                        <ModelDropdown
-                          models={fetchedModels}
-                          onSelect={(id) => handleModelChange(index, "id", id)}
-                        />
-                      )}
-                    </div>
-                  </div>
-                  <div className="flex-1 space-y-1">
-                    <label className="text-xs text-muted-foreground">
-                      {t("hermes.form.modelName", {
-                        defaultValue: "显示名称",
-                      })}
-                    </label>
-                    <Input
-                      value={model.name ?? ""}
-                      onChange={(e) =>
-                        handleModelChange(index, "name", e.target.value)
-                      }
-                      placeholder={t("hermes.form.modelNamePlaceholder", {
-                        defaultValue: "Claude Opus 5",
-                      })}
-                    />
-                  </div>
-                  <Button
-                    type="button"
-                    variant="ghost"
-                    size="icon"
-                    onClick={() => handleRemoveModel(index)}
-                    className="h-9 w-9 mt-5 text-muted-foreground hover:text-destructive"
-                  >
-                    <Trash2 className="h-4 w-4" />
-                  </Button>
-                </div>
-
-                <AdvancedSection
-                  open={expandedModels[index] ?? false}
-                  onOpenChange={() => toggleModelAdvanced(index)}
-                  labelKey="hermes.form.advancedOptions"
+            <PagedModelList
+              items={models}
+              searchText={(model) => `${model.id} ${model.name}`}
+            >
+              {(model, index) => (
+                <div
+                  key={modelKeys[index]}
+                  className="p-3 border border-border/50 rounded-lg space-y-3"
                 >
-                  <div className="space-y-1">
-                    <label className="text-xs text-muted-foreground">
-                      {t("hermes.form.contextLength", {
-                        defaultValue: "上下文长度",
-                      })}
-                    </label>
-                    <Input
-                      type="number"
-                      value={model.context_length ?? ""}
-                      onChange={(e) =>
-                        handleModelChange(
-                          index,
-                          "context_length",
-                          e.target.value ? parseInt(e.target.value) : undefined,
-                        )
-                      }
-                      placeholder="200000"
-                    />
+                  {/* Role badge — first entry is the default written to model.default on switch */}
+                  <div className="flex items-center">
+                    <span
+                      className={`text-[10px] font-medium px-1.5 py-0.5 rounded ${
+                        index === 0
+                          ? "bg-blue-500/15 text-blue-600 dark:text-blue-400"
+                          : "bg-muted text-muted-foreground"
+                      }`}
+                    >
+                      {index === 0
+                        ? t("hermes.form.primaryModel", {
+                            defaultValue: "默认模型",
+                          })
+                        : t("hermes.form.fallbackModel", {
+                            defaultValue: "备选模型",
+                          })}
+                    </span>
                   </div>
-                </AdvancedSection>
-              </div>
-            ))}
+
+                  <div className="flex items-center gap-2">
+                    <div className="flex-1 space-y-1">
+                      <label className="text-xs text-muted-foreground">
+                        {t("hermes.form.modelId", { defaultValue: "模型 ID" })}
+                      </label>
+                      <div className="flex gap-1">
+                        <Input
+                          value={model.id}
+                          onChange={(e) =>
+                            handleModelChange(index, "id", e.target.value)
+                          }
+                          placeholder={t("hermes.form.modelIdPlaceholder", {
+                            defaultValue: "anthropic/claude-opus-5",
+                          })}
+                          className="flex-1"
+                        />
+                        {fetchedModels.length > 0 && (
+                          <ModelDropdown
+                            models={fetchedModels}
+                            onSelect={(id) =>
+                              handleModelChange(index, "id", id)
+                            }
+                          />
+                        )}
+                      </div>
+                    </div>
+                    <div className="flex-1 space-y-1">
+                      <label className="text-xs text-muted-foreground">
+                        {t("hermes.form.modelName", {
+                          defaultValue: "显示名称",
+                        })}
+                      </label>
+                      <Input
+                        value={model.name ?? ""}
+                        onChange={(e) =>
+                          handleModelChange(index, "name", e.target.value)
+                        }
+                        placeholder={t("hermes.form.modelNamePlaceholder", {
+                          defaultValue: "Claude Opus 5",
+                        })}
+                      />
+                    </div>
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="icon"
+                      onClick={() => handleRemoveModel(index)}
+                      className="h-9 w-9 mt-5 text-muted-foreground hover:text-destructive"
+                    >
+                      <Trash2 className="h-4 w-4" />
+                    </Button>
+                  </div>
+
+                  <AdvancedSection
+                    open={expandedModels[index] ?? false}
+                    onOpenChange={() => toggleModelAdvanced(index)}
+                    labelKey="hermes.form.advancedOptions"
+                  >
+                    <div className="space-y-1">
+                      <label className="text-xs text-muted-foreground">
+                        {t("hermes.form.contextLength", {
+                          defaultValue: "上下文长度",
+                        })}
+                      </label>
+                      <Input
+                        type="number"
+                        value={model.context_length ?? ""}
+                        onChange={(e) =>
+                          handleModelChange(
+                            index,
+                            "context_length",
+                            e.target.value
+                              ? parseInt(e.target.value)
+                              : undefined,
+                          )
+                        }
+                        placeholder="200000"
+                      />
+                    </div>
+                  </AdvancedSection>
+                </div>
+              )}
+            </PagedModelList>
           </div>
         )}
 

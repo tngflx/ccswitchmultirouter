@@ -3,6 +3,7 @@ import type { ComponentProps } from "react";
 import { describe, expect, it, vi } from "vitest";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { ProviderForm } from "@/components/providers/forms/ProviderForm";
+import { configApi } from "@/lib/api";
 
 const codexCandidateApiMocks = vi.hoisted(() => ({
   validateProviderCandidate: vi.fn(),
@@ -158,7 +159,7 @@ vi.mock("@/components/providers/forms/CodexFormFields", () => ({
   buildSplitCodexProviderSuggestionForFetchedModels: vi.fn(),
 }));
 
-function renderProviderForm(
+async function renderProviderForm(
   props: Partial<ComponentProps<typeof ProviderForm>> = {},
 ) {
   const queryClient = new QueryClient({
@@ -168,7 +169,7 @@ function renderProviderForm(
     },
   });
 
-  return render(
+  const view = render(
     <QueryClientProvider client={queryClient}>
       <ProviderForm
         appId="codex"
@@ -180,9 +181,32 @@ function renderProviderForm(
       />
     </QueryClientProvider>,
   );
+  await screen.findByTestId("codex-base-url");
+  return view;
 }
 
 describe("ProviderForm Codex preset selection", () => {
+  it("keeps form controls unavailable until common configuration has loaded", async () => {
+    let resolve!: (value: string) => void;
+    vi.mocked(configApi.getCommonConfigSnippet).mockImplementation((app) =>
+      app === "codex"
+        ? new Promise((done) => {
+            resolve = done;
+          })
+        : Promise.resolve(""),
+    );
+    const onSubmittingChange = vi.fn();
+    const view = renderProviderForm({ onSubmittingChange });
+    expect(screen.getByRole("status")).toBeInTheDocument();
+    expect(screen.queryByTestId("codex-base-url")).not.toBeInTheDocument();
+    expect(onSubmittingChange).toHaveBeenLastCalledWith(true);
+    resolve("");
+    await view;
+    await waitFor(() =>
+      expect(onSubmittingChange).toHaveBeenLastCalledWith(false),
+    );
+    vi.mocked(configApi.getCommonConfigSnippet).mockResolvedValue("");
+  });
   beforeEach(() => {
     codexCandidateApiMocks.validateProviderCandidate
       .mockReset()
@@ -190,7 +214,7 @@ describe("ProviderForm Codex preset selection", () => {
   });
 
   it("defaults new Codex providers to model menu projection", async () => {
-    renderProviderForm();
+    await renderProviderForm();
 
     await waitFor(() => {
       expect(screen.getByTestId("codex-takeover")).toHaveTextContent("enabled");
@@ -231,7 +255,7 @@ describe("ProviderForm Codex preset selection", () => {
         codexFastMode: false,
       },
     };
-    const { rerender } = renderProviderForm({ initialData: first });
+    const { rerender } = await renderProviderForm({ initialData: first });
     await waitFor(() =>
       expect(screen.getByTestId("codex-base-url")).toHaveTextContent(
         "https://first.example/v1",
@@ -269,7 +293,7 @@ describe("ProviderForm Codex preset selection", () => {
 
   it("persists the exact custom Codex traffic policy", async () => {
     const onSubmit = vi.fn();
-    renderProviderForm({
+    await renderProviderForm({
       showButtons: true,
       submitLabel: "保存",
       onSubmit,
@@ -306,7 +330,11 @@ describe("ProviderForm Codex preset selection", () => {
 
   it("clears a custom traffic policy when a maintained preset is selected", async () => {
     const onSubmit = vi.fn();
-    renderProviderForm({ showButtons: true, submitLabel: "保存", onSubmit });
+    await renderProviderForm({
+      showButtons: true,
+      submitLabel: "保存",
+      onSubmit,
+    });
     fireEvent.click(
       screen.getByRole("button", { name: "mock-set-traffic-policy" }),
     );
@@ -328,7 +356,7 @@ describe("ProviderForm Codex preset selection", () => {
 
   it("forces a saved maintained preset back to model menu projection", async () => {
     const onSubmit = vi.fn();
-    renderProviderForm({
+    await renderProviderForm({
       showButtons: true,
       submitLabel: "保存",
       onSubmit,
@@ -369,7 +397,7 @@ describe("ProviderForm Codex preset selection", () => {
       value: scrollIntoView,
     });
 
-    renderProviderForm();
+    await renderProviderForm();
 
     await waitFor(() => {
       expect(screen.getByTestId("codex-api-key")).toBeInTheDocument();
@@ -386,7 +414,7 @@ describe("ProviderForm Codex preset selection", () => {
       value: scrollIntoView,
     });
 
-    renderProviderForm();
+    await renderProviderForm();
 
     fireEvent.click(screen.getByRole("button", { name: /DeepSeek$/ }));
 
@@ -423,7 +451,7 @@ describe("ProviderForm Codex preset selection", () => {
 
   it("persists catalog metadata without enabling Codex menu mapping", async () => {
     const onSubmit = vi.fn();
-    renderProviderForm({
+    await renderProviderForm({
       showButtons: true,
       submitLabel: "保存",
       onSubmit,
@@ -480,7 +508,7 @@ describe("ProviderForm Codex preset selection", () => {
         },
       },
     };
-    renderProviderForm({
+    await renderProviderForm({
       showButtons: true,
       submitLabel: "保存",
       onSubmit,
@@ -519,7 +547,7 @@ describe("ProviderForm Codex preset selection", () => {
     codexCandidateApiMocks.validateProviderCandidate.mockRejectedValueOnce(
       new Error("unknown_reasoning_capability_requires_declaration"),
     );
-    renderProviderForm({
+    await renderProviderForm({
       showButtons: true,
       submitLabel: "保存",
       onSubmit,
@@ -574,7 +602,11 @@ describe("ProviderForm Codex preset selection", () => {
 
   it("persists maintained reasoning capabilities after selecting a built-in provider", async () => {
     const onSubmit = vi.fn();
-    renderProviderForm({ showButtons: true, submitLabel: "保存", onSubmit });
+    await renderProviderForm({
+      showButtons: true,
+      submitLabel: "保存",
+      onSubmit,
+    });
 
     fireEvent.click(screen.getByRole("button", { name: /Zhipu GLM$/ }));
     await waitFor(() => {
@@ -607,7 +639,7 @@ describe("ProviderForm Codex preset selection", () => {
   });
 
   it("restores the maintained preset baseline when reopening a saved override", async () => {
-    renderProviderForm({
+    await renderProviderForm({
       initialData: {
         name: "Zhipu override",
         category: "custom",
@@ -651,7 +683,11 @@ describe("ProviderForm Codex preset selection", () => {
 
   it("clears the maintained preset identity after switching to a custom source", async () => {
     const onSubmit = vi.fn();
-    renderProviderForm({ showButtons: true, submitLabel: "保存", onSubmit });
+    await renderProviderForm({
+      showButtons: true,
+      submitLabel: "保存",
+      onSubmit,
+    });
 
     fireEvent.click(screen.getByRole("button", { name: /Zhipu GLM$/ }));
     await waitFor(() => {

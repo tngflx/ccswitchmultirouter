@@ -3,6 +3,7 @@ import { useForm } from "react-hook-form";
 import { zodResolver } from "@hookform/resolvers/zod";
 import { useQuery } from "@tanstack/react-query";
 import { useTranslation } from "react-i18next";
+import { useGlobalLoading } from "@/contexts/GlobalLoadingContext";
 import {
   ChevronDown,
   ChevronRight,
@@ -271,6 +272,7 @@ export function ClaudeDesktopProviderForm({
   showButtons = true,
 }: ClaudeDesktopProviderFormProps) {
   const { t } = useTranslation();
+  const { runWithLoading } = useGlobalLoading();
   const initialMode = isOAuthProviderType(initialData?.meta?.providerType)
     ? "proxy"
     : (initialData?.meta?.claudeDesktopMode ?? "direct");
@@ -553,7 +555,7 @@ export function ClaudeDesktopProviderForm({
 
     setIsFetchingModels(true);
     try {
-      const models = await fetchModelsForConfig(baseUrl.trim(), apiKey.trim());
+      const models = await runWithLoading(() => fetchModelsForConfig(baseUrl.trim(), apiKey.trim()));
       setFetchedModels(models);
       toast.success(
         t("providerForm.fetchModelsSuccess", {

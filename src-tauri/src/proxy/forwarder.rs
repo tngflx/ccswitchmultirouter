@@ -3840,7 +3840,7 @@ impl RequestForwarder {
                                 "summarize_completed",
                             );
                             #[cfg(target_os = "windows")]
-                            super::request_health::show_summarize_restart_result_notification(
+                            super::request_health::notify_summarize_restart_result(
                                 &session_id,
                                 Some(&result.new_thread_id),
                                 None,
@@ -3868,7 +3868,7 @@ impl RequestForwarder {
                                 "summarize_failed",
                             );
                             #[cfg(target_os = "windows")]
-                            super::request_health::show_summarize_restart_result_notification(
+                            super::request_health::notify_summarize_restart_result(
                                 &session_id,
                                 None,
                                 Some(&error),

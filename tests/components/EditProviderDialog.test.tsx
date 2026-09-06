@@ -92,10 +92,81 @@ vi.mock("@/components/providers/forms/ProviderForm", () => ({
 import { EditProviderDialog } from "@/components/providers/EditProviderDialog";
 
 describe("EditProviderDialog", () => {
+  it("reloads live settings when the provider changes while the editor stays open", async () => {
+    apiMocks.getCurrent.mockResolvedValue("first");
+    apiMocks.getLiveProviderSettings.mockResolvedValue({ firstLive: true });
+    const props = {
+      open: true,
+      onOpenChange: vi.fn(),
+      onSubmit: vi.fn(),
+      appId: "claude" as const,
+    };
+    const view = render(
+      <EditProviderDialog
+        {...props}
+        provider={{ id: "first", name: "First", settingsConfig: {} }}
+      />,
+    );
+    await waitFor(() =>
+      expect(screen.getByTestId("settings-config")).toHaveTextContent(
+        "firstLive",
+      ),
+    );
+    let resolve!: (id: string) => void;
+    apiMocks.getCurrent.mockImplementationOnce(
+      () =>
+        new Promise((done) => {
+          resolve = done;
+        }),
+    );
+    apiMocks.getLiveProviderSettings.mockResolvedValue({ secondLive: true });
+    view.rerender(
+      <EditProviderDialog
+        {...props}
+        provider={{ id: "second", name: "Second", settingsConfig: {} }}
+      />,
+    );
+    expect(screen.getByRole("status")).toBeInTheDocument();
+    expect(screen.queryByTestId("settings-config")).not.toBeInTheDocument();
+    resolve("second");
+    await waitFor(() =>
+      expect(screen.getByTestId("settings-config")).toHaveTextContent(
+        "secondLive",
+      ),
+    );
+  });
   beforeEach(() => {
     apiMocks.getCurrent.mockReset();
     apiMocks.getLiveProviderSettings.mockReset();
     apiMocks.getOpenClawLiveProvider.mockReset();
+  });
+
+  it("keeps the loading shell until live lookup finishes and falls back after failure", async () => {
+    let reject!: (reason: Error) => void;
+    apiMocks.getCurrent.mockReturnValue(
+      new Promise((_, fail) => {
+        reject = fail;
+      }),
+    );
+    render(
+      <EditProviderDialog
+        open
+        provider={{ id: "slow", name: "Slow", settingsConfig: { saved: true } }}
+        onOpenChange={vi.fn()}
+        onSubmit={vi.fn()}
+        appId="claude"
+      />,
+    );
+    const loading = screen.getByRole("status");
+    expect(loading).toBeInTheDocument();
+    expect(screen.queryByTestId("settings-config")).not.toBeInTheDocument();
+    reject(new Error("Live lookup unavailable"));
+    await waitFor(() =>
+      expect(screen.getByTestId("settings-config")).toHaveTextContent(
+        '"saved":true',
+      ),
+    );
+    expect(loading).not.toBeInTheDocument();
   });
 
   it("保留 Codex 数据库中的 modelCatalog，避免 live 配置缺字段时清空模型映射", async () => {

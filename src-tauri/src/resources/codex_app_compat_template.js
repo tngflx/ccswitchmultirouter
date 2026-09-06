@@ -524,7 +524,7 @@
         if (!compacted)
           throw new Error("Timed out waiting for native Codex compaction");
 
-        return { completed: true };
+        return;
       } catch (error) {
         lastError = error;
       }
@@ -552,11 +552,10 @@
       startedAt: new Date().toISOString(),
     };
     void runSummarizeSession(normalizedThreadId).then(
-      (result) => {
+      () => {
         state.summarizeJobs[jobId] = {
           ...state.summarizeJobs[jobId],
           status: "completed",
-          result,
           completedAt: new Date().toISOString(),
         };
       },
@@ -665,7 +664,7 @@
               turnId,
               completedAt: new Date().toISOString(),
             };
-            return { completed: true, newThreadId, turnId };
+            return { newThreadId, turnId };
           }
           if (status === "failed" || status === "interrupted") {
             throw new Error(`Fresh-session handoff turn ${status}`);
@@ -695,8 +694,8 @@
       (result) => {
         state.freshSessionJobs[jobId] = {
           ...state.freshSessionJobs[jobId],
+          ...result,
           status: "completed",
-          result,
           completedAt: new Date().toISOString(),
         };
       },

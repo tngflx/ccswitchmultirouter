@@ -1,4 +1,6 @@
 import { useState, useCallback, useEffect } from "react";
+import { PagedModelList } from "./shared/PagedModelList";
+import { DeferredContent } from "@/components/common/DeferredContent";
 import { useTranslation } from "react-i18next";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -16,14 +18,7 @@ import {
   PopoverContent,
   PopoverTrigger,
 } from "@/components/ui/popover";
-import {
-  Command,
-  CommandEmpty,
-  CommandGroup,
-  CommandInput,
-  CommandItem,
-  CommandList,
-} from "@/components/ui/command";
+import { Command, CommandItem } from "@/components/ui/command";
 import {
   Plus,
   Trash2,
@@ -185,20 +180,14 @@ function ModelCombobox({
         collisionPadding={8}
         className="w-[var(--radix-popover-trigger-width)] p-0 border-border-default"
       >
-        <Command>
-          <CommandInput
-            placeholder={t("omo.searchModel", {
-              defaultValue: "Search model...",
-            })}
-          />
-          <CommandList>
-            <CommandEmpty>
-              {t("omo.noEnabledModels", {
-                defaultValue: "No configured models",
-              })}
-            </CommandEmpty>
-            <CommandGroup>
-              {options.map((option) => (
+        <DeferredContent>
+          <Command shouldFilter={false}>
+            <PagedModelList
+              items={options}
+              searchText={(option) => `${option.value} ${option.label}`}
+              command
+            >
+              {(option) => (
                 <CommandItem
                   key={option.value}
                   value={option.value}
@@ -216,10 +205,10 @@ function ModelCombobox({
                   />
                   {option.label}
                 </CommandItem>
-              ))}
-            </CommandGroup>
-          </CommandList>
-        </Command>
+              )}
+            </PagedModelList>
+          </Command>
+        </DeferredContent>
       </PopoverContent>
     </Popover>
   );

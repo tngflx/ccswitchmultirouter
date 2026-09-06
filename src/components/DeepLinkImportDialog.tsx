@@ -1,4 +1,4 @@
-import { useState, useEffect, useMemo } from "react";
+import { useState, useEffect, useMemo, useRef } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { DeepLinkImportRequest, deeplinkApi } from "@/lib/api/deeplink";
 import { parseDeepLinkConfigPreview } from "@/utils/deepLinkConfigPreview";
@@ -26,6 +26,7 @@ import {
   riskI18nKey,
 } from "@/utils/deeplinkRisk";
 import { decodeBase64Utf8 } from "@/lib/utils/base64";
+import { useGlobalLoading } from "@/contexts/GlobalLoadingContext";
 
 interface DeeplinkError {
   url: string;
@@ -35,9 +36,11 @@ interface DeeplinkError {
 export function DeepLinkImportDialog() {
   const { t } = useTranslation();
   const queryClient = useQueryClient();
+  const { runWithLoading } = useGlobalLoading();
   const [request, setRequest] = useState<DeepLinkImportRequest | null>(null);
   const [isImporting, setIsImporting] = useState(false);
   const [isOpen, setIsOpen] = useState(false);
+  const requestSequenceRef = useRef(0);
 
   // 容错判断：MCP 导入结果可能缺少 type 字段
   const isMcpImportResult = (
@@ -62,14 +65,17 @@ export function DeepLinkImportDialog() {
     const unlistenImport = listen<DeepLinkImportRequest>(
       "deeplink-import",
       async (event) => {
+        const requestSequence = ++requestSequenceRef.current;
         // If config is present, merge it to get the complete configuration
         if (event.payload.config || event.payload.configUrl) {
           try {
-            const mergedRequest = await deeplinkApi.mergeDeeplinkConfig(
-              event.payload,
+            const mergedRequest = await runWithLoading(() =>
+              deeplinkApi.mergeDeeplinkConfig(event.payload),
             );
+            if (requestSequenceRef.current !== requestSequence) return;
             setRequest(mergedRequest);
           } catch (error) {
+            if (requestSequenceRef.current !== requestSequence) return;
             console.error("Failed to merge config:", error);
             toast.error(t("deeplink.configMergeError"), {
               description:
@@ -79,9 +85,11 @@ export function DeepLinkImportDialog() {
             setRequest(event.payload);
           }
         } else {
+          if (requestSequenceRef.current !== requestSequence) return;
           setRequest(event.payload);
         }
 
+        if (requestSequenceRef.current !== requestSequence) return;
         setIsOpen(true);
       },
     );
@@ -98,15 +106,19 @@ export function DeepLinkImportDialog() {
       unlistenImport.then((fn) => fn());
       unlistenError.then((fn) => fn());
     };
-  }, [t]);
+  }, [t, runWithLoading]);
 
   const handleImport = async () => {
     if (!request) return;
 
+    const requestSequence = requestSequenceRef.current;
+    const importRequest = request;
+
     setIsImporting(true);
 
     try {
-      const result = await deeplinkApi.importFromDeeplink(request);
+      const result = await deeplinkApi.importFromDeeplink(importRequest);
+      if (requestSequenceRef.current !== requestSequence) return;
       const refreshMcp = async (summary: {
         importedCount: number;
         importedIds: string[];
@@ -178,7 +190,7 @@ export function DeepLinkImportDialog() {
           });
           toast.success(t("deeplink.skillImportSuccess"), {
             description: t("deeplink.skillImportSuccessDescription", {
-              repo: request.repo,
+            repo: importRequest.repo,
             }),
             closeButton: true,
           });
@@ -189,29 +201,34 @@ export function DeepLinkImportDialog() {
       } else {
         // Legacy return type (string ID) - assume provider
         await queryClient.invalidateQueries({
-          queryKey: ["providers", request.app],
+          queryKey: ["providers", importRequest.app],
         });
         toast.success(t("deeplink.importSuccess"), {
           description: t("deeplink.importSuccessDescription", {
-            name: request.name,
+            name: importRequest.name,
           }),
           closeButton: true,
         });
       }
 
       // Close dialog after all refreshes complete
-      setIsOpen(false);
+      if (requestSequenceRef.current === requestSequence) {
+        setIsOpen(false);
+      }
     } catch (error) {
       console.error("Failed to import from deep link:", error);
       toast.error(t("deeplink.importError"), {
         description: error instanceof Error ? error.message : String(error),
       });
     } finally {
-      setIsImporting(false);
+      if (requestSequenceRef.current === requestSequence) {
+        setIsImporting(false);
+      }
     }
   };
 
   const handleCancel = () => {
+    requestSequenceRef.current += 1;
     setIsOpen(false);
   };
 

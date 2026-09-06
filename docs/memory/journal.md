@@ -1,5 +1,94 @@
 # Engineering Journal (newest first)
 
+## 2026-09-06 - Summarized-session verification after fresh-session handoff
+
+- **What happened:** Final verification for the flattened summarized-session job contract was recovered in a fresh task after the original full-suite runners disappeared.
+- **Root cause:** The source fix is isolated and its focused coverage is green, while the shared dirty checkout contains unrelated frontend preset, catalog, and Hermes loader changes; the live pre-fix `cc-switch.exe` also prevents Cargo from replacing the debug executable.
+- **What we did:** Reaudited the six notification/handoff files and all removed-contract references, reran focused frontend and Rust tests, and attempted both full suites without stopping the live process or creating another target directory.
+- **Evidence:** `tests/lib/codexSummaryHandoff.test.ts` passed 7/7; `codex_desktop::tests` passed 44/44; `proxy::request_health::tests` passed 13/13; `cargo check --manifest-path src-tauri/Cargo.toml`, scoped Prettier, and `git diff --check` passed. The full frontend suite passed 170 files / 1408 tests and failed 5 files / 9 tests in `codexProviderPresets.reasoning`, `CodexFormFields`, `LargeModelEditors` (undefined `runWithLoading`), `ProviderForm.codexPreset`, and `codexCatalogSync`; `pnpm typecheck` failed on the same unrelated dirty Hermes scope error. Full Cargo reached compilation but failed with OS error 5 replacing the running `src-tauri/target/debug/cc-switch.exe`. Live Windows toast delivery remains unverified until the normal development process is rebuilt.
+- **What NOT to do again:** Do not attribute shared-checkout failures to this notification contract, kill the live proxy to clear a build lock, or claim native toast acceptance from source tests.
+
+## 2026-09-06 - Explicit Windows taskbar window icon
+
+- **What happened:** A user screenshot showed a present taskbar button with the generic Windows application icon after `pnpm dev`.
+- **Root cause:** The running main window had a small icon but no large icon (`WM_GETICON`: SMALL=258741199, BIG=0; class icons both zero). Tauri/wry delegates its window icon to Tao's small-icon API; the separate taskbar/large slot was never assigned. This is a confirmed assignment gap; whether it fully explains the screenshot still requires rebuilt-runtime acceptance. Extracted 32px PNGs from the configured ICO and running debug EXE had the same SHA256, `3E1F633E16DBD922D6A7A4538B1450276803745DDCC20C0BE5F8AB3875A9F3E5`, so the embedded asset was intact.
+- **What we did:** Register a Windows-only window-ready plugin that loads Tauri's embedded icon resource (32512) and assigns `WM_SETICON/ICON_BIG` for each window, including recreation. Keep the shared resource alive under Windows ownership and leave the small icon and window visibility intact. Provider-logo diagnosis is separate: `e883528ba` deliberately removed automatic website-favicon inference; specific affected provider names remain unconfirmed.
+- **Reference verdict:** Audited BigStrongSun/ccswitchmulti at `a169bf585` and farion1231/cc-switch at `db3461280`, recent icon history and relevant PRs. BigStrongSun's resource tracking and ICO fixes (`d7f012678`, `fe4e531b7`) are already inherited. Original [PR #5236](https://github.com/farion1231/cc-switch/pull/5236), `23ea773226749ec8615e7db1fbd6ca38bf275f51`, changes skip-taskbar behavior after reopening; rejected because this screenshot shows an existing button with a generic icon. No cherry-pick performed.
+- **Evidence:** Changed-source `cargo check --manifest-path src-tauri/Cargo.toml` passed. `cargo test --manifest-path src-tauri/Cargo.toml --lib windows_window_icon::tests` passed: 1 test, 0 failures, after waiting for the normal target lock. The test verifies large-icon assignment, preserved small icon, and unchanged hidden visibility; it does not verify the production executable resource or shell rendering. Scoped `rustfmt --check` and `git diff --check` passed. Earlier provider resolver run passed 12 tests against unchanged provider source. No failed patch checks; full suites and rebuilt live-window acceptance have not run for this fix.
+- **What NOT to do again:** Do not infer a deleted icon asset from a generic taskbar icon, alter Tao's documented small-icon contract, cherry-pick skip-taskbar changes for an icon-only symptom, clear shell caches as a root-cause fix, or use the pre-fix running EXE as acceptance evidence.
+
+## 2026-09-06 - Unified summarized-session job and Windows notification ownership
+
+- **What happened:** Reassessment found that a successful fresh-session job could be reported as failed because the injected renderer stored IDs under `job.result` while the dirty Rust poller read them from the job root. Windows result toasts also duplicated identity setup assumptions, used English-only text, and silently discarded delivery failures.
+- **Root cause:** JavaScript and Rust had competing completion shapes (`status` plus nested `result.completed`), and notification ownership was split between the Request Health module and duplicated forwarder error handling.
+- **What we did:** Flattened completed job data into one authoritative job object, removed the redundant summary result wrapper, retained Rust's root-field reads, centralized WinRT identity registration and localized result strings, and made Request Health own notification delivery-failure logging. Both current reference repositories were audited; neither contains this fork-specific handoff, while original PR #1635 is a separate Claude hook notification service and was not ported.
+- **Evidence:** Production-JavaScript handoff tests passed 7/7, including exact flat job-shape assertions. `codex_desktop::tests` passed 44/44; `proxy::request_health::tests` passed 13/13; `cargo check --manifest-path src-tauri/Cargo.toml`, `pnpm typecheck`, scoped Prettier, and `git diff --check` passed. BigStrongSun main was `a169bf585b` and original main was `db34612807` at audit time. The live `cc-switch.exe` started before the final backend edit, so native Windows notification delivery remains unverified until the normal development process is rebuilt.
+- **What NOT to do again:** Do not change only one side of an injected job contract, represent completion twice, discard WinRT delivery errors, or call source tests proof of a live Windows toast.
+
+## 2026-09-06 - Reaudited global loading coverage across pages
+
+- **What happened:** Direct page API actions were bypassing the global loading context even though query fetches and mutations were tracked automatically.
+- **Root cause:** `runWithLoading` was used only in selected dialogs/hooks; standalone actions in OpenAI-compatible, Hermes memory, MCP, Codex usage, workspace, and history repair could leave users without the global loader. Deferred list rendering used the loader visual but was not registered as a global task.
+- **What we did:** Registered deferred large-list rendering with `beginLoading`, and wrapped the identified direct API actions with `runWithLoading`. Reaudited async page operations and duplicate state writers, retaining existing local pending states for button-level UX.
+- **Evidence:** `pnpm typecheck` passed; focused loading/page/model tests passed (including OpenCode 12/12, large editors 2/2, global loading 4/4, deep link 2/2, settings dialog 10/10); `git diff --check` passed. Full frontend suite still has unrelated existing preset/Codex expectation failures; full Rust tests remain blocked by the live `cc-switch.exe` lock.
+- **What NOT to do again:** Do not assume React Query coverage includes direct IPC/API calls, and do not call a deferred loader global merely because it renders a spinner.
+
+## 2026-09-06 - Full suite rerun after in-list loader fix
+
+- **What happened:** Final frontend verification was rerun against the actual 400+ model loader implementation.
+- **Root cause:** The loader/list fixes were not responsible for the remaining suite failures; they are existing dirty-tree expectation or preset/capability mismatches.
+- **What we did:** Ran the full frontend suite after the latest source and test changes; retained the live process and normal build target constraints for Rust.
+- **Evidence:** `pnpm test:unit -- --reporter=dot` completed with 171 passing files / 1407 passing tests and 4 failing files / 8 failing tests: DeepSeek reasoning parameter, Zhipu GLM preset aliases, Codex rotation visibility, Codex preset endpoint, and catalog hydration expectations. `pnpm typecheck` and focused 19/19 model-loader tests pass. Full Cargo tests remain blocked by the live `cc-switch.exe` target lock.
+- **What NOT to do again:** Do not conflate unrelated preset/expectation failures with the model-list loader regression; investigate them as a separate batch.
+
+## 2026-09-06 - Paint loaders inside large provider model lists
+
+- **What happened:** Provider forms with 400+ OpenRouter/OpenCode models still blocked before users could see the existing page loader.
+- **Root cause:** Pagination limited the final DOM but model row controls were still constructed in the same synchronous render, so the loading shell could not paint. OpenCode also mounted a CodeMirror editor containing the entire model catalog alongside the structured list.
+- **What we did:** Added deferred render factories that commit a loader before constructing large row trees, applied them to OpenCode and the shared OpenClaw/Hermes/dropdown pager, reduced OpenCode pages from 40 to 20 rows, and collapse the large OpenCode raw JSON editor until requested. Opening the raw editor also paints a loader before CodeMirror mounts.
+- **Evidence:** `pnpm typecheck` passed. Focused Vitest passed 5 files / 19 tests, including 431-model OpenCode, OpenClaw, Hermes, shared pager, and dropdown cases. The OpenCode regression asserts the in-list loader, 20 mounted rows, and search access to model 430.
+- **What NOT to do again:** Do not call a list optimized merely because the final DOM is paged; expensive row construction and duplicate full-catalog editors must also sit behind a paint boundary.
+
+## 2026-09-06 - Final verification boundary results
+
+- **What happened:** Full verification was attempted after the competing-writer fixes.
+- **Root cause:** One existing Codex form expectation conflicts with the dirty-tree behavior that exposes the rotation selector; the Rust test binary was locked by a running `cc-switch.exe`.
+- **What we did:** Ran the complete frontend unit command and the complete Cargo test command without killing the live process or creating an alternate target.
+- **Evidence:** Frontend suite reported one failure in `tests/components/CodexFormFields.test.tsx` and otherwise passed; `cargo test --manifest-path src-tauri/Cargo.toml` reached test build then failed with `Access is denied` removing `src-tauri/target/debug/cc-switch.exe`. Targeted tests, `pnpm typecheck`, `cargo check`, and `git diff --check` passed.
+- **What NOT to do again:** Do not kill a live `cc-switch.exe` to clear a Cargo lock, and do not report the full suite as green when the Codex expectation still fails.
+
+## 2026-09-06 - Fixed competing async and state writers
+
+- **What happened:** The overwrite audit findings were converted into owned-layer fixes.
+- **Root cause:** CodeMirror listeners captured stale callbacks and treated external hydration as user edits; provider raw JSON and structured model state did not synchronize; settings refetches replaced dirty drafts; daily-memory and deep-link async completions had no identity gate; settings full replacements wrote outside the shared lock and used truncate writes.
+- **What we did:** Added callback refs and hydration annotations to both editors, valid-JSON rehydration for OpenCode/OpenClaw/Hermes structured state, dirty-field preservation during settings refetch, request sequence guards for daily-memory reads and deep-link imports, and atomic locked settings persistence.
+- **Evidence:** `pnpm typecheck` passed; focused frontend runs passed 8 settings-hook tests, 2 large-model tests, and 11 loading/deep-link/editor-adjacent tests; `cargo check --manifest-path src-tauri/Cargo.toml` passed; `git diff --check` passed. Full frontend/backend suites and live Tauri runtime were not tested.
+- **What NOT to do again:** Do not let external editor hydration call form callbacks, let stale async completions publish state, or persist full settings snapshots outside the settings lock.
+
+## 2026-09-06 - Competing writers audit finds remaining overwrite paths
+
+- **What happened:** Re-auditing beyond loading indicators found actual competing state writers. Findings remain open; application behavior was not changed in this audit.
+- **Root cause:** Provider raw JSON and structured model lists own separate drafts; CodeMirror listeners capture old callbacks and echo hydration; settings refetch replaces local edits; backend full-settings writes persist outside the lock used by field mutations. Daily-memory and deep-link completions lack request identity guards.
+- **What we did:** Traced ownership boundaries, reproduced frontend defects, and retained the [audit and probe fixture](incidents/2026-09-06-competing-writers-audit.md). Both references were inspected; original upstream 84e75ad2 has an applicable JSON callback-ref fix but does not settle every finding.
+- **Evidence:** Temporary actual-component/hook Vitest probes: first run 6/6 assertions failed, expanded run 8/8 failed on the identified defects. Fixture moved outside normal test discovery afterward. Backend and asynchronous event findings are source-level, not runtime-tested. No application edits, backend/full suites, typecheck, or live Tauri inspection in this audit.
+- **What NOT to do again:** Do not claim loaders fix competing writers, blindly wire two-way effects, or equate a per-widget pending flag with serialized settings persistence.
+
+## 2026-09-06 - Follow-up loading audit and async editor identity
+
+- **What happened:** Follow-up to the large-model entry below found additional pending work without feedback and editor identity races.
+- **Root cause:** Workspace reads had no cancellation/error gate; provider live readiness survived provider changes; ProviderForm discarded common-config loading flags. Usage filters still mounted every model, and direct export/deep-link work bypassed query loading tracking.
+- **What we did:** Keyed editor sessions by identity, ignored cancelled file reads, blocked saving failed reads, gated form initialization, bounded usage filters, and exposed export/deep-link/retry/reverse-migration pending states. Preserved encoded filter values so a literal model named `all` remains selectable.
+- **Evidence:** Router suite now passes 90/90 with a real virtualizer and explicit jsdom viewport. Seven related files passed 33/33 tests; migration tests passed 2/2, picker tests 3/3, and delayed common-config regression 1/1. Broader Codex consumer rerun passed 67/72: four failures expect older GLM preset values, one expects rotation hidden despite the pre-existing CodexFormFields edit. Typecheck still reports the pre-existing unused `onPruneOutdated` parameter. Desktop/mobile Chromium picker checks passed with 20 mounted options, 280px JSON editor, and no overflow. Scoped formatting passed. No backend/full suites or live Tauri verification.
+- **What NOT to do again:** Do not assume editor identity remains constant while open, allow failed reads to become writable empty documents, or treat passing targeted tests as proof that every UI is fixed. See the [follow-up audit](incidents/2026-09-06-large-model-loading.md#follow-up-audit).
+
+## 2026-09-06 - Bound large model rendering and expose pending work
+
+- **What happened:** 400+ model catalogs could stall provider forms and model choosers while loading feedback was absent or hidden by cached data.
+- **Root cause:** Eager model-option/editor rendering and unbounded raw JSON editor height created synchronous work; initial observed queries were absent from the global indicator, and edit forms mounted before live configuration settled.
+- **What we did:** Added searchable bounded model lists, deferred form/menu mounting with a loading shell, explicit JSON editor heights, initial-query/manual loading coverage, and refresh spinner precedence. Virtualized the router ordering catalog while retaining cross-viewport dragging, and indexed provider/model ownership instead of repeatedly scanning catalogs. Reference repositories had useful searchable UI but no complete bounded-rendering solution. See [audit and scope](incidents/2026-09-06-large-model-loading.md).
+- **Evidence:** Targeted frontend runs passed 16 files / 145 tests; the 2 large-editor tests passed again after their typing correction. Headless Chromium checked 431-model editors, shared picker, JSON viewport, and router keyboard/cross-viewport drag ordering at desktop/mobile sizes. Scoped formatting and `git diff --check` passed. Final `pnpm typecheck` failed only at the pre-existing dirty `CodexProviderReadinessSection.tsx:68` unused `onPruneOutdated` parameter. Existing test warnings remain. Live Tauri, backend/full suites, and complete router save workflows were not tested.
+- **What NOT to do again:** Do not add spinners while retaining unbounded synchronous rendering, truncate persisted catalogs to improve performance, remove cross-catalog drag semantics, or claim component browser checks verify the running Tauri process.
+
 ## 2026-09-05 - Separate Codex API-key groups from pooled rotation
 
 - **What happened:** A Sublyx `gpt-5.6-sol` request could use a secondary subscription key when primary and secondary groups listed the same model.

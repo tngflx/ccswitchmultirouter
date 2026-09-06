@@ -31,6 +31,7 @@ import { ScrollArea } from "@/components/ui/scroll-area";
 import { ProviderIcon } from "@/components/ProviderIcon";
 import { proxyApi } from "@/lib/api/proxy";
 import { cn } from "@/lib/utils";
+import { useGlobalLoading } from "@/contexts/GlobalLoadingContext";
 import type {
   CodexModelPickerUnlockResult,
   CodexHistorySessionDetailOutcome,
@@ -94,6 +95,7 @@ export function CodexHistoryRepairPanel({
   const didAutoLoadRef = useRef(false);
 
   const { t } = useTranslation();
+  const { runWithLoading } = useGlobalLoading();
 
   const normalizedCodexHome = codexHome.trim();
   const normalizedStateDbPath = stateDbPath.trim();
@@ -124,7 +126,9 @@ export function CodexHistoryRepairPanel({
     setIsRepairingAppHistory(true);
     setAppRepairError(null);
     try {
-      const result = await proxyApi.unlockCodexModelPicker();
+      const result = await runWithLoading(() =>
+        proxyApi.unlockCodexModelPicker(),
+      );
       setAppRepairResult(result);
       if (result.historySyncRequested) {
         toast.success(t("historyRepair.appNativeRebuildTriggered"));

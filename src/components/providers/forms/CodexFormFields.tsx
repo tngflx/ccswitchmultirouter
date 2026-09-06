@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { useTranslation } from "react-i18next";
+import { useGlobalLoading } from "@/contexts/GlobalLoadingContext";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -37,6 +38,7 @@ import {
   CircleHelp,
   ImageIcon,
   Plus,
+  Sparkles,
   Trash2,
   Type,
   X,
@@ -962,6 +964,7 @@ export function CodexFormFields({
   onLocalProxyBodyOverrideChange,
 }: CodexFormFieldsProps) {
   const { t } = useTranslation();
+  const { runWithLoading } = useGlobalLoading();
 
   const [fetchedModels, setFetchedModels] = useState<FetchedModel[]>([]);
   const enabledGroupedApiKeys = useMemo(
@@ -1492,7 +1495,7 @@ export function CodexFormFields({
         }
         const seq = ++fetchModelsSeqRef.current;
         setModelCatalogAction(fetchMode);
-        fetchXaiOauthModels(selectedXaiAccountId ?? null)
+        runWithLoading(() => fetchXaiOauthModels(selectedXaiAccountId ?? null))
           .then((models) => {
             if (seq !== fetchModelsSeqRef.current) return;
             setFetchedModels(models);
@@ -1601,21 +1604,23 @@ export function CodexFormFields({
       setModelCatalogAction(fetchMode);
       const credentialKeys =
         keysToFetch.length > 0 ? keysToFetch : [codexApiKey];
-      Promise.allSettled(
-        credentialKeys.map((key) =>
-          fetchModelsForConfig(
-            codexBaseUrl,
-            key,
-            isFullUrl,
-            undefined,
-            customUserAgent,
-            planModelListAction
-              ? {
-                  action: planModelListAction,
-                  accessKeyId: planAccessKeyId ?? "",
-                  secretAccessKey: planSecretAccessKey ?? "",
-                }
-              : undefined,
+      runWithLoading(() =>
+        Promise.allSettled(
+          credentialKeys.map((key) =>
+            fetchModelsForConfig(
+              codexBaseUrl,
+              key,
+              isFullUrl,
+              undefined,
+              customUserAgent,
+              planModelListAction
+                ? {
+                    action: planModelListAction,
+                    accessKeyId: planAccessKeyId ?? "",
+                    secretAccessKey: planSecretAccessKey ?? "",
+                  }
+                : undefined,
+            ),
           ),
         ),
       )
@@ -1749,6 +1754,7 @@ export function CodexFormFields({
       isXaiOauthAuthenticated,
       selectedXaiAccountId,
       t,
+      runWithLoading,
     ],
   );
 
@@ -2607,7 +2613,7 @@ export function CodexFormFields({
           </div>
           <div className="mt-3">
             <div
-              className="inline-flex rounded-md border border-border-default p-0.5"
+              className="inline-flex rounded-md border border-border-default bg-muted/30 p-1 shadow-sm"
               role="group"
               aria-label={t("codexConfig.apiKeyGroupMode")}
             >
@@ -2617,7 +2623,12 @@ export function CodexFormFields({
                   type="button"
                   size="sm"
                   variant={apiKeyGroupMode === mode ? "secondary" : "ghost"}
-                  className="h-7 rounded px-3"
+                  className={cn(
+                    "h-8 rounded px-3 font-medium transition-colors",
+                    apiKeyGroupMode === mode
+                      ? "bg-primary text-primary-foreground shadow-sm hover:bg-primary/90"
+                      : "text-muted-foreground hover:bg-background hover:text-foreground",
+                  )}
                   aria-pressed={apiKeyGroupMode === mode}
                   onClick={() => onApiKeyGroupModeChange(mode)}
                 >
@@ -2685,46 +2696,44 @@ export function CodexFormFields({
                         defaultValue: "Enabled",
                       })}
                     </label>
-                    {group.apiKeys.length > 1 && (
-                      <Select
-                        value={group.strategy ?? "round_robin"}
-                        onValueChange={(
-                          value: "fixed" | "round_robin" | "random",
-                        ) =>
-                          onApiKeyGroupsChange(
-                            apiKeyGroups.map((item, index) =>
-                              index === groupIndex
-                                ? { ...item, strategy: value }
-                                : item,
-                            ),
-                          )
-                        }
+                    <Select
+                      value={group.strategy ?? "round_robin"}
+                      onValueChange={(
+                        value: "fixed" | "round_robin" | "random",
+                      ) =>
+                        onApiKeyGroupsChange(
+                          apiKeyGroups.map((item, index) =>
+                            index === groupIndex
+                              ? { ...item, strategy: value }
+                              : item,
+                          ),
+                        )
+                      }
+                    >
+                      <SelectTrigger
+                        className="h-9 w-36"
+                        aria-label={t("codexConfig.apiKeyGroupStrategy", {
+                          defaultValue: "Rotation",
+                        })}
                       >
-                        <SelectTrigger
-                          className="h-9 w-36"
-                          aria-label={t("codexConfig.apiKeyGroupStrategy", {
-                            defaultValue: "Rotation",
+                        <SelectValue />
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="fixed">
+                          {t("codexConfig.apiKeyGroupFixed")}
+                        </SelectItem>
+                        <SelectItem value="round_robin">
+                          {t("codexConfig.apiKeyGroupRoundRobin", {
+                            defaultValue: "Round robin",
                           })}
-                        >
-                          <SelectValue />
-                        </SelectTrigger>
-                        <SelectContent>
-                          <SelectItem value="fixed">
-                            {t("codexConfig.apiKeyGroupFixed")}
-                          </SelectItem>
-                          <SelectItem value="round_robin">
-                            {t("codexConfig.apiKeyGroupRoundRobin", {
-                              defaultValue: "Round robin",
-                            })}
-                          </SelectItem>
-                          <SelectItem value="random">
-                            {t("codexConfig.apiKeyGroupRandom", {
-                              defaultValue: "Random",
-                            })}
-                          </SelectItem>
-                        </SelectContent>
-                      </Select>
-                    )}
+                        </SelectItem>
+                        <SelectItem value="random">
+                          {t("codexConfig.apiKeyGroupRandom", {
+                            defaultValue: "Random",
+                          })}
+                        </SelectItem>
+                      </SelectContent>
+                    </Select>
                     <Button
                       type="button"
                       variant="ghost"
@@ -2802,27 +2811,25 @@ export function CodexFormFields({
                         </div>
                       ),
                     )}
-                    {group.strategy !== "fixed" && (
-                      <Button
-                        type="button"
-                        variant="ghost"
-                        size="sm"
-                        onClick={() =>
-                          onApiKeyGroupsChange(
-                            apiKeyGroups.map((item, index) =>
-                              index === groupIndex
-                                ? { ...item, apiKeys: [...item.apiKeys, ""] }
-                                : item,
-                            ),
-                          )
-                        }
-                      >
-                        <Plus className="mr-1 h-3.5 w-3.5" />
-                        {t("codexConfig.apiKeyGroupAddKey", {
-                          defaultValue: "Add key",
-                        })}
-                      </Button>
-                    )}
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="sm"
+                      onClick={() =>
+                        onApiKeyGroupsChange(
+                          apiKeyGroups.map((item, index) =>
+                            index === groupIndex
+                              ? { ...item, apiKeys: [...item.apiKeys, ""] }
+                              : item,
+                          ),
+                        )
+                      }
+                    >
+                      <Plus className="mr-1 h-3.5 w-3.5" />
+                      {t("codexConfig.apiKeyGroupAddKey", {
+                        defaultValue: "Add key",
+                      })}
+                    </Button>
                   </div>
                   <CodexKeyGroupModels
                     group={group}
@@ -3032,7 +3039,6 @@ export function CodexFormFields({
           sectionRef={modelMappingSectionRef}
           onSyncModels={handleFetchModels}
           onFillMissingFields={handleFillMissingModelFields}
-          onPruneOutdated={handlePruneOutdated}
           onCreateProtocolGroups={() => {
             const nextRows = applyDefaultCodexProtocolGroups(
               catalogRowsRef.current,
@@ -4091,6 +4097,26 @@ export function CodexFormFields({
                           )}
                         </div>
                         <div className="flex items-center gap-1 sm:ml-auto">
+                          <Button
+                            type="button"
+                            size="sm"
+                            variant="outline"
+                            className="h-8 gap-1"
+                            disabled={catalogRows.length < 2}
+                            onClick={handlePruneOutdated}
+                            title={t(
+                              "codexConfig.providerReadiness.pruneOutdatedTitle",
+                              {
+                                defaultValue:
+                                  "Keep the newest model versions and common variants",
+                              },
+                            )}
+                          >
+                            <Sparkles className="h-3.5 w-3.5" />
+                            {t("codexConfig.providerReadiness.pruneOutdated", {
+                              defaultValue: "Keep latest versions",
+                            })}
+                          </Button>
                           <label className="flex h-8 cursor-pointer items-center gap-2 rounded-md border px-2 text-xs font-medium">
                             <input
                               type="checkbox"

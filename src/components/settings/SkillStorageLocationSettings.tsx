@@ -83,6 +83,14 @@ export function SkillStorageLocationSettings({
           disabled={isMigrating}
           onClick={() => handleSelect("cc_switch")}
         >
+          {isMigrating && value !== "cc_switch" ? (
+            <Loader2
+              size={14}
+              className="mr-1 animate-spin"
+              role="status"
+              aria-label={t("common.loading")}
+            />
+          ) : null}
           {t("settings.skillStorage.ccSwitch")}
         </StorageButton>
         <StorageButton
@@ -91,7 +99,12 @@ export function SkillStorageLocationSettings({
           onClick={() => handleSelect("unified")}
         >
           {isMigrating && value !== "unified" ? (
-            <Loader2 size={14} className="mr-1 animate-spin" />
+            <Loader2
+              size={14}
+              className="mr-1 animate-spin"
+              role="status"
+              aria-label={t("common.loading")}
+            />
           ) : null}
           {t("settings.skillStorage.unified")}
         </StorageButton>

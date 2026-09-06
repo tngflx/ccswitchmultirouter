@@ -1,58 +1,97 @@
 import { useMemo, useState } from "react";
+import { useTranslation } from "react-i18next";
 import { ChevronDown } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import { Command, CommandItem } from "@/components/ui/command";
 import {
-  DropdownMenu,
-  DropdownMenuContent,
-  DropdownMenuItem,
-  DropdownMenuLabel,
-  DropdownMenuSeparator,
-  DropdownMenuTrigger,
-} from "@/components/ui/dropdown-menu";
+  Popover,
+  PopoverContent,
+  PopoverTrigger,
+} from "@/components/ui/popover";
+import { DeferredContent } from "@/components/common/DeferredContent";
+import { PagedModelList } from "./PagedModelList";
 import type { FetchedModel } from "@/lib/api/model-fetch";
+
+const searchText = (model: FetchedModel) =>
+  `${model.id} ${model.ownedBy || ""}`;
 
 export function ModelDropdown({
   models,
   onSelect,
+  label,
+  getLabel = (id) => id,
 }: {
   models: FetchedModel[];
   onSelect: (id: string) => void;
+  label?: string;
+  getLabel?: (id: string) => string;
 }) {
+  const { t } = useTranslation();
   const [open, setOpen] = useState(false);
-  const grouped = useMemo(() => {
-    if (!open) return {} as Record<string, FetchedModel[]>;
-    const result: Record<string, FetchedModel[]> = {};
-    for (const model of models) {
-      const vendor = model.ownedBy || "Other";
-      if (!result[vendor]) result[vendor] = [];
-      result[vendor].push(model);
-    }
-    return result;
-  }, [models, open]);
-  const vendors = Object.keys(grouped).sort();
+  const ordered = useMemo(
+    () =>
+      open
+        ? [...models].sort((a, b) =>
+            (a.ownedBy || "").localeCompare(b.ownedBy || ""),
+          )
+        : [],
+    [models, open],
+  );
 
   return (
-    <DropdownMenu open={open} onOpenChange={setOpen}>
-      <DropdownMenuTrigger asChild>
-        <Button variant="outline" size="icon" className="shrink-0">
+    <Popover modal open={open} onOpenChange={setOpen}>
+      <PopoverTrigger asChild>
+        <Button
+          type="button"
+          variant="outline"
+          size={label ? "sm" : "icon"}
+          className="shrink-0 max-w-48 gap-2"
+          aria-label={label ?? t("omo.selectModel")}
+          title={label ?? t("omo.selectModel")}
+        >
+          {label && <span className="truncate">{label}</span>}
           <ChevronDown className="h-4 w-4" />
         </Button>
-      </DropdownMenuTrigger>
+      </PopoverTrigger>
       {open && (
-        <DropdownMenuContent align="end" className="max-h-64 overflow-y-auto">
-          {vendors.map((vendor, vi) => (
-            <div key={vendor}>
-              {vi > 0 && <DropdownMenuSeparator />}
-              <DropdownMenuLabel>{vendor}</DropdownMenuLabel>
-              {grouped[vendor].map((m) => (
-                <DropdownMenuItem key={m.id} onSelect={() => onSelect(m.id)}>
-                  {m.id}
-                </DropdownMenuItem>
-              ))}
-            </div>
-          ))}
-        </DropdownMenuContent>
+        <PopoverContent
+          align="end"
+          className="w-80 max-w-[calc(100vw-2rem)] p-0"
+        >
+          <DeferredContent>
+            <Command shouldFilter={false}>
+              <PagedModelList
+                items={ordered}
+                searchText={(model) =>
+                  `${searchText(model)} ${getLabel(model.id)}`
+                }
+                command
+              >
+                {(model) => (
+                  <CommandItem
+                    key={model.id}
+                    value={model.id}
+                    className="min-w-0 break-all"
+                    onSelect={() => {
+                      onSelect(model.id);
+                      setOpen(false);
+                    }}
+                  >
+                    <span>
+                      {getLabel(model.id)}
+                      {model.ownedBy && (
+                        <span className="block text-xs text-muted-foreground">
+                          {model.ownedBy}
+                        </span>
+                      )}
+                    </span>
+                  </CommandItem>
+                )}
+              </PagedModelList>
+            </Command>
+          </DeferredContent>
+        </PopoverContent>
       )}
-    </DropdownMenu>
+    </Popover>
   );
 }

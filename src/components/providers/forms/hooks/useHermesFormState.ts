@@ -1,4 +1,4 @@
-import { useState, useCallback, useMemo } from "react";
+import { useState, useCallback, useMemo, useEffect } from "react";
 import type { AppId } from "@/lib/api";
 import { useProvidersQuery } from "@/lib/query/queries";
 import {
@@ -122,6 +122,17 @@ export function useHermesFormState({
     if (appId !== "hermes") return undefined;
     return parseRateLimitDelay(initialData?.settingsConfig?.rate_limit_delay);
   });
+
+  const settingsConfig = getSettingsConfig();
+  useEffect(() => {
+    if (appId !== "hermes") return;
+    try {
+      const config = JSON.parse(settingsConfig) as Record<string, unknown>;
+      if (Array.isArray(config.models)) setHermesModels(config.models as HermesModel[]);
+    } catch {
+      // Preserve structured state while raw JSON is temporarily invalid.
+    }
+  }, [appId, settingsConfig]);
 
   const updateHermesConfig = useCallback(
     (updater: (config: Record<string, unknown>) => void) => {

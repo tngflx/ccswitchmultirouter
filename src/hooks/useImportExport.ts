@@ -3,6 +3,7 @@ import { useTranslation } from "react-i18next";
 import { toast } from "sonner";
 import { settingsApi } from "@/lib/api";
 import { syncCurrentProvidersLiveSafe } from "@/utils/postChangeSync";
+import { useGlobalLoading } from "@/contexts/GlobalLoadingContext";
 
 export type ImportStatus =
   | "idle"
@@ -32,6 +33,7 @@ export function useImportExport(
   options: UseImportExportOptions = {},
 ): UseImportExportResult {
   const { t } = useTranslation();
+  const { runWithLoading } = useGlobalLoading();
   const { onImportSuccess } = options;
 
   const [selectedFile, setSelectedFile] = useState("");
@@ -155,7 +157,9 @@ export function useImportExport(
         return;
       }
 
-      const result = await settingsApi.exportConfigToFile(destination);
+      const result = await runWithLoading(() =>
+        settingsApi.exportConfigToFile(destination),
+      );
       if (result.success) {
         const displayPath = result.filePath ?? destination;
         toast.success(
@@ -180,7 +184,7 @@ export function useImportExport(
         }),
       );
     }
-  }, [t]);
+  }, [t, runWithLoading]);
 
   const resetStatus = useCallback(() => {
     setStatus("idle");

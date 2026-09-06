@@ -75,7 +75,7 @@ describe("OpenCodeFormFields", () => {
     expect(screen.getByDisplayValue("1048576")).toBeVisible();
   });
 
-  it("bounds large model catalogs and keeps every model searchable", () => {
+  it("paints a loader before bounding large catalogs and keeps every model searchable", async () => {
     const models = Object.fromEntries(
       Array.from({ length: 430 }, (_, index) => [
         `openrouter/model-${index + 1}`,
@@ -85,9 +85,10 @@ describe("OpenCodeFormFields", () => {
 
     renderOpenCodeForm({ models });
 
+    expect(screen.getByRole("status")).toBeInTheDocument();
     expect(
-      screen.getAllByRole("button", { name: "Toggle model details" }),
-    ).toHaveLength(40);
+      await screen.findAllByRole("button", { name: "Toggle model details" }),
+    ).toHaveLength(20);
     expect(screen.queryByDisplayValue("openrouter/model-430")).toBeNull();
 
     fireEvent.change(

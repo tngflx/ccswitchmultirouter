@@ -78,6 +78,7 @@ export function useSettingsForm(): UseSettingsFormResult {
   );
 
   const initialLanguageRef = useRef<Language>("en");
+  const dirtyFieldsRef = useRef<Set<keyof SettingsFormState>>(new Set());
 
   const readPersistedLanguage = useCallback((): Language => {
     if (typeof window !== "undefined") {
@@ -130,7 +131,14 @@ export function useSettingsForm(): UseSettingsFormResult {
       language: normalizedLanguage,
     };
 
-    setSettingsState(normalized);
+    setSettingsState((current) => {
+      if (!current || dirtyFieldsRef.current.size === 0) return normalized;
+      const merged = { ...normalized };
+      for (const field of dirtyFieldsRef.current) {
+        merged[field] = current[field] as never;
+      }
+      return merged;
+    });
     initialLanguageRef.current = normalizedLanguage;
     syncLanguage(normalizedLanguage);
   }, [data, readPersistedLanguage, syncLanguage]);
@@ -156,6 +164,10 @@ export function useSettingsForm(): UseSettingsFormResult {
           ...base,
           ...updates,
         };
+
+        for (const key of Object.keys(updates) as Array<keyof SettingsFormState>) {
+          dirtyFieldsRef.current.add(key);
+        }
 
         if (updates.language) {
           const normalized = normalizeLanguage(updates.language);
@@ -200,6 +212,7 @@ export function useSettingsForm(): UseSettingsFormResult {
         language: normalizedLanguage,
       };
 
+      dirtyFieldsRef.current.clear();
       setSettingsState(normalized);
       syncLanguage(initialLanguageRef.current);
     },

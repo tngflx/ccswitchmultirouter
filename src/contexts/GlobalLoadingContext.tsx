@@ -8,7 +8,7 @@ import {
   useState,
   type ReactNode,
 } from "react";
-import { useIsMutating } from "@tanstack/react-query";
+import { useIsFetching, useIsMutating } from "@tanstack/react-query";
 import { Loader2 } from "lucide-react";
 import { useTranslation } from "react-i18next";
 
@@ -35,6 +35,12 @@ export function GlobalLoadingProvider({
 }) {
   const { t } = useTranslation();
   const nextTaskId = useRef(0);
+  const fetchingCount = useIsFetching({
+    predicate: (query) =>
+      query.getObserversCount() > 0 &&
+      query.state.data === undefined &&
+      query.meta?.showGlobalLoading !== false,
+  });
   const [manualTasks, setManualTasks] = useState<
     Map<number, string | undefined>
   >(() => new Map());
@@ -69,7 +75,7 @@ export function GlobalLoadingProvider({
     [beginLoading],
   );
 
-  const active = manualTasks.size > 0 || mutatingCount > 0;
+  const active = manualTasks.size > 0 || mutatingCount > 0 || fetchingCount > 0;
   const [visible, setVisible] = useState(false);
 
   useEffect(() => {

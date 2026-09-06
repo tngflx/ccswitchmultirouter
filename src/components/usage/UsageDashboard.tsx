@@ -55,6 +55,7 @@ import { UsageDateRangePicker } from "./UsageDateRangePicker";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { usageApi } from "@/lib/api/usage";
 import { toast } from "sonner";
+import { ModelDropdown } from "@/components/providers/forms/shared/ModelDropdown";
 
 const APP_FILTER_OPTIONS: AppTypeFilter[] = ["all", ...KNOWN_APP_TYPES];
 
@@ -312,57 +313,22 @@ export function UsageDashboard({
             })}
           </div>
 
-          <Select
-            value={
-              providerName != null ? encodeOptionValue(providerName) : "all"
-            }
-            onValueChange={(v) => changeProviderName(decodeOptionValue(v))}
-          >
-            <SelectTrigger
-              className="h-9 w-[100px] bg-background text-xs focus:border-border-default [&>span]:min-w-0 [&>span]:truncate"
-              title={providerName ?? t("usage.filterBySource")}
-            >
-              <SelectValue />
-            </SelectTrigger>
-            <SelectContent className="max-w-[280px]">
-              <SelectItem value="all">{t("usage.allSources")}</SelectItem>
-              {providerOptions.map((name) => (
-                <SelectItem
-                  key={name}
-                  value={encodeOptionValue(name)}
-                  title={name}
-                  className="[&>span]:min-w-0 [&>span]:truncate"
-                >
-                  {name}
-                </SelectItem>
-              ))}
-            </SelectContent>
-          </Select>
-
-          <Select
-            value={model != null ? encodeOptionValue(model) : "all"}
-            onValueChange={(v) => setModel(decodeOptionValue(v))}
-          >
-            <SelectTrigger
-              className="h-9 w-[100px] bg-background text-xs focus:border-border-default [&>span]:min-w-0 [&>span]:truncate"
-              title={model ?? t("usage.filterByModel")}
-            >
-              <SelectValue />
-            </SelectTrigger>
-            <SelectContent className="max-w-[280px]">
-              <SelectItem value="all">{t("usage.allModels")}</SelectItem>
-              {modelOptions.map((name) => (
-                <SelectItem
-                  key={name}
-                  value={encodeOptionValue(name)}
-                  title={name}
-                  className="[&>span]:min-w-0 [&>span]:truncate"
-                >
-                  {name}
-                </SelectItem>
-              ))}
-            </SelectContent>
-          </Select>
+          <ModelDropdown
+            label={providerName ?? t("usage.allSources")}
+            models={["all", ...providerOptions.map(encodeOptionValue)].map(
+              (id) => ({ id, ownedBy: null }),
+            )}
+            getLabel={(id) => decodeOptionValue(id) ?? t("usage.allSources")}
+            onSelect={(id) => changeProviderName(decodeOptionValue(id))}
+          />
+          <ModelDropdown
+            label={model ?? t("usage.allModels")}
+            models={["all", ...modelOptions.map(encodeOptionValue)].map(
+              (id) => ({ id, ownedBy: null }),
+            )}
+            getLabel={(id) => decodeOptionValue(id) ?? t("usage.allModels")}
+            onSelect={(id) => setModel(decodeOptionValue(id))}
+          />
 
           <div className="flex items-center gap-2 ml-auto lg:ml-0">
             <Select

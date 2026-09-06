@@ -1,4 +1,4 @@
-import { useState, useCallback, useMemo } from "react";
+import { useState, useCallback, useMemo, useEffect } from "react";
 import type { OpenClawModel, OpenClawProviderConfig } from "@/types";
 import type { AppId } from "@/lib/api";
 import { useProvidersQuery } from "@/lib/query/queries";
@@ -101,6 +101,17 @@ export function useOpenclawFormState({
     );
     return "User-Agent" in headers;
   });
+
+  const settingsConfig = getSettingsConfig();
+  useEffect(() => {
+    if (appId !== "openclaw") return;
+    try {
+      const config = JSON.parse(settingsConfig) as Record<string, unknown>;
+      if (Array.isArray(config.models)) setOpenclawModels(config.models as OpenClawModel[]);
+    } catch {
+      // Preserve structured state while raw JSON is temporarily invalid.
+    }
+  }, [appId, settingsConfig]);
 
   const updateOpenclawConfig = useCallback(
     (updater: (config: Record<string, any>) => void) => {

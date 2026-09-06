@@ -5,6 +5,7 @@ import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { FullScreenPanel } from "@/components/common/FullScreenPanel";
+import { DeferredContent } from "@/components/common/DeferredContent";
 import type { Provider, CustomEndpoint, UniversalProvider } from "@/types";
 import type { AppId } from "@/lib/api";
 import { universalProvidersApi } from "@/lib/api";
@@ -522,14 +523,16 @@ export function AddProviderDialog({
           </TabsList>
 
           <TabsContent value="app-specific" className="mt-0">
-            <ProviderForm
-              appId={appId}
-              submitLabel={t("common.add")}
-              onSubmit={handleSubmit}
-              onCancel={() => onOpenChange(false)}
-              onSubmittingChange={setIsFormSubmitting}
-              showButtons={false}
-            />
+            <DeferredContent>
+              <ProviderForm
+                appId={appId}
+                submitLabel={t("common.add")}
+                onSubmit={handleSubmit}
+                onCancel={() => onOpenChange(false)}
+                onSubmittingChange={setIsFormSubmitting}
+                showButtons={false}
+              />
+            </DeferredContent>
           </TabsContent>
 
           <TabsContent value="universal" className="mt-0">
@@ -540,14 +543,16 @@ export function AddProviderDialog({
         </Tabs>
       ) : (
         // OpenCode/OpenClaw: directly show form without tabs
-        <ProviderForm
-          appId={appId}
-          submitLabel={t("common.add")}
-          onSubmit={handleSubmit}
-          onCancel={() => onOpenChange(false)}
-          onSubmittingChange={setIsFormSubmitting}
-          showButtons={false}
-        />
+        <DeferredContent>
+          <ProviderForm
+            appId={appId}
+            submitLabel={t("common.add")}
+            onSubmit={handleSubmit}
+            onCancel={() => onOpenChange(false)}
+            onSubmittingChange={setIsFormSubmitting}
+            showButtons={false}
+          />
+        </DeferredContent>
       )}
 
       {showUniversalTab && (
