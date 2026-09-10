@@ -1,4 +1,5 @@
-import React, { useEffect, useState } from "react";
+import { useDarkMode } from "@/hooks/useDarkMode";
+import React from "react";
 import { useTranslation } from "react-i18next";
 import JsonEditor from "@/components/JsonEditor";
 
@@ -27,22 +28,7 @@ export const GeminiEnvSection: React.FC<GeminiEnvSectionProps> = ({
   commonConfigError,
 }) => {
   const { t } = useTranslation();
-  const [isDarkMode, setIsDarkMode] = useState(false);
-
-  useEffect(() => {
-    setIsDarkMode(document.documentElement.classList.contains("dark"));
-
-    const observer = new MutationObserver(() => {
-      setIsDarkMode(document.documentElement.classList.contains("dark"));
-    });
-
-    observer.observe(document.documentElement, {
-      attributes: true,
-      attributeFilter: ["class"],
-    });
-
-    return () => observer.disconnect();
-  }, []);
+  const isDarkMode = useDarkMode();
 
   const handleChange = (newValue: string) => {
     onChange(newValue);
@@ -134,22 +120,7 @@ export const GeminiConfigSection: React.FC<GeminiConfigSectionProps> = ({
   configError,
 }) => {
   const { t } = useTranslation();
-  const [isDarkMode, setIsDarkMode] = useState(false);
-
-  useEffect(() => {
-    setIsDarkMode(document.documentElement.classList.contains("dark"));
-
-    const observer = new MutationObserver(() => {
-      setIsDarkMode(document.documentElement.classList.contains("dark"));
-    });
-
-    observer.observe(document.documentElement, {
-      attributes: true,
-      attributeFilter: ["class"],
-    });
-
-    return () => observer.disconnect();
-  }, []);
+  const isDarkMode = useDarkMode();
 
   return (
     <div className="space-y-2">

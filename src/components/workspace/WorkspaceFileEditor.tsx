@@ -1,3 +1,4 @@
+import { useDarkMode } from "@/hooks/useDarkMode";
 import React, { useState, useEffect, useCallback } from "react";
 import { useTranslation } from "react-i18next";
 import { toast } from "sonner";
@@ -23,19 +24,7 @@ const WorkspaceFileEditor: React.FC<WorkspaceFileEditorProps> = ({
   const [loading, setLoading] = useState(true);
   const [loadFailed, setLoadFailed] = useState(false);
   const [saving, setSaving] = useState(false);
-  const [isDarkMode, setIsDarkMode] = useState(false);
-
-  useEffect(() => {
-    setIsDarkMode(document.documentElement.classList.contains("dark"));
-    const observer = new MutationObserver(() => {
-      setIsDarkMode(document.documentElement.classList.contains("dark"));
-    });
-    observer.observe(document.documentElement, {
-      attributes: true,
-      attributeFilter: ["class"],
-    });
-    return () => observer.disconnect();
-  }, []);
+  const isDarkMode = useDarkMode();
 
   useEffect(() => {
     if (!isOpen || !filename) return;

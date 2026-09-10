@@ -1,6 +1,6 @@
 $helperPath = Join-Path (Split-Path -Parent $PSScriptRoot) "release-build-config.ps1"
 
-Describe "CCSwitchMulti local release build config" {
+Describe "CCSwitchMulti release configuration" {
     function Get-CargoPackageVersion {
         param(
             [string]$CargoLock,
@@ -87,33 +87,7 @@ Describe "CCSwitchMulti local release build config" {
         }
     }
 
-    It "runs a frozen dependency install before validating and building a local release" {
-        $pipelinePath = Join-Path (Split-Path -Parent $helperPath) "local-release-pipeline.ps1"
-        $pipeline = [System.IO.File]::ReadAllText($pipelinePath)
-        $installOffset = $pipeline.IndexOf('Invoke-CheckedCommand -FilePath "pnpm" -Arguments @("install", "--frozen-lockfile", "--force")')
-        $assertOffset = $pipeline.IndexOf("Assert-LocalTauriCliVersion -RepoRoot `$repoRoot")
-        $exportOffset = $pipeline.IndexOf('Invoke-CheckedCommand -FilePath "powershell" -Arguments $exportArgs')
 
-        $installOffset | Should BeGreaterThan -1
-        $assertOffset | Should BeGreaterThan $installOffset
-        $exportOffset | Should BeGreaterThan $assertOffset
-    }
-
-    It "captures source identity and exports to staging before replacing the final release root" {
-        $pipelinePath = Join-Path (Split-Path -Parent $helperPath) "local-release-pipeline.ps1"
-        $pipeline = [System.IO.File]::ReadAllText($pipelinePath)
-        $captureOffset = $pipeline.IndexOf('$sourceIdentity = Get-ReleaseSourceIdentity -RepoRoot $repoRoot')
-        $stageOffset = $pipeline.IndexOf('"-ReleaseRoot",')
-        $stageVariableOffset = $pipeline.IndexOf('$stageRoot', $stageOffset)
-        $postExportGuardOffset = $pipeline.IndexOf('Assert-ReleaseSourceIdentity', $pipeline.IndexOf('Invoke-CheckedCommand -FilePath "powershell"'))
-        $swapOffset = $pipeline.IndexOf('Replace-ReleaseRootFromStage')
-
-        $captureOffset | Should BeGreaterThan -1
-        $stageOffset | Should BeGreaterThan $captureOffset
-        $stageVariableOffset | Should BeGreaterThan $stageOffset
-        $postExportGuardOffset | Should BeGreaterThan $stageVariableOffset
-        $swapOffset | Should BeGreaterThan $postExportGuardOffset
-    }
 
     It "rejects a release when the tracked source identity changes during the build" {
         . $helperPath
@@ -316,33 +290,14 @@ Describe "CCSwitchMulti local release build config" {
             Should Throw 'cannot resolve the CCSwitchMulti main repository'
     }
 
-    It "exports the projected NSIS-installed executable hash before final checksums" {
-        $repoRoot = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
-        $exportScript = [System.IO.File]::ReadAllText((Join-Path $repoRoot "scripts\export-latest-ccswitchmulti.ps1"))
-        $sourceOffset = $exportScript.IndexOf('$sourceExe = Join-Path $releaseDir "cc-switch.exe"')
-        $installedHashOffset = $exportScript.IndexOf('Write-NsisInstalledExeHash -SourceExe $sourceExe')
-        $checksumsOffset = $exportScript.LastIndexOf('Write-Checksums -Root $exportRoot')
 
-        $sourceOffset | Should BeGreaterThan -1
-        $installedHashOffset | Should BeGreaterThan $sourceOffset
-        $checksumsOffset | Should BeGreaterThan $installedHashOffset
-    }
 
-    It "writes exported text through the BOM-free UTF-8 helper" {
-        $repoRoot = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
-        $exportScript = [System.IO.File]::ReadAllText((Join-Path $repoRoot "scripts\export-latest-ccswitchmulti.ps1"))
 
-        $exportScript | Should Match "function Write-Utf8NoBom"
-        $exportScript | Should Match 'UTF8Encoding\]::new\(\$false\)'
-        $exportScript | Should Not Match "Set-Content[^\r\n]*-Encoding UTF8"
-        $exportScript.Contains('Write-Utf8NoBom -Path (Join-Path $Root "latest.json")') | Should Be $true
-    }
-
-    It "targets the maintained fork when constructing updater asset URLs" {
-        $repoRoot = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
-        $exportScript = [System.IO.File]::ReadAllText((Join-Path $repoRoot "scripts\export-latest-ccswitchmulti.ps1"))
-
-        $exportScript | Should Match '\$githubRepo = "tngflx/ccswitchmultirouter"'
-        $exportScript | Should Not Match '\$githubRepo = "BigStrongSun/ccswitchmulti"'
+    It "rejects retired local release entrypoints before any side effects" {
+        $scriptsRoot = Split-Path -Parent $helperPath
+        foreach ($name in @("local-release-pipeline", "export-latest-ccswitchmulti", "install-local-release-hook")) {
+            $path = Join-Path $scriptsRoot ($name + ".ps1")
+            { & $path } | Should Throw "retired"
+        }
     }
 }

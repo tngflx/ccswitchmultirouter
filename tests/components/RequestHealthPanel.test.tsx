@@ -24,6 +24,7 @@ function snapshot(): RequestHealthSnapshot {
       reviewTimeoutSeconds: 60,
       reviewMode: "first_large_request",
       summarizeAndRestartEnabled: true,
+      windowsNotificationsEnabled: true,
     },
     diagnostics: [
       {
@@ -47,6 +48,11 @@ function snapshot(): RequestHealthSnapshot {
         itemCount: 350,
         largestItemBytes: 248_581,
         largestItemCategory: "message",
+        mediaBytes: 0,
+        mediaItems: 0,
+        mediaDominated: false,
+        dominantCategory: "tool_calls",
+        recommendedAction: "summarize_and_restart",
         optimizationMode: "safe",
         optimizationApplied: false,
         compactionRequest: true,

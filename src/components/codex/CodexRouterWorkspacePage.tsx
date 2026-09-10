@@ -637,6 +637,10 @@ type CodexCatalogModelDraft = {
   sortIndex?: number;
   reasoning?: CodexCatalogModel["reasoning"];
   codexUltra?: CodexCatalogModel["codexUltra"];
+  apiKeyGroupId?: string;
+  api_key_group_id?: string;
+  apiKeyGroupGenerated?: boolean;
+  api_key_group_generated?: boolean;
   capabilities?: CodexRouteCapabilities;
 };
 
@@ -1816,6 +1820,15 @@ function catalogDraftFromSourceModel(
     ...(codexCache ? { codexCache } : {}),
     ...(source?.codexUltra ? { codexUltra: source.codexUltra } : {}),
     ...(source?.sortIndex !== undefined ? { sortIndex: source.sortIndex } : {}),
+    ...((source?.apiKeyGroupId ?? source?.api_key_group_id)
+      ? {
+          apiKeyGroupId: source.apiKeyGroupId ?? source.api_key_group_id,
+        }
+      : {}),
+    ...(source?.apiKeyGroupGenerated === true ||
+    source?.api_key_group_generated === true
+      ? { apiKeyGroupGenerated: true }
+      : {}),
     ...(capabilities ? { capabilities } : {}),
   };
 }

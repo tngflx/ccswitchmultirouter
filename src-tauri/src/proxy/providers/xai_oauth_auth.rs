@@ -8,7 +8,6 @@ use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
-use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
@@ -803,64 +802,8 @@ impl XaiOAuthManager {
     }
 
     fn write_store_atomic(&self, content: &str) -> Result<(), XaiOAuthError> {
-        let parent = self
-            .storage_path
-            .parent()
-            .ok_or_else(|| XaiOAuthError::IoError("无效的存储路径".to_string()))?;
-        fs::create_dir_all(parent)?;
-        let file_name = self
-            .storage_path
-            .file_name()
-            .ok_or_else(|| XaiOAuthError::IoError("无效的存储文件名".to_string()))?
-            .to_string_lossy();
-        let nonce = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        let temporary_path = parent.join(format!("{file_name}.tmp.{nonce}"));
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-            let result = (|| -> Result<(), std::io::Error> {
-                let mut file = fs::OpenOptions::new()
-                    .create_new(true)
-                    .write(true)
-                    .mode(0o600)
-                    .open(&temporary_path)?;
-                file.write_all(content.as_bytes())?;
-                file.flush()?;
-                fs::rename(&temporary_path, &self.storage_path)?;
-                fs::set_permissions(&self.storage_path, fs::Permissions::from_mode(0o600))?;
-                Ok(())
-            })();
-            if result.is_err() {
-                let _ = fs::remove_file(&temporary_path);
-            }
-            result?;
-        }
-
-        #[cfg(windows)]
-        {
-            let result = (|| -> Result<(), std::io::Error> {
-                let mut file = fs::OpenOptions::new()
-                    .create_new(true)
-                    .write(true)
-                    .open(&temporary_path)?;
-                file.write_all(content.as_bytes())?;
-                file.flush()?;
-                if self.storage_path.exists() {
-                    fs::remove_file(&self.storage_path)?;
-                }
-                fs::rename(&temporary_path, &self.storage_path)?;
-                Ok(())
-            })();
-            if result.is_err() {
-                let _ = fs::remove_file(&temporary_path);
-            }
-            result?;
-        }
-        Ok(())
+        crate::config::atomic_write_private(&self.storage_path, content.as_bytes())
+            .map_err(|error| XaiOAuthError::IoError(error.to_string()))
     }
 }
 

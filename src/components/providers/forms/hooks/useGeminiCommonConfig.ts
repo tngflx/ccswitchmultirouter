@@ -1,3 +1,4 @@
+import { useLoadCommonConfigSnippet } from "./useLoadCommonConfigSnippet";
 import { useState, useEffect, useCallback, useRef } from "react";
 import { useTranslation } from "react-i18next";
 import { configApi } from "@/lib/api";
@@ -219,64 +220,14 @@ export function useGeminiCommonConfig({
     [],
   );
 
-  // 初始化：从 config.json 加载，支持从 localStorage 迁移
-  useEffect(() => {
-    let mounted = true;
-
-    const loadSnippet = async () => {
-      try {
-        // 使用统一 API 加载
-        const snippet = await configApi.getCommonConfigSnippet("gemini");
-
-        if (snippet && snippet.trim()) {
-          if (mounted) {
-            setCommonConfigSnippetState(snippet);
-          }
-        } else {
-          // 如果 config.json 中没有，尝试从 localStorage 迁移
-          if (typeof window !== "undefined") {
-            try {
-              const legacySnippet =
-                window.localStorage.getItem(LEGACY_STORAGE_KEY);
-              if (legacySnippet && legacySnippet.trim()) {
-                const parsed = parseSnippetEnv(legacySnippet);
-                if (parsed.error) {
-                  console.warn(
-                    "[迁移] legacy Gemini 通用配置片段格式不符合当前规则，跳过迁移",
-                  );
-                  return;
-                }
-                // 迁移到 config.json
-                await configApi.setCommonConfigSnippet("gemini", legacySnippet);
-                if (mounted) {
-                  setCommonConfigSnippetState(legacySnippet);
-                }
-                // 清理 localStorage
-                window.localStorage.removeItem(LEGACY_STORAGE_KEY);
-                console.log(
-                  "[迁移] Gemini 通用配置已从 localStorage 迁移到 config.json",
-                );
-              }
-            } catch (e) {
-              console.warn("[迁移] 从 localStorage 迁移失败:", e);
-            }
-          }
-        }
-      } catch (error) {
-        console.error("加载 Gemini 通用配置失败:", error);
-      } finally {
-        if (mounted) {
-          setIsLoading(false);
-        }
-      }
-    };
-
-    loadSnippet();
-
-    return () => {
-      mounted = false;
-    };
-  }, [parseSnippetEnv]);
+  useLoadCommonConfigSnippet(
+    "gemini",
+    LEGACY_STORAGE_KEY,
+    setCommonConfigSnippetState,
+    setIsLoading,
+    true,
+    parseSnippetEnv,
+  );
 
   // 初始化时检查通用配置片段（编辑模式）
   useEffect(() => {

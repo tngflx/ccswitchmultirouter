@@ -1656,9 +1656,25 @@ fn resolve_codex_route_from_settings<'a>(
     settings: &'a JsonValue,
     request_model: &str,
 ) -> Option<&'a JsonValue> {
+    let routes = codex_routes_from_settings(settings)?;
+    if settings.get("codexRouting").is_some() {
+        return find_codex_route_by_match_priority(routes, request_model);
+    }
+    routes
+        .iter()
+        .find(|route| codex_route_has_exact_model_match(route, request_model))
+        .or_else(|| {
+            routes
+                .iter()
+                .find(|route| codex_route_has_prefix_model_match(route, request_model))
+        })
+}
+
+/// Read route schemas with runtime precedence, including explicit disablement.
+pub(crate) fn codex_routes_from_settings(settings: &JsonValue) -> Option<&Vec<JsonValue>> {
     if let Some(routing) = settings.get("codexRouting") {
         if let Some(routes) = routing.as_array() {
-            return find_codex_route_by_match_priority(routes, request_model);
+            return Some(routes);
         }
 
         if routing
@@ -1669,27 +1685,13 @@ fn resolve_codex_route_from_settings<'a>(
             return None;
         }
 
-        let routes = routing.get("routes").and_then(|value| value.as_array())?;
-        if let Some(route) = find_codex_route_by_match_priority(routes, request_model) {
-            return Some(route);
-        }
-        return None;
+        return routing.get("routes").and_then(|value| value.as_array());
     }
 
     settings
         .get("codexModelRoutes")
         .or_else(|| settings.get("modelRoutes"))
         .and_then(|value| value.as_array())
-        .and_then(|routes| {
-            routes
-                .iter()
-                .find(|route| codex_route_has_exact_model_match(route, request_model))
-                .or_else(|| {
-                    routes
-                        .iter()
-                        .find(|route| codex_route_has_prefix_model_match(route, request_model))
-                })
-        })
 }
 
 /// Resolve the route runtime will actually try. Unmatched models fail closed.
@@ -4204,6 +4206,77 @@ mod tests {
                 .unwrap()
                 .api_key,
             "primary-key"
+        );
+    }
+
+    #[test]
+    fn routed_isolated_api_key_group_keeps_catalog_credential_identity() {
+        let router = create_provider(json!({
+            "codexRouting": {
+                "enabled": true,
+                "routes": [{
+                    "id": "sublyx-astra",
+                    "label": "Sublyx Astra",
+                    "targetProviderId": "sublyx",
+                    "match": {"models": ["gpt-5.6-sol--ccg-astra-sublyx"]},
+                    "aliases": {
+                        "gpt-5.6-sol--ccg-astra-sublyx": "gpt-5.6-sol"
+                    },
+                    "upstream": {
+                        "modelMap": {
+                            "gpt-5.6-sol--ccg-astra-sublyx": "gpt-5.6-sol"
+                        },
+                        "auth": {"source": "provider_config"}
+                    }
+                }]
+            },
+            "modelCatalog": {"models": [{
+                "model": "gpt-5.6-sol--ccg-astra-sublyx",
+                "upstreamModel": "gpt-5.6-sol",
+                "apiKeyGroupId": "astra",
+                "apiKeyGroupGenerated": true
+            }]}
+        }));
+        let target = Provider::with_id(
+            "sublyx".to_string(),
+            "Sublyx".to_string(),
+            json!({
+                "auth": {"OPENAI_API_KEY": "primary-key"},
+                "codexApiKeyGroupMode": "isolated",
+                "codexApiKeyGroups": [{
+                    "id": "astra",
+                    "enabled": true,
+                    "strategy": "fixed",
+                    "apiKeys": ["astra-key"],
+                    "models": ["gpt-5.6-sol"]
+                }],
+                "modelCatalog": {"models": [{
+                    "model": "gpt-5.6-sol--ccg-astra",
+                    "upstreamModel": "gpt-5.6-sol",
+                    "apiKeyGroupId": "astra",
+                    "apiKeyGroupGenerated": true
+                }]}
+            }),
+            None,
+        );
+        let routed = resolve_codex_model_routed_provider(
+            &router,
+            &json!({"model": "gpt-5.6-sol--ccg-astra-sublyx"}),
+        )
+        .expect("isolated group route");
+        let materialized = materialize_codex_routed_provider_from_target(&routed, &target);
+        let adapter = CodexAdapter::new();
+
+        assert_eq!(
+            adapter
+                .extract_auth_for_request_model(
+                    &materialized,
+                    Some("gpt-5.6-sol--ccg-astra-sublyx"),
+                    Some("gpt-5.6-sol"),
+                )
+                .expect("group auth")
+                .api_key,
+            "astra-key"
         );
     }
 

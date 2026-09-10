@@ -80,6 +80,11 @@ pub struct RequestHealthDiagnostic {
     pub item_count: usize,
     pub largest_item_bytes: usize,
     pub largest_item_category: Option<String>,
+    pub media_bytes: usize,
+    pub media_items: usize,
+    pub media_dominated: bool,
+    pub dominant_category: Option<String>,
+    pub recommended_action: String,
     pub optimization_mode: RequestOptimizationMode,
     pub optimization_applied: bool,
     pub compaction_request: bool,
@@ -115,6 +120,22 @@ struct Analysis {
     calls: HashSet<String>,
     duplicate_calls: usize,
     outputs: Vec<String>,
+    media_bytes: usize,
+    media_items: usize,
+}
+
+fn recommended_action(
+    media_dominated: bool,
+    token_limit_exceeded: bool,
+    anomaly: bool,
+) -> &'static str {
+    if media_dominated {
+        "continue_once"
+    } else if token_limit_exceeded || anomaly {
+        "summarize_and_restart"
+    } else {
+        "inspect"
+    }
 }
 
 static DIAGNOSTICS: OnceLock<Mutex<VecDeque<RequestHealthDiagnostic>>> = OnceLock::new();
@@ -364,6 +385,16 @@ pub(crate) fn inspect_and_optimize(
         item_count: analysis.item_count,
         largest_item_bytes: analysis.largest_item_bytes,
         largest_item_category: analysis.largest_item_category,
+        media_bytes: analysis.media_bytes,
+        media_items: analysis.media_items,
+        media_dominated: analysis.media_bytes >= optimized_bytes / 2 && analysis.media_bytes > 0,
+        dominant_category: breakdown.first().map(|row| row.category.clone()),
+        recommended_action: recommended_action(
+            analysis.media_bytes >= optimized_bytes / 2 && analysis.media_bytes > 0,
+            token_limit_exceeded,
+            false,
+        )
+        .to_string(),
         optimization_mode: config.optimization_mode,
         optimization_applied,
         compaction_request: context.compaction_request,
@@ -458,6 +489,9 @@ fn refresh_session_review_risk(
                 && candidate.session_client_provided
                 && !candidate.compaction_request
                 && candidate.threshold_exceeded
+                // A large inline image is valid payload, not replayed history
+                // growth. Keep it out of the sustained-growth detector.
+                && !candidate.media_dominated
         })
         .take(3)
         .collect::<Vec<_>>();
@@ -639,7 +673,7 @@ fn review_finding(
                     && !diagnostic.compaction_request
                     && (diagnostic.threshold_exceeded || diagnostic.token_limit_exceeded)
             })
-            .filter(|diagnostic| diagnostic.threshold_exceeded)
+            .filter(|diagnostic| diagnostic.threshold_exceeded && !diagnostic.media_dominated)
             .map(|diagnostic| RequestHealthFinding {
                 code: "oversized_request_preflight".to_string(),
                 severity: "error".to_string(),
@@ -691,6 +725,9 @@ pub(crate) async fn review_before_upstream(
 
     #[cfg(target_os = "windows")]
     {
+        if !config.windows_notifications_enabled {
+            return Ok(PreflightReviewOutcome::ContinueOnce);
+        }
         let risk = review_finding(config, trace_id, session_id);
         let Some(risk) = risk else {
             return Ok(PreflightReviewOutcome::NotRequired);
@@ -721,6 +758,13 @@ pub(crate) async fn review_before_upstream(
             token: token.clone(),
             body_hash: body_hash.clone(),
         };
+        let diagnostic = diagnostics_store()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .rev()
+            .find(|diagnostic| diagnostic.trace_id.as_deref() == Some(trace_id))
+            .cloned();
 
         show_windows_review_notification(
             &token,
@@ -730,6 +774,7 @@ pub(crate) async fn review_before_upstream(
             &risk,
             config.review_timeout_seconds,
             config.summarize_and_restart_enabled,
+            diagnostic.as_ref(),
         )
         .map_err(|error| format!("Windows Request Health notification failed: {error}"))?;
 
@@ -795,6 +840,7 @@ fn show_windows_review_notification(
     risk: &RequestHealthFinding,
     timeout_seconds: u32,
     summarize_and_restart_enabled: bool,
+    diagnostic: Option<&RequestHealthDiagnostic>,
 ) -> Result<(), String> {
     use tauri_winrt_notification::{Scenario, Toast};
 
@@ -807,11 +853,13 @@ fn show_windows_review_notification(
     let continue_action = format!("continue|{token}|{body_hash}");
     let block_action = format!("block|{token}|{body_hash}");
     let summarize_action = format!("summarize|{token}|{body_hash}");
+    let dont_remind_action = format!("dont_remind|{token}|{body_hash}");
     let activated_token = token.to_string();
     let activated_hash = body_hash.to_string();
     let expected_continue = continue_action.clone();
     let expected_block = block_action.clone();
     let expected_summarize = summarize_action.clone();
+    let expected_dont_remind = dont_remind_action.clone();
     let dismissed_token = token.to_string();
     let dismissed_hash = body_hash.to_string();
     let model = truncate_for_notification(model, 80);
@@ -821,24 +869,44 @@ fn show_windows_review_notification(
         body_bytes as f64 / 1024.0,
         u64::from(timeout_seconds).clamp(MIN_REVIEW_TIMEOUT_SECONDS, MAX_REVIEW_TIMEOUT_SECONDS)
     );
+    let composition = diagnostic
+        .map(|value| {
+            let dominant = value.dominant_category.as_deref().unwrap_or("request");
+            let dominant_bytes = value.breakdown.first().map(|row| row.bytes).unwrap_or(0);
+            let share = dominant_bytes as f64 / value.optimized_bytes.max(1) as f64 * 100.0;
+            let action = match value.recommended_action.as_str() {
+                "continue_once" => "image-heavy; continue is recommended",
+                "summarize_and_restart" => "history growth; summarize is recommended",
+                _ => "inspect before continuing",
+            };
+            format!("{dominant} {share:.0}% ({}) · {action}", value.media_items)
+        })
+        .unwrap_or_default();
 
     let toast = Toast::new(REQUEST_HEALTH_NOTIFICATION_APP_ID)
         .title(strings.title)
         .text1(&format!("{}: {model}", strings.model))
-        .text2(&detail)
+        .text2(&format!("{detail} {composition}"))
         .scenario(Scenario::Reminder)
         .on_activated(move |action| {
             let decision = match action.as_deref() {
                 Some(value) if value == expected_continue => ReviewDecision::ContinueOnce,
                 Some(value) if value == expected_block => ReviewDecision::Block,
                 Some(value) if value == expected_summarize => ReviewDecision::SummarizeAndRestart,
+                Some(value) if value == expected_dont_remind => {
+                    let mut settings = crate::settings::get_settings();
+                    settings.request_health.windows_notifications_enabled = false;
+                    let _ = crate::settings::update_settings(settings);
+                    ReviewDecision::ContinueOnce
+                }
                 _ => ReviewDecision::Block,
             };
             let _ = resolve_pending_review(&activated_token, &activated_hash, decision);
             Ok(())
         })
         .add_button(strings.continue_once, &continue_action)
-        .add_button(strings.block, &block_action);
+        .add_button(strings.block, &block_action)
+        .add_button(strings.dont_remind, &dont_remind_action);
     let toast = if summarize_and_restart_enabled {
         toast.add_button(strings.summarize_and_restart, &summarize_action)
     } else {
@@ -931,6 +999,7 @@ struct NativeReviewStrings {
     continue_once: &'static str,
     block: &'static str,
     summarize_and_restart: &'static str,
+    dont_remind: &'static str,
     summary_complete: &'static str,
     summary_failed: &'static str,
     fresh_session: &'static str,
@@ -949,6 +1018,7 @@ impl NativeReviewStrings {
                 continue_once: "仅继续这一次",
                 block: "阻止",
                 summarize_and_restart: "总结并开始新会话",
+                dont_remind: "不再提醒（继续）",
                 summary_complete: "总结移交已完成",
                 summary_failed: "总结并开始新会话失败",
                 fresh_session: "Codex 已将压缩总结移交到新会话",
@@ -962,6 +1032,7 @@ impl NativeReviewStrings {
                 continue_once: "僅繼續這一次",
                 block: "封鎖",
                 summarize_and_restart: "摘要並開始新工作階段",
+                dont_remind: "不再提醒（繼續）",
                 summary_complete: "摘要移交已完成",
                 summary_failed: "摘要並開始新工作階段失敗",
                 fresh_session: "Codex 已將精簡摘要移交到新工作階段",
@@ -975,6 +1046,7 @@ impl NativeReviewStrings {
                 continue_once: "今回のみ続行",
                 block: "ブロック",
                 summarize_and_restart: "要約して新しいセッション",
+                dont_remind: "今後通知しない（続行）",
                 summary_complete: "要約の引き継ぎが完了しました",
                 summary_failed: "要約と新規セッションの作成に失敗しました",
                 fresh_session: "Codex が要約を新しいセッションに引き継ぎました",
@@ -988,6 +1060,7 @@ impl NativeReviewStrings {
                 continue_once: "Continue once",
                 block: "Block",
                 summarize_and_restart: "Summarize + new session",
+                dont_remind: "Don't remind me (continue)",
                 summary_complete: "Summary handoff complete",
                 summary_failed: "Summary + new session failed",
                 fresh_session: "Codex transferred the compact summary to a fresh session",
@@ -1029,6 +1102,11 @@ fn analyze_conversation_items(body: &Value, analysis: &mut Analysis) {
         let bytes = serialized_len(item);
         let category = item_category(item);
         analysis.item_count += 1;
+        let media_bytes = image_payload_bytes(item);
+        if media_bytes > 0 {
+            analysis.media_items += 1;
+            analysis.media_bytes += media_bytes;
+        }
         let entry = analysis.breakdown.entry(category.clone()).or_default();
         entry.0 += 1;
         entry.1 += bytes;
@@ -1052,6 +1130,32 @@ fn analyze_conversation_items(body: &Value, analysis: &mut Analysis) {
                 analysis.outputs.push(call_id.to_string());
             }
         }
+    }
+}
+
+fn image_payload_bytes(value: &Value) -> usize {
+    match value {
+        Value::Object(map) => {
+            let image_object = map
+                .get("type")
+                .and_then(Value::as_str)
+                .is_some_and(|t| matches!(t, "image" | "input_image" | "image_url"))
+                || map
+                    .get("mimeType")
+                    .and_then(Value::as_str)
+                    .is_some_and(|m| m.starts_with("image/"));
+            let nested = map.values().map(image_payload_bytes).sum::<usize>();
+            if image_object && nested == 0 {
+                serialized_len(value)
+            } else {
+                nested
+            }
+        }
+        Value::Array(items) => items.iter().map(image_payload_bytes).sum(),
+        Value::String(text) if text.starts_with("data:image/") && text.contains(";base64,") => {
+            text.len()
+        }
+        _ => 0,
     }
 }
 
@@ -1159,6 +1263,34 @@ mod tests {
             .any(|finding| finding.code == "orphaned_tool_output"));
         let serialized = serde_json::to_string(&diagnostic).expect("serialize diagnostic");
         assert!(!serialized.contains("secret tool output"));
+    }
+
+    #[test]
+    fn image_bytes_are_counted_from_nested_payload_and_bypass_preflight_risk() {
+        let config = RequestHealthConfig {
+            large_request_threshold_bytes: 64 * 1024,
+            ..RequestHealthConfig::default()
+        };
+        let mut body = json!({
+            "input": [{
+                "type": "message",
+                "role": "user",
+                "content": [{
+                    "type": "input_image",
+                    "image_url": {
+                        "url": format!("data:image/png;base64,{}", "a".repeat(120_000))
+                    }
+                }]
+            }]
+        });
+        let diagnostic = inspect_and_optimize(&mut body, &config, context()).expect("diagnostic");
+
+        assert!(diagnostic.threshold_exceeded);
+        assert!(diagnostic.media_dominated);
+        assert_eq!(diagnostic.media_items, 1);
+        assert!(diagnostic.media_bytes >= 120_000);
+        assert_eq!(diagnostic.recommended_action, "continue_once");
+        assert!(review_finding(&config, "trace-1", "session-1").is_none());
     }
 
     #[test]

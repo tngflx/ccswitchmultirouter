@@ -1,3 +1,4 @@
+import { useModelsDevCatalog } from "@/hooks/useModelsDevCatalog";
 import { useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
@@ -37,8 +38,6 @@ import {
   syncModelsDevPricing,
 } from "@/lib/modelsDevAutoSync";
 import {
-  fetchModelsDevPricing,
-  flattenModels,
   formatPrice,
   getCommonModelKeys,
   type ModelsDevEntry,
@@ -47,7 +46,6 @@ import { usageKeys } from "@/lib/query/usage";
 import type { ModelsDevSyncConfig, ModelsDevSyncState } from "@/types/usage";
 import { isTextEditableTarget } from "@/utils/domUtils";
 
-const MODELS_DEV_QUERY_KEY = ["models-dev-pricing"] as const;
 const DEFAULT_VISIBLE_ROWS = 80;
 const MAX_VISIBLE_ROWS = 300;
 
@@ -72,13 +70,21 @@ function AutoSyncDialog({ state, onClose, onSaved }: AutoSyncDialogProps) {
   );
   const [isSaving, setIsSaving] = useState(false);
 
-  const { data, isLoading, error, refetch } = useQuery({
-    queryKey: MODELS_DEV_QUERY_KEY,
-    queryFn: fetchModelsDevPricing,
-    staleTime: 60 * 60 * 1000,
-    retry: 1,
-  });
-  const entries = useMemo(() => (data ? flattenModels(data) : []), [data]);
+  const {
+    entries,
+    providers,
+    filtered,
+    visible,
+    isFiltering,
+    isLoading,
+    error,
+    refetch,
+  } = useModelsDevCatalog(
+    search,
+    providerFilter,
+    DEFAULT_VISIBLE_ROWS,
+    MAX_VISIBLE_ROWS,
+  );
   const commonModelKeys = useMemo(() => getCommonModelKeys(entries), [entries]);
 
   const effectiveSelectedKeys = useMemo(() => {
@@ -95,37 +101,6 @@ function AutoSyncDialog({ state, onClose, onSaved }: AutoSyncDialogProps) {
     includeCommonModels,
     selectedModelKeys,
   ]);
-
-  const providers = useMemo(() => {
-    const map = new Map<string, string>();
-    for (const entry of entries) {
-      if (!map.has(entry.providerId)) {
-        map.set(entry.providerId, entry.providerName);
-      }
-    }
-    return Array.from(map, ([id, name]) => ({ id, name })).sort((a, b) =>
-      a.name.localeCompare(b.name),
-    );
-  }, [entries]);
-
-  const isFiltering = search.trim() !== "" || providerFilter !== "all";
-  const filtered = useMemo(() => {
-    const query = search.trim().toLowerCase();
-    return entries.filter(
-      (entry) =>
-        (providerFilter === "all" || entry.providerId === providerFilter) &&
-        (!query ||
-          entry.modelId.toLowerCase().includes(query) ||
-          entry.normalizedId.includes(query) ||
-          entry.modelName.toLowerCase().includes(query) ||
-          entry.providerName.toLowerCase().includes(query)),
-    );
-  }, [entries, providerFilter, search]);
-  const visible = useMemo(
-    () =>
-      filtered.slice(0, isFiltering ? MAX_VISIBLE_ROWS : DEFAULT_VISIBLE_ROWS),
-    [filtered, isFiltering],
-  );
 
   const toggleEntry = (entry: ModelsDevEntry) => {
     const isSelected = effectiveSelectedKeys.has(entry.key);

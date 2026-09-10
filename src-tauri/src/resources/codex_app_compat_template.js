@@ -503,28 +503,74 @@
           throw new Error(
             "Timed out interrupting the blocked source turn before compaction",
           );
-        const beforeCompactions = countCompactionItems(before);
-        await client.sendRequest("thread/compact/start", {
+        const summaryTurn = await client.sendRequest("turn/start", {
           threadId: normalizedThreadId,
+          input: [{
+            type: "text",
+            text: [
+              "Create a concise handoff summary of this coding session for a fresh session.",
+              "This is a manual coding-agent summary, not context compaction.",
+              "Do not call tools, inspect files, change files, or continue implementation.",
+              "Include: the user's goal, decisions made, files or areas changed, current state,",
+              "known failures, tests run, and the exact next action. Preserve important identifiers.",
+              "Return only the handoff summary in plain text.",
+            ].join(" "),
+          }],
+          effort: "medium",
         });
+        const summaryTurnId = String(
+          summaryTurn?.turn?.id ||
+            summaryTurn?.turnId ||
+            summaryTurn?.turn_id ||
+            "",
+        ).trim();
+        if (!summaryTurnId)
+          throw new Error("Codex did not return the manual summary turn id");
 
-        const deadline = Date.now() + 90000;
-        let compacted = false;
-        while (Date.now() < deadline) {
+        const summaryDeadline = Date.now() + 120000;
+        while (Date.now() < summaryDeadline) {
           await new Promise((resolve) => setTimeout(resolve, 750));
           const current = await client.sendRequest("thread/read", {
             threadId: normalizedThreadId,
             includeTurns: true,
           });
-          if (countCompactionItems(current) > beforeCompactions) {
-            compacted = true;
-            break;
+          const turns = current?.thread?.turns || current?.turns || [];
+          const turn = turns.find((candidate) => candidate?.id === summaryTurnId);
+          const status = String(turn?.status || "").toLowerCase();
+          if (status === "completed") {
+            const extractText = (value, seen = new WeakSet()) => {
+              if (!value || typeof value !== "object") return [];
+              if (seen.has(value)) return [];
+              seen.add(value);
+              if (Array.isArray(value))
+                return value.flatMap((item) => extractText(item, seen));
+              const type = String(value.type || "").toLowerCase();
+              const role = String(value.role || "").toLowerCase();
+              const isAssistantMessage =
+                role === "assistant" ||
+                type === "agentmessage" ||
+                type === "assistant_message";
+              const ownText = isAssistantMessage
+                ? [value.text, value.content]
+                    .flatMap((item) =>
+                      typeof item === "string" ? [item] : extractText(item, seen),
+                    )
+                    .filter(Boolean)
+                : [];
+              return [...ownText, ...Object.values(value).flatMap((item) => extractText(item, seen))];
+            };
+            const summary = [...new Set(extractText(turn))]
+              .map((value) => String(value).trim())
+              .filter(Boolean)
+              .join("\n")
+              .trim();
+            if (!summary) throw new Error("Codex completed without a manual handoff summary");
+            return { summary };
           }
+          if (status === "failed" || status === "interrupted")
+            throw new Error(`Manual summary turn ${status}`);
         }
-        if (!compacted)
-          throw new Error("Timed out waiting for native Codex compaction");
-
-        return;
+        throw new Error("Timed out waiting for the manual handoff summary");
       } catch (error) {
         lastError = error;
       }
@@ -552,9 +598,10 @@
       startedAt: new Date().toISOString(),
     };
     void runSummarizeSession(normalizedThreadId).then(
-      () => {
+      (result) => {
         state.summarizeJobs[jobId] = {
           ...state.summarizeJobs[jobId],
+          ...result,
           status: "completed",
           completedAt: new Date().toISOString(),
         };

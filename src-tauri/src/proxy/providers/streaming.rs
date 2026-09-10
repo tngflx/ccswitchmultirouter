@@ -267,7 +267,12 @@ pub fn create_anthropic_sse_stream<E: std::error::Error + Send + 'static>(
                                         }
 
                                         // 处理 reasoning（thinking）
-                                        if let Some(reasoning) = &choice.delta.reasoning {
+                                        if let Some(reasoning) = choice
+                                            .delta
+                                            .reasoning
+                                            .as_ref()
+                                            .filter(|reasoning| !reasoning.is_empty())
+                                        {
                                             if current_non_tool_block_type != Some("thinking") {
                                                 if let Some(index) = current_non_tool_block_index.take() {
                                                     let event = json!({
@@ -747,6 +752,43 @@ mod tests {
 
     fn event_type(event: &Value) -> Option<&str> {
         event.get("type").and_then(|v| v.as_str())
+    }
+
+    #[tokio::test]
+    async fn empty_reasoning_placeholders_preserve_one_text_block() {
+        for reasoning in ["", "real thought"] {
+            let input = format!(
+                "data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
+                json!({"id":"chat-1","model":"test","choices":[{"delta":{
+                    "reasoning_content":reasoning,"content":"hello "
+                }}]}),
+                json!({"id":"chat-1","model":"test","choices":[{"delta":{
+                    "reasoning_content":"","content":"world"
+                },"finish_reason":"stop"}]}),
+            );
+            let events = collect_anthropic_events(&input).await;
+            let starts: Vec<_> = events
+                .iter()
+                .filter(|event| event_type(event) == Some("content_block_start"))
+                .map(|event| event["content_block"]["type"].as_str().unwrap())
+                .collect();
+            let expected = if reasoning.is_empty() {
+                vec!["text"]
+            } else {
+                vec!["thinking", "text"]
+            };
+            assert_eq!(starts, expected);
+            let text: String = events
+                .iter()
+                .filter_map(|event| event.pointer("/delta/text").and_then(Value::as_str))
+                .collect();
+            let thoughts: String = events
+                .iter()
+                .filter_map(|event| event.pointer("/delta/thinking").and_then(Value::as_str))
+                .collect();
+            assert_eq!(text, "hello world");
+            assert_eq!(thoughts, reasoning);
+        }
     }
 
     #[test]

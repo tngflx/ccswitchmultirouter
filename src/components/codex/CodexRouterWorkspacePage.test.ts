@@ -334,6 +334,7 @@ function createRequestHealthSnapshot(
       reviewTimeoutSeconds: 60,
       reviewMode: "first_large_request",
       summarizeAndRestartEnabled: true,
+      windowsNotificationsEnabled: true,
     },
     diagnostics: [
       {
@@ -357,6 +358,11 @@ function createRequestHealthSnapshot(
         itemCount: 12,
         largestItemBytes: 70000,
         largestItemCategory: "function_call_output",
+        mediaBytes: 0,
+        mediaItems: 0,
+        mediaDominated: false,
+        dominantCategory: "message:user",
+        recommendedAction: "inspect",
         optimizationMode: "safe",
         optimizationApplied: true,
         compactionRequest: false,
@@ -385,6 +391,7 @@ beforeEach(() => {
       reviewTimeoutSeconds: 60,
       reviewMode: "first_large_request",
       summarizeAndRestartEnabled: true,
+      windowsNotificationsEnabled: true,
     },
     diagnostics: [],
   });
@@ -3848,6 +3855,55 @@ describe("Codex MultiRouter workspace route persistence helpers", () => {
     expect(collectRoutedCatalogModels(routeEntry, projected.models)).toEqual([
       "free-enabled",
     ]);
+  });
+
+  it("preserves isolated API key group identity in the MultiRouter catalog", () => {
+    const provider: Provider = {
+      id: "sublyx",
+      name: "Sublyx",
+      category: "custom",
+      settingsConfig: {
+        modelCatalog: {
+          models: [
+            {
+              model: "gpt-5.6-sol--ccg-astra",
+              upstreamModel: "gpt-5.6-sol",
+              displayName: "GPT-5.6 Sol [Astra]",
+              apiKeyGroupId: "astra",
+              apiKeyGroupGenerated: true,
+            },
+          ],
+        },
+      },
+    };
+    const plan = createDraftRoutingPlan([provider], [provider]);
+    const route = normalizeCodexRouteForSave(
+      {
+        targetProviderId: provider.id,
+        modelSelection: { mode: "all" },
+        match: {
+          models: ["gpt-5.6-sol--ccg-astra"],
+          prefixes: [],
+        },
+      },
+      0,
+      new Set<string>(),
+    );
+
+    const projected = buildModelCatalogForRoutes(
+      plan,
+      [route],
+      new Map([[provider.id, provider]]),
+    );
+
+    expect(projected.models).toContainEqual(
+      expect.objectContaining({
+        model: "gpt-5.6-sol--ccg-astra",
+        upstreamModel: "gpt-5.6-sol",
+        apiKeyGroupId: "astra",
+        apiKeyGroupGenerated: true,
+      }),
+    );
   });
 
   it("hides and restores one provider model without losing its metadata", () => {

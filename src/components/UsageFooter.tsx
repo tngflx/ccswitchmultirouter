@@ -1,3 +1,4 @@
+import { formatRelativeTime } from "@/utils/usageRelativeTime";
 import React from "react";
 import { RefreshCw, AlertCircle, Clock } from "lucide-react";
 import { useTranslation } from "react-i18next";
@@ -426,27 +427,5 @@ const UsagePlanItem: React.FC<{ data: UsageData }> = ({ data }) => {
     </div>
   );
 };
-
-// 格式化相对时间
-function formatRelativeTime(
-  timestamp: number,
-  now: number,
-  t: (key: string, options?: { count?: number }) => string,
-): string {
-  const diff = Math.floor((now - timestamp) / 1000); // 秒
-
-  if (diff < 60) {
-    return t("usage.justNow");
-  } else if (diff < 3600) {
-    const minutes = Math.floor(diff / 60);
-    return t("usage.minutesAgo", { count: minutes });
-  } else if (diff < 86400) {
-    const hours = Math.floor(diff / 3600);
-    return t("usage.hoursAgo", { count: hours });
-  } else {
-    const days = Math.floor(diff / 86400);
-    return t("usage.daysAgo", { count: days });
-  }
-}
 
 export default UsageFooter;

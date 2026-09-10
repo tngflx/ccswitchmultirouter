@@ -4,6 +4,7 @@
 //! deliberately separate from Codex current provider, live config, and takeover
 //! state.
 
+use super::providers::{codex_route_target_provider_id_from_route, codex_routes_from_settings};
 use crate::app_config::AppType;
 use crate::database::Database;
 use crate::error::AppError;
@@ -762,7 +763,7 @@ fn route_backend_availability(
     // 新式 MultiRouter route 只保存 targetProviderId，不复制目标 provider 的
     // Base URL、API key 或 OAuth 登录态。运行时也会优先物化这个目标，因此预检
     // 必须先沿相同引用读取真实凭据，不能继续拿无凭据的 Router 外壳做判断。
-    if let Some(target_provider_id) = route_target_provider_id(route) {
+    if let Some(target_provider_id) = codex_route_target_provider_id_from_route(route) {
         let Some(target_provider) = providers.get(target_provider_id) else {
             return (
                 false,
@@ -833,65 +834,12 @@ fn codex_provider_has_runtime_credentials(provider: &Provider) -> bool {
     adapter.extract_base_url(provider).is_ok() && adapter.extract_auth(provider).is_some()
 }
 
-/// 从新旧 MultiRouter route schema 中读取目标 provider id。
-///
-/// 字段优先级与 Codex 运行时 route builder 保持一致，避免 External API 的可用性
-/// 预检和真实请求物化到不同的目标。
-fn route_target_provider_id(route: &Value) -> Option<&str> {
-    let upstream = route.get("upstream").unwrap_or(route);
-    [
-        upstream.get("targetProviderId"),
-        upstream.get("target_provider_id"),
-        upstream.get("providerId"),
-        upstream.get("provider_id"),
-        upstream.get("upstreamProviderId"),
-        upstream.get("upstream_provider_id"),
-        upstream.get("provider"),
-        route.get("targetProviderId"),
-        route.get("target_provider_id"),
-        route.get("providerId"),
-        route.get("provider_id"),
-        route.get("upstreamProviderId"),
-        route.get("upstream_provider_id"),
-        route.get("provider"),
-    ]
-    .into_iter()
-    .flatten()
-    .filter_map(Value::as_str)
-    .map(str::trim)
-    .find(|value| !value.is_empty())
-}
-
-/// 判断 provider 是否是显式开启的 Codex router。
 fn is_codex_router_provider(provider: &Provider) -> bool {
-    if let Some(routing) = provider.settings_config.get("codexRouting") {
-        let disabled = routing
-            .get("enabled")
-            .and_then(|enabled| enabled.as_bool())
-            .is_some_and(|enabled| !enabled);
-        let has_routes = routing
-            .get("routes")
-            .and_then(|routes| routes.as_array())
-            .is_some_and(|routes| !routes.is_empty());
-        return !disabled && has_routes;
-    }
-
-    provider
-        .settings_config
-        .get("codexModelRoutes")
-        .or_else(|| provider.settings_config.get("modelRoutes"))
-        .and_then(|routes| routes.as_array())
-        .is_some_and(|routes| !routes.is_empty())
+    codex_routes_from_settings(&provider.settings_config).is_some_and(|routes| !routes.is_empty())
 }
 
-/// 读取新旧 schema 下的 Codex route 数组，供外部 API 页面和运行时状态共用。
 fn codex_router_routes(provider: &Provider) -> Vec<&Value> {
-    provider
-        .settings_config
-        .pointer("/codexRouting/routes")
-        .or_else(|| provider.settings_config.get("codexModelRoutes"))
-        .or_else(|| provider.settings_config.get("modelRoutes"))
-        .and_then(|routes| routes.as_array())
+    codex_routes_from_settings(&provider.settings_config)
         .map(|routes| routes.iter().collect())
         .unwrap_or_default()
 }
@@ -1046,6 +994,69 @@ mod tests {
     use crate::provider::Provider;
     use axum::http::{HeaderMap, HeaderValue};
     use serde_json::json;
+
+    #[test]
+    fn route_schemas_agree_with_runtime_and_do_not_revive_disabled_routes() {
+        use crate::proxy::providers::resolve_codex_primary_route_from_settings;
+        let routes = json!([{"id": "route", "models": ["test-model"]}]);
+        for settings in [
+            json!({"codexRouting": routes}),
+            json!({"codexRouting": {"routes": routes}}),
+            json!({"codexModelRoutes": routes}),
+            json!({"modelRoutes": routes}),
+        ] {
+            let provider = Provider::with_id("router".into(), "Router".into(), settings, None);
+            assert!(is_codex_router_provider(&provider));
+            let visible = codex_router_routes(&provider);
+            assert_eq!(visible.len(), 1);
+            assert_eq!(
+                resolve_codex_primary_route_from_settings(&provider.settings_config, "test-model"),
+                Some(visible[0])
+            );
+        }
+        for routing in [
+            json!({"enabled": false, "routes": routes}),
+            json!({}),
+            json!([]),
+        ] {
+            let provider = Provider::with_id(
+                "router".into(),
+                "Router".into(),
+                json!({"codexRouting": routing, "modelRoutes": routes}),
+                None,
+            );
+            assert!(!is_codex_router_provider(&provider));
+            assert!(codex_router_routes(&provider).is_empty());
+            assert!(resolve_codex_primary_route_from_settings(
+                &provider.settings_config,
+                "test-model"
+            )
+            .is_none());
+        }
+    }
+
+    #[test]
+    fn runtime_status_exposes_array_form_router() {
+        let db = Database::memory().unwrap();
+        let provider = Provider::with_id(
+            "array-router".into(),
+            "Array Router".into(),
+            json!({
+                "codexRouting": [{"id": "array-route", "models": ["test-model"], "baseUrl": "https://example.com/v1", "apiKey": "placeholder"}]
+            }),
+            None,
+        );
+        db.save_provider("codex", &provider).unwrap();
+        let options = list_backend_options(&db).unwrap();
+        assert!(options
+            .iter()
+            .any(|option| option.provider_id == "array-router"
+                && option.available
+                && option.models.iter().any(|model| model == "test-model")));
+        assert!(options
+            .iter()
+            .any(|option| option.route_id.as_deref() == Some("array-route")));
+    }
 
     #[test]
     fn generated_key_is_hashed_and_validates_from_authorization_header() {

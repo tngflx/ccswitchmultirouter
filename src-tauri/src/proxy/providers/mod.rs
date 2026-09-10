@@ -41,9 +41,9 @@ pub(crate) mod streaming_retry;
 pub mod transform;
 pub mod transform_codex_anthropic;
 pub mod transform_codex_chat;
+pub(crate) mod transform_codex_chat_moonshot_schema;
 pub mod transform_codex_responses_namespace;
 pub mod transform_codex_responses_xai_sanitize;
-pub(crate) mod transform_codex_chat_moonshot_schema;
 pub mod transform_gemini;
 pub mod transform_responses;
 pub mod xai_oauth_auth;
@@ -85,8 +85,8 @@ pub(crate) use codex::{
     apply_detected_codex_transport_to_effective_provider, codex_provider_remote_compaction_enabled,
     codex_route_auth_source, codex_route_supports_responses_compaction,
     codex_route_target_provider_id_from_route, codex_route_uses_official_agent_backend,
-    is_codex_chat_completions_endpoint, is_codex_remote_compact_endpoint,
-    is_codex_responses_endpoint, provider_uses_native_codex_auth,
+    codex_routes_from_settings, is_codex_chat_completions_endpoint,
+    is_codex_remote_compact_endpoint, is_codex_responses_endpoint, provider_uses_native_codex_auth,
     resolve_codex_chat_protocol_target, resolve_codex_chat_reasoning_projection,
     resolve_codex_primary_route_from_settings, CODEX_ACCOUNT_POOL_ENABLED,
 };

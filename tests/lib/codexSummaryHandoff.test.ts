@@ -74,7 +74,7 @@ const active = {
 };
 const idle = { thread: { status: { type: "idle" }, turns: [] } };
 
-describe("native summary active-turn handoff", () => {
+describe("manual coding-agent summary handoff", () => {
   it("publishes one flat completed-job contract for Rust polling", async () => {
     const state = jobController(
       freshSessionJobs,
@@ -112,37 +112,48 @@ describe("native summary active-turn handoff", () => {
     expect(state.readSummarizeJob(started.jobId)).not.toHaveProperty("result");
   });
 
-  it("interrupts the exact blocked turn once, waits idle, then waits for a native compaction item", async () => {
+  it("interrupts the exact blocked turn once, then requests a manual summary without compaction", async () => {
     let reads = 0;
     const send = vi.fn(async (method: string) => {
-      if (method !== "thread/read") return {};
+      if (method === "turn/start") return { turn: { id: "summary-turn" } };
       reads++;
       if (reads <= 2) return active;
-      if (reads <= 4) return idle;
-      return {
-        thread: {
-          ...idle.thread,
-          turns: [{ items: [{ type: "contextCompaction" }] }],
-        },
-      };
+      if (reads <= 3) return idle;
+      return { thread: { ...idle.thread, turns: [{
+        id: "summary-turn",
+        status: "completed",
+        items: [{ type: "agentMessage", text: "Manual handoff summary" }],
+      }] } };
     });
-    await expect(runner(send)("source")).resolves.toBeUndefined();
+    await expect(runner(send)("source")).resolves.toEqual({
+      summary: "Manual handoff summary",
+    });
     expect(send.mock.calls.map(([method]) => method)).toEqual([
       "thread/read",
       "turn/interrupt",
       "thread/read",
-      "thread/read",
-      "thread/compact/start",
-      "thread/read",
+      "turn/start",
       "thread/read",
     ]);
+    expect(send).toHaveBeenCalledWith(
+      "turn/start",
+      expect.objectContaining({
+        threadId: "source",
+        input: [expect.objectContaining({
+          type: "text",
+          text: expect.stringContaining("manual coding-agent summary"),
+        })],
+      }),
+    );
+    expect(send).not.toHaveBeenCalledWith("thread/compact/start", expect.anything());
+    expect(send).not.toHaveBeenCalledWith("responses/compact", expect.anything());
     expect(send).toHaveBeenCalledWith("turn/interrupt", {
       threadId: "source",
       turnId: "blocked-turn",
     });
   });
 
-  it("never starts compaction while the source remains active", async () => {
+  it("never starts summarization or compaction while the source remains active", async () => {
     const send = vi.fn(async (_method: string) => active);
     await expect(runner(send)("source")).rejects.toThrow(
       "Timed out interrupting",
@@ -156,7 +167,7 @@ describe("native summary active-turn handoff", () => {
     ).toHaveLength(1);
   });
 
-  it("does not compact after interruption fails", async () => {
+  it("does not summarize or compact after interruption fails", async () => {
     const send = vi.fn(async (method: string) => {
       if (method === "turn/interrupt") throw new Error("interrupt rejected");
       return active;

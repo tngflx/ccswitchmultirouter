@@ -1,5 +1,7 @@
 use std::collections::{BTreeSet, HashMap};
+#[cfg(test)]
 use std::fs;
+#[cfg(test)]
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -881,11 +883,13 @@ pub(crate) struct CodexSummarizeRestartResult {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg(test)]
 struct PersistedCompactionSummary {
     marker: String,
     message: String,
 }
 
+#[cfg(test)]
 fn collect_codex_rollouts(dir: &Path, depth: usize, files: &mut Vec<PathBuf>) {
     if depth > 5 {
         return;
@@ -903,6 +907,7 @@ fn collect_codex_rollouts(dir: &Path, depth: usize, files: &mut Vec<PathBuf>) {
     }
 }
 
+#[cfg(test)]
 fn latest_codex_compaction_summary_in(
     codex_dir: &Path,
     thread_id: &str,
@@ -960,13 +965,7 @@ fn latest_codex_compaction_summary_in(
     Ok(latest.map(|(_, _, summary)| summary))
 }
 
-fn latest_codex_compaction_summary(
-    thread_id: &str,
-) -> Result<Option<PersistedCompactionSummary>, String> {
-    latest_codex_compaction_summary_in(&crate::codex_config::get_codex_config_dir(), thread_id)
-}
-
-/// Create a native compaction summary, then transfer only that persisted
+/// Ask the coding agent for a manual handoff summary, then transfer only that
 /// summary into a new root thread owned by the live Codex Desktop app-server.
 pub(crate) async fn summarize_and_restart_codex_session(
     thread_id: &str,
@@ -976,8 +975,6 @@ pub(crate) async fn summarize_and_restart_codex_session(
     }
     let thread_id_json =
         serde_json::to_string(thread_id).map_err(|error| format!("Invalid thread id: {error}"))?;
-    let previous_summary_marker =
-        latest_codex_compaction_summary(thread_id)?.map(|summary| summary.marker);
     let start_script = format!(
         r#"(() => {{
           const state = window[{patch_key:?}];
@@ -1078,7 +1075,7 @@ pub(crate) async fn summarize_and_restart_codex_session(
                 let reason = value
                     .get("reason")
                     .and_then(Value::as_str)
-                    .unwrap_or("Codex Desktop did not start compaction");
+                .unwrap_or("Codex Desktop did not start manual summarization");
                 diagnostics.push(format!("target {}: {reason}", target.id));
                 continue;
             }
@@ -1128,24 +1125,18 @@ pub(crate) async fn summarize_and_restart_codex_session(
                     .unwrap_or(Value::Null);
                 match value.get("status").and_then(Value::as_str) {
                     Some("completed") => {
-                        let summary_deadline =
-                            tokio::time::Instant::now() + Duration::from_secs(10);
-                        let summary = loop {
-                            let current = latest_codex_compaction_summary(thread_id)?;
-                            if current.as_ref().is_some_and(|summary| {
-                                Some(summary.marker.as_str()) != previous_summary_marker.as_deref()
-                            }) {
-                                break current.expect("checked as some");
-                            }
-                            if tokio::time::Instant::now() >= summary_deadline {
-                                return Err(format!(
-                                    "target {}: Codex completed compaction but no new persisted handoff summary was found",
+                        let summary = value
+                            .get("summary")
+                            .and_then(Value::as_str)
+                            .filter(|summary| !summary.trim().is_empty())
+                            .ok_or_else(|| {
+                                format!(
+                                    "target {}: manual summary completed without summary text",
                                     target.id
-                                ));
-                            }
-                            tokio::time::sleep(Duration::from_millis(250)).await;
-                        };
-                        let summary_json = serde_json::to_string(&summary.message)
+                                )
+                            })?
+                            .to_string();
+                        let summary_json = serde_json::to_string(&summary)
                             .map_err(|error| format!("Invalid handoff summary: {error}"))?;
                         let fresh_script = format!(
                             r#"(() => {{
@@ -3264,21 +3255,18 @@ JSON.stringify({
         let interrupt = script
             .find(r#"client.sendRequest("turn/interrupt""#)
             .expect("blocked source turn interruption");
-        let compact = script
-            .find(r#"client.sendRequest("thread/compact/start""#)
-            .expect("native compaction request");
-        let wait_for_item = script
-            .find("countCompactionItems(current) > beforeCompactions")
-            .expect("native compaction completion wait");
+        let manual_summary = script
+            .find(r#"text: [
+              "Create a concise handoff summary"#)
+            .expect("manual coding-agent summary request");
         let fresh_thread = script
             .find(r#"client.sendRequest("thread/start""#)
             .expect("fresh thread request");
         let handoff_turn = script
-            .find(r#"client.sendRequest("turn/start""#)
+            .rfind(r#"client.sendRequest("turn/start""#)
             .expect("handoff turn request");
-        assert!(interrupt < compact);
-        assert!(compact < wait_for_item);
-        assert!(wait_for_item < fresh_thread);
+        assert!(interrupt < manual_summary);
+        assert!(manual_summary < fresh_thread);
         assert!(fresh_thread < handoff_turn);
         assert!(script.contains(r#"config: { model_reasoning_effort: "medium" }"#));
         assert!(script.contains("state.startSummarizeSession"));
@@ -3288,6 +3276,8 @@ JSON.stringify({
         assert!(script.contains("await triggerLocalThreadCatalogSync()"));
         assert!(script.contains(r#"String(turn?.status || "") === "inProgress""#));
         assert!(!script.contains(r#"client.sendRequest("thread/fork""#));
+        assert!(!script.contains(r#"client.sendRequest("thread/compact/start""#));
+        assert!(!script.contains(r#"client.sendRequest("responses/compact""#));
         assert!(!script.contains("thread/delete"));
         assert!(!script.contains("thread/archive"));
     }

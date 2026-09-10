@@ -1641,7 +1641,11 @@
     "editRoute": "編輯 route",
     "editRouteHint": "設定這條 route 的匹配規則、上游 API 格式、鑑權、模型映射與能力宣告。",
     "noCommonConfigToApply": "通用設定片段為空或沒有可寫入的內容",
+    "catalogPruneNone": "未發現過時版本",
+    "catalogPrunedFeedback": "已移除 {{count}} 個過時模型",
     "providerReadiness": {
+      "pruneOutdated": "保留近期版本",
+      "pruneOutdatedTitle": "每個分支保留最近兩個版本，每個系列在可用時至少保留四個不同模型",
       "title": "模型與相容性",
       "description": "同步這個模型來源可用的模型，並驗證 Codex 和 MultiRouter 能否正常使用。",
       "syncModels": "同步模型",
@@ -4190,6 +4194,7 @@
       "reviewModeFirst": "第一個大型請求",
       "reviewModeSustained": "持續增長後",
       "summarizeAndRestartEnabled": "提供「摘要並開始新工作階段」",
+      "windowsNotificationsEnabled": "顯示 Windows 核准提醒",
       "detectedOnlyWarning": "已偵測到大型請求，但安全最佳化移除了 0 位元組，因為剩餘內容屬於有語意的會話歷史。請求健康不會修改這些歷史。啟用首次請求審核後，請求會在傳送前暫停，直到你在 Windows 通知中作出選擇。",
       "historyWarning": "請求健康會在時間線中保留近期警告，包括發生時間和採取的操作。",
       "timeline": "請求時間線",
@@ -4200,7 +4205,10 @@
         "blocked": "已阻止",
         "summarize_requested": "已要求摘要",
         "summarize_completed": "摘要並建立新工作階段完成",
-        "summarize_failed": "摘要並建立新工作階段失敗"
+        "summarize_failed": "摘要並建立新工作階段失敗",
+        "continue_once": "僅繼續這一次",
+        "summarize_and_restart": "摘要並開始新工作階段",
+        "inspect": "檢查"
       },
       "items": "歷史項目",
       "removed": "已移除",
@@ -4216,6 +4224,9 @@
       "cachedInputTokens": "快取命中輸入 Token",
       "freshInputTokens": "新鮮輸入 Token",
       "cacheHitRatio": "快取命中率",
+      "mediaBytes": "影像載荷位元組數",
+      "mediaItems": "包含影像的項目",
+      "recommendedAction": "建議操作",
       "cacheAnomaly": "快取健康警告",
       "empty": "尚無請求健康樣本。請透過本機代理傳送一次請求後重新整理。"
     }

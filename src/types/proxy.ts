@@ -66,6 +66,7 @@ export interface RequestHealthConfig {
   reviewTimeoutSeconds: number;
   reviewMode: "off" | "first_large_request" | "sustained_growth";
   summarizeAndRestartEnabled: boolean;
+  windowsNotificationsEnabled: boolean;
 }
 
 export interface RequestHealthBreakdown {
@@ -110,6 +111,15 @@ export interface RequestHealthDiagnostic {
   itemCount: number;
   largestItemBytes: number;
   largestItemCategory: string | null;
+  mediaBytes: number;
+  mediaItems: number;
+  mediaDominated: boolean;
+  dominantCategory: string | null;
+  recommendedAction:
+    | "continue_once"
+    | "summarize_and_restart"
+    | "inspect"
+    | string;
   optimizationMode: RequestOptimizationMode;
   optimizationApplied: boolean;
   compactionRequest: boolean;

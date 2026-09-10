@@ -1,65 +1,31 @@
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
-use std::sync::OnceLock;
-use std::time::{Duration, Instant};
-
+#[cfg(test)]
+use super::auto_sync::{auto_sync_wait_duration, enqueue_change_signal, MAX_AUTO_SYNC_WAIT_MS};
+use super::auto_sync::{AutoSyncState, SuppressionGuard};
 use serde_json::json;
+use std::sync::Arc;
 use tauri::{AppHandle, Emitter};
-use tokio::sync::mpsc::error::TrySendError;
-use tokio::sync::mpsc::{channel, Receiver, Sender};
 
 use crate::error::AppError;
 use crate::services::s3_sync;
-use crate::services::sync_protocol::should_trigger_auto_sync_for_table;
+#[cfg(test)]
+use crate::services::sync_protocol::should_trigger_auto_sync_for_table as should_trigger_for_table;
 use crate::settings::{self, S3SyncSettings};
 
-const AUTO_SYNC_DEBOUNCE_MS: u64 = 1000;
-pub(crate) const MAX_AUTO_SYNC_WAIT_MS: u64 = 10_000;
+static STATE: AutoSyncState = AutoSyncState::new();
 
-static DB_CHANGE_TX: OnceLock<Sender<String>> = OnceLock::new();
-static AUTO_SYNC_SUPPRESS_DEPTH: AtomicUsize = AtomicUsize::new(0);
-
-pub(crate) struct AutoSyncSuppressionGuard;
-
+pub(crate) struct AutoSyncSuppressionGuard {
+    _guard: SuppressionGuard,
+}
 impl AutoSyncSuppressionGuard {
     pub fn new() -> Self {
-        AUTO_SYNC_SUPPRESS_DEPTH.fetch_add(1, Ordering::SeqCst);
-        Self
+        Self {
+            _guard: STATE.suppress(),
+        }
     }
 }
-
-impl Drop for AutoSyncSuppressionGuard {
-    fn drop(&mut self) {
-        let _ =
-            AUTO_SYNC_SUPPRESS_DEPTH.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |value| {
-                Some(value.saturating_sub(1))
-            });
-    }
-}
-
+#[cfg(test)]
 pub(crate) fn is_auto_sync_suppressed() -> bool {
-    AUTO_SYNC_SUPPRESS_DEPTH.load(Ordering::SeqCst) > 0
-}
-
-pub fn should_trigger_for_table(table: &str) -> bool {
-    should_trigger_auto_sync_for_table(table)
-}
-
-pub(crate) fn enqueue_change_signal(tx: &Sender<String>, table: &str) -> bool {
-    match tx.try_send(table.to_string()) {
-        Ok(()) => true,
-        Err(TrySendError::Full(_)) | Err(TrySendError::Closed(_)) => false,
-    }
-}
-
-pub(crate) fn auto_sync_wait_duration(started_at: Instant, now: Instant) -> Option<Duration> {
-    let max_wait = Duration::from_millis(MAX_AUTO_SYNC_WAIT_MS);
-    let debounce = Duration::from_millis(AUTO_SYNC_DEBOUNCE_MS);
-    let elapsed = now.saturating_duration_since(started_at);
-    if elapsed >= max_wait {
-        return None;
-    }
-    Some(debounce.min(max_wait - elapsed))
+    STATE.is_suppressed()
 }
 
 fn should_run_auto_sync(settings: Option<&S3SyncSettings>) -> bool {
@@ -122,61 +88,13 @@ async fn run_auto_sync_upload(
 }
 
 pub fn notify_db_changed(table: &str) {
-    if is_auto_sync_suppressed() {
-        return;
-    }
-    if !should_trigger_for_table(table) {
-        return;
-    }
-    let Some(tx) = DB_CHANGE_TX.get() else {
-        return;
-    };
-    let _ = enqueue_change_signal(tx, table);
+    STATE.notify(table);
 }
 
 pub fn start_worker(db: Arc<crate::database::Database>, app: tauri::AppHandle) {
-    if DB_CHANGE_TX.get().is_some() {
-        return;
-    }
-
-    // Buffer size 1 is enough: we only need "dirty" signals, not every event.
-    let (tx, rx) = channel::<String>(1);
-    if DB_CHANGE_TX.set(tx).is_err() {
-        return;
-    }
-
-    tauri::async_runtime::spawn(async move {
-        run_worker_loop(db, rx, app).await;
+    STATE.start(db, app, "S3", |db, app| async move {
+        run_auto_sync_upload(&db, &app).await
     });
-}
-
-async fn run_worker_loop(
-    db: Arc<crate::database::Database>,
-    mut rx: Receiver<String>,
-    app: tauri::AppHandle,
-) {
-    while let Some(first_table) = rx.recv().await {
-        let started_at = Instant::now();
-        let mut merged_count = 1usize;
-
-        while let Some(wait_for) = auto_sync_wait_duration(started_at, Instant::now()) {
-            let timeout = tokio::time::timeout(wait_for, rx.recv()).await;
-
-            match timeout {
-                Ok(Some(_)) => merged_count += 1,
-                Ok(None) => return,
-                Err(_) => break,
-            }
-        }
-
-        log::debug!(
-            "[S3][AutoSync] Triggered by table={first_table}, merged_changes={merged_count}"
-        );
-
-        if let Err(err) = run_auto_sync_upload(&db, &app).await {
-            log::warn!("[S3][AutoSync] Upload failed: {err}");
-        }
-    }
 }
 
 #[cfg(test)]

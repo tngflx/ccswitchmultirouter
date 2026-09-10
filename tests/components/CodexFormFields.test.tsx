@@ -695,6 +695,29 @@ function renderAutoSplitHarness() {
 }
 
 describe("CodexFormFields local model routing", () => {
+  it("applies recent release retention to the saved catalog", async () => {
+    const names = [
+      "gpt-6-astra",
+      "gpt-5.6-sol",
+      "gpt-5.6-terra",
+      "gpt-5.6-luna",
+      "gpt-5.5",
+      "glm-5.3",
+      "glm-5.2",
+      "glm-5.1",
+      "glm-5",
+      "glm-4.7",
+    ];
+    const harness = renderCatalogHarness(names.map((model) => ({ model })));
+    fireEvent.click(
+      screen.getByRole("button", { name: "Keep recent versions" }),
+    );
+    await waitFor(() =>
+      expect(harness.latestCatalog().map((r) => r.model)).toEqual(
+        names.filter((name) => name !== "gpt-5.5" && name !== "glm-4.7"),
+      ),
+    );
+  });
   it("keeps selection through capability and usage filters and sorts without reordering saved rows", async () => {
     const harness = renderCatalogHarness([
       {

@@ -1,3 +1,4 @@
+import { useDarkMode } from "@/hooks/useDarkMode";
 import React, { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { Save } from "lucide-react";
@@ -13,7 +14,7 @@ const EnvPanel: React.FC = () => {
   const { data: envData, isLoading } = useOpenClawEnv();
   const saveEnvMutation = useSaveOpenClawEnv();
   const [editorValue, setEditorValue] = useState("{}");
-  const [isDarkMode, setIsDarkMode] = useState(false);
+  const isDarkMode = useDarkMode();
 
   useEffect(() => {
     const nextValue =
@@ -22,21 +23,6 @@ const EnvPanel: React.FC = () => {
         : "{}";
     setEditorValue(nextValue);
   }, [envData]);
-
-  useEffect(() => {
-    setIsDarkMode(document.documentElement.classList.contains("dark"));
-
-    const observer = new MutationObserver(() => {
-      setIsDarkMode(document.documentElement.classList.contains("dark"));
-    });
-
-    observer.observe(document.documentElement, {
-      attributes: true,
-      attributeFilter: ["class"],
-    });
-
-    return () => observer.disconnect();
-  }, []);
 
   const handleSave = async () => {
     try {

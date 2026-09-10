@@ -1,64 +1,172 @@
 import type { CodexCatalogModel } from "@/types";
 
-const VARIANT_ORDER = ["astra", "sol", "terra", "luna"];
-const VERSION_RE = /(?:^|[-_])v?(\d+(?:\.\d+)+)(?=$|[-_])/i;
+type Release = {
+  family: string;
+  branch: string;
+  version: number[];
+  identity: string;
+  revision?: string;
+};
 
-function parsedVersion(model: string): number[] {
-  const match = model.match(VERSION_RE);
-  return match ? match[1].split(".").map(Number) : [];
+export function parseRelease(model: CodexCatalogModel): Release | undefined {
+  const name = (
+    model.upstreamModel?.trim() ||
+    model.upstream_model?.trim() ||
+    model.model.trim()
+  ).toLowerCase();
+  const slash = name.lastIndexOf("/");
+  const namespace = name.slice(0, slash + 1);
+  // Offering suffixes do not represent additional model choices.
+  const id = name
+    .slice(slash + 1)
+    .replace(/_/g, "-")
+    .replace(/(?:(?::|-)(?:free|batch|contributor))+$/, "");
+  let family: string;
+  let version: number[];
+  let suffix: string;
+  const claude = id.match(
+    /^claude-(?:(opus|sonnet|haiku|fable)-(\d+)(?:[.-](\d{1,2}))?|(\d+)(?:[.-](\d{1,2}))?-(opus|sonnet|haiku|fable))(?=$|-)/,
+  );
+  if (claude) {
+    family = `claude-${claude[1] || claude[6]}`;
+    version = [
+      Number(claude[2] || claude[4]),
+      Number(claude[3] || claude[5] || 0),
+    ];
+    suffix = id.slice(claude[0].length);
+  } else {
+    // Only known version positions: never interpret parameter sizes as releases.
+    const match = id.match(
+      /^(gpt-|glm-|deepseek-(?:chat-)?[vr]|qwen-?|kimi-k|minimax-m|gemini-|llama-?|grok-(?:build-)?|muse-spark-|ling-|nemotron-|mimo-v|longcat-|hy)(\d{1,2}(?:\.\d+)*)(?=$|-|v(?:-|$))/,
+    );
+    if (!match) return undefined;
+    family = match[1]
+      .replace(/-$/, "")
+      .replace("deepseek-chat-v", "deepseek-v");
+    version = match[2].split(".").map(Number);
+    suffix = id.slice(match[0].length);
+  }
+  const date = suffix.match(/-(\d{4}-\d{2}-\d{2}|\d{8}|\d{2}-\d{2}|\d{4})$/);
+  const revision = date?.[1].replace(/-/g, "");
+  if (date) suffix = suffix.slice(0, -date[0].length);
+  const codename =
+    family === "gpt"
+      ? suffix.match(/^-(astra|sol|luna|terra)(?=-|$)/)?.[1]
+      : undefined;
+  if (codename) suffix = suffix.slice(codename.length + 1);
+  // Keep all other suffixes as branch boundaries, including unknown specialties.
+  // Grok 4.20 is a named series, not semver minor 20; keep it independent.
+  const branch =
+    (family === "grok" && version[0] === 4 && version[1] === 20
+      ? "4.20:"
+      : "") + (suffix || "general");
+  while (version.length > 1 && version.at(-1) === 0) version.pop();
+  const scope = JSON.stringify([
+    model.providerName || model.provider_name || "",
+    model.apiKeyGroupId || model.api_key_group_id || "",
+    namespace + family,
+  ]);
+  const identity = JSON.stringify([branch, version, codename || ""]);
+  return { family: scope, branch, version, identity, revision };
 }
 
-function familyKey(model: string): string {
-  return model
-    .toLowerCase()
-    .replace(/(?:^|[-_])v?\d+(?:\.\d+)+(?=$|[-_])/g, "")
-    .replace(/[-_](?:astra|sol|terra|luna)(?:[-_].*)?$/g, "")
-    .replace(/[-_](?:free|instruct|chat)(?:[-_].*)?$/g, "")
-    .replace(/[-_]+/g, "-")
-    .replace(/^-|-$/g, "");
-}
-
-function compareVersion(a: CodexCatalogModel, b: CodexCatalogModel): number {
-  const av = parsedVersion(a.model);
-  const bv = parsedVersion(b.model);
-  for (let i = 0; i < Math.max(av.length, bv.length); i++) {
-    const diff = (av[i] ?? 0) - (bv[i] ?? 0);
+function compareVersion(a: number[], b: number[]): number {
+  for (let i = 0; i < Math.max(a.length, b.length); i++) {
+    const diff = (a[i] ?? 0) - (b[i] ?? 0);
     if (diff) return diff;
   }
   return 0;
 }
 
-export function pruneOutdatedCodexCatalogModels(
-  models: CodexCatalogModel[],
-  keepPerFamily = 5,
-): { kept: CodexCatalogModel[]; pruned: CodexCatalogModel[] } {
-  const groups = new Map<string, CodexCatalogModel[]>();
-  const manual: CodexCatalogModel[] = [];
-  for (const model of models) {
-    const name = model.model.trim();
-    if (!name || !parsedVersion(name).length) {
-      manual.push(model);
-      continue;
+export type CatalogPruningDecision = {
+  model: CodexCatalogModel;
+  release?: Release;
+  keep: boolean;
+  reason:
+    | "unclassified"
+    | "recent-release"
+    | "family-minimum"
+    | "older-release"
+    | "older-snapshot";
+};
+
+export function pruneOutdatedCodexCatalogModels(models: CodexCatalogModel[]): {
+  kept: CodexCatalogModel[];
+  pruned: CodexCatalogModel[];
+  decisions: CatalogPruningDecision[];
+} {
+  const decisions: CatalogPruningDecision[] = models.map((model) => ({
+    model,
+    release: parseRelease(model),
+    keep: true,
+    reason: "unclassified",
+  }));
+  const families = new Map<string, CatalogPruningDecision[]>();
+  for (const decision of decisions) {
+    if (!decision.release) continue;
+    const key = decision.release.family;
+    const rows = families.get(key) ?? [];
+    rows.push(decision);
+    families.set(key, rows);
+  }
+  for (const rows of families.values()) {
+    const branches = new Map<string, number[][]>();
+    const snapshots = new Map<string, string>();
+    for (const { release: r } of rows) {
+      if (!r) continue;
+      const versions = branches.get(r.branch) ?? [];
+      if (!versions.some((v) => compareVersion(v, r.version) === 0))
+        versions.push(r.version);
+      branches.set(r.branch, versions);
+      if (r.revision) {
+        const key = JSON.stringify([r.identity, r.revision.length]);
+        const previous = snapshots.get(key);
+        if (!previous || r.revision > previous) snapshots.set(key, r.revision);
+      }
     }
-    const key = familyKey(name);
-    const group = groups.get(key) ?? [];
-    group.push(model);
-    groups.set(key, group);
+    for (const versions of branches.values())
+      versions.sort((a, b) => compareVersion(b, a));
+    for (const row of rows) {
+      const r = row.release!;
+      const recent = branches
+        .get(r.branch)!
+        .slice(0, 2)
+        .some((v) => compareVersion(v, r.version) === 0);
+      const oldSnapshot =
+        r.revision &&
+        r.revision <
+          snapshots.get(JSON.stringify([r.identity, r.revision.length]))!;
+      row.keep = recent && !oldSnapshot;
+      row.reason = oldSnapshot
+        ? "older-snapshot"
+        : recent
+          ? "recent-release"
+          : "older-release";
+    }
+    const identities = new Set(
+      rows.filter((r) => r.keep).map((r) => r.release!.identity),
+    );
+    // Backfill whole release tiers, so endpoint ordering cannot change selection.
+    const candidates = rows
+      .filter((r) => !r.keep && r.reason !== "older-snapshot")
+      .sort((a, b) => compareVersion(b.release!.version, a.release!.version));
+    let boundary: number[] | undefined;
+    for (const row of candidates) {
+      const r = row.release!;
+      if (
+        identities.size >= 4 &&
+        (!boundary || compareVersion(r.version, boundary) !== 0)
+      )
+        break;
+      row.keep = true;
+      row.reason = "family-minimum";
+      identities.add(r.identity);
+      boundary = r.version;
+    }
   }
-  const kept = [...manual];
-  const pruned: CodexCatalogModel[] = [];
-  for (const group of groups.values()) {
-    group.sort((a, b) => compareVersion(b, a));
-    const latest = parsedVersion(group[0].model).join(".");
-    const latestGroup = group.filter((m) => parsedVersion(m.model).join(".") === latest);
-    const free = group.filter((m) => /(?:^|[-_])free(?:$|[-_])/i.test(m.model));
-    const ordered = [...latestGroup].sort((a, b) => {
-      const av = VARIANT_ORDER.findIndex((v) => a.model.toLowerCase().includes(v));
-      const bv = VARIANT_ORDER.findIndex((v) => b.model.toLowerCase().includes(v));
-      return (av < 0 ? 99 : av) - (bv < 0 ? 99 : bv);
-    });
-    const selected = new Set([...ordered.slice(0, keepPerFamily), ...free]);
-    group.forEach((m) => (selected.has(m) ? kept : pruned).push(m));
-  }
-  return { kept, pruned };
+  return {
+    kept: decisions.filter((r) => r.keep).map((r) => r.model),
+    pruned: decisions.filter((r) => !r.keep).map((r) => r.model),
+    decisions,
+  };
 }

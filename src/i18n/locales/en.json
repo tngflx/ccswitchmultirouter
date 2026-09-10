@@ -1641,7 +1641,11 @@
     "editRoute": "Edit route",
     "editRouteHint": "Configure matching, upstream API format, auth, model mapping, and capabilities for this route.",
     "noCommonConfigToApply": "The common config snippet is empty or contains nothing to write",
+    "catalogPruneNone": "No outdated versions found",
+    "catalogPrunedFeedback": "Removed {{count}} outdated models",
     "providerReadiness": {
+      "pruneOutdated": "Keep recent versions",
+      "pruneOutdatedTitle": "Keep two recent releases per branch and at least four distinct models per family when available",
       "title": "Models & Compatibility",
       "description": "Sync the models available from this source and verify that Codex and MultiRouter can use them correctly.",
       "syncModels": "Sync Models",
@@ -4190,6 +4194,7 @@
       "reviewModeFirst": "First large request",
       "reviewModeSustained": "After sustained growth",
       "summarizeAndRestartEnabled": "Offer Summarize + new session",
+      "windowsNotificationsEnabled": "Show Windows approval reminders",
       "detectedOnlyWarning": "This large request was detected, but safe optimization removed 0 bytes because the remaining content is semantic history. Request Health will not alter that history. With first-request review enabled, it is held before dispatch until the Windows notification is decided.",
       "historyWarning": "Request Health keeps recent warnings in the timeline, including when they happened and what action was taken.",
       "timeline": "Request timeline",
@@ -4200,7 +4205,10 @@
         "blocked": "Blocked",
         "summarize_requested": "Summarize requested",
         "summarize_completed": "Summary + new session complete",
-        "summarize_failed": "Summary + new session failed"
+        "summarize_failed": "Summary + new session failed",
+        "continue_once": "Continue once",
+        "summarize_and_restart": "Summarize + new session",
+        "inspect": "Inspect"
       },
       "items": "Items",
       "removed": "Removed",
@@ -4216,6 +4224,9 @@
       "cachedInputTokens": "Cached input tokens",
       "freshInputTokens": "Fresh input tokens",
       "cacheHitRatio": "Cache-hit ratio",
+      "mediaBytes": "Image payload bytes",
+      "mediaItems": "Image-bearing items",
+      "recommendedAction": "Recommended action",
       "cacheAnomaly": "Cache-health warning",
       "empty": "No request-health sample yet. Send a request through the local proxy, then refresh."
     }

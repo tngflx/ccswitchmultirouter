@@ -28,6 +28,19 @@ client-versus-proxy growth must have a regression test at the owning boundary.
 When no proxy inflation exists, state that clearly and preserve the evidence rather
 than changing unrelated request logic.
 
+6-C. **Summarize means manual coding-agent summarization; never use compaction for handoff.**
+When the user requests “summarize”, “summarize + new session”, or passover, do not
+call `thread/compact/start`, `/responses/compact`, native context compaction, or any
+other compaction endpoint as the summarization mechanism. Interrupt the blocked source
+turn only when necessary, wait for the source to become idle, then start one ordinary
+coding-agent turn with tools and file mutation explicitly forbidden. Require that turn
+to return a plain-text handoff summary containing the goal, decisions, changed areas,
+current state, failures, tests, and next action. Only after that summary text is
+successfully returned may the system create a fresh root session and pass the summary
+into it. A missing, empty, failed, or ambiguous summary must stop the handoff and
+must never fall back to compaction. Add a regression test that proves no compaction
+method or compaction endpoint is called.
+
 ## ALWAYS RECHECK
 
 7. **After ANY upstream merge:** grep for every function/field/import that our custom code depends on (`resolve_reasoning_content_mode`, `ReasoningContentMode`, `normalize_third_party_responses_reasoning_content_for_strict_schema`, `reasoning_content_mode` on ProviderMeta, LanguageSwitcher, etc.). Upstream may silently remove or rename them.
@@ -38,10 +51,15 @@ than changing unrelated request logic.
 
 10. **When reporting status:** list exactly what passed, what failed, and what was not tested. Never round up or omit failures.
 
-10-A. **Concurrent work uses Git boundaries, not local lease files.** Before editing or
+10-A. **NEVER create a new Git branch, worktree, clone, or alternate checkout without
+the user's explicit permission for that specific action.** A request to audit,
+implement, fix, or test does NOT grant this permission. Work in the user's current
+checkout and branch by default. Dirty files, concurrent tasks, build locks, and a
+running app do NOT authorize creating another branch or worktree. Before editing or
 starting broad verification, inspect `git status --short` and `git diff --name-only`.
-Use a separate Codex task/worktree or branch for parallel work. Do not edit the same
-checkout concurrently unless the other task has explicitly agreed to the overlap.
+Do not edit the same checkout concurrently unless the other task has explicitly
+agreed to the overlap. If overlap prevents progress, coordinate or pause the
+affected work and ask the user; do not create Git isolation as a workaround.
 Treat unexplained dirty files as user or another-task work: do not overwrite,
 format, revert, or attribute them. If a shared checkout is unavoidable, coordinate
 in the task conversation and verify against the moving tree; do not create
@@ -58,9 +76,11 @@ wait for the existing development process; never create a second build tree.
 source fix.** If a live `cc-switch.exe` predates the changed source, the normal
 target is locked, or runtime verification requires a rebuilt process, state the
 exact rebuild action needed and ask the user to perform it. Pause runtime
-verification until they confirm the rebuild completed; do not kill their process,
-create an alternate build target, or present an older binary as evidence for the
-new source.
+verification until they confirm the rebuild completed. For the normal development
+app, ask the user to stop their existing `pnpm dev` process and restart `pnpm dev`
+from the current checkout when needed. Do not kill their process, create a new
+branch/worktree/checkout or alternate build target to bypass the blocker, or
+present an older binary as evidence for the new source.
 
 ## MERGE PROTOCOL
 

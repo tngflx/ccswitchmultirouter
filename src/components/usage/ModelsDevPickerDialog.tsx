@@ -1,6 +1,6 @@
-import { useEffect, useMemo, useState } from "react";
+import { useModelsDevCatalog } from "@/hooks/useModelsDevCatalog";
+import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { useQuery } from "@tanstack/react-query";
 import { toast } from "sonner";
 import { Check, Loader2, Search } from "lucide-react";
 import {
@@ -23,12 +23,7 @@ import {
 } from "@/components/ui/select";
 import { UI_LAYER_CLASS } from "@/components/ui/layers";
 import { useUpdateModelPricing } from "@/lib/query/usage";
-import {
-  fetchModelsDevPricing,
-  flattenModels,
-  formatPrice,
-  type ModelsDevEntry,
-} from "@/lib/modelsDevPricing";
+import { formatPrice, type ModelsDevEntry } from "@/lib/modelsDevPricing";
 import { isTextEditableTarget } from "@/utils/domUtils";
 
 export {
@@ -69,48 +64,22 @@ export function ModelsDevPickerDialog({
     }
   }, [open]);
 
-  const { data, isLoading, isFetching, error, refetch } = useQuery({
-    queryKey: ["models-dev-pricing"],
-    queryFn: fetchModelsDevPricing,
-    enabled: open,
-    staleTime: 60 * 60 * 1000,
-    retry: 1,
-  });
-
-  const entries = useMemo(() => (data ? flattenModels(data) : []), [data]);
-
-  const providers = useMemo(() => {
-    const map = new Map<string, string>();
-    for (const entry of entries) {
-      if (!map.has(entry.providerId)) {
-        map.set(entry.providerId, entry.providerName);
-      }
-    }
-    return Array.from(map, ([id, name]) => ({ id, name })).sort((a, b) =>
-      a.name.localeCompare(b.name),
-    );
-  }, [entries]);
-
-  const isFiltering = search.trim() !== "" || providerFilter !== "all";
-
-  const filtered = useMemo(() => {
-    const query = search.trim().toLowerCase();
-    return entries.filter(
-      (entry) =>
-        (providerFilter === "all" || entry.providerId === providerFilter) &&
-        (!query ||
-          entry.modelId.toLowerCase().includes(query) ||
-          entry.normalizedId.includes(query) ||
-          entry.modelName.toLowerCase().includes(query) ||
-          entry.providerName.toLowerCase().includes(query)),
-    );
-  }, [entries, search, providerFilter]);
-
-  // 默认只展示最新发布的一批，搜索/筛选时展示全量匹配（设上限防卡顿）
-  const visible = useMemo(
-    () =>
-      filtered.slice(0, isFiltering ? MAX_VISIBLE_ROWS : DEFAULT_VISIBLE_ROWS),
-    [filtered, isFiltering],
+  const {
+    data,
+    providers,
+    filtered,
+    visible,
+    isFiltering,
+    isLoading,
+    isFetching,
+    error,
+    refetch,
+  } = useModelsDevCatalog(
+    search,
+    providerFilter,
+    DEFAULT_VISIBLE_ROWS,
+    MAX_VISIBLE_ROWS,
+    open,
   );
 
   // 单选：点击未选中的行替换选择，点击已选中的行取消选择。

@@ -99,6 +99,8 @@ pub struct RequestHealthConfig {
     /// Offer a native handoff summary transferred into a fresh root Codex session.
     #[serde(default = "default_true", alias = "compactAndRestartEnabled")]
     pub summarize_and_restart_enabled: bool,
+    #[serde(default = "default_true")]
+    pub windows_notifications_enabled: bool,
 }
 
 impl Default for RequestHealthConfig {
@@ -111,6 +113,7 @@ impl Default for RequestHealthConfig {
             review_timeout_seconds: default_request_health_review_timeout_seconds(),
             review_mode: RequestHealthReviewMode::FirstLargeRequest,
             summarize_and_restart_enabled: true,
+            windows_notifications_enabled: true,
         }
     }
 }

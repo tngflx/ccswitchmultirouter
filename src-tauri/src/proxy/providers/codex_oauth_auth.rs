@@ -21,7 +21,6 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
@@ -1438,58 +1437,8 @@ impl CodexOAuthManager {
     }
 
     fn write_store_atomic(&self, content: &str) -> Result<(), CodexOAuthError> {
-        if let Some(parent) = self.storage_path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-
-        let parent = self
-            .storage_path
-            .parent()
-            .ok_or_else(|| CodexOAuthError::IoError("无效的存储路径".to_string()))?;
-        let file_name = self
-            .storage_path
-            .file_name()
-            .ok_or_else(|| CodexOAuthError::IoError("无效的存储文件名".to_string()))?
-            .to_string_lossy()
-            .to_string();
-        let ts = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        let tmp_path = parent.join(format!("{file_name}.tmp.{ts}"));
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-
-            let mut file = fs::OpenOptions::new()
-                .create_new(true)
-                .write(true)
-                .mode(0o600)
-                .open(&tmp_path)?;
-            file.write_all(content.as_bytes())?;
-            file.flush()?;
-
-            fs::rename(&tmp_path, &self.storage_path)?;
-            fs::set_permissions(&self.storage_path, fs::Permissions::from_mode(0o600))?;
-        }
-
-        #[cfg(windows)]
-        {
-            let mut file = fs::OpenOptions::new()
-                .create_new(true)
-                .write(true)
-                .open(&tmp_path)?;
-            file.write_all(content.as_bytes())?;
-            file.flush()?;
-
-            if self.storage_path.exists() {
-                let _ = fs::remove_file(&self.storage_path);
-            }
-            fs::rename(&tmp_path, &self.storage_path)?;
-        }
-
-        Ok(())
+        crate::config::atomic_write_private(&self.storage_path, content.as_bytes())
+            .map_err(|error| CodexOAuthError::IoError(error.to_string()))
     }
 
     fn load_from_disk_sync(&self) -> Result<(), CodexOAuthError> {

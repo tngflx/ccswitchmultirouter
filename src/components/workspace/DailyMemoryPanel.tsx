@@ -1,3 +1,4 @@
+import { useDarkMode } from "@/hooks/useDarkMode";
 import React, {
   useState,
   useEffect,
@@ -70,19 +71,7 @@ const DailyMemoryPanel: React.FC<DailyMemoryPanelProps> = ({
   const contentRequestRef = useRef(0);
 
   // Dark mode
-  const [isDarkMode, setIsDarkMode] = useState(false);
-
-  useEffect(() => {
-    setIsDarkMode(document.documentElement.classList.contains("dark"));
-    const observer = new MutationObserver(() => {
-      setIsDarkMode(document.documentElement.classList.contains("dark"));
-    });
-    observer.observe(document.documentElement, {
-      attributes: true,
-      attributeFilter: ["class"],
-    });
-    return () => observer.disconnect();
-  }, []);
+  const isDarkMode = useDarkMode();
 
   // Whether we are in active search mode (search open with a non-empty term)
   const isActiveSearch = useMemo(

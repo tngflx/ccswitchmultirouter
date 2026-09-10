@@ -1641,7 +1641,11 @@
     "editRoute": "编辑 route",
     "editRouteHint": "配置这条 route 的匹配规则、上游 API 格式、鉴权、模型映射和能力声明。",
     "noCommonConfigToApply": "通用配置片段为空或没有可写入的内容",
+    "catalogPruneNone": "未发现过时版本",
+    "catalogPrunedFeedback": "已移除 {{count}} 个过时模型",
     "providerReadiness": {
+      "pruneOutdated": "保留近期版本",
+      "pruneOutdatedTitle": "每个分支保留最近两个版本，每个系列在可用时至少保留四个不同模型",
       "title": "模型与兼容性",
       "description": "同步这个模型源可用的模型，并验证 Codex 和 MultiRouter 能否正常使用。",
       "syncModels": "同步模型",
@@ -4190,6 +4194,7 @@
       "reviewModeFirst": "第一个大请求",
       "reviewModeSustained": "持续增长后",
       "summarizeAndRestartEnabled": "提供“总结并开始新会话”",
+      "windowsNotificationsEnabled": "显示 Windows 审批提醒",
       "detectedOnlyWarning": "已检测到大请求，但安全优化移除了 0 字节，因为剩余内容属于有语义的会话历史。请求健康不会修改这些历史。启用首次请求审核后，请求会在发送前暂停，直到你在 Windows 通知中作出选择。",
       "historyWarning": "请求健康会在时间线中保留近期警告，包括发生时间和采取的操作。",
       "timeline": "请求时间线",
@@ -4200,7 +4205,10 @@
         "blocked": "已阻止",
         "summarize_requested": "已请求总结",
         "summarize_completed": "总结并新建会话完成",
-        "summarize_failed": "总结并新建会话失败"
+        "summarize_failed": "总结并新建会话失败",
+        "continue_once": "仅继续这一次",
+        "summarize_and_restart": "总结并开始新会话",
+        "inspect": "检查"
       },
       "items": "历史项",
       "removed": "已移除",
@@ -4216,6 +4224,9 @@
       "cachedInputTokens": "缓存命中输入 Token",
       "freshInputTokens": "新鲜输入 Token",
       "cacheHitRatio": "缓存命中率",
+      "mediaBytes": "图像载荷字节数",
+      "mediaItems": "包含图像的项目",
+      "recommendedAction": "建议操作",
       "cacheAnomaly": "缓存健康警告",
       "empty": "还没有请求健康样本。请通过本地代理发送一次请求后刷新。"
     }

@@ -273,6 +273,13 @@ pub fn read_json_file<T: for<'a> Deserialize<'a>>(path: &Path) -> Result<T, AppE
     serde_json::from_str(&content).map_err(|e| AppError::json(path, e))
 }
 
+pub(crate) fn read_json_object_or_empty(path: &Path) -> Result<Value, AppError> {
+    if !path.exists() {
+        return Ok(serde_json::json!({}));
+    }
+    read_json_file(path)
+}
+
 /// 递归排序 JSON 对象的键（按字母顺序），确保序列化输出是确定性的
 fn sort_json_keys(value: &Value) -> Value {
     match value {
@@ -363,6 +370,17 @@ fn recover_partial_replace_move(tmp: &Path, path: &Path, backup: &Path) -> Parti
 }
 
 pub fn atomic_write(path: &Path, data: &[u8]) -> Result<(), AppError> {
+    atomic_write_with_permissions(path, data, false)
+}
+
+/// Credential stores must be private from the moment the temporary file exists.
+pub(crate) fn atomic_write_private(path: &Path, data: &[u8]) -> Result<(), AppError> {
+    atomic_write_with_permissions(path, data, true)
+}
+
+fn atomic_write_with_permissions(path: &Path, data: &[u8], private: bool) -> Result<(), AppError> {
+    #[cfg(not(unix))]
+    let _ = private;
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|e| AppError::io(parent, e))?;
     }
@@ -388,11 +406,14 @@ pub fn atomic_write(path: &Path, data: &[u8]) -> Result<(), AppError> {
                 "{file_name}.tmp.{}.{ts}.{counter}",
                 std::process::id()
             ));
-            match fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&candidate)
-            {
+            let mut options = fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            if private {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            match options.open(&candidate) {
                 Ok(file) => return Ok((candidate, file)),
                 Err(source) if source.kind() == std::io::ErrorKind::AlreadyExists => {
                     last_collision = Some((candidate, source));
@@ -415,7 +436,7 @@ pub fn atomic_write(path: &Path, data: &[u8]) -> Result<(), AppError> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        if let Ok(meta) = fs::metadata(path) {
+        if let Some(meta) = fs::metadata(path).ok().filter(|_| !private) {
             let perm = meta.permissions().mode();
             let _ = fs::set_permissions(&tmp, fs::Permissions::from_mode(perm));
         }
@@ -568,6 +589,46 @@ pub fn atomic_write(path: &Path, data: &[u8]) -> Result<(), AppError> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn atomic_write_private_creates_and_replaces_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nested/accounts.json");
+        atomic_write_private(&path, b"first").unwrap();
+        atomic_write_private(&path, b"second").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"second");
+        assert_eq!(
+            std::fs::read_dir(path.parent().unwrap()).unwrap().count(),
+            1
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_private_does_not_inherit_public_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("accounts.json");
+        std::fs::write(&path, b"old").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        atomic_write_private(&path, b"secret").unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+
+    #[test]
+    fn optional_json_keeps_missing_and_invalid_files_distinct() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        assert_eq!(
+            read_json_object_or_empty(&path).unwrap(),
+            serde_json::json!({})
+        );
+        std::fs::write(&path, b"invalid json").unwrap();
+        assert!(read_json_object_or_empty(&path).is_err());
+    }
+
     #[cfg(windows)]
     #[test]
     fn atomic_write_preserves_destination_when_windows_replace_fails() {
@@ -586,6 +647,7 @@ mod tests {
         let result = atomic_write(&path, b"new contents");
 
         assert!(result.is_err());
+        assert!(atomic_write_private(&path, b"new secret").is_err());
         drop(held_file);
         assert_eq!(std::fs::read(&path).unwrap(), b"old contents");
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);

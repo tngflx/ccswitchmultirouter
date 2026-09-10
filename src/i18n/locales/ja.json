@@ -1641,7 +1641,11 @@
     "editRoute": "route を編集",
     "editRouteHint": "この route のマッチ条件、上流 API 形式、認証、モデル変換、能力を設定します。",
     "noCommonConfigToApply": "共通設定スニペットが空か、書き込む内容がありません",
+    "catalogPruneNone": "古いバージョンは見つかりませんでした",
+    "catalogPrunedFeedback": "古いモデルを {{count}} 件削除しました",
     "providerReadiness": {
+      "pruneOutdated": "最近のバージョンを保持",
+      "pruneOutdatedTitle": "各分岐の最新2世代を保持し、利用可能な場合は各系列で少なくとも4つの異なるモデルを保持",
       "title": "モデルと互換性",
       "description": "このモデルソースで利用可能なモデルを同期し、Codex と MultiRouter で正しく使用できることを確認します。",
       "syncModels": "モデルを同期",
@@ -4190,6 +4194,7 @@
       "reviewModeFirst": "最初の大きなリクエスト",
       "reviewModeSustained": "継続的な増加後",
       "summarizeAndRestartEnabled": "「要約して新しいセッション」を表示",
+      "windowsNotificationsEnabled": "Windows の承認通知を表示",
       "detectedOnlyWarning": "大きなリクエストは検出されましたが、残りが意味を持つセッション履歴のため、安全な最適化で削除できたのは 0 バイトでした。リクエスト健全性は履歴を変更しません。最初のリクエスト確認を有効にすると、Windows 通知で選択するまで送信前に保留されます。",
       "historyWarning": "リクエスト健全性は、発生時刻と実行した操作を含む最近の警告をタイムラインに保持します。",
       "timeline": "リクエストのタイムライン",
@@ -4200,7 +4205,10 @@
         "blocked": "ブロック",
         "summarize_requested": "要約を要求",
         "summarize_completed": "要約と新しいセッションが完了",
-        "summarize_failed": "要約と新しいセッションに失敗"
+        "summarize_failed": "要約と新しいセッションに失敗",
+        "continue_once": "今回のみ続行",
+        "summarize_and_restart": "要約して新しいセッション",
+        "inspect": "確認"
       },
       "items": "項目",
       "removed": "削除済み",
@@ -4216,6 +4224,9 @@
       "cachedInputTokens": "キャッシュ済み入力トークン",
       "freshInputTokens": "新規入力トークン",
       "cacheHitRatio": "キャッシュヒット率",
+      "mediaBytes": "画像ペイロードのバイト数",
+      "mediaItems": "画像を含む項目",
+      "recommendedAction": "推奨アクション",
       "cacheAnomaly": "キャッシュ健全性の警告",
       "empty": "リクエスト健全性のサンプルはまだありません。ローカルプロキシ経由でリクエストを送信してから更新してください。"
     }

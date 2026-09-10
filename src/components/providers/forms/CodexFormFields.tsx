@@ -4108,13 +4108,13 @@ export function CodexFormFields({
                               "codexConfig.providerReadiness.pruneOutdatedTitle",
                               {
                                 defaultValue:
-                                  "Keep the newest model versions and common variants",
+                                  "Keep two recent releases per branch and at least four distinct models per family when available",
                               },
                             )}
                           >
                             <Sparkles className="h-3.5 w-3.5" />
                             {t("codexConfig.providerReadiness.pruneOutdated", {
-                              defaultValue: "Keep latest versions",
+                              defaultValue: "Keep recent versions",
                             })}
                           </Button>
                           <label className="flex h-8 cursor-pointer items-center gap-2 rounded-md border px-2 text-xs font-medium">

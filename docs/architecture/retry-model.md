@@ -131,6 +131,15 @@ coordinator's composer-readiness loop is itself bounded.
 | Cancellation/auth/request/model/context/policy failure | Not replayed | Client-owned behavior | Never |
 | HTTP failure before the SSE stream exists | Forwarder/failover policy | Client-owned behavior | Not observed by the final SSE continuation layer |
 
+Recognized daily or billing quota exhaustion is a special terminal case. Some
+third-party gateways return it as HTTP 429, 403, or 402 even though retrying cannot succeed
+until a quota reset or purchase. The proxy normalizes those recognized
+responses to HTTP 402 with an OpenAI-style `insufficient_quota` error body so
+Codex does not exhaust its native 429 retry budget and replace the useful
+provider message with a generic retry-limit error. Unrecognized and genuinely
+transient 429 responses remain 429 and retain the configured bounded retry
+policy.
+
 The last row is intentional: Aggressive recovery observes final streamed
 Responses turns. Admission rejection, request replay, provider failover, and
 pre-stream HTTP failures remain responsibilities of the forwarder and traffic

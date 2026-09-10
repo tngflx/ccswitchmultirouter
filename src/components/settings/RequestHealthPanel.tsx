@@ -327,6 +327,24 @@ export function RequestHealthPanel({
                 className="w-full rounded-md border border-input bg-background px-2 py-1.5"
               />
             </label>
+            <label className="rounded-md border border-border bg-background/70 p-3 text-sm">
+              <span className="mb-2 block font-medium">
+                {t(
+                  "codexRouterWorkspace.requestHealth.windowsNotificationsEnabled",
+                )}
+              </span>
+              <input
+                type="checkbox"
+                checked={draft.windowsNotificationsEnabled}
+                onChange={(event) =>
+                  setDraft({
+                    ...draft,
+                    windowsNotificationsEnabled: event.target.checked,
+                  })
+                }
+                className="h-4 w-4"
+              />
+            </label>
           </div>
         </div>
       ) : null}
@@ -461,6 +479,28 @@ export function RequestHealthPanel({
                     : t("codexRouterWorkspace.requestHealth.notNeeded")
               }
               tone={latest.compactionRecommended ? "amber" : "cyan"}
+            />
+          </div>
+          <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
+            <MetricTile
+              icon={Image}
+              label={t("codexRouterWorkspace.requestHealth.mediaBytes")}
+              value={`${(latest.mediaBytes / 1024).toFixed(1)} KB`}
+              tone={latest.mediaDominated ? "amber" : "cyan"}
+            />
+            <MetricTile
+              icon={Image}
+              label={t("codexRouterWorkspace.requestHealth.mediaItems")}
+              value={String(latest.mediaItems)}
+              tone="violet"
+            />
+            <MetricTile
+              icon={Sparkles}
+              label={t("codexRouterWorkspace.requestHealth.recommendedAction")}
+              value={t(
+                `codexRouterWorkspace.requestHealth.action.${latest.recommendedAction}`,
+              )}
+              tone={latest.mediaDominated ? "amber" : "cyan"}
             />
           </div>
           <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">

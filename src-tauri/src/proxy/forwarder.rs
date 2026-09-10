@@ -3000,7 +3000,11 @@ impl RequestForwarder {
                     ),
                     ("original_bytes", diagnostic.original_bytes.to_string()),
                     ("bytes_removed", diagnostic.bytes_removed.to_string()),
+                    ("transformed_request_bytes", diagnostic.optimized_bytes.to_string()),
                     ("item_count", diagnostic.item_count.to_string()),
+                    ("media_bytes", diagnostic.media_bytes.to_string()),
+                    ("media_items", diagnostic.media_items.to_string()),
+                    ("media_dominated", diagnostic.media_dominated.to_string()),
                     (
                         "largest_item_bytes",
                         diagnostic.largest_item_bytes.to_string(),
@@ -7203,7 +7207,10 @@ where
     loop {
         let response = send().await?;
         let status = response.status();
-        let retryable_status = status == http::StatusCode::TOO_MANY_REQUESTS
+        let inspectable_quota_status = status == http::StatusCode::PAYMENT_REQUIRED
+            || status == http::StatusCode::TOO_MANY_REQUESTS
+            || status == http::StatusCode::FORBIDDEN;
+        let retryable_status = inspectable_quota_status
             || (traffic_policy.rejection_retry_mode
                 == crate::provider::CodexRejectionRetryMode::OpencodeEndpointUnavailable
                 && status == http::StatusCode::SERVICE_UNAVAILABLE);
@@ -7214,6 +7221,26 @@ where
         let mut response_headers = response.headers().clone();
         let retry_after = parse_retry_after_delay(&response_headers);
         let body_text = read_decoded_error_body(response).await?;
+        let terminal_quota = is_terminal_codex_quota_error(body_text.as_deref());
+
+        if matches!(
+            status,
+            http::StatusCode::PAYMENT_REQUIRED | http::StatusCode::FORBIDDEN
+        ) {
+            return if terminal_quota {
+                Ok(rebuild_terminal_quota_response(
+                    status,
+                    &mut response_headers,
+                    body_text,
+                ))
+            } else {
+                Ok(rebuild_consumed_error_response(
+                    status,
+                    &mut response_headers,
+                    body_text,
+                ))
+            };
+        }
 
         if status == http::StatusCode::SERVICE_UNAVAILABLE {
             let recognizable_rejection = is_retryable_opencode_admission_503(body_text.as_deref());
@@ -7257,8 +7284,14 @@ where
             continue;
         }
 
-        let terminal_quota = is_terminal_codex_quota_429(body_text.as_deref());
-        if terminal_quota || rate_limit_retry_count >= traffic_policy.rate_limit_max_retries {
+        if terminal_quota {
+            return Ok(rebuild_terminal_quota_response(
+                status,
+                &mut response_headers,
+                body_text,
+            ));
+        }
+        if rate_limit_retry_count >= traffic_policy.rate_limit_max_retries {
             return Ok(rebuild_consumed_error_response(
                 status,
                 &mut response_headers,
@@ -7336,7 +7369,7 @@ fn codex_rate_limit_backoff(retry_count: usize) -> Duration {
     Duration::from_secs(1u64 << retry_count.min(5))
 }
 
-fn is_terminal_codex_quota_429(body: Option<&str>) -> bool {
+fn is_terminal_codex_quota_error(body: Option<&str>) -> bool {
     let Some(body) = body else {
         return false;
     };
@@ -7345,12 +7378,92 @@ fn is_terminal_codex_quota_429(body: Option<&str>) -> bool {
         "usage_limit_reached",
         "daily_limit_exceeded",
         "daily_usage_limit_exceeded",
+        "daily usage limit exceeded",
         "insufficient_quota",
         "billing_hard_limit_reached",
         "the usage limit has been reached",
     ]
     .iter()
     .any(|marker| normalized.contains(marker))
+}
+
+/// Codex treats every HTTP 429 as transient and replaces the upstream error
+/// body with "exceeded retry limit" after its own retry budget. A recognized
+/// daily/billing quota exhaustion is not transient, so expose it as 402 with a
+/// standard Responses error envelope. This preserves the real cause and stops
+/// the client from replaying a request that cannot succeed until quota resets.
+fn rebuild_terminal_quota_response(
+    upstream_status: http::StatusCode,
+    headers: &mut http::HeaderMap,
+    body: Option<String>,
+) -> ProxyResponse {
+    let message = terminal_quota_error_field(body.as_deref(), "message")
+        .map(|message| message.replace('_', " "))
+        .unwrap_or_else(|| "daily usage limit exceeded".to_string());
+    let code = terminal_quota_error_field(body.as_deref(), "reason")
+        .or_else(|| terminal_quota_error_field(body.as_deref(), "code"))
+        .unwrap_or_else(|| "daily_limit_exceeded".to_string())
+        .to_ascii_lowercase()
+        .replace([' ', '-'], "_");
+    let normalized = serde_json::json!({
+        "error": {
+            "message": message,
+            "type": "insufficient_quota",
+            "code": code,
+            "param": null,
+        }
+    });
+    headers.remove(http::header::CONTENT_ENCODING);
+    headers.remove(http::header::CONTENT_LENGTH);
+    headers.remove(http::header::RETRY_AFTER);
+    headers.insert(
+        http::header::CONTENT_TYPE,
+        http::HeaderValue::from_static("application/json"),
+    );
+    super::codex_router_log::append_event(
+        "terminal_quota_normalized",
+        &[
+            ("upstream_status", upstream_status.as_u16().to_string()),
+            (
+                "client_status",
+                http::StatusCode::PAYMENT_REQUIRED.as_u16().to_string(),
+            ),
+            ("error_type", "insufficient_quota".to_string()),
+            ("error_code", code.clone()),
+        ],
+    );
+    ProxyResponse::buffered(
+        http::StatusCode::PAYMENT_REQUIRED,
+        headers.clone(),
+        Bytes::from(normalized.to_string()),
+    )
+}
+
+fn terminal_quota_error_field(body: Option<&str>, field: &str) -> Option<String> {
+    let body = body?.trim();
+    if let Ok(value) = serde_json::from_str::<Value>(body) {
+        for candidate in [
+            value.get("error").and_then(|error| error.get(field)),
+            value.get(field),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if let Some(value) = candidate.as_str().map(str::trim).filter(|v| !v.is_empty()) {
+                return Some(value.to_string());
+            }
+            if candidate.is_number() {
+                return Some(candidate.to_string());
+            }
+        }
+    }
+
+    let marker = format!("{field}=\"");
+    let start = body.find(&marker)? + marker.len();
+    let remainder = &body[start..];
+    let end = remainder.find('"')?;
+    let value = remainder[..end].trim();
+    (!value.is_empty()).then(|| value.to_string())
 }
 
 fn rebuild_consumed_error_response(
@@ -13269,11 +13382,100 @@ mod tests {
             )
             .await;
 
-            assert_eq!(
-                result.unwrap().status(),
-                http::StatusCode::TOO_MANY_REQUESTS
+            let response = result.unwrap();
+            assert_eq!(response.status(), http::StatusCode::PAYMENT_REQUIRED);
+            let (_, _, body) =
+                read_decoded_proxy_response(response).await.expect("response body");
+            let body: Value = serde_json::from_slice(&body).expect("normalized quota JSON");
+            assert_eq!(body["error"]["type"], "insufficient_quota");
+            assert_eq!(body["error"]["code"], "daily_limit_exceeded");
+            assert!(
+                body["error"]["message"]
+                    .as_str()
+                    .is_some_and(|message| message.to_ascii_lowercase().contains("usage limit"))
             );
             assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 1);
         }
+    }
+
+    #[test]
+    fn terminal_quota_error_field_reads_sublyx_text_envelope() {
+        let body = r#"error: code=429 reason="DAILY_LIMIT_EXCEEDED" message="daily usage limit exceeded" metadata=map[]"#;
+        assert_eq!(
+            terminal_quota_error_field(Some(body), "reason").as_deref(),
+            Some("DAILY_LIMIT_EXCEEDED")
+        );
+        assert_eq!(
+            terminal_quota_error_field(Some(body), "message").as_deref(),
+            Some("daily usage limit exceeded")
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn codex_forbidden_daily_quota_is_normalized_without_retry() {
+        let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let attempts_for_send = attempts.clone();
+        let response = send_codex_request_with_explicit_rejection_retry(
+            "test",
+            test_codex_traffic_policy(false),
+            || {
+                let attempts = attempts_for_send.clone();
+                async move {
+                    attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Ok(ProxyResponse::buffered(
+                        http::StatusCode::FORBIDDEN,
+                        http::HeaderMap::new(),
+                        Bytes::from_static(b"daily usage limit exceeded"),
+                    ))
+                }
+            },
+        )
+        .await
+        .expect("403 quota should be returned as a normalized response");
+
+        assert_eq!(response.status(), http::StatusCode::PAYMENT_REQUIRED);
+        let (_, _, body) = read_decoded_proxy_response(response)
+            .await
+            .expect("response body");
+        let body: Value = serde_json::from_slice(&body).expect("normalized quota JSON");
+        assert_eq!(body["error"]["type"], "insufficient_quota");
+        assert_eq!(body["error"]["code"], "daily_limit_exceeded");
+        assert_eq!(body["error"]["message"], "daily usage limit exceeded");
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn codex_payment_required_daily_quota_gets_openai_error_envelope() {
+        let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let attempts_for_send = attempts.clone();
+        let response = send_codex_request_with_explicit_rejection_retry(
+            "test",
+            test_codex_traffic_policy(false),
+            || {
+                let attempts = attempts_for_send.clone();
+                async move {
+                    attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Ok(ProxyResponse::buffered(
+                        http::StatusCode::PAYMENT_REQUIRED,
+                        http::HeaderMap::new(),
+                        Bytes::from_static(
+                            br#"error: code=429 reason="DAILY LIMIT EXCEEDED" message="daily usage limit exceeded" metadata=map[]"#,
+                        ),
+                    ))
+                }
+            },
+        )
+        .await
+        .expect("402 quota should be normalized");
+
+        assert_eq!(response.status(), http::StatusCode::PAYMENT_REQUIRED);
+        let (_, _, body) = read_decoded_proxy_response(response)
+            .await
+            .expect("response body");
+        let body: Value = serde_json::from_slice(&body).expect("normalized quota JSON");
+        assert_eq!(body["error"]["type"], "insufficient_quota");
+        assert_eq!(body["error"]["code"], "daily_limit_exceeded");
+        assert_eq!(body["error"]["message"], "daily usage limit exceeded");
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 }

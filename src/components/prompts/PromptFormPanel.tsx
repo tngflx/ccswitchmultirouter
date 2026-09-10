@@ -1,3 +1,4 @@
+import { useDarkMode } from "@/hooks/useDarkMode";
 import React, { useState, useEffect, useRef } from "react";
 import { useTranslation } from "react-i18next";
 import { Button } from "@/components/ui/button";
@@ -40,22 +41,7 @@ const PromptFormPanel: React.FC<PromptFormPanelProps> = ({
   const [content, setContent] = useState("");
   const [saving, setSaving] = useState(false);
   const savingRef = useRef(false);
-  const [isDarkMode, setIsDarkMode] = useState(false);
-
-  useEffect(() => {
-    setIsDarkMode(document.documentElement.classList.contains("dark"));
-
-    const observer = new MutationObserver(() => {
-      setIsDarkMode(document.documentElement.classList.contains("dark"));
-    });
-
-    observer.observe(document.documentElement, {
-      attributes: true,
-      attributeFilter: ["class"],
-    });
-
-    return () => observer.disconnect();
-  }, []);
+  const isDarkMode = useDarkMode();
 
   useEffect(() => {
     if (initialData) {
