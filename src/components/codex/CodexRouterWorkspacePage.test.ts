@@ -3050,9 +3050,10 @@ describe("Codex MultiRouter workspace route persistence helpers", () => {
     await user.click(screen.getByRole("tab", { name: "模型排序" }));
 
     const selectors = screen.getAllByRole("combobox");
-    expect(selectors).toHaveLength(2);
+    expect(selectors).toHaveLength(3);
     expect(selectors[0]).toHaveValue("provider-model");
     expect(selectors[1]).toHaveValue("custom");
+    expect(selectors[2]).toHaveValue("medium");
     await user.selectOptions(selectors[0], "model-provider");
     await user.selectOptions(selectors[1], "provider-model");
 
@@ -3081,6 +3082,28 @@ describe("Codex MultiRouter workspace route persistence helpers", () => {
     expect(savedProvider.id).not.toBe(source.id);
     expect(savedProvider.settingsConfig?.codexRouting).toMatchObject({
       modelDisplayStyle: "model-provider",
+    });
+  });
+
+  it("persists the top model default reasoning effort on the router", async () => {
+    const { source, plan } = createSubagentWorkspaceFixture();
+    renderSubagentWorkspace(source, plan);
+
+    const user = userEvent.setup();
+    await user.click(screen.getByRole("tab", { name: "模型排序" }));
+    await user.selectOptions(
+      screen.getByRole("combobox", { name: "Top model default effort" }),
+      "xhigh",
+    );
+    await user.click(screen.getByRole("button", { name: "保存顺序" }));
+
+    await waitFor(() => expect(providersApi.update).toHaveBeenCalledOnce());
+    const [savedProvider, appType] = vi.mocked(providersApi.update).mock
+      .calls[0];
+    expect(appType).toBe("codex");
+    expect(savedProvider.id).toBe(plan.id);
+    expect(savedProvider.settingsConfig?.codexRouting).toMatchObject({
+      defaultReasoningEffort: "xhigh",
     });
   });
 
@@ -4487,6 +4510,43 @@ describe("Codex MultiRouter workspace route persistence helpers", () => {
       providerName: "OpenAI Official Backup",
       contextWindow: 372000,
     });
+  });
+
+  it("preserves official reasoning metadata while refreshing the OAuth catalog", () => {
+    const official: Provider = {
+      id: "codex-official",
+      name: "OpenAI Official",
+      category: "official",
+      settingsConfig: {
+        modelCatalog: { models: [{ model: "gpt-6-astra" }] },
+      },
+    };
+    const reasoning = {
+      schemaVersion: 2,
+      supportStatus: "confirmed_supported" as const,
+      controlKind: "graded" as const,
+      supportedEfforts: ["low", "medium", "high", "xhigh", "max"] as const,
+      defaultEffort: "low" as const,
+      disableAllowed: false,
+      upstream: {
+        format: "string" as const,
+        parameter: "reasoning_effort" as const,
+        effortMap: { none: "low" as const, minimal: "low" as const },
+      },
+      source: "official" as const,
+    };
+
+    const refreshed = providerWithFetchedModelCatalog(official, [
+      {
+        id: "gpt-6-astra",
+        ownedBy: "Codex",
+        reasoning,
+      },
+    ]);
+
+    expect(refreshed.settingsConfig?.modelCatalog?.models[0].reasoning).toEqual(
+      reasoning,
+    );
   });
 
   it("excludes disabled routes from the injected model catalog", () => {

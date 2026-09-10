@@ -216,7 +216,7 @@ const deepSeekV4Reasoning: CodexModelReasoningCapability = {
   disableAllowed: true,
   upstream: {
     format: "string",
-    parameter: "reasoning.effort",
+    parameter: "reasoning_effort",
     effortMap: {
       low: "low",
       medium: "high",

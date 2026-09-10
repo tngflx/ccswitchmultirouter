@@ -3940,7 +3940,9 @@ impl ProxyService {
         if is_multirouter {
             // Fresh threads use this default; an explicit per-thread picker
             // selection can still override it.
-            doc["model_reasoning_effort"] = toml_edit::value("medium");
+            let effort =
+                Self::codex_multirouter_default_reasoning_effort(provider).unwrap_or("medium");
+            doc["model_reasoning_effort"] = toml_edit::value(effort);
         }
         doc.as_table_mut().remove("base_url");
         doc.as_table_mut().remove("openai_base_url");
@@ -4102,6 +4104,16 @@ impl ProxyService {
             .get("routes")
             .and_then(|value| value.as_array())
             .is_some_and(|routes| !routes.is_empty())
+    }
+
+    fn codex_multirouter_default_reasoning_effort(provider: Option<&Provider>) -> Option<&str> {
+        const VALID: &[&str] = &["none", "minimal", "low", "medium", "high", "xhigh", "max"];
+        provider
+            .and_then(|provider| provider.settings_config.get("codexRouting"))
+            .and_then(|routing| routing.get("defaultReasoningEffort"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|effort| VALID.contains(effort))
     }
 
     fn sync_codex_model_catalog_projection_flag(
@@ -7351,6 +7363,23 @@ supports_websockets = true
         );
         assert!(route.get("experimental_bearer_token").is_none());
         assert!(parsed.get("experimental_bearer_token").is_none());
+    }
+
+    #[test]
+    fn codex_multirouter_takeover_uses_configured_default_reasoning_effort() {
+        let mut provider = codex_multirouter_provider("native_codex_auth");
+        provider.settings_config["codexRouting"]["defaultReasoningEffort"] = json!("xhigh");
+
+        let output = ProxyService::apply_codex_proxy_toml_config_with_pool_policy(
+            "",
+            "http://127.0.0.1:5000/v1",
+            Some(&provider),
+            None,
+        )
+        .expect("project configured reasoning effort");
+        let parsed: toml::Value = toml::from_str(&output).expect("valid TOML");
+
+        assert_eq!(parsed["model_reasoning_effort"].as_str(), Some("xhigh"));
     }
 
     #[test]

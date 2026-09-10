@@ -898,6 +898,20 @@ pub fn official_reasoning_capability_for_model(
                 levels.contains(&default_effort).then_some(default_effort)
             }
         });
+    let mut effort_map = levels
+        .iter()
+        .map(|level| (level.clone(), level.clone()))
+        .collect::<HashMap<_, _>>();
+    if !levels.iter().any(|level| level == "none") {
+        if let Some(lowest_effort) = VALID_PROVIDER_EFFORTS
+            .iter()
+            .find(|candidate| levels.iter().any(|level| level == **candidate))
+            .map(|effort| (*effort).to_string())
+        {
+            effort_map.insert("none".to_string(), lowest_effort.clone());
+            effort_map.insert("minimal".to_string(), lowest_effort);
+        }
+    }
     let capability = CodexModelReasoningCapability {
         schema_version: Some(2),
         support_status: Some(ReasoningSupportStatus::ConfirmedSupported),
@@ -909,10 +923,7 @@ pub fn official_reasoning_capability_for_model(
         upstream: CodexModelReasoningUpstream {
             format: "string".to_string(),
             parameter: "reasoning_effort".to_string(),
-            effort_map: levels
-                .into_iter()
-                .map(|level| (level.clone(), level))
-                .collect(),
+            effort_map,
         },
         output_format: None,
         source: Some("official".to_string()),

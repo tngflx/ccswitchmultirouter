@@ -3790,6 +3790,8 @@
     "modelThenProvider": "Model · Provider",
     "providerThenModel": "Provider · Model",
     "modelSort": "Sort models",
+    "topModelDefaultEffort": "Top model default effort",
+    "topModelDefaultEffortHint": "Used by new threads when {{model}} is first.",
     "currentOrder": "Current order (drag)",
     "sortByModel": "Model name",
     "sortByProvider": "Provider grouping",

@@ -2696,44 +2696,46 @@ export function CodexFormFields({
                         defaultValue: "Enabled",
                       })}
                     </label>
-                    <Select
-                      value={group.strategy ?? "round_robin"}
-                      onValueChange={(
-                        value: "fixed" | "round_robin" | "random",
-                      ) =>
-                        onApiKeyGroupsChange(
-                          apiKeyGroups.map((item, index) =>
-                            index === groupIndex
-                              ? { ...item, strategy: value }
-                              : item,
-                          ),
-                        )
-                      }
-                    >
-                      <SelectTrigger
-                        className="h-9 w-36"
-                        aria-label={t("codexConfig.apiKeyGroupStrategy", {
-                          defaultValue: "Rotation",
-                        })}
+                    {group.apiKeys.some((key) => key.trim().length > 0) && (
+                      <Select
+                        value={group.strategy ?? "round_robin"}
+                        onValueChange={(
+                          value: "fixed" | "round_robin" | "random",
+                        ) =>
+                          onApiKeyGroupsChange(
+                            apiKeyGroups.map((item, index) =>
+                              index === groupIndex
+                                ? { ...item, strategy: value }
+                                : item,
+                            ),
+                          )
+                        }
                       >
-                        <SelectValue />
-                      </SelectTrigger>
-                      <SelectContent>
-                        <SelectItem value="fixed">
-                          {t("codexConfig.apiKeyGroupFixed")}
-                        </SelectItem>
-                        <SelectItem value="round_robin">
-                          {t("codexConfig.apiKeyGroupRoundRobin", {
-                            defaultValue: "Round robin",
+                        <SelectTrigger
+                          className="h-9 w-36"
+                          aria-label={t("codexConfig.apiKeyGroupStrategy", {
+                            defaultValue: "Rotation",
                           })}
-                        </SelectItem>
-                        <SelectItem value="random">
-                          {t("codexConfig.apiKeyGroupRandom", {
-                            defaultValue: "Random",
-                          })}
-                        </SelectItem>
-                      </SelectContent>
-                    </Select>
+                        >
+                          <SelectValue />
+                        </SelectTrigger>
+                        <SelectContent>
+                          <SelectItem value="fixed">
+                            {t("codexConfig.apiKeyGroupFixed")}
+                          </SelectItem>
+                          <SelectItem value="round_robin">
+                            {t("codexConfig.apiKeyGroupRoundRobin", {
+                              defaultValue: "Round robin",
+                            })}
+                          </SelectItem>
+                          <SelectItem value="random">
+                            {t("codexConfig.apiKeyGroupRandom", {
+                              defaultValue: "Random",
+                            })}
+                          </SelectItem>
+                        </SelectContent>
+                      </Select>
+                    )}
                     <Button
                       type="button"
                       variant="ghost"
@@ -2811,25 +2813,27 @@ export function CodexFormFields({
                         </div>
                       ),
                     )}
-                    <Button
-                      type="button"
-                      variant="ghost"
-                      size="sm"
-                      onClick={() =>
-                        onApiKeyGroupsChange(
-                          apiKeyGroups.map((item, index) =>
-                            index === groupIndex
-                              ? { ...item, apiKeys: [...item.apiKeys, ""] }
-                              : item,
-                          ),
-                        )
-                      }
-                    >
-                      <Plus className="mr-1 h-3.5 w-3.5" />
-                      {t("codexConfig.apiKeyGroupAddKey", {
-                        defaultValue: "Add key",
-                      })}
-                    </Button>
+                    {group.apiKeys.some((key) => key.trim().length > 0) && (
+                      <Button
+                        type="button"
+                        variant="ghost"
+                        size="sm"
+                        onClick={() =>
+                          onApiKeyGroupsChange(
+                            apiKeyGroups.map((item, index) =>
+                              index === groupIndex
+                                ? { ...item, apiKeys: [...item.apiKeys, ""] }
+                                : item,
+                            ),
+                          )
+                        }
+                      >
+                        <Plus className="mr-1 h-3.5 w-3.5" />
+                        {t("codexConfig.apiKeyGroupAddKey", {
+                          defaultValue: "Add key",
+                        })}
+                      </Button>
+                    )}
                   </div>
                   <CodexKeyGroupModels
                     group={group}

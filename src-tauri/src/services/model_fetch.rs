@@ -19,6 +19,8 @@ pub struct FetchedModel {
     pub context_window: Option<u64>,
     pub input_modalities: Option<Vec<String>>,
     pub supports_image: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<serde_json::Value>,
 }
 
 /// 模型列表获取服务的统一入参。
@@ -223,6 +225,7 @@ pub async fn fetch_models(options: FetchModelsRequest<'_>) -> Result<Vec<Fetched
                     input_modalities: extract_input_modalities(&m.extra),
                     owned_by: m.owned_by,
                     supports_image: extract_supports_image(&m.extra),
+                    reasoning: None,
                 })
                 .collect();
 
@@ -416,6 +419,7 @@ fn parse_volcengine_plan_model_entry(entry: &serde_json::Value) -> Option<Fetche
             context_window: None,
             input_modalities: None,
             supports_image: None,
+            reasoning: None,
         });
     }
 
@@ -441,6 +445,7 @@ fn parse_volcengine_plan_model_entry(entry: &serde_json::Value) -> Option<Fetche
         context_window: extract_context_window(obj),
         input_modalities: extract_input_modalities(obj),
         supports_image: extract_supports_image(obj),
+        reasoning: None,
     })
 }
 
@@ -1319,6 +1324,7 @@ mod tests {
                 input_modalities: None,
                 owned_by: entry.owned_by,
                 supports_image: None,
+                reasoning: None,
             })
             .collect::<Vec<_>>();
 
@@ -1628,6 +1634,7 @@ Coding 能力开源 SOTA，从代码生成走向工程交付 | 1M | 128K |
                 context_window: Some(123_456),
                 input_modalities: None,
                 supports_image: None,
+                reasoning: None,
             },
             FetchedModel {
                 id: "glm-5.1".to_string(),
@@ -1635,6 +1642,7 @@ Coding 能力开源 SOTA，从代码生成走向工程交付 | 1M | 128K |
                 context_window: None,
                 input_modalities: None,
                 supports_image: None,
+                reasoning: None,
             },
         ];
 
@@ -1657,6 +1665,7 @@ Coding 能力开源 SOTA，从代码生成走向工程交付 | 1M | 128K |
                 context_window: Some(123_456),
                 input_modalities: Some(vec!["text".to_string()]),
                 supports_image: Some(false),
+                reasoning: None,
             },
             FetchedModel {
                 id: "gpt-5.6".to_string(),
@@ -1664,6 +1673,7 @@ Coding 能力开源 SOTA，从代码生成走向工程交付 | 1M | 128K |
                 context_window: None,
                 input_modalities: None,
                 supports_image: None,
+                reasoning: None,
             },
         ];
         let entry = serde_json::json!({
@@ -1708,6 +1718,7 @@ Coding 能力开源 SOTA，从代码生成走向工程交付 | 1M | 128K |
                 context_window: Some(1000),
                 input_modalities: None,
                 supports_image: None,
+                reasoning: None,
             },
             FetchedModel {
                 id: "text".into(),
@@ -1715,6 +1726,7 @@ Coding 能力开源 SOTA，从代码生成走向工程交付 | 1M | 128K |
                 context_window: None,
                 input_modalities: Some(vec!["text".into()]),
                 supports_image: None,
+                reasoning: None,
             },
             FetchedModel {
                 id: "hy3-preview".into(),
@@ -1722,6 +1734,7 @@ Coding 能力开源 SOTA，从代码生成走向工程交付 | 1M | 128K |
                 context_window: None,
                 input_modalities: None,
                 supports_image: None,
+                reasoning: None,
             },
         ];
         apply_missing_catalog_facts(&mut models, |id| lookup_models_dev_entry(entries, id));

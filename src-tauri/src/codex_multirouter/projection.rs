@@ -411,7 +411,11 @@ fn projected_model_entry(model: &CompiledCodexModel, sort_index: Option<usize>) 
         "upstreamModel".to_string(),
         Value::String(model.upstream_model.clone()),
     );
-    let provider_name = model.target_provider_name.trim();
+    let provider_name = if model.target_provider_name.trim().is_empty() {
+        model.target_provider_id.trim()
+    } else {
+        model.target_provider_name.trim()
+    };
     let display_name = model.display_name.trim();
     let grouped_display_name = provider_labelled_display_name(provider_name, display_name);
     entry.insert(
@@ -420,7 +424,7 @@ fn projected_model_entry(model: &CompiledCodexModel, sort_index: Option<usize>) 
     );
     entry.insert(
         "providerName".to_string(),
-        Value::String(model.target_provider_name.clone()),
+        Value::String(provider_name.to_string()),
     );
     entry.insert(
         "apiFormat".to_string(),

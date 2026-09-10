@@ -136,6 +136,7 @@ import { RequestHealthPanel } from "@/components/settings/RequestHealthPanel";
 import type {
   CodexOfficialAuthConfig,
   CodexOfficialAuthMode,
+  CodexReasoningEffort,
   CodexRoutingConfig,
   CodexRoutingAuth,
   CodexRoutingConfigV2,
@@ -179,12 +180,7 @@ export type WorkspaceTab =
   | "test";
 
 type StatusView =
-  | "link"
-  | "protocol"
-  | "debug"
-  | "providers"
-  | "traffic"
-  | "request-health";
+  "link" | "protocol" | "debug" | "providers" | "traffic" | "request-health";
 
 type SpawnAgentCandidateView = "selected" | "routed" | "priority" | "all";
 
@@ -1039,6 +1035,7 @@ export function providerWithFetchedModelCatalog(
               supports_image: fetched.supportsImage,
             }
           : {}),
+        ...(fetched.reasoning ? { reasoning: fetched.reasoning } : {}),
       };
       continue;
     }
@@ -1060,6 +1057,7 @@ export function providerWithFetchedModelCatalog(
             supports_image: fetched.supportsImage,
           }
         : {}),
+      ...(fetched.reasoning ? { reasoning: fetched.reasoning } : {}),
     };
     byFetchedModel.set(identity, models.length);
     byVisibleModel.set(identity, models.length);
@@ -4818,14 +4816,9 @@ function SubagentsTab({
 }
 
 export type CodexModelDisplayStyle =
-  | "model"
-  | "model-provider"
-  | "provider-model";
+  "model" | "model-provider" | "provider-model";
 export type CodexModelSortMode =
-  | "custom"
-  | "model"
-  | "provider"
-  | "provider-model";
+  "custom" | "model" | "provider" | "provider-model";
 
 const DEFAULT_CODEX_MODEL_DISPLAY_STYLE: CodexModelDisplayStyle =
   "provider-model";
@@ -4957,6 +4950,12 @@ export function ModelOrderTab({
     DEFAULT_CODEX_MODEL_DISPLAY_STYLE,
   );
   const [sortMode, setSortMode] = useState<CodexModelSortMode>("custom");
+  const configuredDefaultReasoningEffort =
+    selectedPlan?.settingsConfig?.codexRouting?.defaultReasoningEffort;
+  const [defaultReasoningEffort, setDefaultReasoningEffort] =
+    useState<CodexReasoningEffort>(
+      configuredDefaultReasoningEffort ?? "medium",
+    );
   const catalogScrollRef = useRef<HTMLDivElement>(null);
   const [draggedModelId, setDraggedModelId] = useState<string | null>(null);
   const sensors = useSensors(
@@ -5007,6 +5006,15 @@ export function ModelOrderTab({
       ),
     [draftModels, providerNamesByModel, sortMode],
   );
+  const topModel = visibleDraftModels[0];
+  const topReasoningEfforts = useMemo<CodexReasoningEffort[]>(() => {
+    const declared = topModel?.reasoning?.supportedEfforts?.filter(
+      (effort): effort is CodexReasoningEffort => effort !== "ultra",
+    );
+    return declared?.length
+      ? declared
+      : ["none", "minimal", "low", "medium", "high", "xhigh", "max"];
+  }, [topModel]);
   const draggedIndex = visibleDraftModels.findIndex(
     (model) => model.model?.trim() === draggedModelId,
   );
@@ -5059,8 +5067,11 @@ export function ModelOrderTab({
   const styleDirty =
     displayStyle !==
     (catalog.displayNameStyle ?? DEFAULT_CODEX_MODEL_DISPLAY_STYLE);
+  const effortDirty =
+    defaultReasoningEffort !== (configuredDefaultReasoningEffort ?? "medium");
   const hasChanges =
     styleDirty ||
+    effortDirty ||
     visibleDraftModels.map((model) => model.model).join("\n") !==
       catalog.models
         .slice()
@@ -5085,9 +5096,20 @@ export function ModelOrderTab({
             (right.sortIndex ?? Number.MAX_SAFE_INTEGER),
         ),
     );
+    setDefaultReasoningEffort(configuredDefaultReasoningEffort ?? "medium");
     setMessage(null);
     setError(null);
-  }, [selectedPlan?.id, catalogKey]);
+  }, [selectedPlan?.id, catalogKey, configuredDefaultReasoningEffort]);
+
+  useEffect(() => {
+    if (topReasoningEfforts.includes(defaultReasoningEffort)) return;
+    const declaredDefault = topModel?.reasoning?.defaultEffort;
+    setDefaultReasoningEffort(
+      declaredDefault && topReasoningEfforts.includes(declaredDefault)
+        ? declaredDefault
+        : topReasoningEfforts[0],
+    );
+  }, [defaultReasoningEffort, topModel, topReasoningEfforts]);
 
   function handleDragEnd(event: DragEndEvent) {
     setDraggedModelId(null);
@@ -5206,7 +5228,7 @@ export function ModelOrderTab({
       // Schema-v2 modelCatalog is derived and removed by the backend mutation
       // layer. Persist a changed preference in the owned routing document first;
       // subsequent provider updates then reconcile against this newest router.
-      if (styleDirty) {
+      if (styleDirty || effortDirty) {
         await providersApi.update(
           {
             ...selectedPlan,
@@ -5215,6 +5237,7 @@ export function ModelOrderTab({
               codexRouting: {
                 ...(selectedPlan.settingsConfig?.codexRouting ?? {}),
                 modelDisplayStyle: displayStyle,
+                defaultReasoningEffort,
               },
             },
           },
@@ -5480,6 +5503,37 @@ export function ModelOrderTab({
               })}
             </option>
           </select>
+        </label>
+        <label className="grid gap-1 text-xs font-medium text-muted-foreground">
+          <span>
+            {tr("codexRouterWorkspace.topModelDefaultEffort", {
+              defaultValue: "Top model default effort",
+            })}
+          </span>
+          <select
+            value={defaultReasoningEffort}
+            onChange={(event) =>
+              setDefaultReasoningEffort(
+                event.target.value as CodexReasoningEffort,
+              )
+            }
+            aria-label={tr("codexRouterWorkspace.topModelDefaultEffort", {
+              defaultValue: "Top model default effort",
+            })}
+            className="h-8 rounded border border-input bg-background px-2 text-sm text-foreground"
+          >
+            {topReasoningEfforts.map((effort) => (
+              <option key={effort} value={effort}>
+                {effort}
+              </option>
+            ))}
+          </select>
+          <span className="max-w-64 font-normal text-muted-foreground">
+            {tr("codexRouterWorkspace.topModelDefaultEffortHint", {
+              defaultValue: "Used by new threads when {{model}} is first.",
+              model: topModel?.model ?? "—",
+            })}
+          </span>
         </label>
       </div>
 
@@ -8671,11 +8725,11 @@ function StatusTab({
   });
   const configReady = Boolean(
     isProxyRunning &&
-      isCodexTakeoverActive &&
-      selectedPlan &&
-      activeProviderId === selectedPlan.id &&
-      routeEnabled &&
-      hasEnabledRoutes,
+    isCodexTakeoverActive &&
+    selectedPlan &&
+    activeProviderId === selectedPlan.id &&
+    routeEnabled &&
+    hasEnabledRoutes,
   );
   const trafficVerified = currentRouteForwardOk;
   const linkOnline = Boolean(runtimeStatus.running && trafficVerified);

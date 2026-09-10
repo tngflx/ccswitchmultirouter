@@ -3790,6 +3790,8 @@
     "modelThenProvider": "モデル · プロバイダー",
     "providerThenModel": "プロバイダー · モデル",
     "modelSort": "モデルの並べ替え",
+    "topModelDefaultEffort": "先頭モデルの既定推論強度",
+    "topModelDefaultEffortHint": "{{model}} が先頭の場合、新しいセッションでこの強度を使用します。",
     "currentOrder": "現在の順序（ドラッグ可能）",
     "sortByModel": "モデル名",
     "sortByProvider": "プロバイダーでグループ化",

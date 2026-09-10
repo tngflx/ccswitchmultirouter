@@ -159,10 +159,7 @@ export interface ClaudeDesktopModelRoute {
 }
 
 export type CodexChatThinkingParam =
-  | "none"
-  | "thinking"
-  | "enable_thinking"
-  | "reasoning_split";
+  "none" | "thinking" | "enable_thinking" | "reasoning_split";
 
 export type CodexChatEffortParam =
   | "none"
@@ -204,8 +201,7 @@ export interface LocalProxyRequestOverrides {
 }
 
 export type CodexRejectionRetryMode =
-  | "disabled"
-  | "opencode_endpoint_unavailable";
+  "disabled" | "opencode_endpoint_unavailable";
 
 /** Provider-specific local admission and safe explicit-rejection retry policy. */
 export interface CodexTrafficPolicy {
@@ -305,29 +301,16 @@ export type SkillStorageLocation = "cc_switch" | "unified";
 // - "openai_responses": OpenAI Responses API 格式，需要格式转换
 // - "gemini_native": Gemini Native generateContent API 格式，需要格式转换
 export type ClaudeApiFormat =
-  | "anthropic"
-  | "openai_chat"
-  | "openai_responses"
-  | "gemini_native";
+  "anthropic" | "openai_chat" | "openai_responses" | "gemini_native";
 
 // Codex API 格式类型
 // - "openai_responses": OpenAI Responses API 格式，直接透传
 // - "openai_chat": OpenAI Chat Completions 格式，需要本地路由转换
 export type CodexApiFormat =
-  | "openai_responses"
-  | "openai_chat"
-  | "openai_messages"
-  | "anthropic";
+  "openai_responses" | "openai_chat" | "openai_messages" | "anthropic";
 
 export type CodexReasoningEffort =
-  | "none"
-  | "minimal"
-  | "low"
-  | "medium"
-  | "high"
-  | "xhigh"
-  | "max"
-  | "ultra";
+  "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | "ultra";
 
 /**
  * 三态支持状态（模型推理能力 schema v2）。
@@ -336,9 +319,7 @@ export type CodexReasoningEffort =
  * 不在维护库中都只能得到 unknown。
  */
 export type CodexReasoningSupportStatus =
-  | "confirmed_supported"
-  | "confirmed_unsupported"
-  | "unknown";
+  "confirmed_supported" | "confirmed_unsupported" | "unknown";
 
 /**
  * 控制形态（模型推理能力 schema v2）。
@@ -346,18 +327,11 @@ export type CodexReasoningSupportStatus =
  * 与支持状态相互独立，不能互相推导。
  */
 export type CodexReasoningControlKind =
-  | "none"
-  | "boolean"
-  | "graded"
-  | "budget"
-  | "unknown";
+  "none" | "boolean" | "graded" | "budget" | "unknown";
 
 /** 能力声明的证据等级（模型推理能力 schema v2）。 */
 export type CodexReasoningConfidence =
-  | "authoritative"
-  | "verified"
-  | "maintained"
-  | "inferred";
+  "authoritative" | "verified" | "maintained" | "inferred";
 
 export interface CodexModelReasoningCapability {
   /**
@@ -489,9 +463,7 @@ export interface CodexRoutingAuth {
 }
 
 export type CodexOfficialAuthMode =
-  | "desktop_current_login"
-  | "managed_oauth"
-  | "account_pool";
+  "desktop_current_login" | "managed_oauth" | "account_pool";
 
 export interface CodexOfficialAuthConfig {
   mode: CodexOfficialAuthMode;
@@ -535,8 +507,7 @@ export interface CodexRoutingConfig {
 }
 
 export type CodexModelSelectionV2 =
-  | { mode: "all" }
-  | { mode: "include"; models: string[] };
+  { mode: "all" } | { mode: "include"; models: string[] };
 
 export interface CodexRoutingRouteV2 {
   id: string;
@@ -554,6 +525,8 @@ export interface CodexRoutingConfigV2 {
   enabled?: boolean;
   defaultRouteId?: string;
   modelDisplayStyle?: "model" | "model-provider" | "provider-model";
+  /** Default effort for fresh threads using the first model in picker order. */
+  defaultReasoningEffort?: CodexReasoningEffort;
   subagentVersion?: CodexSubagentVersion;
   subagentV2?: CodexSubagentV2Config;
   spawnAgentModels?: string[];
@@ -561,8 +534,7 @@ export interface CodexRoutingConfigV2 {
 }
 
 export type CodexRoutingConfigDocument =
-  | CodexRoutingConfig
-  | CodexRoutingConfigV2;
+  CodexRoutingConfig | CodexRoutingConfigV2;
 
 // Claude 认证字段类型
 export type ClaudeApiKeyField = "ANTHROPIC_AUTH_TOKEN" | "ANTHROPIC_API_KEY";

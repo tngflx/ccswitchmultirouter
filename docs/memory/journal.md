@@ -1,5 +1,21 @@
 # Engineering Journal (newest first)
 
+## 2026-09-10 - Make the Codex Desktop picker follow live router metadata
+
+- **What happened:** Model order already re-injected on catalog fingerprint changes, but Codex Desktop could temporarily lose provider labels, nested MultiRouter reasoning metadata never reached the picker aliases, official OAuth refreshes dropped reasoning metadata, and takeover hardcoded fresh-thread effort to `medium` with no Router UI.
+- **Root cause:** Provider identity had no stable fallback/dual alias at the projection boundary; the Desktop adapter only read top-level reasoning fields while the router SSOT stores `reasoning.defaultEffort` and `reasoning.supportedEfforts`; `FetchedModel` discarded the official OAuth capability; and `model_reasoning_effort` was not owned by a persisted routing preference.
+- **What we did:** Fell back empty provider names to provider id and emit both provider aliases, promoted nested reasoning into Desktop descriptors, carried authoritative OAuth reasoning through Rust/Tauri/TypeScript catalog refresh, and added a localized Model Order control persisted as `codexRouting.defaultReasoningEffort` and projected into fresh-thread TOML. This adapts BigStrongSun commit `3dbc85462`; farion upstream has catalog discovery but not this fork's Desktop live-injection lifecycle.
+- **Evidence:** `cargo check` and `pnpm typecheck` passed; targeted Rust coverage passed 22/22; Router Workspace passed 93/93; full Rust library passed 3,737 tests with 6 ignored; full frontend passed 1,461 tests with one preset-form timeout, and the complete failed file then passed 14/14. Full `cargo test` could not replace the running `src-tauri/target/debug/cc-switch.exe` (OS error 5). After the user restarted `pnpm dev`, the rebuilt process logged a successful 61-model injection; a read-only CDP inspection of the live renderer confirmed Astra and Sol both carried `providerName`/`provider_name = Sublyx`, `defaultReasoningEffort = low`, and the full supported effort descriptors.
+- **What NOT to do again:** Do not hardcode a global MultiRouter effort or reconstruct official reasoning from model names; preserve provider identity and capability metadata at the catalog producer, then let the guardian re-inject the finalized immutable projection.
+
+## 2026-09-10 - Close preset and catalog regression audit
+
+- **What happened:** The final audit found eight frontend failures in Codex preset, catalog synchronization, and grouped API-key UI coverage; no cherry-pick or merge was performed.
+- **Root cause:** A vendor compatibility port changed DeepSeek's documented top-level reasoning parameter and intentionally moved Zhipu to the official GLM-5.3 Responses catalog, while local tests still described the retired GLM-5.2 Chat preset. Separately, empty grouped credentials exposed controls prematurely, and catalog sync attempted to hydrate image metadata across an explicit image exclusion.
+- **What we did:** Restored DeepSeek's `reasoning_effort`, aligned preset tests with Zhipu GLM-5.3 `/api/v1` Responses behavior, hid rotation/key-add controls until a group has a non-empty key, and preserved explicit input-capability exclusions during catalog reconciliation.
+- **Evidence:** Full `pnpm test:unit` passed 181 files / 1460 tests; targeted preset/catalog/provider tests passed 90/90; `pnpm typecheck`, `cargo check --manifest-path src-tauri/Cargo.toml`, and `cargo test --manifest-path src-tauri/Cargo.toml --lib` with `LOCALAPPDATA=$env:TEMP` passed 3733/3733 library tests (6 ignored). Full backend `cargo test` was attempted but could not replace the running `src-tauri/target/debug/cc-switch.exe` and returned OS error 5 before integration execution.
+- **What NOT to do again:** Do not restore retired vendor behavior just to satisfy stale tests, and do not bypass explicit user capability exclusions while filling missing catalog metadata.
+
 ## 2026-09-09 - Complete request-health media accounting and notification opt-out contracts
 
 - **What happened:** Finished the in-progress request-health media handling across Rust diagnostics, TypeScript contracts, the settings panel, and all four locales.

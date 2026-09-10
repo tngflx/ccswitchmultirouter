@@ -57,7 +57,7 @@
       (model) =>
         model && normalizedIdentity(modelIdentity(model)) === normalizedName,
     );
-    return normalizeReasoningDescriptor({
+    const descriptor = normalizeReasoningDescriptor({
       model: name,
       id: name,
       slug: name,
@@ -67,6 +67,17 @@
       name: existing?.displayName || existing?.display_name || name,
       hidden: false,
     });
+    const providerName =
+      descriptor.providerName ||
+      descriptor.provider_name ||
+      (typeof descriptor.provider === "string"
+        ? descriptor.provider
+        : descriptor.provider?.name);
+    if (typeof providerName === "string" && providerName.trim()) {
+      descriptor.providerName = providerName.trim();
+      descriptor.provider_name = providerName.trim();
+    }
+    return descriptor;
   };
   const stringArray = (value) => Array.isArray(value) && value.every((item) => typeof item === "string");
   const modelIdentity = (item) => {

@@ -436,10 +436,10 @@ describe("ProviderForm Codex preset selection", () => {
 
     await waitFor(() => {
       expect(screen.getByTestId("codex-base-url")).toHaveTextContent(
-        "https://open.bigmodel.cn/api/coding/paas/v4",
+        "https://open.bigmodel.cn/api/v1",
       );
     });
-    expect(screen.getByTestId("codex-catalog")).toHaveTextContent("glm-5.2");
+    expect(screen.getByTestId("codex-catalog")).toHaveTextContent("glm-5.3");
     expect(screen.getByTestId("codex-takeover")).toHaveTextContent("enabled");
     await waitFor(() => {
       expect(scrollIntoView).toHaveBeenCalledWith({
@@ -610,7 +610,7 @@ describe("ProviderForm Codex preset selection", () => {
 
     fireEvent.click(screen.getByRole("button", { name: /Zhipu GLM$/ }));
     await waitFor(() => {
-      expect(screen.getByTestId("codex-catalog")).toHaveTextContent("glm-5.2");
+      expect(screen.getByTestId("codex-catalog")).toHaveTextContent("glm-5.3");
     });
     fireEvent.click(screen.getByRole("button", { name: "mock-set-api-key" }));
     fireEvent.click(screen.getByRole("button", { name: "保存" }));
@@ -619,8 +619,8 @@ describe("ProviderForm Codex preset selection", () => {
     expect(onSubmit.mock.calls[0][0].meta.codexPresetId).toBe("zhipu-glm-cn");
     expect(
       screen.getByTestId("codex-preset-reasoning-models"),
-    ).toHaveTextContent("glm-5.2");
-    expect(savedSettings.modelCatalog.models).toHaveLength(1);
+    ).toHaveTextContent("glm-5.3");
+    expect(savedSettings.modelCatalog.models).toHaveLength(2);
     for (const model of savedSettings.modelCatalog.models) {
       expect(model.reasoning).toMatchObject({
         supportedEfforts: [
@@ -677,7 +677,7 @@ describe("ProviderForm Codex preset selection", () => {
     await waitFor(() => {
       expect(
         screen.getByTestId("codex-preset-reasoning-models"),
-      ).toHaveTextContent("glm-5.2");
+      ).toHaveTextContent("glm-5.3");
     });
   });
 
@@ -691,7 +691,7 @@ describe("ProviderForm Codex preset selection", () => {
 
     fireEvent.click(screen.getByRole("button", { name: /Zhipu GLM$/ }));
     await waitFor(() => {
-      expect(screen.getByTestId("codex-catalog")).toHaveTextContent("glm-5.2");
+      expect(screen.getByTestId("codex-catalog")).toHaveTextContent("glm-5.3");
     });
     fireEvent.click(screen.getByRole("button", { name: "Custom provider" }));
     expect(screen.getByTestId("codex-takeover")).toHaveTextContent("enabled");

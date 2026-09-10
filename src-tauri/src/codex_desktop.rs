@@ -499,13 +499,18 @@ fn project_codex_model_descriptor(
     object.insert("display_name".to_string(), Value::String(rendered_display));
     project_reasoning_picker_aliases(&mut object);
     if !provider_name.is_empty() {
-        object.insert("providerName".to_string(), Value::String(provider_name));
+        object.insert(
+            "providerName".to_string(),
+            Value::String(provider_name.clone()),
+        );
+        object.insert("provider_name".to_string(), Value::String(provider_name));
     }
     object.insert("hidden".to_string(), Value::Bool(false));
     Value::Object(object)
 }
 
 fn project_reasoning_picker_aliases(object: &mut serde_json::Map<String, Value>) {
+    let nested_reasoning = object.get("reasoning").and_then(Value::as_object).cloned();
     let default_effort = [
         "defaultReasoningEffort",
         "default_reasoning_level",
@@ -519,6 +524,20 @@ fn project_reasoning_picker_aliases(object: &mut serde_json::Map<String, Value>)
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .map(ToString::to_string)
+    })
+    .or_else(|| {
+        nested_reasoning.as_ref().and_then(|reasoning| {
+            ["defaultEffort", "default_effort", "defaultReasoningEffort"]
+                .into_iter()
+                .find_map(|key| {
+                    reasoning
+                        .get(key)
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                        .map(ToString::to_string)
+                })
+        })
     });
     if let Some(default_effort) = default_effort {
         object.insert(
@@ -534,7 +553,14 @@ fn project_reasoning_picker_aliases(object: &mut serde_json::Map<String, Value>)
         "supported_reasoning_efforts",
     ]
     .into_iter()
-    .find_map(|key| object.get(key).and_then(Value::as_array)) else {
+    .find_map(|key| object.get(key).and_then(Value::as_array))
+    .or_else(|| {
+        nested_reasoning.as_ref().and_then(|reasoning| {
+            ["supportedEfforts", "supported_efforts"]
+                .into_iter()
+                .find_map(|key| reasoning.get(key).and_then(Value::as_array))
+        })
+    }) else {
         return;
     };
 
@@ -2632,6 +2658,34 @@ mod tests {
     }
 
     #[test]
+    fn catalog_projection_promotes_nested_multirouter_reasoning_for_desktop() {
+        let value = json!({
+            "models": [{
+                "model": "gpt-6-astra",
+                "providerName": "Sublyx",
+                "reasoning": {
+                    "supportedEfforts": ["low", "medium", "high", "xhigh", "max"],
+                    "defaultEffort": "low"
+                }
+            }]
+        });
+
+        let (_, models) = codex_model_entries_from_catalog_value(&value);
+
+        assert_eq!(models[0]["defaultReasoningEffort"], "low");
+        assert_eq!(
+            models[0]["supportedReasoningEfforts"],
+            json!([
+                {"reasoningEffort": "low", "description": "low"},
+                {"reasoningEffort": "medium", "description": "medium"},
+                {"reasoningEffort": "high", "description": "high"},
+                {"reasoningEffort": "xhigh", "description": "xhigh"},
+                {"reasoningEffort": "max", "description": "max"}
+            ])
+        );
+    }
+
+    #[test]
     fn catalog_projection_counts_models_with_reasoning_choices() {
         let projection = CodexModelCatalogProjection {
             default_model: None,
@@ -2670,6 +2724,7 @@ mod tests {
         assert_eq!(models[2]["displayName"], "[Qwen] Alpha");
         assert_eq!(models[2]["model"], "qwen-a");
         assert_eq!(models[2]["providerName"], "Qwen");
+        assert_eq!(models[2]["provider_name"], "Qwen");
 
         let provider_first = json!({
             "displayNameStyle": "provider-model",

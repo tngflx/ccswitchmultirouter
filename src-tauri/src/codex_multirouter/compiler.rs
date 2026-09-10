@@ -200,7 +200,7 @@ pub fn compile_v2(
                 upstream_model: candidate.upstream_model.clone(),
                 display_name: model_display_name(candidate.model_entry, &candidate.canonical_model),
                 target_provider_id: candidate.provider.id.clone(),
-                target_provider_name: candidate.provider.name.trim().to_string(),
+                target_provider_name: provider_display_name(candidate.provider),
                 route_id: candidate.route_id.to_string(),
                 api_format,
                 api_format_source,
@@ -546,6 +546,15 @@ fn provider_name_suffix(provider: &Provider) -> String {
         "provider".to_string()
     } else {
         suffix
+    }
+}
+
+fn provider_display_name(provider: &Provider) -> String {
+    let name = provider.name.trim();
+    if name.is_empty() {
+        provider.id.trim().to_string()
+    } else {
+        name.to_string()
     }
 }
 
@@ -1619,6 +1628,27 @@ mod tests {
         let compiled = compile(&plan(vec![route]), [provider]);
 
         assert_eq!(compiled.routes[0].label.as_deref(), Some("Qwen"));
+    }
+
+    #[test]
+    fn empty_provider_name_falls_back_to_stable_provider_id() {
+        let provider = provider(
+            "sublyx",
+            "   ",
+            "openai_responses",
+            json!([{"model": "gpt-6-astra"}]),
+        );
+
+        let compiled = compile(
+            &plan(vec![route(
+                "router-sublyx",
+                "sublyx",
+                CodexModelSelection::All,
+            )]),
+            [provider],
+        );
+
+        assert_eq!(compiled.model_catalog[0].target_provider_name, "sublyx");
     }
 
     #[test]

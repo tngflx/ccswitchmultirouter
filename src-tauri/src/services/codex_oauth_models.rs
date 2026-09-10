@@ -216,6 +216,7 @@ fn push_model_entry(models: &mut Vec<FetchedModel>, entry: &Value, fallback_id: 
             input_modalities: None,
             owned_by: Some("Codex".to_string()),
             supports_image: None,
+            reasoning: None,
         });
         return;
     }
@@ -228,6 +229,7 @@ fn push_model_entry(models: &mut Vec<FetchedModel>, entry: &Value, fallback_id: 
                 input_modalities: None,
                 owned_by: Some("Codex".to_string()),
                 supports_image: None,
+                reasoning: None,
             });
         }
         return;
@@ -256,6 +258,12 @@ fn push_model_entry(models: &mut Vec<FetchedModel>, entry: &Value, fallback_id: 
     let context_window = extract_context_window(obj);
     let input_modalities = extract_input_modalities(obj);
     let supports_image = extract_supports_image(obj, input_modalities.as_deref());
+    let reasoning =
+        crate::proxy::providers::codex_reasoning::official_reasoning_capability_for_model(
+            &id,
+            std::slice::from_ref(entry),
+        )
+        .and_then(|capability| serde_json::to_value(capability).ok());
 
     models.push(FetchedModel {
         context_window,
@@ -263,6 +271,7 @@ fn push_model_entry(models: &mut Vec<FetchedModel>, entry: &Value, fallback_id: 
         input_modalities,
         owned_by,
         supports_image,
+        reasoning,
     });
 }
 
@@ -410,6 +419,31 @@ fn truncate_body(body: String) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn parse_codex_oauth_models_preserves_reasoning_capability() {
+        let models = parse_models(json!({
+            "models": [{
+                "slug": "gpt-6-astra",
+                "default_reasoning_level": "low",
+                "supported_reasoning_levels": ["low", "medium", "high", "xhigh", "max"]
+            }]
+        }));
+
+        let serialized = serde_json::to_value(&models[0]).expect("serialize fetched model");
+        assert_eq!(
+            serialized.pointer("/reasoning/supportedEfforts"),
+            Some(&json!(["low", "medium", "high", "xhigh", "max"]))
+        );
+        assert_eq!(
+            serialized.pointer("/reasoning/defaultEffort"),
+            Some(&json!("low"))
+        );
+        assert_eq!(
+            serialized.pointer("/reasoning/upstream/effortMap/none"),
+            Some(&json!("low"))
+        );
+    }
 
     #[test]
     fn parse_codex_oauth_models_accepts_openai_style_data() {

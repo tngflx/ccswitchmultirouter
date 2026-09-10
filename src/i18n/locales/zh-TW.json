@@ -3790,6 +3790,8 @@
     "modelThenProvider": "模型 · 提供商",
     "providerThenModel": "提供商 · 模型",
     "modelSort": "模型排序",
+    "topModelDefaultEffort": "首選模型預設推理強度",
+    "topModelDefaultEffortHint": "當 {{model}} 排在第一位時，新工作階段使用此強度。",
     "currentOrder": "目前順序（可拖曳）",
     "sortByModel": "模型名稱",
     "sortByProvider": "依提供商分組",

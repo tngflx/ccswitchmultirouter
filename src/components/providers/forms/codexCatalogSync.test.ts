@@ -75,9 +75,7 @@ describe("reconcileFetchedCodexCatalogRows", () => {
       model: "manual-alias",
       upstreamModel: "manual-alias",
       contextWindow: "200000",
-      inputModalities: ["text", "image"],
       supportsImage: false,
-      textOnly: false,
     });
   });
 
