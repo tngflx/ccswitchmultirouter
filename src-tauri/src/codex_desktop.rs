@@ -2830,6 +2830,27 @@ mod tests {
     }
 
     #[test]
+    fn codex_app_compatibility_heartbeat_avoids_repeated_full_react_scans() {
+        let script = build_model_picker_unlock_script(&CodexModelCatalogProjection::empty());
+
+        assert!(script.contains("const rendererSchedulerVersion = \"2\""));
+        assert!(script.contains(
+            "if (state.runPromise) return await state.runPromise"
+        ));
+        assert!(script.contains("state.nextConversationRuntimeScanAt = wallNow + 30000"));
+        assert!(!script.contains("document.querySelectorAll(\"*\")"));
+
+        let module_discovery = script
+            .find("await loadAppModule(\"app-server-manager-signals-\")")
+            .expect("module discovery");
+        let fallback_discovery = script[module_discovery..]
+            .find("await findConversationRuntime()")
+            .map(|offset| module_discovery + offset)
+            .expect("React fallback discovery");
+        assert!(module_discovery < fallback_discovery);
+    }
+
+    #[test]
     fn generated_codex_app_compat_script_has_valid_javascript_syntax() {
         let runtime = rquickjs::Runtime::new().expect("create JavaScript runtime");
         let context = rquickjs::Context::full(&runtime).expect("create JavaScript context");

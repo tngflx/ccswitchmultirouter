@@ -6,6 +6,19 @@
   state.requestIds = state.requestIds || new Set();
   state.modulePromises = state.modulePromises || new Map();
   state.failures = state.failures || [];
+  const rendererSchedulerVersion = "2";
+  if (state.rendererSchedulerVersion !== rendererSchedulerVersion) {
+    if (state.interval) clearInterval(state.interval);
+    try {
+      state.modelPickerObserver?.disconnect();
+    } catch {}
+    state.interval = null;
+    state.runPromise = null;
+    state.modelPickerObserver = null;
+    state.conversationRuntimeScanPromise = null;
+    state.nextConversationRuntimeScanAt = 0;
+    state.rendererSchedulerVersion = rendererSchedulerVersion;
+  }
   window[patchKey] = state;
   __CODEX_MODEL_PICKER_CORE__;
   __CODEX_GUARDIAN_V2_COMPAT_CORE__;
@@ -372,66 +385,107 @@
       names.has("waitForPendingThreadSettingsUpdate")
     );
   };
-  const findConversationRuntime = () => {
+  const yieldConversationRuntimeDiscovery = () =>
+    new Promise((resolve) => {
+      if (typeof globalThis.requestIdleCallback === "function") {
+        globalThis.requestIdleCallback(() => resolve(), { timeout: 50 });
+      } else {
+        setTimeout(resolve, 0);
+      }
+    });
+  const monotonicNow = () =>
+    typeof performance?.now === "function" ? performance.now() : Date.now();
+  const findConversationRuntime = async ({ force = false } = {}) => {
     if (isConversationRuntime(state.conversationRuntime))
       return state.conversationRuntime;
-    const seenFibers = new WeakSet();
-    const seenValues = new WeakSet();
-    const inspect = (value, depth = 0) => {
-      if (
-        !value ||
-        (typeof value !== "object" && typeof value !== "function") ||
-        seenValues.has(value)
-      )
-        return null;
-      seenValues.add(value);
-      if (isConversationRuntime(value)) return value;
-      if (depth >= 3) return null;
-      let descriptors;
-      try {
-        descriptors = Object.getOwnPropertyDescriptors(value);
-      } catch {
-        return null;
-      }
-      for (const [key, descriptor] of Object.entries(descriptors)) {
-        if (
-          !("value" in descriptor) ||
-          key === "return" ||
-          key === "child" ||
-          key === "sibling"
-        )
-          continue;
-        const found = inspect(descriptor.value, depth + 1);
-        if (found) return found;
-      }
+    if (state.conversationRuntimeScanPromise)
+      return await state.conversationRuntimeScanPromise;
+    const wallNow = Date.now();
+    if (!force && wallNow < (state.nextConversationRuntimeScanAt || 0))
       return null;
-    };
-    for (const element of document.querySelectorAll("*")) {
-      for (const key of reactFiberKeys(element)) {
-        for (
-          let fiber = element[key];
-          fiber && !seenFibers.has(fiber);
-          fiber = fiber.return
+    state.nextConversationRuntimeScanAt = wallNow + 30000;
+    state.conversationRuntimeScanPromise = (async () => {
+      const seenFibers = new WeakSet();
+      const seenValues = new WeakSet();
+      const inspect = (value, depth = 0) => {
+        if (
+          !value ||
+          (typeof value !== "object" && typeof value !== "function") ||
+          seenValues.has(value)
+        )
+          return null;
+        seenValues.add(value);
+        if (isConversationRuntime(value)) return value;
+        if (depth >= 3) return null;
+        let descriptors;
+        try {
+          descriptors = Object.getOwnPropertyDescriptors(value);
+        } catch {
+          return null;
+        }
+        for (const [key, descriptor] of Object.entries(descriptors)) {
+          if (
+            !("value" in descriptor) ||
+            key === "return" ||
+            key === "child" ||
+            key === "sibling"
+          )
+            continue;
+          const found = inspect(descriptor.value, depth + 1);
+          if (found) return found;
+        }
+        return null;
+      };
+      const nodes = [
+        document.getElementById("root") || document.body,
+        document.documentElement,
+      ].filter(Boolean);
+      let cursor = 0;
+      while (cursor < nodes.length) {
+        const sliceDeadline = monotonicNow() + 4;
+        let sliceCount = 0;
+        while (
+          cursor < nodes.length &&
+          sliceCount < 800 &&
+          monotonicNow() < sliceDeadline
         ) {
-          seenFibers.add(fiber);
-          const roots = [
-            fiber.updateQueue?.memoCache?.data,
-            fiber.memoizedProps,
-            fiber.memoizedState,
-          ];
-          for (const root of roots) {
-            const found = inspect(root);
-            if (!found) continue;
-            state.conversationRuntime = found;
-            return found;
+          sliceCount += 1;
+          const element = nodes[cursor++];
+          try {
+            for (const child of Array.from(element?.childNodes || []))
+              nodes.push(child);
+          } catch {}
+          for (const key of reactFiberKeys(element)) {
+            for (
+              let fiber = element[key];
+              fiber && !seenFibers.has(fiber);
+              fiber = fiber.return
+            ) {
+              seenFibers.add(fiber);
+              const roots = [
+                fiber.updateQueue?.memoCache?.data,
+                fiber.memoizedProps,
+                fiber.memoizedState,
+              ];
+              for (const root of roots) {
+                const found = inspect(root);
+                if (!found) continue;
+                state.conversationRuntime = found;
+                return found;
+              }
+            }
           }
         }
+        if (cursor < nodes.length) await yieldConversationRuntimeDiscovery();
       }
-    }
-    return null;
+      return null;
+    })().finally(() => {
+      state.conversationRuntimeScanPromise = null;
+    });
+    return await state.conversationRuntimeScanPromise;
   };
   const installAppServerPatch = async () => {
-    let discovered = rememberRequestClient(findConversationRuntime());
+    let discovered = false;
     try {
       const module = await loadAppModule("app-server-manager-signals-");
       for (const candidate of Object.values(module).filter(
@@ -450,14 +504,21 @@
     } catch (error) {
       state.failures.push(String(error?.message || error));
     }
+    if (!discovered)
+      discovered = rememberRequestClient(await findConversationRuntime());
     return discovered;
   };
   const runSummarizeSession = async (threadId) => {
     const normalizedThreadId = String(threadId || "").trim();
     if (!normalizedThreadId) throw new Error("A Codex thread id is required");
     await installAppServerPatch();
+    const conversationRuntime =
+      state.conversationRuntime ??
+      ((state.appServerClients || []).length > 0
+        ? null
+        : await findConversationRuntime({ force: true }));
     const clients = [
-      findConversationRuntime(),
+      conversationRuntime,
       ...(state.appServerClients || []),
     ].filter(
       (client, index, array) =>
@@ -627,8 +688,13 @@
     if (!normalizedSummary)
       throw new Error("The compacted handoff summary is empty");
     await installAppServerPatch();
+    const conversationRuntime =
+      state.conversationRuntime ??
+      ((state.appServerClients || []).length > 0
+        ? null
+        : await findConversationRuntime({ force: true }));
     const clients = [
-      findConversationRuntime(),
+      conversationRuntime,
       ...(state.appServerClients || []),
     ].filter(
       (client, index, array) =>
@@ -855,12 +921,18 @@
     }
   };
   const run = async () => {
-    installMessagePatch();
-    await installAppServerPatch();
-    void triggerLocalThreadCatalogSync();
-    patchStatsig();
-    patchReactState();
-    installModelPickerSpacingFix();
+    if (state.runPromise) return await state.runPromise;
+    state.runPromise = (async () => {
+      installMessagePatch();
+      await installAppServerPatch();
+      void triggerLocalThreadCatalogSync();
+      patchStatsig();
+      patchReactState();
+      installModelPickerSpacingFix();
+    })().finally(() => {
+      state.runPromise = null;
+    });
+    return await state.runPromise;
   };
   await run();
   if (!state.modelPickerObserver && typeof MutationObserver === "function") {
