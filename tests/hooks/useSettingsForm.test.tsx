@@ -1,6 +1,6 @@
 import { renderHook, act, waitFor } from "@testing-library/react";
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import i18n from "i18next";
+import i18n from "@/i18n";
 import { useSettingsForm } from "@/hooks/useSettingsForm";
 
 const useSettingsQueryMock = vi.fn();
@@ -173,7 +173,11 @@ describe("useSettingsForm Hook", () => {
     });
 
     changeLanguageSpy.mockClear();
-    (i18n as any).language = "zh";
+    act(() => {
+      result.current.updateSettings({ language: "zh" });
+    });
+    expect(changeLanguageSpy).toHaveBeenCalledWith("zh");
+    changeLanguageSpy.mockClear();
 
     act(() => {
       result.current.resetSettings({

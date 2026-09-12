@@ -79,6 +79,7 @@ export function useSettingsForm(): UseSettingsFormResult {
 
   const initialLanguageRef = useRef<Language>("en");
   const dirtyFieldsRef = useRef<Set<keyof SettingsFormState>>(new Set());
+  const lastAppliedDataRef = useRef<Settings | null>(null);
 
   const readPersistedLanguage = useCallback((): Language => {
     if (typeof window !== "undefined") {
@@ -102,7 +103,8 @@ export function useSettingsForm(): UseSettingsFormResult {
 
   // 初始化设置数据
   useEffect(() => {
-    if (!data) return;
+    if (!data || data === lastAppliedDataRef.current) return;
+    lastAppliedDataRef.current = data;
 
     const normalizedLanguage = normalizeLanguage(
       data.language ?? readPersistedLanguage(),
@@ -165,7 +167,9 @@ export function useSettingsForm(): UseSettingsFormResult {
           ...updates,
         };
 
-        for (const key of Object.keys(updates) as Array<keyof SettingsFormState>) {
+        for (const key of Object.keys(updates) as Array<
+          keyof SettingsFormState
+        >) {
           dirtyFieldsRef.current.add(key);
         }
 
@@ -213,10 +217,14 @@ export function useSettingsForm(): UseSettingsFormResult {
       };
 
       dirtyFieldsRef.current.clear();
+      // Restoring the original language can rerender useTranslation before
+      // React Query publishes a newer snapshot. Do not let that stale object
+      // immediately overwrite the explicit reset payload.
+      lastAppliedDataRef.current = data ?? serverData;
       setSettingsState(normalized);
       syncLanguage(initialLanguageRef.current);
     },
-    [readPersistedLanguage, syncLanguage],
+    [data, readPersistedLanguage, syncLanguage],
   );
 
   return {
