@@ -73,7 +73,7 @@ export function PagedModelList<T>({
           />
         ))}
       <DeferredRender
-        enabled={items.length > PAGE_SIZE}
+        enabled={!command && items.length > PAGE_SIZE}
         render={() =>
           command ? <CommandList>{renderRows()}</CommandList> : renderRows()
         }

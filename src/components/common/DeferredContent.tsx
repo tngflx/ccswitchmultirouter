@@ -3,6 +3,30 @@ import { Loader2 } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import { useGlobalLoading } from "@/contexts/GlobalLoadingContext";
 
+const DEFERRED_PAINT_FALLBACK_MS = 100;
+
+function scheduleAfterPaint(callback: () => void): () => void {
+  let settled = false;
+  let frame: number | undefined;
+  let fallbackTimer: ReturnType<typeof setTimeout> | undefined;
+  let callbackTimer: ReturnType<typeof setTimeout> | undefined;
+  const complete = () => {
+    if (settled) return;
+    settled = true;
+    if (frame !== undefined) cancelAnimationFrame(frame);
+    clearTimeout(fallbackTimer);
+    callbackTimer = setTimeout(callback, 0);
+  };
+  frame = requestAnimationFrame(complete);
+  fallbackTimer = setTimeout(complete, DEFERRED_PAINT_FALLBACK_MS);
+  return () => {
+    settled = true;
+    if (frame !== undefined) cancelAnimationFrame(frame);
+    clearTimeout(fallbackTimer);
+    clearTimeout(callbackTimer);
+  };
+}
+
 export function LoadingStatus() {
   const { t } = useTranslation();
   return (
@@ -23,13 +47,12 @@ export function DeferredContent({ children }: { children: ReactNode }) {
   const { beginLoading } = useGlobalLoading();
   useEffect(() => {
     const finishGlobalLoading = beginLoading();
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    const frame = requestAnimationFrame(() => {
-      timer = setTimeout(() => setReady(true), 0);
+    const cancelReady = scheduleAfterPaint(() => {
+      setReady(true);
+      finishGlobalLoading();
     });
     return () => {
-      cancelAnimationFrame(frame);
-      clearTimeout(timer);
+      cancelReady();
       finishGlobalLoading();
     };
   }, [beginLoading]);
@@ -53,13 +76,12 @@ export function DeferredRender({
     }
     const finishGlobalLoading = beginLoading();
     setReady(false);
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    const frame = requestAnimationFrame(() => {
-      timer = setTimeout(() => setReady(true), 0);
+    const cancelReady = scheduleAfterPaint(() => {
+      setReady(true);
+      finishGlobalLoading();
     });
     return () => {
-      cancelAnimationFrame(frame);
-      clearTimeout(timer);
+      cancelReady();
       finishGlobalLoading();
     };
   }, [beginLoading, enabled]);

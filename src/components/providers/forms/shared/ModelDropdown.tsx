@@ -8,7 +8,6 @@ import {
   PopoverContent,
   PopoverTrigger,
 } from "@/components/ui/popover";
-import { DeferredContent } from "@/components/common/DeferredContent";
 import { PagedModelList } from "./PagedModelList";
 import type { FetchedModel } from "@/lib/api/model-fetch";
 
@@ -39,7 +38,7 @@ export function ModelDropdown({
   );
 
   return (
-    <Popover modal open={open} onOpenChange={setOpen}>
+    <Popover open={open} onOpenChange={setOpen}>
       <PopoverTrigger asChild>
         <Button
           type="button"
@@ -58,38 +57,36 @@ export function ModelDropdown({
           align="end"
           className="w-80 max-w-[calc(100vw-2rem)] p-0"
         >
-          <DeferredContent>
-            <Command shouldFilter={false}>
-              <PagedModelList
-                items={ordered}
-                searchText={(model) =>
-                  `${searchText(model)} ${getLabel(model.id)}`
-                }
-                command
-              >
-                {(model) => (
-                  <CommandItem
-                    key={model.id}
-                    value={model.id}
-                    className="min-w-0 break-all"
-                    onSelect={() => {
-                      onSelect(model.id);
-                      setOpen(false);
-                    }}
-                  >
-                    <span>
-                      {getLabel(model.id)}
-                      {model.ownedBy && (
-                        <span className="block text-xs text-muted-foreground">
-                          {model.ownedBy}
-                        </span>
-                      )}
-                    </span>
-                  </CommandItem>
-                )}
-              </PagedModelList>
-            </Command>
-          </DeferredContent>
+          <Command shouldFilter={false}>
+            <PagedModelList
+              items={ordered}
+              searchText={(model) =>
+                `${searchText(model)} ${getLabel(model.id)}`
+              }
+              command
+            >
+              {(model) => (
+                <CommandItem
+                  key={model.id}
+                  value={model.id}
+                  className="min-w-0 break-all"
+                  onSelect={() => {
+                    onSelect(model.id);
+                    setOpen(false);
+                  }}
+                >
+                  <span>
+                    {getLabel(model.id)}
+                    {model.ownedBy && (
+                      <span className="block text-xs text-muted-foreground">
+                        {model.ownedBy}
+                      </span>
+                    )}
+                  </span>
+                </CommandItem>
+              )}
+            </PagedModelList>
+          </Command>
         </PopoverContent>
       )}
     </Popover>
