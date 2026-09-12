@@ -566,17 +566,19 @@
           );
         const summaryTurn = await client.sendRequest("turn/start", {
           threadId: normalizedThreadId,
-          input: [{
-            type: "text",
-            text: [
-              "Create a concise handoff summary of this coding session for a fresh session.",
-              "This is a manual coding-agent summary, not context compaction.",
-              "Do not call tools, inspect files, change files, or continue implementation.",
-              "Include: the user's goal, decisions made, files or areas changed, current state,",
-              "known failures, tests run, and the exact next action. Preserve important identifiers.",
-              "Return only the handoff summary in plain text.",
-            ].join(" "),
-          }],
+          input: [
+            {
+              type: "text",
+              text: [
+                "Create a concise handoff summary of this coding session for a fresh session.",
+                "This is a manual coding-agent summary, not context compaction.",
+                "Do not call tools, inspect files, change files, or continue implementation.",
+                "Include: the user's goal, decisions made, files or areas changed, current state,",
+                "known failures, tests run, and the exact next action. Preserve important identifiers.",
+                "Return only the handoff summary in plain text.",
+              ].join(" "),
+            },
+          ],
           effort: "medium",
         });
         const summaryTurnId = String(
@@ -596,7 +598,9 @@
             includeTurns: true,
           });
           const turns = current?.thread?.turns || current?.turns || [];
-          const turn = turns.find((candidate) => candidate?.id === summaryTurnId);
+          const turn = turns.find(
+            (candidate) => candidate?.id === summaryTurnId,
+          );
           const status = String(turn?.status || "").toLowerCase();
           if (status === "completed") {
             const extractText = (value, seen = new WeakSet()) => {
@@ -614,18 +618,28 @@
               const ownText = isAssistantMessage
                 ? [value.text, value.content]
                     .flatMap((item) =>
-                      typeof item === "string" ? [item] : extractText(item, seen),
+                      typeof item === "string"
+                        ? [item]
+                        : extractText(item, seen),
                     )
                     .filter(Boolean)
                 : [];
-              return [...ownText, ...Object.values(value).flatMap((item) => extractText(item, seen))];
+              return [
+                ...ownText,
+                ...Object.values(value).flatMap((item) =>
+                  extractText(item, seen),
+                ),
+              ];
             };
             const summary = [...new Set(extractText(turn))]
               .map((value) => String(value).trim())
               .filter(Boolean)
               .join("\n")
               .trim();
-            if (!summary) throw new Error("Codex completed without a manual handoff summary");
+            if (!summary)
+              throw new Error(
+                "Codex completed without a manual handoff summary",
+              );
             return { summary };
           }
           if (status === "failed" || status === "interrupted")
