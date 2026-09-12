@@ -356,7 +356,16 @@ export interface CodexModelReasoningCapability {
     effortMap?: Partial<Record<CodexReasoningEffort, CodexReasoningEffort>>;
   };
   outputFormat?: CodexChatReasoningOutputFormat;
-  source?: "provider" | "builtin" | "user" | "legacy" | "protocol";
+  source?:
+    | "provider"
+    | "provider_config"
+    | "official"
+    | "builtin"
+    | "library"
+    | "detection"
+    | "user"
+    | "legacy"
+    | "protocol";
   /** 证据等级（schema v2）。易变元数据，不进入能力指纹。 */
   confidence?: CodexReasoningConfidence;
   /** 检测时间（schema v2）。易变元数据，不进入能力指纹。 */

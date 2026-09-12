@@ -31,7 +31,7 @@ import {
 import type { CodexRoutingProjectionStatus } from "@/lib/api/providers";
 import { proxyApi } from "@/lib/api/proxy";
 import { settingsApi } from "@/lib/api/settings";
-import type { Provider } from "@/types";
+import type { CodexModelReasoningCapability, Provider } from "@/types";
 import type { RequestHealthSnapshot } from "@/types/proxy";
 import { RequestHealthPanel } from "@/components/settings/RequestHealthPanel";
 import type { PaginatedLogs, RequestLog } from "@/types/usage";
@@ -4521,19 +4521,20 @@ describe("Codex MultiRouter workspace route persistence helpers", () => {
         modelCatalog: { models: [{ model: "gpt-6-astra" }] },
       },
     };
-    const reasoning = {
+    const reasoning: CodexModelReasoningCapability = {
       schemaVersion: 2,
-      supportStatus: "confirmed_supported" as const,
-      controlKind: "graded" as const,
-      supportedEfforts: ["low", "medium", "high", "xhigh", "max"] as const,
-      defaultEffort: "low" as const,
+      supportStatus: "confirmed_supported",
+      controlKind: "graded",
+      supportedEfforts: ["low", "medium", "high", "xhigh", "max"],
+      defaultEffort: "low",
       disableAllowed: false,
       upstream: {
-        format: "string" as const,
-        parameter: "reasoning_effort" as const,
-        effortMap: { none: "low" as const, minimal: "low" as const },
+        format: "string",
+        parameter: "reasoning_effort",
+        effortMap: { none: "low", minimal: "low" },
       },
-      source: "official" as const,
+      source: "official",
+      confidence: "authoritative",
     };
 
     const refreshed = providerWithFetchedModelCatalog(official, [
