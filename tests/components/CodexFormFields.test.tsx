@@ -8,6 +8,7 @@ import {
 } from "@testing-library/react";
 import { useState, type ReactNode } from "react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { invalidateAutoModelRefresh } from "@/hooks/useAutoModelRefresh";
 import {
   applyCodexProtocolGroups,
   buildSplitCodexProviderSuggestionForFetchedModels,
@@ -94,6 +95,7 @@ vi.mock("@/components/providers/forms/XaiOAuthSection", () => ({
 }));
 
 beforeEach(() => {
+  invalidateAutoModelRefresh();
   vi.useRealTimers();
   vi.mocked(fetchModelsForConfig).mockReset();
   vi.mocked(fetchXaiOauthModels).mockReset();
@@ -388,6 +390,7 @@ function renderCatalogHarness(
     onProviderSplitSuggestionChange?: ReturnType<typeof vi.fn>;
     initialApiKeyGroups?: CodexApiKeyGroup[];
     initialApiKeyGroupMode?: CodexApiKeyGroupMode;
+    autoRefreshModels?: boolean;
     isXaiOauthPreset?: boolean;
     isXaiOauthAuthenticated?: boolean;
     selectedXaiAccountId?: string;
@@ -431,6 +434,7 @@ function renderCatalogHarness(
     return (
       <CodexFormFields
         providerId="codex-thirdparty"
+        autoRefreshModels={options.autoRefreshModels}
         providerName={options.providerName}
         isXaiOauthPreset={options.isXaiOauthPreset}
         isXaiOauthAuthenticated={options.isXaiOauthAuthenticated}
@@ -695,6 +699,94 @@ function renderAutoSplitHarness() {
 }
 
 describe("CodexFormFields local model routing", () => {
+  it("bounds reasoning resolution to the rendered page for a 500-model catalog", async () => {
+    vi.mocked(fetchModelsForConfig).mockResolvedValue(
+      Array.from({ length: 500 }, (_, index) => ({
+        id: `openrouter/vendor-${index}/model-${index}`,
+        ownedBy: "OpenRouter",
+      })),
+    );
+    const harness = renderCatalogHarness([], { autoRefreshModels: true });
+
+    await waitFor(() => expect(harness.latestCatalog()).toHaveLength(500));
+    await waitFor(() =>
+      expect(reasoningApiMocks.resolve).toHaveBeenCalledTimes(10),
+    );
+    expect(reasoningApiMocks.resolve).toHaveBeenCalledWith(
+      expect.any(Object),
+      "codex-thirdparty",
+      "openrouter/vendor-0/model-0",
+    );
+    expect(reasoningApiMocks.resolve).not.toHaveBeenCalledWith(
+      expect.any(Object),
+      "codex-thirdparty",
+      "openrouter/vendor-10/model-10",
+    );
+  });
+
+  it("silently reconciles a saved catalog from a complete automatic refresh", async () => {
+    vi.mocked(fetchModelsForConfig).mockResolvedValue([
+      { id: "gpt-6", ownedBy: "provider" },
+      { id: "glm-5.3", ownedBy: "provider" },
+      { id: "glm-5.2", ownedBy: "provider" },
+      { id: "glm-5.1", ownedBy: "provider" },
+      { id: "glm-5", ownedBy: "provider" },
+      { id: "glm-4.7", ownedBy: "provider" },
+    ]);
+    const harness = renderCatalogHarness(
+      [
+        {
+          model: "old-remote",
+          upstreamModel: "old-remote",
+        },
+        {
+          model: "manual-alias",
+        },
+      ],
+      { autoRefreshModels: true },
+    );
+
+    await waitFor(() =>
+      expect(harness.latestCatalog().map((row) => row.model)).toEqual([
+        "manual-alias",
+        "gpt-6",
+        "glm-5.3",
+        "glm-5.2",
+        "glm-5.1",
+        "glm-5",
+      ]),
+    );
+    expect(fetchModelsForConfig).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps the saved catalog when any grouped credential refresh fails", async () => {
+    vi.mocked(fetchModelsForConfig).mockImplementation(async (_url, key) => {
+      if (key === "sk-second") throw new Error("temporary provider failure");
+      return [{ id: "model-from-first-key", ownedBy: "provider" }];
+    });
+    const harness = renderCatalogHarness(
+      [{ model: "saved-model", upstreamModel: "saved-model" }],
+      {
+        autoRefreshModels: true,
+        apiKey: "sk-first",
+        initialApiKeyGroups: [
+          {
+            id: "group-1",
+            label: "Second",
+            apiKeys: ["sk-second"],
+            enabled: true,
+          },
+        ],
+      },
+    );
+
+    await waitFor(() => expect(fetchModelsForConfig).toHaveBeenCalledTimes(2));
+    expect(harness.latestCatalog()).toEqual([
+      { model: "saved-model", upstreamModel: "saved-model" },
+    ]);
+    expect(harness.onCatalogChange).not.toHaveBeenCalled();
+  });
+
   it("applies recent release retention to the saved catalog", async () => {
     const names = [
       "gpt-6-astra",

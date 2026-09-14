@@ -286,19 +286,12 @@ fn extract_claude_session(
 /// 提取 Codex Session ID
 fn extract_codex_session(headers: &HeaderMap, body: &serde_json::Value) -> Option<SessionIdResult> {
     // 1. 优先读取 official Codex 实际发送的稳定会话头；这些值同时影响上游路由与缓存。
-    for header_name in &[
-        "session-id",
-        "thread-id",
-        "x-client-request-id",
-        "session_id",
-        "x-session-id",
-    ] {
+    for header_name in &["thread-id", "session-id", "session_id", "x-session-id"] {
         if let Some(value) = headers.get(*header_name) {
             if let Ok(session_id) = value.to_str() {
                 // Codex Session ID 通常较长（UUID 格式）
                 let session_id = session_id.trim();
-                // Codex Session/Thread ID 通常是 UUID/ULID；过短值更可能是测试或无效占位。
-                if session_id.len() > 10 {
+                if is_codex_thread_id(session_id) {
                     return Some(SessionIdResult {
                         session_id: session_id.to_string(),
                         source: SessionIdSource::Header,
@@ -334,7 +327,7 @@ fn extract_codex_session(headers: &HeaderMap, body: &serde_json::Value) -> Optio
         .and_then(|v| v.as_str())
     {
         let session_id = session_id.trim();
-        if session_id.len() > 10 {
+        if is_codex_thread_id(session_id) {
             return Some(SessionIdResult {
                 session_id: session_id.to_string(),
                 source: SessionIdSource::MetadataSessionId,
@@ -348,6 +341,15 @@ fn extract_codex_session(headers: &HeaderMap, body: &serde_json::Value) -> Optio
     // 若把它当 prompt_cache_key 或 Codex session header，会导致每轮请求换缓存 key。
 
     None
+}
+
+fn is_codex_thread_id(value: &str) -> bool {
+    let value = value.trim();
+    uuid::Uuid::parse_str(value).is_ok()
+        || (value.len() == 26
+            && value
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() && !"ilo".contains(ch.to_ascii_lowercase())))
 }
 
 /// 从 metadata 提取 Session ID (Claude)
@@ -632,6 +634,33 @@ mod tests {
         assert_eq!(result.session_id, "019cf82b-6a62-7700-bbbd-46909794ef89");
         assert_eq!(result.source, SessionIdSource::Header);
         assert!(result.client_provided);
+    }
+
+    #[test]
+    fn test_codex_request_id_header_is_not_used_as_thread_identity() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-client-request-id",
+            "019cf82b-6a62-7700-bbbd-46909794ef89".parse().unwrap(),
+        );
+        let body = json!({"input": "Write a function"});
+
+        let result = extract_session_id(&headers, &body, "codex");
+
+        assert_eq!(result.source, SessionIdSource::Generated);
+        assert!(!result.client_provided);
+    }
+
+    #[test]
+    fn test_codex_invalid_session_header_is_not_used_for_handoff() {
+        let mut headers = HeaderMap::new();
+        headers.insert("session-id", "account-session".parse().unwrap());
+        let body = json!({"input": "Write a function"});
+
+        let result = extract_session_id(&headers, &body, "codex");
+
+        assert_eq!(result.source, SessionIdSource::Generated);
+        assert!(!result.client_provided);
     }
 
     #[test]

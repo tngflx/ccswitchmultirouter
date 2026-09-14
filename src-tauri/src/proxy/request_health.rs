@@ -702,6 +702,13 @@ pub(crate) async fn review_before_upstream(
     dispatch_scope: &str,
     compaction_request: bool,
 ) -> Result<PreflightReviewOutcome, String> {
+    // The handoff summary is an intentional second turn over the same large
+    // source context. Re-running it through the oversized-request gate would
+    // recursively block the handoff that is supposed to recover the session.
+    if is_manual_summary_request(body) {
+        return Ok(PreflightReviewOutcome::NotRequired);
+    }
+
     if !config.enabled
         || config.review_mode == RequestHealthReviewMode::Off
         || trace_id.is_empty()
@@ -806,6 +813,14 @@ pub(crate) async fn review_before_upstream(
             )),
         }
     }
+}
+
+fn is_manual_summary_request(body: &[u8]) -> bool {
+    let Ok(text) = std::str::from_utf8(body) else {
+        return false;
+    };
+    text.contains("Create a concise handoff summary of this coding session for a fresh session.")
+        && text.contains("This is a manual coding-agent summary, not context compaction.")
 }
 
 #[cfg(target_os = "windows")]
@@ -1622,6 +1637,27 @@ mod tests {
             result,
             Err("Request blocked while the session summary handoff is in progress".to_string())
         );
+    }
+
+    #[tokio::test]
+    async fn manual_summary_turn_bypasses_active_handoff_guard() {
+        let session_id = "summary-handoff-summary-turn";
+        let _guard = begin_summary_handoff(session_id).expect("acquire handoff guard");
+        let body = br#"{"input":[{"type":"message","content":"Create a concise handoff summary of this coding session for a fresh session. This is a manual coding-agent summary, not context compaction."}]}"#;
+
+        let result = review_before_upstream(
+            &RequestHealthConfig::default(),
+            "summary-trace",
+            session_id,
+            true,
+            "gpt-test",
+            body,
+            "provider|POST|https://example.test/responses",
+            false,
+        )
+        .await;
+
+        assert_eq!(result, Ok(PreflightReviewOutcome::NotRequired));
     }
 
     #[test]

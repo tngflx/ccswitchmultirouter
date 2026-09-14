@@ -1,6 +1,11 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { useTranslation } from "react-i18next";
+import {
+  invalidateAutoModelRefresh,
+  modelRefreshCredentialFingerprint,
+  useAutoModelRefresh,
+} from "@/hooks/useAutoModelRefresh";
 import { useGlobalLoading } from "@/contexts/GlobalLoadingContext";
 import { Button } from "@/components/ui/button";
 import {
@@ -297,6 +302,7 @@ function buildSplitCodexProviderSuggestionForProbeRecords({
 interface CodexFormFieldsProps {
   appId?: AppId;
   providerId?: string;
+  autoRefreshModels?: boolean;
   // 当前表单里的 provider 名称；自动生成混合协议 route 标签时使用。
   providerName?: string;
   // xAI OAuth 托管预设（Grok 订阅）：隐藏 API Key / 端点输入，挂账号选择区块
@@ -902,6 +908,7 @@ export function buildSplitCodexProviderSuggestionForFetchedModels({
 export function CodexFormFields({
   appId = "codex",
   providerId,
+  autoRefreshModels = false,
   providerName,
   isXaiOauthPreset,
   isMaintainedPreset = false,
@@ -995,6 +1002,9 @@ export function CodexFormFields({
   const [reasoningResolutions, setReasoningResolutions] = useState<
     Record<string, CodexModelReasoningResolution>
   >({});
+  const [visibleReasoningModels, setVisibleReasoningModels] = useState<
+    string[]
+  >([]);
   const [redetectingReasoningModel, setRedetectingReasoningModel] = useState<
     string | null
   >(null);
@@ -1202,20 +1212,21 @@ export function CodexFormFields({
     visibleCatalogRows.some(({ row }) => selectedCatalogRowIds.has(row.rowId));
 
   useEffect(() => {
-    const rows = catalogRows
-      .map((row) => ({
-        row,
-        model: catalogRowUpstreamModel(row) || row.model.trim(),
-      }))
-      .filter(({ model }) => Boolean(model));
-    if (rows.length === 0) {
+    if (visibleReasoningModels.length === 0) {
       setReasoningResolutions({});
       return;
     }
     const requestId = ++reasoningResolutionRequestRef.current;
     let cancelled = false;
-    void Promise.all(
-      rows.map(async ({ row, model }) => {
+    void (async () => {
+      const next: Record<string, CodexModelReasoningResolution> = {};
+      for (const model of visibleReasoningModels) {
+        const row = catalogRows.find(
+          (candidate) =>
+            (catalogRowUpstreamModel(candidate) || candidate.model.trim()) ===
+            model,
+        );
+        if (!row || cancelled) break;
         const cacheKey = [
           providerId ?? "codex-draft",
           model,
@@ -1226,7 +1237,8 @@ export function CodexFormFields({
         ].join("|");
         const cached = reasoningResolutionCacheRef.current.get(cacheKey);
         if (cached) {
-          return [model, await cached] as const;
+          next[model] = await cached;
+          continue;
         }
 
         const pending = codexSubagentV2Api
@@ -1245,22 +1257,43 @@ export function CodexFormFields({
         reasoningResolutionCacheRef.current.set(cacheKey, pending);
         const resolved = await pending;
         reasoningResolutionCacheRef.current.set(cacheKey, resolved);
-        return [model, resolved] as const;
-      }),
-    ).then((results) => {
+        next[model] = resolved;
+      }
       if (cancelled || requestId !== reasoningResolutionRequestRef.current) {
         return;
       }
-      const next: Record<string, CodexModelReasoningResolution> = {};
-      for (const result of results) {
-        if (result) next[result[0]] = result[1];
-      }
       setReasoningResolutions(next);
-    });
+    })();
     return () => {
       cancelled = true;
     };
-  }, [catalogRows, providerId, reasoningSettingsConfig]);
+  }, [
+    catalogRows,
+    providerId,
+    reasoningSettingsConfig,
+    visibleReasoningModels,
+  ]);
+  const handleVisibleReasoningItemsChange = useCallback(
+    (items: { row: CodexCatalogRow; index: number }[]) => {
+      const next = Array.from(
+        new Set(
+          items
+            .map(
+              ({ row }) =>
+                catalogRowUpstreamModel(row) || row.model.trim(),
+            )
+            .filter(Boolean),
+        ),
+      );
+      setVisibleReasoningModels((current) =>
+        current.length === next.length &&
+        current.every((model, index) => model === next[index])
+          ? current
+          : next,
+      );
+    },
+    [],
+  );
   const catalogRowsRef = useRef<CodexCatalogRow[]>(catalogRows);
   const modelMappingSectionRef = useRef<HTMLDivElement | null>(null);
   const fetchModelsButtonRef = useRef<HTMLButtonElement | null>(null);
@@ -1478,6 +1511,7 @@ export function CodexFormFields({
 
   const handleFetchModels = useCallback(
     (fetchMode: "sync" | "refresh-existing" = "sync") => {
+      invalidateAutoModelRefresh();
       if (fetchMode === "refresh-existing") {
         setPendingSplitRoutingState(null);
         onProviderSplitSuggestionChange?.(null);
@@ -1757,6 +1791,159 @@ export function CodexFormFields({
       runWithLoading,
     ],
   );
+
+  const autoModelRefreshKey = useMemo(() => {
+    const credentialIdentity = [codexApiKey, ...enabledGroupedApiKeys]
+      .concat(planAccessKeyId ?? "", planSecretAccessKey ?? "")
+      .map(modelRefreshCredentialFingerprint)
+      .sort()
+      .join(",");
+    return `provider-models:codex:${providerId ?? "draft"}:${codexBaseUrl}:${selectedXaiAccountId ?? ""}:${credentialIdentity}`;
+  }, [
+    codexApiKey,
+    codexBaseUrl,
+    enabledGroupedApiKeys,
+    planAccessKeyId,
+    planSecretAccessKey,
+    providerId,
+    selectedXaiAccountId,
+  ]);
+
+  const autoFetchModels = useCallback(async (): Promise<FetchedModel[]> => {
+    if (isXaiOauthPreset) {
+      if (!isXaiOauthAuthenticated) return [];
+      return fetchXaiOauthModels(selectedXaiAccountId ?? null);
+    }
+
+    const keys = Array.from(
+      new Set(
+        [codexApiKey, ...enabledGroupedApiKeys]
+          .map((key) => key.trim())
+          .filter(Boolean),
+      ),
+    );
+    const planFetchSource = {
+      baseUrl: codexBaseUrl,
+      partnerPromotionKey,
+      providerName,
+      apiKey: codexApiKey,
+      accessKeyId: planAccessKeyId,
+      secretAccessKey: planSecretAccessKey,
+    };
+    const planModelListAction = codexPlanModelListAction(planFetchSource);
+    if (
+      !codexBaseUrl ||
+      (keys.length === 0 && !planModelListAction) ||
+      isCodexCatalogOnlyPlanModelFetch(planFetchSource)
+    ) {
+      return [];
+    }
+    const credentialKeys = keys.length > 0 ? keys : [""];
+
+    const results = await Promise.all(
+      credentialKeys.map((key) =>
+        fetchModelsForConfig(
+          codexBaseUrl,
+          key,
+          isFullUrl,
+          undefined,
+          customUserAgent,
+          planModelListAction
+            ? {
+                action: planModelListAction,
+                accessKeyId: planAccessKeyId ?? "",
+                secretAccessKey: planSecretAccessKey ?? "",
+              }
+            : undefined,
+        ),
+      ),
+    );
+    const modelsByIdentity = new Map<string, FetchedModel>();
+    for (const model of results.flat()) {
+      if (!model || typeof model.id !== "string") continue;
+      const identity = catalogModelIdentity(model.id);
+      if (!identity || modelsByIdentity.has(identity)) continue;
+      modelsByIdentity.set(identity, model);
+    }
+    return Array.from(modelsByIdentity.values());
+  }, [
+    codexApiKey,
+    codexBaseUrl,
+    customUserAgent,
+    enabledGroupedApiKeys,
+    isFullUrl,
+    isXaiOauthAuthenticated,
+    isXaiOauthPreset,
+    partnerPromotionKey,
+    planAccessKeyId,
+    planSecretAccessKey,
+    providerName,
+    selectedXaiAccountId,
+  ]);
+
+  const applyAutomaticCatalogRefresh = useCallback(
+    (models: FetchedModel[]) => {
+      if (!onCatalogModelsChange || models.length === 0) return;
+      const reconciled = reconcileFetchedCodexCatalogRows(
+        catalogRowsRef.current,
+        models,
+        {
+          providerId,
+          providerName,
+          baseUrl: codexBaseUrl,
+          websiteUrl,
+        },
+        {
+          appendNew: true,
+          createRow: (seed) => createCatalogRow(seed),
+          existingMetadataMode: "refresh",
+          removeMissingRemote: true,
+        },
+      );
+      const outdated = pruneOutdatedCodexCatalogModels(reconciled.rows);
+      const prunedIds = new Set(
+        outdated.pruned.map((model) => model.model.trim()),
+      );
+      const retained = reconciled.rows.filter(
+        (row) => !prunedIds.has(row.model.trim()),
+      );
+      const persistedRows = retained.map(({ rowId: _rowId, ...row }) => row);
+      if (
+        JSON.stringify(lastSentModelsRef.current) ===
+        JSON.stringify(persistedRows)
+      ) {
+        return;
+      }
+      catalogRowsRef.current = retained;
+      setCatalogRows(retained);
+      lastSentModelsRef.current = persistedRows;
+      onCatalogModelsChange(persistedRows);
+    },
+    [codexBaseUrl, onCatalogModelsChange, providerId, providerName, websiteUrl],
+  );
+
+  useAutoModelRefresh({
+    cacheKey: autoModelRefreshKey,
+    enabled:
+      Boolean(autoRefreshModels && providerId) &&
+      ((isXaiOauthPreset && isXaiOauthAuthenticated) ||
+        (!isXaiOauthPreset &&
+          Boolean(codexBaseUrl) &&
+          (Boolean(codexApiKey) ||
+            enabledGroupedApiKeys.length > 0 ||
+            Boolean(
+              codexPlanModelListAction({
+                baseUrl: codexBaseUrl,
+                partnerPromotionKey,
+                providerName,
+                apiKey: codexApiKey,
+                accessKeyId: planAccessKeyId,
+                secretAccessKey: planSecretAccessKey,
+              }),
+            )))),
+    fetcher: autoFetchModels,
+    onSuccess: applyAutomaticCatalogRefresh,
+  });
 
   const handleProtocolProbe = useCallback(async () => {
     const probeApiKey = codexApiKey.trim() || enabledGroupedApiKeys[0] || "";
@@ -3107,6 +3294,7 @@ export function CodexFormFields({
                 selected={selectedCatalogRowIds}
                 onSelect={toggleCatalogRowSelected}
                 showSelection={false}
+                onVisibleItemsChange={handleVisibleReasoningItemsChange}
               >
                 {({ row, index }) => {
                   const model = row.model.trim();

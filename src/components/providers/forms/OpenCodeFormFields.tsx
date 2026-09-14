@@ -1,5 +1,10 @@
 import { useState, useEffect, useCallback, useMemo } from "react";
 import { useTranslation } from "react-i18next";
+import {
+  invalidateAutoModelRefresh,
+  modelRefreshCredentialFingerprint,
+  useAutoModelRefresh,
+} from "@/hooks/useAutoModelRefresh";
 import { useGlobalLoading } from "@/contexts/GlobalLoadingContext";
 import { FormLabel } from "@/components/ui/form";
 import { Input } from "@/components/ui/input";
@@ -198,6 +203,8 @@ function ModelOptionKeyInput({
 }
 
 interface OpenCodeFormFieldsProps {
+  providerId?: string;
+  autoRefreshModels?: boolean;
   // NPM Package
   npm: string;
   onNpmChange: (value: string) => void;
@@ -229,6 +236,8 @@ interface OpenCodeFormFieldsProps {
 }
 
 export function OpenCodeFormFields({
+  providerId,
+  autoRefreshModels = false,
   npm,
   onNpmChange,
   apiKey,
@@ -288,6 +297,7 @@ export function OpenCodeFormFields({
   }, [extraOptions]);
 
   const handleFetchModels = useCallback(() => {
+    invalidateAutoModelRefresh();
     if (!baseUrl || !apiKey) {
       showFetchModelsError(null, t, {
         hasApiKey: !!apiKey,
@@ -313,6 +323,13 @@ export function OpenCodeFormFields({
       })
       .finally(() => setIsFetchingModels(false));
   }, [baseUrl, apiKey, t, runWithLoading]);
+
+  useAutoModelRefresh({
+    cacheKey: `provider-models:opencode:${providerId ?? "draft"}:${baseUrl}:${modelRefreshCredentialFingerprint(apiKey)}`,
+    enabled: Boolean(autoRefreshModels && providerId && baseUrl && apiKey),
+    fetcher: () => fetchModelsForConfig(baseUrl, apiKey),
+    onSuccess: setFetchedModels,
+  });
 
   // Track which models have expanded options panel
   const [expandedModels, setExpandedModels] = useState<Set<string>>(new Set());

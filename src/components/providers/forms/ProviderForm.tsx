@@ -2874,6 +2874,7 @@ function ProviderFormFull({
           {appId === "claude" && (
             <ClaudeFormFields
               providerId={providerId}
+              autoRefreshModels={isEditMode}
               shouldShowApiKey={
                 (category !== "cloud_provider" ||
                   hasApiKeyField(form.getValues("settingsConfig"), "claude")) &&
@@ -2967,6 +2968,7 @@ function ProviderFormFull({
             <div ref={codexProviderDetailsRef}>
               <CodexFormFields
                 providerId={providerId}
+                autoRefreshModels={isEditMode}
                 providerName={form.watch("name")}
                 isXaiOauthPreset={
                   presetProviderType === "xai_oauth" ||
@@ -3056,6 +3058,7 @@ function ProviderFormFull({
           {appId === "gemini" && (
             <GeminiFormFields
               providerId={providerId}
+              autoRefreshModels={isEditMode}
               shouldShowApiKey={shouldShowApiKey(
                 form.getValues("settingsConfig"),
                 isEditMode,
@@ -3084,6 +3087,8 @@ function ProviderFormFull({
 
           {appId === "opencode" && !isAnyOmoCategory && (
             <OpenCodeFormFields
+              providerId={providerId}
+              autoRefreshModels={isEditMode}
               npm={opencodeForm.opencodeNpm}
               onNpmChange={opencodeForm.handleOpencodeNpmChange}
               apiKey={opencodeForm.opencodeApiKey}
@@ -3129,6 +3134,8 @@ function ProviderFormFull({
           {/* OpenClaw 专属字段 */}
           {appId === "openclaw" && (
             <OpenClawFormFields
+              providerId={providerId}
+              autoRefreshModels={isEditMode}
               baseUrl={openclawForm.openclawBaseUrl}
               onBaseUrlChange={openclawForm.handleOpenclawBaseUrlChange}
               apiKey={openclawForm.openclawApiKey}
@@ -3150,6 +3157,8 @@ function ProviderFormFull({
           {/* Hermes 专属字段 */}
           {appId === "hermes" && (
             <HermesFormFields
+              providerId={providerId}
+              autoRefreshModels={isEditMode}
               baseUrl={hermesForm.hermesBaseUrl}
               onBaseUrlChange={hermesForm.handleHermesBaseUrlChange}
               apiKey={hermesForm.hermesApiKey}

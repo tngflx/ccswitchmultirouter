@@ -1,4 +1,11 @@
-import { useId, useRef, useState, type ReactNode } from "react";
+import {
+  useEffect,
+  useId,
+  useMemo,
+  useRef,
+  useState,
+  type ReactNode,
+} from "react";
 import { ChevronDown, ChevronLeft, ChevronRight } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import { Button } from "@/components/ui/button";
@@ -16,6 +23,7 @@ export function CodexCatalogViewport<
   onSelect,
   showSelection = true,
   revealRowId,
+  onVisibleItemsChange,
   children,
 }: {
   items: { row: T; index: number }[];
@@ -24,6 +32,7 @@ export function CodexCatalogViewport<
   onSelect: (id: string, checked: boolean) => void;
   showSelection?: boolean;
   revealRowId?: string;
+  onVisibleItemsChange?: (items: { row: T; index: number }[]) => void;
   children: (item: { row: T; index: number }) => ReactNode;
 }) {
   const { t } = useTranslation();
@@ -46,8 +55,16 @@ export function CodexCatalogViewport<
   const pageSize = 10;
   const pageCount = Math.ceil(items.length / pageSize);
   const start = page * pageSize;
+  const visibleItems = useMemo(
+    () => (compact ? items.slice(start, start + pageSize) : items),
+    [compact, items, start],
+  );
 
-  if (!compact) return <>{items.map(children)}</>;
+  useEffect(() => {
+    onVisibleItemsChange?.(visibleItems);
+  }, [onVisibleItemsChange, visibleItems]);
+
+  if (!compact) return <>{visibleItems.map(children)}</>;
   return (
     <div className="min-w-0 border-y">
       {items.length > pageSize && (
@@ -86,7 +103,7 @@ export function CodexCatalogViewport<
         </div>
       )}
       <div>
-        {items.slice(start, start + pageSize).map((entry) => {
+        {visibleItems.map((entry) => {
           if (!showSelection) return children(entry);
           const { row } = entry;
           const open = expanded === row.rowId;

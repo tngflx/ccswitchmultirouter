@@ -1,4 +1,9 @@
 import { useTranslation } from "react-i18next";
+import {
+  invalidateAutoModelRefresh,
+  modelRefreshCredentialFingerprint,
+  useAutoModelRefresh,
+} from "@/hooks/useAutoModelRefresh";
 import { useGlobalLoading } from "@/contexts/GlobalLoadingContext";
 import {
   useState,
@@ -47,6 +52,8 @@ import {
 import type { ProviderCategory } from "@/types";
 
 interface HermesFormFieldsProps {
+  providerId?: string;
+  autoRefreshModels?: boolean;
   baseUrl: string;
   onBaseUrlChange: (value: string) => void;
   apiKey: string;
@@ -134,6 +141,8 @@ function AdvancedSection({
 }
 
 export function HermesFormFields({
+  providerId,
+  autoRefreshModels = false,
   baseUrl,
   onBaseUrlChange,
   apiKey,
@@ -200,6 +209,7 @@ export function HermesFormFields({
   };
 
   const handleFetchModels = useCallback(() => {
+    invalidateAutoModelRefresh();
     if (!baseUrl || !apiKey) {
       showFetchModelsError(null, t, {
         hasApiKey: !!apiKey,
@@ -225,6 +235,13 @@ export function HermesFormFields({
       })
       .finally(() => setIsFetchingModels(false));
   }, [baseUrl, apiKey, t, runWithLoading]);
+
+  useAutoModelRefresh({
+    cacheKey: `provider-models:hermes:${providerId ?? "draft"}:${baseUrl}:${modelRefreshCredentialFingerprint(apiKey)}`,
+    enabled: Boolean(autoRefreshModels && providerId && baseUrl && apiKey),
+    fetcher: () => fetchModelsForConfig(baseUrl, apiKey),
+    onSuccess: setFetchedModels,
+  });
 
   const handleRemoveModel = (index: number) => {
     modelKeysRef.current.splice(index, 1);

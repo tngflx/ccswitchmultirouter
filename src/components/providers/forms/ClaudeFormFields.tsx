@@ -1,5 +1,10 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
+import {
+  invalidateAutoModelRefresh,
+  modelRefreshCredentialFingerprint,
+  useAutoModelRefresh,
+} from "@/hooks/useAutoModelRefresh";
 import { useGlobalLoading } from "@/contexts/GlobalLoadingContext";
 import { Button } from "@/components/ui/button";
 import {
@@ -74,6 +79,7 @@ interface EndpointCandidate {
 
 interface ClaudeFormFieldsProps {
   providerId?: string;
+  autoRefreshModels?: boolean;
   // API Key
   shouldShowApiKey: boolean;
   apiKey: string;
@@ -164,6 +170,7 @@ interface ClaudeFormFieldsProps {
 
 export function ClaudeFormFields({
   providerId,
+  autoRefreshModels = false,
   shouldShowApiKey,
   apiKey,
   onApiKeyChange,
@@ -287,6 +294,7 @@ export function ClaudeFormFields({
   );
 
   const handleFetchModels = useCallback(() => {
+    invalidateAutoModelRefresh();
     if (!baseUrl || !apiKey) {
       showFetchModelsError(null, t, {
         hasApiKey: !!apiKey,
@@ -303,7 +311,15 @@ export function ClaudeFormFields({
     const modelsUrl = matchedPreset?.modelsUrl;
 
     setIsFetchingModels(true);
-    runWithLoading(() => fetchModelsForConfig(baseUrl, apiKey, isFullUrl, modelsUrl, customUserAgent))
+    runWithLoading(() =>
+      fetchModelsForConfig(
+        baseUrl,
+        apiKey,
+        isFullUrl,
+        modelsUrl,
+        customUserAgent,
+      ),
+    )
       .then((models) => {
         setFetchedModels(models);
         showModelFetchResult(models.length);
@@ -313,9 +329,57 @@ export function ClaudeFormFields({
         showFetchModelsError(err, t);
       })
       .finally(() => setIsFetchingModels(false));
-  }, [baseUrl, apiKey, isFullUrl, customUserAgent, showModelFetchResult, t, runWithLoading]);
+  }, [
+    baseUrl,
+    apiKey,
+    isFullUrl,
+    customUserAgent,
+    showModelFetchResult,
+    t,
+    runWithLoading,
+  ]);
+
+  useAutoModelRefresh({
+    cacheKey: `provider-models:claude:${providerId ?? "draft"}:${baseUrl}:${modelRefreshCredentialFingerprint(apiKey)}`,
+    enabled:
+      !isCopilotPreset &&
+      !isCodexOauthPreset &&
+      !isXaiOauthPreset &&
+      Boolean(autoRefreshModels && providerId && baseUrl && apiKey),
+    fetcher: () =>
+      fetchModelsForConfig(
+        baseUrl,
+        apiKey,
+        isFullUrl,
+        providerPresets.find((preset) => {
+          const env = (
+            preset.settingsConfig as {
+              env?: Record<string, string>;
+            }
+          )?.env;
+          return env?.ANTHROPIC_BASE_URL === baseUrl;
+        })?.modelsUrl,
+        customUserAgent,
+      ),
+    onSuccess: setFetchedModels,
+    compareIds: Boolean(autoRefreshModels && providerId)
+      ? fetchedModels.map((m) => (m.id ?? "").trim()).filter(Boolean)
+      : undefined,
+    onDiff: (added, removed) => {
+      // Non-blocking notification of changed model IDs when entering saved edit form.
+      // Only the saved-provider edit forms expose this banner; new drafts stay silent.
+      const banner = document.getElementById("model-diff-banner");
+      if (banner) {
+        banner.innerHTML = `<strong>Model list changed</strong>` +
+          (added.length ? `<div>Added: ${added.join(", ")}</div>` : "") +
+          (removed.length ? `<div>Removed: ${removed.join(", ")}</div>` : "");
+        banner.style.display = "block";
+      }
+    },
+  });
 
   const handleFetchCopilotModels = useCallback(() => {
+    invalidateAutoModelRefresh();
     if (!isCopilotAuthenticated) {
       toast.error(
         t("copilot.loginRequired", {
@@ -361,6 +425,7 @@ export function ClaudeFormFields({
   ]);
 
   const handleFetchCodexOauthModels = useCallback(() => {
+    invalidateAutoModelRefresh();
     if (!isCodexOauthAuthenticated) {
       toast.error(
         t("codexOauth.loginRequired", {
@@ -398,6 +463,7 @@ export function ClaudeFormFields({
   ]);
 
   const handleFetchXaiOauthModels = useCallback(() => {
+    invalidateAutoModelRefresh();
     if (!isXaiOauthAuthenticated) {
       toast.error(
         t("xaiOauth.loginRequired", {
@@ -426,7 +492,13 @@ export function ClaudeFormFields({
           setXaiOauthModelsLoading(false);
         }
       });
-  }, [isXaiOauthAuthenticated, selectedXaiAccountId, showModelFetchResult, t, runWithLoading]);
+  }, [
+    isXaiOauthAuthenticated,
+    selectedXaiAccountId,
+    showModelFetchResult,
+    t,
+    runWithLoading,
+  ]);
 
   useEffect(() => {
     copilotModelsRequestRef.current += 1;
@@ -445,6 +517,45 @@ export function ClaudeFormFields({
     setXaiOauthModels([]);
     setXaiOauthModelsLoading(false);
   }, [isXaiOauthPreset, isXaiOauthAuthenticated, selectedXaiAccountId]);
+
+  useAutoModelRefresh({
+    cacheKey: `provider-models:claude-copilot:${providerId ?? "draft"}:${selectedGitHubAccountId ?? "default"}`,
+    enabled: Boolean(
+      autoRefreshModels &&
+      providerId &&
+      isCopilotPreset &&
+      isCopilotAuthenticated,
+    ),
+    fetcher: () =>
+      selectedGitHubAccountId
+        ? copilotGetModelsForAccount(selectedGitHubAccountId)
+        : copilotGetModels(),
+    onSuccess: setCopilotModels,
+  });
+
+  useAutoModelRefresh({
+    cacheKey: `provider-models:claude-codex-oauth:${providerId ?? "draft"}:${selectedCodexAccountId ?? "default"}`,
+    enabled: Boolean(
+      autoRefreshModels &&
+      providerId &&
+      isCodexOauthPreset &&
+      isCodexOauthAuthenticated,
+    ),
+    fetcher: () => fetchCodexOauthModels(selectedCodexAccountId),
+    onSuccess: setCodexOauthModels,
+  });
+
+  useAutoModelRefresh({
+    cacheKey: `provider-models:claude-xai-oauth:${providerId ?? "draft"}:${selectedXaiAccountId ?? "default"}`,
+    enabled: Boolean(
+      autoRefreshModels &&
+      providerId &&
+      isXaiOauthPreset &&
+      isXaiOauthAuthenticated,
+    ),
+    fetcher: () => fetchXaiOauthModels(selectedXaiAccountId),
+    onSuccess: setXaiOauthModels,
+  });
 
   const modelFetchLoading = isCopilotPreset
     ? modelsLoading

@@ -1,5 +1,10 @@
 import { useCallback, useState } from "react";
 import { useTranslation } from "react-i18next";
+import {
+  invalidateAutoModelRefresh,
+  modelRefreshCredentialFingerprint,
+  useAutoModelRefresh,
+} from "@/hooks/useAutoModelRefresh";
 import { useGlobalLoading } from "@/contexts/GlobalLoadingContext";
 import { FormLabel } from "@/components/ui/form";
 import { Download, Info, Loader2 } from "lucide-react";
@@ -20,6 +25,7 @@ interface EndpointCandidate {
 
 interface GeminiFormFieldsProps {
   providerId?: string;
+  autoRefreshModels?: boolean;
   // API Key
   shouldShowApiKey: boolean;
   apiKey: string;
@@ -51,6 +57,7 @@ interface GeminiFormFieldsProps {
 
 export function GeminiFormFields({
   providerId,
+  autoRefreshModels = false,
   shouldShowApiKey,
   apiKey,
   onApiKeyChange,
@@ -74,11 +81,14 @@ export function GeminiFormFields({
 }: GeminiFormFieldsProps) {
   const { t } = useTranslation();
   const { runWithLoading } = useGlobalLoading();
+  const isGoogleOfficial =
+    partnerPromotionKey?.toLowerCase() === "google-official";
 
   const [fetchedModels, setFetchedModels] = useState<FetchedModel[]>([]);
   const [isFetchingModels, setIsFetchingModels] = useState(false);
 
   const handleFetchModels = useCallback(() => {
+    invalidateAutoModelRefresh();
     if (!baseUrl || !apiKey) {
       showFetchModelsError(null, t, {
         hasApiKey: !!apiKey,
@@ -105,9 +115,14 @@ export function GeminiFormFields({
       .finally(() => setIsFetchingModels(false));
   }, [baseUrl, apiKey, t, runWithLoading]);
 
-  // 检测是否为 Google 官方（使用 OAuth）
-  const isGoogleOfficial =
-    partnerPromotionKey?.toLowerCase() === "google-official";
+  useAutoModelRefresh({
+    cacheKey: `provider-models:gemini:${providerId ?? "draft"}:${baseUrl}:${modelRefreshCredentialFingerprint(apiKey)}`,
+    enabled:
+      Boolean(autoRefreshModels && providerId && baseUrl && apiKey) &&
+      !isGoogleOfficial,
+    fetcher: () => fetchModelsForConfig(baseUrl, apiKey),
+    onSuccess: setFetchedModels,
+  });
 
   return (
     <>

@@ -3332,8 +3332,7 @@ JSON.stringify({
             .find(r#"client.sendRequest("turn/interrupt""#)
             .expect("blocked source turn interruption");
         let manual_summary = script
-            .find(r#"text: [
-              "Create a concise handoff summary"#)
+            .find("Create a concise handoff summary of this coding session")
             .expect("manual coding-agent summary request");
         let fresh_thread = script
             .find(r#"client.sendRequest("thread/start""#)

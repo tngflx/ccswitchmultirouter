@@ -5252,11 +5252,11 @@ export function ModelOrderTab({
         reset
           ? tr("codexRouterWorkspace.s127", {
               defaultValue:
-                "已从目标 Provider 模型条目移除自定义顺序；投影刷新后生效。",
+                "已从目标 Provider 模型条目移除自定义顺序；Codex Desktop 将在几秒内自动刷新。",
             })
           : tr("codexRouterWorkspace.s128", {
               defaultValue:
-                "已把 {{arg0}} 个模型的展示顺序保存到目标 Provider 模型条目；投影刷新后生效。",
+                "已把 {{arg0}} 个模型的展示顺序保存到目标 Provider 模型条目；Codex Desktop 将在几秒内自动刷新。",
               arg0: models.length,
             }),
       );

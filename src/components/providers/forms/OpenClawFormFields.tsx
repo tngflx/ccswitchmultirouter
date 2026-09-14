@@ -1,4 +1,9 @@
 import { useTranslation } from "react-i18next";
+import {
+  invalidateAutoModelRefresh,
+  modelRefreshCredentialFingerprint,
+  useAutoModelRefresh,
+} from "@/hooks/useAutoModelRefresh";
 import { useGlobalLoading } from "@/contexts/GlobalLoadingContext";
 import { useState, useRef, useCallback } from "react";
 import { FormLabel } from "@/components/ui/form";
@@ -38,6 +43,8 @@ import { openclawApiProtocols } from "@/config/openclawProviderPresets";
 import type { ProviderCategory, OpenClawModel } from "@/types";
 
 interface OpenClawFormFieldsProps {
+  providerId?: string;
+  autoRefreshModels?: boolean;
   // Base URL
   baseUrl: string;
   onBaseUrlChange: (value: string) => void;
@@ -65,6 +72,8 @@ interface OpenClawFormFieldsProps {
 }
 
 export function OpenClawFormFields({
+  providerId,
+  autoRefreshModels = false,
   baseUrl,
   onBaseUrlChange,
   apiKey,
@@ -127,6 +136,7 @@ export function OpenClawFormFields({
 
   // Fetch models from API
   const handleFetchModels = useCallback(() => {
+    invalidateAutoModelRefresh();
     if (!baseUrl || !apiKey) {
       showFetchModelsError(null, t, {
         hasApiKey: !!apiKey,
@@ -152,6 +162,13 @@ export function OpenClawFormFields({
       })
       .finally(() => setIsFetchingModels(false));
   }, [baseUrl, apiKey, t, runWithLoading]);
+
+  useAutoModelRefresh({
+    cacheKey: `provider-models:openclaw:${providerId ?? "draft"}:${baseUrl}:${modelRefreshCredentialFingerprint(apiKey)}`,
+    enabled: Boolean(autoRefreshModels && providerId && baseUrl && apiKey),
+    fetcher: () => fetchModelsForConfig(baseUrl, apiKey),
+    onSuccess: setFetchedModels,
+  });
 
   // Remove a model entry
   const handleRemoveModel = (index: number) => {

@@ -1,5 +1,63 @@
 # Engineering Journal (newest first)
 
+## 2026-09-12 - Bound Codex reasoning resolution after large automatic catalog refreshes
+
+- **What happened:** Opening a saved Codex provider backed by OpenRouter could make the entire application unresponsive when automatic model refresh returned roughly 500 models, despite the catalog editors already paging their visible rows.
+- **Root cause:** The catalog viewport bounded mounted controls to ten rows, but `CodexFormFields` independently reacted to every catalog change by launching one `resolve_codex_model_reasoning_capability` Tauri IPC request per model inside a single `Promise.all`. A 500-model automatic refresh therefore produced 500 concurrent IPC calls, each carrying the full catalog settings payload; pagination did not own or bound this hidden fan-out.
+- **What we did:** Made `CodexCatalogViewport` report its currently mounted page after render. Reasoning resolution now processes only those visible models, sequentially, and stops stale page work after cancellation. The complete catalog remains persisted and searchable; changing pages resolves that page on demand through the existing cache. Added an automatic empty-to-500 OpenRouter refresh regression requiring exactly ten initial reasoning calls.
+- **Reference verdict:** Fetched current `BigStrongSun/ccswitchmulti` and `farion1231/cc-switch` heads and reviewed recent provider-form history plus relevant open/closed model-catalog and dropdown pull requests. Both references retain whole-catalog reasoning or dropdown work and contain no fix for this fork's per-model Tauri reasoning-resolution fan-out, so the fix was implemented at the local viewport/resolver ownership boundary.
+- **Evidence:** The new 500-model automatic-refresh regression passed 1/1 and completed its test body in 266 ms; before the fix the same boundary attempted all 500 resolutions. `CodexCatalogViewport` passed 2/2, and adjacent auto-refresh/catalog suites passed 10/10. `pnpm typecheck` passed. The complete `CodexFormFields` file passed 62/63; the sole model-specific key-group test timed out at five seconds, then passed 1/1 when isolated with its unchanged 27.8-second runtime. Scoped Prettier passed for the viewport and test file but still reports the previously recorded whole-file formatting drift in `CodexFormFields.tsx`. Live Tauri acceptance was not performed after this source edit.
+- **What NOT to do again:** Do not assume bounded DOM rows also bound effects triggered from the complete backing collection. Never fan out one IPC request per provider model concurrently, especially when every request serializes the full catalog; derive background work from the mounted page and process it with an explicit concurrency bound.
+
+## 2026-09-12 - Refresh saved provider catalogs without blocking edit forms
+
+- **What happened:** Saved provider edit forms could open with stale model inventories until the user manually refreshed them, while Codex catalogs could retain explicitly remote-bound models that the provider no longer advertised.
+- **Root cause:** Model discovery was owned only by manual form actions. There was no shared stale-while-revalidate boundary for saved providers, no credential-safe request deduplication, and no conservative automatic reconciliation policy that distinguished remote-bound Codex rows from manual rows or incomplete grouped-credential results.
+- **What we did:** Added a silent form-open refresh hook with a 15-minute in-memory cache, credential fingerprints instead of raw-key cache keys, concurrent request deduplication, and manual-refresh invalidation so manual results win. Enabled it only for saved Claude, Gemini, OpenCode, OpenClaw, Hermes, Copilot OAuth, Codex OAuth, and xAI OAuth providers. Codex now adds and updates fetched models, removes missing explicitly remote-bound rows only after a complete non-empty fetch, preserves manual rows and failed/empty/partial state, requires every grouped credential request to succeed before removal, and retains existing recent-version pruning.
+- **Reference verdict:** Recent BigStrongSun/ccswitchmulti and farion1231/cc-switch history contained no equivalent universal saved-form refresh implementation. GitHub pull-request search could not be completed because `gh` was unauthenticated, so the local owning boundaries were implemented directly.
+- **Evidence:** `pnpm typecheck`, `cargo check --manifest-path src-tauri/Cargo.toml`, and `git diff --check` passed. Focused coverage passed: auto-refresh hook 4/4, Codex catalog sync 4/4, automatic Codex reconciliation/removal/pruning 1/1, grouped-credential failure preservation 1/1, and Claude/OpenCode/ProviderForm consumers 31/31. Full `cargo test --manifest-path src-tauri/Cargo.toml` failed before execution because the running `src-tauri/target/debug/cc-switch.exe` was locked with OS error 5. The observed full frontend run passed the new hook 4/4 and catalog sync 4/4 but did not reach a final summary; it reproduced two `StreamRetryToggle` timeouts and one `LanguageSwitcher` timeout, then remained live without output until the agent stopped its own test process. Isolated reruns also failed `StreamRetryToggle` 2/2 and `LanguageSwitcher` 1/1 with 5-second timeouts. Those components are outside this feature's changed files.
+- **What NOT to do again:** Do not block form rendering on model discovery, store raw credentials in cache identities, let stale automatic results overwrite a manual refresh, or delete Codex catalog rows after an empty, failed, partial, or manually authored result. Do not report the full suites as passing while the executable lock, deterministic unrelated timeouts, and frontend runner non-exit remain unresolved.
+
+## 2026-09-12 - Correction: manual summary is distinct from compaction recommendation
+
+- **What happened:** A follow-up audit showed the earlier threshold-based recommendation change addressed compaction labeling, not the user's requested manual summary handoff.
+- **Root cause:** The actual failure was the manual summary `turn/start` re-entering the proxy while its source-session handoff guard was active, causing the observed 409. The recommendation field was a separate diagnostic/UI contract.
+- **What we did:** Reverted the unrelated threshold-to-compaction recommendation change. Retained the manual-summary preflight bypass and thread-identity validation, which are the fixes that own the 409 and wrong-session risks.
+- **Evidence:** Archived session `01a0948e-4b53-7921-be95-845a7157bb19` records the exact 409 during the manual summary turn; focused manual handoff tests passed 7/7, and the manual-summary bypass test passed 1/1 before this correction.
+- **What NOT to do again:** Do not describe compaction recommendation or native compaction behavior as proof that manual summary plus fresh root session works.
+
+## 2026-09-12 - Recommend summarize for oversized text history
+
+- **What happened:** The current session repeatedly exceeded the configured byte threshold but never exposed the summarize action because its estimated token count stayed below the token ceiling.
+- **Root cause:** Request Health only marked `compaction_recommended` for token-limit overflow or sustained-growth anomalies, even though the owning signal for this workflow is oversized non-media history.
+- **What we did:** Include `threshold_exceeded` in the summarize recommendation and `compaction_recommended` decision for Codex text-history requests, while preserving `continue_once` for media-dominated payloads and excluding explicit compaction requests.
+- **Evidence:** `oversized_text_history_recommends_summarize_before_token_ceiling` passed 1/1; handoff JS tests passed 7/7; `cargo check --manifest-path src-tauri/Cargo.toml` passed.
+- **What NOT to do again:** Do not require token-limit overflow before offering summarize for a request already proven oversized by the configured byte threshold.
+
+## 2026-09-12 - Allow the internal summary turn through Request Health
+
+- **What happened:** Live logs showed oversized Codex requests continuing normally, while earlier summary handoffs could fail with `Manual summary turn failed` or leave retries blocked with 409.
+- **Root cause:** The manual summary turn reused the oversized source context and re-entered the same Request Health handoff guard, so the recovery turn could recursively block itself.
+- **What we did:** Detect the two stable manual-summary prompt sentences at the Request Health boundary and exempt only that internal summary turn from preflight review. Ordinary retries for the source session remain blocked while the handoff guard is active.
+- **Evidence:** `manual_summary_turn_bypasses_active_handoff_guard` passed 1/1; `active_summary_handoff_rejects_a_codex_retry_before_risk_recalculation` passed 1/1; session extraction passed 23/23; `tests/lib/codexSummaryHandoff.test.ts` passed 7/7; `cargo check --manifest-path src-tauri/Cargo.toml` passed. Live runtime was not retested because the running executable predates this source change.
+- **What NOT to do again:** Do not send the recovery summary through the same oversized-request decision loop without an explicit internal marker and regression test.
+
+## 2026-09-12 - Prevent summarize handoff from targeting request IDs
+
+- **What happened:** A Sublyx `/responses` request returned 409 while summary handoff was active, and the handoff could be started from the wrong Codex identity.
+- **Root cause:** Codex session extraction accepted `x-client-request-id` and arbitrary long `session-id` values as stable thread identities. The handoff then passed that value to Codex Desktop as the source thread ID.
+- **What we did:** Restrict Codex client-provided identities to `thread-id`, valid UUID/ULID-compatible session headers, `x-codex-window-id`, and validated `metadata.session_id`; explicitly ignore `x-client-request-id` for handoff identity. Added regressions for request-ID and invalid account-session headers.
+- **Evidence:** `proxy::session::tests::` passed 23/23; both summary-handoff guard tests passed 1/1; `tests/lib/codexSummaryHandoff.test.ts` passed 7/7; `cargo check --manifest-path src-tauri/Cargo.toml` passed.
+- **What NOT to do again:** Do not treat per-request correlation IDs or unvalidated account/session labels as Codex thread IDs. Live acceptance still requires restarting the normal development app and exercising the current session.
+
+## 2026-09-12 - Formatting update broke brittle summarize-handoff assertion
+
+- **What happened:** The latest formatting-only commit changed the indentation of the generated Codex compatibility template and caused the Rust summarize-and-restart ordering test to fail.
+- **Root cause:** The test searched for an exact multiline whitespace shape instead of the semantic manual-summary marker; the handoff implementation itself was unchanged.
+- **What we did:** Updated the assertion to locate the stable summary-request text while retaining ordering checks against interruption, fresh-root creation, and handoff turn startup.
+- **Evidence:** `pnpm exec vitest run tests/lib/codexSummaryHandoff.test.ts --maxWorkers=2 --minWorkers=1` passed 7/7; the focused Rust test passed 1/1; `cargo check --manifest-path src-tauri/Cargo.toml` passed; `git diff --check` passed.
+- **What NOT to do again:** Do not use formatter-sensitive multiline snapshots for generated-script protocol ordering; assert stable semantic markers and behavior.
+
 ## 2026-09-12 - Bound upgrade preflight and Codex renderer discovery
 
 - **What happened:** The two reference repositories contained two applicable hang/performance fixes beyond the provider-form loader correction: original commit `fd14f9c4f` bounded CLI upgrade conflict probes and showed their pending state, while BigStrongSun commit `c53cda76a` removed unconditional periodic React graph scans from the Codex renderer compatibility heartbeat.
