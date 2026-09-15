@@ -21,6 +21,7 @@ export function CodexCatalogViewport<
   compact,
   selected,
   onSelect,
+  onToggleEnabled,
   showSelection = true,
   revealRowId,
   onVisibleItemsChange,
@@ -30,6 +31,7 @@ export function CodexCatalogViewport<
   compact: boolean;
   selected: ReadonlySet<string>;
   onSelect: (id: string, checked: boolean) => void;
+  onToggleEnabled?: (id: string, enabled: boolean) => void;
   showSelection?: boolean;
   revealRowId?: string;
   onVisibleItemsChange?: (items: { row: T; index: number }[]) => void;
@@ -64,7 +66,44 @@ export function CodexCatalogViewport<
     onVisibleItemsChange?.(visibleItems);
   }, [onVisibleItemsChange, visibleItems]);
 
-  if (!compact) return <>{visibleItems.map(children)}</>;
+  if (!compact) {
+    if (!showSelection && !onToggleEnabled) {
+      return <>{visibleItems.map(children)}</>;
+    }
+    return (
+      <div className="min-w-0 border-y">
+        {visibleItems.map((entry) => {
+          const { row } = entry;
+          return (
+            <div key={row.rowId} className="flex min-w-0 items-start gap-3 border-b p-2 last:border-b-0">
+              {(showSelection || onToggleEnabled) && (
+                <label className="flex shrink-0 items-center gap-1.5 pt-1 text-xs font-medium">
+                  <input
+                    type="checkbox"
+                    className="h-4 w-4 rounded border-border-default"
+                    checked={onToggleEnabled ? row.enabled !== false : selected.has(row.rowId)}
+                    onChange={(event) =>
+                      onToggleEnabled
+                        ? onToggleEnabled(row.rowId, event.target.checked)
+                        : onSelect(row.rowId, event.target.checked)
+                    }
+                    aria-label={t(
+                      onToggleEnabled ? "codexConfig.catalogIncludeModel" : "codexConfig.catalogSelectModel",
+                      { model: row.model, defaultValue: onToggleEnabled ? "Include {{model}}" : "Select {{model}}" },
+                    )}
+                  />
+                  {onToggleEnabled && (
+                    <span className="hidden sm:inline">{t("codexConfig.catalogIncludeLabel", { defaultValue: "Include" })}</span>
+                  )}
+                </label>
+              )}
+              <div className="min-w-0 flex-1">{children(entry)}</div>
+            </div>
+          );
+        })}
+      </div>
+    );
+  }
   return (
     <div className="min-w-0 border-y">
       {items.length > pageSize && (
@@ -127,7 +166,7 @@ export function CodexCatalogViewport<
                   }
                 }}
               >
-                {showSelection && (
+                {!onToggleEnabled && showSelection && (
                   <input
                     type="checkbox"
                     className="h-4 w-4 shrink-0"
@@ -140,6 +179,27 @@ export function CodexCatalogViewport<
                       onSelect(row.rowId, event.target.checked)
                     }
                   />
+                )}
+                {onToggleEnabled && (
+                  <label className="flex shrink-0 items-center gap-1.5 text-xs font-medium">
+                    <input
+                      type="checkbox"
+                      className="h-4 w-4 rounded border-border-default"
+                      checked={row.enabled !== false}
+                      onChange={(event) =>
+                        onToggleEnabled(row.rowId, event.target.checked)
+                      }
+                      aria-label={t("codexConfig.catalogIncludeModel", {
+                        model: row.model,
+                        defaultValue: "Include {{model}}",
+                      })}
+                    />
+                    <span className="hidden sm:inline">
+                      {t("codexConfig.catalogIncludeLabel", {
+                        defaultValue: "Include",
+                      })}
+                    </span>
+                  </label>
                 )}
                 <span
                   className={cn(

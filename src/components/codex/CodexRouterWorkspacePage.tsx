@@ -49,7 +49,9 @@ import {
   RefreshCw,
   Route,
   Save,
+  Search,
   Server,
+  Star,
   Settings2,
   Trash2,
   Wand2,
@@ -57,6 +59,7 @@ import {
 } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
 import {
   Dialog,
   DialogContent,
@@ -4950,6 +4953,7 @@ export function ModelOrderTab({
     DEFAULT_CODEX_MODEL_DISPLAY_STYLE,
   );
   const [sortMode, setSortMode] = useState<CodexModelSortMode>("custom");
+  const [modelSearch, setModelSearch] = useState("");
   const configuredDefaultReasoningEffort =
     selectedPlan?.settingsConfig?.codexRouting?.defaultReasoningEffort;
   const [defaultReasoningEffort, setDefaultReasoningEffort] =
@@ -4992,7 +4996,7 @@ export function ModelOrderTab({
     }
     return names;
   }, [selectedRoutes, providersById]);
-  const visibleDraftModels = useMemo(
+  const orderedDraftModels = useMemo(
     () =>
       sortCodexCatalogModels(
         draftModels.map((model) => {
@@ -5006,7 +5010,28 @@ export function ModelOrderTab({
       ),
     [draftModels, providerNamesByModel, sortMode],
   );
-  const topModel = visibleDraftModels[0];
+  const visibleDraftModels = useMemo(() => {
+    const query = modelSearch.trim().toLocaleLowerCase();
+    if (!query) return orderedDraftModels;
+    return orderedDraftModels.filter((model) =>
+      [
+        model.model,
+        model.displayName,
+        model.display_name,
+        codexCatalogProviderName(model),
+        catalogDraftUpstreamModel(model),
+      ].some((value) => value?.toLocaleLowerCase().includes(query)),
+    );
+  }, [modelSearch, orderedDraftModels]);
+  const globalRankByModel = useMemo(
+    () =>
+      new Map(
+        orderedDraftModels.map((model, index) => [model.model?.trim(), index]),
+      ),
+    [orderedDraftModels],
+  );
+  const topModels = orderedDraftModels.slice(0, 5);
+  const topModel = orderedDraftModels[0];
   const topReasoningEfforts = useMemo<CodexReasoningEffort[]>(() => {
     const declared = topModel?.reasoning?.supportedEfforts?.filter(
       (effort): effort is CodexReasoningEffort => effort !== "ultra",
@@ -5072,7 +5097,7 @@ export function ModelOrderTab({
   const hasChanges =
     styleDirty ||
     effortDirty ||
-    visibleDraftModels.map((model) => model.model).join("\n") !==
+    orderedDraftModels.map((model) => model.model).join("\n") !==
       catalog.models
         .slice()
         .sort(
@@ -5134,6 +5159,32 @@ export function ModelOrderTab({
     });
     setMessage(null);
     setError(null);
+  }
+
+  function moveModelToPosition(modelId: string, position: number) {
+    const target = modelId.trim();
+    if (!target) return;
+    const targetIndex = Math.min(
+      Math.max(Math.trunc(position) - 1, 0),
+      Math.max(orderedDraftModels.length - 1, 0),
+    );
+    setSortMode("custom");
+    setDraftModels((current) => {
+      const ordered = sortCodexCatalogModels(current, sortMode);
+      const index = ordered.findIndex(
+        (model) => model.model?.trim() === target,
+      );
+      if (index < 0 || index === targetIndex) return ordered;
+      const [moved] = ordered.splice(index, 1);
+      ordered.splice(targetIndex, 0, moved);
+      return ordered;
+    });
+    setMessage(null);
+    setError(null);
+  }
+
+  function moveModelToTop(modelId: string) {
+    moveModelToPosition(modelId, 1);
   }
 
   async function saveOrder(reset = false) {
@@ -5550,6 +5601,61 @@ export function ModelOrderTab({
         </div>
       ) : null}
 
+      <section
+        aria-label={tr("codexRouterWorkspace.topModels", {
+          defaultValue: "Top models",
+        })}
+        className="mt-4 border-y border-blue-200/70 bg-background/60 px-3 py-3 dark:border-blue-800/50 dark:bg-slate-950/30"
+      >
+        <div className="mb-2 flex items-center gap-2 text-xs font-semibold text-foreground">
+          <Star className="h-4 w-4 text-amber-500" fill="currentColor" />
+          {tr("codexRouterWorkspace.topModels", {
+            defaultValue: "Top models",
+          })}
+        </div>
+        <div className="grid gap-2 sm:grid-cols-2 xl:grid-cols-5">
+          {topModels.map((model, index) => (
+            <div
+              key={model.model}
+              className="flex min-w-0 items-center gap-2 rounded border border-border-default bg-background px-2 py-1.5"
+            >
+              <span className="shrink-0 font-mono text-xs text-muted-foreground">
+                #{index + 1}
+              </span>
+              <span
+                className="min-w-0 truncate text-xs font-medium"
+                title={model.model}
+              >
+                {formatCodexCatalogModelLabel(model, displayStyle)}
+              </span>
+            </div>
+          ))}
+        </div>
+      </section>
+
+      <div className="relative mt-4">
+        <Search className="pointer-events-none absolute left-3 top-2.5 h-4 w-4 text-muted-foreground" />
+        <Input
+          value={modelSearch}
+          onChange={(event) => setModelSearch(event.target.value)}
+          placeholder={tr("codexRouterWorkspace.searchModels", {
+            defaultValue: "Search models or providers",
+          })}
+          aria-label={tr("codexRouterWorkspace.searchModels", {
+            defaultValue: "Search models or providers",
+          })}
+          className="pl-9"
+        />
+        {modelSearch ? (
+          <span className="mt-1 block text-xs text-muted-foreground">
+            {tr("codexRouterWorkspace.searchResults", {
+              defaultValue: "{{count}} results. Rank numbers remain global.",
+              count: visibleDraftModels.length,
+            })}
+          </span>
+        ) : null}
+      </div>
+
       <DndContext
         sensors={sensors}
         collisionDetection={closestCenter}
@@ -5589,9 +5695,22 @@ export function ModelOrderTab({
                 >
                   <SortableCatalogModel
                     model={visibleDraftModels[row.index]}
-                    index={row.index}
+                    index={
+                      globalRankByModel.get(
+                        visibleDraftModels[row.index].model?.trim(),
+                      ) ?? row.index
+                    }
                     displayStyle={displayStyle}
                     onDelete={(modelId) => void hideModel(modelId)}
+                    onMoveToTop={moveModelToTop}
+                    onMoveToPosition={moveModelToPosition}
+                    modelCount={orderedDraftModels.length}
+                    dragDisabled={Boolean(modelSearch.trim())}
+                    isTop={
+                      globalRankByModel.get(
+                        visibleDraftModels[row.index].model?.trim(),
+                      ) === 0
+                    }
                   />
                 </div>
               ))}
@@ -10870,11 +10989,21 @@ function SortableCatalogModel({
   index,
   displayStyle = "model",
   onDelete,
+  onMoveToTop,
+  onMoveToPosition,
+  modelCount = 1,
+  dragDisabled = false,
+  isTop = false,
 }: {
   model: CodexCatalogModel;
   index: number;
   displayStyle?: CodexModelDisplayStyle;
   onDelete?: (modelId: string) => void;
+  onMoveToTop?: (modelId: string) => void;
+  onMoveToPosition?: (modelId: string, position: number) => void;
+  modelCount?: number;
+  dragDisabled?: boolean;
+  isTop?: boolean;
 }) {
   const modelId = model.model?.trim() ?? "";
   const apiFormat = model.apiFormat ?? model.api_format;
@@ -10899,6 +11028,8 @@ function SortableCatalogModel({
       : tr("codexRouterWorkspace.protocolPerModel", {
           defaultValue: "per model",
         });
+  const [rankValue, setRankValue] = useState(String(index + 1));
+  useEffect(() => setRankValue(String(index + 1)), [index]);
   const {
     attributes,
     listeners,
@@ -10906,7 +11037,7 @@ function SortableCatalogModel({
     transform,
     transition,
     isDragging,
-  } = useSortable({ id: modelId });
+  } = useSortable({ id: modelId, disabled: dragDisabled });
 
   return (
     <div
@@ -10925,6 +11056,7 @@ function SortableCatalogModel({
         className="grid h-7 w-7 shrink-0 place-items-center rounded border border-blue-200 bg-blue-50 text-blue-700 hover:bg-blue-100 dark:border-blue-700/60 dark:bg-blue-500/10 dark:text-blue-200 dark:hover:bg-blue-500/20"
         {...attributes}
         {...listeners}
+        disabled={dragDisabled}
         aria-label={tr("codexRouterWorkspace.s488", {
           defaultValue: "拖动 {{arg0}}",
           arg0: modelId,
@@ -10968,6 +11100,71 @@ function SortableCatalogModel({
           </div>
         ) : null}
       </div>
+      {onMoveToPosition ? (
+        <form
+          className="flex shrink-0 items-center gap-1"
+          onSubmit={(event) => {
+            event.preventDefault();
+            const position = Number.parseInt(rankValue, 10);
+            if (Number.isFinite(position)) {
+              onMoveToPosition(modelId, position);
+            }
+          }}
+        >
+          <Input
+            type="number"
+            min={1}
+            max={modelCount}
+            value={rankValue}
+            onChange={(event) => setRankValue(event.target.value)}
+            aria-label={tr("codexRouterWorkspace.rankModel", {
+              defaultValue: "Rank for {{model}}",
+              model: modelId,
+            })}
+            className="h-7 w-16 px-2 text-center text-xs tabular-nums"
+          />
+          <Button
+            type="submit"
+            size="icon"
+            variant="ghost"
+            className="h-7 w-7"
+            aria-label={tr("codexRouterWorkspace.applyRank", {
+              defaultValue: "Move {{model}} to rank {{rank}}",
+              model: modelId,
+              rank: rankValue,
+            })}
+            title={tr("codexRouterWorkspace.applyRankHint", {
+              defaultValue: "Apply global rank",
+            })}
+          >
+            <ArrowRight className="h-4 w-4" />
+          </Button>
+        </form>
+      ) : null}
+      {onMoveToTop ? (
+        <Button
+          type="button"
+          size="icon"
+          variant="ghost"
+          aria-label={tr("codexRouterWorkspace.makeFavorite", {
+            defaultValue: "Make {{model}} the favorite model",
+            model: modelId,
+          })}
+          title={tr("codexRouterWorkspace.makeFavoriteHint", {
+            defaultValue: "Move to the top of the Codex model picker",
+          })}
+          disabled={!modelId || isTop}
+          onClick={() => onMoveToTop(modelId)}
+          className={cn(
+            "h-7 w-7 shrink-0 p-0",
+            isTop
+              ? "text-amber-500"
+              : "text-muted-foreground hover:bg-amber-50 hover:text-amber-600 dark:hover:bg-amber-500/15 dark:hover:text-amber-200",
+          )}
+        >
+          <Star className="h-4 w-4" fill={isTop ? "currentColor" : "none"} />
+        </Button>
+      ) : null}
       {onDelete ? (
         <Button
           type="button"

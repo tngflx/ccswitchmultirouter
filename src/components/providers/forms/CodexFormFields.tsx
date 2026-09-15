@@ -1895,7 +1895,9 @@ export function CodexFormFields({
         },
         {
           appendNew: true,
-          createRow: (seed) => createCatalogRow(seed),
+          // Automatic discovery is informative, not an implicit opt-in. New
+          // remote rows stay visible as excluded until the user includes them.
+          createRow: (seed) => createCatalogRow({ ...seed, enabled: false }),
           existingMetadataMode: "refresh",
           removeMissingRemote: true,
         },
@@ -2274,6 +2276,12 @@ export function CodexFormFields({
     },
     [],
   );
+
+  const toggleCatalogRowEnabled = useCallback((rowId: string, enabled: boolean) => {
+    setCatalogRows((current) =>
+      current.map((row) => (row.rowId === rowId ? { ...row, enabled } : row)),
+    );
+  }, []);
 
   const applySelectedCatalogRowsEnabled = useCallback(
     (enabled: boolean) => {
@@ -4309,48 +4317,34 @@ export function CodexFormFields({
                               defaultValue: "Keep recent versions",
                             })}
                           </Button>
-                          <label className="flex h-8 cursor-pointer items-center gap-2 rounded-md border px-2 text-xs font-medium">
-                            <input
-                              type="checkbox"
-                              className="h-4 w-4 rounded border-border-default"
-                              checked={allVisibleCatalogRowsSelected}
-                              ref={(element) => {
-                                if (element) {
-                                  element.indeterminate =
-                                    someVisibleCatalogRowsSelected;
-                                }
-                              }}
-                              onChange={() => updateCatalogSelection("shown")}
-                              aria-label={t(
-                                "codexConfig.catalogSelectFiltered",
-                                { defaultValue: "Select shown" },
-                              )}
-                            />
-                            {t("codexConfig.catalogShownSummary", {
-                              count: visibleCatalogRows.length,
-                              defaultValue: "{{count}} shown",
-                            })}
-                          </label>
-                          <Button
-                            type="button"
-                            size="icon"
-                            variant="ghost"
-                            className="h-8 w-8"
-                            disabled={visibleCatalogRows.length === 0}
-                            onClick={() => updateCatalogSelection("invert")}
-                            title={t("codexConfig.catalogInvertSelection", {
-                              defaultValue: "Invert shown selection",
-                            })}
-                            aria-label={t(
-                              "codexConfig.catalogInvertSelection",
-                              { defaultValue: "Invert shown selection" },
-                            )}
-                          >
-                            <ArrowLeftRight className="h-4 w-4" />
-                          </Button>
                         </div>
                       </div>
                       <div className="flex flex-wrap gap-2">
+                        <div
+                          className="inline-flex items-center rounded-md border border-border-default bg-muted/30 p-1"
+                          role="group"
+                          aria-label={t("codexConfig.catalogViewLabel", {
+                            defaultValue: "Catalog view",
+                          })}
+                        >
+                          {[
+                            ["used", "catalogViewIncluded", "Included"],
+                            ["all", "catalogViewAll", "All"],
+                            ["unused", "catalogViewExcluded", "Excluded"],
+                          ].map(([value, key, fallback]) => (
+                            <Button
+                              key={value}
+                              type="button"
+                              size="sm"
+                              variant={catalogUsageFilter === value ? "default" : "ghost"}
+                              className="h-7 px-2 text-xs"
+                              aria-pressed={catalogUsageFilter === value}
+                              onClick={() => setCatalogUsageFilter(value)}
+                            >
+                              {t(`codexConfig.${key}`, { defaultValue: fallback })}
+                            </Button>
+                          ))}
+                        </div>
                         {[
                           {
                             label: "capability",
@@ -4398,76 +4392,6 @@ export function CodexFormFields({
                           </label>
                         ))}
                       </div>
-                      <fieldset
-                        disabled={selectedCatalogRowIds.size === 0}
-                        className="sticky top-0 z-10 flex flex-wrap items-center gap-2 border-y bg-background px-3 py-2"
-                      >
-                        <span className="mr-auto text-sm font-medium">
-                          {t("codexConfig.catalogSelectionSummary", {
-                            selected: selectedCatalogRowIds.size,
-                            defaultValue: "{{selected}} selected",
-                          })}
-                        </span>
-                        <Button
-                          type="button"
-                          size="sm"
-                          variant="outline"
-                          onClick={() => applySelectedCatalogRowsEnabled(true)}
-                        >
-                          {t("codexConfig.catalogUseSelected", {
-                            defaultValue: "Use selected",
-                          })}
-                        </Button>
-                        <Button
-                          type="button"
-                          size="sm"
-                          variant="outline"
-                          onClick={() => applySelectedCatalogRowsEnabled(false)}
-                        >
-                          {t("codexConfig.catalogExcludeSelected", {
-                            defaultValue: "Don't use",
-                          })}
-                        </Button>
-                        <Button
-                          type="button"
-                          size="sm"
-                          onClick={useOnlySelectedCatalogRows}
-                        >
-                          {t("codexConfig.catalogUseOnlySelected", {
-                            defaultValue: "Use only these",
-                          })}
-                        </Button>
-                        <Button
-                          type="button"
-                          size="icon"
-                          variant="ghost"
-                          className="h-8 w-8 text-destructive hover:text-destructive"
-                          onClick={removeSelectedCatalogRows}
-                          title={t("codexConfig.catalogRemoveSelected", {
-                            defaultValue: "Remove selected models",
-                          })}
-                          aria-label={t("codexConfig.catalogRemoveSelected", {
-                            defaultValue: "Remove selected models",
-                          })}
-                        >
-                          <Trash2 className="h-4 w-4" />
-                        </Button>
-                        <Button
-                          type="button"
-                          size="icon"
-                          variant="ghost"
-                          className="h-8 w-8"
-                          onClick={() => updateCatalogSelection("clear")}
-                          title={t("codexConfig.catalogClearSelection", {
-                            defaultValue: "Clear selection",
-                          })}
-                          aria-label={t("codexConfig.catalogClearSelection", {
-                            defaultValue: "Clear selection",
-                          })}
-                        >
-                          <X className="h-4 w-4" />
-                        </Button>
-                      </fieldset>
                     </div>
                   )}
                 </div>
@@ -4480,6 +4404,7 @@ export function CodexFormFields({
                       revealRowId={revealedCatalogRowId}
                       selected={selectedCatalogRowIds}
                       onSelect={toggleCatalogRowSelected}
+                      onToggleEnabled={toggleCatalogRowEnabled}
                     >
                       {({ row, index }) => {
                         const model = row.model.trim();
@@ -4941,6 +4866,65 @@ export function CodexFormFields({
                         );
                       }}
                     </CodexCatalogViewport>
+                    <div className="sticky bottom-0 z-10 flex flex-wrap items-center gap-2 border-y bg-background/95 px-3 py-2 shadow-[0_-4px_12px_rgba(0,0,0,0.06)] backdrop-blur">
+                      <label className="flex h-8 cursor-pointer items-center gap-2 rounded-md border px-2 text-xs font-medium">
+                        <input
+                          type="checkbox"
+                          className="h-4 w-4 rounded border-border-default"
+                          checked={allVisibleCatalogRowsSelected}
+                          ref={(element) => {
+                            if (element) {
+                              element.indeterminate = someVisibleCatalogRowsSelected;
+                            }
+                          }}
+                          onChange={() => updateCatalogSelection("shown")}
+                          aria-label={t("codexConfig.catalogSelectFiltered", {
+                            defaultValue: "Select shown",
+                          })}
+                        />
+                        {t("codexConfig.catalogShownSummary", {
+                          count: visibleCatalogRows.length,
+                          defaultValue: "{{count}} shown",
+                        })}
+                      </label>
+                      <Button
+                        type="button"
+                        size="icon"
+                        variant="ghost"
+                        className="h-8 w-8"
+                        disabled={visibleCatalogRows.length === 0}
+                        onClick={() => updateCatalogSelection("invert")}
+                        title={t("codexConfig.catalogInvertSelection", {
+                          defaultValue: "Invert shown selection",
+                        })}
+                        aria-label={t("codexConfig.catalogInvertSelection", {
+                          defaultValue: "Invert shown selection",
+                        })}
+                      >
+                        <ArrowLeftRight className="h-4 w-4" />
+                      </Button>
+                      <span className="mr-auto text-sm font-medium">
+                        {t("codexConfig.catalogSelectionSummary", {
+                          selected: selectedCatalogRowIds.size,
+                          defaultValue: "{{selected}} selected",
+                        })}
+                      </span>
+                      <Button disabled={selectedCatalogRowIds.size === 0} type="button" size="sm" variant="outline" onClick={() => applySelectedCatalogRowsEnabled(true)}>
+                        {t("codexConfig.catalogUseSelected", { defaultValue: "Use selected" })}
+                      </Button>
+                      <Button disabled={selectedCatalogRowIds.size === 0} type="button" size="sm" variant="outline" onClick={() => applySelectedCatalogRowsEnabled(false)}>
+                        {t("codexConfig.catalogExcludeSelected", { defaultValue: "Don't use" })}
+                      </Button>
+                      <Button disabled={selectedCatalogRowIds.size === 0} type="button" size="sm" onClick={useOnlySelectedCatalogRows}>
+                        {t("codexConfig.catalogUseOnlySelected", { defaultValue: "Use only these" })}
+                      </Button>
+                      <Button disabled={selectedCatalogRowIds.size === 0} type="button" size="icon" variant="ghost" className="h-8 w-8 text-destructive hover:text-destructive" onClick={removeSelectedCatalogRows} title={t("codexConfig.catalogRemoveSelected", { defaultValue: "Remove selected models" })} aria-label={t("codexConfig.catalogRemoveSelected", { defaultValue: "Remove selected models" })}>
+                        <Trash2 className="h-4 w-4" />
+                      </Button>
+                      <Button type="button" size="icon" variant="ghost" className="h-8 w-8" onClick={() => updateCatalogSelection("clear")} title={t("codexConfig.catalogClearSelection", { defaultValue: "Clear selection" })} aria-label={t("codexConfig.catalogClearSelection", { defaultValue: "Clear selection" })}>
+                        <X className="h-4 w-4" />
+                      </Button>
+                    </div>
                   </div>
                 )}
               </div>,

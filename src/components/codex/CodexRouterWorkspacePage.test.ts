@@ -3062,6 +3062,43 @@ describe("Codex MultiRouter workspace route persistence helpers", () => {
     expect(screen.getAllByText(/deepseek-v4-flash/).length).toBeGreaterThan(0);
   });
 
+  it("searches a model and assigns an exact global picker rank", async () => {
+    const { source, plan } = createSubagentWorkspaceFixture();
+    renderSubagentWorkspace(source, plan);
+
+    const user = userEvent.setup();
+    await user.click(screen.getByRole("tab", { name: "模型排序" }));
+    await user.type(
+      screen.getByRole("textbox", { name: "Search models or providers" }),
+      "qwen3.8",
+    );
+    const rankInput = screen.getByRole("spinbutton", {
+      name: "Rank for qwen3.8",
+    });
+    expect(rankInput).toHaveValue(3);
+    await user.clear(rankInput);
+    await user.type(rankInput, "2");
+    await user.click(
+      screen.getByRole("button", { name: "Move qwen3.8 to rank 2" }),
+    );
+
+    const topModels = screen.getByRole("region", { name: "Top models" });
+    expect(within(topModels).getByText("#2")).toBeInTheDocument();
+    expect(within(topModels).getByText(/qwen3\.8/)).toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: "保存顺序" }));
+    await waitFor(() => expect(providersApi.update).toHaveBeenCalled());
+    const savedSource = vi
+      .mocked(providersApi.update)
+      .mock.calls.map(([provider]) => provider)
+      .find((provider) => provider.id === source.id);
+    expect(savedSource?.settingsConfig?.modelCatalog?.models).toEqual([
+      expect.objectContaining({ model: "deepseek-v4-flash", sortIndex: 2 }),
+      expect.objectContaining({ model: "deepseek-v4-pro", sortIndex: 0 }),
+      expect.objectContaining({ model: "qwen3.8", sortIndex: 1 }),
+    ]);
+  });
+
   it("persists a display-only change without rewriting provider model order", async () => {
     const { source, plan } = createSubagentWorkspaceFixture();
     renderSubagentWorkspace(source, plan);

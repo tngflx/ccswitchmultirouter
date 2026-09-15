@@ -756,6 +756,12 @@ describe("CodexFormFields local model routing", () => {
         "glm-5",
       ]),
     );
+    expect(
+      harness
+        .latestCatalog()
+        .filter((row) => row.enabled !== false)
+        .map((row) => row.model),
+    ).toEqual(["manual-alias"]);
     expect(fetchModelsForConfig).toHaveBeenCalledTimes(1);
   });
 
@@ -2241,8 +2247,8 @@ describe("CodexFormFields local model routing", () => {
     });
     fireEvent.click(screen.getByLabelText("Select shown"));
 
-    expect(screen.getByLabelText("Select free-a")).toBeChecked();
-    expect(screen.getByLabelText("Select free-b")).toBeChecked();
+    expect(screen.getByLabelText("Include free-a")).toBeChecked();
+    expect(screen.getByLabelText("Include free-b")).not.toBeChecked();
     expect(screen.getByLabelText("Remove selected models")).toBeEnabled();
 
     fireEvent.click(screen.getByLabelText("Remove selected models"));
@@ -2250,8 +2256,8 @@ describe("CodexFormFields local model routing", () => {
     await waitFor(() => {
       expect(latestCatalog().map((model) => model.model)).toEqual(["paid-c"]);
     });
-    expect(screen.queryByLabelText("Select free-a")).not.toBeInTheDocument();
-    expect(screen.queryByLabelText("Select free-b")).not.toBeInTheDocument();
+    expect(screen.queryByLabelText("Include free-a")).not.toBeInTheDocument();
+    expect(screen.queryByLabelText("Include free-b")).not.toBeInTheDocument();
   });
 
   it("adds a key group directly while keeping the fallback API key visible", () => {
