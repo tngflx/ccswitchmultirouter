@@ -126,6 +126,49 @@ pub fn ensure_codex_multirouter_projection(
     })
 }
 
+/// Reconcile the projection owned by the active Router on startup.
+///
+/// Startup previously only refreshed the raw model catalog file. If the
+/// compiler/provider catalog changed, the persisted projection stayed on the
+/// last manual save until the user triggered a retry. Non-forced ensure is
+/// sufficient here: when the dependency fingerprint still matches, it is a
+/// no-op and writes nothing.
+pub(crate) fn ensure_active_codex_multirouter_projection(
+    db: &Database,
+) -> Result<Option<CodexRoutingProjectionStatus>, AppError> {
+    ensure_active_codex_multirouter_projection_with_publisher(db, |artifact| {
+        crate::codex_config::publish_codex_multirouter_projection_for_database(
+            db,
+            &artifact.projection_settings,
+        )
+        .map_err(|error| error.to_string())
+    })
+}
+
+pub(crate) fn ensure_active_codex_multirouter_projection_with_publisher<F>(
+    db: &Database,
+    mut publish: F,
+) -> Result<Option<CodexRoutingProjectionStatus>, AppError>
+where
+    F: FnMut(&CodexRoutingProjectionArtifact) -> Result<ProjectionReadBack, String>,
+{
+    let Some(router_provider_id) = super::active_codex_router_id(db)? else {
+        return Ok(None);
+    };
+    let Some(router) = db.get_provider_by_id(&router_provider_id, "codex")? else {
+        return Ok(None);
+    };
+    let is_schema_v2_router = router
+        .settings_config
+        .get("codexRouting")
+        .and_then(|value| super::schema::CodexRoutingDocument::parse(value).ok())
+        .is_some_and(|document| matches!(document, super::schema::CodexRoutingDocument::V2(_)));
+    if !is_schema_v2_router {
+        return Ok(None);
+    }
+    ensure_projection_with_publisher(db, &router_provider_id, false, &mut publish).map(Some)
+}
+
 pub fn inspect_codex_multirouter_projection(
     db: &Database,
     router_provider_id: &str,
@@ -934,6 +977,44 @@ mod tests {
         assert!(error
             .to_string()
             .contains("codex_multirouter_projection_not_active"));
+    }
+
+    #[test]
+    fn active_startup_reconciliation_publishes_current_router_projection() {
+        let db = Database::memory().expect("memory db");
+        save_fixture(&db, "openai_chat");
+        db.set_current_provider("codex", "router")
+            .expect("make router current");
+        let calls = Cell::new(0);
+
+        let reconciled =
+            ensure_active_codex_multirouter_projection_with_publisher(&db, |artifact| {
+                calls.set(calls.get() + 1);
+                Ok(ProjectionReadBack::verified(
+                    artifact.dependency_fingerprint.clone(),
+                ))
+            })
+            .expect("active startup reconciliation");
+        let status = reconciled.expect("active router must produce a status");
+        assert_eq!(status.state, ProjectionState::Ready);
+        assert_eq!(status.router_provider_id, "router");
+        assert_eq!(calls.get(), 1);
+
+        let unchanged = ensure_active_codex_multirouter_projection_with_publisher(&db, |_| {
+            panic!("matching ready projection must not be republished")
+        })
+        .expect("unchanged active startup reconciliation");
+        assert!(unchanged.is_some());
+        assert_eq!(calls.get(), 1);
+
+        db.set_current_provider("codex", "qwen")
+            .expect("switch to a direct provider");
+        let inactive = ensure_active_codex_multirouter_projection_with_publisher(&db, |_| {
+            panic!("direct provider must not publish a router projection")
+        })
+        .expect("inactive reconciliation");
+        assert!(inactive.is_none());
+        assert_eq!(calls.get(), 1);
     }
 
     #[test]

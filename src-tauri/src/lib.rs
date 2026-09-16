@@ -2318,6 +2318,25 @@ async fn restore_proxy_state_on_startup(state: &store::AppState) -> bool {
             }
         }
     }
+    if codex_ready {
+        match crate::codex_multirouter::projection::ensure_active_codex_multirouter_projection(
+            &state.db,
+        ) {
+            Ok(Some(status)) => {
+                if status.state == crate::codex_multirouter::projection::ProjectionState::Ready {
+                    log::info!("✓ MultiRouter 活动投影启动对账完成 (ready)");
+                } else {
+                    codex_ready = false;
+                    log::warn!("MultiRouter 活动投影启动对账未就绪: {:?}", status.state);
+                }
+            }
+            Ok(None) => log::debug!("未发现活动 MultiRouter，跳过启动投影对账"),
+            Err(e) => {
+                codex_ready = false;
+                log::warn!("启动时对账 MultiRouter 投影失败: {e}");
+            }
+        }
+    }
     codex_ready
 }
 

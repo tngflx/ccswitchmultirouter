@@ -1,5 +1,13 @@
 # Engineering Journal (newest first)
 
+## 2026-09-17 - Reconcile the active MultiRouter projection on startup
+
+- **What happened:** After the user restarted the rebuilt app, the compiler tests passed but the persisted projection status still showed `generatedAt 2026-09-16T03:34:05.343Z` and the old warning set. A restart did not rebuild the cached projection artifact.
+- **Root cause:** `restore_proxy_state_on_startup` reconciled the raw Codex model-catalog file and restored takeover, but never called the router projection publisher (`ensure_codex_multirouter_projection`). The projection was only rebuilt by provider mutations or the Status-page forced retry, so a compiler/catalog change could remain stale indefinitely across restarts.
+- **What we did:** Added `ensure_active_codex_multirouter_projection`, which resolves the active schema-v2 Router, ignores direct providers, and calls the existing non-forced `ensure_projection_with_publisher` (a no-op when the dependency fingerprint matches). Wired it into startup after takeover restoration and before Codex Desktop launch gating; a non-ready projection now keeps `codex_ready=false`. Added a regression covering active publish, no-op on matching fingerprint, and direct-provider skip.
+- **Evidence:** `cargo test --manifest-path src-tauri/Cargo.toml --lib codex_multirouter` passed 100/100, including `active_startup_reconciliation_publishes_current_router_projection`; `cargo check --manifest-path src-tauri/Cargo.toml --lib` passed; scoped rustfmt checks and `git diff --check` passed. Full `cargo test` was not run; this change was verified with the library test target because the live app owns the debug binary.
+- **What NOT to do again:** Do not treat the persisted projection status as authoritative after a compiler or provider-catalog change, and do not make users manually retry a projection that startup can reconcile safely.
+
 ## 2026-09-17 - Live Tauri UI audit of MultiRouter model ordering and alias surfaces
 
 - **What happened:** The user asked for the running cc-switch UI to be re-audited after the model-order/alias work. The app was hidden to tray, so a quiet `PrintWindow` capture was blank; the window had to be restored with explicit user instruction before the WebView2 compositor painted.
