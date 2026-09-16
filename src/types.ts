@@ -533,7 +533,10 @@ export interface CodexRoutingConfigV2 {
   schemaVersion: 2;
   enabled?: boolean;
   defaultRouteId?: string;
+  officialAuth?: CodexOfficialAuthConfig;
   modelDisplayStyle?: "model" | "model-provider" | "provider-model";
+  /** Explicit global Codex picker order for the derived MultiRouter catalog. */
+  modelOrder?: string[];
   /** Default effort for fresh threads using the first model in picker order. */
   defaultReasoningEffort?: CodexReasoningEffort;
   subagentVersion?: CodexSubagentVersion;
@@ -660,6 +663,8 @@ export interface Settings {
   // Whether to show the failover toggle independently on the main page
   enableFailoverToggle?: boolean;
   showProfileSwitcher?: boolean;
+  // Automatically update the user-installed Codex CLI on CCSwitchMulti startup.
+  autoUpdateCodexCli?: boolean;
   // Preserve Codex ChatGPT login in auth.json when switching third-party providers
   preserveCodexOfficialAuthOnSwitch?: boolean;
   // Run official Codex under the shared "custom" provider id so future

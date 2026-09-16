@@ -23,7 +23,6 @@ import {
 } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { defaultRangeExtractor, useVirtualizer } from "@tanstack/react-virtual";
 import { useTranslation } from "react-i18next";
 import i18n from "@/i18n";
 import { PagedModelList } from "@/components/providers/forms/shared/PagedModelList";
@@ -255,6 +254,8 @@ type CodexRouting = {
   enabled?: boolean;
   defaultRouteId?: string;
   modelDisplayStyle?: CodexModelDisplayStyle;
+  modelOrder?: string[];
+  defaultReasoningEffort?: CodexReasoningEffort;
   officialAuth?: CodexOfficialAuthConfig;
   subagentVersion?: CodexSubagentVersion;
   subagentV2?: CodexRoutingConfigV2["subagentV2"];
@@ -1344,10 +1345,14 @@ export function readCodexRouting(
       schemaVersion: 2,
       enabled: v2.enabled,
       defaultRouteId: v2.defaultRouteId,
+      modelDisplayStyle: v2.modelDisplayStyle,
+      modelOrder: v2.modelOrder ?? [],
+      defaultReasoningEffort: v2.defaultReasoningEffort,
+      officialAuth: v2.officialAuth,
       subagentVersion: normalizeCodexSubagentVersion(v2.subagentVersion),
       subagentV2: v2.subagentV2,
       spawnAgentModels: v2.spawnAgentModels ?? [],
-      routes: v2.routes.map((route) => {
+      routes: (v2.routes ?? []).map((route) => {
         const modelSelection = route.modelSelection ?? { mode: "all" as const };
         return {
           ...route,
@@ -1370,6 +1375,20 @@ export function readCodexRouting(
     subagentVersion: normalizeCodexSubagentVersion(
       (routing as { subagentVersion?: unknown }).subagentVersion,
     ),
+  };
+}
+
+export function codexRoutingWithModelOrder(
+  routing: unknown,
+  modelOrder: string[],
+): Record<string, unknown> {
+  const base =
+    routing && typeof routing === "object" && !Array.isArray(routing)
+      ? { ...(routing as Record<string, unknown>) }
+      : {};
+  return {
+    ...base,
+    modelOrder: modelOrder.map((model) => model.trim()).filter(Boolean),
   };
 }
 
@@ -2158,10 +2177,17 @@ export function serializeCodexRouteV2(
   };
 }
 
-function serializeCodexRoutingV2(routing: CodexRouting): CodexRoutingConfigV2 {
+export function serializeCodexRoutingV2(
+  routing: CodexRouting,
+): CodexRoutingConfigV2 {
   return {
     schemaVersion: 2,
     enabled: routing.enabled,
+    defaultRouteId: routing.defaultRouteId,
+    modelDisplayStyle: routing.modelDisplayStyle,
+    modelOrder: routing.modelOrder ?? [],
+    defaultReasoningEffort: routing.defaultReasoningEffort,
+    officialAuth: routing.officialAuth,
     subagentVersion: routing.subagentVersion,
     subagentV2: routing.subagentV2,
     spawnAgentModels: routing.spawnAgentModels ?? [],
@@ -2439,9 +2465,16 @@ export function buildModelCatalogForRoutes(
       ),
     )
     .slice(0, 5);
+  const persistedModelOrder = Array.isArray(routing?.modelOrder)
+    ? routing.modelOrder
+        .map((model, sortIndex) => ({ model, sortIndex }))
+        .filter((model) => model.model.trim())
+    : [];
   const models = applyCodexCatalogModelOrder(
     Array.from(byModel.values()),
-    existingCatalog?.models ?? [],
+    persistedModelOrder.length > 0
+      ? persistedModelOrder
+      : (existingCatalog?.models ?? []),
   );
   return {
     displayNameStyle:
@@ -4825,6 +4858,7 @@ export type CodexModelSortMode =
 
 const DEFAULT_CODEX_MODEL_DISPLAY_STYLE: CodexModelDisplayStyle =
   "provider-model";
+const RANKED_MODEL_LIMIT = 8;
 
 export function codexCatalogProviderName(
   model: Pick<CodexCatalogModel, "providerName" | "provider_name">,
@@ -4931,6 +4965,186 @@ export function sortCodexCatalogModels(
     return 0;
   });
 }
+
+function codexModelRecommendationScore(
+  model: CodexCatalogModel,
+  providerIndex: number,
+): number {
+  const id = (model.model ?? "").trim().toLocaleLowerCase();
+  const label =
+    `${id} ${model.displayName ?? model.display_name ?? ""}`.toLocaleLowerCase();
+  let score = Math.max(0, 30 - providerIndex);
+  if (/(codex|coder|coding|code-|sonnet|opus)/.test(label)) score += 60;
+  if (model.reasoning?.supportStatus === "confirmed_supported") score += 24;
+  if ((model.reasoning?.supportedEfforts?.length ?? 0) >= 3) score += 12;
+  const contextWindow = Number(
+    model.contextWindow ?? model.context_window ?? 0,
+  );
+  if (contextWindow >= 200_000) score += 12;
+  else if (contextWindow >= 100_000) score += 6;
+  if (
+    (model.inputModalities ?? model.input_modalities ?? []).includes("image")
+  ) {
+    score += 4;
+  }
+  const versions = id.match(/\d+(?:\.\d+)*/g) ?? [];
+  score += versions.reduce((total, version) => {
+    const [major = 0, minor = 0] = version.split(".").map(Number);
+    return total + Math.min(major, 20) + Math.min(minor, 20) / 10;
+  }, 0);
+  if (
+    /(embedding|rerank|moderation|guard|audio|speech|tts|transcri|image-gen|realtime)/.test(
+      label,
+    )
+  ) {
+    score -= 120;
+  }
+  if (/(deprecated|legacy|old)/.test(label)) score -= 80;
+  return score;
+}
+
+export function recommendCodexCatalogModels(
+  models: CodexCatalogModel[],
+  limit = RANKED_MODEL_LIMIT,
+  preferredProviders: string[] = [],
+): CodexCatalogModel[] {
+  const providerRank = new Map(
+    preferredProviders.map((provider, index) => [
+      provider.trim().toLocaleLowerCase(),
+      index,
+    ]),
+  );
+  const ranked = models
+    .map((model, index) => ({
+      model,
+      index,
+      provider: codexCatalogProviderName(model) || "unknown",
+      score: codexModelRecommendationScore(model, index),
+    }))
+    .sort(
+      (left, right) =>
+        (providerRank.get(left.provider.toLocaleLowerCase()) ?? 999) -
+          (providerRank.get(right.provider.toLocaleLowerCase()) ?? 999) ||
+        right.score - left.score ||
+        left.index - right.index,
+    );
+  const selected: typeof ranked = [];
+  const firstProvider = preferredProviders[0]?.trim().toLocaleLowerCase();
+  if (firstProvider) {
+    for (const candidate of ranked) {
+      if (candidate.provider.toLocaleLowerCase() !== firstProvider) continue;
+      selected.push(candidate);
+      if (selected.length >= Math.min(2, limit)) break;
+    }
+  }
+  for (const candidate of ranked) {
+    if (selected.includes(candidate)) continue;
+    selected.push(candidate);
+    if (selected.length >= limit) break;
+  }
+  return selected.map(({ model }) => model);
+}
+
+export function buildModelOrderProviderUpdates(
+  models: CodexCatalogModel[],
+  routes: CodexRoute[],
+  providersById: Map<string, Provider>,
+  reset: boolean,
+): Map<string, Provider> {
+  const updates = new Map<string, Provider>();
+  for (const [sortIndex, projectedModel] of models.entries()) {
+    const visibleModel = projectedModel.model?.trim();
+    if (!visibleModel) continue;
+    const unresolvedProviderNames = new Set<string>();
+    const unresolvedUpstreamModels = new Set<string>();
+    let hasEligibleRoute = false;
+    let wasResolved = false;
+    for (const route of routes) {
+      if (route.enabled === false) continue;
+      const targetProviderId = routeTargetProviderId(route);
+      if (!targetProviderId) continue;
+      const aliases = route.aliases ?? route.upstream?.modelMap ?? {};
+      const canonicalModel = aliases[visibleModel] ?? visibleModel;
+      if (
+        route.modelSelection?.mode === "include" &&
+        !route.modelSelection.models.includes(canonicalModel)
+      ) {
+        continue;
+      }
+      hasEligibleRoute = true;
+      const source =
+        updates.get(targetProviderId) ?? providersById.get(targetProviderId);
+      if (!source) {
+        unresolvedProviderNames.add(targetProviderId);
+        unresolvedUpstreamModels.add(canonicalModel);
+        continue;
+      }
+      const sourceModels = readCodexModelCatalog(source).models;
+      const sourceIndex = sourceModels.findIndex(
+        (model) =>
+          model.enabled !== false &&
+          [model.model, model.upstreamModel, model.upstream_model].some(
+            (value) =>
+              value?.trim().toLowerCase() === canonicalModel.toLowerCase(),
+          ),
+      );
+      if (sourceIndex < 0) {
+        unresolvedProviderNames.add(source.name || targetProviderId);
+        unresolvedUpstreamModels.add(canonicalModel);
+        continue;
+      }
+      const nextModels = sourceModels.map((model, index) => {
+        if (index !== sourceIndex) return model;
+        const next = { ...model };
+        if (reset) delete next.sortIndex;
+        else next.sortIndex = sortIndex;
+        return next;
+      });
+      updates.set(targetProviderId, {
+        ...source,
+        settingsConfig: {
+          ...source.settingsConfig,
+          modelCatalog: {
+            ...(source.settingsConfig?.modelCatalog ?? {}),
+            models: nextModels,
+          },
+        },
+      });
+      wasResolved = true;
+      break;
+    }
+    if (wasResolved) continue;
+    if (unresolvedProviderNames.size > 0) {
+      throw new Error(
+        tr("codexRouterWorkspace.modelOrderUnresolvedAlias", {
+          model: visibleModel,
+          upstream: Array.from(unresolvedUpstreamModels).join(", "),
+          provider: Array.from(unresolvedProviderNames).join(", "),
+          defaultValue:
+            'Model "{{model}}" resolves to unavailable upstream model "{{upstream}}" on provider "{{provider}}". Refresh that provider model list or repair the route alias before saving order.',
+        }),
+      );
+    }
+    if (!hasEligibleRoute) {
+      throw new Error(
+        tr("codexRouterWorkspace.modelOrderNoRoute", {
+          model: visibleModel,
+          defaultValue:
+            'Model "{{model}}" has no enabled route eligible for ordering.',
+        }),
+      );
+    }
+    throw new Error(
+      tr("codexRouterWorkspace.modelOrderUnresolved", {
+        model: visibleModel,
+        defaultValue:
+          'Model "{{model}}" could not be resolved to a provider catalog entry.',
+      }),
+    );
+  }
+  return updates;
+}
+
 export function ModelOrderTab({
   selectedPlan,
   catalog,
@@ -4960,8 +5174,6 @@ export function ModelOrderTab({
     useState<CodexReasoningEffort>(
       configuredDefaultReasoningEffort ?? "medium",
     );
-  const catalogScrollRef = useRef<HTMLDivElement>(null);
-  const [draggedModelId, setDraggedModelId] = useState<string | null>(null);
   const sensors = useSensors(
     useSensor(PointerSensor),
     useSensor(KeyboardSensor, {
@@ -4974,9 +5186,18 @@ export function ModelOrderTab({
       (model) => `${model.model ?? ""}:${model.sortIndex ?? ""}`,
     ),
   ].join("\n");
-  const hasCustomOrder = catalog.models.some(
-    (model) => model.sortIndex !== undefined,
-  );
+  const persistedModelOrder = useMemo<string[]>(() => {
+    const order = selectedPlan?.settingsConfig?.codexRouting?.modelOrder;
+    return Array.isArray(order)
+      ? order.filter(
+          (model): model is string =>
+            typeof model === "string" && Boolean(model.trim()),
+        )
+      : [];
+  }, [selectedPlan?.settingsConfig?.codexRouting?.modelOrder]);
+  const hasCustomOrder =
+    persistedModelOrder.length > 0 ||
+    catalog.models.some((model) => model.sortIndex !== undefined);
   const providerNamesByModel = useMemo(() => {
     const names = new Map<string, string>();
     for (const { route } of selectedRoutes) {
@@ -5030,7 +5251,30 @@ export function ModelOrderTab({
       ),
     [orderedDraftModels],
   );
-  const topModels = orderedDraftModels.slice(0, 5);
+  const topModels = orderedDraftModels.slice(0, RANKED_MODEL_LIMIT);
+  const remainingModels = visibleDraftModels.filter(
+    (model) =>
+      !topModels.some(
+        (topModel) => topModel.model?.trim() === model.model?.trim(),
+      ),
+  );
+  const sortableModels = [...topModels, ...remainingModels];
+  const recommendedModelIds = useMemo(
+    () =>
+      new Set(
+        recommendCodexCatalogModels(
+          orderedDraftModels,
+          RANKED_MODEL_LIMIT,
+          selectedRoutes
+            .map(({ route }) =>
+              providersById.get(routeTargetProviderId(route) ?? ""),
+            )
+            .filter((provider): provider is Provider => Boolean(provider))
+            .map((provider) => provider.name),
+        ).map((model) => model.model?.trim()),
+      ),
+    [orderedDraftModels, providersById, selectedRoutes],
+  );
   const topModel = orderedDraftModels[0];
   const topReasoningEfforts = useMemo<CodexReasoningEffort[]>(() => {
     const declared = topModel?.reasoning?.supportedEfforts?.filter(
@@ -5040,24 +5284,6 @@ export function ModelOrderTab({
       ? declared
       : ["none", "minimal", "low", "medium", "high", "xhigh", "max"];
   }, [topModel]);
-  const draggedIndex = visibleDraftModels.findIndex(
-    (model) => model.model?.trim() === draggedModelId,
-  );
-  const catalogVirtualizer = useVirtualizer({
-    count: visibleDraftModels.length,
-    getScrollElement: () => catalogScrollRef.current,
-    estimateSize: () => 64,
-    getItemKey: (index) => visibleDraftModels[index].model ?? index,
-    gap: 8,
-    overscan: 5,
-    // Keep the active sortable mounted when dragging past the viewport.
-    rangeExtractor: (range) => {
-      const indices = defaultRangeExtractor(range);
-      return draggedIndex < 0 || indices.includes(draggedIndex)
-        ? indices
-        : [...indices, draggedIndex].sort((a, b) => a - b);
-    },
-  });
   const hiddenCatalogModels = useMemo(() => {
     const hidden: Array<{
       model: string;
@@ -5098,15 +5324,17 @@ export function ModelOrderTab({
     styleDirty ||
     effortDirty ||
     orderedDraftModels.map((model) => model.model).join("\n") !==
-      catalog.models
-        .slice()
-        .sort(
-          (left, right) =>
-            (left.sortIndex ?? Number.MAX_SAFE_INTEGER) -
-            (right.sortIndex ?? Number.MAX_SAFE_INTEGER),
-        )
-        .map((model) => model.model)
-        .join("\n");
+      (persistedModelOrder.length > 0
+        ? persistedModelOrder
+        : catalog.models
+            .slice()
+            .sort(
+              (left, right) =>
+                (left.sortIndex ?? Number.MAX_SAFE_INTEGER) -
+                (right.sortIndex ?? Number.MAX_SAFE_INTEGER),
+            )
+            .map((model) => model.model)
+      ).join("\n");
 
   useEffect(() => {
     setDisplayStyle(
@@ -5137,7 +5365,6 @@ export function ModelOrderTab({
   }, [defaultReasoningEffort, topModel, topReasoningEfforts]);
 
   function handleDragEnd(event: DragEndEvent) {
-    setDraggedModelId(null);
     const activeModel = String(event.active.id);
     const overModel = event.over ? String(event.over.id) : "";
     if (!overModel || activeModel === overModel) return;
@@ -5145,18 +5372,42 @@ export function ModelOrderTab({
     // prevents the selected alphabetical/provider sort from immediately undoing it.
     setSortMode("custom");
     setDraftModels(() => {
-      const activeIndex = visibleDraftModels.findIndex(
+      const activeIndex = orderedDraftModels.findIndex(
         (model) => model.model?.trim() === activeModel,
       );
-      const overIndex = visibleDraftModels.findIndex(
+      const overIndex = orderedDraftModels.findIndex(
         (model) => model.model?.trim() === overModel,
       );
       if (activeIndex < 0 || overIndex < 0) return draftModels;
-      const next = [...visibleDraftModels];
+      const next = [...orderedDraftModels];
       const [moved] = next.splice(activeIndex, 1);
       next.splice(overIndex, 0, moved);
       return next;
     });
+    setMessage(null);
+    setError(null);
+  }
+
+  function applyRecommendations() {
+    const preferredProviders = selectedRoutes
+      .map(({ route }) => providersById.get(routeTargetProviderId(route) ?? ""))
+      .filter((provider): provider is Provider => Boolean(provider))
+      .map((provider) => provider.name);
+    const recommended = recommendCodexCatalogModels(
+      orderedDraftModels,
+      RANKED_MODEL_LIMIT,
+      preferredProviders,
+    );
+    const recommendedIds = new Set(
+      recommended.map((model) => model.model?.trim()),
+    );
+    setSortMode("custom");
+    setDraftModels([
+      ...recommended,
+      ...orderedDraftModels.filter(
+        (model) => !recommendedIds.has(model.model?.trim()),
+      ),
+    ]);
     setMessage(null);
     setError(null);
   }
@@ -5204,9 +5455,13 @@ export function ModelOrderTab({
             (right.sortIndex ?? Number.MAX_SAFE_INTEGER),
         )
         .map((model) => model.model);
+      const persistedOrderedIds =
+        persistedModelOrder.length > 0
+          ? persistedModelOrder
+          : currentOrderedIds;
       const nextOrderedIds = orderedModels.map((model) => model.model);
       const orderChanged =
-        nextOrderedIds.join("\n") !== currentOrderedIds.join("\n");
+        nextOrderedIds.join("\n") !== persistedOrderedIds.join("\n");
       // A display-style-only change must not unexpectedly rewrite provider sort
       // indexes. Re-number models only when the user explicitly reset or changed
       // the order; the style is persisted independently on the routing document.
@@ -5223,70 +5478,32 @@ export function ModelOrderTab({
               sortIndex: index,
             }))
           : orderedModels;
-      const updates = new Map<string, Provider>();
-      if (persistOrder) {
-        for (const [sortIndex, projectedModel] of models.entries()) {
-          const visibleModel = projectedModel.model?.trim();
-          if (!visibleModel) continue;
-          for (const { route } of selectedRoutes) {
-            if (route.enabled === false) continue;
-            const targetProviderId = routeTargetProviderId(route);
-            if (!targetProviderId) continue;
-            const aliases = route.aliases ?? route.upstream?.modelMap ?? {};
-            const canonicalModel = aliases[visibleModel] ?? visibleModel;
-            if (
-              route.modelSelection?.mode === "include" &&
-              !route.modelSelection.models.includes(canonicalModel)
-            ) {
-              continue;
-            }
-            const source =
-              updates.get(targetProviderId) ??
-              providersById.get(targetProviderId);
-            if (!source) continue;
-            const sourceModels = readCodexModelCatalog(source).models;
-            const sourceIndex = sourceModels.findIndex(
-              (model) =>
-                model.enabled !== false &&
-                [model.model, model.upstreamModel, model.upstream_model].some(
-                  (value) =>
-                    value?.trim().toLowerCase() ===
-                    canonicalModel.toLowerCase(),
-                ),
-            );
-            if (sourceIndex < 0) continue;
-            const nextModels = sourceModels.map((model, index) => {
-              if (index !== sourceIndex) return model;
-              const next = { ...model };
-              if (reset) delete next.sortIndex;
-              else next.sortIndex = sortIndex;
-              return next;
-            });
-            updates.set(targetProviderId, {
-              ...source,
-              settingsConfig: {
-                ...source.settingsConfig,
-                modelCatalog: {
-                  ...(source.settingsConfig?.modelCatalog ?? {}),
-                  models: nextModels,
-                },
-              },
-            });
-            break;
-          }
-        }
-      }
+      const updates = persistOrder
+        ? buildModelOrderProviderUpdates(
+            models,
+            selectedRoutes.map(({ route }) => route),
+            providersById,
+            reset,
+          )
+        : new Map<string, Provider>();
       // Schema-v2 modelCatalog is derived and removed by the backend mutation
       // layer. Persist a changed preference in the owned routing document first;
       // subsequent provider updates then reconcile against this newest router.
-      if (styleDirty || effortDirty) {
+      if (styleDirty || effortDirty || persistOrder) {
         await providersApi.update(
           {
             ...selectedPlan,
             settingsConfig: {
               ...selectedPlan.settingsConfig,
               codexRouting: {
-                ...(selectedPlan.settingsConfig?.codexRouting ?? {}),
+                ...codexRoutingWithModelOrder(
+                  selectedPlan.settingsConfig?.codexRouting,
+                  reset
+                    ? []
+                    : models
+                        .map((model) => model.model?.trim())
+                        .filter((model): model is string => Boolean(model)),
+                ),
                 modelDisplayStyle: displayStyle,
                 defaultReasoningEffort,
               },
@@ -5470,6 +5687,19 @@ export function ModelOrderTab({
               type="button"
               size="sm"
               variant="outline"
+              disabled={isSaving || orderedDraftModels.length < 2}
+              onClick={applyRecommendations}
+              className="gap-2"
+            >
+              <Wand2 className="h-4 w-4" />
+              {tr("codexRouterWorkspace.applyRecommendations", {
+                defaultValue: "Apply recommendations",
+              })}
+            </Button>
+            <Button
+              type="button"
+              size="sm"
+              variant="outline"
               disabled={isSaving || !hasCustomOrder}
               onClick={() => void saveOrder(true)}
             >
@@ -5601,38 +5831,6 @@ export function ModelOrderTab({
         </div>
       ) : null}
 
-      <section
-        aria-label={tr("codexRouterWorkspace.topModels", {
-          defaultValue: "Top models",
-        })}
-        className="mt-4 border-y border-blue-200/70 bg-background/60 px-3 py-3 dark:border-blue-800/50 dark:bg-slate-950/30"
-      >
-        <div className="mb-2 flex items-center gap-2 text-xs font-semibold text-foreground">
-          <Star className="h-4 w-4 text-amber-500" fill="currentColor" />
-          {tr("codexRouterWorkspace.topModels", {
-            defaultValue: "Top models",
-          })}
-        </div>
-        <div className="grid gap-2 sm:grid-cols-2 xl:grid-cols-5">
-          {topModels.map((model, index) => (
-            <div
-              key={model.model}
-              className="flex min-w-0 items-center gap-2 rounded border border-border-default bg-background px-2 py-1.5"
-            >
-              <span className="shrink-0 font-mono text-xs text-muted-foreground">
-                #{index + 1}
-              </span>
-              <span
-                className="min-w-0 truncate text-xs font-medium"
-                title={model.model}
-              >
-                {formatCodexCatalogModelLabel(model, displayStyle)}
-              </span>
-            </div>
-          ))}
-        </div>
-      </section>
-
       <div className="relative mt-4">
         <Search className="pointer-events-none absolute left-3 top-2.5 h-4 w-4 text-muted-foreground" />
         <Input
@@ -5659,62 +5857,100 @@ export function ModelOrderTab({
       <DndContext
         sensors={sensors}
         collisionDetection={closestCenter}
-        onDragStart={({ active }) => setDraggedModelId(String(active.id))}
-        onDragCancel={() => setDraggedModelId(null)}
         onDragEnd={handleDragEnd}
       >
         <SortableContext
-          items={visibleDraftModels
+          items={sortableModels
             .map((model) => model.model?.trim())
             .filter((model): model is string => Boolean(model))}
           strategy={verticalListSortingStrategy}
         >
-          <div
-            ref={catalogScrollRef}
-            className="mt-4 overflow-auto"
-            style={{ maxHeight: 480 }}
-          >
-            <div
-              style={{
-                height: catalogVirtualizer.getTotalSize(),
-                position: "relative",
-              }}
+          <div className="mt-4 grid min-w-0 gap-4 lg:grid-cols-[minmax(0,0.9fr)_minmax(0,1.4fr)]">
+            <section
+              aria-label={tr("codexRouterWorkspace.topModels", {
+                defaultValue: "Ranked models",
+              })}
+              className="min-w-0 border-y border-amber-300/70 bg-amber-50/40 p-3 dark:border-amber-700/50 dark:bg-amber-950/10"
             >
-              {catalogVirtualizer.getVirtualItems().map((row) => (
-                <div
-                  key={row.key}
-                  data-index={row.index}
-                  ref={catalogVirtualizer.measureElement}
-                  style={{
-                    position: "absolute",
-                    top: 0,
-                    left: 0,
-                    width: "100%",
-                    transform: `translateY(${row.start}px)`,
-                  }}
-                >
+              <div className="mb-3 flex items-center justify-between gap-2">
+                <div>
+                  <div className="flex items-center gap-2 text-sm font-semibold">
+                    <Star
+                      className="h-4 w-4 text-amber-500"
+                      fill="currentColor"
+                    />
+                    {tr("codexRouterWorkspace.rankedModels", {
+                      defaultValue: "Ranked models",
+                    })}
+                  </div>
+                  <p className="mt-1 text-xs text-muted-foreground">
+                    {tr("codexRouterWorkspace.rankedModelsHint", {
+                      defaultValue:
+                        "The first eight models shown in the Codex picker.",
+                    })}
+                  </p>
+                </div>
+                <Badge variant="outline" className="shrink-0 tabular-nums">
+                  {topModels.length}/{RANKED_MODEL_LIMIT}
+                </Badge>
+              </div>
+              <div className="space-y-2">
+                {topModels.map((model, index) => (
                   <SortableCatalogModel
-                    model={visibleDraftModels[row.index]}
-                    index={
-                      globalRankByModel.get(
-                        visibleDraftModels[row.index].model?.trim(),
-                      ) ?? row.index
-                    }
+                    key={model.model}
+                    model={model}
+                    index={index}
                     displayStyle={displayStyle}
                     onDelete={(modelId) => void hideModel(modelId)}
                     onMoveToTop={moveModelToTop}
                     onMoveToPosition={moveModelToPosition}
                     modelCount={orderedDraftModels.length}
-                    dragDisabled={Boolean(modelSearch.trim())}
-                    isTop={
-                      globalRankByModel.get(
-                        visibleDraftModels[row.index].model?.trim(),
-                      ) === 0
-                    }
+                    isTop={index === 0}
+                    recommended={recommendedModelIds.has(model.model?.trim())}
                   />
+                ))}
+              </div>
+            </section>
+
+            <section
+              aria-label={tr("codexRouterWorkspace.availableModels", {
+                defaultValue: "Available models",
+              })}
+              className="min-w-0 border-y border-blue-200/70 bg-background/60 p-3 dark:border-blue-800/50 dark:bg-slate-950/30"
+            >
+              <div className="mb-3">
+                <div className="text-sm font-semibold">
+                  {tr("codexRouterWorkspace.availableModels", {
+                    defaultValue: "Available models",
+                  })}
                 </div>
-              ))}
-            </div>
+                <p className="mt-1 text-xs text-muted-foreground">
+                  {tr("codexRouterWorkspace.availableModelsHint", {
+                    defaultValue:
+                      "Drag a model into the ranked column or place it at an exact rank.",
+                  })}
+                </p>
+              </div>
+              <div className="max-h-[480px] space-y-2 overflow-auto pr-1">
+                {remainingModels.map((model) => {
+                  const index = globalRankByModel.get(model.model?.trim()) ?? 0;
+                  return (
+                    <SortableCatalogModel
+                      key={model.model}
+                      model={model}
+                      index={index}
+                      displayStyle={displayStyle}
+                      onDelete={(modelId) => void hideModel(modelId)}
+                      onMoveToTop={moveModelToTop}
+                      onMoveToPosition={moveModelToPosition}
+                      modelCount={orderedDraftModels.length}
+                      isTop={false}
+                      recommended={recommendedModelIds.has(model.model?.trim())}
+                    />
+                  );
+                })}
+              </div>
+            </section>
           </div>
         </SortableContext>
       </DndContext>
@@ -10994,6 +11230,7 @@ function SortableCatalogModel({
   modelCount = 1,
   dragDisabled = false,
   isTop = false,
+  recommended = false,
 }: {
   model: CodexCatalogModel;
   index: number;
@@ -11004,6 +11241,7 @@ function SortableCatalogModel({
   modelCount?: number;
   dragDisabled?: boolean;
   isTop?: boolean;
+  recommended?: boolean;
 }) {
   const modelId = model.model?.trim() ?? "";
   const apiFormat = model.apiFormat ?? model.api_format;
@@ -11085,6 +11323,13 @@ function SortableCatalogModel({
               )}
             >
               {protocolLabel} · {protocolSourceLabel}
+            </Badge>
+          ) : null}
+          {recommended ? (
+            <Badge className="shrink-0 border border-amber-500/30 bg-amber-500/10 px-1.5 py-0 text-[10px] font-medium text-amber-700 dark:text-amber-200">
+              {tr("codexRouterWorkspace.recommended", {
+                defaultValue: "Recommended",
+              })}
             </Badge>
           ) : null}
         </div>

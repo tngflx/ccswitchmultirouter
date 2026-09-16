@@ -4763,25 +4763,52 @@ impl ProviderService {
         }
 
         let outcome = if protocol_profiles.is_empty() {
-            crate::codex_multirouter::mutation::apply_codex_provider_mutation(
+            crate::codex_multirouter::mutation::apply_codex_provider_mutation_persist_only(
                 state.db.as_ref(),
                 provider.clone(),
             )?
         } else {
-            crate::codex_multirouter::mutation::apply_codex_provider_mutation_with_profiles(
+            crate::codex_multirouter::mutation::apply_codex_provider_mutation_persist_only_with_profiles(
                 state.db.as_ref(),
                 provider.clone(),
                 protocol_profiles,
             )?
         };
-        for projection in outcome.projections {
-            if projection.state == crate::codex_multirouter::projection::ProjectionState::Pending {
-                log::warn!(
-                    "Codex MultiRouter projection pending after Provider mutation: router={} code={}",
-                    projection.router_provider_id,
-                    projection.last_error_code.as_deref().unwrap_or("projection_pending")
-                );
+        let db = state.db.clone();
+        tauri::async_runtime::spawn_blocking(move || {
+            let Ok(Some(router_id)) = crate::codex_multirouter::active_codex_router_id(&db) else {
+                return;
+            };
+            match crate::codex_multirouter::projection::ensure_codex_multirouter_projection(
+                &db, &router_id, false,
+            ) {
+                Ok(status)
+                    if status.state
+                        == crate::codex_multirouter::projection::ProjectionState::Pending =>
+                {
+                    log::warn!(
+                        "Codex MultiRouter background projection pending: router={} code={}",
+                        status.router_provider_id,
+                        status
+                            .last_error_code
+                            .as_deref()
+                            .unwrap_or("projection_pending")
+                    );
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    log::warn!(
+                        "Codex MultiRouter background projection failed: router={} error={error}",
+                        router_id
+                    );
+                }
             }
+        });
+        if !outcome.projections.is_empty() {
+            log::debug!(
+                "Codex MultiRouter provider mutation returned {} synchronous projection statuses",
+                outcome.projections.len()
+            );
         }
         Ok(())
     }

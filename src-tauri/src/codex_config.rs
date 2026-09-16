@@ -2105,14 +2105,16 @@ fn codex_catalog_model_specs(settings: &Value, config_text: &str) -> Vec<CodexCa
         });
     }
 
+    let spawn_agent_model_priority = codex_spawn_agent_model_priority(settings);
+    let mut specs = sort_codex_catalog_specs_for_picker(specs, &spawn_agent_model_priority);
+
     if default_model.is_none() {
         if let Some(first) = specs.first_mut() {
             first.is_default = true;
         }
     }
 
-    let spawn_agent_model_priority = codex_spawn_agent_model_priority(settings);
-    sort_codex_catalog_specs_for_picker(specs, &spawn_agent_model_priority)
+    specs
 }
 
 fn find_codex_model_template(catalog: &Value) -> Option<Value> {
@@ -6160,8 +6162,41 @@ fn merge_codex_model_entry(official: Option<&Value>, routed: &Value) -> Value {
         }
         merged.insert(field.clone(), value.clone());
     }
+    compact_third_party_codex_instruction_payload(&mut merged, routed, official_object);
     project_official_picker_metadata_aliases(&mut merged, official_object);
     Value::Object(merged)
+}
+
+/// Official model records contain the full Codex harness prompt and message
+/// templates. Reusing those records for a third-party route needlessly
+/// replicates tens of kilobytes per model and does not describe the upstream
+/// provider. Keep the parser-required instruction field compact and omit the
+/// optional message template for third-party entries.
+fn compact_third_party_codex_instruction_payload(
+    merged: &mut serde_json::Map<String, Value>,
+    routed: &Value,
+    official: &serde_json::Map<String, Value>,
+) {
+    let Some(provider_name) = codex_catalog_provider_name(routed) else {
+        return;
+    };
+    let provider_name = provider_name.trim();
+    if provider_name.is_empty()
+        || matches!(
+            provider_name.to_ascii_lowercase().as_str(),
+            "openai" | "chatgpt" | "codex"
+        )
+    {
+        return;
+    }
+
+    if official.contains_key("base_instructions") || merged.contains_key("base_instructions") {
+        merged.insert(
+            "base_instructions".to_string(),
+            Value::String("You are Codex, a coding agent.".to_string()),
+        );
+    }
+    merged.remove("model_messages");
 }
 
 /// 判断同 slug 官方模型中已经存在、必须保持权威的元数据字段。
@@ -13380,6 +13415,27 @@ openai_base_url = "http://127.0.0.1:15721/v1"
     }
 
     #[test]
+    fn codex_model_catalog_without_explicit_default_uses_first_user_sorted_model() {
+        let settings = json!({
+            "modelCatalog": {
+                "models": [
+                    { "model": "deepseek-v4-flash", "sortIndex": 1 },
+                    { "model": "qwen3.8", "sortIndex": 0 }
+                ]
+            }
+        });
+
+        let specs = codex_catalog_model_specs(&settings, "");
+        assert_eq!(
+            specs
+                .iter()
+                .find(|spec| spec.is_default)
+                .map(|spec| spec.model.as_str()),
+            Some("qwen3.8")
+        );
+    }
+
+    #[test]
     fn codex_model_catalog_keeps_official_transport_and_reserved_tool_metadata() {
         let official_models = json!([{
             "slug": "gpt-5.6-sol",
@@ -13412,6 +13468,32 @@ openai_base_url = "http://127.0.0.1:15721/v1"
         assert_eq!(model["multi_agent_version"], "v2");
         assert_eq!(model["tool_mode"], "direct");
         assert_eq!(model["apply_patch_tool_type"], "freeform");
+    }
+
+    #[test]
+    fn third_party_catalog_entry_does_not_clone_official_instruction_payloads() {
+        let official_models = json!([{
+            "slug": "gpt-5.6-sol",
+            "base_instructions": "official instructions ".repeat(1000),
+            "model_messages": { "instructions_template": "official template" },
+            "use_responses_lite": true
+        }]);
+        let routed_models = json!([{
+            "slug": "gpt-5.6-sol",
+            "providerName": "OpenRouter",
+            "base_instructions": "route instructions ".repeat(1000),
+            "model_messages": { "instructions_template": "route template" }
+        }]);
+
+        let merged = merge_codex_models(
+            official_models.as_array().expect("official models"),
+            routed_models.as_array().expect("routed models"),
+        );
+        let model = merged.first().expect("merged model");
+
+        assert_eq!(model["base_instructions"], "You are Codex, a coding agent.");
+        assert!(model.get("model_messages").is_none());
+        assert_eq!(model["use_responses_lite"], true);
     }
 
     #[test]

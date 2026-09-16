@@ -567,6 +567,10 @@ pub struct AppSettings {
     /// Whether to show the project profile switcher on the main page header
     #[serde(default = "default_show_profile_switcher")]
     pub show_profile_switcher: bool,
+    /// Automatically update the user-installed Codex CLI to the latest stable
+    /// npm release when CCSwitchMulti starts. Skips while Codex is running.
+    #[serde(default)]
+    pub auto_update_codex_cli: bool,
     /// Keep Codex ChatGPT login material in auth.json when switching to third-party providers.
     /// Opt-in: defaults to false so third-party switches cleanly overwrite auth.json.
     #[serde(default)]
@@ -722,6 +726,7 @@ impl Default for AppSettings {
             stream_retry_max_attempts: 3,
             request_health: RequestHealthConfig::default(),
             show_profile_switcher: true,
+            auto_update_codex_cli: false,
             preserve_codex_official_auth_on_switch: false,
             unify_codex_session_history: false,
             unify_codex_migrate_existing: None,
@@ -1496,6 +1501,16 @@ mod tests {
             !decoded.launch_codex_desktop_with_ccswitch,
             "enabling CCSwitchMulti auto-launch must not implicitly start Codex Desktop"
         );
+    }
+
+    #[test]
+    fn codex_cli_auto_update_is_opt_in_and_round_trips() {
+        assert!(!AppSettings::default().auto_update_codex_cli);
+        let decoded: AppSettings = serde_json::from_value(serde_json::json!({
+            "autoUpdateCodexCli": true
+        }))
+        .expect("auto-update setting");
+        assert!(decoded.auto_update_codex_cli);
     }
 
     #[test]

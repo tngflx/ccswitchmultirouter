@@ -11,6 +11,8 @@ import { useProxyStatus } from "@/hooks/useProxyStatus";
 import { cn } from "@/lib/utils";
 import { useTranslation } from "react-i18next";
 import type { AppId } from "@/lib/api";
+import { proxyApi } from "@/lib/api/proxy";
+import { toast } from "sonner";
 
 interface ProxyToggleProps {
   className?: string;
@@ -24,9 +26,29 @@ export function ProxyToggle({ className, activeApp }: ProxyToggleProps) {
 
   const handleToggle = async (checked: boolean) => {
     try {
+      if (activeApp === "codex") {
+        const running = await proxyApi.isCodexDesktopRunning();
+        if (running) {
+          const confirmed = window.confirm(
+            t("proxy.takeover.restartCodexConfirm", {
+              defaultValue:
+                "Codex Desktop is running. Restart it now so the takeover change can apply? Unsaved Codex work may be interrupted.",
+            }),
+          );
+          if (!confirmed) return;
+          await proxyApi.restartCodexDesktop(checked);
+          return;
+        }
+      }
       await setTakeoverForApp({ appType: activeApp, enabled: checked });
     } catch (error) {
       console.error("[ProxyToggle] Toggle takeover failed:", error);
+      toast.error(
+        t("proxy.takeover.failed", {
+          detail: String(error),
+          defaultValue: "切换接管状态失败",
+        }),
+      );
     }
   };
 

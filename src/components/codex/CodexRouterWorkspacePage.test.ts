@@ -40,6 +40,7 @@ import {
   buildMultiRouterRuntimeStatus,
   buildCodexProxyBaseUrl,
   buildModelCatalogForRoutes,
+  buildModelOrderProviderUpdates,
   collectRoutedCatalogModels,
   codexCatalogProviderName,
   formatCodexCatalogModelLabel,
@@ -56,10 +57,12 @@ import {
   providerWithCatalogModelVisibility,
   providersWithCatalogModelVisibilityForRoutes,
   providerWithFetchedModelCatalog,
+  recommendCodexCatalogModels,
   readCodexRouting,
   resolveCodexRouterAuthFacadeLabel,
   routeSummaryDisplayName,
   serializeCodexRouteV2,
+  serializeCodexRoutingV2,
   validateProxyListenDraft,
   workspaceErrorMessage,
 } from "./CodexRouterWorkspacePage";
@@ -650,6 +653,71 @@ describe("Codex model display and sorting", () => {
       "zeta",
       "beta",
       "alpha",
+    ]);
+  });
+
+  it("recommends coding-capable models while keeping provider diversity", () => {
+    const recommended = recommendCodexCatalogModels([
+      {
+        model: "embedding-v3",
+        providerName: "Provider A",
+        contextWindow: 256000,
+      },
+      {
+        model: "alpha-coder-4",
+        providerName: "Provider A",
+        contextWindow: 256000,
+        reasoning: {
+          schemaVersion: 2,
+          supportStatus: "confirmed_supported",
+          controlKind: "graded",
+          supportedEfforts: ["low", "medium", "high"],
+          disableAllowed: false,
+          upstream: { format: "string", parameter: "reasoning_effort" },
+          source: "user",
+        },
+      },
+      {
+        model: "beta-sonnet-5",
+        providerName: "Provider B",
+        contextWindow: 200000,
+      },
+      {
+        model: "alpha-code-3",
+        providerName: "Provider A",
+        contextWindow: 128000,
+      },
+      {
+        model: "gamma-coder-2",
+        providerName: "Provider C",
+        contextWindow: 128000,
+      },
+    ]);
+
+    expect(recommended.map((model) => model.model)).toEqual([
+      "alpha-coder-4",
+      "beta-sonnet-5",
+      "alpha-code-3",
+      "gamma-coder-2",
+      "embedding-v3",
+    ]);
+  });
+
+  it("keeps the first provider's first two models at the top of recommendations", () => {
+    const recommended = recommendCodexCatalogModels(
+      [
+        { model: "provider-b-coder", providerName: "Provider B" },
+        { model: "provider-a-one", providerName: "Provider A" },
+        { model: "provider-a-two", providerName: "Provider A" },
+        { model: "provider-b-best-coder", providerName: "Provider B" },
+      ],
+      8,
+      ["Provider A", "Provider B"],
+    );
+
+    expect(recommended.slice(0, 2).map((model) => model.model)).toEqual([
+      "provider-a-one",
+      "provider-a-two",
     ]);
   });
 });
@@ -3072,6 +3140,7 @@ describe("Codex MultiRouter workspace route persistence helpers", () => {
       screen.getByRole("textbox", { name: "Search models or providers" }),
       "qwen3.8",
     );
+    expect(screen.getByRole("button", { name: "拖动 qwen3.8" })).toBeEnabled();
     const rankInput = screen.getByRole("spinbutton", {
       name: "Rank for qwen3.8",
     });
@@ -3082,9 +3151,13 @@ describe("Codex MultiRouter workspace route persistence helpers", () => {
       screen.getByRole("button", { name: "Move qwen3.8 to rank 2" }),
     );
 
-    const topModels = screen.getByRole("region", { name: "Top models" });
-    expect(within(topModels).getByText("#2")).toBeInTheDocument();
-    expect(within(topModels).getByText(/qwen3\.8/)).toBeInTheDocument();
+    const topModels = screen.getByRole("region", { name: "Ranked models" });
+    expect(topModels).toHaveTextContent("3/8");
+    expect(
+      within(topModels).getByRole("spinbutton", {
+        name: "Rank for qwen3.8",
+      }),
+    ).toHaveValue(2);
 
     await user.click(screen.getByRole("button", { name: "保存顺序" }));
     await waitFor(() => expect(providersApi.update).toHaveBeenCalled());
@@ -3092,11 +3165,18 @@ describe("Codex MultiRouter workspace route persistence helpers", () => {
       .mocked(providersApi.update)
       .mock.calls.map(([provider]) => provider)
       .find((provider) => provider.id === source.id);
+    const savedPlan = vi
+      .mocked(providersApi.update)
+      .mock.calls.map(([provider]) => provider)
+      .find((provider) => provider.id === plan.id);
     expect(savedSource?.settingsConfig?.modelCatalog?.models).toEqual([
       expect.objectContaining({ model: "deepseek-v4-flash", sortIndex: 2 }),
       expect.objectContaining({ model: "deepseek-v4-pro", sortIndex: 0 }),
       expect.objectContaining({ model: "qwen3.8", sortIndex: 1 }),
     ]);
+    expect(savedPlan?.settingsConfig?.codexRouting).toMatchObject({
+      modelOrder: ["deepseek-v4-pro", "qwen3.8", "deepseek-v4-flash"],
+    });
   });
 
   it("persists a display-only change without rewriting provider model order", async () => {
@@ -3120,6 +3200,48 @@ describe("Codex MultiRouter workspace route persistence helpers", () => {
     expect(savedProvider.settingsConfig?.codexRouting).toMatchObject({
       modelDisplayStyle: "model-provider",
     });
+  });
+
+  it("enables saving again when a persisted order is changed a second time", async () => {
+    const { source, plan } = createSubagentWorkspaceFixture();
+    const persistedPlan: Provider = {
+      ...plan,
+      settingsConfig: {
+        ...plan.settingsConfig,
+        codexRouting: {
+          ...plan.settingsConfig?.codexRouting,
+          modelOrder: ["deepseek-v4-flash", "deepseek-v4-pro", "qwen3.8"],
+        },
+      },
+    };
+    renderSubagentWorkspace(source, persistedPlan);
+
+    const user = userEvent.setup();
+    await user.click(screen.getByRole("tab", { name: "模型排序" }));
+    const save = screen.getByRole("button", { name: "保存顺序" });
+    expect(save).toBeDisabled();
+
+    const rankInput = screen.getByRole("spinbutton", {
+      name: "Rank for qwen3.8",
+    });
+    await user.clear(rankInput);
+    await user.type(rankInput, "1");
+    await user.click(
+      screen.getByRole("button", { name: "Move qwen3.8 to rank 1" }),
+    );
+
+    expect(save).toBeEnabled();
+    await user.click(save);
+    await waitFor(() => expect(providersApi.update).toHaveBeenCalled());
+    const savedPlan = vi
+      .mocked(providersApi.update)
+      .mock.calls.map(([provider]) => provider)
+      .find((provider) => provider.id === persistedPlan.id);
+    expect(savedPlan?.settingsConfig?.codexRouting?.modelOrder).toEqual([
+      "qwen3.8",
+      "deepseek-v4-flash",
+      "deepseek-v4-pro",
+    ]);
   });
 
   it("persists the top model default reasoning effort on the router", async () => {
@@ -3236,8 +3358,8 @@ describe("Codex MultiRouter workspace route persistence helpers", () => {
       subagentV2: existingRouting?.subagentV2,
       spawnAgentModels: ["deepseek-v4-pro", "qwen3.8"],
     });
-    expect(savedProvider.settingsConfig?.codexRouting).not.toHaveProperty(
-      "defaultRouteId",
+    expect(savedProvider.settingsConfig?.codexRouting?.defaultRouteId).toBe(
+      existingRouting?.defaultRouteId,
     );
   });
 
@@ -4688,6 +4810,133 @@ describe("Codex MultiRouter workspace route persistence helpers", () => {
       { model: "model-a", providerName: "Sorted Source", sortIndex: 1 },
     ]);
     expect(rebuilt.spawnAgentModels).toEqual(["model-b", "model-a"]);
+  });
+
+  it("restores the router-owned global model order after the tab remounts", () => {
+    const first: Provider = {
+      id: "first-source",
+      name: "First Source",
+      category: "custom",
+      settingsConfig: {
+        modelCatalog: { models: [{ model: "first-a" }, { model: "first-b" }] },
+      },
+    };
+    const second: Provider = {
+      id: "second-source",
+      name: "Second Source",
+      category: "custom",
+      settingsConfig: {
+        modelCatalog: { models: [{ model: "second-a" }] },
+      },
+    };
+    const plan: Provider = {
+      ...createDraftRoutingPlan([first, second], [first, second]),
+      settingsConfig: {
+        codexRouting: {
+          schemaVersion: 2,
+          enabled: true,
+          modelOrder: ["second-a", "first-b", "first-a"],
+          routes: [],
+        },
+      },
+    };
+
+    const rebuilt = buildModelCatalogForRoutes(
+      plan,
+      [
+        {
+          id: "first-route",
+          enabled: true,
+          targetProviderId: first.id,
+          match: { models: [], prefixes: [] },
+          upstream: { apiFormat: "openai_responses" },
+          modelSelection: { mode: "all" },
+        },
+        {
+          id: "second-route",
+          enabled: true,
+          targetProviderId: second.id,
+          match: { models: [], prefixes: [] },
+          upstream: { apiFormat: "openai_responses" },
+          modelSelection: { mode: "all" },
+        },
+      ],
+      new Map([
+        [first.id, first],
+        [second.id, second],
+      ]),
+    );
+
+    expect(rebuilt.models.map((model) => model.model)).toEqual([
+      "second-a",
+      "first-b",
+      "first-a",
+    ]);
+  });
+
+  it("rejects an unresolved route alias before producing any partial model order update", () => {
+    const source: Provider = {
+      id: "order-source",
+      name: "Order Source",
+      category: "custom",
+      settingsConfig: {
+        modelCatalog: {
+          models: [{ model: "model-a" }, { model: "model-b" }],
+        },
+      },
+    };
+    const route = normalizeCodexRouteForSave(
+      {
+        label: source.name,
+        enabled: true,
+        targetProviderId: source.id,
+        modelSelection: { mode: "all" },
+        match: { models: ["model-a", "model-b"], prefixes: [] },
+        aliases: { "model-b": "stale-model" },
+        upstream: { auth: { source: "provider_config" } },
+      },
+      0,
+      new Set<string>(),
+    );
+    expect(() =>
+      buildModelOrderProviderUpdates(
+        [{ model: "model-b" }, { model: "model-a" }],
+        [route],
+        new Map([[source.id, source]]),
+        false,
+      ),
+    ).toThrow(/stale-model.*Order Source/);
+    expect(source.settingsConfig.modelCatalog.models).toEqual([
+      { model: "model-a" },
+      { model: "model-b" },
+    ]);
+  });
+
+  it("preserves model ordering extensions when serializing unrelated routing edits", () => {
+    const routing = readCodexRouting({
+      id: "plan",
+      name: "Plan",
+      category: "custom",
+      settingsConfig: {
+        codexRouting: {
+          schemaVersion: 2,
+          enabled: true,
+          defaultRouteId: "route-a",
+          modelDisplayStyle: "model-provider",
+          modelOrder: ["model-b", "model-a"],
+          defaultReasoningEffort: "xhigh",
+          routes: [],
+        },
+      },
+    });
+    expect(routing).not.toBeNull();
+
+    expect(serializeCodexRoutingV2(routing!)).toMatchObject({
+      modelDisplayStyle: "model-provider",
+      defaultRouteId: "route-a",
+      modelOrder: ["model-b", "model-a"],
+      defaultReasoningEffort: "xhigh",
+    });
   });
 
   it("keeps unsaved route picker enabled draft state across candidate refreshes", () => {

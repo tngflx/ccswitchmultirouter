@@ -1,5 +1,71 @@
 # Engineering Journal (newest first)
 
+## 2026-09-16 - Reaudit MultiRouter schema v2, model ordering, Sub-Agents, and Codex versions
+
+- **What happened:** Repeated model-order persistence failures exposed that routing, ordering, and Sub-Agent saves did not share a complete schema-v2 serialization contract. The installed npm Codex CLI was also one stable patch behind, raising concern that version drift caused the failures.
+- **Root cause:** The routing bugs were owned locally: global order lacked an authoritative router field, dirty state used a derived catalog, and `serializeCodexRoutingV2` dropped extensions during unrelated saves. Stale aliases could also produce partial provider updates, and the implicit default model was selected before applying user sort order. The npm CLI version drift was separate: npm Codex was 0.153.4 while stable was 0.154.0; Desktop bundled app-server was independently versioned at 0.154.0-alpha.6.2.
+- **What we did:** Added router-owned `modelOrder`, preserved all known schema-v2 fields during read/serialize, made model-order resolution atomic, sorted before choosing the implicit default, retained Sub-Agent/provider reconciliation, and added an opt-in startup Codex CLI stable updater that skips while any Codex process is running. Ported/adapted upstream model-order commit `0e6a690a0` and original npm probe commit `556bb2cab`; the schema-v2 protection (`cc52141a8`) and provider-driven Sub-Agent sync (`0dbdfd019`) were already present locally.
+- **Reference verdict:** Current `BigStrongSun/ccswitchmulti` has newer traffic/history/official-auth work but no router-owned cross-provider `modelOrder`; its serializer still drops several extensions. Open PRs #95/#97 are unrelated response/image routing and were not ported. Current `farion1231/cc-switch` contributed the npm dist-tags fix. Its merged stale-account takeover fix `15884b203` addresses deleted/recreated managed OAuth accounts, not model routing or CLI version drift; it touches a separate large auth transaction and was not ported without evidence of that incident. DeepSeek/catalog capability fixes already have equivalent fork coverage.
+- **Evidence:** `cargo check` and `pnpm typecheck` passed. MultiRouter Rust tests passed 79/79; Sub-Agent Rust tests 142/142; Sub-Agent V2 frontend tests 130/130; workspace/wizard/takeover frontend tests 157/157; automatic-update settings test 1/1; implicit-default and npm endpoint tests 1/1 each. Scoped Prettier and `git diff --check` passed. Live rebuilt Tauri acceptance was not performed.
+- **What NOT to do again:** Do not blame npm CLI patch drift for application-owned persistence bugs, do not serialize schema-v2 documents by copying only the currently edited fields, and do not apply cross-provider ordering updates until every model resolves successfully.
+
+## 2026-09-16 - Fix second-save detection and routing serializer order loss
+
+- **What happened:** After saving a model order once, changing the order again could leave Save disabled or allow an unrelated routing save to erase the saved order.
+- **Root cause:** Dirty-state comparison used the sorted catalog projection rather than the router-owned `modelOrder`, and `serializeCodexRoutingV2` rebuilt routing from only routes/subagent fields, dropping `modelOrder`, `modelDisplayStyle`, and `defaultReasoningEffort`.
+- **What we did:** Compare the draft against the router-owned persisted order, use that order for reset and save-change detection, and preserve all schema-v2 routing extension fields when serializing route/subagent edits. Added second-save and serializer regressions.
+- **Evidence:** Focused workspace tests passed 99/99 and takeover tests passed 2/2; `pnpm typecheck`, `cargo check`, Prettier, and `git diff --check` passed.
+- **What NOT to do again:** Do not derive dirty state from a derived projection when an authoritative persisted field exists, and do not rebuild a schema-v2 routing document by copying only the fields currently being edited.
+
+## 2026-09-16 - Restart Codex Desktop before applying takeover toggles
+
+- **What happened:** Toggling Codex proxy takeover often failed while Codex Desktop or its app-server was still running because the live config change could not replace the active runtime.
+- **Root cause:** The toggle wrote live configuration without owning the desktop process lifecycle, so an already-running client retained stale configuration and made the switch appear broken.
+- **What we did:** Added read-only Codex Desktop process detection using the existing Desktop-only identity rules, plus a user-confirmed restart command that terminates only verified Desktop shell processes, applies the requested takeover state, and relaunches through the existing CDP/model-picker path. The toggle now offers this recovery before changing takeover; declining confirmation leaves Codex untouched. Lowercase `codex.exe` CLI/app-server processes are never matched.
+- **Evidence:** Focused `ProxyToggle` tests passed 2/2 for confirmed restart and declined confirmation; `pnpm typecheck`, `cargo check`, scoped Prettier, and `git diff --check` passed. The restart path has not been exercised against a live Codex Desktop process in this session.
+- **What NOT to do again:** Do not silently kill a user's running desktop application, and do not broaden Desktop process matching to the lowercase CLI/app-server process.
+
+## 2026-09-16 - Persist MultiRouter model order on the router
+
+- **What happened:** A saved cross-provider model order disappeared after leaving and reopening the Model ordering tab, even though source-provider rows had received `sortIndex` values.
+- **Root cause:** Schema-v2 routers remove their derived `modelCatalog`, and `buildModelCatalogForRoutes` intentionally ignores source-provider custom order when constructing the aggregate catalog. The global order therefore had no router-owned persisted field. The schema-v2 frontend normalizer also omitted newly added routing extensions.
+- **What we did:** Added `codexRouting.modelOrder` as the authoritative global picker order. Save order now persists it on the router, the frontend aggregate restores it on remount, `readCodexRouting` preserves it, and the Rust compiler applies it to the published model catalog with dense `sortIndex` values.
+- **Evidence:** `pnpm typecheck` and `cargo check --manifest-path src-tauri/Cargo.toml` passed. Frontend remount/ranking regressions passed 2/2. Rust `router_model_order_controls_the_compiled_catalog` passed 1/1. Scoped Prettier and `git diff --check` passed.
+- **What NOT to do again:** Do not store a cross-provider aggregate preference only inside independently owned source-provider rows; persist it at the router that owns the aggregate projection.
+
+## 2026-09-16 - Preserve model order and prioritize the first provider
+
+- **What happened:** The model-order tab kept replacing the current catalog with a recommendation-derived order whenever its catalog props refreshed, and the recommendation ranking ignored the provider ordering the user sees elsewhere.
+- **Root cause:** Recommendation generation was incorrectly used as initialization logic instead of an explicit user action; provider identity was treated as a scoring detail rather than a workflow priority.
+- **What we did:** The tab now initializes and refreshes from the persisted `sortIndex` order without recomputing recommendations. Recommendations run only from the explicit button and reserve the first two ranked slots for models from the first enabled provider in the route/provider ordering, then fill remaining slots from other providers.
+- **Evidence:** `pnpm typecheck` passed; focused recommendation/search regressions passed 3/3; `git diff --check` passed. Full workspace suite is being run after this final adjustment.
+- **What NOT to do again:** Never silently reorder a user’s draft because a catalog prop changed, and never call an inferred popularity score more authoritative than the provider ordering the user explicitly chose.
+
+## 2026-09-15 - Keep filtered model search draggable and rank eight models
+
+- **What happened:** Searching the new model-order workspace disabled every drag handle, so a filtered result could not be moved into the ranked column; the ranked column also remained limited to five.
+- **Root cause:** The redesign retained the old list's `dragDisabled={Boolean(modelSearch)}` guard. Its reorder function was also based on the filtered array, so simply enabling drag would have dropped or misordered models hidden by the search.
+- **What we did:** Kept search results draggable, changed drag completion to move entries inside the complete ordered catalog, built the sortable context from the always-visible ranked entries plus filtered available entries, and expanded the ranked/recommended limit from five to eight. Updated all four locale descriptions and the search regression.
+- **Evidence:** `pnpm typecheck` passed; focused recommendation and searched-ranking tests passed 2/2 before the final formatting-only change. The complete workspace test file and formatting checks were rerun afterward.
+- **What NOT to do again:** Do not disable the primary interaction merely because a collection is filtered, and never apply a filtered reorder by replacing the full backing collection.
+
+## 2026-09-15 - Unify MultiRouter model ranking into one drag workspace
+
+- **What happened:** The model-order page rendered a separate read-only Top Models strip above another full sortable model list, forcing users to reconcile two representations of the same order.
+- **Root cause:** The top-five summary and the editing surface evolved independently even though both represented one persisted `sortIndex` sequence.
+- **What we did:** Replaced the duplicate strip/list layout with one cross-column drag workspace: ranked top five on the left and remaining available models on the right. Added a deterministic recommendation action and default draft ordering based on provider catalog order, coding fit, declared capabilities, context, recency, and provider diversity. The UI explicitly avoids claiming popularity when provider APIs expose availability but not usage.
+- **Reference verdict:** Current `BigStrongSun/ccswitchmulti` and `farion1231/cc-switch` contain no equivalent two-column ranking workspace or provider-popularity implementation. OpenRouter's public models API exposes model metadata and creation order, while its rankings page is a separate product surface; standard OpenAI-compatible `/models` responses do not provide a portable popularity field. The local recommendation layer therefore consumes only owned catalog metadata and labels its evidence honestly.
+- **Evidence:** `pnpm typecheck` passed. `CodexRouterWorkspacePage.test.ts` passed 95/95, including recommendation ordering and exact-rank persistence. Scoped Prettier and `git diff --check` passed.
+- **What NOT to do again:** Do not render a second read-only summary for an order that is already directly editable, and do not market model availability or API response order as real usage popularity.
+
+## 2026-09-15 - Defer Codex MultiRouter publication and compact third-party catalog payloads
+
+- **What happened:** Saving a Codex route-target provider synchronously rewrote the full MultiRouter catalog, cache, config, and managed Agent files before the save promise resolved.
+- **Root cause:** Provider mutation owned both SQLite persistence and derived live projection publication; enrichment also cloned official instruction payloads into matching third-party model entries.
+- **What we did:** Added a persistence-only mutation path, returned after database/profile reconciliation, and queued active-router projection publication on Tauri's blocking worker. Third-party enrichment now replaces inherited `base_instructions` with a compact parser-safe value and removes inherited `model_messages`, while official routes retain official metadata. Added focused regressions.
+- **Evidence:** `cargo check --manifest-path src-tauri/Cargo.toml` passed; the existing MultiRouter mutation suite passed 17/17. `pnpm typecheck` passed. The new catalog test could not execute because the normal `src-tauri\target\debug\cc-switch.exe` was locked (OS error 5); no process was terminated. Full suites and live runtime verification were not run.
+- **What NOT to do again:** Do not add timeouts or truncate request history to mask projection latency; keep SQLite commit and derived publication as separate ownership boundaries, and do not copy full official harness prompts into third-party catalog entries.
+
 ## 2026-09-12 - Bound Codex reasoning resolution after large automatic catalog refreshes
 
 - **What happened:** Opening a saved Codex provider backed by OpenRouter could make the entire application unresponsive when automatic model refresh returned roughly 500 models, despite the catalog editors already paging their visible rows.

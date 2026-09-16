@@ -45,13 +45,44 @@ pub fn apply_codex_provider_mutation(
     db: &Database,
     provider: Provider,
 ) -> Result<CodexProviderMutationOutcome, AppError> {
-    apply_codex_provider_mutation_with_profiles_and_publisher(db, provider, &[], |artifact| {
-        crate::codex_config::publish_codex_multirouter_projection_for_database(
-            db,
-            &artifact.projection_settings,
-        )
-        .map_err(|error| error.to_string())
-    })
+    apply_codex_provider_mutation_with_profiles_and_publisher(
+        db,
+        provider,
+        &[],
+        |artifact| {
+            crate::codex_config::publish_codex_multirouter_projection_for_database(
+                db,
+                &artifact.projection_settings,
+            )
+            .map_err(|error| error.to_string())
+        },
+        true,
+    )
+}
+
+/// Persist a Codex provider mutation without publishing the shared live
+/// projection. The caller can queue publication after the SQLite transaction
+/// has completed so the Save action is not held hostage by large generated
+/// catalogs and managed-agent reconciliation.
+pub fn apply_codex_provider_mutation_persist_only(
+    db: &Database,
+    provider: Provider,
+) -> Result<CodexProviderMutationOutcome, AppError> {
+    apply_codex_provider_mutation_persist_only_with_profiles(db, provider, &[])
+}
+
+pub fn apply_codex_provider_mutation_persist_only_with_profiles(
+    db: &Database,
+    provider: Provider,
+    profiles: &[ProtocolCompatibilityRecord],
+) -> Result<CodexProviderMutationOutcome, AppError> {
+    apply_codex_provider_mutation_with_profiles_and_publisher(
+        db,
+        provider,
+        profiles,
+        |_| Ok(ProjectionReadBack::verified(String::new())),
+        false,
+    )
 }
 
 pub fn apply_codex_provider_mutation_with_profile(
@@ -67,13 +98,19 @@ pub fn apply_codex_provider_mutation_with_profiles(
     provider: Provider,
     profiles: &[ProtocolCompatibilityRecord],
 ) -> Result<CodexProviderMutationOutcome, AppError> {
-    apply_codex_provider_mutation_with_profiles_and_publisher(db, provider, profiles, |artifact| {
-        crate::codex_config::publish_codex_multirouter_projection_for_database(
-            db,
-            &artifact.projection_settings,
-        )
-        .map_err(|error| error.to_string())
-    })
+    apply_codex_provider_mutation_with_profiles_and_publisher(
+        db,
+        provider,
+        profiles,
+        |artifact| {
+            crate::codex_config::publish_codex_multirouter_projection_for_database(
+                db,
+                &artifact.projection_settings,
+            )
+            .map_err(|error| error.to_string())
+        },
+        true,
+    )
 }
 
 pub fn apply_codex_provider_mutation_with_publisher<F>(
@@ -84,7 +121,7 @@ pub fn apply_codex_provider_mutation_with_publisher<F>(
 where
     F: FnMut(&CodexRoutingProjectionArtifact) -> Result<ProjectionReadBack, String>,
 {
-    apply_codex_provider_mutation_with_profiles_and_publisher(db, provider, &[], publish)
+    apply_codex_provider_mutation_with_profiles_and_publisher(db, provider, &[], publish, true)
 }
 
 fn apply_codex_provider_mutation_with_profiles_and_publisher<F>(
@@ -92,6 +129,7 @@ fn apply_codex_provider_mutation_with_profiles_and_publisher<F>(
     provider: Provider,
     profiles: &[ProtocolCompatibilityRecord],
     mut publish: F,
+    publish_projection: bool,
 ) -> Result<CodexProviderMutationOutcome, AppError>
 where
     F: FnMut(&CodexRoutingProjectionArtifact) -> Result<ProjectionReadBack, String>,
@@ -126,6 +164,12 @@ where
     // 模型移除时不静默删除用户配置，仍由 unroutable 状态显式呈现。
     for router_id in &affected_router_ids.subagent_profiles {
         sync_router_subagent_profiles_from_provider_catalog(db, router_id)?;
+    }
+
+    if !publish_projection {
+        return Ok(CodexProviderMutationOutcome {
+            projections: Vec::new(),
+        });
     }
 
     let active_router_id = active_codex_router_id(db)?;
@@ -690,6 +734,7 @@ mod tests {
                     artifact.dependency_fingerprint.clone(),
                 ))
             },
+            true,
         )
         .expect("save provider profile and rebuild router");
 
@@ -736,6 +781,7 @@ mod tests {
                     artifact.dependency_fingerprint.clone(),
                 ))
             },
+            true,
         )
         .expect("save provider profile without borrowing it for the route");
 
@@ -932,6 +978,26 @@ mod tests {
         assert_eq!(
             saved.settings_config["codexRouting"]["subagentV2"]["profiles"]["qwen3.9"]["enabled"],
             false
+        );
+    }
+
+    #[test]
+    fn persist_only_provider_mutation_commits_without_projection_publication() {
+        let db = Database::memory().expect("memory db");
+        db.save_provider("codex", &router("router-a", "qwen"))
+            .expect("seed router");
+        let updated = target("openai_chat");
+
+        let outcome = apply_codex_provider_mutation_persist_only(&db, updated.clone())
+            .expect("persist provider without publishing");
+
+        assert!(outcome.projections.is_empty());
+        assert_eq!(
+            db.get_provider_by_id("qwen", "codex")
+                .expect("read provider")
+                .expect("provider saved")
+                .name,
+            updated.name
         );
     }
 

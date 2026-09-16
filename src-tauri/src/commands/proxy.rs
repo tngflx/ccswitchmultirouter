@@ -260,6 +260,36 @@ pub async fn set_proxy_takeover_for_app(
         .await
 }
 
+/// Report whether the Codex Desktop shell is currently running.
+#[tauri::command]
+pub fn is_codex_desktop_running() -> Result<bool, String> {
+    crate::codex_desktop::list_running_codex_desktop_process_ids()
+        .map(|processes| !processes.is_empty())
+}
+
+/// Stop verified Codex Desktop processes and launch the remembered executable.
+///
+/// The frontend must confirm this action with the user before invoking it. This
+/// never matches lowercase `codex.exe` CLI/app-server processes.
+#[tauri::command]
+pub async fn restart_codex_desktop(
+    state: tauri::State<'_, AppState>,
+    enabled: bool,
+) -> Result<(), String> {
+    let process_ids = crate::codex_desktop::list_running_codex_desktop_process_ids()?;
+    crate::codex_desktop::terminate_running_codex_desktop_processes(&process_ids)?;
+    state
+        .proxy_service
+        .set_takeover_for_app("codex", enabled)
+        .await?;
+    if !process_ids.is_empty() {
+        crate::codex_desktop::unlock_codex_model_picker()
+            .await
+            .map(|_| ())?;
+    }
+    Ok(())
+}
+
 /// 获取代理服务器状态
 #[tauri::command]
 pub async fn get_proxy_status(state: tauri::State<'_, AppState>) -> Result<ProxyStatus, String> {

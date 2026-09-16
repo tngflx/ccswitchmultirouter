@@ -127,6 +127,15 @@ export const proxyApi = {
     return invoke("set_proxy_takeover_for_app", { appType, enabled });
   },
 
+  async isCodexDesktopRunning(): Promise<boolean> {
+    return invoke("is_codex_desktop_running");
+  },
+
+  /// Requires explicit user confirmation before termination and relaunch.
+  async restartCodexDesktop(enabled: boolean): Promise<void> {
+    return invoke("restart_codex_desktop", { enabled });
+  },
+
   // ========== Legacy 代理配置 API (兼容) ==========
 
   // 获取代理配置（旧版 v2 兼容接口）

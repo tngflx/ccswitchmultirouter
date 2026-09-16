@@ -16,6 +16,7 @@ import {
   Stethoscope,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import { Switch } from "@/components/ui/switch";
 import {
   Select,
   SelectContent,
@@ -240,6 +241,8 @@ export function AboutSection({ isPortable }: AboutSectionProps) {
     null,
   );
   const [showInstallCommands, setShowInstallCommands] = useState(false);
+  const [autoUpdateCodexCli, setAutoUpdateCodexCli] = useState(false);
+  const [isSavingCodexAutoUpdate, setIsSavingCodexAutoUpdate] = useState(false);
 
   const { hasUpdate, updateInfo, checkUpdate, resetDismiss, isChecking } =
     useUpdate();
@@ -421,6 +424,17 @@ export function AboutSection({ isPortable }: AboutSectionProps) {
 
     void loadAppVersion();
     void loadAllToolVersions();
+    void settingsApi
+      .get()
+      .then((settings) =>
+        setAutoUpdateCodexCli(settings.autoUpdateCodexCli === true),
+      )
+      .catch((error) =>
+        console.error(
+          "[AboutSection] Failed to load Codex update policy",
+          error,
+        ),
+      );
     return () => {
       active = false;
     };
@@ -429,6 +443,33 @@ export function AboutSection({ isPortable }: AboutSectionProps) {
     // refreshes are handled by refreshToolVersions in the shell/flag handlers.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  const handleCodexAutoUpdateChange = useCallback(
+    async (enabled: boolean) => {
+      setIsSavingCodexAutoUpdate(true);
+      try {
+        const settings = await settingsApi.get();
+        await settingsApi.save({ ...settings, autoUpdateCodexCli: enabled });
+        setAutoUpdateCodexCli(enabled);
+        toast.success(
+          t(
+            enabled
+              ? "settings.codexAutoUpdateEnabled"
+              : "settings.codexAutoUpdateDisabled",
+          ),
+          { closeButton: true },
+        );
+      } catch (error) {
+        toast.error(t("settings.codexAutoUpdateFailed"), {
+          description: extractErrorMessage(error) || undefined,
+          closeButton: true,
+        });
+      } finally {
+        setIsSavingCodexAutoUpdate(false);
+      }
+    },
+    [t],
+  );
 
   // ... (handlers like handleOpenReleaseNotes, handleCheckUpdate) ...
 
@@ -997,6 +1038,24 @@ export function AboutSection({ isPortable }: AboutSectionProps) {
       </motion.div>
 
       <div className="space-y-3">
+        <div className="flex items-center justify-between gap-4 rounded-md border border-border bg-muted/30 px-3 py-2">
+          <div className="min-w-0">
+            <div className="text-sm font-medium">
+              {t("settings.codexAutoUpdate")}
+            </div>
+            <p className="mt-0.5 text-xs text-muted-foreground">
+              {t("settings.codexAutoUpdateHint")}
+            </p>
+          </div>
+          <Switch
+            checked={autoUpdateCodexCli}
+            disabled={isSavingCodexAutoUpdate}
+            onCheckedChange={(enabled) =>
+              void handleCodexAutoUpdateChange(enabled)
+            }
+            aria-label={t("settings.codexAutoUpdate")}
+          />
+        </div>
         <div className="flex flex-col gap-2 px-1 sm:flex-row sm:items-center sm:justify-between">
           <h3 className="text-sm font-medium">{t("settings.localEnvCheck")}</h3>
           <div className="flex flex-wrap items-center gap-2">

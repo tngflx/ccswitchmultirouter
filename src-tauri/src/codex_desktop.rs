@@ -1101,7 +1101,7 @@ pub(crate) async fn summarize_and_restart_codex_session(
                 let reason = value
                     .get("reason")
                     .and_then(Value::as_str)
-                .unwrap_or("Codex Desktop did not start manual summarization");
+                    .unwrap_or("Codex Desktop did not start manual summarization");
                 diagnostics.push(format!("target {}: {reason}", target.id));
                 continue;
             }
@@ -1733,6 +1733,80 @@ pub(crate) fn detect_running_codex_main_process() -> Option<PathBuf> {
     {
         None
     }
+}
+
+/// 列出当前运行中的 Codex Desktop 主进程。只返回 Desktop shell，不包含小写
+/// `codex.exe` CLI/app-server，避免把正在服务的后端进程当成桌面应用结束。
+#[cfg(target_os = "windows")]
+pub(crate) fn list_running_codex_desktop_process_ids() -> Result<Vec<u32>, String> {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x08000000;
+    let script = r#"
+Get-CimInstance Win32_Process -Filter "Name = 'Codex.exe' OR Name = 'ChatGPT.exe'" |
+  Where-Object {
+    if (-not $_.ExecutablePath -or $_.CommandLine -match ' --type=') { return $false }
+    $leaf = Split-Path -Leaf $_.ExecutablePath
+    $legacyCodex = $leaf -ceq 'Codex.exe'
+    $unifiedCodex = $leaf -ceq 'ChatGPT.exe' -and $_.ExecutablePath -match '\\WindowsApps\\OpenAI\.Codex(?:\.Preview)?_'
+    return $legacyCodex -or $unifiedCodex
+  } |
+  Select-Object -ExpandProperty ProcessId
+"#;
+    let output = Command::new("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-Command", script])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .map_err(|error| format!("failed to inspect Codex Desktop processes: {error}"))?;
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
+    }
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| line.trim().parse::<u32>().ok())
+        .collect())
+}
+
+/// 结束已验证身份的 Codex Desktop 主进程及其子进程。
+///
+/// 调用方必须先获得用户明确确认；不会匹配小写 `codex.exe` CLI/app-server。
+#[cfg(target_os = "windows")]
+pub(crate) fn terminate_running_codex_desktop_processes(
+    expected_ids: &[u32],
+) -> Result<u32, String> {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x08000000;
+    let running = list_running_codex_desktop_process_ids()?;
+    let verified = expected_ids
+        .iter()
+        .copied()
+        .filter(|pid| running.contains(pid))
+        .collect::<Vec<_>>();
+    for pid in &verified {
+        let output = Command::new("taskkill")
+            .args(["/PID", &pid.to_string(), "/T", "/F"])
+            .creation_flags(CREATE_NO_WINDOW)
+            .output()
+            .map_err(|error| format!("failed to stop Codex Desktop PID {pid}: {error}"))?;
+        if !output.status.success() {
+            return Err(format!(
+                "failed to stop Codex Desktop PID {pid}: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+    }
+    Ok(verified.len() as u32)
+}
+
+#[cfg(not(target_os = "windows"))]
+pub(crate) fn list_running_codex_desktop_process_ids() -> Result<Vec<u32>, String> {
+    Ok(Vec::new())
+}
+
+#[cfg(not(target_os = "windows"))]
+pub(crate) fn terminate_running_codex_desktop_processes(
+    _expected_ids: &[u32],
+) -> Result<u32, String> {
+    Ok(0)
 }
 
 /// 按常见安装位置寻找 Codex Desktop 可执行文件。
@@ -2834,9 +2908,7 @@ mod tests {
         let script = build_model_picker_unlock_script(&CodexModelCatalogProjection::empty());
 
         assert!(script.contains("const rendererSchedulerVersion = \"2\""));
-        assert!(script.contains(
-            "if (state.runPromise) return await state.runPromise"
-        ));
+        assert!(script.contains("if (state.runPromise) return await state.runPromise"));
         assert!(script.contains("state.nextConversationRuntimeScanAt = wallNow + 30000"));
         assert!(!script.contains("document.querySelectorAll(\"*\")"));
 

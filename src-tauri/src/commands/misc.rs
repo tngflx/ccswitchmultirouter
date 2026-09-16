@@ -205,6 +205,53 @@ pub async fn run_tool_lifecycle_action(
     .map_err(|e| format!("tool lifecycle task join error: {e}"))?
 }
 
+fn codex_process_is_running() -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        return std::process::Command::new("powershell")
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "(Get-CimInstance Win32_Process -Filter \"Name = 'codex.exe' OR Name = 'Codex.exe' OR Name = 'ChatGPT.exe'\" | Select-Object -First 1) -ne $null",
+            ])
+            .creation_flags(CREATE_NO_WINDOW)
+            .output()
+            .ok()
+            .is_some_and(|output| {
+                output.status.success()
+                    && String::from_utf8_lossy(&output.stdout)
+                        .trim()
+                        .eq_ignore_ascii_case("true")
+            });
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        false
+    }
+}
+
+pub(crate) async fn auto_update_codex_cli_if_needed() -> Result<bool, String> {
+    if codex_process_is_running() {
+        log::info!("Skipping automatic Codex CLI update because Codex is running");
+        return Ok(false);
+    }
+    let current = get_single_tool_version_impl("codex", None, None).await;
+    let (Some(version), Some(latest)) = (
+        current.version.as_deref(),
+        current.latest_version.as_deref(),
+    ) else {
+        return Ok(false);
+    };
+    if compare_semver(version, latest) != Some(std::cmp::Ordering::Less) {
+        return Ok(false);
+    }
+    run_tool_lifecycle_action(vec!["codex".to_string()], "update".to_string(), None).await?;
+    Ok(true)
+}
+
 /// 静默执行工具安装/更新脚本：直接捕获子进程输出并阻塞到命令真正结束，
 /// 不再弹出可见终端窗口（与 `launch_terminal_running` 的"开窗即返回"形成对比，
 /// 后者仍保留给 provider 切换等需要交互式终端的场景）。
@@ -945,15 +992,27 @@ fn pick_latest_version(
     Some(best)
 }
 
+fn npm_dist_tags_url(package: &str) -> String {
+    format!(
+        "https://registry.npmjs.org/-/package/{}/dist-tags",
+        package.replace('/', "%2f")
+    )
+}
+
 /// 拉取 npm 包的完整 dist-tags(单次请求即含 latest/next/beta/...)。
 async fn fetch_npm_dist_tags(
     client: &reqwest::Client,
     package: &str,
 ) -> Option<serde_json::Map<String, serde_json::Value>> {
-    let url = format!("https://registry.npmjs.org/{package}");
-    let resp = client.get(&url).send().await.ok()?;
-    let json = resp.json::<serde_json::Value>().await.ok()?;
-    json.get("dist-tags")?.as_object().cloned()
+    let resp = client
+        .get(npm_dist_tags_url(package))
+        .timeout(LATEST_PROBE_TIMEOUT)
+        .send()
+        .await
+        .ok()?;
+    resp.json::<serde_json::Map<String, serde_json::Value>>()
+        .await
+        .ok()
 }
 
 /// 查询某 npm 工具要展示的"最新版本":取 `latest`,并在本地版本领先时按工具的
@@ -5146,6 +5205,18 @@ mod tests {
         assert_eq!(
             pick_latest_version(map, &["next"], None),
             Some("2.1.154".to_string())
+        );
+    }
+
+    #[test]
+    fn npm_dist_tags_url_uses_the_small_dedicated_endpoint() {
+        assert_eq!(
+            npm_dist_tags_url("openclaw"),
+            "https://registry.npmjs.org/-/package/openclaw/dist-tags"
+        );
+        assert_eq!(
+            npm_dist_tags_url("@openai/codex"),
+            "https://registry.npmjs.org/-/package/@openai%2fcodex/dist-tags"
         );
     }
 

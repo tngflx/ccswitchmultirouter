@@ -1344,6 +1344,17 @@ pub fn run() {
 
                 initialize_common_config_snippets(&state);
 
+                let startup_settings = crate::settings::get_settings();
+                if startup_settings.auto_update_codex_cli {
+                    match crate::commands::auto_update_codex_cli_if_needed().await {
+                        Ok(true) => log::info!("Codex CLI automatic stable update completed"),
+                        Ok(false) => {}
+                        Err(error) => {
+                            log::warn!("Codex CLI automatic update failed; startup continues: {error}")
+                        }
+                    }
+                }
+
                 // Restore the listener and live takeover before launching Codex.
                 // The app-server freezes request-local provider/feature state at startup;
                 // launching it against an unrecovered config creates a stale runtime even
@@ -1359,8 +1370,8 @@ pub fn run() {
                     false
                 };
 
-                let launch_codex_desktop_with_ccswitch = crate::settings::get_settings()
-                    .launch_codex_desktop_with_ccswitch;
+                let launch_codex_desktop_with_ccswitch =
+                    startup_settings.launch_codex_desktop_with_ccswitch;
                 if launch_codex_desktop_with_ccswitch && !codex_takeover_ready {
                     log::error!(
                         "Codex 启动门禁未通过：代理接管或 Live 配置恢复未完成，已阻止自动启动 Codex Desktop"
@@ -1731,6 +1742,8 @@ pub fn run() {
             commands::stop_proxy_with_restore,
             commands::get_proxy_takeover_status,
             commands::set_proxy_takeover_for_app,
+            commands::is_codex_desktop_running,
+            commands::restart_codex_desktop,
             commands::get_proxy_status,
             commands::diagnose_codex_multirouter,
             commands::get_request_health_diagnostics,

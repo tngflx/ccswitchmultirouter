@@ -209,6 +209,7 @@ pub fn compile_v2(
             });
         }
     }
+    apply_router_model_order(plan, &mut model_catalog);
 
     let routes = plan
         .routes
@@ -260,6 +261,35 @@ pub fn compile_v2(
         dependency_fingerprint,
         warnings,
     })
+}
+
+fn apply_router_model_order(
+    plan: &CodexRoutingConfigV2,
+    model_catalog: &mut Vec<CompiledCodexModel>,
+) {
+    let Some(model_order) = plan.extensions.get("modelOrder").and_then(Value::as_array) else {
+        return;
+    };
+    let ranks = model_order
+        .iter()
+        .filter_map(Value::as_str)
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
+        .enumerate()
+        .map(|(rank, model)| (model.to_ascii_lowercase(), rank))
+        .collect::<HashMap<_, _>>();
+    if ranks.is_empty() {
+        return;
+    }
+    model_catalog.sort_by_key(|model| {
+        ranks
+            .get(&model.visible_model.to_ascii_lowercase())
+            .copied()
+            .unwrap_or(usize::MAX)
+    });
+    for (sort_index, model) in model_catalog.iter_mut().enumerate() {
+        model.sort_index = Some(sort_index);
+    }
 }
 
 fn collect_candidates<'a>(
@@ -821,6 +851,7 @@ fn dependency_fingerprint(
         "enabled": plan.enabled,
         "defaultRouteId": plan.default_route_id,
         "modelDisplayStyle": plan.extensions.get("modelDisplayStyle"),
+        "modelOrder": plan.extensions.get("modelOrder"),
         "routes": plan.routes,
     });
     let effective_models =
@@ -972,6 +1003,49 @@ mod tests {
 
         assert_eq!(compiled.model_catalog[0].api_format, "openai_responses");
         assert_eq!(compiled.model_catalog[0].api_format_source, "provider");
+    }
+
+    #[test]
+    fn router_model_order_controls_the_compiled_catalog() {
+        let first = provider(
+            "first",
+            "First",
+            "openai_responses",
+            json!([{"model": "first-a"}, {"model": "first-b"}]),
+        );
+        let second = provider(
+            "second",
+            "Second",
+            "openai_responses",
+            json!([{"model": "second-a"}]),
+        );
+        let mut routing_plan = plan(vec![
+            route("first-route", "first", CodexModelSelection::All),
+            route("second-route", "second", CodexModelSelection::All),
+        ]);
+        routing_plan.extensions.insert(
+            "modelOrder".to_string(),
+            json!(["second-a", "first-b", "first-a"]),
+        );
+
+        let compiled = compile(&routing_plan, [first, second]);
+
+        assert_eq!(
+            compiled
+                .model_catalog
+                .iter()
+                .map(|model| model.visible_model.as_str())
+                .collect::<Vec<_>>(),
+            vec!["second-a", "first-b", "first-a"]
+        );
+        assert_eq!(
+            compiled
+                .model_catalog
+                .iter()
+                .map(|model| model.sort_index)
+                .collect::<Vec<_>>(),
+            vec![Some(0), Some(1), Some(2)]
+        );
     }
 
     #[test]
