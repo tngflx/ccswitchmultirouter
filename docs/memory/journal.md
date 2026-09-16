@@ -1,5 +1,13 @@
 # Engineering Journal (newest first)
 
+## 2026-09-17 - Encode the non-disruptive Tauri capture path so audits stop getting stuck
+
+- **What happened:** A live Tauri UI audit stalled when the running `cc-switch.exe` was hidden to tray; `PrintWindow` returned a uniform surface and the WebView2 renderer child was not exposed through child-window enumeration. The process was healthy and actively proxying, so the app itself was not broken.
+- **Root cause:** Tauri closes to tray via `prevent_close` + `window.hide()` (`src-tauri/src/lib.rs`), and a hidden WebView2 compositor does not paint into `PrintWindow` captures. The working Win32 recipe existed only in transcripts, not as a runnable repo artifact.
+- **What we did:** Added `scripts/capture-tauri-window.ps1`: locates the `cc-switch` process, prefers a WebView2/Chrome renderer window, captures via `PrintWindow` with `PW_RENDERFULLCONTENT`, verifies the image is non-blank (sampled unique colors + non-white ratio), and can never activate, restore, move, resize, or send input. Added `AGENTS.md` rule 22-D referencing the helper and the hidden-window failure mode.
+- **Evidence:** `pwsh -File scripts\capture-tauri-window.ps1` correctly exits non-zero against the running tray-hidden app with `No visible candidate window was found ... The app may be hidden to tray`. Git diff is limited to `AGENTS.md`, `scripts/capture-tauri-window.ps1`, and this journal.
+- **What NOT to do again:** Do not rediscover Win32 capture each audit; do not treat a blank `PrintWindow` capture as page evidence; do not restore a hidden window without the user's explicit permission.
+
 ## 2026-09-16 - Reaudit MultiRouter schema v2, model ordering, Sub-Agents, and Codex versions
 
 - **What happened:** Repeated model-order persistence failures exposed that routing, ordering, and Sub-Agent saves did not share a complete schema-v2 serialization contract. The installed npm Codex CLI was also one stable patch behind, raising concern that version drift caused the failures.

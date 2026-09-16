@@ -120,6 +120,10 @@ present an older binary as evidence for the new source.
 
 22-C. **Escalate before disruption.** If verification truly requires focus changes, visible navigation, window-state changes, or foreground input, explain the exact action and ask for permission immediately before doing it. A failed stealth attempt does not grant permission to become disruptive.
 
+22-D. **Use the reusable capture helper instead of rediscovering Win32.** For any live Tauri UI audit on Windows, run:
+    `pwsh -NoProfile -ExecutionPolicy Bypass -File scripts\capture-tauri-window.ps1`
+    The helper locates the `cc-switch` process, prefers the WebView2 renderer child, captures with read-only `PrintWindow` (`PW_RENDERFULLCONTENT`), and exits non-zero when the result is blank. BEWARE: `PrintWindow` results are data, not evidence; a hidden/minimized-to-tray WebView2 compositor returns a uniform surface. The helper never calls `ShowWindow`, never activates, and never moves or resizes the window; if it says the app is hidden, ask the user to open the app instead of working around it. After a successful capture, verify the text by OCR/UI Automation or report that only pixels were checked; never claim a blank capture proves a page state. A subtle but critical distinction: a blank capture means the window is not compositing, not that the page is empty.
+
 ## CODEBASE STRUCTURE
 
 ### Backend (Rust — `src-tauri/`)
