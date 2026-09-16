@@ -12,6 +12,11 @@ export interface ProviderSortUpdate {
   sortIndex: number;
 }
 
+export interface CodexModelOrderEntry {
+  model: string;
+  sortIndex: number | null;
+}
+
 export interface ProviderSwitchEvent {
   appType: AppId;
   providerId: string;
@@ -235,6 +240,16 @@ export const providersApi = {
       app: appId,
       originalId,
       ...(skipAutomaticProbe !== undefined ? { skipAutomaticProbe } : {}),
+    });
+  },
+
+  async updateCodexModelOrder(
+    providerId: string,
+    entries: CodexModelOrderEntry[],
+  ): Promise<boolean> {
+    return await invoke("update_codex_provider_model_order", {
+      providerId,
+      entries,
     });
   },
 

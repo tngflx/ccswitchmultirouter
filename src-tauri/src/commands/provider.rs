@@ -7,7 +7,8 @@ use crate::commands::xai_oauth::XaiOAuthState;
 use crate::error::AppError;
 use crate::provider::{ClaudeDesktopMode, Provider};
 use crate::services::{
-    EndpointLatency, ProviderService, ProviderSortUpdate, SpeedtestService, SwitchResult,
+    CodexModelOrderEntry, EndpointLatency, ProviderService, ProviderSortUpdate, SpeedtestService,
+    SwitchResult,
 };
 use crate::store::AppState;
 use std::{future::Future, str::FromStr};
@@ -78,6 +79,7 @@ pub async fn update_provider(
     #[allow(non_snake_case)] skipAutomaticProbe: Option<bool>,
 ) -> Result<bool, String> {
     let app_type = AppType::from_str(&app).map_err(|e| e.to_string())?;
+    let provider_id = provider.id.clone();
     // See add_provider: ordinary saves are persistence-only. The legacy flag
     // cannot accidentally turn a Save button into a network operation.
     let _ = skipAutomaticProbe;
@@ -88,7 +90,26 @@ pub async fn update_provider(
         provider,
         &[],
     )
-    .map_err(|e| e.to_string())
+    .map_err(|error| {
+        log::warn!(
+            "Provider update failed: app={}, provider_id={}, original_id={}, error={}",
+            app,
+            provider_id,
+            originalId.as_deref().unwrap_or(&provider_id),
+            error
+        );
+        error.to_string()
+    })
+}
+
+#[tauri::command]
+pub fn update_codex_provider_model_order(
+    state: State<'_, AppState>,
+    #[allow(non_snake_case)] providerId: String,
+    entries: Vec<CodexModelOrderEntry>,
+) -> Result<bool, String> {
+    ProviderService::update_codex_provider_model_order(state.inner(), &providerId, &entries)
+        .map_err(|error| error.to_string())
 }
 
 async fn resolve_automatic_probe_outcome<F, Fut>(

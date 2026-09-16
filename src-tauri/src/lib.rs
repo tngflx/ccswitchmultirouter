@@ -1515,6 +1515,7 @@ pub fn run() {
             commands::get_current_provider,
             commands::add_provider,
             commands::update_provider,
+            commands::update_codex_provider_model_order,
             commands::update_codex_subagent_v2,
             commands::initialize_codex_subagent_v2,
             commands::reconcile_codex_subagent_v2_profiles,

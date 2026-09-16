@@ -45,6 +45,13 @@ use live::{
 };
 use usage::validate_usage_script;
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexModelOrderEntry {
+    pub model: String,
+    pub sort_index: Option<u32>,
+}
+
 /// The built-in Codex official provider is safe to select during takeover:
 /// Codex keeps ownership of its ChatGPT login and the proxy only forwards the
 /// authenticated request. Other official providers retain the existing block.
@@ -4236,9 +4243,133 @@ requires_openai_auth = true
             "generated Codex Provider deletion must not leave a dangling V2 route"
         );
     }
+
+    #[test]
+    fn codex_model_order_patch_preserves_latest_provider_credentials() {
+        with_test_home(|state, _home| {
+            let provider = Provider::with_id(
+                "openrouter".to_string(),
+                "OpenRouter".to_string(),
+                json!({
+                    "auth": {"OPENAI_API_KEY": "newly-corrected-key"},
+                    "base_url": "https://openrouter.ai/api/v1",
+                    "apiFormat": "openai_chat",
+                    "modelCatalog": {
+                        "models": [
+                            {"model": "model-a", "sortIndex": 8},
+                            {"model": "model-b", "sortIndex": 9}
+                        ]
+                    }
+                }),
+                None,
+            );
+            state
+                .db
+                .save_provider(AppType::Codex.as_str(), &provider)
+                .expect("save provider with latest credential");
+
+            ProviderService::update_codex_provider_model_order(
+                state,
+                "openrouter",
+                &[
+                    CodexModelOrderEntry {
+                        model: "model-a".to_string(),
+                        sort_index: Some(1),
+                    },
+                    CodexModelOrderEntry {
+                        model: "model-b".to_string(),
+                        sort_index: None,
+                    },
+                ],
+            )
+            .expect("patch model order");
+
+            let saved = state
+                .db
+                .get_provider_by_id("openrouter", AppType::Codex.as_str())
+                .expect("read provider")
+                .expect("provider exists");
+            assert_eq!(
+                saved.settings_config["auth"]["OPENAI_API_KEY"],
+                "newly-corrected-key"
+            );
+            assert_eq!(
+                saved.settings_config["base_url"],
+                "https://openrouter.ai/api/v1"
+            );
+            assert_eq!(saved.settings_config["apiFormat"], "openai_chat");
+            assert_eq!(
+                saved.settings_config["modelCatalog"]["models"][0]["sortIndex"],
+                1
+            );
+            assert!(saved.settings_config["modelCatalog"]["models"][1]
+                .get("sortIndex")
+                .is_none());
+        });
+    }
 }
 
 impl ProviderService {
+    /// Patch only model ordering on the latest persisted Codex provider.
+    ///
+    /// Workspace tabs keep cached provider projections for editing. Accepting a
+    /// complete Provider from those tabs can restore stale credentials while the
+    /// user is only changing model order, so this mutation owns a narrow field set.
+    pub fn update_codex_provider_model_order(
+        state: &AppState,
+        provider_id: &str,
+        entries: &[CodexModelOrderEntry],
+    ) -> Result<bool, AppError> {
+        let mut provider = state
+            .db
+            .get_provider_by_id(provider_id, AppType::Codex.as_str())?
+            .ok_or_else(|| {
+                AppError::InvalidInput(format!("Codex provider '{provider_id}' does not exist"))
+            })?;
+        let models = provider
+            .settings_config
+            .pointer_mut("/modelCatalog/models")
+            .and_then(Value::as_array_mut)
+            .ok_or_else(|| {
+                AppError::InvalidInput(format!(
+                    "Codex provider '{provider_id}' has no model catalog"
+                ))
+            })?;
+
+        let requested = entries
+            .iter()
+            .map(|entry| (entry.model.trim().to_ascii_lowercase(), entry.sort_index))
+            .collect::<std::collections::HashMap<_, _>>();
+        for model in models {
+            let Some(model_id) = model
+                .get("model")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|model| !model.is_empty())
+                .map(str::to_ascii_lowercase)
+            else {
+                continue;
+            };
+            let Some(sort_index) = requested.get(&model_id) else {
+                continue;
+            };
+            let Some(object) = model.as_object_mut() else {
+                continue;
+            };
+            match sort_index {
+                Some(sort_index) => {
+                    object.insert("sortIndex".to_string(), Value::from(*sort_index));
+                }
+                None => {
+                    object.remove("sortIndex");
+                    object.remove("sort_index");
+                }
+            }
+        }
+
+        Self::update(state, AppType::Codex, Some(provider_id), provider)
+    }
+
     fn normalize_provider_if_claude(app_type: &AppType, provider: &mut Provider) {
         if matches!(app_type, AppType::Claude) {
             let mut v = provider.settings_config.clone();

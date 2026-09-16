@@ -36,6 +36,7 @@ import {
   Clipboard,
   Database,
   FileClock,
+  FolderOpen,
   GitFork,
   GitBranch,
   GripVertical,
@@ -75,6 +76,8 @@ import {
   TooltipTrigger,
 } from "@/components/ui/tooltip";
 import { providersApi } from "@/lib/api";
+import { settingsApi } from "@/lib/api/settings";
+import { reportFrontendError } from "@/lib/frontendLogger";
 import type {
   CodexMultiRouterMigrationPreview,
   CodexRoutingProjectionStatus,
@@ -370,6 +373,51 @@ function routeAliasesText(aliases?: Record<string, string>): string {
 
 function collectProviderCanonicalModelIds(provider?: Provider): string[] {
   return provider ? collectProviderModelIds(provider) : [];
+}
+
+function normalizedProviderAliasSuffix(provider: Provider): string {
+  return provider.name
+    .trim()
+    .toLocaleLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+}
+
+function findProviderCatalogModelIndex(
+  models: CodexCatalogModel[],
+  visibleModel: string,
+  canonicalModel: string,
+  provider: Provider,
+): number {
+  const candidates = new Set(
+    [canonicalModel === visibleModel ? visibleModel : canonicalModel]
+      .map((value) => value.trim().toLocaleLowerCase())
+      .filter(Boolean),
+  );
+  const exactIndex = models.findIndex(
+    (model) =>
+      model.enabled !== false &&
+      [model.model, model.upstreamModel, model.upstream_model].some((value) =>
+        value ? candidates.has(value.trim().toLocaleLowerCase()) : false,
+      ),
+  );
+  if (exactIndex >= 0) return exactIndex;
+
+  // Collision-resolved visible ids are generated as `<upstream>-<provider>`.
+  // Recover the owning catalog row before rejecting an otherwise valid order.
+  const suffix = normalizedProviderAliasSuffix(provider);
+  if (!suffix || !visibleModel.toLocaleLowerCase().endsWith(`-${suffix}`)) {
+    return -1;
+  }
+  const baseVisible = visibleModel.slice(0, -(suffix.length + 1)).trim();
+  return models.findIndex(
+    (model) =>
+      model.enabled !== false &&
+      [model.model, model.upstreamModel, model.upstream_model].some(
+        (value) =>
+          value?.trim().toLocaleLowerCase() === baseVisible.toLocaleLowerCase(),
+      ),
+  );
 }
 
 // 编辑草稿必须保持持久化 route 的身份字段不变。展示名由渲染层解析，不能借
@@ -2305,9 +2353,16 @@ export function normalizeCodexRoutesForVisibleModelAliases(
       nextModelMapEntries.length > 0
         ? Object.fromEntries(nextModelMapEntries)
         : undefined;
+    const retainedAliases = Object.fromEntries(
+      Object.entries(route.aliases ?? {}).filter(
+        ([, upstreamModel]) =>
+          targetModelByUpstream.has(upstreamModel.trim().toLowerCase()) ||
+          targetModelByVisible.has(upstreamModel.trim().toLowerCase()),
+      ),
+    );
     const nextAliases = {
       ...(nextModelMap ?? {}),
-      ...(route.aliases ?? {}),
+      ...retainedAliases,
     };
     const { modelMap: _modelMap, ...upstreamWithoutModelMap } =
       route.upstream ?? {};
@@ -5080,13 +5135,11 @@ export function buildModelOrderProviderUpdates(
         continue;
       }
       const sourceModels = readCodexModelCatalog(source).models;
-      const sourceIndex = sourceModels.findIndex(
-        (model) =>
-          model.enabled !== false &&
-          [model.model, model.upstreamModel, model.upstream_model].some(
-            (value) =>
-              value?.trim().toLowerCase() === canonicalModel.toLowerCase(),
-          ),
+      const sourceIndex = findProviderCatalogModelIndex(
+        sourceModels,
+        visibleModel,
+        canonicalModel,
+        source,
       );
       if (sourceIndex < 0) {
         unresolvedProviderNames.add(source.name || targetProviderId);
@@ -5443,6 +5496,8 @@ export function ModelOrderTab({
     setIsSaving(true);
     setMessage(null);
     setError(null);
+    let saveStage = "validate-model-order";
+    let sourceProviderIds: string[] = [];
     try {
       const orderedModels = reset
         ? catalog.models.slice()
@@ -5486,10 +5541,23 @@ export function ModelOrderTab({
             reset,
           )
         : new Map<string, Provider>();
+      sourceProviderIds = Array.from(updates.keys());
+      const currentRouting = readCodexRouting(selectedPlan);
+      const normalizedRouting = currentRouting
+        ? serializeCodexRoutingV2({
+            ...currentRouting,
+            routes: normalizeCodexRoutesForVisibleModelAliases(
+              selectedPlan,
+              currentRouting.routes ?? [],
+              providersById,
+            ),
+          })
+        : selectedPlan.settingsConfig?.codexRouting;
       // Schema-v2 modelCatalog is derived and removed by the backend mutation
       // layer. Persist a changed preference in the owned routing document first;
       // subsequent provider updates then reconcile against this newest router.
       if (styleDirty || effortDirty || persistOrder) {
+        saveStage = "save-router";
         await providersApi.update(
           {
             ...selectedPlan,
@@ -5497,7 +5565,7 @@ export function ModelOrderTab({
               ...selectedPlan.settingsConfig,
               codexRouting: {
                 ...codexRoutingWithModelOrder(
-                  selectedPlan.settingsConfig?.codexRouting,
+                  normalizedRouting,
                   reset
                     ? []
                     : models
@@ -5513,7 +5581,15 @@ export function ModelOrderTab({
         );
       }
       for (const provider of updates.values()) {
-        await providersApi.update(provider, "codex");
+        saveStage = `save-source:${provider.id}`;
+        await providersApi.updateCodexModelOrder(
+          provider.id,
+          readCodexModelCatalog(provider).models.map((model) => ({
+            model: model.model,
+            sortIndex:
+              typeof model.sortIndex === "number" ? model.sortIndex : null,
+          })),
+        );
       }
       setDraftModels(models);
       setMessage(
@@ -5528,8 +5604,20 @@ export function ModelOrderTab({
               arg0: models.length,
             }),
       );
+      saveStage = "refresh-providers";
       await queryClient.invalidateQueries({ queryKey: ["providers", "codex"] });
     } catch (saveError) {
+      reportFrontendError(
+        "Codex model ordering save failed",
+        saveError,
+        [
+          `stage=${saveStage}`,
+          `planId=${selectedPlan.id}`,
+          `sourceProviderIds=${sourceProviderIds.join(",")}`,
+          `modelCount=${draftModels.length}`,
+          `reset=${reset}`,
+        ].join("; "),
+      );
       setError(
         tr("codexRouterWorkspace.s129", {
           defaultValue: "保存模型顺序失败：{{arg0}}",
@@ -6005,7 +6093,21 @@ export function ModelOrderTab({
         </p>
       ) : null}
       {error ? (
-        <p className="mt-3 text-xs text-rose-700 dark:text-rose-200">{error}</p>
+        <div className="mt-3 flex flex-wrap items-center gap-2 text-xs text-rose-700 dark:text-rose-200">
+          <p>{error}</p>
+          <Button
+            type="button"
+            size="sm"
+            variant="outline"
+            className="h-7 gap-1.5"
+            onClick={() => void settingsApi.openLogDir()}
+          >
+            <FolderOpen className="h-3.5 w-3.5" />
+            {tr("settings.advanced.logConfig.openLogDirectory", {
+              defaultValue: "Open Log Directory",
+            })}
+          </Button>
+        </div>
       ) : null}
     </section>
   );

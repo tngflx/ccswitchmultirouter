@@ -368,6 +368,17 @@ fn retryable_failure_affects_provider_health(provider: &Provider, error: &ProxyE
     if matches!(error, ProxyError::AdmissionQueueTimeout { .. }) {
         return false;
     }
+    // A terminal quota response can still fail over to another provider, but it
+    // describes this credential's allowance rather than upstream availability.
+    // Counting it as a health failure opens the circuit after concurrent Codex
+    // retries and replaces the real quota cause with NoAvailableProvider.
+    if matches!(
+        error,
+        ProxyError::UpstreamError { body: Some(body), .. }
+            if is_terminal_codex_quota_error(Some(body))
+    ) {
+        return false;
+    }
     provider_codex_pool_account(provider).is_none()
         || matches!(
             classify_codex_pool_attempt(error),
@@ -9149,6 +9160,38 @@ mod tests {
             &pool,
             &ProxyError::ConfigError("route configuration".to_string()),
         ));
+    }
+
+    #[test]
+    fn terminal_quota_failures_do_not_open_provider_circuits() {
+        let pool = test_codex_pool_candidate("acc-a", 7);
+        let direct = test_codex_official_provider();
+        let forwarder = test_forwarder(Duration::ZERO, Duration::ZERO);
+
+        for error in [
+            ProxyError::UpstreamError {
+                status: 429,
+                body: Some(
+                    r#"error: code=429 reason="DAILY_LIMIT_EXCEEDED" message="daily usage limit exceeded" metadata=map[]"#
+                        .to_string(),
+                ),
+            },
+            ProxyError::UpstreamError {
+                status: 402,
+                body: Some(
+                    r#"{"error":{"message":"daily usage limit exceeded","type":"insufficient_quota","code":"daily_limit_exceeded","param":null}}"#
+                        .to_string(),
+                ),
+            },
+        ] {
+            assert_eq!(
+                forwarder.categorize_proxy_error(&error, &direct),
+                ErrorCategory::Retryable,
+                "terminal quota should remain eligible for provider failover"
+            );
+            assert!(!retryable_failure_affects_provider_health(&direct, &error));
+            assert!(!retryable_failure_affects_provider_health(&pool, &error));
+        }
     }
 
     #[test]

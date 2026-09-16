@@ -120,6 +120,45 @@ present an older binary as evidence for the new source.
 
 22-C. **Escalate before disruption.** If verification truly requires focus changes, visible navigation, window-state changes, or foreground input, explain the exact action and ask for permission immediately before doing it. A failed stealth attempt does not grant permission to become disruptive.
 
+### Windows/Tauri desktop automation playbook
+
+Use this procedure when a task requires inspecting the running CCSwitchMulti desktop UI:
+
+1. Check the automation runtime first (`cua.getState()` and the available browser/app controls). Record whether it can enumerate the native app. An unavailable runtime is a capability limitation, not evidence that the app is missing.
+2. If native automation is unavailable, use a read-only PowerShell/.NET `user32.dll` capture. Locate the real Tauri process (`cc-switch.exe`/`cc-switch2.exe`) and its top-level window without activation. Prefer the WebView renderer child (`ApplicationFrameWindow`/`Chrome_WidgetWin_*`) and fall back to the top-level window only when no renderer child can be found.
+3. Capture with `PrintWindow`; do not use a localhost browser tab as proof of the live Tauri UI. A separate Vite/browser renderer is a different process and must be reported as such.
+4. Make one primary capture attempt and, only for a concrete stale-handle or hot-reload condition, one recovery capture. If the requested screen is not already open, stop and ask the user to open that exact screen. Do not guess through navigation or repeat coordinate clicks.
+5. Capture before and after any explicitly permitted action. Focus changes, window-state changes, mouse input, keyboard input, and visible navigation require user permission immediately before the action. Never kill `cc-switch.exe` to make automation easier.
+
+Minimal read-only capture example (run in PowerShell; it does not focus or mutate the window):
+
+```powershell
+Add-Type @"
+using System;
+using System.Drawing;
+using System.Drawing.Imaging;
+using System.Runtime.InteropServices;
+public static class WinCapture {
+  [DllImport("user32.dll")] public static extern bool PrintWindow(IntPtr hWnd, IntPtr hdc, uint flags);
+  [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr hWnd, out RECT rect);
+  [StructLayout(LayoutKind.Sequential)] public struct RECT { public int L, T, R, B; }
+  public static Bitmap Capture(IntPtr hWnd) {
+    GetWindowRect(hWnd, out var r);
+    var b = new Bitmap(Math.Max(1, r.R-r.L), Math.Max(1, r.B-r.T));
+    using var g = Graphics.FromImage(b);
+    var dc = g.GetHdc();
+    try { PrintWindow(hWnd, dc, 2); } finally { g.ReleaseHdc(dc); }
+    return b;
+  }
+}
+"@
+$p = Get-Process cc-switch,cc-switch2 -ErrorAction SilentlyContinue | Select-Object -First 1
+if (-not $p -or $p.MainWindowHandle -eq 0) { throw "Live Tauri window not found" }
+[WinCapture]::Capture($p.MainWindowHandle).Save("$pwd\tauri-capture.png", [Drawing.Imaging.ImageFormat]::Png)
+```
+
+Treat the image as evidence only after confirming its process/window identity and timestamp. Never claim live verification from a screenshot captured from another process.
+
 ## CODEBASE STRUCTURE
 
 ### Backend (Rust — `src-tauri/`)

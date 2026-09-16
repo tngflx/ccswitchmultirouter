@@ -74,6 +74,12 @@ const requestLogsFixture = vi.hoisted(() => ({
   },
 }));
 
+const reportFrontendError = vi.hoisted(() => vi.fn());
+
+vi.mock("@/lib/frontendLogger", () => ({
+  reportFrontendError,
+}));
+
 vi.mock("@/lib/api/proxy", () => ({
   proxyApi: {
     getGlobalProxyConfig: vi.fn().mockResolvedValue({
@@ -90,6 +96,7 @@ vi.mock("@/lib/api/settings", () => ({
   settingsApi: {
     get: vi.fn(),
     save: vi.fn(),
+    openLogDir: vi.fn(),
   },
 }));
 
@@ -119,6 +126,7 @@ vi.mock("@/lib/api", () => ({
   providersApi: {
     add: vi.fn(),
     update: vi.fn(),
+    updateCodexModelOrder: vi.fn(),
     getAll: vi.fn(),
     inspectCodexMultiRouterProjection: vi.fn(),
     retryCodexMultiRouterProjection: vi.fn(),
@@ -400,8 +408,13 @@ beforeEach(() => {
   });
   vi.mocked(settingsApi.get).mockReset();
   vi.mocked(settingsApi.save).mockReset();
+  vi.mocked(settingsApi.openLogDir).mockReset();
+  vi.mocked(settingsApi.openLogDir).mockResolvedValue(true);
+  reportFrontendError.mockReset();
   vi.mocked(providersApi.add).mockResolvedValue(true);
   vi.mocked(providersApi.update).mockResolvedValue(true);
+  vi.mocked(providersApi.updateCodexModelOrder).mockReset();
+  vi.mocked(providersApi.updateCodexModelOrder).mockResolvedValue(true);
   vi.mocked(providersApi.getAll).mockResolvedValue({});
   vi.mocked(providersApi.inspectCodexMultiRouterProjection).mockResolvedValue({
     schemaVersion: 1,
@@ -3160,23 +3173,58 @@ describe("Codex MultiRouter workspace route persistence helpers", () => {
     ).toHaveValue(2);
 
     await user.click(screen.getByRole("button", { name: "保存顺序" }));
-    await waitFor(() => expect(providersApi.update).toHaveBeenCalled());
-    const savedSource = vi
-      .mocked(providersApi.update)
-      .mock.calls.map(([provider]) => provider)
-      .find((provider) => provider.id === source.id);
+    await waitFor(() =>
+      expect(providersApi.updateCodexModelOrder).toHaveBeenCalled(),
+    );
     const savedPlan = vi
       .mocked(providersApi.update)
       .mock.calls.map(([provider]) => provider)
       .find((provider) => provider.id === plan.id);
-    expect(savedSource?.settingsConfig?.modelCatalog?.models).toEqual([
+    expect(providersApi.updateCodexModelOrder).toHaveBeenCalledWith(source.id, [
       expect.objectContaining({ model: "deepseek-v4-flash", sortIndex: 2 }),
       expect.objectContaining({ model: "deepseek-v4-pro", sortIndex: 0 }),
       expect.objectContaining({ model: "qwen3.8", sortIndex: 1 }),
     ]);
+    expect(
+      vi
+        .mocked(providersApi.update)
+        .mock.calls.some(([provider]) => provider.id === source.id),
+    ).toBe(false);
     expect(savedPlan?.settingsConfig?.codexRouting).toMatchObject({
       modelOrder: ["deepseek-v4-pro", "qwen3.8", "deepseek-v4-flash"],
     });
+  });
+
+  it("logs model-order save failures and opens the log directory from the error", async () => {
+    const { source, plan } = createSubagentWorkspaceFixture();
+    vi.mocked(providersApi.update).mockRejectedValueOnce(
+      new Error("projection write failed"),
+    );
+    renderSubagentWorkspace(source, plan);
+
+    const user = userEvent.setup();
+    await user.click(screen.getByRole("tab", { name: "模型排序" }));
+    const rankInput = screen.getByRole("spinbutton", {
+      name: "Rank for qwen3.8",
+    });
+    await user.clear(rankInput);
+    await user.type(rankInput, "1");
+    await user.click(
+      screen.getByRole("button", { name: "Move qwen3.8 to rank 1" }),
+    );
+    await user.click(screen.getByRole("button", { name: "保存顺序" }));
+
+    expect(await screen.findByText(/保存模型顺序失败/)).toBeInTheDocument();
+    expect(reportFrontendError).toHaveBeenCalledWith(
+      "Codex model ordering save failed",
+      expect.any(Error),
+      expect.stringContaining("stage=save-router"),
+    );
+
+    await user.click(
+      screen.getByRole("button", { name: /日志目录|Log Directory/i }),
+    );
+    expect(settingsApi.openLogDir).toHaveBeenCalledOnce();
   });
 
   it("persists a display-only change without rewriting provider model order", async () => {
@@ -4910,6 +4958,85 @@ describe("Codex MultiRouter workspace route persistence helpers", () => {
       { model: "model-a" },
       { model: "model-b" },
     ]);
+  });
+
+  it("resolves generated provider-name aliases while saving model order", () => {
+    const source: Provider = {
+      id: "sublyx-source",
+      name: "Sublyx",
+      category: "custom",
+      settingsConfig: {
+        modelCatalog: {
+          models: [{ model: "gpt-5.6-terra" }],
+        },
+      },
+    };
+    const route = normalizeCodexRouteForSave(
+      {
+        label: source.name,
+        enabled: true,
+        targetProviderId: source.id,
+        modelSelection: { mode: "all" },
+        match: { models: ["gpt-5.6-terra-sublyx"], prefixes: ["gpt"] },
+      },
+      0,
+      new Set<string>(),
+    );
+
+    const updates = buildModelOrderProviderUpdates(
+      [{ model: "gpt-5.6-terra-sublyx" }],
+      [route],
+      new Map([[source.id, source]]),
+      false,
+    );
+    expect(
+      updates.get(source.id)?.settingsConfig?.modelCatalog?.models,
+    ).toEqual([{ model: "gpt-5.6-terra", sortIndex: 0 }]);
+  });
+
+  it("drops aliases whose upstream model is no longer enabled", () => {
+    const source: Provider = {
+      id: "stale-alias-source",
+      name: "Sublyx",
+      category: "custom",
+      settingsConfig: {
+        modelCatalog: {
+          models: [
+            { model: "gpt-5.6-terra" },
+            { model: "gpt-5.6-luna", enabled: false },
+          ],
+        },
+      },
+    };
+    const plan: Provider = {
+      id: "stale-alias-plan",
+      name: "Router",
+      category: "custom",
+      settingsConfig: {
+        codexRouting: {
+          schemaVersion: 2,
+          enabled: true,
+          routes: [
+            {
+              id: "route",
+              label: source.name,
+              enabled: true,
+              targetProviderId: source.id,
+              modelSelection: { mode: "all" },
+              match: { models: ["gpt-5.6-terra-sublyx"], prefixes: ["gpt"] },
+              aliases: { "gpt-5.6-luna-sublyx": "gpt-5.6-luna" },
+            },
+          ],
+        },
+      },
+    };
+
+    const normalized = normalizeCodexRoutesForVisibleModelAliases(
+      plan,
+      readCodexRouting(plan)!.routes ?? [],
+      new Map([[source.id, source]]),
+    );
+    expect(normalized[0].aliases).toEqual({});
   });
 
   it("preserves model ordering extensions when serializing unrelated routing edits", () => {

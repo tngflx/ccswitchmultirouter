@@ -44,8 +44,8 @@ pub use mcp::McpService;
 pub use omo::OmoService;
 pub use prompt::PromptService;
 pub use provider::{
-    CodexForceRepairOutcome, CodexSubagentV2MutationResult, ProviderService, ProviderSortUpdate,
-    SwitchResult,
+    CodexForceRepairOutcome, CodexModelOrderEntry, CodexSubagentV2MutationResult, ProviderService,
+    ProviderSortUpdate, SwitchResult,
 };
 pub use proxy::ProxyService;
 #[allow(unused_imports)]
