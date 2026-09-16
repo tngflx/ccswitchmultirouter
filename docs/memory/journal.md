@@ -1,5 +1,13 @@
 # Engineering Journal (newest first)
 
+## 2026-09-17 - Live Tauri UI audit of MultiRouter model ordering and alias surfaces
+
+- **What happened:** The user asked for the running cc-switch UI to be re-audited after the model-order/alias work. The app was hidden to tray, so a quiet `PrintWindow` capture was blank; the window had to be restored with explicit user instruction before the WebView2 compositor painted.
+- **Root cause:** The app minimizes to tray on close (`prevent_close` + `window.hide()` in `src-tauri/src/lib.rs`), and `Process.MainWindowHandle` in this build points at an 18x18 placeholder rather than the real Tauri frame, so restore/capture helpers must enumerate top-level windows and target the `Tauri Window` class.
+- **What we did:** Restored the real frame, dismissed the "Codex local routing is enabled" dialog via UIA Invoke, captured seven non-blank pages with `scripts/capture-tauri-window.ps1` (overview, model ordering, model sources, routing rules, Sub-Agents, status), and verified text via the WebView2 UIA tree. Captures live in `docs/audits/2026-09-17-live-tauri-ui-audit/`.
+- **Evidence:** Two findings: (1) persisted `codexRouting.modelOrder` still contains stale OpenCode Zen names (`deepseek-v4-flash-opencode-zen`, `deepseek-v4-pro-opencode-zen`, and four other legacy `*-opencode-zen` entries), which the ordering UI renders through renamed current models and the compiler flags as policy references needing attention; (2) the Routing rules candidate refresh showed one unnamed `Failed` row matching the Sublyx source, whose upstream was returning `402 / DAILY LIMIT EXCEEDED`, and no database provider has an empty name.
+- **What NOT to do again:** Do not treat `Process.MainWindowHandle` as the real Tauri frame, do not treat a hidden-window PrintWindow blank as evidence, and do not promise a UI audit while the app is tray-hidden.
+
 ## 2026-09-17 - Encode the non-disruptive Tauri capture path so audits stop getting stuck
 
 - **What happened:** A live Tauri UI audit stalled when the running `cc-switch.exe` was hidden to tray; `PrintWindow` returned a uniform surface and the WebView2 renderer child was not exposed through child-window enumeration. The process was healthy and actively proxying, so the app itself was not broken.
