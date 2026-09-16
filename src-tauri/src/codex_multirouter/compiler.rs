@@ -270,14 +270,29 @@ fn apply_router_model_order(
     let Some(model_order) = plan.extensions.get("modelOrder").and_then(Value::as_array) else {
         return;
     };
-    let ranks = model_order
+    let mut ranks = HashMap::new();
+    for (rank, model) in model_order
         .iter()
         .filter_map(Value::as_str)
         .map(str::trim)
         .filter(|model| !model.is_empty())
         .enumerate()
-        .map(|(rank, model)| (model.to_ascii_lowercase(), rank))
-        .collect::<HashMap<_, _>>();
+    {
+        let key = model.to_ascii_lowercase();
+        ranks.insert(key.clone(), rank);
+        let mut identity_matches = model_catalog.iter().filter(|entry| {
+            entry.canonical_model.to_ascii_lowercase() == key
+                || entry.upstream_model.to_ascii_lowercase() == key
+        });
+        let first = identity_matches.next();
+        // Only resolve through the canonical/upstream identity when it uniquely
+        // identifies one model. Shared canonical names across providers are
+        // intentionally left as regular compiler warnings instead of smearing a
+        // saved rank over every sibling model.
+        if let (Some(renamed), None) = (first, identity_matches.next()) {
+            ranks.insert(renamed.visible_model.to_ascii_lowercase(), rank);
+        }
+    }
     if ranks.is_empty() {
         return;
     }
@@ -1045,6 +1060,80 @@ mod tests {
                 .map(|model| model.sort_index)
                 .collect::<Vec<_>>(),
             vec![Some(0), Some(1), Some(2)]
+        );
+    }
+
+    #[test]
+    fn router_model_order_keeps_rank_after_unambiguous_visible_model_rename() {
+        let go = provider(
+            "opencode-go",
+            "OpenCode Go",
+            "openai_responses",
+            json!([{"model": "deepseek-v4-flash-opencode-go", "displayName": "DeepSeek V4 Flash"}]),
+        );
+        let mut routing_plan = plan(vec![route(
+            "go-route",
+            "opencode-go",
+            CodexModelSelection::All,
+        )]);
+        routing_plan.extensions.insert(
+            "modelOrder".to_string(),
+            json!(["deepseek-v4-flash-opencode-zen", "second-model"]),
+        );
+
+        let compiled = compile(&routing_plan, [go]);
+
+        assert_eq!(compiled.model_catalog.len(), 1);
+        assert_eq!(
+            compiled.model_catalog[0].visible_model,
+            "deepseek-v4-flash-opencode-go"
+        );
+        assert_eq!(
+            compiled.model_catalog[0].sort_index,
+            Some(0),
+            "an order entry that only the renamed model satisfies must keep its rank"
+        );
+    }
+
+    #[test]
+    fn router_model_order_does_not_smear_ambiguous_renamed_identity() {
+        let zen = provider(
+            "opencode-zen",
+            "OpenCode Zen",
+            "openai_responses",
+            json!([{"model": "deepseek-v4-flash"}]),
+        );
+        let go = provider(
+            "opencode-go",
+            "OpenCode Go",
+            "openai_responses",
+            json!([{"model": "deepseek-v4-flash"}]),
+        );
+        let mut routing_plan = plan(vec![
+            route("zen-route", "opencode-zen", CodexModelSelection::All),
+            route("go-route", "opencode-go", CodexModelSelection::All),
+        ]);
+        routing_plan.extensions.insert(
+            "modelOrder".to_string(),
+            json!(["deepseek-v4-flash-opencode-zen", "other-model"]),
+        );
+
+        let compiled = compile(&routing_plan, [zen, go]);
+
+        assert_eq!(compiled.model_catalog.len(), 2);
+        let exact_visible = compiled
+            .model_catalog
+            .iter()
+            .find(|model| model.visible_model == "deepseek-v4-flash-opencode-zen")
+            .expect("exact visible match must exist");
+        assert_eq!(exact_visible.sort_index, Some(0));
+        assert!(
+            compiled
+                .model_catalog
+                .iter()
+                .filter(|model| model.visible_model != "deepseek-v4-flash-opencode-zen")
+                .all(|model| model.sort_index != Some(0)),
+            "the sibling with the same canonical identity must not inherit rank zero"
         );
     }
 

@@ -40,9 +40,14 @@ non-blank pixel check.
    names (`deepseek-v4-flash-opencode-zen`, `deepseek-v4-pro-opencode-zen`,
    `claude-opus-4-8-opencode-zen`, etc.). The ordering UI correctly renders the
    current renamed visible models; `applyCodexCatalogModelOrder` only applies
-   ranks for models that still exist, so stale entries are inert. The compiler
-   still warns about them because the router document itself references the old
-   names; saving the current ordering once clears them.
+   ranks for models that still exist. Fixed in
+   `src-tauri/src/codex_multirouter/compiler.rs`: untestable order entries now
+   resolve through their canonical/upstream identity when that identity names
+   exactly one catalog entry, so a renamed model keeps its saved rank. When two
+   providers share the canonical name (the OpenCode Zen/Go pair here), the
+   compiler intentionally does not smear one rank over both; the "Policy
+   references needing attention" warning is the correct signal that the router
+   document still references the old name.
 2. The Routing rules candidate-refresh panel showed one unnamed `Failed` row.
    The database has no provider with an empty name; the row corresponds to the
    Sublyx source, which was failing upstream with
@@ -54,3 +59,11 @@ non-blank pixel check.
 
 `scripts/capture-tauri-window.ps1` was exercised end-to-end: hidden-to-tray app
 fails fast with a clear message, restored app captures non-blank output.
+
+## Follow-up fix (2026-09-17)
+
+The stale-order regression from finding 1 was fixed and covered by two compiler
+tests: unambiguous renames keep their rank, ambiguous shared-identity cases are
+left as warnings. Verified with
+`cargo test --manifest-path src-tauri/Cargo.toml --lib codex_multirouter::compiler`
+27/27 and `cargo check --manifest-path src-tauri/Cargo.toml --lib`.

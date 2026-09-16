@@ -8,6 +8,14 @@
 - **Evidence:** Two findings: (1) persisted `codexRouting.modelOrder` still contains stale OpenCode Zen names (`deepseek-v4-flash-opencode-zen`, `deepseek-v4-pro-opencode-zen`, and four other legacy `*-opencode-zen` entries), which the ordering UI renders through renamed current models and the compiler flags as policy references needing attention; (2) the Routing rules candidate refresh showed one unnamed `Failed` row matching the Sublyx source, whose upstream was returning `402 / DAILY LIMIT EXCEEDED`, and no database provider has an empty name.
 - **What NOT to do again:** Do not treat `Process.MainWindowHandle` as the real Tauri frame, do not treat a hidden-window PrintWindow blank as evidence, and do not promise a UI audit while the app is tray-hidden.
 
+## 2026-09-17 - Fix compiler rank loss for renamed model order entries
+
+- **What happened:** The live audit found `codexRouting.modelOrder` still referencing pre-collision OpenCode Zen names, and the compiled catalog no longer applied those old ranks.
+- **Root cause:** `apply_router_model_order` keyed ranks only by exact visible-model name. When an alias collision renamed a visible model (or the provider catalog absorbed the renamed identifier), the old order entry no longer matched anything and its rank was silently discarded.
+- **What we did:** Resolve stale order entries through canonical/upstream identity only when that identity matches exactly one catalog entry; ambiguous shared-identity cases (OpenCode Zen/Go both exposing `deepseek-v4-flash`) keep their existing warning behavior instead of smearing a rank over both models. Added two compiler regressions.
+- **Evidence:** `codex_multirouter::compiler` 27/27 tests pass, including both new tests; `cargo check --manifest-path src-tauri/Cargo.toml --lib` passes; scoped rustfmt check passes. Full `cargo test` was not run because the running `cc-switch.exe` locks `src-tauri/target/debug/cc-switch.exe`; `cargo test --lib` avoids the locked binary.
+- **What NOT to do again:** Do not auto-rewrite ambiguous order references into a shared provider identity, and do not run commands that link the binary while the user's app is running; ask for a user rebuild or use `--lib` checks.
+
 ## 2026-09-17 - Encode the non-disruptive Tauri capture path so audits stop getting stuck
 
 - **What happened:** A live Tauri UI audit stalled when the running `cc-switch.exe` was hidden to tray; `PrintWindow` returned a uniform surface and the WebView2 renderer child was not exposed through child-window enumeration. The process was healthy and actively proxying, so the app itself was not broken.
