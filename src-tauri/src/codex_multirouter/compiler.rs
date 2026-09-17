@@ -270,6 +270,10 @@ fn apply_router_model_order(
     let Some(model_order) = plan.extensions.get("modelOrder").and_then(Value::as_array) else {
         return;
     };
+    let visible_names = model_catalog
+        .iter()
+        .map(|model| model.visible_model.to_ascii_lowercase())
+        .collect::<HashSet<_>>();
     let mut ranks = HashMap::new();
     for (rank, model) in model_order
         .iter()
@@ -280,6 +284,9 @@ fn apply_router_model_order(
     {
         let key = model.to_ascii_lowercase();
         ranks.insert(key.clone(), rank);
+        if visible_names.contains(&key) {
+            continue;
+        }
         let mut identity_matches = model_catalog.iter().filter(|entry| {
             entry.canonical_model.to_ascii_lowercase() == key
                 || entry.upstream_model.to_ascii_lowercase() == key
@@ -290,7 +297,21 @@ fn apply_router_model_order(
         // intentionally left as regular compiler warnings instead of smearing a
         // saved rank over every sibling model.
         if let (Some(renamed), None) = (first, identity_matches.next()) {
-            ranks.insert(renamed.visible_model.to_ascii_lowercase(), rank);
+            ranks
+                .entry(renamed.visible_model.to_ascii_lowercase())
+                .or_insert(rank);
+            continue;
+        }
+        // Orphaned derived name: the saved order may reference a visible name the
+        // compiler generated earlier and then re-generated differently after a
+        // collision set changed (for example `deepseek-v4-flash-opencode-go` ->
+        // `deepseek-v4-flash-opencode-zen-opencode-go`). Recover it by stripping
+        // the owning provider's suffix and matching that provider's canonical or
+        // upstream model, again only when it identifies exactly one entry.
+        if let Some(recovered) = recover_orphaned_visible_model(&key, model_catalog) {
+            ranks
+                .entry(recovered.visible_model.to_ascii_lowercase())
+                .or_insert(rank);
         }
     }
     if ranks.is_empty() {
@@ -305,6 +326,42 @@ fn apply_router_model_order(
     for (sort_index, model) in model_catalog.iter_mut().enumerate() {
         model.sort_index = Some(sort_index);
     }
+}
+
+fn recover_orphaned_visible_model<'a>(
+    orphan_key: &str,
+    model_catalog: &'a [CompiledCodexModel],
+) -> Option<&'a CompiledCodexModel> {
+    let mut recovered: Option<&CompiledCodexModel> = None;
+    for entry in model_catalog {
+        let provider_source = if entry.target_provider_name.trim().is_empty() {
+            entry.target_provider_id.as_str()
+        } else {
+            entry.target_provider_name.as_str()
+        };
+        let suffix = label_suffix(provider_source);
+        if suffix.len() < 2 {
+            continue;
+        }
+        let Some(stem) = orphan_key.strip_suffix(&format!("-{suffix}")) else {
+            continue;
+        };
+        if stem.is_empty() {
+            continue;
+        }
+        if entry.canonical_model.to_ascii_lowercase() != stem
+            && entry.upstream_model.to_ascii_lowercase() != stem
+        {
+            continue;
+        }
+        if recovered.is_some() {
+            // More than one provider could own the stripped stem; leave the rank
+            // unapplied rather than guessing.
+            return None;
+        }
+        recovered = Some(entry);
+    }
+    recovered
 }
 
 fn collect_candidates<'a>(
@@ -568,11 +625,17 @@ fn is_canonical_provider(provider: &Provider) -> bool {
 }
 
 fn provider_name_suffix(provider: &Provider) -> String {
-    let source = if provider.name.trim().is_empty() {
+    label_suffix(if provider.name.trim().is_empty() {
         provider.id.as_str()
     } else {
         provider.name.as_str()
-    };
+    })
+}
+
+/// Normalize a provider display name into the `-suffix` the compiler appends to
+/// disambiguated visible model names. Shared with orphaned order-entry recovery so
+/// both sides derive identical suffixes.
+fn label_suffix(source: &str) -> String {
     let mut suffix = String::new();
     let mut previous_dash = false;
     for character in source.trim().chars().flat_map(char::to_lowercase) {
@@ -1135,6 +1198,51 @@ mod tests {
                 .all(|model| model.sort_index != Some(0)),
             "the sibling with the same canonical identity must not inherit rank zero"
         );
+    }
+
+    #[test]
+    fn router_model_order_recovers_orphaned_provider_suffixed_names() {
+        let zen = provider(
+            "opencode-zen",
+            "OpenCode Zen",
+            "openai_responses",
+            json!([{"model": "claude-opus-4-8"}, {"model": "deepseek-v4-flash"}]),
+        );
+        let go = provider(
+            "opencode-go",
+            "OpenCode Go",
+            "openai_responses",
+            json!([{"model": "deepseek-v4-flash"}]),
+        );
+        let zen_route = route("zen-route", "opencode-zen", CodexModelSelection::All);
+        let mut go_route = route("go-route", "opencode-go", CodexModelSelection::All);
+        go_route.aliases.insert(
+            "deepseek-v4-flash-opencode-zen".to_string(),
+            "deepseek-v4-flash".to_string(),
+        );
+        let mut routing_plan = plan(vec![zen_route, go_route]);
+        routing_plan.extensions.insert(
+            "modelOrder".to_string(),
+            json!([
+                "deepseek-v4-flash-opencode-go",
+                "claude-opus-4-8-opencode-zen"
+            ]),
+        );
+
+        let compiled = compile(&routing_plan, [zen, go]);
+
+        // The Go model now collides twice, so its current visible name is
+        // `deepseek-v4-flash-opencode-zen-opencode-go`; the saved order still holds
+        // the older `deepseek-v4-flash-opencode-go`.
+        assert_eq!(
+            compiled.model_catalog[0].visible_model,
+            "deepseek-v4-flash-opencode-zen-opencode-go"
+        );
+        assert_eq!(compiled.model_catalog[0].sort_index, Some(0));
+        // Zen's `claude-opus-4-8` is no longer suffixed, so the saved
+        // `claude-opus-4-8-opencode-zen` entry must still find it.
+        assert_eq!(compiled.model_catalog[1].visible_model, "claude-opus-4-8");
+        assert_eq!(compiled.model_catalog[1].sort_index, Some(1));
     }
 
     #[test]

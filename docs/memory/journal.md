@@ -1,5 +1,13 @@
 # Engineering Journal (newest first)
 
+## 2026-09-17 - Recover orphaned provider-suffixed model order entries
+
+- **What happened:** Comparing the live `codexRouting.modelOrder` against the compiled projection showed **15 of 115** saved order entries matching no published model, so those models silently lost their saved rank.
+- **Root cause:** `modelOrder` persists *derived* visible names. Two independent producers of those names disagree and drift: the Rust compiler uses a route's explicit alias first then applies `unique_visible_model` collision renaming (`deepseek-v4-flash-opencode-zen-opencode-go`), while the frontend ordering page names colliding models with `aliasModelName` = `<model>-<provider-suffix>` (`deepseek-v4-flash-opencode-go`). When the collision set also changes, names such as `claude-opus-4-8-opencode-zen` revert to `claude-opus-4-8`. Both cases orphan the persisted entry.
+- **What we did:** Added `recover_orphaned_visible_model` to `apply_router_model_order`: when a saved name matches no current visible model and no unique canonical/upstream identity, strip the owning provider's normalized suffix and match that provider's canonical/upstream model, applying the rank only when exactly one entry matches. Shared `label_suffix` with `provider_name_suffix` so both sides derive identical suffixes. Added `router_model_order_recovers_orphaned_provider_suffixed_names`.
+- **Evidence:** `cargo test --lib router_model_order` 4/4 passed. Replaying the exact rule over the live projection and live `modelOrder` resolved all 15 orphans, 0 unresolved and 0 ambiguous, giving 115/115 visible models a saved rank; e.g. `deepseek-v4-flash-opencode-go` -> `deepseek-v4-flash-opencode-zen-opencode-go` and `claude-opus-4-8-opencode-zen` -> `claude-opus-4-8`.
+- **What NOT to do again:** Do not persist derived collision-suffixed visible names as the stable identity for user preferences, and do not treat the frontend ordering catalog and the Rust compiled catalog as interchangeable — they still disagree on explicit-alias collisions. The remaining structural fix is to make the ordering surface consume the backend-compiled visible names (or key the order by provider + canonical model) instead of reimplementing naming in TypeScript.
+
 ## 2026-09-17 - Reconcile the active MultiRouter projection on startup
 
 - **What happened:** After the user restarted the rebuilt app, the compiler tests passed but the persisted projection status still showed `generatedAt 2026-09-16T03:34:05.343Z` and the old warning set. A restart did not rebuild the cached projection artifact.
