@@ -4398,6 +4398,17 @@
     "restoreCcsmPreset": "恢复 CCSM 预设",
     "tomlFormatError": "TOML 格式错误"
   },
+  "codexSessionTraffic": {
+    "title": "{{range}}子 Agent 会话流量",
+    "scope": "只基于本地 Codex 会话索引与已同步的 codex_session 用量；请求统计与会话统计独立，不能相加。",
+    "sync": "立即同步会话用量",
+    "readError": "子 Agent 用量读取失败：",
+    "skipped": "会话用量索引读取跳过：",
+    "collectorIdle": "后台采集空闲",
+    "collectorRunning": "后台采集中",
+    "collectorDegraded": "后台采集降级",
+    "collectorNotStarted": "后台采集尚未启动"
+  },
   "codexUsagePage": {
     "tierFiveHourLabel": "5 小时窗口",
     "tierSevenDayLabel": "每周窗口",

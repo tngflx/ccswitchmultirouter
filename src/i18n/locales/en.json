@@ -4398,6 +4398,17 @@
     "restoreCcsmPreset": "Restore CCSM preset",
     "tomlFormatError": "Invalid TOML format"
   },
+  "codexSessionTraffic": {
+    "title": "{{range}} sub-agent session traffic",
+    "scope": "Uses the local Codex session index and synced codex_session usage. Request and session statistics are independent and must not be added together.",
+    "sync": "Sync session usage now",
+    "readError": "Unable to read sub-agent usage: ",
+    "skipped": "Session usage index skipped: ",
+    "collectorIdle": "Collector idle",
+    "collectorRunning": "Collector running",
+    "collectorDegraded": "Collector degraded",
+    "collectorNotStarted": "Collector not started"
+  },
   "codexUsagePage": {
     "tierFiveHourLabel": "5-hour window",
     "tierSevenDayLabel": "Weekly window",

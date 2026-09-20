@@ -1,4 +1,5 @@
 import { useMemo, useState } from "react";
+import { useTranslation } from "react-i18next";
 import { ChevronDown, RefreshCw } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -72,14 +73,6 @@ const collectorTime = (value: number | null | undefined) =>
         minute: "2-digit",
       })
     : "未记录";
-const collectorLabel = (phase: SessionCollectionStatus["phase"]) =>
-  ({
-    idle: "后台采集空闲",
-    running: "后台采集中",
-    degraded: "后台采集降级",
-    not_started: "后台采集尚未启动",
-  })[phase];
-
 /** Local bounded session evidence; never add it to proxy request traffic. */
 export function CodexSessionTrafficPanel({
   stats,
@@ -92,6 +85,9 @@ export function CodexSessionTrafficPanel({
   collectionStatus,
   collectionStatusError,
 }: Props) {
+  const { t } = useTranslation();
+  const text = (key: string, defaultValue: string, options?: Record<string, unknown>) =>
+    t(`codexSessionTraffic.${key}`, { defaultValue, ...options });
   const [sort, setSort] = useState<SortKey>("tokens");
   const [filter, setFilter] = useState<Filter>("all");
   const [modelQuery, setModelQuery] = useState("");
@@ -160,11 +156,10 @@ export function CodexSessionTrafficPanel({
       <div className="flex flex-wrap items-start justify-between gap-3">
         <div>
           <h3 className="text-base font-semibold">
-            {rangeLabel}子 Agent 会话流量
+            {text("title", "{{range}}子 Agent 会话流量", { range: rangeLabel })}
           </h3>
           <p className="mt-1 text-sm leading-6 text-muted-foreground">
-            只基于本地 Codex 会话索引与已同步的 <code>codex_session</code>{" "}
-            用量；请求统计与会话统计独立，不能相加。
+            {text("scope", "只基于本地 Codex 会话索引与已同步的 codex_session 用量；请求统计与会话统计独立，不能相加。")}
           </p>
         </div>
         <Button
@@ -175,7 +170,7 @@ export function CodexSessionTrafficPanel({
           className="gap-2"
         >
           <RefreshCw className={`h-4 w-4 ${isSyncing ? "animate-spin" : ""}`} />
-          立即同步会话用量
+          {text("sync", "立即同步会话用量")}
         </Button>
       </div>
       {syncMessage ? (
@@ -189,13 +184,13 @@ export function CodexSessionTrafficPanel({
       />
       {error ? (
         <div className="mt-3 rounded-md border border-rose-200 bg-rose-50 px-3 py-2 text-xs text-rose-700">
-          子 Agent 用量读取失败：
+          {text("readError", "子 Agent 用量读取失败：")}
           {error instanceof Error ? error.message : String(error)}
         </div>
       ) : null}
       {stats?.skippedReason ? (
         <div className="mt-3 rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800">
-          会话用量索引读取跳过：{stats.skippedReason}
+          {text("skipped", "会话用量索引读取跳过：")}{stats.skippedReason}
         </div>
       ) : null}
       <div className="mt-3 grid gap-2 sm:grid-cols-3">
@@ -372,13 +367,22 @@ function CollectorStatus({
   const notStarted = status.phase === "not_started";
   const alert =
     notStarted || status.phase === "degraded" || status.deferred > 0;
+  const { t } = useTranslation();
+  const text = (key: string, defaultValue: string) =>
+    t(`codexSessionTraffic.${key}`, { defaultValue });
+  const label = {
+    idle: text("collectorIdle", "后台采集空闲"),
+    running: text("collectorRunning", "后台采集中"),
+    degraded: text("collectorDegraded", "后台采集降级"),
+    not_started: text("collectorNotStarted", "后台采集尚未启动"),
+  }[status.phase];
   return (
     <Collapsible
       className={`mt-3 rounded-md border px-3 py-2 text-xs ${alert ? "border-amber-200 bg-amber-50 text-amber-900" : "border-border bg-muted/20 text-muted-foreground"}`}
     >
       <div className="flex flex-wrap items-center justify-between gap-2">
         <span>
-          <strong>{collectorLabel(status.phase)}</strong>
+          <strong>{label}</strong>
           {notStarted
             ? " · 尚无成功采集；可点击立即同步或等待后台启动。"
             : ` · 最近成功 ${collectorTime(status.lastSuccessAt)} · ${status.imported ? `本轮新增 ${status.imported}` : "本轮暂无新增"} · 待处理 ${status.deferred} · 错误 ${status.errorsCount}`}

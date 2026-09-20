@@ -4398,6 +4398,17 @@
     "restoreCcsmPreset": "還原 CCSM 預設",
     "tomlFormatError": "TOML 格式錯誤"
   },
+  "codexSessionTraffic": {
+    "title": "{{range}}子 Agent 工作階段流量",
+    "scope": "僅根據本機 Codex 工作階段索引與已同步的 codex_session 用量；請求統計與工作階段統計彼此獨立，不能相加。",
+    "sync": "立即同步工作階段用量",
+    "readError": "讀取子 Agent 用量失敗：",
+    "skipped": "工作階段用量索引略過：",
+    "collectorIdle": "背景採集閒置",
+    "collectorRunning": "背景採集中",
+    "collectorDegraded": "背景採集降級",
+    "collectorNotStarted": "背景採集尚未啟動"
+  },
   "codexUsagePage": {
     "tierFiveHourLabel": "5 小時視窗",
     "tierSevenDayLabel": "每週視窗",

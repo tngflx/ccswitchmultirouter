@@ -154,6 +154,10 @@ export const handlers = [
     return success(getProviders(app));
   }),
 
+  http.post(`${TAURI_ENDPOINT}/get_codex_account_pool_policy`, () =>
+    success({ enabled: false, entries: [], desktopAccountId: null }),
+  ),
+
   http.post(`${TAURI_ENDPOINT}/get_current_provider`, async ({ request }) => {
     const { app } = await withJson<{ app: AppId }>(request);
     return success(getCurrentProviderId(app));

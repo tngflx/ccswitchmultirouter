@@ -1,5 +1,13 @@
 # Engineering Journal (newest first)
 
+## 2026-09-20 - Localize session traffic UI and complete OAuth test boundary
+
+- **What happened:** The Codex session-traffic panel was mounted and functionally tested, but its primary headings/status/sync/error strings were hardcoded in Chinese, and OAuth component tests emitted an unhandled MSW warning for the account-pool policy query.
+- **Root cause:** The panel port preserved presentation text inline instead of using the locale contract; the shared Tauri MSW fixture predated the account-pool query.
+- **What we did:** Added the session-traffic translation namespace to all four locales for the panel's top-level and collector-status strings, routed those strings through `react-i18next`, and added a deterministic `get_codex_account_pool_policy` MSW response.
+- **Evidence:** Current-checkout focused Vitest passed **12/12** (`CodexSessionTrafficPanel`, `CodexOAuthSection`) without the previous MSW warning; `pnpm typecheck` passed; `git diff --check` passed. The panel still has legacy hardcoded detail/table copy outside this first namespace slice and should not be described as fully localized.
+- **What NOT to do again:** Do not call a UI port complete when the component is mounted but its user-facing copy bypasses i18n or its tests depend on unhandled IPC requests.
+
 ## 2026-09-20 - Port OAuth pool soft-avoidance recovery after reference audit
 
 - **What happened:** Re-audited `BigStrongSun/ccswitchmulti` and `farion1231/cc-switch` after the latest local merge. Most recent fork and upstream proxy fixes were already present semantically; the fork's OAuth account pool still returned no candidates when every account was temporarily soft-avoided or cooling down.

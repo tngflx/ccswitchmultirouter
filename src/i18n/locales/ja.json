@@ -4398,6 +4398,17 @@
     "restoreCcsmPreset": "CCSM プリセットを復元",
     "tomlFormatError": "TOML の形式が不正です"
   },
+  "codexSessionTraffic": {
+    "title": "{{range}} サブエージェントのセッション通信量",
+    "scope": "ローカルの Codex セッション索引と同期済みの codex_session 使用量のみを表示します。リクエスト統計とセッション統計は独立しており、合算できません。",
+    "sync": "セッション使用量を同期",
+    "readError": "サブエージェント使用量の読み込みに失敗しました: ",
+    "skipped": "セッション使用量索引をスキップしました: ",
+    "collectorIdle": "バックグラウンド収集は待機中",
+    "collectorRunning": "バックグラウンド収集中",
+    "collectorDegraded": "バックグラウンド収集は縮退中",
+    "collectorNotStarted": "バックグラウンド収集は未起動"
+  },
   "codexUsagePage": {
     "tierFiveHourLabel": "5 時間ウィンドウ",
     "tierSevenDayLabel": "週間ウィンドウ",
