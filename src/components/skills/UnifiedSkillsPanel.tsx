@@ -1070,6 +1070,7 @@ const ImportSkillsDialog: React.FC<ImportSkillsDialogProps> = ({
                   type="checkbox"
                   checked={selected.has(skill.directory)}
                   onChange={() => toggleSelect(skill.directory)}
+                  aria-label={skill.name}
                   className="mt-1"
                 />
                 <div className="flex-1 min-w-0">

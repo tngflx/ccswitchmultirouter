@@ -152,6 +152,8 @@ export interface CodexSubagentUsageAgent {
   lastUsedAt?: number;
   updatedAt?: string;
   rolloutPath?: string;
+  usageStatus?: "observed" | "missing";
+  usageSource?: "session_sync" | "rollout" | "none";
 }
 
 /** Codex 子 Agent 本地会话用量按模型聚合后的统计。 */
@@ -165,6 +167,8 @@ export interface CodexSubagentModelUsage {
   cacheCreationTokens: number;
   totalTokens: number;
   totalCost: string;
+  observedUsageAgents?: number;
+  missingUsageAgents?: number;
 }
 
 /** MultiRouter 状态页展示的 Codex 子 Agent 本地会话统计。 */
@@ -176,6 +180,51 @@ export interface CodexSubagentUsageStats {
   agents: CodexSubagentUsageAgent[];
   modelStats: CodexSubagentModelUsage[];
   skippedReason?: string;
+  scannedHistoryAgents?: number;
+  inRangeAgents?: number;
+  unknownRangeAgents?: number;
+  observedUsageAgents?: number;
+  missingUsageAgents?: number;
+  historyTruncated?: boolean;
+  proxyUsageIncluded?: false;
+  parentGroups?: CodexSubagentParentUsageGroup[];
+}
+
+export interface SessionCollectionStatus {
+  revision: number;
+  phase: "not_started" | "idle" | "running" | "degraded";
+  lastStartedAt?: number | null;
+  lastCompletedAt?: number | null;
+  lastSuccessAt?: number | null;
+  imported: number;
+  deferred: number;
+  errorsCount: number;
+  lastErrorSummary?: string | null;
+  nextRunAt?: number | null;
+  intervalSecs: number;
+}
+
+export interface CodexSubagentParentUsageGroup {
+  parentSessionId: string;
+  childSessionCount: number;
+  observedUsageChildren: number;
+  missingUsageChildren: number;
+  childRequestCount: number;
+  childInputTokens: number;
+  childCacheReadTokens: number;
+  childCacheCreationTokens: number;
+  childOutputTokens: number;
+  childTotalTokens: number;
+  parentDirectUsage: {
+    requestCount: number;
+    inputTokens: number;
+    cacheReadTokens: number;
+    cacheCreationTokens: number;
+    outputTokens: number;
+    totalTokens: number;
+  } | null;
+  parentDirectUsageSource: "session_sync" | "none";
+  parentUsageStatus?: "observed" | "unknown_may_overlap" | "not_observed";
 }
 
 /** 单台 CCSwitchMulti 上报的脱敏 Codex 用量聚合。 */

@@ -16,6 +16,7 @@ interface JsonEditorProps {
   value: string;
   onChange: (value: string) => void;
   placeholder?: string;
+  ariaLabel?: string;
   darkMode?: boolean;
   rows?: number;
   showValidation?: boolean;
@@ -28,8 +29,9 @@ const JsonEditor: React.FC<JsonEditorProps> = ({
   value,
   onChange,
   placeholder: placeholderText = "",
+  ariaLabel,
   darkMode = false,
-  rows = 12,
+  rows = 3,
   showValidation = true,
   language = "json",
   height,
@@ -142,6 +144,9 @@ const JsonEditor: React.FC<JsonEditorProps> = ({
       basicSetup,
       language === "javascript" ? javascript() : json(),
       placeholder(placeholderText || ""),
+      ...(ariaLabel
+        ? [EditorView.contentAttributes.of({ "aria-label": ariaLabel })]
+        : []),
       baseTheme,
       sizingTheme,
       jsonLinter,

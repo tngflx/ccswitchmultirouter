@@ -96,12 +96,32 @@ pub enum ReasoningSource {
     None,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HistoryReplay {
     ChatReasoningContent,
+    ResponsesReasoningTextContent,
     Omit,
+    #[default]
     NativeOnly,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolSchemaDialect {
+    #[default]
+    OpenAi,
+    MoonshotMfjs,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolSchemaEvidence {
+    #[default]
+    Unspecified,
+    ExplicitRejection,
+    AmbiguousRejection,
+    NegotiatedToolCall,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -387,6 +407,65 @@ pub fn build_logical_probe_request(case: ProbeCase, model: &str, nonce: &str) ->
     }
 
     request
+}
+
+pub(crate) fn build_safe_tool_probe_request(model: &str, nonce: &str) -> Value {
+    let mut request = build_logical_probe_request(ProbeCase::ForcedToolSse, model, nonce);
+    request["tools"] = json!([{
+        "type": "function",
+        "name": TOOL_NAME,
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "nonce": { "type": "string", "enum": [nonce] }
+            },
+            "required": ["nonce"],
+            "additionalProperties": false
+        }
+    }]);
+    request
+}
+
+/// Finalized probe payload used for one immutable send attempt.
+///
+/// Keeping the logical and wire forms together prevents a retry/continuation
+/// path from rebuilding a request with a different transformation policy.
+#[derive(Debug, Clone)]
+pub(crate) struct PreparedProbeRequest {
+    pub logical_body: Value,
+    pub wire_body: Value,
+    pub transport: TransportKind,
+    pub policy_fingerprint: String,
+}
+
+pub(crate) fn prepare_probe_request(
+    logical_body: Value,
+    transport: TransportKind,
+) -> Result<PreparedProbeRequest, ()> {
+    let wire_body = match transport {
+        TransportKind::OpenAiResponses => logical_body.clone(),
+        TransportKind::OpenAiChat => {
+            crate::proxy::providers::transform_codex_chat::responses_to_chat_completions_with_reasoning(
+                logical_body.clone(),
+                None,
+            )
+            .map_err(|_| ())?
+        }
+    };
+    let material = serde_json::json!({
+        "transport": transport,
+        "logical": logical_body,
+        "wire": wire_body,
+    });
+    let policy_fingerprint = format!("{:x}", Sha256::digest(material.to_string().as_bytes()));
+    let logical_body = material["logical"].clone();
+    let wire_body = material["wire"].clone();
+    Ok(PreparedProbeRequest {
+        logical_body,
+        wire_body,
+        transport,
+        policy_fingerprint,
+    })
 }
 
 fn probe_user_input(text: &str) -> Value {

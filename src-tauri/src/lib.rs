@@ -6,6 +6,7 @@ mod claude_desktop_config;
 mod claude_mcp;
 mod claude_plugin;
 pub mod codex_config;
+pub mod codex_config_consistency;
 mod codex_desktop;
 mod codex_guardian;
 pub mod codex_history_migration;
@@ -43,6 +44,7 @@ mod services;
 mod session_manager;
 mod settings;
 mod store;
+pub mod watchdog;
 
 mod tray;
 mod usage_events;
@@ -719,6 +721,9 @@ pub fn run() {
             }
 
             let app_state = AppState::new(db);
+            crate::services::session_collection::start_periodic_session_collection(
+                app_state.db.clone(),
+            );
 
             // 设置 AppHandle 用于代理故障转移时的 UI 更新
             app_state.proxy_service.set_app_handle(app.handle().clone());
@@ -1355,14 +1360,43 @@ pub fn run() {
                     }
                 }
 
+                let launch_codex_desktop_with_ccswitch =
+                    startup_settings.launch_codex_desktop_with_ccswitch;
+                let proxy_startup_allowed = startup_recovery_classification.allows_proxy_startup();
+                let codex_takeover_requested = state
+                    .db
+                    .get_proxy_config_for_app("codex")
+                    .await
+                    .is_ok_and(|config| config.enabled);
+                let mut codex_stopped_for_takeover = false;
+                let codex_runtime_prepared = if proxy_startup_allowed && codex_takeover_requested {
+                    match crate::codex_desktop::stop_running_codex_desktop_for_managed_lifecycle()
+                    {
+                        Ok(0) => true,
+                        Ok(count) => {
+                            codex_stopped_for_takeover = true;
+                            log::info!(
+                                "Codex managed startup stopped {count} verified Desktop shell process(es) before restoring takeover"
+                            );
+                            true
+                        }
+                        Err(error) => {
+                            log::error!(
+                                "Codex managed startup could not stop the existing Desktop shell; takeover restore is blocked: {error}"
+                            );
+                            false
+                        }
+                    }
+                } else {
+                    true
+                };
+
                 // Restore the listener and live takeover before launching Codex.
                 // The app-server freezes request-local provider/feature state at startup;
                 // launching it against an unrecovered config creates a stale runtime even
                 // when the disk is repaired moments later.
-                let codex_takeover_ready = if startup_recovery_classification
-                    .allows_proxy_startup()
-                {
-                    restore_proxy_state_on_startup(&state).await
+                let codex_takeover_ready = if proxy_startup_allowed {
+                    restore_proxy_state_on_startup(&state, codex_runtime_prepared).await
                 } else {
                     log::warn!(
                         "检测到身份完全匹配的旧 CCSwitchMulti 实例仍在运行；本实例跳过代理恢复与监听接管"
@@ -1370,13 +1404,24 @@ pub fn run() {
                     false
                 };
 
-                let launch_codex_desktop_with_ccswitch =
-                    startup_settings.launch_codex_desktop_with_ccswitch;
-                if launch_codex_desktop_with_ccswitch && !codex_takeover_ready {
+                let watchdog_port = state
+                    .db
+                    .get_proxy_config()
+                    .await
+                    .map(|config| config.listen_port)
+                    .unwrap_or(0);
+                crate::watchdog::spawn_supervisor(
+                    &crate::config::get_app_config_dir(),
+                    watchdog_port,
+                );
+
+                let should_launch_codex_after_startup =
+                    launch_codex_desktop_with_ccswitch || codex_stopped_for_takeover;
+                if should_launch_codex_after_startup && !codex_takeover_ready {
                     log::error!(
                         "Codex 启动门禁未通过：代理接管或 Live 配置恢复未完成，已阻止自动启动 Codex Desktop"
                     );
-                } else if launch_codex_desktop_with_ccswitch {
+                } else if should_launch_codex_after_startup {
                     match crate::codex_config::enforce_codex_guardian_v2_live_compatibility() {
                         Ok(_) => match crate::codex_desktop::launch_codex_desktop_with_ccswitch(true)
                         {
@@ -1447,7 +1492,9 @@ pub fn run() {
                     }
 
                     // 首次同步（含费用回填）
-                    run_session_sync(db_for_session_sync.clone(), true).await;
+                    if crate::settings::get_settings().session_auto_sync_enabled {
+                        run_session_sync(db_for_session_sync.clone(), true).await;
+                    }
 
                     // 定期同步
                     let mut interval = tokio::time::interval(std::time::Duration::from_secs(
@@ -1457,7 +1504,9 @@ pub fn run() {
                     interval.tick().await; // skip immediate first tick
                     loop {
                         interval.tick().await;
-                        run_session_sync(db_for_session_sync.clone(), false).await;
+                        if crate::settings::get_settings().session_auto_sync_enabled {
+                            run_session_sync(db_for_session_sync.clone(), false).await;
+                        }
                     }
                 });
             });
@@ -1543,6 +1592,8 @@ pub fn run() {
             commands::open_config_folder,
             commands::pick_directory,
             commands::open_external,
+            commands::inspect_codex_runtime_refresh,
+            commands::refresh_codex_runtime_state,
             commands::get_init_error,
             commands::get_pending_recovery_outcomes,
             commands::acknowledge_recovery_outcomes,
@@ -1560,6 +1611,9 @@ pub fn run() {
             commands::inspect_codex_plugin_health,
             commands::repair_codex_plugin_registration,
             commands::get_settings,
+            commands::get_watchdog_status,
+            codex_config_consistency::inspect_codex_config_consistency,
+            codex_config_consistency::resolve_codex_config_consistency,
             codex_config::get_codex_subagent_reasoning_capabilities,
             codex_config::resolve_codex_model_reasoning_capability,
             codex_config::trigger_codex_model_reasoning_detection,
@@ -1796,6 +1850,7 @@ pub fn run() {
             commands::get_request_logs,
             commands::get_request_detail,
             commands::get_codex_subagent_usage_stats,
+            commands::get_session_collection_status,
             commands::clear_usage_logs,
             commands::get_model_pricing,
             commands::update_model_pricing,
@@ -2203,6 +2258,10 @@ pub(crate) fn remove_tray_icon_before_exit(app_handle: &tauri::AppHandle) {
 /// 则自动启动代理服务并接管对应应用的 Live 配置。
 const PROXY_STARTUP_APP_TYPES: [&str; 4] = ["claude", "codex", "gemini", "grokbuild"];
 
+fn should_restore_startup_app(app_type: &str, codex_runtime_prepared: bool) -> bool {
+    app_type != "codex" || codex_runtime_prepared
+}
+
 async fn enabled_proxy_apps_on_startup(db: &database::Database) -> Vec<&'static str> {
     let mut apps = Vec::new();
     for app_type in PROXY_STARTUP_APP_TYPES {
@@ -2217,7 +2276,10 @@ async fn enabled_proxy_apps_on_startup(db: &database::Database) -> Vec<&'static 
     apps
 }
 
-async fn restore_proxy_state_on_startup(state: &store::AppState) -> bool {
+async fn restore_proxy_state_on_startup(
+    state: &store::AppState,
+    codex_runtime_prepared: bool,
+) -> bool {
     let mut codex_ready = true;
     match state
         .proxy_service
@@ -2259,6 +2321,13 @@ async fn restore_proxy_state_on_startup(state: &store::AppState) -> bool {
 
     // 逐个恢复接管状态
     for app_type in apps_to_restore {
+        if !should_restore_startup_app(app_type, codex_runtime_prepared) {
+            codex_ready = false;
+            log::error!(
+                "✗ 跳过 Codex 代理接管恢复：已运行的 Codex Desktop 无法由托管启动流程安全停止"
+            );
+            continue;
+        }
         let mut takeover_result = Err(String::new());
         for attempt in 1..=12 {
             takeover_result = state
@@ -2628,7 +2697,8 @@ mod tests {
     use super::{
         classify_exit_request, enabled_proxy_apps_on_startup, redact_url_for_log,
         redact_url_for_log_with_secrets, redact_url_origin_for_log, requested_exit_reason_name,
-        runtime_log_level_allows, ExitRequestAction, RequestedExitReason,
+        runtime_log_level_allows, should_restore_startup_app, ExitRequestAction,
+        RequestedExitReason,
     };
     use crate::database::Database;
 
@@ -2769,5 +2839,13 @@ mod tests {
         let apps = enabled_proxy_apps_on_startup(&db).await;
 
         assert_eq!(apps, vec!["grokbuild"]);
+    }
+
+    #[test]
+    fn startup_restore_blocks_only_codex_when_managed_runtime_could_not_stop() {
+        assert!(!should_restore_startup_app("codex", false));
+        assert!(should_restore_startup_app("codex", true));
+        assert!(should_restore_startup_app("claude", false));
+        assert!(should_restore_startup_app("gemini", false));
     }
 }

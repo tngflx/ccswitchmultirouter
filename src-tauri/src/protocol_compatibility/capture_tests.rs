@@ -31,7 +31,11 @@ async fn spawn_fixture() -> FixtureServer {
     let app = Router::new()
         .route("/json", post(json_response))
         .route("/sse", post(sse_response))
+        .route("/sse-data-type", post(sse_data_type_response))
         .route("/failure", post(http_failure))
+        .route("/tool-schema-failure", post(tool_schema_failure))
+        .route("/reasoning-replay-failure", post(reasoning_replay_failure))
+        .route("/rate-limit-failure", post(rate_limit_failure))
         .route("/slow", get(slow_response));
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
@@ -73,10 +77,48 @@ async fn sse_response() -> Response {
     response
 }
 
+async fn sse_data_type_response() -> Response {
+    let stream = async_stream::stream! {
+        yield Ok::<Bytes, Infallible>(Bytes::from_static(
+            b"data: {\"type\":\"response.reasoning_text.delta\",\"delta\":\"inspect\"}\n\n",
+        ));
+        yield Ok::<Bytes, Infallible>(Bytes::from_static(
+            b"data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"probe\",\"arguments\":\"{}\"}}\n\n",
+        ));
+        yield Ok::<Bytes, Infallible>(Bytes::from_static(b"data: [DONE]\n\n"));
+    };
+    let mut response = Response::new(Body::from_stream(stream));
+    response
+        .headers_mut()
+        .insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
+    response
+}
+
 async fn http_failure() -> impl IntoResponse {
     (
         StatusCode::UNAUTHORIZED,
         Json(json!({"error": {"message": "secret-upstream-error-body"}})),
+    )
+}
+
+async fn tool_schema_failure() -> impl IntoResponse {
+    (
+        StatusCode::UNPROCESSABLE_ENTITY,
+        Json(json!({"error": {"message": "tools.function.parameters is not a valid schema"}})),
+    )
+}
+
+async fn reasoning_replay_failure() -> impl IntoResponse {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(json!({"error": {"message": "Invalid reasoning_text content must be passed back"}})),
+    )
+}
+
+async fn rate_limit_failure() -> impl IntoResponse {
+    (
+        StatusCode::TOO_MANY_REQUESTS,
+        Json(json!({"error": {"message": "invalid tool schema during overload"}})),
     )
 }
 
@@ -138,6 +180,29 @@ async fn captures_chunked_sse_event_names_data_only_frames_and_done() {
 }
 
 #[tokio::test]
+async fn normalizes_data_only_responses_type_into_event_name() {
+    let fixture = spawn_fixture().await;
+    let exchange = capture_transport_probe(
+        reqwest::Client::new().post(format!("{}/sse-data-type", fixture.base_url)),
+        Duration::from_secs(1),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        exchange
+            .payloads()
+            .iter()
+            .map(|payload| payload.event_type.as_deref())
+            .collect::<Vec<_>>(),
+        vec![
+            Some("response.reasoning_text.delta"),
+            Some("response.output_item.done")
+        ]
+    );
+}
+
+#[tokio::test]
 async fn http_failure_is_structural_and_never_contains_the_raw_error_body() {
     let fixture = spawn_fixture().await;
     let client = reqwest::Client::new();
@@ -152,6 +217,43 @@ async fn http_failure_is_structural_and_never_contains_the_raw_error_body() {
     let debug = format!("{error:?}");
     assert!(!debug.contains("secret-upstream-error-body"));
     assert!(!debug.contains("secret-key"));
+}
+
+#[tokio::test]
+async fn classifies_explicit_schema_and_replay_rejections_but_not_availability_errors() {
+    let fixture = spawn_fixture().await;
+    let schema_error = capture_transport_probe(
+        reqwest::Client::new().post(format!("{}/tool-schema-failure", fixture.base_url)),
+        Duration::from_secs(1),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(
+        schema_error,
+        ProbeCaptureError::ToolSchemaRejected { status_code: 422 }
+    );
+
+    let replay_error = capture_transport_probe(
+        reqwest::Client::new().post(format!("{}/reasoning-replay-failure", fixture.base_url)),
+        Duration::from_secs(1),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(
+        replay_error,
+        ProbeCaptureError::ReasoningReplayRejected { status_code: 400 }
+    );
+
+    let availability_error = capture_transport_probe(
+        reqwest::Client::new().post(format!("{}/rate-limit-failure", fixture.base_url)),
+        Duration::from_secs(1),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(
+        availability_error,
+        ProbeCaptureError::HttpStatus { status_code: 429 }
+    );
 }
 
 #[tokio::test]

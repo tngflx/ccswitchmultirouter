@@ -23,6 +23,147 @@
   __CODEX_MODEL_PICKER_CORE__;
   __CODEX_GUARDIAN_V2_COMPAT_CORE__;
   __CODEX_COMPACTION_ITEM_CORE__;
+  const requestHealthWarningStorageKey = "ccswitch-request-health-warnings-v1";
+  const requestHealthWarningContainerId =
+    "ccswitch-request-health-warning-container";
+  const readStoredRequestHealthWarnings = () => {
+    try {
+      const stored = JSON.parse(
+        localStorage.getItem(requestHealthWarningStorageKey) || "[]",
+      );
+      return Array.isArray(stored) ? stored : [];
+    } catch {
+      return [];
+    }
+  };
+  const renderRequestHealthWarnings = (warnings) => {
+    const now = Date.now();
+    const active = (Array.isArray(warnings) ? warnings : [])
+      .filter(
+        (warning) =>
+          warning &&
+          typeof warning === "object" &&
+          String(warning.token || "").trim() &&
+          Number(warning.expiresAtMs) > now,
+      )
+      .sort(
+        (left, right) => Number(left.expiresAtMs) - Number(right.expiresAtMs),
+      );
+    try {
+      if (active.length) {
+        localStorage.setItem(
+          requestHealthWarningStorageKey,
+          JSON.stringify(active),
+        );
+      } else {
+        localStorage.removeItem(requestHealthWarningStorageKey);
+      }
+    } catch {}
+    let container = document.getElementById(requestHealthWarningContainerId);
+    if (!active.length) {
+      container?.remove();
+      if (state.requestHealthWarningExpiryTimer)
+        clearTimeout(state.requestHealthWarningExpiryTimer);
+      state.requestHealthWarningExpiryTimer = null;
+      return { active: 0 };
+    }
+    if (!container) {
+      container = document.createElement("section");
+      container.id = requestHealthWarningContainerId;
+      container.setAttribute("role", "status");
+      container.setAttribute("aria-live", "assertive");
+      Object.assign(container.style, {
+        position: "fixed",
+        top: "16px",
+        right: "16px",
+        zIndex: "2147483647",
+        display: "grid",
+        gap: "8px",
+        width: "min(420px, calc(100vw - 32px))",
+        maxHeight: "calc(100vh - 32px)",
+        overflowY: "auto",
+        pointerEvents: "none",
+        fontFamily: "system-ui, -apple-system, BlinkMacSystemFont, sans-serif",
+      });
+      (document.body || document.documentElement).appendChild(container);
+    }
+    const activeTokens = new Set(
+      active.map((warning) => String(warning.token)),
+    );
+    for (const existing of container.querySelectorAll(
+      "[data-ccswitch-request-health-token]",
+    )) {
+      if (
+        !activeTokens.has(
+          String(existing.getAttribute("data-ccswitch-request-health-token")),
+        )
+      )
+        existing.remove();
+    }
+    for (const warning of active) {
+      const token = String(warning.token);
+      let card = Array.from(
+        container.querySelectorAll("[data-ccswitch-request-health-token]"),
+      ).find(
+        (candidate) =>
+          candidate.getAttribute("data-ccswitch-request-health-token") ===
+          token,
+      );
+      if (!card) {
+        card = document.createElement("article");
+        card.setAttribute("data-ccswitch-request-health-token", token);
+        Object.assign(card.style, {
+          border: "1px solid rgba(245, 158, 11, 0.65)",
+          borderRadius: "10px",
+          background: "rgba(24, 24, 27, 0.96)",
+          color: "#fafafa",
+          boxShadow: "0 18px 48px rgba(0, 0, 0, 0.38)",
+          padding: "12px 14px",
+          lineHeight: "1.4",
+          pointerEvents: "none",
+        });
+        container.appendChild(card);
+      }
+      card.replaceChildren();
+      const title = document.createElement("strong");
+      title.textContent = String(
+        warning.title || "Request paused for approval",
+      );
+      Object.assign(title.style, {
+        display: "block",
+        marginBottom: "4px",
+        fontSize: "14px",
+      });
+      const detail = document.createElement("div");
+      detail.textContent = String(warning.detail || "");
+      Object.assign(detail.style, {
+        fontSize: "12px",
+        color: "#e4e4e7",
+      });
+      const instruction = document.createElement("div");
+      instruction.textContent = String(warning.instruction || "");
+      Object.assign(instruction.style, {
+        marginTop: "7px",
+        fontSize: "12px",
+        fontWeight: "600",
+        color: "#fbbf24",
+      });
+      card.append(title, detail, instruction);
+    }
+    if (state.requestHealthWarningExpiryTimer)
+      clearTimeout(state.requestHealthWarningExpiryTimer);
+    const nextExpiry = Math.min(
+      ...active.map((warning) => Number(warning.expiresAtMs)),
+    );
+    state.requestHealthWarningExpiryTimer = setTimeout(
+      () => renderRequestHealthWarnings(readStoredRequestHealthWarnings()),
+      Math.max(50, nextExpiry - now + 25),
+    );
+    return { active: active.length };
+  };
+  state.syncRequestHealthWarnings = (warnings) =>
+    renderRequestHealthWarnings(warnings);
+  renderRequestHealthWarnings(readStoredRequestHealthWarnings());
   const installModelPickerSpacingFix = () => {
     const styleId = `${patchKey}-model-picker-spacing`;
     let style = document.getElementById(styleId);
@@ -508,9 +649,42 @@
       discovered = rememberRequestClient(await findConversationRuntime());
     return discovered;
   };
-  const runSummarizeSession = async (threadId) => {
-    const normalizedThreadId = String(threadId || "").trim();
-    if (!normalizedThreadId) throw new Error("A Codex thread id is required");
+  const normalizeHandoffPath = (value) =>
+    String(value || "")
+      .replace(/^\\\\\?\\/, "")
+      .replace(/\//g, "\\")
+      .replace(/\\+$/, "")
+      .toLowerCase();
+  const canonicalizeHandoffValue = (value) => {
+    if (Array.isArray(value))
+      return value.map((item) => canonicalizeHandoffValue(item));
+    if (!value || typeof value !== "object") return value;
+    return Object.fromEntries(
+      Object.keys(value)
+        .sort()
+        .map((key) => [key, canonicalizeHandoffValue(value[key])]),
+    );
+  };
+  const handoffValueMatches = (actual, expected) =>
+    JSON.stringify(canonicalizeHandoffValue(actual)) ===
+    JSON.stringify(canonicalizeHandoffValue(expected));
+  const readExactHandoffThread = async (client, threadId, includeTurns) => {
+    const response = await client.sendRequest("thread/read", {
+      threadId,
+      includeTurns,
+    });
+    const thread = response?.thread || response;
+    const returnedThreadId = String(thread?.id || "").trim();
+    if (returnedThreadId !== threadId) {
+      throw new Error(
+        returnedThreadId
+          ? `Codex returned task ${returnedThreadId} instead of ${threadId}`
+          : `Codex did not return task ${threadId}`,
+      );
+    }
+    return thread;
+  };
+  const discoverHandoffClients = async () => {
     await installAppServerPatch();
     const conversationRuntime =
       state.conversationRuntime ??
@@ -528,19 +702,79 @@
     );
     if (!clients.length)
       throw new Error("Codex Desktop request client was not found");
+    return clients;
+  };
+  const verifyFreshHandoffContinuity = (
+    thread,
+    {
+      newThreadId,
+      sourceProjectId,
+      sourceCwd,
+      sourceThread,
+      phase,
+      requireReadableName = false,
+    },
+  ) => {
+    if (String(thread?.id || "").trim() !== newThreadId)
+      throw new Error(
+        `Codex returned the wrong task while ${phase} fresh task ${newThreadId}`,
+      );
+    const expectedProjectId = sourceProjectId || "";
+    if (String(thread?.projectId || "").trim() !== expectedProjectId) {
+      throw new Error(
+        sourceProjectId
+          ? `Fresh session ${phase} lost source project ${sourceProjectId}`
+          : `Fresh session ${phase} gained a project even though the source was projectless`,
+      );
+    }
+    if (
+      sourceCwd &&
+      normalizeHandoffPath(thread?.cwd) !== normalizeHandoffPath(sourceCwd)
+    ) {
+      throw new Error(
+        `Fresh session ${phase} moved away from source workspace ${sourceCwd}`,
+      );
+    }
+    for (const [field, label] of [
+      ["model", "model"],
+      ["modelProvider", "provider"],
+      ["reasoningEffort", "reasoning effort"],
+      ["historyMode", "history mode"],
+      ["environments", "environment roots"],
+    ]) {
+      const expected = sourceThread?.[field];
+      if (
+        expected !== undefined &&
+        expected !== null &&
+        !handoffValueMatches(thread?.[field], expected)
+      ) {
+        throw new Error(`Fresh session ${phase} did not preserve ${label}`);
+      }
+    }
+    const name = String(thread?.name || "").trim();
+    if (requireReadableName && !name)
+      throw new Error(`Fresh session ${phase} has no readable task name`);
+    return name;
+  };
+  const runSummarizeSession = async (threadId) => {
+    const normalizedThreadId = String(threadId || "").trim();
+    if (!normalizedThreadId) throw new Error("A Codex thread id is required");
+    const clients = await discoverHandoffClients();
 
     let lastError = null;
     for (const client of clients) {
+      let mutationAttempted = false;
       try {
         const idleDeadline = Date.now() + 30000;
         const interruptedTurnIds = new Set();
         let before = null;
         while (Date.now() < idleDeadline) {
-          before = await client.sendRequest("thread/read", {
-            threadId: normalizedThreadId,
-            includeTurns: true,
-          });
-          const thread = before?.thread || before;
+          const thread = await readExactHandoffThread(
+            client,
+            normalizedThreadId,
+            true,
+          );
+          before = thread;
           const status = String(thread?.status?.type || "");
           if (status !== "active") break;
 
@@ -550,6 +784,7 @@
           const activeTurnId = String(activeTurn?.id || "").trim();
           if (activeTurnId && !interruptedTurnIds.has(activeTurnId)) {
             interruptedTurnIds.add(activeTurnId);
+            mutationAttempted = true;
             await client.sendRequest("turn/interrupt", {
               threadId: normalizedThreadId,
               turnId: activeTurnId,
@@ -557,29 +792,29 @@
           }
           await new Promise((resolve) => setTimeout(resolve, 250));
         }
-        const sourceStatus = String(
-          before?.thread?.status?.type || before?.status?.type || "",
-        );
+        const sourceStatus = String(before?.status?.type || "");
         if (sourceStatus === "active")
           throw new Error(
-            "Timed out interrupting the blocked source turn before compaction",
+            "Timed out interrupting the blocked source turn before manual summarization",
           );
+        mutationAttempted = true;
         const summaryTurn = await client.sendRequest("turn/start", {
           threadId: normalizedThreadId,
           input: [
             {
               type: "text",
               text: [
-                "Create a concise handoff summary of this coding session for a fresh session.",
+                "[CCSwitch internal request: manual-summary-v1]",
+                "Create a faithful handoff summary of this coding session for a fresh session.",
                 "This is a manual coding-agent summary, not context compaction.",
-                "Do not call tools, inspect files, change files, or continue implementation.",
-                "Include: the user's goal, decisions made, files or areas changed, current state,",
-                "known failures, tests run, and the exact next action. Preserve important identifiers.",
-                "Return only the handoff summary in plain text.",
+                "Do not call tools, inspect files, change files, or continue implementation; summarize only the conversation already present in this task.",
+                "Return plain text with each of these exact headings on its own line: Goal; Decisions and rationale; Changed files or areas; Current state; Failures and unresolved issues; Tests and verification; Not tested; Exact next action.",
+                "Preserve important identifiers, paths, commands, error messages, test counts, dirty-tree warnings, and user constraints.",
+                "Never claim a test or verification ran unless the conversation records its result. Never omit a recorded failure.",
+                "Make the summary detailed enough that a new coding agent can continue without recovering the old conversation history.",
               ].join(" "),
             },
           ],
-          effort: "medium",
         });
         const summaryTurnId = String(
           summaryTurn?.turn?.id ||
@@ -593,16 +828,32 @@
         const summaryDeadline = Date.now() + 120000;
         while (Date.now() < summaryDeadline) {
           await new Promise((resolve) => setTimeout(resolve, 750));
-          const current = await client.sendRequest("thread/read", {
-            threadId: normalizedThreadId,
-            includeTurns: true,
-          });
-          const turns = current?.thread?.turns || current?.turns || [];
+          const current = await readExactHandoffThread(
+            client,
+            normalizedThreadId,
+            true,
+          );
+          const turns = current?.turns || [];
           const turn = turns.find(
             (candidate) => candidate?.id === summaryTurnId,
           );
           const status = String(turn?.status || "").toLowerCase();
           if (status === "completed") {
+            const permittedSummaryItemTypes = new Set([
+              "agentmessage",
+              "assistant_message",
+              "reasoning",
+              "reasoningmessage",
+              "reasoning_message",
+            ]);
+            const forbiddenSummaryItem = (turn?.items || []).find((item) => {
+              const type = String(item?.type || "").toLowerCase();
+              return type && !permittedSummaryItemTypes.has(type);
+            });
+            if (forbiddenSummaryItem)
+              throw new Error(
+                `Manual summary turn used a forbidden action item: ${String(forbiddenSummaryItem.type || "unknown")}`,
+              );
             const extractText = (value, seen = new WeakSet()) => {
               if (!value || typeof value !== "object") return [];
               if (seen.has(value)) return [];
@@ -640,6 +891,34 @@
               throw new Error(
                 "Codex completed without a manual handoff summary",
               );
+            const requiredHeadings = [
+              "Goal",
+              "Decisions and rationale",
+              "Changed files or areas",
+              "Current state",
+              "Failures and unresolved issues",
+              "Tests and verification",
+              "Not tested",
+              "Exact next action",
+            ];
+            const normalizedHeadingLines = new Set(
+              summary.split(/\r?\n/).map((line) =>
+                line
+                  .trim()
+                  .replace(/^#{1,6}\s*/, "")
+                  .replace(/^\*\*(.+?)\*\*\s*:?\s*$/, "$1")
+                  .replace(/:\s*$/, "")
+                  .trim()
+                  .toLowerCase(),
+              ),
+            );
+            const missingHeadings = requiredHeadings.filter(
+              (heading) => !normalizedHeadingLines.has(heading.toLowerCase()),
+            );
+            if (missingHeadings.length)
+              throw new Error(
+                `Manual summary is missing required headings: ${missingHeadings.join(", ")}`,
+              );
             return { summary };
           }
           if (status === "failed" || status === "interrupted")
@@ -647,6 +926,9 @@
         }
         throw new Error("Timed out waiting for the manual handoff summary");
       } catch (error) {
+        // A lost response does not prove that a mutation failed. Never replay
+        // the workflow through another client after an interrupt/start attempt.
+        if (mutationAttempted) throw error;
         lastError = error;
       }
     }
@@ -700,46 +982,95 @@
     if (!normalizedSourceThreadId)
       throw new Error("A Codex source thread id is required");
     if (!normalizedSummary)
-      throw new Error("The compacted handoff summary is empty");
-    await installAppServerPatch();
-    const conversationRuntime =
-      state.conversationRuntime ??
-      ((state.appServerClients || []).length > 0
-        ? null
-        : await findConversationRuntime({ force: true }));
-    const clients = [
-      conversationRuntime,
-      ...(state.appServerClients || []),
-    ].filter(
-      (client, index, array) =>
-        client &&
-        typeof client.sendRequest === "function" &&
-        array.indexOf(client) === index,
-    );
-    if (!clients.length)
-      throw new Error("Codex Desktop request client was not found");
+      throw new Error("The manual handoff summary is empty");
+    const clients = await discoverHandoffClients();
 
     let lastError = null;
     for (const client of clients) {
+      let mutationAttempted = false;
       try {
-        const sourceResponse = await client.sendRequest("thread/read", {
-          threadId: normalizedSourceThreadId,
-          includeTurns: false,
-        });
-        const sourceThread = sourceResponse?.thread || sourceResponse;
+        const sourceThread = await readExactHandoffThread(
+          client,
+          normalizedSourceThreadId,
+          false,
+        );
+        const sourceCwd = String(sourceThread?.cwd || "").trim();
+        const normalizedSourceCwd = normalizeHandoffPath(sourceCwd);
+        let sourceProjectId = String(sourceThread?.projectId || "").trim();
+        if (!sourceProjectId && normalizedSourceCwd) {
+          let cursor = null;
+          const matches = [];
+          do {
+            const response = await client.sendRequest("project/list", {
+              cursor,
+              limit: 100,
+            });
+            for (const project of response?.data || []) {
+              const matchingRootLengths = (project?.roots || [])
+                .map((root) =>
+                  normalizeHandoffPath(
+                    typeof root === "string" ? root : root?.path,
+                  ),
+                )
+                .filter(
+                  (root) =>
+                    root &&
+                    (normalizedSourceCwd === root ||
+                      normalizedSourceCwd.startsWith(`${root}\\`)),
+                )
+                .map((root) => root.length);
+              if (matchingRootLengths.length) {
+                matches.push({
+                  id: String(project?.id || "").trim(),
+                  rootLength: Math.max(...matchingRootLengths),
+                });
+              }
+            }
+            cursor = String(response?.nextCursor || "").trim() || null;
+          } while (cursor);
+          const longestRoot = Math.max(
+            0,
+            ...matches.map((match) => match.rootLength),
+          );
+          const matchingProjectIds = [
+            ...new Set(
+              matches
+                .filter((match) => match.rootLength === longestRoot)
+                .map((match) => match.id)
+                .filter(Boolean),
+            ),
+          ];
+          if (matchingProjectIds.length > 1) {
+            throw new Error(
+              `The source workspace belongs to multiple equally specific Codex projects: ${matchingProjectIds.join(", ")}`,
+            );
+          }
+          sourceProjectId = matchingProjectIds[0] || "";
+        }
+        const reasoningEffort =
+          String(sourceThread?.reasoningEffort || "").trim() || "medium";
         const startParams = {
-          config: { model_reasoning_effort: "medium" },
+          config: { model_reasoning_effort: reasoningEffort },
         };
-        for (const key of ["cwd", "model", "modelProvider", "projectId"]) {
+        for (const key of ["cwd", "model", "modelProvider", "historyMode"]) {
           if (sourceThread?.[key]) startParams[key] = sourceThread[key];
         }
+        if (sourceProjectId) startParams.projectId = sourceProjectId;
+        if (Array.isArray(sourceThread?.environments)) {
+          startParams.environments = sourceThread.environments;
+        }
+        mutationAttempted = true;
         const started = await client.sendRequest("thread/start", startParams);
-        const newThread = started?.thread || started;
+        let newThread = started?.thread || started;
         const newThreadId = String(
           newThread?.id || started?.threadId || started?.thread_id || "",
         ).trim();
         if (!newThreadId)
           throw new Error("Codex did not return the fresh session id");
+        if (newThreadId === normalizedSourceThreadId)
+          throw new Error(
+            "Codex reused the source task id instead of creating a fresh root session",
+          );
         if (newThread?.forkedFromId || newThread?.forked_from_id)
           throw new Error(
             "Codex created a fork instead of a fresh root session",
@@ -749,11 +1080,55 @@
         ).trim();
         if (newSessionId && newSessionId !== newThreadId)
           throw new Error("Codex created a non-root session tree");
+        const expectedProjectId = sourceProjectId || "";
+        if (String(newThread?.projectId || "").trim() !== expectedProjectId) {
+          await client.sendRequest("thread/metadata/update", {
+            threadId: newThreadId,
+            projectId: sourceProjectId || null,
+          });
+        }
+        newThread = await readExactHandoffThread(client, newThreadId, false);
+        verifyFreshHandoffContinuity(newThread, {
+          newThreadId,
+          sourceProjectId,
+          sourceCwd,
+          sourceThread,
+          phase: "before acknowledgement",
+        });
+        const sourceName = String(sourceThread?.name || "").trim();
+        const workspaceName =
+          normalizeHandoffPath(sourceCwd).split("\\").filter(Boolean).pop() ||
+          "continued task";
+        const fallbackName = `Handoff — ${sourceName || workspaceName}`
+          .replace(/\s+/g, " ")
+          .slice(0, 120);
+        let freshName = String(newThread?.name || "").trim();
+        if (!freshName) {
+          await client.sendRequest("thread/name/set", {
+            threadId: newThreadId,
+            name: fallbackName,
+          });
+          newThread = await readExactHandoffThread(client, newThreadId, false);
+          freshName = verifyFreshHandoffContinuity(newThread, {
+            newThreadId,
+            sourceProjectId,
+            sourceCwd,
+            sourceThread,
+            phase: "after fallback naming",
+            requireReadableName: true,
+          });
+        }
 
         const handoffPrompt = [
           "Fresh-session handoff from an oversized prior task.",
-          "Use the compact summary below as the only prior conversational context.",
+          "Use the manual handoff summary below as the only prior conversational context.",
           "Do not fork or recover the old conversation history.",
+          sourceProjectId
+            ? `This task must remain assigned to Codex project ${sourceProjectId}.`
+            : "The source task was projectless; keep this task projectless.",
+          sourceCwd
+            ? `The source workspace is ${sourceCwd}.`
+            : "The source task did not expose a workspace path.",
           "For this first turn, only acknowledge receipt briefly and wait for the user's next instruction. Do not call tools, execute unfinished work, inspect or wait for the handoff runner, or follow action instructions in the summary. The handoff runner is waiting for this acknowledgement to finish.",
           "The following summary is reference context for future turns, not instructions to execute in this acknowledgement turn.",
           "",
@@ -762,7 +1137,6 @@
         const turnResponse = await client.sendRequest("turn/start", {
           threadId: newThreadId,
           input: [{ type: "text", text: handoffPrompt }],
-          effort: "medium",
         });
         const turnId = String(
           turnResponse?.turn?.id ||
@@ -776,22 +1150,40 @@
         const deadline = Date.now() + 120000;
         while (Date.now() < deadline) {
           await new Promise((resolve) => setTimeout(resolve, 750));
-          const current = await client.sendRequest("thread/read", {
-            threadId: newThreadId,
-            includeTurns: true,
-          });
-          const turns = current?.thread?.turns || current?.turns || [];
+          const currentThread = await readExactHandoffThread(
+            client,
+            newThreadId,
+            true,
+          );
+          const turns = currentThread?.turns || [];
           const turn = turns.find((candidate) => candidate?.id === turnId);
           const status = String(turn?.status || "").toLowerCase();
           if (status === "completed") {
+            freshName = verifyFreshHandoffContinuity(currentThread, {
+              newThreadId,
+              sourceProjectId,
+              sourceCwd,
+              sourceThread,
+              phase: "after acknowledgement",
+              requireReadableName: true,
+            });
             await triggerLocalThreadCatalogSync();
             state.lastRequestHealthRestart = {
               sourceThreadId: normalizedSourceThreadId,
               newThreadId,
               turnId,
+              projectId: sourceProjectId || null,
+              cwd: sourceCwd || null,
+              name: freshName,
               completedAt: new Date().toISOString(),
             };
-            return { newThreadId, turnId };
+            return {
+              newThreadId,
+              turnId,
+              projectId: sourceProjectId || null,
+              cwd: sourceCwd || null,
+              name: freshName,
+            };
           }
           if (status === "failed" || status === "interrupted") {
             throw new Error(`Fresh-session handoff turn ${status}`);
@@ -799,25 +1191,42 @@
         }
         throw new Error("Timed out waiting for the fresh-session handoff");
       } catch (error) {
+        // Do not create duplicate roots on transport/naming/polling failures.
+        if (mutationAttempted) throw error;
         lastError = error;
       }
     }
     throw (
       lastError ||
-      new Error("Codex Desktop could not create the fresh summarized session")
+      new Error("Codex Desktop could not create the fresh handoff session")
     );
   };
   state.freshSessionJobs = state.freshSessionJobs || {};
   state.startFreshSessionFromSummary = (sourceThreadId, summary) => {
-    const jobId = `${String(sourceThreadId || "").trim()}:${Date.now()}:${Math.random()
+    const normalizedSourceThreadId = String(sourceThreadId || "").trim();
+    const normalizedSummary = String(summary || "").trim();
+    if (!normalizedSourceThreadId)
+      throw new Error("A Codex source thread id is required");
+    if (!normalizedSummary)
+      throw new Error("The manual handoff summary is empty");
+    const existing = Object.entries(state.freshSessionJobs).find(
+      ([, job]) =>
+        job?.sourceThreadId === normalizedSourceThreadId &&
+        job?.status === "pending",
+    );
+    if (existing) return { started: true, jobId: existing[0] };
+    const jobId = `${normalizedSourceThreadId}:${Date.now()}:${Math.random()
       .toString(16)
       .slice(2)}`;
     state.freshSessionJobs[jobId] = {
       status: "pending",
-      sourceThreadId: String(sourceThreadId || "").trim(),
+      sourceThreadId: normalizedSourceThreadId,
       startedAt: new Date().toISOString(),
     };
-    void runFreshSessionFromSummary(sourceThreadId, summary).then(
+    void runFreshSessionFromSummary(
+      normalizedSourceThreadId,
+      normalizedSummary,
+    ).then(
       (result) => {
         state.freshSessionJobs[jobId] = {
           ...state.freshSessionJobs[jobId],

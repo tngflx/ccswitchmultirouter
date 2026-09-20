@@ -874,6 +874,64 @@ pub(crate) fn write_codex_config_only_with_common_config(
     )
 }
 
+/// Build the exact Codex config payload that the live writer would publish,
+/// without mutating the live file. This is the comparison boundary used by
+/// config-drift reconciliation.
+pub(crate) fn build_codex_live_config_for_provider(
+    db: &Database,
+    provider: &Provider,
+) -> Result<String, AppError> {
+    let mut effective_provider = provider.clone();
+    effective_provider.settings_config =
+        build_effective_settings_with_common_config(db, &AppType::Codex, provider)?;
+
+    let is_v2_router = effective_provider
+        .settings_config
+        .get("codexRouting")
+        .and_then(|routing| {
+            crate::codex_multirouter::schema::CodexRoutingDocument::parse(routing).ok()
+        })
+        .is_some_and(|document| {
+            matches!(
+                document,
+                crate::codex_multirouter::schema::CodexRoutingDocument::V2(_)
+            )
+        });
+    if is_v2_router {
+        let artifact = crate::codex_multirouter::projection::build_projection_artifact(
+            db,
+            &effective_provider.id,
+        )?;
+        crate::codex_multirouter::projection::apply_projection_owned_settings(
+            &mut effective_provider.settings_config,
+            &artifact.projection_settings,
+        );
+    }
+
+    let settings_for_live = codex_settings_for_live_projection(&effective_provider);
+    let config_text = settings_for_live
+        .get("config")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let provider_context = crate::codex_config::codex_provider_classification_context(db)?;
+    let profile =
+        crate::proxy::providers::resolve_codex_catalog_tool_profile(&effective_provider);
+    let prepared =
+        crate::codex_config::prepare_codex_config_text_with_model_catalog_and_provider_context(
+            &settings_for_live,
+            config_text,
+            profile,
+            &provider_context,
+        )?;
+    if effective_provider.category.as_deref() == Some("official")
+        && crate::settings::unify_codex_session_history()
+    {
+        crate::codex_config::inject_codex_unified_session_bucket(&prepared)
+    } else {
+        Ok(prepared)
+    }
+}
+
 pub(crate) fn strip_common_config_from_live_settings(
     db: &Database,
     app_type: &AppType,

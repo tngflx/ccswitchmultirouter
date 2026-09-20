@@ -13,6 +13,10 @@ export function Toaster() {
       position="top-center"
       richColors
       theme={sonnerTheme}
+      // Radix modal dialogs set `pointer-events: none` on body. The global
+      // toaster lives outside the dialog content and otherwise inherits that
+      // lock, making toast actions impossible to click while a modal is open.
+      style={{ pointerEvents: "auto" }}
       toastOptions={{
         duration: 2000,
         classNames: {

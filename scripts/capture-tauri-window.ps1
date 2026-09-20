@@ -37,6 +37,10 @@ using System;
 using System.Text;
 using System.Runtime.InteropServices;
 public static class TauriCaptureNative {
+    [DllImport("user32.dll")]
+    public static extern bool SetProcessDpiAwarenessContext(IntPtr dpiContext);
+    [DllImport("user32.dll")]
+    public static extern bool SetProcessDPIAware();
     public delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
     [DllImport("user32.dll")]
     public static extern bool EnumWindows(EnumWindowsProc lpEnumFunc, IntPtr lParam);
@@ -67,6 +71,16 @@ public static class TauriCaptureNative {
 }
 "@
 Add-Type -TypeDefinition $native
+
+# GetWindowRect is DPI-virtualized for an unaware PowerShell host, while
+# WebView2 PrintWindow paints the renderer's physical pixels. Opt into
+# per-monitor-v2 awareness before reading any HWND rectangle so the bitmap is
+# allocated at the same pixel dimensions as the compositor. Fall back to
+# system awareness on older Windows builds.
+$perMonitorAwareV2 = [IntPtr]::new(-4)
+if (-not [TauriCaptureNative]::SetProcessDpiAwarenessContext($perMonitorAwareV2)) {
+    [TauriCaptureNative]::SetProcessDPIAware() | Out-Null
+}
 
 function Get-ProcessWindows {
     param([int]$ProcessId)

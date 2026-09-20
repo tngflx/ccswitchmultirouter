@@ -12,7 +12,10 @@ import path from "node:path";
 import process from "node:process";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
-const DEFAULT_DELAY_MS = 3_600_000;
+// Backend edits should converge during normal development. A one-hour quiet
+// period leaves the running Tauri binary stale and makes `pnpm dev` appear to
+// ignore Rust changes. Use an explicit longer delay only when needed.
+const DEFAULT_DELAY_MS = 7_200_000;
 const DEFAULT_FRONTEND_PORT = 3000;
 const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(SCRIPT_DIR, "..");
@@ -42,6 +45,10 @@ const BACKEND_ROOT_FILES = new Set([
   "Info.plist",
 ]);
 const BACKEND_REPO_ROOT_FILES = new Set(["rust-toolchain.toml"]);
+
+export function normalizeCliArgs(args) {
+  return args[0] === "--" ? args.slice(1) : args;
+}
 
 export function parseDelayMs(args, environment = process.env) {
   let unsupportedArgument;
@@ -1038,7 +1045,7 @@ export function runCargoTargetMaintenance({
 }
 
 async function run() {
-  const args = process.argv.slice(2);
+  const args = normalizeCliArgs(process.argv.slice(2));
   if (args.includes("--help") || args.includes("-h")) {
     console.log(`Usage: pnpm dev:delayed -- [--delay milliseconds] [--no-rebuild]
 
@@ -1046,7 +1053,7 @@ Runs Vite with immediate frontend HMR and rebuilds the Tauri backend only after
 backend files have remained unchanged for the configured quiet period.
 
 Options:
-  -d, --delay <ms>  Quiet period before a backend rebuild (default: 3600000 / 1 hour)
+  -d, --delay <ms>  Quiet period before a backend rebuild (default: 7200000 / 2 hours)
   --no-rebuild      Detect and log backend edits, but never rebuild/restart Tauri
 
 Environment:

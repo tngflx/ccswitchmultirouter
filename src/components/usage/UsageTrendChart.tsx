@@ -1,3 +1,4 @@
+import { useMemo } from "react";
 import { useTranslation } from "react-i18next";
 import {
   AreaChart,
@@ -44,6 +45,24 @@ export function cacheHitRatePercent(
   );
 }
 
+export function createUsageTrendTokenTickFormatter(
+  locale: string,
+): Intl.NumberFormat {
+  return new Intl.NumberFormat(locale, {
+    notation: "compact",
+    compactDisplay: "short",
+    maximumFractionDigits: 1,
+  });
+}
+
+export function formatUsageTrendTokenTickLabel(
+  value: unknown,
+  formatter: Intl.NumberFormat,
+): string {
+  const num = parseFiniteNumber(value);
+  return num == null ? "--" : formatter.format(num);
+}
+
 export function UsageTrendChart({
   range,
   rangeLabel,
@@ -74,6 +93,10 @@ export function UsageTrendChart({
   const isHourly = durationSeconds <= 24 * 60 * 60;
   const language = i18n.resolvedLanguage || i18n.language || "en";
   const dateLocale = getLocaleFromLanguage(language);
+  const tokenTickFormatter = useMemo(
+    () => createUsageTrendTokenTickFormatter(dateLocale),
+    [dateLocale],
+  );
   const chartData =
     trends?.map((stat) => {
       const pointDate = new Date(stat.date);
@@ -198,16 +221,22 @@ export function UsageTrendChart({
             />
             <YAxis
               yAxisId="tokens"
+              width={72}
               axisLine={false}
               tickLine={false}
+              tickMargin={8}
               tick={{ fill: "hsl(var(--muted-foreground))", fontSize: 12 }}
-              tickFormatter={(value) => `${(value / 1000).toFixed(0)}k`}
+              tickFormatter={(value) =>
+                formatUsageTrendTokenTickLabel(value, tokenTickFormatter)
+              }
             />
             <YAxis
               yAxisId="cost"
               orientation="right"
+              width={56}
               axisLine={false}
               tickLine={false}
+              tickMargin={8}
               tick={{ fill: "hsl(var(--muted-foreground))", fontSize: 12 }}
               tickFormatter={(value) => `$${value}`}
             />

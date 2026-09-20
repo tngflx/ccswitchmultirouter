@@ -12,6 +12,7 @@ import {
   createQuietPeriodScheduler,
   isPathInside,
   isTauriAppStartedOutput,
+  normalizeCliArgs,
   parseDelayMs,
   parseNoRebuild,
   parsePort,
@@ -29,8 +30,14 @@ import {
   windowsFrontendDescendants,
 } from "./dev-tauri-delayed.mjs";
 
+test("CLI normalization removes pnpm's leading argument separator", () => {
+  assert.deepEqual(normalizeCliArgs(["--", "--delay", "0"]), ["--delay", "0"]);
+  assert.deepEqual(normalizeCliArgs(["--no-rebuild"]), ["--no-rebuild"]);
+  assert.deepEqual(normalizeCliArgs([]), []);
+});
+
 test("parseDelayMs uses the default and supports environment and CLI overrides", () => {
-  assert.equal(parseDelayMs([], {}), 3_600_000);
+  assert.equal(parseDelayMs([], {}), 7_200_000);
   assert.equal(
     parseDelayMs([], { TAURI_DEV_REBUILD_DELAY_MS: "15000" }),
     15_000,

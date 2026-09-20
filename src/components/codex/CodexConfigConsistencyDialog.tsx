@@ -1,0 +1,911 @@
+import { useEffect, useState } from "react";
+
+import {
+  AlertTriangle,
+  CheckCircle2,
+  Circle,
+  Loader2,
+  RotateCcw,
+  XCircle,
+} from "lucide-react";
+import { useTranslation } from "react-i18next";
+
+import { Button } from "@/components/ui/button";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
+import type {
+  CodexBlockedHistoryReasonGroup,
+  CodexConfigConsistencyReport,
+} from "@/lib/api/codexConfigConsistency";
+import type {
+  CodexRuntimeRefreshLogEntry,
+  CodexRuntimeRefreshPhase,
+  CodexRuntimeRefreshWorkflow,
+} from "@/hooks/useCodexConfigConsistency";
+
+type CodexRuntimeRefreshView = Pick<
+  CodexRuntimeRefreshWorkflow,
+  "phase" | "preflight" | "progress"
+> &
+  Partial<
+    Pick<
+      CodexRuntimeRefreshWorkflow,
+      | "error"
+      | "result"
+      | "rendererRetryPending"
+      | "logs"
+      | "lastProgressAt"
+      | "stageStartedAt"
+    >
+  >;
+
+interface CodexConfigConsistencyDialogProps {
+  report: CodexConfigConsistencyReport | null;
+  pending: boolean;
+  error: string | null;
+  onApply: () => void;
+  onKeep: () => void;
+  onLater: () => void;
+  onRetry: () => void;
+  refresh?: CodexRuntimeRefreshView;
+  onInspectRefresh?: () => void;
+  onConfirmRefresh?: () => void;
+  onCancelRefresh?: () => void;
+  onRetryRendererCompatibility?: () => void;
+}
+
+const REFRESH_STAGE_ORDER = [
+  "closing",
+  "repairing_history",
+  "applying_config",
+  "launching",
+  "verifying",
+] as const;
+
+function formatProgressTime(emittedAtMs: number): string {
+  return new Date(emittedAtMs).toLocaleTimeString([], {
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+  });
+}
+
+function RefreshProgressLog({
+  logs,
+  lastProgressAt,
+  stageStartedAt,
+  now,
+}: {
+  logs?: CodexRuntimeRefreshLogEntry[];
+  lastProgressAt?: number | null;
+  stageStartedAt?: number | null;
+  now: number;
+}) {
+  const { t } = useTranslation();
+  const visibleLogs = logs ?? [];
+  const lastActivitySeconds =
+    lastProgressAt != null
+      ? Math.max(0, Math.round((now - lastProgressAt) / 1000))
+      : null;
+  const stageSeconds =
+    stageStartedAt != null
+      ? Math.max(0, Math.round((now - stageStartedAt) / 1000))
+      : null;
+  if (visibleLogs.length === 0 && lastActivitySeconds === null) return null;
+  return (
+    <div className="space-y-2 rounded-md border bg-muted/20 p-3">
+      <div className="flex items-center justify-between gap-3">
+        <p className="font-medium">
+          {t("codexConfigConsistency.progressLogTitle")}
+        </p>
+        {lastActivitySeconds !== null ? (
+          <p className="text-xs text-muted-foreground">
+            {t("codexConfigConsistency.progressLastActivity")}{" "}
+            {lastActivitySeconds} {t("codexConfigConsistency.seconds")}
+          </p>
+        ) : null}
+      </div>
+      {stageSeconds !== null ? (
+        <p className="text-xs text-muted-foreground">
+          {t("codexConfigConsistency.progressStageElapsed")} {stageSeconds}{" "}
+          {t("codexConfigConsistency.seconds")}
+        </p>
+      ) : null}
+      <div className="max-h-48 space-y-1 overflow-y-auto font-mono text-xs whitespace-pre-wrap break-words">
+        {visibleLogs.map((entry, index) => (
+          <div
+            key={`${entry.sequence}-${entry.emittedAtMs}-${index}`}
+            className={
+              entry.kind === "stage" ? "font-medium" : "text-muted-foreground"
+            }
+          >
+            <span className="mr-2 text-muted-foreground/70">
+              {formatProgressTime(entry.emittedAtMs)}
+            </span>
+            {entry.message || entry.code || entry.stage}
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function refreshStageIndex(stage?: string): number {
+  if (stage === "force_closing") return 0;
+  if (stage === "completed") return REFRESH_STAGE_ORDER.length;
+  return REFRESH_STAGE_ORDER.indexOf(
+    stage as (typeof REFRESH_STAGE_ORDER)[number],
+  );
+}
+
+/// 后端 `blockedReasonGroups[].code` 到用户可读解释的映射。
+///
+/// 这些条目都不是“待修复项”，而是 CCSM 主动保持原样的文件；面板必须说清
+/// 具体原因，用户才能判断是否需要人工介入。
+const BLOCKED_HISTORY_REASON_KEYS: Record<string, string> = {
+  provider_migration_cursor_mapping_missing:
+    "blockedReasonCursorMappingMissing",
+  provider_migration_history_base_mapping_missing:
+    "blockedReasonHistoryBaseMappingMissing",
+  history_base_offset_not_record_boundary:
+    "blockedReasonHistoryBaseNotBoundary",
+  rollout_session_id_mismatch: "blockedReasonSessionIdMismatch",
+  unsafe_projection_duplicate_record: "blockedReasonUnsafeDuplicate",
+  rollout_lineage_is_not_paginated: "blockedReasonNotPaginated",
+  invalid_rollout_filename: "blockedReasonInvalidRolloutFilename",
+  ambiguous_rollout_id: "blockedReasonAmbiguousRolloutId",
+  rollout_contains_no_records: "blockedReasonEmptyRollout",
+  rollout_does_not_start_with_session_metadata:
+    "blockedReasonMissingSessionMetadata",
+};
+
+const IMMUTABLE_HISTORY_REASON_KEYS: Array<[string, string]> = [
+  ["compressed history", "blockedReasonImmutableCompressed"],
+  ["invalid history header", "blockedReasonImmutableInvalidHeader"],
+  ["missing session metadata", "blockedReasonImmutableMissingMetadata"],
+  ["linked history", "blockedReasonImmutableLinked"],
+  ["non-legacy thread rows", "blockedReasonImmutableThreadRows"],
+  ["non-legacy history envelope", "blockedReasonImmutableNonLegacyEnvelope"],
+];
+
+function blockedHistoryReasonKey(code: string, detail: string): string {
+  if (code === "codex_paginated_history_immutable") {
+    return (
+      IMMUTABLE_HISTORY_REASON_KEYS.find(([needle]) =>
+        detail.includes(needle),
+      )?.[1] ?? "blockedReasonImmutableUnknown"
+    );
+  }
+  return BLOCKED_HISTORY_REASON_KEYS[code] ?? "blockedReasonUnknown";
+}
+
+function BlockedHistoryReasonDetails({
+  groups,
+}: {
+  groups?: CodexBlockedHistoryReasonGroup[];
+}) {
+  const { t } = useTranslation();
+  const [expanded, setExpanded] = useState(false);
+  if (!groups || groups.length === 0) return null;
+  return (
+    <div className="mt-2 space-y-1">
+      <button
+        type="button"
+        className="text-xs text-blue-600 underline-offset-2 hover:underline dark:text-blue-300"
+        onClick={() => setExpanded((current) => !current)}
+      >
+        {expanded
+          ? t("codexConfigConsistency.blockedReasonDetailsHide")
+          : t("codexConfigConsistency.blockedReasonDetailsShow")}
+      </button>
+      {expanded ? (
+        <ul className="space-y-2">
+          {groups.map((group) => (
+            <li
+              key={`${group.code}:${group.detail}`}
+              className="rounded-md border bg-background/60 p-2 text-xs"
+            >
+              <p className="font-medium">
+                {t(
+                  `codexConfigConsistency.${blockedHistoryReasonKey(
+                    group.code,
+                    group.detail,
+                  )}`,
+                )}{" "}
+                · {group.count}{" "}
+                {t("codexConfigConsistency.paginatedHistoryFiles")}
+              </p>
+              <p className="mt-1 break-all text-muted-foreground">
+                {t("codexConfigConsistency.blockedReasonCode")} {group.code}
+                {group.detail ? ` (${group.detail})` : ""}
+              </p>
+              {group.samples.length > 0 ? (
+                <p className="mt-1 break-all text-muted-foreground">
+                  {t("codexConfigConsistency.blockedReasonSamples")}{" "}
+                  {group.samples.join("、")}
+                </p>
+              ) : null}
+            </li>
+          ))}
+        </ul>
+      ) : null}
+    </div>
+  );
+}
+
+export function CodexConfigConsistencyDialog({
+  report,
+  pending,
+  error,
+  onApply,
+  onKeep,
+  onLater,
+  onRetry,
+  refresh = { phase: "idle", preflight: null, progress: null },
+  onInspectRefresh,
+  onConfirmRefresh,
+  onCancelRefresh,
+  onRetryRendererCompatibility,
+}: CodexConfigConsistencyDialogProps) {
+  const { t } = useTranslation();
+  const refreshPhase: CodexRuntimeRefreshPhase = refresh.phase;
+  const [now, setNow] = useState(() => Date.now());
+
+  useEffect(() => {
+    if (refreshPhase !== "refreshing") return;
+    const interval = window.setInterval(() => setNow(Date.now()), 1000);
+    return () => window.clearInterval(interval);
+  }, [refreshPhase]);
+
+  if (refreshPhase !== "idle") {
+    const inspecting = refreshPhase === "inspecting";
+    const showingStatus = refreshPhase === "status";
+    const confirming = refreshPhase === "confirm";
+    const refreshing = refreshPhase === "refreshing";
+    const completed = refreshPhase === "completed";
+    const failed = refreshPhase === "failed";
+    const completedWithWarnings =
+      completed && refresh.result?.outcome === "completed_with_warnings";
+    const history = refresh.preflight?.paginatedHistory;
+    const repairableHistoryCount = history?.affectedRolloutCount ?? 0;
+    const skippedHistoryCount = history?.blockedRolloutCount ?? 0;
+    // 只有“能安全修复”的历史才算需要处理；被保护性跳过（保持原样）的文件
+    // 不是待办项，否则状态面板会在每次开机时反复提示一个永远无法处理的问题。
+    const historyNeedsAttention = repairableHistoryCount > 0;
+    const historySkippedOnly =
+      !historyNeedsAttention && skippedHistoryCount > 0;
+    const blockedHistoryGroups = history?.blockedReasonGroups ?? [];
+    const rotatedThreadCount = history?.rotatedThreadCount ?? 0;
+    const rotatedSegmentCount = history?.rotatedSegmentCount ?? 0;
+    const currentStageIndex = refreshStageIndex(refresh.progress?.stage);
+    const stageLabels = [
+      t("codexConfigConsistency.stageClosing"),
+      t("codexConfigConsistency.stageRepairingHistory"),
+      t("codexConfigConsistency.stageApplyingConfig"),
+      t("codexConfigConsistency.stageLaunching"),
+      t("codexConfigConsistency.stageVerifying"),
+    ];
+
+    return (
+      <Dialog open>
+        <DialogContent className="max-w-lg" zIndex="top">
+          <DialogHeader>
+            <DialogTitle className="flex items-center gap-2">
+              {failed ? (
+                <XCircle className="h-5 w-5 text-destructive" />
+              ) : completedWithWarnings || showingStatus ? (
+                <AlertTriangle className="h-5 w-5 text-amber-500" />
+              ) : completed ? (
+                <CheckCircle2 className="h-5 w-5 text-emerald-500" />
+              ) : inspecting || refreshing ? (
+                <Loader2 className="h-5 w-5 animate-spin text-blue-500" />
+              ) : (
+                <AlertTriangle className="h-5 w-5 text-amber-500" />
+              )}
+              {inspecting
+                ? t("codexConfigConsistency.refreshInspectingTitle")
+                : showingStatus
+                  ? t("codexConfigConsistency.statusTitle")
+                  : confirming
+                    ? t("codexConfigConsistency.refreshConfirmTitle")
+                    : refreshing
+                      ? t("codexConfigConsistency.refreshingTitle")
+                      : completed
+                        ? completedWithWarnings
+                          ? t(
+                              "codexConfigConsistency.refreshCompletedWithWarningsTitle",
+                            )
+                          : t("codexConfigConsistency.refreshCompletedTitle")
+                        : t("codexConfigConsistency.refreshFailedTitle")}
+            </DialogTitle>
+            <DialogDescription>
+              {inspecting
+                ? t("codexConfigConsistency.refreshInspectingDescription")
+                : showingStatus
+                  ? t("codexConfigConsistency.statusDescription")
+                  : confirming
+                    ? t("codexConfigConsistency.refreshConfirmDescription")
+                    : refreshing
+                      ? t("codexConfigConsistency.refreshingDescription")
+                      : completed
+                        ? completedWithWarnings
+                          ? t(
+                              "codexConfigConsistency.refreshCompletedWithWarningsDescription",
+                            )
+                          : t(
+                              "codexConfigConsistency.refreshCompletedDescription",
+                            )
+                        : t("codexConfigConsistency.refreshFailedDescription")}
+            </DialogDescription>
+          </DialogHeader>
+
+          <div className="space-y-3 px-6 py-4 text-sm">
+            {inspecting ? (
+              <div className="flex items-center gap-3 rounded-md border bg-muted/20 p-4">
+                <Loader2 className="h-4 w-4 animate-spin" />
+                <span>{t("codexConfigConsistency.inspectingProcesses")}</span>
+              </div>
+            ) : null}
+
+            {showingStatus && refresh.preflight ? (
+              <div className="space-y-3">
+                {historyNeedsAttention ? (
+                  <div className="rounded-md border border-blue-500/30 bg-blue-500/10 p-3 text-blue-800 dark:text-blue-200">
+                    {t("codexConfigConsistency.codexHistoryBugNotice")}
+                  </div>
+                ) : null}
+                {historySkippedOnly ? (
+                  <div className="rounded-md border bg-muted/20 p-3 text-muted-foreground">
+                    {t("codexConfigConsistency.paginatedHistoryNoActionNotice")}
+                  </div>
+                ) : null}
+                <div className="rounded-md border bg-muted/20 p-3">
+                  <div className="flex items-center justify-between gap-3">
+                    <p className="font-medium">
+                      {t("codexConfigConsistency.configStatus")}
+                    </p>
+                    <span
+                      className={
+                        report?.state === "external_drift" ||
+                        report?.runtimeActivation?.state === "restart_required"
+                          ? "text-amber-600 dark:text-amber-300"
+                          : "text-emerald-600 dark:text-emerald-300"
+                      }
+                    >
+                      {report?.state === "external_drift" ||
+                      report?.runtimeActivation?.state === "restart_required"
+                        ? t("codexConfigConsistency.statusWarning")
+                        : t("codexConfigConsistency.statusReady")}
+                    </span>
+                  </div>
+                </div>
+                <div className="rounded-md border bg-muted/20 p-3">
+                  <div className="flex items-center justify-between gap-3">
+                    <p className="font-medium">
+                      {t("codexConfigConsistency.paginatedHistoryStatus")}
+                    </p>
+                    <span
+                      className={
+                        historyNeedsAttention
+                          ? "text-amber-600 dark:text-amber-300"
+                          : historySkippedOnly
+                            ? "text-muted-foreground"
+                            : "text-emerald-600 dark:text-emerald-300"
+                      }
+                    >
+                      {historyNeedsAttention
+                        ? t("codexConfigConsistency.statusRepairNeeded")
+                        : historySkippedOnly
+                          ? t("codexConfigConsistency.statusNoActionNeeded")
+                          : t("codexConfigConsistency.statusReady")}
+                    </span>
+                  </div>
+                  <p className="mt-1 text-xs text-muted-foreground">
+                    {repairableHistoryCount > 0
+                      ? `${t("codexConfigConsistency.paginatedHistoryFiles")} ${repairableHistoryCount} · ${t("codexConfigConsistency.duplicateOrdinals")} ${refresh.preflight.paginatedHistory.duplicateOrdinalCount} · ${t("codexConfigConsistency.providerMigrationCursors")} ${refresh.preflight.paginatedHistory.providerMigrationCursorCount ?? 0} · ${t("codexConfigConsistency.historyBaseReferences")} ${refresh.preflight.paginatedHistory.providerMigrationHistoryBaseCount ?? 0}`
+                      : skippedHistoryCount > 0
+                        ? `${t("codexConfigConsistency.paginatedHistorySkipped")} ${skippedHistoryCount}`
+                        : t("codexConfigConsistency.noPaginatedHistoryIssue")}
+                  </p>
+                  {repairableHistoryCount > 0 && skippedHistoryCount > 0 ? (
+                    <p className="mt-1 text-xs text-muted-foreground">
+                      {t("codexConfigConsistency.paginatedHistorySkipped")}{" "}
+                      {skippedHistoryCount}
+                    </p>
+                  ) : null}
+                  {repairableHistoryCount > 0 ? (
+                    <p className="mt-1 text-xs text-muted-foreground">
+                      {t("codexConfigConsistency.paginatedHistoryRepairHint")}
+                    </p>
+                  ) : null}
+                  {skippedHistoryCount > 0 ? (
+                    <>
+                      <p className="mt-1 text-xs text-muted-foreground">
+                        {t(
+                          "codexConfigConsistency.paginatedHistorySkippedHint",
+                        )}
+                      </p>
+                      <BlockedHistoryReasonDetails
+                        groups={blockedHistoryGroups}
+                      />
+                    </>
+                  ) : null}
+                  {rotatedThreadCount > 0 ? (
+                    <p className="mt-1 text-xs text-muted-foreground">
+                      {t("codexConfigConsistency.rotatedHistoryThreads")}{" "}
+                      {rotatedThreadCount}
+                      {" · "}
+                      {t("codexConfigConsistency.rotatedHistorySegments")}{" "}
+                      {rotatedSegmentCount}
+                    </p>
+                  ) : null}
+                </div>
+                <div className="rounded-md border bg-muted/20 p-3">
+                  <div className="flex items-center justify-between gap-3">
+                    <p className="font-medium">
+                      {t("codexConfigConsistency.rendererCompatibilityStatus")}
+                    </p>
+                    <span className="text-muted-foreground">
+                      {t("codexConfigConsistency.statusPending")}
+                    </span>
+                  </div>
+                  <p className="mt-1 text-xs text-muted-foreground">
+                    {t("codexConfigConsistency.rendererIndependentHint")}
+                  </p>
+                </div>
+              </div>
+            ) : null}
+
+            {confirming && refresh.preflight ? (
+              <>
+                {historyNeedsAttention ? (
+                  <div className="rounded-md border border-blue-500/30 bg-blue-500/10 p-3 text-blue-800 dark:text-blue-200">
+                    {t("codexConfigConsistency.codexHistoryBugNotice")}
+                  </div>
+                ) : null}
+                {/* 确认页必须先说清“这次到底有没有问题、要做什么”，
+                    否则用户看到破坏性按钮却看不出为什么要点它。 */}
+                <div className="rounded-md border bg-muted/20 p-3">
+                  <p className="font-medium">
+                    {t("codexConfigConsistency.confirmSituationTitle")}
+                  </p>
+                  <p className="mt-1 text-xs text-muted-foreground">
+                    {repairableHistoryCount > 0
+                      ? t("codexConfigConsistency.confirmSituationRepair", {
+                          count: repairableHistoryCount,
+                          duplicates:
+                            refresh.preflight.paginatedHistory
+                              .duplicateOrdinalCount,
+                          cursors:
+                            refresh.preflight.paginatedHistory
+                              .providerMigrationCursorCount ?? 0,
+                          historyBases:
+                            refresh.preflight.paginatedHistory
+                              .providerMigrationHistoryBaseCount ?? 0,
+                        })
+                      : skippedHistoryCount > 0
+                        ? t("codexConfigConsistency.confirmSituationSkipped", {
+                            count: skippedHistoryCount,
+                          })
+                        : t("codexConfigConsistency.confirmSituationNone")}
+                  </p>
+                </div>
+                <div className="grid grid-cols-2 gap-3">
+                  <p className="rounded-md border bg-muted/20 p-3">
+                    {t("codexConfigConsistency.desktopProcesses")}{" "}
+                    {refresh.preflight.desktopProcessCount}
+                  </p>
+                  <p className="rounded-md border bg-muted/20 p-3">
+                    {t("codexConfigConsistency.appServerProcesses")}{" "}
+                    {refresh.preflight.appServerProcessCount}
+                  </p>
+                </div>
+                <div className="rounded-md border border-amber-500/40 bg-amber-500/10 p-3 text-amber-800 dark:text-amber-200">
+                  {t("codexConfigConsistency.activeTasksWarning")}
+                </div>
+                {refresh.preflight.paginatedHistory.affectedRolloutCount > 0 ? (
+                  <div className="rounded-md border border-blue-500/30 bg-blue-500/10 p-3 text-blue-800 dark:text-blue-200">
+                    <p className="font-medium">
+                      {t("codexConfigConsistency.paginatedHistoryRepair")}
+                    </p>
+                    <p className="mt-1 text-xs">
+                      {t("codexConfigConsistency.paginatedHistoryFiles")}{" "}
+                      {refresh.preflight.paginatedHistory.affectedRolloutCount}
+                      {" · "}
+                      {t("codexConfigConsistency.duplicateOrdinals")}{" "}
+                      {refresh.preflight.paginatedHistory.duplicateOrdinalCount}
+                      {" · "}
+                      {t(
+                        "codexConfigConsistency.providerMigrationCursors",
+                      )}{" "}
+                      {refresh.preflight.paginatedHistory
+                        .providerMigrationCursorCount ?? 0}
+                      {" · "}
+                      {t("codexConfigConsistency.historyBaseReferences")}{" "}
+                      {refresh.preflight.paginatedHistory
+                        .providerMigrationHistoryBaseCount ?? 0}
+                    </p>
+                    <p className="mt-1 text-xs">
+                      {t("codexConfigConsistency.paginatedHistoryRepairHint")}
+                    </p>
+                    {rotatedThreadCount > 0 ? (
+                      <p className="mt-1 text-xs">
+                        {t("codexConfigConsistency.rotatedHistoryThreads")}{" "}
+                        {rotatedThreadCount}
+                        {" · "}
+                        {t(
+                          "codexConfigConsistency.rotatedHistorySegments",
+                        )}{" "}
+                        {rotatedSegmentCount}
+                      </p>
+                    ) : null}
+                  </div>
+                ) : null}
+                {refresh.preflight.paginatedHistory.blockedRolloutCount > 0 ? (
+                  <div className="rounded-md border bg-muted/20 p-3 text-muted-foreground">
+                    <p>
+                      {t("codexConfigConsistency.paginatedHistorySkipped")}{" "}
+                      {refresh.preflight.paginatedHistory.blockedRolloutCount}
+                    </p>
+                    <p className="mt-1 text-xs">
+                      {t("codexConfigConsistency.paginatedHistorySkippedHint")}
+                    </p>
+                    <BlockedHistoryReasonDetails
+                      groups={blockedHistoryGroups}
+                    />
+                  </div>
+                ) : null}
+                <div className="rounded-md border border-blue-500/30 bg-blue-500/10 p-3 text-blue-800 dark:text-blue-200">
+                  <p className="font-medium">
+                    {t("codexConfigConsistency.confirmScopeTitle")}
+                  </p>
+                  <p className="mt-1 text-xs">
+                    {t("codexConfigConsistency.historyCompatibilityCheck")}
+                  </p>
+                </div>
+                <p className="break-all text-xs text-muted-foreground">
+                  {t("codexConfigConsistency.launchTarget")}{" "}
+                  {refresh.preflight.launchTarget || t("common.unknown")}
+                </p>
+              </>
+            ) : null}
+
+            {refreshing ? (
+              <div className="space-y-2">
+                {stageLabels.map((label, index) => {
+                  const done = index < currentStageIndex;
+                  const active = index === currentStageIndex;
+                  return (
+                    <div
+                      key={label}
+                      className="flex items-center gap-3 rounded-md border bg-muted/20 p-3"
+                    >
+                      {done ? (
+                        <CheckCircle2 className="h-4 w-4 text-emerald-500" />
+                      ) : active ? (
+                        <Loader2 className="h-4 w-4 animate-spin text-blue-500" />
+                      ) : (
+                        <Circle className="h-4 w-4 text-muted-foreground/50" />
+                      )}
+                      <span className={done ? "text-muted-foreground" : ""}>
+                        {label}
+                      </span>
+                    </div>
+                  );
+                })}
+                {refresh.progress?.stage === "force_closing" ? (
+                  <p className="text-xs text-amber-600 dark:text-amber-300">
+                    {t("codexConfigConsistency.forceClosingHint")}
+                  </p>
+                ) : null}
+                <RefreshProgressLog
+                  logs={refresh.logs}
+                  lastProgressAt={refresh.lastProgressAt}
+                  stageStartedAt={refresh.stageStartedAt}
+                  now={now}
+                />
+              </div>
+            ) : null}
+
+            {completed ? (
+              <div className="space-y-2">
+                <div className="rounded-md border border-emerald-500/40 bg-emerald-500/10 p-3 text-emerald-800 dark:text-emerald-200">
+                  <p>{t("codexConfigConsistency.configApplied")}</p>
+                  <p className="mt-1 text-xs">
+                    {t("codexConfigConsistency.paginatedHistoryReady")}
+                  </p>
+                </div>
+                <RefreshProgressLog
+                  logs={refresh.logs}
+                  lastProgressAt={refresh.lastProgressAt}
+                  stageStartedAt={refresh.stageStartedAt}
+                  now={now}
+                />
+                {refresh.result?.rendererCompatibilityStatus === "warning" ? (
+                  <div className="rounded-md border border-amber-500/40 bg-amber-500/10 p-3 text-amber-800 dark:text-amber-200">
+                    <p className="font-medium">
+                      {t("codexConfigConsistency.rendererCompatibilityWarning")}
+                    </p>
+                    {refresh.result.rendererCompatibilityMessage ? (
+                      <p className="mt-1 break-words text-xs">
+                        {refresh.result.rendererCompatibilityMessage}
+                      </p>
+                    ) : null}
+                    <p className="mt-1 text-xs">
+                      {t("codexConfigConsistency.rendererIndependentHint")}
+                    </p>
+                  </div>
+                ) : null}
+                <div className="rounded-md border bg-muted/20 p-3">
+                  {t("codexConfigConsistency.newTaskHint")}
+                  {refresh.result?.forceTerminated ? (
+                    <p className="mt-2 text-xs">
+                      {t("codexConfigConsistency.forcedCloseUsed")}
+                    </p>
+                  ) : null}
+                  {(refresh.result?.repairedHistoryRolloutCount ?? 0) > 0 ? (
+                    <p className="mt-2 text-xs">
+                      {t("codexConfigConsistency.historyRepairCompleted")}{" "}
+                      {refresh.result?.repairedHistoryRolloutCount}
+                      {" · "}
+                      {t("codexConfigConsistency.duplicateOrdinals")}{" "}
+                      {refresh.result?.repairedHistoryDuplicateCount}
+                      {" · "}
+                      {t(
+                        "codexConfigConsistency.providerMigrationCursors",
+                      )}{" "}
+                      {refresh.result
+                        ?.repairedHistoryProviderMigrationCursorCount ?? 0}
+                      {" · "}
+                      {t("codexConfigConsistency.historyBaseReferences")}{" "}
+                      {refresh.result
+                        ?.repairedHistoryProviderMigrationHistoryBaseCount ?? 0}
+                    </p>
+                  ) : null}
+                </div>
+              </div>
+            ) : null}
+
+            {failed ? (
+              <>
+                {currentStageIndex >= 0 &&
+                currentStageIndex < stageLabels.length ? (
+                  <p className="text-sm font-medium">
+                    {t("codexConfigConsistency.failedStage")}{" "}
+                    {stageLabels[currentStageIndex]}
+                  </p>
+                ) : null}
+                <div className="rounded-md border border-destructive/40 bg-destructive/10 p-3 text-destructive">
+                  {refresh.error ||
+                    t("codexConfigConsistency.refreshUnknownError")}
+                </div>
+                <RefreshProgressLog
+                  logs={refresh.logs}
+                  lastProgressAt={refresh.lastProgressAt}
+                  stageStartedAt={refresh.stageStartedAt}
+                  now={now}
+                />
+              </>
+            ) : null}
+          </div>
+
+          <DialogFooter className="gap-2">
+            {showingStatus ? (
+              <>
+                <Button variant="outline" onClick={onCancelRefresh}>
+                  {t("codexConfigConsistency.back")}
+                </Button>
+                {refresh.preflight?.supported &&
+                refresh.preflight.canRefresh ? (
+                  <Button onClick={onInspectRefresh}>
+                    <RotateCcw className="mr-2 h-4 w-4" />
+                    {t("codexConfigConsistency.refreshCodex")}
+                  </Button>
+                ) : null}
+              </>
+            ) : confirming ? (
+              <>
+                <Button variant="outline" onClick={onCancelRefresh}>
+                  {t("codexConfigConsistency.cancelRefresh")}
+                </Button>
+                <Button onClick={onConfirmRefresh}>
+                  {repairableHistoryCount > 0
+                    ? t("codexConfigConsistency.confirmRefresh")
+                    : t("codexConfigConsistency.confirmRefreshWithoutRepair")}
+                </Button>
+              </>
+            ) : failed ? (
+              <>
+                <Button variant="outline" onClick={onCancelRefresh}>
+                  {t("codexConfigConsistency.back")}
+                </Button>
+                <Button onClick={onInspectRefresh}>
+                  <RotateCcw className="mr-2 h-4 w-4" />
+                  {t("codexConfigConsistency.retryRefresh")}
+                </Button>
+              </>
+            ) : completed ? (
+              <>
+                {refresh.result?.rendererCompatibilityStatus === "warning" &&
+                onRetryRendererCompatibility ? (
+                  <Button
+                    variant="outline"
+                    onClick={onRetryRendererCompatibility}
+                    disabled={refresh.rendererRetryPending}
+                  >
+                    {refresh.rendererRetryPending ? (
+                      <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                    ) : (
+                      <RotateCcw className="mr-2 h-4 w-4" />
+                    )}
+                    {t("codexConfigConsistency.retryRendererCompatibility")}
+                  </Button>
+                ) : null}
+                <Button onClick={onCancelRefresh}>
+                  {t("codexConfigConsistency.finish")}
+                </Button>
+              </>
+            ) : null}
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+    );
+  }
+
+  if (!report) return null;
+  const runtimeRestartRequired =
+    report.runtimeActivation?.state === "restart_required";
+  const externalDrift = report.state === "external_drift";
+  const takeoverProjectionDrift = report.reason === "takeover_projection_drift";
+  if (!externalDrift && !runtimeRestartRequired) return null;
+
+  if (!externalDrift && runtimeRestartRequired) {
+    return (
+      <Dialog
+        open
+        onOpenChange={(open) => {
+          if (!open && !pending) onLater();
+        }}
+      >
+        <DialogContent className="max-w-lg" zIndex="top">
+          <DialogHeader>
+            <DialogTitle className="flex items-center gap-2">
+              <AlertTriangle className="h-5 w-5 text-amber-500" />
+              {t("codexConfigConsistency.runtimeTitle")}
+            </DialogTitle>
+            <DialogDescription>
+              {t("codexConfigConsistency.runtimeDescription")}
+            </DialogDescription>
+          </DialogHeader>
+          <div className="space-y-3 px-6 py-2 text-sm">
+            <p>{t("codexConfigConsistency.runtimeRestartHint")}</p>
+            {error ? (
+              <div className="rounded-md border border-destructive/40 bg-destructive/10 p-3 text-sm text-destructive">
+                {error}
+              </div>
+            ) : null}
+          </div>
+          <DialogFooter className="gap-2">
+            <Button variant="outline" onClick={onLater} disabled={pending}>
+              {t("codexConfigConsistency.later")}
+            </Button>
+            <Button onClick={onRetry} disabled={pending}>
+              {pending ? (
+                <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+              ) : null}
+              {t("codexConfigConsistency.recheck")}
+            </Button>
+            {onInspectRefresh ? (
+              <Button onClick={onInspectRefresh} disabled={pending}>
+                {t("codexConfigConsistency.refreshCodex")}
+              </Button>
+            ) : null}
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+    );
+  }
+
+  return (
+    <Dialog
+      open
+      onOpenChange={(open) => {
+        if (!open && !pending) onLater();
+      }}
+    >
+      <DialogContent className="max-w-lg" zIndex="top">
+        <DialogHeader>
+          <DialogTitle className="flex items-center gap-2">
+            <AlertTriangle className="h-5 w-5 text-amber-500" />
+            {t(
+              takeoverProjectionDrift
+                ? "codexConfigConsistency.projectionTitle"
+                : "codexConfigConsistency.title",
+            )}
+          </DialogTitle>
+          <DialogDescription>
+            {t(
+              takeoverProjectionDrift
+                ? "codexConfigConsistency.projectionDescription"
+                : "codexConfigConsistency.description",
+            )}
+          </DialogDescription>
+        </DialogHeader>
+
+        <div className="space-y-3 px-6 py-2 text-sm">
+          <div>
+            <span className="font-medium">
+              {t("codexConfigConsistency.provider")}
+            </span>{" "}
+            <code>{report.providerId || t("common.unknown")}</code>
+          </div>
+          {takeoverProjectionDrift ? (
+            <p className="rounded-md border border-amber-500/30 bg-amber-500/10 p-3 text-sm text-muted-foreground">
+              {t("codexConfigConsistency.projectionDetail")}
+            </p>
+          ) : (
+            <>
+              <div>
+                <span className="font-medium">
+                  {t("codexConfigConsistency.changedKeys")}
+                </span>
+                <ul className="mt-2 max-h-32 space-y-1 overflow-y-auto rounded-md border bg-muted/20 p-2 font-mono text-xs">
+                  {report.changedKeys.map((key) => (
+                    <li key={key}>{key}</li>
+                  ))}
+                </ul>
+              </div>
+              <p className="text-xs text-muted-foreground">
+                {t("codexConfigConsistency.noSecrets")}
+              </p>
+            </>
+          )}
+          {error ? (
+            <div className="rounded-md border border-destructive/40 bg-destructive/10 p-3 text-sm text-destructive">
+              <p>{error}</p>
+              <Button
+                className="mt-2"
+                size="sm"
+                variant="outline"
+                onClick={onRetry}
+                disabled={pending}
+              >
+                {t("codexConfigConsistency.retry")}
+              </Button>
+            </div>
+          ) : null}
+        </div>
+
+        <DialogFooter className="gap-2">
+          <Button variant="outline" onClick={onLater} disabled={pending}>
+            {t("codexConfigConsistency.later")}
+          </Button>
+          {!takeoverProjectionDrift ? (
+            <Button variant="outline" onClick={onKeep} disabled={pending}>
+              {t("codexConfigConsistency.keepCodex")}
+            </Button>
+          ) : null}
+          <Button onClick={onApply} disabled={pending}>
+            {pending ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : null}
+            {t(
+              takeoverProjectionDrift
+                ? "codexConfigConsistency.restoreTakeover"
+                : "codexConfigConsistency.applyCcsm",
+            )}
+          </Button>
+          {onInspectRefresh ? (
+            <Button onClick={onInspectRefresh} disabled={pending}>
+              {t("codexConfigConsistency.applyAndRefresh")}
+            </Button>
+          ) : null}
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  );
+}

@@ -242,8 +242,8 @@ export interface CodexModelPickerUnlockResult {
   targetTitle: string | null;
   targetUrl: string | null;
   modelCount: number;
-  reasoningModelCount: number;
-  modelsWithoutReasoningCount: number;
+  reasoningModelCount?: number;
+  modelsWithoutReasoningCount?: number;
   modelNames: string[];
   injected: boolean;
   launched: boolean;
@@ -251,6 +251,8 @@ export interface CodexModelPickerUnlockResult {
   historySyncRequested?: boolean;
   historyCatalogComplete?: boolean | null;
   historyCatalogCount?: number | null;
+  allProviderHistoryPatched?: boolean;
+  historyRefreshRequested?: boolean;
   message: string;
 }
 

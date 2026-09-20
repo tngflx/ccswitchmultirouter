@@ -5,6 +5,11 @@ import zhTW from "@/i18n/locales/zh-TW.json";
 import zh from "@/i18n/locales/zh.json";
 
 const requiredKeys = [
+  "codexAutoUpdate",
+  "codexAutoUpdateHint",
+  "codexAutoUpdateEnabled",
+  "codexAutoUpdateDisabled",
+  "codexAutoUpdateFailed",
   "manualInstallCommands",
   "updateAllTools",
   "currentVersion",

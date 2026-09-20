@@ -2453,6 +2453,7 @@ impl Database {
                 GROUP BY {rollup_model}, {rollup_provider}
             )
             GROUP BY model, provider_name
+            HAVING SUM(total_tokens) > 0 OR SUM(total_cost) > 0
             ORDER BY total_cost DESC"
         );
 
@@ -5463,6 +5464,42 @@ mod tests {
         );
         assert!(stats.iter().all(|stat| stat.model == "shared-model"));
 
+        Ok(())
+    }
+
+    #[test]
+    fn test_get_model_stats_drops_zero_usage_routing_ghost() -> Result<(), AppError> {
+        let db = Database::memory()?;
+        {
+            let conn = lock_conn!(db.conn);
+            for (id, name) in [("provider-real", "Real"), ("provider-ghost", "Ghost")] {
+                conn.execute(
+                    "INSERT INTO providers (id, app_type, name, settings_config)
+                     VALUES (?, ?, ?, ?)",
+                    params![id, "codex", name, "{}"],
+                )?;
+            }
+            for (id, provider, input, output, cost) in [
+                ("real", "provider-real", 100, 50, "0.01"),
+                ("ghost", "provider-ghost", 0, 0, "0"),
+            ] {
+                conn.execute(
+                    "INSERT INTO proxy_request_logs (
+                        request_id, provider_id, app_type, model,
+                        input_tokens, output_tokens, total_cost_usd,
+                        latency_ms, status_code, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    params![
+                        id, provider, "codex", "shared-model", input, output, cost, 100, 200, 1000
+                    ],
+                )?;
+            }
+        }
+
+        let stats = db.get_model_stats(None, None, Some("codex"), None, None)?;
+        assert_eq!(stats.len(), 1);
+        assert_eq!(stats[0].provider_name, "Real");
+        assert_eq!(stats[0].total_tokens, 150);
         Ok(())
     }
 

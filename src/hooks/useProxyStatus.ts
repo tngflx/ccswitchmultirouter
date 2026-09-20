@@ -21,10 +21,12 @@ export function useProxyStatus() {
   const { t } = useTranslation();
 
   // 查询状态（自动轮询）
-  const { data: status } = useProxyStatusQuery();
+  const { data: status, isPending: isProxyStatusPending } =
+    useProxyStatusQuery();
 
   // 查询各应用接管状态
-  const { data: takeoverStatus } = useProxyTakeoverStatus(false);
+  const { data: takeoverStatus, isPending: isTakeoverStatusPending } =
+    useProxyTakeoverStatus(false);
 
   // 启动服务器（总开关：仅启动服务，不接管）
   const startProxyServerMutation = useMutation({
@@ -109,48 +111,68 @@ export function useProxyStatus() {
     },
   });
 
+  const handleTakeoverSuccess = async (variables: {
+    appType: string;
+    enabled: boolean;
+  }) => {
+    const appLabel =
+      variables.appType === "claude"
+        ? "Claude"
+        : variables.appType === "codex"
+          ? "Codex"
+          : variables.appType === "gemini"
+            ? "Gemini"
+            : variables.appType === "grokbuild"
+              ? "Grok Build"
+              : "OpenCode";
+
+    toast.success(
+      variables.enabled
+        ? t("proxy.takeover.enabled", {
+            app: appLabel,
+            defaultValue: `已接管 ${appLabel} 配置（请求将走本地代理）`,
+          })
+        : t("proxy.takeover.disabled", {
+            app: appLabel,
+            defaultValue: `已恢复 ${appLabel} 配置`,
+          }),
+      { closeButton: true },
+    );
+
+    await Promise.all([
+      queryClient.invalidateQueries({ queryKey: proxyKeys.status }),
+      queryClient.invalidateQueries({ queryKey: proxyKeys.takeoverStatus }),
+    ]);
+  };
+
+  const handleTakeoverError = (error: Error) => {
+    const detail =
+      extractErrorMessage(error) ||
+      t("common.unknown", { defaultValue: "未知错误" });
+    toast.error(
+      t("proxy.takeover.failed", {
+        detail,
+        defaultValue: `操作失败: ${detail}`,
+      }),
+    );
+  };
+
   // 按应用开启/关闭接管
   const setTakeoverForAppMutation = useMutation({
     mutationFn: ({ appType, enabled }: { appType: string; enabled: boolean }) =>
       proxyApi.setProxyTakeoverForApp(appType, enabled),
-    onSuccess: (_data, variables) => {
-      const appLabel =
-        variables.appType === "claude"
-          ? "Claude"
-          : variables.appType === "codex"
-            ? "Codex"
-            : variables.appType === "gemini"
-              ? "Gemini"
-              : variables.appType === "grokbuild"
-                ? "Grok Build"
-                : "OpenCode";
+    onSuccess: (_data, variables) => handleTakeoverSuccess(variables),
+    onError: handleTakeoverError,
+  });
 
-      toast.success(
-        variables.enabled
-          ? t("proxy.takeover.enabled", {
-              app: appLabel,
-              defaultValue: `已接管 ${appLabel} 配置（请求将走本地代理）`,
-            })
-          : t("proxy.takeover.disabled", {
-              app: appLabel,
-              defaultValue: `已恢复 ${appLabel} 配置`,
-            }),
-        { closeButton: true },
-      );
-
-      queryClient.invalidateQueries({ queryKey: proxyKeys.status });
-      queryClient.invalidateQueries({ queryKey: proxyKeys.takeoverStatus });
-    },
+  // 用户确认后重启 Codex Desktop 并切换接管。该路径必须与普通接管变更
+  // 共用缓存刷新，否则后端已经切换成功，主窗口仍会显示旧开关状态。
+  const restartCodexDesktopMutation = useMutation({
+    mutationFn: (enabled: boolean) => proxyApi.restartCodexDesktop(enabled),
+    onSuccess: (_data, enabled) =>
+      handleTakeoverSuccess({ appType: "codex", enabled }),
     onError: (error: Error) => {
-      const detail =
-        extractErrorMessage(error) ||
-        t("common.unknown", { defaultValue: "未知错误" });
-      toast.error(
-        t("proxy.takeover.failed", {
-          detail,
-          defaultValue: `操作失败: ${detail}`,
-        }),
-      );
+      handleTakeoverError(error);
     },
   });
 
@@ -158,6 +180,7 @@ export function useProxyStatus() {
     status,
     isRunning: status?.running || false,
     takeoverStatus,
+    isInitialStatusPending: isProxyStatusPending || isTakeoverStatusPending,
 
     // 启动/停止（总开关）
     startProxyServer: startProxyServerMutation.mutateAsync,
@@ -166,6 +189,7 @@ export function useProxyStatus() {
 
     // 按应用接管开关
     setTakeoverForApp: setTakeoverForAppMutation.mutateAsync,
+    restartCodexDesktop: restartCodexDesktopMutation.mutateAsync,
 
     // 加载状态
     isStarting: startProxyServerMutation.isPending,
@@ -174,6 +198,7 @@ export function useProxyStatus() {
       startProxyServerMutation.isPending ||
       stopProxyServerMutation.isPending ||
       stopWithRestoreMutation.isPending ||
-      setTakeoverForAppMutation.isPending,
+      setTakeoverForAppMutation.isPending ||
+      restartCodexDesktopMutation.isPending,
   };
 }

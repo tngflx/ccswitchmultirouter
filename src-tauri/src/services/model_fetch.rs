@@ -52,6 +52,22 @@ pub struct VolcengineModelListRequest<'a> {
 #[derive(Debug, Deserialize)]
 struct ModelsResponse {
     data: Option<Vec<ModelEntry>>,
+    /// Zhipu's OpenAI Responses catalog uses `models[].slug`.
+    #[serde(default)]
+    models: Option<Vec<ZhipuModelEntry>>,
+    #[serde(default)]
+    success: Option<bool>,
+    #[serde(default)]
+    msg: Option<String>,
+    #[serde(default)]
+    message: Option<String>,
+    #[serde(default)]
+    error: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ZhipuModelEntry {
+    slug: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -60,6 +76,25 @@ struct ModelEntry {
     owned_by: Option<String>,
     #[serde(flatten)]
     extra: serde_json::Map<String, serde_json::Value>,
+}
+
+fn models_response_error(resp: &ModelsResponse) -> Option<String> {
+    if resp.success == Some(false) || (resp.data.is_none() && resp.models.is_none()) {
+        return resp
+            .msg
+            .clone()
+            .or_else(|| resp.message.clone())
+            .or_else(|| resp.error.as_ref().map(ToString::to_string))
+            .or_else(|| {
+                (resp.success == Some(false))
+                    .then(|| "Provider returned an unsuccessful model-list response".to_string())
+            })
+            .or_else(|| {
+                (resp.data.is_none() && resp.models.is_none())
+                    .then(|| "Provider model-list response did not include data".to_string())
+            });
+    }
+    None
 }
 
 const FETCH_TIMEOUT_SECS: u64 = 15;
@@ -215,19 +250,35 @@ pub async fn fetch_models(options: FetchModelsRequest<'_>) -> Result<Vec<Fetched
                 .await
                 .map_err(|e| format!("Failed to parse response: {e}"))?;
 
-            let mut models: Vec<FetchedModel> = resp
-                .data
-                .unwrap_or_default()
-                .into_iter()
-                .map(|m| FetchedModel {
-                    context_window: extract_context_window(&m.extra),
-                    id: m.id,
-                    input_modalities: extract_input_modalities(&m.extra),
-                    owned_by: m.owned_by,
-                    supports_image: extract_supports_image(&m.extra),
-                    reasoning: None,
-                })
-                .collect();
+            if let Some(detail) = models_response_error(&resp) {
+                return Err(detail);
+            }
+
+            let mut models: Vec<FetchedModel> = if let Some(data) = resp.data {
+                data.into_iter()
+                    .map(|m| FetchedModel {
+                        context_window: extract_context_window(&m.extra),
+                        id: m.id,
+                        input_modalities: extract_input_modalities(&m.extra),
+                        owned_by: m.owned_by,
+                        supports_image: extract_supports_image(&m.extra),
+                        reasoning: None,
+                    })
+                    .collect()
+            } else {
+                resp.models
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|m| FetchedModel {
+                        id: m.slug,
+                        owned_by: None,
+                        context_window: None,
+                        input_modalities: None,
+                        supports_image: None,
+                        reasoning: None,
+                    })
+                    .collect()
+            };
 
             enrich_missing_context_windows(&client, url, &mut models).await;
             models.sort_by(|a, b| a.id.cmp(&b.id));
@@ -1308,6 +1359,48 @@ mod tests {
         let data = resp.data.unwrap();
         assert_eq!(data[0].id, "my-model");
         assert!(data[0].owned_by.is_none());
+    }
+
+    #[test]
+    fn test_parse_zhipu_responses_model_slugs() {
+        let resp: ModelsResponse =
+            serde_json::from_str(r#"{"models":[{"slug":"glm-5"},{"slug":"glm-5-flash"}]}"#)
+                .unwrap();
+        let models = resp.models.unwrap();
+        assert_eq!(
+            models.into_iter().map(|model| model.slug).collect::<Vec<_>>(),
+            ["glm-5", "glm-5-flash"]
+        );
+    }
+
+    #[test]
+    fn test_parse_unsuccessful_http_200_envelope_preserves_provider_detail() {
+        let resp: ModelsResponse =
+            serde_json::from_str(r#"{"success":false,"msg":"HTTP 402: DAILY LIMIT EXCEEDED"}"#)
+                .unwrap();
+        assert_eq!(
+            models_response_error(&resp).as_deref(),
+            Some("HTTP 402: DAILY LIMIT EXCEEDED")
+        );
+    }
+
+    #[test]
+    fn test_parse_missing_data_with_message_is_an_error() {
+        let resp: ModelsResponse =
+            serde_json::from_str(r#"{"message":"upstream unavailable"}"#).unwrap();
+        assert_eq!(
+            models_response_error(&resp).as_deref(),
+            Some("upstream unavailable")
+        );
+    }
+
+    #[test]
+    fn test_parse_missing_data_without_detail_is_still_an_error() {
+        let resp: ModelsResponse = serde_json::from_str(r#"{}"#).unwrap();
+        assert_eq!(
+            models_response_error(&resp).as_deref(),
+            Some("Provider model-list response did not include data")
+        );
     }
 
     #[test]

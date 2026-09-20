@@ -16,12 +16,15 @@ import type {
   DataSourceSummary,
   CodexSubagentUsageStats,
   QuotaCollaborationOverview,
+  SessionCollectionStatus,
 } from "@/types/usage";
 import type { UsageResult } from "@/types";
 import type { AppId } from "./types";
 import type { TemplateType } from "@/config/constants";
 
 export const usageApi = {
+  getSessionCollectionStatus: async (): Promise<SessionCollectionStatus> =>
+    invoke("get_session_collection_status"),
   // Provider usage script methods
   query: async (providerId: string, appId: AppId): Promise<UsageResult> => {
     return invoke("queryProviderUsage", { providerId, app: appId });

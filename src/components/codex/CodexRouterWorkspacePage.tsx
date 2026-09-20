@@ -107,9 +107,18 @@ import {
   usageKeys,
   useCodexSubagentUsageStats,
   useRequestLogs,
+  useSessionCollectionStatus,
 } from "@/lib/query/usage";
+import {
+  redactFrontendLogText,
+  reportFrontendError,
+} from "@/lib/frontendLogger";
 import { cn } from "@/lib/utils";
 import { resolveFetchedCodexModelContextWindow } from "@/utils/codexModelContext";
+import {
+  catalogHasRoleModel,
+  deepSeekRoleForModel,
+} from "@/utils/deepseekRoleModels";
 import {
   catalogModelLabel,
   CODEX_SPAWN_AGENT_PRIORITY_MODELS,
@@ -124,6 +133,7 @@ import {
   extractCodexExperimentalBearerToken,
   getCodexBaseUrl,
 } from "@/utils/providerConfigUtils";
+import { CodexSessionTrafficPanel } from "./CodexSessionTrafficPanel";
 
 import {
   codexCatalogOnlyPlanModelFetchMessage,
@@ -763,17 +773,37 @@ export function workspaceErrorMessage(error: unknown): string {
   ];
   const matched = knownMessages.find(([code]) => message.includes(code));
   if (matched) return matched[1];
-  if (/[^\x00-\x7f]/.test(message)) return message;
+  if (/[^\x00-\x7f]/.test(message)) return redactFrontendLogText(message);
 
   const errorCode = message.match(/\b[a-z][a-z0-9]*(?:_[a-z0-9]+)+\b/)?.[0];
-  return errorCode
-    ? tr("codexRouterWorkspace.s013", {
-        defaultValue: "操作失败，请查看日志中的详细原因（错误代码：{{arg0}}）",
-        arg0: errorCode,
-      })
-    : tr("codexRouterWorkspace.s014", {
-        defaultValue: "操作失败，请检查当前配置或查看日志中的详细原因",
-      });
+  if (errorCode) {
+    return tr("codexRouterWorkspace.s013", {
+      defaultValue: "操作失败，请查看日志中的详细原因（错误代码：{{arg0}}）",
+      arg0: errorCode,
+    });
+  }
+  if (/^HTTP\s+\d{3}\b/i.test(message.trim())) {
+    return redactFrontendLogText(message.trim());
+  }
+  return tr("codexRouterWorkspace.s014", {
+    defaultValue: "操作失败，请检查当前配置或查看日志中的详细原因",
+  });
+}
+
+export function workspaceExactErrorMessage(error: unknown): string {
+  const maxVisibleErrorLength = 2_000;
+  const message = (
+    error instanceof Error ? error.message : String(error)
+  ).trim();
+  if (!message) {
+    return tr("codexRouterWorkspace.s014", {
+      defaultValue: "操作失败，请检查当前配置或查看日志中的详细原因",
+    });
+  }
+  const redacted = redactFrontendLogText(message);
+  return redacted.length > maxVisibleErrorLength
+    ? `${redacted.slice(0, maxVisibleErrorLength)}…`
+    : redacted;
 }
 
 /// 读取 provider 模型列表；官方 OAuth 在线失败时回退到本地 Codex 模型缓存。
@@ -1618,7 +1648,6 @@ function normalizeModelTailForCapability(model: string): string {
 /// 少量内置纯文本模型兜底；只在 provider/catalog 没有显式能力声明时使用，避免把未知多模态模型误降级。
 function modelNameLooksTextOnly(model: string): boolean {
   const tail = normalizeModelTailForCapability(model);
-  const compactTail = tail.replace(/[^a-z0-9]/g, "");
   const exactTextOnlyModels = new Set([
     "ark-code-latest",
     "deepseek-chat",
@@ -1636,7 +1665,7 @@ function modelNameLooksTextOnly(model: string): boolean {
     "us.deepseek.r1-v1",
   ]);
   return (
-    compactTail.startsWith("deepseekv4") ||
+    deepSeekRoleForModel(tail) !== null ||
     exactTextOnlyModels.has(tail) ||
     tail.startsWith("minimax-m2.7") ||
     tail.startsWith("qwen3-coder") ||
@@ -5045,106 +5074,6 @@ export function recommendCodexCatalogModels(
   return selected.map(({ model }) => model);
 }
 
-export function buildModelOrderProviderUpdates(
-  models: CodexCatalogModel[],
-  routes: CodexRoute[],
-  providersById: Map<string, Provider>,
-  reset: boolean,
-): Map<string, Provider> {
-  const updates = new Map<string, Provider>();
-  for (const [sortIndex, projectedModel] of models.entries()) {
-    const visibleModel = projectedModel.model?.trim();
-    if (!visibleModel) continue;
-    const unresolvedProviderNames = new Set<string>();
-    const unresolvedUpstreamModels = new Set<string>();
-    let hasEligibleRoute = false;
-    let wasResolved = false;
-    for (const route of routes) {
-      if (route.enabled === false) continue;
-      const targetProviderId = routeTargetProviderId(route);
-      if (!targetProviderId) continue;
-      const aliases = route.aliases ?? route.upstream?.modelMap ?? {};
-      const canonicalModel = aliases[visibleModel] ?? visibleModel;
-      if (
-        route.modelSelection?.mode === "include" &&
-        !route.modelSelection.models.includes(canonicalModel)
-      ) {
-        continue;
-      }
-      hasEligibleRoute = true;
-      const source =
-        updates.get(targetProviderId) ?? providersById.get(targetProviderId);
-      if (!source) {
-        unresolvedProviderNames.add(targetProviderId);
-        unresolvedUpstreamModels.add(canonicalModel);
-        continue;
-      }
-      const sourceModels = readCodexModelCatalog(source).models;
-      const sourceIndex = sourceModels.findIndex(
-        (model) =>
-          model.enabled !== false &&
-          [model.model, model.upstreamModel, model.upstream_model].some(
-            (value) =>
-              value?.trim().toLowerCase() === canonicalModel.toLowerCase(),
-          ),
-      );
-      if (sourceIndex < 0) {
-        unresolvedProviderNames.add(source.name || targetProviderId);
-        unresolvedUpstreamModels.add(canonicalModel);
-        continue;
-      }
-      const nextModels = sourceModels.map((model, index) => {
-        if (index !== sourceIndex) return model;
-        const next = { ...model };
-        if (reset) delete next.sortIndex;
-        else next.sortIndex = sortIndex;
-        return next;
-      });
-      updates.set(targetProviderId, {
-        ...source,
-        settingsConfig: {
-          ...source.settingsConfig,
-          modelCatalog: {
-            ...(source.settingsConfig?.modelCatalog ?? {}),
-            models: nextModels,
-          },
-        },
-      });
-      wasResolved = true;
-      break;
-    }
-    if (wasResolved) continue;
-    if (unresolvedProviderNames.size > 0) {
-      throw new Error(
-        tr("codexRouterWorkspace.modelOrderUnresolvedAlias", {
-          model: visibleModel,
-          upstream: Array.from(unresolvedUpstreamModels).join(", "),
-          provider: Array.from(unresolvedProviderNames).join(", "),
-          defaultValue:
-            'Model "{{model}}" resolves to unavailable upstream model "{{upstream}}" on provider "{{provider}}". Refresh that provider model list or repair the route alias before saving order.',
-        }),
-      );
-    }
-    if (!hasEligibleRoute) {
-      throw new Error(
-        tr("codexRouterWorkspace.modelOrderNoRoute", {
-          model: visibleModel,
-          defaultValue:
-            'Model "{{model}}" has no enabled route eligible for ordering.',
-        }),
-      );
-    }
-    throw new Error(
-      tr("codexRouterWorkspace.modelOrderUnresolved", {
-        model: visibleModel,
-        defaultValue:
-          'Model "{{model}}" could not be resolved to a provider catalog entry.',
-      }),
-    );
-  }
-  return updates;
-}
-
 export function ModelOrderTab({
   selectedPlan,
   catalog,
@@ -5478,17 +5407,10 @@ export function ModelOrderTab({
               sortIndex: index,
             }))
           : orderedModels;
-      const updates = persistOrder
-        ? buildModelOrderProviderUpdates(
-            models,
-            selectedRoutes.map(({ route }) => route),
-            providersById,
-            reset,
-          )
-        : new Map<string, Provider>();
-      // Schema-v2 modelCatalog is derived and removed by the backend mutation
-      // layer. Persist a changed preference in the owned routing document first;
-      // subsequent provider updates then reconcile against this newest router.
+      // Global picker order belongs to the schema-v2 router. Source-provider
+      // catalogs own model identity/capabilities, not cross-provider ranking;
+      // re-resolving and rewriting them here made an unrelated stale alias block
+      // every ordering save before IPC.
       if (styleDirty || effortDirty || persistOrder) {
         await providersApi.update(
           {
@@ -5512,28 +5434,30 @@ export function ModelOrderTab({
           "codex",
         );
       }
-      for (const provider of updates.values()) {
-        await providersApi.update(provider, "codex");
-      }
       setDraftModels(models);
       setMessage(
         reset
           ? tr("codexRouterWorkspace.s127", {
               defaultValue:
-                "已从目标 Provider 模型条目移除自定义顺序；Codex Desktop 将在几秒内自动刷新。",
+                "已将 MultiRouter 的全局模型顺序恢复为默认值；Codex Desktop 将在几秒内自动刷新。",
             })
           : tr("codexRouterWorkspace.s128", {
               defaultValue:
-                "已把 {{arg0}} 个模型的展示顺序保存到目标 Provider 模型条目；Codex Desktop 将在几秒内自动刷新。",
+                "已将 {{arg0}} 个模型的全局展示顺序保存到 MultiRouter；Codex Desktop 将在几秒内自动刷新。",
               arg0: models.length,
             }),
       );
       await queryClient.invalidateQueries({ queryKey: ["providers", "codex"] });
     } catch (saveError) {
+      reportFrontendError(
+        "codex_model_order_save",
+        saveError,
+        `routerProviderId=${selectedPlan.id}`,
+      );
       setError(
         tr("codexRouterWorkspace.s129", {
           defaultValue: "保存模型顺序失败：{{arg0}}",
-          arg0: workspaceErrorMessage(saveError),
+          arg0: workspaceExactErrorMessage(saveError),
         }),
       );
     } finally {
@@ -7997,7 +7921,7 @@ function SpawnAgentCandidatesPanel({
     selected: draftSpawnAgentModels,
     routed: routedCatalogModelIds,
     priority: CODEX_SPAWN_AGENT_PRIORITY_MODELS.filter((model) =>
-      selectedCatalogByModel.has(model),
+      catalogHasRoleModel(selectedCatalog.models, model),
     ),
     all: selectedCatalog.models
       .map((model) => model.model?.trim())
@@ -8009,21 +7933,12 @@ function SpawnAgentCandidatesPanel({
     selectedCatalog.spawnAgentModels.join("\n");
   const spawnAgentMissingPriorityModels =
     diagnostics?.liveConfig.spawnAgentMissingPriorityModels ?? [];
-  const isFlashRoleModel = (name: string) => {
-    const normalized = name.trim().toLowerCase();
-    return (
-      (normalized === "deepseek-v4-flash" ||
-        normalized.startsWith("deepseek-v4-flash-")) &&
-      !normalized.includes("vision")
-    );
-  };
-  const hasFlashRoleModel = selectedCatalog.models.some((model) =>
-    isFlashRoleModel(model.model?.trim() ?? ""),
+  const hasFlashRoleModel = selectedCatalog.models.some(
+    (model) => deepSeekRoleForModel(model.model?.trim() ?? "") === "flash",
   );
-  const hasProRoleModel = selectedCatalog.models.some((model) => {
-    const name = model.model?.trim().toLowerCase() ?? "";
-    return name === "deepseek-v4-pro" || name.startsWith("deepseek-v4-pro-");
-  });
+  const hasProRoleModel = selectedCatalog.models.some(
+    (model) => deepSeekRoleForModel(model.model?.trim() ?? "") === "pro",
+  );
 
   useEffect(() => {
     setActiveSubagentVersion(persistedSubagentVersion);
@@ -8981,6 +8896,11 @@ function StatusTab({
   >(null);
   const [isUnlockingModelPicker, setIsUnlockingModelPicker] = useState(false);
   const [statusView, setStatusView] = useState<StatusView>("link");
+  const trafficViewActive = statusView === "traffic";
+  const {
+    data: collectionStatus,
+    error: collectionStatusError,
+  } = useSessionCollectionStatus({ enabled: trafficViewActive });
   const {
     data: requestHealth,
     refetch: refetchRequestHealth,
@@ -9953,6 +9873,17 @@ function StatusTab({
 
       {statusView === "traffic" && (
         <div className="space-y-4">
+          <CodexSessionTrafficPanel
+            stats={subagentUsage}
+            isLoading={isLoadingSubagentUsage}
+            error={subagentUsageError}
+            rangeLabel="今日"
+            isSyncing={isSyncingSessionUsage}
+            onSync={() => void syncCodexSessionUsage()}
+            syncMessage={sessionSyncMessage}
+            collectionStatus={collectionStatus}
+            collectionStatusError={collectionStatusError}
+          />
           <section className="rounded-lg border border-emerald-200 bg-emerald-50/70 p-4 dark:border-emerald-700/40 dark:bg-emerald-950/10">
             <SectionHeader
               icon={Database}

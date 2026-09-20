@@ -37,6 +37,7 @@ mod xai_oauth;
 mod lightweight;
 mod s3_sync;
 mod usage;
+mod watchdog;
 mod webdav_sync;
 mod workspace;
 
@@ -76,5 +77,10 @@ pub use xai_oauth::*;
 pub use lightweight::*;
 pub use s3_sync::*;
 pub use usage::*;
+pub use watchdog::*;
 pub use webdav_sync::*;
 pub use workspace::*;
+
+pub use crate::codex_config_consistency::{
+    inspect_codex_config_consistency, resolve_codex_config_consistency,
+};

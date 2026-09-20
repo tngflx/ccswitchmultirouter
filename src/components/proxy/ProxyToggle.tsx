@@ -21,13 +21,35 @@ interface ProxyToggleProps {
 
 export function ProxyToggle({ className, activeApp }: ProxyToggleProps) {
   const { t } = useTranslation();
-  const { isRunning, takeoverStatus, setTakeoverForApp, isPending, status } =
-    useProxyStatus();
+  const {
+    isRunning,
+    takeoverStatus,
+    setTakeoverForApp,
+    restartCodexDesktop,
+    isPending,
+    isInitialStatusPending,
+    status,
+  } = useProxyStatus();
 
   const handleToggle = async (checked: boolean) => {
     try {
       if (activeApp === "codex") {
-        const running = await proxyApi.isCodexDesktopRunning();
+        let running: boolean;
+        try {
+          running = await proxyApi.isCodexDesktopRunning();
+        } catch (error) {
+          console.error(
+            "[ProxyToggle] Failed to inspect Codex Desktop processes:",
+            error,
+          );
+          toast.error(
+            t("proxy.takeover.processCheckFailed", {
+              detail: String(error),
+              defaultValue: `Could not inspect the running Codex Desktop process: ${String(error)}`,
+            }),
+          );
+          return;
+        }
         if (running) {
           const confirmed = window.confirm(
             t("proxy.takeover.restartCodexConfirm", {
@@ -36,19 +58,13 @@ export function ProxyToggle({ className, activeApp }: ProxyToggleProps) {
             }),
           );
           if (!confirmed) return;
-          await proxyApi.restartCodexDesktop(checked);
+          await restartCodexDesktop(checked);
           return;
         }
       }
       await setTakeoverForApp({ appType: activeApp, enabled: checked });
     } catch (error) {
       console.error("[ProxyToggle] Toggle takeover failed:", error);
-      toast.error(
-        t("proxy.takeover.failed", {
-          detail: String(error),
-          defaultValue: "切换接管状态失败",
-        }),
-      );
     }
   };
 
@@ -105,7 +121,8 @@ export function ProxyToggle({ className, activeApp }: ProxyToggleProps) {
       <Switch
         checked={takeoverEnabled}
         onCheckedChange={handleToggle}
-        disabled={isPending}
+        disabled={isPending || isInitialStatusPending}
+        aria-label={t("proxy.takeover.ariaLabel", { appLabel })}
       />
     </div>
   );

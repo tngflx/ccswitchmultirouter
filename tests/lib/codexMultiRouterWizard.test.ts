@@ -473,6 +473,124 @@ describe("codexMultiRouterWizard helpers", () => {
     });
   });
 
+  it("uses persisted route aliases instead of recomputing provider-suffixed names", () => {
+    const relay = provider({
+      id: "relay",
+      name: "Renamed Relay",
+      category: "aggregator",
+      settingsConfig: {
+        modelCatalog: {
+          models: [{ model: "gpt-5.5", upstreamModel: "gpt-5.5" }],
+        },
+      },
+    });
+    const [resolved] = resolveWizardModelNameCollisions(
+      [relay],
+      [
+        {
+          id: "router-relay",
+          enabled: true,
+          targetProviderId: "relay",
+          modelSelection: { mode: "all" },
+          matchPrefixes: [],
+          aliases: { "stable-visible-name": "gpt-5.5" },
+        },
+      ],
+    );
+
+    expect(resolved.settingsConfig.modelCatalog.models).toEqual([
+      expect.objectContaining({
+        model: "stable-visible-name",
+        upstreamModel: "gpt-5.5",
+      }),
+    ]);
+  });
+
+  it("preserves every explicit alias for one upstream model", () => {
+    const relay = provider({
+      id: "relay",
+      name: "Relay",
+      settingsConfig: {
+        modelCatalog: { models: [{ model: "gpt-5.5" }] },
+      },
+    });
+    const routes = buildWizardRoutesFromSources(
+      resolveWizardModelNameCollisions(
+        [relay],
+        [
+          {
+            id: "router-relay",
+            enabled: true,
+            targetProviderId: "relay",
+            modelSelection: { mode: "all" },
+            matchPrefixes: [],
+            aliases: {
+              "gpt-primary": "gpt-5.5",
+              "gpt-secondary": "gpt-5.5",
+            },
+          },
+        ],
+      ),
+      undefined,
+      [
+        {
+          id: "router-relay",
+          enabled: true,
+          targetProviderId: "relay",
+          modelSelection: { mode: "all" },
+          matchPrefixes: [],
+          aliases: {
+            "gpt-primary": "gpt-5.5",
+            "gpt-secondary": "gpt-5.5",
+          },
+        },
+      ],
+    );
+
+    expect(routes[0].aliases).toEqual({
+      "gpt-primary": "gpt-5.5",
+      "gpt-secondary": "gpt-5.5",
+    });
+  });
+
+  it("keeps multi-alias collision resolution idempotent across repeated wizard refreshes", () => {
+    const relay = provider({
+      id: "relay",
+      name: "Relay",
+      settingsConfig: {
+        modelCatalog: { models: [{ model: "gpt-5.5" }] },
+      },
+    });
+    const routes = [
+      {
+        id: "router-relay",
+        enabled: true,
+        targetProviderId: "relay",
+        modelSelection: { mode: "all" as const },
+        matchPrefixes: [],
+        aliases: {
+          "gpt-primary": "gpt-5.5",
+          "gpt-secondary": "gpt-5.5",
+        },
+      },
+    ];
+
+    const [first] = resolveWizardModelNameCollisions([relay], routes);
+    const [second] = resolveWizardModelNameCollisions([first], routes);
+
+    expect(
+      second.settingsConfig.modelCatalog.models.map(
+        (model: { model: string; upstreamModel?: string }) => [
+          model.model,
+          model.upstreamModel,
+        ],
+      ),
+    ).toEqual([
+      ["gpt-primary", "gpt-5.5"],
+      ["gpt-secondary", "gpt-5.5"],
+    ]);
+  });
+
   it("does not treat OpenAI-compatible third-party relays as official sources", () => {
     const official = provider({
       id: "openai",

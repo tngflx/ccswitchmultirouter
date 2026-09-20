@@ -12,11 +12,11 @@ vi.mock("@/hooks/useProxyStatus", () => ({
 vi.mock("@/lib/api/proxy", () => ({
   proxyApi: {
     isCodexDesktopRunning: vi.fn(),
-    restartCodexDesktop: vi.fn(),
   },
 }));
 
 const setTakeoverForApp = vi.fn().mockResolvedValue(undefined);
+const restartCodexDesktop = vi.fn().mockResolvedValue(undefined);
 
 describe("ProxyToggle Codex restart flow", () => {
   beforeEach(() => {
@@ -25,23 +25,22 @@ describe("ProxyToggle Codex restart flow", () => {
       isRunning: true,
       takeoverStatus: { codex: false },
       setTakeoverForApp,
+      restartCodexDesktop,
       isPending: false,
+      isInitialStatusPending: false,
       status: { address: "127.0.0.1", port: 15721 },
     } as unknown as ReturnType<typeof useProxyStatus>);
   });
 
   it("restarts a running Codex Desktop only after confirmation", async () => {
     vi.mocked(proxyApi.isCodexDesktopRunning).mockResolvedValue(true);
-    vi.mocked(proxyApi.restartCodexDesktop).mockResolvedValue(undefined);
     const confirm = vi.spyOn(window, "confirm").mockReturnValue(true);
     const user = userEvent.setup();
 
     render(<ProxyToggle activeApp="codex" />);
     await user.click(screen.getByRole("switch"));
 
-    await waitFor(() =>
-      expect(proxyApi.restartCodexDesktop).toHaveBeenCalledWith(true),
-    );
+    await waitFor(() => expect(restartCodexDesktop).toHaveBeenCalledWith(true));
     expect(confirm).toHaveBeenCalledOnce();
     expect(setTakeoverForApp).not.toHaveBeenCalled();
   });
@@ -55,7 +54,23 @@ describe("ProxyToggle Codex restart flow", () => {
     await user.click(screen.getByRole("switch"));
 
     await waitFor(() => expect(window.confirm).toHaveBeenCalledOnce());
-    expect(proxyApi.restartCodexDesktop).not.toHaveBeenCalled();
+    expect(restartCodexDesktop).not.toHaveBeenCalled();
+    expect(setTakeoverForApp).not.toHaveBeenCalled();
+  });
+
+  it("does not mutate takeover when Codex process inspection fails", async () => {
+    vi.mocked(proxyApi.isCodexDesktopRunning).mockRejectedValue(
+      new Error("CIM unavailable"),
+    );
+    const user = userEvent.setup();
+
+    render(<ProxyToggle activeApp="codex" />);
+    await user.click(screen.getByRole("switch"));
+
+    await waitFor(() =>
+      expect(proxyApi.isCodexDesktopRunning).toHaveBeenCalledOnce(),
+    );
+    expect(restartCodexDesktop).not.toHaveBeenCalled();
     expect(setTakeoverForApp).not.toHaveBeenCalled();
   });
 });

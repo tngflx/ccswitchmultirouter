@@ -104,6 +104,7 @@ import {
   CodexFormFields,
   type CodexProviderSplitSuggestion,
 } from "./CodexFormFields";
+import { CodexOfficialAuthSection } from "./CodexOfficialAuthSection";
 import { completeCodexReasoningEffortMap } from "./codexReasoningCapability";
 import { normalizeCodexInputCapability } from "./codexInputCapability";
 import { GrokBuildProviderForm } from "./GrokBuildProviderForm";
@@ -509,6 +510,7 @@ export interface ProviderFormProps {
   onCancel: () => void;
   onUniversalPresetSelect?: (preset: UniversalProviderPreset) => void;
   onManageUniversalProviders?: () => void;
+  onOpenAuthCenter?: () => void;
   onSubmittingChange?: (isSubmitting: boolean) => void;
   onCodexProviderSplitChange?: (
     suggestion: CodexProviderSplitSuggestion | null,
@@ -546,6 +548,7 @@ function ProviderFormFull({
   onCancel,
   onUniversalPresetSelect,
   onManageUniversalProviders,
+  onOpenAuthCenter,
   onSubmittingChange,
   onCodexProviderSplitChange,
   initialData,
@@ -1867,7 +1870,9 @@ function ProviderFormFull({
         const authJson = JSON.parse(codexAuth);
         // Codex router 自身使用 Responses 接入本地代理，但仍需要保存 catalog/routing。
         const hasCodexRouting =
-          codexRouting.enabled || (codexRouting.routes?.length ?? 0) > 0;
+          codexRouting.enabled ||
+          Boolean(codexRouting.officialAuth) ||
+          (codexRouting.routes?.length ?? 0) > 0;
         const shouldPersistCodexLocalConfig =
           category !== "official" || hasCodexRouting;
         let normalizedCodexConfig =
@@ -2966,6 +2971,20 @@ function ProviderFormFull({
 
           {appId === "codex" && (
             <div ref={codexProviderDetailsRef}>
+              {category === "official" && (
+                <CodexOfficialAuthSection
+                  value={
+                    codexRouting.officialAuth ?? {
+                      mode: "desktop_current_login",
+                    }
+                  }
+                  accounts={codexOauthAccounts}
+                  onChange={(officialAuth) =>
+                    setCodexRouting({ ...codexRouting, officialAuth })
+                  }
+                  onOpenAuthCenter={onOpenAuthCenter ?? (() => undefined)}
+                />
+              )}
               <CodexFormFields
                 providerId={providerId}
                 autoRefreshModels={isEditMode}
@@ -3227,7 +3246,7 @@ function ProviderFormFull({
               <JsonEditor
                 value={omoDraft.mergedOmoJsonPreview}
                 onChange={() => {}}
-                rows={14}
+                rows={3}
                 height={280}
                 showValidation={false}
                 language="json"
@@ -3272,7 +3291,7 @@ function ProviderFormFull({
   },
   "models": {}
 }`}
-                        rows={14}
+                        rows={3}
                         height={280}
                         showValidation={true}
                         language="json"
@@ -3307,7 +3326,7 @@ function ProviderFormFull({
   "models": []
 }`
                   }
-                  rows={14}
+                  rows={3}
                   height={280}
                   showValidation={true}
                   language="json"

@@ -1,0 +1,124 @@
+import { invoke } from "@tauri-apps/api/core";
+
+export type CodexConfigConsistencyState =
+  | "consistent"
+  | "external_drift"
+  | "not_applicable"
+  | "unavailable";
+
+export type CodexConfigConsistencyAction =
+  | "apply_ccsm"
+  | "keep_codex"
+  | "later";
+
+export type CodexConfigRuntimeActivationState =
+  | "not_running"
+  | "current"
+  | "restart_required"
+  | "unknown";
+
+export interface CodexConfigRuntimeActivation {
+  state: CodexConfigRuntimeActivationState;
+  appServerStartedAt: string | null;
+  configModifiedAt: string | null;
+  reason: string | null;
+}
+
+export interface CodexConfigConsistencyReport {
+  state: CodexConfigConsistencyState;
+  providerId: string | null;
+  expectedFingerprint: string | null;
+  actualFingerprint: string | null;
+  changedKeys: string[];
+  reason: string | null;
+  runtimeActivation: CodexConfigRuntimeActivation;
+}
+
+export type CodexRuntimeRefreshStage =
+  | "closing"
+  | "force_closing"
+  | "repairing_history"
+  | "applying_config"
+  | "launching"
+  | "verifying"
+  | "completed";
+
+export type CodexRuntimeRefreshProgressKind = "stage" | "log" | "heartbeat";
+
+export interface CodexRuntimeRefreshProgress {
+  stage: CodexRuntimeRefreshStage;
+  kind?: CodexRuntimeRefreshProgressKind;
+  sequence?: number;
+  emittedAtMs?: number;
+  code?: string | null;
+  message?: string | null;
+}
+
+export interface CodexRuntimeRefreshPreflight {
+  supported: boolean;
+  canRefresh: boolean;
+  snapshotToken: string;
+  desktopProcessCount: number;
+  appServerProcessCount: number;
+  processCount: number;
+  launchTarget: string | null;
+  warning: string | null;
+  paginatedHistory: {
+    affectedRolloutCount: number;
+    duplicateOrdinalCount: number;
+    providerMigrationCursorCount?: number;
+    providerMigrationHistoryBaseCount?: number;
+    rotatedThreadCount?: number;
+    rotatedSegmentCount?: number;
+    affectedBytes: number;
+    blockedRolloutCount: number;
+    blockedReason: string | null;
+    blockedReasonGroups?: CodexBlockedHistoryReasonGroup[];
+  };
+}
+
+export interface CodexBlockedHistoryReasonGroup {
+  code: string;
+  detail: string;
+  count: number;
+  samples: string[];
+}
+
+export interface CodexRuntimeRefreshResult {
+  outcome: "completed" | "completed_with_warnings";
+  configStatus: "ready" | "warning";
+  paginatedHistoryStatus: "ready" | "warning";
+  rendererCompatibilityStatus: "ready" | "warning";
+  rendererCompatibilityMessage: string | null;
+  forceTerminated: boolean;
+  closedProcessCount: number;
+  repairedHistoryRolloutCount: number;
+  repairedHistoryDuplicateCount: number;
+  repairedHistoryProviderMigrationCursorCount?: number;
+  repairedHistoryProviderMigrationHistoryBaseCount?: number;
+  repairedHistoryRotatedThreadCount?: number;
+  repairedHistoryRotatedSegmentCount?: number;
+}
+
+export const codexConfigConsistencyApi = {
+  inspect(): Promise<CodexConfigConsistencyReport> {
+    return invoke("inspect_codex_config_consistency");
+  },
+  resolve(
+    expectedFingerprint: string,
+    action: CodexConfigConsistencyAction,
+  ): Promise<CodexConfigConsistencyReport> {
+    return invoke("resolve_codex_config_consistency", {
+      expectedFingerprint,
+      action,
+    });
+  },
+  inspectRuntimeRefresh(): Promise<CodexRuntimeRefreshPreflight> {
+    return invoke("inspect_codex_runtime_refresh");
+  },
+  refreshRuntimeState(
+    snapshotToken: string,
+  ): Promise<CodexRuntimeRefreshResult> {
+    return invoke("refresh_codex_runtime_state", { snapshotToken });
+  },
+};

@@ -5,10 +5,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use uuid::Uuid;
 
-use crate::proxy::providers::transform_codex_chat::responses_to_chat_completions_with_reasoning;
-
 use super::{
-    build_logical_probe_request,
+    build_logical_probe_request, build_safe_tool_probe_request,
     capture::{capture_transport_probe, CapturedProbeExchange, ProbeCaptureError},
     classify::ClassifiedReasoningShape,
     classify_captured_reasoning_shape,
@@ -16,11 +14,20 @@ use super::{
     redaction::RedactedProbeEvidence,
     selection::select_transport_outcome_with_reasoning,
     PreToolVisibleContent, ProbeCandidate, ProbeCase, ProbeReadiness, ProbeStageStatus,
-    ReasoningSemantic, ReasoningSource, TransportKind, TransportProbeAssessment,
+    HistoryReplay, ReasoningSemantic, ReasoningSource, ToolSchemaDialect,
+    ToolSchemaEvidence, TransportKind, TransportProbeAssessment,
+    prepare_probe_request,
 };
 
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(15);
 const TRANSACTION_TIMEOUT: Duration = Duration::from_secs(120);
+
+fn history_replay_for_transport(transport: TransportKind) -> HistoryReplay {
+    match transport {
+        TransportKind::OpenAiChat => HistoryReplay::ChatReasoningContent,
+        TransportKind::OpenAiResponses => HistoryReplay::NativeOnly,
+    }
+}
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -44,11 +51,39 @@ pub enum ProbeProgressStage {
 #[serde(rename_all = "snake_case")]
 pub enum ProbeFailureKind {
     HttpStatus,
+    ToolSchemaRejected,
+    ReasoningReplayRejected,
     Timeout,
     Network,
     ResponseTooLarge,
     InvalidResponse,
     InvalidRequest,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompatibilityRule {
+    ToolSchema,
+    ReasoningTextReplay,
+    OmitReasoning,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AdaptationTrigger {
+    ExplicitToolSchemaRejection,
+    AmbiguousRequestRejection,
+    MissingValidToolCall,
+    ReasoningReplayRejection,
+    AdaptedReplayRejection,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AdaptationChange {
+    ToolSchemaMoonshotMfjs,
+    ReplayReasoningTextContent,
+    OmitIncompatibleReasoning,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -59,6 +94,12 @@ pub struct RedactedProbeFailure {
     pub status_code: Option<u16>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProbeAdaptation {
+    ToolSchemaSafeFallback,
+}
+
 impl RedactedProbeFailure {
     fn from_capture(stage: ProbeProgressStage, error: ProbeCaptureError) -> Self {
         let (kind, status_code) = match error {
@@ -66,6 +107,12 @@ impl RedactedProbeFailure {
             ProbeCaptureError::Network => (ProbeFailureKind::Network, None),
             ProbeCaptureError::HttpStatus { status_code } => {
                 (ProbeFailureKind::HttpStatus, Some(status_code))
+            }
+            ProbeCaptureError::ToolSchemaRejected { status_code } => {
+                (ProbeFailureKind::ToolSchemaRejected, Some(status_code))
+            }
+            ProbeCaptureError::ReasoningReplayRejected { status_code } => {
+                (ProbeFailureKind::ReasoningReplayRejected, Some(status_code))
             }
             ProbeCaptureError::ResponseTooLarge => (ProbeFailureKind::ResponseTooLarge, None),
             ProbeCaptureError::InvalidPayload => (ProbeFailureKind::InvalidResponse, None),
@@ -101,6 +148,14 @@ impl RedactedProbeFailure {
     rename_all_fields = "camelCase"
 )]
 pub enum ProtocolProbeProgressEvent {
+    CompatibilityRetry {
+        model: String,
+        transport: TransportKind,
+        stage: ProbeProgressStage,
+        rule: CompatibilityRule,
+        trigger: AdaptationTrigger,
+        change: AdaptationChange,
+    },
     CandidateStarted {
         model: String,
     },
@@ -146,9 +201,17 @@ pub enum ProtocolProbeProgressEvent {
 pub struct TransportBranchResult {
     pub assessment: TransportProbeAssessment,
     pub reasoning_shape: ClassifiedReasoningShape,
+    #[serde(default)]
+    pub tool_schema_dialect: ToolSchemaDialect,
+    #[serde(default)]
+    pub tool_schema_evidence: ToolSchemaEvidence,
+    #[serde(default)]
+    pub history_replay: HistoryReplay,
     evidence: Vec<RedactedProbeEvidence>,
     #[serde(default)]
     pub failures: Vec<RedactedProbeFailure>,
+    #[serde(default)]
+    pub adaptations: Vec<ProbeAdaptation>,
 }
 
 impl fmt::Debug for TransportBranchResult {
@@ -157,6 +220,9 @@ impl fmt::Debug for TransportBranchResult {
             .debug_struct("TransportBranchResult")
             .field("assessment", &self.assessment)
             .field("reasoning_shape", &self.reasoning_shape)
+            .field("tool_schema_dialect", &self.tool_schema_dialect)
+            .field("tool_schema_evidence", &self.tool_schema_evidence)
+            .field("history_replay", &self.history_replay)
             .field("evidence_count", &self.evidence.len())
             .field("failures", &self.failures)
             .finish()
@@ -369,8 +435,12 @@ where
             TransportBranchResult {
                 assessment,
                 reasoning_shape,
+                tool_schema_dialect: ToolSchemaDialect::OpenAi,
+                tool_schema_evidence: ToolSchemaEvidence::Unspecified,
+                history_replay: history_replay_for_transport(transport),
                 evidence,
                 failures,
+                adaptations: Vec::new(),
             },
         );
     };
@@ -416,8 +486,12 @@ where
                 TransportBranchResult {
                     assessment,
                     reasoning_shape,
+                    tool_schema_dialect: ToolSchemaDialect::OpenAi,
+                    tool_schema_evidence: ToolSchemaEvidence::Unspecified,
+                    history_replay: history_replay_for_transport(transport),
                     evidence,
                     failures,
+                    adaptations: Vec::new(),
                 },
             );
         }
@@ -439,8 +513,12 @@ where
                 TransportBranchResult {
                     assessment,
                     reasoning_shape,
+                    tool_schema_dialect: ToolSchemaDialect::OpenAi,
+                    tool_schema_evidence: ToolSchemaEvidence::Unspecified,
+                    history_replay: history_replay_for_transport(transport),
                     evidence,
                     failures,
+                    adaptations: Vec::new(),
                 },
             );
         }
@@ -458,8 +536,12 @@ where
             TransportBranchResult {
                 assessment,
                 reasoning_shape,
+                tool_schema_dialect: ToolSchemaDialect::OpenAi,
+                tool_schema_evidence: ToolSchemaEvidence::Unspecified,
+                history_replay: history_replay_for_transport(transport),
                 evidence,
                 failures,
+                adaptations: Vec::new(),
             },
         );
     }
@@ -526,18 +608,29 @@ where
         transport,
         ProbeProgressStage::ForcedTool,
     );
-    let forced = send_case(
+    let forced = send_forced_tool_case(
         candidate,
         client,
         transport,
         &endpoint,
-        ProbeCase::ForcedToolSse,
         nonce,
-        None,
     )
     .await;
-    let (tool_call, forced_exchange) = match forced {
-        Ok(exchange) => {
+    if forced
+        .as_ref()
+        .is_ok_and(|(_, used_fallback)| *used_fallback)
+    {
+        reporter(ProtocolProbeProgressEvent::CompatibilityRetry {
+            model: candidate.public_model.clone(),
+            transport,
+            stage: ProbeProgressStage::ForcedTool,
+            rule: CompatibilityRule::ToolSchema,
+            trigger: AdaptationTrigger::ExplicitToolSchemaRejection,
+            change: AdaptationChange::ToolSchemaMoonshotMfjs,
+        });
+    }
+    let (tool_call, forced_exchange, used_fallback) = match forced {
+        Ok((exchange, used_fallback)) => {
             update_shape(
                 &mut reasoning_shape,
                 classify_captured_reasoning_shape(&exchange),
@@ -555,7 +648,7 @@ where
                         assessment.forced_tool,
                         None,
                     );
-                    (call, exchange)
+                    (call, exchange, used_fallback)
                 }
                 None => {
                     assessment.forced_tool = ProbeStageStatus::Unsupported;
@@ -573,8 +666,24 @@ where
                         TransportBranchResult {
                             assessment,
                             reasoning_shape,
+                            tool_schema_dialect: if used_fallback {
+                                ToolSchemaDialect::MoonshotMfjs
+                            } else {
+                                ToolSchemaDialect::OpenAi
+                            },
+                            tool_schema_evidence: if used_fallback {
+                                ToolSchemaEvidence::ExplicitRejection
+                            } else {
+                                ToolSchemaEvidence::Unspecified
+                            },
+                            history_replay: history_replay_for_transport(transport),
                             evidence,
                             failures,
+                            adaptations: if used_fallback {
+                                vec![ProbeAdaptation::ToolSchemaSafeFallback]
+                            } else {
+                                Vec::new()
+                            },
                         },
                     );
                 }
@@ -598,8 +707,12 @@ where
                 TransportBranchResult {
                     assessment,
                     reasoning_shape,
+                    tool_schema_dialect: ToolSchemaDialect::OpenAi,
+                    tool_schema_evidence: ToolSchemaEvidence::Unspecified,
+                    history_replay: history_replay_for_transport(transport),
                     evidence,
                     failures,
+                    adaptations: Vec::new(),
                 },
             );
         }
@@ -667,10 +780,79 @@ where
         TransportBranchResult {
             assessment,
             reasoning_shape,
+            tool_schema_dialect: if used_fallback {
+                ToolSchemaDialect::MoonshotMfjs
+            } else {
+                ToolSchemaDialect::OpenAi
+            },
+            tool_schema_evidence: if used_fallback {
+                ToolSchemaEvidence::ExplicitRejection
+            } else {
+                ToolSchemaEvidence::Unspecified
+            },
+            history_replay: history_replay_for_transport(transport),
             evidence,
             failures,
+            adaptations: if used_fallback {
+                vec![ProbeAdaptation::ToolSchemaSafeFallback]
+            } else {
+                Vec::new()
+            },
         },
     )
+}
+
+async fn send_forced_tool_case(
+    candidate: &ProbeCandidate,
+    client: &Client,
+    transport: TransportKind,
+    endpoint: &str,
+    nonce: &str,
+) -> Result<(CapturedProbeExchange, bool), ProbeCaptureError> {
+    match send_case(
+        candidate,
+        client,
+        transport,
+        endpoint,
+        ProbeCase::ForcedToolSse,
+        nonce,
+        None,
+    )
+    .await
+    {
+        Err(ProbeCaptureError::ToolSchemaRejected { .. }) => {
+            send_logical_case(
+                candidate,
+                client,
+                transport,
+                endpoint,
+                build_safe_tool_probe_request(&candidate.upstream_model, nonce),
+            )
+            .await
+            .map(|exchange| (exchange, true))
+        }
+        Ok(exchange) => Ok((exchange, false)),
+        Err(error) => Err(error),
+    }
+}
+
+async fn send_logical_case(
+    candidate: &ProbeCandidate,
+    client: &Client,
+    transport: TransportKind,
+    endpoint: &str,
+    logical: Value,
+) -> Result<CapturedProbeExchange, ProbeCaptureError> {
+    let prepared =
+        prepare_probe_request(logical, transport).map_err(|_| ProbeCaptureError::InvalidPayload)?;
+    let mut request = client
+        .post(endpoint)
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .json(&prepared.wire_body);
+    if let Some(authorization) = candidate.bearer_token() {
+        request = request.header(reqwest::header::AUTHORIZATION, authorization.clone());
+    }
+    capture_transport_probe(request, RESPONSE_TIMEOUT).await
 }
 
 fn report_stage_started<F>(
@@ -785,15 +967,18 @@ async fn send_case(
         ),
         None => build_logical_probe_request(case, &candidate.upstream_model, nonce),
     };
-    let wire_body = match transport {
-        TransportKind::OpenAiResponses => logical,
-        TransportKind::OpenAiChat => responses_to_chat_completions_with_reasoning(logical, None)
-            .map_err(|_| ProbeCaptureError::InvalidPayload)?,
-    };
+    let prepared = prepare_probe_request(logical, transport)
+        .map_err(|_| ProbeCaptureError::InvalidPayload)?;
+    log::trace!(
+        "prepared protocol probe request transport={:?} policy_fingerprint={} logical_bytes={}",
+        prepared.transport,
+        prepared.policy_fingerprint,
+        prepared.logical_body.to_string().len()
+    );
     let mut request = client
         .post(endpoint)
         .header(reqwest::header::CONTENT_TYPE, "application/json")
-        .json(&wire_body);
+        .json(&prepared.wire_body);
     if let Some(authorization) = candidate.bearer_token() {
         request = request.header(reqwest::header::AUTHORIZATION, authorization.clone());
     }

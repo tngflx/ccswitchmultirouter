@@ -4,7 +4,10 @@ import path from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
 
-const DEFAULT_MAX_GB = 12;
+// Debug Cargo artifacts accumulate multiple test/linkage generations. Keep the
+// normal target bounded near the size users expect; cleanup remains guarded by
+// process ownership and never runs while the development binary is active.
+const DEFAULT_MAX_GB = 4;
 const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(SCRIPT_DIR, "..");
 const TAURI_DIR = path.join(REPO_ROOT, "src-tauri");

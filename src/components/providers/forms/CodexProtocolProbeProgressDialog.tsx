@@ -24,6 +24,7 @@ import type {
   CodexProtocolCompatibilityRecord,
   CodexProtocolProbeProgressEvent,
   CodexProtocolProbeFailure,
+  CodexProtocolProbeAdaptation,
   CodexProtocolProbeReadiness,
   CodexProtocolProbeStage,
   CodexProtocolProbeStageStatus,
@@ -42,6 +43,7 @@ interface BranchProgress {
   reasoningSource: CodexReasoningSource | null;
   readiness: CodexProtocolProbeReadiness | null;
   failures: CodexProtocolProbeFailure[];
+  adaptations: CodexProtocolProbeAdaptation[];
 }
 
 interface ModelProgress {
@@ -103,6 +105,7 @@ function emptyBranch(): BranchProgress {
     reasoningSource: null,
     readiness: null,
     failures: [],
+    adaptations: [],
   };
 }
 
@@ -140,6 +143,7 @@ function applyRecord(
     target.reasoningSemantic = branch.reasoning_shape.semantic;
     target.reasoningSource = branch.reasoning_shape.source;
     target.failures = branch.failures ?? [];
+    target.adaptations = branch.adaptations ?? [];
   }
 }
 
@@ -170,6 +174,16 @@ function buildProgress(
     branch.touched = true;
     if (event.kind === "stage_started") {
       branch.stages[event.stage] = "running";
+    } else if (event.kind === "compatibility_retry") {
+      if (
+        event.change === "tool_schema_moonshot_mfjs" &&
+        !branch.adaptations.includes("tool_schema_safe_fallback")
+      ) {
+        branch.adaptations = [
+          ...branch.adaptations,
+          "tool_schema_safe_fallback",
+        ];
+      }
     } else if (event.kind === "stage_finished") {
       branch.stages[event.stage] = event.stageStatus;
       if (event.failure) {
@@ -271,6 +285,16 @@ function reasoningLabel(
 }
 
 function failureLabel(failure: CodexProtocolProbeFailure, t: TranslateFn) {
+  if (failure.kind === "tool_schema_rejected") {
+    return t("codexProbe.failureToolSchemaRejected", {
+      defaultValue: "工具 Schema 被上游拒绝（已尝试安全回退）",
+    });
+  }
+  if (failure.kind === "reasoning_replay_rejected") {
+    return t("codexProbe.failureReasoningReplayRejected", {
+      defaultValue: "推理历史回放被上游拒绝",
+    });
+  }
   if (failure.kind === "http_status") {
     if (failure.status_code === 521) {
       return t("codexProbe.failureHttp521", {
@@ -516,6 +540,16 @@ export function CodexProtocolProbeProgressDialog({
                                   </p>
                                 ))}
                               </div>
+                            )}
+                            {branch.adaptations.includes(
+                              "tool_schema_safe_fallback",
+                            ) && (
+                              <p className="border-t pt-2 text-xs text-amber-700 dark:text-amber-300">
+                                {t("codexProbe.adaptationToolSchemaFallback", {
+                                  defaultValue:
+                                    "已使用安全工具 Schema 回退并重新验证",
+                                })}
+                              </p>
                             )}
                           </div>
                         )}

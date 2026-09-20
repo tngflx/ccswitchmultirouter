@@ -131,4 +131,24 @@ describe("useProxyStatus", () => {
     expect(invokeMock).toHaveBeenCalledWith("start_proxy_server");
     expect(invokeMock).toHaveBeenCalledWith("stop_proxy_server");
   });
+
+  it("refreshes takeover state after the confirmed Codex restart path", async () => {
+    const { wrapper, queryClient } = createWrapper();
+    const invalidateSpy = vi.spyOn(queryClient, "invalidateQueries");
+    const { result } = renderHook(() => useProxyStatus(), { wrapper });
+
+    await waitFor(() => expect(result.current.takeoverStatus).toBeDefined());
+
+    await act(async () => {
+      await result.current.restartCodexDesktop(true);
+    });
+
+    expect(invokeMock).toHaveBeenCalledWith("restart_codex_desktop", {
+      enabled: true,
+    });
+    expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: proxyKeys.status });
+    expect(invalidateSpy).toHaveBeenCalledWith({
+      queryKey: proxyKeys.takeoverStatus,
+    });
+  });
 });

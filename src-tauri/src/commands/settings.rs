@@ -109,6 +109,13 @@ fn validate_settings_for_save(settings: &crate::settings::AppSettings) -> Result
         .map_err(|error| error.to_string())
 }
 
+fn codex_auto_update_just_enabled(
+    existing: &crate::settings::AppSettings,
+    incoming: &crate::settings::AppSettings,
+) -> bool {
+    !existing.auto_update_codex_cli && incoming.auto_update_codex_cli
+}
+
 /// 获取设置
 #[tauri::command]
 pub async fn get_settings() -> Result<crate::settings::AppSettings, String> {
@@ -124,6 +131,7 @@ pub async fn save_settings(
     let existing = crate::settings::get_settings();
     let merged = merge_settings_for_save(settings, &existing);
     validate_settings_for_save(&merged)?;
+    let start_codex_auto_update = codex_auto_update_just_enabled(&existing, &merged);
     let env_injection = merged.env_injection.clone();
     let unify_codex_changed =
         merged.unify_codex_session_history != existing.unify_codex_session_history;
@@ -184,6 +192,19 @@ pub async fn save_settings(
         }
     }
     let env_report = crate::env_injection::sync_to_live_configs(&env_injection);
+    // Dispatch only after persistence and rollback-capable save steps succeed.
+    // Updating the CLI must not block settings saves or restart the running app.
+    if start_codex_auto_update {
+        tokio::spawn(async {
+            match crate::commands::auto_update_codex_cli_if_needed().await {
+                Ok(true) => log::info!("Codex CLI automatic update after enabling completed"),
+                Ok(false) => {}
+                Err(error) => log::warn!(
+                    "Codex CLI automatic update after enabling failed; setting remains enabled: {error}"
+                ),
+            }
+        });
+    }
     Ok(SettingsSaveResult {
         settings_saved: true,
         env_injection: env_report,
@@ -488,6 +509,31 @@ mod tests {
         CodexThirdPartyHistoryProviderBucketMigration, LocalMigrations, S3SyncSettings,
         WebDavSyncSettings,
     };
+
+    #[test]
+    fn codex_auto_update_dispatches_only_on_off_to_on_save() {
+        for (before, after, expected) in [
+            (false, false, false),
+            (false, true, true),
+            (true, true, false),
+            (true, false, false),
+        ] {
+            let existing = AppSettings {
+                auto_update_codex_cli: before,
+                ..AppSettings::default()
+            };
+            let incoming = AppSettings {
+                auto_update_codex_cli: after,
+                ..AppSettings::default()
+            };
+            let merged = merge_settings_for_save(incoming, &existing);
+            assert_eq!(
+                super::codex_auto_update_just_enabled(&existing, &merged),
+                expected,
+                "transition {before} -> {after}"
+            );
+        }
+    }
 
     #[test]
     fn check_app_update_info_preserves_release_metadata() {

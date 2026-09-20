@@ -65,6 +65,8 @@ function renderEditor(value: string, onChange = vi.fn()) {
 
 const effortCheckbox = () =>
   screen.getByRole("checkbox", { name: "claudeConfig.effortMax" });
+const artifactCheckbox = () =>
+  screen.getByRole("checkbox", { name: "claudeConfig.disableArtifact" });
 
 describe("CommonConfigEditor max effort toggle", () => {
   it("does not treat legacy top-level effortLevel=max as checked", () => {
@@ -112,6 +114,33 @@ describe("CommonConfigEditor max effort toggle", () => {
       env: {
         ENABLE_TOOL_SEARCH: "true",
       },
+    });
+  });
+});
+
+describe("CommonConfigEditor artifact toggle", () => {
+  it("writes the Claude Code artifact disable environment variable", () => {
+    const onChange = renderEditor("{}");
+    fireEvent.click(artifactCheckbox());
+
+    expect(JSON.parse(onChange.mock.calls[0][0])).toEqual({
+      env: { CLAUDE_CODE_DISABLE_ARTIFACT: "1" },
+    });
+  });
+
+  it("removes only the artifact variable when unchecked", () => {
+    const onChange = renderEditor(
+      JSON.stringify({
+        env: {
+          CLAUDE_CODE_DISABLE_ARTIFACT: "1",
+          ENABLE_TOOL_SEARCH: "true",
+        },
+      }),
+    );
+    fireEvent.click(artifactCheckbox());
+
+    expect(JSON.parse(onChange.mock.calls[0][0])).toEqual({
+      env: { ENABLE_TOOL_SEARCH: "true" },
     });
   });
 });

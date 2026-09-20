@@ -1,5 +1,9 @@
 import { describe, expect, it } from "vitest";
-import { cacheHitRatePercent } from "@/components/usage/UsageTrendChart";
+import {
+  cacheHitRatePercent,
+  createUsageTrendTokenTickFormatter,
+  formatUsageTrendTokenTickLabel,
+} from "@/components/usage/UsageTrendChart";
 
 describe("UsageTrendChart cache hit rate", () => {
   it("calculates cache read tokens as a percentage of cacheable input", () => {
@@ -8,5 +12,11 @@ describe("UsageTrendChart cache hit rate", () => {
 
   it("returns zero when no cacheable input exists", () => {
     expect(cacheHitRatePercent(0, 0, 0)).toBe(0);
+  });
+
+  it("formats large token ticks compactly for the active locale", () => {
+    const formatter = createUsageTrendTokenTickFormatter("en-US");
+    expect(formatUsageTrendTokenTickLabel(12500, formatter)).toBe("12.5K");
+    expect(formatUsageTrendTokenTickLabel("invalid", formatter)).toBe("--");
   });
 });

@@ -529,6 +529,9 @@ pub struct AppSettings {
     /// 是否开机自启
     #[serde(default)]
     pub launch_on_startup: bool,
+    /// Cross-platform supervisor that restarts the app only after an unexpected exit.
+    #[serde(default = "default_watchdog_enabled")]
+    pub watchdog_enabled: bool,
     /// 是否在 CCSwitchMulti 启动后启动 Codex Desktop。
     ///
     /// 这是独立于系统开机自启的显式选择：仅开启 `launch_on_startup`
@@ -549,6 +552,9 @@ pub struct AppSettings {
     pub usage_confirmed: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage_dashboard_refresh_interval_ms: Option<u32>,
+    /// Whether background session-log usage scanning is enabled.
+    #[serde(default = "default_session_auto_sync_enabled")]
+    pub session_auto_sync_enabled: bool,
     /// Whether to show the failover toggle independently on the main page
     #[serde(default)]
     pub enable_failover_toggle: bool,
@@ -696,6 +702,14 @@ fn default_show_in_tray() -> bool {
     true
 }
 
+fn default_watchdog_enabled() -> bool {
+    true
+}
+
+fn default_session_auto_sync_enabled() -> bool {
+    true
+}
+
 fn default_minimize_to_tray_on_close() -> bool {
     true
 }
@@ -714,12 +728,14 @@ impl Default for AppSettings {
             enable_claude_plugin_integration: false,
             skip_claude_onboarding: false,
             launch_on_startup: false,
+            watchdog_enabled: default_watchdog_enabled(),
             launch_codex_desktop_with_ccswitch: false,
             silent_startup: false,
             enable_local_proxy: false,
             proxy_confirmed: None,
             usage_confirmed: None,
             usage_dashboard_refresh_interval_ms: None,
+            session_auto_sync_enabled: default_session_auto_sync_enabled(),
             enable_failover_toggle: false,
             enable_stream_retry: true,
             stream_retry_mode: StreamRetryMode::Safe,
@@ -981,6 +997,12 @@ pub fn update_settings(mut new_settings: AppSettings) -> Result<(), AppError> {
     save_settings_file(&new_settings)?;
     *guard = new_settings;
     Ok(())
+}
+
+pub fn set_request_health_windows_notifications_enabled(enabled: bool) -> Result<(), AppError> {
+    mutate_settings(|settings| {
+        settings.request_health.windows_notifications_enabled = enabled;
+    })
 }
 
 fn mutate_settings<F>(mutator: F) -> Result<(), AppError>

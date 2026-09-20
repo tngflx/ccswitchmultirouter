@@ -1020,13 +1020,14 @@ export function ClaudeFormFields({
                     variant="outline"
                     size="sm"
                     onClick={() => {
+                      // Follow the visible form order; use the generic model last.
                       const value =
-                        claudeModel ||
                         defaultSonnetModel ||
                         defaultOpusModel ||
                         defaultFableModel ||
                         defaultHaikuModel ||
-                        subagentModel;
+                        subagentModel ||
+                        claudeModel;
                       if (value) {
                         for (const row of modelRoleRows) {
                           const roleValue = row.supportsOneM

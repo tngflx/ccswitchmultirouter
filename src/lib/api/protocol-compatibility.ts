@@ -27,11 +27,40 @@ export type CodexReasoningSource =
 
 export type CodexProtocolProbeFailureKind =
   | "http_status"
+  | "tool_schema_rejected"
+  | "reasoning_replay_rejected"
   | "timeout"
   | "network"
   | "response_too_large"
   | "invalid_response"
   | "invalid_request";
+
+export type CodexProtocolProbeAdaptation = "tool_schema_safe_fallback";
+export type CodexProtocolCompatibilityRule =
+  | "tool_schema"
+  | "reasoning_text_replay"
+  | "omit_reasoning";
+export type CodexProtocolAdaptationTrigger =
+  | "explicit_tool_schema_rejection"
+  | "ambiguous_request_rejection"
+  | "missing_valid_tool_call"
+  | "reasoning_replay_rejection"
+  | "adapted_replay_rejection";
+export type CodexProtocolAdaptationChange =
+  | "tool_schema_moonshot_mfjs"
+  | "replay_reasoning_text_content"
+  | "omit_incompatible_reasoning";
+export type CodexProtocolToolSchemaDialect = "open_ai" | "moonshot_mfjs";
+export type CodexProtocolToolSchemaEvidence =
+  | "unspecified"
+  | "explicit_rejection"
+  | "ambiguous_rejection"
+  | "negotiated_tool_call";
+export type CodexProtocolHistoryReplay =
+  | "chat_reasoning_content"
+  | "responses_reasoning_text_content"
+  | "omit"
+  | "native_only";
 
 export interface CodexProtocolProbeFailure {
   stage: CodexProtocolProbeStage;
@@ -40,6 +69,15 @@ export interface CodexProtocolProbeFailure {
 }
 
 export type CodexProtocolProbeProgressEvent =
+  | {
+      kind: "compatibility_retry";
+      model: string;
+      transport: CodexProtocolTransport;
+      stage: CodexProtocolProbeStage;
+      rule: CodexProtocolCompatibilityRule;
+      trigger: CodexProtocolAdaptationTrigger;
+      change: CodexProtocolAdaptationChange;
+    }
   | { kind: "candidate_started"; model: string }
   | {
       kind: "stage_started";
@@ -96,7 +134,11 @@ export interface CodexProtocolProbeBranch {
     source: CodexReasoningSource;
     pre_tool_visible_content: "absent" | "present";
   };
+  tool_schema_dialect?: CodexProtocolToolSchemaDialect;
+  tool_schema_evidence?: CodexProtocolToolSchemaEvidence;
+  history_replay?: CodexProtocolHistoryReplay;
   failures?: CodexProtocolProbeFailure[];
+  adaptations?: CodexProtocolProbeAdaptation[];
 }
 
 export interface CodexProtocolCompatibilityRecord {

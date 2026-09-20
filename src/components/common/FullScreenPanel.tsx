@@ -2,6 +2,7 @@ import React from "react";
 import { createPortal } from "react-dom";
 import { motion, AnimatePresence } from "framer-motion";
 import { ArrowLeft } from "lucide-react";
+import { useTranslation } from "react-i18next";
 import { Button } from "@/components/ui/button";
 import {
   isWindows,
@@ -89,6 +90,7 @@ export const FullScreenPanel: React.FC<FullScreenPanelProps> = ({
   childPanelZIndexClassName,
   contentClassName,
 }) => {
+  const { t } = useTranslation();
   const parentLayer = useOverlayLayerContext();
   const effectiveZIndexClassName =
     zIndexClassName ??
@@ -193,7 +195,8 @@ export const FullScreenPanel: React.FC<FullScreenPanelProps> = ({
                   type="button"
                   variant="outline"
                   size="icon"
-                  onClick={onClose}
+                onClick={onClose}
+                aria-label={t("common.back")}
                   className="rounded-lg select-none"
                   style={{ WebkitAppRegion: "no-drag" } as React.CSSProperties}
                 >

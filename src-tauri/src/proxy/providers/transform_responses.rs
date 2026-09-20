@@ -352,8 +352,14 @@ pub fn anthropic_to_responses_with_cache_retention(
     // Claude Code may send 1 as a probe, while OpenAI requires at least 16.
     if let Some(v) = body.get("max_tokens") {
         result["max_output_tokens"] = v
-            .as_i64()
-            .map(|tokens| json!(tokens.max(16)))
+            .as_u64()
+            .map(|tokens| {
+                if (1..16).contains(&tokens) {
+                    json!(16)
+                } else {
+                    json!(tokens)
+                }
+            })
             .unwrap_or_else(|| v.clone());
     }
 
@@ -385,14 +391,17 @@ pub fn anthropic_to_responses_with_cache_retention(
             .iter()
             .filter(|t| t.get("type").and_then(|v| v.as_str()) != Some("BatchTool"))
             .map(|t| {
-                json!({
+                let mut response_tool = json!({
                     "type": "function",
                     "name": t.get("name").and_then(|n| n.as_str()).unwrap_or(""),
-                    "description": t.get("description"),
-                    "parameters": super::transform::clean_schema(
-                        t.get("input_schema").cloned().unwrap_or(json!({}))
-                    )
-                })
+                });
+                if let Some(description) = t.get("description").filter(|d| !d.is_null()) {
+                    response_tool["description"] = description.clone();
+                }
+                response_tool["parameters"] = super::transform::clean_schema(
+                    t.get("input_schema").cloned().unwrap_or(json!({}))
+                );
+                response_tool
             })
             .collect();
 
@@ -1054,6 +1063,40 @@ mod tests {
             let result = anthropic_to_responses(input, None, false, false).unwrap();
             assert_eq!(result["max_output_tokens"], expected);
         }
+    }
+
+    #[test]
+    fn test_anthropic_to_responses_preserves_zero_and_non_integer_output_tokens() {
+        for raw in [json!(0), json!("16"), json!(12.5)] {
+            let input = json!({
+                "model": "gpt-5",
+                "max_tokens": raw,
+                "messages": [{"role": "user", "content": "Hello"}]
+            });
+            let result = anthropic_to_responses(input, None, false, false).unwrap();
+            assert_eq!(result["max_output_tokens"], raw);
+        }
+    }
+
+    #[test]
+    fn test_anthropic_to_responses_omits_missing_tool_description() {
+        let input = json!({
+            "model": "gpt-4o",
+            "max_tokens": 1024,
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [
+                {"name": "NoDesc", "input_schema": {"type": "object"}},
+                {"name": "Described", "description": "Has one",
+                 "input_schema": {"type": "object"}}
+            ]
+        });
+
+        let result = anthropic_to_responses(input, None, false, false).unwrap();
+        let tools = result["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 2);
+        assert!(tools[0].get("description").is_none());
+        assert!(tools[0].get("parameters").is_some());
+        assert_eq!(tools[1]["description"], json!("Has one"));
     }
 
     #[test]

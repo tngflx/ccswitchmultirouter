@@ -104,8 +104,7 @@ export function readWizardCodexOAuthAccountId(
       })
     | undefined;
   const authBinding = (meta?.authBinding ?? meta?.auth_binding) as
-    | { accountId?: string; account_id?: string }
-    | undefined;
+    { accountId?: string; account_id?: string } | undefined;
   const accountId = authBinding?.accountId ?? authBinding?.account_id;
   return typeof accountId === "string" && accountId.trim()
     ? accountId.trim()
@@ -176,8 +175,7 @@ function isWizardNativeCodexAuthSource(provider: Provider): boolean {
     auth_binding?: { source?: string; accountId?: string; account_id?: string };
   };
   const binding = (meta.authBinding ?? legacyMeta.auth_binding) as
-    | { source?: string; accountId?: string; account_id?: string }
-    | undefined;
+    { source?: string; accountId?: string; account_id?: string } | undefined;
   const source = String(
     binding?.source ?? config.auth?.source ?? "",
   ).toLowerCase();
@@ -225,8 +223,8 @@ export function isCodexMultiRouterPlan(provider: Provider): boolean {
   const routing = provider.settingsConfig?.codexRouting;
   return Boolean(
     routing &&
-      typeof routing === "object" &&
-      (routing.enabled !== false || Array.isArray(routing.routes)),
+    typeof routing === "object" &&
+    (routing.enabled !== false || Array.isArray(routing.routes)),
   );
 }
 
@@ -643,6 +641,7 @@ function hasOpenAiResponsesNativeModels(provider: Provider): boolean {
 // 检测多个 provider 暴露的同名模型；官方保留原名，第三方/中转站自动生成可见别名。
 export function resolveWizardModelNameCollisions(
   providers: Provider[],
+  existingRoutes: CodexRoutingRouteV2[] = [],
 ): Provider[] {
   const ownersByUpstream = new Map<string, Provider[]>();
   for (const provider of providers) {
@@ -653,25 +652,55 @@ export function resolveWizardModelNameCollisions(
       if (!upstream) continue;
       const owners =
         ownersByUpstream.get(normalizedWizardModelId(upstream)) ?? [];
-      owners.push(provider);
+      if (!owners.some((owner) => owner.id === provider.id)) {
+        owners.push(provider);
+      }
       ownersByUpstream.set(normalizedWizardModelId(upstream), owners);
     }
   }
 
   return providers.map((provider) => {
-    const nextModels = readWizardModelCatalog(provider).map((model) => {
+    const existingRoute = existingRoutes.find(
+      (route) => route.targetProviderId === provider.id,
+    );
+    const emittedModels = new Set<string>();
+    const nextModels = readWizardModelCatalog(provider).flatMap((model) => {
       const upstream = wizardModelUpstream(model);
-      const owners =
-        ownersByUpstream.get(normalizedWizardModelId(upstream)) ?? [];
-      if (owners.length <= 1 || isCanonicalModelSource(provider)) {
-        return { ...model, upstreamModel: upstream };
-      }
-      return {
-        ...model,
-        model: aliasModelName(provider, upstream),
-        displayName: model.displayName ?? aliasModelName(provider, upstream),
-        upstreamModel: upstream,
-      };
+      const explicitAliases = Object.entries(existingRoute?.aliases ?? {})
+        .filter(
+          ([alias, target]) =>
+            Boolean(alias.trim()) &&
+            (normalizedWizardModelId(target) ===
+              normalizedWizardModelId(upstream) ||
+              normalizedWizardModelId(target) ===
+                normalizedWizardModelId(model.model)),
+        )
+        .map(([alias]) => alias.trim());
+      const candidates =
+        explicitAliases.length > 0
+          ? explicitAliases.map((visible) => ({
+              ...model,
+              model: visible,
+              upstreamModel: upstream,
+            }))
+          : (ownersByUpstream.get(normalizedWizardModelId(upstream)) ?? [])
+                .length <= 1 || isCanonicalModelSource(provider)
+            ? [{ ...model, upstreamModel: upstream }]
+            : [
+                {
+                  ...model,
+                  model: aliasModelName(provider, upstream),
+                  displayName:
+                    model.displayName ?? aliasModelName(provider, upstream),
+                  upstreamModel: upstream,
+                },
+              ];
+      return candidates.filter((candidate) => {
+        const identity = `${normalizedWizardModelId(candidate.model)}\u0000${normalizedWizardModelId(wizardModelUpstream(candidate))}`;
+        if (emittedModels.has(identity)) return false;
+        emittedModels.add(identity);
+        return true;
+      });
     });
     return {
       ...provider,
@@ -1117,16 +1146,21 @@ export function buildWizardRoutesFromSources(
     const aliases = { ...(modelMap ?? {}) };
     // A generated collision alias becomes part of the route contract on first
     // save. Keep that persisted spelling when the Provider is renamed later.
-    for (const [visible, canonical] of Object.entries(
+    const persistedAliases = Object.entries(
       existingRoute?.aliases ?? {},
-    )) {
+    ).filter(
+      ([visible, canonical]) =>
+        Boolean(visible.trim()) && canonicalModels.has(canonical.trim()),
+    );
+    const persistedTargets = new Set(
+      persistedAliases.map(([, canonical]) => canonical.trim()),
+    );
+    for (const [generatedVisible, generatedTarget] of Object.entries(aliases)) {
+      if (persistedTargets.has(generatedTarget))
+        delete aliases[generatedVisible];
+    }
+    for (const [visible, canonical] of persistedAliases) {
       const target = canonical.trim();
-      if (!target || !canonicalModels.has(target)) continue;
-      for (const [generatedVisible, generatedTarget] of Object.entries(
-        aliases,
-      )) {
-        if (generatedTarget === target) delete aliases[generatedVisible];
-      }
       aliases[visible] = target;
     }
     const oauthAccountId = isWizardCodexOAuthSource(provider)
@@ -1267,8 +1301,7 @@ export function initialWizardSelectedSourceIds(
 ): string[] {
   const availableIds = sourceProviders.map((provider) => provider.id);
   const routing = existingPlan?.settingsConfig?.codexRouting as
-    | CodexRoutingConfigV2
-    | undefined;
+    CodexRoutingConfigV2 | undefined;
   if (routing?.schemaVersion !== 2) return availableIds;
 
   const routedProviderIds = new Set(
@@ -1282,8 +1315,7 @@ export function initialWizardCatalogModelOrder(
   sourceProviders: Provider[],
 ): string[] | null {
   const routing = existingPlan?.settingsConfig?.codexRouting as
-    | CodexRoutingConfigV2
-    | undefined;
+    CodexRoutingConfigV2 | undefined;
   if (routing?.schemaVersion !== 2) {
     return existingPlan?.settingsConfig?.modelCatalog
       ? readWizardModelCatalog(existingPlan).map((model) => model.model)
@@ -1300,7 +1332,10 @@ export function initialWizardCatalogModelOrder(
     return null;
   }
 
-  const sources = resolveWizardModelNameCollisions(sourceProviders);
+  const sources = resolveWizardModelNameCollisions(
+    sourceProviders,
+    routing.routes ?? [],
+  );
   const sourceById = new Map(
     sources.map((provider) => [provider.id, provider]),
   );
@@ -1365,7 +1400,8 @@ function buildSubagentNameRedirector(
   }
 
   const identityToNewVisible = new Map<string, string>();
-  for (const source of resolvedSources) {
+  const refreshedSources = resolveWizardModelNameCollisions(resolvedSources, []);
+  for (const source of refreshedSources) {
     for (const model of readWizardModelCatalog(source)) {
       const upstream = (
         model.upstreamModel ??
@@ -1456,8 +1492,17 @@ export function buildCodexMultiRouterWizardPlan(
   existingPlan?: Provider | null,
   options: WizardPlanBuildOptions = {},
 ): WizardPlanBuildResult {
-  const collisionResolvedSources =
-    resolveWizardModelNameCollisions(sourceProviders);
+  const existingRouting = existingPlan?.settingsConfig?.codexRouting as
+    CodexRoutingConfig | undefined;
+  const existingRoutingV2 =
+    (existingRouting as { schemaVersion?: unknown } | undefined)
+      ?.schemaVersion === 2
+      ? (existingRouting as unknown as CodexRoutingConfigV2)
+      : undefined;
+  const collisionResolvedSources = resolveWizardModelNameCollisions(
+    sourceProviders,
+    existingRoutingV2?.routes ?? [],
+  );
   const resolvedSources = filterWizardProvidersByModelOrder(
     collisionResolvedSources,
     options.catalogModelOrder,
@@ -1489,14 +1534,6 @@ export function buildCodexMultiRouterWizardPlan(
       };
     })
     .filter((provider) => readWizardModelCatalog(provider).length > 0);
-  const existingRouting = existingPlan?.settingsConfig?.codexRouting as
-    | CodexRoutingConfig
-    | undefined;
-  const existingRoutingV2 =
-    (existingRouting as { schemaVersion?: unknown } | undefined)
-      ?.schemaVersion === 2
-      ? (existingRouting as unknown as CodexRoutingConfigV2)
-      : undefined;
   const officialAuth =
     options.officialAuth ??
     inferCodexOfficialAuth(existingRouting) ??
@@ -1531,7 +1568,7 @@ export function buildCodexMultiRouterWizardPlan(
     };
   });
   const selectedVisibleModels = new Set(
-    resolvedSources.flatMap((provider) =>
+    resolveWizardModelNameCollisions(resolvedSources, []).flatMap((provider) =>
       readWizardModelCatalog(provider).map((model) =>
         normalizedWizardModelId(model.model),
       ),
@@ -1550,7 +1587,7 @@ export function buildCodexMultiRouterWizardPlan(
   const subagentNameRedirector = buildSubagentNameRedirector(
     existingRoutingV2?.routes ?? [],
     routes,
-    resolvedSources,
+    collisionResolvedSources,
   );
   const routing: CodexRoutingConfigV2 = {
     ...(existingRoutingV2 ?? {}),

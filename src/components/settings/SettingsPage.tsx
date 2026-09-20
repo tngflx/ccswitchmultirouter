@@ -39,6 +39,7 @@ import { settingsApi } from "@/lib/api";
 import { LanguageSettings } from "@/components/settings/LanguageSettings";
 import { ThemeSettings } from "@/components/settings/ThemeSettings";
 import { WindowSettings } from "@/components/settings/WindowSettings";
+import { WatchdogStatusPanel } from "@/components/settings/WatchdogStatusPanel";
 import { AppVisibilitySettings } from "@/components/settings/AppVisibilitySettings";
 import { SkillStorageLocationSettings } from "@/components/settings/SkillStorageLocationSettings";
 import { SkillSyncMethodSettings } from "@/components/settings/SkillSyncMethodSettings";
@@ -307,6 +308,7 @@ export function SettingsPage({
                       settings={settings}
                       onChange={handleAutoSave}
                     />
+                    <WatchdogStatusPanel />
                     <TerminalSettings
                       value={settings.preferredTerminal}
                       onChange={(terminal) =>
@@ -589,6 +591,10 @@ export function SettingsPage({
                   refreshIntervalMs={settings?.usageDashboardRefreshIntervalMs}
                   onRefreshIntervalChange={(usageDashboardRefreshIntervalMs) =>
                     handleAutoSave({ usageDashboardRefreshIntervalMs })
+                  }
+                  sessionAutoSyncEnabled={settings?.sessionAutoSyncEnabled !== false}
+                  onSessionAutoSyncEnabledChange={(sessionAutoSyncEnabled) =>
+                    handleAutoSave({ sessionAutoSyncEnabled })
                   }
                 />
               </TabsContent>

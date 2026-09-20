@@ -339,6 +339,12 @@ fn provider_codex_pool_account(provider: &Provider) -> Option<(&str, u64)> {
 fn classify_codex_pool_attempt(error: &ProxyError) -> CodexPoolAttemptOutcome {
     match error {
         ProxyError::AuthError(_) => CodexPoolAttemptOutcome::Credential { status: None },
+        ProxyError::UpstreamError {
+            status: status @ (402 | 403 | 429),
+            body,
+        } if is_terminal_codex_quota_error(body.as_deref()) => {
+            CodexPoolAttemptOutcome::Quota { status: *status }
+        }
         ProxyError::UpstreamError { status, .. } if matches!(*status, 401 | 403) => {
             CodexPoolAttemptOutcome::Credential {
                 status: Some(*status),
@@ -366,6 +372,15 @@ fn classify_codex_pool_attempt(error: &ProxyError) -> CodexPoolAttemptOutcome {
 
 fn retryable_failure_affects_provider_health(provider: &Provider, error: &ProxyError) -> bool {
     if matches!(error, ProxyError::AdmissionQueueTimeout { .. }) {
+        return false;
+    }
+    if matches!(
+        error,
+        ProxyError::UpstreamError {
+            status: 402 | 403 | 429,
+            body: Some(body),
+        } if is_terminal_codex_quota_error(Some(body))
+    ) {
         return false;
     }
     provider_codex_pool_account(provider).is_none()
@@ -3000,7 +3015,10 @@ impl RequestForwarder {
                     ),
                     ("original_bytes", diagnostic.original_bytes.to_string()),
                     ("bytes_removed", diagnostic.bytes_removed.to_string()),
-                    ("transformed_request_bytes", diagnostic.optimized_bytes.to_string()),
+                    (
+                        "transformed_request_bytes",
+                        diagnostic.optimized_bytes.to_string(),
+                    ),
                     ("item_count", diagnostic.item_count.to_string()),
                     ("media_bytes", diagnostic.media_bytes.to_string()),
                     ("media_items", diagnostic.media_items.to_string()),
@@ -9149,6 +9167,61 @@ mod tests {
             &pool,
             &ProxyError::ConfigError("route configuration".to_string()),
         ));
+    }
+
+    #[test]
+    fn terminal_codex_quota_does_not_open_direct_provider_circuit() {
+        let direct = test_provider_with_type(None);
+
+        for status in [402, 403, 429] {
+            let error = ProxyError::UpstreamError {
+                status,
+                body: Some(
+                    r#"{"error":{"message":"daily usage limit exceeded","type":"insufficient_quota","code":"daily_limit_exceeded"}}"#
+                        .to_string(),
+                ),
+            };
+
+            assert!(
+                !retryable_failure_affects_provider_health(&direct, &error),
+                "terminal quota must not poison provider health or open its circuit"
+            );
+        }
+    }
+
+    #[test]
+    fn terminal_forbidden_quota_is_not_misclassified_as_pool_credential_failure() {
+        let terminal = ProxyError::UpstreamError {
+            status: 403,
+            body: Some(
+                r#"{"error":{"message":"daily usage limit exceeded","code":"daily_limit_exceeded"}}"#
+                    .to_string(),
+            ),
+        };
+        assert_eq!(
+            classify_codex_pool_attempt(&terminal),
+            CodexPoolAttemptOutcome::Quota { status: 403 }
+        );
+
+        let credential = ProxyError::UpstreamError {
+            status: 403,
+            body: Some(r#"{"error":{"message":"credential rejected"}}"#.to_string()),
+        };
+        assert_eq!(
+            classify_codex_pool_attempt(&credential),
+            CodexPoolAttemptOutcome::Credential { status: Some(403) }
+        );
+    }
+
+    #[test]
+    fn unclassified_payment_required_still_affects_direct_provider_health() {
+        let direct = test_provider_with_type(None);
+        let error = ProxyError::UpstreamError {
+            status: 402,
+            body: Some(r#"{"error":{"message":"account disabled"}}"#.to_string()),
+        };
+
+        assert!(retryable_failure_affects_provider_health(&direct, &error));
     }
 
     #[test]

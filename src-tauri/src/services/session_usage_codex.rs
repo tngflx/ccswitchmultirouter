@@ -441,6 +441,22 @@ fn explicit_parent_from_meta(payload: &serde_json::Value) -> ParentResolution {
     }
 }
 
+/// Resolve the physical rollout whose replayed token prefix must be removed.
+///
+/// Paginated Codex rollouts keep the original lineage in `forked_from_id`, but
+/// `history_base.thread_id` identifies the immediately preceding physical page.
+/// Usage deduplication must follow that page when present; the older lineage
+/// target may already have been pruned even though the paginated chain is intact.
+fn replay_parent_from_meta(payload: &serde_json::Value) -> ParentResolution {
+    non_empty_string(
+        payload
+            .get("history_base")
+            .and_then(|history_base| history_base.get("thread_id")),
+    )
+    .map(ParentResolution::Parent)
+    .unwrap_or_else(|| explicit_parent_from_meta(payload))
+}
+
 fn parse_timestamp(value: Option<&serde_json::Value>) -> Option<DateTime<Utc>> {
     value
         .and_then(serde_json::Value::as_str)
@@ -852,7 +868,7 @@ fn parse_codex_file(
                 root_meta_seen = true;
                 root_timestamp = parse_timestamp(value.get("timestamp"));
                 let payload = value.get("payload").unwrap_or(&serde_json::Value::Null);
-                parent = explicit_parent_from_meta(payload);
+                parent = replay_parent_from_meta(payload);
 
                 root_meta_thread_id = non_empty_string(
                     payload
@@ -2662,6 +2678,51 @@ mod tests {
         );
         let recovered = sync_test_file(&db, &child, &[&parent, &child])?;
         assert_eq!((recovered.imported, recovered.deferred), (1, false));
+        Ok(())
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_paginated_rollout_uses_history_base_when_lineage_parent_is_missing(
+    ) -> Result<(), AppError> {
+        clear_codex_replay_caches();
+        let db = Database::memory()?;
+        let temp = tempdir().unwrap();
+        let parent = forked_rollout_path(temp.path(), PARENT_ID, CHILD_A_ID);
+        let child = forked_rollout_path(temp.path(), PARENT_ID, CHILD_B_ID);
+        write_jsonl(
+            &parent,
+            &[
+                session_meta(PARENT_ID),
+                token_count_at(100, 50, 10, "2026-07-10T03:00:01Z"),
+            ],
+        );
+        let missing_lineage_parent = "00000000-0000-4000-8000-000000000099";
+        let mut child_meta = session_meta_at(
+            PARENT_ID,
+            Some(missing_lineage_parent),
+            None,
+            "2026-07-10T03:00:05Z",
+        );
+        child_meta["payload"]["history_base"] = serde_json::json!({
+            "thread_id": CHILD_A_ID,
+            "end_ordinal_exclusive": 2,
+            "end_byte_offset": 100
+        });
+        write_jsonl(
+            &child,
+            &[
+                child_meta,
+                token_count_at(100, 50, 10, "2026-07-10T03:00:06Z"),
+                token_count_at(200, 100, 20, "2026-07-10T03:00:07Z"),
+            ],
+        );
+
+        let result = sync_test_file(&db, &child, &[&parent, &child])?;
+        assert_eq!(
+            (result.imported, result.skipped, result.deferred),
+            (1, 1, false)
+        );
         Ok(())
     }
 

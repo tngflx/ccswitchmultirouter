@@ -16,7 +16,14 @@ vi.mock("@tanstack/react-virtual", async (importOriginal) => {
       }),
   };
 });
-import { act, render, screen, waitFor, within } from "@testing-library/react";
+import {
+  act,
+  cleanup,
+  render,
+  screen,
+  waitFor,
+  within,
+} from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import React from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -31,7 +38,11 @@ import {
 import type { CodexRoutingProjectionStatus } from "@/lib/api/providers";
 import { proxyApi } from "@/lib/api/proxy";
 import { settingsApi } from "@/lib/api/settings";
-import type { CodexModelReasoningCapability, Provider } from "@/types";
+import type {
+  CodexModelReasoningCapability,
+  CodexRoutingRouteV2,
+  Provider,
+} from "@/types";
 import type { RequestHealthSnapshot } from "@/types/proxy";
 import { RequestHealthPanel } from "@/components/settings/RequestHealthPanel";
 import type { PaginatedLogs, RequestLog } from "@/types/usage";
@@ -40,7 +51,6 @@ import {
   buildMultiRouterRuntimeStatus,
   buildCodexProxyBaseUrl,
   buildModelCatalogForRoutes,
-  buildModelOrderProviderUpdates,
   collectRoutedCatalogModels,
   codexCatalogProviderName,
   formatCodexCatalogModelLabel,
@@ -65,6 +75,7 @@ import {
   serializeCodexRoutingV2,
   validateProxyListenDraft,
   workspaceErrorMessage,
+  workspaceExactErrorMessage,
 } from "./CodexRouterWorkspacePage";
 
 const requestLogsFixture = vi.hoisted(() => ({
@@ -113,6 +124,10 @@ vi.mock("@/lib/query/usage", () => ({
     error: null,
   }),
   useRequestLogs: () => requestLogsFixture.value,
+  useSessionCollectionStatus: () => ({
+    data: undefined,
+    error: null,
+  }),
 }));
 
 vi.mock("@/lib/api", () => ({
@@ -444,6 +459,7 @@ describe("Request Health panel", () => {
   });
 
   afterEach(async () => {
+    cleanup();
     await i18n.changeLanguage(previousLanguage);
   });
 
@@ -463,6 +479,11 @@ describe("Request Health panel", () => {
       }),
     );
 
+    await waitFor(() =>
+      expect(screen.getByLabelText("Large request threshold (KB)")).toHaveValue(
+        384,
+      ),
+    );
     await user.click(screen.getByLabelText("Diagnostics enabled"));
     await user.clear(screen.getByLabelText("Large request threshold (KB)"));
     await user.type(
@@ -483,7 +504,7 @@ describe("Request Health panel", () => {
     );
   });
 
-  it("does not expose background compaction or thread deletion controls", () => {
+  it("does not expose background compaction or thread deletion controls", async () => {
     render(
       React.createElement(RequestHealthPanel, {
         snapshot: createRequestHealthSnapshot(),
@@ -493,6 +514,11 @@ describe("Request Health panel", () => {
       }),
     );
 
+    await waitFor(() =>
+      expect(screen.getByLabelText("Large request threshold (KB)")).toHaveValue(
+        384,
+      ),
+    );
     expect(
       screen.queryByRole("button", {
         name: "Compact, continue & remove old",
@@ -738,6 +764,31 @@ describe("Codex MultiRouter workspace route persistence helpers", () => {
         ),
       ),
     ).toBe("当前是旧版路由配置，请先完成迁移后再保存");
+  });
+
+  it("preserves actionable provider details when no machine-readable code is present", () => {
+    expect(
+      workspaceErrorMessage(new Error("HTTP 402: DAILY LIMIT EXCEEDED")),
+    ).toBe("HTTP 402: DAILY LIMIT EXCEEDED");
+    expect(
+      workspaceErrorMessage(
+        new Error("HTTP 401: authorization=Bearer secret-token"),
+      ),
+    ).toBe("HTTP 401: authorization=[REDACTED] [REDACTED]");
+  });
+
+  it("preserves and redacts exact error details for ordering saves", () => {
+    expect(
+      workspaceExactErrorMessage(new Error("database revision mismatch")),
+    ).toBe("database revision mismatch");
+    expect(
+      workspaceExactErrorMessage(
+        new Error("save rejected: authorization=Bearer secret-token"),
+      ),
+    ).toBe("save rejected: authorization=[REDACTED] [REDACTED]");
+    expect(
+      workspaceExactErrorMessage(new Error(`failure ${"x".repeat(3_000)}`)),
+    ).toHaveLength(2_001);
   });
 
   it("previews include selection as a strict allowlist", async () => {
@@ -3161,22 +3212,88 @@ describe("Codex MultiRouter workspace route persistence helpers", () => {
 
     await user.click(screen.getByRole("button", { name: "保存顺序" }));
     await waitFor(() => expect(providersApi.update).toHaveBeenCalled());
-    const savedSource = vi
-      .mocked(providersApi.update)
-      .mock.calls.map(([provider]) => provider)
-      .find((provider) => provider.id === source.id);
-    const savedPlan = vi
-      .mocked(providersApi.update)
-      .mock.calls.map(([provider]) => provider)
-      .find((provider) => provider.id === plan.id);
-    expect(savedSource?.settingsConfig?.modelCatalog?.models).toEqual([
-      expect.objectContaining({ model: "deepseek-v4-flash", sortIndex: 2 }),
-      expect.objectContaining({ model: "deepseek-v4-pro", sortIndex: 0 }),
-      expect.objectContaining({ model: "qwen3.8", sortIndex: 1 }),
-    ]);
+    expect(providersApi.update).toHaveBeenCalledOnce();
+    const [savedPlan, appType] = vi.mocked(providersApi.update).mock.calls[0];
+    expect(appType).toBe("codex");
+    expect(savedPlan.id).toBe(plan.id);
+    expect(savedPlan.id).not.toBe(source.id);
     expect(savedPlan?.settingsConfig?.codexRouting).toMatchObject({
       modelOrder: ["deepseek-v4-pro", "qwen3.8", "deepseek-v4-flash"],
     });
+  });
+
+  it("saves router-owned order without validating or rewriting a stale source alias", async () => {
+    const { source, plan } = createSubagentWorkspaceFixture();
+    const routing = plan.settingsConfig?.codexRouting;
+    const staleAliasPlan: Provider = {
+      ...plan,
+      settingsConfig: {
+        ...plan.settingsConfig,
+        codexRouting: {
+          ...routing,
+          routes: (routing?.routes ?? []).map(
+            (route: CodexRoutingRouteV2, index: number) =>
+              index === 0
+                ? {
+                    ...route,
+                    aliases: {
+                      ...(route.aliases ?? {}),
+                      "deepseek-v4-flash": "removed-upstream-model",
+                    },
+                  }
+                : route,
+          ),
+        },
+      },
+    };
+    renderSubagentWorkspace(source, staleAliasPlan);
+
+    const user = userEvent.setup();
+    await user.click(screen.getByRole("tab", { name: "模型排序" }));
+    const rankInput = screen.getByRole("spinbutton", {
+      name: "Rank for qwen3.8",
+    });
+    await user.clear(rankInput);
+    await user.type(rankInput, "2");
+    await user.click(
+      screen.getByRole("button", { name: "Move qwen3.8 to rank 2" }),
+    );
+    await user.click(screen.getByRole("button", { name: "保存顺序" }));
+
+    await waitFor(() => expect(providersApi.update).toHaveBeenCalledOnce());
+    const [savedPlan] = vi.mocked(providersApi.update).mock.calls[0];
+    expect(savedPlan.id).toBe(staleAliasPlan.id);
+    expect(savedPlan.settingsConfig?.codexRouting?.modelOrder).toEqual([
+      "deepseek-v4-pro",
+      "qwen3.8",
+      "deepseek-v4-flash",
+    ]);
+    expect(screen.queryByText(/保存模型顺序失败/)).not.toBeInTheDocument();
+  });
+
+  it("shows the exact backend error when saving model order fails", async () => {
+    const { source, plan } = createSubagentWorkspaceFixture();
+    vi.mocked(providersApi.update).mockRejectedValueOnce(
+      new Error("projection revision mismatch: expected 41, received 42"),
+    );
+    renderSubagentWorkspace(source, plan);
+
+    const user = userEvent.setup();
+    await user.click(screen.getByRole("tab", { name: "模型排序" }));
+    const rankInput = screen.getByRole("spinbutton", {
+      name: "Rank for qwen3.8",
+    });
+    await user.clear(rankInput);
+    await user.type(rankInput, "2");
+    await user.click(
+      screen.getByRole("button", { name: "Move qwen3.8 to rank 2" }),
+    );
+    await user.click(screen.getByRole("button", { name: "保存顺序" }));
+
+    expect(await screen.findByText(/保存模型顺序失败/)).toHaveTextContent(
+      "projection revision mismatch: expected 41, received 42",
+    );
+    expect(screen.queryByText(/操作失败，请检查/)).not.toBeInTheDocument();
   });
 
   it("persists a display-only change without rewriting provider model order", async () => {
@@ -4871,44 +4988,6 @@ describe("Codex MultiRouter workspace route persistence helpers", () => {
       "second-a",
       "first-b",
       "first-a",
-    ]);
-  });
-
-  it("rejects an unresolved route alias before producing any partial model order update", () => {
-    const source: Provider = {
-      id: "order-source",
-      name: "Order Source",
-      category: "custom",
-      settingsConfig: {
-        modelCatalog: {
-          models: [{ model: "model-a" }, { model: "model-b" }],
-        },
-      },
-    };
-    const route = normalizeCodexRouteForSave(
-      {
-        label: source.name,
-        enabled: true,
-        targetProviderId: source.id,
-        modelSelection: { mode: "all" },
-        match: { models: ["model-a", "model-b"], prefixes: [] },
-        aliases: { "model-b": "stale-model" },
-        upstream: { auth: { source: "provider_config" } },
-      },
-      0,
-      new Set<string>(),
-    );
-    expect(() =>
-      buildModelOrderProviderUpdates(
-        [{ model: "model-b" }, { model: "model-a" }],
-        [route],
-        new Map([[source.id, source]]),
-        false,
-      ),
-    ).toThrow(/stale-model.*Order Source/);
-    expect(source.settingsConfig.modelCatalog.models).toEqual([
-      { model: "model-a" },
-      { model: "model-b" },
     ]);
   });
 

@@ -1,4 +1,7 @@
-use super::{build_logical_probe_request, ProbeCase};
+use super::{
+    build_logical_probe_request, build_safe_tool_probe_request, prepare_probe_request, ProbeCase,
+    TransportKind,
+};
 
 #[test]
 fn baseline_json_is_a_bounded_static_responses_request() {
@@ -81,4 +84,31 @@ fn forced_tool_request_owns_a_single_non_strict_nonce_tool() {
     assert!(request["input"][0]["content"][0]["text"]
         .as_str()
         .is_some_and(|text| text.contains("run-4f8ad2d0")));
+}
+
+#[test]
+fn prepared_probe_request_keeps_logical_and_wire_bodies_immutable() {
+    let logical = build_logical_probe_request(ProbeCase::BaselineJson, "qwen3.8", "unused");
+    let prepared = prepare_probe_request(logical.clone(), TransportKind::OpenAiChat).unwrap();
+
+    assert_eq!(prepared.transport, TransportKind::OpenAiChat);
+    assert_eq!(prepared.logical_body, logical);
+    assert_ne!(prepared.policy_fingerprint, "");
+    assert_eq!(prepared.wire_body["model"], "qwen3.8");
+    assert_eq!(prepared.wire_body["stream"], false);
+}
+
+#[test]
+fn safe_tool_fallback_is_narrow_and_nonce_bound() {
+    let request = build_safe_tool_probe_request("qwen3.8", "nonce-123");
+    assert_eq!(request["tools"].as_array().map(Vec::len), Some(1));
+    assert_eq!(request["tools"][0]["type"], "function");
+    assert_eq!(
+        request["tools"][0]["parameters"]["properties"]["nonce"]["enum"][0],
+        "nonce-123"
+    );
+    assert_eq!(
+        request["tools"][0]["parameters"]["additionalProperties"],
+        false
+    );
 }

@@ -12,6 +12,18 @@ use tauri::AppHandle;
 use tauri::State;
 use tauri_plugin_opener::OpenerExt;
 
+#[tauri::command]
+pub async fn inspect_codex_runtime_refresh() -> Result<serde_json::Value, String> {
+    Err("Codex runtime refresh is unavailable in this build".to_string())
+}
+
+#[tauri::command]
+pub async fn refresh_codex_runtime_state(
+    _snapshot_token: String,
+) -> Result<serde_json::Value, String> {
+    Err("Codex runtime refresh is unavailable in this build".to_string())
+}
+
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
 
@@ -205,12 +217,28 @@ pub async fn run_tool_lifecycle_action(
     .map_err(|e| format!("tool lifecycle task join error: {e}"))?
 }
 
+#[cfg(target_os = "windows")]
+fn codex_process_probe_indicates_running(status_success: bool, stdout: &[u8]) -> bool {
+    if !status_success {
+        return true;
+    }
+    match String::from_utf8_lossy(stdout)
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "true" => true,
+        "false" => false,
+        _ => true,
+    }
+}
+
 fn codex_process_is_running() -> bool {
     #[cfg(target_os = "windows")]
     {
         use std::os::windows::process::CommandExt;
         const CREATE_NO_WINDOW: u32 = 0x08000000;
-        return std::process::Command::new("powershell")
+        return match std::process::Command::new("powershell")
             .args([
                 "-NoProfile",
                 "-NonInteractive",
@@ -219,13 +247,33 @@ fn codex_process_is_running() -> bool {
             ])
             .creation_flags(CREATE_NO_WINDOW)
             .output()
-            .ok()
-            .is_some_and(|output| {
-                output.status.success()
-                    && String::from_utf8_lossy(&output.stdout)
-                        .trim()
-                        .eq_ignore_ascii_case("true")
-            });
+        {
+            Ok(output) => {
+                let running =
+                    codex_process_probe_indicates_running(output.status.success(), &output.stdout);
+                if running
+                    && (!output.status.success()
+                        || !matches!(
+                            String::from_utf8_lossy(&output.stdout)
+                                .trim()
+                                .to_ascii_lowercase()
+                                .as_str(),
+                            "true" | "false"
+                        ))
+                {
+                    log::warn!(
+                        "Skipping automatic Codex CLI update because the process probe was inconclusive"
+                    );
+                }
+                running
+            }
+            Err(error) => {
+                log::warn!(
+                    "Skipping automatic Codex CLI update because the process probe failed: {error}"
+                );
+                true
+            }
+        };
     }
     #[cfg(not(target_os = "windows"))]
     {
@@ -234,6 +282,14 @@ fn codex_process_is_running() -> bool {
 }
 
 pub(crate) async fn auto_update_codex_cli_if_needed() -> Result<bool, String> {
+    static AUTO_UPDATE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    let Ok(_guard) = AUTO_UPDATE.try_lock() else {
+        return Ok(false);
+    };
+    // A saved opt-in can be disabled before its background task starts.
+    if !crate::settings::get_settings().auto_update_codex_cli {
+        return Ok(false);
+    }
     if codex_process_is_running() {
         log::info!("Skipping automatic Codex CLI update because Codex is running");
         return Ok(false);
@@ -246,6 +302,9 @@ pub(crate) async fn auto_update_codex_cli_if_needed() -> Result<bool, String> {
         return Ok(false);
     };
     if compare_semver(version, latest) != Some(std::cmp::Ordering::Less) {
+        return Ok(false);
+    }
+    if !crate::settings::get_settings().auto_update_codex_cli || codex_process_is_running() {
         return Ok(false);
     }
     run_tool_lifecycle_action(vec!["codex".to_string()], "update".to_string(), None).await?;
@@ -7260,5 +7319,15 @@ mod tests {
             command,
             "pushd \"\\\\server\\share\\100%%^&^(test^)\" || exit /b 1\r\n"
         );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn codex_process_probe_fails_closed() {
+        assert!(codex_process_probe_indicates_running(false, b"false"));
+        assert!(codex_process_probe_indicates_running(true, b""));
+        assert!(codex_process_probe_indicates_running(true, b"unexpected"));
+        assert!(codex_process_probe_indicates_running(true, b"true"));
+        assert!(!codex_process_probe_indicates_running(true, b"false"));
     }
 }

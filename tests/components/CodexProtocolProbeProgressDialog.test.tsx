@@ -261,4 +261,37 @@ describe("CodexProtocolProbeProgressDialog", () => {
 
     expect(screen.getByText("HTTP 521 · 上游不可达")).toBeInTheDocument();
   });
+
+  it("shows schema fallback evidence immediately from a compatibility retry event", () => {
+    const events: CodexProtocolProbeProgressEvent[] = [
+      {
+        kind: "candidate_started",
+        model: "qwen3.8",
+      },
+      {
+        kind: "compatibility_retry",
+        model: "qwen3.8",
+        transport: "open_ai_responses",
+        stage: "forced_tool",
+        rule: "tool_schema",
+        trigger: "explicit_tool_schema_rejection",
+        change: "tool_schema_moonshot_mfjs",
+      },
+    ];
+
+    render(
+      <CodexProtocolProbeProgressDialog
+        open
+        running
+        events={events}
+        outcome={null}
+        error=""
+        onOpenChange={vi.fn()}
+      />,
+    );
+
+    expect(
+      screen.getByText("已使用安全工具 Schema 回退并重新验证"),
+    ).toBeInTheDocument();
+  });
 });

@@ -78,6 +78,7 @@ import { UpdateBadge } from "@/components/UpdateBadge";
 import { CCSWITCHMULTI_REPOSITORY_URL } from "@/config/productLinks";
 import { EnvWarningBanner } from "@/components/env/EnvWarningBanner";
 import { ProxyToggle } from "@/components/proxy/ProxyToggle";
+import { RoutingActivationBrand } from "@/components/proxy/RoutingActivationBrand";
 import { ClaudeDesktopRouteToggle } from "@/components/proxy/ClaudeDesktopRouteToggle";
 import { FailoverToggle } from "@/components/proxy/FailoverToggle";
 import { StreamRetryToggle } from "@/components/proxy/StreamRetryToggle";
@@ -125,6 +126,8 @@ import {
 } from "@/components/codex/CodexRouterWorkspacePage";
 import { CodexUsagePage } from "@/components/codex/CodexUsagePage";
 import { CodexMultiRouterWizard } from "@/components/codex/CodexMultiRouterWizard";
+import { CodexConfigConsistencyDialog } from "@/components/codex/CodexConfigConsistencyDialog";
+import { useCodexConfigConsistency } from "@/hooks/useCodexConfigConsistency";
 
 type View =
   | "providers"
@@ -208,6 +211,7 @@ function App() {
   const { t } = useTranslation();
   const queryClient = useQueryClient();
   const shownRecoveryOutcomeIds = useRef(new Set<string>());
+  const codexConfigConsistency = useCodexConfigConsistency();
 
   const acknowledgeRecoveryOutcome = (outcome: RecoveryOutcome) => {
     void settingsApi
@@ -1524,6 +1528,7 @@ function App() {
                   variant="outline"
                   size="icon"
                   disabled={managementBusy}
+                  aria-label={t("common.back")}
                   onClick={() =>
                     setCurrentView(
                       currentView === "skillsDiscovery"
@@ -1566,21 +1571,15 @@ function App() {
               </div>
             ) : (
               <div className="flex items-center gap-2">
-                <div className="relative inline-flex items-center">
-                  <a
-                    href={CCSWITCHMULTI_REPOSITORY_URL}
-                    target="_blank"
-                    rel="noreferrer"
-                    className={cn(
-                      "text-xl font-semibold transition-colors",
-                      isProxyRunning && isCurrentAppTakeoverActive
-                        ? "text-emerald-500 hover:text-emerald-600 dark:text-emerald-400 dark:hover:text-emerald-300"
-                        : "text-blue-500 hover:text-blue-600 dark:text-blue-400 dark:hover:text-blue-300",
-                    )}
-                  >
-                    CCSwitchMulti
-                  </a>
-                </div>
+                <RoutingActivationBrand
+                  active={isProxyRunning && isCurrentAppTakeoverActive}
+                  contextKey={activeApp}
+                  ready={
+                    proxyStatus !== undefined && takeoverStatus !== undefined
+                  }
+                  href={CCSWITCHMULTI_REPOSITORY_URL}
+                  label="CCSwitchMulti"
+                />
                 <Button
                   variant="ghost"
                   size="icon"
@@ -2039,6 +2038,11 @@ function App() {
           isCodexMultiRouterWizardOpen ? "z-[140]" : undefined
         }
         onSubmit={addProvider}
+        onOpenAuthCenter={() => {
+          setIsAddOpen(false);
+          setSettingsDefaultTab("auth");
+          setCurrentView("settings");
+        }}
       />
 
       <Dialog
@@ -2160,6 +2164,11 @@ function App() {
         onSubmit={handleEditProvider}
         appId={activeApp}
         isProxyTakeover={isCurrentAppTakeoverActive}
+        onOpenAuthCenter={() => {
+          setEditingProvider(null);
+          setSettingsDefaultTab("auth");
+          setCurrentView("settings");
+        }}
       />
 
       {effectiveUsageProvider && (
@@ -2249,6 +2258,15 @@ function App() {
 
       <DeepLinkImportDialog />
       <FirstRunNoticeDialog />
+      <CodexConfigConsistencyDialog
+        report={codexConfigConsistency.report}
+        pending={codexConfigConsistency.pending}
+        error={codexConfigConsistency.error}
+        onApply={() => void codexConfigConsistency.resolve("apply_ccsm")}
+        onKeep={() => void codexConfigConsistency.resolve("keep_codex")}
+        onLater={() => void codexConfigConsistency.resolve("later")}
+        onRetry={() => void codexConfigConsistency.resolve("apply_ccsm")}
+      />
     </div>
   );
 }

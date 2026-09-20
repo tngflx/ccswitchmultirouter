@@ -276,18 +276,29 @@ pub async fn restart_codex_desktop(
     state: tauri::State<'_, AppState>,
     enabled: bool,
 ) -> Result<(), String> {
-    let process_ids = crate::codex_desktop::list_running_codex_desktop_process_ids()?;
-    crate::codex_desktop::terminate_running_codex_desktop_processes(&process_ids)?;
-    state
+    let stopped = crate::codex_desktop::stop_running_codex_desktop_for_managed_lifecycle()?;
+    let takeover_result = state
         .proxy_service
         .set_takeover_for_app("codex", enabled)
-        .await?;
-    if !process_ids.is_empty() {
+        .await;
+    let relaunch_result = if stopped > 0 {
         crate::codex_desktop::unlock_codex_model_picker()
             .await
-            .map(|_| ())?;
+            .map(|_| ())
+    } else {
+        Ok(())
+    };
+
+    match (takeover_result, relaunch_result) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(takeover_error), Ok(())) => Err(takeover_error),
+        (Ok(()), Err(relaunch_error)) => Err(format!(
+            "Codex takeover changed successfully, but Codex Desktop could not be relaunched: {relaunch_error}"
+        )),
+        (Err(takeover_error), Err(relaunch_error)) => Err(format!(
+            "Codex takeover change failed: {takeover_error}; Codex Desktop relaunch also failed: {relaunch_error}"
+        )),
     }
-    Ok(())
 }
 
 /// 获取代理服务器状态

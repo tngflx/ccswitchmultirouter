@@ -5,6 +5,7 @@ use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use futures::{SinkExt, StreamExt};
@@ -22,8 +23,174 @@ const MODEL_PICKER_PATCH_KEY: &str = "__ccSwitchCodexAppCompat";
 const REMEMBERED_CODEX_DESKTOP_EXECUTABLE_FILENAME: &str = "codex-desktop-executable.json";
 const CODEX_MODEL_PICKER_CORE_SCRIPT: &str = include_str!("resources/codex_model_picker_core.js");
 const CODEX_APP_COMPAT_TEMPLATE: &str = include_str!("resources/codex_app_compat_template.js");
+static CODEX_REQUEST_HEALTH_WARNINGS: OnceLock<Mutex<HashMap<String, CodexRequestHealthWarning>>> =
+    OnceLock::new();
+static CODEX_REQUEST_HEALTH_WARNING_SYNC: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 #[cfg(any(target_os = "macos", test))]
 const CODEX_DESKTOP_BUNDLE_IDENTIFIER: &str = "com.openai.codex";
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct CodexRequestHealthWarning {
+    pub token: String,
+    pub title: String,
+    pub detail: String,
+    pub instruction: String,
+    pub expires_at_ms: u64,
+}
+
+fn codex_request_health_warnings() -> &'static Mutex<HashMap<String, CodexRequestHealthWarning>> {
+    CODEX_REQUEST_HEALTH_WARNINGS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn codex_request_health_warning_sync_lock() -> &'static tokio::sync::Mutex<()> {
+    CODEX_REQUEST_HEALTH_WARNING_SYNC.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
+pub(crate) fn show_codex_request_health_warning(warning: CodexRequestHealthWarning) {
+    codex_request_health_warnings()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(warning.token.clone(), warning);
+    spawn_codex_request_health_warning_sync();
+}
+
+pub(crate) fn hide_codex_request_health_warning(token: &str) {
+    let removed = codex_request_health_warnings()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .remove(token)
+        .is_some();
+    if removed {
+        spawn_codex_request_health_warning_sync();
+    }
+}
+
+fn spawn_codex_request_health_warning_sync() {
+    tauri::async_runtime::spawn(async {
+        if let Err(error) = sync_codex_request_health_warnings().await {
+            log::debug!("[RequestHealth] Codex advisory warning was not injected: {error}");
+        }
+    });
+}
+
+async fn sync_codex_request_health_warnings() -> Result<usize, String> {
+    let _sync_guard = codex_request_health_warning_sync_lock().lock().await;
+    let mut warnings = codex_request_health_warnings()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .values()
+        .cloned()
+        .collect::<Vec<_>>();
+    warnings.sort_by(|left, right| left.token.cmp(&right.token));
+    let script = build_codex_request_health_warning_sync_script(&warnings)?;
+    evaluate_codex_app_compat_script(&script).await
+}
+
+fn build_codex_request_health_warning_sync_script(
+    warnings: &[CodexRequestHealthWarning],
+) -> Result<String, String> {
+    let warnings_json = serde_json::to_string(warnings)
+        .map_err(|error| format!("Failed to serialize Codex Request Health warnings: {error}"))?;
+    Ok(format!(
+        r#"(() => {{
+          const state = window[{patch_key:?}];
+          if (!state || typeof state.syncRequestHealthWarnings !== "function") return false;
+          state.syncRequestHealthWarnings({warnings_json});
+          return true;
+        }})()"#,
+        patch_key = MODEL_PICKER_PATCH_KEY,
+    ))
+}
+
+async fn evaluate_codex_app_compat_script(script: &str) -> Result<usize, String> {
+    let mut diagnostics = Vec::new();
+    let mut updated_targets = 0usize;
+    for port in candidate_debug_ports(DEFAULT_CODEX_DEBUG_PORT) {
+        let targets = match list_cdp_targets(port).await {
+            Ok(targets) => targets,
+            Err(error) => {
+                diagnostics.push(format!("port {port}: {error}"));
+                continue;
+            }
+        };
+        let targets = match pick_codex_page_targets(&targets, port) {
+            Ok(targets) => targets,
+            Err(error) => {
+                diagnostics.push(format!("port {port}: {error}"));
+                continue;
+            }
+        };
+        for target in targets {
+            let Some(websocket_url) = target.web_socket_debugger_url.as_deref() else {
+                continue;
+            };
+            let (socket, _) =
+                match tokio::time::timeout(CDP_CONNECT_TIMEOUT, connect_async(websocket_url)).await
+                {
+                    Ok(Ok(value)) => value,
+                    Ok(Err(error)) => {
+                        diagnostics.push(format!(
+                            "target {}: failed to connect Codex Desktop CDP: {error}",
+                            target.id
+                        ));
+                        continue;
+                    }
+                    Err(_) => {
+                        diagnostics.push(format!(
+                            "target {}: timed out connecting Codex Desktop CDP",
+                            target.id
+                        ));
+                        continue;
+                    }
+                };
+            let mut session = CdpSession::new(socket);
+            let evaluation = match session
+                .send_command(
+                    1,
+                    "Runtime.evaluate",
+                    json!({
+                        "expression": script,
+                        "awaitPromise": false,
+                        "returnByValue": true,
+                        "allowUnsafeEvalBlockedByCSP": true
+                    }),
+                )
+                .await
+            {
+                Ok(value) => value,
+                Err(error) => {
+                    diagnostics.push(format!("target {}: {error}", target.id));
+                    continue;
+                }
+            };
+            if evaluation
+                .pointer("/result/result/value")
+                .and_then(Value::as_bool)
+                == Some(true)
+            {
+                updated_targets += 1;
+            } else {
+                diagnostics.push(format!(
+                    "target {}: compatibility warning bridge is unavailable",
+                    target.id
+                ));
+            }
+        }
+        if updated_targets > 0 {
+            break;
+        }
+    }
+    if updated_targets > 0 {
+        Ok(updated_targets)
+    } else {
+        Err(if diagnostics.is_empty() {
+            "No Codex Desktop CDP target was found".to_string()
+        } else {
+            diagnostics.join("; ")
+        })
+    }
+}
 /// Codex App 历史目录与模型兼容层安装命令的执行结果。
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -1116,7 +1283,10 @@ pub(crate) async fn summarize_and_restart_codex_session(
                 }})()"#,
                 patch_key = MODEL_PICKER_PATCH_KEY,
             );
-            let deadline = tokio::time::Instant::now() + Duration::from_secs(100);
+            // The renderer owns a 120-second summary deadline. Keep the CDP
+            // coordinator alive beyond it so a valid late completion is not
+            // reported as a failure while the renderer is still working.
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(130);
             let mut command_id = 2;
             loop {
                 if tokio::time::Instant::now() >= deadline {
@@ -1284,7 +1454,7 @@ pub(crate) async fn summarize_and_restart_codex_session(
                         let reason = value
                             .get("reason")
                             .and_then(Value::as_str)
-                            .unwrap_or("Codex Desktop compaction job failed");
+                            .unwrap_or("Codex Desktop manual summary job failed");
                         return Err(format!("target {}: {reason}", target.id));
                     }
                     _ => {}
@@ -1807,6 +1977,19 @@ pub(crate) fn terminate_running_codex_desktop_processes(
     _expected_ids: &[u32],
 ) -> Result<u32, String> {
     Ok(0)
+}
+
+/// Capture the verified Desktop executable before terminating the running shell.
+///
+/// Callers must already have explicit user consent or an enabled managed-lifecycle
+/// setting. Remembering the path first is required because executable discovery can
+/// no longer inspect the process after it has been stopped.
+pub(crate) fn stop_running_codex_desktop_for_managed_lifecycle() -> Result<u32, String> {
+    if let Some(executable) = detect_running_codex_main_process() {
+        remember_codex_desktop_executable(&executable)?;
+    }
+    let process_ids = list_running_codex_desktop_process_ids()?;
+    terminate_running_codex_desktop_processes(&process_ids)
 }
 
 /// 按常见安装位置寻找 Codex Desktop 可执行文件。
@@ -2904,6 +3087,36 @@ mod tests {
     }
 
     #[test]
+    fn codex_request_health_warning_sync_uses_one_advisory_renderer_bridge() {
+        let warnings = vec![CodexRequestHealthWarning {
+            token: "review-token".to_string(),
+            title: "Request paused for approval".to_string(),
+            detail: "Model: gpt-test".to_string(),
+            instruction: "Choose an action in the Windows notification.".to_string(),
+            expires_at_ms: 1_789_000_000_000,
+        }];
+        let script = build_codex_request_health_warning_sync_script(&warnings)
+            .expect("build warning sync script");
+
+        assert!(script.contains("state.syncRequestHealthWarnings"));
+        assert!(script.contains(r#""token":"review-token""#));
+        assert!(script.contains("Windows notification"));
+        assert!(!script.contains("resolve_pending_review"));
+        assert!(!script.contains("thread/start"));
+    }
+
+    #[test]
+    fn codex_request_health_warning_renderer_is_non_interactive_and_expiring() {
+        let script = build_model_picker_unlock_script(&CodexModelCatalogProjection::empty());
+
+        assert!(script.contains("ccswitch-request-health-warnings-v1"));
+        assert!(script.contains("data-ccswitch-request-health-token"));
+        assert!(script.contains(r#"container.setAttribute("role", "status")"#));
+        assert!(script.contains("Number(warning.expiresAtMs) > now"));
+        assert!(script.contains("state.syncRequestHealthWarnings"));
+    }
+
+    #[test]
     fn codex_app_compatibility_heartbeat_avoids_repeated_full_react_scans() {
         let script = build_model_picker_unlock_script(&CodexModelCatalogProjection::empty());
 
@@ -3404,7 +3617,7 @@ JSON.stringify({
             .find(r#"client.sendRequest("turn/interrupt""#)
             .expect("blocked source turn interruption");
         let manual_summary = script
-            .find("Create a concise handoff summary of this coding session")
+            .find("[CCSwitch internal request: manual-summary-v1]")
             .expect("manual coding-agent summary request");
         let fresh_thread = script
             .find(r#"client.sendRequest("thread/start""#)
@@ -3415,12 +3628,30 @@ JSON.stringify({
         assert!(interrupt < manual_summary);
         assert!(manual_summary < fresh_thread);
         assert!(fresh_thread < handoff_turn);
-        assert!(script.contains(r#"config: { model_reasoning_effort: "medium" }"#));
+        assert!(
+            script.contains(r#"String(sourceThread?.reasoningEffort || "").trim() || "medium""#)
+        );
+        assert!(script.contains(r#"config: { model_reasoning_effort: reasoningEffort }"#));
         assert!(script.contains("state.startSummarizeSession"));
         assert!(script.contains("state.readSummarizeJob"));
         assert!(script.contains("state.startFreshSessionFromSummary"));
         assert!(script.contains("state.readFreshSessionJob"));
         assert!(script.contains("await triggerLocalThreadCatalogSync()"));
+        assert!(script.contains(r#"client.sendRequest("project/list""#));
+        assert!(script.contains(r#"client.sendRequest("thread/metadata/update""#));
+        assert!(script.contains(r#"client.sendRequest("thread/name/set""#));
+        assert!(script.contains("verifyFreshHandoffContinuity"));
+        assert!(script.contains(r#"["reasoningEffort", "reasoning effort"]"#));
+        assert!(script.contains(r#"["environments", "environment roots"]"#));
+        assert!(script.contains("did not preserve ${label}"));
+        assert!(script.contains("has no readable task name"));
+        assert!(script.contains("job?.status === \"pending\""));
+        assert!(script.contains("Fresh session ${phase} lost source project"));
+        assert!(script.contains(
+            "Fresh session ${phase} gained a project even though the source was projectless"
+        ));
+        assert!(script.contains("Manual summary is missing required headings"));
+        assert!(script.contains("Manual summary turn used a forbidden action item"));
         assert!(script.contains(r#"String(turn?.status || "") === "inProgress""#));
         assert!(!script.contains(r#"client.sendRequest("thread/fork""#));
         assert!(!script.contains(r#"client.sendRequest("thread/compact/start""#));

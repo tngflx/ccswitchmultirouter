@@ -16,6 +16,7 @@ const H_TIER_NAMES: &[&str] = &[crate::services::subscription::TIER_FIVE_HOUR];
 const W_TIER_NAMES: &[&str] = &[
     crate::services::subscription::TIER_WEEKLY_LIMIT,
     crate::services::subscription::TIER_SEVEN_DAY,
+    crate::services::subscription::TIER_SEVEN_DAY_FABLE,
     crate::services::subscription::TIER_SEVEN_DAY_OPUS,
     crate::services::subscription::TIER_SEVEN_DAY_SONNET,
 ];

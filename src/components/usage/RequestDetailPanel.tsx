@@ -7,6 +7,7 @@ import {
 } from "@/components/ui/dialog";
 import { useRequestDetail } from "@/lib/query/usage";
 import { getFreshInputTokens, isUnpricedUsage } from "@/types/usage";
+import { formatOutputTokensPerSecond } from "./format";
 
 interface RequestDetailPanelProps {
   requestId: string;
@@ -179,6 +180,12 @@ export function RequestDetailPanel({
                 </dt>
                 <dd className="font-mono">
                   {request.outputTokens.toLocaleString()}
+                  {formatOutputTokensPerSecond(request) != null && (
+                    <span className="ml-2 text-xs text-muted-foreground font-normal">
+                      ({formatOutputTokensPerSecond(request)}{" "}
+                      {t("usage.tokensPerSecond", "tps")})
+                    </span>
+                  )}
                 </dd>
               </div>
               <div>

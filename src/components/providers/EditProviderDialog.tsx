@@ -21,6 +21,7 @@ interface EditProviderDialogProps {
   open: boolean;
   provider: Provider | null;
   onOpenChange: (open: boolean) => void;
+  onOpenAuthCenter?: () => void;
   onSubmit: (payload: {
     provider: Provider;
     originalId?: string;
@@ -88,6 +89,7 @@ function EditProviderSession({
   open,
   provider,
   onOpenChange,
+  onOpenAuthCenter,
   onSubmit,
   appId,
   isProxyTakeover = false,
@@ -332,6 +334,7 @@ function EditProviderSession({
             submitLabel={t("common.save")}
             onSubmit={handleSubmit}
             onCancel={() => onOpenChange(false)}
+            onOpenAuthCenter={onOpenAuthCenter}
             onSubmittingChange={setIsFormSubmitting}
             initialData={initialData}
             showButtons={false}

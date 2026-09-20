@@ -36,6 +36,7 @@ type RequestLogsKey = {
 // Query keys
 export const usageKeys = {
   all: ["usage"] as const,
+  sessionCollectionStatus: () => [...usageKeys.all, "session-collection-status"] as const,
   summary: (
     preset: UsageRangeSelection["preset"],
     customStartDate: number | undefined,
@@ -364,6 +365,16 @@ export function useCodexSubagentUsageStats(
       return usageApi.getCodexSubagentUsageStats(startDate, endDate, limit);
     },
     refetchInterval: options?.refetchInterval ?? DEFAULT_REFETCH_INTERVAL_MS,
+    refetchIntervalInBackground: options?.refetchIntervalInBackground ?? false,
+  });
+}
+
+export function useSessionCollectionStatus(options?: UsageQueryOptions & { enabled?: boolean }) {
+  return useQuery({
+    queryKey: usageKeys.sessionCollectionStatus(),
+    queryFn: usageApi.getSessionCollectionStatus,
+    enabled: options?.enabled ?? true,
+    refetchInterval: options?.refetchInterval ?? 30000,
     refetchIntervalInBackground: options?.refetchIntervalInBackground ?? false,
   });
 }

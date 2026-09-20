@@ -31,6 +31,7 @@ import { useGlobalLoading } from "@/contexts/GlobalLoadingContext";
 interface AddProviderDialogProps {
   open: boolean;
   onOpenChange: (open: boolean) => void;
+  onOpenAuthCenter?: () => void;
   appId: AppId;
   panelZIndexClassName?: string;
   onSubmit: (
@@ -113,6 +114,7 @@ export function buildMixedCodexProviderData(
 export function AddProviderDialog({
   open,
   onOpenChange,
+  onOpenAuthCenter,
   appId,
   panelZIndexClassName,
   onSubmit,
@@ -529,6 +531,7 @@ export function AddProviderDialog({
                 submitLabel={t("common.add")}
                 onSubmit={handleSubmit}
                 onCancel={() => onOpenChange(false)}
+                onOpenAuthCenter={onOpenAuthCenter}
                 onSubmittingChange={setIsFormSubmitting}
                 showButtons={false}
               />
@@ -549,6 +552,7 @@ export function AddProviderDialog({
             submitLabel={t("common.add")}
             onSubmit={handleSubmit}
             onCancel={() => onOpenChange(false)}
+            onOpenAuthCenter={onOpenAuthCenter}
             onSubmittingChange={setIsFormSubmitting}
             showButtons={false}
           />

@@ -138,6 +138,14 @@ fn recommended_action(
     }
 }
 
+fn current_time_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| {
+            u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+        })
+}
+
 static DIAGNOSTICS: OnceLock<Mutex<VecDeque<RequestHealthDiagnostic>>> = OnceLock::new();
 static SESSION_REVIEW_RISKS: OnceLock<Mutex<HashMap<String, RequestHealthFinding>>> =
     OnceLock::new();
@@ -638,6 +646,7 @@ fn resolve_pending_review(token: &str, body_hash: &str, decision: ReviewDecision
     let Some(pending) = pending else {
         return false;
     };
+    crate::codex_desktop::hide_codex_request_health_warning(token);
     if decision == ReviewDecision::ContinueOnce {
         remember_approved_payload(
             &pending.trace_id,
@@ -705,7 +714,7 @@ pub(crate) async fn review_before_upstream(
     // The handoff summary is an intentional second turn over the same large
     // source context. Re-running it through the oversized-request gate would
     // recursively block the handoff that is supposed to recover the session.
-    if is_manual_summary_request(body) {
+    if is_active_manual_summary_request(session_id, body) {
         return Ok(PreflightReviewOutcome::NotRequired);
     }
 
@@ -819,8 +828,12 @@ fn is_manual_summary_request(body: &[u8]) -> bool {
     let Ok(text) = std::str::from_utf8(body) else {
         return false;
     };
-    text.contains("Create a concise handoff summary of this coding session for a fresh session.")
+    text.contains("[CCSwitch internal request: manual-summary-v1]")
         && text.contains("This is a manual coding-agent summary, not context compaction.")
+}
+
+fn is_active_manual_summary_request(session_id: &str, body: &[u8]) -> bool {
+    summary_handoff_active(session_id) && is_manual_summary_request(body)
 }
 
 #[cfg(target_os = "windows")]
@@ -897,11 +910,26 @@ fn show_windows_review_notification(
             format!("{dominant} {share:.0}% ({}) · {action}", value.media_items)
         })
         .unwrap_or_default();
+    let detail_line = format!("{detail} {composition}").trim().to_string();
+    crate::codex_desktop::show_codex_request_health_warning(
+        crate::codex_desktop::CodexRequestHealthWarning {
+            token: token.to_string(),
+            title: strings.title.to_string(),
+            detail: format!("{}: {model} · {detail_line}", strings.model),
+            instruction: strings.codex_warning_instruction.to_string(),
+            expires_at_ms: current_time_millis().saturating_add(
+                u64::from(timeout_seconds)
+                    .clamp(MIN_REVIEW_TIMEOUT_SECONDS, MAX_REVIEW_TIMEOUT_SECONDS)
+                    .saturating_mul(1_000)
+                    .saturating_add(5_000),
+            ),
+        },
+    );
 
     let toast = Toast::new(REQUEST_HEALTH_NOTIFICATION_APP_ID)
         .title(strings.title)
         .text1(&format!("{}: {model}", strings.model))
-        .text2(&format!("{detail} {composition}"))
+        .text2(&detail_line)
         .scenario(Scenario::Reminder)
         .on_activated(move |action| {
             let decision = match action.as_deref() {
@@ -909,9 +937,25 @@ fn show_windows_review_notification(
                 Some(value) if value == expected_block => ReviewDecision::Block,
                 Some(value) if value == expected_summarize => ReviewDecision::SummarizeAndRestart,
                 Some(value) if value == expected_dont_remind => {
-                    let mut settings = crate::settings::get_settings();
-                    settings.request_health.windows_notifications_enabled = false;
-                    let _ = crate::settings::update_settings(settings);
+                    if let Err(error) =
+                        crate::settings::set_request_health_windows_notifications_enabled(false)
+                    {
+                        let reason = error.to_string();
+                        log::error!(
+                            "[RequestHealth] Failed to disable Windows approval reminders: {reason}"
+                        );
+                        super::codex_router_log::append_event(
+                            "request_health_notification_preference_save_failed",
+                            &[("reason", reason.clone())],
+                        );
+                        if let Err(notification_error) =
+                            show_notification_preference_save_failure(&reason)
+                        {
+                            log::warn!(
+                                "[RequestHealth] Failed to show notification preference error: {notification_error}"
+                            );
+                        }
+                    }
                     ReviewDecision::ContinueOnce
                 }
                 _ => ReviewDecision::Block,
@@ -935,6 +979,24 @@ fn show_windows_review_notification(
         })
         .show()
         .map_err(|error| error.to_string())
+}
+
+#[cfg(target_os = "windows")]
+fn show_notification_preference_save_failure(error: &str) -> Result<(), String> {
+    use tauri_winrt_notification::{Scenario, Toast};
+
+    ensure_windows_notification_identity()?;
+    let language = crate::settings::get_settings()
+        .language
+        .unwrap_or_else(|| "en".to_string());
+    let strings = NativeReviewStrings::for_language(&language);
+    Toast::new(REQUEST_HEALTH_NOTIFICATION_APP_ID)
+        .title(strings.preference_save_failed)
+        .text1(strings.preference_still_enabled)
+        .text2(&truncate_for_notification(error, 180))
+        .scenario(Scenario::Reminder)
+        .show()
+        .map_err(|notification_error| notification_error.to_string())
 }
 
 #[cfg(target_os = "windows")]
@@ -1015,6 +1077,9 @@ struct NativeReviewStrings {
     block: &'static str,
     summarize_and_restart: &'static str,
     dont_remind: &'static str,
+    codex_warning_instruction: &'static str,
+    preference_save_failed: &'static str,
+    preference_still_enabled: &'static str,
     summary_complete: &'static str,
     summary_failed: &'static str,
     fresh_session: &'static str,
@@ -1034,9 +1099,12 @@ impl NativeReviewStrings {
                 block: "阻止",
                 summarize_and_restart: "总结并开始新会话",
                 dont_remind: "不再提醒（继续）",
+                codex_warning_instruction: "请在 Windows 通知中选择继续、阻止或总结并开始新会话。",
+                preference_save_failed: "无法保存提醒设置",
+                preference_still_enabled: "当前请求将继续，但 Windows 审批提醒仍保持启用。",
                 summary_complete: "总结移交已完成",
                 summary_failed: "总结并开始新会话失败",
-                fresh_session: "Codex 已将压缩总结移交到新会话",
+                fresh_session: "Codex 已将手动总结移交到新会话",
                 no_fresh_session: "未创建新会话。",
                 no_session_id: "Codex 未返回新会话 ID。",
                 source_session: "来源会话",
@@ -1048,9 +1116,13 @@ impl NativeReviewStrings {
                 block: "封鎖",
                 summarize_and_restart: "摘要並開始新工作階段",
                 dont_remind: "不再提醒（繼續）",
+                codex_warning_instruction:
+                    "請在 Windows 通知中選擇繼續、封鎖或摘要並開始新工作階段。",
+                preference_save_failed: "無法儲存提醒設定",
+                preference_still_enabled: "目前的請求將繼續，但 Windows 核准提醒仍保持啟用。",
                 summary_complete: "摘要移交已完成",
                 summary_failed: "摘要並開始新工作階段失敗",
-                fresh_session: "Codex 已將精簡摘要移交到新工作階段",
+                fresh_session: "Codex 已將手動摘要移交到新工作階段",
                 no_fresh_session: "未建立新工作階段。",
                 no_session_id: "Codex 未傳回新工作階段 ID。",
                 source_session: "來源工作階段",
@@ -1062,9 +1134,14 @@ impl NativeReviewStrings {
                 block: "ブロック",
                 summarize_and_restart: "要約して新しいセッション",
                 dont_remind: "今後通知しない（続行）",
+                codex_warning_instruction:
+                    "Windows 通知で続行、ブロック、または要約して新しいセッションを選択してください。",
+                preference_save_failed: "通知設定を保存できませんでした",
+                preference_still_enabled:
+                    "現在のリクエストは続行しますが、Windows 承認通知は有効なままです。",
                 summary_complete: "要約の引き継ぎが完了しました",
                 summary_failed: "要約と新規セッションの作成に失敗しました",
-                fresh_session: "Codex が要約を新しいセッションに引き継ぎました",
+                fresh_session: "Codex が手動要約を新しいセッションに引き継ぎました",
                 no_fresh_session: "新しいセッションは作成されませんでした。",
                 no_session_id: "Codex から新しいセッション ID が返されませんでした。",
                 source_session: "元のセッション",
@@ -1076,9 +1153,14 @@ impl NativeReviewStrings {
                 block: "Block",
                 summarize_and_restart: "Summarize + new session",
                 dont_remind: "Don't remind me (continue)",
+                codex_warning_instruction:
+                    "Choose Continue, Block, or Summarize + new session in the Windows notification.",
+                preference_save_failed: "Could not save reminder preference",
+                preference_still_enabled:
+                    "This request will continue, but Windows approval reminders remain enabled.",
                 summary_complete: "Summary handoff complete",
                 summary_failed: "Summary + new session failed",
-                fresh_session: "Codex transferred the compact summary to a fresh session",
+                fresh_session: "Codex transferred the manual summary to a fresh session",
                 no_fresh_session: "No fresh session was created.",
                 no_session_id: "Codex did not return a new session id.",
                 source_session: "Source session",
@@ -1643,7 +1725,7 @@ mod tests {
     async fn manual_summary_turn_bypasses_active_handoff_guard() {
         let session_id = "summary-handoff-summary-turn";
         let _guard = begin_summary_handoff(session_id).expect("acquire handoff guard");
-        let body = br#"{"input":[{"type":"message","content":"Create a concise handoff summary of this coding session for a fresh session. This is a manual coding-agent summary, not context compaction."}]}"#;
+        let body = br#"{"input":[{"type":"message","content":"[CCSwitch internal request: manual-summary-v1] Create a faithful handoff summary of this coding session for a fresh session. This is a manual coding-agent summary, not context compaction."}]}"#;
 
         let result = review_before_upstream(
             &RequestHealthConfig::default(),
@@ -1658,6 +1740,41 @@ mod tests {
         .await;
 
         assert_eq!(result, Ok(PreflightReviewOutcome::NotRequired));
+    }
+
+    #[test]
+    fn forged_manual_summary_marker_is_not_internal_without_active_handoff() {
+        let session_id = "forged-summary-marker";
+        let body = br#"{"input":[{"type":"message","content":"[CCSwitch internal request: manual-summary-v1] Create a faithful handoff summary of this coding session for a fresh session. This is a manual coding-agent summary, not context compaction."}]}"#;
+
+        assert!(is_manual_summary_request(body));
+        assert!(!is_active_manual_summary_request(session_id, body));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[tokio::test]
+    async fn disabled_windows_notifications_continue_without_creating_a_review() {
+        let config = RequestHealthConfig {
+            windows_notifications_enabled: false,
+            ..RequestHealthConfig::default()
+        };
+        let result = review_before_upstream(
+            &config,
+            "notifications-disabled-trace",
+            "notifications-disabled-session",
+            true,
+            "gpt-test",
+            br#"{"input":"oversized request"}"#,
+            "provider|POST|https://example.test/responses",
+            false,
+        )
+        .await;
+
+        assert_eq!(result, Ok(PreflightReviewOutcome::ContinueOnce));
+        assert!(pending_reviews()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_empty());
     }
 
     #[test]

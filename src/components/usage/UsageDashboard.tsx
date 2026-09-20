@@ -26,6 +26,7 @@ import {
 import { ProviderIcon } from "@/components/ProviderIcon";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { Button } from "@/components/ui/button";
+import { Switch } from "@/components/ui/switch";
 import {
   Select,
   SelectContent,
@@ -90,11 +91,17 @@ const decodeOptionValue = (value: string) =>
 interface UsageDashboardProps {
   refreshIntervalMs?: number;
   onRefreshIntervalChange?: (next: number) => Promise<boolean> | boolean | void;
+  sessionAutoSyncEnabled?: boolean;
+  onSessionAutoSyncEnabledChange?: (
+    next: boolean,
+  ) => Promise<boolean> | boolean | void;
 }
 
 export function UsageDashboard({
   refreshIntervalMs: savedRefreshIntervalMs,
   onRefreshIntervalChange,
+  sessionAutoSyncEnabled = true,
+  onSessionAutoSyncEnabledChange,
 }: UsageDashboardProps = {}) {
   const { t, i18n } = useTranslation();
   const queryClient = useQueryClient();
@@ -202,6 +209,23 @@ export function UsageDashboard({
       );
     } finally {
       setRebuildingCodex(false);
+    }
+  };
+
+  const runManualSessionSync = async () => {
+    try {
+      const result = await usageApi.syncSessionUsage();
+      await queryClient.invalidateQueries({ queryKey: usageKeys.all });
+      const message = t("usage.sessionSync.syncCompleted", {
+        imported: result.imported,
+        files: result.filesScanned,
+        errors: result.errors.length,
+      });
+      result.errors.length > 0 ? toast.warning(message) : toast.success(message);
+    } catch (error) {
+      toast.error(
+        t("usage.sessionSync.syncFailed", { error: String(error) }),
+      );
     }
   };
 
@@ -470,7 +494,37 @@ export function UsageDashboard({
         onCancel={() => setClearConfirmOpen(false)}
       />
 
-      <Accordion type="multiple" defaultValue={[]} className="w-full space-y-4">
+      <div className="space-y-4">
+        <div className="rounded-xl glass-card px-6 py-4 flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+          <div>
+            <h3 className="text-base font-semibold">
+              {t("usage.sessionSync.title")}
+            </h3>
+            <p className="text-sm text-muted-foreground">
+              {t("usage.sessionSync.description")}
+            </p>
+          </div>
+          <div className="flex items-center gap-3 shrink-0">
+            {!sessionAutoSyncEnabled && (
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => void runManualSessionSync()}
+              >
+                <RefreshCw className="mr-2 h-4 w-4" />
+                {t("usage.sessionSync.syncNow")}
+              </Button>
+            )}
+            <Switch
+              checked={sessionAutoSyncEnabled}
+              onCheckedChange={(value) =>
+                void onSessionAutoSyncEnabledChange?.(value)
+              }
+              aria-label={t("usage.sessionSync.title")}
+            />
+          </div>
+        </div>
+        <Accordion type="multiple" defaultValue={[]} className="w-full space-y-4">
         <AccordionItem
           value="pricing"
           className="rounded-xl glass-card overflow-hidden"
@@ -530,7 +584,8 @@ export function UsageDashboard({
             </div>
           </AccordionContent>
         </AccordionItem>
-      </Accordion>
+        </Accordion>
+      </div>
 
       <ConfirmDialog
         isOpen={showRebuildConfirm}

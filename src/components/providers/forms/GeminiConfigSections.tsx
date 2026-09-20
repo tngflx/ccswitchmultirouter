@@ -85,7 +85,7 @@ export const GeminiEnvSection: React.FC<GeminiEnvSectionProps> = ({
 GEMINI_API_KEY=sk-your-api-key-here
 GEMINI_MODEL=gemini-3.6-flash`}
         darkMode={isDarkMode}
-        rows={6}
+        rows={3}
         showValidation={false}
         language="javascript"
       />
@@ -141,7 +141,7 @@ export const GeminiConfigSection: React.FC<GeminiConfigSectionProps> = ({
   "maxRetries": 3
 }`}
         darkMode={isDarkMode}
-        rows={8}
+        rows={3}
         showValidation={true}
         language="json"
       />

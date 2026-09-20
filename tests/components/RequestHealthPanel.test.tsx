@@ -1,6 +1,8 @@
-import { render, screen } from "@testing-library/react";
-import { describe, expect, it, vi } from "vitest";
+import { render, screen, waitFor } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import { RequestHealthPanel } from "@/components/settings/RequestHealthPanel";
+import { settingsApi } from "@/lib/api/settings";
 import type { RequestHealthSnapshot } from "@/types/proxy";
 
 vi.mock("react-i18next", () => ({
@@ -70,6 +72,11 @@ function snapshot(): RequestHealthSnapshot {
 }
 
 describe("RequestHealthPanel", () => {
+  beforeEach(() => {
+    vi.mocked(settingsApi.get).mockReset();
+    vi.mocked(settingsApi.save).mockReset();
+  });
+
   it("explains when a large semantic request was detected but not reduced", () => {
     render(
       <RequestHealthPanel
@@ -168,5 +175,45 @@ describe("RequestHealthPanel", () => {
     expect(
       screen.getByText("codexRouterWorkspace.requestHealth.action.blocked"),
     ).toBeInTheDocument();
+  });
+
+  it("lets the user re-enable Windows reminders after Don't remind me", async () => {
+    const user = userEvent.setup();
+    const health = snapshot();
+    health.config.windowsNotificationsEnabled = false;
+    vi.mocked(settingsApi.get).mockResolvedValue({
+      requestHealth: health.config,
+    } as Awaited<ReturnType<typeof settingsApi.get>>);
+    vi.mocked(settingsApi.save).mockResolvedValue(true);
+
+    render(
+      <RequestHealthPanel
+        snapshot={health}
+        isRefreshing={false}
+        onRefresh={() => {}}
+        onSaved={() => {}}
+      />,
+    );
+
+    const reminders = screen.getByLabelText(
+      "codexRouterWorkspace.requestHealth.windowsNotificationsEnabled",
+    );
+    expect(reminders).not.toBeChecked();
+    await user.click(reminders);
+    await user.click(
+      screen.getByRole("button", {
+        name: "codexRouterWorkspace.requestHealth.save",
+      }),
+    );
+
+    await waitFor(() =>
+      expect(settingsApi.save).toHaveBeenCalledWith(
+        expect.objectContaining({
+          requestHealth: expect.objectContaining({
+            windowsNotificationsEnabled: true,
+          }),
+        }),
+      ),
+    );
   });
 });

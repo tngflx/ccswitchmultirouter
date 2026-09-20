@@ -14,7 +14,7 @@ test("cleanup options use a bounded default and accept overrides", () => {
   assert.deepEqual(parseCleanupOptions([], {}), {
     dryRun: false,
     force: false,
-    maxGb: 12,
+    maxGb: 4,
   });
   assert.equal(
     parseCleanupOptions([], { CCSM_CARGO_TARGET_MAX_GB: "12.5" }).maxGb,
@@ -23,7 +23,7 @@ test("cleanup options use a bounded default and accept overrides", () => {
   assert.deepEqual(parseCleanupOptions(["--force", "--dry-run"], {}), {
     dryRun: true,
     force: true,
-    maxGb: 12,
+    maxGb: 4,
   });
   assert.throws(() => parseCleanupOptions(["--max-gb"], {}), /Missing value/);
   assert.throws(
