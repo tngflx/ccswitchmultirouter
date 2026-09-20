@@ -1,5 +1,13 @@
 # Engineering Journal (newest first)
 
+## 2026-09-20 - Port OAuth pool soft-avoidance recovery after reference audit
+
+- **What happened:** Re-audited `BigStrongSun/ccswitchmulti` and `farion1231/cc-switch` after the latest local merge. Most recent fork and upstream proxy fixes were already present semantically; the fork's OAuth account pool still returned no candidates when every account was temporarily soft-avoided or cooling down.
+- **Root cause:** Soft avoidance was treated as a hard empty-pool condition. The forwarder therefore produced an immediate `503 NoAvailableProvider` without probing any upstream, so no success could clear the transient state and the outage could persist for the full avoidance window.
+- **What we did:** Ported `BigStrongSun/ccswitchmulti` commit `4861a2046` (the relevant source portion of release v3.20.2-16): preserve eligible pool entries, fall back to the earliest recovering account, retain fail-closed behavior for invalid credentials/quota reserves, and add actionable pool diagnostics.
+- **Evidence:** `cargo test --manifest-path src-tauri/Cargo.toml --lib codex_oauth -- --test-threads=1` passed **122/122**; `cargo check --manifest-path src-tauri/Cargo.toml --lib` passed; `pnpm typecheck` passed; staged diff check passed. The pre-existing dirty `pnpm-lock.yaml` was not changed. No original-repository commit was ported because the inspected candidates were already implemented or incompatible with the fork's custom contracts.
+- **What NOT to do again:** Do not treat temporary pool avoidance as credential failure or import whole release snapshots. Preserve the fork's pool/auth ownership and port only the bounded recovery invariant with a regression test.
+
 ## 2026-09-20 — Merge origin maintenance changes without restoring obsolete provider-owned ordering
 
 - **What happened:** `origin/main` had one divergent commit (`dc1d92d32`) touching eleven files. Its useful changes overlapped newer local work, while its provider-level model-order mutation and older desktop-capture playbook had been superseded by router-owned global ordering and the reusable non-activating capture workflow.
