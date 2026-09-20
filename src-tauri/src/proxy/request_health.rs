@@ -741,7 +741,7 @@ pub(crate) async fn review_before_upstream(
 
     #[cfg(target_os = "windows")]
     {
-        if !config.windows_notifications_enabled {
+        if !crate::settings::request_health_windows_notifications_active(config) {
             return Ok(PreflightReviewOutcome::ContinueOnce);
         }
         let risk = review_finding(config, trace_id, session_id);
@@ -938,7 +938,7 @@ fn show_windows_review_notification(
                 Some(value) if value == expected_summarize => ReviewDecision::SummarizeAndRestart,
                 Some(value) if value == expected_dont_remind => {
                     if let Err(error) =
-                        crate::settings::set_request_health_windows_notifications_enabled(false)
+                        crate::settings::snooze_request_health_windows_notifications()
                     {
                         let reason = error.to_string();
                         log::error!(

@@ -4258,6 +4258,7 @@
       "reviewModeSustained": "持續增長後",
       "summarizeAndRestartEnabled": "提供「摘要並開始新工作階段」",
       "windowsNotificationsEnabled": "顯示 Windows 核准提醒",
+      "notificationSnoozeHours": "「不再提醒」的暫停時長（小時）",
       "summarizeRequiresNotifications": "「摘要並開始新工作階段」需要 Windows 核准提醒。提醒關閉時，大型請求會自動繼續，無法選擇摘要操作。",
       "detectedOnlyWarning": "已偵測到大型請求，但安全最佳化移除了 0 位元組，因為剩餘內容屬於有語意的會話歷史。請求健康不會修改這些歷史。啟用首次請求審核後，請求會在傳送前暫停，直到你在 Windows 通知中作出選擇。",
       "historyWarning": "請求健康會在時間線中保留近期警告，包括發生時間和採取的操作。",

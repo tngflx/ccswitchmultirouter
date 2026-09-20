@@ -4258,6 +4258,7 @@
       "reviewModeSustained": "継続的な増加後",
       "summarizeAndRestartEnabled": "「要約して新しいセッション」を表示",
       "windowsNotificationsEnabled": "Windows の承認通知を表示",
+      "notificationSnoozeHours": "「今後通知しない」の一時停止時間（時間）",
       "summarizeRequiresNotifications": "「要約して新しいセッション」には Windows の承認通知が必要です。通知が無効な間は大きなリクエストが自動的に続行され、要約操作を選択できません。",
       "detectedOnlyWarning": "大きなリクエストは検出されましたが、残りが意味を持つセッション履歴のため、安全な最適化で削除できたのは 0 バイトでした。リクエスト健全性は履歴を変更しません。最初のリクエスト確認を有効にすると、Windows 通知で選択するまで送信前に保留されます。",
       "historyWarning": "リクエスト健全性は、発生時刻と実行した操作を含む最近の警告をタイムラインに保持します。",

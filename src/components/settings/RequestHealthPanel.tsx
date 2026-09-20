@@ -329,6 +329,25 @@ export function RequestHealthPanel({
             </label>
             <label className="rounded-md border border-border bg-background/70 p-3 text-sm">
               <span className="mb-2 block font-medium">
+                {t("codexRouterWorkspace.requestHealth.notificationSnoozeHours")}
+              </span>
+              <select
+                value={draft.windowsNotificationSnoozeHours ?? 4}
+                onChange={(event) =>
+                  setDraft({
+                    ...draft,
+                    windowsNotificationSnoozeHours: Number(event.target.value),
+                  })
+                }
+                className="w-full rounded-md border border-input bg-background px-2 py-1.5"
+              >
+                <option value={1}>1</option>
+                <option value={4}>4</option>
+                <option value={24}>24</option>
+              </select>
+            </label>
+            <label className="rounded-md border border-border bg-background/70 p-3 text-sm">
+              <span className="mb-2 block font-medium">
                 {t(
                   "codexRouterWorkspace.requestHealth.windowsNotificationsEnabled",
                 )}
@@ -347,7 +366,8 @@ export function RequestHealthPanel({
             </label>
           </div>
           {draft.summarizeAndRestartEnabled &&
-          !draft.windowsNotificationsEnabled ? (
+          (!draft.windowsNotificationsEnabled ||
+            (draft.windowsNotificationsSnoozedUntilMs ?? 0) > Date.now()) ? (
             <div
               role="alert"
               className="mt-3 rounded-md border border-amber-300/60 bg-amber-50 px-3 py-2 text-xs text-amber-900 dark:border-amber-700/50 dark:bg-amber-950/20 dark:text-amber-100"

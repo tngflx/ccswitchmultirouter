@@ -1,5 +1,13 @@
 # Engineering Journal (newest first)
 
+## 2026-09-20 - Make Request Health notification dismissal a bounded snooze
+
+- **What happened:** The native “Don't remind me (continue)” action permanently set `windowsNotificationsEnabled=false`, which disabled the only interactive Request Health surface indefinitely and made “Summarize + new session” unavailable until manual settings repair.
+- **Root cause:** A temporary per-notification dismissal was wired to a global permanent feature toggle; the setting had no expiry or preset duration.
+- **What we did:** Kept notifications enabled, added a persisted snooze expiry with a configurable 1/4/24-hour preset, made review activation honor expiry, and exposed the preset plus an explicit summarize-unavailable warning in the Request Health UI. Restored the user's on-disk preference to notifications enabled.
+- **Evidence:** `tests/lib/codexSummaryHandoff.test.ts` passed **17/17**; Request Health component tests passed **6/6**; `pnpm typecheck` passed; `cargo check --lib` passed; `git diff --check` passed. Live acceptance remains pending because the running process predates this source change and must be rebuilt/restarted.
+- **What NOT to do again:** Do not persist “Don't remind me” as an indefinite global disable when the user only dismissed one review; snooze the notification and preserve the review/summarize path.
+
 ## 2026-09-20 - Re-audit Codex 0.155.1 and restore the summarize workflow boundary
 
 - **What happened:** Live Codex CLI/app-server `0.155.1` inspection showed oversized requests were being auto-approved, and the manual “Summarize + new session” path would fail against the current app-server contract if selected.

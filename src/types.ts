@@ -651,6 +651,8 @@ export interface Settings {
     reviewMode: "off" | "first_large_request" | "sustained_growth";
     summarizeAndRestartEnabled: boolean;
     windowsNotificationsEnabled: boolean;
+    windowsNotificationSnoozeHours?: number;
+    windowsNotificationsSnoozedUntilMs?: number | null;
   };
   // 是否启用主页面本地代理功能（默认关闭）
   enableLocalProxy?: boolean;

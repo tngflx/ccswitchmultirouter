@@ -50,6 +50,10 @@ fn default_request_health_review_timeout_seconds() -> u32 {
     60
 }
 
+fn default_request_health_notification_snooze_hours() -> u32 {
+    4
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum RequestOptimizationMode {
@@ -101,6 +105,12 @@ pub struct RequestHealthConfig {
     pub summarize_and_restart_enabled: bool,
     #[serde(default = "default_true")]
     pub windows_notifications_enabled: bool,
+    /// Duration applied by the native “Don't remind me” action. The action
+    /// snoozes notifications; it must not permanently disable the review path.
+    #[serde(default = "default_request_health_notification_snooze_hours")]
+    pub windows_notification_snooze_hours: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub windows_notifications_snoozed_until_ms: Option<i64>,
 }
 
 impl Default for RequestHealthConfig {
@@ -114,6 +124,8 @@ impl Default for RequestHealthConfig {
             review_mode: RequestHealthReviewMode::FirstLargeRequest,
             summarize_and_restart_enabled: true,
             windows_notifications_enabled: true,
+            windows_notification_snooze_hours: default_request_health_notification_snooze_hours(),
+            windows_notifications_snoozed_until_ms: None,
         }
     }
 }
@@ -1003,6 +1015,28 @@ pub fn set_request_health_windows_notifications_enabled(enabled: bool) -> Result
     mutate_settings(|settings| {
         settings.request_health.windows_notifications_enabled = enabled;
     })
+}
+
+pub fn snooze_request_health_windows_notifications() -> Result<(), AppError> {
+    mutate_settings(|settings| {
+        let hours = settings
+            .request_health
+            .windows_notification_snooze_hours
+            .clamp(1, 24);
+        settings.request_health.windows_notifications_enabled = true;
+        settings.request_health.windows_notifications_snoozed_until_ms = Some(
+            chrono::Utc::now()
+                .timestamp_millis()
+                .saturating_add(i64::from(hours).saturating_mul(60 * 60 * 1000)),
+        );
+    })
+}
+
+pub fn request_health_windows_notifications_active(config: &RequestHealthConfig) -> bool {
+    config.windows_notifications_enabled
+        && config
+            .windows_notifications_snoozed_until_ms
+            .is_none_or(|until| chrono::Utc::now().timestamp_millis() >= until)
 }
 
 fn mutate_settings<F>(mutator: F) -> Result<(), AppError>

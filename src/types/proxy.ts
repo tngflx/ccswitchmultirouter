@@ -67,6 +67,8 @@ export interface RequestHealthConfig {
   reviewMode: "off" | "first_large_request" | "sustained_growth";
   summarizeAndRestartEnabled: boolean;
   windowsNotificationsEnabled: boolean;
+  windowsNotificationSnoozeHours?: number;
+  windowsNotificationsSnoozedUntilMs?: number | null;
 }
 
 export interface RequestHealthBreakdown {
