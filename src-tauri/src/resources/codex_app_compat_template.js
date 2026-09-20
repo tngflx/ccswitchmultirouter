@@ -739,8 +739,6 @@
       ["model", "model"],
       ["modelProvider", "provider"],
       ["reasoningEffort", "reasoning effort"],
-      ["historyMode", "history mode"],
-      ["environments", "environment roots"],
     ]) {
       const expected = sourceThread?.[field];
       if (
@@ -995,69 +993,14 @@
           false,
         );
         const sourceCwd = String(sourceThread?.cwd || "").trim();
-        const normalizedSourceCwd = normalizeHandoffPath(sourceCwd);
-        let sourceProjectId = String(sourceThread?.projectId || "").trim();
-        if (!sourceProjectId && normalizedSourceCwd) {
-          let cursor = null;
-          const matches = [];
-          do {
-            const response = await client.sendRequest("project/list", {
-              cursor,
-              limit: 100,
-            });
-            for (const project of response?.data || []) {
-              const matchingRootLengths = (project?.roots || [])
-                .map((root) =>
-                  normalizeHandoffPath(
-                    typeof root === "string" ? root : root?.path,
-                  ),
-                )
-                .filter(
-                  (root) =>
-                    root &&
-                    (normalizedSourceCwd === root ||
-                      normalizedSourceCwd.startsWith(`${root}\\`)),
-                )
-                .map((root) => root.length);
-              if (matchingRootLengths.length) {
-                matches.push({
-                  id: String(project?.id || "").trim(),
-                  rootLength: Math.max(...matchingRootLengths),
-                });
-              }
-            }
-            cursor = String(response?.nextCursor || "").trim() || null;
-          } while (cursor);
-          const longestRoot = Math.max(
-            0,
-            ...matches.map((match) => match.rootLength),
-          );
-          const matchingProjectIds = [
-            ...new Set(
-              matches
-                .filter((match) => match.rootLength === longestRoot)
-                .map((match) => match.id)
-                .filter(Boolean),
-            ),
-          ];
-          if (matchingProjectIds.length > 1) {
-            throw new Error(
-              `The source workspace belongs to multiple equally specific Codex projects: ${matchingProjectIds.join(", ")}`,
-            );
-          }
-          sourceProjectId = matchingProjectIds[0] || "";
-        }
+        const sourceProjectId = String(sourceThread?.projectId || "").trim();
         const reasoningEffort =
           String(sourceThread?.reasoningEffort || "").trim() || "medium";
         const startParams = {
           config: { model_reasoning_effort: reasoningEffort },
         };
-        for (const key of ["cwd", "model", "modelProvider", "historyMode"]) {
+        for (const key of ["cwd", "model", "modelProvider"]) {
           if (sourceThread?.[key]) startParams[key] = sourceThread[key];
-        }
-        if (sourceProjectId) startParams.projectId = sourceProjectId;
-        if (Array.isArray(sourceThread?.environments)) {
-          startParams.environments = sourceThread.environments;
         }
         mutationAttempted = true;
         const started = await client.sendRequest("thread/start", startParams);
@@ -1080,13 +1023,6 @@
         ).trim();
         if (newSessionId && newSessionId !== newThreadId)
           throw new Error("Codex created a non-root session tree");
-        const expectedProjectId = sourceProjectId || "";
-        if (String(newThread?.projectId || "").trim() !== expectedProjectId) {
-          await client.sendRequest("thread/metadata/update", {
-            threadId: newThreadId,
-            projectId: sourceProjectId || null,
-          });
-        }
         newThread = await readExactHandoffThread(client, newThreadId, false);
         verifyFreshHandoffContinuity(newThread, {
           newThreadId,

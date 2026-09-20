@@ -199,7 +199,13 @@ describe("RequestHealthPanel", () => {
       "codexRouterWorkspace.requestHealth.windowsNotificationsEnabled",
     );
     expect(reminders).not.toBeChecked();
+    expect(
+      screen.getByRole("alert"),
+    ).toHaveTextContent(
+      "codexRouterWorkspace.requestHealth.summarizeRequiresNotifications",
+    );
     await user.click(reminders);
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
     await user.click(
       screen.getByRole("button", {
         name: "codexRouterWorkspace.requestHealth.save",

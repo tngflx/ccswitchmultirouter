@@ -417,16 +417,6 @@ describe("manual coding-agent summary handoff", () => {
     let named = false;
     const send = vi.fn(
       async (method: string, params: Record<string, unknown>) => {
-        if (method === "project/list")
-          return {
-            data: [
-              {
-                id: "project-canonical",
-                roots: [{ path: "H:\\repos\\ccswitchmulti-fork" }],
-              },
-            ],
-            nextCursor: null,
-          };
         if (method === "thread/start")
           return {
             thread: {
@@ -436,11 +426,9 @@ describe("manual coding-agent summary handoff", () => {
               model: "gpt-5.6-sol",
               modelProvider: "codex_model_router_v2",
               reasoningEffort: "high",
-              historyMode: "full",
-              environments: [{ root: "H:\\repos\\ccswitchmulti-fork" }],
+              historyMode: "legacy",
             },
           };
-        if (method === "thread/metadata/update") return {};
         if (method === "thread/name/set") {
           named = true;
           return {};
@@ -456,7 +444,7 @@ describe("manual coding-agent summary handoff", () => {
               model: "gpt-5.6-sol",
               modelProvider: "codex_model_router_v2",
               reasoningEffort: "high",
-              historyMode: "full",
+              historyMode: "paginated",
               environments: [{ root: "H:\\repos\\ccswitchmulti-fork" }],
               turns: [{ secretHistory: "DO NOT REPLAY" }],
             },
@@ -465,13 +453,12 @@ describe("manual coding-agent summary handoff", () => {
           thread: {
             id: "fresh",
             cwd: "H:\\repos\\ccswitchmulti-fork",
-            projectId: "project-canonical",
+            projectId: null,
             name: named ? "Handoff — Source" : "",
             model: "gpt-5.6-sol",
             modelProvider: "codex_model_router_v2",
             reasoningEffort: "high",
-            historyMode: "full",
-            environments: [{ root: "H:\\repos\\ccswitchmulti-fork" }],
+            historyMode: "legacy",
             turns: [{ id: "handoff", status: "completed" }],
           },
         };
@@ -482,17 +469,14 @@ describe("manual coding-agent summary handoff", () => {
     ).resolves.toEqual({
       newThreadId: "fresh",
       turnId: "handoff",
-      projectId: "project-canonical",
+      projectId: null,
       cwd: "H:\\repos\\ccswitchmulti-fork",
       name: "Handoff — Source",
     });
     expect(send).toHaveBeenCalledWith("thread/start", {
       cwd: "H:\\repos\\ccswitchmulti-fork",
-      projectId: "project-canonical",
       model: "gpt-5.6-sol",
       modelProvider: "codex_model_router_v2",
-      historyMode: "full",
-      environments: [{ root: "H:\\repos\\ccswitchmulti-fork" }],
       config: { model_reasoning_effort: "high" },
     });
     const turnParams = send.mock.calls.find(
@@ -509,9 +493,7 @@ describe("manual coding-agent summary handoff", () => {
     );
     expect(send.mock.calls.map(([method]) => method)).toEqual([
       "thread/read",
-      "project/list",
       "thread/start",
-      "thread/metadata/update",
       "thread/read",
       "thread/name/set",
       "thread/read",
@@ -600,11 +582,9 @@ describe("manual coding-agent summary handoff", () => {
     expect(send).not.toHaveBeenCalledWith("turn/start", expect.anything());
   });
 
-  it("removes an unexpected project assignment for a projectless source", async () => {
-    let repaired = false;
+  it("fails closed when app-server assigns a project to a projectless source", async () => {
     const send = vi.fn(
       async (method: string, params: Record<string, unknown>) => {
-        if (method === "project/list") return { data: [], nextCursor: null };
         if (method === "thread/start")
           return {
             thread: {
@@ -613,13 +593,6 @@ describe("manual coding-agent summary handoff", () => {
               projectId: "unexpected-project",
             },
           };
-        if (method === "thread/metadata/update") {
-          expect(params).toEqual({ threadId: "fresh", projectId: null });
-          repaired = true;
-          return {};
-        }
-        if (method === "thread/name/set") return {};
-        if (method === "turn/start") return { turn: { id: "handoff" } };
         if (params.threadId === "source")
           return {
             thread: {
@@ -633,9 +606,8 @@ describe("manual coding-agent summary handoff", () => {
           thread: {
             id: "fresh",
             cwd: "H:\\scratch",
-            projectId: repaired ? null : "unexpected-project",
+            projectId: "unexpected-project",
             name: "Handoff — Scratch",
-            turns: [{ id: "handoff", status: "completed" }],
           },
         };
       },
@@ -643,11 +615,11 @@ describe("manual coding-agent summary handoff", () => {
 
     await expect(
       runner(send, true)("source", "Manual summary"),
-    ).resolves.toMatchObject({
-      newThreadId: "fresh",
-      projectId: null,
-      cwd: "H:\\scratch",
-    });
+    ).rejects.toThrow("gained a project");
+    expect(send).not.toHaveBeenCalledWith(
+      "thread/metadata/update",
+      expect.anything(),
+    );
   });
 
   it("reports a failed fresh-session turn instead of claiming completion", async () => {

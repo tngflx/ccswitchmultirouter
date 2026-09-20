@@ -1,5 +1,13 @@
 # Engineering Journal (newest first)
 
+## 2026-09-20 - Re-audit Codex 0.155.1 and restore the summarize workflow boundary
+
+- **What happened:** Live Codex CLI/app-server `0.155.1` inspection showed oversized requests were being auto-approved, and the manual “Summarize + new session” path would fail against the current app-server contract if selected.
+- **Root cause:** The persisted setting had `requestHealth.windowsNotificationsEnabled=false`, which intentionally returns `ContinueOnce` before creating a review token; the only interactive surface for choosing summarize is the Windows notification. Separately, the handoff script still used removed/unsupported app-server fields and methods: `project/list`, `thread/metadata/update.projectId`, `thread/start.projectId`, `thread/start.historyMode`, and `thread/start.environments`. The installed schema only accepts legacy/paginated thread history as a returned contract, and current paginated creation is unsupported.
+- **What we did:** Restored the on-disk Windows reminder preference to `true`; added a Request Health UI warning when summarize is enabled but reminders are disabled; removed unsupported project discovery/metadata mutation and history/environment copying from fresh-session creation; retained strict root-ID, workspace, model/provider/reasoning, title, no-tool acknowledgement, and no-compaction invariants.
+- **Evidence:** Current live logs show request-health diagnostics at 0.5-2.1 MB with exact client/transformed/upstream accounting and upstream HTTP 200; `tests/lib/codexSummaryHandoff.test.ts` passed **17/17**; Request Health component tests passed **6/6**; generated Rust compatibility-script test passed **1/1**; `cargo check --lib` passed; `pnpm typecheck` passed. `codex app-server generate-ts` from installed `0.155.1` confirmed the schema; official OpenAI documentation confirms `thread/start`, `thread/read`, `turn/start`, and `thread/name/set`, and documents paginated creation as unsupported.
+- **What NOT to do again:** Do not diagnose an absent summarize action from request size alone; inspect notification settings and review-token events first. Do not validate app-server integrations with synthetic `historyMode="full"` or project mutation fixtures that the installed protocol does not accept.
+
 ## 2026-09-20 - Localize session traffic UI and complete OAuth test boundary
 
 - **What happened:** The Codex session-traffic panel was mounted and functionally tested, but its primary headings/status/sync/error strings were hardcoded in Chinese, and OAuth component tests emitted an unhandled MSW warning for the account-pool policy query.
