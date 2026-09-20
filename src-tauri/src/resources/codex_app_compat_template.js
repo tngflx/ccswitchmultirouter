@@ -846,6 +846,11 @@
             ]);
             const forbiddenSummaryItem = (turn?.items || []).find((item) => {
               const type = String(item?.type || "").toLowerCase();
+              if (type === "usermessage" || type === "user_message") {
+                return !JSON.stringify(item).includes(
+                  "[CCSwitch internal request: manual-summary-v1]",
+                );
+              }
               return type && !permittedSummaryItemTypes.has(type);
             });
             if (forbiddenSummaryItem)

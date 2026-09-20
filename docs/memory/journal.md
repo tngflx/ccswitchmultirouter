@@ -1,5 +1,13 @@
 # Engineering Journal (newest first)
 
+## 2026-09-20 - Accept the current Codex summary turn envelope without weakening action rejection
+
+- **What happened:** A live disposable-task acceptance on Codex app-server `0.155.1` reached and completed the manual summary turn, but CCSwitch rejected it as `Manual summary turn used a forbidden action item: userMessage` before creating the fresh root.
+- **Root cause:** Current `thread/read(includeTurns=true)` returns the summary turn's own persisted `userMessage` together with `reasoning` and `agentMessage`. The validator allowed only assistant/reasoning items and mistook the expected prompt envelope for a tool/file action.
+- **What we did:** Allow a `userMessage` only when its serialized content contains the exact internal `manual-summary-v1` marker; unrelated user messages and every unknown/tool/action item remain fail-closed. Added a live-shaped regression fixture and an explicit unrelated-user-message rejection test.
+- **Evidence:** The live turn contained exactly `userMessage`, `reasoning`, and `agentMessage`; the agent returned all eight required headings and used no tools. Updated summary tests passed **18/18**; Request Health tests passed **6/6**; the generated Rust compatibility-script contract passed **1/1**; `pnpm typecheck` passed. End-to-end fresh-root acceptance still requires the rebuilt renderer template to be loaded.
+- **What NOT to do again:** Do not equate the summary turn's own authenticated user prompt envelope with a tool action, and do not broadly allow arbitrary user messages; require the internal marker exactly.
+
 ## 2026-09-20 - Make Request Health notification dismissal a bounded snooze
 
 - **What happened:** The native “Don't remind me (continue)” action permanently set `windowsNotificationsEnabled=false`, which disabled the only interactive Request Health surface indefinitely and made “Summarize + new session” unavailable until manual settings repair.

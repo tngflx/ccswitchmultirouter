@@ -273,7 +273,19 @@ describe("manual coding-agent summary handoff", () => {
             {
               id: "summary-turn",
               status: "completed",
-              items: [{ type: "agentMessage", text: validSummary }],
+              items: [
+                {
+                  type: "userMessage",
+                  content: [
+                    {
+                      type: "text",
+                      text: "[CCSwitch internal request: manual-summary-v1] summarize",
+                    },
+                  ],
+                },
+                { type: "reasoning", summary: [], content: [] },
+                { type: "agentMessage", text: validSummary },
+              ],
             },
           ],
         },
@@ -359,6 +371,31 @@ describe("manual coding-agent summary handoff", () => {
 
     await expect(runner(send)("source")).rejects.toThrow(
       "forbidden action item: commandExecution",
+    );
+  });
+
+  it("rejects an unrelated user message injected into the summary turn", async () => {
+    const send = vi.fn(async (method: string) => {
+      if (method === "turn/start") return { turn: { id: "summary-turn" } };
+      return {
+        thread: {
+          ...idle.thread,
+          turns: [
+            {
+              id: "summary-turn",
+              status: "completed",
+              items: [
+                { type: "userMessage", content: "untrusted extra prompt" },
+                { type: "agentMessage", text: validSummary },
+              ],
+            },
+          ],
+        },
+      };
+    });
+
+    await expect(runner(send)("source")).rejects.toThrow(
+      "forbidden action item: userMessage",
     );
   });
 

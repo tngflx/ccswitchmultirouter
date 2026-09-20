@@ -1011,12 +1011,6 @@ pub fn update_settings(mut new_settings: AppSettings) -> Result<(), AppError> {
     Ok(())
 }
 
-pub fn set_request_health_windows_notifications_enabled(enabled: bool) -> Result<(), AppError> {
-    mutate_settings(|settings| {
-        settings.request_health.windows_notifications_enabled = enabled;
-    })
-}
-
 pub fn snooze_request_health_windows_notifications() -> Result<(), AppError> {
     mutate_settings(|settings| {
         let hours = settings
@@ -1638,5 +1632,21 @@ mod tests {
         }))
         .expect("previous compact action setting remains readable");
         assert!(!previous_name.request_health.summarize_and_restart_enabled);
+    }
+
+    #[test]
+    fn request_health_notification_snooze_expires_without_disabling_notifications() {
+        let now = chrono::Utc::now().timestamp_millis();
+        let mut config = RequestHealthConfig::default();
+        assert!(request_health_windows_notifications_active(&config));
+
+        config.windows_notifications_snoozed_until_ms = Some(now + 60_000);
+        assert!(!request_health_windows_notifications_active(&config));
+
+        config.windows_notifications_snoozed_until_ms = Some(now - 1);
+        assert!(request_health_windows_notifications_active(&config));
+
+        config.windows_notifications_enabled = false;
+        assert!(!request_health_windows_notifications_active(&config));
     }
 }
