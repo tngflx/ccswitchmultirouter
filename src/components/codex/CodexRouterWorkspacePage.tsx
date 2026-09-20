@@ -36,6 +36,7 @@ import {
   Clipboard,
   Database,
   FileClock,
+  FolderOpen,
   GitFork,
   GitBranch,
   GripVertical,
@@ -75,6 +76,7 @@ import {
   TooltipTrigger,
 } from "@/components/ui/tooltip";
 import { providersApi } from "@/lib/api";
+import { settingsApi } from "@/lib/api/settings";
 import type {
   CodexMultiRouterMigrationPreview,
   CodexRoutingProjectionStatus,
@@ -5372,6 +5374,7 @@ export function ModelOrderTab({
     setIsSaving(true);
     setMessage(null);
     setError(null);
+    let saveStage = "save-router";
     try {
       const orderedModels = reset
         ? catalog.models.slice()
@@ -5447,12 +5450,18 @@ export function ModelOrderTab({
               arg0: models.length,
             }),
       );
+      saveStage = "refresh-providers";
       await queryClient.invalidateQueries({ queryKey: ["providers", "codex"] });
     } catch (saveError) {
       reportFrontendError(
         "codex_model_order_save",
         saveError,
-        `routerProviderId=${selectedPlan.id}`,
+        [
+          `stage=${saveStage}`,
+          `routerProviderId=${selectedPlan.id}`,
+          `modelCount=${draftModels.length}`,
+          `reset=${reset}`,
+        ].join("; "),
       );
       setError(
         tr("codexRouterWorkspace.s129", {
@@ -5929,7 +5938,21 @@ export function ModelOrderTab({
         </p>
       ) : null}
       {error ? (
-        <p className="mt-3 text-xs text-rose-700 dark:text-rose-200">{error}</p>
+        <div className="mt-3 flex flex-wrap items-center gap-2 text-xs text-rose-700 dark:text-rose-200">
+          <p>{error}</p>
+          <Button
+            type="button"
+            size="sm"
+            variant="outline"
+            className="h-7 gap-1.5"
+            onClick={() => void settingsApi.openLogDir()}
+          >
+            <FolderOpen className="h-3.5 w-3.5" />
+            {tr("settings.advanced.logConfig.openLogDirectory", {
+              defaultValue: "Open Log Directory",
+            })}
+          </Button>
+        </div>
       ) : null}
     </section>
   );

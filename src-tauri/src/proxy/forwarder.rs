@@ -374,6 +374,10 @@ fn retryable_failure_affects_provider_health(provider: &Provider, error: &ProxyE
     if matches!(error, ProxyError::AdmissionQueueTimeout { .. }) {
         return false;
     }
+    // Terminal quota exhaustion can still fail over to another provider, but
+    // it describes this credential's allowance rather than provider health.
+    // Limit this exemption to the statuses owned by the quota normalizer so an
+    // unrelated error body cannot become health-neutral accidentally.
     if matches!(
         error,
         ProxyError::UpstreamError {
@@ -9171,20 +9175,31 @@ mod tests {
 
     #[test]
     fn terminal_codex_quota_does_not_open_direct_provider_circuit() {
+        let forwarder = test_forwarder(Duration::ZERO, Duration::ZERO);
         let direct = test_provider_with_type(None);
+        let pool = test_codex_pool_candidate("acc-a", 7);
 
         for status in [402, 403, 429] {
             let error = ProxyError::UpstreamError {
                 status,
                 body: Some(
                     r#"{"error":{"message":"daily usage limit exceeded","type":"insufficient_quota","code":"daily_limit_exceeded"}}"#
-                        .to_string(),
+                    .to_string(),
                 ),
             };
 
+            assert_eq!(
+                forwarder.categorize_proxy_error(&error, &direct),
+                ErrorCategory::Retryable,
+                "terminal quota should remain eligible for provider failover"
+            );
             assert!(
                 !retryable_failure_affects_provider_health(&direct, &error),
                 "terminal quota must not poison provider health or open its circuit"
+            );
+            assert!(
+                !retryable_failure_affects_provider_health(&pool, &error),
+                "terminal quota must not poison account-pool provider health"
             );
         }
     }

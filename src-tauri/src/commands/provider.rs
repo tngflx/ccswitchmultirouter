@@ -78,6 +78,7 @@ pub async fn update_provider(
     #[allow(non_snake_case)] skipAutomaticProbe: Option<bool>,
 ) -> Result<bool, String> {
     let app_type = AppType::from_str(&app).map_err(|e| e.to_string())?;
+    let provider_id = provider.id.clone();
     // See add_provider: ordinary saves are persistence-only. The legacy flag
     // cannot accidentally turn a Save button into a network operation.
     let _ = skipAutomaticProbe;
@@ -88,7 +89,16 @@ pub async fn update_provider(
         provider,
         &[],
     )
-    .map_err(|e| e.to_string())
+    .map_err(|error| {
+        log::warn!(
+            "Provider update failed: app={}, provider_id={}, original_id={}, error={}",
+            app,
+            provider_id,
+            originalId.as_deref().unwrap_or(&provider_id),
+            error
+        );
+        error.to_string()
+    })
 }
 
 async fn resolve_automatic_probe_outcome<F, Fut>(

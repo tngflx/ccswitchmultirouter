@@ -101,6 +101,7 @@ vi.mock("@/lib/api/settings", () => ({
   settingsApi: {
     get: vi.fn(),
     save: vi.fn(),
+    openLogDir: vi.fn(),
   },
 }));
 
@@ -415,6 +416,8 @@ beforeEach(() => {
   });
   vi.mocked(settingsApi.get).mockReset();
   vi.mocked(settingsApi.save).mockReset();
+  vi.mocked(settingsApi.openLogDir).mockReset();
+  vi.mocked(settingsApi.openLogDir).mockResolvedValue(true);
   vi.mocked(providersApi.add).mockResolvedValue(true);
   vi.mocked(providersApi.update).mockResolvedValue(true);
   vi.mocked(providersApi.getAll).mockResolvedValue({});
@@ -3294,6 +3297,10 @@ describe("Codex MultiRouter workspace route persistence helpers", () => {
       "projection revision mismatch: expected 41, received 42",
     );
     expect(screen.queryByText(/操作失败，请检查/)).not.toBeInTheDocument();
+    await user.click(
+      screen.getByRole("button", { name: /日志目录|Log Directory/i }),
+    );
+    expect(settingsApi.openLogDir).toHaveBeenCalledOnce();
   });
 
   it("persists a display-only change without rewriting provider model order", async () => {
