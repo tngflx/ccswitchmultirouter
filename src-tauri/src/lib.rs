@@ -2262,6 +2262,10 @@ fn should_restore_startup_app(app_type: &str, codex_runtime_prepared: bool) -> b
     app_type != "codex" || codex_runtime_prepared
 }
 
+fn should_retry_startup_takeover_error(error: &str) -> bool {
+    !error.starts_with("PORT_OWNERSHIP_GUARD:")
+}
+
 async fn enabled_proxy_apps_on_startup(db: &database::Database) -> Vec<&'static str> {
     let mut apps = Vec::new();
     for app_type in PROXY_STARTUP_APP_TYPES {
@@ -2337,12 +2341,16 @@ async fn restore_proxy_state_on_startup(
             if takeover_result.is_ok() {
                 break;
             }
-            if attempt < 12 {
+            let error = takeover_result.as_ref().unwrap_err();
+            if attempt < 12 && should_retry_startup_takeover_error(error) {
                 log::warn!(
-                    "恢复 {app_type} 代理接管第 {attempt}/12 次失败，将在 500ms 后重试: {}",
-                    takeover_result.as_ref().unwrap_err()
+                    "恢复 {app_type} 代理接管第 {attempt}/12 次失败，将在 500ms 后重试: {error}"
                 );
                 tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            } else if !should_retry_startup_takeover_error(error) {
+                log::error!(
+                    "恢复 {app_type} 代理接管因端口所有权无法验证而停止重试；需要先释放端口或更换监听端口: {error}"
+                );
             }
         }
         match takeover_result {
@@ -2697,8 +2705,8 @@ mod tests {
     use super::{
         classify_exit_request, enabled_proxy_apps_on_startup, redact_url_for_log,
         redact_url_for_log_with_secrets, redact_url_origin_for_log, requested_exit_reason_name,
-        runtime_log_level_allows, should_restore_startup_app, ExitRequestAction,
-        RequestedExitReason,
+        runtime_log_level_allows, should_restore_startup_app, should_retry_startup_takeover_error,
+        ExitRequestAction, RequestedExitReason,
     };
     use crate::database::Database;
 
@@ -2847,5 +2855,15 @@ mod tests {
         assert!(should_restore_startup_app("codex", true));
         assert!(should_restore_startup_app("claude", false));
         assert!(should_restore_startup_app("gemini", false));
+    }
+
+    #[test]
+    fn startup_takeover_does_not_retry_unverifiable_port_ownership() {
+        assert!(!should_retry_startup_takeover_error(
+            "PORT_OWNERSHIP_GUARD: listener identity is unknown"
+        ));
+        assert!(should_retry_startup_takeover_error(
+            "代理启动失败: temporary bind race"
+        ));
     }
 }

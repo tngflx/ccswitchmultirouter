@@ -1,5 +1,29 @@
 # Engineering Journal (newest first)
 
+## 2026-09-21 - Complete port-ownership retry fix and live capture verification
+
+- **What happened:** The user reopened CCSwitch and requested completion of the remaining fix plus live verification.
+- **Root cause:** The retry fix was present in source but the active development binary still predated it. The earlier capture failure was caused by the Tauri window being minimized, not by an absent window handle.
+- **What we did:** Restored the Tauri window non-activatingly with `ShowWindowAsync(SW_SHOWNOACTIVATE)`, captured the live 1870x997 surface, and kept the startup change that stops retrying `PORT_OWNERSHIP_GUARD` errors while retaining retries for transient startup failures.
+- **Evidence:** Capture helper passed with `PrintWindow=True`, `NonBlankRatio=1`, and 738 sampled colors at `C:\Users\Felix\.cc-switch\inspection\capture-20260921-123554.png`. `cargo check --lib`, `pnpm typecheck`, targeted Rust regressions **2/2**, and focused proxy UI/hook tests **7/7** passed. The running binary remains older than `src-tauri/src/lib.rs` (binary 10:32:10; source 12:01:10), so live runtime proof of the new retry branch requires the user to restart `pnpm dev`.
+- **What NOT to do again:** Do not stop at a minimized-window error when a non-activating restore is allowed, and do not claim a source fix is live until binary and source timestamps are compared.
+
+## 2026-09-21 - Stop retry storms when proxy port ownership is unverifiable
+
+- **What happened:** Historical startup logs showed twelve identical takeover retries within roughly six seconds when port 15721 was occupied by a process CCSwitch could not safely identify.
+- **Root cause:** Startup retried every takeover error uniformly. `PORT_OWNERSHIP_GUARD` is a safety decision requiring user action or a port change, not a transient bind race; retrying cannot make the foreign process verifiable.
+- **What we did:** Startup takeover now stops retrying immediately for `PORT_OWNERSHIP_GUARD` errors and emits one actionable error telling the user to release the port or choose another port. Transient non-ownership errors retain the existing bounded retry policy.
+- **Evidence:** Regression `tests::startup_takeover_does_not_retry_unverifiable_port_ownership` passed **1/1**; `pnpm typecheck` passed; scoped Rust formatting and `git diff --check` passed. The live window remained hidden to tray, so the requested capture helper still could not find a visible CCSwitch window; no foreground activation or process termination was performed.
+- **What NOT to do again:** Do not retry an unverifiable foreign listener as if it were a transient startup race, and do not kill an owner without the existing identity, executable, start-time, scope, and protocol proof.
+
+## 2026-09-21 - Live restart verification confirms Codex takeover recovery path
+
+- **What happened:** After the user restarted the development app, we rechecked the actual running processes, executable timestamp, startup log, proxy traffic, and targeted tests.
+- **Root cause:** The previous stale-binary blocker is cleared. The observed startup warnings were recovery evidence from the prior unclean exit, not a current takeover failure.
+- **What we did:** Verified CCSwitch PID 22716 started at 10:32:11, the supervisor at 10:32:21, and the Codex/ChatGPT shell as a child of CCSwitch at 10:32:44 with `--remote-debugging-port=9229`. Verified startup restored `codex` takeover, started `127.0.0.1:15721`, completed MultiRouter projection, injected 114 models, and forwarded subsequent Codex requests to `https://api.sublyx.org/v1/responses`. No source changes were needed from this verification pass.
+- **Evidence:** Current startup segment contained **0 errors**, **2 expected recovery warnings**, **1 takeover restoration**, **1 model-menu injection**, and **245 proxy request records** through the inspected runtime. `pnpm typecheck` passed; `cargo check --manifest-path src-tauri/Cargo.toml --lib` passed; Codex Desktop tests passed **49/49**; proxy-service tests passed **94/94**; focused proxy UI/hook tests passed **7/7**. The capture helper could not capture the Tauri window because it was hidden to tray; no foreground or disruptive UI action was used.
+- **What NOT to do again:** Do not treat the `UncleanExit` recovery warning or the historical September 19 port-owner refusal as evidence that the September 21 startup failed; distinguish historical failures from the current process generation and verify parent/child ownership before making runtime claims.
+
 ## 2026-09-20 - Accept the current Codex summary turn envelope without weakening action rejection
 
 - **What happened:** A live disposable-task acceptance on Codex app-server `0.155.1` reached and completed the manual summary turn, but CCSwitch rejected it as `Manual summary turn used a forbidden action item: userMessage` before creating the fresh root.
