@@ -80,6 +80,12 @@ export function UsageTrendChart({
       refetchInterval: refreshIntervalMs > 0 ? refreshIntervalMs : false,
     },
   );
+  const language = i18n.resolvedLanguage || i18n.language || "en";
+  const dateLocale = getLocaleFromLanguage(language);
+  const tokenTickFormatter = useMemo(
+    () => createUsageTrendTokenTickFormatter(dateLocale),
+    [dateLocale],
+  );
 
   if (isLoading) {
     return (
@@ -91,12 +97,6 @@ export function UsageTrendChart({
 
   const durationSeconds = Math.max(endDate - startDate, 0);
   const isHourly = durationSeconds <= 24 * 60 * 60;
-  const language = i18n.resolvedLanguage || i18n.language || "en";
-  const dateLocale = getLocaleFromLanguage(language);
-  const tokenTickFormatter = useMemo(
-    () => createUsageTrendTokenTickFormatter(dateLocale),
-    [dateLocale],
-  );
   const chartData =
     trends?.map((stat) => {
       const pointDate = new Date(stat.date);

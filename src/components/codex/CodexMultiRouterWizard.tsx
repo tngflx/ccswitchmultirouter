@@ -129,12 +129,7 @@ interface WizardIssue {
 }
 
 type ModelFetchCardStatus =
-  | "idle"
-  | "loading"
-  | "updated"
-  | "unchanged"
-  | "skipped"
-  | "error";
+  "idle" | "loading" | "updated" | "unchanged" | "skipped" | "error";
 
 interface ModelFetchDiff {
   added: string[];
@@ -1802,6 +1797,7 @@ export function CodexMultiRouterWizard({
             planId: activePlan?.id ?? createPlanIdRef.current ?? undefined,
             planName: draftPlanName,
             catalogModelOrder: activeCatalogModelOrder,
+            clearModelOrder: catalogModelOrder === null,
             spawnAgentModels: activeSpawnAgentModels,
             officialAuth: draftOfficialAuth,
             hostedTools: {
@@ -1897,6 +1893,7 @@ export function CodexMultiRouterWizard({
       planId: activePlan?.id ?? createPlanIdRef.current ?? undefined,
       planName: draftPlanName,
       catalogModelOrder: activeCatalogModelOrder,
+      clearModelOrder: catalogModelOrder === null,
       spawnAgentModels: activeSpawnAgentModels,
       officialAuth: draftOfficialAuth,
     },

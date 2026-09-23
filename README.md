@@ -352,7 +352,7 @@ backend to stay fixed for an entire session. Local dev and test profiles disable
 Rust incremental state and debug symbols because this crate can otherwise
 produce multi-gigabyte cache generations on Windows. Before starting Tauri,
 the dev launcher runs a guarded `cargo clean` only when the normal target
-directory exceeds 12 GB and no matching Cargo, rustc, or app process is active.
+directory exceeds 5 GB and no matching Cargo, rustc, or app process is active.
 Set `CCSM_CARGO_TARGET_MAX_GB=0` to disable automatic cleanup, or run
 `pnpm clean:rust-cache` manually while the development app is stopped.
 

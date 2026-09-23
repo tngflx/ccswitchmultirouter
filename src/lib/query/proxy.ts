@@ -15,6 +15,9 @@ export const proxyKeys = {
   appConfig: (appType: string) => ["appProxyConfig", appType] as const,
 };
 
+export const proxyStatusPollInterval = (running: boolean | undefined) =>
+  running ? 2000 : 5000;
+
 // ========== 代理服务器状态 Hooks ==========
 
 /**
@@ -24,8 +27,10 @@ export function useProxyStatusQuery() {
   return useQuery({
     queryKey: proxyKeys.status,
     queryFn: () => proxyApi.getProxyStatus(),
-    // 仅在服务运行时轮询
-    refetchInterval: (query) => (query.state.data?.running ? 2000 : false),
+    // Startup recovery or another window can start the listener after a
+    // stopped result; keep polling so the shared status cache can recover.
+    refetchInterval: (query) =>
+      proxyStatusPollInterval(query.state.data?.running),
     // 保持之前的数据，避免闪烁
     placeholderData: (previousData) => previousData,
   });
@@ -60,6 +65,10 @@ export function useSetProxyTakeoverForApp() {
     mutationFn: ({ appType, enabled }: { appType: string; enabled: boolean }) =>
       proxyApi.setProxyTakeoverForApp(appType, enabled),
     onSuccess: () => {
+      // Toggling the first/last app takeover also starts/stops the listener.
+      // Refresh both queries so settings-panel status cannot lag behind the
+      // backend transition.
+      queryClient.invalidateQueries({ queryKey: proxyKeys.status });
       queryClient.invalidateQueries({ queryKey: proxyKeys.takeoverStatus });
     },
   });

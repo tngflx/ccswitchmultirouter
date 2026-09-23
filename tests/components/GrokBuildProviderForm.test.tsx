@@ -124,7 +124,9 @@ describe("GrokBuildProviderForm", () => {
 
     await user.click(screen.getByRole("button", { name: /展开全部/ }));
     await user.click(screen.getByRole("button", { name: /APIKEY\.FUN/ }));
-    await user.type(screen.getByLabelText("API Key"), "secret-key");
+    fireEvent.change(screen.getByLabelText("API Key"), {
+      target: { value: "secret-key" },
+    });
     await user.click(screen.getByRole("button", { name: "Save" }));
 
     expect(onSubmit).toHaveBeenCalledTimes(1);

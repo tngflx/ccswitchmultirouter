@@ -55,6 +55,7 @@ export interface WizardPlanBuildOptions {
   planId?: string;
   planName?: string;
   catalogModelOrder?: string[];
+  clearModelOrder?: boolean;
   spawnAgentModels?: string[];
   subagentVersion?: CodexSubagentVersion;
   officialAuth?: CodexOfficialAuthConfig;
@@ -1322,6 +1323,62 @@ export function initialWizardCatalogModelOrder(
       : null;
   }
 
+  const collisionResolvedSources = resolveWizardModelNameCollisions(
+    sourceProviders,
+    routing.routes ?? [],
+  );
+  const enabledRouteIds = new Set(
+    (routing.routes ?? [])
+      .filter((route) => route.enabled !== false)
+      .map((route) => route.targetProviderId),
+  );
+  const catalogSources =
+    enabledRouteIds.size > 0
+      ? collisionResolvedSources.filter((provider) =>
+          enabledRouteIds.has(provider.id),
+        )
+      : collisionResolvedSources;
+  const availableModels = catalogSources.flatMap((provider) =>
+    readWizardModelCatalog(provider)
+      .filter(isWizardModelEnabled)
+      .map((model) => model.model),
+  );
+  const availableByIdentity = new Map<string, string>();
+  for (const provider of catalogSources) {
+    for (const model of readWizardModelCatalog(provider).filter(
+      isWizardModelEnabled,
+    )) {
+      for (const identity of wizardModelIdentities(model)) {
+        const key = normalizedWizardModelId(identity);
+        if (key && !availableByIdentity.has(key)) {
+          availableByIdentity.set(key, model.model);
+        }
+      }
+    }
+  }
+  if (Array.isArray(routing.modelOrder)) {
+    const retained: string[] = [];
+    const retainedSet = new Set<string>();
+    for (const savedModel of routing.modelOrder) {
+      const visibleModel = availableByIdentity.get(
+        normalizedWizardModelId(savedModel),
+      );
+      if (
+        visibleModel &&
+        !retainedSet.has(normalizedWizardModelId(visibleModel))
+      ) {
+        retained.push(visibleModel);
+        retainedSet.add(normalizedWizardModelId(visibleModel));
+      }
+    }
+    return [
+      ...retained,
+      ...availableModels.filter(
+        (model) => !retainedSet.has(normalizedWizardModelId(model)),
+      ),
+    ];
+  }
+
   const enabledRoutes = (routing.routes ?? []).filter(
     (route) => route.enabled !== false,
   );
@@ -1332,10 +1389,7 @@ export function initialWizardCatalogModelOrder(
     return null;
   }
 
-  const sources = resolveWizardModelNameCollisions(
-    sourceProviders,
-    routing.routes ?? [],
-  );
+  const sources = collisionResolvedSources;
   const sourceById = new Map(
     sources.map((provider) => [provider.id, provider]),
   );
@@ -1400,7 +1454,10 @@ function buildSubagentNameRedirector(
   }
 
   const identityToNewVisible = new Map<string, string>();
-  const refreshedSources = resolveWizardModelNameCollisions(resolvedSources, []);
+  const refreshedSources = resolveWizardModelNameCollisions(
+    resolvedSources,
+    [],
+  );
   for (const source of refreshedSources) {
     for (const model of readWizardModelCatalog(source)) {
       const upstream = (
@@ -1607,6 +1664,13 @@ export function buildCodexMultiRouterWizardPlan(
       ),
     routes,
   };
+  if (options.catalogModelOrder !== undefined) {
+    routing.modelOrder = options.catalogModelOrder
+      .map((model) => model.trim())
+      .filter(Boolean);
+  } else if (options.clearModelOrder) {
+    delete routing.modelOrder;
+  }
   const existingIds = new Set(allProviders.map((provider) => provider.id));
   const planId =
     existingPlan?.id ??

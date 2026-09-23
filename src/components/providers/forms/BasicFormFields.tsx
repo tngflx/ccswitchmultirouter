@@ -151,6 +151,7 @@ export function BasicFormFields({
               <FormControl>
                 <Input
                   {...field}
+                  value={field.value ?? ""}
                   placeholder={t("provider.notesPlaceholder")}
                 />
               </FormControl>

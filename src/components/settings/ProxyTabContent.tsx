@@ -18,6 +18,8 @@ import { GlobalProxySettings } from "@/components/settings/GlobalProxySettings";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { ToggleRow } from "@/components/ui/toggle-row";
 import { useProxyStatus } from "@/hooks/useProxyStatus";
+import { proxyApi } from "@/lib/api/proxy";
+import { toast } from "sonner";
 import type { SettingsFormState } from "@/hooks/useSettings";
 
 interface ProxyTabContentProps {
@@ -45,8 +47,44 @@ export function ProxyTabContent({
     takeoverStatus,
     startProxyServer,
     stopWithRestore,
+    restartCodexDesktop,
+    setTakeoverForApp,
     isPending: isProxyPending,
   } = useProxyStatus();
+
+  const handleTakeoverChange = async (appType: string, enabled: boolean) => {
+    if (appType === "codex") {
+      let running: boolean;
+      try {
+        running = await proxyApi.isCodexDesktopRunning();
+      } catch (error) {
+        toast.error(
+          t("proxy.takeover.processCheckFailed", {
+            detail: String(error),
+            defaultValue: `Could not inspect the running Codex Desktop process: ${String(error)}`,
+          }),
+        );
+        return false;
+      }
+      if (running) {
+        const confirmed = window.confirm(
+          t("proxy.takeover.restartCodexConfirm", {
+            defaultValue:
+              "Codex Desktop is running. Restart it now so the takeover change can apply? Unsaved Codex work may be interrupted.",
+          }),
+        );
+        if (!confirmed) return false;
+        await restartCodexDesktop(enabled);
+        return true;
+      }
+    }
+
+    // The hook owns mutation, error handling, and cache invalidation for the
+    // ordinary path. Keeping this branch here makes the panel and header use
+    // the same Codex restart contract without duplicating mutation state.
+    await setTakeoverForApp({ appType, enabled });
+    return true;
+  };
 
   const handleToggleProxy = async (checked: boolean) => {
     try {
@@ -134,6 +172,7 @@ export function ProxyTabContent({
               }
               onToggleProxy={handleToggleProxy}
               isProxyPending={isProxyPending}
+              onTakeoverChange={handleTakeoverChange}
             />
           </AccordionContent>
         </AccordionItem>

@@ -1,5 +1,45 @@
 # Engineering Journal (newest first)
 
+## 2026-09-23 - Background UIA audit found Usage Statistics hook crash
+
+- **What happened:** A page-by-page audit of the minimized live app was completed without foregrounding it. Settings General/Routing/Auth/Advanced/Usage Statistics, Skills, Prompts, Session Manager, and MCP Management were inspected through the WebView2 accessibility tree.
+- **Root cause:** `UsageTrendChart` called `useMemo` after its `isLoading` early return, so loading and loaded renders used different hook counts and triggered React's "Rendered more hooks than during the previous render" boundary.
+- **What we did:** Moved the locale formatter `useMemo` above the conditional return and documented the minimized-window UI Automation procedure in `AGENTS.md` rules 22-E/22-F.
+- **Evidence:** UI Automation on minimized `CCSwitchMulti` window handle `788824` showed the crash before the edit and the full Usage Statistics dashboard after hot reload; `tests/components/UsageTrendChart.test.tsx` passed 3/3 and `pnpm typecheck` passed.
+- **What NOT to do again:** Never place hooks below loading/error returns; exercise both loading and loaded states when auditing chart/dashboard components.
+
+## 2026-09-23 - Persist MultiRouter wizard model ordering
+
+- **What happened:** The MultiRouter setup wizard displayed controls for keeping and reordering models, but an explicit order was only used to filter/rebuild source catalogs; it was not written to the router's global `codexRouting.modelOrder` field used by the picker compiler.
+- **Root cause:** Wizard model-selection state and the compiler's global ordering field had separate contracts. Reopening the wizard also ignored an existing saved `modelOrder`, so the UI could silently show provider order instead.
+- **What we did:** The wizard plan builder now writes explicit `modelOrder`, clears a prior custom order when the user chooses automatic provider-follow mode, and rehydrates saved order on open while retaining valid renamed identities and appending newly available models. Added focused regression tests.
+- **Evidence:** `src/lib/codexMultiRouterWizard.test.ts` passed 11/11 (the test runner also discovered an existing duplicate worktree copy, 8/8); `pnpm typecheck` passed; Prettier check and `git diff --check` passed.
+- **What NOT to do again:** Do not add a model reorder control without asserting the persisted router field and reopen behavior; source-catalog order and picker order are distinct state.
+
+## 2026-09-23 - Raise guarded Cargo target cleanup threshold
+
+- **What happened:** Development startup could run a full `cargo clean` while the normal Cargo target was still a manageable size, forcing the next backend build to start from scratch.
+- **Root cause:** The guarded cleanup default was 4 GiB, while the target contains multiple debug/test artifact generations and cleanup invalidates all of them.
+- **What we did:** Raised the default automatic cleanup threshold to 5 GiB and aligned the regression test and README. The existing owner checks, `--dry-run`, `--force`, and `CCSM_CARGO_TARGET_MAX_GB` override remain unchanged. Reference review found no equivalent threshold in `farion1231/cc-switch`; `BigStrongSun/ccswitchmulti` uses a separate historical-target cleanup design.
+- **Evidence:** Targeted `node --test scripts/prune-cargo-target.node-test.mjs` passed after the edit; `git diff --check` passed.
+- **What NOT to do again:** Do not lower the default without measuring target growth and confirming that a full clean is worth the rebuild cost; use `CCSM_CARGO_TARGET_MAX_GB` for machine-specific limits.
+
+## 2026-09-23 - Keep proxy status fresh after startup recovery
+
+- **What happened:** The live MultiRouter status page reported "Not started" while `127.0.0.1:15721` was listening under the CCSwitch process and requests were forwarding through it.
+- **Root cause:** The shared proxy-status query stopped polling whenever its cached result said the listener was stopped; startup recovery could start the listener outside that query's mutation path.
+- **What we did:** Poll stopped status every five seconds (running status remains every two seconds), and prevent a declined Codex restart in Settings from producing a takeover success toast. Both reference branches retained the stopped-state polling gap; no upstream commit was cherry-picked.
+- **Evidence:** Live `PrintWindow` capture showed "Not started"; `Get-NetTCPConnection -LocalPort 15721 -State Listen` showed PID 44400; the log recorded startup recovery and successful forwards. Focused Vitest passed 13/13; Prettier check and `git diff --check` passed. Rebuilt-app verification is pending.
+- **What NOT to do again:** Do not make status refresh depend exclusively on the last cached status when another lifecycle path can start the listener.
+
+## 2026-09-23 - Route Settings-panel takeover through Codex restart lifecycle
+
+- **What happened:** The header takeover switch handled running Codex Desktop safely, but the Settings-panel app takeover switches called the raw takeover mutation and could rewrite live config without restarting the running desktop shell.
+- **Root cause:** `ProxyPanel` had its own mutation path while `ProxyToggle` used the lifecycle-aware `restart_codex_desktop` command.
+- **What we did:** Made the Settings panel receive the shared takeover callback, added the Codex process check and confirmation/restart path there, and refreshed proxy status as well as takeover status after ordinary takeover mutations.
+- **Evidence:** Focused Vitest verification passed **15/15**; `pnpm typecheck` passed; `git diff --check` passed. The targeted Cargo integration test could not finish because two running `cc-switch.exe` processes held `src-tauri/target/debug/cc-switch.exe` (`Access is denied`).
+- **What NOT to do again:** Do not maintain separate Codex takeover mutation paths in the header and Settings panel; they must share the same process/restart contract.
+
 ## 2026-09-22 - Preserve maintained reasoning fallback during MultiRouter catalog projection
 
 - **What happened:** The live MultiRouter wizard stopped at Step 4 with `Codex subagent V2 configuration is incomplete (unknown_reasoning_capability_requires_declaration)` while two enabled profiles were `deepseek-v4-flash` and `deepseek-v4-pro`.

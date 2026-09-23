@@ -20,6 +20,79 @@ const deepseekSource: Provider = {
 };
 
 describe("buildCodexMultiRouterWizardPlan subagent version", () => {
+  it("persists an explicit wizard model order in the router document", () => {
+    const { plan } = buildCodexMultiRouterWizardPlan(
+      [deepseekSource],
+      [deepseekSource],
+      null,
+      { catalogModelOrder: ["deepseek-v4-pro", "deepseek-v4-flash"] },
+    );
+
+    expect(plan.settingsConfig.codexRouting.modelOrder).toEqual([
+      "deepseek-v4-pro",
+      "deepseek-v4-flash",
+    ]);
+  });
+
+  it("rehydrates saved order and appends newly available models", () => {
+    const source = {
+      ...deepseekSource,
+      settingsConfig: {
+        ...deepseekSource.settingsConfig,
+        modelCatalog: {
+          models: [
+            { model: "deepseek-v4-flash" },
+            { model: "deepseek-v4-pro" },
+            { model: "deepseek-v4-vision" },
+          ],
+        },
+      },
+    };
+    const existingPlan: Provider = {
+      id: "router-v2",
+      name: "Router V2",
+      category: "custom",
+      settingsConfig: {
+        codexRouting: {
+          schemaVersion: 2,
+          enabled: true,
+          modelOrder: ["deepseek-v4-pro", "removed-model"],
+          routes: [],
+        },
+      },
+    };
+
+    expect(initialWizardCatalogModelOrder(existingPlan, [source])).toEqual([
+      "deepseek-v4-pro",
+      "deepseek-v4-flash",
+      "deepseek-v4-vision",
+    ]);
+  });
+
+  it("clears a prior custom order when wizard follows provider order", () => {
+    const existingPlan: Provider = {
+      id: "router-v2",
+      name: "Router V2",
+      category: "custom",
+      settingsConfig: {
+        codexRouting: {
+          schemaVersion: 2,
+          enabled: true,
+          modelOrder: ["deepseek-v4-pro", "deepseek-v4-flash"],
+          routes: [],
+        },
+      },
+    };
+    const { plan } = buildCodexMultiRouterWizardPlan(
+      [deepseekSource, existingPlan],
+      [deepseekSource],
+      existingPlan,
+      { clearModelOrder: true },
+    );
+
+    expect(plan.settingsConfig.codexRouting).not.toHaveProperty("modelOrder");
+  });
+
   it("initializes an existing schema-v2 plan from its route Provider ids", () => {
     const unusedSource: Provider = {
       ...deepseekSource,

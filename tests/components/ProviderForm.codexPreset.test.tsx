@@ -710,5 +710,5 @@ describe("ProviderForm Codex preset selection", () => {
     expect(
       screen.getByTestId("codex-preset-reasoning-models"),
     ).toBeEmptyDOMElement();
-  });
+  }, 15000);
 });

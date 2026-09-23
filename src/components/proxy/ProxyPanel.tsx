@@ -23,20 +23,19 @@ import { useProviderHealth } from "@/lib/query/failover";
 import {
   useProxyStatusQuery,
   useProxyTakeoverStatus,
-  useSetProxyTakeoverForApp,
   useGlobalProxyConfig,
   useUpdateGlobalProxyConfig,
 } from "@/lib/query/proxy";
 import type { ProxyStatus } from "@/types/proxy";
 import { useTranslation } from "react-i18next";
 import { AnimatePresence, motion } from "framer-motion";
-import { extractErrorMessage } from "@/utils/errorUtils";
 
 interface ProxyPanelProps {
   enableLocalProxy: boolean;
   onEnableLocalProxyChange: (checked: boolean) => void;
   onToggleProxy: (checked: boolean) => Promise<void>;
   isProxyPending: boolean;
+  onTakeoverChange: (appType: string, enabled: boolean) => Promise<boolean>;
 }
 
 export function ProxyPanel({
@@ -44,6 +43,7 @@ export function ProxyPanel({
   onEnableLocalProxyChange,
   onToggleProxy,
   isProxyPending,
+  onTakeoverChange,
 }: ProxyPanelProps) {
   const { t } = useTranslation();
   const { data: status } = useProxyStatusQuery();
@@ -51,7 +51,6 @@ export function ProxyPanel({
 
   // 获取应用接管状态
   const { data: takeoverStatus } = useProxyTakeoverStatus();
-  const setTakeoverForApp = useSetProxyTakeoverForApp();
 
   // 获取全局代理配置
   const { data: globalConfig } = useGlobalProxyConfig();
@@ -78,29 +77,10 @@ export function ProxyPanel({
 
   const handleTakeoverChange = async (appType: string, enabled: boolean) => {
     try {
-      await setTakeoverForApp.mutateAsync({ appType, enabled });
-      toast.success(
-        enabled
-          ? t("proxy.takeover.enabled", {
-              app: appType,
-              defaultValue: `${appType} 接管已启用`,
-            })
-          : t("proxy.takeover.disabled", {
-              app: appType,
-              defaultValue: `${appType} 接管已关闭`,
-            }),
-        { closeButton: true },
-      );
+      await onTakeoverChange(appType, enabled);
     } catch (error) {
-      const detail =
-        extractErrorMessage(error) ||
-        t("common.unknown", { defaultValue: "未知错误" });
-      toast.error(
-        t("proxy.takeover.failed", {
-          detail,
-          defaultValue: "切换接管状态失败",
-        }),
-      );
+      // useProxyStatus owns mutation errors and their user-facing toast.
+      console.error("[ProxyPanel] Toggle takeover failed:", error);
     }
   };
 
@@ -295,7 +275,7 @@ export function ProxyPanel({
                             onCheckedChange={(checked) =>
                               handleTakeoverChange(appType, checked)
                             }
-                            disabled={setTakeoverForApp.isPending}
+                            disabled={isProxyPending}
                           />
                         </div>
                       );

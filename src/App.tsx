@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState, useRef } from "react";
+import { useEffect, useLayoutEffect, useMemo, useState, useRef } from "react";
 import { useTranslation } from "react-i18next";
 import { motion, AnimatePresence } from "framer-motion";
 import { toast } from "sonner";
@@ -283,9 +283,24 @@ function App() {
   }, [t]);
 
   const [activeApp, setActiveApp] = useState<AppId>(getInitialApp);
+  const mainScrollRef = useRef<HTMLElement>(null);
+  const providerScrollContainerRef = useRef<HTMLDivElement>(null);
   const sharedFeatureApp: AppId =
     activeApp === "claude-desktop" ? "claude" : activeApp;
   const [currentView, setCurrentView] = useState<View>(getInitialView);
+  useLayoutEffect(() => {
+    if (currentView !== "providers") return;
+
+    for (const container of [
+      mainScrollRef.current,
+      providerScrollContainerRef.current,
+    ]) {
+      if (container) {
+        container.scrollTop = 0;
+        container.scrollLeft = 0;
+      }
+    }
+  }, [activeApp, currentView]);
   const [skillsDiscoverySource, setSkillsDiscoverySource] =
     useState<SkillsPageSource>("repos");
   const [settingsDefaultTab, setSettingsDefaultTab] = useState("general");
@@ -891,6 +906,10 @@ function App() {
         await queryClient.invalidateQueries({
           queryKey: hermesKeys.liveProviderIds,
         });
+      } else if (activeApp === "mcode") {
+        await queryClient.invalidateQueries({
+          queryKey: ["providers", "mcode"],
+        });
       }
       toast.success(
         t("notifications.removeFromConfigSuccess", {
@@ -1331,7 +1350,10 @@ function App() {
         default:
           return (
             <div className="px-6 flex flex-col flex-1 min-h-0 overflow-hidden">
-              <div className="flex-1 overflow-y-auto overflow-x-hidden pb-12 px-1">
+              <div
+                ref={providerScrollContainerRef}
+                className="flex-1 overflow-y-auto overflow-x-hidden pb-12 px-1"
+              >
                 <AnimatePresence mode="wait">
                   <motion.div
                     key={activeApp}
@@ -1410,7 +1432,7 @@ function App() {
       <AnimatePresence mode="wait">
         <motion.div
           key={currentView}
-          className="flex-1 min-h-0"
+          className="flex flex-1 min-h-0 flex-col"
           initial={{ opacity: 0 }}
           animate={{ opacity: 1 }}
           exit={{ opacity: 0 }}
@@ -2019,6 +2041,7 @@ function App() {
       </header>
 
       <main
+        ref={mainScrollRef}
         className={cn(
           "flex-1 min-h-0 flex flex-col animate-fade-in",
           currentView === "sessions" ? "overflow-hidden" : "overflow-y-auto",
