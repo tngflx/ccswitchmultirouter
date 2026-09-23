@@ -2078,6 +2078,24 @@ fn codex_catalog_model_specs(settings: &Value, config_text: &str) -> Vec<CodexCa
                     .and_then(|upstream| configured_reasoning.get(&upstream.to_ascii_lowercase()))
                     .cloned()
             });
+        // Provider catalogs created before reasoning metadata was persisted do not
+        // carry a `reasoning` object.  Keep the maintained exact-model fallback
+        // in the catalog projection too, otherwise V2 profiles for DeepSeek V4
+        // become "unknown" at save time even though the runtime adapter knows the
+        // model's capability.
+        let reasoning = reasoning
+            .or_else(|| {
+                crate::proxy::providers::codex_reasoning::builtin_reasoning_capability_for_model(
+                    model,
+                )
+            })
+            .or_else(|| {
+                upstream_model.as_deref().and_then(|upstream| {
+                    crate::proxy::providers::codex_reasoning::builtin_reasoning_capability_for_model(
+                        upstream,
+                    )
+                })
+            });
         let reasoning_fingerprint = resolved.fingerprint;
         let reasoning_source = resolved.source.as_str().to_string();
 
@@ -15857,6 +15875,10 @@ model_provider = "codex_model_router_v2"
         assert_eq!(specs.len(), 1);
         assert_eq!(specs[0].model, "deepseek-v4-flash");
         assert!(specs[0].text_only);
+        assert!(
+            specs[0].reasoning.is_some(),
+            "maintained DeepSeek capability fallback must survive catalog projection"
+        );
 
         let catalog = codex_model_catalog_from_specs(
             &specs,

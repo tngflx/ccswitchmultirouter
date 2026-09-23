@@ -1,5 +1,13 @@
 # Engineering Journal (newest first)
 
+## 2026-09-22 - Preserve maintained reasoning fallback during MultiRouter catalog projection
+
+- **What happened:** The live MultiRouter wizard stopped at Step 4 with `Codex subagent V2 configuration is incomplete (unknown_reasoning_capability_requires_declaration)` while two enabled profiles were `deepseek-v4-flash` and `deepseek-v4-pro`.
+- **Root cause:** Existing provider catalog rows had no persisted `reasoning` metadata. Runtime reasoning code knew exact DeepSeek V4 capabilities through the maintained builtin fallback, but `codex_catalog_model_specs` only consulted the shared resolver and provider-config declarations. The projected specs therefore marked those routable models as unknown and the save validator rejected the wizard payload.
+- **What we did:** Added the exact-model maintained builtin reasoning fallback (including `upstreamModel`) to catalog projection, after explicit/shared/provider-config metadata so declared capabilities remain authoritative. Added a regression assertion for a metadata-less `deepseek-v4-flash` catalog row.
+- **Evidence:** `cargo test --manifest-path src-tauri/Cargo.toml --lib codex_catalog_text_only_capabilities_override_hardcoded_name` passed **1/1**; `cargo check --manifest-path src-tauri/Cargo.toml --lib` passed; `pnpm typecheck` passed. Live logs showed the save rejection at 23:09:41 on September 22, 2026. Existing request logs showed upstream 200 responses, so this wizard failure was validation/configuration rather than proxy transport.
+- **What NOT to do again:** Do not make the user manually declare capabilities for exact models already covered by the maintained builtin resolver, and do not weaken the save validator; fix the catalog projection that feeds it.
+
 ## 2026-09-21 - Complete port-ownership retry fix and live capture verification
 
 - **What happened:** The user reopened CCSwitch and requested completion of the remaining fix plus live verification.
