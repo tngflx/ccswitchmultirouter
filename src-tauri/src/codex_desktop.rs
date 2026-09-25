@@ -423,7 +423,6 @@ fn codex_desktop_executable_not_found_message() -> String {
 pub(crate) fn load_cc_switch_model_catalog_projection(
 ) -> Result<CodexModelCatalogProjection, String> {
     let catalog_path = crate::codex_config::get_codex_model_catalog_path();
-    let default_model = read_current_codex_default_model();
     let mut candidates = Vec::new();
 
     if let Ok(catalog) = crate::config::read_json_file::<Value>(&catalog_path) {
@@ -442,8 +441,7 @@ pub(crate) fn load_cc_switch_model_catalog_projection(
     }
 
     if let Some(merged) = merge_codex_model_catalog_values(&candidates) {
-        if let Some(projection) = codex_model_catalog_projection_from_value(&merged, default_model)
-        {
+        if let Some(projection) = codex_model_catalog_projection_from_value(&merged) {
             return Ok(projection);
         }
     }
@@ -518,14 +516,16 @@ fn merge_codex_model_catalog_values(candidates: &[Value]) -> Option<Value> {
 /// 从单个目录值构造 renderer 投影；空目录返回 `None` 以便调用方继续尝试回退源。
 fn codex_model_catalog_projection_from_value(
     catalog: &Value,
-    default_model: Option<String>,
 ) -> Option<CodexModelCatalogProjection> {
     let (model_names, models) = codex_model_entries_from_catalog_value(catalog);
     if model_names.is_empty() {
         return None;
     }
     Some(CodexModelCatalogProjection {
-        default_model: default_model.or_else(|| model_names.first().cloned()),
+        // The catalog order is the provider's intentional picker order. The live
+        // config may contain an old model and must not reintroduce it ahead of the
+        // first routed model.
+        default_model: model_names.first().cloned(),
         model_names,
         models,
     })
@@ -820,18 +820,6 @@ fn strip_provider_prefix<'a>(
                 .map(|_| display_name[prefix.len()..].trim_start())
         })
         .unwrap_or(display_name)
-}
-
-/// 读取当前 Codex 默认模型，用于 renderer 动态配置的 default_model。
-fn read_current_codex_default_model() -> Option<String> {
-    let text = crate::codex_config::read_codex_config_text().ok()?;
-    let parsed = text.parse::<toml::Value>().ok()?;
-    parsed
-        .get("model")
-        .and_then(toml::Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToString::to_string)
 }
 
 /// 在候选 CDP 端口中寻找 Codex renderer 并安装模型白名单补丁。
@@ -1964,6 +1952,27 @@ pub(crate) fn terminate_running_codex_desktop_processes(
             ));
         }
     }
+
+    // taskkill returns after requesting termination, while WebView2 children
+    // may still be unwinding.  Relaunching before they disappear creates a
+    // second Desktop shell and can leave the old shell owning the CDP/runtime
+    // state.  Require the verified process set to be gone before returning.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let remaining = list_running_codex_desktop_process_ids()?
+            .into_iter()
+            .filter(|pid| verified.contains(pid))
+            .collect::<Vec<_>>();
+        if remaining.is_empty() {
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(format!(
+                "Codex Desktop processes did not exit after taskkill: {remaining:?}"
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
     Ok(verified.len() as u32)
 }
 
@@ -2786,6 +2795,47 @@ fn version_tuple_from_package_name(name: &str) -> Vec<u32> {
         .unwrap_or_default()
 }
 
+/// Detect the installed Codex Desktop package version for config projection.
+/// Unknown versions intentionally return `None`; callers must preserve the
+/// legacy projection behavior when detection is unavailable.
+#[cfg(target_os = "windows")]
+pub(crate) fn installed_codex_desktop_version() -> Option<Vec<u32>> {
+    let mut candidates = Vec::new();
+    collect_windowsapps_codex_executable_candidates(&mut candidates);
+    if let Some(version) = candidates
+        .iter()
+        .filter(|(version, _)| !version.is_empty())
+        .map(|(version, _)| version.clone())
+        .max()
+    {
+        return Some(version);
+    }
+    let mut appx_candidates = Vec::new();
+    collect_appx_codex_executable_candidates(&mut appx_candidates);
+    appx_candidates
+        .iter()
+        .filter(|(version, _)| !version.is_empty())
+        .map(|(version, _)| version.clone())
+        .max()
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn installed_codex_desktop_version() -> Option<Vec<u32>> {
+    macos_codex_common_bundle_candidates()
+        .iter()
+        .find_map(|bundle| {
+            macos_bundle_info_value(bundle, "CFBundleShortVersionString").and_then(|version| {
+                let version = version_tuple_from_text(&version);
+                (!version.is_empty()).then_some(version)
+            })
+        })
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+pub(crate) fn installed_codex_desktop_version() -> Option<Vec<u32>> {
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3027,7 +3077,7 @@ mod tests {
     fn catalog_projection_skips_empty_source_and_accepts_fallback_source() {
         let empty = json!({ "models": [] });
         assert!(
-            codex_model_catalog_projection_from_value(&empty, None).is_none(),
+            codex_model_catalog_projection_from_value(&empty).is_none(),
             "empty primary catalog must not freeze an empty renderer payload"
         );
 
@@ -3037,15 +3087,33 @@ mod tests {
                 { "model": "qwen3.6", "display_name": "Qwen3.6 Local" }
             ]
         });
-        let projection =
-            codex_model_catalog_projection_from_value(&fallback, Some("qwen3.6".to_string()))
-                .expect("fallback catalog projection");
+        let projection = codex_model_catalog_projection_from_value(&fallback)
+            .expect("fallback catalog projection");
 
         assert_eq!(
             projection.model_names,
             vec!["gpt-5.6-sol".to_string(), "qwen3.6".to_string()]
         );
-        assert_eq!(projection.default_model.as_deref(), Some("qwen3.6"));
+        assert_eq!(projection.default_model.as_deref(), Some("gpt-5.6-sol"));
+    }
+
+    #[test]
+    fn catalog_projection_uses_first_catalog_model_over_live_default() {
+        let catalog = json!({
+            "models": [
+                {"model": "first-provider-model"},
+                {"model": "second-provider-model"}
+            ]
+        });
+
+        let projection = codex_model_catalog_projection_from_value(&catalog)
+            .expect("catalog projection");
+
+        assert_eq!(projection.model_names[0], "first-provider-model");
+        assert_eq!(
+            projection.default_model.as_deref(),
+            Some("first-provider-model")
+        );
     }
 
     #[test]

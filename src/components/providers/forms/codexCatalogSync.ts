@@ -27,6 +27,7 @@ export interface CatalogSyncResult<T extends CodexCatalogRowLike> {
   rows: T[];
   added: number;
   hydrated: number;
+  updated: string[];
   removed: number;
 }
 
@@ -41,14 +42,6 @@ function nonEmptyString(value: unknown): string {
   return typeof value === "string" ? value.trim() : "";
 }
 
-function rowUpstreamModel(row: CodexCatalogRowLike): string {
-  return (
-    nonEmptyString(row.upstreamModel) ||
-    nonEmptyString(row.upstream_model) ||
-    nonEmptyString(row.model)
-  );
-}
-
 function rowExplicitUpstreamModel(row: CodexCatalogRowLike): string {
   return (
     nonEmptyString(row.upstreamModel) || nonEmptyString(row.upstream_model)
@@ -56,12 +49,9 @@ function rowExplicitUpstreamModel(row: CodexCatalogRowLike): string {
 }
 
 function rowIdentities(row: CodexCatalogRowLike): string[] {
-  const identities = new Set<string>();
-  const visibleModel = catalogModelIdentity(row.model);
-  const upstreamModel = catalogModelIdentity(rowUpstreamModel(row));
-  if (visibleModel) identities.add(visibleModel);
-  if (upstreamModel) identities.add(upstreamModel);
-  return [...identities];
+  const upstreamModel = catalogModelIdentity(rowExplicitUpstreamModel(row));
+  const identity = upstreamModel || catalogModelIdentity(row.model);
+  return identity ? [identity] : [];
 }
 
 function hasValue(value: unknown): boolean {
@@ -187,6 +177,7 @@ export function reconcileFetchedCodexCatalogRows<T extends CodexCatalogRowLike>(
 
   let hydrated = 0;
   let added = 0;
+  const updated: string[] = [];
 
   for (const fetched of fetchedModels) {
     const model = fetched.id.trim();
@@ -232,6 +223,7 @@ export function reconcileFetchedCodexCatalogRows<T extends CodexCatalogRowLike>(
       if (Object.keys(patch).length > 0) {
         next[existingIndex] = { ...row, ...patch };
         hydrated += 1;
+        updated.push(model);
       }
       continue;
     }
@@ -276,6 +268,7 @@ export function reconcileFetchedCodexCatalogRows<T extends CodexCatalogRowLike>(
     rows: authoritativeResult.rows,
     added,
     hydrated,
+    updated,
     removed: authoritativeResult.removed,
   };
 }

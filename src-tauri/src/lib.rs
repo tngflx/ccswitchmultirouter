@@ -11,6 +11,7 @@ mod codex_desktop;
 mod codex_guardian;
 pub mod codex_history_migration;
 pub mod codex_multirouter;
+pub mod codex_runtime_refresh;
 pub mod codex_session_coordination;
 mod codex_state_db;
 pub(crate) mod codex_subagent_profiles;
@@ -1592,8 +1593,8 @@ pub fn run() {
             commands::open_config_folder,
             commands::pick_directory,
             commands::open_external,
-            commands::inspect_codex_runtime_refresh,
-            commands::refresh_codex_runtime_state,
+            codex_runtime_refresh::inspect_codex_runtime_refresh,
+            codex_runtime_refresh::refresh_codex_runtime_state,
             commands::get_init_error,
             commands::get_pending_recovery_outcomes,
             commands::acknowledge_recovery_outcomes,

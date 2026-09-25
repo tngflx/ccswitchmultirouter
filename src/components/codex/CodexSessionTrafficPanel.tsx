@@ -86,8 +86,11 @@ export function CodexSessionTrafficPanel({
   collectionStatusError,
 }: Props) {
   const { t } = useTranslation();
-  const text = (key: string, defaultValue: string, options?: Record<string, unknown>) =>
-    t(`codexSessionTraffic.${key}`, { defaultValue, ...options });
+  const text = (
+    key: string,
+    defaultValue: string,
+    options?: Record<string, unknown>,
+  ) => t(`codexSessionTraffic.${key}`, { defaultValue, ...options });
   const [sort, setSort] = useState<SortKey>("tokens");
   const [filter, setFilter] = useState<Filter>("all");
   const [modelQuery, setModelQuery] = useState("");
@@ -159,7 +162,10 @@ export function CodexSessionTrafficPanel({
             {text("title", "{{range}}子 Agent 会话流量", { range: rangeLabel })}
           </h3>
           <p className="mt-1 text-sm leading-6 text-muted-foreground">
-            {text("scope", "只基于本地 Codex 会话索引与已同步的 codex_session 用量；请求统计与会话统计独立，不能相加。")}
+            {text(
+              "scope",
+              "只基于本地 Codex 会话索引与已同步的 codex_session 用量；请求统计与会话统计独立，不能相加。",
+            )}
           </p>
         </div>
         <Button
@@ -190,7 +196,8 @@ export function CodexSessionTrafficPanel({
       ) : null}
       {stats?.skippedReason ? (
         <div className="mt-3 rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800">
-          {text("skipped", "会话用量索引读取跳过：")}{stats.skippedReason}
+          {text("skipped", "会话用量索引读取跳过：")}
+          {stats.skippedReason}
         </div>
       ) : null}
       <div className="mt-3 grid gap-2 sm:grid-cols-3">

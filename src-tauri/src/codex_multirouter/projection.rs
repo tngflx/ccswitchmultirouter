@@ -379,7 +379,12 @@ pub(crate) fn effective_settings_for_candidate(
 
 fn projection_settings(router: &Provider, compiled: &CompiledCodexRoutingPlan) -> Value {
     let mut settings = router.settings_config.clone();
-    let models = projected_model_entries(compiled);
+    let has_router_order = router
+        .settings_config
+        .pointer("/codexRouting/modelOrder")
+        .and_then(Value::as_array)
+        .is_some_and(|order| !order.is_empty());
+    let models = projected_model_entries(compiled, has_router_order);
     let display_name_style = router
         .settings_config
         .pointer("/codexRouting/modelDisplayStyle")
@@ -414,29 +419,19 @@ pub(crate) fn apply_projection_owned_settings(target: &mut Value, projection: &V
     }
 }
 
-fn projected_model_entries(compiled: &CompiledCodexRoutingPlan) -> Vec<Value> {
-    let has_source_custom_order = compiled
-        .model_catalog
-        .iter()
-        .any(|model| model.sort_index.is_some());
-
-    let mut indexed = compiled
+fn projected_model_entries(
+    compiled: &CompiledCodexRoutingPlan,
+    has_router_order: bool,
+) -> Vec<Value> {
+    // The compiler applies the Router's global modelOrder before this point.
+    // Source-provider sortIndex is local to that provider and must not reorder
+    // models across routes in the shared Codex picker.
+    compiled
         .model_catalog
         .iter()
         .enumerate()
-        .collect::<Vec<_>>();
-    if has_source_custom_order {
-        indexed.sort_by_key(|(index, model)| (model.sort_index.unwrap_or(usize::MAX), *index));
-    } else {
-        // Without explicit indexes, compiled route/catalog order is the user's current order.
-        // Keep it intact; providers may be intentionally interleaved in the picker.
-    }
-
-    indexed
-        .into_iter()
-        .enumerate()
-        .map(|(sort_index, (_, model))| {
-            projected_model_entry(model, has_source_custom_order.then_some(sort_index))
+        .map(|(sort_index, model)| {
+            projected_model_entry(model, has_router_order.then_some(sort_index))
         })
         .collect()
 }
@@ -787,17 +782,11 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["qwen-a", "qwen-b"]
         );
-        assert_eq!(
-            models
-                .iter()
-                .map(|model| model["sortIndex"].as_u64().unwrap())
-                .collect::<Vec<_>>(),
-            vec![0, 1]
-        );
+        assert!(models.iter().all(|model| model.get("sortIndex").is_none()));
     }
 
     #[test]
-    fn projection_uses_source_sort_indexes_when_router_has_no_custom_order() {
+    fn projection_ignores_source_sort_indexes_when_router_has_no_custom_order() {
         let db = Database::memory().expect("memory db");
         let router = router();
         let target = Provider::with_id(
@@ -816,6 +805,40 @@ mod tests {
             .expect("save router without custom order");
         db.save_provider("codex", &target)
             .expect("save target with source order");
+
+        let artifact = build_projection_artifact(&db, "router").expect("projection artifact");
+        let models = artifact.projection_settings["modelCatalog"]["models"]
+            .as_array()
+            .expect("projected models");
+        assert_eq!(
+            models
+                .iter()
+                .map(|model| model["model"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            vec!["qwen-a", "qwen-b"]
+        );
+        assert!(models.iter().all(|model| model.get("sortIndex").is_none()));
+    }
+
+    #[test]
+    fn projection_uses_router_model_order_over_source_indexes() {
+        let db = Database::memory().expect("memory db");
+        let mut router = router();
+        router.settings_config["codexRouting"]["modelOrder"] = json!(["qwen-b", "qwen-a"]);
+        let target = Provider::with_id(
+            "qwen".to_string(),
+            "Qwen".to_string(),
+            json!({
+                "base_url": "https://qwen.example/v1",
+                "modelCatalog": {"models": [
+                    {"model": "qwen-a", "sortIndex": 0},
+                    {"model": "qwen-b", "sortIndex": 1}
+                ]}
+            }),
+            None,
+        );
+        db.save_provider("codex", &router).expect("save router");
+        db.save_provider("codex", &target).expect("save target");
 
         let artifact = build_projection_artifact(&db, "router").expect("projection artifact");
         let models = artifact.projection_settings["modelCatalog"]["models"]
@@ -1170,7 +1193,7 @@ mod tests {
             warnings: Vec::new(),
         };
 
-        let entries = projected_model_entries(&compiled);
+        let entries = projected_model_entries(&compiled, false);
         assert_eq!(
             entries
                 .iter()

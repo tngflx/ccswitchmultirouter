@@ -38,6 +38,7 @@ import {
 import type { CodexRoutingProjectionStatus } from "@/lib/api/providers";
 import { proxyApi } from "@/lib/api/proxy";
 import { settingsApi } from "@/lib/api/settings";
+import { toast } from "sonner";
 import type {
   CodexModelReasoningCapability,
   CodexRoutingRouteV2,
@@ -141,6 +142,14 @@ vi.mock("@/lib/api", () => ({
     getCodexMultiRouterRevision: vi.fn(),
     previewCodexMultiRouterMigration: vi.fn(),
     applyCodexMultiRouterMigration: vi.fn(),
+  },
+}));
+
+vi.mock("sonner", () => ({
+  toast: {
+    success: vi.fn(),
+    error: vi.fn(),
+    info: vi.fn(),
   },
 }));
 
@@ -418,6 +427,9 @@ beforeEach(() => {
   vi.mocked(settingsApi.save).mockReset();
   vi.mocked(settingsApi.openLogDir).mockReset();
   vi.mocked(settingsApi.openLogDir).mockResolvedValue(true);
+  vi.mocked(toast.success).mockReset();
+  vi.mocked(toast.error).mockReset();
+  vi.mocked(toast.info).mockReset();
   vi.mocked(providersApi.add).mockResolvedValue(true);
   vi.mocked(providersApi.update).mockResolvedValue(true);
   vi.mocked(providersApi.getAll).mockResolvedValue({});
@@ -849,6 +861,70 @@ describe("Codex MultiRouter workspace route persistence helpers", () => {
     await user.click(screen.getByRole("button", { name: "预览命中" }));
 
     expect(screen.getByText(/gpt-5\.4.*不可路由/)).toBeInTheDocument();
+  });
+
+  it("previews selected provider aliases without accepting excluded aliases", async () => {
+    const source: Provider = {
+      id: "relay-source",
+      name: "Relay Source",
+      category: "custom",
+      settingsConfig: {
+        modelCatalog: {
+          models: [{ model: "gpt-5.6-sol" }, { model: "gpt-6-astra" }],
+        },
+      },
+    };
+    const plan: Provider = {
+      id: "alias-router",
+      name: "Alias Router",
+      category: "custom",
+      settingsConfig: {
+        codexRouting: {
+          schemaVersion: 2,
+          enabled: true,
+          routes: [
+            {
+              id: "relay-route",
+              label: "Relay Source",
+              enabled: true,
+              targetProviderId: source.id,
+              modelSelection: { mode: "include", models: ["gpt-5.6-sol"] },
+              aliases: {
+                "gpt-5.6-sol-relay": "gpt-5.6-sol",
+                "gpt-6-astra-relay": "gpt-6-astra",
+              },
+            },
+          ],
+        },
+      },
+    };
+
+    renderWorkspace(
+      React.createElement(CodexRouterWorkspacePage, {
+        providers: [source, plan],
+        activeProviderId: plan.id,
+        initialProviderId: plan.id,
+        initialTab: "test",
+        isProxyRunning: true,
+        isCodexTakeoverActive: true,
+        onEditProvider: vi.fn(),
+        onDeletePlan: vi.fn(),
+        onCreateProvider: vi.fn(),
+      }),
+    );
+
+    const user = userEvent.setup();
+    const input = screen.getByPlaceholderText(/gpt-5\.4-mini/);
+    await user.type(input, "gpt-5.6-sol-relay");
+    await user.click(screen.getByRole("button", { name: "预览命中" }));
+    expect(
+      screen.getByText(/gpt-5\.6-sol-relay.*Relay Source/),
+    ).toBeInTheDocument();
+
+    await user.clear(input);
+    await user.type(input, "gpt-6-astra-relay");
+    await user.click(screen.getByRole("button", { name: "预览命中" }));
+    expect(screen.getByText(/gpt-6-astra-relay.*不可路由/)).toBeInTheDocument();
   });
 
   it("previews routes from the selected plan only", async () => {
@@ -3221,8 +3297,34 @@ describe("Codex MultiRouter workspace route persistence helpers", () => {
     expect(savedPlan.id).toBe(plan.id);
     expect(savedPlan.id).not.toBe(source.id);
     expect(savedPlan?.settingsConfig?.codexRouting).toMatchObject({
-      modelOrder: ["deepseek-v4-pro", "qwen3.8", "deepseek-v4-flash"],
+      modelOrder: ["deepseek-v4-flash", "qwen3.8", "deepseek-v4-pro"],
     });
+    expect(savedPlan.settingsConfig?.config).toContain(
+      'model = "deepseek-v4-flash"',
+    );
+    expect(source.settingsConfig?.config).toBeUndefined();
+  });
+
+  it("uses the router favorite as its default model when saved", async () => {
+    const { source, plan } = createSubagentWorkspaceFixture();
+    renderSubagentWorkspace(source, plan);
+
+    const user = userEvent.setup();
+    await user.click(screen.getByRole("tab", { name: "模型排序" }));
+    await user.click(
+      screen.getByRole("button", {
+        name: "Make qwen3.8 the favorite model",
+      }),
+    );
+    await user.click(screen.getByRole("button", { name: "保存顺序" }));
+
+    await waitFor(() => expect(providersApi.update).toHaveBeenCalledOnce());
+    const [savedPlan] = vi.mocked(providersApi.update).mock.calls[0];
+    expect(savedPlan.settingsConfig?.codexRouting?.modelOrder?.[0]).toBe(
+      "qwen3.8",
+    );
+    expect(savedPlan.settingsConfig?.config).toContain('model = "qwen3.8"');
+    expect(savedPlan.id).not.toBe(source.id);
   });
 
   it("saves router-owned order without validating or rewriting a stale source alias", async () => {
@@ -3267,9 +3369,9 @@ describe("Codex MultiRouter workspace route persistence helpers", () => {
     const [savedPlan] = vi.mocked(providersApi.update).mock.calls[0];
     expect(savedPlan.id).toBe(staleAliasPlan.id);
     expect(savedPlan.settingsConfig?.codexRouting?.modelOrder).toEqual([
-      "deepseek-v4-pro",
-      "qwen3.8",
       "deepseek-v4-flash",
+      "qwen3.8",
+      "deepseek-v4-pro",
     ]);
     expect(screen.queryByText(/保存模型顺序失败/)).not.toBeInTheDocument();
   });
@@ -3293,14 +3395,57 @@ describe("Codex MultiRouter workspace route persistence helpers", () => {
     );
     await user.click(screen.getByRole("button", { name: "保存顺序" }));
 
-    expect(await screen.findByText(/保存模型顺序失败/)).toHaveTextContent(
-      "projection revision mismatch: expected 41, received 42",
+    await waitFor(() => expect(toast.error).toHaveBeenCalledOnce());
+    expect(toast.error).toHaveBeenCalledWith(
+      expect.stringContaining(
+        "保存模型顺序失败：projection revision mismatch: expected 41, received 42",
+      ),
     );
     expect(screen.queryByText(/操作失败，请检查/)).not.toBeInTheDocument();
-    await user.click(
-      screen.getByRole("button", { name: /日志目录|Log Directory/i }),
+    expect(settingsApi.openLogDir).not.toHaveBeenCalled();
+  });
+
+  it("does not report a live picker update when projection remains pending", async () => {
+    const { source, plan } = createSubagentWorkspaceFixture();
+    const pending = await providersApi.inspectCodexMultiRouterProjection(
+      plan.id,
     );
-    expect(settingsApi.openLogDir).toHaveBeenCalledOnce();
+    vi.mocked(providersApi.inspectCodexMultiRouterProjection).mockResolvedValue(
+      {
+        ...pending,
+        state: "pending",
+        lastErrorCode: "projection_publish_failed",
+      },
+    );
+    vi.mocked(providersApi.retryCodexMultiRouterProjection).mockResolvedValue({
+      ...pending,
+      state: "pending",
+      lastErrorCode: "projection_publish_failed",
+    });
+    renderSubagentWorkspace(source, plan);
+
+    const user = userEvent.setup();
+    await user.click(screen.getByRole("tab", { name: "模型排序" }));
+    const rankInput = screen.getByRole("spinbutton", {
+      name: "Rank for qwen3.8",
+    });
+    await user.clear(rankInput);
+    await user.type(rankInput, "1");
+    await user.click(
+      screen.getByRole("button", { name: "Move qwen3.8 to rank 1" }),
+    );
+    await user.click(screen.getByRole("button", { name: "保存顺序" }));
+
+    await waitFor(() =>
+      expect(providersApi.retryCodexMultiRouterProjection).toHaveBeenCalledWith(
+        plan.id,
+      ),
+    );
+    await waitFor(() => expect(toast.info).toHaveBeenCalledOnce());
+    expect(toast.info).toHaveBeenCalledWith(
+      expect.stringMatching(/待同步|pending|modelOrderPending/),
+    );
+    expect(screen.queryByText(/Codex 实时目录已更新/)).not.toBeInTheDocument();
   });
 
   it("persists a display-only change without rewriting provider model order", async () => {
@@ -3724,6 +3869,100 @@ describe("Codex MultiRouter workspace route persistence helpers", () => {
     ]);
   });
 
+  it("uses home provider ranking and newest releases for the default model order", () => {
+    const sublyx: Provider = {
+      id: "sublyx",
+      name: "Sublyx",
+      category: "custom",
+      sortIndex: 0,
+      settingsConfig: {
+        modelCatalog: {
+          models: [
+            { model: "gpt-5.4" },
+            { model: "gpt-5.6-sol" },
+            { model: "gpt-6-sol" },
+            { model: "gpt-6" },
+          ],
+        },
+      },
+    };
+    const fallback: Provider = {
+      id: "fallback",
+      name: "Fallback",
+      category: "custom",
+      sortIndex: 1,
+      settingsConfig: {
+        modelCatalog: { models: [{ model: "qwen3.6" }] },
+      },
+    };
+    const plan = createDraftRoutingPlan([sublyx, fallback], [sublyx, fallback]);
+    const routes = [sublyx, fallback].map((provider, index) =>
+      normalizeCodexRouteForSave(
+        {
+          label: provider.name,
+          targetProviderId: provider.id,
+          match: { models: [] },
+        },
+        index,
+        new Set<string>(),
+      ),
+    );
+
+    const catalog = buildModelCatalogForRoutes(
+      plan,
+      routes,
+      new Map([
+        [sublyx.id, sublyx],
+        [fallback.id, fallback],
+      ]),
+    );
+
+    expect(catalog.models.map((model) => model.model)).toEqual([
+      "gpt-6-sol",
+      "gpt-6",
+      "gpt-5.6-sol",
+      "gpt-5.4",
+      "qwen3.6",
+    ]);
+
+    expect(
+      buildModelCatalogForRoutes(
+        plan,
+        routes,
+        new Map([
+          [sublyx.id, sublyx],
+          [fallback.id, fallback],
+        ]),
+        {
+          ignorePersistedModelOrder: true,
+          pruneOutdatedModels: true,
+        },
+      ).models.map((model) => model.model),
+    ).toEqual(["gpt-6-sol", "gpt-6", "qwen3.6"]);
+
+    const customizedPlan: Provider = {
+      ...plan,
+      settingsConfig: {
+        ...plan.settingsConfig,
+        codexRouting: {
+          ...readCodexRouting(plan),
+          modelOrder: ["qwen3.6", "gpt-5.4", "gpt-6", "gpt-6-sol"],
+        },
+      },
+    };
+    expect(
+      buildModelCatalogForRoutes(
+        customizedPlan,
+        routes,
+        new Map([
+          [sublyx.id, sublyx],
+          [fallback.id, fallback],
+        ]),
+        { ignorePersistedModelOrder: true },
+      ).models.map((model) => model.model),
+    ).toEqual(catalog.models.map((model) => model.model));
+  });
+
   it("aliases duplicate provider models when saving manual multirouter routes", async () => {
     const official: Provider = {
       id: "codex-official",
@@ -3848,6 +4087,7 @@ describe("Codex MultiRouter workspace route persistence helpers", () => {
           id: "router-official",
           label: official.name,
           targetProviderId: official.id,
+          modelSelection: { mode: "include", models: ["gpt-5.5"] },
           match: { models: ["gpt-5.5"], prefixes: ["gpt"] },
           upstream: { apiFormat: "openai_responses" },
         },
@@ -4094,6 +4334,7 @@ describe("Codex MultiRouter workspace route persistence helpers", () => {
           id: "router-longnows-claude",
           label: longnows.name,
           targetProviderId: longnows.id,
+          modelSelection: { mode: "include", models: ["claude-opus-4-8"] },
           match: { models: ["claude-opus-4-8"], prefixes: ["claude"] },
           upstream: { apiFormat: "openai_chat" },
         },
@@ -4930,10 +5171,157 @@ describe("Codex MultiRouter workspace route persistence helpers", () => {
     );
 
     expect(rebuilt.models).toEqual([
-      { model: "model-b", providerName: "Sorted Source", sortIndex: 0 },
-      { model: "model-a", providerName: "Sorted Source", sortIndex: 1 },
+      { model: "model-a", providerName: "Sorted Source" },
+      { model: "model-b", providerName: "Sorted Source" },
     ]);
     expect(rebuilt.spawnAgentModels).toEqual(["model-b", "model-a"]);
+  });
+
+  it("keeps same-name models from two providers distinct in the picker preview", () => {
+    const first: Provider = {
+      id: "relay-one",
+      name: "Relay One",
+      category: "custom",
+      settingsConfig: {
+        providerType: "custom_codex_oauth",
+        modelCatalog: { models: [{ model: "shared" }] },
+      },
+    };
+    const second: Provider = {
+      id: "relay-two",
+      name: "Relay Two",
+      category: "custom",
+      settingsConfig: { modelCatalog: { models: [{ model: "shared" }] } },
+    };
+    const plan = createDraftRoutingPlan([], []);
+    const routes = [first, second].map((provider) => ({
+      id: provider.id,
+      enabled: true,
+      targetProviderId: provider.id,
+      modelSelection: { mode: "all" as const },
+      match: { models: [], prefixes: [] },
+    }));
+    const projected = buildModelCatalogForRoutes(
+      plan,
+      routes,
+      new Map([
+        [first.id, first],
+        [second.id, second],
+      ]),
+    );
+    expect(projected.models.map((model) => model.model)).toEqual([
+      "shared-relay-one",
+      "shared-relay-two",
+    ]);
+  });
+
+  it("keeps the compiler's canonical Codex URL owner unsuffixed", () => {
+    const relay: Provider = {
+      id: "relay",
+      name: "Relay",
+      category: "custom",
+      settingsConfig: { modelCatalog: { models: [{ model: "shared" }] } },
+    };
+    const canonical: Provider = {
+      id: "codex-account",
+      name: "Codex Account",
+      category: "custom",
+      settingsConfig: {
+        config: 'base_url = "https://chatgpt.com/backend-api/codex"',
+        modelCatalog: { models: [{ model: "shared" }] },
+      },
+    };
+    const routes = [relay, canonical].map((provider) => ({
+      id: provider.id,
+      enabled: true,
+      targetProviderId: provider.id,
+      modelSelection: { mode: "all" as const },
+      match: { models: [], prefixes: [] },
+    }));
+    const projected = buildModelCatalogForRoutes(
+      createDraftRoutingPlan([], []),
+      routes,
+      new Map([
+        [relay.id, relay],
+        [canonical.id, canonical],
+      ]),
+    );
+    expect(projected.models.map((model) => model.model)).toEqual([
+      "shared-relay",
+      "shared",
+    ]);
+  });
+
+  it("does not expose unavailable schema-v2 exact matches in the picker preview", () => {
+    const source: Provider = {
+      id: "current-source",
+      name: "Current Source",
+      category: "custom",
+      settingsConfig: { modelCatalog: { models: [{ model: "current" }] } },
+    };
+    const plan: Provider = {
+      ...createDraftRoutingPlan([], []),
+      settingsConfig: {
+        codexRouting: { schemaVersion: 2, enabled: true, routes: [] },
+      },
+    };
+    const projected = buildModelCatalogForRoutes(
+      plan,
+      [
+        {
+          id: "current-route",
+          enabled: true,
+          targetProviderId: source.id,
+          modelSelection: { mode: "all" },
+          match: { models: ["removed"], prefixes: [] },
+        },
+      ],
+      new Map([[source.id, source]]),
+    );
+    expect(projected.models.map((model) => model.model)).toEqual(["current"]);
+  });
+
+  it("selects schema-v2 catalog rows by canonical or upstream ID, independent of legacy matches", () => {
+    const source: Provider = {
+      id: "source",
+      name: "Source",
+      category: "custom",
+      settingsConfig: {
+        modelCatalog: {
+          models: [
+            { model: "visible-a", upstreamModel: "upstream-a" },
+            { model: "visible-b", upstreamModel: "upstream-b" },
+            { model: "excluded" },
+          ],
+        },
+      },
+    };
+    const plan: Provider = {
+      ...createDraftRoutingPlan([], []),
+      settingsConfig: {
+        codexRouting: { schemaVersion: 2, enabled: true, routes: [] },
+      },
+    };
+    const projected = buildModelCatalogForRoutes(
+      plan,
+      [
+        {
+          id: "route",
+          enabled: true,
+          targetProviderId: source.id,
+          modelSelection: {
+            mode: "include",
+            models: ["visible-a", "upstream-b"],
+          },
+          match: { models: ["excluded"], prefixes: [] },
+        },
+      ],
+      new Map([[source.id, source]]),
+    );
+    expect(projected.models.map((model) => model.model)).toEqual([
+      "visible-a",
+      "visible-b",
+    ]);
   });
 
   it("restores the router-owned global model order after the tab remounts", () => {

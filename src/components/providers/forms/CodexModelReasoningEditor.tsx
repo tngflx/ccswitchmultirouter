@@ -293,8 +293,7 @@ export function CodexModelReasoningEditor({
                 disabled={readOnly}
                 onChange={(event) => {
                   const format = event.target.value as
-                    | "string"
-                    | "reasoning_object";
+                    "string" | "reasoning_object";
                   update({
                     ...capability,
                     upstream: {

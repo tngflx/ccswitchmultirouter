@@ -8,7 +8,12 @@ import {
 describe("CodexOfficialAuthSection", () => {
   it("rejects a missing or reauth-required managed account", () => {
     const accounts = [
-      { id: "a", login: "a@example.com", is_default: true, requires_reauth: true },
+      {
+        id: "a",
+        login: "a@example.com",
+        is_default: true,
+        requires_reauth: true,
+      },
     ] as any;
     expect(
       validateCodexOfficialAuthSelection(

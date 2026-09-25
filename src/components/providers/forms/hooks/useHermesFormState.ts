@@ -128,7 +128,8 @@ export function useHermesFormState({
     if (appId !== "hermes") return;
     try {
       const config = JSON.parse(settingsConfig) as Record<string, unknown>;
-      if (Array.isArray(config.models)) setHermesModels(config.models as HermesModel[]);
+      if (Array.isArray(config.models))
+        setHermesModels(config.models as HermesModel[]);
     } catch {
       // Preserve structured state while raw JSON is temporarily invalid.
     }

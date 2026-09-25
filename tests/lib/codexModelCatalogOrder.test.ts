@@ -40,14 +40,14 @@ describe("applyCodexCatalogModelOrder", () => {
     ]);
   });
 
-  it("上一次没有自定义排序时只按数组顺序补位，不写入 sortIndex", () => {
+  it("没有 Router 自定义排序时按当前路由目录顺序，不继承旧快照", () => {
     const previous = [{ model: "e" }, { model: "c" }, { model: "a" }];
     const rebuilt = [{ model: "a" }, { model: "new" }, { model: "e" }];
 
     expect(applyCodexCatalogModelOrder(rebuilt, previous)).toEqual([
-      { model: "e" },
       { model: "a" },
       { model: "new" },
+      { model: "e" },
     ]);
   });
 
@@ -59,8 +59,33 @@ describe("applyCodexCatalogModelOrder", () => {
     ];
 
     expect(applyCodexCatalogModelOrder(rebuilt, previous)).toEqual([
-      { model: "a" },
       { model: "b" },
+      { model: "a" },
     ]);
+  });
+
+  it("recovers a saved rank after a unique visible model is renamed", () => {
+    const next = [
+      { model: "other", providerName: "Other" },
+      { model: "shared-relay", upstreamModel: "shared", providerName: "Relay" },
+    ];
+    expect(
+      applyCodexCatalogModelOrder(next, [
+        { model: "shared", sortIndex: 0 },
+        { model: "other", sortIndex: 1 },
+      ]).map((model) => model.model),
+    ).toEqual(["shared-relay", "other"]);
+  });
+
+  it("keeps a saved rank when a model's casing changes", () => {
+    expect(
+      applyCodexCatalogModelOrder(
+        [{ model: "OTHER" }, { model: "MODEL-A" }],
+        [
+          { model: "model-a", sortIndex: 0 },
+          { model: "other", sortIndex: 1 },
+        ],
+      ).map((model) => model.model),
+    ).toEqual(["MODEL-A", "OTHER"]);
   });
 });

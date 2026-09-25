@@ -39,4 +39,15 @@ impl SwitchLockManager {
         };
         lock.lock_owned().await
     }
+
+    /// Return whether an app currently has a switch/takeover operation in
+    /// flight. This is intentionally a non-blocking observation used to
+    /// distinguish an activation-window backup from a stale backup row.
+    pub async fn is_locked_for_app(&self, app_type: &str) -> bool {
+        let lock = {
+            let locks = self.locks.read().await;
+            locks.get(app_type).cloned()
+        };
+        lock.is_some_and(|lock| lock.try_lock().is_err())
+    }
 }

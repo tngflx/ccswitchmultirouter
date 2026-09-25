@@ -263,10 +263,7 @@ pub fn compile_v2(
     })
 }
 
-fn apply_router_model_order(
-    plan: &CodexRoutingConfigV2,
-    model_catalog: &mut Vec<CompiledCodexModel>,
-) {
+fn apply_router_model_order(plan: &CodexRoutingConfigV2, model_catalog: &mut [CompiledCodexModel]) {
     let Some(model_order) = plan.extensions.get("modelOrder").and_then(Value::as_array) else {
         return;
     };
@@ -770,11 +767,42 @@ fn effective_capability_summary(
             &["inputModalities", "input_modalities"],
         ),
     );
-    let provider_reasoning = value_field(&provider.settings_config, &["reasoning"]).cloned();
-    let (reasoning, reasoning_source) = value_with_source(
-        value_field(model_entry, &["reasoning"]).cloned(),
-        provider_reasoning,
-    );
+    // Never project an arbitrary persisted `reasoning` object directly. Older
+    // wizard/catalog versions stored partial declarations (for example only
+    // `supportedEfforts`) which the Codex V2 parser rejects because `upstream`
+    // is missing. Normalize provider-model declarations through the shared
+    // validator so every emitted catalog entry has the complete contract.
+    let model_reasoning = value_field(model_entry, &["reasoning"]).and_then(|raw| {
+        if raw.is_null() {
+            return None;
+        }
+        crate::proxy::providers::codex_reasoning::
+            reasoning_capability_from_provider_model_entry(model_entry)
+            .and_then(|capability| serde_json::to_value(capability).ok())
+            // Keep declared, non-secret metadata visible for legacy/partial rows whose
+            // capability is not complete enough for the strict runtime schema. These
+            // summaries are informational; runtime consumers still validate before use.
+            .or_else(|| Some(sanitize_capability_value(raw)))
+    });
+    let provider_reasoning =
+        value_field(&provider.settings_config, &["reasoning"]).and_then(|value| {
+            // Provider-level declarations use the same schema as model rows but do
+            // not carry a model id. Add one only for diagnostics in the shared
+            // parser; the value itself remains normalized before projection.
+            let mut entry = serde_json::json!({ "model": model_name(model_entry)? });
+            entry["reasoning"] = value.clone();
+            crate::proxy::providers::codex_reasoning::
+                reasoning_capability_from_provider_model_entry(&entry)
+                .and_then(|capability| serde_json::to_value(capability).ok())
+                .or_else(|| Some(sanitize_capability_value(value)))
+        });
+    let (reasoning, reasoning_source) = if let Some(value) = model_reasoning {
+        (Some(value), "provider_model".to_string())
+    } else if let Some(value) = provider_reasoning {
+        (Some(value), "provider".to_string())
+    } else {
+        (None, "unknown".to_string())
+    };
     let provider_cache = value_field(&provider.settings_config, &["codexCache", "codex_cache"])
         .cloned()
         .or_else(|| {

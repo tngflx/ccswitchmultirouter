@@ -48,6 +48,10 @@ import {
 } from "./helpers/opencodeFormUtils";
 import type { ProviderCategory, OpenCodeModel } from "@/types";
 import { DeferredRender } from "@/components/common/DeferredContent";
+import {
+  ModelListChangeDialog,
+  type ModelListChange,
+} from "./shared/ModelListChangeDialog";
 
 const MODEL_PAGE_SIZE = 20;
 
@@ -61,10 +65,12 @@ function ModelIdInput({
   modelId,
   onChange,
   placeholder,
+  unavailable = false,
 }: {
   modelId: string;
   onChange: (newId: string) => void;
   placeholder?: string;
+  unavailable?: boolean;
 }) {
   const [localValue, setLocalValue] = useState(modelId);
 
@@ -83,7 +89,12 @@ function ModelIdInput({
         }
       }}
       placeholder={placeholder}
-      className="flex-1"
+      className={cn(
+        "flex-1",
+        unavailable &&
+          "border-destructive text-destructive focus-visible:ring-destructive",
+      )}
+      aria-invalid={unavailable || undefined}
     />
   );
 }
@@ -261,6 +272,23 @@ export function OpenCodeFormFields({
 
   const [fetchedModels, setFetchedModels] = useState<FetchedModel[]>([]);
   const [isFetchingModels, setIsFetchingModels] = useState(false);
+  const [modelListDiff, setModelListDiff] = useState<ModelListChange | null>(
+    null,
+  );
+  const modelFetchIdentity = `${providerId ?? "draft"}:${baseUrl}:${modelRefreshCredentialFingerprint(apiKey)}`;
+  const [verifiedModelIdentity, setVerifiedModelIdentity] = useState("");
+  const applyFetchedModels = useCallback(
+    (items: FetchedModel[]) => {
+      setFetchedModels(items);
+      setVerifiedModelIdentity(items.length > 0 ? modelFetchIdentity : "");
+    },
+    [modelFetchIdentity],
+  );
+  const verifiedIds = new Set(
+    verifiedModelIdentity === modelFetchIdentity
+      ? fetchedModels.map((item) => item.id.trim())
+      : [],
+  );
   const [extraOptionsOpen, setExtraOptionsOpen] = useState(
     () => Object.keys(extraOptions).length > 0,
   );
@@ -308,7 +336,7 @@ export function OpenCodeFormFields({
     setIsFetchingModels(true);
     runWithLoading(() => fetchModelsForConfig(baseUrl, apiKey))
       .then((models) => {
-        setFetchedModels(models);
+        applyFetchedModels(models);
         if (models.length === 0) {
           toast.info(t("providerForm.fetchModelsEmpty"));
         } else {
@@ -322,13 +350,18 @@ export function OpenCodeFormFields({
         showFetchModelsError(err, t);
       })
       .finally(() => setIsFetchingModels(false));
-  }, [baseUrl, apiKey, t, runWithLoading]);
+  }, [baseUrl, apiKey, t, runWithLoading, applyFetchedModels]);
 
   useAutoModelRefresh({
-    cacheKey: `provider-models:opencode:${providerId ?? "draft"}:${baseUrl}:${modelRefreshCredentialFingerprint(apiKey)}`,
+    cacheKey: `provider-models:opencode:${modelFetchIdentity}`,
     enabled: Boolean(autoRefreshModels && providerId && baseUrl && apiKey),
     fetcher: () => fetchModelsForConfig(baseUrl, apiKey),
-    onSuccess: setFetchedModels,
+    onSuccess: applyFetchedModels,
+    snapshotKey: `opencode:${modelFetchIdentity}`,
+    compareIds: Object.keys(models),
+    onDiff: (added, removed, updated) =>
+      setModelListDiff({ added, removed, updated }),
+    ttlMs: 0,
   });
 
   // Track which models have expanded options panel
@@ -985,6 +1018,9 @@ export function OpenCodeFormFields({
                       <div className="flex gap-1 flex-1">
                         <ModelIdInput
                           modelId={key}
+                          unavailable={
+                            verifiedIds.size > 0 && !verifiedIds.has(key.trim())
+                          }
                           onChange={(newId) => handleModelIdChange(key, newId)}
                           placeholder={t("opencode.modelId", {
                             defaultValue: "Model ID",
@@ -1311,6 +1347,10 @@ export function OpenCodeFormFields({
           })}
         </p>
       </div>
+      <ModelListChangeDialog
+        change={modelListDiff}
+        onClose={() => setModelListDiff(null)}
+      />
     </>
   );
 }

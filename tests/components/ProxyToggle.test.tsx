@@ -73,4 +73,29 @@ describe("ProxyToggle Codex restart flow", () => {
     expect(restartCodexDesktop).not.toHaveBeenCalled();
     expect(setTakeoverForApp).not.toHaveBeenCalled();
   });
+
+  it("disables takeover directly without inspecting or restarting Codex Desktop", async () => {
+    vi.mocked(useProxyStatus).mockReturnValue({
+      isRunning: true,
+      takeoverStatus: { codex: true },
+      setTakeoverForApp,
+      restartCodexDesktop,
+      isPending: false,
+      isInitialStatusPending: false,
+      status: { address: "127.0.0.1", port: 15721 },
+    } as unknown as ReturnType<typeof useProxyStatus>);
+    const user = userEvent.setup();
+
+    render(<ProxyToggle activeApp="codex" />);
+    await user.click(screen.getByRole("switch"));
+
+    await waitFor(() =>
+      expect(setTakeoverForApp).toHaveBeenCalledWith({
+        appType: "codex",
+        enabled: false,
+      }),
+    );
+    expect(proxyApi.isCodexDesktopRunning).not.toHaveBeenCalled();
+    expect(restartCodexDesktop).not.toHaveBeenCalled();
+  });
 });

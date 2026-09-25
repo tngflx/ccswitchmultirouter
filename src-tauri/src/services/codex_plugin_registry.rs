@@ -39,7 +39,7 @@ pub struct RepairableCodexPlugin {
     pub repair_action: CodexPluginRepairAction,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct CodexBrowserIntegrationHealth {
     pub plugin_installed: bool,
@@ -54,25 +54,6 @@ pub struct CodexBrowserIntegrationHealth {
     pub store_url: Option<String>,
     pub extension_management_url: Option<String>,
     pub problems: Vec<String>,
-}
-
-impl Default for CodexBrowserIntegrationHealth {
-    fn default() -> Self {
-        Self {
-            plugin_installed: false,
-            plugin_enabled: false,
-            browser_family: None,
-            browser_name: None,
-            browser_installed: false,
-            browser_running: false,
-            extension_installed: false,
-            extension_enabled: false,
-            native_host_correct: false,
-            store_url: None,
-            extension_management_url: None,
-            problems: Vec::new(),
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

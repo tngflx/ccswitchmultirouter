@@ -5,7 +5,13 @@
       : null;
   const modelNames = () => {
     const payload = currentPayload();
-    return Array.from(new Set([...(payload.modelNames || []), payload.defaultModel].filter((name) => typeof name === "string" && name.trim()).map((name) => name.trim())));
+    const ordered = Array.from(new Set((payload.modelNames || [])
+      .filter((name) => typeof name === "string" && name.trim())
+      .map((name) => name.trim())));
+    if (ordered.length) return ordered;
+    return typeof payload.defaultModel === "string" && payload.defaultModel.trim()
+      ? [payload.defaultModel.trim()]
+      : [];
   };
   const normalizeReasoningDescriptor = (descriptor) => {
     if (!descriptor || typeof descriptor !== "object") return descriptor;

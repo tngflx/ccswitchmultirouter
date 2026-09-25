@@ -1,9 +1,14 @@
 import { describe, expect, it } from "vitest";
-import type { Provider } from "@/types";
+import type { CodexModelReasoningCapability, Provider } from "@/types";
 import {
   buildCodexMultiRouterWizardPlan,
+  buildWizardModelCatalog,
+  buildWizardRoutesFromSources,
+  canonicalizeWizardProviderModels,
   initialWizardCatalogModelOrder,
   initialWizardSelectedSourceIds,
+  mergeFetchedModelsIntoWizardProvider,
+  resolveWizardModelNameCollisions,
 } from "./codexMultiRouterWizard";
 
 const deepseekSource: Provider = {
@@ -18,6 +23,276 @@ const deepseekSource: Provider = {
     },
   },
 };
+
+describe("mergeFetchedModelsIntoWizardProvider", () => {
+  it("deduplicates case/whitespace variants without losing fetched metadata", () => {
+    const models = canonicalizeWizardProviderModels([
+      { model: " GPT-5 ", upstreamModel: "gpt-5" },
+      { model: "gpt-5", upstreamModel: "GPT-5", contextWindow: 128000 },
+    ]);
+    expect(models).toHaveLength(1);
+    expect(models[0]?.model).toBe("GPT-5");
+    expect(models[0]?.contextWindow).toBe(128000);
+  });
+
+  it("persists reasoning capability metadata returned by model discovery", () => {
+    const reasoning: CodexModelReasoningCapability = {
+      schemaVersion: 2,
+      supportStatus: "confirmed_supported",
+      controlKind: "graded",
+      supportedEfforts: ["low", "high", "max"],
+      defaultEffort: "high",
+      disableAllowed: false,
+      upstream: {
+        format: "string",
+        parameter: "reasoning_effort",
+        effortMap: {},
+      },
+      source: "provider",
+    };
+
+    const merged = mergeFetchedModelsIntoWizardProvider(
+      {
+        ...deepseekSource,
+        settingsConfig: {
+          ...deepseekSource.settingsConfig,
+          modelCatalog: {
+            models: [{ model: "deepseek-v4-flash" }],
+          },
+        },
+      },
+      [
+        {
+          id: "deepseek-v4-flash",
+          ownedBy: "provider",
+          reasoning,
+        },
+      ],
+      { preserveExistingSelection: true },
+    );
+
+    expect(merged.settingsConfig.modelCatalog?.models[0]?.reasoning).toEqual(
+      reasoning,
+    );
+  });
+
+  it("does not duplicate fetched rows when the endpoint repeats an id with different casing", () => {
+    const merged = mergeFetchedModelsIntoWizardProvider(
+      {
+        ...deepseekSource,
+        settingsConfig: {
+          ...deepseekSource.settingsConfig,
+          modelCatalog: { models: [] },
+        },
+      },
+      [
+        { id: "DeepSeek-V4-Flash", ownedBy: "provider" },
+        { id: "deepseek-v4-flash", ownedBy: "provider" },
+      ],
+    );
+    expect(merged.settingsConfig.modelCatalog?.models).toHaveLength(1);
+  });
+});
+
+describe("wizard mixed-provider catalog identity", () => {
+  it("does not turn unrelated manual rows into remote-bound rows on save", () => {
+    const source: Provider = {
+      ...deepseekSource,
+      settingsConfig: {
+        ...deepseekSource.settingsConfig,
+        modelCatalog: { models: [{ model: "manual-custom" }] },
+      },
+    };
+    const result = buildCodexMultiRouterWizardPlan([source], [source]);
+    expect(
+      result.persistedSourceProviders[0].settingsConfig.modelCatalog?.models,
+    ).toEqual([{ model: "manual-custom" }]);
+  });
+
+  it("repairs a previously saved alias using the route's canonical target", () => {
+    const relay: Provider = {
+      ...deepseekSource,
+      id: "sublyx",
+      name: "Sublyx",
+      settingsConfig: {
+        ...deepseekSource.settingsConfig,
+        modelCatalog: { models: [{ model: "gpt-5.6-sol-sublyx" }] },
+      },
+    };
+    const plan: Provider = {
+      id: "router",
+      name: "Router",
+      settingsConfig: {
+        codexRouting: {
+          schemaVersion: 2,
+          enabled: true,
+          routes: [
+            {
+              id: "relay-route",
+              targetProviderId: "sublyx",
+              modelSelection: { mode: "all" },
+              aliases: { "gpt-5.6-sol-sublyx": "gpt-5.6-sol" },
+            },
+          ],
+        },
+      },
+    };
+
+    const result = buildCodexMultiRouterWizardPlan(
+      [relay, plan],
+      [relay],
+      plan,
+    );
+    expect(
+      result.persistedSourceProviders[0].settingsConfig.modelCatalog?.models[0],
+    ).toMatchObject({
+      model: "gpt-5.6-sol-sublyx",
+      upstreamModel: "gpt-5.6-sol",
+    });
+  });
+
+  it("persists collision aliases with their upstream ids without dropping excluded rows", () => {
+    const left: Provider = {
+      ...deepseekSource,
+      id: "official",
+      name: "Official",
+      settingsConfig: {
+        ...deepseekSource.settingsConfig,
+        modelCatalog: { models: [{ model: "gpt-5.6-sol" }] },
+      },
+    };
+    const relay: Provider = {
+      ...deepseekSource,
+      id: "sublyx",
+      name: "Sublyx",
+      settingsConfig: {
+        ...deepseekSource.settingsConfig,
+        modelCatalog: {
+          models: [
+            { model: "gpt-5.6-sol" },
+            { model: "excluded", enabled: false },
+          ],
+          spawnAgentModels: ["gpt-5.6-sol"],
+        },
+      },
+    };
+
+    const result = buildCodexMultiRouterWizardPlan(
+      [left, relay],
+      [left, relay],
+      null,
+      { catalogModelOrder: ["gpt-5.6-sol", "gpt-5.6-sol-sublyx"] },
+    );
+    const stored = result.persistedSourceProviders.find(
+      (provider) => provider.id === "sublyx",
+    );
+    expect(stored?.settingsConfig.modelCatalog?.models).toEqual([
+      expect.objectContaining({
+        model: "gpt-5.6-sol-sublyx",
+        upstreamModel: "gpt-5.6-sol",
+      }),
+      { model: "excluded", enabled: false },
+    ]);
+    expect(stored?.settingsConfig.modelCatalog?.spawnAgentModels).toEqual([
+      "gpt-5.6-sol-sublyx",
+    ]);
+    expect(
+      result.sourceProviders.find((source) => source.id === "sublyx")
+        ?.settingsConfig.modelCatalog?.models[0],
+    ).toMatchObject({
+      model: "gpt-5.6-sol-sublyx",
+      upstreamModel: "gpt-5.6-sol",
+    });
+    expect(
+      result.plan.settingsConfig.codexRouting?.routes?.find(
+        (route: { targetProviderId?: string }) =>
+          route.targetProviderId === "sublyx",
+      )?.aliases,
+    ).toMatchObject({ "gpt-5.6-sol-sublyx": "gpt-5.6-sol" });
+  });
+
+  it("keeps distinct models that collide on visible names and routes aliases to upstream ids", () => {
+    const left: Provider = {
+      ...deepseekSource,
+      id: "left",
+      name: "Left",
+      settingsConfig: {
+        ...deepseekSource.settingsConfig,
+        modelCatalog: { models: [{ model: "shared", upstreamModel: "alpha" }] },
+      },
+    };
+    const right: Provider = {
+      ...deepseekSource,
+      id: "right",
+      name: "Right",
+      settingsConfig: {
+        ...deepseekSource.settingsConfig,
+        modelCatalog: { models: [{ model: "shared", upstreamModel: "beta" }] },
+      },
+    };
+    const resolved = resolveWizardModelNameCollisions([left, right]);
+    const models = resolved.flatMap(
+      (provider) => provider.settingsConfig.modelCatalog?.models ?? [],
+    );
+    expect(new Set(models.map((model) => model.model.toLowerCase())).size).toBe(
+      2,
+    );
+    const routes = buildWizardRoutesFromSources(resolved);
+    const rightRoute = routes.find(
+      (route) => route.targetProviderId === "right",
+    );
+    expect(rightRoute?.aliases).toMatchObject({ "beta-right": "beta" });
+    expect(buildWizardModelCatalog(resolved).models).toHaveLength(2);
+  });
+
+  it("qualifies a stale explicit alias when it collides across provider routes", () => {
+    const left: Provider = {
+      ...deepseekSource,
+      id: "left",
+      name: "Left",
+      settingsConfig: {
+        ...deepseekSource.settingsConfig,
+        modelCatalog: { models: [{ model: "shared", upstreamModel: "alpha" }] },
+      },
+    };
+    const right: Provider = {
+      ...deepseekSource,
+      id: "right",
+      name: "Right",
+      settingsConfig: {
+        ...deepseekSource.settingsConfig,
+        modelCatalog: { models: [{ model: "shared", upstreamModel: "alpha" }] },
+      },
+    };
+    const resolved = resolveWizardModelNameCollisions(
+      [left, right],
+      [
+        {
+          id: "left-route",
+          targetProviderId: "left",
+          modelSelection: { mode: "all" },
+          aliases: {},
+        },
+        {
+          id: "right-route",
+          targetProviderId: "right",
+          modelSelection: { mode: "all" },
+          aliases: { shared: "alpha" },
+        },
+      ],
+    );
+    const models = resolved.flatMap(
+      (provider) => provider.settingsConfig.modelCatalog?.models ?? [],
+    );
+    expect(new Set(models.map((model) => model.model.toLowerCase())).size).toBe(
+      2,
+    );
+    expect(models.map((model) => model.model.toLowerCase())).toEqual([
+      "alpha-left",
+      "shared",
+    ]);
+  });
+});
 
 describe("buildCodexMultiRouterWizardPlan subagent version", () => {
   it("persists an explicit wizard model order in the router document", () => {

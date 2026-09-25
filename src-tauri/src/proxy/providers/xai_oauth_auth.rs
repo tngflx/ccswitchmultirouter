@@ -4,7 +4,7 @@
 //! from xAI's OpenID Connect discovery document so authentication protocol
 //! changes do not require duplicating endpoint constants across the app.
 
-use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
@@ -1098,10 +1098,12 @@ mod tests {
         let status = reloaded.get_status().await;
         assert_eq!(status.accounts.len(), 2);
         assert_eq!(status.default_account_id.as_deref(), Some("account-one"));
-        assert!(status
-            .accounts
-            .iter()
-            .all(|account| !account.requires_reauth));
+        assert!(
+            status
+                .accounts
+                .iter()
+                .all(|account| !account.requires_reauth)
+        );
 
         reloaded.mark_reauth_required("account-one").await.unwrap();
         let after_reauth = XaiOAuthManager::new(data_dir.path().to_path_buf())
@@ -1111,11 +1113,13 @@ mod tests {
             after_reauth.default_account_id.as_deref(),
             Some("account-two")
         );
-        assert!(after_reauth
-            .accounts
-            .iter()
-            .find(|account| account.id == "account-one")
-            .is_some_and(|account| account.requires_reauth));
+        assert!(
+            after_reauth
+                .accounts
+                .iter()
+                .find(|account| account.id == "account-one")
+                .is_some_and(|account| account.requires_reauth)
+        );
 
         #[cfg(unix)]
         {
@@ -1225,11 +1229,13 @@ mod tests {
             removed_result,
             Err(XaiOAuthError::AccountNotFound(_))
         ));
-        assert!(!manager
-            .access_tokens
-            .read()
-            .await
-            .contains_key("account-one"));
+        assert!(
+            !manager
+                .access_tokens
+                .read()
+                .await
+                .contains_key("account-one")
+        );
 
         manager
             .add_account_internal(
@@ -1257,11 +1263,13 @@ mod tests {
             replaced_result,
             Err(XaiOAuthError::TokenFetchFailed(_))
         ));
-        assert!(!manager
-            .access_tokens
-            .read()
-            .await
-            .contains_key("account-one"));
+        assert!(
+            !manager
+                .access_tokens
+                .read()
+                .await
+                .contains_key("account-one")
+        );
         assert_eq!(
             manager
                 .accounts

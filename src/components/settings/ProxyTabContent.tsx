@@ -53,7 +53,7 @@ export function ProxyTabContent({
   } = useProxyStatus();
 
   const handleTakeoverChange = async (appType: string, enabled: boolean) => {
-    if (appType === "codex") {
+    if (appType === "codex" && enabled) {
       let running: boolean;
       try {
         running = await proxyApi.isCodexDesktopRunning();

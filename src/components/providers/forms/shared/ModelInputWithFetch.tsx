@@ -4,6 +4,7 @@ import { Input } from "@/components/ui/input";
 import { Download, Loader2 } from "lucide-react";
 import type { FetchedModel } from "@/lib/api/model-fetch";
 import { ModelDropdown } from "./ModelDropdown";
+import { cn } from "@/lib/utils";
 
 interface ModelInputWithFetchProps {
   id: string;
@@ -14,6 +15,9 @@ interface ModelInputWithFetchProps {
   isLoading: boolean;
   /** 传入时显示获取按钮；不传时只在有数据后显示下拉 */
   onFetch?: () => void;
+  inputClassName?: string;
+  ariaInvalid?: boolean;
+  ariaDescribedBy?: string;
 }
 
 export function ModelInputWithFetch({
@@ -24,6 +28,9 @@ export function ModelInputWithFetch({
   fetchedModels,
   isLoading,
   onFetch,
+  inputClassName,
+  ariaInvalid,
+  ariaDescribedBy,
 }: ModelInputWithFetchProps) {
   const { t } = useTranslation();
 
@@ -38,7 +45,9 @@ export function ModelInputWithFetch({
           onChange={(e) => onChange(e.target.value)}
           placeholder={placeholder}
           autoComplete="off"
-          className="flex-1"
+          className={cn("flex-1", inputClassName)}
+          aria-invalid={ariaInvalid || undefined}
+          aria-describedby={ariaDescribedBy}
         />
         <ModelDropdown models={fetchedModels} onSelect={onChange} />
       </div>
@@ -56,7 +65,9 @@ export function ModelInputWithFetch({
           onChange={(e) => onChange(e.target.value)}
           placeholder={placeholder}
           autoComplete="off"
-          className="flex-1"
+          className={cn("flex-1", inputClassName)}
+          aria-invalid={ariaInvalid || undefined}
+          aria-describedby={ariaDescribedBy}
         />
         <Button
           type="button"
@@ -83,7 +94,9 @@ export function ModelInputWithFetch({
           onChange={(e) => onChange(e.target.value)}
           placeholder={placeholder}
           autoComplete="off"
-          className="flex-1"
+          className={cn("flex-1", inputClassName)}
+          aria-invalid={ariaInvalid || undefined}
+          aria-describedby={ariaDescribedBy}
         />
         <Button
           variant="outline"
@@ -108,6 +121,9 @@ export function ModelInputWithFetch({
       onChange={(e) => onChange(e.target.value)}
       placeholder={placeholder}
       autoComplete="off"
+      className={inputClassName}
+      aria-invalid={ariaInvalid || undefined}
+      aria-describedby={ariaDescribedBy}
     />
   );
 }

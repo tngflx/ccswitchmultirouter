@@ -52,9 +52,11 @@ pub struct VolcengineModelListRequest<'a> {
 #[derive(Debug, Deserialize)]
 struct ModelsResponse {
     data: Option<Vec<ModelEntry>>,
-    /// Zhipu's OpenAI Responses catalog uses `models[].slug`.
+    /// Some providers append a `models` field with a shape unrelated to the
+    /// standard OpenAI `data` list. Keep it untyped so malformed auxiliary
+    /// data cannot invalidate an otherwise valid response.
     #[serde(default)]
-    models: Option<Vec<ZhipuModelEntry>>,
+    models: Option<serde_json::Value>,
     #[serde(default)]
     success: Option<bool>,
     #[serde(default)]
@@ -65,9 +67,24 @@ struct ModelsResponse {
     error: Option<serde_json::Value>,
 }
 
-#[derive(Debug, Deserialize)]
-struct ZhipuModelEntry {
-    slug: String,
+/// Extract model IDs from a vendor catalog, preferring Zhipu's `slug` and
+/// falling back to the OpenAI-compatible `id`. Ignore every other shape.
+fn catalog_model_ids(models: Option<serde_json::Value>) -> Vec<String> {
+    let Some(serde_json::Value::Array(entries)) = models else {
+        return Vec::new();
+    };
+    entries
+        .iter()
+        .filter_map(|entry| {
+            ["slug", "id"].iter().find_map(|key| {
+                entry
+                    .get(*key)
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|value| !value.is_empty())
+            })
+        })
+        .map(str::to_owned)
+        .collect()
 }
 
 #[derive(Debug, Deserialize)]
@@ -245,6 +262,7 @@ pub async fn fetch_models(options: FetchModelsRequest<'_>) -> Result<Vec<Fetched
         let status = response.status();
 
         if status.is_success() {
+            let is_openrouter_catalog = is_openrouter_catalog_url(url);
             let resp: ModelsResponse = response
                 .json()
                 .await
@@ -258,19 +276,23 @@ pub async fn fetch_models(options: FetchModelsRequest<'_>) -> Result<Vec<Fetched
                 data.into_iter()
                     .map(|m| FetchedModel {
                         context_window: extract_context_window(&m.extra),
+                        reasoning: extract_reasoning_capability(
+                            &m.id,
+                            &m.extra,
+                            is_openrouter_catalog,
+                        )
+                            .or_else(|| maintained_reasoning_capability(&m.id)),
                         id: m.id,
                         input_modalities: extract_input_modalities(&m.extra),
                         owned_by: m.owned_by,
                         supports_image: extract_supports_image(&m.extra),
-                        reasoning: None,
                     })
                     .collect()
             } else {
-                resp.models
-                    .unwrap_or_default()
+                catalog_model_ids(resp.models)
                     .into_iter()
-                    .map(|m| FetchedModel {
-                        id: m.slug,
+                    .map(|id| FetchedModel {
+                        id,
                         owned_by: None,
                         context_window: None,
                         input_modalities: None,
@@ -424,6 +446,65 @@ fn extract_supports_image(obj: &serde_json::Map<String, serde_json::Value>) -> O
             .iter()
             .any(|modality| modality.eq_ignore_ascii_case("image"))
     })
+}
+
+/// Preserve a validated reasoning contract advertised by `/models`.
+///
+/// The wizard persists `FetchedModel` rows into each source Provider catalog.
+/// Dropping this metadata makes a later MultiRouter projection look like the
+/// model has unknown reasoning support, so enabled Sub-Agent V2 profiles fail
+/// validation even though the upstream already declared the capability.
+fn extract_reasoning_capability(
+    model_id: &str,
+    obj: &serde_json::Map<String, serde_json::Value>,
+    is_openrouter_catalog: bool,
+) -> Option<serde_json::Value> {
+    let mut entry = obj.clone();
+    entry.insert(
+        "model".to_string(),
+        serde_json::Value::String(model_id.to_string()),
+    );
+    let entry = serde_json::Value::Object(entry);
+    let has_explicit_contract = entry.pointer("/reasoning/upstream").is_some()
+        || [
+            "supported_reasoning_levels",
+            "supported_reasoning_efforts",
+            "supportedReasoningEfforts",
+        ]
+        .iter()
+        .any(|key| entry.get(*key).is_some());
+    let capability = if is_openrouter_catalog {
+        crate::proxy::providers::codex_reasoning::reasoning_capability_from_openrouter_model_entry(
+            &entry,
+        )
+    } else {
+        None
+    }
+    .or_else(|| {
+        if !has_explicit_contract {
+            return None;
+        }
+        crate::proxy::providers::codex_reasoning::reasoning_capability_from_provider_model_entry(
+            &entry,
+        )
+    })?;
+    serde_json::to_value(capability).ok()
+}
+
+fn is_openrouter_catalog_url(url: &str) -> bool {
+    reqwest::Url::parse(url)
+        .ok()
+        .and_then(|parsed| parsed.host_str().map(str::to_owned))
+        .is_some_and(|host| host.eq_ignore_ascii_case("openrouter.ai"))
+}
+
+/// Seed the same narrow, maintained exact-model fallback used by runtime
+/// routing.  Many compatible `/models` endpoints expose only IDs, so without
+/// this fallback the wizard would persist known DeepSeek models as unknown.
+fn maintained_reasoning_capability(model_id: &str) -> Option<serde_json::Value> {
+    let capability =
+        crate::proxy::providers::codex_reasoning::builtin_reasoning_capability_for_model(model_id)?;
+    serde_json::to_value(capability).ok()
 }
 
 /// 解析火山 `ListArkAgentPlanModel` / `ListArkCodingPlanModel` 的模型列表。
@@ -1366,11 +1447,7 @@ mod tests {
         let resp: ModelsResponse =
             serde_json::from_str(r#"{"models":[{"slug":"glm-5"},{"slug":"glm-5-flash"}]}"#)
                 .unwrap();
-        let models = resp.models.unwrap();
-        assert_eq!(
-            models.into_iter().map(|model| model.slug).collect::<Vec<_>>(),
-            ["glm-5", "glm-5-flash"]
-        );
+        assert_eq!(catalog_model_ids(resp.models), ["glm-5", "glm-5-flash"]);
     }
 
     #[test]
@@ -1452,6 +1529,83 @@ mod tests {
         assert_eq!(extract_supports_image(&data[1].extra), Some(true));
         assert_eq!(extract_supports_image(&data[2].extra), Some(false));
         assert_eq!(extract_supports_image(&data[3].extra), None);
+    }
+
+    #[test]
+    fn test_parse_response_extracts_declared_reasoning_capability() {
+        let response: ModelsResponse = serde_json::from_value(serde_json::json!({
+            "data": [{
+                "id": "deepseek-v4-flash",
+                "reasoning": {
+                    "supported": true,
+                    "supportedEfforts": ["low", "high", "max"],
+                    "defaultEffort": "high",
+                    "upstream": {
+                        "format": "string",
+                        "parameter": "reasoning_effort"
+                    }
+                }
+            }]
+        }))
+        .unwrap();
+        let entry = response.data.unwrap().into_iter().next().unwrap();
+        let reasoning = extract_reasoning_capability(&entry.id, &entry.extra, false)
+            .expect("declared reasoning capability should be retained");
+        assert_eq!(
+            reasoning["supportedEfforts"],
+            serde_json::json!(["low", "high", "max"])
+        );
+        assert_eq!(reasoning["defaultEffort"], "high");
+    }
+
+    #[test]
+    fn openrouter_reasoning_metadata_survives_model_fetch() {
+        let response: ModelsResponse = serde_json::from_value(serde_json::json!({
+            "data": [{
+                "id": "fireworks/ember-1",
+                "reasoning": {
+                    "mandatory": false,
+                    "default_enabled": true,
+                    "supported_efforts": ["max", "high", "low"],
+                    "default_effort": "max"
+                }
+            }]
+        }))
+        .expect("OpenRouter models response");
+        let entry = response.data.unwrap().into_iter().next().unwrap();
+        let reasoning = extract_reasoning_capability(&entry.id, &entry.extra, true)
+            .expect("OpenRouter reasoning must be retained");
+        assert_eq!(
+            reasoning["supportedEfforts"],
+            serde_json::json!(["max", "high", "low"])
+        );
+        assert_eq!(reasoning["defaultEffort"], "max");
+        assert_eq!(reasoning["upstream"]["format"], "object");
+        assert_eq!(reasoning["upstream"]["parameter"], "reasoning.effort");
+        assert_eq!(reasoning["upstream"]["effortMap"]["max"], "max");
+        assert!(extract_reasoning_capability(&entry.id, &entry.extra, false).is_none());
+    }
+
+    #[test]
+    fn openrouter_reasoning_conversion_requires_exact_catalog_host() {
+        assert!(is_openrouter_catalog_url("https://openrouter.ai/api/v1/models"));
+        assert!(!is_openrouter_catalog_url(
+            "https://openrouter.ai.example.com/api/v1/models"
+        ));
+        assert!(!is_openrouter_catalog_url(
+            "https://other.example/api/v1/models"
+        ));
+    }
+
+    #[test]
+    fn maintained_reasoning_fallback_covers_id_only_deepseek_models() {
+        let reasoning = maintained_reasoning_capability("deepseek-v4-flash")
+            .expect("maintained DeepSeek fallback should be serialized");
+        assert_eq!(reasoning["source"], "builtin");
+        assert_eq!(
+            reasoning["supportedEfforts"],
+            serde_json::json!(["low", "high", "max"])
+        );
     }
 
     #[test]
@@ -1888,5 +2042,38 @@ Coding 能力开源 SOTA，从代码生成走向工程交付 | 1M | 128K |
         let json = r#"{"object":"list","data":[]}"#;
         let resp: ModelsResponse = serde_json::from_str(json).unwrap();
         assert!(resp.data.unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_catalog_model_ids_prefers_slug_and_falls_back_to_id() {
+        let resp: ModelsResponse = serde_json::from_str(
+            r#"{"models":[
+                {"slug":"glm-4.7"},
+                {"id":"openai-shaped"},
+                {"name":"missing-id"},
+                {"slug":1},
+                {}
+            ]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            catalog_model_ids(resp.models),
+            vec!["glm-4.7".to_string(), "openai-shaped".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_models_field_cannot_break_valid_data_response() {
+        for models in [
+            r#"["a","b"]"#,
+            r#"{"count":1}"#,
+            "2",
+            r#"[{"slug":"glm","id":123}]"#,
+            r#"[{"slug":1}]"#,
+        ] {
+            let json = format!(r#"{{"data":[{{"id":"model-a"}}],"models":{models}}}"#);
+            let resp: ModelsResponse = serde_json::from_str(&json).unwrap();
+            assert_eq!(resp.data.unwrap()[0].id, "model-a");
+        }
     }
 }

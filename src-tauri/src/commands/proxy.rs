@@ -217,25 +217,14 @@ pub async fn start_proxy_server(
 /// 停止代理服务器（仅停止服务，不恢复/清理 Live 接管状态）
 #[tauri::command]
 pub async fn stop_proxy_server(state: tauri::State<'_, AppState>) -> Result<(), String> {
-    let takeover = state.proxy_service.get_takeover_status().await?;
-    if takeover.claude
-        || takeover.codex
-        || takeover.gemini
-        || takeover.grokbuild
-        || takeover.opencode
-        || takeover.openclaw
-    {
-        return Err(
-            "仍有应用处于代理接管状态，请先在设置中关闭对应应用接管后再停止本地路由。".to_string(),
-        );
-    }
-
-    state.proxy_service.stop().await
+    state.proxy_service.stop_if_no_takeover().await
 }
 
 /// 停止代理服务器（恢复 Live 配置）
 #[tauri::command]
 pub async fn stop_proxy_with_restore(state: tauri::State<'_, AppState>) -> Result<(), String> {
+    let takeover = state.proxy_service.get_takeover_status().await?;
+    ensure_codex_desktop_closed_for_disable(takeover.codex)?;
     state.proxy_service.stop_with_restore().await
 }
 
@@ -254,10 +243,31 @@ pub async fn set_proxy_takeover_for_app(
     app_type: String,
     enabled: bool,
 ) -> Result<(), String> {
+    if app_type == "codex" && !enabled {
+        let takeover = state.proxy_service.get_takeover_status().await?;
+        ensure_codex_desktop_closed_for_disable(takeover.codex)?;
+    }
     state
         .proxy_service
         .set_takeover_for_app(&app_type, enabled)
         .await
+}
+
+fn ensure_codex_desktop_closed_for_disable(codex_takeover_enabled: bool) -> Result<(), String> {
+    ensure_codex_desktop_closed_for_disable_with(
+        codex_takeover_enabled,
+        crate::codex_desktop::list_running_codex_desktop_process_ids,
+    )
+}
+
+fn ensure_codex_desktop_closed_for_disable_with(
+    codex_takeover_enabled: bool,
+    inspect: impl FnOnce() -> Result<Vec<u32>, String>,
+) -> Result<(), String> {
+    if codex_takeover_enabled && !inspect()?.is_empty() {
+        return Err("CODEX_DESKTOP_ACTIVE: Close Codex Desktop before disabling its local routing, then reopen it after the switch. The running app-server can retain the old local proxy address even after config.toml is restored.".to_string());
+    }
+    Ok(())
 }
 
 /// Report whether the Codex Desktop shell is currently running.
@@ -276,6 +286,18 @@ pub async fn restart_codex_desktop(
     state: tauri::State<'_, AppState>,
     enabled: bool,
 ) -> Result<(), String> {
+    // Disabling takeover only restores the live configuration. It must not
+    // terminate or relaunch Codex Desktop; this command is for the enable
+    // path where the Desktop shell must reload the config.
+    if !enabled {
+        let takeover = state.proxy_service.get_takeover_status().await?;
+        ensure_codex_desktop_closed_for_disable(takeover.codex)?;
+        return state
+            .proxy_service
+            .set_takeover_for_app("codex", false)
+            .await;
+    }
+
     let stopped = crate::codex_desktop::stop_running_codex_desktop_for_managed_lifecycle()?;
     let takeover_result = state
         .proxy_service
@@ -1842,6 +1864,22 @@ fn codex_router_log_protocol_from_path(value: &str) -> Option<&'static str> {
 mod codex_router_log_diagnostics_tests {
     use super::*;
     use std::sync::{Mutex, OnceLock};
+
+    #[test]
+    fn disabling_codex_requires_a_closed_desktop_without_changing_state() {
+        let active = ensure_codex_desktop_closed_for_disable_with(true, || Ok(vec![42]));
+        assert!(active.unwrap_err().starts_with("CODEX_DESKTOP_ACTIVE:"));
+        assert!(ensure_codex_desktop_closed_for_disable_with(true, || Ok(vec![])).is_ok());
+        assert!(ensure_codex_desktop_closed_for_disable_with(false, || {
+            panic!("inactive takeover must not inspect Desktop")
+        })
+        .is_ok());
+        assert_eq!(
+            ensure_codex_desktop_closed_for_disable_with(true, || Err("CIM failed".to_string()))
+                .unwrap_err(),
+            "CIM failed"
+        );
+    }
 
     #[test]
     fn legacy_default_route_warning_is_compatibility_only() {

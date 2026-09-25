@@ -7,8 +7,8 @@
 
 use super::{AuthInfo, AuthStrategy, ProviderAdapter};
 use crate::codex_multirouter::compiler::{
-    compile_provider_v2, CodexRoutingCompileError, CompiledCodexModel, CompiledCodexRoute,
-    CompiledCodexRoutingPlan,
+    CodexRoutingCompileError, CompiledCodexModel, CompiledCodexRoute, CompiledCodexRoutingPlan,
+    compile_provider_v2,
 };
 use crate::codex_multirouter::schema::{
     CodexRouteAuthPolicy, CodexRouteAuthSource, CodexRoutingConfigV2,
@@ -22,8 +22,8 @@ use crate::proxy::providers::codex_oauth_auth::{CodexAccountPoolPolicy, NATIVE_C
 use crate::{
     database::Database,
     protocol_compatibility::{
-        endpoint::build_probe_url, ProbeReadiness, ProbeTargetKey, ProtocolCompatibilityRecord,
-        ReasoningProjection, TransportKind, PROBE_PROFILE_VERSION,
+        PROBE_PROFILE_VERSION, ProbeReadiness, ProbeTargetKey, ProtocolCompatibilityRecord,
+        ReasoningProjection, TransportKind, endpoint::build_probe_url,
     },
 };
 use regex::Regex;
@@ -2804,7 +2804,9 @@ fn codex_chat_reasoning_config_from_capability(
     CodexChatReasoningConfig {
         supports_thinking: Some(supported),
         supports_effort: Some(has_efforts && !boolean_thinking),
-        thinking_param: Some(if boolean_thinking {
+        thinking_param: Some(if capability.upstream.parameter == "reasoning.effort" {
+            "none".to_string()
+        } else if boolean_thinking {
             capability.upstream.parameter.clone()
         } else if capability.disable_allowed {
             "thinking".to_string()
@@ -4953,11 +4955,13 @@ experimental_bearer_token = "PROXY_MANAGED"
             .expect("official route");
         let materialized = materialize_codex_routed_provider_from_target(&routed, &target);
 
-        assert!(materialized
-            .meta
-            .as_ref()
-            .and_then(|meta| meta.provider_type.as_deref())
-            .is_none());
+        assert!(
+            materialized
+                .meta
+                .as_ref()
+                .and_then(|meta| meta.provider_type.as_deref())
+                .is_none()
+        );
         assert_eq!(
             adapter.extract_base_url(&materialized).unwrap(),
             "https://chatgpt.com/backend-api/codex"
@@ -5000,11 +5004,13 @@ experimental_bearer_token = "PROXY_MANAGED"
             materialized.settings_config["codexNativeAuthPassthrough"],
             true
         );
-        assert!(materialized
-            .meta
-            .as_ref()
-            .and_then(|meta| meta.provider_type.as_deref())
-            .is_none());
+        assert!(
+            materialized
+                .meta
+                .as_ref()
+                .and_then(|meta| meta.provider_type.as_deref())
+                .is_none()
+        );
         assert!(CodexAdapter::new().extract_auth(&materialized).is_none());
     }
 
@@ -5927,11 +5933,13 @@ wire_api = "chat"
                 .and_then(|binding| binding.auth_provider.as_deref()),
             Some("codex_oauth")
         );
-        assert!(routed
-            .meta
-            .as_ref()
-            .and_then(|m| m.auth_binding.as_ref())
-            .is_some());
+        assert!(
+            routed
+                .meta
+                .as_ref()
+                .and_then(|m| m.auth_binding.as_ref())
+                .is_some()
+        );
         assert!(
             routed.settings_config.get("auth").is_none(),
             "managed auth route should not inline raw auth into settings"
@@ -6589,11 +6597,13 @@ wire_api = "anthropic"
             JsonValue::Bool(true)
         );
         assert!(effective.settings_config.get("auth").is_none());
-        assert!(effective
-            .meta
-            .as_ref()
-            .and_then(|meta| meta.auth_binding.as_ref())
-            .is_none());
+        assert!(
+            effective
+                .meta
+                .as_ref()
+                .and_then(|meta| meta.auth_binding.as_ref())
+                .is_none()
+        );
         assert_eq!(
             explain_codex_responses_upstream_protocol(&effective).protocol,
             CodexResponsesUpstreamProtocol::Responses
@@ -7228,10 +7238,12 @@ wire_api = "chat"
         let config = resolve_codex_chat_reasoning_config(&provider, &json!({"model":"glm-5.2"}))
             .expect("reasoning config");
         assert_eq!(config.effort_param.as_deref(), Some("reasoning_effort"));
-        assert!(config
-            .effort_value_mode
-            .as_deref()
-            .is_some_and(|mode| mode.contains("medium=high") && mode.contains("xhigh=max")));
+        assert!(
+            config
+                .effort_value_mode
+                .as_deref()
+                .is_some_and(|mode| mode.contains("medium=high") && mode.contains("xhigh=max"))
+        );
     }
 
     #[test]
@@ -7372,6 +7384,42 @@ wire_api = "chat"
     }
 
     #[test]
+    fn fetched_openrouter_capability_keeps_native_reasoning_request_shape() {
+        let entry = json!({
+            "model": "fireworks/ember-1",
+            "reasoning": {
+                "supported_efforts": ["none", "low", "max"],
+                "default_effort": "max"
+            }
+        });
+        let capability = crate::proxy::providers::codex_reasoning::
+            reasoning_capability_from_openrouter_model_entry(&entry)
+        .expect("OpenRouter model reasoning capability");
+        let config = codex_chat_reasoning_config_from_capability(capability);
+        assert_eq!(config.thinking_param.as_deref(), Some("none"));
+        assert_eq!(config.effort_param.as_deref(), Some("reasoning.effort"));
+        assert!(config.disable_contract);
+        assert_eq!(
+            crate::proxy::providers::transform_codex_chat::map_codex_reasoning_effort("max", &config)
+                .expect("max remains OpenRouter's advertised max"),
+            Some("max")
+        );
+        let outbound = crate::proxy::providers::transform_codex_chat::
+            responses_to_chat_completions_with_reasoning(
+                json!({
+                    "model": "fireworks/ember-1",
+                    "input": "hello",
+                    "reasoning": {"effort": "max"}
+                }),
+                Some(&config),
+            )
+            .expect("OpenRouter Chat request");
+        assert_eq!(outbound["reasoning"]["effort"], "max");
+        assert!(outbound.get("reasoning_effort").is_none());
+        assert!(outbound.get("thinking").is_none());
+    }
+
+    #[test]
     fn test_resolve_codex_chat_reasoning_siliconflow_platform_overrides_minimax() {
         let provider = create_provider(json!({
             "config": r#"
@@ -7501,8 +7549,11 @@ wire_api = "chat"
 
         let mut body_b = json!({ "model": "deepseek-v4-flash-provider-b", "input": "test" });
         let result_b = apply_codex_request_upstream_model(&materialized, &mut body_b);
-        assert_eq!(result_b.as_deref(), Some("deepseek-v4-flash"),
-            "aliased visible name 'deepseek-v4-flash-provider-b' should map to upstream 'deepseek-v4-flash'");
+        assert_eq!(
+            result_b.as_deref(),
+            Some("deepseek-v4-flash"),
+            "aliased visible name 'deepseek-v4-flash-provider-b' should map to upstream 'deepseek-v4-flash'"
+        );
     }
 
     /// 验证 materialize_codex_routed_provider_from_target 保留 route 的 apiFormat。
@@ -7986,11 +8037,13 @@ wire_api = "responses"
                 .and_then(JsonValue::as_bool),
             Some(true)
         );
-        assert!(native
-            .effective_provider
-            .settings_config
-            .get("auth")
-            .is_none());
+        assert!(
+            native
+                .effective_provider
+                .settings_config
+                .get("auth")
+                .is_none()
+        );
         assert_eq!(
             managed
                 .effective_provider
@@ -8015,11 +8068,12 @@ wire_api = "responses"
                 .and_then(JsonValue::as_bool),
             Some(true)
         );
-        assert!(pool
-            .effective_provider
-            .settings_config
-            .get("auth")
-            .is_none());
+        assert!(
+            pool.effective_provider
+                .settings_config
+                .get("auth")
+                .is_none()
+        );
     }
 
     #[test]

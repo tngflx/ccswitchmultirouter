@@ -1,5 +1,238 @@
 # Engineering Journal (newest first)
 
+## 2026-09-25 - Persist MultiRouter aliases with upstream model identity
+
+- **What happened:** A MultiRouter setup-wizard alias such as `gpt-5.6-sol-sublyx` was compared with the provider's remote model list as if it were the upstream ID, so silent sync could report the alias as removed and delete or flag a still-valid model.
+- **Root cause:** Collision resolution changed the visible picker name but only kept that information in the transient wizard/router projection. Provider-form reconciliation keyed remote rows by visible `model`, while the source provider database row did not receive the resolved alias plus `upstreamModel` pair.
+- **What we did:** The wizard now returns collision-resolved source providers and a persistence catalog, saves those source catalogs before publishing the router, restores legacy route aliases into missing `upstreamModel` fields, and remaps spawn-agent selections by upstream identity. Catalog reconciliation and router projection use explicit upstream IDs while preserving visible aliases; unrelated manual rows remain unbound.
+- **Evidence:** Reference audit: BigStrongSun/ccswitchmulti's current docs confirm provider `modelCatalog` is the source of truth and router files are projections; original farion1231/cc-switch issue #5608 requests model-list-to-catalog synchronization but does not address collision aliases. Focused wizard/workspace/provider-form/refresh suites passed 251/251; `pnpm typecheck`, targeted Prettier, and `git diff --check` passed. Full suites and rebuilt-app runtime verification were not run.
+- **What NOT to do again:** Never use a collision alias as the remote identity, never prune manual rows by assuming every `model` is remotely bound, and never claim live behavior from the pre-existing binary; rebuild the normal app before runtime verification.
+
+## 2026-09-25 - Keep profile restore and manual stop inside takeover ownership boundaries
+
+- **What happened:** A queued manual/profile stop could shut down a listener after another app enabled takeover, and applying a profile could replay an old backup over an ordinary live config.
+- **Root cause:** The command checked takeover before acquiring service locks; profile apply scheduled a later unchecked stop. Its synchronous disable helper neither held the app/lifecycle locks nor checked whether the current live file was still proxy-owned.
+- **What we did:** Added an app-locked, lifecycle-locked stop that rechecks takeover at the decision point, used it from manual and delayed profile stops, and made synchronous profile disable serialize with takeover and restore only proxy-owned live state. Codex guardian shutdown precedes profile restore.
+- **Evidence:** `cargo check --manifest-path src-tauri/Cargo.toml --lib` passed; serial proxy-service tests passed 103/103, including the new queued-stop and stale-backup regressions; profile tests passed 11/11; proxy frontend tests passed 13/13. The Rust test build still emitted two existing version-detection unused-symbol warnings. Rebuilt-app runtime verification and full suites were not run.
+- **What NOT to do again:** Do not split an ownership check from its stop transaction or treat a persisted backup alone as permission to overwrite the user's current live config. The Codex Desktop precheck outside takeover locks and provider-switch shutdown paths still require separate audit; these tests do not certify the entire workflow.
+
+## 2026-09-25 - Serialize proxy listener ownership across takeover transitions
+
+- **What happened:** Disabling and re-enabling local proxy routing could leave a listener alive while `ProxyService` had already published `server = None`; a subsequent start then saw a stale/foreign owner and could report takeover failure. The provider form also lacked a silent, verified model refresh and default-model staleness signal.
+- **Root cause:** `ProxyService::stop()` removed the server wrapper before shutdown completed, and per-app takeover transactions serialized only their own app lock. A second app or restore workflow could therefore interleave live-file restoration, shared-server stop, and shared-server start. Model refresh had no verified identity-scoped reconciliation boundary.
+- **What we did:** Keep the server wrapper until `ProxyServer::stop()` succeeds, retain the task handle on timeout, serialize start/stop and full takeover/restore transactions with a lifecycle mutex, reject current-process self-takeover, and use locked internal start/stop paths to avoid mutex re-entry. Added identity-scoped silent model refresh, complete non-empty catalog diff dialogs, and red invalid styling/alert for defaults absent from the latest verified list while allowing aliases whose upstream model remains available.
+- **Evidence:** `pnpm exec vitest run tests/components/CodexFormFields.test.tsx tests/hooks/useAutoModelRefresh.test.tsx src/components/providers/forms/codexCatalogSync.test.ts` passed 75/75; proxy frontend tests passed 13/13; `pnpm typecheck` passed; `cargo check --manifest-path src-tauri/Cargo.toml` passed; watchdog lib tests passed 4/4; proxy lib tests passed 98/99, with the one Windows temp-file sharing failure passing when rerun alone (1/1). A non-lib cargo test attempt was blocked by the running debug `cc-switch.exe` (`os error 5`) and no process was killed. Live post-rebuild toggle verification remains pending.
+- **What NOT to do again:** Never remove or replace the listener wrapper before the task has terminated, never let a shared proxy stop race another app's start, and never treat an empty/failed model response as evidence that saved models were removed. Do not kill the live app to bypass the normal target lock.
+
+## 2026-09-25 - Keep ProviderForm model controls stable and Ultra claims accurate
+
+- **What happened:** Large Codex catalogs expanded an editor after mouse hover, displacing Include checkboxes; every reasoning row also offered an Ultra unlock before graded provider capability was resolved.
+- **Root cause:** `HoverExpandRow` changed the active editor after a 300 ms pointer delay, while the summary rendered Ultra independently of resolved provider efforts. The form already has separate model-selection controls, so adding another checkbox inside the row would duplicate accessible labels.
+- **What we did:** Require explicit chevron activation in the compact catalog; retain one stable Include checkbox; show the Codex Ultra mapping only for resolved graded efforts or an existing mapping that needs repair; label it as Codex orchestration rather than provider-native Ultra. The two larger catalog/reasoning presentations remain separate and need a dedicated consolidation pass.
+- **Evidence:** Focused Vitest passed 80/80 across four files; `pnpm typecheck`, `cargo check --manifest-path src-tauri/Cargo.toml --lib`, focused OpenRouter/provider-isolation/proxy-stop Rust tests, and scoped `git diff --check` passed. Live rebuilt-app verification and full suites were not run.
+- **What NOT to do again:** Do not bind editor expansion to hover or infer a native Ultra tier from a Codex orchestration setting; do not add duplicate Select controls to the existing form.
+
+## 2026-09-25 - Preserve OpenRouter's distinct max and xhigh efforts
+
+- **What happened:** A safety review of the OpenRouter catalog fix below found that its first pass collapsed an advertised `max` effort into `xhigh`.
+- **Root cause:** We assumed OpenRouter would reject `max`, but its current Chat API reference lists both `max` and `xhigh` as valid reasoning efforts. The catalog can advertise them separately, so the collapse changed provider semantics.
+- **What we did:** Keep each advertised effort and default unchanged, use an identity effort map, and retain OpenRouter's native `reasoning.effort` request object without an extra `thinking` or top-level `reasoning_effort`. The conversion remains gated to the exact `openrouter.ai` catalog host; other providers keep the generic parser.
+- **Evidence:** Official OpenRouter Chat API reference lists both values. `codex_reasoning` tests passed 27/27, `model_fetch` 65/65, outbound-body test 1/1, and neighboring provider-resolution tests 6/6. Rebuilt-app runtime behavior and full suites were not tested.
+- **What NOT to do again:** Do not collapse distinct upstream effort tiers from a presumed compatibility rule; preserve the provider's declared values unless a verified endpoint contract requires translation.
+
+## 2026-09-25 - Normalize OpenRouter reasoning levels before catalog save
+
+- **What happened:** A model refresh produced 188 `effortMap target must be present in supportedEfforts` warnings, and the ordinary Codex provider form did not retain fetched reasoning declarations.
+- **Root cause:** OpenRouter's `/models` response used `reasoning.supported_efforts` and `default_effort`. The backend generated an identity `effortMap` from the snake_case levels but left CCSM's camelCase `supportedEfforts` empty, so validation rejected every graded declaration. The form's catalog merge independently omitted `fetched.reasoning`.
+- **What we did:** Normalize the remote levels, default, and explicit `none` contract before validation; skip boolean-only remote metadata without advertised levels; fill missing reasoning on ordinary catalog sync without replacing user declarations. BigStrongSun's closed reasoning-route PRs and original cc-switch's recent reasoning-effort PRs address different boundaries, so no upstream change was ported.
+- **Evidence:** The live OpenRouter catalog exposed exactly 188 `reasoning.supported_efforts` entries, matching the warning count. Focused `codex_reasoning` tests passed 26/26, `model_fetch` tests 64/64, Codex form tests 64/64, `cargo check` and `pnpm typecheck` passed. The Rust test build emitted two existing cfg(test)-only unused-symbol warnings; the form suite emitted existing React `act(...)` warnings. Live rebuilt-app verification and full suites were not run. Repository-wide `cargo fmt --check` failed on extensive pre-existing formatting differences.
+- **What NOT to do again:** Do not construct an effort map from a remote schema without normalizing its supported levels in the same step, or discard validated fetched reasoning in the standard catalog save path.
+
+## 2026-09-25 - Guard Codex takeover shutdown while Desktop retains routing
+
+- **What happened:** The local Codex routing toggle was turned off at 00:31:32; the log shows live-config restoration and listener shutdown at 00:31:39, followed by re-enable at 00:32:49. That sequence has no logged backend error. A separate burst of frontend `handlerId` unhandled rejections occurred at 00:53:36, after re-enable, so it is not evidence that disable itself failed.
+- **Root cause:** The confirmed code-level shutdown hazard was stopping the listener before restoring client configs, with an asynchronous guardian writer able to race restoration. A running Codex Desktop app-server retaining its old proxy endpoint after config restoration is a plausible additional cause of post-disable failures, but is **not proven** by this log.
+- **What we did:** Restore before stopping the listener, await guardian shutdown before restore, retain the listener and backup if restore fails, and reject manual Codex disable or global stop while Codex Desktop is active. The UI gives a translated close-Desktop instruction; disable never terminates or relaunches Desktop.
+- **Evidence:** `pnpm typecheck`, `cargo check --manifest-path src-tauri/Cargo.toml`, focused Vitest 13/13, both new focused Rust tests 1/1 each, targeted Prettier, and scoped `git diff --check` passed. Full suites and live post-rebuild toggle behavior were not tested. The 00:53 frontend rejection burst remains a separate unresolved incident.
+- **What NOT to do again:** Do not stop the proxy before restoring live configs, race restoration with the guardian, terminate Desktop to force disable, or claim the cached-endpoint hypothesis is established without observing the rebuilt runtime.
+
+## 2026-09-24 - Remove duplicate paginated-history module wiring
+
+- **What happened:** A library check emitted a warning storm covering nearly every paginated-history repair helper, plus an unused backup-parent helper.
+- **Root cause:** The port declared `codex_paginated_history_repair` at crate root even though the active runtime-refresh implementation did not wire that module. This created an unreachable duplicate helper graph; the backup-parent helper was likewise added without an active caller.
+- **What we did:** Removed the duplicate root module declaration and the orphan backup-parent helper. No `allow(dead_code)` suppression was added.
+- **Evidence:** `cargo check --manifest-path src-tauri/Cargo.toml --lib` passed with no warnings; the focused `codex_runtime_refresh` test filter passed 8/8. The test build still reports two expected cfg(test)-only version-detection warnings because those symbols are used only by non-test projection code.
+- **What NOT to do again:** Do not expose the paginated repair file as a second crate-level module while runtime-refresh owns its integration. Port the complete runtime wiring before restoring backup-generation helpers.
+
+## 2026-09-24 - Model ordering feedback and picker projection status
+
+- **What happened:** Model Ordering saves and failures were only shown as inline status text, and disabled source-catalog rows appeared in a separate hidden-model section.
+- **Root cause:** The tab owned transient `message`/`error` state instead of using the app-wide toast surface; source visibility rows were being conflated with sortable router picker entries.
+- **What we did:** Switched save, reset, hide, pending, inactive, and failure feedback to Sonner toasts; removed hidden source rows from the ordering list; kept provider-level hide as the source-of-truth action. Saved order still persists to `codexRouting.modelOrder`, then checks/retries the active projection before reporting picker synchronization.
+- **Evidence:** Focused ordering/projection/catalog tests passed 3 files / 139 tests; full frontend suite passed 196 files / 1,579 tests; `pnpm typecheck`, `cargo check --manifest-path src-tauri/Cargo.toml --lib`, and `git diff --check` passed. Full Rust tests were attempted but blocked by Windows access denial removing the live `src-tauri/target/debug/cc-switch.exe` (`os error 5`).
+- **What NOT to do again:** Do not use inline status text for one-shot save outcomes, and do not present provider-disabled catalog rows as sortable live picker models. Do not kill a running desktop process to force a backend test build.
+
+## 2026-09-24 - Recheck v3.20.2-20 release parity
+
+- **What happened:** The release-description audit found the Codex Desktop strict-config projection gate was still missing, and orphan synthetic Codex App deliveries could be removed before Chat conversion.
+- **Root cause:** Inline provider models were always written; generic orphan sanitization did not distinguish the documented `codex_app` delivery shape.
+- **What we did:** Added Desktop version gating at 26.912+, stale inline-model cleanup, runtime-refresh command parity, and preservation tests for known `codex_app.send_message_to_thread`/`automation_update` outputs while keeping unrelated orphan outputs fail-closed.
+- **Evidence:** `cargo check --manifest-path src-tauri/Cargo.toml --lib` passed; strict projection test passed 1/1; runtime-refresh tests passed 8/8; orphan conversion and sanitizer tests passed; `pnpm typecheck` passed.
+- **What NOT to do again:** Do not infer release parity from symbol presence alone; verify each release description's behavioral gate and boundary tests.
+
+## 2026-09-24 - Reset model order now prunes stale releases
+
+- **What happened:** A post-restart audit found that resetting the MultiRouter model order still placed stale GPT 5.6 entries from the highest-ranked provider ahead of models from lower-ranked providers.
+- **Root cause:** The reset path ignored persisted order but did not invoke the already-tested recent-release pruning rule; provider ranking therefore grouped every source model, including superseded releases.
+- **What we did:** Added reset-only pruning before provider ranking, preserving route metadata and leaving normal read-only projections unchanged. Added a regression covering a Sublyx-ranked provider with GPT 6, GPT 5.6, and GPT 5.4 entries.
+- **Evidence:** `pnpm vitest run src/components/codex/CodexRouterWorkspacePage.test.ts tests/components/codexCatalogVersionPruning.test.ts --reporter=dot` passed 133/133; `cargo check --manifest-path src-tauri/Cargo.toml --lib` passed; `pnpm typecheck` passed; `git diff --check` passed.
+- **What NOT to do again:** Do not treat “ignore persisted order” as equivalent to “rebuild the current latest catalog.” Reset must apply the same release-pruning policy used by provider catalog maintenance.
+
+## 2026-09-24 - Port complete BigStrongSun MFJS tool-schema compiler
+
+- **What happened:** A post-restart release audit found that the fork's Moonshot adapter only dropped boolean/combined-union schemas, while BigStrongSun v3.20.2-20's fix handled dynamic Codex tools such as `automation_update` and `agents__followup_task` recursively.
+- **Root cause:** The fork had no `codex_tool_schema` compiler at the final Chat request boundary, so unsupported nested keywords, local/remote `$ref`, tuple constraints, and non-disjoint `oneOf` could still reject the whole request or reach MFJS unchanged.
+- **What we did:** Added the upstream recursive MFJS compiler with per-function-tool fail-open, path-aware warnings, unsupported-key stripping with `strict=false`, non-disjoint `oneOf` widening, local `$ref` handling, and root-union projection. Wired it into the existing Moonshot/Kimi endpoint gate and removed the now-redundant boolean-only dropper.
+- **Evidence:** `cargo test --manifest-path src-tauri/Cargo.toml codex_tool_schema --lib` passed 7/7; `cargo check --manifest-path src-tauri/Cargo.toml --lib` passed; `pnpm typecheck` passed; `git diff --check` passed. Full backend tests remain unrun because the live `cc-switch.exe` processes keep the normal test binary target locked.
+- **What NOT to do again:** Do not treat a two-case schema filter as MFJS compatibility. Compile at the final merged request boundary, retain valid sibling tools, and preserve fail-closed behavior for unknown non-function tool entries.
+
+## 2026-09-24 - BigStrongSun parity audit after OpenRouter 503
+
+- **What happened:** A parity audit checked `upstream/main` after diagnosing the OpenRouter capacity failure.
+- **Root cause:** This fork does not contain BigStrongSun's bounded Codex capacity auto-resume (`9e831c571`), bounded/scoped proxy error journal (`738a50ea8`, `727b47435`), or the latest cross-platform CI fixes (`00c7dd4d6`, `160d28adb`, `651bb0f3a`, `bb1237333`). The fork's new SSE payload preservation is only a diagnostic subset of the error-journal work.
+- **What we did:** Compared commit contents and current symbols. Confirmed `capacity_retry_enabled`, `CAPACITY_STREAM_MAX_RETRIES`, `error_journal`, and the upstream CI portability changes are absent; did not blindly merge because the fork has substantially diverged proxy, database, and process-identity code.
+- **Evidence:** `git show --stat` and source searches against `upstream/main`; current `cargo check --manifest-path src-tauri/Cargo.toml --lib`, targeted SSE/routing tests, `pnpm typecheck`, and `git diff --check` pass. The missing-feature implementations were not ported or tested in this audit.
+- **What NOT to do again:** Do not claim upstream parity from a clean local compile, and do not cherry-pick the large capacity commit without reconciling its schema, proxy constructor, settings, and replay boundaries with this fork.
+
+## 2026-09-24 - Re-audit reference releases and close reasoning/tool-schema gaps
+
+- **What happened:** A second audit against `BigStrongSun/ccswitchmulti` and `farion1231/cc-switch` found that the earlier port set covered the model-list, Grok-family, takeover/auth, ordering, and release reliability fixes, but two current original-repo proxy fixes were still absent.
+- **Root cause:** The fork still collapsed the explicit `max` effort tier to `xhigh` for GPT-5.6/GPT-6 Astra, and its Responses-to-Chat converter serialized missing tool descriptions as JSON `null`, which strict OpenAI-compatible gateways reject.
+- **What we did:** Added a narrow max-tier capability predicate for `gpt-5.6`, its Sol/Terra/Luna variants, and `gpt-6-astra`; preserved `max` only for those models while retaining the existing `xhigh` fallback elsewhere. Changed function-tool conversion to omit absent/null descriptions and added regression tests for both behaviors.
+- **Evidence:** Focused Rust tests passed: reasoning max mapping `2/2`, Responses max preservation `1/1`, and missing tool description `1/1`. Frontend regression suite passed `4 files / 38 tests`; `pnpm typecheck`, `cargo check --lib`, and `git diff --check` are the remaining verification gates for this edit. The full unfiltered backend suite remains subject to the existing running `src-tauri/target/debug/cc-switch.exe` replacement lock.
+- **Reference verdict:** `f2537fdf6`, Grok 4.x reasoning, additional-tools, auth-preservation, takeover-auth, and provider-refresh fixes were already present in the dirty tree. Token Exchange and unrelated Pi/auto-launch/release feature series were rejected as non-crucial or incompatible with this fork's contracts.
+- **What NOT to do again:** Do not port a release commit by hash alone. Compare its ownership boundary with the fork, preserve fork-specific reasoning/provider contracts, and add a regression at the converter boundary before declaring parity.
+
+## 2026-09-24 - Release audit: Token Exchange series intentionally not ported
+
+- **What happened:** The v3.20.2-19/v3.20.2-20 release history contained a six-commit Token Exchange (TE) provider series alongside the applicable reliability fixes already present in this fork.
+- **Root cause:** TE is a new provider feature, not a standalone bug fix. It requires a `token_exchange` provider type, OpenClaw TE form/state, live-import canonicalization, and runtime probe IPC. This fork has none of those contracts and its OpenClaw/provider persistence paths are otherwise unrelated.
+- **What we did:** Audited commits `10aa7443f`, `ecd6cb62a`, `e15f2d015`, `b5a97025c`, `b5460fda3`, and `ba97bf5db` against the current provider model and rejected a blind port. Confirmed the release reliability fixes (usage ghost filtering, toast pointer-events, image fallback, env-injection empty-state contract, MFJS fail-open, strict config projection gate, orphan output repair, duplicate namespace handling, MiMo tools, and plugin repair) are already represented locally.
+- **Evidence:** `rg` found no TE provider type, command, API wrapper, utility, or form in the fork; the current `ProviderMeta` and `OpenClaw` contracts contain no TE fields. Release commit stats show the TE series adds roughly 2,000 lines across those unsupported surfaces. No source edit was made for this rejected feature port.
+- **What NOT to do again:** Do not import a release feature by cherry-picking its commits when its provider type and persistence/runtime contracts do not exist locally. Revisit TE only as an explicitly scoped feature with migrations and end-to-end tests.
+
+## 2026-09-24 - Preflight Codex router schema before takeover
+
+- **What happened:** Disabling Codex proxy takeover and enabling it again could surface a local-router schema/database error during the second enable attempt.
+- **Root cause:** The home-page takeover path started the proxy and began takeover state changes before validating the active provider's `codexRouting` document. Legacy, malformed, or uncompileable MultiRouter data therefore failed late in live projection instead of at the owning activation boundary.
+- **What we did:** Added a Codex takeover preflight that requires explicit migration for active legacy routing, rejects malformed/unsupported schema documents, and compiles schema-v2 projections before starting the proxy or touching backups/live config. The existing disable path remains a restore-only operation, so re-enable no longer inherits a partially mutated state from a failed validation.
+- **Evidence:** `cargo test --manifest-path src-tauri/Cargo.toml services::proxy::tests::codex_takeover_rejects_legacy_router_before_starting_proxy_or_touching_live_state --lib` passed (1/1); `cargo test --manifest-path src-tauri/Cargo.toml services::proxy --lib` passed (95/95); `cargo check --manifest-path src-tauri/Cargo.toml --lib` passed; `pnpm typecheck` and `git diff --check` passed.
+- **What NOT to do again:** Do not start the proxy, rewrite the live config, or create/replace a restore backup before validating the active router schema and projection. Do not silently migrate legacy routing during a toggle; use the explicit migration flow.
+
+## 2026-09-24 - Diagnose OpenRouter 503 for stealth/space-bunny-alpha
+
+- **What happened:** Codex requests repeatedly failed with `503 Service Unavailable` and eventually reported no available MultiRouter provider.
+- **Root cause:** The configured OpenRouter route correctly translated Codex Responses input to `https://openrouter.ai/api/v1/chat/completions`; OpenRouter then returned `JSON error injected into SSE stream` for `stealth/space-bunny-alpha`. Four upstream failures opened the local circuit breaker, which explains the later `no available provider` message.
+- **What we did:** Rechecked the route resolver and reasoning projection test, confirmed the OpenRouter platform override, and preserved the circuit breaker as containment. No Responses/Chat routing change was made because the route is already Chat Completions.
+- **Evidence:** `cc-switch.log` shows the exact Chat Completions URL and upstream 503s. `cargo test --manifest-path src-tauri/Cargo.toml --lib test_resolve_codex_chat_reasoning_openrouter_platform_overrides_model -- --nocapture` passed (1/1). `pnpm typecheck` passed.
+- **What NOT to do again:** Do not switch OpenRouter to Responses or disable the circuit breaker to mask an upstream 503. Add another healthy provider/model route or wait for OpenRouter recovery; reset the breaker only after upstream health is confirmed.
+
+## 2026-09-24 - Preserve structured provider errors from SSE priming
+
+- **What happened:** An upstream Chat SSE response could begin with an error event, but CCSwitch converted the event to only its message text before logging and returning it.
+- **Root cause:** `retryable_error_from_primed_sse_chunk` extracted `/error/message` and discarded provider error type/code/details.
+- **What we did:** Preserve the compact structured JSON payload, bounded to 4096 characters, in `ProxyError::UpstreamError`; ordinary logs still summarize the message while the client receives the full diagnostic payload.
+- **Evidence:** `cargo test --manifest-path src-tauri/Cargo.toml --lib streaming_first_sse_error_event_is_retryable_before_response_is_returned -- --nocapture` passed (1/1); the regression now verifies both the human message and `provider_capacity` code survive.
+- **What NOT to do again:** Do not flatten upstream structured errors at the stream boundary when they are needed for provider diagnosis.
+
+## 2026-09-24 - Wire paginated repair and MFJS fail-open boundaries
+
+- **What happened:** Runtime-refresh IPC commands were unconditional stubs, paginated repair was not compiled into the library, and Moonshot/Kimi Chat conversion could reject an entire request because one function tool had an unrepresentable schema.
+- **Root cause:** The repair implementation had been ported without its module/command integration, while the existing Moonshot adapter only rewrote `$ref` siblings and had no per-tool containment boundary.
+- **What we did:** Registered the repair module, made the runtime commands perform snapshot-checked safe history repair with explicit `runtimeRestarted: false` disclosure, restored the missing migration-backup parent helper, and added per-function-tool dropping for malformed MFJS schemas before the existing rewrite.
+- **Evidence:** `cargo check --manifest-path src-tauri/Cargo.toml` passed; focused Rust tests for MFJS fail-open, env serialization, and standalone Codex-app output each passed; `git diff --check` passed. Runtime process restart was not tested because the existing `cc-switch.exe` must not be killed or replaced.
+- **What NOT to do again:** Do not expose a repair implementation as an “unavailable” command, and do not fail an otherwise valid tool request because one function schema is not representable in a vendor dialect.
+
+## 2026-09-24 - Rank default MultiRouter models by provider priority
+
+- **What happened:** Reset to default in the model ordering page followed route/catalog insertion order instead of the provider ranking shown on the home page, so a lower-ranked provider could appear before Sublyx's newest GPT models.
+- **Root cause:** The default catalog projection did not use provider `sortIndex`, and reset reused the already-custom-ordered catalog instead of rebuilding the default projection.
+- **What we did:** When provider rankings exist, sort the default projection by provider `sortIndex` and then descending parsed numeric model release. Reset now rebuilds with persisted `modelOrder` ignored before clearing the custom order. Existing explicit model orders remain authoritative.
+- **Evidence:** `pnpm exec vitest run src/components/codex/CodexRouterWorkspacePage.test.ts tests/lib/codexModelCatalogOrder.test.ts` passed **2 files / 116 tests**; `pnpm typecheck` and `git diff --check` passed. Reference history in both `upstream/main` and `original/main` contained ordering-preservation work but no provider-ranked default reset behavior, so this was implemented locally.
+- **What NOT to do again:** Do not treat the current custom catalog order as the reset baseline; do not use provider-local model indexes as the global ranking source when the home provider list already exposes `sortIndex`.
+
+## 2026-09-24 - Keep only newest numeric model releases
+
+- **What happened:** ProviderForm's Keep recent versions action retained older GPT 5.6 entries when GPT 6 was available, and could retain older image releases as well.
+- **Root cause:** Pruning kept two numeric releases per branch and then backfilled older release tiers until each family had four identities, so old releases were intentionally reintroduced. Image IDs such as `gpt-image-N` were also not parsed as a versioned family.
+- **What we did:** Retain only the newest numeric release in each parsed branch, preserve same-release aliases and provider variants, and parse `gpt-image-N` as the `gpt-image` family. Updated ProviderForm expectations and all four locale descriptions to match the contract.
+- **Evidence:** `pnpm exec vitest run tests/components/codexCatalogVersionPruning.test.ts tests/components/CodexFormFields.test.tsx` passed **2 files / 86 tests**; `git diff --check` passed.
+- **What NOT to do again:** Do not restore family-minimum backfill or infer recency from provider-specific hardcoded model IDs; use parsed numeric versions and branch semantics.
+
+## 2026-09-24 - Make frontend saved model ranks case-insensitive
+
+- **What happened:** A final pre-rebuild audit found that the frontend order helper could lose a saved rank if a provider changed only the casing of a model identifier, while the Rust compiler preserved that rank case-insensitively.
+- **Root cause:** The frontend rank map was keyed by the original model spelling even though identity matching and compiler ordering use lowercase keys.
+- **What we did:** Normalized both saved and rebuilt model keys to lowercase in `applyCodexCatalogModelOrder`, with a regression covering casing changes.
+- **Evidence:** Focused ordering/workspace tests passed **115/115**; Prettier and `git diff --check` passed.
+- **What NOT to do again:** Do not use raw model spelling as an ordering identity when the compiler treats model IDs case-insensitively.
+
+## 2026-09-24 - Align MultiRouter model ordering with the Codex picker
+
+- **What happened:** Resetting model order or changing provider catalogs could make the ordering page disagree with the Codex Desktop picker; duplicate provider model names disappeared from the preview, and save could report success before projection publication.
+- **Root cause:** The frontend default stripped source `sortIndex` while the backend promoted it into global picker order; the frontend keyed preview rows only by canonical model name; and save feedback stopped at provider persistence. Schema-v2 preview also used legacy `match` rules instead of `modelSelection` and classified some custom OAuth-looking providers as canonical when the compiler did not.
+- **What we did:** Made Router `modelOrder` the only global order override. Default order now follows current route/provider catalog sequence without source indexes; explicit order keeps dense indexes. The preview retains provider-qualified collisions, recovers unambiguous renamed ranks, selects schema-v2 rows by canonical/upstream IDs, and applies the compiler's canonical-provider collision rule. Save inspects and retries projection, reporting ready, pending, or inactive accurately. Upstream `BigStrongSun/ccswitchmulti` PRs #26/#41 and original `farion1231/cc-switch` PR #7612 were reviewed during the audit; none resolved this ordering contract, so the fixes were adapted locally rather than ported.
+- **Evidence:** Focused frontend ordering/workspace tests passed **130/130**; full `pnpm test:unit` passed **196 files / 1576 tests**; full Rust library tests passed **3817/3817** with **6 ignored**; compiler tests **28/28**, projection tests **19/19**, and Codex Desktop picker-array patch test **1/1** passed in the prior focused run. `cargo check --manifest-path src-tauri/Cargo.toml`, selected Prettier checks, and `git diff --check` passed. `pnpm typecheck` fails only on the pre-existing `src/App.tsx:909` `mcode` comparison. Unfiltered `cargo test` could not replace the running `src-tauri/target/debug/cc-switch.exe` (`Access is denied`), so its binary/integration targets were not run. The running app predates these edits; its live Codex picker was not used as evidence.
+- **What NOT to do again:** Do not elevate provider-local indexes or stale Router catalog rows into global picker order; do not report a live Codex update from a database write alone.
+
+## 2026-09-24 - Adapt protocol and usage fixes from the reference repositories
+
+- **What happened:** The reference-repository audit found four bounded fixes that were still missing from this fork: strict Responses message discriminators, tolerant auxiliary `models` parsing, Codex rollout cache-write accounting, and vendor-gated thinking-history healing after Responses-to-Anthropic conversion.
+- **Root cause:** The fork's converters emitted role messages without `type = "message"`; model discovery strongly typed every top-level `models` field as Zhipu entries; session import discarded `cache_write_input_tokens`; and the converted Anthropic path skipped the provider normalization already used by direct Claude traffic.
+- **What we did:** Manually adapted original PR #7553 and commit `f2537fdf6` around the fork's existing reasoning metadata, then applied and reviewed original PRs #7635 and #7605. Preserved the existing dirty-tree work and updated the imported cache-write cost regression to the fork's current GPT-5.6 Sol pricing seed.
+- **Evidence:** Model-fetch tests passed **49/49**; Responses transform tests passed **85/85**; Codex session-usage tests passed **50/50** with **1 ignored**; the vendor history-heal regression passed **1/1**; the full Rust library suite passed **3816/3816** with **6 ignored**; `cargo check --manifest-path src-tauri/Cargo.toml` passed; full frontend Vitest passed **196 files / 1570 tests**. The restarted `src-tauri/target/debug/cc-switch.exe` was rebuilt at **2026-09-24 10:38:55 +08:00**, after all five backend source edits. `pnpm typecheck` remains blocked by three pre-existing dirty-tree errors (`src/App.tsx:909` and two missing `modelSelection` fields in `src/lib/codexMultiRouterWizard.test.ts`). The unfiltered `cargo test` command still could not replace the now-running executable (`Access is denied`), so binary/integration targets were not run; repository-wide `cargo fmt --check` still reports unrelated existing formatting differences.
+- **What NOT to do again:** Do not strongly type optional vendor sidecar fields when standard response data is independently valid; do not omit required Responses discriminators; do not discard cache-write counters from cumulative usage; and do not bypass provider-owned history normalization on converted request paths.
+
+## 2026-09-24 - Background preview exposed include-alias mismatch
+
+- **What happened:** The live workspace's background `Test publish` preview rejected `gpt-5.6-sol-sublyx` even though the published catalog and route alias map contained it.
+- **Root cause:** The frontend preview returned early for `modelSelection.mode === "include"` before checking explicit aliases. Runtime projection and save validation already handled the provider-qualified alias correctly, so this was a preview-only contract mismatch.
+- **What we did:** Preview now resolves an alias target and accepts it only when the target is explicitly selected (or selected through a catalog row's upstream model); excluded aliases remain rejected. Added a component regression covering both cases.
+- **Evidence:** Background UIA reproduced the rejection without foregrounding the app. `pnpm exec vitest run src/components/codex/CodexRouterWorkspacePage.test.ts` passed **104/104**, including `previews selected provider aliases without accepting excluded aliases`. The direct localhost probe was rejected before routing with `403 external_openai_api_disabled`, so it was not used as upstream forwarding evidence.
+- **What NOT to do again:** Do not treat a saved projection/catalog check as proof that the workspace's local route preview uses the same alias-selection contract.
+
+## 2026-09-24 - Restarted live wizard publish verification
+
+- **What happened:** Reopened the live MultiRouter wizard after restart and ran the automatic fetch, alias recomputation, route preview, and `Save & publish` flow through the background UI Automation path.
+- **Root cause:** The prior `unknown_reasoning_capability_requires_declaration` messages were historical failures from earlier save attempts; the restarted binary used the current source and accepted the same plan.
+- **What we did:** Fetched and wrote provider catalogs, recomputed aliases, advanced through all four steps, and published the plan. Read-only SQLite and on-disk catalog checks verified 52 unique visible slugs, 52 unique projected routes, valid provider-qualified alias targets, and a `ready` projection with matching dependency fingerprint. The status page reported synced catalog, listener, Codex takeover, routing entry, and four enabled match rules.
+- **Evidence:** Background UIA observed `modelsFetched`, `routePreview`, and `published`; SQLite projection state was `ready` with 52 routes; `~/.codex/cc-switch-model-catalog.json` contained 52 models with 52 unique slugs; every projected upstream target existed in its source catalog; capture helper passed with `PrintWindow=True`, `NonBlankRatio=0.9989`. No new `unknown_reasoning_capability_requires_declaration` error appeared during this run.
+- **What NOT to do again:** Do not treat old log entries as failures of the restarted process. A separate foreground Codex request was not generated during this non-disruptive audit, so request-level proof must remain explicitly scoped.
+
+## 2026-09-23 - Prefer declared reasoning across provider-qualified aliases
+
+- **What happened:** Saving the live `Codex MultiRouter` failed with `unknown_reasoning_capability_requires_declaration` even though the enabled DeepSeek V2 profiles had routable provider aliases with declared reasoning metadata.
+- **Root cause:** Multiple provider-qualified catalog rows map to the same canonical DeepSeek role. The compiler inserted the first row's resolved capability and never replaced `Unknown` when a later alias carried a valid declaration, so catalog order determined whether the canonical profile could save.
+- **What we did:** Reasoning capability aggregation now replaces an existing `Unknown` entry with a later known capability for both visible and canonical alias keys. Added a regression with an unknown OpenCode Zen row followed by a declared OpenCode Go row. Read-only inspection of the live DB confirmed the two enabled profiles and provider-qualified catalog pattern.
+- **Evidence:** Focused Rust tests `codex_subagent_v2_save_prefers_known_capability_across_provider_aliases` and `codex_subagent_v2_save_rejects_unknown_reasoning_for_enabled_routable_profile` passed; reference audit found the same validation/alias implementation in `upstream/main` and no equivalent Sub-Agent V2 implementation in `original/main`; `git diff --check` passed.
+- **What NOT to do again:** Do not let the first duplicate identity win when merging capability metadata. Merge by canonical identity and prefer a validated declaration over `Unknown`.
+
+## 2026-09-23 - Canonicalize mixed-provider wizard model identities
+
+- **What happened:** The MultiRouter setup wizard could export duplicate or silently missing picker entries when model discovery returned casing/whitespace variants or different providers exposed the same visible model name.
+- **Root cause:** Provider catalogs were merged by raw visible strings, collision resolution deduplicated only visible+upstream pairs, and final picker aggregation kept the first visible name. These layers used different identity rules, so a mixed catalog could lose a model or emit aliases that did not match the route projection.
+- **What we did:** Added a provider-boundary canonicalizer that normalizes and merges duplicate rows while preserving distinct user aliases and metadata. Collision resolution now canonicalizes first and assigns deterministic provider-qualified aliases for remaining visible-name conflicts; filtering uses the same canonicalizer. Added regressions for duplicate fetch rows, metadata retention, mixed-provider collisions, route alias targets, and picker cardinality.
+- **Evidence:** `pnpm exec vitest run src/lib/codexMultiRouterWizard.test.ts` passed 15/15; `git diff --check` passed. `pnpm typecheck` remains blocked only by the pre-existing `src/App.tsx:909` `"mcode"` union comparison.
+- **What NOT to do again:** Do not repair duplicate database rows as a one-off. Keep fetch merge, collision resolution, route aliases, and picker export on one explicit identity contract.
+
+## 2026-09-23 - Preserve reasoning metadata through MultiRouter wizard model refresh
+
+- **What happened:** Running the MultiRouter dashboard wizard's automatic model refresh left enabled Sub-Agent V2 profiles unable to save with `unknown_reasoning_capability_requires_declaration`.
+- **Root cause:** The model-fetch backend already exposed a `reasoning` field, but generic `/models` parsing always set it to `None`; then the wizard merge function discarded `FetchedModel.reasoning` even when OAuth/provider-specific fetchers supplied it. The generated provider catalogs therefore lost the capability contract before MultiRouter projection and validation.
+- **What we did:** Extract validated reasoning declarations from compatible `/models` entries, seed the same narrow maintained fallback for ID-only DeepSeek rows, and preserve fetched reasoning metadata when merging wizard catalogs. Added frontend and backend regressions.
+- **Evidence:** `src/lib/codexMultiRouterWizard.test.ts` passed 12/12; all 47 `services::model_fetch` tests passed; `cargo check --manifest-path src-tauri/Cargo.toml --lib` passed. `pnpm typecheck` still fails only on the pre-existing `src/App.tsx:909` `mcode` comparison.
+- **What NOT to do again:** Do not treat automatic model refresh as ID-only data. Keep capability fields intact across fetch → merge → provider catalog → router projection.
+
 ## 2026-09-23 - Background UIA audit found Usage Statistics hook crash
 
 - **What happened:** A page-by-page audit of the minimized live app was completed without foregrounding it. Settings General/Routing/Auth/Advanced/Usage Statistics, Skills, Prompts, Session Manager, and MCP Management were inspected through the WebView2 accessibility tree.
@@ -1625,3 +1858,35 @@ What NOT to do again: do not call the command “nonexistent” without checking
 - **What we did:** Replaced the compatibility-layer summarize step with an ordinary `turn/start` whose prompt forbids tools and file mutation and requires a plain-text handoff summary. The fresh root session is created only after that summary turn completes and returns non-empty text. Added an explicit permanent rule to `AGENTS.md` forbidding compaction for summarize/passover and tests asserting no compaction endpoint is called.
 - **Evidence:** `pnpm vitest run tests/lib/codexSummaryHandoff.test.ts` passed **7/7** after the change. The Rust compatibility-script test was rerun after correcting its assertion to distinguish the summary turn from the later fresh-session handoff turn.
 - **What NOT to do again:** Never implement “summarize” with native compaction, `/responses/compact`, or `thread/compact/start`; never create the fresh session before a successful manual coding-agent summary exists.
+
+# 2026-09-23 - Proxy takeover disable must not restart Codex Desktop
+
+- **What happened:** Turning Codex proxy takeover off could terminate Codex Desktop and then launch another CCSwitchMulti/Codex lifecycle, leaving conflicting processes for the next toggle.
+- **Root cause:** Both frontend takeover handlers inspected/restarted Codex for `enabled=false`, and `restart_codex_desktop` unconditionally stopped the Desktop shell before relaunching it through the model-picker unlock path.
+- **What we did:** Disable now uses the ordinary takeover mutation directly; the backend restart command has a defensive `enabled=false` branch that only restores takeover state. Automatic Codex CLI update probing now ignores the Desktop shell names (`Codex.exe`/`ChatGPT.exe`) and blocks only the lowercase CLI/app-server process. Renamed the Settings tab to “Updates” and kept the Codex CLI auto-update switch in that visible update section.
+- **Evidence:** Focused frontend tests passed 9/9 (`ProxyToggle` and `ProxyTabContent.takeover`). `pnpm typecheck` was run but failed on unrelated pre-existing `src/App.tsx:909` (`"mcode"` not in the app-id union). Rust `cargo check` and library test were run but failed on unrelated pre-existing `src-tauri/src/codex_multirouter/mutation.rs:211` (`item.id` on a `(String, Provider)` tuple); an earlier binary test also hit the running `cc-switch.exe` access-denied lock. No running process was killed.
+- **What NOT to do again:** Never route takeover disable through a command that stops or relaunches Desktop; never use Desktop process names as proof that the user’s Codex CLI is active.
+
+# 2026-09-23 - MultiRouter wizard persisted incomplete reasoning and stale aliases
+
+- **What happened:** MultiRouter save failed with `unknown_reasoning_capability_requires_declaration`; the log also emitted repeated `Codex reasoning declaration ... missing field upstream` warnings and a stale `gpt-5.6-terra` alias warning.
+- **Root cause:** The wizard/model fetch path persisted provider model metadata but `codex_catalog_model_specs` dropped the row-level `reasoning` declaration during Sub-Agent V2 validation. Separately, router aliases survived catalog refreshes after their target model was removed, so strict routing validation saw an unavailable target. The installed Codex CLI was not the cause: `codex-cli 0.156.1` matched the npm latest checked on September 23, 2026.
+- **What we did:** Kept fetched reasoning metadata through the wizard merge, projected only validated/normalized reasoning contracts (repairing legacy declarations missing `upstream`), consumed catalog-row reasoning in Sub-Agent V2 specs, and repaired stale aliases before router mutation validation while honoring include selections and disabled catalog rows.
+- **Evidence:** `cargo check --manifest-path src-tauri/Cargo.toml` passed; compiler tests passed 28/28; mutation tests passed 18/18 plus stale-alias regressions 3/3; model-fetch tests passed 47/47; catalog-spec reasoning regression passed 1/1; focused wizard Vitest passed 12/12; `git diff --check` passed. `pnpm typecheck` remains blocked by the unrelated pre-existing `src/App.tsx:909` `"mcode"` union error. Full suites were not run.
+- **What NOT to do again:** Do not treat a current CLI version as proof that persisted CCSwitch state is valid; do not discard `/models` reasoning metadata before Sub-Agent V2 validation; do not “fix” stale aliases by clearing the whole router document.
+
+# 2026-09-24 - BigStrongSun release re-audit closure
+
+- **What happened:** Re-audited the fork against the live `BigStrongSun/ccswitchmulti` `main` ref and its relevant PR refs after the model-pruning, reset-order, and takeover-recovery work.
+- **Reference verdict:** `upstream/main` remains `651bb0f3` (v3.20.2-20); no newer BigStrongSun commits were available. The relevant PR-19 usage aggregation, PR-24 disabled-model semantics, PR-26 model-order preservation, and PR-61 cached-plugin/native-reasoning work are already present or adapted in this tree. Token Exchange and unrelated Pi/release series remain intentionally unported because their ownership/contracts do not match this fork's current architecture.
+- **What we verified:** Provider catalog pruning keeps only the newest numeric release per capability branch, including `gpt-image-*`; default MultiRouter reset rebuilds from home-provider `sortIndex` and newest releases; takeover enable preflights malformed/legacy routing before proxy, backup, or live-file mutation; Windows project-key normalization, OAuth soft-avoidance fallback, hidden-model retention, usage ghost filtering, and the other audited release fixes remain present.
+- **Evidence:** live `git ls-remote upstream` matched local `upstream/main`; focused frontend suite passed 139/139; takeover preflight regression passed 1/1; GPT-5.6/GPT-6 max-effort regression passed 1/1; `pnpm typecheck`, `cargo check --lib`, `git diff --check`, and earlier full frontend suite passed. Full backend `cargo test` was attempted but could not replace the locked `src-tauri\\target\\debug\\cc-switch.exe` while PIDs 30100 and 63652 were running; no process was killed.
+- **What NOT to do again:** Do not claim the backend full suite passed while the executable lock remains; do not blindly port unrelated upstream architecture or use a release tag as evidence when the live branch ref is the authoritative comparison.
+
+# 2026-09-24 - Codex takeover lifecycle ownership race
+
+- **What happened:** Disabling and immediately re-enabling local proxy takeover could leave a stale Codex Desktop/guardian owner, producing duplicate Desktop shells or a port-takeover failure saying the listener was already owned.
+- **Root cause:** `taskkill` returned before verified Codex Desktop processes had disappeared, and guardian shutdown was fire-and-forget. The normal enabled-disable path also never stopped the guardian before restoring the live config, so its compatibility loop could write during or after restore.
+- **What we did:** Managed Desktop shutdown now waits up to five seconds for the verified process IDs to disappear and fails instead of relaunching into a stale process tree. Guardian shutdown now signals and awaits both background tasks (up to ten seconds, then aborts), and takeover disable/provider-switch restore stops the guardian before touching live config.
+- **Evidence:** `cargo check --manifest-path src-tauri/Cargo.toml` passed; focused frontend proxy tests passed 9/9; `pnpm typecheck` passed; `git diff --check` passed. Rust test binaries were blocked at link/replace time by the live `src-tauri\\target\\debug\\cc-switch.exe` access-denied lock, so the new async guardian test could not execute. No running process was killed.
+- **What NOT to do again:** Do not treat `taskkill` completion or a sent shutdown signal as lifecycle completion; do not restore takeover config while a guardian writer remains active; do not bypass the normal target lock with an alternate Cargo target.

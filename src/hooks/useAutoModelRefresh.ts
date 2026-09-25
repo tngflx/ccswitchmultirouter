@@ -30,6 +30,69 @@ function cachedValue<T>(key: string): T | undefined {
   return entry.value as T;
 }
 
+function reportModelDiff<T>(
+  value: T,
+  compareIds: string[] | undefined,
+  onDiff:
+    | ((added: string[], removed: string[], updated: string[]) => void)
+    | undefined,
+  snapshotKey?: string,
+  reportInitialAdditions = false,
+): void {
+  if (!onDiff) return;
+  const fetched = Array.isArray(value)
+    ? (value as { id?: string }[]).filter(
+        (model) => typeof model?.id === "string" && model.id.trim(),
+      )
+    : [];
+  const fetchedIds = fetched.map((model) => model.id!.trim());
+  // An empty response is not evidence that every saved model was removed.
+  if (fetchedIds.length === 0) return;
+  let previous: { id?: string }[] | undefined;
+  if (snapshotKey) {
+    try {
+      const raw = localStorage.getItem(`model-catalog:${snapshotKey}`);
+      const parsed: unknown = raw ? JSON.parse(raw) : undefined;
+      if (Array.isArray(parsed))
+        previous = parsed.filter(
+          (model): model is { id: string } =>
+            model !== null &&
+            typeof model === "object" &&
+            typeof model.id === "string" &&
+            Boolean(model.id.trim()),
+        );
+      localStorage.setItem(
+        `model-catalog:${snapshotKey}`,
+        JSON.stringify(fetched),
+      );
+    } catch {
+      // Storage is optional; the fetched list remains usable without it.
+    }
+  }
+  if (!previous && !compareIds) return;
+  const savedIds = previous
+    ? previous.map((model) => (model.id ?? "").trim()).filter(Boolean)
+    : (compareIds ?? []).map((id) => id.trim()).filter(Boolean);
+  const savedSet = new Set(savedIds);
+  const fetchedSet = new Set(fetchedIds);
+  const added =
+    previous || reportInitialAdditions
+      ? fetchedIds.filter((id) => !savedSet.has(id))
+      : [];
+  const removed = savedIds.filter((id) => !fetchedSet.has(id));
+  const previousById = new Map(previous?.map((model) => [model.id, model]));
+  const updated = previous
+    ? fetchedIds.filter((id, index) => {
+        const before = previousById.get(id);
+        return (
+          before && JSON.stringify(before) !== JSON.stringify(fetched[index])
+        );
+      })
+    : [];
+  if (added.length || removed.length || updated.length)
+    onDiff(added, removed, updated);
+}
+
 export function invalidateAutoModelRefresh(key?: string): void {
   invalidationEpoch += 1;
   if (key) {
@@ -47,6 +110,8 @@ export function useAutoModelRefresh<T>({
   fetcher,
   onSuccess,
   compareIds,
+  snapshotKey,
+  reportInitialAdditions = false,
   onDiff,
   ttlMs = AUTO_MODEL_CACHE_TTL_MS,
 }: {
@@ -55,19 +120,33 @@ export function useAutoModelRefresh<T>({
   fetcher: () => Promise<T>;
   onSuccess: (value: T) => void;
   compareIds?: string[];
-  onDiff?: (added: string[], removed: string[]) => void;
+  snapshotKey?: string;
+  reportInitialAdditions?: boolean;
+  onDiff?: (added: string[], removed: string[], updated: string[]) => void;
   ttlMs?: number;
 }): void {
   const onSuccessRef = useRef(onSuccess);
   const fetcherRef = useRef(fetcher);
+  const onDiffRef = useRef(onDiff);
+  const compareIdsRef = useRef(compareIds);
   onSuccessRef.current = onSuccess;
   fetcherRef.current = fetcher;
+  onDiffRef.current = onDiff;
+  compareIdsRef.current = compareIds;
 
   useEffect(() => {
     if (!enabled || !cacheKey) return;
 
     const cached = cachedValue<T>(cacheKey);
     if (cached !== undefined) {
+      if (!snapshotKey)
+        reportModelDiff(
+          cached,
+          compareIdsRef.current,
+          onDiffRef.current,
+          undefined,
+          reportInitialAdditions,
+        );
       onSuccessRef.current(cached);
       return;
     }
@@ -88,18 +167,13 @@ export function useAutoModelRefresh<T>({
     request
       .then((value) => {
         if (!cancelled && requestEpoch === invalidationEpoch) {
-          if (compareIds && onDiff) {
-            const fetchedIds = (value as unknown as { id?: string }[])
-              ?.map((m) => (m?.id ?? "").trim())
-              ?.filter(Boolean) ?? [];
-            const savedSet = new Set(compareIds.filter(Boolean));
-            const fetchedSet = new Set(fetchedIds);
-            const added = fetchedIds.filter((id) => !savedSet.has(id));
-            const removed = compareIds.filter((id) => !fetchedSet.has(id));
-            if (added.length || removed.length) {
-              onDiff(added, removed);
-            }
-          }
+          reportModelDiff(
+            value,
+            compareIdsRef.current,
+            onDiffRef.current,
+            snapshotKey,
+            reportInitialAdditions,
+          );
           onSuccessRef.current(value);
         }
       })
@@ -113,5 +187,5 @@ export function useAutoModelRefresh<T>({
     return () => {
       cancelled = true;
     };
-  }, [cacheKey, enabled, ttlMs]);
+  }, [cacheKey, enabled, reportInitialAdditions, snapshotKey, ttlMs]);
 }

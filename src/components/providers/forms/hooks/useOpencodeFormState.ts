@@ -105,7 +105,9 @@ export function useOpencodeFormState({
       const parsed = parseOpencodeConfig(JSON.parse(settingsConfig));
       if (!parsed) return;
       setOpencodeModels(parsed.models || {});
-      setOpencodeHeaders((parsed.options?.headers as Record<string, string>) || {});
+      setOpencodeHeaders(
+        (parsed.options?.headers as Record<string, string>) || {},
+      );
       setOpencodeExtraOptions(toOpencodeExtraOptions(parsed.options || {}));
     } catch {
       // Preserve structured state while raw JSON is temporarily invalid.

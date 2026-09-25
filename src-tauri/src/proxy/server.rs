@@ -295,20 +295,26 @@ impl ProxyServer {
 
     pub async fn stop(&self) -> Result<(), ProxyError> {
         // 1. 发送关闭信号
-        if let Some(tx) = self.shutdown_tx.write().await.take() {
+        let shutdown_requested = if let Some(tx) = self.shutdown_tx.write().await.take() {
             let _ = tx.send(());
+            true
         } else {
-            return Err(ProxyError::NotRunning);
-        }
+            false
+        };
 
-        // 2. 等待服务器任务结束（带 5 秒超时保护）
-        if let Some(handle) = self.server_handle.write().await.take() {
+        // 2. 等待服务器任务结束（带 5 秒超时保护）。 Borrow the handle
+        // instead of taking it before the await: on timeout the accept task is
+        // still alive and must remain represented by this server object.
+        let mut handle_guard = self.server_handle.write().await;
+        if let Some(handle) = handle_guard.as_mut() {
             match tokio::time::timeout(std::time::Duration::from_secs(5), handle).await {
                 Ok(Ok(())) => {
+                    handle_guard.take();
                     log::info!("[{}] 代理服务器已完全停止", log_srv::STOPPED);
                     Ok(())
                 }
                 Ok(Err(e)) => {
+                    handle_guard.take();
                     log::warn!("[{}] 代理服务器任务异常终止: {e}", log_srv::TASK_ERROR);
                     Err(ProxyError::StopFailed(e.to_string()))
                 }
@@ -320,8 +326,10 @@ impl ProxyServer {
                     Err(ProxyError::StopTimeout)
                 }
             }
-        } else {
+        } else if shutdown_requested {
             Ok(())
+        } else {
+            Err(ProxyError::NotRunning)
         }
     }
 

@@ -7,7 +7,7 @@
 //! Anthropic tool schemas are closer to JSON Schema, so we choose the richer
 //! channel when unsupported `Schema` fields are present.
 
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum GeminiFunctionParameters {

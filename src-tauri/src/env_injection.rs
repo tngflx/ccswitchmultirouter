@@ -116,17 +116,17 @@ pub enum EnvInjectionTargetSyncState {
 #[serde(rename_all = "camelCase")]
 pub struct EnvInjectionTargetSyncStatus {
     pub state: EnvInjectionTargetSyncState,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(default)]
     pub managed_keys: Vec<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(default)]
     pub added_keys: Vec<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(default)]
     pub updated_keys: Vec<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(default)]
     pub removed_keys: Vec<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(default)]
     pub relinquished_keys: Vec<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(default)]
     pub conflicted_keys: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
@@ -1148,5 +1148,29 @@ mod tests {
 
         let total = EnvInjectionSyncReport::new(failed.clone(), failed, false);
         assert_eq!(total.state, EnvInjectionSyncState::Failed);
+    }
+
+    #[test]
+    fn empty_target_status_serializes_all_key_arrays() {
+        let status = EnvInjectionTargetSyncStatus::success(
+            false,
+            &BTreeMap::new(),
+            EnvInjectionTargetReport::default(),
+        );
+        let json = serde_json::to_value(&status).expect("serialize status");
+        assert_eq!(json["state"], "disabled");
+        for key in [
+            "managedKeys",
+            "addedKeys",
+            "updatedKeys",
+            "removedKeys",
+            "relinquishedKeys",
+            "conflictedKeys",
+        ] {
+            assert_eq!(json[key], JsonValue::Array(vec![]));
+        }
+        let round_trip: EnvInjectionTargetSyncStatus =
+            serde_json::from_value(json).expect("deserialize status");
+        assert_eq!(round_trip, status);
     }
 }

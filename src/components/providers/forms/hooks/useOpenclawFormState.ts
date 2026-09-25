@@ -107,7 +107,8 @@ export function useOpenclawFormState({
     if (appId !== "openclaw") return;
     try {
       const config = JSON.parse(settingsConfig) as Record<string, unknown>;
-      if (Array.isArray(config.models)) setOpenclawModels(config.models as OpenClawModel[]);
+      if (Array.isArray(config.models))
+        setOpenclawModels(config.models as OpenClawModel[]);
     } catch {
       // Preserve structured state while raw JSON is temporarily invalid.
     }

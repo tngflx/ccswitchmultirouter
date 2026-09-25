@@ -925,8 +925,8 @@ function ProviderFormFull({
         ? value.filter((group): group is CodexApiKeyGroup =>
             Boolean(
               group &&
-                typeof group === "object" &&
-                Array.isArray(group.apiKeys),
+              typeof group === "object" &&
+              Array.isArray(group.apiKeys),
             ),
           )
         : [],
@@ -1167,8 +1167,7 @@ function ProviderFormFull({
     if (!identity) return undefined;
     return identity.startsWith("codex-")
       ? (presetEntries.find((entry) => entry.id === identity)?.preset as
-          | CodexProviderPreset
-          | undefined)
+          CodexProviderPreset | undefined)
       : codexProviderPresets.find(
           (candidate) => candidate.presetKey === identity,
         );
@@ -1204,8 +1203,7 @@ function ProviderFormFull({
     const savedModels = Object.values(codexCapabilityProviders).flatMap(
       (provider) => {
         const settings = provider.settingsConfig as
-          | Record<string, unknown>
-          | undefined;
+          Record<string, unknown> | undefined;
         const catalog = settings?.modelCatalog;
         if (!catalog || typeof catalog !== "object") return [];
         const models = (catalog as { models?: unknown }).models;

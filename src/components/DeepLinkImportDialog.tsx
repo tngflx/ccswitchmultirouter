@@ -190,7 +190,7 @@ export function DeepLinkImportDialog() {
           });
           toast.success(t("deeplink.skillImportSuccess"), {
             description: t("deeplink.skillImportSuccessDescription", {
-            repo: importRequest.repo,
+              repo: importRequest.repo,
             }),
             closeButton: true,
           });
@@ -391,9 +391,7 @@ export function DeepLinkImportDialog() {
                             }
                           >
                             {idx === 0 ? "🔹 " : "└ "}
-                            {endpointRisk && (
-                              <span aria-hidden="true">⚠ </span>
-                            )}
+                            {endpointRisk && <span aria-hidden="true">⚠ </span>}
                             {ep.trim()}
                             {idx === 0 && request.endpoint?.includes(",") && (
                               <span className="text-xs text-muted-foreground ml-2">

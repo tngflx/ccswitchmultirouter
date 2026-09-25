@@ -1,19 +1,21 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 import { CodexCatalogViewport } from "@/components/providers/forms/CodexCatalogViewport";
 
 describe("large catalog viewport", () => {
-  it("reveals the full editor on hover and protects a focused editor", async () => {
+  it("opens only on explicit activation and keeps Include clickable", async () => {
     const items = ["first", "second"].map((model, index) => ({
       row: { rowId: model, model },
       index,
     }));
+    const onToggleEnabled = vi.fn();
     render(
       <CodexCatalogViewport
         items={items}
         compact
         selected={new Set()}
         onSelect={vi.fn()}
+        onToggleEnabled={onToggleEnabled}
       >
         {({ row }) => (
           <input aria-label={`editor-${row.model}`} defaultValue="128000" />
@@ -28,19 +30,25 @@ describe("large catalog viewport", () => {
         }),
       );
     hover("first");
-    const input = await screen.findByLabelText("editor-first");
+    await new Promise((resolve) => setTimeout(resolve, 350));
+    expect(screen.queryByLabelText("editor-first")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("checkbox", { name: "Include first" }));
+    expect(onToggleEnabled).toHaveBeenCalledWith("first", false);
+    expect(screen.queryByLabelText("editor-first")).not.toBeInTheDocument();
+    fireEvent.click(
+      screen.getAllByRole("button", { name: "catalogBrowser.editModel" })[0],
+    );
+    const input = screen.getByLabelText("editor-first");
     expect(input).toHaveValue("128000");
-    input.focus();
     hover("second");
     await new Promise((resolve) => setTimeout(resolve, 350));
-    expect(input).toHaveFocus();
+    expect(input).toBeInTheDocument();
     expect(screen.queryByLabelText("editor-second")).not.toBeInTheDocument();
-    input.blur();
-    fireEvent.pointerLeave(screen.getByText("second"));
-    hover("second");
-    await waitFor(() =>
-      expect(screen.getByLabelText("editor-second")).toBeVisible(),
+    fireEvent.click(
+      screen.getAllByRole("button", { name: "catalogBrowser.editModel" })[1],
     );
+    expect(screen.getByLabelText("editor-second")).toBeVisible();
+    expect(screen.queryByLabelText("editor-first")).not.toBeInTheDocument();
   });
 
   it("pages 431 models and expands a filtered result without a clipped scroll container", () => {

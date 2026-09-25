@@ -33,7 +33,7 @@ export function ProxyToggle({ className, activeApp }: ProxyToggleProps) {
 
   const handleToggle = async (checked: boolean) => {
     try {
-      if (activeApp === "codex") {
+      if (activeApp === "codex" && checked) {
         let running: boolean;
         try {
           running = await proxyApi.isCodexDesktopRunning();

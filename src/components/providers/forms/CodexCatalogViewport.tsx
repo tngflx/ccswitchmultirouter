@@ -1,18 +1,10 @@
-import {
-  useEffect,
-  useId,
-  useMemo,
-  useRef,
-  useState,
-  type ReactNode,
-} from "react";
+import { useEffect, useId, useMemo, useState, type ReactNode } from "react";
 import { ChevronDown, ChevronLeft, ChevronRight } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import { Button } from "@/components/ui/button";
 import type { CodexCatalogModel } from "@/types";
 import { cn } from "@/lib/utils";
 import { codexInputCapabilityState } from "./codexInputCapability";
-import { HoverExpandRow } from "./shared/HoverExpandRow";
 
 export function CodexCatalogViewport<
   T extends CodexCatalogModel & { rowId: string },
@@ -40,7 +32,6 @@ export function CodexCatalogViewport<
   const { t } = useTranslation();
   const id = useId();
   const [expanded, setExpanded] = useState<string | null>(null);
-  const activeEditor = useRef<HTMLDivElement>(null);
   const identity = JSON.stringify(items.map(({ row }) => row.rowId));
   const [pagination, setPagination] = useState({ identity, page: 0 });
   const [lastRevealed, setLastRevealed] = useState(revealRowId);
@@ -75,25 +66,43 @@ export function CodexCatalogViewport<
         {visibleItems.map((entry) => {
           const { row } = entry;
           return (
-            <div key={row.rowId} className="flex min-w-0 items-start gap-3 border-b p-2 last:border-b-0">
+            <div
+              key={row.rowId}
+              className="flex min-w-0 items-start gap-3 border-b p-2 last:border-b-0"
+            >
               {(showSelection || onToggleEnabled) && (
                 <label className="flex shrink-0 items-center gap-1.5 pt-1 text-xs font-medium">
                   <input
                     type="checkbox"
                     className="h-4 w-4 rounded border-border-default"
-                    checked={onToggleEnabled ? row.enabled !== false : selected.has(row.rowId)}
+                    checked={
+                      onToggleEnabled
+                        ? row.enabled !== false
+                        : selected.has(row.rowId)
+                    }
                     onChange={(event) =>
                       onToggleEnabled
                         ? onToggleEnabled(row.rowId, event.target.checked)
                         : onSelect(row.rowId, event.target.checked)
                     }
                     aria-label={t(
-                      onToggleEnabled ? "codexConfig.catalogIncludeModel" : "codexConfig.catalogSelectModel",
-                      { model: row.model, defaultValue: onToggleEnabled ? "Include {{model}}" : "Select {{model}}" },
+                      onToggleEnabled
+                        ? "codexConfig.catalogIncludeModel"
+                        : "codexConfig.catalogSelectModel",
+                      {
+                        model: row.model,
+                        defaultValue: onToggleEnabled
+                          ? "Include {{model}}"
+                          : "Select {{model}}",
+                      },
                     )}
                   />
                   {onToggleEnabled && (
-                    <span className="hidden sm:inline">{t("codexConfig.catalogIncludeLabel", { defaultValue: "Include" })}</span>
+                    <span className="hidden sm:inline">
+                      {t("codexConfig.catalogIncludeLabel", {
+                        defaultValue: "Include",
+                      })}
+                    </span>
                   )}
                 </label>
               )}
@@ -157,15 +166,7 @@ export function CodexCatalogViewport<
                 selected.has(row.rowId) && "bg-primary/5",
               )}
             >
-              <HoverExpandRow
-                className="flex min-h-[52px] items-center gap-3 px-2"
-                onExpand={() => {
-                  // Hovering another row must not unmount a focused editor.
-                  if (!activeEditor.current?.contains(document.activeElement)) {
-                    setExpanded(row.rowId);
-                  }
-                }}
-              >
+              <div className="flex min-h-[52px] items-center gap-3 px-2">
                 {!onToggleEnabled && showSelection && (
                   <input
                     type="checkbox"
@@ -260,10 +261,9 @@ export function CodexCatalogViewport<
                     <ChevronRight className="h-4 w-4" />
                   )}
                 </Button>
-              </HoverExpandRow>
+              </div>
               {open && (
                 <div
-                  ref={activeEditor}
                   id={editorId}
                   className="min-w-0 border-t bg-muted/20 px-2 py-3"
                 >

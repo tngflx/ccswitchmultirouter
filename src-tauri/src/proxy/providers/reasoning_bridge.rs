@@ -5,8 +5,8 @@
 //! carried in a versioned thinking signature/redacted-thinking payload and
 //! restored when the client replays the assistant message.
 
-use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-use serde_json::{json, Value};
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use serde_json::{Value, json};
 
 pub(crate) const OPENAI_REASONING_ITEM_PREFIX: &str = "ccswitch-openai-reasoning-v1:";
 

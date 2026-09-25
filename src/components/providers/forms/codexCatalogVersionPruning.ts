@@ -24,27 +24,34 @@ export function parseRelease(model: CodexCatalogModel): Release | undefined {
   let family: string;
   let version: number[];
   let suffix: string;
-  const claude = id.match(
-    /^claude-(?:(opus|sonnet|haiku|fable)-(\d+)(?:[.-](\d{1,2}))?|(\d+)(?:[.-](\d{1,2}))?-(opus|sonnet|haiku|fable))(?=$|-)/,
-  );
-  if (claude) {
-    family = `claude-${claude[1] || claude[6]}`;
-    version = [
-      Number(claude[2] || claude[4]),
-      Number(claude[3] || claude[5] || 0),
-    ];
-    suffix = id.slice(claude[0].length);
+  const gptImage = id.match(/^gpt-image-(\d+(?:\.\d+)*)(?=$|-)/);
+  if (gptImage) {
+    family = "gpt-image";
+    version = gptImage[1].split(".").map(Number);
+    suffix = id.slice(gptImage[0].length);
   } else {
-    // Only known version positions: never interpret parameter sizes as releases.
-    const match = id.match(
-      /^(gpt-|glm-|deepseek-(?:chat-)?[vr]|qwen-?|kimi-k|minimax-m|gemini-|llama-?|grok-(?:build-)?|muse-spark-|ling-|nemotron-|mimo-v|longcat-|hy)(\d{1,2}(?:\.\d+)*)(?=$|-|v(?:-|$))/,
+    const claude = id.match(
+      /^claude-(?:(opus|sonnet|haiku|fable)-(\d+)(?:[.-](\d{1,2}))?|(\d+)(?:[.-](\d{1,2}))?-(opus|sonnet|haiku|fable))(?=$|-)/,
     );
-    if (!match) return undefined;
-    family = match[1]
-      .replace(/-$/, "")
-      .replace("deepseek-chat-v", "deepseek-v");
-    version = match[2].split(".").map(Number);
-    suffix = id.slice(match[0].length);
+    if (claude) {
+      family = `claude-${claude[1] || claude[6]}`;
+      version = [
+        Number(claude[2] || claude[4]),
+        Number(claude[3] || claude[5] || 0),
+      ];
+      suffix = id.slice(claude[0].length);
+    } else {
+      // Only known version positions: never interpret parameter sizes as releases.
+      const match = id.match(
+        /^(gpt-|glm-|deepseek-(?:chat-)?[vr]|qwen-?|kimi-k|minimax-m|gemini-|llama-?|grok-(?:build-)?|muse-spark-|ling-|nemotron-|mimo-v|longcat-|hy)(\d{1,2}(?:\.\d+)*)(?=$|-|v(?:-|$))/,
+      );
+      if (!match) return undefined;
+      family = match[1]
+        .replace(/-$/, "")
+        .replace("deepseek-chat-v", "deepseek-v");
+      version = match[2].split(".").map(Number);
+      suffix = id.slice(match[0].length);
+    }
   }
   const date = suffix.match(/-(\d{4}-\d{2}-\d{2}|\d{8}|\d{2}-\d{2}|\d{4})$/);
   const revision = date?.[1].replace(/-/g, "");
@@ -83,11 +90,7 @@ export type CatalogPruningDecision = {
   release?: Release;
   keep: boolean;
   reason:
-    | "unclassified"
-    | "recent-release"
-    | "family-minimum"
-    | "older-release"
-    | "older-snapshot";
+    "unclassified" | "recent-release" | "older-release" | "older-snapshot";
 };
 
 export function pruneOutdatedCodexCatalogModels(models: CodexCatalogModel[]): {
@@ -128,9 +131,12 @@ export function pruneOutdatedCodexCatalogModels(models: CodexCatalogModel[]): {
       versions.sort((a, b) => compareVersion(b, a));
     for (const row of rows) {
       const r = row.release!;
+      // A branch represents one model capability/role (for example `image`,
+      // `coder`, or the default chat branch). Keep only its newest numeric
+      // release. Same-version aliases and provider offerings remain intact.
       const recent = branches
         .get(r.branch)!
-        .slice(0, 2)
+        .slice(0, 1)
         .some((v) => compareVersion(v, r.version) === 0);
       const oldSnapshot =
         r.revision &&
@@ -142,26 +148,6 @@ export function pruneOutdatedCodexCatalogModels(models: CodexCatalogModel[]): {
         : recent
           ? "recent-release"
           : "older-release";
-    }
-    const identities = new Set(
-      rows.filter((r) => r.keep).map((r) => r.release!.identity),
-    );
-    // Backfill whole release tiers, so endpoint ordering cannot change selection.
-    const candidates = rows
-      .filter((r) => !r.keep && r.reason !== "older-snapshot")
-      .sort((a, b) => compareVersion(b.release!.version, a.release!.version));
-    let boundary: number[] | undefined;
-    for (const row of candidates) {
-      const r = row.release!;
-      if (
-        identities.size >= 4 &&
-        (!boundary || compareVersion(r.version, boundary) !== 0)
-      )
-        break;
-      row.keep = true;
-      row.reason = "family-minimum";
-      identities.add(r.identity);
-      boundary = r.version;
     }
   }
   return {

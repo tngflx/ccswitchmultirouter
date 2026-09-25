@@ -464,8 +464,8 @@ export function useCodexConfigConsistency(): CodexConfigConsistencyState {
       const retry = await proxyApi.unlockCodexModelPicker();
       const ready = Boolean(
         retry.injected &&
-          retry.allProviderHistoryPatched &&
-          retry.historyRefreshRequested,
+        retry.allProviderHistoryPatched &&
+        retry.historyRefreshRequested,
       );
       setRefresh((current) => ({
         ...current,

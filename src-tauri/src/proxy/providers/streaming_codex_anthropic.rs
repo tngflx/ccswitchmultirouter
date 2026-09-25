@@ -7,24 +7,24 @@
 //! this set of events.
 
 use super::codex_responses_sse as sse;
+#[cfg(test)]
+use super::transform_codex_anthropic::{
+    ANTHROPIC_THINKING_ENCRYPTED_PREFIX, decode_anthropic_thinking_block,
+};
 use super::transform_codex_anthropic::{
     build_responses_usage_from_anthropic, map_anthropic_stop_reason_to_status,
     responses_reasoning_item_from_anthropic_block,
 };
-#[cfg(test)]
-use super::transform_codex_anthropic::{
-    decode_anthropic_thinking_block, ANTHROPIC_THINKING_ENCRYPTED_PREFIX,
-};
 use super::transform_codex_chat::{
-    response_message_item_id, response_tool_call_item_from_chat_name,
-    response_tool_call_item_id_from_chat_name, CodexToolContext,
+    CodexToolContext, response_message_item_id, response_tool_call_item_from_chat_name,
+    response_tool_call_item_id_from_chat_name,
 };
 use super::transform_responses::sanitize_anthropic_tool_use_input_json;
 use crate::proxy::json_canonical::canonicalize_tool_arguments_str;
 use crate::proxy::sse::{strip_sse_field, take_sse_block};
 use bytes::Bytes;
 use futures::stream::{Stream, StreamExt};
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 use std::collections::BTreeMap;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

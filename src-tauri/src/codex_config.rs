@@ -4,8 +4,8 @@ use std::path::{Path, PathBuf};
 use crate::app_config::AppType;
 use crate::codex_subagent_profiles::{
     compile_subagent_v2_profiles, deepseek_role_identity_for_model, deepseek_role_models_match,
-    initialize_legacy_subagent_v2, normalize_profile_key,
-    parse_persisted_subagent_v2, parse_persisted_subagent_v2_tolerant, render_generated_role_toml,
+    initialize_legacy_subagent_v2, normalize_profile_key, parse_persisted_subagent_v2,
+    parse_persisted_subagent_v2_tolerant, render_generated_role_toml,
     CatalogModel as SubagentCatalogModel, CodexSubagentProfileConfig,
     CompileError as SubagentCompileError, CompileOutput as SubagentCompileOutput,
     CompileRequest as SubagentCompileRequest, DiagnosticReasonCode as SubagentDiagnosticReasonCode,
@@ -38,6 +38,9 @@ use std::process::{Command, Stdio};
 use std::sync::{Mutex, OnceLock};
 use tauri::State;
 use toml_edit::{Array, DocumentMut, InlineTable, Item, TableLike};
+
+const CODEX_DESKTOP_STRICT_CONFIG_MIN_VERSION: [u32; 3] = [26, 912, 0];
+static CODEX_DESKTOP_VERSION_CACHE: OnceLock<Option<Vec<u32>>> = OnceLock::new();
 
 pub const CC_SWITCH_CODEX_MODEL_PROVIDER_ID: &str = "custom";
 /// Codex MultiRouter 专用的本地 provider id。
@@ -2068,6 +2071,14 @@ fn codex_catalog_model_specs(settings: &Value, config_text: &str) -> Vec<CodexCa
         let reasoning = resolved
             .capability
             .or_else(|| {
+                // The wizard persists provider `/models` capability metadata
+                // on each catalog row. Keep that declaration in the same
+                // resolver path as live Codex config entries instead of
+                // silently dropping it during Sub-Agent V2 validation.
+                crate::proxy::providers::codex_reasoning::
+                    reasoning_capability_from_provider_model_entry(model_config)
+            })
+            .or_else(|| {
                 configured_reasoning
                     .get(&model.to_ascii_lowercase())
                     .cloned()
@@ -3131,6 +3142,32 @@ fn set_codex_model_catalog_json_field(
     Ok(doc.to_string())
 }
 
+fn codex_desktop_warns_on_unrecognized_settings(version: &[u32]) -> bool {
+    version.first() == Some(&26)
+        && (0..CODEX_DESKTOP_STRICT_CONFIG_MIN_VERSION.len()).all(|index| {
+            version.get(index).copied().unwrap_or(0)
+                >= CODEX_DESKTOP_STRICT_CONFIG_MIN_VERSION[index]
+        })
+}
+
+fn projection_write_inline_provider_models_for(version: Option<&[u32]>) -> bool {
+    !version.is_some_and(codex_desktop_warns_on_unrecognized_settings)
+}
+
+#[cfg(test)]
+fn projection_write_inline_provider_models() -> bool {
+    true
+}
+
+#[cfg(not(test))]
+fn projection_write_inline_provider_models() -> bool {
+    projection_write_inline_provider_models_for(
+        CODEX_DESKTOP_VERSION_CACHE
+            .get_or_init(crate::codex_desktop::installed_codex_desktop_version)
+            .as_deref(),
+    )
+}
+
 /// 同步 Codex Desktop 需要的 catalog 指针和 provider 内联模型。
 fn set_codex_model_catalog_projection_fields(
     config_text: &str,
@@ -3145,7 +3182,11 @@ fn set_codex_model_catalog_projection_fields(
     match (catalog_path, specs) {
         (Some(path), Some(specs)) => {
             doc["model_catalog_json"] = toml_edit::value(path.to_string_lossy().as_ref());
-            set_active_codex_provider_models(&mut doc, specs, catalog);
+            if projection_write_inline_provider_models() {
+                set_active_codex_provider_models(&mut doc, specs, catalog);
+            } else {
+                remove_active_codex_provider_models(&mut doc);
+            }
             ensure_codex_agents_defaults(&mut doc);
             ensure_codex_multi_agent_reserved_schema_compatible(
                 &mut doc,
@@ -4111,12 +4152,12 @@ fn compile_configured_codex_subagent_roles(
                 );
             }
             if let Some(classification) = classification.clone() {
-                route_classifications.insert(spec.model.to_ascii_lowercase(), classification.clone());
+                route_classifications
+                    .insert(spec.model.to_ascii_lowercase(), classification.clone());
                 // 别名键：profile 用旧 slug（deepseek-v4-flash）时也能查到
                 // catalog 新 slug（deepseek-flash）的路由分类。
                 if let Some(role_identity) = deepseek_role_identity_for_model(&spec.model) {
-                    route_classifications
-                        .insert(role_identity.to_string(), classification);
+                    route_classifications.insert(role_identity.to_string(), classification);
                 }
             }
             SubagentCatalogModel {
@@ -4134,17 +4175,28 @@ fn compile_configured_codex_subagent_roles(
             }
         })
         .collect();
-    let mut reasoning_capabilities: HashMap<String, _> = HashMap::new();
+    let mut reasoning_capabilities: HashMap<
+        String,
+        crate::proxy::providers::codex_reasoning::ResolvedSubagentReasoningCapability,
+    > = HashMap::new();
     for model in &catalog_models {
-        reasoning_capabilities
-            .entry(model.model.to_ascii_lowercase())
-            .or_insert_with(|| model.reasoning.clone());
+        let mut insert_reasoning = |key: String,
+                                value: &crate::proxy::providers::codex_reasoning::ResolvedSubagentReasoningCapability| {
+            let replace = reasoning_capabilities
+                .get(&key)
+                .is_none_or(|existing| {
+                    existing.support_kind == ReasoningSupportKind::Unknown
+                        && value.support_kind != ReasoningSupportKind::Unknown
+                });
+            if replace {
+                reasoning_capabilities.insert(key, value.clone());
+            }
+        };
+        insert_reasoning(model.model.to_ascii_lowercase(), &model.reasoning);
         // 别名键：profile 用旧 slug（deepseek-v4-flash）时也能查到
         // catalog 新 slug（deepseek-flash）的 reasoning 能力。
         if let Some(role_identity) = deepseek_role_identity_for_model(&model.model) {
-            reasoning_capabilities
-                .entry(role_identity.to_string())
-                .or_insert_with(|| model.reasoning.clone());
+            insert_reasoning(role_identity.to_string(), &model.reasoning);
         }
     }
     let mut compile_persisted = persisted.clone();
@@ -4207,9 +4259,20 @@ fn validate_codex_subagent_reasoning_completeness(
         let capability = compilation
             .reasoning_capabilities
             .get(&profile.model.to_ascii_lowercase());
-        if capability.is_none()
-            || capability.is_some_and(|value| value.support_kind == ReasoningSupportKind::Unknown)
-        {
+        let capability_is_unknown = capability.is_none()
+            || capability.is_some_and(|value| value.support_kind == ReasoningSupportKind::Unknown);
+        // MultiRouter candidates are projected from provider-owned rows. A
+        // provider-qualified alias can be routable while the profile retains
+        // the canonical role slug, so the projected catalog may not contain
+        // an exact key for the profile even though the maintained model
+        // resolver has a declaration for it. Keep strict rejection for models
+        // outside that resolver's maintained catalog.
+        let maintained_capability = capability_is_unknown.then(|| {
+            crate::proxy::providers::codex_reasoning::builtin_reasoning_capability_for_model(
+                &profile.model,
+            )
+        });
+        if capability_is_unknown && maintained_capability.as_ref().is_none_or(Option::is_none) {
             return Err(AppError::InvalidInput(
                 "Codex subagent V2 configuration is incomplete (unknown_reasoning_capability_requires_declaration)".to_string(),
             ));
@@ -4403,7 +4466,10 @@ fn catalog_profile_draft(
         Some(canonical) => canonical,
         None => identity.as_str(),
     };
-    if let Some(mut preset) = defaults.pointer(&format!("/profiles/{preset_key}")).cloned() {
+    if let Some(mut preset) = defaults
+        .pointer(&format!("/profiles/{preset_key}"))
+        .cloned()
+    {
         preset["model"] = Value::String(model.to_string());
         preset["enabled"] = Value::Bool(enabled_preferred);
         if !enabled_preferred {
@@ -8437,6 +8503,23 @@ mod tests {
     use super::*;
 
     #[test]
+    fn strict_desktop_projection_gate_matrix() {
+        assert!(!projection_write_inline_provider_models_for(Some(&[
+            26, 912, 0, 0
+        ])));
+        assert!(!projection_write_inline_provider_models_for(Some(&[
+            26, 999, 1, 0
+        ])));
+        assert!(projection_write_inline_provider_models_for(Some(&[
+            26, 911, 9, 0
+        ])));
+        assert!(projection_write_inline_provider_models_for(Some(&[
+            25, 999, 9, 0
+        ])));
+        assert!(projection_write_inline_provider_models_for(None));
+    }
+
+    #[test]
     fn deepseek_vendor_catalog_keeps_mcp_tools_directly_visible() {
         let models = load_codex_deepseek_official_catalog_models();
         assert!(
@@ -8494,7 +8577,9 @@ mod tests {
         assert!(!codex_catalog_model_name_is_text_only(
             "deepseek-v4-flash-vision-exp"
         ));
-        assert!(!codex_catalog_model_name_is_text_only("deepseek-flash-vision"));
+        assert!(!codex_catalog_model_name_is_text_only(
+            "deepseek-flash-vision"
+        ));
     }
 
     #[test]
@@ -8503,7 +8588,10 @@ mod tests {
             codex_agent_role_name_for_model("deepseek-flash"),
             "deepseek-flash"
         );
-        assert_eq!(codex_agent_role_name_for_model("deepseek-pro"), "deepseek-pro");
+        assert_eq!(
+            codex_agent_role_name_for_model("deepseek-pro"),
+            "deepseek-pro"
+        );
         assert!(codex_agent_description_for_model("deepseek-flash")
             .contains("DeepSeek V4 Flash worker"));
         assert_eq!(
@@ -8522,20 +8610,20 @@ mod tests {
 
     #[test]
     fn catalog_profile_draft_uses_flash_preset_for_official_alias() {
-        let draft = catalog_profile_draft("deepseek-flash", true, None)
-            .expect("flash alias draft");
+        let draft = catalog_profile_draft("deepseek-flash", true, None).expect("flash alias draft");
         assert_eq!(draft["model"], "deepseek-flash");
         assert_eq!(draft["enabled"], true);
         let strengths = draft["questionnaire"]["taskStrengths"]
             .as_array()
             .expect("taskStrengths");
-        assert!(strengths.iter().any(|value| value == "long_context_reading"));
+        assert!(strengths
+            .iter()
+            .any(|value| value == "long_context_reading"));
     }
 
     #[test]
     fn catalog_profile_draft_keeps_generic_stub_for_unknown_models() {
-        let draft = catalog_profile_draft("some-model", false, None)
-            .expect("unknown model draft");
+        let draft = catalog_profile_draft("some-model", false, None).expect("unknown model draft");
         assert_eq!(draft["model"], "some-model");
         assert_eq!(draft["enabled"], false);
         assert_eq!(draft["questionnaire"]["preference"], "eligible");
@@ -8846,6 +8934,54 @@ mod tests {
         assert!(error
             .to_string()
             .contains("unknown_reasoning_capability_requires_declaration"));
+    }
+
+    #[test]
+    fn codex_subagent_v2_save_prefers_known_capability_across_provider_aliases() {
+        let settings = codex_subagent_profile_status_settings(
+            "v2",
+            json!({ "deepseek-v4-flash": codex_subagent_profile_status_profile("deepseek-v4-flash", true) }),
+            json!([
+                { "model": "deepseek-v4-flash-opencode-zen", "contextWindow": 128000 },
+                {
+                    "model": "deepseek-v4-flash-opencode-go",
+                    "contextWindow": 128000,
+                    "reasoning": {
+                        "schemaVersion": 2,
+                        "supportStatus": "confirmed_supported",
+                        "controlKind": "graded",
+                        "supportedEfforts": ["low", "high", "max"],
+                        "defaultEffort": "high",
+                        "disableAllowed": true,
+                        "upstream": {
+                            "format": "string",
+                            "parameter": "reasoning_effort",
+                            "effortMap": {
+                                "low": "low",
+                                "medium": "high",
+                                "high": "high",
+                                "xhigh": "high",
+                                "max": "max"
+                            }
+                        },
+                        "outputFormat": "reasoning_content",
+                        "source": "builtin",
+                        "confidence": "maintained"
+                    }
+                }
+            ]),
+            json!([
+                {
+                    "id": "deepseek-route",
+                    "match": { "models": ["deepseek-v4-flash-opencode-zen", "deepseek-v4-flash-opencode-go"] },
+                    "upstream": { "auth": { "source": "provider_config" } }
+                }
+            ]),
+        );
+
+        validate_codex_subagent_v2_candidate(&settings, None, true).expect(
+            "a later provider alias with declared reasoning must repair an earlier unknown alias",
+        );
     }
 
     #[test]
@@ -11044,6 +11180,34 @@ mod tests {
             compilation.output.generated_roles.is_empty(),
             "catalog presence alone must not make a model routable"
         );
+    }
+
+    #[test]
+    fn codex_catalog_specs_keep_reasoning_declared_on_provider_model_rows() {
+        let settings = json!({
+            "modelCatalog": { "models": [{
+                "model": "third-party-reasoning",
+                "reasoning": {
+                    "schemaVersion": 2,
+                    "supportStatus": "confirmed_supported",
+                    "controlKind": "graded",
+                    "supportedEfforts": ["low", "high"],
+                    "defaultEffort": "high",
+                    "upstream": {
+                        "format": "string",
+                        "parameter": "reasoning_effort",
+                        "effortMap": {"low": "low", "high": "high"}
+                    }
+                }
+            }] }
+        });
+
+        let specs = codex_catalog_model_specs(&settings, "");
+        let capability = specs[0]
+            .reasoning
+            .as_ref()
+            .expect("model-row reasoning declaration must be retained");
+        assert_eq!(capability.supported_efforts, vec!["low", "high"]);
     }
 
     #[test]

@@ -15,7 +15,7 @@
 //! - Provider 通过 meta.authBinding 关联账号（auth_provider = "codex_oauth"）
 //! - 通过 JWT id_token 提取 chatgpt_account_id 作为账号唯一标识
 
-use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -1872,10 +1872,12 @@ mod tests {
         apply_desktop_account_dedupe(&mut policy, &managed_ids, Some("acc-desktop"));
 
         assert_eq!(policy.entries.len(), 2);
-        assert!(policy
-            .entries
-            .iter()
-            .all(|entry| entry.account_id != "acc-desktop"));
+        assert!(
+            policy
+                .entries
+                .iter()
+                .all(|entry| entry.account_id != "acc-desktop")
+        );
         assert_eq!(policy.entries[0].account_id, NATIVE_CODEX_ACCOUNT_ID);
         assert_eq!(policy.entries[1].account_id, "acc-other");
     }
@@ -2094,10 +2096,12 @@ mod tests {
         enable_single_managed_pool(&manager, "acc-a", 10.0).await;
         manager.record_pool_remaining_percent("acc-a", 9.0).await;
 
-        assert!(manager
-            .ordered_pool_entries("thread-old", None)
-            .await
-            .is_empty());
+        assert!(
+            manager
+                .ordered_pool_entries("thread-old", None)
+                .await
+                .is_empty()
+        );
     }
 
     #[tokio::test]
@@ -2112,10 +2116,12 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(manager
-            .ordered_pool_entries("thread-new", None)
-            .await
-            .is_empty());
+        assert!(
+            manager
+                .ordered_pool_entries("thread-new", None)
+                .await
+                .is_empty()
+        );
     }
 
     #[tokio::test]
@@ -2131,10 +2137,12 @@ mod tests {
         set_single_managed_pool_enabled(&manager, "acc-a", true, 10.0).await;
         manager.record_pool_remaining_percent("acc-a", 9.0).await;
 
-        assert!(manager
-            .ordered_pool_entries("thread-old", None)
-            .await
-            .is_empty());
+        assert!(
+            manager
+                .ordered_pool_entries("thread-old", None)
+                .await
+                .is_empty()
+        );
     }
 
     #[tokio::test]
@@ -2151,10 +2159,12 @@ mod tests {
         enable_single_managed_pool(&manager, "acc-a", 10.0).await;
         manager.record_pool_remaining_percent("acc-a", 9.0).await;
 
-        assert!(manager
-            .ordered_pool_entries("thread-old", None)
-            .await
-            .is_empty());
+        assert!(
+            manager
+                .ordered_pool_entries("thread-old", None)
+                .await
+                .is_empty()
+        );
     }
 
     #[tokio::test]
@@ -2217,10 +2227,12 @@ mod tests {
             )
             .await;
 
-        assert!(manager
-            .ordered_pool_entries("thread-late", None)
-            .await
-            .is_empty());
+        assert!(
+            manager
+                .ordered_pool_entries("thread-late", None)
+                .await
+                .is_empty()
+        );
     }
 
     #[tokio::test]
@@ -2248,10 +2260,12 @@ mod tests {
                 )
                 .await
         );
-        assert!(manager
-            .ordered_pool_entries("thread", None)
-            .await
-            .is_empty());
+        assert!(
+            manager
+                .ordered_pool_entries("thread", None)
+                .await
+                .is_empty()
+        );
         assert!(
             !manager
                 .record_pool_attempt(
@@ -2289,10 +2303,12 @@ mod tests {
         let manager = CodexOAuthManager::new(temp.path().to_path_buf());
         manager.record_pool_remaining_percent("acc-a", 9.0).await;
 
-        assert!(manager
-            .ordered_pool_entries("thread-new", None)
-            .await
-            .is_empty());
+        assert!(
+            manager
+                .ordered_pool_entries("thread-new", None)
+                .await
+                .is_empty()
+        );
     }
 
     /// 真实事故回归：2026-09-15 09:17 chatgpt.com 的 TLS 握手连续失败
@@ -2421,10 +2437,12 @@ mod tests {
         manager
             .record_pool_remaining_percent(NATIVE_CODEX_ACCOUNT_ID, 9.0)
             .await;
-        assert!(manager
-            .ordered_pool_entries("native-thread", Some("Bearer native-b"))
-            .await
-            .is_empty());
+        assert!(
+            manager
+                .ordered_pool_entries("native-thread", Some("Bearer native-b"))
+                .await
+                .is_empty()
+        );
         assert!(
             !manager.storage_path.exists()
                 || !std::fs::read_to_string(&manager.storage_path)
@@ -2474,10 +2492,12 @@ mod tests {
         manager.reload_from_disk().await.unwrap();
         manager.record_pool_remaining_percent("acc-a", 9.0).await;
 
-        assert!(manager
-            .ordered_pool_entries("old-thread", None)
-            .await
-            .is_empty());
+        assert!(
+            manager
+                .ordered_pool_entries("old-thread", None)
+                .await
+                .is_empty()
+        );
     }
 
     #[tokio::test]
@@ -2519,10 +2539,12 @@ mod tests {
             manager.accounts.read().await["acc-a"].credential_generation,
             2
         );
-        assert!(manager
-            .ordered_pool_entries("old-thread", None)
-            .await
-            .is_empty());
+        assert!(
+            manager
+                .ordered_pool_entries("old-thread", None)
+                .await
+                .is_empty()
+        );
     }
 
     #[tokio::test]

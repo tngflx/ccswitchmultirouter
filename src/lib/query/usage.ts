@@ -36,7 +36,8 @@ type RequestLogsKey = {
 // Query keys
 export const usageKeys = {
   all: ["usage"] as const,
-  sessionCollectionStatus: () => [...usageKeys.all, "session-collection-status"] as const,
+  sessionCollectionStatus: () =>
+    [...usageKeys.all, "session-collection-status"] as const,
   summary: (
     preset: UsageRangeSelection["preset"],
     customStartDate: number | undefined,
@@ -369,7 +370,9 @@ export function useCodexSubagentUsageStats(
   });
 }
 
-export function useSessionCollectionStatus(options?: UsageQueryOptions & { enabled?: boolean }) {
+export function useSessionCollectionStatus(
+  options?: UsageQueryOptions & { enabled?: boolean },
+) {
   return useQuery({
     queryKey: usageKeys.sessionCollectionStatus(),
     queryFn: usageApi.getSessionCollectionStatus,

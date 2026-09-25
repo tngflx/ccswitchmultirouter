@@ -8,11 +8,11 @@ use super::{
         extract_reasoning_field_text, is_think_open_prefix, split_leading_think_block,
         starts_with_think_open, strip_leading_think_open_tag,
     },
-    codex_terminal::{classify_chat_terminal, ChatTerminalEvidence, TerminalDisposition},
+    codex_terminal::{ChatTerminalEvidence, TerminalDisposition, classify_chat_terminal},
     transform_codex_chat::{
-        chat_usage_to_responses_usage, custom_tool_input_from_chat_arguments,
+        CodexToolContext, chat_usage_to_responses_usage, custom_tool_input_from_chat_arguments,
         response_id_from_chat_id, response_message_item_id, response_tool_call_item_from_chat_name,
-        response_tool_call_item_id_from_chat_name, CodexToolContext,
+        response_tool_call_item_id_from_chat_name,
     },
 };
 use crate::protocol_compatibility::ReasoningProjection;
@@ -20,7 +20,7 @@ use crate::proxy::json_canonical::canonicalize_tool_arguments_str;
 use crate::proxy::sse::{strip_sse_field, take_sse_block};
 use bytes::Bytes;
 use futures::stream::{Stream, StreamExt};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::future::Future;
 use std::pin::Pin;
@@ -1401,7 +1401,7 @@ fn extract_chat_sse_error(value: &Value) -> (String, Option<String>) {
 mod tests {
     use super::*;
     use crate::protocol_compatibility::ReasoningProjection;
-    use futures::{stream, StreamExt};
+    use futures::{StreamExt, stream};
 
     async fn collect(chunks: Vec<&str>) -> String {
         collect_with_context(chunks, CodexToolContext::default()).await

@@ -136,9 +136,7 @@ const PROVIDER_REASONING_EFFORT_CHOICES: CodexReasoningEffort[] = [
 ];
 
 export type CodexReasoningCapabilitySourceMode =
-  | "automatic"
-  | "builtin"
-  | "manual";
+  "automatic" | "builtin" | "manual";
 
 export function applyCodexReasoningCapabilitySource(
   mode: CodexReasoningCapabilitySourceMode,
@@ -829,6 +827,9 @@ function mergeFetchedModelsIntoCatalogRows(
           ? { contextWindow: contextWindowText }
           : {}),
         ...capabilityPatch,
+        ...(!existing.row.reasoning && fetched.reasoning
+          ? { reasoning: fetched.reasoning }
+          : {}),
       };
       next[existing.index] = updatedRow;
       rowByFetchedModel.set(modelIdentity, {
@@ -843,6 +844,7 @@ function mergeFetchedModelsIntoCatalogRows(
       displayName: model,
       ...(contextWindowText ? { contextWindow: contextWindowText } : {}),
       ...capabilityPatch,
+      ...(fetched.reasoning ? { reasoning: fetched.reasoning } : {}),
     });
     rowByFetchedModel.set(modelIdentity, { row, index: next.length });
     next.push(row);
@@ -974,6 +976,15 @@ export function CodexFormFields({
   const { runWithLoading } = useGlobalLoading();
 
   const [fetchedModels, setFetchedModels] = useState<FetchedModel[]>([]);
+  const [verifiedModelList, setVerifiedModelList] = useState<{
+    identity: string;
+    ids: string[];
+  } | null>(null);
+  const [modelListDiff, setModelListDiff] = useState<{
+    added: string[];
+    removed: string[];
+    updated: string[];
+  } | null>(null);
   const enabledGroupedApiKeys = useMemo(
     () =>
       apiKeyGroups
@@ -989,6 +1000,50 @@ export function CodexFormFields({
   );
   const apiKeyGroupsRef = useRef(apiKeyGroups);
   apiKeyGroupsRef.current = apiKeyGroups;
+  const modelFetchIdentity = useMemo(
+    () =>
+      JSON.stringify([
+        providerId,
+        codexBaseUrl,
+        isFullUrl,
+        modelRefreshCredentialFingerprint(codexApiKey),
+        modelRefreshCredentialFingerprint(apiKeyGroupsFingerprint),
+        customUserAgent,
+        isXaiOauthPreset,
+        isXaiOauthAuthenticated,
+        selectedXaiAccountId,
+        partnerPromotionKey,
+        planAccessKeyId,
+        modelRefreshCredentialFingerprint(planSecretAccessKey ?? ""),
+      ]),
+    [
+      providerId,
+      codexBaseUrl,
+      isFullUrl,
+      codexApiKey,
+      apiKeyGroupsFingerprint,
+      customUserAgent,
+      isXaiOauthPreset,
+      isXaiOauthAuthenticated,
+      selectedXaiAccountId,
+      partnerPromotionKey,
+      planAccessKeyId,
+      planSecretAccessKey,
+    ],
+  );
+  const recordVerifiedModelList = useCallback(
+    (models: FetchedModel[]) => {
+      if (models.length > 0) {
+        setVerifiedModelList({
+          identity: modelFetchIdentity,
+          ids: models
+            .map((model) => catalogModelIdentity(model.id))
+            .filter(Boolean),
+        });
+      }
+    },
+    [modelFetchIdentity],
+  );
   const [modelCatalogAction, setModelCatalogAction] = useState<
     "sync" | "refresh-existing" | null
   >(null);
@@ -1049,8 +1104,10 @@ export function CodexFormFields({
   useEffect(() => {
     fetchModelsSeqRef.current += 1;
     setFetchedModels((prev) => (prev.length === 0 ? prev : []));
+    setVerifiedModelList(null);
     setModelCatalogAction(null);
   }, [
+    providerId,
     codexBaseUrl,
     isFullUrl,
     codexApiKey,
@@ -1137,6 +1194,22 @@ export function CodexFormFields({
       inputCapabilityReferences,
     ),
   );
+
+  // New third-party providers start with the first enabled catalog row. Keep a
+  // non-empty value, including a stale one, so the existing availability warning
+  // remains visible until the user changes it.
+  useEffect(() => {
+    if (category === "official" || !onModelChange || codexModel.trim()) {
+      return;
+    }
+    const firstEnabledModel = catalogRows.find(
+      (row) => row.enabled !== false && row.model.trim(),
+    )?.model.trim();
+    if (firstEnabledModel) {
+      onModelChange(firstEnabledModel);
+    }
+  }, [catalogRows, category, codexModel, onModelChange]);
+
   const [expandedReasoningRowId, setExpandedReasoningRowId] = useState<
     string | null
   >(null);
@@ -1278,10 +1351,7 @@ export function CodexFormFields({
       const next = Array.from(
         new Set(
           items
-            .map(
-              ({ row }) =>
-                catalogRowUpstreamModel(row) || row.model.trim(),
-            )
+            .map(({ row }) => catalogRowUpstreamModel(row) || row.model.trim())
             .filter(Boolean),
         ),
       );
@@ -1533,6 +1603,7 @@ export function CodexFormFields({
           .then((models) => {
             if (seq !== fetchModelsSeqRef.current) return;
             setFetchedModels(models);
+            recordVerifiedModelList(models);
             let nextCatalogRows = catalogRowsRef.current;
             if (fetchMode === "sync" && onCatalogModelsChange) {
               nextCatalogRows = mergeFetchedModelsIntoCatalogRows(
@@ -1681,6 +1752,7 @@ export function CodexFormFields({
           const models = Array.from(modelsByIdentity.values());
           if (seq !== fetchModelsSeqRef.current) return;
           setFetchedModels(models);
+          if (failedCount === 0) recordVerifiedModelList(models);
           let splitCatalogRows = catalogRowsRef.current;
           if (fetchMode === "sync" && onCatalogModelsChange) {
             const mergedRows = mergeFetchedModelsIntoCatalogRows(
@@ -1789,25 +1861,11 @@ export function CodexFormFields({
       selectedXaiAccountId,
       t,
       runWithLoading,
+      recordVerifiedModelList,
     ],
   );
 
-  const autoModelRefreshKey = useMemo(() => {
-    const credentialIdentity = [codexApiKey, ...enabledGroupedApiKeys]
-      .concat(planAccessKeyId ?? "", planSecretAccessKey ?? "")
-      .map(modelRefreshCredentialFingerprint)
-      .sort()
-      .join(",");
-    return `provider-models:codex:${providerId ?? "draft"}:${codexBaseUrl}:${selectedXaiAccountId ?? ""}:${credentialIdentity}`;
-  }, [
-    codexApiKey,
-    codexBaseUrl,
-    enabledGroupedApiKeys,
-    planAccessKeyId,
-    planSecretAccessKey,
-    providerId,
-    selectedXaiAccountId,
-  ]);
+  const autoModelRefreshKey = `provider-models:codex:${modelFetchIdentity}`;
 
   const autoFetchModels = useCallback(async (): Promise<FetchedModel[]> => {
     if (isXaiOauthPreset) {
@@ -1883,6 +1941,7 @@ export function CodexFormFields({
 
   const applyAutomaticCatalogRefresh = useCallback(
     (models: FetchedModel[]) => {
+      recordVerifiedModelList(models);
       if (!onCatalogModelsChange || models.length === 0) return;
       const reconciled = reconcileFetchedCodexCatalogRows(
         catalogRowsRef.current,
@@ -1910,6 +1969,13 @@ export function CodexFormFields({
         (row) => !prunedIds.has(row.model.trim()),
       );
       const persistedRows = retained.map(({ rowId: _rowId, ...row }) => row);
+      if (reconciled.updated.length > 0) {
+        setModelListDiff((current) => ({
+          added: current?.added ?? [],
+          removed: current?.removed ?? [],
+          updated: reconciled.updated,
+        }));
+      }
       if (
         JSON.stringify(lastSentModelsRef.current) ===
         JSON.stringify(persistedRows)
@@ -1921,7 +1987,34 @@ export function CodexFormFields({
       lastSentModelsRef.current = persistedRows;
       onCatalogModelsChange(persistedRows);
     },
-    [codexBaseUrl, onCatalogModelsChange, providerId, providerName, websiteUrl],
+    [
+      codexBaseUrl,
+      onCatalogModelsChange,
+      providerId,
+      providerName,
+      recordVerifiedModelList,
+      websiteUrl,
+    ],
+  );
+
+  const savedCatalogModelIds = useMemo(
+    () =>
+      catalogRows
+        .map((row) =>
+          catalogModelIdentity(row.upstreamModel || row.upstream_model),
+        )
+        .filter(Boolean),
+    [catalogRows],
+  );
+  const handleAutomaticModelDiff = useCallback(
+    (added: string[], removed: string[], updated: string[]) => {
+      setModelListDiff((current) => ({
+        added,
+        removed,
+        updated: Array.from(new Set([...(current?.updated ?? []), ...updated])),
+      }));
+    },
+    [],
   );
 
   useAutoModelRefresh({
@@ -1945,6 +2038,11 @@ export function CodexFormFields({
             )))),
     fetcher: autoFetchModels,
     onSuccess: applyAutomaticCatalogRefresh,
+    compareIds: savedCatalogModelIds,
+    snapshotKey: `codex:${modelFetchIdentity}`,
+    reportInitialAdditions: true,
+    onDiff: handleAutomaticModelDiff,
+    ttlMs: 0,
   });
 
   const handleProtocolProbe = useCallback(async () => {
@@ -2277,11 +2375,14 @@ export function CodexFormFields({
     [],
   );
 
-  const toggleCatalogRowEnabled = useCallback((rowId: string, enabled: boolean) => {
-    setCatalogRows((current) =>
-      current.map((row) => (row.rowId === rowId ? { ...row, enabled } : row)),
-    );
-  }, []);
+  const toggleCatalogRowEnabled = useCallback(
+    (rowId: string, enabled: boolean) => {
+      setCatalogRows((current) =>
+        current.map((row) => (row.rowId === rowId ? { ...row, enabled } : row)),
+      );
+    },
+    [],
+  );
 
   const applySelectedCatalogRowsEnabled = useCallback(
     (enabled: boolean) => {
@@ -2540,6 +2641,13 @@ export function CodexFormFields({
   // 移动模型目录行本身；单 provider 表格里的顺序代表保留下来的模型展示/路由顺序，不再混用子 Agent 候选顺序。
   const handleMoveCatalogRow = useCallback(
     (index: number, direction: -1 | 1) => {
+      if (index + direction === 0) {
+        const nextDefault =
+          catalogRows[index]?.enabled !== false
+            ? catalogRows[index]?.model.trim()
+            : undefined;
+        if (nextDefault) onModelChange?.(nextDefault);
+      }
       setCatalogRows((current) => {
         const targetIndex = index + direction;
         if (index < 0 || targetIndex < 0 || targetIndex >= current.length) {
@@ -2550,7 +2658,7 @@ export function CodexFormFields({
         return next;
       });
     },
-    [],
+    [catalogRows, onModelChange],
   );
 
   const handleConfirmSplitRouting = useCallback(() => {
@@ -2590,6 +2698,23 @@ export function CodexFormFields({
   const splitRoutingProviderName = providerName?.trim() || "provider";
   const pendingResponsesModels = pendingSplitRouting?.responsesModels ?? [];
   const pendingChatModels = pendingSplitRouting?.chatModels ?? [];
+  const defaultModelIdentity = catalogModelIdentity(codexModel);
+  const verifiedIds =
+    verifiedModelList?.identity === modelFetchIdentity
+      ? new Set(verifiedModelList.ids)
+      : null;
+  const defaultModelAvailable =
+    !defaultModelIdentity ||
+    verifiedIds?.has(defaultModelIdentity) ||
+    catalogRows.some(
+      (row) =>
+        row.enabled !== false &&
+        (catalogModelIdentity(row.model) === defaultModelIdentity ||
+          catalogModelIdentity(row.displayName) === defaultModelIdentity) &&
+        verifiedIds?.has(catalogModelIdentity(catalogRowUpstreamModel(row))),
+    );
+  const defaultModelMissingFromProvider =
+    Boolean(verifiedIds && defaultModelIdentity) && !defaultModelAvailable;
 
   const renderCatalogActionButtons = (onAdd: () => void, addLabel: string) => (
     <div className="flex gap-1">
@@ -3092,6 +3217,16 @@ export function CodexFormFields({
               id="codexDefaultModel"
               value={codexModel}
               onChange={(event) => onModelChange(event.target.value)}
+              aria-invalid={defaultModelMissingFromProvider || undefined}
+              aria-describedby={
+                defaultModelMissingFromProvider
+                  ? "codexDefaultModelAvailability"
+                  : undefined
+              }
+              className={cn(
+                defaultModelMissingFromProvider &&
+                  "border-destructive text-destructive focus-visible:ring-destructive",
+              )}
               placeholder={t("codexConfig.defaultModelPlaceholder", {
                 defaultValue: "例如: gpt-5.6",
               })}
@@ -3103,6 +3238,15 @@ export function CodexFormFields({
               />
             )}
           </div>
+          {defaultModelMissingFromProvider && (
+            <p
+              id="codexDefaultModelAvailability"
+              role="alert"
+              className="text-xs leading-relaxed text-destructive"
+            >
+              {t("codexConfig.defaultModelMissingFromProvider")}
+            </p>
+          )}
           <p className="text-xs leading-relaxed text-muted-foreground">
             {t("codexConfig.defaultModelHint", {
               defaultValue:
@@ -3111,6 +3255,67 @@ export function CodexFormFields({
           </p>
         </div>
       )}
+
+      <Dialog
+        open={Boolean(modelListDiff)}
+        onOpenChange={(open) => {
+          if (!open) setModelListDiff(null);
+        }}
+      >
+        <DialogContent className="max-w-lg">
+          <DialogHeader>
+            <DialogTitle>{t("codexConfig.modelListChangedTitle")}</DialogTitle>
+            <DialogDescription>
+              {t("codexConfig.modelListChangedDescription")}
+            </DialogDescription>
+          </DialogHeader>
+          {modelListDiff && (
+            <div className="space-y-3 px-6 pb-2 text-sm">
+              {modelListDiff.added.length > 0 && (
+                <div>
+                  <p className="font-medium text-emerald-600 dark:text-emerald-400">
+                    {t("codexConfig.modelListAdded", {
+                      count: modelListDiff.added.length,
+                    })}
+                  </p>
+                  <p className="mt-1 max-h-24 overflow-y-auto break-words font-mono text-xs text-muted-foreground">
+                    {modelListDiff.added.join(", ")}
+                  </p>
+                </div>
+              )}
+              {modelListDiff.removed.length > 0 && (
+                <div>
+                  <p className="font-medium text-destructive">
+                    {t("codexConfig.modelListRemoved", {
+                      count: modelListDiff.removed.length,
+                    })}
+                  </p>
+                  <p className="mt-1 max-h-24 overflow-y-auto break-words font-mono text-xs text-muted-foreground">
+                    {modelListDiff.removed.join(", ")}
+                  </p>
+                </div>
+              )}
+              {modelListDiff.updated.length > 0 && (
+                <div>
+                  <p className="font-medium text-blue-600 dark:text-blue-400">
+                    {t("codexConfig.modelListUpdated", {
+                      count: modelListDiff.updated.length,
+                    })}
+                  </p>
+                  <p className="mt-1 max-h-24 overflow-y-auto break-words font-mono text-xs text-muted-foreground">
+                    {modelListDiff.updated.join(", ")}
+                  </p>
+                </div>
+              )}
+            </div>
+          )}
+          <DialogFooter>
+            <Button type="button" onClick={() => setModelListDiff(null)}>
+              {t("codexConfig.modelListDismiss")}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
 
       <Dialog
         open={Boolean(pendingSplitRouting)}
@@ -3377,8 +3582,12 @@ export function CodexFormFields({
                         ultraEnabled={row.codexUltra?.enabled === true}
                         ultraEffort={row.codexUltra?.providerEffort}
                         ultraEfforts={
-                          reasoningResolution?.resolved
-                            .providerAcceptedEfforts ?? []
+                          reasoningResolution?.resolved.supportKind ===
+                          "effort_levels"
+                            ? reasoningResolution.resolved.providerAcceptedEfforts.filter(
+                                (effort) => effort !== "none",
+                              )
+                            : []
                         }
                         onUltraChange={(codexUltra) =>
                           handleUpdateCatalogRow(index, { codexUltra })
@@ -4336,12 +4545,18 @@ export function CodexFormFields({
                               key={value}
                               type="button"
                               size="sm"
-                              variant={catalogUsageFilter === value ? "default" : "ghost"}
+                              variant={
+                                catalogUsageFilter === value
+                                  ? "default"
+                                  : "ghost"
+                              }
                               className="h-7 px-2 text-xs"
                               aria-pressed={catalogUsageFilter === value}
                               onClick={() => setCatalogUsageFilter(value)}
                             >
-                              {t(`codexConfig.${key}`, { defaultValue: fallback })}
+                              {t(`codexConfig.${key}`, {
+                                defaultValue: fallback,
+                              })}
                             </Button>
                           ))}
                         </div>
@@ -4437,14 +4652,13 @@ export function CodexFormFields({
                         const isTextOnly = inputCapability === "text_only";
                         const presetDeclaresInputCapability = Boolean(
                           presetCatalogModel &&
-                            (presetCatalogModel.inputModalities !== undefined ||
-                              presetCatalogModel.input_modalities !==
-                                undefined ||
-                              presetCatalogModel.supportsImage !== undefined ||
-                              presetCatalogModel.supports_image !== undefined ||
-                              presetCatalogModel.vision !== undefined ||
-                              presetCatalogModel.textOnly !== undefined ||
-                              presetCatalogModel.text_only !== undefined),
+                          (presetCatalogModel.inputModalities !== undefined ||
+                            presetCatalogModel.input_modalities !== undefined ||
+                            presetCatalogModel.supportsImage !== undefined ||
+                            presetCatalogModel.supports_image !== undefined ||
+                            presetCatalogModel.vision !== undefined ||
+                            presetCatalogModel.textOnly !== undefined ||
+                            presetCatalogModel.text_only !== undefined),
                         );
 
                         return (
@@ -4874,7 +5088,8 @@ export function CodexFormFields({
                           checked={allVisibleCatalogRowsSelected}
                           ref={(element) => {
                             if (element) {
-                              element.indeterminate = someVisibleCatalogRowsSelected;
+                              element.indeterminate =
+                                someVisibleCatalogRowsSelected;
                             }
                           }}
                           onChange={() => updateCatalogSelection("shown")}
@@ -4909,19 +5124,67 @@ export function CodexFormFields({
                           defaultValue: "{{selected}} selected",
                         })}
                       </span>
-                      <Button disabled={selectedCatalogRowIds.size === 0} type="button" size="sm" variant="outline" onClick={() => applySelectedCatalogRowsEnabled(true)}>
-                        {t("codexConfig.catalogUseSelected", { defaultValue: "Use selected" })}
+                      <Button
+                        disabled={selectedCatalogRowIds.size === 0}
+                        type="button"
+                        size="sm"
+                        variant="outline"
+                        onClick={() => applySelectedCatalogRowsEnabled(true)}
+                      >
+                        {t("codexConfig.catalogUseSelected", {
+                          defaultValue: "Use selected",
+                        })}
                       </Button>
-                      <Button disabled={selectedCatalogRowIds.size === 0} type="button" size="sm" variant="outline" onClick={() => applySelectedCatalogRowsEnabled(false)}>
-                        {t("codexConfig.catalogExcludeSelected", { defaultValue: "Don't use" })}
+                      <Button
+                        disabled={selectedCatalogRowIds.size === 0}
+                        type="button"
+                        size="sm"
+                        variant="outline"
+                        onClick={() => applySelectedCatalogRowsEnabled(false)}
+                      >
+                        {t("codexConfig.catalogExcludeSelected", {
+                          defaultValue: "Don't use",
+                        })}
                       </Button>
-                      <Button disabled={selectedCatalogRowIds.size === 0} type="button" size="sm" onClick={useOnlySelectedCatalogRows}>
-                        {t("codexConfig.catalogUseOnlySelected", { defaultValue: "Use only these" })}
+                      <Button
+                        disabled={selectedCatalogRowIds.size === 0}
+                        type="button"
+                        size="sm"
+                        onClick={useOnlySelectedCatalogRows}
+                      >
+                        {t("codexConfig.catalogUseOnlySelected", {
+                          defaultValue: "Use only these",
+                        })}
                       </Button>
-                      <Button disabled={selectedCatalogRowIds.size === 0} type="button" size="icon" variant="ghost" className="h-8 w-8 text-destructive hover:text-destructive" onClick={removeSelectedCatalogRows} title={t("codexConfig.catalogRemoveSelected", { defaultValue: "Remove selected models" })} aria-label={t("codexConfig.catalogRemoveSelected", { defaultValue: "Remove selected models" })}>
+                      <Button
+                        disabled={selectedCatalogRowIds.size === 0}
+                        type="button"
+                        size="icon"
+                        variant="ghost"
+                        className="h-8 w-8 text-destructive hover:text-destructive"
+                        onClick={removeSelectedCatalogRows}
+                        title={t("codexConfig.catalogRemoveSelected", {
+                          defaultValue: "Remove selected models",
+                        })}
+                        aria-label={t("codexConfig.catalogRemoveSelected", {
+                          defaultValue: "Remove selected models",
+                        })}
+                      >
                         <Trash2 className="h-4 w-4" />
                       </Button>
-                      <Button type="button" size="icon" variant="ghost" className="h-8 w-8" onClick={() => updateCatalogSelection("clear")} title={t("codexConfig.catalogClearSelection", { defaultValue: "Clear selection" })} aria-label={t("codexConfig.catalogClearSelection", { defaultValue: "Clear selection" })}>
+                      <Button
+                        type="button"
+                        size="icon"
+                        variant="ghost"
+                        className="h-8 w-8"
+                        onClick={() => updateCatalogSelection("clear")}
+                        title={t("codexConfig.catalogClearSelection", {
+                          defaultValue: "Clear selection",
+                        })}
+                        aria-label={t("codexConfig.catalogClearSelection", {
+                          defaultValue: "Clear selection",
+                        })}
+                      >
                         <X className="h-4 w-4" />
                       </Button>
                     </div>

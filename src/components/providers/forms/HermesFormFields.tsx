@@ -40,6 +40,10 @@ import {
 import { ApiKeySection, ModelDropdown } from "./shared";
 import { PagedModelList } from "./shared/PagedModelList";
 import {
+  ModelListChangeDialog,
+  type ModelListChange,
+} from "./shared/ModelListChangeDialog";
+import {
   fetchModelsForConfig,
   showFetchModelsError,
   type FetchedModel,
@@ -50,6 +54,7 @@ import {
   type HermesModel,
 } from "@/config/hermesProviderPresets";
 import type { ProviderCategory } from "@/types";
+import { cn } from "@/lib/utils";
 
 interface HermesFormFieldsProps {
   providerId?: string;
@@ -166,6 +171,27 @@ export function HermesFormFields({
   );
   const [fetchedModels, setFetchedModels] = useState<FetchedModel[]>([]);
   const [isFetchingModels, setIsFetchingModels] = useState(false);
+  const [modelListDiff, setModelListDiff] = useState<ModelListChange | null>(
+    null,
+  );
+  const modelFetchIdentity = `${providerId ?? "draft"}:${baseUrl}:${modelRefreshCredentialFingerprint(apiKey)}`;
+  const [verifiedModelIdentity, setVerifiedModelIdentity] = useState("");
+  const applyFetchedModels = useCallback(
+    (items: FetchedModel[]) => {
+      setFetchedModels(items);
+      setVerifiedModelIdentity(items.length > 0 ? modelFetchIdentity : "");
+    },
+    [modelFetchIdentity],
+  );
+  const verifiedModelIds = new Set(
+    verifiedModelIdentity === modelFetchIdentity
+      ? fetchedModels.map((item) => item.id.trim())
+      : [],
+  );
+  const isModelUnavailable = (id: string) =>
+    verifiedModelIds.size > 0 &&
+    !!id.trim() &&
+    !verifiedModelIds.has(id.trim());
   const [baseUrlTouched, setBaseUrlTouched] = useState(false);
   const [providerAdvancedOpen, setProviderAdvancedOpen] = useState(
     rateLimitDelay !== undefined,
@@ -220,7 +246,7 @@ export function HermesFormFields({
     setIsFetchingModels(true);
     runWithLoading(() => fetchModelsForConfig(baseUrl, apiKey))
       .then((fetched) => {
-        setFetchedModels(fetched);
+        applyFetchedModels(fetched);
         if (fetched.length === 0) {
           toast.info(t("providerForm.fetchModelsEmpty"));
         } else {
@@ -234,13 +260,18 @@ export function HermesFormFields({
         showFetchModelsError(err, t);
       })
       .finally(() => setIsFetchingModels(false));
-  }, [baseUrl, apiKey, t, runWithLoading]);
+  }, [baseUrl, apiKey, t, runWithLoading, applyFetchedModels]);
 
   useAutoModelRefresh({
-    cacheKey: `provider-models:hermes:${providerId ?? "draft"}:${baseUrl}:${modelRefreshCredentialFingerprint(apiKey)}`,
+    cacheKey: `provider-models:hermes:${modelFetchIdentity}`,
     enabled: Boolean(autoRefreshModels && providerId && baseUrl && apiKey),
     fetcher: () => fetchModelsForConfig(baseUrl, apiKey),
-    onSuccess: setFetchedModels,
+    onSuccess: applyFetchedModels,
+    snapshotKey: `hermes:${modelFetchIdentity}`,
+    compareIds: models.map((item) => item.id),
+    onDiff: (added, removed, updated) =>
+      setModelListDiff({ added, removed, updated }),
+    ttlMs: 0,
   });
 
   const handleRemoveModel = (index: number) => {
@@ -417,7 +448,14 @@ export function HermesFormFields({
                           placeholder={t("hermes.form.modelIdPlaceholder", {
                             defaultValue: "anthropic/claude-opus-5",
                           })}
-                          className="flex-1"
+                          className={cn(
+                            "flex-1",
+                            isModelUnavailable(model.id) &&
+                              "border-destructive text-destructive focus-visible:ring-destructive",
+                          )}
+                          aria-invalid={
+                            isModelUnavailable(model.id) || undefined
+                          }
                         />
                         {fetchedModels.length > 0 && (
                           <ModelDropdown
@@ -534,6 +572,10 @@ export function HermesFormFields({
           </p>
         </div>
       </AdvancedSection>
+      <ModelListChangeDialog
+        change={modelListDiff}
+        onClose={() => setModelListDiff(null)}
+      />
     </>
   );
 }

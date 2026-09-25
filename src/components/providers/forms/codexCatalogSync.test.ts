@@ -18,6 +18,19 @@ const remoteModels = [
 ];
 
 describe("reconcileFetchedCodexCatalogRows", () => {
+  it("does not confuse an alias with another fetched upstream id", () => {
+    const result = reconcileFetchedCodexCatalogRows(
+      [{ model: "new-upstream", upstreamModel: "real-upstream" }],
+      [{ id: "real-upstream" }, { id: "new-upstream" }],
+      source,
+      { appendNew: true, createRow },
+    );
+    expect(result.rows.map((row) => [row.model, row.upstreamModel])).toEqual([
+      ["new-upstream", "real-upstream"],
+      ["new-upstream", "new-upstream"],
+    ]);
+  });
+
   it("keeps disabled rows excluded and does not re-add their identities", () => {
     const initial: CodexCatalogRowLike[] = [
       { model: "Keep Me", upstreamModel: "keep-me", contextWindow: "" },
@@ -37,6 +50,7 @@ describe("reconcileFetchedCodexCatalogRows", () => {
       "new-model",
     ]);
     expect(result.added).toBe(1);
+    expect(result.updated).toEqual(["keep-me", "blocked-model"]);
     expect(result.rows[0].enabled).toBeUndefined();
     expect(result.rows[1].enabled).toBe(false);
     expect(result.rows[0].contextWindow).toBe("128000");
@@ -71,6 +85,7 @@ describe("reconcileFetchedCodexCatalogRows", () => {
     expect(result.rows).toHaveLength(2);
     expect(result.added).toBe(0);
     expect(result.hydrated).toBe(1);
+    expect(result.updated).toEqual(["manual-alias"]);
     expect(result.rows[0]).toMatchObject({
       model: "manual-alias",
       upstreamModel: "manual-alias",
@@ -141,6 +156,7 @@ describe("reconcileFetchedCodexCatalogRows", () => {
     );
 
     expect(result.hydrated).toBe(1);
+    expect(result.updated).toEqual(["gpt-5.5"]);
     expect(result.rows[0]).toMatchObject({
       model: "friendly-gpt",
       upstreamModel: "gpt-5.5",

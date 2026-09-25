@@ -6,11 +6,7 @@ import { syncCurrentProvidersLiveSafe } from "@/utils/postChangeSync";
 import { useGlobalLoading } from "@/contexts/GlobalLoadingContext";
 
 export type ImportStatus =
-  | "idle"
-  | "importing"
-  | "success"
-  | "partial-success"
-  | "error";
+  "idle" | "importing" | "success" | "partial-success" | "error";
 
 export interface UseImportExportOptions {
   onImportSuccess?: () => void | Promise<void>;

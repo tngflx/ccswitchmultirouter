@@ -1,6 +1,5 @@
 import { Button } from "@/components/ui/button";
 import type { CodexReasoningEffort } from "@/types";
-import { useState } from "react";
 import { useTranslation } from "react-i18next";
 
 export interface CodexModelReasoningSummaryProps {
@@ -34,10 +33,12 @@ export function CodexModelReasoningSummary({
   const { t } = useTranslation();
   const displayModel =
     model || t("codexReasoning.unnamedModel", { defaultValue: "未命名模型" });
-  const [requestedUltraSetup, setRequestedUltraSetup] = useState(false);
+  const canConfigureUltra = ultraEfforts.length > 0;
 
   return (
-    <div className="grid gap-3 text-xs lg:grid-cols-[minmax(10rem,1fr)_minmax(12rem,1.2fr)_minmax(16rem,1.2fr)_auto] lg:items-center">
+    <div
+      className={`grid gap-3 text-xs lg:items-center ${canConfigureUltra || ultraEnabled ? "lg:grid-cols-[minmax(10rem,1fr)_minmax(12rem,1.2fr)_minmax(16rem,1.2fr)_auto]" : "lg:grid-cols-[minmax(10rem,1fr)_minmax(12rem,1.2fr)_auto]"}`}
+    >
       <div className="min-w-0">
         <p className="font-medium text-foreground">{displayModel}</p>
       </div>
@@ -65,79 +66,74 @@ export function CodexModelReasoningSummary({
           })}
         </p>
       </div>
-      <div className="space-y-1 border-t pt-3 lg:border-l lg:border-t-0 lg:pl-3 lg:pt-0">
-        <span className="label text-muted-foreground">Ultra</span>
-        <label className="flex items-center gap-2 font-medium">
-          <input
-            type="checkbox"
-            aria-label={t("codexReasoning.ariaUltraToggle", {
+      {(canConfigureUltra || ultraEnabled) && (
+        <div className="space-y-1 border-t pt-3 lg:border-l lg:border-t-0 lg:pl-3 lg:pt-0">
+          <span className="label text-muted-foreground">Ultra</span>
+          <label className="flex items-center gap-2 font-medium">
+            <input
+              type="checkbox"
+              aria-label={t("codexReasoning.ariaUltraToggle", {
+                model: displayModel,
+                defaultValue: `为 ${displayModel} 启用 Codex Ultra`,
+              })}
+              checked={ultraEnabled}
+              disabled={!canConfigureUltra && !ultraEnabled}
+              onChange={(event) => {
+                onUltraChange({
+                  enabled: event.target.checked,
+                  providerEffort: ultraEffort,
+                });
+              }}
+            />
+            {t("codexReasoning.unlockUltra", {
+              defaultValue: "启用 Codex Ultra",
+            })}
+          </label>
+          <select
+            className="w-full rounded border bg-background px-2 py-1"
+            aria-label={t("codexReasoning.ariaUltraSelect", {
               model: displayModel,
-              defaultValue: `解锁 ${displayModel} 的 Ultra 档`,
+              defaultValue: `${displayModel} Ultra 对应的 Provider 推理强度`,
             })}
-            checked={ultraEnabled}
-            onChange={(event) => {
-              setRequestedUltraSetup(
-                event.target.checked && ultraEfforts.length === 0,
-              );
-              if (
-                event.target.checked &&
-                ultraEfforts.length === 0 &&
-                !expanded
-              ) {
-                onToggle();
-              }
+            value={ultraEffort ?? ""}
+            disabled={!ultraEnabled || ultraEfforts.length === 0}
+            onChange={(event) =>
               onUltraChange({
-                enabled: event.target.checked,
-                providerEffort: ultraEffort,
-              });
-            }}
-          />
-          {t("codexReasoning.unlockUltra", { defaultValue: "解锁 Ultra 档" })}
-        </label>
-        <select
-          className="w-full rounded border bg-background px-2 py-1"
-          aria-label={t("codexReasoning.ariaUltraSelect", {
-            model: displayModel,
-            defaultValue: `${displayModel} Ultra 对应的 Provider 推理强度`,
-          })}
-          value={ultraEffort ?? ""}
-          disabled={!ultraEnabled || ultraEfforts.length === 0}
-          onChange={(event) =>
-            onUltraChange({
-              enabled: ultraEnabled,
-              providerEffort: (event.target.value || undefined) as
-                | CodexReasoningEffort
-                | undefined,
-            })
-          }
-        >
-          <option value="">
-            {t("codexReasoning.selectProviderEffort", {
-              defaultValue: "选择 Provider 强度…",
-            })}
-          </option>
-          {ultraEfforts.map((effort) => (
-            <option key={effort} value={effort}>
-              {effort}
-            </option>
-          ))}
-        </select>
-        <p className="text-muted-foreground">
-          {requestedUltraSetup || (ultraEnabled && ultraEfforts.length === 0)
-            ? t("codexReasoning.needSetup", {
-                defaultValue:
-                  "需要先确认该模型可接收的推理强度；已为你展开推理能力配置，完成后才能保存。",
+                enabled: ultraEnabled,
+                providerEffort: (event.target.value || undefined) as
+                  CodexReasoningEffort | undefined,
               })
-            : ultraEnabled && ultraEffort
-              ? t("codexReasoning.unlockedUsing", {
-                  effort: ultraEffort,
-                  defaultValue: `已解锁，使用 ${ultraEffort}`,
+            }
+          >
+            <option value="">
+              {t("codexReasoning.selectProviderEffort", {
+                defaultValue: "选择 Provider 强度…",
+              })}
+            </option>
+            {ultraEfforts.map((effort) => (
+              <option key={effort} value={effort}>
+                {effort}
+              </option>
+            ))}
+          </select>
+          <p className="text-muted-foreground">
+            {ultraEnabled && !canConfigureUltra
+              ? t("codexReasoning.needSetup", {
+                  defaultValue:
+                    "该映射暂无已确认的供应商推理强度。请配置模型能力或关闭 Codex Ultra 后再保存。",
                 })
-              : t("codexReasoning.independent", {
-                  defaultValue: "独立于能力来源；解锁后请选择强度",
-                })}
-        </p>
-      </div>
+              : ultraEnabled && ultraEffort
+                ? t("codexReasoning.unlockedUsing", {
+                    effort: ultraEffort,
+                    defaultValue: `已解锁，使用 ${ultraEffort}`,
+                  })
+                : t("codexReasoning.independent", {
+                    defaultValue:
+                      "Codex orchestration mapped to a provider effort; not native Ultra support",
+                  })}
+          </p>
+        </div>
+      )}
       <Button
         type="button"
         variant={expanded ? "secondary" : "outline"}

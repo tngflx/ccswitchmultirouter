@@ -282,8 +282,7 @@ describe("useCodexConfigConsistency", () => {
       new Promise(() => {}),
     );
     let onProgress:
-      | ((payload: CodexRuntimeRefreshProgress) => void)
-      | undefined;
+      ((payload: CodexRuntimeRefreshProgress) => void) | undefined;
     vi.mocked(useTauriEvent).mockImplementation((name, handler) => {
       if (name === "codex-runtime-refresh-progress") {
         onProgress = handler as (payload: CodexRuntimeRefreshProgress) => void;

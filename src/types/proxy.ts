@@ -118,10 +118,7 @@ export interface RequestHealthDiagnostic {
   mediaDominated: boolean;
   dominantCategory: string | null;
   recommendedAction:
-    | "continue_once"
-    | "summarize_and_restart"
-    | "inspect"
-    | string;
+    "continue_once" | "summarize_and_restart" | "inspect" | string;
   optimizationMode: RequestOptimizationMode;
   optimizationApplied: boolean;
   compactionRequest: boolean;

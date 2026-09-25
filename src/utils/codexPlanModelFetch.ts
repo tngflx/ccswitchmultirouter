@@ -66,7 +66,7 @@ export function isCodexBytePlusPlanModelFetch(
   const baseUrl = normalizePlanFetchText(source.baseUrl);
   return Boolean(
     baseUrl &&
-      BYTEPLUS_PLAN_BASE_URL_MARKERS.some((marker) => baseUrl.includes(marker)),
+    BYTEPLUS_PLAN_BASE_URL_MARKERS.some((marker) => baseUrl.includes(marker)),
   );
 }
 

@@ -54,32 +54,22 @@ fn default_request_health_notification_snooze_hours() -> u32 {
     4
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum RequestOptimizationMode {
     Off,
     Diagnose,
+    #[default]
     Safe,
 }
 
-impl Default for RequestOptimizationMode {
-    fn default() -> Self {
-        Self::Safe
-    }
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum RequestHealthReviewMode {
     Off,
+    #[default]
     FirstLargeRequest,
     SustainedGrowth,
-}
-
-impl Default for RequestHealthReviewMode {
-    fn default() -> Self {
-        Self::FirstLargeRequest
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1018,7 +1008,9 @@ pub fn snooze_request_health_windows_notifications() -> Result<(), AppError> {
             .windows_notification_snooze_hours
             .clamp(1, 24);
         settings.request_health.windows_notifications_enabled = true;
-        settings.request_health.windows_notifications_snoozed_until_ms = Some(
+        settings
+            .request_health
+            .windows_notifications_snoozed_until_ms = Some(
             chrono::Utc::now()
                 .timestamp_millis()
                 .saturating_add(i64::from(hours).saturating_mul(60 * 60 * 1000)),

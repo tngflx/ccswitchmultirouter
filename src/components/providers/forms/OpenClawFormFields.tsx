@@ -35,12 +35,17 @@ import { Checkbox } from "@/components/ui/checkbox";
 import { ApiKeySection, ModelDropdown } from "./shared";
 import { PagedModelList } from "./shared/PagedModelList";
 import {
+  ModelListChangeDialog,
+  type ModelListChange,
+} from "./shared/ModelListChangeDialog";
+import {
   fetchModelsForConfig,
   showFetchModelsError,
   type FetchedModel,
 } from "@/lib/api/model-fetch";
 import { openclawApiProtocols } from "@/config/openclawProviderPresets";
 import type { ProviderCategory, OpenClawModel } from "@/types";
+import { cn } from "@/lib/utils";
 
 interface OpenClawFormFieldsProps {
   providerId?: string;
@@ -97,6 +102,27 @@ export function OpenClawFormFields({
   );
   const [fetchedModels, setFetchedModels] = useState<FetchedModel[]>([]);
   const [isFetchingModels, setIsFetchingModels] = useState(false);
+  const [modelListDiff, setModelListDiff] = useState<ModelListChange | null>(
+    null,
+  );
+  const modelFetchIdentity = `${providerId ?? "draft"}:${baseUrl}:${modelRefreshCredentialFingerprint(apiKey)}`;
+  const [verifiedModelIdentity, setVerifiedModelIdentity] = useState("");
+  const applyFetchedModels = useCallback(
+    (items: FetchedModel[]) => {
+      setFetchedModels(items);
+      setVerifiedModelIdentity(items.length > 0 ? modelFetchIdentity : "");
+    },
+    [modelFetchIdentity],
+  );
+  const verifiedModelIds = new Set(
+    verifiedModelIdentity === modelFetchIdentity
+      ? fetchedModels.map((item) => item.id.trim())
+      : [],
+  );
+  const isModelUnavailable = (id: string) =>
+    verifiedModelIds.size > 0 &&
+    !!id.trim() &&
+    !verifiedModelIds.has(id.trim());
 
   // Stable key tracking for models list
   const modelKeysRef = useRef<string[]>([]);
@@ -147,7 +173,7 @@ export function OpenClawFormFields({
     setIsFetchingModels(true);
     runWithLoading(() => fetchModelsForConfig(baseUrl, apiKey))
       .then((models) => {
-        setFetchedModels(models);
+        applyFetchedModels(models);
         if (models.length === 0) {
           toast.info(t("providerForm.fetchModelsEmpty"));
         } else {
@@ -161,13 +187,18 @@ export function OpenClawFormFields({
         showFetchModelsError(err, t);
       })
       .finally(() => setIsFetchingModels(false));
-  }, [baseUrl, apiKey, t, runWithLoading]);
+  }, [baseUrl, apiKey, t, runWithLoading, applyFetchedModels]);
 
   useAutoModelRefresh({
-    cacheKey: `provider-models:openclaw:${providerId ?? "draft"}:${baseUrl}:${modelRefreshCredentialFingerprint(apiKey)}`,
+    cacheKey: `provider-models:openclaw:${modelFetchIdentity}`,
     enabled: Boolean(autoRefreshModels && providerId && baseUrl && apiKey),
     fetcher: () => fetchModelsForConfig(baseUrl, apiKey),
-    onSuccess: setFetchedModels,
+    onSuccess: applyFetchedModels,
+    snapshotKey: `openclaw:${modelFetchIdentity}`,
+    compareIds: models.map((item) => item.id),
+    onDiff: (added, removed, updated) =>
+      setModelListDiff({ added, removed, updated }),
+    ttlMs: 0,
   });
 
   // Remove a model entry
@@ -378,7 +409,14 @@ export function OpenClawFormFields({
                           placeholder={t("openclaw.modelIdPlaceholder", {
                             defaultValue: "claude-3-sonnet",
                           })}
-                          className="flex-1"
+                          className={cn(
+                            "flex-1",
+                            isModelUnavailable(model.id) &&
+                              "border-destructive text-destructive focus-visible:ring-destructive",
+                          )}
+                          aria-invalid={
+                            isModelUnavailable(model.id) || undefined
+                          }
                         />
                         {fetchedModels.length > 0 && (
                           <ModelDropdown
@@ -648,6 +686,10 @@ export function OpenClawFormFields({
           })}
         </p>
       </div>
+      <ModelListChangeDialog
+        change={modelListDiff}
+        onClose={() => setModelListDiff(null)}
+      />
     </>
   );
 }

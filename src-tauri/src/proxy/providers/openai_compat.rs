@@ -14,7 +14,7 @@ use crate::proxy::{
 };
 use bytes::Bytes;
 use futures::stream::{Stream, StreamExt};
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 use std::collections::HashSet;
 
 /// 将 OpenAI Chat Completions 请求转换为 ChatGPT Codex 后端接受的 Responses 请求。
@@ -1979,7 +1979,7 @@ fn normalize_error_object(error: &Value) -> Value {
 mod tests {
     use super::*;
     use base64::Engine as _;
-    use futures::{stream, StreamExt};
+    use futures::{StreamExt, stream};
 
     #[test]
     fn mixed_router_plaintext_rewrite_targets_only_non_reserved_agents_tools() {
@@ -2059,8 +2059,7 @@ mod tests {
                 .is_none()
         );
         assert_eq!(
-            request["tools"][0]["tools"][0]["parameters"]["properties"]["private_note"]
-                ["encrypted"],
+            request["tools"][0]["tools"][0]["parameters"]["properties"]["private_note"]["encrypted"],
             true
         );
         assert_eq!(
@@ -2127,10 +2126,12 @@ mod tests {
 
         assert_eq!(reparsed["instructions"], "你是一个中文教学助手。");
         assert_eq!(reparsed["input"][0]["content"][0]["text"], user_text);
-        assert!(!reparsed["input"][0]["content"][0]["text"]
-            .as_str()
-            .unwrap()
-            .contains('?'));
+        assert!(
+            !reparsed["input"][0]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains('?')
+        );
 
         let escaped_input: Value = serde_json::from_slice(
             br#"{"model":"gpt-5.5","messages":[{"role":"user","content":"\u4f60\u597d\uff0c\u4e16\u754c\uff01"}]}"#,
@@ -2595,9 +2596,11 @@ mod tests {
         assert_eq!(fallback["tools"][1]["name"], "update_plan");
         assert_eq!(input.len(), 1);
         assert_eq!(input[0]["role"], "user");
-        assert!(input
-            .iter()
-            .all(|item| item.get("type").and_then(Value::as_str) != Some("additional_tools")));
+        assert!(
+            input
+                .iter()
+                .all(|item| item.get("type").and_then(Value::as_str) != Some("additional_tools"))
+        );
     }
 
     #[test]
@@ -2723,9 +2726,11 @@ mod tests {
 
         assert_eq!(item["type"], "message");
         assert!(item.get("encrypted_content").is_none());
-        assert!(item["content"][0]["text"]
-            .as_str()
-            .is_some_and(|text| { text.contains("not readable by this provider") }));
+        assert!(
+            item["content"][0]["text"]
+                .as_str()
+                .is_some_and(|text| { text.contains("not readable by this provider") })
+        );
     }
 
     #[test]
@@ -2831,9 +2836,10 @@ mod tests {
             item["summary"],
             json!([{ "type": "summary_text", "text": "Check the route first." }])
         );
-        assert!(item
-            .get("internal_chat_message_metadata_passthrough")
-            .is_none());
+        assert!(
+            item.get("internal_chat_message_metadata_passthrough")
+                .is_none()
+        );
         assert_eq!(normalized["input"][1]["role"], "user");
     }
 
@@ -2896,9 +2902,10 @@ mod tests {
         );
         assert!(item.get("summary").is_none());
         assert!(item.get("encrypted_content").is_none());
-        assert!(item
-            .get("internal_chat_message_metadata_passthrough")
-            .is_none());
+        assert!(
+            item.get("internal_chat_message_metadata_passthrough")
+                .is_none()
+        );
         // 非 reasoning item 不受影响
         assert_eq!(input[1]["role"], "user");
     }

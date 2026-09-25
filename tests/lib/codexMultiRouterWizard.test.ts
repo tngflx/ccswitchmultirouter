@@ -1320,7 +1320,7 @@ describe("codexMultiRouterWizard helpers", () => {
       }),
     );
     expect(sourceProviders[1].settingsConfig.modelCatalog.models).toEqual([
-      { model: "gpt-5.5" },
+      { model: "gpt-5.5-relay", upstreamModel: "gpt-5.5" },
     ]);
   });
 

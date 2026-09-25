@@ -701,6 +701,7 @@ fn review_finding(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn review_before_upstream(
     config: &RequestHealthConfig,
     trace_id: &str,
@@ -860,6 +861,7 @@ fn ensure_windows_notification_identity() -> Result<(), String> {
 }
 
 #[cfg(target_os = "windows")]
+#[allow(clippy::too_many_arguments)]
 fn show_windows_review_notification(
     token: &str,
     body_hash: &str,

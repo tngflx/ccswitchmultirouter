@@ -67,7 +67,10 @@ export function CodexOfficialAuthSection({
           className="h-10 rounded-md border bg-background px-3 text-sm"
         >
           <option value="desktop_current_login">
-            {t("codexOfficialAuth.desktopOption", "Codex Desktop current login")}
+            {t(
+              "codexOfficialAuth.desktopOption",
+              "Codex Desktop current login",
+            )}
           </option>
           <option value="managed_oauth">
             {t("codexOfficialAuth.managedOption", "CCSM OAuth account")}
@@ -92,10 +95,17 @@ export function CodexOfficialAuthSection({
             className="h-10 rounded-md border bg-background px-3 text-sm"
           >
             <option value="" disabled>
-              {t("codexOfficialAuth.selectAccount", "Select a signed-in account")}
+              {t(
+                "codexOfficialAuth.selectAccount",
+                "Select a signed-in account",
+              )}
             </option>
             {accounts.map((account) => (
-              <option key={account.id} value={account.id} disabled={account.requires_reauth}>
+              <option
+                key={account.id}
+                value={account.id}
+                disabled={account.requires_reauth}
+              >
                 {account.login}
                 {account.requires_reauth ? " (reauth required)" : ""}
               </option>
@@ -115,7 +125,12 @@ export function CodexOfficialAuthSection({
             "Sign-in and account-pool membership are managed in the authentication center. This section stores only a non-secret account reference.",
           )}
         </p>
-        <Button type="button" variant="outline" size="sm" onClick={onOpenAuthCenter}>
+        <Button
+          type="button"
+          variant="outline"
+          size="sm"
+          onClick={onOpenAuthCenter}
+        >
           {t("codexOfficialAuth.openAuthCenter", "Open authentication center")}
           <ExternalLink className="h-4 w-4" />
         </Button>

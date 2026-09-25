@@ -1,12 +1,9 @@
 import type { CodexTrafficPolicy } from "@/types";
 
 export type CodexTrafficPolicySource =
-  | "recommended"
-  | "safe_default"
-  | "custom";
+  "recommended" | "safe_default" | "custom";
 
-export interface ResolvedCodexTrafficPolicy
-  extends Required<CodexTrafficPolicy> {
+export interface ResolvedCodexTrafficPolicy extends Required<CodexTrafficPolicy> {
   source: CodexTrafficPolicySource;
 }
 

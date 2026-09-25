@@ -11,12 +11,12 @@ use super::{
     classify::ClassifiedReasoningShape,
     classify_captured_reasoning_shape,
     endpoint::build_probe_url,
+    prepare_probe_request,
     redaction::RedactedProbeEvidence,
     selection::select_transport_outcome_with_reasoning,
-    PreToolVisibleContent, ProbeCandidate, ProbeCase, ProbeReadiness, ProbeStageStatus,
-    HistoryReplay, ReasoningSemantic, ReasoningSource, ToolSchemaDialect,
-    ToolSchemaEvidence, TransportKind, TransportProbeAssessment,
-    prepare_probe_request,
+    HistoryReplay, PreToolVisibleContent, ProbeCandidate, ProbeCase, ProbeReadiness,
+    ProbeStageStatus, ReasoningSemantic, ReasoningSource, ToolSchemaDialect, ToolSchemaEvidence,
+    TransportKind, TransportProbeAssessment,
 };
 
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(15);
@@ -608,14 +608,7 @@ where
         transport,
         ProbeProgressStage::ForcedTool,
     );
-    let forced = send_forced_tool_case(
-        candidate,
-        client,
-        transport,
-        &endpoint,
-        nonce,
-    )
-    .await;
+    let forced = send_forced_tool_case(candidate, client, transport, &endpoint, nonce).await;
     if forced
         .as_ref()
         .is_ok_and(|(_, used_fallback)| *used_fallback)
@@ -820,17 +813,15 @@ async fn send_forced_tool_case(
     )
     .await
     {
-        Err(ProbeCaptureError::ToolSchemaRejected { .. }) => {
-            send_logical_case(
-                candidate,
-                client,
-                transport,
-                endpoint,
-                build_safe_tool_probe_request(&candidate.upstream_model, nonce),
-            )
-            .await
-            .map(|exchange| (exchange, true))
-        }
+        Err(ProbeCaptureError::ToolSchemaRejected { .. }) => send_logical_case(
+            candidate,
+            client,
+            transport,
+            endpoint,
+            build_safe_tool_probe_request(&candidate.upstream_model, nonce),
+        )
+        .await
+        .map(|exchange| (exchange, true)),
         Ok(exchange) => Ok((exchange, false)),
         Err(error) => Err(error),
     }
@@ -967,8 +958,8 @@ async fn send_case(
         ),
         None => build_logical_probe_request(case, &candidate.upstream_model, nonce),
     };
-    let prepared = prepare_probe_request(logical, transport)
-        .map_err(|_| ProbeCaptureError::InvalidPayload)?;
+    let prepared =
+        prepare_probe_request(logical, transport).map_err(|_| ProbeCaptureError::InvalidPayload)?;
     log::trace!(
         "prepared protocol probe request transport={:?} policy_fingerprint={} logical_bytes={}",
         prepared.transport,

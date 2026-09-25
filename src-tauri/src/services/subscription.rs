@@ -1681,7 +1681,11 @@ mod tests {
             ]
         }));
         assert_eq!(
-            quota.tiers.iter().map(|tier| tier.name.as_str()).collect::<Vec<_>>(),
+            quota
+                .tiers
+                .iter()
+                .map(|tier| tier.name.as_str())
+                .collect::<Vec<_>>(),
             vec![TIER_SEVEN_DAY_FABLE, TIER_SEVEN_DAY_SONNET]
         );
         assert_eq!(quota.tiers[0].utilization, 37.5);

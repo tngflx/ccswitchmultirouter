@@ -394,6 +394,7 @@ function renderCatalogHarness(
     isXaiOauthPreset?: boolean;
     isXaiOauthAuthenticated?: boolean;
     selectedXaiAccountId?: string;
+    defaultModel?: string;
   } = {},
 ) {
   const onCatalogChange = vi.fn();
@@ -413,6 +414,9 @@ function renderCatalogHarness(
       useState<CodexApiKeyGroupMode>(
         options.initialApiKeyGroupMode ?? "isolated",
       );
+    const [defaultModel, setDefaultModel] = useState(
+      options.defaultModel ?? "",
+    );
 
     // 测试壳模拟 ProviderForm 对 modelCatalog 的受控回写。
     const handleCatalogChange = (next: CodexCatalogModel[]) => {
@@ -465,6 +469,8 @@ function renderCatalogHarness(
         allowModelMenuProjectionToggle={
           options.allowModelMenuProjectionToggle ?? true
         }
+        codexModel={defaultModel}
+        onModelChange={setDefaultModel}
         apiFormat="openai_chat"
         onApiFormatChange={onApiFormatChange}
         catalogModels={catalog}
@@ -751,9 +757,6 @@ describe("CodexFormFields local model routing", () => {
         "manual-alias",
         "gpt-6",
         "glm-5.3",
-        "glm-5.2",
-        "glm-5.1",
-        "glm-5",
       ]),
     );
     expect(
@@ -763,6 +766,150 @@ describe("CodexFormFields local model routing", () => {
         .map((row) => row.model),
     ).toEqual(["manual-alias"]);
     expect(fetchModelsForConfig).toHaveBeenCalledTimes(1);
+  });
+
+  it("warns in red when a complete refresh no longer lists the default model", async () => {
+    vi.mocked(fetchModelsForConfig).mockResolvedValue([
+      { id: "current-model", ownedBy: "provider" },
+    ]);
+    renderCatalogHarness(
+      [{ model: "removed-model", upstreamModel: "removed-model" }],
+      { autoRefreshModels: true, defaultModel: "removed-model" },
+    );
+
+    // The automatic catalog-diff dialog is intentionally opened at the same
+    // time. Radix marks the underlying form aria-hidden while that dialog is
+    // open, so query the stable warning id rather than the hidden subtree.
+    const warning = await waitFor(() => {
+      const element = document.getElementById("codexDefaultModelAvailability");
+      expect(element).toBeTruthy();
+      return element as HTMLElement;
+    });
+    expect(warning).toHaveTextContent(
+      "codexConfig.defaultModelMissingFromProvider",
+    );
+    expect(warning).toHaveClass("text-destructive");
+    expect(screen.getByDisplayValue("removed-model")).toHaveAttribute(
+      "aria-invalid",
+      "true",
+    );
+  });
+
+  it("sets the provider default when a catalog model moves to first", async () => {
+    const harness = renderCatalogHarness(
+      [{ model: "first" }, { model: "second" }, { model: "third" }],
+      { defaultModel: "first" },
+    );
+
+    fireEvent.click(screen.getAllByTitle("上移")[2]);
+    await waitFor(() =>
+      expect(harness.latestCatalog().map((row) => row.model)).toEqual([
+        "first",
+        "third",
+        "second",
+      ]),
+    );
+    expect(document.getElementById("codexDefaultModel")).toHaveValue("first");
+
+    fireEvent.click(screen.getAllByTitle("上移")[1]);
+    await waitFor(() =>
+      expect(document.getElementById("codexDefaultModel")).toHaveValue("third"),
+    );
+  });
+
+  it("dismisses the model-list change popup with its button", async () => {
+    vi.mocked(fetchModelsForConfig).mockResolvedValue([
+      { id: "new-model", ownedBy: "provider" },
+    ]);
+    renderCatalogHarness([{ model: "old-model" }], {
+      autoRefreshModels: true,
+    });
+
+    expect(await screen.findByRole("dialog")).toBeInTheDocument();
+    fireEvent.click(
+      screen.getByRole("button", { name: "codexConfig.modelListDismiss" }),
+    );
+    await waitFor(() =>
+      expect(screen.queryByRole("dialog")).not.toBeInTheDocument(),
+    );
+  });
+
+  it("accepts a default alias when its upstream model is still listed", async () => {
+    vi.mocked(fetchModelsForConfig).mockResolvedValue([
+      { id: "current-model", ownedBy: "provider" },
+    ]);
+    renderCatalogHarness(
+      [{ model: "my-alias", upstreamModel: "current-model" }],
+      { autoRefreshModels: true, defaultModel: "my-alias" },
+    );
+
+    await waitFor(() => expect(fetchModelsForConfig).toHaveBeenCalledTimes(1));
+    await act(async () => {});
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(document.getElementById("codexDefaultModel")).not.toHaveAttribute(
+      "aria-invalid",
+    );
+  });
+
+  it("does not report a wizard alias as removed when its upstream id remains", async () => {
+    localStorage.clear();
+    vi.mocked(fetchModelsForConfig).mockResolvedValue([
+      { id: "gpt-5.6-sol", ownedBy: "provider" },
+    ]);
+    renderCatalogHarness(
+      [{ model: "gpt-5.6-sol-sublyx", upstreamModel: "gpt-5.6-sol" }],
+      { autoRefreshModels: true, defaultModel: "gpt-5.6-sol-sublyx" },
+    );
+
+    await waitFor(() => expect(fetchModelsForConfig).toHaveBeenCalledTimes(1));
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    expect(document.getElementById("codexDefaultModel")).not.toHaveAttribute(
+      "aria-invalid",
+    );
+  });
+
+  it("does not infer removal from failed, empty, or partial fetches", async () => {
+    const cases: Array<{
+      result: "failed" | "empty" | "partial";
+      grouped: boolean;
+    }> = [
+      { result: "failed", grouped: false },
+      { result: "empty", grouped: false },
+      { result: "partial", grouped: true },
+    ];
+    for (const { result, grouped } of cases) {
+      vi.mocked(fetchModelsForConfig).mockReset();
+      invalidateAutoModelRefresh();
+      if (result === "failed") {
+        vi.mocked(fetchModelsForConfig).mockRejectedValue(new Error("offline"));
+      } else if (result === "empty") {
+        vi.mocked(fetchModelsForConfig).mockResolvedValue([]);
+      } else {
+        vi.mocked(fetchModelsForConfig).mockImplementation(
+          async (_url, key) => {
+            if (key === "sk-second") throw new Error("group unavailable");
+            return [{ id: "current-model", ownedBy: "provider" }];
+          },
+        );
+      }
+      const view = renderCatalogHarness([], {
+        autoRefreshModels: true,
+        defaultModel: "old-model",
+        ...(grouped
+          ? {
+              initialApiKeyGroups: [
+                { id: "second", enabled: true, apiKeys: ["sk-second"] },
+              ],
+            }
+          : {}),
+      });
+      await waitFor(() =>
+        expect(fetchModelsForConfig).toHaveBeenCalledTimes(grouped ? 2 : 1),
+      );
+      await act(async () => {});
+      expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+      view.unmount();
+    }
   });
 
   it("keeps the saved catalog when any grouped credential refresh fails", async () => {
@@ -793,7 +940,7 @@ describe("CodexFormFields local model routing", () => {
     expect(harness.onCatalogChange).not.toHaveBeenCalled();
   });
 
-  it("applies recent release retention to the saved catalog", async () => {
+  it("keeps only the newest release in each model branch", async () => {
     const names = [
       "gpt-6-astra",
       "gpt-5.6-sol",
@@ -811,9 +958,10 @@ describe("CodexFormFields local model routing", () => {
       screen.getByRole("button", { name: "Keep recent versions" }),
     );
     await waitFor(() =>
-      expect(harness.latestCatalog().map((r) => r.model)).toEqual(
-        names.filter((name) => name !== "gpt-5.5" && name !== "glm-4.7"),
-      ),
+      expect(harness.latestCatalog().map((r) => r.model)).toEqual([
+        "gpt-6-astra",
+        "glm-5.3",
+      ]),
     );
   });
   it("keeps selection through capability and usage filters and sorts without reordering saved rows", async () => {
@@ -1118,7 +1266,7 @@ describe("CodexFormFields local model routing", () => {
     ).toBeInTheDocument();
     fireEvent.click(
       screen.getByRole("checkbox", {
-        name: "解锁 deepseek-v4-flash 的 Ultra 档",
+        name: "为 deepseek-v4-flash 启用 Codex Ultra",
       }),
     );
     fireEvent.change(
@@ -1907,6 +2055,46 @@ describe("CodexFormFields local model routing", () => {
           contextWindow: "272000",
         },
       ]);
+    });
+  });
+
+  it("saves fetched reasoning for new and unconfigured rows without replacing user declarations", async () => {
+    const fetchedReasoning: NonNullable<CodexCatalogModel["reasoning"]> = {
+      supportStatus: "confirmed_supported",
+      controlKind: "graded",
+      supportedEfforts: ["low", "high"],
+      defaultEffort: "high",
+      disableAllowed: false,
+      upstream: {
+        format: "string",
+        parameter: "reasoning_effort",
+        effortMap: { low: "low", high: "high" },
+      },
+      source: "provider_config",
+    };
+    const userReasoning = { ...fetchedReasoning, source: "user" as const };
+    vi.mocked(fetchModelsForConfig).mockResolvedValueOnce([
+      { id: "existing", ownedBy: null, reasoning: fetchedReasoning },
+      { id: "custom", ownedBy: null, reasoning: fetchedReasoning },
+      { id: "new", ownedBy: null, reasoning: fetchedReasoning },
+    ]);
+    const { latestCatalog } = renderCatalogHarness([
+      { model: "existing" },
+      { model: "custom", reasoning: userReasoning },
+    ]);
+
+    fireEvent.click(screen.getByRole("button", { name: "Sync Models" }));
+
+    await waitFor(() => {
+      expect(
+        latestCatalog().find((row) => row.model === "existing")?.reasoning,
+      ).toEqual(fetchedReasoning);
+      expect(
+        latestCatalog().find((row) => row.model === "custom")?.reasoning,
+      ).toEqual(userReasoning);
+      expect(
+        latestCatalog().find((row) => row.model === "new")?.reasoning,
+      ).toEqual(fetchedReasoning);
     });
   });
 

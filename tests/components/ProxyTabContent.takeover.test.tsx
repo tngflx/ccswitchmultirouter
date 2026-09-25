@@ -87,19 +87,40 @@ describe("Settings takeover lifecycle", () => {
       />,
     );
 
-  it.each([
-    ["Codex on", true],
-    ["Codex off", false],
-  ])("restarts running Codex after confirming %s", async (label, enabled) => {
+  it("restarts running Codex after confirming Codex on", async () => {
     vi.mocked(proxyApi.isCodexDesktopRunning).mockResolvedValue(true);
     const confirm = vi.spyOn(window, "confirm").mockReturnValue(true);
     show();
-    await userEvent.setup().click(screen.getByRole("button", { name: label }));
+    await userEvent
+      .setup()
+      .click(screen.getByRole("button", { name: "Codex on" }));
     await waitFor(() =>
-      expect(restartCodexDesktop).toHaveBeenCalledWith(enabled),
+      expect(restartCodexDesktop).toHaveBeenCalledWith(true),
     );
     expect(confirm).toHaveBeenCalledOnce();
     expect(setTakeoverForApp).not.toHaveBeenCalled();
+  });
+
+  it("disables Codex takeover directly without restarting Desktop", async () => {
+    vi.mocked(useProxyStatus).mockReturnValue({
+      isRunning: true,
+      takeoverStatus: { codex: true },
+      restartCodexDesktop,
+      setTakeoverForApp,
+      isPending: false,
+    } as unknown as ReturnType<typeof useProxyStatus>);
+    show();
+    await userEvent
+      .setup()
+      .click(screen.getByRole("button", { name: "Codex off" }));
+    await waitFor(() =>
+      expect(setTakeoverForApp).toHaveBeenCalledWith({
+        appType: "codex",
+        enabled: false,
+      }),
+    );
+    expect(proxyApi.isCodexDesktopRunning).not.toHaveBeenCalled();
+    expect(restartCodexDesktop).not.toHaveBeenCalled();
   });
 
   it("does not change takeover when restart is declined", async () => {

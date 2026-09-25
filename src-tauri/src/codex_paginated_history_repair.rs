@@ -192,7 +192,7 @@ pub(crate) enum PaginatedHistoryRepairProgress {
     },
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
 pub(crate) struct PaginatedHistoryRepairOutcome {
     pub repaired_rollout_count: usize,
     pub repaired_duplicate_count: usize,
@@ -200,6 +200,7 @@ pub(crate) struct PaginatedHistoryRepairOutcome {
     pub repaired_provider_migration_history_base_count: usize,
     pub repaired_rotated_thread_count: usize,
     pub repaired_rotated_segment_count: usize,
+    #[serde(skip)]
     pub(super) targets: Vec<ProjectionCatchUpTarget>,
 }
 

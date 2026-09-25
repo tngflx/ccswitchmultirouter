@@ -2,7 +2,7 @@
 
 use crate::proxy::error::ProxyError;
 use base64::Engine as _;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 /// Project Codex-private `agent_message` items into third-party Responses input.
 ///

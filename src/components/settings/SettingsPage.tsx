@@ -262,7 +262,7 @@ export function SettingsPage({
               {t("settings.tabAdvanced")}
             </TabsTrigger>
             <TabsTrigger value="usage">{t("usage.title")}</TabsTrigger>
-            <TabsTrigger value="about">{t("common.about")}</TabsTrigger>
+            <TabsTrigger value="about">{t("settings.tabUpdates")}</TabsTrigger>
           </TabsList>
 
           <div className="flex-1 min-h-0 flex flex-col">
@@ -592,7 +592,9 @@ export function SettingsPage({
                   onRefreshIntervalChange={(usageDashboardRefreshIntervalMs) =>
                     handleAutoSave({ usageDashboardRefreshIntervalMs })
                   }
-                  sessionAutoSyncEnabled={settings?.sessionAutoSyncEnabled !== false}
+                  sessionAutoSyncEnabled={
+                    settings?.sessionAutoSyncEnabled !== false
+                  }
                   onSessionAutoSyncEnabledChange={(sessionAutoSyncEnabled) =>
                     handleAutoSave({ sessionAutoSyncEnabled })
                   }

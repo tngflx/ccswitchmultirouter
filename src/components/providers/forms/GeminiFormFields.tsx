@@ -1,4 +1,4 @@
-import { useCallback, useState } from "react";
+import { useCallback, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import {
   invalidateAutoModelRefresh,
@@ -10,6 +10,14 @@ import { FormLabel } from "@/components/ui/form";
 import { Download, Info, Loader2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { toast } from "sonner";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
 import EndpointSpeedTest from "./EndpointSpeedTest";
 import { ApiKeySection, EndpointField, ModelInputWithFetch } from "./shared";
 import {
@@ -18,6 +26,7 @@ import {
   type FetchedModel,
 } from "@/lib/api/model-fetch";
 import type { ProviderCategory } from "@/types";
+import { cn } from "@/lib/utils";
 
 interface EndpointCandidate {
   url: string;
@@ -86,6 +95,30 @@ export function GeminiFormFields({
 
   const [fetchedModels, setFetchedModels] = useState<FetchedModel[]>([]);
   const [isFetchingModels, setIsFetchingModels] = useState(false);
+  const [modelListDiff, setModelListDiff] = useState<{
+    added: string[];
+    removed: string[];
+    updated: string[];
+  } | null>(null);
+  const modelFetchIdentity = `${providerId ?? "draft"}:${baseUrl}:${modelRefreshCredentialFingerprint(apiKey)}`;
+  const [verifiedModelIdentity, setVerifiedModelIdentity] = useState("");
+  const applyFetchedModels = useCallback(
+    (models: FetchedModel[]) => {
+      setFetchedModels(models);
+      setVerifiedModelIdentity(models.length > 0 ? modelFetchIdentity : "");
+    },
+    [modelFetchIdentity],
+  );
+  const latestModelIds = useMemo(
+    () => new Set(fetchedModels.map((item) => item.id.trim()).filter(Boolean)),
+    [fetchedModels],
+  );
+  const modelUnavailable = Boolean(
+    model.trim() &&
+    verifiedModelIdentity === modelFetchIdentity &&
+    fetchedModels.length > 0 &&
+    !latestModelIds.has(model.trim()),
+  );
 
   const handleFetchModels = useCallback(() => {
     invalidateAutoModelRefresh();
@@ -99,7 +132,7 @@ export function GeminiFormFields({
     setIsFetchingModels(true);
     runWithLoading(() => fetchModelsForConfig(baseUrl, apiKey))
       .then((models) => {
-        setFetchedModels(models);
+        applyFetchedModels(models);
         if (models.length === 0) {
           toast.info(t("providerForm.fetchModelsEmpty"));
         } else {
@@ -113,15 +146,20 @@ export function GeminiFormFields({
         showFetchModelsError(err, t);
       })
       .finally(() => setIsFetchingModels(false));
-  }, [baseUrl, apiKey, t, runWithLoading]);
+  }, [baseUrl, apiKey, t, runWithLoading, applyFetchedModels]);
 
   useAutoModelRefresh({
-    cacheKey: `provider-models:gemini:${providerId ?? "draft"}:${baseUrl}:${modelRefreshCredentialFingerprint(apiKey)}`,
+    cacheKey: `provider-models:gemini:${modelFetchIdentity}`,
     enabled:
       Boolean(autoRefreshModels && providerId && baseUrl && apiKey) &&
       !isGoogleOfficial,
     fetcher: () => fetchModelsForConfig(baseUrl, apiKey),
-    onSuccess: setFetchedModels,
+    onSuccess: applyFetchedModels,
+    snapshotKey: `gemini:${modelFetchIdentity}`,
+    compareIds: model.trim() ? [model.trim()] : undefined,
+    onDiff: (added, removed, updated) =>
+      setModelListDiff({ added, removed, updated }),
+    ttlMs: 0,
   });
 
   return (
@@ -205,9 +243,93 @@ export function GeminiFormFields({
             placeholder="gemini-3.6-flash"
             fetchedModels={fetchedModels}
             isLoading={isFetchingModels}
+            inputClassName={cn(
+              modelUnavailable &&
+                "border-destructive text-destructive focus-visible:ring-destructive",
+            )}
+            ariaInvalid={modelUnavailable}
           />
+          {modelUnavailable && (
+            <p
+              className="text-xs leading-relaxed text-destructive"
+              role="alert"
+            >
+              {t("codexConfig.defaultModelMissingFromProvider", {
+                defaultValue:
+                  "This default model is absent from the latest complete model list. It may have been removed or renamed by the provider.",
+              })}
+            </p>
+          )}
         </div>
       )}
+
+      <Dialog
+        open={Boolean(modelListDiff)}
+        onOpenChange={(open) => {
+          if (!open) setModelListDiff(null);
+        }}
+      >
+        <DialogContent className="max-w-lg">
+          <DialogHeader>
+            <DialogTitle>
+              {t("codexConfig.modelListChangedTitle", {
+                defaultValue: "Provider model list changed",
+              })}
+            </DialogTitle>
+            <DialogDescription>
+              {t("codexConfig.modelListChangedDescription", {
+                defaultValue:
+                  "A silent refresh found differences from the saved model list.",
+              })}
+            </DialogDescription>
+          </DialogHeader>
+          {modelListDiff && (
+            <div className="space-y-3 px-6 pb-2 text-sm">
+              {modelListDiff.added.length > 0 && (
+                <div>
+                  <p className="font-medium text-emerald-600 dark:text-emerald-400">
+                    {t("codexConfig.modelListAdded", {
+                      count: modelListDiff.added.length,
+                    })}
+                  </p>
+                  <p className="mt-1 break-words font-mono text-xs text-muted-foreground">
+                    {modelListDiff.added.join(", ")}
+                  </p>
+                </div>
+              )}
+              {modelListDiff.removed.length > 0 && (
+                <div>
+                  <p className="font-medium text-destructive">
+                    {t("codexConfig.modelListRemoved", {
+                      count: modelListDiff.removed.length,
+                    })}
+                  </p>
+                  <p className="mt-1 break-words font-mono text-xs text-muted-foreground">
+                    {modelListDiff.removed.join(", ")}
+                  </p>
+                </div>
+              )}
+              {modelListDiff.updated.length > 0 && (
+                <div>
+                  <p className="font-medium text-blue-600 dark:text-blue-400">
+                    {t("codexConfig.modelListUpdated", {
+                      count: modelListDiff.updated.length,
+                    })}
+                  </p>
+                  <p className="mt-1 break-words font-mono text-xs text-muted-foreground">
+                    {modelListDiff.updated.join(", ")}
+                  </p>
+                </div>
+              )}
+            </div>
+          )}
+          <DialogFooter>
+            <Button type="button" onClick={() => setModelListDiff(null)}>
+              {t("codexConfig.modelListDismiss")}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
 
       {/* 端点测速弹窗 */}
       {shouldShowSpeedTest && isEndpointModalOpen && (

@@ -1,14 +1,16 @@
 /**
- * MultiRouter 聚合模型目录的排序 SSOT。
+ * MultiRouter 聚合模型目录的预览排序，与编译器的 Router modelOrder 对齐。
  *
- * 聚合目录会因为删除供应商、路由增删、`/models` 刷新而整体重建。如果顺序完全由
- * “route 迭代顺序 × 目标 provider 目录顺序”推导，任何集合变化都会让老模型跳位。
- * 这里统一按上一次目录的相对顺序补位，真正新增的模型追加到末尾。
+ * 默认顺序来自当前 route × provider 目录；只有 Router 保存了 modelOrder 时才
+ * 按旧名次补位，新增模型追加到末尾。源 provider 的 sortIndex 不参与全局排序。
  */
 
 export interface CodexOrderableCatalogModel {
   model?: string;
   sortIndex?: number;
+  upstreamModel?: string;
+  upstream_model?: string;
+  providerName?: string;
 }
 
 /**
@@ -35,7 +37,8 @@ function buildPreviousRankByModel(
 
   const rankByModel = new Map<string, number>();
   for (const entry of ranked) {
-    if (!rankByModel.has(entry.id)) rankByModel.set(entry.id, rankByModel.size);
+    const key = entry.id.toLowerCase();
+    if (!rankByModel.has(key)) rankByModel.set(key, rankByModel.size);
   }
   return rankByModel;
 }
@@ -68,12 +71,10 @@ function writeCatalogSortIndexes<T extends CodexOrderableCatalogModel>(
 }
 
 /**
- * 按上一次目录顺序重排重建结果，并把新增模型追加到末尾。
+ * 有 Router 自定义顺序时按旧名次重排，并把新增模型追加到末尾。
  *
- * 上一次目录使用过自定义排序时（存在任意 `sortIndex`），返回值会为全部模型写入
- * 稠密 `sortIndex`（0 起），这样删除中间模型不会留下空洞，新增模型也拿到末尾序号，
- * 而不是回落到后端的默认供应商启发式排序。上一次目录没有自定义排序时保持“无
- * `sortIndex`”语义，只由数组顺序表达默认顺序，让“恢复默认”继续生效。
+ * 自定义顺序写入稠密 `sortIndex`（0 起）；无自定义顺序时清除继承的索引，
+ * 保持当前 route/catalog 数组顺序。
  *
  * 上游 provider 目录里的 `sortIndex` 不参与聚合排序：聚合目录的顺序偏好只属于
  * MultiRouter 自身，否则模型源刷新会把无关序号带进方案。
@@ -84,12 +85,46 @@ export function applyCodexCatalogModelOrder<
   nextModels: readonly T[],
   previousModels: readonly CodexOrderableCatalogModel[],
 ): T[] {
+  if (!hasCustomCatalogOrder(previousModels)) {
+    return writeCatalogSortIndexes(nextModels, false);
+  }
   const rankByModel = buildPreviousRankByModel(previousModels);
+  for (const [savedName, rank] of rankByModel) {
+    if (
+      nextModels.some(
+        (model) => model.model?.toLowerCase() === savedName.toLowerCase(),
+      )
+    ) {
+      continue;
+    }
+    const key = savedName.toLowerCase();
+    const identityMatches = nextModels.filter(
+      (model) =>
+        model.upstreamModel?.toLowerCase() === key ||
+        model.upstream_model?.toLowerCase() === key,
+    );
+    const suffixMatches = nextModels.filter((model) => {
+      const suffix = (model.providerName ?? "")
+        .toLowerCase()
+        .replace(/[^a-z0-9]+/g, "-")
+        .replace(/^-|-$/g, "");
+      return (
+        Boolean(suffix) &&
+        key ===
+          `${model.upstreamModel ?? model.upstream_model ?? model.model}-${suffix}`.toLowerCase()
+      );
+    });
+    const matches =
+      identityMatches.length === 1 ? identityMatches : suffixMatches;
+    if (matches.length === 1 && matches[0].model) {
+      rankByModel.set(matches[0].model, rank);
+    }
+  }
   const ordered = nextModels
     .map((model, index) => ({
       model,
       index,
-      rank: rankByModel.get(model.model?.trim() ?? ""),
+      rank: rankByModel.get(model.model?.trim().toLowerCase() ?? ""),
     }))
     .sort(
       (left, right) =>

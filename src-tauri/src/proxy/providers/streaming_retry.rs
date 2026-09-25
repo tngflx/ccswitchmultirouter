@@ -28,18 +28,18 @@
 //! 长思考误判为断流。
 
 use super::codex_terminal::{
-    classify_native_responses_terminal, NativeResponsesEvidence, NativeResponsesTerminalDisposition,
+    NativeResponsesEvidence, NativeResponsesTerminalDisposition, classify_native_responses_terminal,
 };
 use super::streaming_responses::{
-    anthropic_error_sse, anthropic_sse, create_anthropic_sse_stream_from_responses,
-    RETRYABLE_STREAM_MARKER,
+    RETRYABLE_STREAM_MARKER, anthropic_error_sse, anthropic_sse,
+    create_anthropic_sse_stream_from_responses,
 };
 use crate::proxy::error::ProxyError;
 use crate::proxy::hyper_client::ProxyResponse;
 use crate::proxy::sse::{strip_sse_field, take_sse_block};
 use bytes::{Bytes, BytesMut};
 use futures::stream::{Stream, StreamExt};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::future::Future;
 use std::pin::Pin;

@@ -7,11 +7,11 @@ use crate::proxy::{
     error::ProxyError,
     json_canonical::canonical_json_string,
     tool_media::{
-        chat_media_part_from_tool_part, flush_pending_chat_tool_media, plan_chat_tool_output_media,
-        queue_chat_tool_output_media, ToolMediaScope,
+        ToolMediaScope, chat_media_part_from_tool_part, flush_pending_chat_tool_media,
+        plan_chat_tool_output_media, queue_chat_tool_output_media,
     },
 };
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 const ANTHROPIC_BILLING_HEADER_PREFIX: &str = "x-anthropic-billing-header:";
 
@@ -89,18 +89,32 @@ pub fn supports_reasoning_effort(model: &str) -> bool {
         || normalized.starts_with("grok-build-")
 }
 
+/// Models whose Responses API exposes a distinct `max` reasoning tier.
+fn supports_max_reasoning_effort(model: &str) -> bool {
+    matches!(
+        model.to_ascii_lowercase().as_str(),
+        "gpt-5.6" | "gpt-5.6-sol" | "gpt-5.6-terra" | "gpt-5.6-luna" | "gpt-6-astra"
+    )
+}
+
 /// Resolve the appropriate OpenAI `reasoning_effort` from an Anthropic request body.
 ///
 /// Priority:
 /// 1. Explicit `output_config.effort` — preserves the user's intent directly.
 ///    `low`/`medium`/`high` map 1:1; `max` maps to `xhigh`
-///    (supported by mainstream GPT models). Unknown values are ignored.
+///    (supported by mainstream GPT models). Models with a distinct max tier
+///    preserve `max`. Unknown values are ignored.
 /// 2. Fallback: `thinking.type` + `budget_tokens`:
 ///    - `adaptive` → `xhigh` (adaptive = maximum reasoning effort)
 ///    - `enabled` with budget → `low` (<4 000) / `medium` (4 000–15 999) / `high` (≥16 000)
 ///    - `enabled` without budget → `high` (conservative default)
 ///    - `disabled` / absent → `None`
 pub fn resolve_reasoning_effort(body: &Value) -> Option<&'static str> {
+    let model = body
+        .get("model")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+
     // --- Priority 1: explicit output_config.effort ---
     if let Some(effort) = body
         .pointer("/output_config/effort")
@@ -111,8 +125,9 @@ pub fn resolve_reasoning_effort(body: &Value) -> Option<&'static str> {
             "medium" => Some("medium"),
             "high" => Some("high"),
             "xhigh" => Some("xhigh"),
-            "max" => Some("xhigh"), // OpenAI xhigh = maximum reasoning effort
-            _ => None,              // unknown value — do not inject
+            "max" if supports_max_reasoning_effort(model) => Some("max"),
+            "max" => Some("xhigh"),
+            _ => None, // unknown value — do not inject
         };
     }
 
@@ -1229,14 +1244,18 @@ mod tests {
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[0]["role"], "tool");
         assert_eq!(messages[0]["tool_call_id"], "call_image");
-        assert!(messages[0]["content"]
-            .as_str()
-            .unwrap()
-            .contains("tool result media moved"));
-        assert!(!messages[0]["content"]
-            .as_str()
-            .unwrap()
-            .contains("CLAUDE_CHAT_IMAGE_SENTINEL"));
+        assert!(
+            messages[0]["content"]
+                .as_str()
+                .unwrap()
+                .contains("tool result media moved")
+        );
+        assert!(
+            !messages[0]["content"]
+                .as_str()
+                .unwrap()
+                .contains("CLAUDE_CHAT_IMAGE_SENTINEL")
+        );
         assert_eq!(messages[1]["role"], "user");
         assert_eq!(
             messages[1]["content"][0]["text"],
@@ -1244,9 +1263,11 @@ mod tests {
         );
         assert_eq!(messages[1]["content"][1]["type"], "image_url");
         assert!(messages[1]["content"][1].get("cache_control").is_none());
-        assert!(messages[1]["content"][1]
-            .get("prompt_cache_breakpoint")
-            .is_none());
+        assert!(
+            messages[1]["content"][1]
+                .get("prompt_cache_breakpoint")
+                .is_none()
+        );
         assert_eq!(
             messages[1]["content"][1]["image_url"]["url"],
             "data:image/png;base64,CLAUDE_CHAT_IMAGE_SENTINEL"
@@ -1313,12 +1334,16 @@ mod tests {
             result["messages"][0]["content"][0]["image_url"]["url"],
             "https://example.com/image.png"
         );
-        assert!(result["messages"][0]["content"][0]
-            .get("cache_control")
-            .is_none());
-        assert!(result["messages"][0]["content"][0]
-            .get("prompt_cache_breakpoint")
-            .is_none());
+        assert!(
+            result["messages"][0]["content"][0]
+                .get("cache_control")
+                .is_none()
+        );
+        assert!(
+            result["messages"][0]["content"][0]
+                .get("prompt_cache_breakpoint")
+                .is_none()
+        );
     }
 
     #[test]
@@ -1797,8 +1822,22 @@ mod tests {
     }
 
     #[test]
-    fn test_output_config_max_maps_to_reasoning_effort_xhigh() {
-        let body = json!({"output_config": {"effort": "max"}});
+    fn test_output_config_max_preserved_for_max_capable_models() {
+        for model in [
+            "gpt-5.6",
+            "gpt-5.6-sol",
+            "gpt-5.6-terra",
+            "gpt-5.6-luna",
+            "gpt-6-astra",
+        ] {
+            let body = json!({"model": model, "output_config": {"effort": "max"}});
+            assert_eq!(resolve_reasoning_effort(&body), Some("max"));
+        }
+    }
+
+    #[test]
+    fn test_output_config_max_maps_to_reasoning_effort_xhigh_for_other_models() {
+        let body = json!({"model": "gpt-5.4", "output_config": {"effort": "max"}});
         assert_eq!(resolve_reasoning_effort(&body), Some("xhigh"));
     }
 
@@ -1825,7 +1864,10 @@ mod tests {
         let result = anthropic_to_openai_with_reasoning_content(input, false).unwrap();
         let tools = result["tools"].as_array().unwrap();
         assert_eq!(tools.len(), 3);
-        assert_eq!(tools[0]["function"]["description"], json!("Run a bash command"));
+        assert_eq!(
+            tools[0]["function"]["description"],
+            json!("Run a bash command")
+        );
         assert!(tools[1]["function"].get("description").is_none());
         assert!(tools[2]["function"].get("description").is_none());
         assert!(tools[1]["function"].get("parameters").is_some());

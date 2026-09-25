@@ -2701,6 +2701,10 @@ impl RequestForwarder {
             if super::providers::transform_codex_chat_moonshot_schema::
                 upstream_requires_ref_sibling_all_of(&base_url)
             {
+                super::providers::codex_tool_schema::compile_tool_schemas(
+                    &mut chat_body,
+                    crate::protocol_compatibility::ToolSchemaDialect::MoonshotMfjs,
+                )?;
                 super::providers::transform_codex_chat_moonshot_schema::
                     wrap_ref_siblings_in_chat_tools(&mut chat_body);
             }
@@ -2751,6 +2755,19 @@ impl RequestForwarder {
             if codex_impersonate_claude_code {
                 prepend_claude_code_system_prompt(&mut anthropic_body);
             }
+            // Mirror the Claude adapter's vendor-gated history normalization above:
+            // strict Anthropic-compatible upstreams (DeepSeek official, MiMo) reject
+            // assistant tool-call turns without a thinking block (`content[].thinking
+            // ... must be passed back`, #7525). The conversion only replays thinking
+            // that round-tripped through our encrypted envelope; reasoning items from
+            // any other origin drop silently, so this path needs the same heal.
+            // Applied before prompt-cache injection so breakpoints land on the final
+            // history layout.
+            super::providers::normalize_anthropic_messages_for_provider(
+                &mut anthropic_body,
+                provider,
+                "anthropic",
+            );
             // Enable Anthropic prompt caching (no beta header required). Reuse the
             // configured TTL rather than silently forcing 5m on this conversion path.
             // otherwise system/tools/history are re-sent at full price every round,
@@ -5635,10 +5652,13 @@ impl RequestForwarder {
             ));
         };
 
-        if let Some(message) = retryable_error_from_primed_sse_chunk(&first) {
+        if let Some(error_payload) = retryable_error_from_primed_sse_chunk(&first) {
             return Err(ProxyError::UpstreamError {
                 status: 503,
-                body: Some(message),
+                // Preserve the provider's structured SSE error so the caller and
+                // diagnostics can see its code/type/details. `summarize_proxy_error`
+                // still reduces this to the human-readable message for normal logs.
+                body: Some(error_payload),
             });
         }
 
@@ -5977,26 +5997,13 @@ fn retryable_error_from_primed_sse_chunk(first: &Bytes) -> Option<String> {
     None
 }
 
-/// 提取 SSE 错误体里最适合写入日志/返回给重试分类器的消息。
+/// Preserve the structured SSE error payload for diagnostics and the downstream
+/// error response. The payload is bounded because it originated in an upstream
+/// stream and must not be allowed to create an unbounded local error response.
 fn extract_sse_error_message(value: Option<&Value>) -> Option<String> {
     let value = value?;
-    for pointer in [
-        "/error/message",
-        "/message",
-        "/response/error/message",
-        "/response/incomplete_details/reason",
-    ] {
-        if let Some(message) = value
-            .pointer(pointer)
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|message| !message.is_empty())
-        {
-            return Some(message.to_string());
-        }
-    }
-
-    Some(value.to_string())
+    let serialized = serde_json::to_string(value).ok()?;
+    Some(serialized.chars().take(4096).collect())
 }
 
 fn summarize_upstream_body(body: &str) -> String {
@@ -6045,6 +6052,15 @@ pub(crate) fn sanitize_codex_orphan_function_call_outputs(mut body: Value) -> Va
                 .and_then(Value::as_str)
                 .is_some_and(|call_id| !call_id.trim().is_empty());
             if !has_call_id {
+                let known_codex_app_synthetic = item.get("namespace").and_then(Value::as_str)
+                    == Some("codex_app")
+                    && matches!(
+                        item.get("name").and_then(Value::as_str),
+                        Some("send_message_to_thread" | "automation_update")
+                    );
+                if known_codex_app_synthetic {
+                    return true;
+                }
                 log::debug!(
                     "[Codex] Dropping function_call_output lacking call_id: id={:?}, name={:?}",
                     item.get("id"),
@@ -8796,6 +8812,21 @@ mod tests {
         assert_eq!(input[1]["call_id"], "call_valid");
     }
 
+    #[test]
+    fn sanitize_codex_orphan_function_call_outputs_preserves_known_codex_app_delivery() {
+        let body = serde_json::json!({
+            "input": [{
+                "type": "function_call_output",
+                "namespace": "codex_app",
+                "name": "send_message_to_thread",
+                "output": "cross-thread message"
+            }]
+        });
+
+        let sanitized = sanitize_codex_orphan_function_call_outputs(body);
+        assert_eq!(sanitized["input"].as_array().unwrap().len(), 1);
+    }
+
     use super::*;
     use crate::provider::{LocalProxyRequestOverrides, ProviderMeta};
     use crate::proxy::providers::codex_oauth_auth::CodexAccountPoolEntry;
@@ -10820,7 +10851,7 @@ mod tests {
             HeaderMap::new(),
             futures::stream::once(async {
                 Ok::<Bytes, std::io::Error>(Bytes::from_static(
-                    b"event: error\ndata: {\"error\":{\"message\":\"We're currently experiencing high demand\",\"type\":\"server_error\"}}\n\n",
+                    b"event: error\ndata: {\"error\":{\"message\":\"We're currently experiencing high demand\",\"type\":\"server_error\",\"code\":\"provider_capacity\"}}\n\n",
                 ))
             }),
         );
@@ -10838,7 +10869,7 @@ mod tests {
             ProxyError::UpstreamError {
                 status: 503,
                 body: Some(message),
-            } if message.contains("high demand")
+            } if message.contains("high demand") && message.contains("provider_capacity")
         ));
     }
 

@@ -11,19 +11,18 @@
 //! - this module:               Responses request → Anthropic request, Anthropic response → Responses response
 
 use super::transform_codex_chat::{
-    build_codex_tool_context_from_request, response_message_item_id,
+    CodexToolContext, build_codex_tool_context_from_request, response_message_item_id,
     response_tool_call_item_from_chat_name, response_tool_call_item_id_from_chat_name,
-    CodexToolContext,
 };
-use super::transform_responses::{sanitize_anthropic_tool_use_input, TOOL_RESULT_ERROR_MARKER};
+use super::transform_responses::{TOOL_RESULT_ERROR_MARKER, sanitize_anthropic_tool_use_input};
 use crate::proxy::error::ProxyError;
 use crate::proxy::json_canonical::canonical_json_string;
 use crate::proxy::sse::{strip_sse_field, take_sse_block};
 use crate::proxy::tool_media::{
-    strip_and_clamp_media_from_tool_value, ToolMediaScope, TOOL_RESULT_MEDIA_ATTACHED_MARKER,
+    TOOL_RESULT_MEDIA_ATTACHED_MARKER, ToolMediaScope, strip_and_clamp_media_from_tool_value,
 };
-use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-use serde_json::{json, Value};
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashSet};
 
 pub(crate) const ANTHROPIC_THINKING_ENCRYPTED_PREFIX: &str = "ccswitch-anthropic-thinking-v1:";
@@ -128,7 +127,9 @@ pub(crate) fn map_anthropic_stop_reason_to_status(
         // pause_turn is unreachable on this path (Codex requests do not declare Anthropic server-side tools);
         // if it does occur, log a warning and treat it as completed.
         Some("pause_turn") => {
-            log::warn!("[Codex] Received unexpected Anthropic stop_reason=pause_turn, treating it as completed");
+            log::warn!(
+                "[Codex] Received unexpected Anthropic stop_reason=pause_turn, treating it as completed"
+            );
             ("completed", None)
         }
         _ => ("completed", None),
@@ -154,7 +155,7 @@ pub(crate) fn build_responses_usage_from_anthropic(usage: Option<&Value>) -> Val
                 "output_tokens": 0,
                 "total_tokens": 0,
                 "output_tokens_details": { "reasoning_tokens": 0 }
-            })
+            });
         }
     };
 
@@ -2577,10 +2578,12 @@ mod tests {
         }))
         .unwrap();
         let reasoning = converted["output"][0].clone();
-        assert!(reasoning["encrypted_content"]
-            .as_str()
-            .unwrap()
-            .starts_with(ANTHROPIC_THINKING_ENCRYPTED_PREFIX));
+        assert!(
+            reasoning["encrypted_content"]
+                .as_str()
+                .unwrap()
+                .starts_with(ANTHROPIC_THINKING_ENCRYPTED_PREFIX)
+        );
 
         let replay = responses_request_to_anthropic(
             json!({
@@ -2732,10 +2735,12 @@ mod tests {
         let content = &response["messages"][2]["content"][0]["content"];
 
         assert_eq!(content[0]["type"], "text");
-        assert!(!content[0]["text"]
-            .as_str()
-            .unwrap()
-            .contains("MCP_ANTHROPIC_IMAGE_SENTINEL"));
+        assert!(
+            !content[0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("MCP_ANTHROPIC_IMAGE_SENTINEL")
+        );
         assert_eq!(content[1]["type"], "image");
         assert_eq!(content[1]["source"]["media_type"], "image/webp");
         assert_eq!(content[1]["source"]["data"], "MCP_ANTHROPIC_IMAGE_SENTINEL");
@@ -2777,10 +2782,12 @@ mod tests {
             .expect("stringified tool image should become an Anthropic image block");
 
         assert_eq!(image["source"]["data"], "STRING_IMAGE_SENTINEL");
-        assert!(content
-            .iter()
-            .filter_map(|block| block.get("text").and_then(Value::as_str))
-            .all(|text| !text.contains("STRING_IMAGE_SENTINEL")));
+        assert!(
+            content
+                .iter()
+                .filter_map(|block| block.get("text").and_then(Value::as_str))
+                .all(|text| !text.contains("STRING_IMAGE_SENTINEL"))
+        );
         let serialized = response.to_string();
         assert!(serialized.contains("[cc-switch: omitted 20000 bytes]"));
         assert!(!serialized.contains(&"A".repeat(64)));
@@ -2814,10 +2821,12 @@ mod tests {
         assert_eq!(tool_result["content"][1]["type"], "document");
         assert_eq!(tool_result["content"][1]["source"]["type"], "url");
         assert_eq!(tool_result["content"][2]["type"], "text");
-        assert!(tool_result["content"][2]["text"]
-            .as_str()
-            .unwrap()
-            .contains("future_part"));
+        assert!(
+            tool_result["content"][2]["text"]
+                .as_str()
+                .unwrap()
+                .contains("future_part")
+        );
     }
 
     // ==================== Request normalization: non-empty & first is user ====================

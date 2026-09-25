@@ -195,4 +195,33 @@ describe("ClaudeFormFields", () => {
       "shared-model[1M]",
     );
   });
+
+  it("silently checks saved providers and marks a missing default red on first verification", async () => {
+    modelFetchApiMock.fetchModelsForConfig.mockResolvedValueOnce([
+      { id: "kept-model", ownedBy: "provider" },
+      { id: "new-model", ownedBy: "provider" },
+    ]);
+
+    const fallbackInput = "removed-model";
+    renderCopilotForm({
+      providerId: "provider-1",
+      autoRefreshModels: true,
+      isCopilotPreset: false,
+      usesOAuth: false,
+      shouldShowSpeedTest: true,
+      baseUrl: "https://provider.example/v1",
+      apiKey: "secret",
+      claudeModel: fallbackInput,
+      defaultSonnetModel: "kept-model",
+    });
+
+    await waitFor(() => {
+      expect(modelFetchApiMock.fetchModelsForConfig).toHaveBeenCalled();
+      expect(screen.getByText("removed-model")).toBeInTheDocument();
+    });
+
+    const input = screen.getByDisplayValue(fallbackInput);
+    expect(input).toHaveAttribute("aria-invalid", "true");
+    expect(input.className).toContain("text-destructive");
+  });
 });

@@ -906,10 +906,6 @@ function App() {
         await queryClient.invalidateQueries({
           queryKey: hermesKeys.liveProviderIds,
         });
-      } else if (activeApp === "mcode") {
-        await queryClient.invalidateQueries({
-          queryKey: ["providers", "mcode"],
-        });
       }
       toast.success(
         t("notifications.removeFromConfigSuccess", {
@@ -1162,8 +1158,7 @@ function App() {
   const handleSwitchProviderFromList = (provider: Provider) => {
     if (activeApp === "codex" && isRoutingPlan(provider)) {
       const routing = provider.settingsConfig?.codexRouting as
-        | { schemaVersion?: number }
-        | undefined;
+        { schemaVersion?: number } | undefined;
       if (routing?.schemaVersion !== 2) {
         handleEditCodexMultiRouter(provider);
         return;

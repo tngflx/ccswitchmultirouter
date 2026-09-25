@@ -207,26 +207,24 @@ function isUsableProfile(value: unknown): value is CodexSubagentV2Profile {
   }
   const questionnaire = value.questionnaire;
   const inputModalities = value.inputModalities;
-  if (
-    !(
-      (inputModalities === undefined ||
-        (Array.isArray(inputModalities) &&
-          (inputModalities.length === 1 || inputModalities.length === 2) &&
-          inputModalities[0] === "text" &&
-          (inputModalities.length === 1 || inputModalities[1] === "image"))) &&
-      Array.isArray(questionnaire.taskStrengths) &&
-      questionnaire.taskStrengths.every(
-        (strength) =>
-          typeof strength === "string" && TASK_STRENGTH_VALUES.has(strength),
-      ) &&
-      typeof questionnaire.optimization === "string" &&
-      OPTIMIZATION_VALUES.has(questionnaire.optimization) &&
-      typeof questionnaire.writeScope === "string" &&
-      WRITE_SCOPE_VALUES.has(questionnaire.writeScope) &&
-      typeof questionnaire.preference === "string" &&
-      PREFERENCE_VALUES.has(questionnaire.preference)
-    )
-  ) {
+  if (!(
+    (inputModalities === undefined ||
+      (Array.isArray(inputModalities) &&
+        (inputModalities.length === 1 || inputModalities.length === 2) &&
+        inputModalities[0] === "text" &&
+        (inputModalities.length === 1 || inputModalities[1] === "image"))) &&
+    Array.isArray(questionnaire.taskStrengths) &&
+    questionnaire.taskStrengths.every(
+      (strength) =>
+        typeof strength === "string" && TASK_STRENGTH_VALUES.has(strength),
+    ) &&
+    typeof questionnaire.optimization === "string" &&
+    OPTIMIZATION_VALUES.has(questionnaire.optimization) &&
+    typeof questionnaire.writeScope === "string" &&
+    WRITE_SCOPE_VALUES.has(questionnaire.writeScope) &&
+    typeof questionnaire.preference === "string" &&
+    PREFERENCE_VALUES.has(questionnaire.preference)
+  )) {
     return false;
   }
   if (

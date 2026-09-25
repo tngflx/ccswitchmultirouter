@@ -102,6 +102,10 @@ export function useProxyStatus() {
       const detail =
         extractErrorMessage(error) ||
         t("common.unknown", { defaultValue: "未知错误" });
+      if (detail.includes("CODEX_DESKTOP_ACTIVE")) {
+        toast.error(t("proxy.takeover.closeCodexBeforeDisable"));
+        return;
+      }
       toast.error(
         t("proxy.stopWithRestoreFailed", {
           detail,
@@ -149,6 +153,10 @@ export function useProxyStatus() {
     const detail =
       extractErrorMessage(error) ||
       t("common.unknown", { defaultValue: "未知错误" });
+    if (detail.includes("CODEX_DESKTOP_ACTIVE")) {
+      toast.error(t("proxy.takeover.closeCodexBeforeDisable"));
+      return;
+    }
     toast.error(
       t("proxy.takeover.failed", {
         detail,

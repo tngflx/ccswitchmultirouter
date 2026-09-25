@@ -1,4 +1,4 @@
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 
 const THINK_TAG_PAIRS: [(&str, &str); 2] = [("<think>", "</think>"), ("<thinking>", "</thinking>")];
 

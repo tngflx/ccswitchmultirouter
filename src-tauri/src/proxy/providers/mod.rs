@@ -23,6 +23,7 @@ pub(crate) mod codex_oauth_pool;
 pub(crate) mod codex_reasoning;
 pub(crate) mod codex_responses_sse;
 pub(crate) mod codex_terminal;
+pub(crate) mod codex_tool_schema;
 pub mod copilot_auth;
 pub mod copilot_model_map;
 mod gemini;
@@ -59,12 +60,22 @@ pub const XAI_API_BASE_URL: &str = "https://api.x.ai/v1";
 pub use adapter::ProviderAdapter;
 pub use auth::{AuthInfo, AuthStrategy, CODEX_OAUTH_ORIGINATOR};
 pub use claude::{
-    claude_api_format_needs_transform, get_claude_api_format,
+    ClaudeAdapter, claude_api_format_needs_transform, get_claude_api_format,
     normalize_anthropic_messages_for_provider, transform_claude_request_for_api_format,
-    ClaudeAdapter,
 };
 pub use codex::CodexAdapter;
+pub(crate) use codex::{
+    CODEX_ACCOUNT_POOL_ENABLED, apply_detected_codex_transport_to_effective_provider,
+    codex_provider_remote_compaction_enabled, codex_route_auth_source,
+    codex_route_supports_responses_compaction, codex_route_target_provider_id_from_route,
+    codex_route_uses_official_agent_backend, codex_routes_from_settings,
+    is_codex_chat_completions_endpoint, is_codex_remote_compact_endpoint,
+    is_codex_responses_endpoint, provider_uses_native_codex_auth,
+    resolve_codex_chat_protocol_target, resolve_codex_chat_reasoning_projection,
+    resolve_codex_primary_route_from_settings,
+};
 pub use codex::{
+    CodexMultiRouterAuthFacade, ReasoningContentMode, ResolvedCodexRoute,
     apply_codex_chat_upstream_model, apply_codex_native_responses_reasoning_effort,
     apply_codex_request_upstream_model, apply_codex_upstream_model,
     build_codex_route_probe_provider, classify_codex_multirouter_auth_facade,
@@ -79,16 +90,6 @@ pub use codex::{
     resolve_codex_v2_raw_passthrough_provider, resolve_codex_v2_routed_provider,
     resolve_reasoning_content_mode, should_convert_codex_responses_to_anthropic,
     should_convert_codex_responses_to_chat, should_convert_codex_responses_to_messages,
-    CodexMultiRouterAuthFacade, ReasoningContentMode, ResolvedCodexRoute,
-};
-pub(crate) use codex::{
-    apply_detected_codex_transport_to_effective_provider, codex_provider_remote_compaction_enabled,
-    codex_route_auth_source, codex_route_supports_responses_compaction,
-    codex_route_target_provider_id_from_route, codex_route_uses_official_agent_backend,
-    codex_routes_from_settings, is_codex_chat_completions_endpoint,
-    is_codex_remote_compact_endpoint, is_codex_responses_endpoint, provider_uses_native_codex_auth,
-    resolve_codex_chat_protocol_target, resolve_codex_chat_reasoning_projection,
-    resolve_codex_primary_route_from_settings, CODEX_ACCOUNT_POOL_ENABLED,
 };
 pub use gemini::GeminiAdapter;
 

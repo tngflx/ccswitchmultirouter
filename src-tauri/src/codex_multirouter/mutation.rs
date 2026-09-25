@@ -135,6 +135,7 @@ where
     F: FnMut(&CodexRoutingProjectionArtifact) -> Result<ProjectionReadBack, String>,
 {
     let mut provider = provider;
+    repair_stale_v2_route_aliases(db, &mut provider)?;
     remove_schema_v2_router_derived_catalog(&mut provider);
     let affected_router_ids = validate_and_collect_affected_router_ids(db, &provider)?;
     let profiles = materialize_equivalent_router_protocol_profiles(
@@ -190,6 +191,108 @@ where
         )?);
     }
     Ok(CodexProviderMutationOutcome { projections })
+}
+
+/// Keep the persisted V2 routing document closed over the current provider
+/// catalog. A wizard refresh can remove a model while an older explicit alias
+/// still points at it; leaving that alias in place makes strict compilation
+/// fail before the corrected plan can be saved.
+fn repair_stale_v2_route_aliases(db: &Database, provider: &mut Provider) -> Result<(), AppError> {
+    let Some(routing) = provider.settings_config.get_mut("codexRouting") else {
+        return Ok(());
+    };
+    let Some(routes) = routing
+        .get_mut("routes")
+        .and_then(serde_json::Value::as_array_mut)
+    else {
+        return Ok(());
+    };
+    let providers = db
+        .get_all_providers("codex")?
+        .into_iter()
+        .collect::<HashMap<_, _>>();
+
+    for route in routes {
+        let Some(target_id) = route
+            .get("targetProviderId")
+            .and_then(serde_json::Value::as_str)
+        else {
+            continue;
+        };
+        let Some(target) = providers.get(target_id) else {
+            continue;
+        };
+        let selected = route
+            .get("modelSelection")
+            .and_then(|value| value.get("mode").and_then(serde_json::Value::as_str))
+            .filter(|mode| *mode == "include")
+            .and_then(|_| {
+                route
+                    .get("modelSelection")
+                    .and_then(|value| value.get("models"))
+                    .and_then(serde_json::Value::as_array)
+            })
+            .map(|models| {
+                models
+                    .iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .map(|model| model.trim().to_ascii_lowercase())
+                    .filter(|model| !model.is_empty())
+                    .collect::<HashSet<_>>()
+            });
+        let route_id = route
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("<unknown>")
+            .to_string();
+        let Some(aliases) = route
+            .get_mut("aliases")
+            .and_then(serde_json::Value::as_object_mut)
+        else {
+            continue;
+        };
+        let mut available = HashSet::new();
+        for model in target
+            .settings_config
+            .pointer("/modelCatalog/models")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            if model.get("enabled").and_then(serde_json::Value::as_bool) == Some(false) {
+                continue;
+            }
+            let identities = ["model", "upstreamModel", "upstream_model"]
+                .into_iter()
+                .filter_map(|field| model.get(field).and_then(serde_json::Value::as_str))
+                .map(|value| value.trim().to_ascii_lowercase())
+                .filter(|value| !value.is_empty())
+                .collect::<HashSet<_>>();
+            if selected
+                .as_ref()
+                .is_some_and(|selection| identities.is_disjoint(selection))
+            {
+                continue;
+            }
+            available.extend(identities);
+        }
+        let before = aliases.len();
+        aliases.retain(|_, target| {
+            let Some(value) = target.as_str().map(str::trim) else {
+                return false;
+            };
+            let normalized = value.to_ascii_lowercase();
+            available.contains(&normalized)
+        });
+        if aliases.len() != before {
+            log::warn!(
+                "Removed {} stale Codex MultiRouter aliases from route {}",
+                before - aliases.len(),
+                route_id
+            );
+        }
+    }
+    Ok(())
 }
 
 fn materialize_equivalent_router_protocol_profiles(
@@ -663,6 +766,52 @@ mod tests {
             }),
             None,
         )
+    }
+
+    #[test]
+    fn router_save_reconciles_stale_alias_without_losing_valid_aliases() {
+        let db = Database::memory().expect("memory db");
+        db.save_provider("codex", &target("openai_responses"))
+            .expect("seed target");
+        let mut candidate = router("router-a", "qwen");
+        candidate.settings_config["codexRouting"]["routes"][0]["aliases"] = json!({
+            "old-name": "removed-model",
+            "current-name": "qwen3.8"
+        });
+        apply_codex_provider_mutation_persist_only(&db, candidate)
+            .expect("stale alias must not make the router unsavable");
+        let saved = db
+            .get_provider_by_id("router-a", "codex")
+            .expect("read router")
+            .expect("saved router");
+        assert_eq!(
+            saved.settings_config["codexRouting"]["routes"][0]["aliases"],
+            json!({"current-name": "qwen3.8"})
+        );
+    }
+
+    #[test]
+    fn router_save_keeps_alias_to_upstream_identity_selected_by_canonical_model() {
+        let db = Database::memory().expect("memory db");
+        let mut source = target("openai_responses");
+        source.settings_config["modelCatalog"]["models"] =
+            json!([{"model": "qwen3.8", "upstreamModel": "qwen3.8-upstream"}]);
+        db.save_provider("codex", &source).expect("seed target");
+        let mut candidate = router("router-a", "qwen");
+        candidate.settings_config["codexRouting"]["routes"][0]["modelSelection"] =
+            json!({"mode": "include", "models": ["qwen3.8"]});
+        candidate.settings_config["codexRouting"]["routes"][0]["aliases"] =
+            json!({"upstream-name": "qwen3.8-upstream", "stale-name": "removed-model"});
+        apply_codex_provider_mutation_persist_only(&db, candidate)
+            .expect("selected upstream alias is valid");
+        let saved = db
+            .get_provider_by_id("router-a", "codex")
+            .expect("read router")
+            .expect("saved router");
+        assert_eq!(
+            saved.settings_config["codexRouting"]["routes"][0]["aliases"],
+            json!({"upstream-name": "qwen3.8-upstream"})
+        );
     }
 
     #[test]

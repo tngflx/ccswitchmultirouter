@@ -141,6 +141,57 @@ beforeEach(() => {
 });
 
 describe("CodexMultiRouterWizard", () => {
+  it("writes collision aliases and upstream ids to source providers before publishing", async () => {
+    const sources = [
+      provider({
+        id: "official",
+        name: "Official",
+        settingsConfig: {
+          base_url: "https://official.example/v1",
+          auth: { OPENAI_API_KEY: "sk-official" },
+          modelCatalog: { models: [{ model: "gpt-5.6-sol" }] },
+        },
+      }),
+      provider({
+        id: "sublyx",
+        name: "Sublyx",
+        settingsConfig: {
+          base_url: "https://sublyx.example/v1",
+          auth: { OPENAI_API_KEY: "sk-sublyx" },
+          modelCatalog: { models: [{ model: "gpt-5.6-sol" }] },
+        },
+      }),
+    ];
+    renderWithQueryClient(
+      <CodexMultiRouterWizard
+        open
+        providers={sources}
+        onOpenChange={vi.fn()}
+        onCreateProvider={vi.fn()}
+        onOpenWorkspace={vi.fn()}
+        onEnablePlan={vi.fn()}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "下一步" }));
+    fireEvent.click(screen.getByRole("button", { name: "下一步" }));
+    fireEvent.click(screen.getByRole("button", { name: "下一步" }));
+    fireEvent.click(screen.getByRole("button", { name: "保存并发布" }));
+
+    await waitFor(() => expect(providersApi.add).toHaveBeenCalledTimes(1));
+    const storedSource = vi
+      .mocked(providersApi.update)
+      .mock.calls.map(([candidate]) => candidate)
+      .find((candidate) => candidate.id === "sublyx");
+    expect(storedSource?.settingsConfig.modelCatalog?.models[0]).toMatchObject({
+      model: "gpt-5.6-sol-sublyx",
+      upstreamModel: "gpt-5.6-sol",
+    });
+    expect(
+      vi.mocked(providersApi.update).mock.invocationCallOrder[0],
+    ).toBeLessThan(vi.mocked(providersApi.add).mock.invocationCallOrder[0]);
+  });
+
   it("keeps the first step focused on source selection and provider-owned configuration", () => {
     renderWithQueryClient(
       <CodexMultiRouterWizard

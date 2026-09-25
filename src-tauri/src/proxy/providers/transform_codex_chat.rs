@@ -9,7 +9,7 @@ use super::codex_chat_common::{
     response_function_call_item, response_function_call_item_with_namespace,
     split_leading_think_block,
 };
-use super::codex_terminal::{classify_chat_terminal, ChatTerminalEvidence, TerminalDisposition};
+use super::codex_terminal::{ChatTerminalEvidence, TerminalDisposition, classify_chat_terminal};
 use super::hosted_tools::{
     image_generation::{self, HostedImageGenerationConfig, IMAGE_GENERATION_FUNCTION_NAME},
     web_search::{self, HostedWebSearchConfig},
@@ -23,13 +23,14 @@ use crate::proxy::{
         short_sha256_hex,
     },
     tool_media::{
-        chat_audio_from_input_audio, chat_file_from_input_file, flush_pending_chat_tool_media,
-        normalize_chat_image_detail, plan_chat_tool_output_media, queue_chat_tool_output_media,
-        strip_and_clamp_media_from_tool_value, ToolMediaScope, TOOL_RESULT_MEDIA_MOVED_MARKER,
+        TOOL_RESULT_MEDIA_MOVED_MARKER, ToolMediaScope, chat_audio_from_input_audio,
+        chat_file_from_input_file, flush_pending_chat_tool_media, normalize_chat_image_detail,
+        plan_chat_tool_output_media, queue_chat_tool_output_media,
+        strip_and_clamp_media_from_tool_value,
     },
 };
-use base64::{engine::general_purpose::STANDARD, Engine as _};
-use serde_json::{json, Value};
+use base64::{Engine as _, engine::general_purpose::STANDARD};
+use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 
 const EXTRA_CHAT_PASSTHROUGH_FIELDS: &[&str] = &[
@@ -1284,6 +1285,31 @@ fn append_responses_item_as_chat_message(
             );
             let call_id = item.get("call_id").and_then(|v| v.as_str()).unwrap_or("");
             if call_id.trim().is_empty() {
+                // Codex Desktop can persist synthetic `codex_app` delegation and
+                // automation outputs without a function call id. They are
+                // already user-visible context, not executable tool results;
+                // preserve them instead of silently erasing the history item.
+                let producer = item
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .or_else(|| item.get("producer").and_then(Value::as_str))
+                    .unwrap_or_default();
+                if producer == "codex_app"
+                    || producer.starts_with("codex_app__")
+                    || producer == "send_message_to_thread"
+                    || producer == "automation_update"
+                {
+                    let content = match item.get("output") {
+                        Some(Value::String(value)) => value.clone(),
+                        Some(value) => canonical_json_string(value),
+                        None => canonical_json_string(item),
+                    };
+                    messages.push(json!({
+                        "role": "user",
+                        "content": content,
+                    }));
+                    return Ok(());
+                }
                 log::debug!(
                     "[Codex] Dropping function_call_output lacking call_id in chat transform: id={:?}, name={:?}",
                     item.get("id"),
@@ -2128,9 +2154,11 @@ fn responses_function_tool_to_chat_tool(tool: &Value, chat_name: &str) -> Option
 
     let mut function = json!({
         "name": chat_name,
-        "description": tool.get("description").cloned().unwrap_or(Value::Null),
         "parameters": normalize_function_parameters(tool.get("parameters"))
     });
+    if let Some(description) = tool.get("description").filter(|value| !value.is_null()) {
+        function["description"] = description.clone();
+    }
     if let Some(strict) = tool.get("strict") {
         function["strict"] = strict.clone();
     }
@@ -3472,6 +3500,22 @@ mod tests {
     }
 
     #[test]
+    fn responses_request_to_chat_omits_missing_tool_description() {
+        let input = json!({
+            "model": "gpt-5.4",
+            "tools": [
+                {"type": "function", "name": "no_desc", "parameters": {"type": "object"}},
+                {"type": "function", "name": "with_desc", "description": "Has one", "parameters": {"type": "object"}}
+            ],
+            "input": "hi"
+        });
+
+        let result = responses_to_chat_completions(input).unwrap();
+        assert!(result["tools"][0]["function"].get("description").is_none());
+        assert_eq!(result["tools"][1]["function"]["description"], "Has one");
+    }
+
+    #[test]
     fn responses_request_to_chat_downgrades_images_with_text_only_override() {
         let input = json!({
             "model": "gpt-5.4",
@@ -3704,10 +3748,12 @@ mod tests {
         );
         assert_eq!(result["messages"][1]["role"], "tool");
         assert_eq!(result["messages"][1]["tool_call_id"], "call_tool_search_1");
-        assert!(result["messages"][1]["content"]
-            .as_str()
-            .unwrap()
-            .contains("mcp__codex_apps__gmail"));
+        assert!(
+            result["messages"][1]["content"]
+                .as_str()
+                .unwrap()
+                .contains("mcp__codex_apps__gmail")
+        );
     }
 
     #[test]
@@ -4813,9 +4859,11 @@ mod tests {
         .unwrap();
         let messages = result["messages"].as_array().unwrap();
 
-        assert!(messages
-            .iter()
-            .all(|message| { message["role"] == "assistant" || message["content"].is_string() }));
+        assert!(
+            messages.iter().all(|message| {
+                message["role"] == "assistant" || message["content"].is_string()
+            })
+        );
         assert_eq!(
             messages
                 .iter()
@@ -5061,10 +5109,12 @@ mod tests {
             .iter()
             .find(|message| message.get("role").and_then(Value::as_str) == Some("system"))
             .expect("restored system summary");
-        assert!(system["content"]
-            .as_str()
-            .expect("system content")
-            .contains("compact summary"));
+        assert!(
+            system["content"]
+                .as_str()
+                .expect("system content")
+                .contains("compact summary")
+        );
         assert_eq!(messages.last().unwrap()["role"], "user");
         assert_eq!(messages.last().unwrap()["content"], "continue");
     }
@@ -5086,10 +5136,12 @@ mod tests {
         let input = body["input"].as_array().expect("input");
         assert_eq!(input[0]["type"], "message");
         assert_eq!(input[0]["role"], "user");
-        assert!(input[0]["content"][0]["text"]
-            .as_str()
-            .expect("summary text")
-            .contains("compact summary"));
+        assert!(
+            input[0]["content"][0]["text"]
+                .as_str()
+                .expect("summary text")
+                .contains("compact summary")
+        );
         assert_eq!(input[1]["type"], "message");
     }
 
@@ -5186,10 +5238,12 @@ mod tests {
         let messages = result["messages"].as_array().unwrap();
 
         assert_eq!(messages[1]["role"], "tool");
-        assert!(messages[1]["content"]
-            .as_str()
-            .unwrap()
-            .contains(TOOL_RESULT_MEDIA_MOVED_MARKER));
+        assert!(
+            messages[1]["content"]
+                .as_str()
+                .unwrap()
+                .contains(TOOL_RESULT_MEDIA_MOVED_MARKER)
+        );
         assert_eq!(messages[2]["role"], "user");
         assert_eq!(messages[2]["content"][1]["type"], "image_url");
         assert_eq!(
@@ -5321,9 +5375,11 @@ mod tests {
         assert_eq!(content[0]["input_audio"]["format"], "mp3");
         assert_eq!(content[0]["input_audio"]["data"], "TVAz");
         assert_eq!(content[1]["text"], "[file omitted: unsupported file URL]");
-        assert!(!result
-            .to_string()
-            .contains("https://example.test/report.pdf"));
+        assert!(
+            !result
+                .to_string()
+                .contains("https://example.test/report.pdf")
+        );
     }
 
     #[test]
@@ -5804,14 +5860,18 @@ mod tests {
         assert_eq!(messages[2]["tool_call_id"], "call_2");
         assert!(messages[1]["content"].is_string());
         assert!(messages[2]["content"].is_string());
-        assert!(!messages[1]["content"]
-            .as_str()
-            .unwrap()
-            .contains(&first_url));
-        assert!(!messages[2]["content"]
-            .as_str()
-            .unwrap()
-            .contains(second_payload));
+        assert!(
+            !messages[1]["content"]
+                .as_str()
+                .unwrap()
+                .contains(&first_url)
+        );
+        assert!(
+            !messages[2]["content"]
+                .as_str()
+                .unwrap()
+                .contains(second_payload)
+        );
         assert_eq!(messages[3]["content"].as_array().unwrap().len(), 4);
         assert_eq!(
             messages[3]["content"][3]["image_url"]["url"],
@@ -6002,10 +6062,12 @@ mod tests {
             tool_content["content"][1]["text"],
             TOOL_RESULT_MEDIA_MOVED_MARKER
         );
-        assert!(!messages[1]["content"]
-            .as_str()
-            .unwrap()
-            .contains("STRING_MCP_SENTINEL"));
+        assert!(
+            !messages[1]["content"]
+                .as_str()
+                .unwrap()
+                .contains("STRING_MCP_SENTINEL")
+        );
         assert_eq!(
             messages[2]["content"][1]["image_url"]["url"],
             "data:image/png;base64,STRING_MCP_SENTINEL"
@@ -6230,6 +6292,21 @@ mod tests {
     }
 
     #[test]
+    fn responses_request_to_chat_preserves_standalone_codex_app_output() {
+        let result = convert_test_input(vec![json!({
+            "type": "function_call_output",
+            "name": "codex_app__automation_update",
+            "output": {"status": "completed", "name": "nightly"}
+        })]);
+
+        assert_eq!(message_roles(&result), vec!["user"]);
+        assert_eq!(
+            result["messages"][0]["content"],
+            r#"{"name":"nightly","status":"completed"}"#
+        );
+    }
+
+    #[test]
     fn responses_request_to_chat_preserves_legacy_unknown_item_batch_boundary_without_media() {
         let result = convert_test_input(vec![
             test_function_call("call_1"),
@@ -6275,10 +6352,12 @@ mod tests {
         let tool_content: Value = serde_json::from_str(tool_content_text).unwrap();
 
         assert_eq!(tool_content[1]["text"], long_text);
-        assert!(tool_content[2]["data"]
-            .as_str()
-            .unwrap()
-            .starts_with("[cc-switch: omitted 20000 bytes]"));
+        assert!(
+            tool_content[2]["data"]
+                .as_str()
+                .unwrap()
+                .starts_with("[cc-switch: omitted 20000 bytes]")
+        );
         assert!(!tool_content_text.contains(&data_url));
         assert!(!tool_content_text.contains("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"));
     }
@@ -6388,9 +6467,11 @@ mod tests {
         });
 
         assert_eq!(normalize_replayed_item_ids_for_openai(&mut body), 1);
-        assert!(body["input"][0]["id"]
-            .as_str()
-            .is_some_and(|id| id.starts_with("msg_")));
+        assert!(
+            body["input"][0]["id"]
+                .as_str()
+                .is_some_and(|id| id.starts_with("msg_"))
+        );
         assert_eq!(body["input"][1]["id"], "msg_official_unchanged");
     }
 
@@ -6415,9 +6496,11 @@ mod tests {
         });
 
         assert_eq!(normalize_replayed_item_ids_for_openai(&mut body), 1);
-        assert!(body["input"][0]["id"]
-            .as_str()
-            .is_some_and(|id| id.starts_with("ws_")));
+        assert!(
+            body["input"][0]["id"]
+                .as_str()
+                .is_some_and(|id| id.starts_with("ws_"))
+        );
         assert_eq!(body["input"][1]["id"], "ws_official_unchanged");
     }
 
@@ -6474,12 +6557,16 @@ mod tests {
 
         assert_eq!(normalize_replayed_item_ids_for_openai(&mut body), 3);
         assert!(body["input"][0].get("id").is_none());
-        assert!(body["input"][1]["id"]
-            .as_str()
-            .is_some_and(|id| id.starts_with("fc_")));
-        assert!(body["input"][2]["id"]
-            .as_str()
-            .is_some_and(|id| id.starts_with("ctc_")));
+        assert!(
+            body["input"][1]["id"]
+                .as_str()
+                .is_some_and(|id| id.starts_with("fc_"))
+        );
+        assert!(
+            body["input"][2]["id"]
+                .as_str()
+                .is_some_and(|id| id.starts_with("ctc_"))
+        );
     }
 
     #[test]

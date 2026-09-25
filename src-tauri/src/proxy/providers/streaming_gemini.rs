@@ -5,13 +5,13 @@
 
 use super::gemini_shadow::{GeminiShadowStore, GeminiToolCallMeta};
 use super::transform_gemini::{
-    build_anthropic_usage, is_synthesized_tool_call_id, rectify_tool_call_parts,
-    synthesize_tool_call_id, AnthropicToolSchemaHints,
+    AnthropicToolSchemaHints, build_anthropic_usage, is_synthesized_tool_call_id,
+    rectify_tool_call_parts, synthesize_tool_call_id,
 };
 use crate::proxy::sse::{append_utf8_safe, strip_sse_field, take_sse_block};
 use bytes::Bytes;
 use futures::stream::{Stream, StreamExt};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::collections::HashSet;
 use std::sync::Arc;
 

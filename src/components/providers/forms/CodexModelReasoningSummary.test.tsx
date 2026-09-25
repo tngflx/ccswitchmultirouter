@@ -43,11 +43,11 @@ describe("CodexModelReasoningSummary", () => {
       screen.getByText("Codex 档位：low / medium / high"),
     ).toBeInTheDocument();
     expect(
-      screen.getByRole("checkbox", { name: "解锁 qwen3.8 的 Ultra 档" }),
+      screen.getByRole("checkbox", { name: "为 qwen3.8 启用 Codex Ultra" }),
     ).not.toBeChecked();
     expect(
       screen.getByRole("checkbox", {
-        name: "解锁 qwen3.8-coder 的 Ultra 档",
+        name: "为 qwen3.8-coder 启用 Codex Ultra",
       }),
     ).toBeChecked();
 
@@ -57,7 +57,7 @@ describe("CodexModelReasoningSummary", () => {
     expect(onToggle).toHaveBeenCalledOnce();
 
     fireEvent.click(
-      screen.getByRole("checkbox", { name: "解锁 qwen3.8 的 Ultra 档" }),
+      screen.getByRole("checkbox", { name: "为 qwen3.8 启用 Codex Ultra" }),
     );
     expect(onUltraChange).toHaveBeenNthCalledWith(1, {
       enabled: true,
@@ -65,7 +65,7 @@ describe("CodexModelReasoningSummary", () => {
     });
   });
 
-  it("allows Ultra to be unlocked before Provider effort discovery and opens the required configuration", () => {
+  it("withholds Ultra until graded efforts are resolved while preserving configuration access", () => {
     const onToggle = vi.fn();
     const onUltraChange = vi.fn();
 
@@ -82,22 +82,38 @@ describe("CodexModelReasoningSummary", () => {
       />,
     );
 
-    const unlock = screen.getByRole("checkbox", {
-      name: "解锁 glm-4.5 的 Ultra 档",
-    });
-    expect(unlock).toBeEnabled();
+    expect(
+      screen.queryByRole("checkbox", {
+        name: "为 glm-4.5 启用 Codex Ultra",
+      }),
+    ).not.toBeInTheDocument();
+    fireEvent.click(
+      screen.getByRole("button", { name: "配置 glm-4.5 的推理能力" }),
+    );
+    expect(onToggle).toHaveBeenCalledOnce();
+    expect(onUltraChange).not.toHaveBeenCalled();
+  });
 
-    fireEvent.click(unlock);
-
+  it("keeps an existing unresolved Ultra mapping visible so it can be turned off", () => {
+    const onUltraChange = vi.fn();
+    render(
+      <CodexModelReasoningSummary
+        model="legacy"
+        source="unknown"
+        selectableEfforts={[]}
+        ultraEnabled
+        ultraEfforts={[]}
+        onUltraChange={onUltraChange}
+        expanded={false}
+        onToggle={vi.fn()}
+      />,
+    );
+    fireEvent.click(
+      screen.getByRole("checkbox", { name: "为 legacy 启用 Codex Ultra" }),
+    );
     expect(onUltraChange).toHaveBeenCalledWith({
-      enabled: true,
+      enabled: false,
       providerEffort: undefined,
     });
-    expect(onToggle).toHaveBeenCalledOnce();
-    expect(
-      screen.getByText(
-        "需要先确认该模型可接收的推理强度；已为你展开推理能力配置，完成后才能保存。",
-      ),
-    ).toBeInTheDocument();
   });
 });

@@ -5490,7 +5490,16 @@ mod tests {
                         latency_ms, status_code, created_at
                     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     params![
-                        id, provider, "codex", "shared-model", input, output, cost, 100, 200, 1000
+                        id,
+                        provider,
+                        "codex",
+                        "shared-model",
+                        input,
+                        output,
+                        cost,
+                        100,
+                        200,
+                        1000
                     ],
                 )?;
             }

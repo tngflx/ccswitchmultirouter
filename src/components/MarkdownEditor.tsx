@@ -72,7 +72,11 @@ const MarkdownEditor: React.FC<MarkdownEditorProps> = ({
         placeholderExt(placeholderText),
         EditorView.updateListener.of((update) => {
           if (update.docChanged && onChange) {
-            if (!update.transactions.some((transaction) => transaction.annotation(externalChange))) {
+            if (
+              !update.transactions.some((transaction) =>
+                transaction.annotation(externalChange),
+              )
+            ) {
               onChangeRef.current?.(update.state.doc.toString());
             }
           }
@@ -135,7 +139,14 @@ const MarkdownEditor: React.FC<MarkdownEditorProps> = ({
       view.destroy();
       viewRef.current = null;
     };
-  }, [darkMode, readOnly, minHeight, maxHeight, placeholderText, externalChange]); // 添加 placeholderText 依赖以支持国际化切换
+  }, [
+    darkMode,
+    readOnly,
+    minHeight,
+    maxHeight,
+    placeholderText,
+    externalChange,
+  ]); // 添加 placeholderText 依赖以支持国际化切换
 
   // 当 value 从外部改变时更新编辑器内容
   useEffect(() => {

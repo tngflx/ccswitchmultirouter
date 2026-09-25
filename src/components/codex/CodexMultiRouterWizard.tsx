@@ -1806,13 +1806,11 @@ export function CodexMultiRouterWizard({
             },
           },
         );
-        for (const source of routeReadySources) {
-          const draftSource = draftSources.find(
-            (item) => item.id === source.id,
-          );
+        for (const source of result.persistedSourceProviders) {
+          const savedSource = providers.find((item) => item.id === source.id);
           if (
-            draftSource &&
-            JSON.stringify(draftSource.settingsConfig?.modelCatalog ?? null) !==
+            savedSource &&
+            JSON.stringify(savedSource.settingsConfig?.modelCatalog ?? null) !==
               JSON.stringify(source.settingsConfig?.modelCatalog ?? null)
           ) {
             await providersApi.update(source, "codex", undefined, true);

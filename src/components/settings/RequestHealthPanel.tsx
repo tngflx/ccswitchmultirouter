@@ -329,7 +329,9 @@ export function RequestHealthPanel({
             </label>
             <label className="rounded-md border border-border bg-background/70 p-3 text-sm">
               <span className="mb-2 block font-medium">
-                {t("codexRouterWorkspace.requestHealth.notificationSnoozeHours")}
+                {t(
+                  "codexRouterWorkspace.requestHealth.notificationSnoozeHours",
+                )}
               </span>
               <select
                 value={draft.windowsNotificationSnoozeHours ?? 4}

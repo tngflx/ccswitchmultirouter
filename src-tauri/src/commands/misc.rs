@@ -12,18 +12,6 @@ use tauri::AppHandle;
 use tauri::State;
 use tauri_plugin_opener::OpenerExt;
 
-#[tauri::command]
-pub async fn inspect_codex_runtime_refresh() -> Result<serde_json::Value, String> {
-    Err("Codex runtime refresh is unavailable in this build".to_string())
-}
-
-#[tauri::command]
-pub async fn refresh_codex_runtime_state(
-    _snapshot_token: String,
-) -> Result<serde_json::Value, String> {
-    Err("Codex runtime refresh is unavailable in this build".to_string())
-}
-
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
 
@@ -238,12 +226,12 @@ fn codex_process_is_running() -> bool {
     {
         use std::os::windows::process::CommandExt;
         const CREATE_NO_WINDOW: u32 = 0x08000000;
-        return match std::process::Command::new("powershell")
+        match std::process::Command::new("powershell")
             .args([
                 "-NoProfile",
                 "-NonInteractive",
                 "-Command",
-                "(Get-CimInstance Win32_Process -Filter \"Name = 'codex.exe' OR Name = 'Codex.exe' OR Name = 'ChatGPT.exe'\" | Select-Object -First 1) -ne $null",
+                codex_cli_process_probe_command(),
             ])
             .creation_flags(CREATE_NO_WINDOW)
             .output()
@@ -273,12 +261,19 @@ fn codex_process_is_running() -> bool {
                 );
                 true
             }
-        };
+        }
     }
     #[cfg(not(target_os = "windows"))]
     {
         false
     }
+}
+
+#[cfg(target_os = "windows")]
+fn codex_cli_process_probe_command() -> &'static str {
+    // WMI name filters are case-insensitive. Use PowerShell's case-sensitive
+    // `-ceq` and exclude the OpenAI.Codex WindowsApps shell explicitly.
+    "(Get-CimInstance Win32_Process | Where-Object { $_.Name -ceq 'codex.exe' -and $_.ExecutablePath -notmatch '\\\\WindowsApps\\\\OpenAI\\.Codex(?:\\.Preview)?_' } | Select-Object -First 1) -ne $null"
 }
 
 pub(crate) async fn auto_update_codex_cli_if_needed() -> Result<bool, String> {
@@ -7329,5 +7324,15 @@ mod tests {
         assert!(codex_process_probe_indicates_running(true, b"unexpected"));
         assert!(codex_process_probe_indicates_running(true, b"true"));
         assert!(!codex_process_probe_indicates_running(true, b"false"));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn codex_auto_update_probe_ignores_desktop_shell_names() {
+        let command = codex_cli_process_probe_command();
+        assert!(command.contains(".Name -ceq 'codex.exe'"));
+        assert!(command.contains("WindowsApps"));
+        assert!(!command.contains("Name = 'Codex.exe'"));
+        assert!(!command.contains("Name = 'ChatGPT.exe'"));
     }
 }

@@ -4,16 +4,9 @@ import type { Provider } from "@/types";
 
 export type CodexProtocolTransport = "open_ai_responses" | "open_ai_chat";
 export type CodexProtocolProbeStage =
-  | "baseline"
-  | "streaming"
-  | "reasoning"
-  | "forced_tool"
-  | "continuation";
+  "baseline" | "streaming" | "reasoning" | "forced_tool" | "continuation";
 export type CodexProtocolProbeStageStatus =
-  | "passed"
-  | "unsupported"
-  | "failed"
-  | "skipped";
+  "passed" | "unsupported" | "failed" | "skipped";
 export type CodexProtocolProbeReadiness = "verified" | "partial" | "unverified";
 export type CodexProtocolProbeMode = "light" | "deep";
 export type CodexReasoningSemantic = "readable" | "summary" | "opaque" | "none";
@@ -37,9 +30,7 @@ export type CodexProtocolProbeFailureKind =
 
 export type CodexProtocolProbeAdaptation = "tool_schema_safe_fallback";
 export type CodexProtocolCompatibilityRule =
-  | "tool_schema"
-  | "reasoning_text_replay"
-  | "omit_reasoning";
+  "tool_schema" | "reasoning_text_replay" | "omit_reasoning";
 export type CodexProtocolAdaptationTrigger =
   | "explicit_tool_schema_rejection"
   | "ambiguous_request_rejection"

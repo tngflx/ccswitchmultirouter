@@ -153,7 +153,11 @@ const JsonEditor: React.FC<JsonEditorProps> = ({
       EditorView.updateListener.of((update) => {
         if (update.docChanged) {
           const newValue = update.state.doc.toString();
-          if (!update.transactions.some((transaction) => transaction.annotation(externalChange))) {
+          if (
+            !update.transactions.some((transaction) =>
+              transaction.annotation(externalChange),
+            )
+          ) {
             onChangeRef.current(newValue);
           }
         }

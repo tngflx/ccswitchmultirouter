@@ -30,7 +30,7 @@ use std::collections::HashMap;
 
 use bytes::Bytes;
 use futures::stream::{Stream, StreamExt};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use super::transform_codex_chat::flatten_namespace_tool_name;
 use crate::proxy::error::ProxyError;

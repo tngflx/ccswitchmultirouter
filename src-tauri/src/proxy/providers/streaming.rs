@@ -6,7 +6,7 @@ use crate::proxy::sse::{strip_sse_field, take_sse_block};
 use bytes::Bytes;
 use futures::stream::{Stream, StreamExt};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 
 /// OpenAI 流式响应数据结构
@@ -723,8 +723,8 @@ fn map_stop_reason(finish_reason: Option<&str>) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use futures::stream;
     use futures::StreamExt;
+    use futures::stream;
     use serde_json::Value;
     use std::collections::HashMap;
 
@@ -1247,12 +1247,16 @@ mod tests {
 
         let events = collect_anthropic_events(input).await;
 
-        assert!(!events
-            .iter()
-            .any(|event| event_type(event) == Some("message_delta")));
-        assert!(!events
-            .iter()
-            .any(|event| event_type(event) == Some("message_stop")));
+        assert!(
+            !events
+                .iter()
+                .any(|event| event_type(event) == Some("message_delta"))
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| event_type(event) == Some("message_stop"))
+        );
     }
 
     #[tokio::test]
@@ -1278,14 +1282,20 @@ mod tests {
             })
             .collect();
 
-        assert!(events
-            .iter()
-            .any(|e| e.get("type").and_then(|v| v.as_str()) == Some("error")));
-        assert!(!events
-            .iter()
-            .any(|e| e.get("type").and_then(|v| v.as_str()) == Some("message_delta")));
-        assert!(!events
-            .iter()
-            .any(|e| e.get("type").and_then(|v| v.as_str()) == Some("message_stop")));
+        assert!(
+            events
+                .iter()
+                .any(|e| e.get("type").and_then(|v| v.as_str()) == Some("error"))
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|e| e.get("type").and_then(|v| v.as_str()) == Some("message_delta"))
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|e| e.get("type").and_then(|v| v.as_str()) == Some("message_stop"))
+        );
     }
 }

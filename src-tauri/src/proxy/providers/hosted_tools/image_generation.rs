@@ -2,8 +2,8 @@
 
 use crate::proxy::error::ProxyError;
 use crate::proxy::json_canonical::{canonical_json_string, short_sha256_hex};
-use base64::{engine::general_purpose::STANDARD, Engine as _};
-use serde_json::{json, Value};
+use base64::{Engine as _, engine::general_purpose::STANDARD};
+use serde_json::{Value, json};
 
 pub(crate) const IMAGE_GENERATION_FUNCTION_NAME: &str = "generate_image";
 

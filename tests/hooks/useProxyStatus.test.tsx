@@ -151,4 +151,33 @@ describe("useProxyStatus", () => {
       queryKey: proxyKeys.takeoverStatus,
     });
   });
+
+  it("explains why an active Codex Desktop blocks either disable toggle", async () => {
+    invokeMock.mockImplementation((command: string) => {
+      if (
+        command === "set_proxy_takeover_for_app" ||
+        command === "stop_proxy_with_restore"
+      ) {
+        return Promise.reject(new Error("CODEX_DESKTOP_ACTIVE: still running"));
+      }
+      return Promise.resolve(null);
+    });
+    const { wrapper } = createWrapper();
+    const { result } = renderHook(() => useProxyStatus(), { wrapper });
+
+    await act(async () => {
+      await expect(
+        result.current.setTakeoverForApp({ appType: "codex", enabled: false }),
+      ).rejects.toThrow("CODEX_DESKTOP_ACTIVE");
+      await expect(result.current.stopWithRestore()).rejects.toThrow(
+        "CODEX_DESKTOP_ACTIVE",
+      );
+    });
+
+    expect(toastErrorMock).toHaveBeenCalledTimes(2);
+    expect(toastErrorMock).toHaveBeenCalledWith(
+      "proxy.takeover.closeCodexBeforeDisable",
+    );
+    expect(toastSuccessMock).not.toHaveBeenCalled();
+  });
 });

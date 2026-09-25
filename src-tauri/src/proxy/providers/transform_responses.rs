@@ -12,10 +12,10 @@ use crate::proxy::{
     error::ProxyError,
     json_canonical::canonical_json_string,
     tool_media::{
-        strip_and_clamp_media_from_tool_value, ToolMediaScope, TOOL_RESULT_MEDIA_ATTACHED_MARKER,
+        TOOL_RESULT_MEDIA_ATTACHED_MARKER, ToolMediaScope, strip_and_clamp_media_from_tool_value,
     },
 };
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use super::reasoning_bridge::{
     anthropic_block_from_openai_reasoning_item, openai_reasoning_item_from_anthropic_block,
@@ -399,7 +399,7 @@ pub fn anthropic_to_responses_with_cache_retention(
                     response_tool["description"] = description.clone();
                 }
                 response_tool["parameters"] = super::transform::clean_schema(
-                    t.get("input_schema").cloned().unwrap_or(json!({}))
+                    t.get("input_schema").cloned().unwrap_or(json!({})),
                 );
                 response_tool
             })
@@ -608,7 +608,7 @@ pub(crate) fn build_anthropic_usage_from_responses(usage: Option<&Value>) -> Val
             return json!({
                 "input_tokens": 0,
                 "output_tokens": 0
-            })
+            });
         }
     };
 
@@ -749,6 +749,7 @@ fn convert_messages_to_input(messages: &[Value]) -> Result<Vec<Value>, ProxyErro
                     "input_text"
                 };
                 input.push(json!({
+                    "type": "message",
                     "role": role,
                     "content": [{ "type": content_type, "text": text }]
                 }));
@@ -799,6 +800,7 @@ fn convert_messages_to_input(messages: &[Value]) -> Result<Vec<Value>, ProxyErro
                             // 先刷新已累积的消息内容
                             if !message_content.is_empty() {
                                 input.push(json!({
+                                    "type": "message",
                                     "role": role,
                                     "content": message_content.clone()
                                 }));
@@ -822,6 +824,7 @@ fn convert_messages_to_input(messages: &[Value]) -> Result<Vec<Value>, ProxyErro
                             // 先刷新已累积的消息内容
                             if !message_content.is_empty() {
                                 input.push(json!({
+                                    "type": "message",
                                     "role": role,
                                     "content": message_content.clone()
                                 }));
@@ -848,6 +851,7 @@ fn convert_messages_to_input(messages: &[Value]) -> Result<Vec<Value>, ProxyErro
                             {
                                 if !message_content.is_empty() {
                                     input.push(json!({
+                                        "type": "message",
                                         "role": role,
                                         "content": message_content.clone()
                                     }));
@@ -864,6 +868,7 @@ fn convert_messages_to_input(messages: &[Value]) -> Result<Vec<Value>, ProxyErro
                 // 刷新剩余的消息内容
                 if !message_content.is_empty() {
                     input.push(json!({
+                        "type": "message",
                         "role": role,
                         "content": message_content
                     }));
@@ -872,7 +877,7 @@ fn convert_messages_to_input(messages: &[Value]) -> Result<Vec<Value>, ProxyErro
 
             _ => {
                 // 无内容或 null
-                input.push(json!({ "role": role }));
+                input.push(json!({ "type": "message", "role": role }));
             }
         }
 
@@ -962,7 +967,7 @@ pub fn responses_to_anthropic(body: Value) -> Result<Value, ProxyError> {
                         Err(error) => {
                             return Err(ProxyError::TransformError(format!(
                                 "Invalid function_call arguments for '{name}': {error}"
-                            )))
+                            )));
                         }
                     }
                 };
@@ -1049,6 +1054,27 @@ mod tests {
         assert_eq!(result["input"][0]["content"][0]["text"], "Hello");
         // stop_sequences should not appear
         assert!(result.get("stop_sequences").is_none());
+    }
+
+    #[test]
+    fn test_anthropic_to_responses_message_items_carry_type() {
+        let input = json!({
+            "model": "gpt-5.6",
+            "max_tokens": 1024,
+            "messages": [
+                {"role": "user", "content": "what time is it?"},
+                {"role": "assistant", "content": [{"type": "text", "text": "Let me check."}]},
+                {"role": "user", "content": "and tomorrow?"}
+            ]
+        });
+
+        let result = anthropic_to_responses(input, None, false, false).unwrap();
+        let input_items = result["input"].as_array().unwrap();
+        assert_eq!(input_items.len(), 3);
+        for item in input_items {
+            assert_eq!(item["type"], "message");
+            assert!(item.get("role").is_some());
+        }
     }
 
     #[test]
@@ -1409,10 +1435,12 @@ mod tests {
         let output = result["input"][0]["output"].as_array().unwrap();
 
         assert_eq!(output[0]["type"], "input_text");
-        assert!(!output[0]["text"]
-            .as_str()
-            .unwrap()
-            .contains("MCP_RESPONSES_IMAGE_SENTINEL"));
+        assert!(
+            !output[0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("MCP_RESPONSES_IMAGE_SENTINEL")
+        );
         assert_eq!(output[1]["type"], "input_image");
         assert_eq!(
             output[1]["image_url"],
@@ -1453,10 +1481,12 @@ mod tests {
             image["image_url"],
             "data:image/png;base64,STRING_RESPONSES_SENTINEL"
         );
-        assert!(output
-            .iter()
-            .filter_map(|part| part.get("text").and_then(Value::as_str))
-            .all(|text| !text.contains("STRING_RESPONSES_SENTINEL")));
+        assert!(
+            output
+                .iter()
+                .filter_map(|part| part.get("text").and_then(Value::as_str))
+                .all(|text| !text.contains("STRING_RESPONSES_SENTINEL"))
+        );
         let serialized = result.to_string();
         assert!(serialized.contains("[cc-switch: omitted 20000 bytes]"));
         assert!(!serialized.contains(&"A".repeat(64)));
@@ -1761,9 +1791,11 @@ mod tests {
         let anthropic = responses_to_anthropic(response).unwrap();
         let thinking = anthropic["content"][0].clone();
         assert_eq!(thinking["type"], "thinking");
-        assert!(thinking["signature"]
-            .as_str()
-            .is_some_and(|value| value.starts_with("ccswitch-openai-reasoning-v1:")));
+        assert!(
+            thinking["signature"]
+                .as_str()
+                .is_some_and(|value| value.starts_with("ccswitch-openai-reasoning-v1:"))
+        );
 
         let replay = anthropic_to_responses(
             json!({
@@ -1962,9 +1994,11 @@ mod tests {
         });
 
         let result = anthropic_to_responses(input, None, false, false).unwrap();
-        assert!(result["input"][0]["content"][0]
-            .get("cache_control")
-            .is_none());
+        assert!(
+            result["input"][0]["content"][0]
+                .get("cache_control")
+                .is_none()
+        );
     }
 
     #[test]
@@ -2043,6 +2077,26 @@ mod tests {
 
         let result = anthropic_to_responses(input, None, false, false).unwrap();
         assert_eq!(result["reasoning"]["effort"], "xhigh");
+    }
+
+    #[test]
+    fn test_responses_max_capable_models_preserve_max_reasoning() {
+        for model in [
+            "gpt-5.6",
+            "gpt-5.6-sol",
+            "gpt-5.6-terra",
+            "gpt-5.6-luna",
+            "gpt-6-astra",
+        ] {
+            let input = json!({
+                "model": model,
+                "max_tokens": 1024,
+                "output_config": {"effort": "max"},
+                "messages": [{"role": "user", "content": "Hello"}]
+            });
+            let result = anthropic_to_responses(input, None, false, false).unwrap();
+            assert_eq!(result["reasoning"]["effort"], "max", "model {model}");
+        }
     }
 
     #[test]
@@ -2225,13 +2279,17 @@ mod tests {
             .expect("include should be array");
 
         // 原有项必须保留
-        assert!(includes
-            .iter()
-            .any(|v| v.as_str() == Some("something.else")));
+        assert!(
+            includes
+                .iter()
+                .any(|v| v.as_str() == Some("something.else"))
+        );
         // marker 必须存在
-        assert!(includes
-            .iter()
-            .any(|v| v.as_str() == Some("reasoning.encrypted_content")));
+        assert!(
+            includes
+                .iter()
+                .any(|v| v.as_str() == Some("reasoning.encrypted_content"))
+        );
         // 不重复：marker 只出现一次
         let marker_count = includes
             .iter()

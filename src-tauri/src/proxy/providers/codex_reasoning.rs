@@ -826,6 +826,84 @@ pub fn reasoning_capability_from_provider_model_entry(
     capability.validate().ok().map(|_| capability)
 }
 
+/// OpenRouter's `/models` metadata names its levels differently from our
+/// persisted capability schema. Only the OpenRouter fetch boundary calls this.
+pub fn reasoning_capability_from_openrouter_model_entry(
+    model_entry: &Value,
+) -> Option<CodexModelReasoningCapability> {
+    let repaired_entry = model_entry.get("reasoning").and_then(|reasoning| {
+        let object = reasoning.as_object()?;
+        if object.contains_key("upstream") {
+            return None;
+        }
+        let mut entry = model_entry.clone();
+        let reasoning = entry.get_mut("reasoning")?.as_object_mut()?;
+        let advertised_efforts = reasoning
+            .get("supported_efforts")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        if advertised_efforts.is_empty() {
+            return None;
+        }
+        let efforts = advertised_efforts
+            .iter()
+            .filter_map(Value::as_str)
+            .map(|effort| Value::String(effort.to_string()))
+            .collect::<Vec<_>>();
+        let effort_map = advertised_efforts
+            .iter()
+            .filter_map(Value::as_str)
+            .map(|effort| (effort.to_string(), Value::String(effort.to_string())))
+            .collect::<serde_json::Map<_, _>>();
+        reasoning.insert(
+            "supportedEfforts".to_string(),
+            Value::Array(efforts.clone()),
+        );
+        if !reasoning.contains_key("defaultEffort") {
+            if let Some(default) = reasoning.get("default_effort").cloned() {
+                reasoning.insert("defaultEffort".to_string(), default);
+            }
+        }
+        if !reasoning.contains_key("disableAllowed") {
+            reasoning.insert(
+                "disableAllowed".to_string(),
+                Value::Bool(efforts.iter().any(|effort| effort.as_str() == Some("none"))),
+            );
+        }
+        if !reasoning.contains_key("supportStatus") && !reasoning.contains_key("supported") {
+            reasoning.insert(
+                "supportStatus".to_string(),
+                Value::String("confirmed_supported".to_string()),
+            );
+        }
+        if !reasoning.contains_key("controlKind") {
+            reasoning.insert(
+                "controlKind".to_string(),
+                Value::String("graded".to_string()),
+            );
+        }
+        reasoning.insert(
+            "upstream".to_string(),
+            serde_json::json!({
+                "format": "object",
+                "parameter": "reasoning.effort",
+                "effortMap": effort_map,
+            }),
+        );
+        Some(entry)
+    });
+    if let Some(mut capability) = repaired_entry
+        .as_ref()
+        .and_then(reasoning_capability_from_model_entry)
+    {
+        capability.source = Some("provider_config".to_string());
+        capability.confidence = Some(CapabilityConfidence::Authoritative);
+        return capability.validate().ok().map(|_| capability);
+    }
+    None
+}
+
 pub fn resolve_reasoning_capability_from_settings(
     settings: &Value,
     model: &str,
@@ -970,9 +1048,11 @@ mod tests {
         let repaired = &settings["modelCatalog"]["models"][0]["reasoning"];
         assert_eq!(repaired["supportedEfforts"], json!(["low", "high", "max"]));
         assert_eq!(repaired["defaultEffort"], json!("high"));
-        assert!(outcome
-            .repaired_models
-            .contains(&"deepseek-v4-flash".to_string()));
+        assert!(
+            outcome
+                .repaired_models
+                .contains(&"deepseek-v4-flash".to_string())
+        );
         assert!(!outcome.warnings.is_empty());
     }
 
@@ -997,9 +1077,11 @@ mod tests {
         assert_eq!(repaired["supportedEfforts"], json!(["low"]));
         assert_eq!(repaired["defaultEffort"], json!("low"));
         assert_eq!(repaired["source"], json!("user"));
-        assert!(outcome
-            .repaired_models
-            .contains(&"private-model".to_string()));
+        assert!(
+            outcome
+                .repaired_models
+                .contains(&"private-model".to_string())
+        );
     }
 
     fn deepseek_capability() -> CodexModelReasoningCapability {
@@ -1039,9 +1121,11 @@ mod tests {
             resolved.effort_map.get(&CodexReasoningEffort::Medium),
             Some(&CodexReasoningEffort::High)
         );
-        assert!(!resolved
-            .codex_selectable_efforts
-            .contains(&CodexReasoningEffort::Ultra));
+        assert!(
+            !resolved
+                .codex_selectable_efforts
+                .contains(&CodexReasoningEffort::Ultra)
+        );
     }
 
     #[test]
@@ -1058,9 +1142,11 @@ mod tests {
             efforts(&["low", "high", "max"]),
             "Ultra is a Codex orchestration mode, not a Provider-native effort"
         );
-        assert!(resolved
-            .codex_selectable_efforts
-            .contains(&CodexReasoningEffort::Ultra));
+        assert!(
+            resolved
+                .codex_selectable_efforts
+                .contains(&CodexReasoningEffort::Ultra)
+        );
         assert_eq!(
             resolved.effort_map.get(&CodexReasoningEffort::Ultra),
             Some(&CodexReasoningEffort::Max),
@@ -1197,6 +1283,73 @@ mod tests {
                 "upstream":{"format":"string","parameter":"reasoning_effort"}}
         }]}});
         assert!(resolve_reasoning_capability_from_settings(&settings, "broken").is_none());
+    }
+
+    #[test]
+    fn normalizes_openrouter_snake_case_reasoning_without_losing_efforts() {
+        let entry = json!({
+            "model": "fireworks/ember-1",
+            "reasoning": {
+                "mandatory": false,
+                "default_enabled": true,
+                "supported_efforts": ["max", "high", "low"],
+                "default_effort": "max"
+            }
+        });
+        let capability = reasoning_capability_from_openrouter_model_entry(&entry)
+            .expect("OpenRouter effort levels must form a valid capability");
+        assert_eq!(capability.supported_efforts, vec!["max", "high", "low"]);
+        assert_eq!(capability.default_effort.as_deref(), Some("max"));
+        assert_eq!(capability.upstream.format, "object");
+        assert_eq!(capability.upstream.parameter, "reasoning.effort");
+        assert_eq!(
+            capability
+                .upstream
+                .effort_map
+                .get("max")
+                .map(String::as_str),
+            Some("max")
+        );
+        assert!(capability.validate().is_ok());
+
+        let both_highest = json!({
+            "model": "example/both-highest",
+            "reasoning": {"supported_efforts": ["max", "xhigh", "high"]}
+        });
+        let capability = reasoning_capability_from_openrouter_model_entry(&both_highest)
+            .expect("distinct OpenRouter tiers should remain distinct");
+        assert_eq!(capability.supported_efforts, vec!["max", "xhigh", "high"]);
+
+        let disabled = json!({
+            "model": "example/optional-reasoning",
+            "reasoning": {"supported_efforts": ["none", "low"], "default_effort": "low"}
+        });
+        let capability = reasoning_capability_from_openrouter_model_entry(&disabled)
+            .expect("explicit none level must remain valid");
+        assert!(capability.disable_allowed);
+        assert_eq!(
+            capability
+                .upstream
+                .effort_map
+                .get("none")
+                .map(String::as_str),
+            Some("none")
+        );
+    }
+
+    #[test]
+    fn does_not_invent_efforts_from_openrouter_boolean_metadata() {
+        let entry = json!({"model": "example/unknown", "reasoning": {"mandatory": true}});
+        assert!(reasoning_capability_from_openrouter_model_entry(&entry).is_none());
+    }
+
+    #[test]
+    fn generic_provider_does_not_guess_upstream_parameter_from_levels() {
+        let entry = json!({
+            "model": "other-provider/model",
+            "reasoning": {"supported_efforts": ["low", "high"], "default_effort": "high"}
+        });
+        assert!(reasoning_capability_from_provider_model_entry(&entry).is_none());
     }
 
     #[test]
@@ -1510,13 +1663,17 @@ mod tests {
         .expect("parse");
         let resolved = resolve_subagent_reasoning_capability(Some(&capability));
         // provider_accepted_efforts 含 none（关闭契约需要）。
-        assert!(resolved
-            .provider_accepted_efforts
-            .contains(&CodexReasoningEffort::None));
+        assert!(
+            resolved
+                .provider_accepted_efforts
+                .contains(&CodexReasoningEffort::None)
+        );
         // codex_selectable_efforts 不含 none（none 是关闭，不是可选正向档位）。
-        assert!(!resolved
-            .codex_selectable_efforts
-            .contains(&CodexReasoningEffort::None));
+        assert!(
+            !resolved
+                .codex_selectable_efforts
+                .contains(&CodexReasoningEffort::None)
+        );
         assert_eq!(
             resolved.codex_selectable_efforts,
             vec![

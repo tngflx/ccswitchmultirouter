@@ -49,6 +49,7 @@ export interface WizardModelFetchConfig {
 export interface WizardPlanBuildResult {
   plan: Provider;
   sourceProviders: Provider[];
+  persistedSourceProviders: Provider[];
 }
 
 export interface WizardPlanBuildOptions {
@@ -457,17 +458,93 @@ function wizardModelIdentities(model: CodexCatalogModel): string[] {
   );
 }
 
+/**
+ * Canonicalize rows at the provider boundary. A provider may return the same
+ * upstream model repeatedly (often with casing/whitespace differences). Those
+ * rows are one capability entry, not multiple picker entries. Distinct visible
+ * aliases are intentionally retained, because aliases are user-authored
+ * routing contracts and must not be collapsed.
+ */
+export function canonicalizeWizardProviderModels(
+  models: CodexCatalogModel[],
+): CodexCatalogModel[] {
+  const byIdentity = new Map<string, CodexCatalogModel>();
+  for (const raw of models) {
+    if (!raw || typeof raw.model !== "string" || !raw.model.trim()) continue;
+    const model = raw.model.trim();
+    const declaredUpstream = nonEmptyWizardModelField(
+      raw.upstreamModel,
+      raw.upstream_model,
+    );
+    const upstream = declaredUpstream || model;
+    const key = `${normalizedWizardModelId(model)}\u0000${normalizedWizardModelId(upstream)}`;
+    const existing = byIdentity.get(key);
+    if (!existing) {
+      byIdentity.set(key, {
+        ...raw,
+        model,
+        ...(declaredUpstream ? { upstreamModel: upstream } : {}),
+      });
+      continue;
+    }
+    // Keep the first user-authored values, while filling missing metadata from
+    // later duplicate rows returned by a provider/catalog migration.
+    byIdentity.set(key, {
+      ...raw,
+      ...existing,
+      model: existing.model,
+      ...(existing.upstreamModel || declaredUpstream
+        ? { upstreamModel: existing.upstreamModel ?? upstream }
+        : {}),
+      displayName:
+        existing.displayName ??
+        existing.display_name ??
+        raw.displayName ??
+        raw.display_name,
+      contextWindow:
+        existing.contextWindow ??
+        existing.context_window ??
+        raw.contextWindow ??
+        raw.context_window,
+      reasoning: existing.reasoning ?? raw.reasoning,
+      inputModalities:
+        existing.inputModalities ??
+        existing.input_modalities ??
+        raw.inputModalities ??
+        raw.input_modalities,
+      input_modalities:
+        existing.input_modalities ??
+        existing.inputModalities ??
+        raw.input_modalities ??
+        raw.inputModalities,
+      supportsImage:
+        existing.supportsImage ??
+        existing.supports_image ??
+        raw.supportsImage ??
+        raw.supports_image,
+      supports_image:
+        existing.supports_image ??
+        existing.supportsImage ??
+        raw.supports_image ??
+        raw.supportsImage,
+    });
+  }
+  return Array.from(byIdentity.values());
+}
+
 // 把 /models 返回值合并进 provider modelCatalog；可选择把已有目录当作用户保留列表，只刷新元数据不追加已删除模型。
 export function mergeFetchedModelsIntoWizardProvider(
   provider: Provider,
   fetchedModels: FetchedModel[],
   options: MergeFetchedWizardModelsOptions = {},
 ): Provider {
-  const existingModels = readWizardModelCatalog(provider);
+  const existingModels = canonicalizeWizardProviderModels(
+    readWizardModelCatalog(provider),
+  );
   const byModel = new Map<string, CodexCatalogModel>();
   const byFetchedModel = new Map<string, string>();
   for (const model of existingModels) {
-    byModel.set(model.model, model);
+    byModel.set(normalizedWizardModelId(model.model), model);
     const visibleModel = nonEmptyWizardModelField(model.model);
     if (visibleModel) {
       byFetchedModel.set(normalizedWizardModelId(visibleModel), model.model);
@@ -488,7 +565,7 @@ export function mergeFetchedModelsIntoWizardProvider(
     if (!modelId) continue;
     const fetchedIdentity = normalizedWizardModelId(modelId);
     const visibleModelId = byFetchedModel.get(fetchedIdentity) ?? modelId;
-    const existing = byModel.get(visibleModelId);
+    const existing = byModel.get(normalizedWizardModelId(visibleModelId));
     if (!existing && !shouldAppendFetchedModels) continue;
     const nextModel = {
       ...(existing ?? {}),
@@ -516,8 +593,15 @@ export function mergeFetchedModelsIntoWizardProvider(
             supports_image: fetched.supportsImage,
           }
         : {}),
+      // Preserve capability metadata returned by OAuth/provider-specific model
+      // list endpoints.  The wizard previously dropped this field while
+      // merging /models results, leaving the projected MultiRouter catalog
+      // unable to validate enabled Sub-Agent V2 reasoning contracts.
+      ...(fetched.reasoning !== undefined && fetched.reasoning !== null
+        ? { reasoning: fetched.reasoning }
+        : {}),
     };
-    byModel.set(visibleModelId, nextModel);
+    byModel.set(normalizedWizardModelId(visibleModelId), nextModel);
     // Index every fetched identity as it is inserted so case-variant rows in
     // one response cannot create duplicate visible catalog entries.
     for (const identity of wizardModelIdentities(nextModel)) {
@@ -644,8 +728,35 @@ export function resolveWizardModelNameCollisions(
   providers: Provider[],
   existingRoutes: CodexRoutingRouteV2[] = [],
 ): Provider[] {
+  const canonicalProviders = providers.map((provider) => {
+    const route = existingRoutes.find(
+      (candidate) => candidate.targetProviderId === provider.id,
+    );
+    const models = readWizardModelCatalog(provider).map((model) => {
+      const visible = model.model.trim();
+      const routedUpstream = route?.aliases?.[visible]?.trim();
+      const declaredUpstream = nonEmptyWizardModelField(
+        model.upstreamModel,
+        model.upstream_model,
+      );
+      return routedUpstream &&
+        (!declaredUpstream || declaredUpstream === visible)
+        ? { ...model, upstreamModel: routedUpstream }
+        : model;
+    });
+    return {
+      ...provider,
+      settingsConfig: {
+        ...provider.settingsConfig,
+        modelCatalog: {
+          ...(provider.settingsConfig?.modelCatalog ?? {}),
+          models: canonicalizeWizardProviderModels(models),
+        },
+      },
+    };
+  });
   const ownersByUpstream = new Map<string, Provider[]>();
-  for (const provider of providers) {
+  for (const provider of canonicalProviders) {
     for (const model of readWizardModelCatalog(provider).filter(
       isWizardModelEnabled,
     )) {
@@ -660,7 +771,7 @@ export function resolveWizardModelNameCollisions(
     }
   }
 
-  return providers.map((provider) => {
+  const upstreamResolved = canonicalProviders.map((provider) => {
     const existingRoute = existingRoutes.find(
       (route) => route.targetProviderId === provider.id,
     );
@@ -686,7 +797,7 @@ export function resolveWizardModelNameCollisions(
             }))
           : (ownersByUpstream.get(normalizedWizardModelId(upstream)) ?? [])
                 .length <= 1 || isCanonicalModelSource(provider)
-            ? [{ ...model, upstreamModel: upstream }]
+            ? [model]
             : [
                 {
                   ...model,
@@ -710,6 +821,57 @@ export function resolveWizardModelNameCollisions(
         modelCatalog: {
           ...(provider.settingsConfig?.modelCatalog ?? {}),
           models: nextModels,
+        },
+      },
+    };
+  });
+  // A visible model name is also a picker identity. If two different
+  // upstreams survive the upstream-collision pass with the same visible name,
+  // retain both by giving later providers a stable provider-qualified alias.
+  const visibleOwners = new Map<
+    string,
+    { upstream: string; providerId: string }
+  >();
+  return upstreamResolved.map((provider) => {
+    const models = readWizardModelCatalog(provider).map((model) => {
+      const visible = model.model.trim();
+      const visibleKey = normalizedWizardModelId(visible);
+      const upstream = wizardModelUpstream(model);
+      const previous = visibleOwners.get(visibleKey);
+      if (!previous) {
+        visibleOwners.set(visibleKey, {
+          upstream: normalizedWizardModelId(upstream),
+          providerId: provider.id,
+        });
+        return model;
+      }
+      if (previous.providerId === provider.id) {
+        return model;
+      }
+      let alias = aliasModelName(provider, upstream);
+      let suffix = 2;
+      while (visibleOwners.has(normalizedWizardModelId(alias))) {
+        alias = `${aliasModelName(provider, upstream)}-${suffix}`;
+        suffix += 1;
+      }
+      visibleOwners.set(normalizedWizardModelId(alias), {
+        upstream: normalizedWizardModelId(upstream),
+        providerId: provider.id,
+      });
+      return {
+        ...model,
+        model: alias,
+        displayName: model.displayName ?? alias,
+        upstreamModel: upstream,
+      };
+    });
+    return {
+      ...provider,
+      settingsConfig: {
+        ...provider.settingsConfig,
+        modelCatalog: {
+          ...(provider.settingsConfig?.modelCatalog ?? {}),
+          models,
         },
       },
     };
@@ -1011,7 +1173,9 @@ export function filterWizardProvidersByModelOrder(
   );
   return providers
     .map((provider) => {
-      const models = readWizardModelCatalog(provider)
+      const models = canonicalizeWizardProviderModels(
+        readWizardModelCatalog(provider),
+      )
         .filter(isWizardModelEnabled)
         .filter((model) =>
           wizardModelIdentities(model).some((id) => enabledModels.has(id)),
@@ -1570,7 +1734,7 @@ export function buildCodexMultiRouterWizardPlan(
       new Set(canonicalWizardModelIds(provider)),
     ]),
   );
-  const canonicalSourceProviders = sourceProviders
+  const canonicalSourceProviders = collisionResolvedSources
     .map((provider) => {
       const selected = selectedCanonicalByProvider.get(provider.id);
       if (!selected) return provider;
@@ -1591,6 +1755,40 @@ export function buildCodexMultiRouterWizardPlan(
       };
     })
     .filter((provider) => readWizardModelCatalog(provider).length > 0);
+  const persistedSourceProviders = collisionResolvedSources.map((provider) => {
+    const original = sourceProviders.find(
+      (source) => source.id === provider.id,
+    );
+    const excluded =
+      original?.settingsConfig?.modelCatalog?.models.filter(
+        (model: CodexCatalogModel) => model.enabled === false,
+      ) ?? [];
+    const models = [...readWizardModelCatalog(provider), ...excluded];
+    const visibleByUpstream = new Map(
+      models
+        .filter(isWizardModelEnabled)
+        .map((model) => [
+          normalizedWizardModelId(wizardModelUpstream(model)),
+          model.model,
+        ]),
+    );
+    const spawnAgentModels =
+      original?.settingsConfig?.modelCatalog?.spawnAgentModels?.map(
+        (model: string) =>
+          visibleByUpstream.get(normalizedWizardModelId(model)) ?? model,
+      );
+    return {
+      ...provider,
+      settingsConfig: {
+        ...provider.settingsConfig,
+        modelCatalog: {
+          ...provider.settingsConfig.modelCatalog,
+          models,
+          ...(spawnAgentModels ? { spawnAgentModels } : {}),
+        },
+      },
+    };
+  });
   const officialAuth =
     options.officialAuth ??
     inferCodexOfficialAuth(existingRouting) ??
@@ -1704,5 +1902,9 @@ export function buildCodexMultiRouterWizardPlan(
       hostedTools,
     },
   };
-  return { plan, sourceProviders: canonicalSourceProviders };
+  return {
+    plan,
+    sourceProviders: canonicalSourceProviders,
+    persistedSourceProviders,
+  };
 }

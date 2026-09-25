@@ -36,6 +36,8 @@ struct GuardianInner {
 pub(crate) struct GuardianHandle {
     shutdown_tx: watch::Sender<bool>,
     pub(crate) status: Arc<Mutex<CodexGuardianStatus>>,
+    guardian_task: tokio::task::JoinHandle<()>,
+    config_task: tokio::task::JoinHandle<()>,
 }
 
 /// 启动 Codex 桌面模型菜单生命周期守护。
@@ -63,18 +65,20 @@ pub(crate) fn start_codex_guardian() -> GuardianHandle {
 
     let s = status.clone();
     let i = inner.clone();
-    tokio::spawn(async move {
+    let guardian_task = tokio::spawn(async move {
         guardian_loop(s, i, shutdown_rx).await;
     });
 
     let config_shutdown_rx = shutdown_tx.subscribe();
-    tokio::spawn(async move {
+    let config_task = tokio::spawn(async move {
         guardian_config_compatibility_loop(config_shutdown_rx).await;
     });
 
     GuardianHandle {
         shutdown_tx,
         status,
+        guardian_task,
+        config_task,
     }
 }
 
@@ -98,8 +102,26 @@ async fn guardian_config_compatibility_loop(mut shutdown: watch::Receiver<bool>)
 }
 
 impl GuardianHandle {
-    pub(crate) fn stop(self) {
+    pub(crate) async fn stop(self) {
         let _ = self.shutdown_tx.send(true);
+        let GuardianHandle {
+            guardian_task,
+            config_task,
+            ..
+        } = self;
+        let mut guardian_task = guardian_task;
+        let mut config_task = config_task;
+        tokio::select! {
+            _ = async {
+                let _ = (&mut guardian_task).await;
+                let _ = (&mut config_task).await;
+            } => {}
+            _ = tokio::time::sleep(Duration::from_secs(10)) => {
+                log::warn!("Codex guardian did not stop within 10 seconds; aborting tasks");
+                guardian_task.abort();
+                config_task.abort();
+            }
+        }
     }
 }
 
@@ -358,5 +380,13 @@ mod tests {
             Some("catalog-v2"),
             "catalog-v2"
         ));
+    }
+
+    #[tokio::test]
+    async fn stop_waits_until_guardian_reports_inactive() {
+        let handle = start_codex_guardian();
+        let status = handle.status.clone();
+        handle.stop().await;
+        assert!(!status.lock().await.active);
     }
 }

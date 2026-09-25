@@ -34,9 +34,8 @@ pub(crate) use live::sanitize_claude_settings_for_live;
 pub(crate) use live::{
     build_codex_live_config_for_provider, build_effective_settings_with_common_config,
     normalize_provider_common_config_for_storage, provider_exists_in_live_config,
-    strip_common_config_from_live_settings,
-    sync_current_provider_for_app_to_live, write_codex_config_only_with_common_config,
-    write_live_with_common_config,
+    strip_common_config_from_live_settings, sync_current_provider_for_app_to_live,
+    write_codex_config_only_with_common_config, write_live_with_common_config,
 };
 
 // Internal re-exports
@@ -74,15 +73,12 @@ pub fn reapply_current_codex_official_live(state: &AppState) -> Result<bool, App
     // 代理接管期间 live 归代理所有（开启代理时官方供应商只警告不拦截，
     // 二者可以共存）。与切换/保存路径一致：以 backup/占位符为所有权信号，
     // 只更新备份，注入后的配置由接管释放时的恢复路径落盘。
-    let has_live_backup =
-        futures::executor::block_on(state.db.get_live_backup(AppType::Codex.as_str()))
-            .ok()
-            .flatten()
-            .is_some();
-    let live_taken_over = state
-        .proxy_service
-        .detect_takeover_in_live_config_for_app(&AppType::Codex);
-    if has_live_backup || live_taken_over {
+    let should_sync_via_proxy = futures::executor::block_on(
+        state
+            .proxy_service
+            .provider_sync_should_preserve_live(&AppType::Codex),
+    );
+    if should_sync_via_proxy {
         futures::executor::block_on(
             state
                 .proxy_service
@@ -4674,18 +4670,17 @@ impl ProviderService {
             // 如果 Claude 代理接管处于激活状态，并且代理服务正在运行：
             // - 不直接走普通 Live 写入逻辑
             // - 改为更新 Live 备份，并在 Claude 下同步代理安全的 Live 配置
-            let has_live_backup =
-                block_on_tauri_runtime(state.db.get_live_backup(app_type.as_str()))
-                    .ok()
-                    .flatten()
-                    .is_some();
             let live_taken_over = state
                 .proxy_service
                 .detect_takeover_in_live_config_for_app(&app_type);
             // Backup or live placeholders mean the live file is currently owned
             // by proxy takeover, including the short activation window before
             // proxy_config.enabled is committed.
-            let should_sync_via_proxy = has_live_backup || live_taken_over;
+            let should_sync_via_proxy = block_on_tauri_runtime(
+                state
+                    .proxy_service
+                    .provider_sync_should_preserve_live(&app_type),
+            );
 
             if should_sync_via_proxy {
                 if matches!(app_type, AppType::ClaudeDesktop) {
@@ -5764,18 +5759,18 @@ impl ProviderService {
             return Ok(());
         }
 
-        let has_live_backup = block_on_tauri_runtime(state.db.get_live_backup(app_type.as_str()))
-            .ok()
-            .flatten()
-            .is_some();
-
         let live_taken_over = state
             .proxy_service
             .detect_takeover_in_live_config_for_app(&app_type);
 
         // See the save path above: backup/placeholders are the ownership signal
         // here, not just proxy_config.enabled.
-        if has_live_backup || live_taken_over {
+        let should_sync_via_proxy = block_on_tauri_runtime(
+            state
+                .proxy_service
+                .provider_sync_should_preserve_live(&app_type),
+        );
+        if should_sync_via_proxy {
             if matches!(app_type, AppType::ClaudeDesktop) {
                 write_live_with_common_config(state.db.as_ref(), &app_type, provider)?;
                 return Ok(());

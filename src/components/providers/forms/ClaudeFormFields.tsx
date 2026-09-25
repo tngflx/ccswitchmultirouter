@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import {
   invalidateAutoModelRefresh,
@@ -57,6 +57,15 @@ import {
 } from "@/lib/api/model-fetch";
 import { CustomUserAgentField } from "./CustomUserAgentField";
 import { LocalProxyRequestOverridesField } from "./LocalProxyRequestOverridesField";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
+import { cn } from "@/lib/utils";
 import type {
   ProviderCategory,
   ClaudeApiFormat,
@@ -281,6 +290,63 @@ export function ClaudeFormFields({
   // 通用模型获取（非 Copilot 供应商）
   const [fetchedModels, setFetchedModels] = useState<FetchedModel[]>([]);
   const [isFetchingModels, setIsFetchingModels] = useState(false);
+  const [modelListDiff, setModelListDiff] = useState<{
+    added: string[];
+    removed: string[];
+    updated: string[];
+  } | null>(null);
+  const modelFetchIdentity = `${providerId ?? "draft"}:${baseUrl}:${isFullUrl}:${customUserAgent}:${modelRefreshCredentialFingerprint(apiKey)}`;
+  const [verifiedModelIdentity, setVerifiedModelIdentity] = useState("");
+  const applyFetchedModels = useCallback(
+    (models: FetchedModel[]) => {
+      setFetchedModels(models);
+      setVerifiedModelIdentity(models.length > 0 ? modelFetchIdentity : "");
+    },
+    [modelFetchIdentity],
+  );
+
+  const savedModelIds = useMemo(
+    () =>
+      [
+        claudeModel,
+        defaultHaikuModel,
+        defaultSonnetModel,
+        defaultOpusModel,
+        defaultFableModel,
+        subagentModel,
+      ]
+        .map((model) => stripClaudeOneMMarker(model).trim())
+        .filter(Boolean),
+    [
+      claudeModel,
+      defaultFableModel,
+      defaultHaikuModel,
+      defaultOpusModel,
+      defaultSonnetModel,
+      subagentModel,
+    ],
+  );
+  const latestModelIds = useMemo(
+    () =>
+      new Set(
+        fetchedModels
+          .map((model) => stripClaudeOneMMarker(model.id ?? "").trim())
+          .filter(Boolean),
+      ),
+    [fetchedModels],
+  );
+  const isModelUnavailable = useCallback(
+    (model: string) => {
+      const normalized = stripClaudeOneMMarker(model).trim();
+      return Boolean(
+        normalized &&
+        verifiedModelIdentity === modelFetchIdentity &&
+        fetchedModels.length > 0 &&
+        !latestModelIds.has(normalized),
+      );
+    },
+    [fetchedModels.length, latestModelIds, modelFetchIdentity, verifiedModelIdentity],
+  );
 
   const showModelFetchResult = useCallback(
     (count: number) => {
@@ -321,7 +387,7 @@ export function ClaudeFormFields({
       ),
     )
       .then((models) => {
-        setFetchedModels(models);
+        applyFetchedModels(models);
         showModelFetchResult(models.length);
       })
       .catch((err) => {
@@ -334,13 +400,14 @@ export function ClaudeFormFields({
     apiKey,
     isFullUrl,
     customUserAgent,
+    applyFetchedModels,
     showModelFetchResult,
     t,
     runWithLoading,
   ]);
 
   useAutoModelRefresh({
-    cacheKey: `provider-models:claude:${providerId ?? "draft"}:${baseUrl}:${modelRefreshCredentialFingerprint(apiKey)}`,
+    cacheKey: `provider-models:claude:${modelFetchIdentity}`,
     enabled:
       !isCopilotPreset &&
       !isCodexOauthPreset &&
@@ -361,21 +428,14 @@ export function ClaudeFormFields({
         })?.modelsUrl,
         customUserAgent,
       ),
-    onSuccess: setFetchedModels,
+    onSuccess: applyFetchedModels,
+    snapshotKey: `claude:${modelFetchIdentity}`,
     compareIds: Boolean(autoRefreshModels && providerId)
-      ? fetchedModels.map((m) => (m.id ?? "").trim()).filter(Boolean)
+      ? savedModelIds
       : undefined,
-    onDiff: (added, removed) => {
-      // Non-blocking notification of changed model IDs when entering saved edit form.
-      // Only the saved-provider edit forms expose this banner; new drafts stay silent.
-      const banner = document.getElementById("model-diff-banner");
-      if (banner) {
-        banner.innerHTML = `<strong>Model list changed</strong>` +
-          (added.length ? `<div>Added: ${added.join(", ")}</div>` : "") +
-          (removed.length ? `<div>Removed: ${removed.join(", ")}</div>` : "");
-        banner.style.display = "block";
-      }
-    },
+    onDiff: (added, removed, updated) =>
+      setModelListDiff({ added, removed, updated }),
+    ttlMs: 0,
   });
 
   const handleFetchCopilotModels = useCallback(() => {
@@ -582,6 +642,10 @@ export function ClaudeFormFields({
   ) => {
     const updateValue =
       onValueChange ?? ((next: string) => onModelChange(field, next));
+    const unavailable = isModelUnavailable(value);
+    const inputClassName = unavailable
+      ? "border-destructive text-destructive focus-visible:ring-destructive"
+      : undefined;
 
     if (isCodexOauthPreset) {
       return (
@@ -592,6 +656,8 @@ export function ClaudeFormFields({
           placeholder={placeholder}
           fetchedModels={codexOauthModels}
           isLoading={codexOauthModelsLoading}
+          inputClassName={inputClassName}
+          ariaInvalid={unavailable}
         />
       );
     }
@@ -605,6 +671,8 @@ export function ClaudeFormFields({
           placeholder={placeholder}
           fetchedModels={xaiOauthModels}
           isLoading={xaiOauthModelsLoading}
+          inputClassName={inputClassName}
+          ariaInvalid={unavailable}
         />
       );
     }
@@ -628,7 +696,8 @@ export function ClaudeFormFields({
             onChange={(e) => updateValue(e.target.value)}
             placeholder={placeholder}
             autoComplete="off"
-            className="flex-1"
+            className={cn("flex-1", inputClassName)}
+            aria-invalid={unavailable || undefined}
           />
           <DropdownMenu>
             <DropdownMenuTrigger asChild>
@@ -670,7 +739,8 @@ export function ClaudeFormFields({
             onChange={(e) => updateValue(e.target.value)}
             placeholder={placeholder}
             autoComplete="off"
-            className="flex-1"
+            className={cn("flex-1", inputClassName)}
+            aria-invalid={unavailable || undefined}
           />
           <Button variant="outline" size="icon" className="shrink-0" disabled>
             <Loader2 className="h-4 w-4 animate-spin" />
@@ -688,6 +758,8 @@ export function ClaudeFormFields({
           onChange={(e) => updateValue(e.target.value)}
           placeholder={placeholder}
           autoComplete="off"
+          className={inputClassName}
+          aria-invalid={unavailable || undefined}
         />
       );
     }
@@ -701,6 +773,8 @@ export function ClaudeFormFields({
         placeholder={placeholder}
         fetchedModels={fetchedModels}
         isLoading={isFetchingModels}
+        inputClassName={inputClassName}
+        ariaInvalid={unavailable}
       />
     );
   };
@@ -1218,6 +1292,17 @@ export function ClaudeFormFields({
                     "用于未明确落到 Sonnet、Opus、Fable、Haiku 角色的请求。使用第三方/中转端点时建议填写：否则这些请求（含 Haiku 后台子任务）会以原始 Claude 模型名透传给上游，可能因上游无此模型而报错。官方端点可留空。",
                 })}
               </p>
+              {isModelUnavailable(claudeModel) && (
+                <p
+                  className="text-xs leading-relaxed text-destructive"
+                  role="alert"
+                >
+                  {t("codexConfig.defaultModelMissingFromProvider", {
+                    defaultValue:
+                      "This model is absent from the latest complete model list. It may have been removed or renamed by the provider.",
+                  })}
+                </p>
+              )}
             </div>
 
             <CustomUserAgentField
@@ -1237,6 +1322,74 @@ export function ClaudeFormFields({
           </CollapsibleContent>
         </Collapsible>
       )}
+
+      <Dialog
+        open={Boolean(modelListDiff)}
+        onOpenChange={(open) => {
+          if (!open) setModelListDiff(null);
+        }}
+      >
+        <DialogContent className="max-w-lg">
+          <DialogHeader>
+            <DialogTitle>
+              {t("codexConfig.modelListChangedTitle", {
+                defaultValue: "Provider model list changed",
+              })}
+            </DialogTitle>
+            <DialogDescription>
+              {t("codexConfig.modelListChangedDescription", {
+                defaultValue:
+                  "A silent refresh found differences from the saved model list.",
+              })}
+            </DialogDescription>
+          </DialogHeader>
+          {modelListDiff && (
+            <div className="space-y-3 px-6 pb-2 text-sm">
+              {modelListDiff.added.length > 0 && (
+                <div>
+                  <p className="font-medium text-emerald-600 dark:text-emerald-400">
+                    {t("codexConfig.modelListAdded", {
+                      count: modelListDiff.added.length,
+                    })}
+                  </p>
+                  <p className="mt-1 max-h-24 overflow-y-auto break-words font-mono text-xs text-muted-foreground">
+                    {modelListDiff.added.join(", ")}
+                  </p>
+                </div>
+              )}
+              {modelListDiff.removed.length > 0 && (
+                <div>
+                  <p className="font-medium text-destructive">
+                    {t("codexConfig.modelListRemoved", {
+                      count: modelListDiff.removed.length,
+                    })}
+                  </p>
+                  <p className="mt-1 max-h-24 overflow-y-auto break-words font-mono text-xs text-muted-foreground">
+                    {modelListDiff.removed.join(", ")}
+                  </p>
+                </div>
+              )}
+              {modelListDiff.updated.length > 0 && (
+                <div>
+                  <p className="font-medium text-blue-600 dark:text-blue-400">
+                    {t("codexConfig.modelListUpdated", {
+                      count: modelListDiff.updated.length,
+                    })}
+                  </p>
+                  <p className="mt-1 max-h-24 overflow-y-auto break-words font-mono text-xs text-muted-foreground">
+                    {modelListDiff.updated.join(", ")}
+                  </p>
+                </div>
+              )}
+            </div>
+          )}
+          <DialogFooter>
+            <Button type="button" onClick={() => setModelListDiff(null)}>
+              {t("codexConfig.modelListDismiss")}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </>
   );
 }

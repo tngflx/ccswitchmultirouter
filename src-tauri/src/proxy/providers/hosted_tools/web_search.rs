@@ -1,7 +1,7 @@
 //! Hosted `web_search` bridge primitives.
 
 use crate::proxy::json_canonical::{canonical_json_string, short_sha256_hex};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 pub(crate) const WEB_SEARCH_FUNCTION_NAME: &str = "web_search";
 const DEFAULT_MAX_RESULTS: u64 = 5;

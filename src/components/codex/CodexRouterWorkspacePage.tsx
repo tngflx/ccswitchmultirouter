@@ -23,6 +23,7 @@ import {
 } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { toast } from "sonner";
 import { useTranslation } from "react-i18next";
 import i18n from "@/i18n";
 import { PagedModelList } from "@/components/providers/forms/shared/PagedModelList";
@@ -36,7 +37,6 @@ import {
   Clipboard,
   Database,
   FileClock,
-  FolderOpen,
   GitFork,
   GitBranch,
   GripVertical,
@@ -76,7 +76,6 @@ import {
   TooltipTrigger,
 } from "@/components/ui/tooltip";
 import { providersApi } from "@/lib/api";
-import { settingsApi } from "@/lib/api/settings";
 import type {
   CodexMultiRouterMigrationPreview,
   CodexRoutingProjectionStatus,
@@ -96,6 +95,7 @@ import {
   inferCodexOfficialAuth,
   isWizardCodexOAuthSource,
   readWizardCodexOAuthAccountId,
+  readWizardProviderBaseUrl,
   resolveWizardModelNameCollisions,
 } from "@/lib/codexMultiRouterWizard";
 import {
@@ -104,6 +104,10 @@ import {
   writeHostedToolsConfig,
 } from "@/lib/hostedTools";
 import { applyCodexCatalogModelOrder } from "@/lib/codexModelCatalogOrder";
+import {
+  parseRelease,
+  pruneOutdatedCodexCatalogModels,
+} from "@/components/providers/forms/codexCatalogVersionPruning";
 import { usageApi } from "@/lib/api/usage";
 import {
   usageKeys,
@@ -134,6 +138,7 @@ import {
 import {
   extractCodexExperimentalBearerToken,
   getCodexBaseUrl,
+  setCodexModelName,
 } from "@/utils/providerConfigUtils";
 import { CodexSessionTrafficPanel } from "./CodexSessionTrafficPanel";
 
@@ -2398,11 +2403,44 @@ function applyRouteCapabilitiesToCatalogModel(
   };
 }
 
+function isCompilerCanonicalProvider(provider: Provider): boolean {
+  if (
+    provider.id.toLowerCase() === "codex-official" ||
+    provider.category === "official"
+  ) {
+    return true;
+  }
+  const identity = `${provider.id} ${provider.name}`.toLowerCase();
+  if (identity.includes("openai") && identity.includes("official")) {
+    return true;
+  }
+  const settings = provider.settingsConfig;
+  const providerType =
+    provider.meta?.providerType ??
+    settings?.providerType ??
+    settings?.provider_type;
+  const baseUrl =
+    settings?.baseUrl ??
+    settings?.base_url ??
+    settings?.openaiBaseUrl ??
+    settings?.openai_base_url ??
+    readWizardProviderBaseUrl(provider);
+  return (
+    providerType?.toLowerCase() === "codex_oauth" ||
+    (typeof baseUrl === "string" &&
+      baseUrl.includes("chatgpt.com/backend-api/codex"))
+  );
+}
+
 /// 从已选 route 和目标模型源汇总 MultiRouter 的模型目录；Codex 选择器和 spawn_agent 都依赖这个目录。
 export function buildModelCatalogForRoutes(
   plan: Provider,
   routes: CodexRoute[],
   providersById: Map<string, Provider>,
+  options?: {
+    ignorePersistedModelOrder?: boolean;
+    pruneOutdatedModels?: boolean;
+  },
 ): CodexModelCatalogDraft {
   const routing = readCodexRouting(plan);
   const isSchemaV2 = routing?.schemaVersion === 2;
@@ -2411,7 +2449,11 @@ export function buildModelCatalogForRoutes(
     ? new Map<string, CodexCatalogModelDraft>()
     : buildExistingCatalogByModel(plan);
 
-  const byModel = new Map<string, CodexCatalogModelDraft>();
+  const candidates: Array<{
+    model: CodexCatalogModelDraft;
+    provider: Provider | undefined;
+    route: CodexRoute;
+  }> = [];
   for (const route of routes) {
     if (route.enabled === false) continue;
     const targetProvider = routeTargetProviderId(route)
@@ -2431,40 +2473,56 @@ export function buildModelCatalogForRoutes(
         .map((value) => value?.trim().toLowerCase())
         .filter((value): value is string => Boolean(value)),
     );
-    const routableCatalogModels =
-      route.modelSelection?.mode === "all"
-        ? targetCatalogModels.filter(
-            (catalogModel) => catalogModel.enabled !== false,
+    const selectedModels = new Set(
+      route.modelSelection?.mode === "include"
+        ? route.modelSelection.models.map((model) => model.trim().toLowerCase())
+        : [],
+    );
+    const routableCatalogModels = targetCatalogModels.filter((catalogModel) => {
+      if (catalogModel.enabled === false) return false;
+      if (isSchemaV2) {
+        return (
+          route.modelSelection?.mode !== "include" ||
+          selectedModels.has(catalogModel.model.trim().toLowerCase()) ||
+          selectedModels.has(
+            catalogDraftUpstreamModel(catalogModel).toLowerCase(),
           )
-        : targetCatalogModels.filter(
-            (catalogModel) =>
-              catalogModel.enabled !== false &&
-              routeCanMatchVisibleCatalogModel(route, catalogModel.model ?? ""),
-          );
+        );
+      }
+      return (
+        route.modelSelection?.mode === "all" ||
+        routeCanMatchVisibleCatalogModel(route, catalogModel.model ?? "")
+      );
+    });
+    const seenCanonical = new Set<string>();
     for (const catalogModel of routableCatalogModels) {
       const id = catalogModel.model?.trim();
       const key = id?.toLowerCase() ?? "";
-      if (!id || !key || byModel.has(key)) continue;
-      byModel.set(
-        key,
-        applyRouteCapabilitiesToCatalogModel(
+      if (!id || seenCanonical.has(key)) continue;
+      seenCanonical.add(key);
+      candidates.push({
+        provider: targetProvider,
+        route,
+        model: applyRouteCapabilitiesToCatalogModel(
           catalogDraftFromSourceModel(id, catalogModel, targetProvider),
           route,
         ),
-      );
+      });
     }
-    for (const model of route.match?.models ?? []) {
+    for (const model of isSchemaV2 ? [] : (route.match?.models ?? [])) {
       const id = model.trim();
       if (
         !id ||
-        byModel.has(id.toLowerCase()) ||
+        seenCanonical.has(id.toLowerCase()) ||
         disabledTargetIdentities.has(id.toLowerCase())
       ) {
         continue;
       }
-      byModel.set(
-        id.toLowerCase(),
-        applyRouteCapabilitiesToCatalogModel(
+      seenCanonical.add(id.toLowerCase());
+      candidates.push({
+        provider: targetProvider,
+        route,
+        model: applyRouteCapabilitiesToCatalogModel(
           catalogDraftFromSourceModel(
             id,
             legacyModelById.get(id.toLowerCase()),
@@ -2472,7 +2530,110 @@ export function buildModelCatalogForRoutes(
           ),
           route,
         ),
-      );
+      });
+    }
+  }
+
+  if (options?.pruneOutdatedModels) {
+    const kept = new Set(
+      pruneOutdatedCodexCatalogModels(
+        candidates.map(({ model }) => model),
+      ).kept,
+    );
+    // Keep candidate metadata and route capabilities attached to each row while
+    // dropping stale releases before the default provider ranking is applied.
+    for (let index = candidates.length - 1; index >= 0; index -= 1) {
+      if (!kept.has(candidates[index].model)) candidates.splice(index, 1);
+    }
+  }
+
+  // Match the home provider list when no explicit MultiRouter model order is
+  // configured: higher-ranked providers lead, and their newest numeric model
+  // releases appear first within that provider block.
+  if (candidates.some(({ provider }) => provider?.sortIndex !== undefined)) {
+    const providerRank = (provider: Provider | undefined) =>
+      provider?.sortIndex ?? Number.MAX_SAFE_INTEGER;
+    const versionRank = (model: CodexCatalogModelDraft) =>
+      parseRelease({
+        model: model.model,
+        upstreamModel: model.upstreamModel,
+        upstream_model: model.upstream_model,
+      });
+    const compareVersions = (left: number[], right: number[]) => {
+      for (
+        let index = 0;
+        index < Math.max(left.length, right.length);
+        index++
+      ) {
+        const difference = (right[index] ?? 0) - (left[index] ?? 0);
+        if (difference) return difference;
+      }
+      return 0;
+    };
+    candidates.sort((left, right) => {
+      const providerDifference =
+        providerRank(left.provider) - providerRank(right.provider);
+      if (providerDifference) return providerDifference;
+      const leftRelease = versionRank(left.model);
+      const rightRelease = versionRank(right.model);
+      if (leftRelease && rightRelease) {
+        const versionDifference = compareVersions(
+          leftRelease.version,
+          rightRelease.version,
+        );
+        if (versionDifference) return versionDifference;
+      } else if (leftRelease) {
+        return -1;
+      } else if (rightRelease) {
+        return 1;
+      }
+      return 0;
+    });
+  }
+
+  const counts = new Map<string, number>();
+  const officialCounts = new Map<string, number>();
+  for (const { model, provider } of candidates) {
+    const key = model.model.trim().toLowerCase();
+    counts.set(key, (counts.get(key) ?? 0) + 1);
+    if (provider && isCompilerCanonicalProvider(provider)) {
+      officialCounts.set(key, (officialCounts.get(key) ?? 0) + 1);
+    }
+  }
+  const byModel = new Map<string, CodexCatalogModelDraft>();
+  for (const { model, provider, route } of candidates) {
+    const canonical = model.model.trim();
+    const key = canonical.toLowerCase();
+    const upstream = catalogDraftUpstreamModel(model);
+    const aliases = Object.entries(route.aliases ?? {})
+      .sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0))
+      .filter(([, target]) =>
+        [key, upstream.toLowerCase()].includes(target.trim().toLowerCase()),
+      )
+      .map(([alias]) => alias.trim())
+      .filter(Boolean);
+    const suffix =
+      (provider?.name.trim() || provider?.id || "provider")
+        .toLowerCase()
+        .replace(/[^a-z0-9]+/g, "-")
+        .replace(/^-|-$/g, "") || "provider";
+    const automatic =
+      (counts.get(key) ?? 0) <= 1 ||
+      (officialCounts.get(key) === 1 &&
+        provider !== undefined &&
+        isCompilerCanonicalProvider(provider))
+        ? canonical
+        : `${canonical}-${suffix}`;
+    for (const requested of aliases.length ? aliases : [automatic]) {
+      let visible = requested;
+      if (byModel.has(visible.toLowerCase())) {
+        const base = `${requested}-${suffix}`;
+        visible = base;
+        for (let index = 2; byModel.has(visible.toLowerCase()); index++) {
+          visible = `${base}-${index}`;
+        }
+      }
+      byModel.set(visible.toLowerCase(), { ...model, model: visible });
     }
   }
 
@@ -2496,16 +2657,15 @@ export function buildModelCatalogForRoutes(
       ),
     )
     .slice(0, 5);
-  const persistedModelOrder = Array.isArray(routing?.modelOrder)
-    ? routing.modelOrder
-        .map((model, sortIndex) => ({ model, sortIndex }))
-        .filter((model) => model.model.trim())
-    : [];
+  const persistedModelOrder =
+    !options?.ignorePersistedModelOrder && Array.isArray(routing?.modelOrder)
+      ? routing.modelOrder
+          .map((model, sortIndex) => ({ model, sortIndex }))
+          .filter((model) => model.model.trim())
+      : [];
   const models = applyCodexCatalogModelOrder(
     Array.from(byModel.values()),
-    persistedModelOrder.length > 0
-      ? persistedModelOrder
-      : (existingCatalog?.models ?? []),
+    persistedModelOrder,
   );
   return {
     displayNameStyle:
@@ -3993,16 +4153,36 @@ export function CodexRouterWorkspacePage({
     const matched = selectedPlanRouteEntries.find(({ route }) => {
       if (route.enabled === false) return false;
       if (routeCanMatchVisibleCatalogModel(route, model)) return true;
-      if (route.modelSelection?.mode !== "all") return false;
 
       const aliases = route.aliases ?? route.upstream?.modelMap ?? {};
-      if (
-        Object.keys(aliases).some(
-          (alias) => alias.trim().toLowerCase() === model.toLowerCase(),
-        )
-      ) {
-        return true;
+      const aliasTarget = Object.entries(aliases).find(
+        ([alias]) => alias.trim().toLowerCase() === model.toLowerCase(),
+      )?.[1];
+      if (aliasTarget) {
+        if (route.modelSelection?.mode === "all") return true;
+        if (route.modelSelection?.mode === "include") {
+          const target = routeTargetProvider(route, providersById);
+          const selected = new Set(
+            route.modelSelection.models.map((value) =>
+              value.trim().toLowerCase(),
+            ),
+          );
+          const normalizedTarget = aliasTarget.trim().toLowerCase();
+          if (selected.has(normalizedTarget)) return true;
+          if (
+            readCodexModelCatalog(target ?? null).models.some(
+              (catalogModel) =>
+                catalogModel.enabled !== false &&
+                selected.has(catalogModel.model.trim().toLowerCase()) &&
+                catalogDraftUpstreamModel(catalogModel).toLowerCase() ===
+                  normalizedTarget,
+            )
+          ) {
+            return true;
+          }
+        }
       }
+      if (route.modelSelection?.mode !== "all") return false;
       const target = routeTargetProvider(route, providersById);
       return readCodexModelCatalog(target ?? null)
         .models.filter((catalogModel) => catalogModel.enabled !== false)
@@ -5092,8 +5272,6 @@ export function ModelOrderTab({
   const queryClient = useQueryClient();
   const [draftModels, setDraftModels] = useState<CodexCatalogModel[]>([]);
   const [isSaving, setIsSaving] = useState(false);
-  const [message, setMessage] = useState<string | null>(null);
-  const [error, setError] = useState<string | null>(null);
   const [displayStyle, setDisplayStyle] = useState<CodexModelDisplayStyle>(
     DEFAULT_CODEX_MODEL_DISPLAY_STYLE,
   );
@@ -5215,34 +5393,6 @@ export function ModelOrderTab({
       ? declared
       : ["none", "minimal", "low", "medium", "high", "xhigh", "max"];
   }, [topModel]);
-  const hiddenCatalogModels = useMemo(() => {
-    const hidden: Array<{
-      model: string;
-      upstream?: string;
-      providerId: string;
-      providerName: string;
-    }> = [];
-    const seen = new Set<string>();
-    for (const { route } of selectedRoutes) {
-      if (route.enabled === false) continue;
-      const providerId = routeTargetProviderId(route);
-      if (!providerId || seen.has(providerId)) continue;
-      seen.add(providerId);
-      const provider = providersById.get(providerId);
-      if (!provider) continue;
-      for (const model of readCodexModelCatalog(provider).models) {
-        if (model.enabled === false && model.model?.trim()) {
-          hidden.push({
-            model: model.model.trim(),
-            upstream: model.upstreamModel ?? model.upstream_model,
-            providerId,
-            providerName: provider.name,
-          });
-        }
-      }
-    }
-    return hidden;
-  }, [selectedRoutes, providersById]);
   const fallbackProtocolCount = visibleDraftModels.filter(
     isCodexProtocolFallback,
   ).length;
@@ -5281,8 +5431,6 @@ export function ModelOrderTab({
         ),
     );
     setDefaultReasoningEffort(configuredDefaultReasoningEffort ?? "medium");
-    setMessage(null);
-    setError(null);
   }, [selectedPlan?.id, catalogKey, configuredDefaultReasoningEffort]);
 
   useEffect(() => {
@@ -5315,8 +5463,6 @@ export function ModelOrderTab({
       next.splice(overIndex, 0, moved);
       return next;
     });
-    setMessage(null);
-    setError(null);
   }
 
   function applyRecommendations() {
@@ -5339,8 +5485,6 @@ export function ModelOrderTab({
         (model) => !recommendedIds.has(model.model?.trim()),
       ),
     ]);
-    setMessage(null);
-    setError(null);
   }
 
   function moveModelToPosition(modelId: string, position: number) {
@@ -5361,8 +5505,6 @@ export function ModelOrderTab({
       ordered.splice(targetIndex, 0, moved);
       return ordered;
     });
-    setMessage(null);
-    setError(null);
   }
 
   function moveModelToTop(modelId: string) {
@@ -5372,12 +5514,18 @@ export function ModelOrderTab({
   async function saveOrder(reset = false) {
     if (!selectedPlan) return;
     setIsSaving(true);
-    setMessage(null);
-    setError(null);
     let saveStage = "save-router";
     try {
       const orderedModels = reset
-        ? catalog.models.slice()
+        ? buildModelCatalogForRoutes(
+            selectedPlan,
+            selectedRoutes.map(({ route }) => route),
+            providersById,
+            {
+              ignorePersistedModelOrder: true,
+              pruneOutdatedModels: true,
+            },
+          ).models
         : sortCodexCatalogModels(draftModels, sortMode);
       const currentOrderedIds = catalog.models
         .slice()
@@ -5415,11 +5563,21 @@ export function ModelOrderTab({
       // re-resolving and rewriting them here made an unrelated stale alias block
       // every ordering save before IPC.
       if (styleDirty || effortDirty || persistOrder) {
+        const topModelId = models[0]?.model?.trim();
+        const currentConfig = selectedPlan.settingsConfig?.config;
         await providersApi.update(
           {
             ...selectedPlan,
             settingsConfig: {
               ...selectedPlan.settingsConfig,
+              ...(persistOrder && topModelId
+                ? {
+                    config: setCodexModelName(
+                      typeof currentConfig === "string" ? currentConfig : "",
+                      topModelId,
+                    ),
+                  }
+                : {}),
               codexRouting: {
                 ...codexRoutingWithModelOrder(
                   selectedPlan.settingsConfig?.codexRouting,
@@ -5437,21 +5595,45 @@ export function ModelOrderTab({
           "codex",
         );
       }
-      setDraftModels(models);
-      setMessage(
-        reset
-          ? tr("codexRouterWorkspace.s127", {
-              defaultValue:
-                "已将 MultiRouter 的全局模型顺序恢复为默认值；Codex Desktop 将在几秒内自动刷新。",
-            })
-          : tr("codexRouterWorkspace.s128", {
-              defaultValue:
-                "已将 {{arg0}} 个模型的全局展示顺序保存到 MultiRouter；Codex Desktop 将在几秒内自动刷新。",
-              arg0: models.length,
-            }),
-      );
       saveStage = "refresh-providers";
       await queryClient.invalidateQueries({ queryKey: ["providers", "codex"] });
+      setDraftModels(models);
+      if (styleDirty || effortDirty || persistOrder) {
+        saveStage = "publish-projection";
+        try {
+          let projection = await providersApi.inspectCodexMultiRouterProjection(
+            selectedPlan.id,
+          );
+          if (projection.state === "pending") {
+            projection = await providersApi.retryCodexMultiRouterProjection(
+              selectedPlan.id,
+            );
+          }
+          queryClient.setQueryData(
+            ["codexMultiRouterProjection", selectedPlan.id],
+            projection,
+          );
+          if (projection.state === "pending") {
+            toast.info(tr("codexRouterWorkspace.modelOrderPending"));
+            return;
+          }
+          if (projection.state === "not_required") {
+            toast.info(tr("codexRouterWorkspace.modelOrderInactive"));
+            return;
+          }
+        } catch (projectionError) {
+          reportFrontendError("codex_model_order_projection", projectionError);
+          toast.error(tr("codexRouterWorkspace.modelOrderPending"), {
+            description: workspaceExactErrorMessage(projectionError),
+          });
+          return;
+        }
+      }
+      toast.success(
+        reset
+          ? tr("codexRouterWorkspace.s127")
+          : tr("codexRouterWorkspace.s128", { arg0: models.length }),
+      );
     } catch (saveError) {
       reportFrontendError(
         "codex_model_order_save",
@@ -5463,7 +5645,7 @@ export function ModelOrderTab({
           `reset=${reset}`,
         ].join("; "),
       );
-      setError(
+      toast.error(
         tr("codexRouterWorkspace.s129", {
           defaultValue: "保存模型顺序失败：{{arg0}}",
           arg0: workspaceExactErrorMessage(saveError),
@@ -5488,8 +5670,6 @@ export function ModelOrderTab({
     )
       return;
     setIsSaving(true);
-    setMessage(null);
-    setError(null);
     try {
       const updates = providersWithCatalogModelVisibilityForRoutes(
         selectedRoutes,
@@ -5501,7 +5681,7 @@ export function ModelOrderTab({
         for (const nextProvider of updates) {
           await providersApi.update(nextProvider, "codex");
         }
-        setMessage(
+        toast.success(
           tr("codexRouterWorkspace.hideModelSuccess", {
             defaultValue: "Hidden {{model}}; it can be restored below.",
             model: target,
@@ -5512,52 +5692,16 @@ export function ModelOrderTab({
         });
         return;
       }
-      setError(
+      toast.error(
         tr("codexRouterWorkspace.hideModelNotFound", {
           defaultValue: "No matching model entry found for {{model}}.",
           model: target,
         }),
       );
     } catch (saveError) {
-      setError(
+      toast.error(
         tr("codexRouterWorkspace.hideModelFailed", {
           defaultValue: "Failed to hide model: {{error}}",
-          error: workspaceErrorMessage(saveError),
-        }),
-      );
-    } finally {
-      setIsSaving(false);
-    }
-  }
-
-  async function restoreHiddenModel(target: {
-    model: string;
-    providerId: string;
-  }) {
-    const provider = providersById.get(target.providerId);
-    if (!provider) return;
-    setIsSaving(true);
-    setMessage(null);
-    setError(null);
-    try {
-      const nextProvider = providerWithCatalogModelVisibility(
-        provider,
-        target.model,
-        true,
-      );
-      if (!nextProvider) return;
-      await providersApi.update(nextProvider, "codex");
-      setMessage(
-        tr("codexRouterWorkspace.restoreModelSuccess", {
-          defaultValue: "Restored {{model}}.",
-          model: target.model,
-        }),
-      );
-      await queryClient.invalidateQueries({ queryKey: ["providers", "codex"] });
-    } catch (saveError) {
-      setError(
-        tr("codexRouterWorkspace.restoreModelFailed", {
-          defaultValue: "Failed to restore model: {{error}}",
           error: workspaceErrorMessage(saveError),
         }),
       );
@@ -5585,7 +5729,7 @@ export function ModelOrderTab({
     );
   }
 
-  if (catalog.models.length === 0 && hiddenCatalogModels.length === 0) {
+  if (catalog.models.length === 0) {
     return (
       <EmptyState
         icon={GripVertical}
@@ -5888,72 +6032,6 @@ export function ModelOrderTab({
         </SortableContext>
       </DndContext>
 
-      {hiddenCatalogModels.length > 0 ? (
-        <details
-          className="mt-4 rounded-md border border-border p-3"
-          open={visibleDraftModels.length === 0}
-        >
-          <summary className="cursor-pointer text-xs font-medium">
-            {tr("codexRouterWorkspace.hiddenModels", {
-              defaultValue: "Hidden models ({{count}})",
-              count: hiddenCatalogModels.length,
-            })}
-          </summary>
-          <div className="mt-2 space-y-2">
-            <PagedModelList
-              items={hiddenCatalogModels}
-              searchText={(hidden) => `${hidden.model} ${hidden.providerName}`}
-            >
-              {(hidden) => (
-                <div
-                  key={`${hidden.providerId}:${hidden.model}`}
-                  className="flex items-center justify-between gap-2 text-xs"
-                >
-                  <span className="truncate">
-                    {hidden.model}
-                    {hidden.upstream ? ` (${hidden.upstream})` : ""} ·{" "}
-                    {hidden.providerName}
-                  </span>
-                  <Button
-                    type="button"
-                    size="sm"
-                    variant="outline"
-                    disabled={isSaving}
-                    onClick={() => void restoreHiddenModel(hidden)}
-                  >
-                    {tr("codexRouterWorkspace.restoreModel", {
-                      defaultValue: "Restore",
-                    })}
-                  </Button>
-                </div>
-              )}
-            </PagedModelList>
-          </div>
-        </details>
-      ) : null}
-
-      {message ? (
-        <p className="mt-3 text-xs text-emerald-700 dark:text-emerald-200">
-          {message}
-        </p>
-      ) : null}
-      {error ? (
-        <div className="mt-3 flex flex-wrap items-center gap-2 text-xs text-rose-700 dark:text-rose-200">
-          <p>{error}</p>
-          <Button
-            type="button"
-            size="sm"
-            variant="outline"
-            className="h-7 gap-1.5"
-            onClick={() => void settingsApi.openLogDir()}
-          >
-            <FolderOpen className="h-3.5 w-3.5" />
-            {tr("settings.advanced.logConfig.openLogDirectory", {
-              defaultValue: "Open Log Directory",
-            })}
-          </Button>
-        </div>
-      ) : null}
     </section>
   );
 }
@@ -8920,10 +8998,8 @@ function StatusTab({
   const [isUnlockingModelPicker, setIsUnlockingModelPicker] = useState(false);
   const [statusView, setStatusView] = useState<StatusView>("link");
   const trafficViewActive = statusView === "traffic";
-  const {
-    data: collectionStatus,
-    error: collectionStatusError,
-  } = useSessionCollectionStatus({ enabled: trafficViewActive });
+  const { data: collectionStatus, error: collectionStatusError } =
+    useSessionCollectionStatus({ enabled: trafficViewActive });
   const {
     data: requestHealth,
     refetch: refetchRequestHealth,

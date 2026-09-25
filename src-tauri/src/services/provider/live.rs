@@ -914,8 +914,7 @@ pub(crate) fn build_codex_live_config_for_provider(
         .and_then(Value::as_str)
         .unwrap_or("");
     let provider_context = crate::codex_config::codex_provider_classification_context(db)?;
-    let profile =
-        crate::proxy::providers::resolve_codex_catalog_tool_profile(&effective_provider);
+    let profile = crate::proxy::providers::resolve_codex_catalog_tool_profile(&effective_provider);
     let prepared =
         crate::codex_config::prepare_codex_config_text_with_model_catalog_and_provider_context(
             &settings_for_live,
@@ -1521,10 +1520,6 @@ fn sync_current_provider_for_app_respecting_takeover(
         return Ok(());
     }
 
-    let has_live_backup = block_on_tauri_runtime(state.db.get_live_backup(app_type.as_str()))
-        .ok()
-        .flatten()
-        .is_some();
     let live_taken_over = state
         .proxy_service
         .detect_takeover_in_live_config_for_app(app_type);
@@ -1532,7 +1527,12 @@ fn sync_current_provider_for_app_respecting_takeover(
     // `enabled` is set only after takeover writes complete. During that
     // activation window, backup/live placeholders are the authoritative signal
     // that normal provider sync must not rewrite the managed live file.
-    if has_live_backup || live_taken_over {
+    let should_sync_via_proxy = block_on_tauri_runtime(
+        state
+            .proxy_service
+            .provider_sync_should_preserve_live(app_type),
+    );
+    if should_sync_via_proxy {
         if matches!(app_type, AppType::ClaudeDesktop) {
             write_live_with_common_config(state.db.as_ref(), app_type, provider)?;
         } else {
