@@ -70,9 +70,15 @@ function reportModelDiff<T>(
     }
   }
   if (!previous && !compareIds) return;
-  const savedIds = previous
-    ? previous.map((model) => (model.id ?? "").trim()).filter(Boolean)
-    : (compareIds ?? []).map((id) => id.trim()).filter(Boolean);
+  // `compareIds` is the saved catalog and is the ONLY baseline for additions
+  // and removals. The localStorage snapshot records the last *fetched* payload
+  // purely so metadata edits can be reported as "updated".
+  //
+  // The snapshot must never contribute to `removed`. It is a record of what
+  // upstream returned one poll ago, not of what the user saved, so folding it
+  // in re-created the original bug: every model the provider trimmed upstream
+  // was announced as "removed" although it had never been in the catalog.
+  const savedIds = (compareIds ?? []).map((id) => id.trim()).filter(Boolean);
   const savedSet = new Set(savedIds);
   const fetchedSet = new Set(fetchedIds);
   const added =
@@ -81,16 +87,25 @@ function reportModelDiff<T>(
       : [];
   const removed = savedIds.filter((id) => !fetchedSet.has(id));
   const previousById = new Map(previous?.map((model) => [model.id, model]));
+  const fetchedById = new Map(fetched.map((model) => [model.id, model]));
   const updated = previous
-    ? fetchedIds.filter((id, index) => {
+    ? fetchedIds.filter((id) => {
         const before = previousById.get(id);
+        const after = fetchedById.get(id);
         return (
-          before && JSON.stringify(before) !== JSON.stringify(fetched[index])
+          before && after && JSON.stringify(before) !== JSON.stringify(after)
         );
       })
     : [];
+  // A model cannot be both removed and updated in the same report. Removal
+  // wins, because an absent model has no metadata left to update.
+  const removedSet = new Set(removed);
   if (added.length || removed.length || updated.length)
-    onDiff(added, removed, updated);
+    onDiff(
+      added,
+      removed,
+      updated.filter((id) => !removedSet.has(id)),
+    );
 }
 
 export function invalidateAutoModelRefresh(key?: string): void {

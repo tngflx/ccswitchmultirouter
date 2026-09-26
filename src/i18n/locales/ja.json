@@ -3103,7 +3103,10 @@
       "enabled": "{{app}} ルーティング有効",
       "disabled": "{{app}} ルーティング無効",
       "failed": "ルーティングの切り替えに失敗しました: {{detail}}",
+      "restartCodexTitle": "Codex Desktop を再起動",
       "restartCodexConfirm": "Codex Desktop が実行中です。ルーティング変更を適用するため今すぐ再起動しますか？未保存の作業が中断される可能性があります。ルーティングが有効な間は、CCSwitchMulti の起動時にもテイクオーバー復元前に確認済みの Codex シェルが再起動されます。",
+      "stopCodexConfirm": "Codex Desktop が実行中です。ローカルルーティングを無効にするため再起動しますか？未保存の作業が中断される可能性があります。",
+      "stopAllCodexConfirm": "Codex Desktop が実行中です。プロキシを停止してすべてのアプリ設定を復元する際に再起動しますか？未保存の作業が中断される可能性があります。",
       "processCheckFailed": "実行中の Codex Desktop プロセスを確認できませんでした: {{detail}}",
       "closeCodexBeforeDisable": "Codex Desktop を閉じてからローカルルーティングを無効にし、その後 Codex を開き直してください。実行中の app-server は古いプロキシアドレスを使い続ける可能性があります。",
       "tooltip": {

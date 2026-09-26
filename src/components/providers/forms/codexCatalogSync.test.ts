@@ -84,14 +84,137 @@ describe("reconcileFetchedCodexCatalogRows", () => {
 
     expect(result.rows).toHaveLength(2);
     expect(result.added).toBe(0);
-    expect(result.hydrated).toBe(1);
-    expect(result.updated).toEqual(["manual-alias"]);
+    // The visible name already equals the remote id, so there is no alias to
+    // record. Writing `upstreamModel: "manual-alias"` here would be a no-op
+    // that reclassifies a manually maintained row as remotely bound, and
+    // `pruneMissingRemoteCodexCatalogRows` would then delete it on the first
+    // refresh that omits it.
+    expect(result.hydrated).toBe(0);
+    expect(result.updated).toEqual([]);
     expect(result.rows[0]).toMatchObject({
       model: "manual-alias",
-      upstreamModel: "manual-alias",
+      upstreamModel: "",
       contextWindow: "200000",
       supportsImage: false,
     });
+  });
+
+  it("records an upstream binding when the visible name is a real alias", () => {
+    const result = reconcileFetchedCodexCatalogRows(
+      [
+        {
+          model: "gpt-5.6-sol-sublyx",
+          upstreamModel: "gpt-5.6-sol",
+          contextWindow: "",
+        },
+      ],
+      [{ id: "gpt-5.6-sol", contextWindow: 999 }],
+      source,
+      { appendNew: false, createRow },
+    );
+
+    // The alias is matched through the upstream id the wizard persisted, so
+    // the remote refresh hydrates the alias row instead of appending a
+    // duplicate plain `gpt-5.6-sol` row beside it.
+    expect(result.rows[0]).toMatchObject({
+      model: "gpt-5.6-sol-sublyx",
+      upstreamModel: "gpt-5.6-sol",
+    });
+    expect(result.rows).toHaveLength(1);
+    expect(result.added).toBe(0);
+  });
+
+  it("does not prune a bound alias while its upstream model is still offered", () => {
+    const result = reconcileFetchedCodexCatalogRows(
+      [
+        { model: "gpt-5.6-sol-sublyx", upstreamModel: "gpt-5.6-sol" },
+        { model: "gpt-6-astra", upstreamModel: "gpt-6-astra" },
+        { model: "gpt-6-luna", upstreamModel: "gpt-6-luna" },
+        { model: "gpt-6-sol", upstreamModel: "gpt-6-sol" },
+      ],
+      [{ id: "gpt-5.6-sol" }, { id: "gpt-6-sol" }],
+      source,
+      {
+        appendNew: true,
+        createRow,
+        existingMetadataMode: "refresh",
+        removeMissingRemote: true,
+        maxRemovalRatio: 1,
+      },
+    );
+
+    // The wizard's alias must survive a refresh that legitimately drops the
+    // other models; it is still routable through `gpt-5.6-sol`.
+    expect(result.rows.map((row) => row.model)).toContain("gpt-5.6-sol-sublyx");
+  });
+
+  it("keeps every catalog row when a refresh returns a truncated list", () => {
+    const initial: CodexCatalogRowLike[] = [
+      { model: "gpt-5.6-sol", upstreamModel: "gpt-5.6-sol" },
+      { model: "gpt-6-astra", upstreamModel: "gpt-6-astra" },
+      { model: "gpt-6-luna", upstreamModel: "gpt-6-luna" },
+      { model: "gpt-6-sol", upstreamModel: "gpt-6-sol" },
+    ];
+
+    const result = reconcileFetchedCodexCatalogRows(
+      initial,
+      [{ id: "gpt-6-sol" }],
+      source,
+      {
+        appendNew: true,
+        createRow,
+        existingMetadataMode: "refresh",
+        removeMissingRemote: true,
+        maxRemovalRatio: 0.5,
+      },
+    );
+
+    // A single-model response is not authoritative evidence that the other
+    // three were retired upstream; keep them and say the removal was declined.
+    expect(result.rows.map((row) => row.model)).toEqual([
+      "gpt-5.6-sol",
+      "gpt-6-astra",
+      "gpt-6-luna",
+      "gpt-6-sol",
+    ]);
+    expect(result.removed).toBe(0);
+    expect(result.removalSuppressed).toBe(true);
+    expect(result.removedModels).toEqual([
+      "gpt-5.6-sol",
+      "gpt-6-astra",
+      "gpt-6-luna",
+    ]);
+  });
+
+  it("still removes a small genuinely-missing set", () => {
+    const initial: CodexCatalogRowLike[] = [
+      { model: "a", upstreamModel: "a" },
+      { model: "b", upstreamModel: "b" },
+      { model: "c", upstreamModel: "c" },
+      { model: "d", upstreamModel: "d" },
+    ];
+
+    const result = reconcileFetchedCodexCatalogRows(
+      initial,
+      [{ id: "a" }, { id: "b" }, { id: "c" }, { id: "d" }, { id: "e" }],
+      source,
+      {
+        appendNew: true,
+        createRow,
+        existingMetadataMode: "refresh",
+        removeMissingRemote: true,
+      },
+    );
+
+    expect(result.rows.map((row) => row.model)).toEqual([
+      "a",
+      "b",
+      "c",
+      "d",
+      "e",
+    ]);
+    expect(result.removed).toBe(0);
+    expect(result.removalSuppressed).toBe(false);
   });
 
   it("preserves catalog order and existing row state when syncing", () => {

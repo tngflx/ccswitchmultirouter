@@ -3107,7 +3107,10 @@
       "enabled": "{{app}} routing enabled",
       "disabled": "{{app}} routing disabled",
       "failed": "Failed to toggle routing: {{detail}}",
+      "restartCodexTitle": "Restart Codex Desktop",
       "restartCodexConfirm": "Codex Desktop is running. Restart it now so the routing change can apply? Unsaved Codex work may be interrupted. While routing remains enabled, CCSwitchMulti startup will also restart a verified running Codex shell before restoring takeover.",
+      "stopCodexConfirm": "Codex Desktop is running. Restart it to turn off local routing? Unsaved Codex work may be interrupted.",
+      "stopAllCodexConfirm": "Codex Desktop is running. Restart it while stopping the proxy and restoring all app configurations? Unsaved Codex work may be interrupted.",
       "processCheckFailed": "Could not inspect the running Codex Desktop process: {{detail}}",
       "closeCodexBeforeDisable": "Close Codex Desktop before turning off its local routing, then reopen it. Its running app-server may still use the old proxy address.",
       "tooltip": {

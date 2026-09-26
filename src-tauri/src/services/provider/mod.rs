@@ -5425,6 +5425,8 @@ impl ProviderService {
         state: &AppState,
         provider_id: &str,
     ) -> Result<CodexForceRepairOutcome, AppError> {
+        crate::codex_desktop::ensure_codex_desktop_closed_for_routing_transition()
+            .map_err(AppError::Message)?;
         let original_provider = state
             .db
             .get_provider_by_id(provider_id, AppType::Codex.as_str())?

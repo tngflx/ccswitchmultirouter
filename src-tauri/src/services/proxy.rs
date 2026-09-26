@@ -709,7 +709,7 @@ impl ProxyService {
     /// or live configuration state. Provider switching already has this
     /// boundary; takeover must enforce the same invariant because it can be
     /// invoked independently from the home-page toggle.
-    fn preflight_codex_takeover(&self) -> Result<(), String> {
+    pub(crate) fn preflight_codex_takeover(&self) -> Result<(), String> {
         let Some(provider) = self.get_current_provider_for_app(&AppType::Codex)? else {
             return Ok(());
         };
@@ -1066,6 +1066,29 @@ impl ProxyService {
         has_backup && self.switch_locks.is_locked_for_app(app_type_str).await
     }
 
+    /// Restoring Codex routing is a runtime transition, even when the persisted
+    /// takeover flag has drifted. Protect every service-level restore entry point
+    /// so callers cannot bypass the command-layer Desktop check.
+    async fn ensure_codex_desktop_closed_before_restore(&self) -> Result<(), String> {
+        let configured = self
+            .db
+            .get_proxy_config_for_app("codex")
+            .await
+            .map_err(|e| format!("获取 codex 配置失败: {e}"))?
+            .enabled;
+        let has_backup = self
+            .db
+            .get_live_backup("codex")
+            .await
+            .map_err(|e| format!("读取 codex Live 备份失败: {e}"))?
+            .is_some();
+        let live_taken_over = self.detect_takeover_in_live_config_for_app(&AppType::Codex);
+        if configured || has_backup || live_taken_over {
+            crate::codex_desktop::ensure_codex_desktop_closed_for_routing_transition()?;
+        }
+        Ok(())
+    }
+
     /// 为指定应用开启/关闭 Live 接管
     ///
     /// - 开启：自动启动代理服务，仅接管当前 app 的 Live 配置
@@ -1076,14 +1099,42 @@ impl ProxyService {
         let _guard = self.switch_locks.lock_for_app(app_type_str).await;
         let _lifecycle_guard = self.lifecycle_lock.lock().await;
 
-        if enabled {
-            if app == AppType::Codex {
-                // Do this before starting the proxy or changing the live
-                // backup. A malformed/legacy local router must leave the
-                // toggle and the user's live config untouched.
+        // Codex Desktop keeps its app-server route in memory. Any implicit
+        // takeover transition must therefore be rejected while the shell is
+        // alive; the explicit UI restart command is the only path allowed to
+        // stop and relaunch it.
+        if app == AppType::Codex {
+            // Validate the active router before inspecting Desktop state. A
+            // malformed or legacy router must fail with its actionable schema
+            // error even when Desktop happens to be running; no routing or
+            // process transition is needed for this rejected request.
+            if enabled {
                 self.preflight_codex_takeover()?;
             }
 
+            let current_config = self
+                .db
+                .get_proxy_config_for_app(app_type_str)
+                .await
+                .map_err(|e| format!("获取 {app_type_str} 配置失败: {e}"))?;
+            let live_taken_over = self.detect_takeover_in_live_config_for_app(&app);
+            let has_backup = self
+                .db
+                .get_live_backup(app_type_str)
+                .await
+                .map_err(|e| format!("读取 {app_type_str} Live 备份失败: {e}"))?
+                .is_some();
+            let transition_required = if enabled {
+                !current_config.enabled || !live_taken_over
+            } else {
+                current_config.enabled || live_taken_over || has_backup
+            };
+            if transition_required {
+                crate::codex_desktop::ensure_codex_desktop_closed_for_routing_transition()?;
+            }
+        }
+
+        if enabled {
             // 1) 代理服务未运行则自动启动
             if !self.is_running().await {
                 if let Err(start_error) = self.start_locked().await {
@@ -1404,6 +1455,10 @@ impl ProxyService {
         );
 
         if *app == AppType::Codex {
+            crate::codex_desktop::ensure_codex_desktop_closed_for_routing_transition()?;
+        }
+
+        if *app == AppType::Codex {
             self.stop_codex_guardian().await;
         }
 
@@ -1458,6 +1513,9 @@ impl ProxyService {
         provider_id: &str,
     ) -> Result<(), String> {
         let app_type_str = app_type.as_str();
+        if *app_type == AppType::Codex {
+            crate::codex_desktop::ensure_codex_desktop_closed_for_routing_transition()?;
+        }
         let previous_current = crate::settings::get_effective_current_provider(&self.db, app_type)
             .map_err(|e| format!("读取当前 provider 失败: {e}"))?;
 
@@ -1570,6 +1628,22 @@ impl ProxyService {
         let app_type_str = app_type.as_str();
         let _switch_guard = self.switch_locks.lock_for_app(app_type_str).await;
         let _lifecycle_guard = self.lifecycle_lock.lock().await;
+        let current_config = self
+            .db
+            .get_proxy_config_for_app(app_type_str)
+            .await
+            .map_err(|e| format!("获取 {app_type_str} 配置失败: {e}"))?;
+        let has_backup = self
+            .db
+            .get_live_backup(app_type_str)
+            .await
+            .map_err(|e| format!("读取 {app_type_str} Live 备份失败: {e}"))?
+            .is_some();
+        let live_taken_over = self.detect_takeover_in_live_config_for_app(app_type);
+        if *app_type == AppType::Codex && (current_config.enabled || has_backup || live_taken_over)
+        {
+            crate::codex_desktop::ensure_codex_desktop_closed_for_routing_transition()?;
+        }
         if *app_type == AppType::Codex {
             self.stop_codex_guardian().await;
         }
@@ -1989,6 +2063,7 @@ impl ProxyService {
     pub async fn stop_with_restore(&self) -> Result<(), String> {
         let _switch_guards = self.lock_all_takeover_apps().await;
         let _lifecycle_guard = self.lifecycle_lock.lock().await;
+        self.ensure_codex_desktop_closed_before_restore().await?;
         // Keep the listener alive until clients can read restored live config.
         // On failure, leave the proxy available and retain the takeover state.
         self.stop_codex_guardian().await;
@@ -2039,6 +2114,7 @@ impl ProxyService {
     pub async fn stop_with_restore_keep_state(&self) -> Result<(), String> {
         let _switch_guards = self.lock_all_takeover_apps().await;
         let _lifecycle_guard = self.lifecycle_lock.lock().await;
+        self.ensure_codex_desktop_closed_before_restore().await?;
         self.stop_codex_guardian().await;
         self.restore_live_configs_locked().await?;
 
@@ -3183,6 +3259,7 @@ impl ProxyService {
     pub async fn recover_from_crash(&self) -> Result<(), String> {
         let _switch_guards = self.lock_all_takeover_apps().await;
         let _lifecycle_guard = self.lifecycle_lock.lock().await;
+        self.ensure_codex_desktop_closed_before_restore().await?;
         // 1. 恢复 Live 配置
         self.restore_live_configs_locked().await?;
 
@@ -6628,6 +6705,27 @@ wire_api = "responses"
             .set_takeover_for_app("codex", false)
             .await
             .expect("disable Codex takeover");
+        assert!(
+            !service.detect_takeover_in_live_config_for_app(&AppType::Codex),
+            "disable must restore a non-proxy live config"
+        );
+        assert!(
+            db.get_live_backup("codex")
+                .await
+                .expect("read backup after disable")
+                .is_none(),
+            "disable must clear the old takeover backup"
+        );
+        service
+            .set_takeover_for_app("codex", true)
+            .await
+            .expect("re-enable Codex takeover after restore");
+        assert!(service.detect_takeover_in_live_config_for_app(&AppType::Codex));
+        assert!(service.is_running().await);
+        service
+            .set_takeover_for_app("codex", false)
+            .await
+            .expect("disable Codex takeover again");
         crate::settings::update_settings(crate::settings::AppSettings::default())
             .expect("reset settings");
     }

@@ -141,10 +141,14 @@ describe("useProxyStatus", () => {
 
     await act(async () => {
       await result.current.restartCodexDesktop(true);
+      await result.current.restartCodexDesktop(false);
     });
 
     expect(invokeMock).toHaveBeenCalledWith("restart_codex_desktop", {
       enabled: true,
+    });
+    expect(invokeMock).toHaveBeenCalledWith("restart_codex_desktop", {
+      enabled: false,
     });
     expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: proxyKeys.status });
     expect(invalidateSpy).toHaveBeenCalledWith({
@@ -179,5 +183,16 @@ describe("useProxyStatus", () => {
       "proxy.takeover.closeCodexBeforeDisable",
     );
     expect(toastSuccessMock).not.toHaveBeenCalled();
+  });
+
+  it("passes confirmed master-stop consent to the backend", async () => {
+    const { wrapper } = createWrapper();
+    const { result } = renderHook(() => useProxyStatus(), { wrapper });
+    await act(async () => {
+      await result.current.stopWithRestore(true);
+    });
+    expect(invokeMock).toHaveBeenCalledWith("stop_proxy_with_restore", {
+      restartCodexDesktop: true,
+    });
   });
 });

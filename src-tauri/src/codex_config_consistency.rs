@@ -42,11 +42,7 @@ pub enum CodexConfigConsistencyAction {
     Later,
 }
 
-fn canonicalize_toml_value(value: &toml::Value, key: Option<&str>) -> JsonValue {
-    if key == Some("model_catalog_json") {
-        return JsonValue::String("<ccsm-managed-model-catalog>".to_string());
-    }
-
+fn canonicalize_toml_value(value: &toml::Value) -> JsonValue {
     match value {
         toml::Value::String(value) => JsonValue::String(value.clone()),
         toml::Value::Integer(value) => JsonValue::Number((*value).into()),
@@ -55,38 +51,156 @@ fn canonicalize_toml_value(value: &toml::Value, key: Option<&str>) -> JsonValue 
             .unwrap_or_else(|| JsonValue::String(value.to_string())),
         toml::Value::Boolean(value) => JsonValue::Bool(*value),
         toml::Value::Datetime(value) => JsonValue::String(value.to_string()),
-        toml::Value::Array(values) => JsonValue::Array(
-            values
-                .iter()
-                .map(|value| canonicalize_toml_value(value, None))
-                .collect(),
-        ),
+        toml::Value::Array(values) => {
+            JsonValue::Array(values.iter().map(canonicalize_toml_value).collect())
+        }
         toml::Value::Table(values) => {
             let mut object = JsonMap::new();
             for (name, value) in values {
-                object.insert(
-                    name.clone(),
-                    canonicalize_toml_value(value, Some(name.as_str())),
-                );
+                object.insert(name.clone(), canonicalize_toml_value(value));
             }
             JsonValue::Object(object)
         }
     }
 }
 
+#[cfg(test)]
 fn canonicalize_toml(text: &str) -> Result<JsonValue, AppError> {
     let value = text.parse::<toml::Value>().map_err(|error| {
         AppError::Config(format!("Codex config.toml semantic parse failed: {error}"))
     })?;
-    Ok(canonicalize_toml_value(&value, None))
+    Ok(canonicalize_toml_value(&value))
 }
 
+#[cfg(test)]
 pub(crate) fn fingerprint_toml(text: &str) -> Result<String, AppError> {
     let canonical = canonicalize_toml(text)?;
     let bytes = serde_json::to_vec(&canonical)
         .map_err(|error| AppError::JsonSerialize { source: error })?;
     let digest = Sha256::digest(bytes);
     Ok(digest.iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
+/// Top-level `config.toml` keys CCSwitchMulti owns and may rewrite.
+///
+/// This is the ownership boundary that keeps Codex-owned runtime state out of
+/// the drift fingerprint. Codex CLI and Codex Desktop legitimately own
+/// `approval_policy`, `notify`, `[agents]`, `[desktop]`, `[features.*]`,
+/// `[marketplaces]`, `[mcp_servers]`, `[plugins]`, `[projects]` and `[windows]`,
+/// and rewrite them on every launch and update. Fingerprinting the whole
+/// document made each of those look like external Provider drift.
+const CCSM_MANAGED_TOP_LEVEL_KEYS: &[&str] = &[
+    "model",
+    "model_provider",
+    // Fork-owned: per-provider reasoning effort is part of the Provider's
+    // Codex config, so a hand edit that disagrees with the Provider form is
+    // real routing drift worth reporting.
+    "model_reasoning_effort",
+    "model_catalog_json",
+    "openai_base_url",
+    "experimental_bearer_token",
+];
+
+/// `developer_instructions` is shared: CCSwitchMulti owns only the Sub-Agent V2
+/// policy block. The rest of the string is the user's own text.
+const NO_MANAGED_SUBAGENT_POLICY: &str = "<ccsm-no-managed-subagent-policy>";
+
+fn active_model_provider_id(value: &toml::Value) -> Option<String> {
+    value
+        .get("model_provider")
+        .and_then(toml::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn managed_subagent_policy(root: &toml::map::Map<String, toml::Value>) -> Option<String> {
+    let instructions = root.get("developer_instructions")?.as_str()?;
+    Some(
+        codex_config::codex_subagent_v2_policy_block(instructions)
+            .unwrap_or_else(|| NO_MANAGED_SUBAGENT_POLICY.to_string()),
+    )
+}
+
+fn ccsm_owned_projection(
+    text: &str,
+    provider_id_hint: Option<&str>,
+) -> Result<JsonValue, AppError> {
+    let value = text.parse::<toml::Value>().map_err(|error| {
+        AppError::Config(format!("Codex config.toml semantic parse failed: {error}"))
+    })?;
+    let root = value
+        .as_table()
+        .ok_or_else(|| AppError::Config("Codex config.toml root must be a table".to_string()))?;
+    let mut managed = toml::map::Map::new();
+
+    for key in CCSM_MANAGED_TOP_LEVEL_KEYS {
+        if let Some(value) = root.get(*key) {
+            managed.insert((*key).to_string(), value.clone());
+        }
+    }
+
+    if let Some(policy) = managed_subagent_policy(root) {
+        managed.insert(
+            "developer_instructions".to_string(),
+            toml::Value::String(policy),
+        );
+    }
+
+    if root
+        .get(crate::codex_config::CODEX_WEB_SEARCH_FIELD)
+        .and_then(toml::Value::as_str)
+        == Some(crate::codex_config::CODEX_WEB_SEARCH_DISABLED)
+    {
+        managed.insert(
+            crate::codex_config::CODEX_WEB_SEARCH_FIELD.to_string(),
+            root[crate::codex_config::CODEX_WEB_SEARCH_FIELD].clone(),
+        );
+    }
+
+    let provider_id = provider_id_hint
+        .map(str::to_string)
+        .or_else(|| active_model_provider_id(&value));
+    if provider_id.as_deref() == Some(crate::codex_config::CC_SWITCH_CODEX_ROUTER_MODEL_PROVIDER_ID)
+    {
+        for key in ["model_context_window", "model_auto_compact_token_limit"] {
+            if let Some(value) = root.get(key) {
+                managed.insert(key.to_string(), value.clone());
+            }
+        }
+    }
+
+    if let Some(provider_id) = provider_id {
+        if let Some(provider) = root
+            .get("model_providers")
+            .and_then(toml::Value::as_table)
+            .and_then(|providers| providers.get(&provider_id))
+        {
+            let mut providers = toml::map::Map::new();
+            providers.insert(provider_id, provider.clone());
+            managed.insert("model_providers".to_string(), toml::Value::Table(providers));
+        }
+    }
+
+    Ok(canonicalize_toml_value(&toml::Value::Table(managed)))
+}
+
+fn fingerprint_json(value: &JsonValue) -> Result<String, AppError> {
+    let bytes =
+        serde_json::to_vec(value).map_err(|error| AppError::JsonSerialize { source: error })?;
+    let digest = Sha256::digest(bytes);
+    Ok(digest.iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
+fn managed_fingerprint(text: &str, provider_id_hint: Option<&str>) -> Result<String, AppError> {
+    fingerprint_json(&ccsm_owned_projection(text, provider_id_hint)?)
+}
+
+fn active_model_provider_id_from_text(text: &str) -> Result<Option<String>, AppError> {
+    let value = text.parse::<toml::Value>().map_err(|error| {
+        AppError::Config(format!("Codex config.toml semantic parse failed: {error}"))
+    })?;
+    Ok(active_model_provider_id(&value))
 }
 
 fn flatten_json(value: &JsonValue, prefix: &str, output: &mut BTreeMap<String, String>) {
@@ -118,6 +232,7 @@ fn flatten_json(value: &JsonValue, prefix: &str, output: &mut BTreeMap<String, S
     }
 }
 
+#[cfg(test)]
 pub(crate) fn changed_key_paths(before: &str, after: &str) -> Result<Vec<String>, AppError> {
     let before = canonicalize_toml(before)?;
     let after = canonicalize_toml(after)?;
@@ -134,6 +249,172 @@ pub(crate) fn changed_key_paths(before: &str, after: &str) -> Result<Vec<String>
         .take(64)
         .cloned()
         .collect())
+}
+
+fn changed_managed_key_paths(
+    expected: &str,
+    actual: &str,
+    provider_id_hint: Option<&str>,
+) -> Result<Vec<String>, AppError> {
+    let expected = ccsm_owned_projection(expected, provider_id_hint)?;
+    let actual = ccsm_owned_projection(actual, provider_id_hint)?;
+    let mut expected_paths = BTreeMap::new();
+    let mut actual_paths = BTreeMap::new();
+    flatten_json(&expected, "", &mut expected_paths);
+    flatten_json(&actual, "", &mut actual_paths);
+    Ok(expected_paths
+        .keys()
+        .chain(actual_paths.keys())
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .filter(|key| expected_paths.get(*key) != actual_paths.get(*key))
+        .take(64)
+        .cloned()
+        .collect())
+}
+
+fn copy_or_remove_top_level_item(
+    target: &mut toml_edit::DocumentMut,
+    expected: &toml_edit::DocumentMut,
+    key: &str,
+) {
+    match expected.get(key).cloned() {
+        Some(item) => {
+            target.as_table_mut().insert(key, item);
+        }
+        None => {
+            target.as_table_mut().remove(key);
+        }
+    }
+}
+
+/// Rewrite only the Sub-Agent V2 policy block inside `developer_instructions`.
+///
+/// This mirrors the ownership rule enforced by
+/// `codex_config::project_codex_subagent_v2_parent_instructions`: user text
+/// outside the markers is preserved verbatim, and the block is re-encoded as a
+/// basic string so Codex Desktop's notify updater cannot mistake a line inside
+/// the instructions for the root `notify` setting.
+fn merge_managed_subagent_policy(
+    target: &mut toml_edit::DocumentMut,
+    expected: &toml_edit::DocumentMut,
+) -> Result<(), AppError> {
+    let expected_policy = expected
+        .get("developer_instructions")
+        .and_then(toml_edit::Item::as_str)
+        .and_then(codex_config::codex_subagent_v2_policy_block);
+    let live_value = target
+        .get("developer_instructions")
+        .and_then(toml_edit::Item::as_str)
+        .unwrap_or("");
+    let user_instructions = codex_config::strip_codex_subagent_v2_policy_block(live_value);
+    let projected = match expected_policy {
+        Some(policy) if user_instructions.is_empty() => policy,
+        Some(policy) => format!("{user_instructions}\n\n{policy}"),
+        None => user_instructions,
+    };
+    if projected.is_empty() {
+        target.as_table_mut().remove("developer_instructions");
+        return Ok(());
+    }
+    let basic_repr = serde_json::to_string(&projected)
+        .map_err(|error| AppError::JsonSerialize { source: error })?;
+    let projected_value = basic_repr.parse::<toml_edit::Value>().map_err(|error| {
+        AppError::Config(format!(
+            "Failed to encode Codex developer instructions: {error}"
+        ))
+    })?;
+    target.as_table_mut().remove("developer_instructions");
+    target["developer_instructions"] = toml_edit::Item::Value(projected_value);
+    Ok(())
+}
+
+/// Merge the CCSwitchMulti-owned projection into the latest live document.
+///
+/// Replacing the whole file (the previous behaviour) deleted Codex-owned
+/// `desktop`, `projects`, `plugins`, `mcp_servers` and runtime sections, which
+/// Codex immediately rewrote — re-arming the same drift on the next poll.
+fn merge_ccsm_owned_projection(current: &str, expected: &str) -> Result<String, AppError> {
+    let mut target = current
+        .parse::<toml_edit::DocumentMut>()
+        .map_err(|error| AppError::Config(format!("Invalid live Codex config.toml: {error}")))?;
+    let expected = expected
+        .parse::<toml_edit::DocumentMut>()
+        .map_err(|error| {
+            AppError::Config(format!("Invalid expected Codex config.toml: {error}"))
+        })?;
+
+    for key in CCSM_MANAGED_TOP_LEVEL_KEYS {
+        copy_or_remove_top_level_item(&mut target, &expected, key);
+    }
+
+    merge_managed_subagent_policy(&mut target, &expected)?;
+
+    match expected
+        .get(crate::codex_config::CODEX_WEB_SEARCH_FIELD)
+        .and_then(toml_edit::Item::as_str)
+    {
+        Some(crate::codex_config::CODEX_WEB_SEARCH_DISABLED) => copy_or_remove_top_level_item(
+            &mut target,
+            &expected,
+            crate::codex_config::CODEX_WEB_SEARCH_FIELD,
+        ),
+        _ => {
+            if target
+                .get(crate::codex_config::CODEX_WEB_SEARCH_FIELD)
+                .and_then(toml_edit::Item::as_str)
+                == Some(crate::codex_config::CODEX_WEB_SEARCH_DISABLED)
+            {
+                target
+                    .as_table_mut()
+                    .remove(crate::codex_config::CODEX_WEB_SEARCH_FIELD);
+            }
+        }
+    }
+
+    let expected_provider_id = expected
+        .get("model_provider")
+        .and_then(toml_edit::Item::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+
+    if expected_provider_id.as_deref()
+        == Some(crate::codex_config::CC_SWITCH_CODEX_ROUTER_MODEL_PROVIDER_ID)
+    {
+        for key in ["model_context_window", "model_auto_compact_token_limit"] {
+            copy_or_remove_top_level_item(&mut target, &expected, key);
+        }
+    }
+
+    if let Some(provider_id) = expected_provider_id {
+        let expected_provider = expected
+            .get("model_providers")
+            .and_then(toml_edit::Item::as_table_like)
+            .and_then(|providers| providers.get(&provider_id))
+            .cloned();
+
+        if target.get("model_providers").is_none() {
+            target["model_providers"] = toml_edit::table();
+        }
+        let providers = target
+            .get_mut("model_providers")
+            .and_then(toml_edit::Item::as_table_like_mut)
+            .ok_or_else(|| AppError::Config("Codex model_providers must be a table".to_string()))?;
+        match expected_provider {
+            Some(provider) => {
+                providers.insert(&provider_id, provider);
+            }
+            None => {
+                providers.remove(&provider_id);
+            }
+        }
+        if providers.is_empty() {
+            target.as_table_mut().remove("model_providers");
+        }
+    }
+
+    Ok(target.to_string())
 }
 
 fn report(
@@ -200,6 +481,10 @@ pub fn inspect(state: &AppState) -> Result<CodexConfigConsistencyReport, AppErro
         }
     };
 
+    let expected_provider_id = active_model_provider_id_from_text(&expected_text)?;
+    let expected_fingerprint =
+        managed_fingerprint(&expected_text, expected_provider_id.as_deref())?;
+
     let live_path = codex_config::get_codex_config_path();
     let actual_text = match fs::read_to_string(&live_path) {
         Ok(text) => text,
@@ -207,7 +492,7 @@ pub fn inspect(state: &AppState) -> Result<CodexConfigConsistencyReport, AppErro
             return Ok(report(
                 CodexConfigConsistencyState::Unavailable,
                 Some(provider_id),
-                Some(fingerprint_toml(&expected_text)?),
+                Some(expected_fingerprint),
                 None,
                 Vec::new(),
                 Some("live_config_missing"),
@@ -216,21 +501,21 @@ pub fn inspect(state: &AppState) -> Result<CodexConfigConsistencyReport, AppErro
         Err(error) => return Err(AppError::io(&live_path, error)),
     };
 
-    let expected_fingerprint = fingerprint_toml(&expected_text)?;
-    let actual_fingerprint = match fingerprint_toml(&actual_text) {
-        Ok(fingerprint) => fingerprint,
-        Err(error) => {
-            log::warn!("Codex config consistency live TOML parse failed: {error}");
-            return Ok(report(
-                CodexConfigConsistencyState::Unavailable,
-                Some(provider_id),
-                Some(expected_fingerprint),
-                None,
-                Vec::new(),
-                Some("invalid_toml"),
-            ));
-        }
-    };
+    let actual_fingerprint =
+        match managed_fingerprint(&actual_text, expected_provider_id.as_deref()) {
+            Ok(fingerprint) => fingerprint,
+            Err(error) => {
+                log::warn!("Codex config consistency live TOML parse failed: {error}");
+                return Ok(report(
+                    CodexConfigConsistencyState::Unavailable,
+                    Some(provider_id),
+                    Some(expected_fingerprint),
+                    None,
+                    Vec::new(),
+                    Some("invalid_toml"),
+                ));
+            }
+        };
 
     if expected_fingerprint == actual_fingerprint {
         return Ok(report(
@@ -248,7 +533,11 @@ pub fn inspect(state: &AppState) -> Result<CodexConfigConsistencyReport, AppErro
         Some(provider_id),
         Some(expected_fingerprint),
         Some(actual_fingerprint),
-        changed_key_paths(&expected_text, &actual_text)?,
+        changed_managed_key_paths(
+            &expected_text,
+            &actual_text,
+            expected_provider_id.as_deref(),
+        )?,
         Some("live_config_changed"),
     ))
 }
@@ -300,19 +589,20 @@ pub fn resolve(
             ));
             let mut backup_created = false;
             codex_config::reconcile_codex_live_config_atomic(|before| {
-                let observed = fingerprint_toml(before)?;
+                let candidate = build_codex_live_config_for_provider(&state.db, &provider)?;
+                let provider_id_hint = active_model_provider_id_from_text(&candidate)?;
+                let observed = managed_fingerprint(before, provider_id_hint.as_deref())?;
                 if observed != expected_fingerprint {
                     return Err(AppError::InvalidInput(
                         "codex_config_consistency_stale_fingerprint".to_string(),
                     ));
                 }
-                let candidate = build_codex_live_config_for_provider(&state.db, &provider)?;
                 if !backup_created {
                     fs::write(&backup_path, before.as_bytes())
                         .map_err(|error| AppError::io(&backup_path, error))?;
                     backup_created = true;
                 }
-                Ok(candidate)
+                merge_ccsm_owned_projection(before, &candidate)
             })?;
             inspect(state)
         }
@@ -446,6 +736,237 @@ mod tests {
             .changed_keys
             .contains(&"model_reasoning_effort".to_string()));
         assert!(result.changed_keys.iter().all(|key| !key.contains("high")));
+    }
+
+    /// Regression for the reported Codex 0.157 upgrade regression: every key
+    /// Codex CLI / Codex Desktop writes on its own launch used to be reported
+    /// as "Codex configuration differs from CCSM", and the 30s poll re-armed
+    /// the dialog after every Apply.
+    #[test]
+    #[serial]
+    fn inspect_ignores_codex_owned_runtime_and_user_changes() {
+        let _home = TestHomeGuard::new();
+        crate::settings::reload_settings().expect("reload settings");
+        let (state, _) = seed_provider();
+        let provider = state
+            .db
+            .get_provider_by_id("consistency-provider", AppType::Codex.as_str())
+            .expect("read provider")
+            .expect("provider exists");
+        let expected = build_codex_live_config_for_provider(&state.db, &provider)
+            .expect("build expected live config");
+        let mut live = expected
+            .parse::<toml_edit::DocumentMut>()
+            .expect("parse expected config");
+        live["approval_policy"] = toml_edit::value("on-request");
+        live["notify"] = toml_edit::value(
+            r"C:\Users\felix\AppData\Local\OpenAI\Codex\runtimes\cua_node\bin\codex-computer-use.exe",
+        );
+        live["agents"]["max_concurrent_threads_per_session"] = toml_edit::value(10);
+        live["agents"]["max_depth"] = toml_edit::value(1);
+        live["desktop"]["ambient-suggestions-enabled"] = toml_edit::value(true);
+        live["desktop"]["conversationDetailMode"] = toml_edit::value("expanded");
+        live["desktop"]["followUpQueueMode"] = toml_edit::value("queue");
+        live["desktop"]["integratedTerminalShell"] = toml_edit::value(false);
+        live["desktop"]["runCodexInWindowsSubsystemForLinux"] = toml_edit::value(false);
+        live["features"]["guardianv2"] = toml_edit::value(false);
+        live["features"]["multi_agent_v2"]["enabled"] = toml_edit::value(true);
+        live["marketplaces"]["openai-bundled"]["source_type"] = toml_edit::value("local");
+        live["mcp_servers"]["node_repl"]["command"] = toml_edit::value(
+            r"C:\Users\felix\AppData\Local\OpenAI\Codex\runtimes\cua_node\bin\node_repl.exe",
+        );
+        live["mcp_servers"]["node_repl"]["env"]["BROWSER_USE_CODEX_APP_VERSION"] =
+            toml_edit::value("26.924.20706");
+        live["plugins"]["browser@openai-bundled"]["enabled"] = toml_edit::value(true);
+        live["projects"][r"h:\repos\ccswitchmulti-fork"]["trust_level"] =
+            toml_edit::value("trusted");
+        live["windows"]["sandbox"] = toml_edit::value("elevated");
+        codex_config::write_codex_live_config_atomic(Some(&live.to_string()))
+            .expect("write Codex-owned changes");
+
+        let result = inspect(&state).expect("inspect config consistency");
+
+        assert_eq!(
+            result.state,
+            CodexConfigConsistencyState::Consistent,
+            "Codex-owned keys leaked into drift: {:?}",
+            result.changed_keys
+        );
+        assert!(result.changed_keys.is_empty());
+    }
+
+    /// Real routing drift must still be reported, and the reported key list
+    /// must not be padded with Codex-owned noise.
+    #[test]
+    #[serial]
+    fn inspect_reports_only_ccsm_owned_route_drift() {
+        let _home = TestHomeGuard::new();
+        crate::settings::reload_settings().expect("reload settings");
+        let (state, _) = seed_provider();
+        let provider = state
+            .db
+            .get_provider_by_id("consistency-provider", AppType::Codex.as_str())
+            .expect("read provider")
+            .expect("provider exists");
+        let expected = build_codex_live_config_for_provider(&state.db, &provider)
+            .expect("build expected live config");
+        let mut live = expected
+            .parse::<toml_edit::DocumentMut>()
+            .expect("parse expected config");
+        live["model"] = toml_edit::value("gpt-5.6-sol");
+        live["approval_policy"] = toml_edit::value("never");
+        live["desktop"]["integratedTerminalShell"] = toml_edit::value(false);
+        codex_config::write_codex_live_config_atomic(Some(&live.to_string()))
+            .expect("write drifted live config");
+
+        let result = inspect(&state).expect("inspect config consistency");
+
+        assert_eq!(result.state, CodexConfigConsistencyState::ExternalDrift);
+        assert_eq!(result.changed_keys, vec!["model".to_string()]);
+    }
+
+    /// `developer_instructions` is shared: the user's own text is not
+    /// CCSwitchMulti drift, but damage to the managed Sub-Agent V2 policy
+    /// block is.
+    #[test]
+    fn subagent_policy_ownership_ignores_user_text_and_tracks_the_managed_block() {
+        let expected = concat!(
+            "developer_instructions = \"[CCSWITCHMULTI_SUBAGENT_V2_POLICY_BEGIN]\\n",
+            "policy v2\\n",
+            "[CCSWITCHMULTI_SUBAGENT_V2_POLICY_END]\"\n",
+        );
+        let with_user_text = concat!(
+            "developer_instructions = \"Keep my own house rule.\\n\\n",
+            "[CCSWITCHMULTI_SUBAGENT_V2_POLICY_BEGIN]\\n",
+            "policy v2\\n",
+            "[CCSWITCHMULTI_SUBAGENT_V2_POLICY_END]\"\n",
+        );
+        let damaged = concat!(
+            "developer_instructions = \"[CCSWITCHMULTI_SUBAGENT_V2_POLICY_BEGIN]\\n",
+            "policy v1\\n",
+            "[CCSWITCHMULTI_SUBAGENT_V2_POLICY_END]\"\n",
+        );
+
+        assert!(changed_managed_key_paths(expected, with_user_text, None)
+            .expect("user text diff")
+            .is_empty());
+        assert_eq!(
+            changed_managed_key_paths(expected, damaged, None).expect("policy diff"),
+            vec!["developer_instructions".to_string()]
+        );
+    }
+
+    #[test]
+    fn apply_merge_replaces_the_policy_block_and_preserves_user_instructions() {
+        let live = concat!(
+            "developer_instructions = \"Keep my own house rule.\\n\\n",
+            "[CCSWITCHMULTI_SUBAGENT_V2_POLICY_BEGIN]\\n",
+            "stale policy\\n",
+            "[CCSWITCHMULTI_SUBAGENT_V2_POLICY_END]\"\n",
+        );
+        let expected = concat!(
+            "developer_instructions = \"[CCSWITCHMULTI_SUBAGENT_V2_POLICY_BEGIN]\\n",
+            "fresh policy\\n",
+            "[CCSWITCHMULTI_SUBAGENT_V2_POLICY_END]\"\n",
+        );
+
+        let merged = merge_ccsm_owned_projection(live, expected).expect("merge owned projection");
+        let parsed: toml::Value = toml::from_str(&merged).expect("parse merged config");
+        let instructions = parsed
+            .get("developer_instructions")
+            .and_then(toml::Value::as_str)
+            .expect("merged developer_instructions");
+
+        assert!(instructions.contains("Keep my own house rule."));
+        assert!(instructions.contains("fresh policy"));
+        assert!(!instructions.contains("stale policy"));
+    }
+
+    /// Apply must repair owned drift without deleting the Codex-owned state
+    /// that the previous whole-file replacement used to wipe.
+    #[test]
+    #[serial]
+    fn apply_ccsm_preserves_codex_owned_sections() {
+        let (_home, state, _) = seed_drifted_state();
+        let live_path = codex_config::get_codex_config_path();
+        let mut live = fs::read_to_string(&live_path)
+            .expect("read drifted live config")
+            .parse::<toml_edit::DocumentMut>()
+            .expect("parse drifted live config");
+        live["approval_policy"] = toml_edit::value("on-request");
+        live["desktop"]["integratedTerminalShell"] = toml_edit::value(false);
+        live["mcp_servers"]["node_repl"]["env"]["BROWSER_USE_CODEX_APP_VERSION"] =
+            toml_edit::value("26.924.20706");
+        live["plugins"]["browser@openai-bundled"]["enabled"] = toml_edit::value(true);
+        live["projects"][r"h:\repos\ccswitchmulti-fork"]["trust_level"] =
+            toml_edit::value("trusted");
+        live["windows"]["sandbox"] = toml_edit::value("elevated");
+        codex_config::write_codex_live_config_atomic(Some(&live.to_string()))
+            .expect("write unmanaged live fields");
+        let before = inspect(&state).expect("inspect drift");
+        let actual = before
+            .actual_fingerprint
+            .clone()
+            .expect("actual fingerprint");
+
+        let after = resolve(&state, actual, CodexConfigConsistencyAction::ApplyCcsm)
+            .expect("apply CCSM config");
+
+        assert_eq!(after.state, CodexConfigConsistencyState::Consistent);
+        let applied = fs::read_to_string(&live_path)
+            .expect("read applied live config")
+            .parse::<toml::Value>()
+            .expect("parse applied live config");
+        assert_eq!(
+            applied.get("approval_policy").and_then(toml::Value::as_str),
+            Some("on-request")
+        );
+        assert_eq!(
+            applied
+                .get("desktop")
+                .and_then(|desktop| desktop.get("integratedTerminalShell"))
+                .and_then(toml::Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            applied
+                .get("mcp_servers")
+                .and_then(|servers| servers.get("node_repl"))
+                .and_then(|server| server.get("env"))
+                .and_then(|env| env.get("BROWSER_USE_CODEX_APP_VERSION"))
+                .and_then(toml::Value::as_str),
+            Some("26.924.20706")
+        );
+        assert_eq!(
+            applied
+                .get("plugins")
+                .and_then(|plugins| plugins.get("browser@openai-bundled"))
+                .and_then(|plugin| plugin.get("enabled"))
+                .and_then(toml::Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            applied
+                .get("projects")
+                .and_then(|projects| projects.get(r"h:\repos\ccswitchmulti-fork"))
+                .and_then(|project| project.get("trust_level"))
+                .and_then(toml::Value::as_str),
+            Some("trusted")
+        );
+        assert_eq!(
+            applied
+                .get("windows")
+                .and_then(|windows| windows.get("sandbox"))
+                .and_then(toml::Value::as_str),
+            Some("elevated")
+        );
+        assert_eq!(
+            applied
+                .get("model_reasoning_effort")
+                .and_then(toml::Value::as_str),
+            Some("medium"),
+            "owned drift must still be repaired"
+        );
     }
 
     #[test]

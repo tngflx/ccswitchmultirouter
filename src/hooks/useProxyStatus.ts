@@ -81,39 +81,44 @@ export function useProxyStatus() {
   });
 
   // 停止服务器（总开关关闭：强制恢复所有已接管的 Live 配置）
-  const stopWithRestoreMutation = useMutation({
-    mutationFn: () => proxyApi.stopProxyWithRestore(),
-    onSuccess: () => {
-      toast.success(
-        t("proxy.stoppedWithRestore", {
-          defaultValue: "代理服务已关闭，已恢复所有接管配置",
-        }),
-        { closeButton: true },
-      );
-      queryClient.invalidateQueries({ queryKey: proxyKeys.status });
-      queryClient.invalidateQueries({ queryKey: proxyKeys.takeoverStatus });
-      // 彻底删除所有供应商健康状态缓存（后端已清空数据库记录）
-      queryClient.removeQueries({ queryKey: ["providerHealth"] });
-      // 彻底删除所有熔断器统计缓存（代理停止后熔断器状态已重置）
-      queryClient.removeQueries({ queryKey: ["circuitBreakerStats"] });
-      // 注意：故障转移队列和开关状态会保留，不需要刷新
+  const stopWithRestoreMutation = useMutation<void, Error, boolean | undefined>(
+    {
+      mutationFn: (restartCodexDesktop = false) =>
+        proxyApi.stopProxyWithRestore(restartCodexDesktop),
+      onSuccess: () => {
+        toast.success(
+          t("proxy.stoppedWithRestore", {
+            defaultValue: "代理服务已关闭，已恢复所有接管配置",
+          }),
+          { closeButton: true },
+        );
+        queryClient.invalidateQueries({ queryKey: proxyKeys.status });
+        queryClient.invalidateQueries({ queryKey: proxyKeys.takeoverStatus });
+        // 彻底删除所有供应商健康状态缓存（后端已清空数据库记录）
+        queryClient.removeQueries({ queryKey: ["providerHealth"] });
+        // 彻底删除所有熔断器统计缓存（代理停止后熔断器状态已重置）
+        queryClient.removeQueries({ queryKey: ["circuitBreakerStats"] });
+        // 注意：故障转移队列和开关状态会保留，不需要刷新
+      },
+      onError: (error: Error) => {
+        queryClient.invalidateQueries({ queryKey: proxyKeys.status });
+        queryClient.invalidateQueries({ queryKey: proxyKeys.takeoverStatus });
+        const detail =
+          extractErrorMessage(error) ||
+          t("common.unknown", { defaultValue: "未知错误" });
+        if (detail.includes("CODEX_DESKTOP_ACTIVE")) {
+          toast.error(t("proxy.takeover.closeCodexBeforeDisable"));
+          return;
+        }
+        toast.error(
+          t("proxy.stopWithRestoreFailed", {
+            detail,
+            defaultValue: `停止失败: ${detail}`,
+          }),
+        );
+      },
     },
-    onError: (error: Error) => {
-      const detail =
-        extractErrorMessage(error) ||
-        t("common.unknown", { defaultValue: "未知错误" });
-      if (detail.includes("CODEX_DESKTOP_ACTIVE")) {
-        toast.error(t("proxy.takeover.closeCodexBeforeDisable"));
-        return;
-      }
-      toast.error(
-        t("proxy.stopWithRestoreFailed", {
-          detail,
-          defaultValue: `停止失败: ${detail}`,
-        }),
-      );
-    },
-  });
+  );
 
   const handleTakeoverSuccess = async (variables: {
     appType: string;
@@ -150,6 +155,8 @@ export function useProxyStatus() {
   };
 
   const handleTakeoverError = (error: Error) => {
+    queryClient.invalidateQueries({ queryKey: proxyKeys.status });
+    queryClient.invalidateQueries({ queryKey: proxyKeys.takeoverStatus });
     const detail =
       extractErrorMessage(error) ||
       t("common.unknown", { defaultValue: "未知错误" });

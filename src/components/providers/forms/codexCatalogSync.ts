@@ -29,6 +29,13 @@ export interface CatalogSyncResult<T extends CodexCatalogRowLike> {
   hydrated: number;
   updated: string[];
   removed: number;
+  /** Visible row names that the authoritative remote list no longer offers. */
+  removedModels: string[];
+  /**
+   * True when a large one-sided drop was declined as a truncated response.
+   * The catalog is kept intact and `removed` is reported as 0.
+   */
+  removalSuppressed: boolean;
 }
 
 export type ExistingCatalogMetadataMode = "fill-missing" | "refresh";
@@ -161,6 +168,7 @@ export function reconcileFetchedCodexCatalogRows<T extends CodexCatalogRowLike>(
     createRow: (seed: CodexCatalogRowLike) => T;
     existingMetadataMode?: ExistingCatalogMetadataMode;
     removeMissingRemote?: boolean;
+    maxRemovalRatio?: number;
   },
 ): CatalogSyncResult<T> {
   const next = [...rows];
@@ -193,7 +201,17 @@ export function reconcileFetchedCodexCatalogRows<T extends CodexCatalogRowLike>(
         existingModels: rows,
       });
       const patch: Partial<CodexCatalogRowLike> = {};
-      if (!hasValue(rowExplicitUpstreamModel(row))) {
+      // Only persist an upstream binding when it carries information the
+      // visible name does not already have. Writing `upstreamModel` for a row
+      // whose `model` already equals the remote id looks like a harmless
+      // no-op, but it reclassifies a manually maintained row as remotely
+      // bound, and `pruneMissingRemoteCodexCatalogRows` then deletes it on the
+      // next refresh that omits it. That silent second-pass deletion is what
+      // made a saved catalog lose models after an otherwise routine sync.
+      if (
+        !hasValue(rowExplicitUpstreamModel(row)) &&
+        catalogModelIdentity(row.model) !== identity
+      ) {
         patch.upstreamModel = model;
       }
       if (
@@ -262,13 +280,22 @@ export function reconcileFetchedCodexCatalogRows<T extends CodexCatalogRowLike>(
   }
 
   const authoritativeResult = options.removeMissingRemote
-    ? pruneMissingRemoteCodexCatalogRows(next, fetchedModels)
-    : { rows: next, removed: 0 };
+    ? pruneMissingRemoteCodexCatalogRows(next, fetchedModels, {
+        maxRemovalRatio: options.maxRemovalRatio,
+      })
+    : {
+        rows: next,
+        removed: 0,
+        removedModels: [] as string[],
+        removalSuppressed: false,
+      };
   return {
     rows: authoritativeResult.rows,
     added,
     hydrated,
     updated,
     removed: authoritativeResult.removed,
+    removedModels: authoritativeResult.removedModels,
+    removalSuppressed: authoritativeResult.removalSuppressed,
   };
 }

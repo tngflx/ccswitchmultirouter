@@ -1308,6 +1308,47 @@ pub fn run() {
                 };
                 // 检查 Live 配置是否仍处于被接管状态（包含占位符）
                 let live_taken_over = state.proxy_service.detect_takeover_in_live_configs();
+                let proxy_startup_allowed = startup_recovery_classification.allows_proxy_startup();
+                let codex_takeover_requested = state
+                    .db
+                    .get_proxy_config_for_app("codex")
+                    .await
+                    .is_ok_and(|config| config.enabled);
+                let codex_recovery_needed = state
+                    .db
+                    .get_live_backup("codex")
+                    .await
+                    .map(|backup| backup.is_some())
+                    .unwrap_or(false)
+                    || state
+                        .proxy_service
+                        .detect_takeover_in_live_config_for_app(&AppType::Codex);
+                let mut codex_stopped_for_takeover = false;
+                let codex_runtime_prepared = if proxy_startup_allowed
+                    && (codex_takeover_requested
+                        || (startup_recovery_classification.allows_crash_recovery()
+                            && codex_recovery_needed))
+                {
+                    match crate::codex_desktop::stop_running_codex_desktop_for_managed_lifecycle()
+                    {
+                        Ok(0) => true,
+                        Ok(count) => {
+                            codex_stopped_for_takeover = codex_takeover_requested;
+                            log::info!(
+                                "Codex managed startup stopped {count} verified Desktop shell process(es) before routing recovery"
+                            );
+                            true
+                        }
+                        Err(error) => {
+                            log::error!(
+                                "Codex managed startup could not stop the existing Desktop shell; routing recovery is blocked: {error}"
+                            );
+                            false
+                        }
+                    }
+                } else {
+                    true
+                };
 
                 if (has_backups || live_taken_over)
                     && startup_recovery_classification.allows_crash_recovery()
@@ -1363,34 +1404,6 @@ pub fn run() {
 
                 let launch_codex_desktop_with_ccswitch =
                     startup_settings.launch_codex_desktop_with_ccswitch;
-                let proxy_startup_allowed = startup_recovery_classification.allows_proxy_startup();
-                let codex_takeover_requested = state
-                    .db
-                    .get_proxy_config_for_app("codex")
-                    .await
-                    .is_ok_and(|config| config.enabled);
-                let mut codex_stopped_for_takeover = false;
-                let codex_runtime_prepared = if proxy_startup_allowed && codex_takeover_requested {
-                    match crate::codex_desktop::stop_running_codex_desktop_for_managed_lifecycle()
-                    {
-                        Ok(0) => true,
-                        Ok(count) => {
-                            codex_stopped_for_takeover = true;
-                            log::info!(
-                                "Codex managed startup stopped {count} verified Desktop shell process(es) before restoring takeover"
-                            );
-                            true
-                        }
-                        Err(error) => {
-                            log::error!(
-                                "Codex managed startup could not stop the existing Desktop shell; takeover restore is blocked: {error}"
-                            );
-                            false
-                        }
-                    }
-                } else {
-                    true
-                };
 
                 // Restore the listener and live takeover before launching Codex.
                 // The app-server freezes request-local provider/feature state at startup;
@@ -2208,6 +2221,26 @@ pub async fn cleanup_before_exit(app_handle: &tauri::AppHandle) {
         let needs_restore = has_backups || live_taken_over;
 
         if needs_restore {
+            let codex_needs_restore = state
+                .db
+                .get_live_backup("codex")
+                .await
+                .map(|backup| backup.is_some())
+                .unwrap_or(false)
+                || proxy_service.detect_takeover_in_live_config_for_app(&AppType::Codex);
+            if codex_needs_restore {
+                match crate::codex_desktop::stop_running_codex_desktop_for_managed_lifecycle() {
+                    Ok(count) => log::info!(
+                        "退出清理在恢复 Codex Live 配置前停止了 {count} 个已验证的 Desktop shell 进程"
+                    ),
+                    Err(error) => {
+                        log::error!(
+                            "退出时无法在恢复 Codex Live 配置前停止 Desktop shell，保留接管状态: {error}"
+                        );
+                        return;
+                    }
+                }
+            }
             log::info!("检测到接管残留，开始恢复 Live 配置（保留代理状态）...");
             // 使用 keep_state 版本，保留 settings 表中的代理状态
             if let Err(e) = proxy_service.stop_with_restore_keep_state().await {

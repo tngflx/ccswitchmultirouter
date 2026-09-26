@@ -219,6 +219,120 @@ describe("useAutoModelRefresh", () => {
     );
   });
 
+  it("never reports the same model as both removed and updated", async () => {
+    localStorage.setItem(
+      "model-catalog:overlap",
+      JSON.stringify([
+        { id: "gpt-5.6-sol", contextWindow: 1 },
+        { id: "gpt-6-luna", contextWindow: 1 },
+      ]),
+    );
+    const onDiff = vi.fn();
+    renderHook(() =>
+      useAutoModelRefresh({
+        cacheKey: "provider:overlap",
+        snapshotKey: "overlap",
+        enabled: true,
+        // The catalog knows only gpt-5.6-sol. gpt-6-luna is present in the
+        // previous fetch but in neither the catalog nor this response.
+        compareIds: ["gpt-5.6-sol"],
+        fetcher: () =>
+          Promise.resolve([{ id: "gpt-5.6-sol", contextWindow: 2 }]),
+        onSuccess: vi.fn(),
+        onDiff,
+        ttlMs: 0,
+      }),
+    );
+
+    await waitFor(() => expect(onDiff).toHaveBeenCalled());
+    const [, removed, updated] = onDiff.mock.calls[0];
+    // gpt-6-luna was in the previous *fetch* but never in the saved catalog,
+    // so it is not something the user lost and must not be reported at all.
+    expect(removed).not.toContain("gpt-6-luna");
+    expect(updated).not.toContain("gpt-6-luna");
+  });
+
+  it("does not report upstream churn as removals the user never had", async () => {
+    // The previous fetch offered thirteen models the catalog never saved.
+    localStorage.setItem(
+      "model-catalog:churn",
+      JSON.stringify([
+        { id: "gpt-5.2" },
+        { id: "gpt-5.3-codex-spark" },
+        { id: "gpt-5.4" },
+        { id: "gpt-5.4-mini" },
+        { id: "gpt-5.6" },
+        { id: "gpt-5.6-luna" },
+        { id: "gpt-6-luna" },
+        { id: "gpt-5.6-sol" },
+        { id: "gpt-image-1.5" },
+        { id: "gpt-image-2" },
+        { id: "gpt-image-2.5-flare" },
+        { id: "gpt-image-2.5-sunburst" },
+        { id: "gpt-reserve" },
+      ]),
+    );
+    const onDiff = vi.fn();
+    renderHook(() =>
+      useAutoModelRefresh({
+        cacheKey: "provider:churn",
+        snapshotKey: "churn",
+        enabled: true,
+        // The saved catalog holds only these three.
+        compareIds: ["gpt-5.6-sol", "gpt-6-sol", "gpt-6-astra"],
+        fetcher: () =>
+          Promise.resolve([{ id: "gpt-5.6-sol" }, { id: "gpt-reserve" }]),
+        onSuccess: vi.fn(),
+        onDiff,
+        reportInitialAdditions: true,
+        ttlMs: 0,
+      }),
+    );
+
+    await waitFor(() => expect(onDiff).toHaveBeenCalled());
+    const [added, removed] = onDiff.mock.calls[0];
+    // gpt-5.6-sol and gpt-6-sol really are gone from the fetched list.
+    expect(removed.sort()).toEqual(["gpt-6-astra", "gpt-6-sol"]);
+    // gpt-reserve is new; the ten other vanished upstream models are not
+    // reported as removed because the user never had them.
+    expect(added).toEqual(["gpt-reserve"]);
+  });
+
+  it("compares metadata by id rather than array position", async () => {
+    localStorage.setItem(
+      "model-catalog:reorder",
+      JSON.stringify([
+        { id: "first", contextWindow: 1 },
+        { id: "second", contextWindow: 2 },
+      ]),
+    );
+    const onDiff = vi.fn();
+    const fetcher = vi.fn().mockResolvedValue([
+      { id: "second", contextWindow: 2 },
+      { id: "first", contextWindow: 1 },
+    ]);
+    renderHook(() =>
+      useAutoModelRefresh({
+        cacheKey: "provider:reorder",
+        snapshotKey: "reorder",
+        enabled: true,
+        compareIds: ["first", "second"],
+        // Same models, reversed order, no metadata change at all.
+        fetcher,
+        onSuccess: vi.fn(),
+        onDiff,
+        ttlMs: 0,
+      }),
+    );
+
+    // Reordering the remote list changes nothing, so there is no diff to
+    // report at all. Index-based pairing used to report every model as
+    // "updated" here.
+    await waitFor(() => expect(fetcher).toHaveBeenCalled());
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(onDiff).not.toHaveBeenCalled();
+  });
+
   it("changes the credential identity without exposing the credential", () => {
     const first = modelRefreshCredentialFingerprint("sk-first-secret");
     const second = modelRefreshCredentialFingerprint("sk-second-secret");

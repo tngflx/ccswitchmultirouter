@@ -1828,6 +1828,35 @@ fn launch_codex_with_debug_port(executable: &Path, debug_port: u16) -> Result<()
         .map_err(|error| format!("failed to launch {}: {error}", executable.display()))
 }
 
+/// Relaunch after routing is disabled without installing the takeover picker patch.
+pub(crate) fn relaunch_codex_desktop_after_takeover() -> Result<(), String> {
+    let executable =
+        resolve_codex_executable().ok_or_else(codex_desktop_executable_not_found_message)?;
+    if detect_running_codex_main_process().is_some() {
+        return Err(
+            "Codex Desktop started again before its routing transition completed".to_string(),
+        );
+    }
+    #[cfg(target_os = "macos")]
+    if let Some(bundle) = macos_codex_bundle_for_executable(&executable) {
+        return Command::new("open")
+            .arg(bundle)
+            .spawn()
+            .map(|_| ())
+            .map_err(|error| format!("failed to relaunch {}: {error}", executable.display()));
+    }
+    let mut command = Command::new(&executable);
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x08000000);
+    }
+    command
+        .spawn()
+        .map(|_| ())
+        .map_err(|error| format!("failed to relaunch {}: {error}", executable.display()))
+}
+
 /// 为 Desktop 启动命令追加 Chromium remote-debugging 参数。
 fn append_codex_debug_args(command: &mut Command, debug_port: u16) {
     command
@@ -1924,6 +1953,30 @@ Get-CimInstance Win32_Process -Filter "Name = 'Codex.exe' OR Name = 'ChatGPT.exe
         .collect())
 }
 
+/// Reject an implicit routing transition while Codex Desktop is alive.
+///
+/// The Desktop app-server keeps its routing configuration in memory. Restoring
+/// or replacing `config.toml` underneath it therefore does not update the
+/// running route and can leave the next request pointed at a dead or stale
+/// local proxy. Explicit UI restart flows stop/relaunch the shell; all other
+/// callers must fail before mutating live configuration.
+pub(crate) fn ensure_codex_desktop_closed_for_routing_transition() -> Result<(), String> {
+    ensure_codex_desktop_closed_for_routing_transition_with(list_running_codex_desktop_process_ids)
+}
+
+fn ensure_codex_desktop_closed_for_routing_transition_with(
+    inspect: impl FnOnce() -> Result<Vec<u32>, String>,
+) -> Result<(), String> {
+    let processes = inspect()?;
+    if processes.is_empty() {
+        return Ok(());
+    }
+
+    Err(format!(
+        "CODEX_DESKTOP_ACTIVE: Close Codex Desktop before changing its local routing; the running app-server retains the previous proxy address (processes: {processes:?})"
+    ))
+}
+
 /// 结束已验证身份的 Codex Desktop 主进程及其子进程。
 ///
 /// 调用方必须先获得用户明确确认；不会匹配小写 `codex.exe` CLI/app-server。
@@ -1956,13 +2009,10 @@ pub(crate) fn terminate_running_codex_desktop_processes(
     // taskkill returns after requesting termination, while WebView2 children
     // may still be unwinding.  Relaunching before they disappear creates a
     // second Desktop shell and can leave the old shell owning the CDP/runtime
-    // state.  Require the verified process set to be gone before returning.
+    // state. Require every verified Desktop shell to be gone before returning.
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     loop {
-        let remaining = list_running_codex_desktop_process_ids()?
-            .into_iter()
-            .filter(|pid| verified.contains(pid))
-            .collect::<Vec<_>>();
+        let remaining = list_running_codex_desktop_process_ids()?;
         if remaining.is_empty() {
             break;
         }
@@ -2840,6 +2890,28 @@ pub(crate) fn installed_codex_desktop_version() -> Option<Vec<u32>> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn routing_transition_guard_rejects_active_desktop() {
+        let error = ensure_codex_desktop_closed_for_routing_transition_with(|| Ok(vec![42]))
+            .expect_err("active Desktop must block implicit routing changes");
+        assert!(error.starts_with("CODEX_DESKTOP_ACTIVE:"));
+        assert!(error.contains("42"));
+    }
+
+    #[test]
+    fn routing_transition_guard_allows_closed_desktop() {
+        assert!(ensure_codex_desktop_closed_for_routing_transition_with(|| Ok(vec![])).is_ok());
+    }
+
+    #[test]
+    fn routing_transition_guard_preserves_process_inspection_errors() {
+        let error = ensure_codex_desktop_closed_for_routing_transition_with(|| {
+            Err("process inspection failed".to_string())
+        })
+        .expect_err("inspection errors must not be swallowed");
+        assert_eq!(error, "process inspection failed");
+    }
+
     /// 返回当前测试平台的 Desktop 主程序文件名。
     fn desktop_test_executable_name() -> &'static str {
         if cfg!(target_os = "windows") {
@@ -3106,8 +3178,8 @@ mod tests {
             ]
         });
 
-        let projection = codex_model_catalog_projection_from_value(&catalog)
-            .expect("catalog projection");
+        let projection =
+            codex_model_catalog_projection_from_value(&catalog).expect("catalog projection");
 
         assert_eq!(projection.model_names[0], "first-provider-model");
         assert_eq!(
@@ -3533,6 +3605,23 @@ JSON.stringify({
                     "hidden": false
                 }
             ])
+        );
+    }
+
+    #[test]
+    fn model_picker_model_names_ignore_stale_default_when_catalog_is_present() {
+        let result = run_model_picker_patch_core_probe_with_payload(
+            json!({
+                "defaultModel": "stale-live-model",
+                "modelNames": ["first-provider-model", "second-provider-model"],
+                "models": []
+            }),
+            r#"JSON.stringify({names: modelNames()})"#,
+        );
+
+        assert_eq!(
+            result["names"],
+            json!(["first-provider-model", "second-provider-model"])
         );
     }
 

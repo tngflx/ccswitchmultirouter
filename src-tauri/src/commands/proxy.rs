@@ -222,10 +222,22 @@ pub async fn stop_proxy_server(state: tauri::State<'_, AppState>) -> Result<(), 
 
 /// 停止代理服务器（恢复 Live 配置）
 #[tauri::command]
-pub async fn stop_proxy_with_restore(state: tauri::State<'_, AppState>) -> Result<(), String> {
+pub async fn stop_proxy_with_restore(
+    state: tauri::State<'_, AppState>,
+    restart_codex_desktop: bool,
+) -> Result<(), String> {
     let takeover = state.proxy_service.get_takeover_status().await?;
-    ensure_codex_desktop_closed_for_disable(takeover.codex)?;
-    state.proxy_service.stop_with_restore().await
+    if !restart_codex_desktop {
+        ensure_codex_desktop_closed_for_disable(takeover.codex)?;
+        return state.proxy_service.stop_with_restore().await;
+    }
+    let stopped = if takeover.codex {
+        crate::codex_desktop::stop_running_codex_desktop_for_managed_lifecycle()?
+    } else {
+        0
+    };
+    let result = state.proxy_service.stop_with_restore().await;
+    finish_codex_desktop_transition(result, stopped, false).await
 }
 
 /// 获取各应用接管状态
@@ -265,7 +277,7 @@ fn ensure_codex_desktop_closed_for_disable_with(
     inspect: impl FnOnce() -> Result<Vec<u32>, String>,
 ) -> Result<(), String> {
     if codex_takeover_enabled && !inspect()?.is_empty() {
-        return Err("CODEX_DESKTOP_ACTIVE: Close Codex Desktop before disabling its local routing, then reopen it after the switch. The running app-server can retain the old local proxy address even after config.toml is restored.".to_string());
+        return Err("CODEX_DESKTOP_ACTIVE: Close Codex Desktop before changing its local routing; the running app-server retains the previous proxy address.".to_string());
     }
     Ok(())
 }
@@ -286,27 +298,34 @@ pub async fn restart_codex_desktop(
     state: tauri::State<'_, AppState>,
     enabled: bool,
 ) -> Result<(), String> {
-    // Disabling takeover only restores the live configuration. It must not
-    // terminate or relaunch Codex Desktop; this command is for the enable
-    // path where the Desktop shell must reload the config.
-    if !enabled {
-        let takeover = state.proxy_service.get_takeover_status().await?;
-        ensure_codex_desktop_closed_for_disable(takeover.codex)?;
-        return state
-            .proxy_service
-            .set_takeover_for_app("codex", false)
-            .await;
+    if enabled {
+        state.proxy_service.preflight_codex_takeover()?;
     }
-
     let stopped = crate::codex_desktop::stop_running_codex_desktop_for_managed_lifecycle()?;
     let takeover_result = state
         .proxy_service
         .set_takeover_for_app("codex", enabled)
         .await;
+    finish_codex_desktop_transition(takeover_result, stopped, enabled).await
+}
+
+async fn finish_codex_desktop_transition(
+    takeover_result: Result<(), String>,
+    stopped: u32,
+    enabled: bool,
+) -> Result<(), String> {
+    // If applying/restoring the routing config failed, the live file is still
+    // the pre-transition version. Relaunch the plain Desktop against that
+    // unchanged config instead of installing the takeover picker patch.
+    let takeover_succeeded = takeover_result.is_ok();
     let relaunch_result = if stopped > 0 {
-        crate::codex_desktop::unlock_codex_model_picker()
-            .await
-            .map(|_| ())
+        if takeover_succeeded && enabled {
+            crate::codex_desktop::unlock_codex_model_picker()
+                .await
+                .map(|_| ())
+        } else {
+            crate::codex_desktop::relaunch_codex_desktop_after_takeover()
+        }
     } else {
         Ok(())
     };

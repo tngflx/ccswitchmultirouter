@@ -817,6 +817,20 @@ describe("CodexFormFields local model routing", () => {
     );
   });
 
+  it("initializes an empty provider default from the first enabled catalog model", async () => {
+    renderCatalogHarness([
+      { model: "disabled-first", enabled: false },
+      { model: "provider-first", enabled: true },
+      { model: "provider-second", enabled: true },
+    ]);
+
+    await waitFor(() =>
+      expect(document.getElementById("codexDefaultModel")).toHaveValue(
+        "provider-first",
+      ),
+    );
+  });
+
   it("dismisses the model-list change popup with its button", async () => {
     vi.mocked(fetchModelsForConfig).mockResolvedValue([
       { id: "new-model", ownedBy: "provider" },

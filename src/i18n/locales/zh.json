@@ -3107,7 +3107,10 @@
       "enabled": "{{app}} 路由已启用",
       "disabled": "{{app}} 路由已关闭",
       "failed": "切换路由状态失败: {{detail}}",
+      "restartCodexTitle": "重启 Codex Desktop",
       "restartCodexConfirm": "Codex Desktop 正在运行。是否立即重启以应用路由变更？未保存的 Codex 工作可能中断。路由保持启用期间，CCSwitchMulti 启动恢复接管前也会重启已验证的 Codex 外壳。",
+      "stopCodexConfirm": "Codex Desktop 正在运行。是否重启以关闭本地路由？未保存的 Codex 工作可能中断。",
+      "stopAllCodexConfirm": "Codex Desktop 正在运行。是否在停止代理并恢复所有应用配置时重启？未保存的 Codex 工作可能中断。",
       "processCheckFailed": "无法检查正在运行的 Codex Desktop 进程：{{detail}}",
       "closeCodexBeforeDisable": "请先关闭 Codex Desktop，再关闭本地路由，之后重新打开 Codex。运行中的 app-server 可能仍使用旧代理地址。",
       "tooltip": {

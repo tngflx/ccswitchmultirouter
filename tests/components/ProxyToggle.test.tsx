@@ -34,26 +34,26 @@ describe("ProxyToggle Codex restart flow", () => {
 
   it("restarts a running Codex Desktop only after confirmation", async () => {
     vi.mocked(proxyApi.isCodexDesktopRunning).mockResolvedValue(true);
-    const confirm = vi.spyOn(window, "confirm").mockReturnValue(true);
     const user = userEvent.setup();
 
     render(<ProxyToggle activeApp="codex" />);
     await user.click(screen.getByRole("switch"));
-
+    expect(await screen.findByRole("dialog")).toBeInTheDocument();
+    expect(restartCodexDesktop).not.toHaveBeenCalled();
+    await user.click(screen.getByRole("button", { name: "common.confirm" }));
     await waitFor(() => expect(restartCodexDesktop).toHaveBeenCalledWith(true));
-    expect(confirm).toHaveBeenCalledOnce();
     expect(setTakeoverForApp).not.toHaveBeenCalled();
   });
 
   it("does not terminate Codex when the confirmation is declined", async () => {
     vi.mocked(proxyApi.isCodexDesktopRunning).mockResolvedValue(true);
-    vi.spyOn(window, "confirm").mockReturnValue(false);
     const user = userEvent.setup();
 
     render(<ProxyToggle activeApp="codex" />);
     await user.click(screen.getByRole("switch"));
-
-    await waitFor(() => expect(window.confirm).toHaveBeenCalledOnce());
+    await user.click(
+      await screen.findByRole("button", { name: "common.cancel" }),
+    );
     expect(restartCodexDesktop).not.toHaveBeenCalled();
     expect(setTakeoverForApp).not.toHaveBeenCalled();
   });
@@ -74,7 +74,7 @@ describe("ProxyToggle Codex restart flow", () => {
     expect(setTakeoverForApp).not.toHaveBeenCalled();
   });
 
-  it("disables takeover directly without inspecting or restarting Codex Desktop", async () => {
+  it("restarts a running Desktop before disabling takeover", async () => {
     vi.mocked(useProxyStatus).mockReturnValue({
       isRunning: true,
       takeoverStatus: { codex: true },
@@ -85,17 +85,37 @@ describe("ProxyToggle Codex restart flow", () => {
       status: { address: "127.0.0.1", port: 15721 },
     } as unknown as ReturnType<typeof useProxyStatus>);
     const user = userEvent.setup();
+    vi.mocked(proxyApi.isCodexDesktopRunning).mockResolvedValue(true);
 
     render(<ProxyToggle activeApp="codex" />);
     await user.click(screen.getByRole("switch"));
-
-    await waitFor(() =>
-      expect(setTakeoverForApp).toHaveBeenCalledWith({
-        appType: "codex",
-        enabled: false,
-      }),
-    );
-    expect(proxyApi.isCodexDesktopRunning).not.toHaveBeenCalled();
     expect(restartCodexDesktop).not.toHaveBeenCalled();
+    await user.click(
+      await screen.findByRole("button", { name: "common.confirm" }),
+    );
+    await waitFor(() =>
+      expect(restartCodexDesktop).toHaveBeenCalledWith(false),
+    );
+    expect(setTakeoverForApp).not.toHaveBeenCalled();
+  });
+
+  it("leaves takeover enabled when the off restart is declined", async () => {
+    vi.mocked(useProxyStatus).mockReturnValue({
+      isRunning: true,
+      takeoverStatus: { codex: true },
+      setTakeoverForApp,
+      restartCodexDesktop,
+      isPending: false,
+      isInitialStatusPending: false,
+      status: { address: "127.0.0.1", port: 15721 },
+    } as unknown as ReturnType<typeof useProxyStatus>);
+    vi.mocked(proxyApi.isCodexDesktopRunning).mockResolvedValue(true);
+    render(<ProxyToggle activeApp="codex" />);
+    await userEvent.setup().click(screen.getByRole("switch"));
+    await userEvent
+      .setup()
+      .click(await screen.findByRole("button", { name: "common.cancel" }));
+    expect(restartCodexDesktop).not.toHaveBeenCalled();
+    expect(setTakeoverForApp).not.toHaveBeenCalled();
   });
 });

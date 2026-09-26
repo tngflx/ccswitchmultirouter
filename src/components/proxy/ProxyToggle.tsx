@@ -5,8 +5,10 @@
  * 启用时自动接管 Live 配置，关闭时恢复原始配置
  */
 
+import { useState } from "react";
 import { Radio, Loader2 } from "lucide-react";
 import { Switch } from "@/components/ui/switch";
+import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { useProxyStatus } from "@/hooks/useProxyStatus";
 import { cn } from "@/lib/utils";
 import { useTranslation } from "react-i18next";
@@ -21,6 +23,7 @@ interface ProxyToggleProps {
 
 export function ProxyToggle({ className, activeApp }: ProxyToggleProps) {
   const { t } = useTranslation();
+  const [pendingRestart, setPendingRestart] = useState<boolean | null>(null);
   const {
     isRunning,
     takeoverStatus,
@@ -33,7 +36,7 @@ export function ProxyToggle({ className, activeApp }: ProxyToggleProps) {
 
   const handleToggle = async (checked: boolean) => {
     try {
-      if (activeApp === "codex" && checked) {
+      if (activeApp === "codex") {
         let running: boolean;
         try {
           running = await proxyApi.isCodexDesktopRunning();
@@ -51,20 +54,24 @@ export function ProxyToggle({ className, activeApp }: ProxyToggleProps) {
           return;
         }
         if (running) {
-          const confirmed = window.confirm(
-            t("proxy.takeover.restartCodexConfirm", {
-              defaultValue:
-                "Codex Desktop is running. Restart it now so the takeover change can apply? Unsaved Codex work may be interrupted.",
-            }),
-          );
-          if (!confirmed) return;
-          await restartCodexDesktop(checked);
+          setPendingRestart(checked);
           return;
         }
       }
       await setTakeoverForApp({ appType: activeApp, enabled: checked });
     } catch (error) {
       console.error("[ProxyToggle] Toggle takeover failed:", error);
+    }
+  };
+
+  const handleRestartConfirm = async () => {
+    const enabled = pendingRestart;
+    setPendingRestart(null);
+    if (enabled === null) return;
+    try {
+      await restartCodexDesktop(enabled);
+    } catch (error) {
+      console.error("[ProxyToggle] Codex Desktop restart failed:", error);
     }
   };
 
@@ -99,31 +106,44 @@ export function ProxyToggle({ className, activeApp }: ProxyToggleProps) {
       });
 
   return (
-    <div
-      className={cn(
-        "flex items-center gap-1 px-1.5 h-8 rounded-lg bg-muted/50 transition-all",
-        className,
-      )}
-      title={tooltipText}
-    >
-      {isPending ? (
-        <Loader2 className="h-4 w-4 animate-spin text-muted-foreground" />
-      ) : (
-        <Radio
-          className={cn(
-            "h-4 w-4 transition-colors",
-            takeoverEnabled
-              ? "text-emerald-500 status-heartbeat"
-              : "text-muted-foreground",
-          )}
+    <>
+      <div
+        className={cn(
+          "flex items-center gap-1 px-1.5 h-8 rounded-lg bg-muted/50 transition-all",
+          className,
+        )}
+        title={tooltipText}
+      >
+        {isPending ? (
+          <Loader2 className="h-4 w-4 animate-spin text-muted-foreground" />
+        ) : (
+          <Radio
+            className={cn(
+              "h-4 w-4 transition-colors",
+              takeoverEnabled
+                ? "text-emerald-500 status-heartbeat"
+                : "text-muted-foreground",
+            )}
+          />
+        )}
+        <Switch
+          checked={takeoverEnabled}
+          onCheckedChange={handleToggle}
+          disabled={isPending || isInitialStatusPending}
+          aria-label={t("proxy.takeover.ariaLabel", { appLabel })}
         />
-      )}
-      <Switch
-        checked={takeoverEnabled}
-        onCheckedChange={handleToggle}
-        disabled={isPending || isInitialStatusPending}
-        aria-label={t("proxy.takeover.ariaLabel", { appLabel })}
+      </div>
+      <ConfirmDialog
+        isOpen={pendingRestart !== null}
+        title={t("proxy.takeover.restartCodexTitle")}
+        message={t(
+          pendingRestart
+            ? "proxy.takeover.restartCodexConfirm"
+            : "proxy.takeover.stopCodexConfirm",
+        )}
+        onConfirm={() => void handleRestartConfirm()}
+        onCancel={() => setPendingRestart(null)}
       />
-    </div>
+    </>
   );
 }

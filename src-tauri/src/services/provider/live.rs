@@ -778,6 +778,10 @@ pub(crate) fn write_live_with_common_config(
     app_type: &AppType,
     provider: &Provider,
 ) -> Result<(), AppError> {
+    if matches!(app_type, AppType::Codex) {
+        crate::codex_desktop::ensure_codex_desktop_closed_for_routing_transition()
+            .map_err(AppError::Message)?;
+    }
     let mut effective_provider = provider.clone();
     effective_provider.settings_config =
         build_effective_settings_with_common_config(db, app_type, provider)?;
@@ -850,6 +854,8 @@ pub(crate) fn write_codex_config_only_with_common_config(
     db: &Database,
     provider: &Provider,
 ) -> Result<(), AppError> {
+    crate::codex_desktop::ensure_codex_desktop_closed_for_routing_transition()
+        .map_err(AppError::Message)?;
     let mut effective_provider = provider.clone();
     effective_provider.settings_config =
         build_effective_settings_with_common_config(db, &AppType::Codex, provider)?;

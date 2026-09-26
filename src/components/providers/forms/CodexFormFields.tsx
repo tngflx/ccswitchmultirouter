@@ -1959,6 +1959,10 @@ export function CodexFormFields({
           createRow: (seed) => createCatalogRow({ ...seed, enabled: false }),
           existingMetadataMode: "refresh",
           removeMissingRemote: true,
+          // Silent refresh only: a background poll that would drop most of
+          // the catalog is far more likely a truncated upstream response than
+          // a real mass retirement, so it must not delete anything.
+          maxRemovalRatio: 0.5,
         },
       );
       const outdated = pruneOutdatedCodexCatalogModels(reconciled.rows);
@@ -1973,7 +1977,14 @@ export function CodexFormFields({
         setModelListDiff((current) => ({
           added: current?.added ?? [],
           removed: current?.removed ?? [],
-          updated: reconciled.updated,
+          // Union, never replace: the refresh diff and the catalog
+          // reconciliation observe the same fetch through two different
+          // lenses. Replacing here silently discarded the refresh's updates,
+          // and a model already reported as removed could reappear as
+          // "updated" in the same dialog.
+          updated: Array.from(
+            new Set([...(current?.updated ?? []), ...reconciled.updated]),
+          ).filter((model) => !(current?.removed ?? []).includes(model)),
         }));
       }
       if (
@@ -2000,19 +2011,31 @@ export function CodexFormFields({
   const savedCatalogModelIds = useMemo(
     () =>
       catalogRows
-        .map((row) =>
-          catalogModelIdentity(row.upstreamModel || row.upstream_model),
-        )
+        .map((row) => {
+          // Fall back to the visible name. Reading only `upstreamModel`
+          // produced an empty baseline for every catalog whose rows were not
+          // explicitly bound, which silently handed the comparison to the
+          // stale localStorage fetch snapshot instead of the saved catalog.
+          const explicit = catalogModelIdentity(
+            row.upstreamModel || row.upstream_model,
+          );
+          return explicit || catalogModelIdentity(row.model);
+        })
         .filter(Boolean),
     [catalogRows],
   );
   const handleAutomaticModelDiff = useCallback(
     (added: string[], removed: string[], updated: string[]) => {
-      setModelListDiff((current) => ({
+      const removedSet = new Set(removed);
+      // Each report replaces the previous one. Accumulating `updated` across
+      // refreshes made the dialog re-list models that had not changed since
+      // the previous poll, which is what made the same "updated" list
+      // reappear on every silent refresh.
+      setModelListDiff({
         added,
         removed,
-        updated: Array.from(new Set([...(current?.updated ?? []), ...updated])),
-      }));
+        updated: updated.filter((model) => !removedSet.has(model)),
+      });
     },
     [],
   );

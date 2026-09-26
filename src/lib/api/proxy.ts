@@ -37,8 +37,8 @@ export const proxyApi = {
   },
 
   // 停止代理服务器并恢复配置
-  async stopProxyWithRestore(): Promise<void> {
-    return invoke("stop_proxy_with_restore");
+  async stopProxyWithRestore(restartCodexDesktop = false): Promise<void> {
+    return invoke("stop_proxy_with_restore", { restartCodexDesktop });
   },
 
   // 获取代理服务器状态

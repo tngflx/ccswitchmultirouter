@@ -41,6 +41,9 @@ export function ProxyTabContent({
   const { t } = useTranslation();
   const [showProxyConfirm, setShowProxyConfirm] = useState(false);
   const [showFailoverConfirm, setShowFailoverConfirm] = useState(false);
+  const [codexRestartAction, setCodexRestartAction] = useState<
+    { kind: "takeover"; enabled: boolean } | { kind: "stopProxy" } | null
+  >(null);
 
   const {
     isRunning,
@@ -53,7 +56,7 @@ export function ProxyTabContent({
   } = useProxyStatus();
 
   const handleTakeoverChange = async (appType: string, enabled: boolean) => {
-    if (appType === "codex" && enabled) {
+    if (appType === "codex") {
       let running: boolean;
       try {
         running = await proxyApi.isCodexDesktopRunning();
@@ -67,15 +70,8 @@ export function ProxyTabContent({
         return false;
       }
       if (running) {
-        const confirmed = window.confirm(
-          t("proxy.takeover.restartCodexConfirm", {
-            defaultValue:
-              "Codex Desktop is running. Restart it now so the takeover change can apply? Unsaved Codex work may be interrupted.",
-          }),
-        );
-        if (!confirmed) return false;
-        await restartCodexDesktop(enabled);
-        return true;
+        setCodexRestartAction({ kind: "takeover", enabled });
+        return false;
       }
     }
 
@@ -89,7 +85,14 @@ export function ProxyTabContent({
   const handleToggleProxy = async (checked: boolean) => {
     try {
       if (!checked) {
-        await stopWithRestore();
+        if (takeoverStatus?.codex) {
+          const running = await proxyApi.isCodexDesktopRunning();
+          if (running) {
+            setCodexRestartAction({ kind: "stopProxy" });
+            return;
+          }
+        }
+        await stopWithRestore(false);
       } else if (!settings?.proxyConfirmed) {
         setShowProxyConfirm(true);
       } else {
@@ -97,6 +100,21 @@ export function ProxyTabContent({
       }
     } catch (error) {
       console.error("Toggle proxy failed:", error);
+    }
+  };
+
+  const handleCodexRestartConfirm = async () => {
+    const action = codexRestartAction;
+    setCodexRestartAction(null);
+    if (!action) return;
+    try {
+      if (action.kind === "stopProxy") {
+        await stopWithRestore(true);
+      } else {
+        await restartCodexDesktop(action.enabled);
+      }
+    } catch (error) {
+      console.error("Codex Desktop restart failed:", error);
     }
   };
 
@@ -309,6 +327,20 @@ export function ProxyTabContent({
         </AccordionItem>
       </Accordion>
 
+      <ConfirmDialog
+        isOpen={codexRestartAction !== null}
+        title={t("proxy.takeover.restartCodexTitle")}
+        message={t(
+          codexRestartAction?.kind === "stopProxy"
+            ? "proxy.takeover.stopAllCodexConfirm"
+            : codexRestartAction?.kind === "takeover" &&
+                codexRestartAction.enabled
+              ? "proxy.takeover.restartCodexConfirm"
+              : "proxy.takeover.stopCodexConfirm",
+        )}
+        onConfirm={() => void handleCodexRestartConfirm()}
+        onCancel={() => setCodexRestartAction(null)}
+      />
       <ConfirmDialog
         isOpen={showProxyConfirm}
         variant="info"

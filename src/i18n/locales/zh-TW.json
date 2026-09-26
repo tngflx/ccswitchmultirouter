@@ -3103,7 +3103,10 @@
       "enabled": "{{app}} 路由已啟用",
       "disabled": "{{app}} 路由已關閉",
       "failed": "切換路由狀態失敗：{{detail}}",
+      "restartCodexTitle": "重新啟動 Codex Desktop",
       "restartCodexConfirm": "Codex Desktop 正在執行。是否立即重新啟動以套用路由變更？未儲存的 Codex 工作可能中斷。路由保持啟用期間，CCSwitchMulti 啟動恢復接管前也會重新啟動已驗證的 Codex 外殼。",
+      "stopCodexConfirm": "Codex Desktop 正在執行。是否重新啟動以關閉本機路由？未儲存的 Codex 工作可能中斷。",
+      "stopAllCodexConfirm": "Codex Desktop 正在執行。是否在停止代理並還原所有應用程式設定時重新啟動？未儲存的 Codex 工作可能中斷。",
       "processCheckFailed": "無法檢查正在執行的 Codex Desktop 程序：{{detail}}",
       "closeCodexBeforeDisable": "請先關閉 Codex Desktop，再關閉本地路由，之後重新開啟 Codex。執行中的 app-server 可能仍使用舊代理位址。",
       "tooltip": {
