@@ -2578,19 +2578,25 @@ impl Database {
                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             )
             .map_err(|e| AppError::Database(format!("准备模型定价语句失败: {e}")))?;
+        let mut inserted_count = 0usize;
         for (model_id, display_name, input, output, cache_read, cache_creation) in pricing_data {
-            stmt.execute(rusqlite::params![
-                model_id,
-                display_name,
-                input,
-                output,
-                cache_read,
-                cache_creation
-            ])
-            .map_err(|e| AppError::Database(format!("插入模型定价失败: {e}")))?;
+            inserted_count += stmt
+                .execute(rusqlite::params![
+                    model_id,
+                    display_name,
+                    input,
+                    output,
+                    cache_read,
+                    cache_creation
+                ])
+                .map_err(|e| AppError::Database(format!("插入模型定价失败: {e}")))?;
         }
 
-        log::info!("已插入 {} 条默认模型定价数据", pricing_data.len());
+        if inserted_count > 0 {
+            log::info!("已插入 {inserted_count} 条默认模型定价数据");
+        } else {
+            log::debug!("默认模型定价已存在，无需新增");
+        }
         Ok(())
     }
 

@@ -217,8 +217,13 @@ describe("ClaudeFormFields", () => {
 
     await waitFor(() => {
       expect(modelFetchApiMock.fetchModelsForConfig).toHaveBeenCalled();
-      expect(screen.getByText("removed-model")).toBeInTheDocument();
+      expect(screen.getByDisplayValue(fallbackInput)).toHaveAttribute(
+        "aria-invalid",
+        "true",
+      );
     });
+
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
 
     const input = screen.getByDisplayValue(fallbackInput);
     expect(input).toHaveAttribute("aria-invalid", "true");

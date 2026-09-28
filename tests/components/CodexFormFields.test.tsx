@@ -8,7 +8,11 @@ import {
 } from "@testing-library/react";
 import { useState, type ReactNode } from "react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { invalidateAutoModelRefresh } from "@/hooks/useAutoModelRefresh";
+import {
+  invalidateAutoModelRefresh,
+  modelRefreshCredentialFingerprint,
+  rememberModelRefreshSnapshot,
+} from "@/hooks/useAutoModelRefresh";
 import {
   applyCodexProtocolGroups,
   buildSplitCodexProviderSuggestionForFetchedModels,
@@ -96,6 +100,7 @@ vi.mock("@/components/providers/forms/XaiOAuthSection", () => ({
 
 beforeEach(() => {
   invalidateAutoModelRefresh();
+  localStorage.clear();
   vi.useRealTimers();
   vi.mocked(fetchModelsForConfig).mockReset();
   vi.mocked(fetchXaiOauthModels).mockReset();
@@ -712,7 +717,9 @@ describe("CodexFormFields local model routing", () => {
         ownedBy: "OpenRouter",
       })),
     );
-    const harness = renderCatalogHarness([], { autoRefreshModels: true });
+    const harness = renderCatalogHarness([]);
+
+    fireEvent.click(screen.getByRole("button", { name: "Sync Models" }));
 
     await waitFor(() => expect(harness.latestCatalog()).toHaveLength(500));
     await waitFor(() =>
@@ -730,7 +737,7 @@ describe("CodexFormFields local model routing", () => {
     );
   });
 
-  it("silently reconciles a saved catalog from a complete automatic refresh", async () => {
+  it("does not reconcile a saved catalog on automatic refresh", async () => {
     vi.mocked(fetchModelsForConfig).mockResolvedValue([
       { id: "gpt-6", ownedBy: "provider" },
       { id: "glm-5.3", ownedBy: "provider" },
@@ -752,20 +759,38 @@ describe("CodexFormFields local model routing", () => {
       { autoRefreshModels: true },
     );
 
-    await waitFor(() =>
-      expect(harness.latestCatalog().map((row) => row.model)).toEqual([
-        "manual-alias",
-        "gpt-6",
-        "glm-5.3",
-      ]),
+    await waitFor(() => expect(fetchModelsForConfig).toHaveBeenCalledTimes(1));
+    await act(async () => {});
+    expect(harness.latestCatalog()).toEqual([
+      { model: "old-remote", upstreamModel: "old-remote" },
+      { model: "manual-alias" },
+    ]);
+    expect(harness.onCatalogChange).not.toHaveBeenCalled();
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+  });
+
+  it("does not treat saved catalog differences as upstream changes", async () => {
+    vi.mocked(fetchModelsForConfig).mockResolvedValue([
+      { id: "model-a", ownedBy: "provider" },
+    ]);
+    const harness = renderCatalogHarness(
+      ["model-a", "model-b", "model-c", "model-d"].map((model) => ({
+        model,
+        upstreamModel: model,
+      })),
+      { autoRefreshModels: true },
     );
-    expect(
-      harness
-        .latestCatalog()
-        .filter((row) => row.enabled !== false)
-        .map((row) => row.model),
-    ).toEqual(["manual-alias"]);
-    expect(fetchModelsForConfig).toHaveBeenCalledTimes(1);
+
+    await waitFor(() => expect(fetchModelsForConfig).toHaveBeenCalledTimes(1));
+    await act(async () => {});
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    expect(harness.onCatalogChange).not.toHaveBeenCalled();
+    expect(harness.latestCatalog().map((row) => row.model)).toEqual([
+      "model-a",
+      "model-b",
+      "model-c",
+      "model-d",
+    ]);
   });
 
   it("warns in red when a complete refresh no longer lists the default model", async () => {
@@ -777,9 +802,7 @@ describe("CodexFormFields local model routing", () => {
       { autoRefreshModels: true, defaultModel: "removed-model" },
     );
 
-    // The automatic catalog-diff dialog is intentionally opened at the same
-    // time. Radix marks the underlying form aria-hidden while that dialog is
-    // open, so query the stable warning id rather than the hidden subtree.
+    // Availability can be checked without changing the saved catalog.
     const warning = await waitFor(() => {
       const element = document.getElementById("codexDefaultModelAvailability");
       expect(element).toBeTruthy();
@@ -789,7 +812,7 @@ describe("CodexFormFields local model routing", () => {
       "codexConfig.defaultModelMissingFromProvider",
     );
     expect(warning).toHaveClass("text-destructive");
-    expect(screen.getByDisplayValue("removed-model")).toHaveAttribute(
+    expect(document.getElementById("codexDefaultModel")).toHaveAttribute(
       "aria-invalid",
       "true",
     );
@@ -832,6 +855,23 @@ describe("CodexFormFields local model routing", () => {
   });
 
   it("dismisses the model-list change popup with its button", async () => {
+    const modelFetchIdentity = JSON.stringify([
+      "codex-thirdparty",
+      "https://api.thirdparty.example/v1",
+      false,
+      modelRefreshCredentialFingerprint("sk-test"),
+      modelRefreshCredentialFingerprint("[]"),
+      "",
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      modelRefreshCredentialFingerprint(""),
+    ]);
+    rememberModelRefreshSnapshot(`codex:${modelFetchIdentity}`, [
+      { id: "old-model", ownedBy: "provider" },
+    ]);
     vi.mocked(fetchModelsForConfig).mockResolvedValue([
       { id: "new-model", ownedBy: "provider" },
     ]);

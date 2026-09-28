@@ -2,6 +2,7 @@ import { useTranslation } from "react-i18next";
 import {
   invalidateAutoModelRefresh,
   modelRefreshCredentialFingerprint,
+  rememberModelRefreshSnapshot,
   useAutoModelRefresh,
 } from "@/hooks/useAutoModelRefresh";
 import { useGlobalLoading } from "@/contexts/GlobalLoadingContext";
@@ -247,6 +248,7 @@ export function HermesFormFields({
     runWithLoading(() => fetchModelsForConfig(baseUrl, apiKey))
       .then((fetched) => {
         applyFetchedModels(fetched);
+        rememberModelRefreshSnapshot(`hermes:${modelFetchIdentity}`, fetched);
         if (fetched.length === 0) {
           toast.info(t("providerForm.fetchModelsEmpty"));
         } else {
@@ -260,7 +262,14 @@ export function HermesFormFields({
         showFetchModelsError(err, t);
       })
       .finally(() => setIsFetchingModels(false));
-  }, [baseUrl, apiKey, t, runWithLoading, applyFetchedModels]);
+  }, [
+    baseUrl,
+    apiKey,
+    t,
+    runWithLoading,
+    applyFetchedModels,
+    modelFetchIdentity,
+  ]);
 
   useAutoModelRefresh({
     cacheKey: `provider-models:hermes:${modelFetchIdentity}`,
@@ -268,7 +277,6 @@ export function HermesFormFields({
     fetcher: () => fetchModelsForConfig(baseUrl, apiKey),
     onSuccess: applyFetchedModels,
     snapshotKey: `hermes:${modelFetchIdentity}`,
-    compareIds: models.map((item) => item.id),
     onDiff: (added, removed, updated) =>
       setModelListDiff({ added, removed, updated }),
     ttlMs: 0,

@@ -1174,11 +1174,27 @@ export function providersWithCatalogModelVisibilityForRoutes(
       Object.entries(aliases).find(
         ([alias]) => alias.trim().toLowerCase() === targetIdentity,
       )?.[1] ?? target;
+    const canonicalIdentitySet = new Set(
+      readCodexModelCatalog(provider)
+        .models.filter((model) => model.enabled !== false)
+        .filter((model) =>
+          [model.model, model.upstreamModel, model.upstream_model].some(
+            (identity) =>
+              identity?.trim().toLowerCase() ===
+              canonicalModel.trim().toLowerCase(),
+          ),
+        )
+        .flatMap((model) =>
+          [model.model, model.upstreamModel, model.upstream_model]
+            .map((identity) => identity?.trim().toLowerCase())
+            .filter((identity): identity is string => Boolean(identity)),
+        ),
+    );
+    canonicalIdentitySet.add(canonicalModel.trim().toLowerCase());
     if (
       route.modelSelection?.mode === "include" &&
-      !route.modelSelection.models.some(
-        (model) =>
-          model.trim().toLowerCase() === canonicalModel.trim().toLowerCase(),
+      !route.modelSelection.models.some((model) =>
+        canonicalIdentitySet.has(model.trim().toLowerCase()),
       )
     ) {
       continue;
@@ -2170,7 +2186,13 @@ export function serializeCodexRouteV2(
   const canonicalModels = Array.from(
     new Set(
       requestedModels
-        .map((model) => aliases[model] ?? model)
+        .map((model) => {
+          const aliasTarget = Object.entries(aliases).find(
+            ([visible]) =>
+              visible.trim().toLowerCase() === model.trim().toLowerCase(),
+          )?.[1];
+          return aliasTarget ?? model;
+        })
         .map((model) => model.trim())
         .filter(Boolean),
     ),

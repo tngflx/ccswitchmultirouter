@@ -3,6 +3,7 @@ import { useTranslation } from "react-i18next";
 import {
   invalidateAutoModelRefresh,
   modelRefreshCredentialFingerprint,
+  rememberModelRefreshSnapshot,
   useAutoModelRefresh,
 } from "@/hooks/useAutoModelRefresh";
 import { useGlobalLoading } from "@/contexts/GlobalLoadingContext";
@@ -337,6 +338,7 @@ export function OpenCodeFormFields({
     runWithLoading(() => fetchModelsForConfig(baseUrl, apiKey))
       .then((models) => {
         applyFetchedModels(models);
+        rememberModelRefreshSnapshot(`opencode:${modelFetchIdentity}`, models);
         if (models.length === 0) {
           toast.info(t("providerForm.fetchModelsEmpty"));
         } else {
@@ -350,7 +352,14 @@ export function OpenCodeFormFields({
         showFetchModelsError(err, t);
       })
       .finally(() => setIsFetchingModels(false));
-  }, [baseUrl, apiKey, t, runWithLoading, applyFetchedModels]);
+  }, [
+    baseUrl,
+    apiKey,
+    t,
+    runWithLoading,
+    applyFetchedModels,
+    modelFetchIdentity,
+  ]);
 
   useAutoModelRefresh({
     cacheKey: `provider-models:opencode:${modelFetchIdentity}`,
@@ -358,7 +367,6 @@ export function OpenCodeFormFields({
     fetcher: () => fetchModelsForConfig(baseUrl, apiKey),
     onSuccess: applyFetchedModels,
     snapshotKey: `opencode:${modelFetchIdentity}`,
-    compareIds: Object.keys(models),
     onDiff: (added, removed, updated) =>
       setModelListDiff({ added, removed, updated }),
     ttlMs: 0,

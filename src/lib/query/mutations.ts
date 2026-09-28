@@ -36,6 +36,7 @@ interface CreateProviderSwitchFailureToastOptionsInput {
   detail: string;
   copy: (detail: string) => void;
   forceRepair: (providerId: string) => void | Promise<void>;
+  switchWithDesktopRestart?: () => void | Promise<void>;
   t: (key: string, fallback: string) => string;
 }
 
@@ -46,8 +47,29 @@ export function createProviderSwitchFailureToastOptions({
   detail,
   copy,
   forceRepair,
+  switchWithDesktopRestart,
   t,
 }: CreateProviderSwitchFailureToastOptionsInput): ProviderSwitchFailureToastOptions {
+  if (
+    appId === "codex" &&
+    detail.includes("CODEX_DESKTOP_ACTIVE") &&
+    switchWithDesktopRestart
+  ) {
+    return {
+      action: {
+        label: t(
+          "notifications.switchWithDesktopRestart",
+          "Restart Desktop and switch",
+        ),
+        onClick: switchWithDesktopRestart,
+      },
+      cancel: {
+        label: t("common.copy", "Copy"),
+        onClick: () => copy(detail),
+      },
+    };
+  }
+
   return {
     action: {
       label: t("common.copy", "复制"),
@@ -499,6 +521,65 @@ export const useSwitchProviderMutation = (appId: AppId) => {
             codexForceRepairInFlight.delete(failedProviderId);
           }
         },
+        switchWithDesktopRestart:
+          appId === "codex"
+            ? async () => {
+                if (
+                  !window.confirm(
+                    t("notifications.switchWithDesktopRestartConfirm"),
+                  )
+                ) {
+                  return;
+                }
+                try {
+                  await providersApi.switchCodexProviderWithDesktopRestart(
+                    providerId,
+                  );
+                } catch (restartError) {
+                  toast.error(
+                    t("notifications.codexSwitchRestartFailed", {
+                      defaultValue:
+                        "Could not switch provider and restart Codex Desktop: {{error}}",
+                      error:
+                        extractErrorMessage(restartError) ||
+                        t("common.unknown"),
+                    }),
+                  );
+                  return;
+                }
+                toast.success(
+                  t("notifications.codexSwitchedWithRestart", {
+                    defaultValue:
+                      "Provider switched and Codex Desktop restarted.",
+                  }),
+                );
+                try {
+                  await Promise.all([
+                    queryClient.invalidateQueries({
+                      queryKey: ["providers", appId],
+                    }),
+                    queryClient.invalidateQueries({
+                      queryKey: ["proxyStatus"],
+                    }),
+                    queryClient.invalidateQueries({
+                      queryKey: ["proxyRunning"],
+                    }),
+                    queryClient.invalidateQueries({
+                      queryKey: ["proxyTakeoverStatus"],
+                    }),
+                    queryClient.invalidateQueries({
+                      queryKey: ["liveTakeoverActive"],
+                    }),
+                  ]);
+                  await providersApi.updateTrayMenu();
+                } catch (refreshError) {
+                  console.error(
+                    "Failed to refresh provider state after Desktop switch",
+                    refreshError,
+                  );
+                }
+              }
+            : undefined,
         t: (key, fallback) => t(key, { defaultValue: fallback }),
       });
 

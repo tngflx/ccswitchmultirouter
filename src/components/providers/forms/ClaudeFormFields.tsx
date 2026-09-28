@@ -3,6 +3,7 @@ import { useTranslation } from "react-i18next";
 import {
   invalidateAutoModelRefresh,
   modelRefreshCredentialFingerprint,
+  rememberModelRefreshSnapshot,
   useAutoModelRefresh,
 } from "@/hooks/useAutoModelRefresh";
 import { useGlobalLoading } from "@/contexts/GlobalLoadingContext";
@@ -305,27 +306,6 @@ export function ClaudeFormFields({
     [modelFetchIdentity],
   );
 
-  const savedModelIds = useMemo(
-    () =>
-      [
-        claudeModel,
-        defaultHaikuModel,
-        defaultSonnetModel,
-        defaultOpusModel,
-        defaultFableModel,
-        subagentModel,
-      ]
-        .map((model) => stripClaudeOneMMarker(model).trim())
-        .filter(Boolean),
-    [
-      claudeModel,
-      defaultFableModel,
-      defaultHaikuModel,
-      defaultOpusModel,
-      defaultSonnetModel,
-      subagentModel,
-    ],
-  );
   const latestModelIds = useMemo(
     () =>
       new Set(
@@ -345,7 +325,12 @@ export function ClaudeFormFields({
         !latestModelIds.has(normalized),
       );
     },
-    [fetchedModels.length, latestModelIds, modelFetchIdentity, verifiedModelIdentity],
+    [
+      fetchedModels.length,
+      latestModelIds,
+      modelFetchIdentity,
+      verifiedModelIdentity,
+    ],
   );
 
   const showModelFetchResult = useCallback(
@@ -388,6 +373,7 @@ export function ClaudeFormFields({
     )
       .then((models) => {
         applyFetchedModels(models);
+        rememberModelRefreshSnapshot(`claude:${modelFetchIdentity}`, models);
         showModelFetchResult(models.length);
       })
       .catch((err) => {
@@ -401,6 +387,7 @@ export function ClaudeFormFields({
     isFullUrl,
     customUserAgent,
     applyFetchedModels,
+    modelFetchIdentity,
     showModelFetchResult,
     t,
     runWithLoading,
@@ -430,9 +417,6 @@ export function ClaudeFormFields({
       ),
     onSuccess: applyFetchedModels,
     snapshotKey: `claude:${modelFetchIdentity}`,
-    compareIds: Boolean(autoRefreshModels && providerId)
-      ? savedModelIds
-      : undefined,
     onDiff: (added, removed, updated) =>
       setModelListDiff({ added, removed, updated }),
     ttlMs: 0,

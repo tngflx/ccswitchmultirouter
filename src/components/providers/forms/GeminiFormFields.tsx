@@ -3,6 +3,7 @@ import { useTranslation } from "react-i18next";
 import {
   invalidateAutoModelRefresh,
   modelRefreshCredentialFingerprint,
+  rememberModelRefreshSnapshot,
   useAutoModelRefresh,
 } from "@/hooks/useAutoModelRefresh";
 import { useGlobalLoading } from "@/contexts/GlobalLoadingContext";
@@ -133,6 +134,7 @@ export function GeminiFormFields({
     runWithLoading(() => fetchModelsForConfig(baseUrl, apiKey))
       .then((models) => {
         applyFetchedModels(models);
+        rememberModelRefreshSnapshot(`gemini:${modelFetchIdentity}`, models);
         if (models.length === 0) {
           toast.info(t("providerForm.fetchModelsEmpty"));
         } else {
@@ -146,7 +148,14 @@ export function GeminiFormFields({
         showFetchModelsError(err, t);
       })
       .finally(() => setIsFetchingModels(false));
-  }, [baseUrl, apiKey, t, runWithLoading, applyFetchedModels]);
+  }, [
+    baseUrl,
+    apiKey,
+    t,
+    runWithLoading,
+    applyFetchedModels,
+    modelFetchIdentity,
+  ]);
 
   useAutoModelRefresh({
     cacheKey: `provider-models:gemini:${modelFetchIdentity}`,
@@ -156,7 +165,6 @@ export function GeminiFormFields({
     fetcher: () => fetchModelsForConfig(baseUrl, apiKey),
     onSuccess: applyFetchedModels,
     snapshotKey: `gemini:${modelFetchIdentity}`,
-    compareIds: model.trim() ? [model.trim()] : undefined,
     onDiff: (added, removed, updated) =>
       setModelListDiff({ added, removed, updated }),
     ttlMs: 0,

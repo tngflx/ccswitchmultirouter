@@ -4,6 +4,7 @@ import { useTranslation } from "react-i18next";
 import {
   invalidateAutoModelRefresh,
   modelRefreshCredentialFingerprint,
+  rememberModelRefreshSnapshot,
   useAutoModelRefresh,
 } from "@/hooks/useAutoModelRefresh";
 import { useGlobalLoading } from "@/contexts/GlobalLoadingContext";
@@ -984,6 +985,7 @@ export function CodexFormFields({
     added: string[];
     removed: string[];
     updated: string[];
+    removalSuppressed: boolean;
   } | null>(null);
   const enabledGroupedApiKeys = useMemo(
     () =>
@@ -1202,9 +1204,9 @@ export function CodexFormFields({
     if (category === "official" || !onModelChange || codexModel.trim()) {
       return;
     }
-    const firstEnabledModel = catalogRows.find(
-      (row) => row.enabled !== false && row.model.trim(),
-    )?.model.trim();
+    const firstEnabledModel = catalogRows
+      .find((row) => row.enabled !== false && row.model.trim())
+      ?.model.trim();
     if (firstEnabledModel) {
       onModelChange(firstEnabledModel);
     }
@@ -1604,6 +1606,7 @@ export function CodexFormFields({
             if (seq !== fetchModelsSeqRef.current) return;
             setFetchedModels(models);
             recordVerifiedModelList(models);
+            rememberModelRefreshSnapshot(`codex:${modelFetchIdentity}`, models);
             let nextCatalogRows = catalogRowsRef.current;
             if (fetchMode === "sync" && onCatalogModelsChange) {
               nextCatalogRows = mergeFetchedModelsIntoCatalogRows(
@@ -1752,7 +1755,10 @@ export function CodexFormFields({
           const models = Array.from(modelsByIdentity.values());
           if (seq !== fetchModelsSeqRef.current) return;
           setFetchedModels(models);
-          if (failedCount === 0) recordVerifiedModelList(models);
+          if (failedCount === 0) {
+            recordVerifiedModelList(models);
+            rememberModelRefreshSnapshot(`codex:${modelFetchIdentity}`, models);
+          }
           let splitCatalogRows = catalogRowsRef.current;
           if (fetchMode === "sync" && onCatalogModelsChange) {
             const mergedRows = mergeFetchedModelsIntoCatalogRows(
@@ -1862,6 +1868,7 @@ export function CodexFormFields({
       t,
       runWithLoading,
       recordVerifiedModelList,
+      modelFetchIdentity,
     ],
   );
 
@@ -1942,87 +1949,8 @@ export function CodexFormFields({
   const applyAutomaticCatalogRefresh = useCallback(
     (models: FetchedModel[]) => {
       recordVerifiedModelList(models);
-      if (!onCatalogModelsChange || models.length === 0) return;
-      const reconciled = reconcileFetchedCodexCatalogRows(
-        catalogRowsRef.current,
-        models,
-        {
-          providerId,
-          providerName,
-          baseUrl: codexBaseUrl,
-          websiteUrl,
-        },
-        {
-          appendNew: true,
-          // Automatic discovery is informative, not an implicit opt-in. New
-          // remote rows stay visible as excluded until the user includes them.
-          createRow: (seed) => createCatalogRow({ ...seed, enabled: false }),
-          existingMetadataMode: "refresh",
-          removeMissingRemote: true,
-          // Silent refresh only: a background poll that would drop most of
-          // the catalog is far more likely a truncated upstream response than
-          // a real mass retirement, so it must not delete anything.
-          maxRemovalRatio: 0.5,
-        },
-      );
-      const outdated = pruneOutdatedCodexCatalogModels(reconciled.rows);
-      const prunedIds = new Set(
-        outdated.pruned.map((model) => model.model.trim()),
-      );
-      const retained = reconciled.rows.filter(
-        (row) => !prunedIds.has(row.model.trim()),
-      );
-      const persistedRows = retained.map(({ rowId: _rowId, ...row }) => row);
-      if (reconciled.updated.length > 0) {
-        setModelListDiff((current) => ({
-          added: current?.added ?? [],
-          removed: current?.removed ?? [],
-          // Union, never replace: the refresh diff and the catalog
-          // reconciliation observe the same fetch through two different
-          // lenses. Replacing here silently discarded the refresh's updates,
-          // and a model already reported as removed could reappear as
-          // "updated" in the same dialog.
-          updated: Array.from(
-            new Set([...(current?.updated ?? []), ...reconciled.updated]),
-          ).filter((model) => !(current?.removed ?? []).includes(model)),
-        }));
-      }
-      if (
-        JSON.stringify(lastSentModelsRef.current) ===
-        JSON.stringify(persistedRows)
-      ) {
-        return;
-      }
-      catalogRowsRef.current = retained;
-      setCatalogRows(retained);
-      lastSentModelsRef.current = persistedRows;
-      onCatalogModelsChange(persistedRows);
     },
-    [
-      codexBaseUrl,
-      onCatalogModelsChange,
-      providerId,
-      providerName,
-      recordVerifiedModelList,
-      websiteUrl,
-    ],
-  );
-
-  const savedCatalogModelIds = useMemo(
-    () =>
-      catalogRows
-        .map((row) => {
-          // Fall back to the visible name. Reading only `upstreamModel`
-          // produced an empty baseline for every catalog whose rows were not
-          // explicitly bound, which silently handed the comparison to the
-          // stale localStorage fetch snapshot instead of the saved catalog.
-          const explicit = catalogModelIdentity(
-            row.upstreamModel || row.upstream_model,
-          );
-          return explicit || catalogModelIdentity(row.model);
-        })
-        .filter(Boolean),
-    [catalogRows],
+    [recordVerifiedModelList],
   );
   const handleAutomaticModelDiff = useCallback(
     (added: string[], removed: string[], updated: string[]) => {
@@ -2035,6 +1963,7 @@ export function CodexFormFields({
         added,
         removed,
         updated: updated.filter((model) => !removedSet.has(model)),
+        removalSuppressed: false,
       });
     },
     [],
@@ -2061,9 +1990,7 @@ export function CodexFormFields({
             )))),
     fetcher: autoFetchModels,
     onSuccess: applyAutomaticCatalogRefresh,
-    compareIds: savedCatalogModelIds,
     snapshotKey: `codex:${modelFetchIdentity}`,
-    reportInitialAdditions: true,
     onDiff: handleAutomaticModelDiff,
     ttlMs: 0,
   });
@@ -3294,6 +3221,11 @@ export function CodexFormFields({
           </DialogHeader>
           {modelListDiff && (
             <div className="space-y-3 px-6 pb-2 text-sm">
+              {modelListDiff.removalSuppressed && (
+                <p className="rounded-md border border-amber-500/40 bg-amber-50 px-3 py-2 text-xs text-amber-800 dark:bg-amber-950/30 dark:text-amber-200">
+                  {t("codexConfig.modelListRemovalSuppressed")}
+                </p>
+              )}
               {modelListDiff.added.length > 0 && (
                 <div>
                   <p className="font-medium text-emerald-600 dark:text-emerald-400">

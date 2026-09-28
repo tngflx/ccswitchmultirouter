@@ -2168,8 +2168,13 @@ impl RequestForwarder {
             .settings_config
             .get("codexResolvedRouteId")
             .is_some();
+        // Route attempts are materialized before this method is entered.  The
+        // materialized provider intentionally contains only the target route
+        // settings, so the parent's `codexRouting` object is gone by this
+        // point.  Preserve the diagnostic meaning by recognizing the route
+        // marker as router context as well.
         let codex_router_configured =
-            matches!(app_type, AppType::Codex) && codex_provider_has_routing_config(provider);
+            matches!(app_type, AppType::Codex) && codex_request_router_configured(provider);
         let codex_router_provider = provider;
         let routed_provider = if matches!(app_type, AppType::Codex) {
             (!provider_is_resolved_codex_route)
@@ -4673,7 +4678,7 @@ impl RequestForwarder {
             .get("codexResolvedRouteId")
             .is_some();
         let codex_router_configured =
-            matches!(app_type, AppType::Codex) && codex_provider_has_routing_config(provider);
+            matches!(app_type, AppType::Codex) && codex_request_router_configured(provider);
         let v2_routed_provider = if matches!(app_type, AppType::Codex)
             && !provider_is_resolved_codex_route
             && codex_provider_has_v2_routing(provider)
@@ -8334,6 +8339,20 @@ fn codex_provider_has_routing_config(provider: &Provider) -> bool {
         || provider.settings_config.get("modelRoutes").is_some()
 }
 
+/// Return whether a request is operating in Codex router context.
+///
+/// A resolved route no longer carries the parent's routing object, but it is
+/// marked with `codexResolvedRouteId`.  Diagnostics must retain the fact that
+/// the request came through a router without changing the expansion predicate
+/// above, which is intentionally limited to unresolved providers.
+fn codex_request_router_configured(provider: &Provider) -> bool {
+    codex_provider_has_routing_config(provider)
+        || provider
+            .settings_config
+            .get("codexResolvedRouteId")
+            .is_some()
+}
+
 fn codex_provider_has_v2_routing(provider: &Provider) -> bool {
     provider
         .settings_config
@@ -9675,12 +9694,19 @@ mod tests {
     fn codex_routing_config_detection_reads_new_and_legacy_fields() {
         let mut provider = test_provider_with_type(None);
         assert!(!codex_provider_has_routing_config(&provider));
+        assert!(!codex_request_router_configured(&provider));
 
         provider.settings_config = json!({ "codexRouting": { "routes": [] } });
         assert!(codex_provider_has_routing_config(&provider));
+        assert!(codex_request_router_configured(&provider));
 
         provider.settings_config = json!({ "modelRoutes": [] });
         assert!(codex_provider_has_routing_config(&provider));
+        assert!(codex_request_router_configured(&provider));
+
+        provider.settings_config = json!({ "codexResolvedRouteId": "route-1" });
+        assert!(!codex_provider_has_routing_config(&provider));
+        assert!(codex_request_router_configured(&provider));
     }
 
     #[test]

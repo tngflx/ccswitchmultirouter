@@ -15,6 +15,10 @@ use sha2::{Digest, Sha256};
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
 
+#[cfg(target_os = "windows")]
+#[path = "codex_windows_launch.rs"]
+mod windows_launch;
+
 pub(crate) const DEFAULT_CODEX_DEBUG_PORT: u16 = 9229;
 pub(crate) const CDP_HTTP_TIMEOUT: Duration = Duration::from_secs(2);
 const CDP_CONNECT_TIMEOUT: Duration = Duration::from_secs(4);
@@ -1815,6 +1819,12 @@ fn launch_codex_with_debug_port(executable: &Path, debug_port: u16) -> Result<()
                 .map_err(|error| format!("failed to launch {}: {error}", executable.display()));
         }
     }
+    #[cfg(target_os = "windows")]
+    {
+        if let Some(aumid) = windows_launch::resolve_app_id(executable)? {
+            return windows_launch::activate(&aumid, Some(debug_port));
+        }
+    }
     let mut command = Command::new(executable);
     append_codex_debug_args(&mut command, debug_port);
     #[cfg(target_os = "windows")]
@@ -1845,6 +1855,12 @@ pub(crate) fn relaunch_codex_desktop_after_takeover() -> Result<(), String> {
             .map(|_| ())
             .map_err(|error| format!("failed to relaunch {}: {error}", executable.display()));
     }
+    #[cfg(target_os = "windows")]
+    {
+        if let Some(aumid) = windows_launch::resolve_app_id(&executable)? {
+            return windows_launch::activate(&aumid, None);
+        }
+    }
     let mut command = Command::new(&executable);
     #[cfg(target_os = "windows")]
     {
@@ -1855,6 +1871,19 @@ pub(crate) fn relaunch_codex_desktop_after_takeover() -> Result<(), String> {
         .spawn()
         .map(|_| ())
         .map_err(|error| format!("failed to relaunch {}: {error}", executable.display()))
+}
+
+#[cfg(target_os = "windows")]
+pub(crate) fn resolve_windows_codex_aumid() -> Result<Option<String>, String> {
+    let Some(executable) = resolve_codex_executable() else {
+        return Ok(None);
+    };
+    windows_launch::resolve_app_id(&executable)
+}
+
+#[cfg(target_os = "windows")]
+pub(crate) fn launch_windows_codex_aumid(aumid: &str, debug_port: u16) -> Result<(), String> {
+    windows_launch::activate(aumid, Some(debug_port))
 }
 
 /// 为 Desktop 启动命令追加 Chromium remote-debugging 参数。

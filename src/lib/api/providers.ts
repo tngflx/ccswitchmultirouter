@@ -296,6 +296,14 @@ export const providersApi = {
     return await invoke("switch_provider", { id, app: appId });
   },
 
+  async switchCodexProviderWithDesktopRestart(
+    providerId: string,
+  ): Promise<SwitchResult> {
+    return await invoke("switch_codex_provider_with_desktop_restart", {
+      providerId,
+    });
+  },
+
   async forceRepairAndSwitchCodexProvider(
     providerId: string,
   ): Promise<CodexForceRepairOutcome> {

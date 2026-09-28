@@ -379,7 +379,7 @@ describe("SessionManagerPage", () => {
     deleteManySpy.mockRestore();
   });
 
-  it("preselects archived Codex sessions for the normal batch delete flow", async () => {
+  it("exposes a dedicated archived-session purge flow", async () => {
     setSessionFixtures(
       [
         {
@@ -394,36 +394,34 @@ describe("SessionManagerPage", () => {
       ],
       {},
     );
-    const deleteSpy = vi.spyOn(sessionsApi, "delete").mockResolvedValue(true);
+    const purgeSpy = vi.spyOn(sessionsApi, "purgeArchived").mockResolvedValue({
+      attempted: 1,
+      deleted: 1,
+      failed: 0,
+      indexCleanupWarnings: 0,
+      errors: [],
+    });
 
     renderPage();
 
     const purgeButton = await screen.findByRole("button", {
-      name: /选择所有已归档的 Codex 会话/i,
+      name: /删除所有已归档的 Codex 会话/i,
     });
     fireEvent.click(purgeButton);
 
-    expect(
-      screen.getByRole("button", { name: /批量删除/i }),
-    ).toBeInTheDocument();
-    expect(screen.getByText(/已选 1 项/)).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: /批量删除/i }));
-
     const dialog = screen.getByTestId("confirm-dialog");
-    fireEvent.click(within(dialog).getByRole("button", { name: /删除会话/i }));
-
-    await waitFor(() =>
-      expect(deleteSpy).toHaveBeenCalledWith({
-        providerId: "codex",
-        sessionId: "archived-session-1",
-        sourcePath:
-          "C:\\Users\\test\\.codex\\archived_sessions\\archived-session-1.jsonl",
+    expect(dialog).toHaveTextContent("删除所有已归档的 Codex 会话");
+    fireEvent.click(
+      within(dialog).getByRole("button", {
+        name: /删除所有封存项目|删除所有归档会话/i,
       }),
     );
+
+    await waitFor(() => expect(purgeSpy).toHaveBeenCalledWith("codex"));
     expect(toastSuccessMock).toHaveBeenCalled();
     expect(toastErrorMock).not.toHaveBeenCalled();
 
-    deleteSpy.mockRestore();
+    purgeSpy.mockRestore();
   });
 
   it("keeps the exit batch mode button visible when search hides all sessions", async () => {

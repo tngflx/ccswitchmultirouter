@@ -309,7 +309,7 @@ pub async fn restart_codex_desktop(
     finish_codex_desktop_transition(takeover_result, stopped, enabled).await
 }
 
-async fn finish_codex_desktop_transition(
+pub(crate) async fn finish_codex_desktop_transition(
     takeover_result: Result<(), String>,
     stopped: u32,
     enabled: bool,
@@ -320,9 +320,7 @@ async fn finish_codex_desktop_transition(
     let takeover_succeeded = takeover_result.is_ok();
     let relaunch_result = if stopped > 0 {
         if takeover_succeeded && enabled {
-            crate::codex_desktop::unlock_codex_model_picker()
-                .await
-                .map(|_| ())
+            relaunch_codex_desktop_for_takeover_state(true).await
         } else {
             crate::codex_desktop::relaunch_codex_desktop_after_takeover()
         }
@@ -339,6 +337,26 @@ async fn finish_codex_desktop_transition(
         (Err(takeover_error), Err(relaunch_error)) => Err(format!(
             "Codex takeover change failed: {takeover_error}; Codex Desktop relaunch also failed: {relaunch_error}"
         )),
+    }
+}
+
+pub(crate) async fn relaunch_codex_desktop_for_takeover_state(enabled: bool) -> Result<(), String> {
+    if enabled {
+        crate::codex_desktop::unlock_codex_model_picker()
+            .await
+            .and_then(|result| ensure_model_picker_injected(result.injected, &result.message))
+    } else {
+        crate::codex_desktop::relaunch_codex_desktop_after_takeover()
+    }
+}
+
+fn ensure_model_picker_injected(injected: bool, message: &str) -> Result<(), String> {
+    if injected {
+        Ok(())
+    } else {
+        Err(format!(
+            "Codex Desktop relaunched, but model-picker injection did not complete: {message}"
+        ))
     }
 }
 
@@ -1883,6 +1901,13 @@ fn codex_router_log_protocol_from_path(value: &str) -> Option<&'static str> {
 mod codex_router_log_diagnostics_tests {
     use super::*;
     use std::sync::{Mutex, OnceLock};
+
+    #[test]
+    fn desktop_transition_rejects_uninjected_picker_result() {
+        assert!(ensure_model_picker_injected(true, "installed").is_ok());
+        let error = ensure_model_picker_injected(false, "no CDP target").unwrap_err();
+        assert!(error.contains("no CDP target"));
+    }
 
     #[test]
     fn disabling_codex_requires_a_closed_desktop_without_changing_state() {

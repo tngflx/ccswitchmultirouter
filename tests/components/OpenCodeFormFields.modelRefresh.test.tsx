@@ -3,7 +3,11 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { useForm } from "react-hook-form";
 import { OpenCodeFormFields } from "@/components/providers/forms/OpenCodeFormFields";
 import { Form } from "@/components/ui/form";
-import { invalidateAutoModelRefresh } from "@/hooks/useAutoModelRefresh";
+import {
+  invalidateAutoModelRefresh,
+  modelRefreshCredentialFingerprint,
+  rememberModelRefreshSnapshot,
+} from "@/hooks/useAutoModelRefresh";
 
 const fetchModelsForConfig = vi.hoisted(() => vi.fn());
 
@@ -26,6 +30,11 @@ describe("OpenCodeFormFields model refresh", () => {
   it("silently checks a saved model and marks an unavailable model ID red", async () => {
     fetchModelsForConfig.mockResolvedValue([
       { id: "current-model", ownedBy: "provider" },
+    ]);
+    const modelFetchIdentity = `opencode-provider:https://provider.example/v1:${modelRefreshCredentialFingerprint("secret")}`;
+    rememberModelRefreshSnapshot(`opencode:${modelFetchIdentity}`, [
+      { id: "old-model", ownedBy: "provider" },
+      { id: "retired-model", ownedBy: "provider" },
     ]);
     const onModelsChange = vi.fn();
     render(

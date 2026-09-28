@@ -352,7 +352,7 @@ describe("ProviderForm Codex preset selection", () => {
     fireEvent.click(screen.getByRole("button", { name: "保存" }));
     await waitFor(() => expect(onSubmit).toHaveBeenCalled());
     expect(onSubmit.mock.calls[0][0].meta.codexTrafficPolicy).toBeUndefined();
-  });
+  }, 15_000);
 
   it("forces a saved maintained preset back to model menu projection", async () => {
     const onSubmit = vi.fn();

@@ -322,6 +322,71 @@ pub async fn switch_provider(
     .map_err(|e| format!("供应商切换任务执行失败: {e}"))?
 }
 
+/// The frontend must obtain explicit confirmation before stopping Desktop.
+/// Reuse the normal switch path while the shell is closed, then relaunch using
+/// the takeover state actually left by the switch (including partial failures).
+#[tauri::command]
+#[allow(non_snake_case)]
+pub async fn switch_codex_provider_with_desktop_restart(
+    app_handle: tauri::AppHandle,
+    providerId: String,
+) -> Result<SwitchResult, String> {
+    let state = app_handle
+        .try_state::<AppState>()
+        .ok_or_else(|| "应用状态不可用".to_string())?;
+    if state
+        .db
+        .get_provider_by_id(&providerId, AppType::Codex.as_str())
+        .map_err(|error| error.to_string())?
+        .is_none()
+    {
+        return Err(format!("Codex provider {providerId} does not exist"));
+    }
+    let previous_takeover = state.proxy_service.get_takeover_status().await?.codex;
+    let stopped = tauri::async_runtime::spawn_blocking(
+        crate::codex_desktop::stop_running_codex_desktop_for_managed_lifecycle,
+    )
+    .await
+    .map_err(|error| format!("Codex Desktop stop task failed: {error}"))??;
+
+    let switch_result = switch_provider(app_handle.clone(), "codex".to_string(), providerId).await;
+    let takeover_result = state.proxy_service.get_takeover_status().await;
+    let takeover_enabled = takeover_result
+        .as_ref()
+        .map(|takeover| takeover.codex)
+        .unwrap_or(previous_takeover);
+    let transition_result = match (&switch_result, takeover_result) {
+        (Ok(_), Ok(_)) => Ok(()),
+        (Err(error), Ok(_)) => Err(error.clone()),
+        (Ok(_), Err(error)) => Err(format!(
+            "Provider switched, but Codex takeover state could not be read: {error}"
+        )),
+        (Err(switch_error), Err(status_error)) => Err(format!(
+            "Provider switch failed: {switch_error}; Codex takeover state could not be read: {status_error}"
+        )),
+    };
+    let relaunch_result = if stopped > 0 {
+        super::proxy::relaunch_codex_desktop_for_takeover_state(takeover_enabled).await
+    } else {
+        Ok(())
+    };
+    match (transition_result, relaunch_result) {
+        (Ok(()), Ok(())) => {}
+        (Err(error), Ok(())) => return Err(error),
+        (Ok(()), Err(error)) => {
+            return Err(format!(
+                "Provider switched, but Codex Desktop could not be relaunched: {error}"
+            ));
+        }
+        (Err(switch_error), Err(relaunch_error)) => {
+            return Err(format!(
+                "{switch_error}; Codex Desktop relaunch also failed: {relaunch_error}"
+            ));
+        }
+    }
+    switch_result
+}
+
 /// Explicitly repair legacy Codex configuration and retry the requested provider switch.
 #[tauri::command]
 #[allow(non_snake_case)]

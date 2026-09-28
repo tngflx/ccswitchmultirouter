@@ -296,6 +296,36 @@ export const handlers = [
     );
   }),
 
+  http.post(
+    `${TAURI_ENDPOINT}/purge_archived_sessions`,
+    async ({ request }) => {
+      const { providerId } = await withJson<{ providerId: string }>(request);
+      const archived = listSessions().filter(
+        (session) =>
+          providerId === "codex" &&
+          session.providerId === "codex" &&
+          session.sourcePath
+            ?.replace(/\\/g, "/")
+            .split("/")
+            .includes("archived_sessions"),
+      );
+      archived.forEach((session) => {
+        deleteSession(
+          session.providerId,
+          session.sessionId,
+          session.sourcePath!,
+        );
+      });
+      return success({
+        attempted: archived.length,
+        deleted: archived.length,
+        failed: 0,
+        indexCleanupWarnings: 0,
+        errors: [],
+      });
+    },
+  ),
+
   // MCP APIs
   http.post(`${TAURI_ENDPOINT}/get_mcp_config`, async ({ request }) => {
     const { app } = await withJson<{ app: AppId }>(request);

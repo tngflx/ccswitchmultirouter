@@ -348,27 +348,12 @@ async fn query_refresh_targets() -> Result<CodexRuntimeRefreshTargets, String> {
     Ok(classify_refresh_targets(&processes))
 }
 
-#[cfg(target_os = "windows")]
-fn resolve_windows_codex_aumid() -> Option<String> {
-    let output = powershell_utf8_output(
-        r#"
-[Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false)
-Get-StartApps |
-  Where-Object { $_.AppID -match '^OpenAI\.Codex(?:\.Preview)?_.*!App$' } |
-  Select-Object -First 1 -ExpandProperty AppID
-"#,
-    )
-    .ok()?;
-    let aumid = output.lines().next()?.trim();
-    (!aumid.is_empty()).then(|| aumid.to_string())
-}
-
-fn resolve_launch_target() -> Option<CodexRuntimeLaunchTarget> {
+fn resolve_launch_target() -> Result<Option<CodexRuntimeLaunchTarget>, String> {
     #[cfg(target_os = "windows")]
-    if let Some(aumid) = resolve_windows_codex_aumid() {
-        return Some(CodexRuntimeLaunchTarget::WindowsAumid(aumid));
+    if let Some(aumid) = crate::codex_desktop::resolve_windows_codex_aumid()? {
+        return Ok(Some(CodexRuntimeLaunchTarget::WindowsAumid(aumid)));
     }
-    Some(CodexRuntimeLaunchTarget::DesktopExecutable)
+    Ok(Some(CodexRuntimeLaunchTarget::DesktopExecutable))
 }
 
 async fn build_preflight() -> Result<CodexRuntimeRefreshPreflight, String> {
@@ -389,7 +374,7 @@ async fn build_preflight() -> Result<CodexRuntimeRefreshPreflight, String> {
     #[cfg(target_os = "windows")]
     {
         let targets = query_refresh_targets().await?;
-        let launch_target = resolve_launch_target();
+        let launch_target = resolve_launch_target()?;
         Ok(CodexRuntimeRefreshPreflight {
             supported: true,
             can_refresh: launch_target.is_some(),
@@ -495,13 +480,10 @@ fn force_terminate_process_tree(_pid: u32, _include_descendants: bool) -> Result
 
 #[cfg(target_os = "windows")]
 fn launch_windows_aumid(aumid: &str) -> Result<(), String> {
-    let script = format!(
-        "Start-Process 'shell:AppsFolder\\{}' -ArgumentList '--remote-debugging-port={} --remote-allow-origins=http://127.0.0.1:{}'",
+    crate::codex_desktop::launch_windows_codex_aumid(
         aumid,
         crate::codex_desktop::DEFAULT_CODEX_DEBUG_PORT,
-        crate::codex_desktop::DEFAULT_CODEX_DEBUG_PORT
-    );
-    powershell_utf8_output(&script).map(|_| ())
+    )
 }
 
 fn launch_codex_target(target: &CodexRuntimeLaunchTarget) -> Result<(), String> {
@@ -680,7 +662,7 @@ pub async fn refresh_codex_runtime_state(
     let _refresh_guard = CODEX_RUNTIME_REFRESH_LOCK
         .try_lock()
         .map_err(|_| "codex_runtime_refresh_already_running".to_string())?;
-    let launch_target = resolve_launch_target()
+    let launch_target = resolve_launch_target()?
         .ok_or_else(|| "codex_desktop_launch_target_not_found".to_string())?;
     let mut operations = SystemCodexRuntimeRefreshOperations {
         state: &state,

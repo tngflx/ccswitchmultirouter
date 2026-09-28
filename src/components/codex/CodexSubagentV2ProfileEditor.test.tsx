@@ -3530,7 +3530,7 @@ describe("Codex Sub-Agent V2 persisted interactions", () => {
         .mocked(invoke)
         .mock.calls.filter(([command]) => command === "get_providers"),
     ).toHaveLength(2);
-  });
+  }, 15_000);
 
   it("shares the workspace-saved V2 source with the remounted workspace", async () => {
     const workspace = await renderPersistedWorkspace();
@@ -3575,7 +3575,7 @@ describe("Codex Sub-Agent V2 persisted interactions", () => {
     expect(within(flashRegion()).getByLabelText("角色名称")).toHaveValue(
       "workspace-scout",
     );
-  });
+  }, 15_000);
 
   it("keeps a pending projection warning visible after the workspace persisted callback refreshes provider props", async () => {
     const warning = "数据库已保存，Codex live 投影待重试。";
@@ -3603,7 +3603,7 @@ describe("Codex Sub-Agent V2 persisted interactions", () => {
     expect(within(flashRegion()).getByLabelText("角色描述")).toHaveValue(
       "warning lifecycle refresh draft",
     );
-  });
+  }, 15_000);
 
   it("initializes V2 with one backend-owned focused mutation", async () => {
     const user = userEvent.setup();

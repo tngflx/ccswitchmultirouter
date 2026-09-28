@@ -1147,6 +1147,20 @@ describe("Codex MultiRouter workspace route persistence helpers", () => {
     expect(route).not.toHaveProperty("capabilities");
   });
 
+  it("resolves alias keys case-insensitively when deriving an include selection", () => {
+    expect(
+      serializeCodexRouteV2(
+        {
+          id: "case-insensitive-alias",
+          targetProviderId: "provider",
+          match: { models: ["VISIBLE-MODEL"] },
+          aliases: { "visible-model": "upstream-model" },
+        },
+        0,
+      ).modelSelection,
+    ).toEqual({ mode: "include", models: ["upstream-model"] });
+  });
+
   it("normalizes merged v2 routes that are missing modelSelection", () => {
     const plan = {
       id: "merged-router",
@@ -4572,6 +4586,48 @@ describe("Codex MultiRouter workspace route persistence helpers", () => {
           provider.settingsConfig?.modelCatalog?.models[0]?.enabled === false,
       ),
     ).toBe(true);
+  });
+
+  it("keeps aliased catalog visibility updates when include selection uses another model identity", () => {
+    const provider: Provider = {
+      id: "identity-visibility-source",
+      name: "Identity Visibility Source",
+      category: "custom",
+      settingsConfig: {
+        modelCatalog: {
+          models: [{ model: "friendly-gpt", upstreamModel: "GPT-5.5" }],
+        },
+      },
+    };
+    const routes = [
+      {
+        provider,
+        index: 0,
+        route: normalizeCodexRouteForSave(
+          {
+            targetProviderId: provider.id,
+            aliases: { "friendly-alias": "friendly-gpt" },
+            modelSelection: { mode: "include", models: ["GPT-5.5"] },
+          },
+          0,
+          new Set<string>(),
+        ),
+      },
+    ];
+
+    const updates = providersWithCatalogModelVisibilityForRoutes(
+      routes,
+      new Map([[provider.id, provider]]),
+      "friendly-alias",
+      false,
+    );
+
+    expect(updates).toHaveLength(1);
+    expect(updates[0].settingsConfig?.modelCatalog?.models[0]).toMatchObject({
+      model: "friendly-gpt",
+      upstreamModel: "GPT-5.5",
+      enabled: false,
+    });
   });
 
   it("preserves hidden state while refreshing model metadata", () => {

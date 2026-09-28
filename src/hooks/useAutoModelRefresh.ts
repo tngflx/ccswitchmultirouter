@@ -30,22 +30,41 @@ function cachedValue<T>(key: string): T | undefined {
   return entry.value as T;
 }
 
+function stableSerialize(value: unknown): string {
+  if (Array.isArray(value)) {
+    const items = value.map(stableSerialize);
+    // Model modalities are a set. Providers are free to return them in a
+    // different order on each request without changing the model metadata.
+    if (value.every((item) => typeof item === "string")) items.sort();
+    return `[${items.join(",")}]`;
+  }
+  if (value !== null && typeof value === "object") {
+    return `{${Object.keys(value as Record<string, unknown>)
+      .sort()
+      .map(
+        (key) =>
+          `${JSON.stringify(key)}:${stableSerialize((value as Record<string, unknown>)[key])}`,
+      )
+      .join(",")}}`;
+  }
+  return JSON.stringify(value);
+}
+
 function reportModelDiff<T>(
   value: T,
-  compareIds: string[] | undefined,
   onDiff:
     | ((added: string[], removed: string[], updated: string[]) => void)
     | undefined,
   snapshotKey?: string,
-  reportInitialAdditions = false,
 ): void {
-  if (!onDiff) return;
   const fetched = Array.isArray(value)
     ? (value as { id?: string }[]).filter(
         (model) => typeof model?.id === "string" && model.id.trim(),
       )
     : [];
-  const fetchedIds = fetched.map((model) => model.id!.trim());
+  const fetchedIds = Array.from(
+    new Set(fetched.map((model) => model.id!.trim())),
+  );
   // An empty response is not evidence that every saved model was removed.
   if (fetchedIds.length === 0) return;
   let previous: { id?: string }[] | undefined;
@@ -53,7 +72,7 @@ function reportModelDiff<T>(
     try {
       const raw = localStorage.getItem(`model-catalog:${snapshotKey}`);
       const parsed: unknown = raw ? JSON.parse(raw) : undefined;
-      if (Array.isArray(parsed))
+      if (Array.isArray(parsed) && parsed.length > 0)
         previous = parsed.filter(
           (model): model is { id: string } =>
             model !== null &&
@@ -61,51 +80,50 @@ function reportModelDiff<T>(
             typeof model.id === "string" &&
             Boolean(model.id.trim()),
         );
-      localStorage.setItem(
-        `model-catalog:${snapshotKey}`,
-        JSON.stringify(fetched),
-      );
+      rememberModelRefreshSnapshot(snapshotKey, fetched);
     } catch {
       // Storage is optional; the fetched list remains usable without it.
     }
   }
-  if (!previous && !compareIds) return;
-  // `compareIds` is the saved catalog and is the ONLY baseline for additions
-  // and removals. The localStorage snapshot records the last *fetched* payload
-  // purely so metadata edits can be reported as "updated".
-  //
-  // The snapshot must never contribute to `removed`. It is a record of what
-  // upstream returned one poll ago, not of what the user saved, so folding it
-  // in re-created the original bug: every model the provider trimmed upstream
-  // was announced as "removed" although it had never been in the catalog.
-  const savedIds = (compareIds ?? []).map((id) => id.trim()).filter(Boolean);
-  const savedSet = new Set(savedIds);
+  if (!previous || !onDiff) return;
+  // A saved catalog is user-curated, not a prior upstream observation.
+  const previousIds = Array.from(
+    new Set(previous.map((model) => model.id!.trim())),
+  );
+  const previousSet = new Set(previousIds);
   const fetchedSet = new Set(fetchedIds);
-  const added =
-    previous || reportInitialAdditions
-      ? fetchedIds.filter((id) => !savedSet.has(id))
-      : [];
-  const removed = savedIds.filter((id) => !fetchedSet.has(id));
-  const previousById = new Map(previous?.map((model) => [model.id, model]));
-  const fetchedById = new Map(fetched.map((model) => [model.id, model]));
-  const updated = previous
-    ? fetchedIds.filter((id) => {
-        const before = previousById.get(id);
-        const after = fetchedById.get(id);
-        return (
-          before && after && JSON.stringify(before) !== JSON.stringify(after)
-        );
-      })
-    : [];
-  // A model cannot be both removed and updated in the same report. Removal
-  // wins, because an absent model has no metadata left to update.
-  const removedSet = new Set(removed);
-  if (added.length || removed.length || updated.length)
-    onDiff(
-      added,
-      removed,
-      updated.filter((id) => !removedSet.has(id)),
+  const added = fetchedIds.filter((id) => !previousSet.has(id));
+  const removed = previousIds.filter((id) => !fetchedSet.has(id));
+  const previousById = new Map(
+    previous?.map((model) => [model.id!.trim(), model]),
+  );
+  const fetchedById = new Map(
+    fetched.map((model) => [model.id!.trim(), model]),
+  );
+  const updated = fetchedIds.filter((id) => {
+    const before = previousById.get(id);
+    const after = fetchedById.get(id);
+    return (
+      before && after && stableSerialize(before) !== stableSerialize(after)
     );
+  });
+  if (added.length || removed.length || updated.length)
+    onDiff(added, removed, updated);
+}
+
+export function rememberModelRefreshSnapshot<T>(key: string, value: T): void {
+  if (
+    !Array.isArray(value) ||
+    !value.some(
+      (model) => typeof model?.id === "string" && Boolean(model.id.trim()),
+    )
+  )
+    return;
+  try {
+    localStorage.setItem(`model-catalog:${key}`, JSON.stringify(value));
+  } catch {
+    // Storage is optional; the fetched list remains usable without it.
+  }
 }
 
 export function invalidateAutoModelRefresh(key?: string): void {
@@ -124,9 +142,7 @@ export function useAutoModelRefresh<T>({
   enabled,
   fetcher,
   onSuccess,
-  compareIds,
   snapshotKey,
-  reportInitialAdditions = false,
   onDiff,
   ttlMs = AUTO_MODEL_CACHE_TTL_MS,
 }: {
@@ -134,34 +150,22 @@ export function useAutoModelRefresh<T>({
   enabled: boolean;
   fetcher: () => Promise<T>;
   onSuccess: (value: T) => void;
-  compareIds?: string[];
   snapshotKey?: string;
-  reportInitialAdditions?: boolean;
   onDiff?: (added: string[], removed: string[], updated: string[]) => void;
   ttlMs?: number;
 }): void {
   const onSuccessRef = useRef(onSuccess);
   const fetcherRef = useRef(fetcher);
   const onDiffRef = useRef(onDiff);
-  const compareIdsRef = useRef(compareIds);
   onSuccessRef.current = onSuccess;
   fetcherRef.current = fetcher;
   onDiffRef.current = onDiff;
-  compareIdsRef.current = compareIds;
 
   useEffect(() => {
     if (!enabled || !cacheKey) return;
 
     const cached = cachedValue<T>(cacheKey);
     if (cached !== undefined) {
-      if (!snapshotKey)
-        reportModelDiff(
-          cached,
-          compareIdsRef.current,
-          onDiffRef.current,
-          undefined,
-          reportInitialAdditions,
-        );
       onSuccessRef.current(cached);
       return;
     }
@@ -182,13 +186,7 @@ export function useAutoModelRefresh<T>({
     request
       .then((value) => {
         if (!cancelled && requestEpoch === invalidationEpoch) {
-          reportModelDiff(
-            value,
-            compareIdsRef.current,
-            onDiffRef.current,
-            snapshotKey,
-            reportInitialAdditions,
-          );
+          reportModelDiff(value, onDiffRef.current, snapshotKey);
           onSuccessRef.current(value);
         }
       })
@@ -202,5 +200,5 @@ export function useAutoModelRefresh<T>({
     return () => {
       cancelled = true;
     };
-  }, [cacheKey, enabled, reportInitialAdditions, snapshotKey, ttlMs]);
+  }, [cacheKey, enabled, snapshotKey, ttlMs]);
 }

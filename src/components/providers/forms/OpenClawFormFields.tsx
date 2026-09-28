@@ -2,6 +2,7 @@ import { useTranslation } from "react-i18next";
 import {
   invalidateAutoModelRefresh,
   modelRefreshCredentialFingerprint,
+  rememberModelRefreshSnapshot,
   useAutoModelRefresh,
 } from "@/hooks/useAutoModelRefresh";
 import { useGlobalLoading } from "@/contexts/GlobalLoadingContext";
@@ -174,6 +175,7 @@ export function OpenClawFormFields({
     runWithLoading(() => fetchModelsForConfig(baseUrl, apiKey))
       .then((models) => {
         applyFetchedModels(models);
+        rememberModelRefreshSnapshot(`openclaw:${modelFetchIdentity}`, models);
         if (models.length === 0) {
           toast.info(t("providerForm.fetchModelsEmpty"));
         } else {
@@ -187,7 +189,14 @@ export function OpenClawFormFields({
         showFetchModelsError(err, t);
       })
       .finally(() => setIsFetchingModels(false));
-  }, [baseUrl, apiKey, t, runWithLoading, applyFetchedModels]);
+  }, [
+    baseUrl,
+    apiKey,
+    t,
+    runWithLoading,
+    applyFetchedModels,
+    modelFetchIdentity,
+  ]);
 
   useAutoModelRefresh({
     cacheKey: `provider-models:openclaw:${modelFetchIdentity}`,
@@ -195,7 +204,6 @@ export function OpenClawFormFields({
     fetcher: () => fetchModelsForConfig(baseUrl, apiKey),
     onSuccess: applyFetchedModels,
     snapshotKey: `openclaw:${modelFetchIdentity}`,
-    compareIds: models.map((item) => item.id),
     onDiff: (added, removed, updated) =>
       setModelListDiff({ added, removed, updated }),
     ttlMs: 0,

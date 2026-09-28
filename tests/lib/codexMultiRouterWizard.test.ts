@@ -553,6 +553,37 @@ describe("codexMultiRouterWizard helpers", () => {
     });
   });
 
+  it("keeps persisted aliases that target a visible provider model identity", () => {
+    const relay = provider({
+      id: "relay",
+      name: "Relay",
+      settingsConfig: {
+        modelCatalog: {
+          models: [{ model: "friendly-gpt", upstreamModel: "GPT-5.5" }],
+        },
+      },
+    });
+    const existingRoute = {
+      id: "router-relay",
+      enabled: true,
+      targetProviderId: "relay",
+      modelSelection: { mode: "include" as const, models: ["GPT-5.5"] },
+      matchPrefixes: [],
+      aliases: { "stable-gpt": "friendly-gpt" },
+    };
+
+    expect(
+      buildWizardRoutesFromSources([relay], undefined, [existingRoute])[0]
+        .aliases,
+    ).toEqual({
+      "friendly-gpt": "GPT-5.5",
+      "stable-gpt": "friendly-gpt",
+    });
+    expect(
+      collectWizardRouteAliasSelectionIssues([existingRoute], [relay]),
+    ).toEqual([]);
+  });
+
   it("keeps multi-alias collision resolution idempotent across repeated wizard refreshes", () => {
     const relay = provider({
       id: "relay",

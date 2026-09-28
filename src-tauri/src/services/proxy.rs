@@ -1082,8 +1082,11 @@ impl ProxyService {
             .await
             .map_err(|e| format!("读取 codex Live 备份失败: {e}"))?
             .is_some();
-        let live_taken_over = self.detect_takeover_in_live_config_for_app(&AppType::Codex);
-        if configured || has_backup || live_taken_over {
+        let live_taken_over = self.codex_live_restore_requires_desktop_stop(has_backup);
+        // A backup can remain after Live was already restored (for example when
+        // a prior disable was interrupted). It is not proof that Desktop still
+        // owns the proxy route, so it must not force an unnecessary shutdown.
+        if codex_restore_requires_desktop_stop(configured, live_taken_over) {
             crate::codex_desktop::ensure_codex_desktop_closed_for_routing_transition()?;
         }
         Ok(())
@@ -2891,6 +2894,13 @@ impl ProxyService {
             },
             _ => false,
         }
+    }
+
+    pub(crate) fn codex_live_restore_requires_desktop_stop(&self, has_backup: bool) -> bool {
+        let live_taken_over = self
+            .read_codex_live()
+            .map(|config| Self::is_codex_live_taken_over(&config));
+        codex_live_restore_requires_desktop_stop(has_backup, live_taken_over)
     }
 
     /// 当 Live 备份缺失时，尝试用 SSOT（当前供应商）写回 Live，以解除占位符接管。
@@ -5078,6 +5088,17 @@ impl ProxyService {
     }
 }
 
+fn codex_restore_requires_desktop_stop(configured: bool, live_taken_over: bool) -> bool {
+    configured || live_taken_over
+}
+
+fn codex_live_restore_requires_desktop_stop(
+    has_backup: bool,
+    live_taken_over: Result<bool, String>,
+) -> bool {
+    live_taken_over.unwrap_or(has_backup)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5085,6 +5106,22 @@ mod tests {
     use serial_test::serial;
     use std::env;
     use tempfile::TempDir;
+
+    #[test]
+    fn restore_guard_ignores_backup_only_residue_but_blocks_active_routing() {
+        assert!(!codex_restore_requires_desktop_stop(false, false));
+        assert!(codex_restore_requires_desktop_stop(true, false));
+        assert!(codex_restore_requires_desktop_stop(false, true));
+        assert!(!codex_live_restore_requires_desktop_stop(true, Ok(false)));
+        assert!(codex_live_restore_requires_desktop_stop(
+            true,
+            Err("invalid TOML".into())
+        ));
+        assert!(!codex_live_restore_requires_desktop_stop(
+            false,
+            Err("missing".into())
+        ));
+    }
 
     struct TempHome {
         #[allow(dead_code)]

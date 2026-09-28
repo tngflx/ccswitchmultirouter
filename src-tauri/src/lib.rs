@@ -1314,15 +1314,15 @@ pub fn run() {
                     .get_proxy_config_for_app("codex")
                     .await
                     .is_ok_and(|config| config.enabled);
-                let codex_recovery_needed = state
+                let codex_has_backup = state
                     .db
                     .get_live_backup("codex")
                     .await
                     .map(|backup| backup.is_some())
-                    .unwrap_or(false)
-                    || state
-                        .proxy_service
-                        .detect_takeover_in_live_config_for_app(&AppType::Codex);
+                    .unwrap_or(false);
+                let codex_recovery_needed = state
+                    .proxy_service
+                    .codex_live_restore_requires_desktop_stop(codex_has_backup);
                 let mut codex_stopped_for_takeover = false;
                 let codex_runtime_prepared = if proxy_startup_allowed
                     && (codex_takeover_requested
@@ -1333,7 +1333,10 @@ pub fn run() {
                     {
                         Ok(0) => true,
                         Ok(count) => {
-                            codex_stopped_for_takeover = codex_takeover_requested;
+                            // A crash-recovery stop is just as authoritative as an
+                            // explicit takeover stop: if we successfully stopped a
+                            // Desktop shell, startup must relaunch it after recovery.
+                            codex_stopped_for_takeover = should_relaunch_stopped_codex(count);
                             log::info!(
                                 "Codex managed startup stopped {count} verified Desktop shell process(es) before routing recovery"
                             );
@@ -1590,6 +1593,7 @@ pub fn run() {
             commands::delete_provider,
             commands::remove_provider_from_live_config,
             commands::switch_provider,
+            commands::switch_codex_provider_with_desktop_restart,
             commands::force_repair_and_switch_codex_provider,
             commands::switch_codex_to_official_and_repair_history,
             commands::import_default_config,
@@ -2221,13 +2225,14 @@ pub async fn cleanup_before_exit(app_handle: &tauri::AppHandle) {
         let needs_restore = has_backups || live_taken_over;
 
         if needs_restore {
-            let codex_needs_restore = state
+            let codex_has_backup = state
                 .db
                 .get_live_backup("codex")
                 .await
                 .map(|backup| backup.is_some())
-                .unwrap_or(false)
-                || proxy_service.detect_takeover_in_live_config_for_app(&AppType::Codex);
+                .unwrap_or(false);
+            let codex_needs_restore =
+                proxy_service.codex_live_restore_requires_desktop_stop(codex_has_backup);
             if codex_needs_restore {
                 match crate::codex_desktop::stop_running_codex_desktop_for_managed_lifecycle() {
                     Ok(count) => log::info!(
@@ -2689,6 +2694,10 @@ fn classify_exit_request(code: Option<i32>) -> ExitRequestAction {
     }
 }
 
+fn should_relaunch_stopped_codex(stopped_process_count: u32) -> bool {
+    stopped_process_count > 0
+}
+
 // ============================================================
 // 在应用主动退出前显式持久化窗口状态
 // ============================================================
@@ -2739,10 +2748,16 @@ mod tests {
     use super::{
         classify_exit_request, enabled_proxy_apps_on_startup, redact_url_for_log,
         redact_url_for_log_with_secrets, redact_url_origin_for_log, requested_exit_reason_name,
-        runtime_log_level_allows, should_restore_startup_app, should_retry_startup_takeover_error,
-        ExitRequestAction, RequestedExitReason,
+        runtime_log_level_allows, should_relaunch_stopped_codex, should_restore_startup_app,
+        should_retry_startup_takeover_error, ExitRequestAction, RequestedExitReason,
     };
     use crate::database::Database;
+
+    #[test]
+    fn startup_relaunches_any_desktop_shell_stopped_for_crash_recovery() {
+        assert!(!should_relaunch_stopped_codex(0));
+        assert!(should_relaunch_stopped_codex(1));
+    }
 
     #[test]
     fn log_url_redaction_strips_credentials_and_query_keeps_path() {

@@ -3,6 +3,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
   invalidateAutoModelRefresh,
   modelRefreshCredentialFingerprint,
+  rememberModelRefreshSnapshot,
   useAutoModelRefresh,
 } from "@/hooks/useAutoModelRefresh";
 
@@ -89,7 +90,7 @@ describe("useAutoModelRefresh", () => {
     expect(fetcher).toHaveBeenCalledTimes(2);
   });
 
-  it("reports model diffs when a fresh cached result is reused", async () => {
+  it("does not treat a cached result as a new upstream observation", async () => {
     const fetcher = vi.fn().mockResolvedValue([{ id: "model-new" }]);
     renderHook(() =>
       useAutoModelRefresh({
@@ -108,7 +109,7 @@ describe("useAutoModelRefresh", () => {
         cacheKey: "provider:cached-diff",
         enabled: true,
         fetcher,
-        compareIds: ["model-old"],
+        snapshotKey: "cached-diff",
         onDiff,
         onSuccess,
       }),
@@ -117,7 +118,7 @@ describe("useAutoModelRefresh", () => {
     await waitFor(() =>
       expect(onSuccess).toHaveBeenCalledWith([{ id: "model-new" }]),
     );
-    expect(onDiff).toHaveBeenCalledWith([], ["model-old"], []);
+    expect(onDiff).not.toHaveBeenCalled();
     expect(fetcher).toHaveBeenCalledTimes(1);
   });
 
@@ -139,7 +140,6 @@ describe("useAutoModelRefresh", () => {
         snapshotKey: "provider:snapshot",
         enabled: true,
         fetcher,
-        compareIds: ["kept", "removed"],
         onSuccess: vi.fn(),
         onDiff: firstDiff,
         ttlMs: 0,
@@ -161,7 +161,6 @@ describe("useAutoModelRefresh", () => {
         snapshotKey: "provider:snapshot",
         enabled: true,
         fetcher,
-        compareIds: ["kept", "removed"],
         onSuccess: vi.fn(),
         onDiff: secondDiff,
         ttlMs: 0,
@@ -173,7 +172,7 @@ describe("useAutoModelRefresh", () => {
     expect(fetcher).toHaveBeenCalledTimes(2);
   });
 
-  it("reports initial additions only for forms with a saved complete catalog", async () => {
+  it("uses the first successful fetch as a silent baseline", async () => {
     const onDiff = vi.fn();
     renderHook(() =>
       useAutoModelRefresh({
@@ -181,16 +180,73 @@ describe("useAutoModelRefresh", () => {
         snapshotKey: "catalog-first",
         enabled: true,
         fetcher: () => Promise.resolve([{ id: "saved" }, { id: "new" }]),
-        compareIds: ["saved", "removed"],
-        reportInitialAdditions: true,
         onSuccess: vi.fn(),
         onDiff,
         ttlMs: 0,
       }),
     );
     await waitFor(() =>
-      expect(onDiff).toHaveBeenCalledWith(["new"], ["removed"], []),
+      expect(localStorage.getItem("model-catalog:catalog-first")).toContain(
+        '"new"',
+      ),
     );
+    expect(onDiff).not.toHaveBeenCalled();
+  });
+
+  it("does not notify on repeated identical fetches", async () => {
+    const fetcher = vi.fn().mockResolvedValue([{ id: "remote-only" }]);
+    const first = renderHook(() =>
+      useAutoModelRefresh({
+        cacheKey: "provider:repeat",
+        snapshotKey: "repeat",
+        enabled: true,
+        fetcher,
+        onSuccess: vi.fn(),
+        onDiff: vi.fn(),
+        ttlMs: 0,
+      }),
+    );
+    await waitFor(() =>
+      expect(localStorage.getItem("model-catalog:repeat")).toContain(
+        "remote-only",
+      ),
+    );
+    first.unmount();
+
+    const onDiff = vi.fn();
+    renderHook(() =>
+      useAutoModelRefresh({
+        cacheKey: "provider:repeat",
+        snapshotKey: "repeat",
+        enabled: true,
+        fetcher,
+        onSuccess: vi.fn(),
+        onDiff,
+        ttlMs: 0,
+      }),
+    );
+    await waitFor(() => expect(fetcher).toHaveBeenCalledTimes(2));
+    expect(onDiff).not.toHaveBeenCalled();
+  });
+
+  it("lets a manual fetch advance the comparison baseline", async () => {
+    rememberModelRefreshSnapshot("manual", [{ id: "old" }]);
+    rememberModelRefreshSnapshot("manual", [{ id: "new" }]);
+    const onDiff = vi.fn();
+    const onSuccess = vi.fn();
+    renderHook(() =>
+      useAutoModelRefresh({
+        cacheKey: "provider:manual",
+        snapshotKey: "manual",
+        enabled: true,
+        fetcher: () => Promise.resolve([{ id: "new" }]),
+        onSuccess,
+        onDiff,
+        ttlMs: 0,
+      }),
+    );
+    await waitFor(() => expect(onSuccess).toHaveBeenCalled());
+    expect(onDiff).not.toHaveBeenCalled();
   });
 
   it("does not replace a good snapshot or report removals for an empty response", async () => {
@@ -206,7 +262,6 @@ describe("useAutoModelRefresh", () => {
         snapshotKey: "empty",
         enabled: true,
         fetcher: () => Promise.resolve([]),
-        compareIds: ["saved"],
         onSuccess,
         onDiff,
         ttlMs: 0,
@@ -219,7 +274,7 @@ describe("useAutoModelRefresh", () => {
     );
   });
 
-  it("never reports the same model as both removed and updated", async () => {
+  it("reports a prior upstream removal even when it was never saved", async () => {
     localStorage.setItem(
       "model-catalog:overlap",
       JSON.stringify([
@@ -233,9 +288,6 @@ describe("useAutoModelRefresh", () => {
         cacheKey: "provider:overlap",
         snapshotKey: "overlap",
         enabled: true,
-        // The catalog knows only gpt-5.6-sol. gpt-6-luna is present in the
-        // previous fetch but in neither the catalog nor this response.
-        compareIds: ["gpt-5.6-sol"],
         fetcher: () =>
           Promise.resolve([{ id: "gpt-5.6-sol", contextWindow: 2 }]),
         onSuccess: vi.fn(),
@@ -246,13 +298,11 @@ describe("useAutoModelRefresh", () => {
 
     await waitFor(() => expect(onDiff).toHaveBeenCalled());
     const [, removed, updated] = onDiff.mock.calls[0];
-    // gpt-6-luna was in the previous *fetch* but never in the saved catalog,
-    // so it is not something the user lost and must not be reported at all.
-    expect(removed).not.toContain("gpt-6-luna");
+    expect(removed).toContain("gpt-6-luna");
     expect(updated).not.toContain("gpt-6-luna");
   });
 
-  it("does not report upstream churn as removals the user never had", async () => {
+  it("reports upstream churn only once, independently of saved selections", async () => {
     // The previous fetch offered thirteen models the catalog never saved.
     localStorage.setItem(
       "model-catalog:churn",
@@ -278,24 +328,19 @@ describe("useAutoModelRefresh", () => {
         cacheKey: "provider:churn",
         snapshotKey: "churn",
         enabled: true,
-        // The saved catalog holds only these three.
-        compareIds: ["gpt-5.6-sol", "gpt-6-sol", "gpt-6-astra"],
         fetcher: () =>
           Promise.resolve([{ id: "gpt-5.6-sol" }, { id: "gpt-reserve" }]),
         onSuccess: vi.fn(),
         onDiff,
-        reportInitialAdditions: true,
         ttlMs: 0,
       }),
     );
 
     await waitFor(() => expect(onDiff).toHaveBeenCalled());
     const [added, removed] = onDiff.mock.calls[0];
-    // gpt-5.6-sol and gpt-6-sol really are gone from the fetched list.
-    expect(removed.sort()).toEqual(["gpt-6-astra", "gpt-6-sol"]);
-    // gpt-reserve is new; the ten other vanished upstream models are not
-    // reported as removed because the user never had them.
-    expect(added).toEqual(["gpt-reserve"]);
+    expect(removed).toHaveLength(11);
+    expect(removed).not.toContain("gpt-6-astra");
+    expect(added).toEqual([]);
   });
 
   it("compares metadata by id rather than array position", async () => {
@@ -316,7 +361,6 @@ describe("useAutoModelRefresh", () => {
         cacheKey: "provider:reorder",
         snapshotKey: "reorder",
         enabled: true,
-        compareIds: ["first", "second"],
         // Same models, reversed order, no metadata change at all.
         fetcher,
         onSuccess: vi.fn(),
@@ -330,6 +374,45 @@ describe("useAutoModelRefresh", () => {
     // "updated" here.
     await waitFor(() => expect(fetcher).toHaveBeenCalled());
     await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(onDiff).not.toHaveBeenCalled();
+  });
+
+  it("ignores metadata key and modality ordering changes", async () => {
+    localStorage.setItem(
+      "model-catalog:metadata-order",
+      JSON.stringify([
+        {
+          id: "same",
+          ownedBy: "provider",
+          inputModalities: ["text", "image"],
+        },
+      ]),
+    );
+    const onDiff = vi.fn();
+    renderHook(() =>
+      useAutoModelRefresh({
+        cacheKey: "provider:metadata-order",
+        snapshotKey: "metadata-order",
+        enabled: true,
+        fetcher: () =>
+          Promise.resolve([
+            {
+              inputModalities: ["image", "text"],
+              ownedBy: "provider",
+              id: "same",
+            },
+          ]),
+        onSuccess: vi.fn(),
+        onDiff,
+        ttlMs: 0,
+      }),
+    );
+
+    await waitFor(() =>
+      expect(localStorage.getItem("model-catalog:metadata-order")).toContain(
+        '"same"',
+      ),
+    );
     expect(onDiff).not.toHaveBeenCalled();
   });
 

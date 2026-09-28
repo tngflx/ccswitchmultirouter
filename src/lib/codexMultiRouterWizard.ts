@@ -1218,6 +1218,14 @@ function canonicalWizardModelIds(provider: Provider): string[] {
   );
 }
 
+function wizardProviderModelIdentitySet(provider: Provider): Set<string> {
+  return new Set(
+    readWizardModelCatalog(provider)
+      .filter(isWizardModelEnabled)
+      .flatMap(wizardModelIdentities),
+  );
+}
+
 export interface WizardRouteAliasSelectionIssue {
   routeId: string;
   routeLabel?: string;
@@ -1256,9 +1264,10 @@ export function collectWizardRouteAliasSelectionIssues(
     const provider = providersById.get(route.targetProviderId);
     if (!provider) continue;
     const routeLabel = wizardRouteDisplayLabel(route, provider.name);
-    const canonicalIds = canonicalWizardModelIds(provider);
     const canonicalSet = new Set(
-      canonicalIds.map((model) => model.toLowerCase()),
+      Array.from(wizardProviderModelIdentitySet(provider)).map((model) =>
+        model.toLowerCase(),
+      ),
     );
     const selectedSet =
       route.modelSelection?.mode === "all"
@@ -1268,6 +1277,19 @@ export function collectWizardRouteAliasSelectionIssues(
               model.trim().toLowerCase(),
             ),
           );
+    const selectedIdentitySet = new Set(selectedSet);
+    if (route.modelSelection?.mode === "include") {
+      for (const model of readWizardModelCatalog(provider).filter(
+        isWizardModelEnabled,
+      )) {
+        const identities = wizardModelIdentities(model).map((identity) =>
+          identity.toLowerCase(),
+        );
+        if (identities.some((identity) => selectedSet.has(identity))) {
+          identities.forEach((identity) => selectedIdentitySet.add(identity));
+        }
+      }
+    }
     for (const [alias, target] of Object.entries(route.aliases ?? {})) {
       const canonicalModel = target.trim();
       if (!canonicalModel) continue;
@@ -1281,7 +1303,7 @@ export function collectWizardRouteAliasSelectionIssues(
           canonicalModel,
           reason: i18n.t("codexWizard.lib.aliasRemovedOrRenamed"),
         });
-      } else if (!selectedSet.has(canonicalKey)) {
+      } else if (!selectedIdentitySet.has(canonicalKey)) {
         issues.push({
           routeId: route.id,
           routeLabel,
@@ -1307,7 +1329,7 @@ export function buildWizardRoutesFromSources(
     const existingRoute = existingRoutes.find(
       (route) => route.targetProviderId === provider.id,
     );
-    const canonicalModels = new Set(canonicalWizardModelIds(provider));
+    const canonicalModels = wizardProviderModelIdentitySet(provider);
     const aliases = { ...(modelMap ?? {}) };
     // A generated collision alias becomes part of the route contract on first
     // save. Keep that persisted spelling when the Provider is renamed later.
@@ -1315,13 +1337,16 @@ export function buildWizardRoutesFromSources(
       existingRoute?.aliases ?? {},
     ).filter(
       ([visible, canonical]) =>
-        Boolean(visible.trim()) && canonicalModels.has(canonical.trim()),
+        Boolean(visible.trim()) &&
+        canonicalModels.has(normalizedWizardModelId(canonical)),
     );
     const persistedTargets = new Set(
-      persistedAliases.map(([, canonical]) => canonical.trim()),
+      persistedAliases.map(([, canonical]) =>
+        normalizedWizardModelId(canonical),
+      ),
     );
     for (const [generatedVisible, generatedTarget] of Object.entries(aliases)) {
-      if (persistedTargets.has(generatedTarget))
+      if (persistedTargets.has(normalizedWizardModelId(generatedTarget)))
         delete aliases[generatedVisible];
     }
     for (const [visible, canonical] of persistedAliases) {
@@ -1342,7 +1367,7 @@ export function buildWizardRoutesFromSources(
         Object.entries(aliases).filter(
           ([visible, canonical]) =>
             visible.trim() !== canonical.trim() &&
-            canonicalModels.has(canonical.trim()),
+            canonicalModels.has(normalizedWizardModelId(canonical)),
         ),
       ),
       authPolicy:
