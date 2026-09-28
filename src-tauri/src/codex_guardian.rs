@@ -23,6 +23,21 @@ pub struct CodexGuardianStatus {
     pub injected: bool,
     pub last_event: String,
     pub message: String,
+    /// Stable frontend translation key for the current human-readable status.
+    /// `message` remains as a compatibility fallback for older clients.
+    pub message_key: String,
+    pub message_args: Vec<String>,
+}
+
+fn set_status_message(
+    status: &mut CodexGuardianStatus,
+    key: &str,
+    message: impl Into<String>,
+    args: Vec<String>,
+) {
+    status.message_key = key.into();
+    status.message_args = args;
+    status.message = message.into();
 }
 
 /// 守护内部持有的可变更状态。
@@ -55,6 +70,8 @@ pub(crate) fn start_codex_guardian() -> GuardianHandle {
         injected: false,
         last_event: "守护已启动".into(),
         message: "守护已启动，等待 Codex Desktop...".into(),
+        message_key: "codexRouterWorkspace.guardian.started".into(),
+        message_args: Vec::new(),
     }));
 
     let inner = Arc::new(Mutex::new(GuardianInner {
@@ -135,7 +152,12 @@ async fn guardian_loop(
             let mut s = status.lock().await;
             s.active = false;
             s.last_event = "守护已停止".into();
-            s.message = "守护已停止".into();
+            set_status_message(
+                &mut s,
+                "codexRouterWorkspace.guardian.stopped",
+                "守护已停止",
+                Vec::new(),
+            );
             return;
         }
 
@@ -147,7 +169,12 @@ async fn guardian_loop(
                 let mut s = status.lock().await;
                 s.active = false;
                 s.last_event = "守护已停止".into();
-                s.message = "守护已停止".into();
+                set_status_message(
+                    &mut s,
+                    "codexRouterWorkspace.guardian.stopped",
+                    "守护已停止",
+                    Vec::new(),
+                );
                 return;
             }
         }
@@ -167,7 +194,12 @@ async fn run_guardian_cycle(
         s.injected = false;
         s.injected_target_count = 0;
         s.last_event = "Codex 未运行".into();
-        s.message = "Codex Desktop 未运行，等待用户启动...".into();
+        set_status_message(
+            &mut s,
+            "codexRouterWorkspace.guardian.codexNotRunning",
+            "Codex Desktop 未运行，等待用户启动...",
+            Vec::new(),
+        );
         // 进程消失时清理已知 target，下次启动不会跳过新 target。
         let mut guard = inner.lock().await;
         guard.injected_target_ids.clear();
@@ -204,7 +236,12 @@ async fn run_guardian_cycle(
         s.injected = false;
         s.injected_target_count = 0;
         s.last_event = "Codex 运行中但无 CDP".into();
-        s.message = "Codex Desktop 正在运行但未开放 CDP 调试端口；CCSM 不会静默终止 Codex，请退出后从 CCSM 启动或等待下次 CCSM 启动 Codex 时自动注入。".into();
+        set_status_message(
+            &mut s,
+            "codexRouterWorkspace.guardian.noCdp",
+            "Codex Desktop 正在运行但未开放 CDP 调试端口；CCSM 不会静默终止 Codex，请退出后从 CCSM 启动或等待下次 CCSM 启动 Codex 时自动注入。",
+            Vec::new(),
+        );
         let mut guard = inner.lock().await;
         guard.injected_target_ids.clear();
         guard.injected_catalog_fingerprint = None;
@@ -220,7 +257,12 @@ async fn run_guardian_cycle(
             s.codex_running = true;
             s.cdp_available = true;
             s.last_event = "模型目录加载失败".into();
-            s.message = format!("无法加载 CCSM 模型目录: {error}");
+            set_status_message(
+                &mut s,
+                "codexRouterWorkspace.guardian.catalogLoadFailed",
+                format!("无法加载 CCSM 模型目录: {error}"),
+                vec![error.to_string()],
+            );
             log::warn!("Codex 守护: 模型目录加载失败: {error}");
             return;
         }
@@ -246,12 +288,20 @@ async fn run_guardian_cycle(
         s.injected_target_count = guard.injected_target_ids.len();
         s.last_event = "CDP target 与模型目录无变化".into();
         if s.injected {
-            s.message = format!(
-                "已守护 {} 个 CDP renderer target；模型菜单注入有效。",
-                guard.injected_target_ids.len()
+            let count = guard.injected_target_ids.len();
+            set_status_message(
+                s,
+                "codexRouterWorkspace.guardian.injectedTargets",
+                format!("已守护 {count} 个 CDP renderer target；模型菜单注入有效。"),
+                vec![count.to_string()],
             );
         } else {
-            s.message = "CDP 可用但尚未注入（可能 target 启动中）".into();
+            set_status_message(
+                s,
+                "codexRouterWorkspace.guardian.noInjection",
+                "CDP 可用但尚未注入（可能 target 启动中）",
+                Vec::new(),
+            );
         }
         // 清理已消失的 target
         guard
@@ -277,14 +327,22 @@ async fn run_guardian_cycle(
         } else {
             format!("检测到新 CDP target，发起注入 (gen {gen})")
         };
-        s.message = if catalog_changed {
-            "Provider 模型目录已更新，正在刷新现有 Codex Desktop renderer...".into()
+        if catalog_changed {
+            set_status_message(
+                &mut s,
+                "codexRouterWorkspace.guardian.catalogRefreshing",
+                "Provider 模型目录已更新，正在刷新现有 Codex Desktop renderer...",
+                Vec::new(),
+            );
         } else {
-            format!(
-                "检测到 {} 个新 CDP renderer target，正在注入...",
-                new_ids.len()
-            )
-        };
+            let count = new_ids.len();
+            set_status_message(
+                &mut s,
+                "codexRouterWorkspace.guardian.targetInjecting",
+                format!("检测到 {count} 个新 CDP renderer target，正在注入..."),
+                vec![count.to_string()],
+            );
+        }
     }
 
     match try_inject_on_candidate_ports(&catalog, &ports).await {
@@ -308,9 +366,12 @@ async fn run_guardian_cycle(
             s.injected = true;
             s.injected_target_count = guard.injected_target_ids.len();
             s.last_event = format!("注入成功 (gen {gen})");
-            s.message = format!(
-                "已将模型菜单兼容层注入 {} 个 renderer target (gen {gen})。",
-                guard.injected_target_ids.len()
+            let count = guard.injected_target_ids.len();
+            set_status_message(
+                &mut s,
+                "codexRouterWorkspace.guardian.injectionSuccess",
+                format!("已将模型菜单兼容层注入 {count} 个 renderer target (gen {gen})。"),
+                vec![count.to_string(), gen.to_string()],
             );
             log::info!(
                 "Codex 守护: 模型菜单已注入 target={:?}, models={}",
@@ -323,7 +384,12 @@ async fn run_guardian_cycle(
             s.codex_running = true;
             s.cdp_available = true;
             s.last_event = format!("注入未完成 (gen {gen})");
-            s.message = format!("模型菜单注入尝试未完成: {}", result.message);
+            set_status_message(
+                &mut s,
+                "codexRouterWorkspace.guardian.injectionIncomplete",
+                format!("模型菜单注入尝试未完成: {}", result.message),
+                vec![result.message.clone()],
+            );
             log::warn!("Codex 守护: 注入未完成: {}", result.message);
         }
         None => {
@@ -331,7 +397,12 @@ async fn run_guardian_cycle(
             s.codex_running = true;
             s.cdp_available = true;
             s.last_event = format!("注入失败 (gen {gen})");
-            s.message = "模型菜单注入失败：未找到可注入的 CDP target。".into();
+            set_status_message(
+                &mut s,
+                "codexRouterWorkspace.guardian.injectionFailed",
+                "模型菜单注入失败：未找到可注入的 CDP target。",
+                Vec::new(),
+            );
             log::warn!("Codex 守护: 注入失败，未找到可注入的 target");
         }
     }
@@ -388,5 +459,34 @@ mod tests {
         let status = handle.status.clone();
         handle.stop().await;
         assert!(!status.lock().await.active);
+    }
+
+    #[test]
+    fn guardian_status_serializes_translation_metadata() {
+        let mut status = CodexGuardianStatus {
+            active: true,
+            codex_running: true,
+            cdp_available: true,
+            injected_target_count: 2,
+            injected: true,
+            last_event: String::new(),
+            message: String::new(),
+            message_key: String::new(),
+            message_args: Vec::new(),
+        };
+        set_status_message(
+            &mut status,
+            "codexRouterWorkspace.guardian.injectedTargets",
+            "legacy fallback",
+            vec!["2".into()],
+        );
+
+        let value = serde_json::to_value(status).expect("guardian status should serialize");
+        assert_eq!(
+            value["messageKey"],
+            "codexRouterWorkspace.guardian.injectedTargets"
+        );
+        assert_eq!(value["messageArgs"][0], "2");
+        assert_eq!(value["message"], "legacy fallback");
     }
 }

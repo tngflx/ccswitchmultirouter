@@ -105,6 +105,11 @@ pub(crate) fn thinking_cannot_be_disabled(model: &str) -> bool {
         .any(|needle| normalized.contains(needle))
 }
 
+/// Opus 5 accepts omitted thinking, but rejects an explicit disabled block.
+pub(crate) fn omits_disabled_thinking_on_wire(model: &str) -> bool {
+    normalize_model_name(model).contains("opus-5")
+}
+
 fn normalize_model_name(model: &str) -> String {
     model.trim().to_ascii_lowercase().replace(['.', '_'], "-")
 }
@@ -179,6 +184,15 @@ mod tests {
         assert!(adaptive_thinking_is_default("claude-sonnet-5"));
         assert!(thinking_cannot_be_disabled("claude-fable-5"));
         assert!(!thinking_cannot_be_disabled("claude-sonnet-5"));
+    }
+
+    #[test]
+    fn opus_5_wire_omission_does_not_change_required_thinking_policy() {
+        assert!(omits_disabled_thinking_on_wire("anthropic/claude-opus-5"));
+        assert!(!thinking_cannot_be_disabled("claude-opus-5"));
+        for model in ["claude-fable-5", "claude-mythos-5", "claude-sonnet-5"] {
+            assert!(!omits_disabled_thinking_on_wire(model));
+        }
     }
 
     #[test]

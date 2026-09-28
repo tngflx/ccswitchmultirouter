@@ -4,6 +4,7 @@ import {
   reconcileFetchedCodexCatalogRows,
   type CodexCatalogRowLike,
 } from "./codexCatalogSync";
+import type { CodexModelReasoningCapability } from "@/types";
 
 const source = { providerName: "Sublyx", baseUrl: "https://api.example.com" };
 
@@ -292,5 +293,67 @@ describe("reconcileFetchedCodexCatalogRows", () => {
       sortIndex: 7,
     });
     expect(result.rows[0].reasoning?.source).toBe("user");
+  });
+
+  it("refreshes provider reasoning metadata and its effort map", () => {
+    const discovered: CodexModelReasoningCapability = {
+      schemaVersion: 2,
+      supportStatus: "confirmed_supported" as const,
+      controlKind: "graded" as const,
+      supportedEfforts: ["low", "high"] as const,
+      defaultEffort: "high" as const,
+      disableAllowed: false,
+      upstream: {
+        format: "string" as const,
+        parameter: "reasoning_effort" as const,
+        effortMap: { low: "low" as const, high: "high" as const },
+      },
+      source: "provider" as const,
+    };
+    const result = reconcileFetchedCodexCatalogRows(
+      [
+        {
+          model: "gpt-5.5",
+          reasoning: {
+            supportedEfforts: ["low"],
+            disableAllowed: false,
+            upstream: {
+              format: "string",
+              parameter: "reasoning_effort",
+              effortMap: { low: "low" },
+            },
+          },
+        },
+      ],
+      [{ id: "gpt-5.5", reasoning: discovered }],
+      source,
+      { appendNew: false, createRow, existingMetadataMode: "refresh" },
+    );
+
+    expect(result.rows[0].reasoning).toEqual(discovered);
+    expect(result.rows[0].reasoning?.upstream.effortMap).toEqual({
+      low: "low",
+      high: "high",
+    });
+  });
+
+  it("fills missing reasoning metadata during normal sync", () => {
+    const reasoning: CodexModelReasoningCapability = {
+      supportedEfforts: ["medium"],
+      disableAllowed: true,
+      upstream: {
+        format: "reasoning_object" as const,
+        parameter: "reasoning.effort" as const,
+        effortMap: { medium: "medium" as const },
+      },
+    };
+    const result = reconcileFetchedCodexCatalogRows(
+      [{ model: "gpt-5.5" }],
+      [{ id: "gpt-5.5", reasoning }],
+      source,
+      { appendNew: false, createRow },
+    );
+
+    expect(result.rows[0].reasoning).toEqual(reasoning);
   });
 });

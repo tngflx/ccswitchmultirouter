@@ -8,6 +8,9 @@
 /// 标识触发官方后端不同的模型准入策略。
 pub const CODEX_OAUTH_ORIGINATOR: &str = "codex_cli_rs";
 
+/// App-owned OAuth requests use the minimum Codex cohort for GPT-6 Sol/Luna.
+pub const CODEX_OAUTH_CLIENT_VERSION: &str = "0.155.0";
+
 /// 认证信息
 ///
 /// 包含 API Key 和对应的认证策略

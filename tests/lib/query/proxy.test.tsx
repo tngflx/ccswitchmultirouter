@@ -3,6 +3,7 @@ import { QueryClientProvider } from "@tanstack/react-query";
 import { act, renderHook } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 import {
+  useSetCodexCapacityRetryEnabled,
   useSetProxyTakeoverForApp,
   proxyKeys,
   proxyStatusPollInterval,
@@ -12,6 +13,7 @@ import { createTestQueryClient } from "../../utils/testQueryClient";
 
 vi.mock("@/lib/api/proxy", () => ({
   proxyApi: {
+    setCodexCapacityRetryEnabled: vi.fn(),
     setProxyTakeoverForApp: vi.fn(),
   },
 }));
@@ -53,5 +55,38 @@ describe("proxy takeover mutation", () => {
         ([args]) => args?.queryKey === proxyKeys.takeoverStatus,
       ),
     ).toHaveLength(2);
+  });
+});
+
+describe("Codex capacity retry mutation", () => {
+  it("updates only Codex and invalidates its proxy config", async () => {
+    vi.mocked(proxyApi.setCodexCapacityRetryEnabled).mockResolvedValue(
+      undefined,
+    );
+    const queryClient = createTestQueryClient();
+    queryClient.setQueryData(proxyKeys.appConfig("codex"), {
+      capacityRetryEnabled: true,
+    });
+    const invalidateSpy = vi.spyOn(queryClient, "invalidateQueries");
+    const wrapper = ({ children }: { children: ReactNode }) => (
+      <QueryClientProvider client={queryClient}>{children}</QueryClientProvider>
+    );
+    const { result } = renderHook(() => useSetCodexCapacityRetryEnabled(), {
+      wrapper,
+    });
+
+    await act(async () => {
+      await result.current.mutateAsync(false);
+    });
+
+    expect(proxyApi.setCodexCapacityRetryEnabled).toHaveBeenCalledWith(false);
+    expect(
+      queryClient.getQueryData<{ capacityRetryEnabled: boolean }>(
+        proxyKeys.appConfig("codex"),
+      )?.capacityRetryEnabled,
+    ).toBe(false);
+    expect(invalidateSpy).toHaveBeenCalledWith({
+      queryKey: proxyKeys.appConfig("codex"),
+    });
   });
 });

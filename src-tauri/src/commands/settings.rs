@@ -116,6 +116,18 @@ fn codex_auto_update_just_enabled(
     !existing.auto_update_codex_cli && incoming.auto_update_codex_cli
 }
 
+fn newly_enabled_auto_update_tools(
+    existing: &crate::settings::AppSettings,
+    incoming: &crate::settings::AppSettings,
+) -> Vec<String> {
+    incoming
+        .auto_update_cli_tools
+        .iter()
+        .filter(|tool| !existing.auto_update_cli_tools.contains(tool))
+        .cloned()
+        .collect()
+}
+
 /// 获取设置
 #[tauri::command]
 pub async fn get_settings() -> Result<crate::settings::AppSettings, String> {
@@ -132,6 +144,7 @@ pub async fn save_settings(
     let merged = merge_settings_for_save(settings, &existing);
     validate_settings_for_save(&merged)?;
     let start_codex_auto_update = codex_auto_update_just_enabled(&existing, &merged);
+    let newly_enabled_tools = newly_enabled_auto_update_tools(&existing, &merged);
     let env_injection = merged.env_injection.clone();
     let unify_codex_changed =
         merged.unify_codex_session_history != existing.unify_codex_session_history;
@@ -202,6 +215,17 @@ pub async fn save_settings(
                 Err(error) => log::warn!(
                     "Codex CLI automatic update after enabling failed; setting remains enabled: {error}"
                 ),
+            }
+        });
+    }
+    if !newly_enabled_tools.is_empty() {
+        tokio::spawn(async move {
+            for (tool, result) in
+                crate::commands::auto_update_cli_tools_if_needed(newly_enabled_tools).await
+            {
+                if let Err(error) = result {
+                    log::warn!("{tool} automatic update after enabling failed: {error}");
+                }
             }
         });
     }
@@ -533,6 +557,24 @@ mod tests {
                 "transition {before} -> {after}"
             );
         }
+    }
+
+    #[test]
+    fn cli_auto_update_dispatches_only_newly_enabled_tools() {
+        let existing = AppSettings {
+            auto_update_cli_tools: vec!["claude".into()],
+            ..AppSettings::default()
+        };
+        let incoming = AppSettings {
+            auto_update_cli_tools: vec!["claude".into(), "gemini".into()],
+            ..AppSettings::default()
+        };
+        assert_eq!(
+            super::newly_enabled_auto_update_tools(&existing, &incoming),
+            vec!["gemini"]
+        );
+        let disabled = AppSettings::default();
+        assert!(super::newly_enabled_auto_update_tools(&existing, &disabled).is_empty());
     }
 
     #[test]

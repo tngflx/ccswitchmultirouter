@@ -293,5 +293,8 @@ describe("CodexProtocolProbeProgressDialog", () => {
     expect(
       screen.getByText("已使用安全工具 Schema 回退并重新验证"),
     ).toBeInTheDocument();
+    expect(screen.getByLabelText("Automatic compatibility handling")).toHaveTextContent(
+      "A tool-schema compatibility retry was requested",
+    );
   });
 });

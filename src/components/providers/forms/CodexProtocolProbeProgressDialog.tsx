@@ -30,20 +30,27 @@ import type {
   CodexProtocolProbeStageStatus,
   CodexProtocolTransport,
   CodexProviderProtocolPreflightOutcome,
+  CodexProtocolCompatibilityRule,
+  CodexProtocolHistoryReplay,
+  CodexProtocolToolSchemaDialect,
   CodexReasoningSemantic,
   CodexReasoningSource,
 } from "@/lib/api/protocol-compatibility";
+import { CodexCompatibilitySummary } from "./CodexCompatibilitySummary";
 
 type VisibleStageStatus = CodexProtocolProbeStageStatus | "pending" | "running";
 
 interface BranchProgress {
   touched: boolean;
+  retries: CodexProtocolCompatibilityRule[];
   stages: Record<CodexProtocolProbeStage, VisibleStageStatus>;
   reasoningSemantic: CodexReasoningSemantic | null;
   reasoningSource: CodexReasoningSource | null;
   readiness: CodexProtocolProbeReadiness | null;
   failures: CodexProtocolProbeFailure[];
   adaptations: CodexProtocolProbeAdaptation[];
+  toolSchemaDialect: CodexProtocolToolSchemaDialect | null;
+  historyReplay: CodexProtocolHistoryReplay | null;
 }
 
 interface ModelProgress {
@@ -94,6 +101,7 @@ const TRANSPORTS: CodexProtocolTransport[] = [
 function emptyBranch(): BranchProgress {
   return {
     touched: false,
+    retries: [],
     stages: {
       baseline: "pending",
       streaming: "pending",
@@ -106,6 +114,8 @@ function emptyBranch(): BranchProgress {
     readiness: null,
     failures: [],
     adaptations: [],
+    toolSchemaDialect: null,
+    historyReplay: null,
   };
 }
 
@@ -142,6 +152,8 @@ function applyRecord(
         : "passed";
     target.reasoningSemantic = branch.reasoning_shape.semantic;
     target.reasoningSource = branch.reasoning_shape.source;
+    target.toolSchemaDialect = branch.tool_schema_dialect ?? null;
+    target.historyReplay = branch.history_replay ?? null;
     target.failures = branch.failures ?? [];
     target.adaptations = branch.adaptations ?? [];
   }
@@ -175,6 +187,9 @@ function buildProgress(
     if (event.kind === "stage_started") {
       branch.stages[event.stage] = "running";
     } else if (event.kind === "compatibility_retry") {
+      if (!branch.retries.includes(event.rule)) {
+        branch.retries = [...branch.retries, event.rule];
+      }
       if (
         event.change === "tool_schema_moonshot_mfjs" &&
         !branch.adaptations.includes("tool_schema_safe_fallback")
@@ -492,6 +507,20 @@ export function CodexProtocolProbeProgressDialog({
                           </p>
                         ) : (
                           <div className="space-y-2">
+                            <CodexCompatibilitySummary
+                              transport={transport}
+                              readiness={branch.readiness}
+                              baselinePassed={
+                                branch.stages.baseline === "passed"
+                              }
+                              reasoningSemantic={branch.reasoningSemantic}
+                              reasoningSource={branch.reasoningSource}
+                              toolSchemaDialect={branch.toolSchemaDialect}
+                              historyReplay={branch.historyReplay}
+                              retries={branch.retries}
+                              running={running}
+                              selected={model.selectedTransport === transport}
+                            />
                             {STAGES.map((stage) => {
                               const status = statusPresentation(
                                 branch.stages[stage.id],

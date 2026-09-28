@@ -30,26 +30,6 @@ function cachedValue<T>(key: string): T | undefined {
   return entry.value as T;
 }
 
-function stableSerialize(value: unknown): string {
-  if (Array.isArray(value)) {
-    const items = value.map(stableSerialize);
-    // Model modalities are a set. Providers are free to return them in a
-    // different order on each request without changing the model metadata.
-    if (value.every((item) => typeof item === "string")) items.sort();
-    return `[${items.join(",")}]`;
-  }
-  if (value !== null && typeof value === "object") {
-    return `{${Object.keys(value as Record<string, unknown>)
-      .sort()
-      .map(
-        (key) =>
-          `${JSON.stringify(key)}:${stableSerialize((value as Record<string, unknown>)[key])}`,
-      )
-      .join(",")}}`;
-  }
-  return JSON.stringify(value);
-}
-
 function reportModelDiff<T>(
   value: T,
   onDiff:
@@ -94,21 +74,9 @@ function reportModelDiff<T>(
   const fetchedSet = new Set(fetchedIds);
   const added = fetchedIds.filter((id) => !previousSet.has(id));
   const removed = previousIds.filter((id) => !fetchedSet.has(id));
-  const previousById = new Map(
-    previous?.map((model) => [model.id!.trim(), model]),
-  );
-  const fetchedById = new Map(
-    fetched.map((model) => [model.id!.trim(), model]),
-  );
-  const updated = fetchedIds.filter((id) => {
-    const before = previousById.get(id);
-    const after = fetchedById.get(id);
-    return (
-      before && after && stableSerialize(before) !== stableSerialize(after)
-    );
-  });
-  if (added.length || removed.length || updated.length)
-    onDiff(added, removed, updated);
+  // Metadata is refreshed silently through onSuccess. Only membership changes
+  // are actionable enough to interrupt the user with a modal.
+  if (added.length || removed.length) onDiff(added, removed, []);
 }
 
 export function rememberModelRefreshSnapshot<T>(key: string, value: T): void {

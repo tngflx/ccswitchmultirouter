@@ -190,6 +190,10 @@ export const proxyApi = {
     return invoke("get_proxy_config_for_app", { appType });
   },
 
+  async setCodexCapacityRetryEnabled(enabled: boolean): Promise<void> {
+    return invoke("set_codex_capacity_retry_enabled", { enabled });
+  },
+
   // 更新指定应用的代理配置
   async updateProxyConfigForApp(config: AppProxyConfig): Promise<void> {
     return invoke("update_proxy_config_for_app", { config });

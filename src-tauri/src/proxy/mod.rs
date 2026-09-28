@@ -11,6 +11,7 @@ pub(crate) mod codex_turn_recovery;
 pub(crate) mod content_encoding;
 pub mod copilot_optimizer;
 pub mod error;
+pub(crate) mod error_journal;
 pub mod error_mapper;
 pub mod external_openai_api;
 pub(crate) mod failover_switch;

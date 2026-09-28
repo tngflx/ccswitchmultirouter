@@ -72,6 +72,7 @@ const TOOL_NAMES = [
   "opencode",
   "openclaw",
   "hermes",
+  "pi",
 ] as const;
 type ToolName = (typeof TOOL_NAMES)[number];
 type ToolLifecycleAction = "install" | "update";
@@ -142,7 +143,9 @@ ${posixScriptInstallCommand("https://opencode.ai/install")} || npm i -g opencode
 # OpenClaw
 npm i -g openclaw@latest
 # Hermes
-${posixScriptInstallCommand("https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/install.sh")}`;
+${posixScriptInstallCommand("https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/install.sh")}
+# Pi
+npm i -g @earendil-works/pi-coding-agent@latest`;
 
 const WINDOWS_ONE_CLICK_INSTALL_COMMANDS = `# Claude Code
 npm i -g @anthropic-ai/claude-code@latest
@@ -157,7 +160,9 @@ npm i -g opencode-ai@latest
 # OpenClaw
 npm i -g openclaw@latest
 # Hermes
-${HERMES_WINDOWS_INSTALL_COMMAND}`;
+${HERMES_WINDOWS_INSTALL_COMMAND}
+# Pi
+npm i -g @earendil-works/pi-coding-agent@latest`;
 
 const ONE_CLICK_INSTALL_COMMANDS = isWindows()
   ? WINDOWS_ONE_CLICK_INSTALL_COMMANDS
@@ -171,6 +176,7 @@ const TOOL_DISPLAY_NAMES: Record<ToolName, string> = {
   opencode: "OpenCode",
   openclaw: "OpenClaw",
   hermes: "Hermes",
+  pi: "Pi",
 };
 
 // 后端返回的 tool 是 string；这里收敛唯一的 ToolName 断言与兜底，供升级确认
@@ -179,7 +185,7 @@ function toolDisplayName(tool: string): string {
   return TOOL_DISPLAY_NAMES[tool as ToolName] ?? tool;
 }
 
-const TOOL_APP_IDS: Record<ToolName, AppId> = {
+const TOOL_APP_IDS: Partial<Record<ToolName, AppId>> = {
   claude: "claude",
   codex: "codex",
   gemini: "gemini",
@@ -241,8 +247,12 @@ export function AboutSection({ isPortable }: AboutSectionProps) {
     null,
   );
   const [showInstallCommands, setShowInstallCommands] = useState(false);
-  const [autoUpdateCodexCli, setAutoUpdateCodexCli] = useState(false);
-  const [isSavingCodexAutoUpdate, setIsSavingCodexAutoUpdate] = useState(false);
+  const [autoUpdateCliTools, setAutoUpdateCliTools] = useState<Set<ToolName>>(
+    () => new Set(),
+  );
+  const [savingAutoUpdateTools, setSavingAutoUpdateTools] = useState<
+    Set<ToolName>
+  >(() => new Set());
 
   const { hasUpdate, updateInfo, checkUpdate, resetDismiss, isChecking } =
     useUpdate();
@@ -426,9 +436,16 @@ export function AboutSection({ isPortable }: AboutSectionProps) {
     void loadAllToolVersions();
     void settingsApi
       .get()
-      .then((settings) =>
-        setAutoUpdateCodexCli(settings.autoUpdateCodexCli === true),
-      )
+      .then((settings) => {
+        const enabled = new Set(
+          (settings.autoUpdateCliTools ?? []).filter((name): name is ToolName =>
+            TOOL_NAMES.includes(name as ToolName),
+          ),
+        );
+        // Migrate the historical Codex-only preference into the per-tool model.
+        if (settings.autoUpdateCodexCli === true) enabled.add("codex");
+        setAutoUpdateCliTools(enabled);
+      })
       .catch((error) =>
         console.error(
           "[AboutSection] Failed to load Codex update policy",
@@ -444,28 +461,53 @@ export function AboutSection({ isPortable }: AboutSectionProps) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  const handleCodexAutoUpdateChange = useCallback(
-    async (enabled: boolean) => {
-      setIsSavingCodexAutoUpdate(true);
+  const handleAutoUpdateChange = useCallback(
+    async (toolName: ToolName, enabled: boolean) => {
+      setSavingAutoUpdateTools((prev) => new Set(prev).add(toolName));
       try {
         const settings = await settingsApi.get();
-        await settingsApi.save({ ...settings, autoUpdateCodexCli: enabled });
-        setAutoUpdateCodexCli(enabled);
+        const next = new Set(settings.autoUpdateCliTools ?? []);
+        if (settings.autoUpdateCodexCli === true) next.add("codex");
+        if (enabled) next.add(toolName);
+        else next.delete(toolName);
+        await settingsApi.save({
+          ...settings,
+          autoUpdateCliTools: [...next],
+          autoUpdateCodexCli:
+            toolName === "codex" ? enabled : settings.autoUpdateCodexCli,
+        });
+        setAutoUpdateCliTools(
+          new Set(
+            [...next].filter((name): name is ToolName =>
+              TOOL_NAMES.includes(name as ToolName),
+            ),
+          ),
+        );
         toast.success(
           t(
             enabled
-              ? "settings.codexAutoUpdateEnabled"
-              : "settings.codexAutoUpdateDisabled",
+              ? "settings.cliAutoUpdateEnabled"
+              : "settings.cliAutoUpdateDisabled",
+            { tool: TOOL_DISPLAY_NAMES[toolName] },
           ),
           { closeButton: true },
         );
       } catch (error) {
-        toast.error(t("settings.codexAutoUpdateFailed"), {
-          description: extractErrorMessage(error) || undefined,
-          closeButton: true,
-        });
+        toast.error(
+          t("settings.cliAutoUpdateFailed", {
+            tool: TOOL_DISPLAY_NAMES[toolName],
+          }),
+          {
+            description: extractErrorMessage(error) || undefined,
+            closeButton: true,
+          },
+        );
       } finally {
-        setIsSavingCodexAutoUpdate(false);
+        setSavingAutoUpdateTools((prev) => {
+          const next = new Set(prev);
+          next.delete(toolName);
+          return next;
+        });
       }
     },
     [t],
@@ -1038,24 +1080,6 @@ export function AboutSection({ isPortable }: AboutSectionProps) {
       </motion.div>
 
       <div className="space-y-3">
-        <div className="flex items-center justify-between gap-4 rounded-md border border-border bg-muted/30 px-3 py-2">
-          <div className="min-w-0">
-            <div className="text-sm font-medium">
-              {t("settings.codexAutoUpdate")}
-            </div>
-            <p className="mt-0.5 text-xs text-muted-foreground">
-              {t("settings.codexAutoUpdateHint")}
-            </p>
-          </div>
-          <Switch
-            checked={autoUpdateCodexCli}
-            disabled={isSavingCodexAutoUpdate}
-            onCheckedChange={(enabled) =>
-              void handleCodexAutoUpdateChange(enabled)
-            }
-            aria-label={t("settings.codexAutoUpdate")}
-          />
-        </div>
         <div className="flex flex-col gap-2 px-1 sm:flex-row sm:items-center sm:justify-between">
           <h3 className="text-sm font-medium">{t("settings.localEnvCheck")}</h3>
           <div className="flex flex-wrap items-center gap-2">
@@ -1116,7 +1140,8 @@ export function AboutSection({ isPortable }: AboutSectionProps) {
         <div className="grid gap-3 px-1 sm:grid-cols-2 xl:grid-cols-3">
           {TOOL_NAMES.map((toolName, index) => {
             const tool = toolVersionByName.get(toolName);
-            const appConfig = APP_ICON_MAP[TOOL_APP_IDS[toolName]];
+            const appId = TOOL_APP_IDS[toolName];
+            const appConfig = appId ? APP_ICON_MAP[appId] : undefined;
             const displayName = TOOL_DISPLAY_NAMES[toolName];
             // 单卡片 loading 用「结果是否已到」而非「整批是否结束」驱动，实现渐进式刷新：
             //   - loadingTools[t]：本工具探测在途（首次加载或单工具刷新）；
@@ -1263,6 +1288,27 @@ export function AboutSection({ isPortable }: AboutSectionProps) {
                     </Select>
                   </div>
                 )}
+
+                <div className="flex items-center justify-between gap-3 rounded-md border border-border/70 bg-muted/20 px-2.5 py-2">
+                  <div className="min-w-0">
+                    <div className="text-xs font-medium">
+                      {t("settings.cliAutoUpdate")}
+                    </div>
+                    <p className="text-[10px] leading-snug text-muted-foreground">
+                      {t("settings.cliAutoUpdateHint")}
+                    </p>
+                  </div>
+                  <Switch
+                    checked={autoUpdateCliTools.has(toolName)}
+                    disabled={savingAutoUpdateTools.has(toolName)}
+                    onCheckedChange={(enabled) =>
+                      void handleAutoUpdateChange(toolName, enabled)
+                    }
+                    aria-label={t("settings.cliAutoUpdateForTool", {
+                      tool: displayName,
+                    })}
+                  />
+                </div>
 
                 {/* 多处安装冲突诊断结果：仅在懒触发后有数据时渲染。 */}
                 {conflicts && conflicts.length > 0 && (

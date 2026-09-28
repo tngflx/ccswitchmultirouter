@@ -5233,7 +5233,40 @@ pub(crate) fn responses_sse_to_response_value(body: &str) -> Result<Value, Proxy
 
     if !output_items.is_empty() {
         if let Some(obj) = response.as_object_mut() {
-            obj.insert("output".to_string(), Value::Array(output_items));
+            // A terminal event may already carry a partial/final `output` array.
+            // Keep it, then add items observed in output_item.done events that are
+            // missing from that array.  This is important when a stream is cut off
+            // between an item event and response.completed.  Deduplicate by id but
+            // retain anonymous items (some gateways omit ids).
+            let existing = obj
+                .get("output")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            let mut seen_ids = std::collections::HashSet::new();
+            for item in &existing {
+                if let Some(id) = item.get("id").and_then(Value::as_str) {
+                    seen_ids.insert(id.to_string());
+                }
+            }
+            let mut final_output = existing;
+            final_output.extend(output_items.into_iter().filter(|item| {
+                item.get("id")
+                    .and_then(Value::as_str)
+                    .map(|id| seen_ids.insert(id.to_string()))
+                    .unwrap_or(true)
+            }));
+            if final_output
+                .iter()
+                .any(|item| item.get("output_index").is_some())
+            {
+                final_output.sort_by_key(|item| {
+                    item.get("output_index")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(u64::MAX)
+                });
+            }
+            obj.insert("output".to_string(), Value::Array(final_output));
         } else {
             return Err(ProxyError::TransformError(
                 "response.completed payload is not an object".to_string(),
@@ -5247,13 +5280,29 @@ pub(crate) fn responses_sse_to_response_value(body: &str) -> Result<Value, Proxy
 /// 判断响应体是否"看起来像" SSE 文本（#2234 兜底嗅探）。
 ///
 /// 仅在 JSON 解析已失败后调用：合法 JSON 不可能以这些前缀开头，误判面为零。
-/// 覆盖 SSE 规范的全部四种字段行；包含 ":" 是因为 OpenRouter 等会在流前发
-/// `: PROCESSING` 注释行。
+/// 覆盖 SSE 规范的全部四种字段行；包含注释行是因为 OpenRouter 等会在流前发
+/// `: PROCESSING`/`: ping`。对注释行要求后续出现真正的 SSE 字段，避免把
+/// `: Bad Gateway` 这类单行代理错误误送进聚合器。
 fn body_looks_like_sse(body: &str) -> bool {
     let trimmed = body.trim_start_matches('\u{feff}').trim_start();
-    ["data:", "event:", "id:", "retry:", ":"]
-        .iter()
-        .any(|prefix| trimmed.starts_with(prefix))
+    if trimmed.is_empty() {
+        return false;
+    }
+    if !trimmed.starts_with(':') {
+        return ["data:", "event:", "id:", "retry:"]
+            .iter()
+            .any(|prefix| trimmed.starts_with(prefix));
+    }
+
+    // SSE comments are arbitrary text (including lowercase), so do not use the
+    // uppercase-only heuristic from PR #7044. A comment-only error body is not
+    // enough evidence; accept it only when a later line is an SSE field.
+    trimmed.lines().skip(1).any(|line| {
+        let line = line.trim_start();
+        ["data:", "event:", "id:", "retry:"]
+            .iter()
+            .any(|prefix| line.starts_with(prefix))
+    })
 }
 
 /// 构造带现场诊断的上游解析错误：只附结构化分类与元数据，
@@ -6383,11 +6432,14 @@ mod tests {
         assert!(body_looks_like_sse(
             ": OPENROUTER PROCESSING\n\ndata: {}\n\n"
         ));
+        assert!(body_looks_like_sse(": ping\n\ndata: {}\n\n"));
         // BOM + 前导空白
         assert!(body_looks_like_sse("\u{feff}\n  data: {}\n\n"));
         // HTML 拦截页与普通文本不应误判为 SSE
         assert!(!body_looks_like_sse("<html><body>blocked</body></html>"));
         assert!(!body_looks_like_sse("Bad Gateway"));
+        assert!(!body_looks_like_sse(": Bad Gateway"));
+        assert!(!body_looks_like_sse(": connection refused\n"));
         assert!(!body_looks_like_sse(""));
     }
 
@@ -7126,6 +7178,25 @@ data: {"type":"response.completed","response":{"id":"resp_1","status":"completed
         assert_eq!(response["id"], "resp_1");
         assert_eq!(response["output"][0]["type"], "message");
         assert_eq!(response["output"][0]["content"][0]["text"], "hello");
+    }
+
+    #[test]
+    fn responses_sse_to_response_value_merges_completed_output_without_duplicates() {
+        let sse = r#"event: response.output_item.done
+data: {"type":"response.output_item.done","output_index":1,"item":{"id":"tool_1","type":"function_call","name":"later"}}
+
+event: response.output_item.done
+data: {"type":"response.output_item.done","output_index":0,"item":{"id":"msg_0","type":"message","content":[]}}
+
+event: response.completed
+data: {"type":"response.completed","response":{"id":"resp_merge","status":"completed","output":[{"id":"msg_0","type":"message","content":[]} ]}}
+
+"#;
+        let response = responses_sse_to_response_value(sse).unwrap();
+        let output = response["output"].as_array().unwrap();
+        assert_eq!(output.len(), 2);
+        assert_eq!(output[0]["id"], "msg_0");
+        assert_eq!(output[1]["id"], "tool_1");
     }
 
     #[test]

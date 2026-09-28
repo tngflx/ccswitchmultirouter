@@ -26,7 +26,7 @@ use axum::{
 use hyper_util::rt::TokioIo;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tokio::sync::{oneshot, RwLock};
+use tokio::sync::{oneshot, Mutex, RwLock};
 use tokio::task::JoinHandle;
 
 /// 代理服务器状态（共享）
@@ -92,6 +92,9 @@ pub struct ProxyServer {
     shutdown_tx: Arc<RwLock<Option<oneshot::Sender<()>>>>,
     /// 服务器任务句柄，用于等待服务器实际关闭
     server_handle: Arc<RwLock<Option<JoinHandle<()>>>>,
+    /// 已接受的连接任务。停止时必须一起中止，否则 keep-alive/流式连接会继续
+    /// 持有 socket，Windows 下紧接着重绑定同一端口会失败并表现为“端口被占用”。
+    connection_tasks: Arc<Mutex<Vec<JoinHandle<()>>>>,
 }
 
 impl ProxyServer {
@@ -146,12 +149,13 @@ impl ProxyServer {
             state,
             shutdown_tx: Arc::new(RwLock::new(None)),
             server_handle: Arc::new(RwLock::new(None)),
+            connection_tasks: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
     pub async fn start(&self) -> Result<ProxyServerInfo, ProxyError> {
         // 检查是否已在运行
-        if self.shutdown_tx.read().await.is_some() {
+        if self.shutdown_tx.read().await.is_some() || self.server_handle.read().await.is_some() {
             return Err(ProxyError::AlreadyRunning);
         }
 
@@ -170,6 +174,14 @@ impl ProxyServer {
         let listener = tokio::net::TcpListener::bind(&addr)
             .await
             .map_err(|e| ProxyError::BindFailed(format_bind_error(&addr, e)))?;
+        // 防止 WebView2/其它子进程继承监听句柄，避免父进程退出后留下无法归属的残留监听。
+        #[cfg(target_os = "windows")]
+        {
+            use std::os::windows::io::AsRawSocket;
+            crate::process_identity::harden_socket_handle_not_inheritable(
+                listener.as_raw_socket() as usize
+            );
+        }
         let local_addr = listener
             .local_addr()
             .map_err(|e| ProxyError::BindFailed(format_bind_error(&addr, e)))?;
@@ -209,6 +221,7 @@ impl ProxyServer {
         // 启动服务器 — 使用手动 hyper HTTP/1.1 accept loop
         // 开启 preserve_header_case 以捕获客户端请求头的原始大小写
         let state = self.state.clone();
+        let connection_tasks = self.connection_tasks.clone();
         let handle = tokio::spawn(async move {
             let mut shutdown_rx = shutdown_rx;
             loop {
@@ -224,7 +237,8 @@ impl ProxyServer {
                         };
 
                         let app = app.clone();
-                        tokio::spawn(async move {
+                        let connection_tasks = connection_tasks.clone();
+                        let connection = tokio::spawn(async move {
                             // Peek raw TCP bytes to capture original header casing
                             // before hyper parses (and lowercases) the header names.
                             let original_cases = {
@@ -271,6 +285,9 @@ impl ProxyServer {
                                 log::debug!("[{SRV}] connection error: {e}", SRV = log_srv::CONN_ERR);
                             }
                         });
+                        let mut tasks = connection_tasks.lock().await;
+                        tasks.retain(|task| !task.is_finished());
+                        tasks.push(connection);
                     }
                     _ = &mut shutdown_rx => {
                         break;
@@ -302,31 +319,60 @@ impl ProxyServer {
             false
         };
 
-        // 2. 等待服务器任务结束（带 5 秒超时保护）。 Borrow the handle
-        // instead of taking it before the await: on timeout the accept task is
-        // still alive and must remain represented by this server object.
-        let mut handle_guard = self.server_handle.write().await;
-        if let Some(handle) = handle_guard.as_mut() {
-            match tokio::time::timeout(std::time::Duration::from_secs(5), handle).await {
-                Ok(Ok(())) => {
-                    handle_guard.take();
-                    log::info!("[{}] 代理服务器已完全停止", log_srv::STOPPED);
-                    Ok(())
+        // 2. 等待 accept loop 结束（带 5 秒超时保护）。必须先让它退出，避免
+        // 在清理连接任务的同时又接受一个新连接，导致最后一个 socket 逃过追踪。
+        let mut stop_error = None;
+        let had_server_handle = {
+            let mut handle = self.server_handle.write().await.take();
+            if let Some(handle_value) = handle.as_mut() {
+                match tokio::time::timeout(std::time::Duration::from_secs(5), &mut *handle_value)
+                    .await
+                {
+                    Ok(Ok(())) => {
+                        log::info!("[{}] 代理服务器已完全停止", log_srv::STOPPED);
+                    }
+                    Ok(Err(e)) => {
+                        log::warn!("[{}] 代理服务器任务异常终止: {e}", log_srv::TASK_ERROR);
+                        stop_error = Some(ProxyError::StopFailed(e.to_string()));
+                    }
+                    Err(_) => {
+                        log::warn!(
+                            "[{ST}] 代理服务器停止超时（5秒），强制终止 accept loop",
+                            ST = log_srv::STOP_TIMEOUT
+                        );
+                        handle_value.abort();
+                        let _ = handle_value.await;
+                        stop_error = Some(ProxyError::StopTimeout);
+                    }
                 }
-                Ok(Err(e)) => {
-                    handle_guard.take();
-                    log::warn!("[{}] 代理服务器任务异常终止: {e}", log_srv::TASK_ERROR);
-                    Err(ProxyError::StopFailed(e.to_string()))
-                }
-                Err(_) => {
-                    log::warn!(
-                        "[{}] 代理服务器停止超时（5秒），强制继续",
-                        log_srv::STOP_TIMEOUT
-                    );
-                    Err(ProxyError::StopTimeout)
-                }
+                true
+            } else {
+                false
             }
-        } else if shutdown_requested {
+        };
+
+        // 3. accept loop 已退出后再中止并等待全部已接受连接。这样即使 shutdown
+        // 与 listener.accept 同时就绪，也不会留下未追踪的 socket 阻塞下一次 bind。
+        {
+            let mut tasks = self.connection_tasks.lock().await;
+            let aborted = tasks.len();
+            for task in tasks.iter() {
+                task.abort();
+            }
+            for task in tasks.drain(..) {
+                let _ = task.await;
+            }
+            if aborted > 0 {
+                log::info!(
+                    "[{ST}]{aborted} 个在途连接任务已中止，代理端口已释放",
+                    ST = log_srv::STOPPED
+                );
+            }
+        }
+
+        if let Some(error) = stop_error {
+            Err(error)
+        } else if had_server_handle || shutdown_requested {
             Ok(())
         } else {
             Err(ProxyError::NotRunning)
@@ -663,6 +709,37 @@ mod tests {
             ProxyServer::new_external_openai_api(config, db.clone(), None),
             db,
         )
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn stop_aborts_open_connections_before_rebind() {
+        let _home = TestHomeGuard::new();
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("probe port");
+        let port = probe.local_addr().expect("probe address").port();
+        drop(probe);
+
+        let db = Arc::new(Database::memory().expect("memory db"));
+        let config = ProxyConfig {
+            listen_address: "127.0.0.1".to_string(),
+            listen_port: port,
+            ..ProxyConfig::default()
+        };
+        let server = ProxyServer::new(config, db, None);
+        server.start().await.expect("first start");
+
+        // Keep a client socket open while stopping. Before connection-task tracking,
+        // this socket survived the accept-loop shutdown and blocked the next bind.
+        let client = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .expect("client connect");
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        server.stop().await.expect("stop");
+        server.start().await.expect("rebind after stop");
+
+        drop(client);
+        server.stop().await.expect("final stop");
     }
 
     #[tokio::test]

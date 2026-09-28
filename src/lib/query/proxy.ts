@@ -120,6 +120,22 @@ export function useAppProxyConfig(appType: string) {
   });
 }
 
+export function useSetCodexCapacityRetryEnabled() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (enabled: boolean) =>
+      proxyApi.setCodexCapacityRetryEnabled(enabled),
+    onSuccess: (_, enabled) => {
+      queryClient.setQueryData<AppProxyConfig>(
+        proxyKeys.appConfig("codex"),
+        (config) =>
+          config ? { ...config, capacityRetryEnabled: enabled } : config,
+      );
+      queryClient.invalidateQueries({ queryKey: proxyKeys.appConfig("codex") });
+    },
+  });
+}
+
 /**
  * 更新指定应用的代理配置
  */

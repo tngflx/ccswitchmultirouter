@@ -394,6 +394,7 @@ pub fn anthropic_to_responses_with_cache_retention(
                 let mut response_tool = json!({
                     "type": "function",
                     "name": t.get("name").and_then(|n| n.as_str()).unwrap_or(""),
+                    "strict": false,
                 });
                 if let Some(description) = t.get("description").filter(|d| !d.is_null()) {
                     response_tool["description"] = description.clone();
@@ -1261,6 +1262,7 @@ mod tests {
         let result = anthropic_to_responses(input, None, false, false).unwrap();
         assert_eq!(result["tools"][0]["type"], "function");
         assert_eq!(result["tools"][0]["name"], "get_weather");
+        assert_eq!(result["tools"][0]["strict"], false);
         assert!(result["tools"][0].get("parameters").is_some());
         assert_eq!(result["tools"][0]["parameters"]["type"], json!("object"));
         assert_eq!(
@@ -1269,6 +1271,36 @@ mod tests {
         );
         // input_schema should not appear
         assert!(result["tools"][0].get("input_schema").is_none());
+    }
+
+    #[test]
+    fn test_optional_agent_tool_fields_stay_optional_for_responses_and_oauth() {
+        for is_codex_oauth in [false, true] {
+            let input = json!({
+                "model": "gpt-6-luna",
+                "messages": [{"role": "user", "content": "Start a teammate"}],
+                "tools": [{
+                    "name": "Agent",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {
+                            "prompt": {"type": "string"},
+                            "description": {"type": "string"},
+                            "isolation": {"type": "string", "enum": ["worktree"]}
+                        },
+                        "required": ["prompt", "description"]
+                    }
+                }]
+            });
+            let result = anthropic_to_responses(input, None, is_codex_oauth, false).unwrap();
+            let tool = &result["tools"][0];
+            assert_eq!(tool["strict"], false);
+            assert_eq!(
+                tool["parameters"]["required"],
+                json!(["prompt", "description"])
+            );
+            assert!(tool["parameters"]["properties"].get("isolation").is_some());
+        }
     }
 
     #[test]
@@ -2087,6 +2119,8 @@ mod tests {
             "gpt-5.6-terra",
             "gpt-5.6-luna",
             "gpt-6-astra",
+            "gpt-6-sol",
+            "gpt-6-luna",
         ] {
             let input = json!({
                 "model": model,

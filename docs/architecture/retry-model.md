@@ -145,6 +145,32 @@ Responses turns. Admission rejection, request replay, provider failover, and
 pre-stream HTTP failures remain responsibilities of the forwarder and traffic
 policy layers.
 
+## Codex Capacity Retry And Error Evidence
+
+The Codex proxy configuration has a separate capacity-retry switch (enabled by
+default for Codex only). It covers explicit temporary capacity responses, not
+generic HTTP 5xx, ordinary rate limits, quota/billing failures, or transport
+timeouts. The forwarder reuses the finalized request bytes and headers for at
+most 10 capacity replays within the existing bounded delay budget. Native
+Responses, Chat SSE, and Anthropic-converted streams may reconnect on a
+classified capacity failure only before semantic output reaches the client.
+The main-page Retry Off mode still disables proxy stream reconnects; it does
+not alter the separately configured explicit HTTP rejection policy.
+
+`src-tauri/src/proxy/error_journal.rs` observes upstream responses at the send
+boundary and reconnect boundary. It writes bounded, redacted JSONL failures to
+`~/.cc-switch/logs/proxy-errors.jsonl`, rotating two older files. Entries may
+include HTTP status, selected safe headers, a scrubbed error excerpt, SSE
+terminal/parse errors, transport errors, and a target origin/attempt ID.
+They are diagnostic evidence, not full request or response archives. A dropped
+consumer is labeled separately from an upstream failure. Review the log before
+sharing it, since third-party error messages can still contain unexpected data.
+
+The repository's `docs/memory/journal.md` serves a different purpose: durable
+engineering decisions, root causes, and verification results. Codex memory or
+thread context can help an agent find those lessons, but cannot replace runtime
+failure capture or safely decide whether an HTTP request may be replayed.
+
 ## Related Components
 
 - `src/components/proxy/StreamRetryToggle.tsx`: compact main-page selector.

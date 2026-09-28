@@ -669,6 +669,8 @@ export interface Settings {
   showProfileSwitcher?: boolean;
   // Automatically update the user-installed Codex CLI on CCSwitchMulti startup.
   autoUpdateCodexCli?: boolean;
+  // Independently opt managed CLIs into background updates at startup.
+  autoUpdateCliTools?: string[];
   // Preserve Codex ChatGPT login in auth.json when switching third-party providers
   preserveCodexOfficialAuthOnSwitch?: boolean;
   // Run official Codex under the shared "custom" provider id so future

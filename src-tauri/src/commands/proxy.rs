@@ -2677,6 +2677,18 @@ pub async fn get_proxy_config_for_app(
         .map_err(|e| e.to_string())
 }
 
+#[tauri::command]
+pub async fn set_codex_capacity_retry_enabled(
+    state: tauri::State<'_, AppState>,
+    enabled: bool,
+) -> Result<(), String> {
+    state
+        .db
+        .set_codex_capacity_retry_enabled(enabled)
+        .await
+        .map_err(|error| error.to_string())
+}
+
 /// 更新指定应用的代理配置
 ///
 /// 更新应用级配置（enabled、auto_failover、超时、熔断器等）

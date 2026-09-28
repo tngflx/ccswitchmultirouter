@@ -31,7 +31,7 @@ use super::codex_terminal::{
     NativeResponsesEvidence, NativeResponsesTerminalDisposition, classify_native_responses_terminal,
 };
 use super::streaming_responses::{
-    RETRYABLE_STREAM_MARKER, anthropic_error_sse, anthropic_sse,
+    CAPACITY_STREAM_MARKER, RETRYABLE_STREAM_MARKER, anthropic_error_sse, anthropic_sse,
     create_anthropic_sse_stream_from_responses,
 };
 use crate::proxy::error::ProxyError;
@@ -47,6 +47,7 @@ use std::time::Duration;
 
 /// 与官方 Codex CLI 的 `stream_max_retries` 默认值对齐。
 pub(crate) const RESPONSES_STREAM_MAX_RETRIES: u32 = 5;
+pub(crate) const CAPACITY_STREAM_MAX_RETRIES: u32 = 10;
 
 /// 重连等待与正常流转静默期间向下游发 keepalive 的间隔。
 ///
@@ -80,6 +81,7 @@ pub struct StreamReconnector {
     first_byte_timeout: Duration,
     /// `u32::MAX` enables relentless retries; all other values are bounded.
     max_retries: u32,
+    capacity_retry_enabled: bool,
 }
 
 /// 上游原生 Responses SSE 的最小排障关联信息。
@@ -99,6 +101,7 @@ impl StreamReconnector {
             connect,
             first_byte_timeout,
             max_retries: RESPONSES_STREAM_MAX_RETRIES,
+            capacity_retry_enabled: false,
         }
     }
 
@@ -107,12 +110,29 @@ impl StreamReconnector {
         self
     }
 
+    pub fn with_capacity_retry(mut self, enabled: bool) -> Self {
+        self.capacity_retry_enabled = enabled;
+        self
+    }
+
+    fn retry_limit_for(&self, capacity_error: bool) -> u32 {
+        if capacity_error && self.capacity_retry_enabled && self.max_retries > 0 {
+            self.max_retries.max(CAPACITY_STREAM_MAX_RETRIES)
+        } else {
+            self.max_retries
+        }
+    }
+
     fn retry_limit(&self) -> u32 {
         self.max_retries
     }
 
-    async fn connect(&self) -> Result<ProxyResponse, ProxyError> {
-        if self.first_byte_timeout.is_zero() {
+    pub(crate) async fn connect(&self) -> Result<ProxyResponse, ProxyError> {
+        let diagnostic = crate::proxy::error_journal::Context::new(
+            "responses_reconnect",
+            &http::HeaderMap::new(),
+        );
+        let result = if self.first_byte_timeout.is_zero() {
             (self.connect)().await
         } else {
             tokio::time::timeout(self.first_byte_timeout, (self.connect)())
@@ -123,7 +143,10 @@ impl StreamReconnector {
                         self.first_byte_timeout.as_secs()
                     ))
                 })?
-        }
+        };
+        result
+            .inspect_err(|error| diagnostic.failed(error))
+            .map(|response| diagnostic.observe(response))
     }
 }
 
@@ -180,6 +203,76 @@ fn raw_responses_sse_payload(block: &[u8]) -> Option<Value> {
         return None;
     }
     serde_json::from_str(&data).ok()
+}
+
+pub(crate) fn is_capacity_error_payload(payload: &Value, status: Option<http::StatusCode>) -> bool {
+    let error = payload
+        .pointer("/response/error")
+        .or_else(|| payload.get("error"))
+        .unwrap_or(payload);
+    let kind = [error.get("type"), error.get("code")]
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase();
+    let message = error
+        .get("message")
+        .and_then(Value::as_str)
+        .or_else(|| payload.get("message").and_then(Value::as_str))
+        .unwrap_or("")
+        .to_ascii_lowercase();
+
+    if is_explicit_non_replayable_error_payload(payload) {
+        return false;
+    }
+    ["server_is_overloaded", "overloaded_error", "provider_capacity", "model_at_capacity", "capacity_exceeded"]
+        .iter()
+        .any(|marker| kind.contains(marker))
+        || ["selected model is at capacity", "model is at capacity", "servers are currently overloaded", "currently experiencing high demand"]
+            .iter()
+            .any(|marker| message.contains(marker))
+        || (status.is_some_and(|status| status.is_server_error())
+            && message.contains("capacity exhausted"))
+}
+
+pub(crate) fn is_capacity_error_response(status: http::StatusCode, body: Option<&str>) -> bool {
+    if !matches!(status.as_u16(), 429 | 500 | 502 | 503 | 504 | 529) {
+        return false;
+    }
+    let Some(body) = body.filter(|body| !body.trim().is_empty()) else {
+        return false;
+    };
+    let payload = serde_json::from_str::<Value>(body)
+        .unwrap_or_else(|_| json!({"message": body}));
+    is_capacity_error_payload(&payload, Some(status))
+}
+
+fn is_explicit_non_replayable_error_payload(payload: &Value) -> bool {
+    let error = payload
+        .pointer("/response/error")
+        .or_else(|| payload.get("error"))
+        .unwrap_or(payload);
+    let kind = [error.get("type"), error.get("code")]
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase();
+    let message = error
+        .get("message")
+        .and_then(Value::as_str)
+        .or_else(|| payload.get("message").and_then(Value::as_str))
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    ["quota", "billing", "authentication", "unauthorized", "forbidden", "permission", "policy", "invalid_request", "invalid_parameter", "unsupported_parameter"]
+        .iter()
+        .any(|marker| kind.contains(marker))
+        || ["quota exhausted", "insufficient quota", "invalid token", "authentication failed", "request blocked by policy", "unsupported parameter"]
+            .iter()
+            .any(|marker| message.contains(marker))
 }
 
 struct NativeResponsesSseErrorDiagnostic {
@@ -380,6 +473,7 @@ pub(crate) fn create_resilient_responses_sse_stream_with_context(
             let Some(mut stream) = current.take() else { break };
             let mut buffer = BytesMut::new();
             let mut silence = Duration::ZERO;
+            let mut capacity_error = false;
 
             let mut reason = 'stream: loop {
                 let item = match tokio::time::timeout(KEEPALIVE_INTERVAL, stream.next()).await {
@@ -458,6 +552,17 @@ pub(crate) fn create_resilient_responses_sse_stream_with_context(
                             if let Some(context) = log_context.as_ref() {
                                 log_native_responses_sse_error(context, &block, attempt);
                             }
+                            if !semantic_output_forwarded
+                                && reconnector.as_ref().is_some_and(|reconnector| {
+                                    reconnector.capacity_retry_enabled && reconnector.retry_limit() > 0
+                                })
+                                && payload.as_ref().is_some_and(|payload| {
+                                    is_capacity_error_payload(payload, None)
+                                })
+                            {
+                                capacity_error = true;
+                                break 'stream "upstream Responses SSE reported temporary capacity exhaustion".into();
+                            }
                             match disposition {
                                 NativeResponsesTerminalDisposition::Completed
                                 | NativeResponsesTerminalDisposition::Incomplete
@@ -487,7 +592,7 @@ pub(crate) fn create_resilient_responses_sse_stream_with_context(
             loop {
                 let effective_max_retries = reconnector
                     .as_ref()
-                    .map(StreamReconnector::retry_limit)
+                    .map(|reconnector| reconnector.retry_limit_for(capacity_error))
                     .unwrap_or(RESPONSES_STREAM_MAX_RETRIES);
                 let Some(reconnector) = reconnector.as_ref() else {
                     let message = if semantic_output_forwarded {
@@ -529,8 +634,15 @@ pub(crate) fn create_resilient_responses_sse_stream_with_context(
                         current = Some(Box::pin(response.bytes_stream()));
                         continue 'attempts;
                     }
-                    Ok(response) => reason = format!("reconnect got HTTP {} from upstream", response.status().as_u16()),
-                    Err(error) => reason = format!("reconnect failed: {error}"),
+                    Ok(response) => {
+                        reason = format!("reconnect got HTTP {} from upstream", response.status().as_u16());
+                        capacity_error = false;
+                        crate::proxy::error_journal::capture_discarded_response(response);
+                    }
+                    Err(error) => {
+                        reason = format!("reconnect failed: {error}");
+                        capacity_error = false;
+                    }
                 }
             }
         }
@@ -609,6 +721,11 @@ fn is_retryable_error_event(event: &ScannedEvent) -> bool {
             .any(|line| line == RETRYABLE_STREAM_MARKER)
 }
 
+fn is_capacity_error_event(event: &ScannedEvent) -> bool {
+    event.name == "error"
+        && event.raw.lines().any(|line| line == CAPACITY_STREAM_MARKER)
+}
+
 fn retry_failure_reason(event: &ScannedEvent) -> String {
     event
         .data
@@ -683,6 +800,7 @@ pub fn create_resilient_anthropic_sse_stream_from_responses(
 
             // 本次尝试因可重试原因终止时的描述；None 表示尝试正常走完。
             let mut fail_reason: Option<String> = None;
+            let mut capacity_error = false;
             // 重连后的尝试对首个转换事件套用首包超时，防止上游连上后静默挂起。
             let mut awaiting_first_item = attempt > 0;
 
@@ -753,6 +871,15 @@ pub fn create_resilient_anthropic_sse_stream_from_responses(
                 let text = String::from_utf8_lossy(&chunk);
                 let mut forward = String::new();
                 for event in scan_chunk(&text) {
+                    if !content_forwarded
+                        && reconnector.capacity_retry_enabled
+                        && reconnector.retry_limit() > 0
+                        && is_capacity_error_event(&event)
+                    {
+                        capacity_error = true;
+                        fail_reason = Some("Responses upstream reported temporary capacity exhaustion".into());
+                        break;
+                    }
                     if !content_forwarded && is_retryable_error_event(&event) {
                         fail_reason = Some(retry_failure_reason(&event));
                         break;
@@ -783,7 +910,8 @@ pub fn create_resilient_anthropic_sse_stream_from_responses(
             };
 
             loop {
-                if attempt >= effective_max_retries {
+                let retry_limit = reconnector.retry_limit_for(capacity_error);
+                if attempt >= retry_limit {
                     log::error!(
                         "[Claude/Responses] stream failed after {attempt} reconnect attempt(s): {reason}"
                     );
@@ -802,7 +930,7 @@ pub fn create_resilient_anthropic_sse_stream_from_responses(
                     );
                 } else {
                     log::warn!(
-                        "[Claude/Responses] upstream stream dropped before any content reached the client ({reason}); reconnecting (attempt {attempt}/{effective_max_retries})"
+                        "[Claude/Responses] upstream stream dropped before any content reached the client ({reason}); reconnecting (attempt {attempt}/{retry_limit})"
                     );
                 }
                 if message_start_forwarded {
@@ -834,9 +962,12 @@ pub fn create_resilient_anthropic_sse_stream_from_responses(
                             "reconnect got HTTP {} from upstream",
                             response.status().as_u16()
                         );
+                        capacity_error = false;
+                        crate::proxy::error_journal::capture_discarded_response(response);
                     }
                     Err(error) => {
                         reason = format!("reconnect failed: {error}");
+                        capacity_error = false;
                     }
                 }
             }
@@ -942,6 +1073,20 @@ pub(crate) fn create_resilient_chat_sse_stream_with_context(
                             if let Some(context) = log_context.as_ref() {
                                 log_chat_upstream_error(context, &block, attempt);
                             }
+                            if !semantic_output_forwarded
+                                && reconnector.as_ref().is_some_and(|reconnector| {
+                                    reconnector.capacity_retry_enabled && reconnector.retry_limit() > 0
+                                })
+                                && raw_responses_sse_payload(&block)
+                                    .as_ref()
+                                    .is_some_and(|payload| is_capacity_error_payload(payload, None))
+                            {
+                                failure = Some((
+                                    "capacity_error".to_string(),
+                                    "upstream Chat SSE reported temporary capacity exhaustion".to_string(),
+                                ));
+                                break;
+                            }
                             semantic_output_forwarded = true;
                             terminal = true;
                             yield Ok(block);
@@ -970,7 +1115,7 @@ pub(crate) fn create_resilient_chat_sse_stream_with_context(
                 break 'attempts;
             }
 
-            if let Some((reason_class, reason)) = failure {
+            if let Some((mut reason_class, reason)) = failure {
                 if semantic_output_forwarded {
                     let message = "上游 Chat Completions 响应流在输出正文后中断，无法安全自动重放";
                     log::error!("[Chat/Completions] {message}: {reason}");
@@ -986,10 +1131,6 @@ pub(crate) fn create_resilient_chat_sse_stream_with_context(
                     break 'attempts;
                 }
 
-                let effective_max_retries = reconnector
-                    .as_ref()
-                    .map(StreamReconnector::retry_limit)
-                    .unwrap_or(RESPONSES_STREAM_MAX_RETRIES);
                 let Some(reconnector) = reconnector.as_ref() else {
                     let message = "上游 Chat Completions 响应流在输出正文前中断";
                     log::error!("[Chat/Completions] stream dropped without reconnector ({reason})");
@@ -1002,6 +1143,8 @@ pub(crate) fn create_resilient_chat_sse_stream_with_context(
 
                 let mut reason = reason;
                 loop {
+                    let effective_max_retries =
+                        reconnector.retry_limit_for(reason_class == "capacity_error");
                     if attempt >= effective_max_retries {
                         let message = "上游 Chat Completions 响应流反复中断，自动重连已耗尽，请检查网络或代理后重试";
                         log::error!(
@@ -1041,9 +1184,12 @@ pub(crate) fn create_resilient_chat_sse_stream_with_context(
                                 "reconnect got HTTP {} from upstream",
                                 response.status().as_u16()
                             );
+                            reason_class = "reconnect_http_failure".into();
+                            crate::proxy::error_journal::capture_discarded_response(response);
                         }
                         Err(error) => {
                             reason = format!("reconnect failed: {error}");
+                            reason_class = "reconnect_transport_failure".into();
                         }
                     }
                 }
@@ -1352,6 +1498,90 @@ mod tests {
             out.push_str(&String::from_utf8_lossy(&item.unwrap()));
         }
         out
+    }
+
+    #[test]
+    fn capacity_classifier_requires_explicit_temporary_capacity_signal() {
+        assert!(is_capacity_error_response(
+            http::StatusCode::SERVICE_UNAVAILABLE,
+            Some(r#"{"error":{"type":"server_is_overloaded","message":"try later"}}"#),
+        ));
+        assert!(!is_capacity_error_response(http::StatusCode::BAD_GATEWAY, None));
+        assert!(!is_capacity_error_response(
+            http::StatusCode::SERVICE_UNAVAILABLE,
+            Some(r#"{"error":{"type":"billing_error","message":"quota exhausted"}}"#),
+        ));
+        assert!(!is_capacity_error_response(
+            http::StatusCode::TOO_MANY_REQUESTS,
+            Some(r#"{"error":{"type":"rate_limit_exceeded","message":"slow down"}}"#),
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn native_capacity_failure_reconnects_only_before_semantic_output() {
+        let failure = sse(
+            "response.failed",
+            json!({"type":"response.failed","response":{"error":{"type":"server_is_overloaded","message":"model is at capacity"}}}),
+        );
+        let recovered = [created(), text_delta("recovered"), completed()].concat();
+        let (reconnector, calls) = scripted_reconnector(vec![Ok(streamed_response(&[&recovered]))]);
+        let first = ok_chunks(&[created().as_str(), failure.as_str()]);
+        let out = collect(create_resilient_responses_sse_stream(
+            first,
+            Some(reconnector.with_capacity_retry(true)),
+        )).await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(out.contains("recovered"), "{out}");
+        assert!(!out.contains("model is at capacity"), "{out}");
+
+        let (reconnector, calls) = scripted_reconnector(vec![]);
+        let first = ok_chunks(&[created().as_str(), text_delta("visible").as_str(), failure.as_str()]);
+        let out = collect(create_resilient_responses_sse_stream(
+            first,
+            Some(reconnector.with_capacity_retry(true)),
+        )).await;
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert!(out.contains("visible"));
+        assert!(out.contains("model is at capacity"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn native_capacity_toggle_off_preserves_upstream_failure() {
+        let failure = sse("response.failed", json!({"type":"response.failed","response":{"error":{"type":"server_is_overloaded","message":"model is at capacity"}}}));
+        let (reconnector, calls) = scripted_reconnector(vec![]);
+        let out = collect(create_resilient_responses_sse_stream(
+            ok_chunks(&[failure.as_str()]),
+            Some(reconnector),
+        )).await;
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert!(out.contains("model is at capacity"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn anthropic_conversion_retries_capacity_only_before_content() {
+        let failure = sse("response.failed", json!({"type":"response.failed","response":{"error":{"type":"server_is_overloaded","message":"model is at capacity"}}}));
+        let recovered = [created(), text_delta("recovered"), completed()].concat();
+        let (reconnector, calls) = scripted_reconnector(vec![Ok(streamed_response(&[&recovered]))]);
+        let first = ok_chunks(&[created().as_str(), failure.as_str()]);
+        let out = collect(create_resilient_anthropic_sse_stream_from_responses(
+            first,
+            Some(reconnector.with_capacity_retry(true)),
+        ))
+        .await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(out.contains("recovered"), "{out}");
+        assert!(!out.contains("model is at capacity"), "{out}");
+
+        let (reconnector, calls) = scripted_reconnector(vec![]);
+        let first = ok_chunks(&[created().as_str(), text_delta("visible").as_str(), failure.as_str()]);
+        let out = collect(create_resilient_anthropic_sse_stream_from_responses(
+            first,
+            Some(reconnector.with_capacity_retry(true)),
+        ))
+        .await;
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert!(out.contains("visible"), "{out}");
+        assert!(out.contains("model is at capacity"), "{out}");
     }
 
     #[tokio::test(start_paused = true)]
@@ -2215,5 +2445,34 @@ data: {"error":{"type":"upstream_down","message":"explicit upstream failure"}}
 
         assert_eq!(calls.load(Ordering::SeqCst), 0);
         assert!(out.contains("explicit upstream failure"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn chat_retries_capacity_only_before_content() {
+        let failure = sse("error", json!({"error":{"type":"server_is_overloaded","message":"model is at capacity"}}));
+        let recovered = [chat_role(), chat_delta("recovered"), chat_finish(), "data: [DONE]\n\n".into()].concat();
+        let (reconnector, calls) = scripted_reconnector(vec![Ok(streamed_response(&[&recovered]))]);
+        let first = ok_chunks(&[chat_role().as_str(), failure.as_str()]);
+        let out = collect(create_resilient_chat_sse_stream_with_context(
+            first,
+            Some(reconnector.with_capacity_retry(true)),
+            None,
+        ))
+        .await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(out.contains("recovered"), "{out}");
+        assert!(!out.contains("model is at capacity"), "{out}");
+
+        let (reconnector, calls) = scripted_reconnector(vec![]);
+        let first = ok_chunks(&[chat_role().as_str(), chat_delta("visible").as_str(), failure.as_str()]);
+        let out = collect(create_resilient_chat_sse_stream_with_context(
+            first,
+            Some(reconnector.with_capacity_retry(true)),
+            None,
+        ))
+        .await;
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert!(out.contains("visible"), "{out}");
+        assert!(out.contains("model is at capacity"), "{out}");
     }
 }

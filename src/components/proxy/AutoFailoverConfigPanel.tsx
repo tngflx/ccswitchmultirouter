@@ -3,10 +3,15 @@ import { useTranslation } from "react-i18next";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { Switch } from "@/components/ui/switch";
 import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Save, Loader2, Info } from "lucide-react";
 import { toast } from "sonner";
-import { useAppProxyConfig, useUpdateAppProxyConfig } from "@/lib/query/proxy";
+import {
+  useAppProxyConfig,
+  useUpdateAppProxyConfig,
+  useSetCodexCapacityRetryEnabled,
+} from "@/lib/query/proxy";
 
 export interface AutoFailoverConfigPanelProps {
   appType: string;
@@ -20,6 +25,7 @@ export function AutoFailoverConfigPanel({
   const { t } = useTranslation();
   const { data: config, isLoading, error } = useAppProxyConfig(appType);
   const updateConfig = useUpdateAppProxyConfig();
+  const updateCapacityRetry = useSetCodexCapacityRetryEnabled();
 
   // 使用字符串状态以支持完全清空数字输入框
   const [formData, setFormData] = useState({
@@ -163,6 +169,7 @@ export function AutoFailoverConfigPanel({
         appType,
         enabled: config.enabled,
         autoFailoverEnabled: formData.autoFailoverEnabled,
+        capacityRetryEnabled: config.capacityRetryEnabled,
         maxRetries: raw.maxRetries,
         streamingFirstByteTimeout: raw.streamingFirstByteTimeout,
         streamingIdleTimeout: raw.streamingIdleTimeout,
@@ -211,7 +218,8 @@ export function AutoFailoverConfigPanel({
     );
   }
 
-  const isDisabled = disabled || updateConfig.isPending;
+  const isDisabled =
+    disabled || updateConfig.isPending || updateCapacityRetry.isPending;
 
   return (
     <div className="border-0 rounded-none shadow-none bg-transparent">
@@ -231,6 +239,34 @@ export function AutoFailoverConfigPanel({
             )}
           </AlertDescription>
         </Alert>
+
+        {appType === "codex" && config && (
+          <div className="flex items-center justify-between gap-4 border-b pb-4">
+            <div className="space-y-1">
+              <Label htmlFor="codex-capacity-retry">
+                {t("proxy.autoFailover.capacityRetry")}
+              </Label>
+              <p className="text-xs text-muted-foreground">
+                {t("proxy.autoFailover.capacityRetryHint")}
+              </p>
+            </div>
+            <Switch
+              id="codex-capacity-retry"
+              checked={config.capacityRetryEnabled}
+              disabled={isDisabled || updateCapacityRetry.isPending}
+              onCheckedChange={(enabled) => {
+                updateCapacityRetry.mutate(enabled, {
+                  onError: (cause) =>
+                    toast.error(
+                      t("proxy.autoFailover.configSaveFailed") +
+                        ": " +
+                        String(cause),
+                    ),
+                });
+              }}
+            />
+          </div>
+        )}
 
         {/* 重试与超时配置 */}
         <div className="space-y-4 rounded-lg border border-white/10 bg-muted/30 p-4">

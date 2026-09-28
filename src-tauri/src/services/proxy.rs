@@ -235,6 +235,8 @@ impl ProxyService {
                 injected: false,
                 last_event: String::new(),
                 message: String::new(),
+                message_key: String::new(),
+                message_args: Vec::new(),
             })),
         }
     }

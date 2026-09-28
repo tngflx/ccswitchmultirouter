@@ -14,6 +14,8 @@ export interface FetchedCodexCatalogModel extends RemoteModelMetadata {
   id: string;
   inputModalities?: string[] | null;
   supportsImage?: boolean | null;
+  /** Provider-discovered reasoning metadata, including the upstream effort map. */
+  reasoning?: CodexCatalogModel["reasoning"] | null;
 }
 
 export interface CodexCatalogSyncSource {
@@ -119,10 +121,17 @@ function missingCapabilityPatch(
     }
   }
 
+  // A normal sync only fills absent reasoning metadata. Explicit JSON edits
+  // (source === "user") must remain authoritative.
+  if (!row.reasoning && fetched.reasoning) {
+    patch.reasoning = fetched.reasoning;
+  }
+
   return patch;
 }
 
 function refreshedCapabilityPatch(
+  row: CodexCatalogRowLike,
   fetched: FetchedCodexCatalogModel,
 ): Partial<CodexCatalogRowLike> {
   const patch: Partial<CodexCatalogRowLike> = {};
@@ -147,6 +156,12 @@ function refreshedCapabilityPatch(
   if (fetchedSupportsImage !== undefined) {
     patch.supportsImage = fetchedSupportsImage;
     patch.textOnly = !fetchedSupportsImage;
+  }
+
+  // Refresh provider-owned/discovered metadata, but never overwrite an
+  // explicit user capability declaration.
+  if (fetched.reasoning && row.reasoning?.source !== "user") {
+    patch.reasoning = fetched.reasoning;
   }
 
   return patch;
@@ -226,7 +241,7 @@ export function reconcileFetchedCodexCatalogRows<T extends CodexCatalogRowLike>(
       Object.assign(
         patch,
         refreshExisting
-          ? refreshedCapabilityPatch(fetched)
+          ? refreshedCapabilityPatch(row, fetched)
           : missingCapabilityPatch(row, fetched),
       );
 
@@ -264,6 +279,7 @@ export function reconcileFetchedCodexCatalogRows<T extends CodexCatalogRowLike>(
       ...(typeof fetched.supportsImage === "boolean"
         ? { supportsImage: fetched.supportsImage }
         : {}),
+      ...(fetched.reasoning ? { reasoning: fetched.reasoning } : {}),
     };
     const capabilityPatch = missingCapabilityPatch(seed, fetched);
     const created = options.createRow({ ...seed, ...capabilityPatch });

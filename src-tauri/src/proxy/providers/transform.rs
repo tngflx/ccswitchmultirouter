@@ -93,7 +93,13 @@ pub fn supports_reasoning_effort(model: &str) -> bool {
 fn supports_max_reasoning_effort(model: &str) -> bool {
     matches!(
         model.to_ascii_lowercase().as_str(),
-        "gpt-5.6" | "gpt-5.6-sol" | "gpt-5.6-terra" | "gpt-5.6-luna" | "gpt-6-astra"
+        "gpt-5.6"
+            | "gpt-5.6-sol"
+            | "gpt-5.6-terra"
+            | "gpt-5.6-luna"
+            | "gpt-6-astra"
+            | "gpt-6-sol"
+            | "gpt-6-luna"
     )
 }
 
@@ -1829,6 +1835,8 @@ mod tests {
             "gpt-5.6-terra",
             "gpt-5.6-luna",
             "gpt-6-astra",
+            "gpt-6-sol",
+            "gpt-6-luna",
         ] {
             let body = json!({"model": model, "output_config": {"effort": "max"}});
             assert_eq!(resolve_reasoning_effort(&body), Some("max"));

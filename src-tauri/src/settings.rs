@@ -579,6 +579,10 @@ pub struct AppSettings {
     /// npm release when CCSwitchMulti starts. Skips while Codex is running.
     #[serde(default)]
     pub auto_update_codex_cli: bool,
+    /// Managed CLI names opted into startup/background updates.
+    /// The legacy Codex flag above remains supported for existing settings files.
+    #[serde(default)]
+    pub auto_update_cli_tools: Vec<String>,
     /// Keep Codex ChatGPT login material in auth.json when switching to third-party providers.
     /// Opt-in: defaults to false so third-party switches cleanly overwrite auth.json.
     #[serde(default)]
@@ -745,6 +749,7 @@ impl Default for AppSettings {
             request_health: RequestHealthConfig::default(),
             show_profile_switcher: true,
             auto_update_codex_cli: false,
+            auto_update_cli_tools: Vec::new(),
             preserve_codex_official_auth_on_switch: false,
             unify_codex_session_history: false,
             unify_codex_migrate_existing: None,
@@ -1548,11 +1553,16 @@ mod tests {
     #[test]
     fn codex_cli_auto_update_is_opt_in_and_round_trips() {
         assert!(!AppSettings::default().auto_update_codex_cli);
+        assert!(AppSettings::default().auto_update_cli_tools.is_empty());
         let decoded: AppSettings = serde_json::from_value(serde_json::json!({
-            "autoUpdateCodexCli": true
+            "autoUpdateCodexCli": true,
+            "autoUpdateCliTools": ["claude", "gemini"]
         }))
         .expect("auto-update setting");
         assert!(decoded.auto_update_codex_cli);
+        assert_eq!(decoded.auto_update_cli_tools, vec!["claude", "gemini"]);
+        let encoded = serde_json::to_value(decoded).expect("serialize update settings");
+        assert_eq!(encoded["autoUpdateCliTools"], serde_json::json!(["claude", "gemini"]));
     }
 
     #[test]

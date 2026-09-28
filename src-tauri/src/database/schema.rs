@@ -128,6 +128,7 @@ impl Database {
             proxy_enabled INTEGER NOT NULL DEFAULT 0, listen_address TEXT NOT NULL DEFAULT '127.0.0.1',
             listen_port INTEGER NOT NULL DEFAULT 15721, enable_logging INTEGER NOT NULL DEFAULT 1,
             enabled INTEGER NOT NULL DEFAULT 0, auto_failover_enabled INTEGER NOT NULL DEFAULT 0,
+            capacity_retry_enabled INTEGER NOT NULL DEFAULT 0,
             max_retries INTEGER NOT NULL DEFAULT 3, streaming_first_byte_timeout INTEGER NOT NULL DEFAULT 60,
             streaming_idle_timeout INTEGER NOT NULL DEFAULT 120, non_streaming_timeout INTEGER NOT NULL DEFAULT 600,
             circuit_failure_threshold INTEGER NOT NULL DEFAULT 4, circuit_success_threshold INTEGER NOT NULL DEFAULT 2,
@@ -137,6 +138,18 @@ impl Database {
             pricing_model_source TEXT NOT NULL DEFAULT 'response',
             created_at TEXT NOT NULL DEFAULT (datetime('now')), updated_at TEXT NOT NULL DEFAULT (datetime('now'))
         )", []).map_err(|e| AppError::Database(e.to_string()))?;
+
+        // 确保 capacity_retry_enabled 列存在。
+        // create_tables 先于 apply_schema_migrations 运行；对已存在的旧库，
+        // CREATE TABLE IF NOT EXISTS 不会补列，而下面的 codex seed INSERT 引用了该列。
+        // v18→v19 迁移在之后才执行，若不在此先补列，启动即报
+        // "table proxy_config has no column named capacity_retry_enabled"。
+        Self::add_column_if_missing(
+            conn,
+            "proxy_config",
+            "capacity_retry_enabled",
+            "INTEGER NOT NULL DEFAULT 0",
+        )?;
 
         // 初始化三行数据（每应用不同默认值）
         //
@@ -154,11 +167,11 @@ impl Database {
             )
             .map_err(|e| AppError::Database(e.to_string()))?;
             conn.execute(
-                "INSERT OR IGNORE INTO proxy_config (app_type, max_retries,
+                "INSERT OR IGNORE INTO proxy_config (app_type, capacity_retry_enabled, max_retries,
                 streaming_first_byte_timeout, streaming_idle_timeout, non_streaming_timeout,
                 circuit_failure_threshold, circuit_success_threshold, circuit_timeout_seconds,
                 circuit_error_rate_threshold, circuit_min_requests)
-                VALUES ('codex', 3, 60, 120, 600, 4, 2, 60, 0.6, 10)",
+                VALUES ('codex', 1, 3, 60, 120, 600, 4, 2, 60, 0.6, 10)",
                 [],
             )
             .map_err(|e| AppError::Database(e.to_string()))?;
@@ -535,6 +548,11 @@ impl Database {
                         log::info!("迁移数据库从 v17 到 v18（添加 Codex reasoning 手工覆盖）");
                         Self::migrate_v17_to_v18(conn)?;
                         Self::set_user_version(conn, 18)?;
+                    }
+                    18 => {
+                        log::info!("迁移数据库从 v18 到 v19（添加 Codex 容量重试配置）");
+                        Self::migrate_v18_to_v19(conn)?;
+                        Self::set_user_version(conn, 19)?;
                     }
                     _ => {
                         return Err(AppError::Database(format!(
@@ -1565,6 +1583,28 @@ impl Database {
 
     fn migrate_v17_to_v18(conn: &Connection) -> Result<(), AppError> {
         Self::create_reasoning_manual_override_tables(conn)
+    }
+
+    fn migrate_v18_to_v19(conn: &Connection) -> Result<(), AppError> {
+        // A few legacy/test databases do not contain proxy_config yet; the
+        // migration remains valid and the table will be created by the normal
+        // schema bootstrap path later.
+        if !Self::table_exists(conn, "proxy_config")? {
+            return Ok(());
+        }
+        if !Self::has_column(conn, "proxy_config", "capacity_retry_enabled")? {
+            conn.execute(
+                "ALTER TABLE proxy_config ADD COLUMN capacity_retry_enabled INTEGER NOT NULL DEFAULT 0",
+                [],
+            )
+            .map_err(|error| AppError::Database(error.to_string()))?;
+        }
+        conn.execute(
+            "UPDATE proxy_config SET capacity_retry_enabled = 1 WHERE app_type = 'codex'",
+            [],
+        )
+        .map_err(|error| AppError::Database(error.to_string()))?;
+        Ok(())
     }
 
     fn create_protocol_compatibility_tables(conn: &Connection) -> Result<(), AppError> {
@@ -3641,6 +3681,111 @@ impl Database {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn fresh_proxy_seed_enables_capacity_retry_only_for_codex() -> Result<(), AppError> {
+        let conn = Connection::open_in_memory()?;
+        Database::create_tables_on_conn(&conn)?;
+        let values: Vec<(String, i64)> = conn
+            .prepare(
+                "SELECT app_type, capacity_retry_enabled FROM proxy_config
+                 WHERE app_type IN ('codex', 'claude') ORDER BY app_type",
+            )?
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<Result<_, _>>()?;
+        assert_eq!(
+            values,
+            vec![("claude".to_string(), 0), ("codex".to_string(), 1)]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn migrate_v18_to_v19_adds_capacity_retry_and_preserves_app_defaults() -> Result<(), AppError>
+    {
+        let conn = Connection::open_in_memory()?;
+        conn.execute(
+            "CREATE TABLE proxy_config (app_type TEXT PRIMARY KEY)",
+            [],
+        )?;
+        conn.execute_batch(
+            "INSERT INTO proxy_config (app_type) VALUES ('codex'), ('claude');
+             PRAGMA user_version = 18;",
+        )?;
+
+        Database::apply_schema_migrations_on_conn(&conn)?;
+
+        assert_eq!(Database::get_user_version(&conn)?, SCHEMA_VERSION);
+        let values: Vec<(String, i64)> = conn
+            .prepare(
+                "SELECT app_type, capacity_retry_enabled FROM proxy_config
+                 ORDER BY app_type",
+            )?
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<Result<_, _>>()?;
+        assert_eq!(
+            values,
+            vec![("claude".to_string(), 0), ("codex".to_string(), 1)]
+        );
+        Ok(())
+    }
+
+    /// 回归：已存在的 v18 库（proxy_config 无 capacity_retry_enabled 列）启动时，
+    /// create_tables 先于迁移执行。此前 codex seed INSERT 直接引用新列，导致
+    /// `table proxy_config has no column named capacity_retry_enabled` 启动失败。
+    /// 修复后 create_tables 会先补齐该列，再 seed，随后迁移把 codex 置 1。
+    #[test]
+    fn create_tables_on_v18_db_adds_capacity_retry_before_seed_insert() -> Result<(), AppError> {
+        let conn = Connection::open_in_memory()?;
+        // v18 形态：三行结构（有 app_type），但没有 capacity_retry_enabled 列。
+        conn.execute(
+            "CREATE TABLE proxy_config (
+                app_type TEXT PRIMARY KEY CHECK (app_type IN ('claude','codex','gemini','grokbuild')),
+                proxy_enabled INTEGER NOT NULL DEFAULT 0,
+                listen_address TEXT NOT NULL DEFAULT '127.0.0.1',
+                listen_port INTEGER NOT NULL DEFAULT 15721,
+                enable_logging INTEGER NOT NULL DEFAULT 1,
+                enabled INTEGER NOT NULL DEFAULT 0,
+                auto_failover_enabled INTEGER NOT NULL DEFAULT 0,
+                max_retries INTEGER NOT NULL DEFAULT 3,
+                streaming_first_byte_timeout INTEGER NOT NULL DEFAULT 60,
+                streaming_idle_timeout INTEGER NOT NULL DEFAULT 120,
+                non_streaming_timeout INTEGER NOT NULL DEFAULT 600,
+                circuit_failure_threshold INTEGER NOT NULL DEFAULT 4,
+                circuit_success_threshold INTEGER NOT NULL DEFAULT 2,
+                circuit_timeout_seconds INTEGER NOT NULL DEFAULT 60,
+                circuit_error_rate_threshold REAL NOT NULL DEFAULT 0.6,
+                circuit_min_requests INTEGER NOT NULL DEFAULT 10,
+                default_cost_multiplier TEXT NOT NULL DEFAULT '1',
+                pricing_model_source TEXT NOT NULL DEFAULT 'response',
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+            )",
+            [],
+        )?;
+        conn.execute_batch(
+            "INSERT INTO proxy_config (app_type, max_retries) VALUES ('codex', 3), ('claude', 6);
+             PRAGMA user_version = 18;",
+        )?;
+
+        // 关键：先跑 create_tables（含 codex seed INSERT），再跑迁移。
+        Database::create_tables_on_conn(&conn)?;
+        Database::apply_schema_migrations_on_conn(&conn)?;
+
+        assert_eq!(Database::get_user_version(&conn)?, SCHEMA_VERSION);
+        let values: Vec<(String, i64)> = conn
+            .prepare(
+                "SELECT app_type, capacity_retry_enabled FROM proxy_config
+                 WHERE app_type IN ('codex', 'claude') ORDER BY app_type",
+            )?
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<Result<_, _>>()?;
+        assert_eq!(
+            values,
+            vec![("claude".to_string(), 0), ("codex".to_string(), 1)]
+        );
+        Ok(())
+    }
 
     /// 验证 v12 数据库升级后具备完整 v13 列，并且重复执行保持幂等。
     #[test]

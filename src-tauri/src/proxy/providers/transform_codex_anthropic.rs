@@ -302,6 +302,8 @@ pub fn responses_request_to_anthropic(
     let adaptive_by_default = crate::proxy::thinking_optimizer::adaptive_thinking_is_default(model);
     let cannot_disable_thinking =
         crate::proxy::thinking_optimizer::thinking_cannot_be_disabled(model);
+    let omit_disabled_thinking =
+        crate::proxy::thinking_optimizer::omits_disabled_thinking_on_wire(model);
 
     // max_output_tokens → max_tokens (required)
     let max_tokens = body
@@ -327,7 +329,7 @@ pub fn responses_request_to_anthropic(
                     .to_string(),
             ));
         }
-        if adaptive_should_think {
+        if adaptive_should_think && !omit_disabled_thinking {
             result["thinking"] = json!({ "type": "disabled" });
         }
     } else if adaptive_should_think && (!explicitly_disabled || cannot_disable_thinking) {
@@ -340,7 +342,7 @@ pub fn responses_request_to_anthropic(
             // representation of Codex's explicit `none` request.
             result["output_config"] = json!({ "effort": "low" });
         }
-    } else if explicitly_disabled {
+    } else if explicitly_disabled && !omit_disabled_thinking {
         result["thinking"] = json!({ "type": "disabled" });
     } else if thinking_budget > 0 {
         thinking_enabled = true;
@@ -413,7 +415,11 @@ pub fn responses_request_to_anthropic(
                 // Anthropic rejects forced tools while thinking is enabled. Preserve
                 // the caller's explicit tool constraint and disable thinking for this
                 // request instead of silently weakening `required`/named selection.
-                result["thinking"] = json!({ "type": "disabled" });
+                if omit_disabled_thinking {
+                    result.as_object_mut().unwrap().remove("thinking");
+                } else {
+                    result["thinking"] = json!({ "type": "disabled" });
+                }
                 result.as_object_mut().unwrap().remove("output_config");
                 if let Some(value) = body.get("temperature") {
                     result["temperature"] = value.clone();
@@ -1397,6 +1403,10 @@ pub fn anthropic_sse_to_message_value(body: &str) -> Result<Value, ProxyError> {
     let mut stop_reason: Option<String> = None;
     let mut delta_output_tokens: Option<u64> = None;
     let mut saw_message_stop = false;
+    // Some gateways omit `index` on delta/stop events. Keep the most recently
+    // opened block so those events cannot all collapse into block 0 and corrupt
+    // a preceding tool call when multiple content blocks are present.
+    let mut active_index: Option<u64> = None;
 
     let mut buffer = body.to_string();
     let process_block = |block: &str,
@@ -1405,7 +1415,8 @@ pub fn anthropic_sse_to_message_value(body: &str) -> Result<Value, ProxyError> {
                          json_accum: &mut BTreeMap<u64, String>,
                          stop_reason: &mut Option<String>,
                          delta_output_tokens: &mut Option<u64>,
-                         saw_message_stop: &mut bool|
+                         saw_message_stop: &mut bool,
+                         active_index: &mut Option<u64>|
      -> Result<(), ProxyError> {
         let mut data = String::new();
         for line in block.lines() {
@@ -1460,10 +1471,15 @@ pub fn anthropic_sse_to_message_value(body: &str) -> Result<Value, ProxyError> {
                     };
                     blocks.insert(index, block);
                     json_accum.entry(index).or_default();
+                    *active_index = Some(index);
                 }
             }
             "content_block_delta" => {
-                if let Some(index) = value.get("index").and_then(|v| v.as_u64()) {
+                let index = value
+                    .get("index")
+                    .and_then(|v| v.as_u64())
+                    .or(*active_index);
+                if let Some(index) = index {
                     let delta = value.get("delta").cloned().unwrap_or(json!({}));
                     match delta.get("type").and_then(|t| t.as_str()).unwrap_or("") {
                         "text_delta" => {
@@ -1501,7 +1517,11 @@ pub fn anthropic_sse_to_message_value(body: &str) -> Result<Value, ProxyError> {
                 }
             }
             "content_block_stop" => {
-                if let Some(index) = value.get("index").and_then(|v| v.as_u64()) {
+                let index = value
+                    .get("index")
+                    .and_then(|v| v.as_u64())
+                    .or(*active_index);
+                if let Some(index) = index {
                     if let Some(accum) = json_accum.get(&index) {
                         if !accum.trim().is_empty() {
                             let parsed: Value =
@@ -1510,6 +1530,9 @@ pub fn anthropic_sse_to_message_value(body: &str) -> Result<Value, ProxyError> {
                                 block["input"] = parsed;
                             }
                         }
+                    }
+                    if *active_index == Some(index) {
+                        *active_index = None;
                     }
                 }
             }
@@ -1548,6 +1571,7 @@ pub fn anthropic_sse_to_message_value(body: &str) -> Result<Value, ProxyError> {
             &mut stop_reason,
             &mut delta_output_tokens,
             &mut saw_message_stop,
+            &mut active_index,
         )?;
     }
     // Tolerate the last event missing a trailing blank line (truncated stream).
@@ -1560,6 +1584,7 @@ pub fn anthropic_sse_to_message_value(body: &str) -> Result<Value, ProxyError> {
             &mut stop_reason,
             &mut delta_output_tokens,
             &mut saw_message_stop,
+            &mut active_index,
         )?;
     }
 
@@ -2125,6 +2150,39 @@ mod tests {
 
         let opus = responses_request_to_anthropic(request("claude-opus-4.8"), 4096).unwrap();
         assert!(opus.get("thinking").is_none());
+    }
+
+    #[test]
+    fn test_opus_5_omits_disabled_thinking_in_all_conversion_paths() {
+        let base = json!({
+            "model": "claude-opus-5",
+            "max_output_tokens": 4096,
+            "input": [{"role": "user", "content": "hi"}]
+        });
+
+        let mut explicit_none = base.clone();
+        explicit_none["reasoning"] = json!({"effort": "none"});
+        let result = responses_request_to_anthropic(explicit_none, 4096).unwrap();
+        assert!(result.get("thinking").is_none());
+
+        let mut forced_tool = base.clone();
+        forced_tool["reasoning"] = json!({"effort": "high"});
+        forced_tool["tools"] =
+            json!([{"type": "function", "name": "x", "parameters": {"type": "object"}}]);
+        forced_tool["tool_choice"] = json!("required");
+        let result = responses_request_to_anthropic(forced_tool, 4096).unwrap();
+        assert!(result.get("thinking").is_none());
+        assert_eq!(result["tool_choice"], json!({"type": "any"}));
+
+        let mut unsigned_tool_history = base;
+        unsigned_tool_history["reasoning"] = json!({"effort": "high"});
+        unsigned_tool_history["input"] = json!([
+            {"role": "user", "content": "call tool"},
+            {"type": "function_call", "call_id": "c1", "name": "x", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "c1", "output": "ok"}
+        ]);
+        let result = responses_request_to_anthropic(unsigned_tool_history, 4096).unwrap();
+        assert!(result.get("thinking").is_none());
     }
 
     #[test]
@@ -2952,6 +3010,24 @@ data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usa
         // Identical to the deltas-only case above — neither path may drop start input.
         assert_eq!(msg["content"][0]["input"]["city"], "Tokyo");
         assert_eq!(msg["stop_reason"], "tool_use");
+    }
+
+    #[test]
+    fn test_anthropic_sse_aggregation_indexless_deltas_follow_active_block() {
+        let sse = concat!(
+            "data: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"role\":\"assistant\",\"content\":[],\"usage\":{}}}\n\n",
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"a\",\"name\":\"first\",\"input\":{}}}\n\n",
+            "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"x\\\":1}\"}}\n\n",
+            "data: {\"type\":\"content_block_stop\"}\n\n",
+            "data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"b\",\"name\":\"second\",\"input\":{}}}\n\n",
+            "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"y\\\":2}\"}}\n\n",
+            "data: {\"type\":\"content_block_stop\"}\n\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"}}\n\n",
+            "data: {\"type\":\"message_stop\"}\n\n",
+        );
+        let msg = anthropic_sse_to_message_value(sse).unwrap();
+        assert_eq!(msg["content"][0]["input"]["x"], 1);
+        assert_eq!(msg["content"][1]["input"]["y"], 2);
     }
 
     #[test]

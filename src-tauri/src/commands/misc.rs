@@ -269,11 +269,39 @@ fn codex_process_is_running() -> bool {
     }
 }
 
+fn managed_cli_process_is_running(tool: &str) -> bool {
+    if tool == "codex" {
+        return codex_process_is_running();
+    }
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        let escaped = tool.replace('\'', "''");
+        let script = format!(
+            "(Get-CimInstance Win32_Process | Where-Object {{ $_.Name -match '^{escaped}(?:\\.exe)?$' }} | Select-Object -First 1) -ne $null"
+        );
+        return std::process::Command::new("powershell")
+            .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+            .creation_flags(CREATE_NO_WINDOW)
+            .output()
+            .map(|output| codex_process_probe_indicates_running(output.status.success(), &output.stdout))
+            .unwrap_or(true);
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        std::process::Command::new("pgrep")
+            .args(["-x", tool])
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(true)
+    }
+}
+
 #[cfg(target_os = "windows")]
 fn codex_cli_process_probe_command() -> &'static str {
-    // WMI name filters are case-insensitive. Use PowerShell's case-sensitive
-    // `-ceq` and exclude the OpenAI.Codex WindowsApps shell explicitly.
-    "(Get-CimInstance Win32_Process | Where-Object { $_.Name -ceq 'codex.exe' -and $_.ExecutablePath -notmatch '\\\\WindowsApps\\\\OpenAI\\.Codex(?:\\.Preview)?_' } | Select-Object -First 1) -ne $null"
+    // Desktop's versioned, bundled app-server is not the npm/standalone CLI
+    // being updated. Keep blocking a user-installed codex.exe that may be in use.
+    "(Get-CimInstance Win32_Process | Where-Object { $_.Name -ceq 'codex.exe' -and $_.ExecutablePath -notmatch '\\\\WindowsApps\\\\OpenAI\\.Codex(?:\\.Preview)?_' -and $_.ExecutablePath -notmatch '\\\\OpenAI\\\\Codex\\\\bin\\\\[0-9a-f]+\\\\codex\\.exe$' } | Select-Object -First 1) -ne $null"
 }
 
 pub(crate) async fn auto_update_codex_cli_if_needed() -> Result<bool, String> {
@@ -304,6 +332,44 @@ pub(crate) async fn auto_update_codex_cli_if_needed() -> Result<bool, String> {
     }
     run_tool_lifecycle_action(vec!["codex".to_string()], "update".to_string(), None).await?;
     Ok(true)
+}
+
+/// Update each opted-in managed CLI independently. A failure for one tool must
+/// not prevent the remaining enabled tools from being checked.
+pub(crate) async fn auto_update_cli_tools_if_needed(
+    tools: Vec<String>,
+) -> Vec<(String, Result<bool, String>)> {
+    let mut results = Vec::new();
+    for tool in tools {
+        if !VALID_TOOLS.contains(&tool.as_str()) {
+            continue;
+        }
+        // Codex has a dedicated updater with a process-in-use guard.
+        if tool == "codex" {
+            continue;
+        }
+        if managed_cli_process_is_running(&tool) {
+            results.push((tool, Ok(false)));
+            continue;
+        }
+        let current = get_single_tool_version_impl(&tool, None, None).await;
+        let (Some(version), Some(latest)) = (
+            current.version.as_deref(),
+            current.latest_version.as_deref(),
+        ) else {
+            results.push((tool, Ok(false)));
+            continue;
+        };
+        if compare_semver(version, latest) != Some(std::cmp::Ordering::Less) {
+            results.push((tool, Ok(false)));
+            continue;
+        }
+        let result = run_tool_lifecycle_action(vec![tool.clone()], "update".to_string(), None)
+            .await
+            .map(|()| true);
+        results.push((tool, result));
+    }
+    results
 }
 
 /// 静默执行工具安装/更新脚本：直接捕获子进程输出并阻塞到命令真正结束，
@@ -7328,11 +7394,51 @@ mod tests {
 
     #[cfg(target_os = "windows")]
     #[test]
-    fn codex_auto_update_probe_ignores_desktop_shell_names() {
+    fn codex_auto_update_probe_ignores_desktop_binaries() {
         let command = codex_cli_process_probe_command();
         assert!(command.contains(".Name -ceq 'codex.exe'"));
         assert!(command.contains("WindowsApps"));
+        assert!(command.contains("OpenAI\\\\Codex\\\\bin\\\\[0-9a-f]+\\\\codex"));
         assert!(!command.contains("Name = 'Codex.exe'"));
         assert!(!command.contains("Name = 'ChatGPT.exe'"));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn codex_auto_update_process_classification_distinguishes_desktop_and_cli() {
+        use std::os::windows::process::CommandExt;
+
+        let cases = [
+            (
+                r"C:\Users\Felix\AppData\Local\OpenAI\Codex\bin\faa963e871dd422c\codex.exe",
+                false,
+            ),
+            (
+                r"C:\Users\Felix\AppData\Roaming\npm\node_modules\@openai\codex\bin\codex.exe",
+                true,
+            ),
+            (
+                r"C:\Program Files\WindowsApps\OpenAI.Codex_1.2.3\app\codex.exe",
+                false,
+            ),
+        ];
+        for (path, expected) in cases {
+            let fixture = format!(
+                "@([pscustomobject]@{{Name='codex.exe';ExecutablePath='{path}'}})"
+            );
+            let script = codex_cli_process_probe_command()
+                .replace("Get-CimInstance Win32_Process", &fixture);
+            let output = std::process::Command::new("powershell")
+                .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+                .creation_flags(0x08000000)
+                .output()
+                .expect("PowerShell process probe fixture");
+            assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+            assert_eq!(
+                codex_process_probe_indicates_running(true, &output.stdout),
+                expected,
+                "{path}"
+            );
+        }
     }
 }

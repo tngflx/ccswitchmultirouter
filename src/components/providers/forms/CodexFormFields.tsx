@@ -1949,8 +1949,40 @@ export function CodexFormFields({
   const applyAutomaticCatalogRefresh = useCallback(
     (models: FetchedModel[]) => {
       recordVerifiedModelList(models);
+      if (!onCatalogModelsChange || models.length === 0) return;
+
+      // Background refreshes are allowed to hydrate metadata on rows already
+      // present in the user-curated catalog. New model membership remains a
+      // deliberate/manual sync decision, so it still appears only in the
+      // membership diff modal.
+      const result = reconcileFetchedCodexCatalogRows(
+        catalogRowsRef.current,
+        models,
+        { providerId, providerName, baseUrl: codexBaseUrl, websiteUrl },
+        {
+          appendNew: false,
+          createRow: (seed) => createCatalogRow(seed),
+          existingMetadataMode: "refresh",
+        },
+      );
+      if (result.hydrated === 0) return;
+
+      catalogRowsRef.current = result.rows;
+      setCatalogRows(result.rows);
+      const persistedRows = result.rows.map(
+        ({ rowId: _rowId, ...row }) => row,
+      );
+      lastSentModelsRef.current = persistedRows;
+      onCatalogModelsChange(persistedRows);
     },
-    [recordVerifiedModelList],
+    [
+      codexBaseUrl,
+      onCatalogModelsChange,
+      providerId,
+      providerName,
+      recordVerifiedModelList,
+      websiteUrl,
+    ],
   );
   const handleAutomaticModelDiff = useCallback(
     (added: string[], removed: string[], updated: string[]) => {

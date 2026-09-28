@@ -233,6 +233,8 @@ export interface CodexGuardianStatus {
   injected: boolean;
   lastEvent: string;
   message: string;
+  messageKey?: string;
+  messageArgs?: string[];
 }
 export interface CodexModelPickerUnlockResult {
   attemptedPorts: number[];
@@ -520,6 +522,7 @@ export interface AppProxyConfig {
   appType: string;
   enabled: boolean;
   autoFailoverEnabled: boolean;
+  capacityRetryEnabled: boolean;
   maxRetries: number;
   streamingFirstByteTimeout: number;
   streamingIdleTimeout: number;

@@ -9617,7 +9617,15 @@ function StatusTab({
                         defaultValue: " · 轮询中",
                       })}
               </div>
-              <div className="mt-1">{guardianStatus.message}</div>
+              <div className="mt-1">
+                {guardianStatus.messageKey
+                  ? tr(guardianStatus.messageKey, {
+                      defaultValue: guardianStatus.message,
+                      arg0: guardianStatus.messageArgs?.[0] ?? "",
+                      arg1: guardianStatus.messageArgs?.[1] ?? "",
+                    })
+                  : guardianStatus.message}
+              </div>
               <div className="mt-1 font-mono text-[11px] opacity-80">
                 codex=
                 {guardianStatus.codexRunning

@@ -283,6 +283,7 @@ pub struct RequestForwarder {
     /// `max_attempts = max_retries + 1`，所以 max_retries=0 表示仅尝试一家、
     /// max_retries=3（默认）表示最多 4 家。loop 同时受 providers.len() 自然限制。
     max_attempts: usize,
+    capacity_retry_enabled: bool,
 }
 
 fn provider_requests_codex_account_pool(provider: &Provider) -> bool {
@@ -759,6 +760,7 @@ impl RequestForwarder {
         optimizer_config: OptimizerConfig,
         copilot_optimizer_config: CopilotOptimizerConfig,
         max_retries: u32,
+        capacity_retry_enabled: bool,
     ) -> Self {
         // max_retries 是「失败后重试次数」语义，attempt 上限 = retries + 1。
         // saturating_add 防止 u32::MAX + 1 溢出。
@@ -785,6 +787,7 @@ impl RequestForwarder {
                 streaming_first_byte_timeout,
             ),
             max_attempts,
+            capacity_retry_enabled,
         }
     }
 
@@ -4125,7 +4128,8 @@ impl RequestForwarder {
                 };
             Some(
                 StreamReconnector::new(connect, first_byte_timeout)
-                    .with_max_retries(stream_retry_budget),
+                    .with_max_retries(stream_retry_budget)
+                    .with_capacity_retry(self.capacity_retry_enabled),
             )
         } else {
             None
@@ -4192,9 +4196,10 @@ impl RequestForwarder {
             })
         };
         let mut response = if matches!(app_type, AppType::Codex) {
-            send_codex_request_with_explicit_rejection_retry(
+            send_codex_request_with_capacity_retry(
                 adapter.name(),
                 super::codex_traffic_policy::resolve_codex_traffic_policy(provider),
+                self.capacity_retry_enabled,
                 send_once,
             )
             .await
@@ -6632,8 +6637,8 @@ fn codex_client_version_from_user_agent(user_agent: &str) -> Option<&str> {
 /// 可信本地 Codex 请求只有在恰好携带一个官方 first-party 值时才保留原值；缺失、
 /// 重复、未知值以及 External API/协议转换请求统一回退到官方 CLI 默认值。这样既避免
 /// `originator=cc-switch` 触发模型准入差异，也不会把 Desktop/VS Code 误报成 CLI。
-/// `version` 只信任 first-party User-Agent 中的进程构建版本：旧配置、外部 API 或
-/// 客户端自报的独立 version 都先移除，再按可信 UA 重建。
+/// `version` only trusts first-party User-Agent for native clients. For app-owned
+/// OAuth requests, replace any client claim with the shared model-discovery cohort.
 fn enforce_codex_oauth_originator(
     headers: &mut http::HeaderMap,
     is_codex_official_upstream: bool,
@@ -6647,6 +6652,10 @@ fn enforce_codex_oauth_originator(
     headers.remove("version");
     if !preserve_client_originator {
         headers.remove("x-oai-attestation");
+        headers.insert(
+            http::HeaderName::from_static("version"),
+            http::HeaderValue::from_static(super::providers::CODEX_OAUTH_CLIENT_VERSION),
+        );
     }
     if preserve_client_originator {
         let user_agent = headers
@@ -7137,6 +7146,43 @@ async fn send_forwarder_upstream_request(
     preserve_exact_header_case: bool,
     upstream_proxy_url: Option<&str>,
 ) -> Result<ProxyResponse, ProxyError> {
+    let diagnostic = super::error_journal::Context::new(&url, &headers);
+    send_forwarder_upstream_request_inner(
+        method,
+        url,
+        target_for_log,
+        headers,
+        extensions,
+        body_bytes,
+        timeout,
+        request_is_streaming,
+        non_streaming_timeout,
+        streaming_first_byte_timeout,
+        is_socks_proxy,
+        preserve_exact_header_case,
+        upstream_proxy_url,
+    )
+    .await
+    .inspect_err(|error| diagnostic.failed(error))
+    .map(|response| diagnostic.observe(response))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn send_forwarder_upstream_request_inner(
+    method: http::Method,
+    url: String,
+    target_for_log: String,
+    headers: http::HeaderMap,
+    extensions: Extensions,
+    body_bytes: Vec<u8>,
+    timeout: std::time::Duration,
+    request_is_streaming: bool,
+    non_streaming_timeout: std::time::Duration,
+    streaming_first_byte_timeout: std::time::Duration,
+    is_socks_proxy: bool,
+    preserve_exact_header_case: bool,
+    upstream_proxy_url: Option<&str>,
+) -> Result<ProxyResponse, ProxyError> {
     if is_socks_proxy || !preserve_exact_header_case {
         log::debug!(
             "[Forwarder] Using pooled reqwest client (preserve_exact_header_case={preserve_exact_header_case}, socks_proxy={is_socks_proxy})"
@@ -7245,9 +7291,23 @@ where
 /// HTTP 429 表示服务端拒绝处理当前请求，因此复用完全相同的 headers/body 不会重复
 /// 已开始的模型采样或工具调用。明确的订阅/余额耗尽则立即交回外层账号池或路由降级，
 /// 避免在同一账号上等待和空转。
+#[cfg(test)]
 async fn send_codex_request_with_explicit_rejection_retry<F, Fut>(
     app_tag: &str,
     traffic_policy: super::codex_traffic_policy::ResolvedCodexTrafficPolicy,
+    send: F,
+) -> Result<ProxyResponse, ProxyError>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<ProxyResponse, ProxyError>>,
+{
+    send_codex_request_with_capacity_retry(app_tag, traffic_policy, false, send).await
+}
+
+async fn send_codex_request_with_capacity_retry<F, Fut>(
+    app_tag: &str,
+    traffic_policy: super::codex_traffic_policy::ResolvedCodexTrafficPolicy,
+    capacity_retry_enabled: bool,
     mut send: F,
 ) -> Result<ProxyResponse, ProxyError>
 where
@@ -7257,6 +7317,8 @@ where
     let mut rate_limit_retry_count = 0usize;
     let mut rate_limit_total_delay = Duration::ZERO;
     let mut admission_retry_count = 0usize;
+    let mut capacity_retry_count = 0usize;
+    let mut capacity_total_delay = Duration::ZERO;
 
     loop {
         let response = send().await?;
@@ -7264,11 +7326,13 @@ where
         let inspectable_quota_status = status == http::StatusCode::PAYMENT_REQUIRED
             || status == http::StatusCode::TOO_MANY_REQUESTS
             || status == http::StatusCode::FORBIDDEN;
+        let capacity_status = capacity_retry_enabled
+            && matches!(status.as_u16(), 429 | 500 | 502 | 503 | 504 | 529);
         let retryable_status = inspectable_quota_status
             || (traffic_policy.rejection_retry_mode
                 == crate::provider::CodexRejectionRetryMode::OpencodeEndpointUnavailable
                 && status == http::StatusCode::SERVICE_UNAVAILABLE);
-        if !retryable_status {
+        if !capacity_status && !retryable_status {
             return Ok(response);
         }
 
@@ -7276,6 +7340,57 @@ where
         let retry_after = parse_retry_after_delay(&response_headers);
         let body_text = read_decoded_error_body(response).await?;
         let terminal_quota = is_terminal_codex_quota_error(body_text.as_deref());
+
+        if capacity_status
+            && super::providers::streaming_retry::is_capacity_error_response(
+                status,
+                body_text.as_deref(),
+            )
+        {
+            let remaining = CODEX_RATE_LIMIT_TOTAL_DELAY_BUDGET
+                .saturating_sub(capacity_total_delay);
+            if capacity_retry_count >= super::providers::streaming_retry::CAPACITY_STREAM_MAX_RETRIES as usize
+                || remaining.is_zero()
+            {
+                return Ok(rebuild_consumed_error_response(
+                    status,
+                    &mut response_headers,
+                    body_text,
+                ));
+            }
+            let delay = retry_after
+                .unwrap_or_else(|| codex_rate_limit_backoff(capacity_retry_count))
+                .min(CODEX_RATE_LIMIT_MAX_SINGLE_DELAY)
+                .min(remaining);
+            super::codex_router_log::append_event(
+                "upstream_capacity_retry",
+                &[
+                    ("attempt", (capacity_retry_count + 1).to_string()),
+                    ("status", status.as_u16().to_string()),
+                    ("delay_ms", delay.as_millis().to_string()),
+                ],
+            );
+            log::warn!(
+                "[{app_tag}] upstream capacity rejection; replaying identical request {}/{} after {}ms",
+                capacity_retry_count + 1,
+                super::providers::streaming_retry::CAPACITY_STREAM_MAX_RETRIES,
+                delay.as_millis()
+            );
+            tokio::time::sleep(delay).await;
+            capacity_total_delay += delay;
+            capacity_retry_count += 1;
+            continue;
+        }
+
+        // A generic 5xx is not a capacity rejection. Do not route it through
+        // the 429/quota loop, which would otherwise replay arbitrary outages.
+        if capacity_status && !retryable_status {
+            return Ok(rebuild_consumed_error_response(
+                status,
+                &mut response_headers,
+                body_text,
+            ));
+        }
 
         if matches!(
             status,
@@ -9400,6 +9515,7 @@ mod tests {
             non_streaming_timeout,
             streaming_first_byte_timeout,
             max_attempts: 1,
+            capacity_retry_enabled: false,
         }
     }
 
@@ -9870,6 +9986,7 @@ mod tests {
             non_streaming_timeout: Duration::ZERO,
             streaming_first_byte_timeout: Duration::ZERO,
             max_attempts: 1,
+            capacity_retry_enabled: false,
         };
 
         let effective = forwarder
@@ -9933,6 +10050,7 @@ mod tests {
             non_streaming_timeout: Duration::ZERO,
             streaming_first_byte_timeout: Duration::ZERO,
             max_attempts: 1,
+            capacity_retry_enabled: false,
         };
         let mut router = test_provider_with_type(None);
         router.id = "codex-multirouter".to_string();
@@ -10046,6 +10164,7 @@ mod tests {
             non_streaming_timeout: Duration::ZERO,
             streaming_first_byte_timeout: Duration::ZERO,
             max_attempts: 1,
+            capacity_retry_enabled: false,
         };
 
         let effective = forwarder
@@ -11074,7 +11193,7 @@ mod tests {
     }
 
     #[test]
-    fn codex_official_identity_strips_external_api_version_claim() {
+    fn codex_official_identity_replaces_external_api_version_claim() {
         let mut headers = HeaderMap::new();
         headers.insert("originator", HeaderValue::from_static("Codex Desktop"));
         headers.insert(
@@ -11093,7 +11212,12 @@ mod tests {
             headers.get("originator"),
             Some(&HeaderValue::from_static("codex_cli_rs"))
         );
-        assert!(headers.get("version").is_none());
+        assert_eq!(
+            headers.get("version"),
+            Some(&HeaderValue::from_static(
+                crate::proxy::providers::CODEX_OAUTH_CLIENT_VERSION
+            ))
+        );
         assert!(headers.get("x-oai-attestation").is_none());
     }
 
@@ -12926,6 +13050,7 @@ mod tests {
             non_streaming_timeout: Duration::ZERO,
             streaming_first_byte_timeout: Duration::ZERO,
             max_attempts: 1,
+            capacity_retry_enabled: false,
         };
 
         let mut stream = forwarder
@@ -13400,6 +13525,130 @@ mod tests {
         assert_eq!(
             tokio::time::Instant::now() - started_at,
             Duration::from_secs(17)
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn codex_capacity_retry_recovers_transient_server_capacity_rejection() {
+        let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let attempts_for_send = attempts.clone();
+        let response = send_codex_request_with_capacity_retry(
+            "test",
+            test_codex_traffic_policy(false),
+            true,
+            || {
+                let attempts = attempts_for_send.clone();
+                async move {
+                    if attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                        Ok(ProxyResponse::buffered(
+                            http::StatusCode::SERVICE_UNAVAILABLE,
+                            http::HeaderMap::new(),
+                            Bytes::from_static(
+                                br#"{"error":{"type":"server_is_overloaded","message":"model is at capacity"}}"#,
+                            ),
+                        ))
+                    } else {
+                        Ok(ProxyResponse::buffered(
+                            http::StatusCode::OK,
+                            http::HeaderMap::new(),
+                            Bytes::new(),
+                        ))
+                    }
+                }
+            },
+        )
+        .await
+        .expect("capacity retry should recover");
+
+        assert_eq!(response.status(), http::StatusCode::OK);
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn codex_capacity_retry_does_not_replay_generic_server_errors() {
+        let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let attempts_for_send = attempts.clone();
+        let response = send_codex_request_with_capacity_retry(
+            "test",
+            test_codex_traffic_policy(false),
+            true,
+            || {
+                let attempts = attempts_for_send.clone();
+                async move {
+                    attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Ok(ProxyResponse::buffered(
+                        http::StatusCode::SERVICE_UNAVAILABLE,
+                        http::HeaderMap::new(),
+                        Bytes::from_static(b"generic maintenance outage"),
+                    ))
+                }
+            },
+        )
+        .await
+        .expect("generic 503 should be returned");
+
+        assert_eq!(response.status(), http::StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn codex_capacity_retry_is_disabled_without_explicit_opt_in() {
+        let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let attempts_for_send = attempts.clone();
+        let response = send_codex_request_with_capacity_retry(
+            "test",
+            test_codex_traffic_policy(false),
+            false,
+            || {
+                let attempts = attempts_for_send.clone();
+                async move {
+                    attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Ok(ProxyResponse::buffered(
+                        http::StatusCode::SERVICE_UNAVAILABLE,
+                        http::HeaderMap::new(),
+                        Bytes::from_static(
+                            br#"{"error":{"type":"server_is_overloaded","message":"model is at capacity"}}"#,
+                        ),
+                    ))
+                }
+            },
+        )
+        .await
+        .expect("disabled capacity retry should return");
+
+        assert_eq!(response.status(), http::StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn codex_capacity_retry_stops_after_bounded_replays() {
+        let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let attempts_for_send = attempts.clone();
+        let response = send_codex_request_with_capacity_retry(
+            "test",
+            test_codex_traffic_policy(false),
+            true,
+            || {
+                let attempts = attempts_for_send.clone();
+                async move {
+                    attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Ok(ProxyResponse::buffered(
+                        http::StatusCode::SERVICE_UNAVAILABLE,
+                        http::HeaderMap::new(),
+                        Bytes::from_static(
+                            br#"{"error":{"type":"server_is_overloaded","message":"model is at capacity"}}"#,
+                        ),
+                    ))
+                }
+            },
+        )
+        .await
+        .expect("bounded retry should return final rejection");
+
+        assert_eq!(response.status(), http::StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            attempts.load(std::sync::atomic::Ordering::SeqCst),
+            super::super::providers::streaming_retry::CAPACITY_STREAM_MAX_RETRIES as usize + 1,
         );
     }
 

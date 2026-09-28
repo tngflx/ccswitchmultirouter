@@ -1404,6 +1404,21 @@ pub fn run() {
                         }
                     }
                 }
+                let mut auto_update_tools = startup_settings.auto_update_cli_tools.clone();
+                if startup_settings.auto_update_codex_cli
+                    && !auto_update_tools.iter().any(|tool| tool == "codex")
+                {
+                    auto_update_tools.push("codex".to_string());
+                }
+                if !auto_update_tools.is_empty() {
+                    for (tool, result) in crate::commands::auto_update_cli_tools_if_needed(auto_update_tools).await {
+                        match result {
+                            Ok(true) => log::info!("{tool} automatic update completed"),
+                            Ok(false) => {}
+                            Err(error) => log::warn!("{tool} automatic update failed; startup continues: {error}"),
+                        }
+                    }
+                }
 
                 let launch_codex_desktop_with_ccswitch =
                     startup_settings.launch_codex_desktop_with_ccswitch;
@@ -1838,6 +1853,7 @@ pub fn run() {
             commands::get_global_proxy_config,
             commands::update_global_proxy_config,
             commands::get_proxy_config_for_app,
+            commands::set_codex_capacity_retry_enabled,
             commands::update_proxy_config_for_app,
             commands::get_default_cost_multiplier,
             commands::set_default_cost_multiplier,

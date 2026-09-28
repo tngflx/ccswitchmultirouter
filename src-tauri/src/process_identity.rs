@@ -41,6 +41,24 @@ pub(crate) fn executable_fingerprint(path: &str) -> String {
     format!("{:x}", hasher.finalize())[..16].to_string()
 }
 
+/// Mark a Windows socket as non-inheritable so child processes cannot keep a
+/// listener alive after the owning CCSwitch process exits.
+#[cfg(target_os = "windows")]
+pub(crate) fn harden_socket_handle_not_inheritable(raw_socket: usize) {
+    use windows_sys::Win32::Foundation::{SetHandleInformation, HANDLE_FLAG_INHERIT};
+
+    if raw_socket == 0 || raw_socket == usize::MAX {
+        return;
+    }
+    let handle = raw_socket as windows_sys::Win32::Foundation::HANDLE;
+    unsafe {
+        SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0);
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+pub(crate) fn harden_socket_handle_not_inheritable(_raw_socket: usize) {}
+
 #[cfg(target_os = "windows")]
 fn taskkill_tree_args(pid: u32) -> [String; 4] {
     [

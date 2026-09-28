@@ -3,7 +3,7 @@
 //! ChatGPT Codex exposes models through `chatgpt.com/backend-api/codex/models`,
 //! which is not an OpenAI-compatible `/v1/models` endpoint.
 
-use crate::proxy::providers::CODEX_OAUTH_ORIGINATOR;
+use crate::proxy::providers::{CODEX_OAUTH_CLIENT_VERSION, CODEX_OAUTH_ORIGINATOR};
 use crate::services::model_fetch::FetchedModel;
 use serde_json::Value;
 use std::error::Error;
@@ -14,7 +14,6 @@ use std::time::Duration;
 const CODEX_OAUTH_MODELS_URL: &str = "https://chatgpt.com/backend-api/codex/models";
 const CODEX_OAUTH_FETCH_TIMEOUT_SECS: u64 = 15;
 const ERROR_BODY_MAX_CHARS: usize = 512;
-const CODEX_OAUTH_CLIENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 const CODEX_MODELS_CACHE_FILENAME: &str = "models_cache.json";
 const CODEX_MODELS_CACHE_BACKUP_FILENAME: &str = "models_cache.cc-switch-backup.json";
 
@@ -27,13 +26,7 @@ pub async fn fetch_models_with_token(
     account_id: &str,
 ) -> Result<Vec<FetchedModel>, String> {
     let client = crate::proxy::http_client::get();
-    let response = client
-        .get(CODEX_OAUTH_MODELS_URL)
-        .query(&[("client_version", CODEX_OAUTH_CLIENT_VERSION)])
-        .header("Authorization", format!("Bearer {token}"))
-        .header("originator", CODEX_OAUTH_ORIGINATOR)
-        .header("chatgpt-account-id", account_id)
-        .timeout(Duration::from_secs(CODEX_OAUTH_FETCH_TIMEOUT_SECS))
+    let response = build_models_request(&client, token, account_id)
         .send()
         .await
         .map_err(format_codex_oauth_request_error)?;
@@ -50,6 +43,21 @@ pub async fn fetch_models_with_token(
         .map_err(|e| format!("Failed to parse response: {e}"))?;
 
     Ok(parse_models(value))
+}
+
+fn build_models_request(
+    client: &reqwest::Client,
+    token: &str,
+    account_id: &str,
+) -> reqwest::RequestBuilder {
+    client
+        .get(CODEX_OAUTH_MODELS_URL)
+        .query(&[("client_version", CODEX_OAUTH_CLIENT_VERSION)])
+        .header("Authorization", format!("Bearer {token}"))
+        .header("originator", CODEX_OAUTH_ORIGINATOR)
+        .header("version", CODEX_OAUTH_CLIENT_VERSION)
+        .header("chatgpt-account-id", account_id)
+        .timeout(Duration::from_secs(CODEX_OAUTH_FETCH_TIMEOUT_SECS))
 }
 
 /// 格式化 OAuth 模型列表请求的网络层错误。
@@ -419,6 +427,23 @@ fn truncate_body(body: String) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn model_discovery_advertises_supported_codex_client_cohort() {
+        let request = build_models_request(&reqwest::Client::new(), "test-token", "test-account")
+            .build()
+            .expect("build model discovery request");
+        assert_eq!(
+            request
+                .url()
+                .query_pairs()
+                .find(|(key, _)| key == "client_version")
+                .map(|(_, value)| value.into_owned()),
+            Some("0.155.0".to_string())
+        );
+        assert_eq!(request.headers()["version"], CODEX_OAUTH_CLIENT_VERSION);
+        assert_eq!(request.headers()["originator"], CODEX_OAUTH_ORIGINATOR);
+    }
 
     #[test]
     fn parse_codex_oauth_models_preserves_reasoning_capability() {

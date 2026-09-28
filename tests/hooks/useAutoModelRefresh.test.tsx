@@ -122,7 +122,7 @@ describe("useAutoModelRefresh", () => {
     expect(fetcher).toHaveBeenCalledTimes(1);
   });
 
-  it("compares later fetches with the complete prior catalog, including metadata", async () => {
+  it("reports membership changes while refreshing metadata silently", async () => {
     const fetcher = vi
       .fn()
       .mockResolvedValueOnce([
@@ -167,9 +167,39 @@ describe("useAutoModelRefresh", () => {
       }),
     );
     await waitFor(() =>
-      expect(secondDiff).toHaveBeenCalledWith(["added"], ["removed"], ["kept"]),
+      expect(secondDiff).toHaveBeenCalledWith(["added"], ["removed"], []),
     );
     expect(fetcher).toHaveBeenCalledTimes(2);
+  });
+
+  it("does not notify for metadata-only changes", async () => {
+    localStorage.setItem(
+      "model-catalog:metadata-only",
+      JSON.stringify([{ id: "kept", contextWindow: 128 }]),
+    );
+    const onDiff = vi.fn();
+    const onSuccess = vi.fn();
+    renderHook(() =>
+      useAutoModelRefresh({
+        cacheKey: "provider:metadata-only",
+        snapshotKey: "metadata-only",
+        enabled: true,
+        fetcher: () => Promise.resolve([{ id: "kept", contextWindow: 256 }]),
+        onSuccess,
+        onDiff,
+        ttlMs: 0,
+      }),
+    );
+
+    await waitFor(() =>
+      expect(onSuccess).toHaveBeenCalledWith([
+        { id: "kept", contextWindow: 256 },
+      ]),
+    );
+    expect(onDiff).not.toHaveBeenCalled();
+    expect(localStorage.getItem("model-catalog:metadata-only")).toContain(
+      "256",
+    );
   });
 
   it("uses the first successful fetch as a silent baseline", async () => {

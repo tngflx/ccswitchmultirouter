@@ -68,6 +68,7 @@ pub(crate) fn anthropic_error_sse(message: &str, error_type: &str) -> Bytes {
 /// 恰好叫 "stream_error" 时会被误当成传输中断而错误地重试。
 /// SSE 规范规定以冒号开头的行是注释，客户端解析器会忽略。
 pub(crate) const RETRYABLE_STREAM_MARKER: &str = ": cc-switch-retryable-stream-interruption";
+pub(crate) const CAPACITY_STREAM_MARKER: &str = ": cc-switch-retryable-capacity-rejection";
 
 /// 带 [`RETRYABLE_STREAM_MARKER`] 注释行的错误事件。
 pub(crate) fn retryable_stream_error_sse(message: &str, error_type: &str) -> Bytes {
@@ -1285,7 +1286,17 @@ pub fn create_anthropic_sse_stream_from_responses<E: std::error::Error + Send + 
                                         "Responses upstream emitted an error event"
                                     },
                                 );
-                                yield Ok(anthropic_error_sse(&message, &error_type));
+                                let error = anthropic_error_sse(&message, &error_type);
+                                if !has_substantive_output
+                                    && super::streaming_retry::is_capacity_error_payload(&data, None)
+                                {
+                                    let mut marked = CAPACITY_STREAM_MARKER.as_bytes().to_vec();
+                                    marked.push(b'\n');
+                                    marked.extend_from_slice(&error);
+                                    yield Ok(Bytes::from(marked));
+                                } else {
+                                    yield Ok(error);
+                                }
                                 terminated = true;
                             }
 
