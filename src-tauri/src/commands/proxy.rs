@@ -210,8 +210,12 @@ use std::str::FromStr;
 #[tauri::command]
 pub async fn start_proxy_server(
     state: tauri::State<'_, AppState>,
+    resume_codex_desktop: bool,
 ) -> Result<ProxyServerInfo, String> {
-    state.proxy_service.start().await
+    state
+        .proxy_service
+        .start_with_deferred_codex_relaunch(resume_codex_desktop)
+        .await
 }
 
 /// 停止代理服务器（仅停止服务，不恢复/清理 Live 接管状态）
@@ -237,7 +241,12 @@ pub async fn stop_proxy_with_restore(
         0
     };
     let result = state.proxy_service.stop_with_restore().await;
-    finish_codex_desktop_transition(result, stopped, false).await
+    if result.is_ok() && stopped > 0 {
+        state
+            .proxy_service
+            .defer_codex_relaunch_until_proxy_start();
+    }
+    result
 }
 
 /// 获取各应用接管状态
@@ -314,16 +323,17 @@ pub(crate) async fn finish_codex_desktop_transition(
     stopped: u32,
     enabled: bool,
 ) -> Result<(), String> {
-    // If applying/restoring the routing config failed, the live file is still
-    // the pre-transition version. Relaunch the plain Desktop against that
-    // unchanged config instead of installing the takeover picker patch.
-    let takeover_succeeded = takeover_result.is_ok();
-    let relaunch_result = if stopped > 0 {
-        if takeover_succeeded && enabled {
-            relaunch_codex_desktop_for_takeover_state(true).await
-        } else {
-            crate::codex_desktop::relaunch_codex_desktop_after_takeover()
-        }
+    // A stopped Desktop is relaunched only for an explicit, successful
+    // takeover enable. Disabling takeover must leave Desktop stopped so the
+    // restored config cannot be consumed by a process that the user did not
+    // ask us to start. Failed transitions also stay stopped; the user can
+    // retry explicitly after the underlying error is visible.
+    let relaunch_result = if should_relaunch_codex_desktop_after_transition(
+        stopped,
+        takeover_result.is_ok(),
+        enabled,
+    ) {
+        relaunch_codex_desktop_for_takeover_state(true).await
     } else {
         Ok(())
     };
@@ -338,6 +348,14 @@ pub(crate) async fn finish_codex_desktop_transition(
             "Codex takeover change failed: {takeover_error}; Codex Desktop relaunch also failed: {relaunch_error}"
         )),
     }
+}
+
+fn should_relaunch_codex_desktop_after_transition(
+    stopped: u32,
+    takeover_succeeded: bool,
+    enabled: bool,
+) -> bool {
+    stopped > 0 && takeover_succeeded && enabled
 }
 
 pub(crate) async fn relaunch_codex_desktop_for_takeover_state(enabled: bool) -> Result<(), String> {
@@ -1907,6 +1925,14 @@ mod codex_router_log_diagnostics_tests {
         assert!(ensure_model_picker_injected(true, "installed").is_ok());
         let error = ensure_model_picker_injected(false, "no CDP target").unwrap_err();
         assert!(error.contains("no CDP target"));
+    }
+
+    #[test]
+    fn desktop_transition_relaunches_only_after_explicit_successful_enable() {
+        assert!(should_relaunch_codex_desktop_after_transition(1, true, true));
+        assert!(!should_relaunch_codex_desktop_after_transition(1, true, false));
+        assert!(!should_relaunch_codex_desktop_after_transition(1, false, true));
+        assert!(!should_relaunch_codex_desktop_after_transition(0, true, true));
     }
 
     #[test]

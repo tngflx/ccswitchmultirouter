@@ -122,23 +122,35 @@ impl GuardianHandle {
     pub(crate) async fn stop(self) {
         let _ = self.shutdown_tx.send(true);
         let GuardianHandle {
+            status,
             guardian_task,
             config_task,
             ..
         } = self;
+
+        // Mark the externally visible state stopped before cancelling the
+        // workers. The compatibility writer and CDP loop are independent; a
+        // sequential await allowed a stuck injection request to keep the
+        // config writer alive until the ten-second timeout, racing Live config
+        // restoration and reintroducing guardianv2 schema failures.
+        {
+            let mut current = status.lock().await;
+            current.active = false;
+            current.last_event = "守护已停止".into();
+            set_status_message(
+                &mut current,
+                "codexRouterWorkspace.guardian.stopped",
+                "守护已停止",
+                Vec::new(),
+            );
+        }
+
         let mut guardian_task = guardian_task;
         let mut config_task = config_task;
-        tokio::select! {
-            _ = async {
-                let _ = (&mut guardian_task).await;
-                let _ = (&mut config_task).await;
-            } => {}
-            _ = tokio::time::sleep(Duration::from_secs(10)) => {
-                log::warn!("Codex guardian did not stop within 10 seconds; aborting tasks");
-                guardian_task.abort();
-                config_task.abort();
-            }
-        }
+        guardian_task.abort();
+        config_task.abort();
+        let _ = (&mut guardian_task).await;
+        let _ = (&mut config_task).await;
     }
 }
 

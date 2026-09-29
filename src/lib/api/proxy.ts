@@ -27,8 +27,8 @@ export const proxyApi = {
   // ========== 代理服务器控制 API ==========
 
   // 启动代理服务器
-  async startProxyServer(): Promise<ProxyServerInfo> {
-    return invoke("start_proxy_server");
+  async startProxyServer(resumeCodexDesktop = true): Promise<ProxyServerInfo> {
+    return invoke("start_proxy_server", { resumeCodexDesktop });
   },
 
   // 停止代理服务器（不恢复已接管配置）

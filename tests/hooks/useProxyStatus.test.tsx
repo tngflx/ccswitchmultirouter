@@ -128,7 +128,9 @@ describe("useProxyStatus", () => {
       await result.current.stopProxyServer();
     });
 
-    expect(invokeMock).toHaveBeenCalledWith("start_proxy_server");
+    expect(invokeMock).toHaveBeenCalledWith("start_proxy_server", {
+      resumeCodexDesktop: true,
+    });
     expect(invokeMock).toHaveBeenCalledWith("stop_proxy_server");
   });
 

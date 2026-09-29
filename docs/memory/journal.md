@@ -1,5 +1,13 @@
 # Engineering Journal (newest first)
 
+## 2026-09-29 - Global proxy-off must not autonomously relaunch Codex
+
+- **What happened:** Turning the global local proxy switch off could stop Codex Desktop, then stale startup or route-toggle work could relaunch it minutes later. Disabling also coincided with recurring `model_catalogue`/`guardianv2` schema reports, making the lifecycle race look like a config-write failure.
+- **Root cause:** Deferred Codex resume intent was not isolated to the explicit global-on transition, and the final startup launch check could race the global-off transaction. Takeover lifecycle also had duplicate model-picker/Guardian launch paths. Disk TOML alone was insufficient evidence for the renderer-side Statsig Guardian mutation.
+- **What we did:** Made deferred relaunch a one-shot consumed only by explicit global proxy start; route-only starts and disable paths cannot consume it. Held the lifecycle lock across listener start, deferred-intent consumption, compatibility enforcement, and relaunch so global-off cannot commit and then be followed by stale startup work. Guardian shutdown now aborts/awaits both workers before restoration, the duplicate detached picker launcher was removed, and startup recovery is gated by the persisted global switch and rechecks it during retries.
+- **Evidence:** `cargo check --manifest-path src-tauri/Cargo.toml` passed; `pnpm typecheck` passed; full `pnpm test:unit` passed **197 files / 1,625 tests**; focused lifecycle tests passed startup restore **3/3**, startup global-switch gate **1/1**, deferred relaunch one-shot **1/1**, disabled launch boundary **1/1**, and no-listener global-stop persistence **1/1**; `git diff --check` passed. Full `cargo test --manifest-path src-tauri/Cargo.toml` was blocked before execution because Windows could not replace the locked `src-tauri\\target\\debug\\cc-switch.exe` (`Access is denied`); no process was killed. Current `~/.codex/config.toml` has `guardianv2 = false` and CCSwitch-owned `model_catalog_json`; recent `cc-switch.log` contained no current `FeatureToml`, `guardianv2`, or model-catalog errors.
+- **What NOT to do again:** Do not add another detached Codex/model-picker launcher, let route-only startup consume global resume intent, or treat a clean disk TOML as proof that renderer-side Guardian state is repaired. Runtime validation of the changed source requires the user to stop and restart the existing `pnpm dev` process.
+
 ## 2026-09-29 - Proxy toggle rebind retained accepted sockets
 
 - **What happened:** Turning local routing off succeeded, but turning it back on could fail with `PORT_OWNERSHIP_GUARD` and Windows `10048` for the same listener port.

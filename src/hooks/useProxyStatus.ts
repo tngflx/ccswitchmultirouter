@@ -30,7 +30,8 @@ export function useProxyStatus() {
 
   // 启动服务器（总开关：仅启动服务，不接管）
   const startProxyServerMutation = useMutation({
-    mutationFn: () => proxyApi.startProxyServer(),
+    mutationFn: (resumeCodexDesktop: boolean) =>
+      proxyApi.startProxyServer(resumeCodexDesktop),
     onSuccess: (info) => {
       toast.success(
         t("proxy.server.started", {
@@ -198,7 +199,11 @@ export function useProxyStatus() {
     isInitialStatusPending: isProxyStatusPending || isTakeoverStatusPending,
 
     // 启动/停止（总开关）
-    startProxyServer: startProxyServerMutation.mutateAsync,
+    // Only the global proxy switch may resume a Codex Desktop that was
+    // explicitly stopped while turning the proxy off. Other route toggles
+    // start the listener without consuming that one-shot user intent.
+    startProxyServer: (resumeCodexDesktop = true) =>
+      startProxyServerMutation.mutateAsync(resumeCodexDesktop),
     stopProxyServer: stopProxyServerMutation.mutateAsync,
     stopWithRestore: stopWithRestoreMutation.mutateAsync,
 

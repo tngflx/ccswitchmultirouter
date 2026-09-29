@@ -36,7 +36,9 @@ export function ClaudeDesktopRouteToggle({
   const handleToggle = async (checked: boolean) => {
     try {
       if (checked) {
-        await startProxyServer();
+        // Starting Claude's route is not an explicit request to resume a
+        // Codex Desktop stopped by the global proxy-off transition.
+        await startProxyServer(false);
         return;
       }
 

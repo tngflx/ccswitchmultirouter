@@ -728,10 +728,6 @@ pub fn run() {
 
             // 设置 AppHandle 用于代理故障转移时的 UI 更新
             app_state.proxy_service.set_app_handle(app.handle().clone());
-            // Keep the Codex renderer repair lifecycle alive across CCSwitch restarts.
-            // The guardian is inert when Codex is absent and never terminates a running process.
-            app_state.proxy_service.ensure_codex_guardian_started();
-
             // ============================================================
             // 按表独立判断的导入逻辑（各类数据独立检查，互不影响）
             // ============================================================
@@ -1309,11 +1305,16 @@ pub fn run() {
                 // 检查 Live 配置是否仍处于被接管状态（包含占位符）
                 let live_taken_over = state.proxy_service.detect_takeover_in_live_configs();
                 let proxy_startup_allowed = startup_recovery_classification.allows_proxy_startup();
+                let global_proxy_enabled = state
+                    .db
+                    .get_global_proxy_config()
+                    .await
+                    .is_ok_and(|config| config.proxy_enabled);
                 let codex_takeover_requested = state
                     .db
                     .get_proxy_config_for_app("codex")
                     .await
-                    .is_ok_and(|config| config.enabled);
+                    .is_ok_and(|config| global_proxy_enabled && config.enabled);
                 let codex_has_backup = state
                     .db
                     .get_live_backup("codex")
@@ -1447,28 +1448,56 @@ pub fn run() {
                     watchdog_port,
                 );
 
-                let should_launch_codex_after_startup =
-                    launch_codex_desktop_with_ccswitch || codex_stopped_for_takeover;
+                // Startup recovery may have decided to stop Codex before the
+                // user disabled the proxy. Re-read the committed state before
+                // launching so that stale startup work cannot undo an explicit
+                // proxy-off action minutes later.
+                let proxy_enabled_now = state
+                    .db
+                    .get_global_proxy_config()
+                    .await
+                    .is_ok_and(|config| config.proxy_enabled);
+                let codex_takeover_still_requested = if codex_stopped_for_takeover {
+                    let codex_enabled = state
+                        .db
+                        .get_proxy_config_for_app("codex")
+                        .await
+                        .map(|config| config.enabled)
+                        .unwrap_or(false);
+                    should_launch_stopped_codex_after_startup(
+                        codex_stopped_for_takeover,
+                        proxy_enabled_now,
+                        codex_enabled,
+                    )
+                } else {
+                    false
+                };
+                let should_launch_codex_after_startup = should_launch_codex_after_startup_now(
+                    proxy_enabled_now,
+                    launch_codex_desktop_with_ccswitch,
+                    codex_takeover_still_requested,
+                );
                 if should_launch_codex_after_startup && !codex_takeover_ready {
                     log::error!(
                         "Codex 启动门禁未通过：代理接管或 Live 配置恢复未完成，已阻止自动启动 Codex Desktop"
                     );
                 } else if should_launch_codex_after_startup {
-                    match crate::codex_config::enforce_codex_guardian_v2_live_compatibility() {
-                        Ok(_) => match crate::codex_desktop::launch_codex_desktop_with_ccswitch(true)
-                        {
-                            Ok(true) => {
-                                log::info!("Codex 配置与代理接管验证通过，已启动 Codex Desktop")
-                            }
-                            Ok(false) => {
-                                log::info!("Codex Desktop 已在运行，跳过启动门禁事务")
-                            }
-                            Err(error) => {
-                                log::warn!("验证后启动 Codex Desktop 失败: {error}")
-                            }
-                        },
+                    match state
+                        .proxy_service
+                        .launch_codex_desktop_if_global_proxy_enabled()
+                        .await
+                    {
+                        Ok(Some(true)) => {
+                            log::info!("Codex 配置与代理接管验证通过，已启动 Codex Desktop")
+                        }
+                        Ok(Some(false)) => {
+                            log::info!("Codex Desktop 已在运行，跳过启动门禁事务")
+                        }
+                        Ok(None) => {
+                            log::info!("跳过启动 Codex Desktop：全局代理开关已关闭")
+                        }
                         Err(error) => log::error!(
-                            "Codex 启动门禁未通过：Guardian V2 配置兼容性检查失败，已阻止自动启动: {error}"
+                            "Codex 启动门禁未通过，已阻止自动启动: {error}"
                         ),
                     }
                 }
@@ -2317,11 +2346,33 @@ fn should_restore_startup_app(app_type: &str, codex_runtime_prepared: bool) -> b
     app_type != "codex" || codex_runtime_prepared
 }
 
+fn should_launch_stopped_codex_after_startup(
+    codex_stopped_for_takeover: bool,
+    proxy_enabled: bool,
+    codex_takeover_enabled: bool,
+) -> bool {
+    codex_stopped_for_takeover && proxy_enabled && codex_takeover_enabled
+}
+
+fn should_launch_codex_after_startup_now(
+    proxy_enabled: bool,
+    launch_setting_enabled: bool,
+    stopped_codex_requested: bool,
+) -> bool {
+    proxy_enabled && (launch_setting_enabled || stopped_codex_requested)
+}
+
 fn should_retry_startup_takeover_error(error: &str) -> bool {
     !error.starts_with("PORT_OWNERSHIP_GUARD:")
 }
 
-async fn enabled_proxy_apps_on_startup(db: &database::Database) -> Vec<&'static str> {
+async fn enabled_proxy_apps_on_startup(
+    db: &database::Database,
+    global_proxy_enabled: bool,
+) -> Vec<&'static str> {
+    if !global_proxy_enabled {
+        return Vec::new();
+    }
     let mut apps = Vec::new();
     for app_type in PROXY_STARTUP_APP_TYPES {
         if db
@@ -2340,17 +2391,32 @@ async fn restore_proxy_state_on_startup(
     codex_runtime_prepared: bool,
 ) -> bool {
     let mut codex_ready = true;
-    match state
-        .proxy_service
-        .reconcile_codex_owned_projection_on_startup()
+    let global_proxy_enabled = state
+        .db
+        .get_global_proxy_config()
         .await
-    {
-        Ok(true) => log::info!("✓ 已对账 CCSwitchMulti 自有 Codex 模型目录"),
-        Ok(false) => log::debug!("Codex 未使用 CCSwitchMulti 自有模型目录，跳过启动对账"),
-        Err(e) => {
-            codex_ready = false;
-            log::warn!("启动时对账 Codex 模型目录失败: {e}");
+        .is_ok_and(|config| config.proxy_enabled);
+    let codex_takeover_enabled = global_proxy_enabled
+        && state
+        .db
+        .get_proxy_config_for_app("codex")
+        .await
+        .is_ok_and(|config| config.enabled);
+    if codex_takeover_enabled {
+        match state
+            .proxy_service
+            .reconcile_codex_owned_projection_on_startup()
+            .await
+        {
+            Ok(true) => log::info!("✓ 已对账 CCSwitchMulti 自有 Codex 模型目录"),
+            Ok(false) => log::debug!("Codex 未使用 CCSwitchMulti 自有模型目录，跳过启动对账"),
+            Err(e) => {
+                codex_ready = false;
+                log::warn!("启动时对账 Codex 模型目录失败: {e}");
+            }
         }
+    } else {
+        log::debug!("Codex 接管未启用，跳过启动模型目录对账");
     }
 
     match crate::proxy::external_openai_api::load_profile(&state.db) {
@@ -2369,7 +2435,7 @@ async fn restore_proxy_state_on_startup(
     }
 
     // 收集需要恢复接管的应用列表（从 proxy_config.enabled 读取）
-    let apps_to_restore = enabled_proxy_apps_on_startup(&state.db).await;
+    let apps_to_restore = enabled_proxy_apps_on_startup(&state.db, global_proxy_enabled).await;
 
     if apps_to_restore.is_empty() {
         log::debug!("启动时没有需要恢复的 app takeover");
@@ -2380,6 +2446,27 @@ async fn restore_proxy_state_on_startup(
 
     // 逐个恢复接管状态
     for app_type in apps_to_restore {
+        let global_proxy_enabled = state
+            .db
+            .get_global_proxy_config()
+            .await
+            .is_ok_and(|config| config.proxy_enabled);
+        if !global_proxy_enabled {
+            log::info!("启动恢复停止 {app_type}：全局代理开关已关闭");
+            break;
+        }
+        // The startup list is only a snapshot. A user can turn the global
+        // switch or an app route off while recovery is retrying; do not
+        // resurrect a route that has since been explicitly disabled.
+        let still_enabled = state
+            .db
+            .get_proxy_config_for_app(app_type)
+            .await
+            .is_ok_and(|config| config.enabled);
+        if !still_enabled {
+            log::info!("启动恢复跳过 {app_type}：用户已在恢复期间关闭该接管");
+            continue;
+        }
         if !should_restore_startup_app(app_type, codex_runtime_prepared) {
             codex_ready = false;
             log::error!(
@@ -2388,7 +2475,20 @@ async fn restore_proxy_state_on_startup(
             continue;
         }
         let mut takeover_result = Err(String::new());
+        let mut cancelled_by_user = false;
         for attempt in 1..=12 {
+            let still_enabled = state
+                .db
+                .get_proxy_config_for_app(app_type)
+                .await
+                .is_ok_and(|config| config.enabled);
+            if !still_enabled {
+                log::info!(
+                    "启动恢复停止 {app_type} 重试：用户已在恢复期间关闭该接管"
+                );
+                cancelled_by_user = true;
+                break;
+            }
             takeover_result = state
                 .proxy_service
                 .set_takeover_for_app(app_type, true)
@@ -2407,6 +2507,9 @@ async fn restore_proxy_state_on_startup(
                     "恢复 {app_type} 代理接管因端口所有权无法验证而停止重试；需要先释放端口或更换监听端口: {error}"
                 );
             }
+        }
+        if cancelled_by_user {
+            continue;
         }
         match takeover_result {
             Ok(()) => {
@@ -2764,7 +2867,9 @@ mod tests {
     use super::{
         classify_exit_request, enabled_proxy_apps_on_startup, redact_url_for_log,
         redact_url_for_log_with_secrets, redact_url_origin_for_log, requested_exit_reason_name,
-        runtime_log_level_allows, should_relaunch_stopped_codex, should_restore_startup_app,
+        runtime_log_level_allows, should_launch_codex_after_startup_now,
+        should_launch_stopped_codex_after_startup,
+        should_relaunch_stopped_codex, should_restore_startup_app,
         should_retry_startup_takeover_error, ExitRequestAction, RequestedExitReason,
     };
     use crate::database::Database;
@@ -2909,9 +3014,26 @@ mod tests {
             .await
             .expect("enable Grok Build proxy config");
 
-        let apps = enabled_proxy_apps_on_startup(&db).await;
+        let apps = enabled_proxy_apps_on_startup(&db, true).await;
 
         assert_eq!(apps, vec!["grokbuild"]);
+    }
+
+    #[tokio::test]
+    async fn startup_restore_ignores_enabled_routes_when_global_proxy_is_off() {
+        let db = Database::memory().expect("initialize database");
+        let mut config = db
+            .get_proxy_config_for_app("codex")
+            .await
+            .expect("read Codex proxy config");
+        config.enabled = true;
+        db.update_proxy_config_for_app(config)
+            .await
+            .expect("enable Codex proxy config");
+
+        let apps = enabled_proxy_apps_on_startup(&db, false).await;
+
+        assert!(apps.is_empty());
     }
 
     #[test]
@@ -2920,6 +3042,22 @@ mod tests {
         assert!(should_restore_startup_app("codex", true));
         assert!(should_restore_startup_app("claude", false));
         assert!(should_restore_startup_app("gemini", false));
+    }
+
+    #[test]
+    fn stale_startup_stop_cannot_relaunch_after_proxy_was_disabled() {
+        assert!(should_launch_stopped_codex_after_startup(true, true, true));
+        assert!(!should_launch_stopped_codex_after_startup(true, false, true));
+        assert!(!should_launch_stopped_codex_after_startup(true, true, false));
+        assert!(!should_launch_stopped_codex_after_startup(false, true, true));
+    }
+
+    #[test]
+    fn startup_launch_requires_global_proxy_switch() {
+        assert!(should_launch_codex_after_startup_now(true, true, false));
+        assert!(should_launch_codex_after_startup_now(true, false, true));
+        assert!(!should_launch_codex_after_startup_now(false, true, true));
+        assert!(!should_launch_codex_after_startup_now(false, true, false));
     }
 
     #[test]
