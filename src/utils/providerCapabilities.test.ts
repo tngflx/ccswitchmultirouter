@@ -1,7 +1,10 @@
 import { describe, it, expect } from "vitest";
 import type { Provider } from "@/types";
 import type { AppId } from "@/lib/api";
-import { providerNeedsRouting } from "@/utils/providerCapabilities";
+import {
+  codexRoutingHasEnabledRoutes,
+  providerNeedsRouting,
+} from "@/utils/providerCapabilities";
 
 function mkProvider(overrides: Partial<Provider> = {}): Provider {
   return { id: "p1", name: "Test", settingsConfig: {}, ...overrides };
@@ -220,5 +223,20 @@ describe("providerNeedsRouting", () => {
         ).toBe(true);
       },
     );
+  });
+});
+
+describe("codexRoutingHasEnabledRoutes", () => {
+  it.each([
+    [{ codexRouting: [{ id: "legacy" }] }, true],
+    [{ codexRouting: { routes: [{ id: "v2" }] } }, true],
+    [{ codexRouting: { enabled: false, routes: [{ id: "v2" }] } }, false],
+    [{ codexRouting: { routes: [{ id: "off", enabled: false }] } }, false],
+    [{ codexModelRoutes: [{ id: "legacy" }] }, true],
+    [{ modelRoutes: [{ id: "legacy" }] }, true],
+    [{ codexRouting: { routes: [] }, modelRoutes: [{ id: "legacy" }] }, false],
+    [{ codexRouting: null, modelRoutes: [{ id: "legacy" }] }, false],
+  ])("uses the canonical route activation rule", (settings, expected) => {
+    expect(codexRoutingHasEnabledRoutes(settings)).toBe(expected);
   });
 });

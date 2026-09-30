@@ -118,7 +118,7 @@ export function useSettingsForm(): UseSettingsFormResult {
       enableClaudePluginIntegration:
         data.enableClaudePluginIntegration ?? false,
       launchCodexDesktopWithCcswitch:
-        data.launchCodexDesktopWithCcswitch ?? false,
+        data.launchCodexDesktopWithCcswitch ?? true,
       silentStartup: data.silentStartup ?? false,
       skipClaudeOnboarding: data.skipClaudeOnboarding ?? false,
       preserveCodexOfficialAuthOnSwitch:
@@ -155,7 +155,7 @@ export function useSettingsForm(): UseSettingsFormResult {
             minimizeToTrayOnClose: true,
             useAppWindowControls: false,
             enableClaudePluginIntegration: false,
-            launchCodexDesktopWithCcswitch: false,
+            launchCodexDesktopWithCcswitch: true,
             skipClaudeOnboarding: false,
             preserveCodexOfficialAuthOnSwitch: false,
             unifyCodexSessionHistory: false,
@@ -201,7 +201,7 @@ export function useSettingsForm(): UseSettingsFormResult {
         enableClaudePluginIntegration:
           serverData.enableClaudePluginIntegration ?? false,
         launchCodexDesktopWithCcswitch:
-          serverData.launchCodexDesktopWithCcswitch ?? false,
+          serverData.launchCodexDesktopWithCcswitch ?? true,
         silentStartup: serverData.silentStartup ?? false,
         skipClaudeOnboarding: serverData.skipClaudeOnboarding ?? false,
         preserveCodexOfficialAuthOnSwitch:

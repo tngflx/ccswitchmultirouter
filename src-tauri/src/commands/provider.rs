@@ -342,19 +342,33 @@ pub async fn switch_codex_provider_with_desktop_restart(
     {
         return Err(format!("Codex provider {providerId} does not exist"));
     }
-    let previous_takeover = state.proxy_service.get_takeover_status().await?.codex;
+    // Keep the Codex app switch and lifecycle locks across the entire
+    // stop -> provider mutation -> relaunch transaction. A proxy toggle must
+    // not restore Live config or relaunch an old provider in the middle.
+    let _switch_guard = state.proxy_service.lock_switch_for_app("codex").await;
+    let _lifecycle_guard = state.proxy_service.lock_codex_lifecycle().await;
     let stopped = tauri::async_runtime::spawn_blocking(
         crate::codex_desktop::stop_running_codex_desktop_for_managed_lifecycle,
     )
     .await
     .map_err(|error| format!("Codex Desktop stop task failed: {error}"))??;
 
-    let switch_result = switch_provider(app_handle.clone(), "codex".to_string(), providerId).await;
+    let switch_result = tauri::async_runtime::spawn_blocking({
+        let state = state.inner().clone();
+        let provider_id = providerId.clone();
+        move || {
+            ProviderService::switch_locked_with_lifecycle(
+                &state,
+                AppType::Codex,
+                &provider_id,
+                true,
+            )
+        }
+    })
+    .await
+    .map_err(|error| format!("Codex provider switch task failed: {error}"))?
+    .map_err(String::from);
     let takeover_result = state.proxy_service.get_takeover_status().await;
-    let takeover_enabled = takeover_result
-        .as_ref()
-        .map(|takeover| takeover.codex)
-        .unwrap_or(previous_takeover);
     let transition_result = match (&switch_result, takeover_result) {
         (Ok(_), Ok(_)) => Ok(()),
         (Err(error), Ok(_)) => Err(error.clone()),
@@ -365,8 +379,11 @@ pub async fn switch_codex_provider_with_desktop_restart(
             "Provider switch failed: {switch_error}; Codex takeover state could not be read: {status_error}"
         )),
     };
-    let relaunch_result = if stopped > 0 {
-        super::proxy::relaunch_codex_desktop_for_takeover_state(takeover_enabled).await
+    let relaunch_result = if stopped > 0 && switch_result.is_ok() {
+        state
+            .proxy_service
+            .relaunch_codex_after_provider_switch_locked()
+            .await
     } else {
         Ok(())
     };

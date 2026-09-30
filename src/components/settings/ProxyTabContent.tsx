@@ -85,12 +85,10 @@ export function ProxyTabContent({
   const handleToggleProxy = async (checked: boolean) => {
     try {
       if (!checked) {
-        if (takeoverStatus?.codex) {
-          const running = await proxyApi.isCodexDesktopRunning();
-          if (running) {
-            setCodexRestartAction({ kind: "stopProxy" });
-            return;
-          }
+        const running = await proxyApi.isCodexDesktopRunning();
+        if (running) {
+          setCodexRestartAction({ kind: "stopProxy" });
+          return;
         }
         await stopWithRestore(false);
       } else if (!settings?.proxyConfirmed) {

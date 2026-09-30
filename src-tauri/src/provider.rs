@@ -766,7 +766,7 @@ impl ProviderMeta {
     /// 旧数据没有 `codexLocalModelMapping` 字段，若已经存在 `modelCatalog` 则沿用旧行为继续投射；
     /// 新数据显式保存 `false` 后，目录仍保留在 DB 里，但不会改写 Codex `/model` 菜单。
     pub fn codex_model_catalog_projection_enabled(&self, settings_config: &Value) -> bool {
-        if codex_routing_has_enabled_routes(settings_config) {
+        if codex_settings_has_enabled_routes(settings_config) {
             return true;
         }
 
@@ -800,8 +800,8 @@ impl ProviderMeta {
 }
 
 /// 判断 Codex provider 是否启用了多上游路由；多路由需要强制投射模型目录供 Codex 菜单和路由解析使用。
-fn codex_routing_has_enabled_routes(settings_config: &Value) -> bool {
-    let Some(routing) = settings_config.get("codexRouting") else {
+pub(crate) fn codex_routing_has_enabled_routes(routing: Option<&Value>) -> bool {
+    let Some(routing) = routing else {
         return false;
     };
 
@@ -816,7 +816,36 @@ fn codex_routing_has_enabled_routes(settings_config: &Value) -> bool {
     routing
         .get("routes")
         .and_then(Value::as_array)
-        .is_some_and(|routes| !routes.is_empty())
+        .is_some_and(|routes| routes.iter().any(codex_route_is_enabled))
+}
+
+/// Return whether a provider's persisted Codex settings contain a runnable
+/// route. This is the canonical activation predicate for callers that receive
+/// the complete settings object rather than only `codexRouting`.
+///
+/// Runtime precedence is intentional: when `codexRouting` exists, its array or
+/// object form wins over legacy `codexModelRoutes`/`modelRoutes`, including an
+/// explicit disable or an empty route list.
+pub(crate) fn codex_settings_has_enabled_routes(settings: &Value) -> bool {
+    if let Some(routing) = settings.get("codexRouting") {
+        if let Some(routes) = routing.as_array() {
+            return routes.iter().any(codex_route_is_enabled);
+        }
+        return codex_routing_has_enabled_routes(Some(routing));
+    }
+
+    settings
+        .get("codexModelRoutes")
+        .or_else(|| settings.get("modelRoutes"))
+        .and_then(Value::as_array)
+        .is_some_and(|routes| routes.iter().any(codex_route_is_enabled))
+}
+
+fn codex_route_is_enabled(route: &Value) -> bool {
+    route
+        .get("enabled")
+        .and_then(Value::as_bool)
+        .unwrap_or(true)
 }
 
 impl ProviderManager {
@@ -1313,6 +1342,40 @@ mod tests {
             serde_json::from_value(value).expect("deserialize ProviderMeta");
         assert_eq!(decoded.codex_preset_id.as_deref(), Some("opencode-zen"));
         assert_eq!(decoded.api_format_source.as_deref(), Some("manual"));
+    }
+
+    #[test]
+    fn codex_settings_route_activation_uses_one_precedence_rule() {
+        let route = |enabled: Option<bool>| {
+            let mut value = json!({ "id": "route" });
+            if let Some(enabled) = enabled {
+                value["enabled"] = json!(enabled);
+            }
+            value
+        };
+
+        assert!(super::codex_settings_has_enabled_routes(&json!({
+            "codexRouting": [route(None)]
+        })));
+        assert!(super::codex_settings_has_enabled_routes(&json!({
+            "codexRouting": { "routes": [route(None)] }
+        })));
+        assert!(!super::codex_settings_has_enabled_routes(&json!({
+            "codexRouting": { "enabled": false, "routes": [route(None)] }
+        })));
+        assert!(!super::codex_settings_has_enabled_routes(&json!({
+            "codexRouting": { "routes": [route(Some(false))] }
+        })));
+        assert!(super::codex_settings_has_enabled_routes(&json!({
+            "codexModelRoutes": [route(None)]
+        })));
+        assert!(super::codex_settings_has_enabled_routes(&json!({
+            "modelRoutes": [route(None)]
+        })));
+        assert!(!super::codex_settings_has_enabled_routes(&json!({
+            "codexRouting": { "routes": [] },
+            "modelRoutes": [route(None)]
+        })));
     }
 
     #[test]

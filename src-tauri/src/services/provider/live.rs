@@ -591,7 +591,7 @@ pub(crate) fn provider_uses_common_config(
     {
         Some(explicit) => explicit && has_snippet,
         None if matches!(app_type, AppType::Codex)
-            && codex_provider_has_enabled_routing(provider) =>
+            && crate::services::proxy::ProxyService::codex_provider_has_enabled_routing(Some(provider)) =>
         {
             // MultiRouter stores route/catalog state instead of a materialized
             // `settings_config.config`. Its live config is synthesized later, so
@@ -605,23 +605,6 @@ pub(crate) fn provider_uses_common_config(
             settings_contain_common_config(app_type, &provider.settings_config, value)
         }),
     }
-}
-
-fn codex_provider_has_enabled_routing(provider: &Provider) -> bool {
-    let Some(routing) = provider.settings_config.get("codexRouting") else {
-        return false;
-    };
-    if routing
-        .get("enabled")
-        .and_then(Value::as_bool)
-        .is_some_and(|enabled| !enabled)
-    {
-        return false;
-    }
-    routing
-        .get("routes")
-        .and_then(Value::as_array)
-        .is_some_and(|routes| !routes.is_empty())
 }
 
 pub(crate) fn remove_common_config_from_settings(
@@ -1518,6 +1501,20 @@ fn sync_current_provider_for_app_respecting_takeover(
             .and_then(Value::as_u64)
             == Some(2)
     {
+        // A v2 provider is projected into the managed MultiRouter only while
+        // the user's global proxy switch is on. Projection before this guard
+        // used to recreate router state after an explicit proxy-off and made
+        // the next consistency/recovery pass report a false mismatch.
+        let global_proxy_enabled = block_on_tauri_runtime(state.db.get_global_proxy_config())
+            .map_err(|e| AppError::Message(format!("读取全局代理状态失败: {e}")))?
+            .proxy_enabled;
+        if !global_proxy_enabled {
+            log::info!(
+                "跳过 Codex v2 MultiRouter 投影：全局代理已关闭 provider={}",
+                provider.id
+            );
+            return write_live_with_common_config(state.db.as_ref(), app_type, provider);
+        }
         crate::codex_multirouter::projection::ensure_codex_multirouter_projection(
             state.db.as_ref(),
             &provider.id,
@@ -1571,19 +1568,21 @@ fn sync_current_provider_for_app_respecting_takeover(
     // provider section，Codex 仍按内置 openai provider 语义处理 WebSocket/
     // compact/模型上下文，导致"live 显示 openai"和 compaction 失败。
     if matches!(app_type, AppType::Codex) {
-        let has_enabled_routing = provider
-            .settings_config
-            .get("codexRouting")
-            .and_then(|r| r.get("enabled"))
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false)
-            && provider
-                .settings_config
-                .get("codexRouting")
-                .and_then(|r| r.get("routes"))
-                .and_then(|v| v.as_array())
-                .is_some_and(|routes| !routes.is_empty());
+        let has_enabled_routing =
+            crate::services::proxy::ProxyService::codex_provider_has_enabled_routing(Some(provider));
         if has_enabled_routing {
+            let global_proxy_enabled = block_on_tauri_runtime(
+                state.db.get_global_proxy_config(),
+            )
+            .map_err(|e| AppError::Message(format!("读取全局代理状态失败: {e}")))?
+            .proxy_enabled;
+            if !global_proxy_enabled {
+                log::info!(
+                    "跳过 Codex MultiRouter 自动接管：全局代理已关闭 provider={}",
+                    provider.id
+                );
+                return write_live_with_common_config(state.db.as_ref(), app_type, provider);
+            }
             block_on_tauri_runtime(
                 state
                     .proxy_service

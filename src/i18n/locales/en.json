@@ -838,7 +838,7 @@
     "watchdogRecentEvents": "Recent events",
     "watchdogNoEvents": "No events yet",
     "launchCodexDesktopWithCcswitch": "Launch Codex Desktop with CCSwitchMulti",
-    "launchCodexDesktopWithCcswitchDescription": "Independent and off by default. Starts Codex when it was not already running. While Codex routing remains enabled, CCSwitchMulti will still restart a verified existing Codex shell during takeover recovery.",
+    "launchCodexDesktopWithCcswitchDescription": "On by default. Starts Codex when CCSwitchMulti opens or you turn the local proxy back on, if Codex is not running. Turn this off to leave Codex closed, except when proxy-on resumes a shell stopped by proxy-off.",
     "silentStartup": "Silent Startup",
     "silentStartupDescription": "Start in background mode without showing main window",
     "autoLaunchFailed": "Failed to set auto-launch",

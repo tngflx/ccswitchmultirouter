@@ -838,7 +838,7 @@
     "watchdogRecentEvents": "最近事件",
     "watchdogNoEvents": "尚無事件",
     "launchCodexDesktopWithCcswitch": "啟動 CCSwitchMulti 時啟動 Codex Desktop",
-    "launchCodexDesktopWithCcswitchDescription": "獨立開關，預設關閉；用於 Codex 原本未執行時啟動它。Codex 路由保持啟用期間，CCSwitchMulti 啟動恢復接管時仍會重新啟動已驗證的現有 Codex 外殼。",
+    "launchCodexDesktopWithCcswitchDescription": "預設開啟。啟動 CCSwitchMulti 或重新開啟本機代理時，若 Codex 未執行就會啟動。停用此項可讓 Codex 保持關閉，但重新開啟代理仍會恢復先前由代理關閉的 Codex。",
     "silentStartup": "靜默啟動",
     "silentStartupDescription": "程式啟動時不顯示主視窗，僅在系統匣執行",
     "autoLaunchFailed": "設定開機自動啟動失敗",

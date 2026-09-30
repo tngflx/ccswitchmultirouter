@@ -134,6 +134,30 @@ impl Database {
         Ok(())
     }
 
+    /// Commit only the global on/off switch.
+    ///
+    /// `GlobalProxyConfig` also carries the listener's `listen_address`,
+    /// `listen_port`, and `enable_logging`, so writing the whole struct from a
+    /// snapshot taken before the listener bound clobbers the resolved ephemeral
+    /// port back to `0`. The switch is a lifecycle fact owned by the proxy
+    /// service; it must never overwrite listener configuration. The user-facing
+    /// config editor keeps using `update_global_proxy_config`, which legitimately
+    /// owns all of those columns.
+    ///
+    /// Like `update_global_proxy_config`, this keeps the three mirrored
+    /// `proxy_config` rows in agreement.
+    pub async fn set_global_proxy_enabled(&self, enabled: bool) -> Result<(), AppError> {
+        let conn = lock_conn!(self.conn);
+        conn.execute(
+            "UPDATE proxy_config SET
+                proxy_enabled = ?1,
+                updated_at = datetime('now')",
+            rusqlite::params![if enabled { 1 } else { 0 }],
+        )
+        .map_err(|e| AppError::Database(e.to_string()))?;
+        Ok(())
+    }
+
     const CODEX_RESPECT_SYSTEM_PROXY_KEY: &'static str = "codex_respect_system_proxy";
 
     pub fn get_codex_respect_system_proxy(&self) -> Result<bool, AppError> {

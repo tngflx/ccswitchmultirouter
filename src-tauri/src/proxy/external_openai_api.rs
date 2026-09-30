@@ -835,7 +835,7 @@ fn codex_provider_has_runtime_credentials(provider: &Provider) -> bool {
 }
 
 fn is_codex_router_provider(provider: &Provider) -> bool {
-    codex_routes_from_settings(&provider.settings_config).is_some_and(|routes| !routes.is_empty())
+    crate::provider::codex_settings_has_enabled_routes(&provider.settings_config)
 }
 
 fn codex_router_routes(provider: &Provider) -> Vec<&Value> {

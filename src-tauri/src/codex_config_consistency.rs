@@ -466,6 +466,19 @@ pub fn inspect(state: &AppState) -> Result<CodexConfigConsistencyReport, AppErro
         .db
         .get_provider_by_id(&provider_id, AppType::Codex.as_str())?
         .ok_or_else(|| AppError::Config("Codex current provider is missing".to_string()))?;
+    // A MultiRouter provider only owns Codex's route while takeover is active.
+    // Global-off deliberately restores the prior direct config, which is not
+    // drift to repair back into a proxy route.
+    if crate::services::proxy::ProxyService::codex_provider_has_enabled_routing(Some(&provider)) {
+        return Ok(report(
+            CodexConfigConsistencyState::NotApplicable,
+            Some(provider_id),
+            None,
+            None,
+            Vec::new(),
+            Some("multirouter_takeover_inactive"),
+        ));
+    }
     let expected_text = match build_codex_live_config_for_provider(&state.db, &provider) {
         Ok(text) => text,
         Err(error) => {
@@ -542,12 +555,12 @@ pub fn inspect(state: &AppState) -> Result<CodexConfigConsistencyReport, AppErro
     ))
 }
 
-pub fn resolve(
+pub(crate) fn resolve_from_report(
     state: &AppState,
+    current: CodexConfigConsistencyReport,
     expected_fingerprint: String,
     action: CodexConfigConsistencyAction,
 ) -> Result<CodexConfigConsistencyReport, AppError> {
-    let current = inspect(state)?;
     if action == CodexConfigConsistencyAction::Later {
         return Ok(current);
     }
@@ -610,6 +623,15 @@ pub fn resolve(
     }
 }
 
+pub fn resolve(
+    state: &AppState,
+    expected_fingerprint: String,
+    action: CodexConfigConsistencyAction,
+) -> Result<CodexConfigConsistencyReport, AppError> {
+    let current = inspect(state)?;
+    resolve_from_report(state, current, expected_fingerprint, action)
+}
+
 #[tauri::command]
 pub fn inspect_codex_config_consistency(
     state: State<'_, AppState>,
@@ -618,11 +640,12 @@ pub fn inspect_codex_config_consistency(
 }
 
 #[tauri::command]
-pub fn resolve_codex_config_consistency(
+pub async fn resolve_codex_config_consistency(
     state: State<'_, AppState>,
     expected_fingerprint: String,
     action: CodexConfigConsistencyAction,
 ) -> Result<CodexConfigConsistencyReport, String> {
+    let _guards = state.proxy_service.lock_codex_config_consistency().await;
     resolve(&state, expected_fingerprint, action).map_err(String::from)
 }
 
@@ -736,6 +759,40 @@ mod tests {
             .changed_keys
             .contains(&"model_reasoning_effort".to_string()));
         assert!(result.changed_keys.iter().all(|key| !key.contains("high")));
+    }
+
+    #[test]
+    #[serial]
+    fn inspect_does_not_offer_to_apply_a_suspended_multirouter_route() {
+        let _home = TestHomeGuard::new();
+        crate::settings::reload_settings().expect("reload settings");
+        let (state, _) = seed_provider();
+        let mut provider = state
+            .db
+            .get_provider_by_id("consistency-provider", AppType::Codex.as_str())
+            .expect("read provider")
+            .expect("provider exists");
+        provider.settings_config["codexRouting"] = json!({
+            "enabled": true,
+            "routes": [{"id": "route-1"}]
+        });
+        state
+            .db
+            .update_provider_settings_config(
+                AppType::Codex.as_str(),
+                &provider.id,
+                &provider.settings_config,
+            )
+            .expect("update router settings");
+        codex_config::write_codex_live_config_atomic(Some(
+            "model = \"direct-model\"\nmodel_provider = \"direct\"\n",
+        ))
+        .expect("write restored direct config");
+
+        let report = inspect(&state).expect("inspect suspended route");
+        assert_eq!(report.state, CodexConfigConsistencyState::NotApplicable);
+        assert_eq!(report.reason.as_deref(), Some("multirouter_takeover_inactive"));
+        assert!(report.actual_fingerprint.is_none());
     }
 
     /// Regression for the reported Codex 0.157 upgrade regression: every key

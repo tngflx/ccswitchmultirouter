@@ -536,23 +536,38 @@ fn handle_auto_click(app: &tauri::AppHandle, app_type: &AppType) -> Result<(), A
         // 真正启用 failover：启动代理服务 + 执行接管 + 开启 auto_failover
         let proxy_service = &app_state.proxy_service;
 
-        // 1) 确保代理服务运行（会自动设置 proxy_enabled = true）
-        let is_running = futures::executor::block_on(proxy_service.is_running());
-        if !is_running {
-            log::info!("[Tray] Auto 模式：启动代理服务");
-            if let Err(e) = futures::executor::block_on(proxy_service.start()) {
-                log::error!("[Tray] 启动代理服务失败: {e}");
-                return Err(AppError::Message(format!("启动代理服务失败: {e}")));
+        // Codex Desktop keeps its app-server route in memory. Its explicit
+        // transition must own listener startup, config takeover, and the
+        // managed Desktop relaunch as one transaction. The generic path is
+        // still correct for CLI-style apps and intentionally does not launch
+        // a desktop client.
+        if *app_type == AppType::Codex {
+            log::info!("[Tray] Auto 模式：通过显式 Codex 接管事务启用代理");
+            if let Err(e) = futures::executor::block_on(
+                proxy_service.set_codex_takeover_explicit(true, true),
+            ) {
+                log::error!("[Tray] 执行 Codex 接管失败: {e}");
+                return Err(AppError::Message(format!("执行 Codex 接管失败: {e}")));
             }
-        }
+        } else {
+            // 1) 确保代理服务运行（会自动设置 proxy_enabled = true）
+            let is_running = futures::executor::block_on(proxy_service.is_running());
+            if !is_running {
+                log::info!("[Tray] Auto 模式：启动代理服务");
+                if let Err(e) = futures::executor::block_on(proxy_service.start()) {
+                    log::error!("[Tray] 启动代理服务失败: {e}");
+                    return Err(AppError::Message(format!("启动代理服务失败: {e}")));
+                }
+            }
 
-        // 2) 执行 Live 配置接管（确保该 app 被代理接管）
-        log::info!("[Tray] Auto 模式：对 {app_type_str} 执行接管");
-        if let Err(e) =
-            futures::executor::block_on(proxy_service.set_takeover_for_app(app_type_str, true))
-        {
-            log::error!("[Tray] 执行接管失败: {e}");
-            return Err(AppError::Message(format!("执行接管失败: {e}")));
+            // 2) 执行 Live 配置接管（确保该 app 被代理接管）
+            log::info!("[Tray] Auto 模式：对 {app_type_str} 执行接管");
+            if let Err(e) =
+                futures::executor::block_on(proxy_service.set_takeover_for_app(app_type_str, true))
+            {
+                log::error!("[Tray] 执行接管失败: {e}");
+                return Err(AppError::Message(format!("执行接管失败: {e}")));
+            }
         }
 
         // 3) 设置 auto_failover_enabled = true

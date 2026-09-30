@@ -10,6 +10,40 @@ import {
 export const CODEX_OFFICIAL_PROVIDER_ID = "codex-official";
 export const GROKBUILD_OFFICIAL_PROVIDER_ID = "grokbuild-official";
 
+/** Keep Codex route activation aligned with the backend runtime resolver. */
+export function codexRoutingHasEnabledRoutes(
+  settingsConfig: Record<string, unknown> | undefined,
+): boolean {
+  if (!settingsConfig) return false;
+  const hasCanonicalRouting = Object.prototype.hasOwnProperty.call(
+    settingsConfig,
+    "codexRouting",
+  );
+  const routing = settingsConfig.codexRouting;
+  // Match the backend: a present codexRouting key is authoritative, including
+  // an explicit null/undefined value used to disable legacy route fallback.
+  const routesValue = hasCanonicalRouting
+    ? routing
+    : (settingsConfig.codexModelRoutes ?? settingsConfig.modelRoutes);
+  if (hasCanonicalRouting && routing !== null && typeof routing === "object") {
+    if (Array.isArray(routing)) return routing.some(codexRouteIsEnabled);
+    const object = routing as Record<string, unknown>;
+    if (object.enabled === false) return false;
+    return (
+      Array.isArray(object.routes) && object.routes.some(codexRouteIsEnabled)
+    );
+  }
+  return Array.isArray(routesValue) && routesValue.some(codexRouteIsEnabled);
+}
+
+function codexRouteIsEnabled(route: unknown): boolean {
+  return (
+    !route ||
+    typeof route !== "object" ||
+    (route as Record<string, unknown>).enabled !== false
+  );
+}
+
 /** Keep the UI capability rule aligned with the Rust takeover policy. */
 export function supportsOfficialProxyTakeover(
   appId: AppId,
@@ -40,17 +74,7 @@ export function providerNeedsRouting(
   provider: Provider,
 ): boolean {
   if (appId === "codex") {
-    const codexRouting = (provider.settingsConfig as Record<string, unknown>)
-      ?.codexRouting;
-    if (codexRouting && typeof codexRouting === "object") {
-      const routing = codexRouting as {
-        enabled?: boolean;
-        routes?: unknown[];
-      };
-      if (routing.enabled !== false || (routing.routes?.length ?? 0) > 0) {
-        return true;
-      }
-    }
+    if (codexRoutingHasEnabledRoutes(provider.settingsConfig)) return true;
   }
 
   if (provider.category === "official") return false;

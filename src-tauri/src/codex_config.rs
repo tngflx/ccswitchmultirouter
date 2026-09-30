@@ -3216,20 +3216,7 @@ fn set_codex_model_catalog_projection_fields(
 /// 多路路由把不同模型放在同一个 Codex provider 下。此时顶层窗口或压缩阈值会被
 /// Codex 无条件套用到每个模型，必须让每个 catalog 模型自己的元数据生效。
 fn codex_multi_router_is_enabled(settings: &Value) -> bool {
-    let Some(routing) = settings.get("codexRouting") else {
-        return false;
-    };
-    if routing
-        .get("enabled")
-        .and_then(Value::as_bool)
-        .is_some_and(|enabled| !enabled)
-    {
-        return false;
-    }
-    routing
-        .get("routes")
-        .and_then(Value::as_array)
-        .is_some_and(|routes| !routes.is_empty())
+    crate::provider::codex_settings_has_enabled_routes(settings)
 }
 
 /// 判断当前 MultiRouter 是否包含需要跨 provider 投递的启用 route。

@@ -8449,9 +8449,7 @@ fn value_for_log(value: &Value) -> String {
 /// 这个标记用于区分普通 Codex provider 与“外层 bucket router”。只有 router
 /// provider 发生 route miss 时，才需要额外防止回退到自身本地代理地址。
 fn codex_provider_has_routing_config(provider: &Provider) -> bool {
-    provider.settings_config.get("codexRouting").is_some()
-        || provider.settings_config.get("codexModelRoutes").is_some()
-        || provider.settings_config.get("modelRoutes").is_some()
+    crate::provider::codex_settings_has_enabled_routes(&provider.settings_config)
 }
 
 /// Return whether a request is operating in Codex router context.
@@ -9813,12 +9811,12 @@ mod tests {
         assert!(!codex_request_router_configured(&provider));
 
         provider.settings_config = json!({ "codexRouting": { "routes": [] } });
-        assert!(codex_provider_has_routing_config(&provider));
-        assert!(codex_request_router_configured(&provider));
+        assert!(!codex_provider_has_routing_config(&provider));
+        assert!(!codex_request_router_configured(&provider));
 
         provider.settings_config = json!({ "modelRoutes": [] });
-        assert!(codex_provider_has_routing_config(&provider));
-        assert!(codex_request_router_configured(&provider));
+        assert!(!codex_provider_has_routing_config(&provider));
+        assert!(!codex_request_router_configured(&provider));
 
         provider.settings_config = json!({ "codexResolvedRouteId": "route-1" });
         assert!(!codex_provider_has_routing_config(&provider));

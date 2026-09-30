@@ -76,6 +76,56 @@ describe("mergeFetchedModelsIntoWizardProvider", () => {
     );
   });
 
+  it("preserves explicitly excluded rows while refreshing fetched metadata", () => {
+    const merged = mergeFetchedModelsIntoWizardProvider(
+      {
+        ...deepseekSource,
+        settingsConfig: {
+          ...deepseekSource.settingsConfig,
+          modelCatalog: {
+            models: [
+              { model: "enabled-model" },
+              { model: "excluded-model", enabled: false },
+            ],
+            spawnAgentModels: ["enabled-model", "excluded-model"],
+          },
+        },
+      },
+      [
+        {
+          id: "enabled-model",
+          ownedBy: "provider",
+          contextWindow: 131072,
+        },
+        {
+          id: "excluded-model",
+          ownedBy: "provider",
+          contextWindow: 65536,
+        },
+      ],
+      { preserveExistingSelection: true },
+    );
+
+    expect(merged.settingsConfig.modelCatalog?.models).toEqual([
+      {
+        model: "enabled-model",
+        upstreamModel: "enabled-model",
+        displayName: "enabled-model",
+        contextWindow: 131072,
+      },
+      {
+        model: "excluded-model",
+        enabled: false,
+        upstreamModel: "excluded-model",
+        displayName: "excluded-model",
+        contextWindow: 65536,
+      },
+    ]);
+    expect(merged.settingsConfig.modelCatalog?.spawnAgentModels).toEqual([
+      "enabled-model",
+    ]);
+  });
+
   it("does not duplicate fetched rows when the endpoint repeats an id with different casing", () => {
     const merged = mergeFetchedModelsIntoWizardProvider(
       {

@@ -298,11 +298,21 @@ describe("codexMultiRouterWizard helpers", () => {
       { preserveExistingSelection: true },
     );
 
-    expect(
-      refreshed.settingsConfig.modelCatalog.models.map(
-        (model: { model: string }) => model.model,
-      ),
-    ).toEqual(["first-model", "second-model"]);
+    expect(refreshed.settingsConfig.modelCatalog.models).toEqual([
+      {
+        model: "first-model",
+        enabled: false,
+        upstreamModel: "first-model",
+        displayName: "first-model",
+        contextWindow: 128000,
+      },
+      {
+        model: "second-model",
+        enabled: false,
+        upstreamModel: "second-model",
+        displayName: "second-model",
+      },
+    ]);
   });
 
   it("preserves fetched official image capability in provider catalog", () => {
@@ -332,6 +342,7 @@ describe("codexMultiRouterWizard helpers", () => {
     expect(refreshed.settingsConfig.modelCatalog.models).toEqual([
       {
         model: "gpt-5.6-sol",
+        enabled: false,
         upstreamModel: "gpt-5.6-sol",
         displayName: "gpt-5.6-sol",
         contextWindow: 272000,

@@ -6,7 +6,7 @@ use crate::app_config::AppType;
 use crate::codex_guardian::{self, GuardianHandle};
 use crate::config::{get_claude_settings_path, read_json_file, write_json_file};
 use crate::database::Database;
-use crate::provider::Provider;
+use crate::provider::{codex_settings_has_enabled_routes, Provider};
 use crate::proxy::providers::codex_route_auth_source;
 use crate::proxy::switch_lock::SwitchLockManager;
 use crate::proxy::types::*;
@@ -203,6 +203,17 @@ pub struct ProxyService {
     /// It is consumed by the matching explicit proxy-on command; no background
     /// lifecycle task is allowed to interpret this as permission to relaunch.
     deferred_codex_relaunch: Arc<AtomicBool>,
+    /// Routes suspended by an explicit global-off in this process. Persisted
+    /// enabled flags stay false so a restart cannot undo that user action.
+    suspended_takeover_apps: Arc<Mutex<Vec<&'static str>>>,
+    /// An explicit global proxy-off transition cancels an in-flight startup
+    /// launch so a client the user closed cannot be resurrected afterward.
+    startup_codex_launch_cancelled: Arc<AtomicBool>,
+    /// Once an explicit off supersedes startup recovery, a later on must not
+    /// revive that old startup task; the on command owns its own launch.
+    startup_recovery_superseded: Arc<AtomicBool>,
+    /// Global off supersedes recovery for every app, unlike Codex-only off.
+    startup_global_recovery_superseded: Arc<AtomicBool>,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -218,6 +229,46 @@ pub struct CodexAuthFacadeReprojectionOutcome {
     pub codex_restart_required: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub facade: Option<String>,
+}
+
+fn should_launch_codex_after_explicit_proxy_start(
+    resume_codex_desktop: bool,
+    launch_setting_enabled: bool,
+    deferred_relaunch: bool,
+) -> bool {
+    resume_codex_desktop && (launch_setting_enabled || deferred_relaunch)
+}
+
+fn should_launch_codex_after_explicit_takeover(
+    enabled: bool,
+    stopped: u32,
+    launch_setting_enabled: bool,
+    deferred_relaunch: bool,
+) -> bool {
+    enabled && (stopped > 0 || launch_setting_enabled || deferred_relaunch)
+}
+
+fn should_defer_codex_relaunch_after_explicit_stop(
+    close_codex_desktop: bool,
+    stopped_process_count: u32,
+) -> bool {
+    // The command is the user's authoritative close decision. Process
+    // enumeration can race with shutdown and return zero even though the
+    // frontend observed a running Desktop shell, so the intent must not
+    // depend on the count returned by the best-effort verifier.
+    close_codex_desktop || stopped_process_count > 0
+}
+
+fn should_launch_codex_at_startup(
+    proxy_startup_allowed: bool,
+    proxy_enabled: bool,
+    launch_setting_enabled: bool,
+    stopped_for_takeover: bool,
+    codex_takeover_requested: bool,
+) -> bool {
+    proxy_startup_allowed
+        && proxy_enabled
+        && (launch_setting_enabled || (stopped_for_takeover && codex_takeover_requested))
 }
 
 impl ProxyService {
@@ -243,7 +294,159 @@ impl ProxyService {
                 message_args: Vec::new(),
             })),
             deferred_codex_relaunch: Arc::new(AtomicBool::new(false)),
+            suspended_takeover_apps: Arc::new(Mutex::new(Vec::new())),
+            startup_codex_launch_cancelled: Arc::new(AtomicBool::new(false)),
+            startup_recovery_superseded: Arc::new(AtomicBool::new(false)),
+            startup_global_recovery_superseded: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    pub(crate) fn cancel_startup_codex_launch(&self) {
+        self.startup_codex_launch_cancelled
+            .store(true, Ordering::SeqCst);
+        self.startup_recovery_superseded.store(true, Ordering::SeqCst);
+    }
+
+    pub(crate) fn startup_recovery_is_superseded(&self) -> bool {
+        self.startup_recovery_superseded.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn startup_global_recovery_is_superseded(&self) -> bool {
+        self.startup_global_recovery_superseded.load(Ordering::SeqCst)
+    }
+
+    pub(crate) async fn prepare_codex_desktop_for_startup_recovery(
+        &self,
+        allow_crash_recovery: bool,
+    ) -> Result<u32, String> {
+        self.prepare_codex_desktop_for_startup_recovery_with(
+            allow_crash_recovery,
+            crate::codex_desktop::stop_running_codex_desktop_for_managed_lifecycle,
+        )
+        .await
+    }
+
+    async fn prepare_codex_desktop_for_startup_recovery_with(
+        &self,
+        allow_crash_recovery: bool,
+        stop_desktop: impl FnOnce() -> Result<u32, String>,
+    ) -> Result<u32, String> {
+        let _switch_guard = self.switch_locks.lock_for_app("codex").await;
+        let _lifecycle_guard = self.lifecycle_lock.lock().await;
+        if self.startup_recovery_superseded.load(Ordering::SeqCst) {
+            return Ok(0);
+        }
+        let global_enabled = self
+            .db
+            .get_global_proxy_config()
+            .await
+            .map_err(|error| format!("读取全局代理状态失败: {error}"))?
+            .proxy_enabled;
+        let codex_enabled = self
+            .db
+            .get_proxy_config_for_app("codex")
+            .await
+            .map_err(|error| format!("读取 Codex 接管状态失败: {error}"))?
+            .enabled;
+        let has_backup = self
+            .db
+            .get_live_backup("codex")
+            .await
+            .map_err(|error| format!("读取 Codex Live 备份失败: {error}"))?
+            .is_some();
+        if global_enabled && codex_enabled
+            || allow_crash_recovery && self.codex_live_restore_requires_desktop_stop(has_backup)
+        {
+            stop_desktop()
+        } else {
+            Ok(0)
+        }
+    }
+
+    /// Hold both lifecycle locks across a manual close/config/relaunch transaction.
+    pub(crate) async fn lock_codex_runtime_refresh(
+        &self,
+    ) -> Result<(tokio::sync::OwnedMutexGuard<()>, tokio::sync::MutexGuard<'_, ()>), String> {
+        let switch_guard = self.switch_locks.lock_for_app("codex").await;
+        let lifecycle_guard = self.lifecycle_lock.lock().await;
+        if self.startup_codex_launch_cancelled.load(Ordering::SeqCst) {
+            return Err("codex_runtime_refresh_cancelled_by_proxy_off".to_string());
+        }
+        Ok((switch_guard, lifecycle_guard))
+    }
+
+    /// Serialize the consistency dialog's inspect/apply transaction with every
+    /// Codex takeover, restore, and provider-switch writer. Unlike the runtime
+    /// refresh path this is also valid while startup relaunch has been cancelled.
+    pub(crate) async fn lock_codex_config_consistency(
+        &self,
+    ) -> (tokio::sync::OwnedMutexGuard<()>, tokio::sync::MutexGuard<'_, ()>) {
+        let switch_guard = self.switch_locks.lock_for_app("codex").await;
+        let lifecycle_guard = self.lifecycle_lock.lock().await;
+        (switch_guard, lifecycle_guard)
+    }
+
+    pub(crate) async fn relaunch_codex_after_provider_switch_locked(
+        &self,
+    ) -> Result<(), String> {
+        if self.startup_codex_launch_cancelled.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+        let takeover_enabled = self.get_takeover_status().await?.codex;
+        if takeover_enabled {
+            let result = crate::codex_desktop::unlock_codex_model_picker().await?;
+            if !result.injected {
+                return Err(format!(
+                    "Codex Desktop relaunched, but model-picker injection did not complete: {}",
+                    result.message
+                ));
+            }
+        } else {
+            crate::codex_desktop::relaunch_codex_desktop_after_takeover()?;
+        }
+        Ok(())
+    }
+
+    /// Keep per-app stop, Live mutation and launch in the same lock order as
+    /// global off so either explicit transition leaves a coherent final state.
+    pub async fn set_codex_takeover_explicit(
+        &self,
+        enabled: bool,
+        restart_running_desktop: bool,
+    ) -> Result<(), String> {
+        let _switch_guard = self.switch_locks.lock_for_app("codex").await;
+        let _lifecycle_guard = self.lifecycle_lock.lock().await;
+        if enabled {
+            self.preflight_codex_takeover()?;
+        }
+        let stopped = if restart_running_desktop {
+            crate::codex_desktop::stop_running_codex_desktop_for_managed_lifecycle()?
+        } else {
+            0
+        };
+        if stopped > 0 && enabled {
+            self.defer_codex_relaunch_until_proxy_start();
+        }
+        self.set_takeover_for_app_locked("codex", enabled).await?;
+        self.suspended_takeover_apps.lock().await.retain(|app| *app != "codex");
+
+        if enabled {
+            self.startup_codex_launch_cancelled.store(false, Ordering::SeqCst);
+        } else {
+            self.cancel_startup_codex_launch();
+            self.take_deferred_codex_relaunch();
+        }
+
+        let launch_setting = crate::settings::get_settings().launch_codex_desktop_with_ccswitch;
+        let deferred = self.deferred_codex_relaunch.load(Ordering::SeqCst);
+        if should_launch_codex_after_explicit_takeover(enabled, stopped, launch_setting, deferred) {
+            crate::codex_config::enforce_codex_guardian_v2_live_compatibility()
+                .map_err(|error| format!("Guardian V2 配置兼容性检查失败: {error}"))?;
+            crate::codex_desktop::launch_codex_desktop_with_ccswitch(true)
+                .map_err(|error| format!("Codex takeover changed, but Desktop could not start: {error}"))?;
+            self.take_deferred_codex_relaunch();
+        }
+        Ok(())
     }
 
     pub(crate) fn defer_codex_relaunch_until_proxy_start(&self) {
@@ -260,28 +463,61 @@ impl ProxyService {
 
     /// Authorize and launch Codex as one lifecycle transaction.
     ///
-    /// Startup recovery can spend minutes updating tools and restoring routes.
-    /// The final persisted global-switch check must be serialized with the
-    /// explicit proxy-off transaction; otherwise a stop can commit `false`
-    /// immediately after the check and stale startup work can still launch
-    /// Codex. The compatibility write belongs in the same boundary so restore
-    /// cannot race a last-moment schema repair.
-    pub(crate) async fn launch_codex_desktop_if_global_proxy_enabled(
+    /// The explicit proxy-off command cancels this boundary before restoring
+    /// live files, so stale startup work cannot resurrect a closed client.
+    pub(crate) async fn launch_codex_desktop_at_startup(
         &self,
+        proxy_startup_allowed: bool,
+        stopped_for_takeover: bool,
+        takeover_ready: bool,
     ) -> Result<Option<bool>, String> {
         let _lifecycle_guard = self.lifecycle_lock.lock().await;
+        if self
+            .startup_recovery_superseded
+            .load(Ordering::SeqCst)
+        {
+            return Ok(None);
+        }
         let proxy_enabled = self
             .db
             .get_global_proxy_config()
             .await
             .map(|config| config.proxy_enabled)
             .unwrap_or(false);
-        if !proxy_enabled {
+        let codex_takeover_requested = proxy_enabled
+            && self
+                .db
+                .get_proxy_config_for_app("codex")
+                .await
+                .is_ok_and(|config| config.enabled);
+        if !proxy_startup_allowed || !proxy_enabled {
             return Ok(None);
         }
-
+        let launch_setting_enabled = crate::settings::get_settings().launch_codex_desktop_with_ccswitch;
+        let should_launch = should_launch_codex_at_startup(
+            proxy_startup_allowed,
+            proxy_enabled,
+            launch_setting_enabled,
+            stopped_for_takeover,
+            codex_takeover_requested,
+        );
+        if !should_launch {
+            return Ok(None);
+        }
+        if stopped_for_takeover && codex_takeover_requested && !takeover_ready {
+            return Err(
+                "Codex 启动门禁未通过：代理接管或 Live 配置恢复未完成，已阻止自动启动 Codex Desktop"
+                    .to_string(),
+            );
+        }
         crate::codex_config::enforce_codex_guardian_v2_live_compatibility()
             .map_err(|error| format!("Guardian V2 配置兼容性检查失败: {error}"))?;
+        if self
+            .startup_recovery_superseded
+            .load(Ordering::SeqCst)
+        {
+            return Ok(None);
+        }
         crate::codex_desktop::launch_codex_desktop_with_ccswitch(true)
             .map(Some)
             .map_err(|error| format!("启动 Codex Desktop 失败: {error}"))
@@ -764,20 +1000,7 @@ impl ProxyService {
         let Some(routing) = provider.settings_config.get("codexRouting") else {
             return Ok(());
         };
-        let Some(routing_object) = routing.as_object() else {
-            return Err(
-                "codex_multirouter_invalid_schema: codexRouting must be an object".to_string(),
-            );
-        };
-        let enabled = routing_object
-            .get("enabled")
-            .and_then(Value::as_bool)
-            .unwrap_or(true);
-        let has_routes = routing_object
-            .get("routes")
-            .and_then(Value::as_array)
-            .is_some_and(|routes| !routes.is_empty());
-        if !enabled && !has_routes {
+        if !codex_settings_has_enabled_routes(&provider.settings_config) {
             return Ok(());
         }
 
@@ -813,6 +1036,10 @@ impl ProxyService {
         self.switch_locks.lock_for_app(app_type).await
     }
 
+    pub(crate) async fn lock_codex_lifecycle(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.lifecycle_lock.lock().await
+    }
+
     // Global live-file transactions use the same ordering as per-app switches:
     // app locks first, lifecycle lock second. Never reacquire an app lock inside.
     async fn lock_all_takeover_apps(&self) -> Vec<tokio::sync::OwnedMutexGuard<()>> {
@@ -826,7 +1053,7 @@ impl ProxyService {
     /// 启动代理服务器
     pub async fn start(&self) -> Result<ProxyServerInfo, String> {
         let _lifecycle_guard = self.lifecycle_lock.lock().await;
-        self.start_locked().await
+        self.start_global_locked().await
     }
 
     /// Start the global proxy and, only for an explicit global start, consume
@@ -839,45 +1066,64 @@ impl ProxyService {
         &self,
         resume_codex_desktop: bool,
     ) -> Result<ProxyServerInfo, String> {
+        let _switch_guards = self.lock_all_takeover_apps().await;
         let _lifecycle_guard = self.lifecycle_lock.lock().await;
-        let info = self.start_locked().await?;
-        if resume_codex_desktop && self.take_deferred_codex_relaunch() {
-            if let Err(error) = crate::codex_desktop::relaunch_codex_desktop_after_takeover() {
-                // Preserve explicit user intent for the next explicit start;
-                // no background task may retry this transition.
-                self.restore_deferred_codex_relaunch();
-                return Err(format!(
-                    "代理服务已启动，但此前停止的 Codex Desktop 未能恢复: {error}"
-                ));
+        let info = self.start_global_locked().await?;
+        let suspended = self.suspended_takeover_apps.lock().await.clone();
+        for app_type in &suspended {
+            if let Err(error) = self.set_takeover_for_app_locked(app_type, true).await {
+                let rollback = self.stop_with_restore_locked().await;
+                return Err(match rollback {
+                    Ok(()) => format!("恢复 {app_type} 代理接管失败，已回滚到全局关闭状态: {error}"),
+                    Err(rollback_error) => format!(
+                        "恢复 {app_type} 代理接管失败: {error}; 回滚 Live 配置失败: {rollback_error}"
+                    ),
+                });
             }
+        }
+        self.suspended_takeover_apps.lock().await.clear();
+        self.startup_codex_launch_cancelled.store(false, Ordering::SeqCst);
+        let launch_setting = crate::settings::get_settings().launch_codex_desktop_with_ccswitch;
+        let deferred = self.deferred_codex_relaunch.load(Ordering::SeqCst);
+        if should_launch_codex_after_explicit_proxy_start(
+            resume_codex_desktop,
+            launch_setting,
+            deferred,
+        ) {
+            let deferred = self.take_deferred_codex_relaunch();
+            let launch_result = crate::codex_config::enforce_codex_guardian_v2_live_compatibility()
+                .map_err(|error| format!("Guardian V2 配置兼容性检查失败: {error}"))
+                .and_then(|_| crate::codex_desktop::launch_codex_desktop_with_ccswitch(true));
+            match launch_result {
+                Ok(true) => log::info!("显式开启代理后已启动 Codex Desktop"),
+                Ok(false) => log::info!("显式开启代理后 Codex Desktop 已在运行，跳过启动"),
+                Err(error) => {
+                    if deferred {
+                        self.restore_deferred_codex_relaunch();
+                    }
+                    return Err(format!("代理服务已启动，但 Codex Desktop 未能启动: {error}"));
+                }
+            }
+        } else {
+            log::info!(
+                "显式开启代理后跳过 Codex Desktop 启动: resume={resume_codex_desktop} setting={launch_setting} deferred={deferred}"
+            );
         }
         Ok(info)
     }
 
-    async fn start_locked(&self) -> Result<ProxyServerInfo, String> {
-        // 1. 启动时自动设置 proxy_enabled = true
-        let mut global_config = self
-            .db
-            .get_global_proxy_config()
-            .await
-            .map_err(|e| format!("获取全局代理配置失败: {e}"))?;
-
-        if !global_config.proxy_enabled {
-            global_config.proxy_enabled = true;
-            self.db
-                .update_global_proxy_config(global_config.clone())
-                .await
-                .map_err(|e| format!("更新代理总开关失败: {e}"))?;
-        }
-
-        // 2. 获取配置
+    /// Start the listener without changing the user's persisted global switch.
+    /// Internal recovery/provider paths use this boundary; only explicit global
+    /// start owns the `proxy_enabled = true` write.
+    async fn start_listener_locked(&self) -> Result<ProxyServerInfo, String> {
+        // 1. 获取配置
         let config = self
             .db
             .get_proxy_config()
             .await
             .map_err(|e| format!("获取代理配置失败: {e}"))?;
 
-        // 3. 若已在运行：确保持久化状态（如需要）并返回当前信息
+        // 2. 若已在运行：返回当前信息
         let existing_server = self.server.read().await;
         if let Some(server) = existing_server.as_ref() {
             let status = server.get_status().await;
@@ -886,20 +1132,16 @@ impl ProxyService {
                 return Ok(ProxyServerInfo {
                     address: status.address,
                     port: status.port,
-                    // 无法精确取回首次启动时间，返回当前时间用于 UI 展示即可
                     started_at: chrono::Utc::now().to_rfc3339(),
                 });
             }
-            // A completed task can leave the wrapper behind after an
-            // unexpected listener failure. Clear only that non-running
-            // wrapper before binding; never treat a live listener as stale.
             drop(existing_server);
             self.server.write().await.take();
         } else {
             drop(existing_server);
         }
 
-        // 4. 创建并启动服务器
+        // 3. 创建并启动服务器
         let app_handle = self.app_handle.read().await.clone();
         let server = ProxyServer::new(config.clone(), self.db.clone(), app_handle);
         let info = server
@@ -914,10 +1156,28 @@ impl ProxyService {
             return Err(e);
         }
 
-        // 5. 保存服务器实例
+        // 4. 保存服务器实例
         *self.server.write().await = Some(server);
 
         log::info!("代理服务器已启动: {}:{}", info.address, info.port);
+        Ok(info)
+    }
+
+    /// Explicit global start. Persist the enabled state only after the listener
+    /// is ready, and roll the listener back if the state write fails.
+    async fn start_global_locked(&self) -> Result<ProxyServerInfo, String> {
+        let global_config = self
+            .db
+            .get_global_proxy_config()
+            .await
+            .map_err(|e| format!("获取全局代理配置失败: {e}"))?;
+        let info = self.start_listener_locked().await?;
+        if !global_config.proxy_enabled {
+            if let Err(error) = self.db.set_global_proxy_enabled(true).await {
+                let _ = self.stop_listener_locked().await;
+                return Err(format!("更新代理总开关失败: {error}"));
+            }
+        }
         Ok(info)
     }
 
@@ -996,7 +1256,7 @@ impl ProxyService {
             return Ok(false);
         }
 
-        self.start_locked().await?;
+        self.start_listener_locked().await?;
         Ok(true)
     }
 
@@ -1060,7 +1320,7 @@ impl ProxyService {
         }
 
         // 5. 启动代理服务器
-        match self.start_locked().await {
+        match self.start_global_locked().await {
             Ok(info) => {
                 self.ensure_codex_guardian_started();
                 Ok(info)
@@ -1174,6 +1434,17 @@ impl ProxyService {
         let app_type_str = app.as_str();
         let _guard = self.switch_locks.lock_for_app(app_type_str).await;
         let _lifecycle_guard = self.lifecycle_lock.lock().await;
+        self.set_takeover_for_app_locked(app_type_str, enabled).await?;
+        self.suspended_takeover_apps
+            .lock()
+            .await
+            .retain(|suspended| *suspended != app_type_str);
+        Ok(())
+    }
+
+    async fn set_takeover_for_app_locked(&self, app_type: &str, enabled: bool) -> Result<(), String> {
+        let app = AppType::from_str(app_type).map_err(|e| format!("无效的应用类型: {e}"))?;
+        let app_type_str = app.as_str();
 
         // Codex Desktop keeps its app-server route in memory. Any implicit
         // takeover transition must therefore be rejected while the shell is
@@ -1213,7 +1484,7 @@ impl ProxyService {
         if enabled {
             // 1) 代理服务未运行则自动启动
             if !self.is_running().await {
-                if let Err(start_error) = self.start_locked().await {
+                if let Err(start_error) = self.start_global_locked().await {
                     let listen_port = self
                         .db
                         .get_proxy_config()
@@ -1251,7 +1522,7 @@ impl ProxyService {
 
                             let mut restart_error = start_error;
                             for attempt in 1..=20 {
-                                match self.start_locked().await {
+                                match self.start_global_locked().await {
                                     Ok(_) => {
                                         log::info!(
                                             "旧 CCSwitchMulti PID {owner_pid} 的进程树已结束，代理端口 {listen_port} 已由当前实例接管"
@@ -1412,88 +1683,7 @@ impl ProxyService {
             return Ok(());
         }
 
-        // 关闭接管：检查 enabled 状态
-        let current_config = self
-            .db
-            .get_proxy_config_for_app(app_type_str)
-            .await
-            .map_err(|e| format!("获取 {app_type_str} 配置失败: {e}"))?;
-
-        let live_taken_over = self.detect_takeover_in_live_config_for_app(&app);
-        let has_backup = self
-            .db
-            .get_live_backup(app_type_str)
-            .await
-            .map_err(|e| format!("读取 {app_type_str} Live 备份失败: {e}"))?
-            .is_some();
-        if !current_config.enabled && !live_taken_over && !has_backup {
-            if app == AppType::Codex {
-                self.stop_codex_guardian().await;
-            }
-            return Ok(());
-        }
-
-        log::info!(
-            "set_takeover_for_app 正在关闭 {app_type_str} takeover：source=proxy_toggle_or_command"
-        );
-
-        // Stop all Codex background writers before restoring the user's live
-        // config. Otherwise the guardian can race the restore and put the
-        // takeover markers back immediately after they are removed.
-        if app == AppType::Codex {
-            self.stop_codex_guardian().await;
-        }
-
-        // 1) 恢复 Live 配置
-        //
-        // 必须走 with_fallback 版本：备份 → SSOT → 清理占位符 的三层兜底。
-        // 简版 restore_live_config_for_app 在备份缺失时会静默 Ok(())，
-        // 留下接管时写入的占位符（代理地址/PROXY_MANAGED token），客户端无法工作。
-        self.restore_live_config_for_app_if_owned_inner(&app)
-            .await?;
-
-        // 2) 删除该 app 的备份（避免长期存储敏感 Token）
-        self.db
-            .delete_live_backup(app_type_str)
-            .await
-            .map_err(|e| format!("删除 {app_type_str} Live 备份失败: {e}"))?;
-
-        // 3) 设置 proxy_config.enabled = false
-        let mut updated_config = self
-            .db
-            .get_proxy_config_for_app(app_type_str)
-            .await
-            .map_err(|e| format!("获取 {app_type_str} 配置失败: {e}"))?;
-        updated_config.enabled = false;
-        self.db
-            .update_proxy_config_for_app(updated_config)
-            .await
-            .map_err(|e| format!("清除 {app_type_str} enabled 状态失败: {e}"))?;
-
-        // 4) 清除该应用的健康状态（关闭代理时重置队列状态）
-        self.db
-            .clear_provider_health_for_app(app_type_str)
-            .await
-            .map_err(|e| format!("清除 {app_type_str} 健康状态失败: {e}"))?;
-
-        // 5) 若无其它接管，更新旧标志，并停止代理服务
-        // 检查是否还有其它 app 的 enabled = true
-        let any_enabled = self
-            .db
-            .is_live_takeover_active()
-            .await
-            .map_err(|e| format!("检查接管状态失败: {e}"))?;
-
-        if !any_enabled {
-            let _ = self.db.set_live_takeover_active(false).await;
-
-            if self.is_running().await {
-                // 此时没有任何 app 处于接管状态，停止服务即可
-                let _ = self.stop_locked().await;
-            }
-        }
-
-        Ok(())
+        return self.disable_takeover_for_app_locked_inner(&app, true).await;
     }
 
     /// 在 provider 切换锁内关闭单个 app 的代理接管。
@@ -1504,78 +1694,12 @@ impl ProxyService {
     pub(crate) async fn disable_takeover_for_app_after_switch_lock(
         &self,
         app: &AppType,
+        lifecycle_lock_held: bool,
     ) -> Result<(), String> {
-        let app_type_str = app.as_str();
-        let current_config = self
-            .db
-            .get_proxy_config_for_app(app_type_str)
-            .await
-            .map_err(|e| format!("鑾峰彇 {app_type_str} 閰嶇疆澶辫触: {e}"))?;
-        let has_backup = self
-            .db
-            .get_live_backup(app_type_str)
-            .await
-            .map_err(|e| format!("璇诲彇 {app_type_str} Live 澶囦唤澶辫触: {e}"))?
-            .is_some();
-        let live_taken_over = self.detect_takeover_in_live_config_for_app(app);
+        return self
+            .disable_takeover_for_app_locked_inner(app, lifecycle_lock_held)
+            .await;
 
-        if !current_config.enabled && !has_backup && !live_taken_over {
-            return Ok(());
-        }
-
-        log::info!(
-            "provider switch 正在关闭 {app_type_str} takeover：source=official_switch enabled={} has_backup={} live_taken_over={}",
-            current_config.enabled,
-            has_backup,
-            live_taken_over
-        );
-
-        if *app == AppType::Codex {
-            crate::codex_desktop::ensure_codex_desktop_closed_for_routing_transition()?;
-        }
-
-        if *app == AppType::Codex {
-            self.stop_codex_guardian().await;
-        }
-
-        self.restore_live_config_for_app_if_owned_inner(app).await?;
-
-        self.db
-            .delete_live_backup(app_type_str)
-            .await
-            .map_err(|e| format!("鍒犻櫎 {app_type_str} Live 澶囦唤澶辫触: {e}"))?;
-
-        let mut updated_config = self
-            .db
-            .get_proxy_config_for_app(app_type_str)
-            .await
-            .map_err(|e| format!("鑾峰彇 {app_type_str} 閰嶇疆澶辫触: {e}"))?;
-        updated_config.enabled = false;
-        self.db
-            .update_proxy_config_for_app(updated_config)
-            .await
-            .map_err(|e| format!("娓呴櫎 {app_type_str} enabled 鐘舵€佸け璐? {e}"))?;
-
-        self.db
-            .clear_provider_health_for_app(app_type_str)
-            .await
-            .map_err(|e| format!("娓呴櫎 {app_type_str} 鍋ュ悍鐘舵€佸け璐? {e}"))?;
-
-        let any_enabled = self
-            .db
-            .is_live_takeover_active()
-            .await
-            .map_err(|e| format!("妫€鏌ユ帴绠＄姸鎬佸け璐? {e}"))?;
-
-        if !any_enabled {
-            let _ = self.db.set_live_takeover_active(false).await;
-
-            if self.is_running().await {
-                let _ = self.stop().await;
-            }
-        }
-
-        Ok(())
     }
 
     /// 在 ProviderService 已经持有 app 切换锁时启用单应用接管，并切到指定 provider。
@@ -1587,8 +1711,30 @@ impl ProxyService {
         &self,
         app_type: &AppType,
         provider_id: &str,
+        lifecycle_lock_held: bool,
     ) -> Result<(), String> {
         let app_type_str = app_type.as_str();
+
+        // This path is reached from provider switching, not from an explicit
+        // proxy-on command.  A provider switch must never turn the user's
+        // global proxy switch back on after they deliberately disabled it.
+        // `start_locked` persists `proxy_enabled = true`, so enforce the
+        // ownership boundary before closing Codex or mutating any Live file.
+        let global_proxy_enabled = self
+            .db
+            .get_global_proxy_config()
+            .await
+            .map_err(|e| format!("读取全局代理状态失败: {e}"))?
+            .proxy_enabled;
+        if !global_proxy_enabled {
+            log::info!(
+                "跳过 Codex 本地代理接管：provider switch 要求本地代理，但全局代理已关闭 provider={provider_id}"
+            );
+            return Err(
+                "全局代理已关闭；请先开启代理，再切换到需要本地路由的 Codex provider".to_string(),
+            );
+        }
+
         if *app_type == AppType::Codex {
             crate::codex_desktop::ensure_codex_desktop_closed_for_routing_transition()?;
         }
@@ -1596,7 +1742,11 @@ impl ProxyService {
             .map_err(|e| format!("读取当前 provider 失败: {e}"))?;
 
         if !self.is_running().await {
-            self.start().await?;
+            if lifecycle_lock_held {
+                self.start_listener_locked().await?;
+            } else {
+                self.start().await?;
+            }
         }
 
         let current_config = self
@@ -1704,6 +1854,15 @@ impl ProxyService {
         let app_type_str = app_type.as_str();
         let _switch_guard = self.switch_locks.lock_for_app(app_type_str).await;
         let _lifecycle_guard = self.lifecycle_lock.lock().await;
+        self.disable_takeover_for_app_locked_inner(app_type, true).await
+    }
+
+    async fn disable_takeover_for_app_locked_inner(
+        &self,
+        app_type: &AppType,
+        lifecycle_lock_held: bool,
+    ) -> Result<(), String> {
+        let app_type_str = app_type.as_str();
         let current_config = self
             .db
             .get_proxy_config_for_app(app_type_str)
@@ -1716,8 +1875,7 @@ impl ProxyService {
             .map_err(|e| format!("读取 {app_type_str} Live 备份失败: {e}"))?
             .is_some();
         let live_taken_over = self.detect_takeover_in_live_config_for_app(app_type);
-        if *app_type == AppType::Codex && (current_config.enabled || has_backup || live_taken_over)
-        {
+        if *app_type == AppType::Codex && (current_config.enabled || has_backup || live_taken_over) {
             crate::codex_desktop::ensure_codex_desktop_closed_for_routing_transition()?;
         }
         if *app_type == AppType::Codex {
@@ -1758,6 +1916,19 @@ impl ProxyService {
                 .set_live_takeover_active(false)
                 .await
                 .map_err(|e| e.to_string())?;
+        }
+        if !self
+            .db
+            .is_live_takeover_active()
+            .await
+            .map_err(|e| e.to_string())?
+            && self.is_running().await
+        {
+            if lifecycle_lock_held {
+                self.stop_locked().await?;
+            } else {
+                self.stop().await?;
+            }
         }
         Ok(())
     }
@@ -2079,7 +2250,9 @@ impl ProxyService {
         self.stop_locked().await
     }
 
-    async fn stop_locked(&self) -> Result<(), String> {
+    /// Stop only the in-process listener. This never changes the persisted
+    /// global switch, which is required by normal application shutdown.
+    async fn stop_listener_locked(&self) -> Result<(), String> {
         let mut server_guard = self.server.write().await;
         let Some(server) = server_guard.as_ref() else {
             return Err("代理服务器未运行".to_string());
@@ -2094,10 +2267,24 @@ impl ProxyService {
         server_guard.take();
         drop(server_guard);
 
-        self.persist_global_proxy_disabled().await?;
-
         log::info!("代理服务器已停止");
         Ok(())
+    }
+
+    /// Stop only the in-process listener while preserving the persisted global
+    /// proxy switch. This is the shutdown/restart boundary; an explicit user
+    /// proxy-off action must use `stop_with_restore_explicit` instead.
+    pub async fn stop_listener_keep_state(&self) -> Result<(), String> {
+        let _switch_guards = self.lock_all_takeover_apps().await;
+        let _lifecycle_guard = self.lifecycle_lock.lock().await;
+        self.stop_listener_locked().await
+    }
+
+    /// Explicit global stop. Listener teardown and persisted global-off state
+    /// are committed as one lifecycle operation.
+    async fn stop_locked(&self) -> Result<(), String> {
+        self.stop_listener_locked().await?;
+        self.persist_global_proxy_disabled().await
     }
 
     /// Commit the global-off state independently of the listener wrapper.
@@ -2106,16 +2293,15 @@ impl ProxyService {
     /// global-stop/restore transaction must still prevent startup recovery from
     /// treating the old persisted switch as permission to relaunch routing.
     async fn persist_global_proxy_disabled(&self) -> Result<(), String> {
-        let mut global_config = self
+        let global_config = self
             .db
             .get_global_proxy_config()
             .await
             .map_err(|e| format!("获取全局代理配置失败: {e}"))?;
 
         if global_config.proxy_enabled {
-            global_config.proxy_enabled = false;
             self.db
-                .update_global_proxy_config(global_config)
+                .set_global_proxy_enabled(false)
                 .await
                 .map_err(|e| format!("更新代理总开关失败: {e}"))?;
         }
@@ -2150,6 +2336,49 @@ impl ProxyService {
     pub async fn stop_with_restore(&self) -> Result<(), String> {
         let _switch_guards = self.lock_all_takeover_apps().await;
         let _lifecycle_guard = self.lifecycle_lock.lock().await;
+        self.stop_with_restore_and_snapshot_locked().await
+    }
+
+    /// The confirmed global-off command closes Codex and restores Live under
+    /// the same lifecycle lock used by startup launch and explicit proxy-on.
+    pub async fn stop_with_restore_explicit(&self, close_codex_desktop: bool) -> Result<(), String> {
+        let _switch_guards = self.lock_all_takeover_apps().await;
+        let _lifecycle_guard = self.lifecycle_lock.lock().await;
+        self.cancel_startup_codex_launch();
+        self.startup_global_recovery_superseded.store(true, Ordering::SeqCst);
+        let stopped = if close_codex_desktop {
+            crate::codex_desktop::stop_running_codex_desktop_for_managed_lifecycle()?
+        } else {
+            0
+        };
+        log::info!("显式关闭代理后 Codex Desktop 停止进程数: {stopped}");
+        if should_defer_codex_relaunch_after_explicit_stop(close_codex_desktop, stopped) {
+            self.defer_codex_relaunch_until_proxy_start();
+        }
+        self.stop_with_restore_and_snapshot_locked().await
+    }
+
+    async fn stop_with_restore_and_snapshot_locked(&self) -> Result<(), String> {
+        let takeover = self.get_takeover_status().await?;
+        self.stop_with_restore_locked().await?;
+        let mut suspended = self.suspended_takeover_apps.lock().await;
+        for app in [
+            ("claude", takeover.claude),
+            ("codex", takeover.codex),
+            ("gemini", takeover.gemini),
+            ("grokbuild", takeover.grokbuild),
+        ]
+        .into_iter()
+        .filter_map(|(app, enabled)| enabled.then_some(app))
+        {
+            if !suspended.contains(&app) {
+                suspended.push(app);
+            }
+        }
+        Ok(())
+    }
+
+    async fn stop_with_restore_locked(&self) -> Result<(), String> {
         self.ensure_codex_desktop_closed_before_restore().await?;
         // Keep the listener alive until clients can read restored live config.
         // On failure, leave the proxy available and retain the takeover state.
@@ -2157,7 +2386,7 @@ impl ProxyService {
         self.restore_live_configs_locked().await?;
 
         if self.is_running().await {
-            self.stop_locked().await?;
+            self.stop_listener_locked().await?;
         }
 
         // `stop_locked` owns this write when a listener is present. Keep the
@@ -2210,7 +2439,7 @@ impl ProxyService {
         self.restore_live_configs_locked().await?;
 
         if self.is_running().await {
-            self.stop_locked().await?;
+            self.stop_listener_locked().await?;
         }
 
         // 3. 更新 proxy_config 表中的 live_takeover_active 标志（兼容旧版）
@@ -3357,6 +3586,9 @@ impl ProxyService {
     pub async fn recover_from_crash(&self) -> Result<(), String> {
         let _switch_guards = self.lock_all_takeover_apps().await;
         let _lifecycle_guard = self.lifecycle_lock.lock().await;
+        if self.startup_global_recovery_is_superseded() {
+            return Ok(());
+        }
         self.ensure_codex_desktop_closed_before_restore().await?;
         // 1. 恢复 Live 配置
         self.restore_live_configs_locked().await?;
@@ -4502,23 +4734,10 @@ impl ProxyService {
     /// MultiRouter 需要恢复稳定的 `codex_model_router_v2` 桶。Codex 候选列表由
     /// `model_catalog_json` 提供，provider id 只用于历史/线程归属，不能随构建漂移。
     /// 这里只读取 cc-switch 私有的 `codexRouting` 配置，不访问数据库，也不改变 route 状态。
-    fn codex_provider_has_enabled_routing(provider: Option<&Provider>) -> bool {
-        let Some(routing) =
-            provider.and_then(|provider| provider.settings_config.get("codexRouting"))
-        else {
-            return false;
-        };
-        if routing
-            .get("enabled")
-            .and_then(|value| value.as_bool())
-            .is_some_and(|enabled| !enabled)
-        {
-            return false;
-        }
-        routing
-            .get("routes")
-            .and_then(|value| value.as_array())
-            .is_some_and(|routes| !routes.is_empty())
+    pub(crate) fn codex_provider_has_enabled_routing(provider: Option<&Provider>) -> bool {
+        provider.is_some_and(|provider| {
+            codex_settings_has_enabled_routes(&provider.settings_config)
+        })
     }
 
     fn codex_multirouter_default_reasoning_effort(provider: Option<&Provider>) -> Option<&str> {
@@ -5986,6 +6205,176 @@ mod tests {
 
     #[tokio::test]
     #[serial]
+    async fn global_start_keeps_ephemeral_port_resolved_for_db_only_paths() {
+        let _home = TempHome::new();
+        crate::settings::reload_settings().expect("reload settings");
+        let db = Arc::new(Database::memory().expect("init db"));
+        use_ephemeral_proxy_port(&db).await;
+        let service = ProxyService::new(db.clone());
+
+        let info = service
+            .start()
+            .await
+            .expect("explicit global start should bind an ephemeral port");
+        assert_ne!(info.port, 0, "an ephemeral listener must report a real port");
+
+        // `GlobalProxyConfig` carries `listen_port`, and
+        // `update_global_proxy_config` writes the whole `proxy_config` row.
+        // Committing the switch from a struct read *before* the listener bound
+        // therefore writes port 0 back over the resolved port, and every
+        // DB-only gateway-URL path (Claude Desktop profiles, Codex
+        // `base_url`) starts failing with "needs a real listening port".
+        assert_eq!(
+            db.get_proxy_config()
+                .await
+                .expect("read proxy config after start")
+                .listen_port,
+            info.port,
+            "explicit global start must not clobber the resolved ephemeral port"
+        );
+
+        service.stop().await.expect("stop test listener");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn explicit_global_off_on_restores_suspended_takeover_before_returning() {
+        let _home = TempHome::new();
+        crate::settings::reload_settings().expect("reload settings");
+        let db = Arc::new(Database::memory().expect("init db"));
+        use_ephemeral_proxy_port(&db).await;
+        let service = ProxyService::new(db.clone());
+        let provider = Provider::with_id(
+            "p1".to_string(),
+            "P1".to_string(),
+            json!({"env": {"ANTHROPIC_API_KEY": "provider-key", "ANTHROPIC_BASE_URL": "https://api.anthropic.com"}}),
+            None,
+        );
+        db.save_provider("claude", &provider).expect("save provider");
+        db.set_current_provider("claude", "p1")
+            .expect("set current provider");
+        crate::settings::set_current_provider(&AppType::Claude, Some("p1"))
+            .expect("set local current provider");
+        let original = json!({"env": {"ANTHROPIC_API_KEY": "live-key", "ANTHROPIC_BASE_URL": "https://api.anthropic.com"}});
+        service.write_claude_live(&original).expect("seed live config");
+
+        service
+            .set_takeover_for_app("claude", true)
+            .await
+            .expect("enable takeover");
+        service
+            .stop_with_restore_explicit(false)
+            .await
+            .expect("explicit global off");
+        assert!(service.startup_codex_launch_cancelled.load(Ordering::SeqCst));
+        assert!(service.startup_global_recovery_is_superseded());
+        assert!(!service.is_running().await);
+        assert!(!service.get_takeover_status().await.expect("status").claude);
+        assert_eq!(service.read_claude_live().expect("restored live"), original);
+        assert_eq!(*service.suspended_takeover_apps.lock().await, vec!["claude"]);
+
+        service.stop_with_restore().await.expect("repeated global off");
+        assert_eq!(*service.suspended_takeover_apps.lock().await, vec!["claude"]);
+
+        service
+            .start_with_deferred_codex_relaunch(false)
+            .await
+            .expect("explicit global on");
+        assert!(service.is_running().await);
+        assert!(service.get_takeover_status().await.expect("status").claude);
+        assert!(service.detect_takeover_in_live_config_for_app(&AppType::Claude));
+        assert!(service.suspended_takeover_apps.lock().await.is_empty());
+        service.stop_with_restore().await.expect("cleanup listener");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn failed_global_on_keeps_suspended_route_for_retry() {
+        let _home = TempHome::new();
+        crate::settings::reload_settings().expect("reload settings");
+        let db = Arc::new(Database::memory().expect("init db"));
+        use_ephemeral_proxy_port(&db).await;
+        let service = ProxyService::new(db.clone());
+        let provider = Provider::with_id(
+            "p1".to_string(),
+            "P1".to_string(),
+            json!({"env": {"ANTHROPIC_API_KEY": "provider-key", "ANTHROPIC_BASE_URL": "https://api.anthropic.com"}}),
+            None,
+        );
+        db.save_provider("claude", &provider).expect("save provider");
+        db.set_current_provider("claude", "p1")
+            .expect("set current provider");
+        crate::settings::set_current_provider(&AppType::Claude, Some("p1"))
+            .expect("set local current provider");
+        let original = json!({"env": {"ANTHROPIC_API_KEY": "live-key", "ANTHROPIC_BASE_URL": "https://api.anthropic.com"}});
+        service.write_claude_live(&original).expect("seed live config");
+        service.set_takeover_for_app("claude", true).await.expect("takeover");
+        service.stop_with_restore().await.expect("global off");
+        std::fs::remove_file(get_claude_settings_path()).expect("remove live config");
+
+        assert!(service.start_with_deferred_codex_relaunch(false).await.is_err());
+        assert!(!service.is_running().await, "failed reapply must roll back listener");
+        assert_eq!(*service.suspended_takeover_apps.lock().await, vec!["claude"]);
+
+        service.write_claude_live(&original).expect("repair live config");
+        service
+            .start_with_deferred_codex_relaunch(false)
+            .await
+            .expect("retry global on");
+        assert!(service.get_takeover_status().await.expect("status").claude);
+        service.stop_with_restore().await.expect("cleanup listener");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn explicit_off_does_not_restore_routes_after_service_recreation() {
+        let _home = TempHome::new();
+        crate::settings::reload_settings().expect("reload settings");
+        let db = Arc::new(Database::memory().expect("init db"));
+        use_ephemeral_proxy_port(&db).await;
+        let service = ProxyService::new(db.clone());
+        let provider = Provider::with_id(
+            "p1".to_string(),
+            "P1".to_string(),
+            json!({"env": {"ANTHROPIC_API_KEY": "provider-key", "ANTHROPIC_BASE_URL": "https://api.anthropic.com"}}),
+            None,
+        );
+        db.save_provider("claude", &provider).expect("save provider");
+        db.set_current_provider("claude", "p1")
+            .expect("set current provider");
+        crate::settings::set_current_provider(&AppType::Claude, Some("p1"))
+            .expect("set local current provider");
+        service
+            .write_claude_live(&json!({"env": {"ANTHROPIC_API_KEY": "live-key", "ANTHROPIC_BASE_URL": "https://api.anthropic.com"}}))
+            .expect("seed live config");
+        service.set_takeover_for_app("claude", true).await.expect("takeover");
+        service.stop_with_restore().await.expect("explicit off");
+
+        let restarted = ProxyService::new(db.clone());
+        assert!(restarted.suspended_takeover_apps.lock().await.is_empty());
+        assert!(!db.get_proxy_config_for_app("claude").await.expect("config").enabled);
+        assert!(!db.get_global_proxy_config().await.expect("global config").proxy_enabled);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn per_app_action_clears_suspended_global_route() {
+        let _home = TempHome::new();
+        crate::settings::reload_settings().expect("reload settings");
+        let db = Arc::new(Database::memory().expect("init db"));
+        let service = ProxyService::new(db);
+        service.suspended_takeover_apps.lock().await.push("claude");
+
+        service
+            .set_takeover_for_app("claude", false)
+            .await
+            .expect("explicit per-app off");
+
+        assert!(service.suspended_takeover_apps.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    #[serial]
     async fn global_stop_waits_for_app_lock_before_taking_lifecycle_lock() {
         let _home = TempHome::new();
         crate::settings::reload_settings().expect("reload settings");
@@ -6096,6 +6485,74 @@ mod tests {
         assert!(!service.take_deferred_codex_relaunch());
     }
 
+    #[test]
+    fn explicit_proxy_on_launch_policy_covers_absent_desktop_and_opt_out() {
+        use super::should_launch_codex_after_explicit_proxy_start as should_launch;
+
+        assert!(should_launch(true, true, false));
+        assert!(should_launch(true, false, true));
+        assert!(!should_launch(true, false, false));
+        assert!(!should_launch(false, true, true));
+    }
+
+    #[test]
+    fn explicit_global_off_preserves_relaunch_intent_when_stop_count_is_zero() {
+        use super::should_defer_codex_relaunch_after_explicit_stop as should_defer;
+
+        assert!(should_defer(true, 0));
+        assert!(should_defer(true, 1));
+        assert!(!should_defer(false, 0));
+        assert!(should_defer(false, 1));
+    }
+
+    #[test]
+    fn codex_routing_activation_uses_one_default_for_missing_enabled_flag() {
+        let active_without_flag = serde_json::json!({
+            "routes": [{"id": "route-1"}]
+        });
+        let disabled_with_routes = serde_json::json!({
+            "enabled": false,
+            "routes": [{"id": "route-1"}]
+        });
+        let enabled_without_routes = serde_json::json!({
+            "enabled": true,
+            "routes": []
+        });
+
+        assert!(crate::provider::codex_routing_has_enabled_routes(Some(
+            &active_without_flag
+        )));
+        assert!(!crate::provider::codex_routing_has_enabled_routes(Some(
+            &disabled_with_routes
+        )));
+        assert!(!crate::provider::codex_routing_has_enabled_routes(Some(
+            &enabled_without_routes
+        )));
+        assert!(!crate::provider::codex_routing_has_enabled_routes(None));
+    }
+
+    #[test]
+    fn explicit_codex_takeover_launch_policy_preserves_default_and_retry_intent() {
+        use super::should_launch_codex_after_explicit_takeover as should_launch;
+
+        assert!(should_launch(true, 0, true, false));
+        assert!(should_launch(true, 0, false, true));
+        assert!(should_launch(true, 1, false, false));
+        assert!(!should_launch(true, 0, false, false));
+        assert!(!should_launch(false, 1, true, true));
+    }
+
+    #[test]
+    fn startup_launch_policy_requires_an_authorized_live_proxy() {
+        use super::should_launch_codex_at_startup as should_launch;
+
+        assert!(should_launch(true, true, true, false, false));
+        assert!(should_launch(true, true, false, true, true));
+        assert!(!should_launch(false, true, true, true, true));
+        assert!(!should_launch(true, false, true, true, true));
+        assert!(!should_launch(true, true, false, true, false));
+    }
+
     #[tokio::test]
     #[serial]
     async fn startup_codex_launch_boundary_rejects_disabled_global_switch() {
@@ -6105,7 +6562,7 @@ mod tests {
         let service = ProxyService::new(db.clone());
 
         let result = service
-            .launch_codex_desktop_if_global_proxy_enabled()
+            .launch_codex_desktop_at_startup(true, false, false)
             .await
             .expect("disabled startup launch should be a normal no-op");
 
@@ -6116,6 +6573,146 @@ mod tests {
                 .expect("read global proxy config")
                 .proxy_enabled,
             "the launch boundary must not turn the global switch back on"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn explicit_proxy_off_cancels_normal_startup_codex_launch() {
+        let _home = TempHome::new();
+        crate::settings::reload_settings().expect("reload settings");
+        let db = Arc::new(Database::memory().expect("init db"));
+        let service = ProxyService::new(db);
+
+        service.cancel_startup_codex_launch();
+
+        let result = service
+            .launch_codex_desktop_at_startup(false, false, false)
+            .await
+            .expect("cancelled startup launch should be a normal no-op");
+
+        assert_eq!(result, None);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn startup_recovery_rechecks_route_after_waiting_for_lifecycle_lock() {
+        let _home = TempHome::new();
+        crate::settings::reload_settings().expect("reload settings");
+        let db = Arc::new(Database::memory().expect("init db"));
+        let service = ProxyService::new(db.clone());
+        let mut global = db.get_global_proxy_config().await.expect("global config");
+        global.proxy_enabled = true;
+        db.update_global_proxy_config(global).await.expect("enable proxy");
+        let mut codex = db.get_proxy_config_for_app("codex").await.expect("codex config");
+        codex.enabled = true;
+        db.update_proxy_config_for_app(codex.clone()).await.expect("enable route");
+
+        let guard = service.lifecycle_lock.lock().await;
+        let called = Arc::new(AtomicBool::new(false));
+        let called_in_stop = called.clone();
+        let startup = service.clone();
+        let prepare = tokio::spawn(async move {
+            startup
+                .prepare_codex_desktop_for_startup_recovery_with(false, || {
+                    called_in_stop.store(true, Ordering::SeqCst);
+                    Ok(1)
+                })
+                .await
+        });
+        codex.enabled = false;
+        db.update_proxy_config_for_app(codex).await.expect("disable route");
+        drop(guard);
+
+        assert_eq!(prepare.await.expect("join prepare").expect("prepare"), 0);
+        assert!(!called.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn explicit_off_on_does_not_revive_superseded_startup_recovery() {
+        let _home = TempHome::new();
+        crate::settings::reload_settings().expect("reload settings");
+        let db = Arc::new(Database::memory().expect("init db"));
+        let service = ProxyService::new(db);
+        service.cancel_startup_codex_launch();
+        // Explicit on reauthorizes manual runtime operations, not the old startup task.
+        service.startup_codex_launch_cancelled.store(false, Ordering::SeqCst);
+
+        assert!(service.startup_recovery_is_superseded());
+        assert!(!service.startup_global_recovery_is_superseded());
+        let result = service
+            .prepare_codex_desktop_for_startup_recovery_with(true, || {
+                panic!("superseded startup must not stop Codex Desktop")
+            })
+            .await
+            .expect("superseded startup is a no-op");
+        assert_eq!(result, 0);
+        assert_eq!(
+            service
+                .launch_codex_desktop_at_startup(false, false, false)
+                .await
+                .unwrap(),
+            None
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn explicit_proxy_off_cancels_pending_provider_switch_relaunch() {
+        let _home = TempHome::new();
+        crate::settings::reload_settings().expect("reload settings");
+        let db = Arc::new(Database::memory().expect("init db"));
+        let service = ProxyService::new(db);
+        service.cancel_startup_codex_launch();
+
+        let _switch_guard = service.lock_switch_for_app("codex").await;
+        let _lifecycle_guard = service.lock_codex_lifecycle().await;
+        service
+            .relaunch_codex_after_provider_switch_locked()
+            .await
+            .expect("provider switch must not relaunch after explicit off");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn per_app_codex_off_discards_deferred_relaunch_intent() {
+        let _home = TempHome::new();
+        crate::settings::reload_settings().expect("reload settings");
+        let db = Arc::new(Database::memory().expect("init db"));
+        let service = ProxyService::new(db);
+        service.defer_codex_relaunch_until_proxy_start();
+
+        service
+            .set_codex_takeover_explicit(false, false)
+            .await
+            .expect("disable codex takeover");
+
+        assert!(service.startup_codex_launch_cancelled.load(Ordering::SeqCst));
+        assert!(!service.deferred_codex_relaunch.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn runtime_refresh_uses_proxy_off_lifecycle_boundary() {
+        let _home = TempHome::new();
+        crate::settings::reload_settings().expect("reload settings");
+        let db = Arc::new(Database::memory().expect("init db"));
+        let service = ProxyService::new(db);
+        let guards = service
+            .lock_codex_runtime_refresh()
+            .await
+            .expect("begin refresh");
+        let stop_service = service.clone();
+        let stop = tokio::spawn(async move { stop_service.stop_with_restore_explicit(false).await });
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert!(!stop.is_finished(), "proxy off must wait for refresh transaction");
+
+        drop(guards);
+        stop.await.expect("join stop").expect("stop proxy");
+        assert_eq!(
+            service.lock_codex_runtime_refresh().await.err().as_deref(),
+            Some("codex_runtime_refresh_cancelled_by_proxy_off")
         );
     }
 
@@ -10135,6 +10732,19 @@ requires_openai_auth = true
         let db = Arc::new(Database::memory().expect("init db"));
         let state = crate::store::AppState::new(db.clone());
         tauri::async_runtime::block_on(use_ephemeral_proxy_port(&db));
+        // Provider synchronization must never enable a global proxy the user
+        // turned off; the local-routing precondition is stated explicitly here
+        // instead of relying on the old implicit auto-enable side effect.
+        tauri::async_runtime::block_on(async {
+            let mut global = db
+                .get_global_proxy_config()
+                .await
+                .expect("get global proxy config");
+            global.proxy_enabled = true;
+            db.update_global_proxy_config(global)
+                .await
+                .expect("enable global proxy");
+        });
 
         let openai_config = r#"model_provider = "openai"
 model = "gpt-5.4-mini"
@@ -11567,6 +12177,32 @@ requires_openai_auth = true
                 .await
                 .expect("read enabled state")
                 .enabled
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn stop_keep_state_preserves_global_switch_without_listener() {
+        let _home = TempHome::new();
+        crate::settings::reload_settings().expect("reload settings");
+        let db = Arc::new(Database::memory().expect("init db"));
+        let mut global = db.get_global_proxy_config().await.expect("read global config");
+        global.proxy_enabled = true;
+        db.update_global_proxy_config(global)
+            .await
+            .expect("enable global proxy");
+        let service = ProxyService::new(db.clone());
+
+        service
+            .stop_with_restore_keep_state()
+            .await
+            .expect("keep-state stop should not disable global proxy");
+
+        assert!(
+            db.get_global_proxy_config()
+                .await
+                .expect("read global state")
+                .proxy_enabled
         );
     }
 

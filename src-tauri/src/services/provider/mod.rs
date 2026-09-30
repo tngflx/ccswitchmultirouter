@@ -2532,6 +2532,15 @@ command = "legacy-cmd"
             .await
             .expect("use ephemeral proxy port");
 
+        let mut global_proxy_config = db
+            .get_global_proxy_config()
+            .await
+            .expect("get global proxy config");
+        global_proxy_config.proxy_enabled = true;
+        db.update_global_proxy_config(global_proxy_config)
+            .await
+            .expect("enable global proxy");
+
         let current_config = r#"model_provider = "openai"
 model = "gpt-5.4-mini"
 
@@ -2622,6 +2631,93 @@ wire_api = "responses"
 
     #[tokio::test]
     #[serial]
+    async fn switching_codex_chat_provider_does_not_revive_disabled_global_proxy() {
+        let _home = TempHome::new();
+        crate::settings::reload_settings().expect("reload settings");
+
+        let db = Arc::new(Database::memory().expect("init db"));
+        let state = AppState::new(db.clone());
+        let mut proxy_config = db.get_proxy_config().await.expect("get proxy config");
+        proxy_config.listen_port = 0;
+        db.update_proxy_config(proxy_config)
+            .await
+            .expect("use ephemeral proxy port");
+
+        let current_config = r#"model_provider = "openai"
+model = "gpt-5.4-mini"
+
+[model_providers.openai]
+name = "OpenAI"
+base_url = "https://api.openai.com/v1"
+wire_api = "responses"
+"#;
+        crate::codex_config::write_codex_live_atomic(
+            &json!({ "OPENAI_API_KEY": "old-openai-key" }),
+            Some(current_config),
+        )
+        .expect("seed Codex live config");
+
+        let current = Provider::with_id(
+            "openai".to_string(),
+            "OpenAI".to_string(),
+            json!({
+                "auth": { "OPENAI_API_KEY": "old-openai-key" },
+                "config": current_config,
+            }),
+            None,
+        );
+        let mut deepseek = Provider::with_id(
+            "deepseek".to_string(),
+            "DeepSeek".to_string(),
+            json!({
+                "auth": { "OPENAI_API_KEY": "deepseek-key" },
+                "config": r#"model_provider = "deepseek"
+model = "deepseek-chat"
+
+[model_providers.deepseek]
+name = "DeepSeek"
+base_url = "https://api.deepseek.com"
+wire_api = "responses"
+"#,
+            }),
+            None,
+        );
+        deepseek.category = Some("custom".to_string());
+
+        db.save_provider("codex", &current)
+            .expect("save current provider");
+        db.save_provider("codex", &deepseek)
+            .expect("save DeepSeek provider");
+        db.set_current_provider("codex", "openai")
+            .expect("set current provider");
+        crate::settings::set_current_provider(&AppType::Codex, Some("openai"))
+            .expect("set local current provider");
+
+        let error = ProviderService::switch(&state, AppType::Codex, "deepseek")
+            .expect_err("a provider switch must not enable a disabled global proxy");
+        assert!(error
+            .to_string()
+            .contains("全局代理已关闭"), "unexpected error: {error}");
+        assert!(!db
+            .get_global_proxy_config()
+            .await
+            .expect("read global proxy config")
+            .proxy_enabled);
+        assert!(!db
+            .get_proxy_config_for_app("codex")
+            .await
+            .expect("read Codex proxy config")
+            .enabled);
+        assert!(!state.proxy_service.is_running().await);
+        assert_eq!(
+            std::fs::read_to_string(crate::codex_config::get_codex_config_path())
+                .expect("read unchanged Codex live config"),
+            current_config
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
     async fn switching_codex_router_provider_auto_enables_dedicated_local_takeover() {
         let _home = TempHome::new();
         crate::settings::reload_settings().expect("reload settings");
@@ -2667,6 +2763,16 @@ wire_api = "responses"
         db.update_proxy_config(proxy_config)
             .await
             .expect("use ephemeral proxy port");
+        // A provider switch must never turn a user-disabled global proxy back
+        // on, so the local-routing precondition is set up explicitly here.
+        let mut global_proxy_config = db
+            .get_global_proxy_config()
+            .await
+            .expect("get global proxy config");
+        global_proxy_config.proxy_enabled = true;
+        db.update_global_proxy_config(global_proxy_config)
+            .await
+            .expect("enable global proxy");
 
         let current_config = r#"model_provider = "openai"
 model = "gpt-5.4-mini"
@@ -3113,6 +3219,16 @@ experimental_bearer_token = "PROXY_MANAGED"
             db.update_proxy_config(proxy_config)
                 .await
                 .expect("use ephemeral proxy port");
+            // A provider switch must never turn a user-disabled global proxy
+            // back on, so the local-routing precondition is explicit here.
+            let mut global = db
+                .get_global_proxy_config()
+                .await
+                .expect("get global proxy config");
+            global.proxy_enabled = true;
+            db.update_global_proxy_config(global)
+                .await
+                .expect("enable global proxy");
         });
 
         let current_config = r#"model_provider = "openai"
@@ -4362,21 +4478,7 @@ impl ProviderService {
             return true;
         }
 
-        let Some(routing) = provider.settings_config.get("codexRouting") else {
-            return false;
-        };
-
-        let enabled = routing
-            .get("enabled")
-            .and_then(|value| value.as_bool())
-            .unwrap_or(false);
-        let has_routes = routing
-            .get("routes")
-            .and_then(|value| value.as_array())
-            .map(|routes| !routes.is_empty())
-            .unwrap_or(false);
-
-        enabled || has_routes
+        crate::provider::codex_settings_has_enabled_routes(&provider.settings_config)
     }
 
     /// List all providers for an app type
@@ -4834,30 +4936,22 @@ impl ProviderService {
         if *app_type != AppType::Codex {
             return Ok(());
         }
-        let Some(routing) = provider
-            .settings_config
-            .get("codexRouting")
-            .and_then(Value::as_object)
-        else {
+        let Some(routing) = provider.settings_config.get("codexRouting") else {
             return Ok(());
         };
-        let enabled = routing
-            .get("enabled")
-            .and_then(Value::as_bool)
-            .unwrap_or(true);
-        let has_routes = routing
-            .get("routes")
-            .and_then(Value::as_array)
-            .is_some_and(|routes| !routes.is_empty());
-        if !enabled && !has_routes {
+        if !crate::provider::codex_settings_has_enabled_routes(&provider.settings_config) {
             return Ok(());
         }
-        if routing.get("schemaVersion").and_then(Value::as_u64) == Some(2) {
-            return Ok(());
+        match crate::codex_multirouter::schema::CodexRoutingDocument::parse(routing) {
+            Ok(crate::codex_multirouter::schema::CodexRoutingDocument::V2(_)) => Ok(()),
+            Ok(crate::codex_multirouter::schema::CodexRoutingDocument::Legacy(_)) => Err(
+                AppError::Message("codex_multirouter_migration_required".to_string()),
+            ),
+            Err(error) => Err(AppError::Message(format!(
+                "codex_multirouter_{}: {}",
+                error.code, error.message
+            ))),
         }
-        Err(AppError::Message(
-            "codex_multirouter_migration_required".to_string(),
-        ))
     }
 
     fn refresh_codex_multirouter_projection_after_activation(
@@ -5265,7 +5359,43 @@ impl ProviderService {
     /// After the provider switch succeeds, keep the active project snapshot in
     /// sync so Codex projection ownership cannot be shadowed by a stale profile.
     pub fn switch(state: &AppState, app_type: AppType, id: &str) -> Result<SwitchResult, AppError> {
-        let mut result = Self::switch_inner(state, app_type.clone(), id)?;
+        let _switch_guard = if matches!(
+            app_type,
+            AppType::Claude | AppType::Codex | AppType::Gemini | AppType::GrokBuild
+        ) {
+            Some(block_on_tauri_runtime(
+                state.proxy_service.lock_switch_for_app(app_type.as_str()),
+            ))
+        } else {
+            None
+        };
+        Self::switch_locked(state, app_type, id)
+    }
+
+    /// Switch a provider while the caller already owns the app switch lock.
+    ///
+    /// The Codex desktop restart command uses this to keep stop, provider
+    /// mutation, and relaunch in one lifecycle transaction. Callers that do
+    /// not own the lock must use [`Self::switch`].
+    pub(crate) fn switch_locked(
+        state: &AppState,
+        app_type: AppType,
+        id: &str,
+    ) -> Result<SwitchResult, AppError> {
+        Self::switch_locked_with_lifecycle(state, app_type, id, false)
+    }
+
+    /// Switch while the caller owns both the app switch lock and the Codex
+    /// lifecycle lock. Provider-specific takeover helpers must use their
+    /// lock-assuming start/stop variants in this mode or they deadlock trying
+    /// to reacquire the lifecycle mutex.
+    pub(crate) fn switch_locked_with_lifecycle(
+        state: &AppState,
+        app_type: AppType,
+        id: &str,
+        lifecycle_lock_held: bool,
+    ) -> Result<SwitchResult, AppError> {
+        let mut result = Self::switch_inner(state, app_type.clone(), id, lifecycle_lock_held)?;
         if let Err(error) = Self::sync_active_profile_provider_snapshot(state, &app_type, id) {
             log::warn!("供应商切换成功，但当前项目快照同步失败: {error}");
             result
@@ -5279,6 +5409,7 @@ impl ProviderService {
         state: &AppState,
         app_type: AppType,
         id: &str,
+        lifecycle_lock_held: bool,
     ) -> Result<SwitchResult, AppError> {
         // Check if provider exists
         let providers = state.db.get_all_providers(app_type.as_str())?;
@@ -5302,21 +5433,6 @@ impl ProviderService {
         if matches!(app_type, AppType::ClaudeDesktop) {
             return Self::switch_normal(state, app_type, id, &providers);
         }
-
-        // Provider switches and takeover toggles both mutate live config and the
-        // restore backup. Serialize them per app, then decide from the locked
-        // current state so a just-started takeover cannot be overwritten by a
-        // normal live write.
-        let _switch_guard = if matches!(
-            app_type,
-            AppType::Claude | AppType::Codex | AppType::Gemini | AppType::GrokBuild
-        ) {
-            Some(block_on_tauri_runtime(
-                state.proxy_service.lock_switch_for_app(app_type.as_str()),
-            ))
-        } else {
-            None
-        };
 
         // Backup or live placeholders mean the live file is owned by proxy
         // takeover, even if the proxy server is temporarily stopped or is in the
@@ -5349,7 +5465,7 @@ impl ProviderService {
             block_on_tauri_runtime(
                 state
                     .proxy_service
-                    .disable_takeover_for_app_after_switch_lock(&app_type),
+                    .disable_takeover_for_app_after_switch_lock(&app_type, lifecycle_lock_held),
             )
             .map_err(|e| AppError::Message(format!("关闭代理接管失败: {e}")))?;
 
@@ -5375,7 +5491,11 @@ impl ProviderService {
             block_on_tauri_runtime(
                 state
                     .proxy_service
-                    .takeover_app_and_switch_provider_after_switch_lock(&app_type, id),
+                    .takeover_app_and_switch_provider_after_switch_lock(
+                        &app_type,
+                        id,
+                        lifecycle_lock_held,
+                    ),
             )
             .map_err(|e| AppError::Message(format!("启用 Codex 本地代理接管失败: {e}")))?;
 

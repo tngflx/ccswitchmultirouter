@@ -536,9 +536,9 @@ pub struct AppSettings {
     pub watchdog_enabled: bool,
     /// 是否在 CCSwitchMulti 启动后启动 Codex Desktop。
     ///
-    /// 这是独立于系统开机自启的显式选择：仅开启 `launch_on_startup`
-    /// 绝不会拉起 Codex Desktop。
-    #[serde(default)]
+    /// 默认开启，并独立于系统开机自启；用户可以关闭它以保持 Codex
+    /// Desktop 关闭。仅开启 `launch_on_startup` 不会改变此开关。
+    #[serde(default = "default_launch_codex_desktop_with_ccswitch")]
     pub launch_codex_desktop_with_ccswitch: bool,
     /// 静默启动（程序启动时不显示主窗口，仅托盘运行）
     #[serde(default)]
@@ -712,6 +712,10 @@ fn default_watchdog_enabled() -> bool {
     true
 }
 
+fn default_launch_codex_desktop_with_ccswitch() -> bool {
+    true
+}
+
 fn default_session_auto_sync_enabled() -> bool {
     true
 }
@@ -735,7 +739,7 @@ impl Default for AppSettings {
             skip_claude_onboarding: false,
             launch_on_startup: false,
             watchdog_enabled: default_watchdog_enabled(),
-            launch_codex_desktop_with_ccswitch: false,
+            launch_codex_desktop_with_ccswitch: default_launch_codex_desktop_with_ccswitch(),
             silent_startup: false,
             enable_local_proxy: false,
             proxy_confirmed: None,
@@ -1534,20 +1538,23 @@ mod tests {
     }
 
     #[test]
-    fn codex_desktop_startup_is_opt_in_and_independent_from_auto_launch() {
+    fn codex_desktop_startup_is_on_by_default_and_independent_from_auto_launch() {
         let defaults = AppSettings::default();
         assert!(!defaults.launch_on_startup);
-        assert!(!defaults.launch_codex_desktop_with_ccswitch);
+        assert!(defaults.launch_codex_desktop_with_ccswitch);
 
         let decoded: AppSettings = serde_json::from_value(serde_json::json!({
             "launchOnStartup": true,
         }))
         .expect("legacy settings remain readable");
         assert!(decoded.launch_on_startup);
-        assert!(
-            !decoded.launch_codex_desktop_with_ccswitch,
-            "enabling CCSwitchMulti auto-launch must not implicitly start Codex Desktop"
-        );
+        assert!(decoded.launch_codex_desktop_with_ccswitch);
+
+        let explicitly_disabled: AppSettings = serde_json::from_value(serde_json::json!({
+            "launchCodexDesktopWithCcswitch": false,
+        }))
+        .expect("explicit opt-out remains readable");
+        assert!(!explicitly_disabled.launch_codex_desktop_with_ccswitch);
     }
 
     #[test]

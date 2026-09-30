@@ -626,6 +626,7 @@ type ProxyListenDraftValidation =
 
 type CodexCatalogModelDraft = {
   model: string;
+  enabled?: boolean;
   upstreamModel?: string;
   upstream_model?: string;
   displayName?: string;
@@ -1085,6 +1086,9 @@ export function providerWithFetchedModelCatalog(
       model: id,
       upstreamModel: id,
       displayName: id,
+      // A provider refresh discovers inventory, not user-approved catalog
+      // membership. Keep new rows excluded until the user opts them in.
+      enabled: false,
       ...(contextWindow ? { contextWindow } : {}),
       ...(fetched.inputModalities && fetched.inputModalities.length > 0
         ? {

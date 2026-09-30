@@ -607,8 +607,9 @@ impl CodexRuntimeRefreshOperations for SystemCodexRuntimeRefreshOperations<'_> {
                 .actual_fingerprint
                 .clone()
                 .ok_or_else(|| "codex_config_consistency_actual_fingerprint_missing".to_string())?;
-            crate::codex_config_consistency::resolve(
+            crate::codex_config_consistency::resolve_from_report(
                 self.state,
+                consistency,
                 expected,
                 CodexConfigConsistencyAction::ApplyCcsm,
             )
@@ -662,6 +663,7 @@ pub async fn refresh_codex_runtime_state(
     let _refresh_guard = CODEX_RUNTIME_REFRESH_LOCK
         .try_lock()
         .map_err(|_| "codex_runtime_refresh_already_running".to_string())?;
+    let _proxy_lifecycle_guards = state.proxy_service.lock_codex_runtime_refresh().await?;
     let launch_target = resolve_launch_target()?
         .ok_or_else(|| "codex_desktop_launch_target_not_found".to_string())?;
     let mut operations = SystemCodexRuntimeRefreshOperations {

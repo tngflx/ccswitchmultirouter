@@ -82,6 +82,7 @@ import {
   mergeFetchedModelsIntoWizardProvider,
   readWizardCodexOAuthAccountId,
   readWizardModelCatalog,
+  readRawWizardModelCatalog,
   readWizardProviderBaseUrl,
   resolveWizardModelNameCollisions,
   skippedWizardConnectivityResult,
@@ -532,6 +533,75 @@ function modelCatalogSignature(model: CodexCatalogModel): string {
   });
 }
 
+// Parent query snapshots can lag a refresh performed inside the wizard. Keep
+// the parent as the source for provider metadata, but merge catalog rows so a
+// stale snapshot cannot discard locally discovered models or user exclusions.
+function mergeWizardDraftProviderSnapshot(
+  current: Provider | undefined,
+  parent: Provider,
+): Provider {
+  if (!current) return parent;
+  const currentModels = readRawWizardModelCatalog(current);
+  const parentModels = readRawWizardModelCatalog(parent);
+  const currentByIdentity = new Map(
+    currentModels.map((model) => [
+      `${model.model.trim().toLowerCase()}\u0000${(
+        model.upstreamModel ?? model.upstream_model ?? model.model
+      )
+        .trim()
+        .toLowerCase()}`,
+      model,
+    ]),
+  );
+  const parentKeys = new Set(
+    parentModels.map(
+      (model) =>
+        `${model.model.trim().toLowerCase()}\u0000${(
+          model.upstreamModel ?? model.upstream_model ?? model.model
+        )
+          .trim()
+          .toLowerCase()}`,
+    ),
+  );
+  const mergedModels = [
+    ...parentModels.map((model) => {
+      const key = `${model.model.trim().toLowerCase()}\u0000${(
+        model.upstreamModel ?? model.upstream_model ?? model.model
+      )
+        .trim()
+        .toLowerCase()}`;
+      const draftModel = currentByIdentity.get(key);
+      return draftModel?.enabled === undefined
+        ? model
+        : { ...model, enabled: draftModel.enabled };
+    }),
+    ...currentModels.filter((model) => {
+      const key = `${model.model.trim().toLowerCase()}\u0000${(
+        model.upstreamModel ?? model.upstream_model ?? model.model
+      )
+        .trim()
+        .toLowerCase()}`;
+      return !parentKeys.has(key);
+    }),
+  ];
+  const currentSpawnAgentModels = current.settingsConfig?.modelCatalog
+    ?.spawnAgentModels;
+  const parentCatalog = parent.settingsConfig?.modelCatalog ?? {};
+  return {
+    ...parent,
+    settingsConfig: {
+      ...parent.settingsConfig,
+      modelCatalog: {
+        ...parentCatalog,
+        models: mergedModels,
+        ...(Array.isArray(currentSpawnAgentModels)
+          ? { spawnAgentModels: currentSpawnAgentModels }
+          : {}),
+      },
+    },
+  };
+}
+
 // 比较刷新前后的目录，用于在 provider 卡片上标注“有更新/无更新”。
 function diffWizardModelCatalog(
   beforeModels: CodexCatalogModel[],
@@ -771,7 +841,11 @@ function resolveActiveCatalogModelOrder(
   draftOrder: string[] | null,
 ) {
   const availableNames = availableModels.map((model) => model.model);
-  if (draftOrder === null) return availableNames;
+  if (draftOrder === null) {
+    return availableModels
+      .filter((model) => model.enabled !== false)
+      .map((model) => model.model);
+  }
   const availableSet = new Set(availableNames);
   return draftOrder.filter((model) => availableSet.has(model));
 }
@@ -788,17 +862,14 @@ function resolveActiveSpawnAgentModels(
 // 刷新模型列表后保留用户已经勾选的模型，只把真正新增的模型追加进去。
 function reconcileCatalogModelOrderAfterFetch(
   currentOrder: string[] | null,
-  previousAvailableModels: string[],
   nextAvailableModels: string[],
 ) {
   if (currentOrder === null) return null;
   const nextAvailableSet = new Set(nextAvailableModels);
-  const previousAvailableSet = new Set(previousAvailableModels);
-  const retained = currentOrder.filter((model) => nextAvailableSet.has(model));
-  const added = nextAvailableModels.filter(
-    (model) => !previousAvailableSet.has(model),
-  );
-  return [...retained, ...added];
+  // A non-null order is an explicit user selection. Refreshes may add
+  // inventory, but they must never implicitly add that inventory to the
+  // included route; the picker exposes new rows as disabled until selected.
+  return currentOrder.filter((model) => nextAvailableSet.has(model));
 }
 
 export function CodexMultiRouterWizard({
@@ -856,6 +927,7 @@ export function CodexMultiRouterWizard({
   const [isLoadingMigration, setIsLoadingMigration] = useState(false);
   const [isApplyingMigration, setIsApplyingMigration] = useState(false);
   const initializedOpenRef = useRef(false);
+  const lastParentSourceSignaturesRef = useRef<Map<string, string>>(new Map());
   const createPlanIdRef = useRef<string | null>(null);
   const saveInFlightRef = useRef<Promise<void> | null>(null);
 
@@ -920,8 +992,17 @@ export function CodexMultiRouterWizard({
     draftSources,
     connectivityResults,
   );
+  // The picker must show disabled catalog tombstones so the user can
+  // explicitly re-enable a newly discovered or previously excluded model.
+  // Runtime projections below continue to use the default enabled-only view.
+  const selectionResolvedSources = resolveWizardModelNameCollisions(
+    routeReadySources,
+    [],
+    { includeDisabled: true },
+  );
   const availableCatalogModels = buildWizardModelCatalog(
-    resolveWizardModelNameCollisions(routeReadySources),
+    selectionResolvedSources,
+    { includeDisabled: true },
   ).models;
   const activeCatalogModelOrder = resolveActiveCatalogModelOrder(
     availableCatalogModels,
@@ -1034,6 +1115,12 @@ export function CodexMultiRouterWizard({
         initialSourceIdSet.has(provider.id),
       ),
     );
+    lastParentSourceSignaturesRef.current = new Map(
+      providerModelSources.map((provider) => [
+        provider.id,
+        JSON.stringify(provider),
+      ]),
+    );
     setSelectedSourceIds(initialSourceIds);
     setDraftPlanName(existingPlan?.name ?? CODEX_MULTI_ROUTER_DEFAULT_NAME);
     setDraftOfficialAuth(
@@ -1076,21 +1163,46 @@ export function CodexMultiRouterWizard({
     });
   }, [existingPlan, open, planId, providerModelSources, resolvedMode]);
 
-  // Provider 是模型事实的唯一来源。向导打开期间也必须采用父层查询的最新快照，
-  // 否则 Provider 新增模型、上下文或能力变化只会在关闭并重开向导后出现。
-  // 向导自己的协议探测结果保存在 connectivityResults，模型刷新又会先持久化 Provider，
-  // 因此这里不需要为完整 Provider 对象维护第二份长期草稿。
+  // Provider 是模型事实的唯一来源，但 parent query 可能短暂落后于向导内
+  // 的刷新请求。只有检测到真实 parent 变化时才同步，并保留草稿的模型选择。
   useEffect(() => {
     if (!open || !initializedOpenRef.current) return;
     setSavedPlan((currentPlan) => existingPlan ?? currentPlan);
-    setDraftSources(() => {
-      const nextSourceById = new Map(
-        providerModelSources.map((provider) => [provider.id, provider]),
+    const nextParentSourceSignatures = new Map(
+      providerModelSources.map((provider) => [
+        provider.id,
+        JSON.stringify(provider),
+      ]),
+    );
+    const parentSourcesChanged =
+      nextParentSourceSignatures.size !==
+        lastParentSourceSignaturesRef.current.size ||
+      Array.from(nextParentSourceSignatures).some(
+        ([providerId, signature]) =>
+          lastParentSourceSignaturesRef.current.get(providerId) !== signature,
       );
-      return selectedSourceIds
-        .map((providerId) => nextSourceById.get(providerId))
-        .filter((provider): provider is Provider => Boolean(provider));
-    });
+    if (parentSourcesChanged) {
+      setDraftSources((currentSources) => {
+        const currentById = new Map(
+          currentSources.map((provider) => [provider.id, provider]),
+        );
+        const nextSourceById = new Map(
+          providerModelSources.map((provider) => [provider.id, provider]),
+        );
+        return selectedSourceIds
+          .map((providerId) => {
+            const parent = nextSourceById.get(providerId);
+            return parent
+              ? mergeWizardDraftProviderSnapshot(
+                  currentById.get(providerId),
+                  parent,
+                )
+              : undefined;
+          })
+          .filter((provider): provider is Provider => Boolean(provider));
+      });
+    }
+    lastParentSourceSignaturesRef.current = nextParentSourceSignatures;
     setSelectedSourceIds((currentIds) => {
       const nextIds = currentIds.filter((providerId) =>
         providerModelSources.some((provider) => provider.id === providerId),
@@ -1147,16 +1259,81 @@ export function CodexMultiRouterWizard({
   };
 
   // 切换最终模型池里的保留状态；第一次编辑时从当前完整列表复制一份显式顺序。
-  const toggleCatalogModel = (model: string, checked: boolean) => {
+  const toggleCatalogModel = (model: CodexCatalogModel, checked: boolean) => {
+    const targetModel = model.model.trim().toLowerCase();
+    const targetUpstream = (
+      model.upstreamModel ??
+      model.upstream_model ??
+      model.model
+    )
+      .trim()
+      .toLowerCase();
+    const matchingProviderIds = new Set(
+      selectionResolvedSources
+        .filter((provider) =>
+          readRawWizardModelCatalog(provider).some((candidate) => {
+            const candidateModel = candidate.model.trim().toLowerCase();
+            const candidateUpstream = (
+              candidate.upstreamModel ??
+              candidate.upstream_model ??
+              candidate.model
+            )
+              .trim()
+              .toLowerCase();
+            return (
+              candidateModel === targetModel ||
+              candidateUpstream === targetUpstream
+            );
+          }),
+        )
+        .map((provider) => provider.id),
+    );
+    if (matchingProviderIds.size > 0) {
+      setDraftSources((current) =>
+        current.map((provider) => {
+          if (!matchingProviderIds.has(provider.id)) return provider;
+          const models = readRawWizardModelCatalog(provider).map((candidate) => {
+            const candidateModel = candidate.model.trim().toLowerCase();
+            const candidateUpstream = (
+              candidate.upstreamModel ??
+              candidate.upstream_model ??
+              candidate.model
+            )
+              .trim()
+              .toLowerCase();
+            return candidateModel === targetModel ||
+              candidateUpstream === targetUpstream
+              ? { ...candidate, enabled: checked }
+              : candidate;
+          });
+          return {
+            ...provider,
+            settingsConfig: {
+              ...provider.settingsConfig,
+              modelCatalog: {
+                ...(provider.settingsConfig?.modelCatalog ?? {}),
+                models,
+              },
+            },
+          };
+        }),
+      );
+    }
     setCatalogModelOrder((current) => {
-      const base = current ?? availableCatalogModels.map((item) => item.model);
+      const base =
+        current ??
+        availableCatalogModels
+          .filter((item) => item.enabled !== false)
+          .map((item) => item.model);
       if (checked) {
-        return base.includes(model) ? base : [...base, model];
+        return base.includes(model.model)
+          ? base
+          : [...base, model.model];
       }
       setDraftSpawnAgentModels((spawnModels) =>
-        spawnModels.filter((item) => item !== model),
+        spawnModels.filter((item) => item !== model.model),
       );
-      return base.filter((item) => item !== model);
+      return base.filter((item) => item !== model.model);
     });
   };
 
@@ -1164,7 +1341,10 @@ export function CodexMultiRouterWizard({
   const moveCatalogModel = (model: string, direction: -1 | 1) => {
     setCatalogModelOrder((current) =>
       moveOrderedItem(
-        current ?? availableCatalogModels.map((item) => item.model),
+        current ??
+          availableCatalogModels
+            .filter((item) => item.enabled !== false)
+            .map((item) => item.model),
         model,
         direction,
       ),
@@ -1285,9 +1465,6 @@ export function CodexMultiRouterWizard({
   const refreshModelSources = async () => {
     dispatchFlow({ type: "FETCH_START" });
     clearWizardIssuesForStage("prepare");
-    const previousAvailableModels = availableCatalogModels.map(
-      (model) => model.model,
-    );
     let successCount = 0;
     let skippedCount = 0;
     let failedCount = 0;
@@ -1295,7 +1472,7 @@ export function CodexMultiRouterWizard({
       Object.fromEntries(
         draftSources.map((provider) => {
           const config = getWizardModelFetchConfig(provider);
-          const existingCount = readWizardModelCatalog(provider).length;
+          const existingCount = readRawWizardModelCatalog(provider).length;
           const isCatalogOnlyPlan = isWizardCatalogOnlyModelSource(provider);
           const isCodexOAuth = isWizardCodexOAuthSource(provider);
           return [
@@ -1331,7 +1508,7 @@ export function CodexMultiRouterWizard({
       const nextSources: Provider[] = [];
       for (const provider of draftSources) {
         const config = getWizardModelFetchConfig(provider);
-        const beforeModels = readWizardModelCatalog(provider);
+        const beforeModels = readRawWizardModelCatalog(provider);
         const isCatalogOnlyPlan = isWizardCatalogOnlyModelSource(provider);
         const isCodexOAuth = isWizardCodexOAuthSource(provider);
         if (isCodexOAuth) {
@@ -1354,9 +1531,12 @@ export function CodexMultiRouterWizard({
             const nextProvider = mergeFetchedModelsIntoWizardProvider(
               provider,
               fetchedModels,
-              { preserveExistingSelection: true },
+              {
+                preserveExistingSelection: true,
+                appendNewModels: true,
+              },
             );
-            const afterModels = readWizardModelCatalog(nextProvider);
+            const afterModels = readRawWizardModelCatalog(nextProvider);
             const diff = diffWizardModelCatalog(beforeModels, afterModels);
             const hasDiff = hasModelFetchDiff(diff);
             await providersApi.update(nextProvider, "codex", undefined, true);
@@ -1387,8 +1567,12 @@ export function CodexMultiRouterWizard({
                 const nextProvider = mergeFetchedModelsIntoWizardProvider(
                   provider,
                   cachedModels,
+                  {
+                    preserveExistingSelection: true,
+                    appendNewModels: true,
+                  },
                 );
-                const afterModels = readWizardModelCatalog(nextProvider);
+                const afterModels = readRawWizardModelCatalog(nextProvider);
                 const diff = diffWizardModelCatalog(beforeModels, afterModels);
                 const hasDiff = hasModelFetchDiff(diff);
                 await providersApi.update(
@@ -1544,9 +1728,12 @@ export function CodexMultiRouterWizard({
           const nextProvider = mergeFetchedModelsIntoWizardProvider(
             provider,
             fetchedModels,
-            { preserveExistingSelection: true },
+            {
+              preserveExistingSelection: true,
+              appendNewModels: true,
+            },
           );
-          const afterModels = readWizardModelCatalog(nextProvider);
+          const afterModels = readRawWizardModelCatalog(nextProvider);
           const diff = diffWizardModelCatalog(beforeModels, afterModels);
           const hasDiff = hasModelFetchDiff(diff);
           await providersApi.update(nextProvider, "codex", undefined, true);
@@ -1609,13 +1796,18 @@ export function CodexMultiRouterWizard({
         }
       }
       setDraftSources(nextSources);
+      const nextSelectionSources = resolveWizardModelNameCollisions(
+        nextSources,
+        [],
+        { includeDisabled: true },
+      );
       const nextAvailableModels = buildWizardModelCatalog(
-        resolveWizardModelNameCollisions(nextSources),
+        nextSelectionSources,
+        { includeDisabled: true },
       ).models.map((model) => model.model);
       setCatalogModelOrder((current) =>
         reconcileCatalogModelOrderAfterFetch(
           current,
-          previousAvailableModels,
           nextAvailableModels,
         ),
       );
@@ -2425,7 +2617,7 @@ export function CodexMultiRouterWizard({
                           checked={kept}
                           onChange={(event) =>
                             toggleCatalogModel(
-                              model.model,
+                              model,
                               event.target.checked,
                             )
                           }

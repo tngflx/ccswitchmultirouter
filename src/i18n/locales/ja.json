@@ -838,7 +838,7 @@
     "watchdogRecentEvents": "最近のイベント",
     "watchdogNoEvents": "イベントはありません",
     "launchCodexDesktopWithCcswitch": "CCSwitchMulti の起動時に Codex Desktop を起動",
-    "launchCodexDesktopWithCcswitchDescription": "独立した既定でオフの設定で、Codex がまだ実行されていない場合に起動します。Codex ルーティングが有効な間は、CCSwitchMulti の起動時にテイクオーバーを復元するため、確認済みの既存 Codex シェルは再起動されます。",
+    "launchCodexDesktopWithCcswitchDescription": "既定でオンです。CCSwitchMulti の起動時やローカルプロキシを再びオンにしたとき、Codex が実行されていなければ起動します。無効にすると Codex を閉じたままにできますが、プロキシをオフにした際に停止した Codex は再びオンにすると復元されます。",
     "silentStartup": "サイレント起動",
     "silentStartupDescription": "起動時にメインウィンドウを表示せず、トレイのみで起動",
     "autoLaunchFailed": "自動起動の設定に失敗しました",

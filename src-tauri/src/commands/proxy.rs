@@ -230,23 +230,10 @@ pub async fn stop_proxy_with_restore(
     state: tauri::State<'_, AppState>,
     restart_codex_desktop: bool,
 ) -> Result<(), String> {
-    let takeover = state.proxy_service.get_takeover_status().await?;
-    if !restart_codex_desktop {
-        ensure_codex_desktop_closed_for_disable(takeover.codex)?;
-        return state.proxy_service.stop_with_restore().await;
-    }
-    let stopped = if takeover.codex {
-        crate::codex_desktop::stop_running_codex_desktop_for_managed_lifecycle()?
-    } else {
-        0
-    };
-    let result = state.proxy_service.stop_with_restore().await;
-    if result.is_ok() && stopped > 0 {
-        state
-            .proxy_service
-            .defer_codex_relaunch_until_proxy_start();
-    }
-    result
+    state
+        .proxy_service
+        .stop_with_restore_explicit(restart_codex_desktop)
+        .await
 }
 
 /// 获取各应用接管状态
@@ -264,9 +251,15 @@ pub async fn set_proxy_takeover_for_app(
     app_type: String,
     enabled: bool,
 ) -> Result<(), String> {
-    if app_type == "codex" && !enabled {
-        let takeover = state.proxy_service.get_takeover_status().await?;
-        ensure_codex_desktop_closed_for_disable(takeover.codex)?;
+    if app_type == "codex" {
+        if !enabled {
+            let takeover = state.proxy_service.get_takeover_status().await?;
+            ensure_codex_desktop_closed_for_disable(takeover.codex)?;
+        }
+        return state
+            .proxy_service
+            .set_codex_takeover_explicit(enabled, false)
+            .await;
     }
     state
         .proxy_service
@@ -307,75 +300,10 @@ pub async fn restart_codex_desktop(
     state: tauri::State<'_, AppState>,
     enabled: bool,
 ) -> Result<(), String> {
-    if enabled {
-        state.proxy_service.preflight_codex_takeover()?;
-    }
-    let stopped = crate::codex_desktop::stop_running_codex_desktop_for_managed_lifecycle()?;
-    let takeover_result = state
+    state
         .proxy_service
-        .set_takeover_for_app("codex", enabled)
-        .await;
-    finish_codex_desktop_transition(takeover_result, stopped, enabled).await
-}
-
-pub(crate) async fn finish_codex_desktop_transition(
-    takeover_result: Result<(), String>,
-    stopped: u32,
-    enabled: bool,
-) -> Result<(), String> {
-    // A stopped Desktop is relaunched only for an explicit, successful
-    // takeover enable. Disabling takeover must leave Desktop stopped so the
-    // restored config cannot be consumed by a process that the user did not
-    // ask us to start. Failed transitions also stay stopped; the user can
-    // retry explicitly after the underlying error is visible.
-    let relaunch_result = if should_relaunch_codex_desktop_after_transition(
-        stopped,
-        takeover_result.is_ok(),
-        enabled,
-    ) {
-        relaunch_codex_desktop_for_takeover_state(true).await
-    } else {
-        Ok(())
-    };
-
-    match (takeover_result, relaunch_result) {
-        (Ok(()), Ok(())) => Ok(()),
-        (Err(takeover_error), Ok(())) => Err(takeover_error),
-        (Ok(()), Err(relaunch_error)) => Err(format!(
-            "Codex takeover changed successfully, but Codex Desktop could not be relaunched: {relaunch_error}"
-        )),
-        (Err(takeover_error), Err(relaunch_error)) => Err(format!(
-            "Codex takeover change failed: {takeover_error}; Codex Desktop relaunch also failed: {relaunch_error}"
-        )),
-    }
-}
-
-fn should_relaunch_codex_desktop_after_transition(
-    stopped: u32,
-    takeover_succeeded: bool,
-    enabled: bool,
-) -> bool {
-    stopped > 0 && takeover_succeeded && enabled
-}
-
-pub(crate) async fn relaunch_codex_desktop_for_takeover_state(enabled: bool) -> Result<(), String> {
-    if enabled {
-        crate::codex_desktop::unlock_codex_model_picker()
-            .await
-            .and_then(|result| ensure_model_picker_injected(result.injected, &result.message))
-    } else {
-        crate::codex_desktop::relaunch_codex_desktop_after_takeover()
-    }
-}
-
-fn ensure_model_picker_injected(injected: bool, message: &str) -> Result<(), String> {
-    if injected {
-        Ok(())
-    } else {
-        Err(format!(
-            "Codex Desktop relaunched, but model-picker injection did not complete: {message}"
-        ))
-    }
+        .set_codex_takeover_explicit(enabled, true)
+        .await
 }
 
 /// 获取代理服务器状态
@@ -1919,21 +1847,6 @@ fn codex_router_log_protocol_from_path(value: &str) -> Option<&'static str> {
 mod codex_router_log_diagnostics_tests {
     use super::*;
     use std::sync::{Mutex, OnceLock};
-
-    #[test]
-    fn desktop_transition_rejects_uninjected_picker_result() {
-        assert!(ensure_model_picker_injected(true, "installed").is_ok());
-        let error = ensure_model_picker_injected(false, "no CDP target").unwrap_err();
-        assert!(error.contains("no CDP target"));
-    }
-
-    #[test]
-    fn desktop_transition_relaunches_only_after_explicit_successful_enable() {
-        assert!(should_relaunch_codex_desktop_after_transition(1, true, true));
-        assert!(!should_relaunch_codex_desktop_after_transition(1, true, false));
-        assert!(!should_relaunch_codex_desktop_after_transition(1, false, true));
-        assert!(!should_relaunch_codex_desktop_after_transition(0, true, true));
-    }
 
     #[test]
     fn disabling_codex_requires_a_closed_desktop_without_changing_state() {

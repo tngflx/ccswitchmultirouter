@@ -147,6 +147,17 @@ describe("Settings takeover lifecycle", () => {
     await waitFor(() => expect(stopWithRestore).toHaveBeenCalledWith(true));
   });
 
+  it("closes running Codex on master proxy off even without Codex takeover", async () => {
+    vi.mocked(proxyApi.isCodexDesktopRunning).mockResolvedValue(true);
+    const user = userEvent.setup();
+    show();
+    await user.click(screen.getByRole("button", { name: "Proxy off" }));
+    expect(await screen.findByRole("dialog")).toBeInTheDocument();
+    expect(stopWithRestore).not.toHaveBeenCalled();
+    await user.click(screen.getByRole("button", { name: "common.confirm" }));
+    await waitFor(() => expect(stopWithRestore).toHaveBeenCalledWith(true));
+  });
+
   it("keeps the master proxy running when the restart is declined", async () => {
     vi.mocked(useProxyStatus).mockReturnValue({
       isRunning: true,

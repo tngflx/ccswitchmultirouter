@@ -751,9 +751,11 @@ describe("CodexFormFields local model routing", () => {
         {
           model: "old-remote",
           upstreamModel: "old-remote",
+          enabled: true,
         },
         {
           model: "manual-alias",
+          enabled: false,
         },
       ],
       { autoRefreshModels: true },
@@ -762,8 +764,8 @@ describe("CodexFormFields local model routing", () => {
     await waitFor(() => expect(fetchModelsForConfig).toHaveBeenCalledTimes(1));
     await act(async () => {});
     expect(harness.latestCatalog()).toEqual([
-      { model: "old-remote", upstreamModel: "old-remote" },
-      { model: "manual-alias" },
+      { model: "old-remote", upstreamModel: "old-remote", enabled: true },
+      { model: "manual-alias", enabled: false },
     ]);
     expect(harness.onCatalogChange).not.toHaveBeenCalled();
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
@@ -2149,6 +2151,39 @@ describe("CodexFormFields local model routing", () => {
       expect(
         latestCatalog().find((row) => row.model === "new")?.reasoning,
       ).toEqual(fetchedReasoning);
+      expect(
+        latestCatalog().find((row) => row.model === "new")?.enabled,
+      ).toBe(false);
+    });
+  });
+
+  it("does not change existing inclusion choices and excludes newly synced models", async () => {
+    vi.mocked(fetchModelsForConfig).mockResolvedValueOnce([
+      { id: "included", ownedBy: null },
+      { id: "excluded", ownedBy: null },
+      { id: "new-model", ownedBy: null },
+    ]);
+    const { latestCatalog } = renderCatalogHarness([
+      { model: "included", enabled: true },
+      { model: "excluded", enabled: false },
+    ]);
+
+    fireEvent.click(screen.getByRole("button", { name: "Sync Models" }));
+
+    await waitFor(() => {
+      expect(latestCatalog()).toHaveLength(3);
+      expect(latestCatalog()[0]).toMatchObject({
+        model: "included",
+        enabled: true,
+      });
+      expect(latestCatalog()[1]).toMatchObject({
+        model: "excluded",
+        enabled: false,
+      });
+      expect(latestCatalog()[2]).toMatchObject({
+        model: "new-model",
+        enabled: false,
+      });
     });
   });
 
@@ -2394,7 +2429,7 @@ describe("CodexFormFields local model routing", () => {
         "free-model",
         "paid-model",
       ]);
-      expect(latestCatalog().every((model) => model.enabled !== false)).toBe(
+      expect(latestCatalog().every((model) => model.enabled === false)).toBe(
         true,
       );
     });

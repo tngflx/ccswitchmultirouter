@@ -674,7 +674,12 @@ describe("CodexMultiRouterWizard", () => {
       saved.settingsConfig.modelCatalog.models.map(
         (model: { model: string }) => model.model,
       ),
-    ).toEqual(["fallback-model", "stale-model"]);
+    ).toEqual(["fallback-model", "stale-model", "group-model"]);
+    expect(
+      saved.settingsConfig.modelCatalog.models.find(
+        (model: { model: string }) => model.model === "group-model",
+      ),
+    ).toMatchObject({ enabled: false });
     expect(saved.settingsConfig.modelCatalog.spawnAgentModels).toEqual([
       "fallback-model",
       "stale-model",
@@ -772,7 +777,12 @@ describe("CodexMultiRouterWizard", () => {
       savedProvider.settingsConfig.modelCatalog.models.map(
         (model: { model: string }) => model.model,
       ),
-    ).toEqual(["gpt-5.5"]);
+    ).toEqual(["gpt-5.5", "gpt-5.6-sol"]);
+    expect(
+      savedProvider.settingsConfig.modelCatalog.models.find(
+        (model: { model: string }) => model.model === "gpt-5.6-sol",
+      ),
+    ).toMatchObject({ enabled: false });
     expect(fetchModelsForConfig).not.toHaveBeenCalled();
   });
 
@@ -938,7 +948,12 @@ describe("CodexMultiRouterWizard", () => {
       savedProvider.settingsConfig.modelCatalog.models.map(
         (model: { model: string }) => model.model,
       ),
-    ).toEqual(["deepseek-chat"]);
+    ).toEqual(["deepseek-chat", "deepseek-reasoner"]);
+    expect(
+      savedProvider.settingsConfig.modelCatalog.models.find(
+        (model: { model: string }) => model.model === "deepseek-reasoner",
+      ),
+    ).toMatchObject({ enabled: false });
     expect(savedProvider.settingsConfig.modelCatalog.spawnAgentModels).toEqual([
       "deepseek-chat",
     ]);
@@ -991,7 +1006,7 @@ describe("CodexMultiRouterWizard", () => {
       );
       expect(providersApi.update).toHaveBeenCalledTimes(1);
     });
-    expect(screen.queryByText(/新增/)).not.toBeInTheDocument();
+    expect(screen.getByText(/新增 1: doubao-seed-1\.6/)).toBeInTheDocument();
   });
 
   it("skips AgentPlan model fetch when both inference key and AK/SK are missing", async () => {
@@ -1089,10 +1104,10 @@ describe("CodexMultiRouterWizard", () => {
       );
       expect(providersApi.update).toHaveBeenCalledTimes(1);
     });
-    expect(screen.queryByText(/新增/)).not.toBeInTheDocument();
+    expect(screen.getByText(/新增 1: doubao-seed-1\.6/)).toBeInTheDocument();
   });
 
-  it("keeps previous model selections without adding fetched models", async () => {
+  it("keeps previous model selections while showing new fetched models excluded", async () => {
     vi.mocked(fetchModelsForConfig).mockResolvedValueOnce([
       { id: "model-a", ownedBy: null },
       { id: "model-b", ownedBy: null },
@@ -1135,12 +1150,18 @@ describe("CodexMultiRouterWizard", () => {
       screen.getByRole("button", { name: "自动获取并写入模型列表" }),
     );
 
-    expect(screen.queryByText(/新增/)).not.toBeInTheDocument();
+    await waitFor(() => expect(providersApi.update).toHaveBeenCalledTimes(1));
+    expect(screen.getByText(/新增 1: model-c/)).toBeInTheDocument();
 
     fireEvent.click(screen.getByRole("button", { name: "选择模型并预览路由" }));
-    expect(screen.getByLabelText("保留 model-a")).toBeChecked();
-    expect(screen.getByLabelText("保留 model-b")).not.toBeChecked();
-    expect(screen.queryByLabelText("保留 model-c")).not.toBeInTheDocument();
+    await waitFor(() => {
+      expect(screen.getByLabelText("保留 model-a")).toBeChecked();
+      expect(screen.getByLabelText("保留 model-b")).not.toBeChecked();
+      expect(screen.getByLabelText("保留 model-c")).not.toBeChecked();
+    });
+
+    fireEvent.click(screen.getByLabelText("保留 model-c"));
+    expect(screen.getByLabelText("保留 model-c")).toBeChecked();
   });
 
   it("opens a provider config page from the model fetch cards", () => {

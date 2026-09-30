@@ -41,6 +41,7 @@ import { settingsApi } from "@/lib/api/settings";
 import { toast } from "sonner";
 import type {
   CodexModelReasoningCapability,
+  CodexCatalogModel,
   CodexRoutingRouteV2,
   Provider,
 } from "@/types";
@@ -2666,7 +2667,7 @@ describe("Codex MultiRouter workspace route persistence helpers", () => {
     ).not.toBeInTheDocument();
   });
 
-  it("refreshes visible route picker candidates after provider catalog save without parent refetch", async () => {
+  it("keeps newly fetched provider models excluded until explicitly enabled", async () => {
     const refresh = createDeferred<FetchedModel[]>();
     vi.mocked(fetchModelsForConfig).mockReturnValueOnce(refresh.promise);
     const provider: Provider = {
@@ -2714,19 +2715,19 @@ describe("Codex MultiRouter workspace route persistence helpers", () => {
           .mock.calls.some(
             ([savedProvider]) =>
               savedProvider.id === provider.id &&
-              JSON.stringify(savedProvider.settingsConfig).includes(
-                "fresh-route-model",
+              savedProvider.settingsConfig?.modelCatalog?.models?.some(
+                (model: CodexCatalogModel) =>
+                  model.model === "fresh-route-model" &&
+                  model.enabled === false,
               ),
           ),
       ).toBe(true),
     );
 
-    await waitFor(() =>
-      expect(screen.getByText("fresh-route-model")).toBeInTheDocument(),
-    );
+    expect(screen.queryByText("fresh-route-model")).not.toBeInTheDocument();
     expect(
-      screen.queryByText("未发现模型目录，保存后可在模型源补充目录"),
-    ).not.toBeInTheDocument();
+      screen.getByText("未发现模型目录，保存后可在模型源补充目录"),
+    ).toBeInTheDocument();
   });
 
   it("updates the Provider catalog without mutating a stale MultiRouter projection", async () => {
@@ -4653,6 +4654,27 @@ describe("Codex MultiRouter workspace route persistence helpers", () => {
         supportsImage: true,
       }),
     );
+  });
+
+  it("keeps newly discovered models excluded when initializing an empty catalog", () => {
+    const provider: Provider = {
+      id: "empty-catalog-source",
+      name: "Empty Catalog Source",
+      category: "custom",
+      settingsConfig: {},
+    };
+
+    const refreshed = providerWithFetchedModelCatalog(provider, [
+      { id: "new-model", ownedBy: null },
+    ]);
+
+    expect(refreshed.settingsConfig?.modelCatalog?.models).toEqual([
+      expect.objectContaining({
+        model: "new-model",
+        upstreamModel: "new-model",
+        enabled: false,
+      }),
+    ]);
   });
 
   it("preserves catalog model casing in projected spawn-agent candidates", () => {

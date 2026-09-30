@@ -1679,12 +1679,7 @@ fn resolve_codex_v2_runtime_provider_from_db(
 /// 兼容 `codexRouting` 新 schema 以及旧版 `codexModelRoutes` / `modelRoutes`，
 /// 只用于决定图片请求是否需要额外探测官方 route。
 fn codex_provider_has_routing_config(provider: &crate::provider::Provider) -> bool {
-    provider
-        .settings_config
-        .get("codexRouting")
-        .or_else(|| provider.settings_config.get("codexModelRoutes"))
-        .or_else(|| provider.settings_config.get("modelRoutes"))
-        .is_some()
+    crate::provider::codex_settings_has_enabled_routes(&provider.settings_config)
 }
 
 fn codex_provider_has_v2_routing(provider: &crate::provider::Provider) -> bool {
@@ -2234,14 +2229,14 @@ fn resolve_external_codex_router_raw_target(
     Ok(None)
 }
 
-/// 判断 provider 是否是显式开启的 Codex router。
+/// 判断 provider 是否包含可运行的 Codex router 路由。
+///
+/// `enabled` is an optional compatibility field. The canonical activation
+/// rule treats a non-empty route list as active unless the field is explicitly
+/// `false`; keeping a second `enabled == true` rule here caused external API
+/// requests to skip otherwise valid legacy/new router configurations.
 fn is_codex_router_provider(provider: &crate::provider::Provider) -> bool {
-    provider
-        .settings_config
-        .get("codexRouting")
-        .and_then(|routing| routing.get("enabled"))
-        .and_then(|enabled| enabled.as_bool())
-        .unwrap_or(false)
+    crate::provider::codex_settings_has_enabled_routes(&provider.settings_config)
 }
 
 /// 按 id 查找 Codex router route。
@@ -5955,7 +5950,7 @@ mod tests {
         codex_proxy_error_status, codex_request_classification_fields,
         create_codex_chat_sse_stream_from_verified_profile, external_openai_api_models_response,
         external_openai_api_unsupported_response, is_codex_desktop_request,
-        is_verified_codex_desktop_request, mark_external_openai_headers,
+        is_codex_router_provider, is_verified_codex_desktop_request, mark_external_openai_headers,
         request_is_literal_continue, resolve_codex_image_generation_provider,
         resolve_external_codex_router_raw_target, resolve_external_codex_router_target,
         resolve_forward_error_provider_for_logging, resolve_forward_error_route_provider,
@@ -6015,6 +6010,35 @@ mod tests {
                 Some((event, payload))
             })
             .collect()
+    }
+
+    #[test]
+    fn codex_router_activation_defaults_on_when_enabled_flag_is_omitted() {
+        let provider = Provider::with_id(
+            "router".to_string(),
+            "Router".to_string(),
+            json!({
+                "codexRouting": {
+                    "routes": [{"id": "official", "targetProviderId": "codex-official"}]
+                }
+            }),
+            None,
+        );
+
+        assert!(is_codex_router_provider(&provider));
+
+        let disabled = Provider::with_id(
+            "router-disabled".to_string(),
+            "Router disabled".to_string(),
+            json!({
+                "codexRouting": {
+                    "enabled": false,
+                    "routes": [{"id": "official", "targetProviderId": "codex-official"}]
+                }
+            }),
+            None,
+        );
+        assert!(!is_codex_router_provider(&disabled));
     }
 
     fn verified_qwen_chat_profile(db: &Database) -> Provider {

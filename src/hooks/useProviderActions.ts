@@ -26,6 +26,7 @@ import {
   isCodexChatWireApi,
 } from "@/utils/providerConfigUtils";
 import {
+  codexRoutingHasEnabledRoutes,
   providerNeedsRouting,
   supportsOfficialProxyTakeover,
 } from "@/utils/providerCapabilities";
@@ -178,16 +179,10 @@ export function useProviderActions(
                 (provider.settingsConfig as Record<string, any>).config,
               ),
             )));
-      const codexRouting = (provider.settingsConfig as Record<string, any>)
-        ?.codexRouting;
       // 有 codexRouting 的 provider 必须通过 CC Switch 本地代理分流，即使 route 内使用官方 OAuth。
       const isCodexRouterProvider =
         activeApp === "codex" &&
-        codexRouting &&
-        typeof codexRouting === "object" &&
-        (codexRouting.enabled !== false ||
-          (Array.isArray(codexRouting.routes) &&
-            codexRouting.routes.length > 0));
+        codexRoutingHasEnabledRoutes(provider.settingsConfig);
       const isCodexAnthropicFormat =
         (activeApp === "codex" || activeApp === "grokbuild") &&
         (provider.meta?.apiFormat === "anthropic" ||

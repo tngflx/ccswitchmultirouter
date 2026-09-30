@@ -178,13 +178,26 @@ describe("ProviderForm Codex catalog helpers", () => {
     ).toBe("unknown");
   });
 
-  it("persists only models included in the provider catalog", () => {
+  it("persists excluded rows so their selection survives save and reopen", () => {
     expect(
       normalizeCodexCatalogModelsForSave([
         { model: "enabled-model" },
-        { model: "disabled-model", enabled: false },
+        {
+          model: "disabled-model",
+          enabled: false,
+          upstreamModel: "disabled-upstream",
+          displayName: "Disabled model",
+        },
       ]),
-    ).toEqual([{ model: "enabled-model" }]);
+    ).toEqual([
+      { model: "enabled-model" },
+      {
+        model: "disabled-model",
+        enabled: false,
+        upstreamModel: "disabled-upstream",
+        displayName: "Disabled model",
+      },
+    ]);
   });
 
   it("round-trips model transport, cache, and ordering metadata through provider editing", () => {

@@ -271,6 +271,9 @@ export function reconcileFetchedCodexCatalogRows<T extends CodexCatalogRowLike>(
       model,
       upstreamModel: model,
       displayName: model,
+      // A newly discovered model has no prior user selection. Do not opt it
+      // into the provider until the user explicitly includes it.
+      enabled: false,
       ...(contextWindow ? { contextWindow: String(contextWindow) } : {}),
       ...(Array.isArray(fetched.inputModalities) &&
       fetched.inputModalities.length > 0

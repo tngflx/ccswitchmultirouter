@@ -201,19 +201,32 @@ function isWizardNativeCodexAuthSource(provider: Provider): boolean {
 // 读取 Codex provider 的真实持久化模型目录；缺失或结构异常时返回空目录，不能伪造 OAuth 模型权限。
 export function readWizardModelCatalog(
   provider: Provider,
+  options: { enabledOnly?: boolean } = { enabledOnly: true },
 ): CodexCatalogModel[] {
   const models = provider.settingsConfig?.modelCatalog?.models;
   if (!Array.isArray(models)) {
     return [];
   }
-  return models.filter(
-    (model): model is CodexCatalogModel =>
-      typeof model === "object" &&
-      model !== null &&
-      typeof (model as CodexCatalogModel).model === "string" &&
-      Boolean((model as CodexCatalogModel).model.trim()) &&
-      (model as CodexCatalogModel).enabled !== false,
-  );
+  return models
+    .filter(
+      (model): model is CodexCatalogModel =>
+        typeof model === "object" &&
+        model !== null &&
+        typeof (model as CodexCatalogModel).model === "string" &&
+        Boolean((model as CodexCatalogModel).model.trim()),
+    )
+    .filter(
+      (model) =>
+        (options.enabledOnly ?? true) === false || model.enabled !== false,
+    );
+}
+
+// Persistence and metadata refresh paths must retain disabled tombstones so a
+// provider refresh cannot silently turn an explicit exclusion into inclusion.
+export function readRawWizardModelCatalog(
+  provider: Provider,
+): CodexCatalogModel[] {
+  return readWizardModelCatalog(provider, { enabledOnly: false });
 }
 
 function isWizardModelEnabled(model: CodexCatalogModel): boolean {
@@ -427,6 +440,8 @@ export function getWizardConfigIssues(
 
 export interface MergeFetchedWizardModelsOptions {
   preserveExistingSelection?: boolean;
+  /** Append fetched models that are not already in the saved catalog. */
+  appendNewModels?: boolean;
 }
 
 function normalizedWizardModelId(value: unknown): string {
@@ -539,7 +554,7 @@ export function mergeFetchedModelsIntoWizardProvider(
   options: MergeFetchedWizardModelsOptions = {},
 ): Provider {
   const existingModels = canonicalizeWizardProviderModels(
-    readWizardModelCatalog(provider),
+    readRawWizardModelCatalog(provider),
   );
   const byModel = new Map<string, CodexCatalogModel>();
   const byFetchedModel = new Map<string, string>();
@@ -559,7 +574,8 @@ export function mergeFetchedModelsIntoWizardProvider(
     }
   }
   const shouldAppendFetchedModels =
-    !options.preserveExistingSelection || existingModels.length === 0;
+    options.appendNewModels ??
+    (!options.preserveExistingSelection || existingModels.length === 0);
   for (const fetched of fetchedModels) {
     const modelId = fetched.id.trim();
     if (!modelId) continue;
@@ -570,6 +586,9 @@ export function mergeFetchedModelsIntoWizardProvider(
     const nextModel = {
       ...(existing ?? {}),
       model: visibleModelId,
+      // A fetched row is new provider inventory, not an implicit user
+      // selection. Existing rows retain their current enabled state above.
+      ...(existing ? {} : { enabled: false }),
       upstreamModel: nonEmptyWizardModelField(
         existing?.upstreamModel,
         existing?.upstream_model,
@@ -609,7 +628,11 @@ export function mergeFetchedModelsIntoWizardProvider(
     }
   }
   const models = Array.from(byModel.values());
-  const allowedModels = new Set(models.map((model) => model.model));
+  const allowedModels = new Set(
+    models
+      .filter((model) => model.enabled !== false)
+      .map((model) => model.model),
+  );
   const rawSpawnAgentModels =
     provider.settingsConfig?.modelCatalog?.spawnAgentModels;
   const spawnAgentModels = Array.isArray(rawSpawnAgentModels)
@@ -727,12 +750,17 @@ function hasOpenAiResponsesNativeModels(provider: Provider): boolean {
 export function resolveWizardModelNameCollisions(
   providers: Provider[],
   existingRoutes: CodexRoutingRouteV2[] = [],
+  options: { includeDisabled?: boolean } = {},
 ): Provider[] {
+  const readModels = (provider: Provider) =>
+    options.includeDisabled
+      ? readRawWizardModelCatalog(provider)
+      : readWizardModelCatalog(provider);
   const canonicalProviders = providers.map((provider) => {
     const route = existingRoutes.find(
       (candidate) => candidate.targetProviderId === provider.id,
     );
-    const models = readWizardModelCatalog(provider).map((model) => {
+    const models = readModels(provider).map((model) => {
       const visible = model.model.trim();
       const routedUpstream = route?.aliases?.[visible]?.trim();
       const declaredUpstream = nonEmptyWizardModelField(
@@ -757,8 +785,8 @@ export function resolveWizardModelNameCollisions(
   });
   const ownersByUpstream = new Map<string, Provider[]>();
   for (const provider of canonicalProviders) {
-    for (const model of readWizardModelCatalog(provider).filter(
-      isWizardModelEnabled,
+    for (const model of readModels(provider).filter(
+      (candidate) => options.includeDisabled || isWizardModelEnabled(candidate),
     )) {
       const upstream = wizardModelUpstream(model);
       if (!upstream) continue;
@@ -776,7 +804,7 @@ export function resolveWizardModelNameCollisions(
       (route) => route.targetProviderId === provider.id,
     );
     const emittedModels = new Set<string>();
-    const nextModels = readWizardModelCatalog(provider).flatMap((model) => {
+    const nextModels = readModels(provider).flatMap((model) => {
       const upstream = wizardModelUpstream(model);
       const explicitAliases = Object.entries(existingRoute?.aliases ?? {})
         .filter(
@@ -833,7 +861,7 @@ export function resolveWizardModelNameCollisions(
     { upstream: string; providerId: string }
   >();
   return upstreamResolved.map((provider) => {
-    const models = readWizardModelCatalog(provider).map((model) => {
+    const models = readModels(provider).map((model) => {
       const visible = model.model.trim();
       const visibleKey = normalizedWizardModelId(visible);
       const upstream = wizardModelUpstream(model);
@@ -1218,6 +1246,16 @@ function canonicalWizardModelIds(provider: Provider): string[] {
   );
 }
 
+function rawCanonicalWizardModelIds(provider: Provider): string[] {
+  return Array.from(
+    new Set(
+      readRawWizardModelCatalog(provider)
+        .map((model) => wizardModelUpstream(model))
+        .filter(Boolean),
+    ),
+  );
+}
+
 function wizardProviderModelIdentitySet(provider: Provider): Set<string> {
   return new Set(
     readWizardModelCatalog(provider)
@@ -1391,12 +1429,16 @@ export function buildWizardModelCatalog(
   options: Pick<
     WizardPlanBuildOptions,
     "catalogModelOrder" | "spawnAgentModels"
-  > = {},
+  > & { includeDisabled?: boolean } = {},
 ): CodexModelCatalogConfig {
+  const readModels = (provider: Provider) =>
+    options.includeDisabled
+      ? readRawWizardModelCatalog(provider)
+      : readWizardModelCatalog(provider);
   const byModel = new Map<string, CodexCatalogModel>();
   for (const provider of providers) {
-    for (const model of readWizardModelCatalog(provider).filter(
-      isWizardModelEnabled,
+    for (const model of readModels(provider).filter(
+      (candidate) => options.includeDisabled || isWizardModelEnabled(candidate),
     )) {
       const key = normalizedWizardModelId(model.model);
       if (key && !byModel.has(key)) {
@@ -1749,6 +1791,11 @@ export function buildCodexMultiRouterWizardPlan(
     sourceProviders,
     existingRoutingV2?.routes ?? [],
   );
+  const fullCollisionResolvedSources = resolveWizardModelNameCollisions(
+    sourceProviders,
+    existingRoutingV2?.routes ?? [],
+    { includeDisabled: true },
+  );
   const resolvedSources = filterWizardProvidersByModelOrder(
     collisionResolvedSources,
     options.catalogModelOrder,
@@ -1830,12 +1877,15 @@ export function buildCodexMultiRouterWizardPlan(
     const selectedSource = resolvedSources.find(
       (provider) => provider.id === route.targetProviderId,
     );
-    const fullSource = collisionResolvedSources.find(
+    const fullSource = fullCollisionResolvedSources.find(
       (provider) => provider.id === route.targetProviderId,
     );
     if (!selectedSource || !fullSource) return route;
     const selectedModels = canonicalWizardModelIds(selectedSource);
-    const fullModels = canonicalWizardModelIds(fullSource);
+    // Compare against the complete persisted inventory, including disabled
+    // tombstones. Otherwise an explicit exclusion can collapse to `all` and
+    // become implicitly included if that model is enabled later.
+    const fullModels = rawCanonicalWizardModelIds(fullSource);
     const selectedSet = new Set(selectedModels);
     const includesEveryProviderModel =
       selectedSet.size === fullModels.length &&
