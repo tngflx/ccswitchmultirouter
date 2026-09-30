@@ -79,7 +79,6 @@ import {
 } from "./codexTrafficPolicy";
 import {
   catalogModelIdentity,
-  pruneMissingRemoteCodexCatalogRows,
   reconcileFetchedCodexCatalogRows,
 } from "./codexCatalogSync";
 import {
@@ -785,7 +784,6 @@ function mergeFetchedModelsIntoCatalogRows(
     baseUrl?: string;
     websiteUrl?: string;
   } = {},
-  removeMissingRemote = false,
 ): CodexCatalogRow[] {
   const next = [...rows];
   const rowByFetchedModel = new Map<
@@ -854,9 +852,10 @@ function mergeFetchedModelsIntoCatalogRows(
     next.push(row);
   }
 
-  return removeMissingRemote
-    ? pruneMissingRemoteCodexCatalogRows(next, fetchedModels).rows
-    : next;
+  // A sync discovers upstream availability but must not rewrite catalog
+  // membership. Existing included and excluded rows are user choices; stale
+  // rows remain visible until the user explicitly removes them.
+  return next;
 }
 
 // 判断模型名是否大概率属于支持 Responses 的 OpenAI/GPT 系列。
@@ -1616,7 +1615,6 @@ export function CodexFormFields({
                 catalogRowsRef.current,
                 models,
                 { providerId, providerName, websiteUrl },
-                true,
               );
               catalogRowsRef.current = nextCatalogRows;
               setCatalogRows(nextCatalogRows);
@@ -1773,7 +1771,6 @@ export function CodexFormFields({
                 baseUrl: codexBaseUrl,
                 websiteUrl,
               },
-              failedCount === 0,
             );
             catalogRowsRef.current = mergedRows;
             splitCatalogRows = mergedRows;
@@ -3163,7 +3160,6 @@ export function CodexFormFields({
                           baseUrl: codexBaseUrl,
                           websiteUrl,
                         },
-                        false,
                       );
                       catalogRowsRef.current = rows;
                       setCatalogRows(rows);

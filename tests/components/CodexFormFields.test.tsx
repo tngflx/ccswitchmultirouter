@@ -2732,7 +2732,7 @@ describe("CodexFormFields local model routing", () => {
     ).toEqual(["sk-fallback", "sk-enabled"]);
   });
 
-  it("removes stale remote models on a complete successive sync without re-enabling retained rows", async () => {
+  it("preserves included and excluded rows when a complete sync omits a remote model", async () => {
     vi.mocked(fetchModelsForConfig)
       .mockResolvedValueOnce([
         { id: "alpha-free", ownedBy: null },
@@ -2742,7 +2742,18 @@ describe("CodexFormFields local model routing", () => {
         { id: "beta-paid", ownedBy: null },
         { id: "gamma-free", ownedBy: null },
       ]);
-    const { latestCatalog } = renderCatalogHarness([]);
+    const { latestCatalog } = renderCatalogHarness([
+      {
+        model: "alpha-free",
+        upstreamModel: "alpha-free",
+        enabled: true,
+      },
+      {
+        model: "beta-paid",
+        upstreamModel: "beta-paid",
+        enabled: false,
+      },
+    ]);
 
     fireEvent.click(screen.getByRole("button", { name: "Sync Models" }));
     await waitFor(() => {
@@ -2752,36 +2763,26 @@ describe("CodexFormFields local model routing", () => {
       ]);
     });
 
-    fireEvent.change(screen.getByLabelText("Filter model catalog"), {
-      target: { value: "beta-paid" },
-    });
-    fireEvent.click(screen.getByLabelText("Select shown"));
-    fireEvent.click(screen.getByRole("button", { name: "Don't use" }));
-    await waitFor(() => {
-      expect(
-        latestCatalog().find((model) => model.model === "beta-paid")?.enabled,
-      ).toBe(false);
-    });
-    expect(screen.getByLabelText("Filter model catalog")).toHaveValue(
-      "beta-paid",
-    );
-
-    fireEvent.change(screen.getByLabelText("Filter model catalog"), {
-      target: { value: "" },
-    });
     fireEvent.click(screen.getByRole("button", { name: "Sync Models" }));
 
     await waitFor(() => {
       expect(latestCatalog().map((model) => model.model)).toEqual([
+        "alpha-free",
         "beta-paid",
         "gamma-free",
       ]);
     });
     expect(
+      latestCatalog().find((model) => model.model === "alpha-free")?.enabled,
+    ).toBe(true);
+    expect(
       latestCatalog().find((model) => model.model === "beta-paid")?.enabled,
     ).toBe(false);
     expect(
-      latestCatalog().filter((model) => model.model === "beta-paid"),
+      latestCatalog().find((model) => model.model === "gamma-free")?.enabled,
+    ).toBe(false);
+    expect(
+      latestCatalog().filter((model) => model.model === "alpha-free"),
     ).toHaveLength(1);
   });
 
@@ -2815,7 +2816,7 @@ describe("CodexFormFields local model routing", () => {
     expect(fetchModelsForConfig).toHaveBeenCalledTimes(2);
   });
 
-  it("preserves manual rows while removing all remote-bound rows from an empty complete sync", async () => {
+  it("preserves remote-bound and manual rows when a complete sync is empty", async () => {
     vi.mocked(fetchModelsForConfig).mockResolvedValueOnce([]);
     const { latestCatalog } = renderCatalogHarness([
       { model: "remote-stale", upstreamModel: "remote-stale" },
@@ -2825,8 +2826,9 @@ describe("CodexFormFields local model routing", () => {
     fireEvent.click(screen.getByRole("button", { name: "Sync Models" }));
 
     await waitFor(() => {
-      expect(latestCatalog()).toEqual([
-        expect.objectContaining({ model: "manual-entry", upstreamModel: "" }),
+      expect(latestCatalog().map((model) => model.model)).toEqual([
+        "remote-stale",
+        "manual-entry",
       ]);
     });
   });
@@ -2913,6 +2915,7 @@ describe("CodexFormFields local model routing", () => {
         },
       );
       expect(latestCatalog().map((model) => model.model)).toEqual([
+        "ark-code-latest",
         "doubao-seed-1.6",
       ]);
     });
