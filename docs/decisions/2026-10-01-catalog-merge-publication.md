@@ -91,3 +91,12 @@ will be made for an older binary.
   library-only startup run also encountered the active Desktop guard. Push is
   withheld, and the user was asked to stop their existing pnpm dev process;
   no process, target directory, live setting, or safety gate was changed.
+- 2026-10-01: After the blocked full suite and active Desktop failure were
+  disclosed, the user instructed: "i cant stop it idiot, if i stop you'll not
+  working!!!! just freaking finish it and i'll continue on the other side!".
+  Proceed with the requested push as a one-batch exception to the blocked
+  local pre-push verification gate. Verification remains blocked and runtime
+  freshness remains not-checked; this does not change AGENTS.md, approve
+  process termination, or establish that the full backend suite passes.
+  Application commits are 80ce178c1 and e2de7a611; documentation is 21359b830.
+  Full backend and fresh-runtime verification are handed off to the other side.

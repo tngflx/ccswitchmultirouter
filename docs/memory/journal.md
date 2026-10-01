@@ -1,5 +1,23 @@
 # Engineering Journal (newest first)
 
+## 2026-10-01 - User-directed delivery with blocked backend verification
+
+- **What happened:** After the pre-push blockers were disclosed, the user
+  requested finishing delivery without stopping the apps supporting this chat,
+  and said they would continue on the other side.
+- **Root cause:** The running normal-target CCSwitch executable prevents full
+  Cargo test linking, and active Codex Desktop rejects a takeover test. Neither
+  can be bypassed safely by stopping the user's current session.
+- **What we did:** Recorded a one-batch exception for the requested push in the
+  [decision history](../decisions/2026-10-01-catalog-merge-publication.md),
+  preserving the failed/blocked statuses and existing rules. No application
+  source, running process, live configuration, or build target was changed.
+- **Evidence:** The preceding entry retains the exact passing and failing
+  checks. Full backend and fresh-runtime behavior remain unverified, not waived
+  as evidence; those checks are the continuation work on the other side.
+- **What NOT to do again:** Do not relabel requested delivery as full
+  verification or turn this explicit exception into a permanent policy change.
+
 ## 2026-10-01 - Reconcile incoming catalog retention with approved publication fixes
 
 - **What happened:** The user approved intelligently merging the disclosed

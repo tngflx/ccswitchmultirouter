@@ -64,3 +64,9 @@ change is included in this batch.
   diagnostic regression passed; full suite execution is separately blocked by
   the running executable. Runtime freshness remains not-checked; no process
   was stopped and no live startup claim is made.
+- 2026-10-01: The user explicitly requested finishing delivery without
+  stopping the active apps after the verification blockers were disclosed;
+  the exact message and one-batch push exception are recorded in
+  2026-10-01-catalog-merge-publication.md. Verification remains failed for
+  the focused run, full execution remains blocked, and runtime freshness is
+  not-checked. The other side must complete backend and fresh-runtime checks.
