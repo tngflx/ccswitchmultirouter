@@ -118,11 +118,11 @@ present an older binary as evidence for the new source.
 
 22-B. **Use evidence-driven background exploration, not blind clicking.** Agents may enumerate windows and renderer handles, inspect UI Automation trees, navigate through semantically identified tabs/buttons, and capture as many relevant pages as needed for a systematic audit, provided the app remains in the background and the user's cursor/focus are untouched. Retries are allowed for concrete transient conditions such as stale handles, hot reload, or a delayed WebView compositor. Never loop coordinate guesses, repeatedly invoke the same control without checking the resulting state, or navigate through unidentified controls. Keep a record of which page/state each capture represents.
 
-22-C. **Background window-state changes are allowed when they remain non-activating.** If the app is hidden or minimized, agents may restore/show it with no-activate APIs (for example `ShowWindow` with a non-activating mode or equivalent) and keep it behind the user's active window. Do not move, resize, maximize, minimize, or foreground the window merely for inspection. Ask permission only when verification truly requires activation, foreground input, visible repositioning, or another action that could interrupt the user.
+22-C. **Background window-state changes are allowed when they remain non-activating.** For a hidden-to-tray window, agents may show it with no-activate APIs (for example `ShowWindow` with a non-activating mode or equivalent) and keep it behind the user's active window. For a minimized window, rule 22-E takes precedence: use UIA without restoring it. Do not move, resize, maximize, minimize, or foreground the window merely for inspection. Ask permission only when verification truly requires activation, foreground input, visible repositioning, or another action that could interrupt the user.
 
 22-D. **Use the reusable capture helper as the first capture mechanism, not as an exploration limit.** For any live Tauri UI audit on Windows, start with:
     `pwsh -NoProfile -ExecutionPolicy Bypass -File scripts\capture-tauri-window.ps1`
-    The helper locates the `cc-switch` process, prefers the WebView2 renderer child, captures with read-only `PrintWindow` (`PW_RENDERFULLCONTENT`), and exits non-zero when the result is blank. `PrintWindow` results are data, not evidence; a hidden/minimized-to-tray WebView2 compositor can return a uniform surface. If that happens, continue with non-activating restore/show plus semantic background automation rather than asking the user to navigate manually. Capture each audited page and verify its text/state through OCR, UI Automation, or DOM/CDP inspection; if only pixels were checked, say so. A blank capture means the window is not compositing, not that the page is empty.
+    The helper locates the `cc-switch` process and renderer handle, captures the selected top-level window with read-only `PrintWindow` (`PW_RENDERFULLCONTENT`), and exits non-zero when the result is blank. `PrintWindow` success alone is not proof of page content; a hidden or minimized WebView2 compositor can return a uniform surface. For minimized windows, follow rule 22-E without restoring them; for hidden-to-tray windows, rule 22-C permits non-activating show plus semantic background automation. The helper itself does not restore/show windows, and its suggestion to ask the user is not a prohibition on these background fallbacks. Capture each audited page and verify its text/state through OCR, UI Automation, or DOM/CDP inspection; if only pixels were checked, say so. A blank capture means the window is not compositing, not that the page is empty.
 
 22-E. **Background UI Automation fallback for minimized WebView2.** When the capture helper reports that a minimized `cc-switch.exe` has no visible candidate, do not restore or activate it. Bind the existing top-level window through `System.Windows.Automation.AutomationElement::FromHandle` using the returned `MainWindowHandle`, locate the WebView2 `RootWebArea` (`AutomationId=RootWebArea`), and read its descendant controls and text. Navigate only with semantic `InvokePattern` or `SelectionItemPattern` actions on safe page/navigation controls, reacquiring the root and descendants after every action. This works while the window remains minimized and does not move focus or the user's cursor. Record each page and state observed. Do not use coordinate clicks, guessed indexes, or invoke destructive controls during an audit.
 
@@ -134,47 +134,47 @@ present an older binary as evidence for the new source.
 
 | Path | Purpose |
 |------|---------|
-| `src/main.rs` | Tauri app entry point |
-| `src/lib.rs` | Library root, module declarations |
-| `src/provider.rs` | Provider metadata types (`ProviderMeta`, `ReasoningContentMode`) |
-| `src/config.rs` | App config, provider settings schema |
-| `src/settings.rs` | User settings (stream retry toggle, language, etc.) |
-| `src/codex_config.rs` | Codex config file parsing/writing |
-| `src/codex_desktop.rs` | CDP integration with Codex desktop app (model picker injection) |
-| `src/codex_multirouter/` | Multi-router compiler, mutation, projection logic |
-| `src/proxy/` | HTTP proxy server (axum) |
-| `src/proxy/codex_traffic_policy.rs` | Codex admission + rejection retry policy (max in-flight, queue wait, 429/503 replay) |
-| `src/proxy/forwarder.rs` | Request forwarding, retry, streaming |
-| `src/proxy/provider_router.rs` | Provider selection and routing |
-| `src/proxy/providers/` | Per-provider adapters (Claude, Codex, OpenAI-compatible) |
-| `src/proxy/providers/streaming_retry.rs` | Stream retry on failure |
-| `src/proxy/usage/` | Token usage parsing and logging |
-| `src/resources/` | JS templates injected via CDP (model picker, app compat) |
-| `src/commands/` | Tauri IPC command handlers |
-| `src/services/` | Business logic (provider sync, proxy management, skills, presets) |
-| `src/database/` | SQLite schema, migrations, backup |
-| `src/store.rs` | Persistent state store |
-| `tests/` | Integration tests |
+| `src-tauri/src/main.rs` | Tauri app entry point |
+| `src-tauri/src/lib.rs` | Library root, module declarations |
+| `src-tauri/src/provider.rs` | Provider metadata types (`ProviderMeta`); `ReasoningContentMode` lives in `src-tauri/src/proxy/providers/codex.rs` |
+| `src-tauri/src/config.rs` | App config, provider settings schema |
+| `src-tauri/src/settings.rs` | User settings (stream retry toggle, language, etc.) |
+| `src-tauri/src/codex_config.rs` | Codex config file parsing/writing |
+| `src-tauri/src/codex_desktop.rs` | CDP integration with Codex desktop app (model picker injection) |
+| `src-tauri/src/codex_multirouter/` | Multi-router compiler, mutation, projection logic |
+| `src-tauri/src/proxy/` | HTTP proxy server (axum) |
+| `src-tauri/src/proxy/codex_traffic_policy.rs` | Codex admission + rejection retry policy (max in-flight, queue wait, 429/503 replay) |
+| `src-tauri/src/proxy/forwarder.rs` | Request forwarding, retry, streaming |
+| `src-tauri/src/proxy/provider_router.rs` | Provider selection and routing |
+| `src-tauri/src/proxy/providers/` | Per-provider adapters (Claude, Codex, OpenAI-compatible) |
+| `src-tauri/src/proxy/providers/streaming_retry.rs` | Stream retry on failure |
+| `src-tauri/src/proxy/usage/` | Token usage parsing and logging |
+| `src-tauri/src/resources/` | JS templates injected via CDP (model picker, app compat) |
+| `src-tauri/src/commands/` | Tauri IPC command handlers |
+| `src-tauri/src/services/` | Business logic (provider sync, proxy management, skills, presets) |
+| `src-tauri/src/database/` | SQLite schema, migrations, backup |
+| `src-tauri/src/store.rs` | Persistent state store |
+| `src-tauri/tests/` | Rust integration tests |
 
 ### Frontend (TypeScript/React — `src/`)
 
 | Path | Purpose |
 |------|---------|
-| `App.tsx` | Root component, routing |
-| `components/codex/` | Codex-specific UI (router workspace, wizard, subagent editor, usage) |
-| `components/providers/` | Provider list, cards, forms |
-| `components/providers/forms/` | Provider form fields, reasoning editor, catalog sync, traffic policy |
-| `components/settings/` | Settings page, language switcher, global config |
-| `components/sessions/` | Session manager, history repair |
-| `components/openai/` | OpenAI-compatible API page |
-| `components/proxy/` | Proxy controls (stream retry toggle) |
-| `config/` | Provider preset definitions (per-app: Claude, Codex, Gemini, etc.) |
-| `i18n/` | Internationalization (index.ts + locales/en.json, zh.json, zh-TW.json, ja.json) |
-| `icons/extracted/` | Provider icons (SVG/PNG + metadata) |
-| `lib/schemas/` | Zod schemas for provider and settings validation |
-| `lib/openai/` | External profile handling |
-| `hooks/` | React hooks (provider actions, settings form) |
-| `types.ts` | Shared TypeScript type definitions |
+| `src/App.tsx` | Root component, routing |
+| `src/components/codex/` | Codex-specific UI (router workspace, wizard, subagent editor, usage) |
+| `src/components/providers/` | Provider list, cards, forms |
+| `src/components/providers/forms/` | Provider form fields, reasoning editor, catalog sync, traffic policy |
+| `src/components/settings/` | Settings page, language switcher, global config |
+| `src/components/sessions/` | Session manager, history repair |
+| `src/components/openai/` | OpenAI-compatible API page |
+| `src/components/proxy/` | Proxy controls (stream retry toggle) |
+| `src/config/` | Provider preset definitions (per-app: Claude, Codex, Gemini, etc.) |
+| `src/i18n/` | Internationalization (index.ts + locales/en.json, zh.json, zh-TW.json, ja.json) |
+| `src/icons/extracted/` | Provider icons (SVG/PNG + metadata) |
+| `src/lib/schemas/` | Zod schemas for provider and settings validation |
+| `src/lib/openai/` | External profile handling |
+| `src/hooks/` | React hooks (provider actions, settings form) |
+| `src/types.ts` | Shared TypeScript type definitions |
 
 ### Tests
 
@@ -230,7 +230,7 @@ Backend (Rust, Tauri 2.8, rusqlite)
 
 ### Core Design Principles
 
-- **SSOT** — SQLite at `~/.cc-switch/cc-switch.db` (schema v18) holds providers, MCP,
+- **SSOT** — SQLite at `~/.cc-switch/cc-switch.db` (schema v19) holds providers, MCP,
   prompts, skills, settings. Device UI prefs live in `~/.cc-switch/settings.json`.
 - **Live-file sync** — switching writes the active provider into real CLI configs
   (`~/.codex/config.toml`, `~/.claude/settings.json`, …); editing the active provider
@@ -271,8 +271,9 @@ Verification scope and reporting are governed by rules 2, 8, 9, and 10. In pract
 
 ### Conventions
 
-- **IPC**: command names camelCase on the JS side; Rust `#[tauri::command]` fns are
-  snake_case behind the crate boundary. Payloads crossing IPC carry
+- **IPC**: invoke command names match the registered Rust snake_case names
+  (for example `get_providers`); JS wrapper methods and argument keys are camelCase.
+  Structured payloads crossing IPC carry
   `#[serde(rename_all = "camelCase")]`. Never call `invoke` directly in components —
   add a typed wrapper in `src/lib/api/<domain>.ts` and re-export from `index.ts`.
 - **Frontend**: `@/` alias → `src/`. Prefer TanStack Query hooks from `src/lib/query/`.
@@ -305,7 +306,7 @@ Verification scope and reporting are governed by rules 2, 8, 9, and 10. In pract
 
 ## UPSTREAM SYNC PROTOCOL
 
-26. **Before merging upstream, fetch and list ALL incoming commits:** `git log HEAD..upstream/main --oneline`
+26. **Before merging a reference repository, verify its remote URL, fetch, and list ALL incoming commits:** use `git remote -v` and `git log HEAD..<verified-remote>/<branch> --oneline`. Do not infer repository identity from the name `upstream`: in this checkout `bigstrongsun` points to `BigStrongSun/ccswitchmulti` and `upstream` points to `farion1231/cc-switch`; recheck before every sync.
 27. **After upstream merge, verify these fork-specific identifiers still exist:**
     - `resolve_reasoning_content_mode`
     - `ReasoningContentMode`
@@ -345,3 +346,48 @@ the error recurs intermittently. Every CCSwitch write or restore of
 30. **Before reverting or "cleaning up" anything unusual, search `docs/memory/` first** — the oddity may be a deliberate, documented decision.
 
 31. **Deep investigations** that exceed one entry go to `docs/memory/incidents/YYYY-MM-DD-<topic>.md`, linked from the journal entry.
+
+## CHANGE AUTHORIZATION & DECISION RECORDS
+
+32. **Investigation is read-only by default.** A request to audit logs, inspect
+    commits, reaudit a document, or explain a failure does not authorize source,
+    configuration, database, or user-data changes. A request to implement a
+    named fix authorizes that stated fix only; do not infer approval for extra
+    behavior, migrations, recovery actions, cleanup, or policy changes.
+
+33. **Ask and wait before making an ambiguous behavioral decision.** Before editing code
+    when more than one reasonable behavior satisfies the request, present the
+    proposed behavior, affected boundary, alternatives, risks, and verification
+    plan. Wait for explicit user approval of that scope before implementing it;
+    silence, a progress update, or a prior broad approval is not consent for an
+    expanded scope. Do not use urgency, an existing dirty tree, passing tests,
+    or a model harness recommendation as implied approval.
+
+34. **Record every substantive decision.** Create or update
+    `docs/decisions/YYYY-MM-DD-<slug>.md` before implementing a non-trivial
+    behavior change, including deliberate retain/reject/defer choices that
+    materially affect the design. Record the goal, evidence, decision, alternatives,
+    ownership boundary, affected files, approval status, and verification. Use
+    the template in `docs/decisions/README.md`. Routine commands and mechanical
+    formatting do not need separate records. Link related incidents and journal
+    entries rather than duplicating them. Never include API keys, tokens, or raw
+    private request bodies in these records.
+
+35. **Keep approval, implementation, verification, and runtime freshness separate.**
+    Use the independent fields and allowed values in `docs/decisions/README.md`;
+    a single `verified` status must never conceal missing approval. Include the
+    user's exact approval or the approving message reference when available.
+    Tests, runtime observations, a journal entry, or another agent's recommendation
+    are evidence, not approval. Append dated status transitions and corrections;
+    preserve prior evidence, approval boundaries, and rejected alternatives.
+    Never rewrite a record to make an unapproved decision appear approved.
+
+36. **Journal the outcome, not the permission.** Add a concise newest-first
+    entry to `docs/memory/journal.md` for significant incidents, rejected or
+    superseded decisions, and verification evidence, linking the decision
+    record. If an unapproved edit already exists, say so plainly, keep it
+    uncommitted, and ask whether to retain, revise, or revert it; do not claim
+    that application work is complete until the user decides. Inventory the
+    affected files and decisions with approval `not-approved` and implementation
+    `implemented`; do not invent approval from an earlier bug report. A request
+    to update these instructions does not approve earlier application edits.

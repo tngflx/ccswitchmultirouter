@@ -1,5 +1,86 @@
 # Engineering Journal (newest first)
 
+## 2026-10-01 - Reconcile incoming catalog retention with approved publication fixes
+
+- **What happened:** The user approved intelligently merging the disclosed
+  application/documentation batch before push. Origin added 6046562bd while
+  local catalog, startup diagnostics, and approval-protocol changes were pending.
+- **Root cause:** Catalog membership, source inclusion, and explicit route
+  selection are distinct contracts; keeping only one side would lose either
+  saved rows or newly fetched model publication. Backend verification also
+  depends on the normal executable and active Desktop lifecycle boundaries.
+- **What we did:** Fast-forwarded the existing main checkout and restored the
+  saved work, retaining saved omissions/exclusions and default inclusion for
+  new rows. Explicit Follow all re-enables source rows; automatic refresh does
+  not overwrite route selection. Retained diagnostic-only startup changes and
+  the existing approval policy. See the [catalog decision](../decisions/2026-10-01-catalog-merge-publication.md)
+  and [startup decision](../decisions/2026-10-01-startup-skip-diagnostics.md).
+- **Evidence:** Typecheck and cargo check passed; targeted frontend **7 files /
+  205 tests** passed; full frontend **197 files / 1,639 tests** passed. Validator
+  **172/172**, status regressions **8/8**, script parsing **2/2**, and whitespace
+  check passed. Prettier failed on wizard formatting also present at HEAD;
+  seven other checked files passed. Full cargo test exited **1 before tests**
+  on locked debug cc-switch.exe (**Access is denied, os error 5**). Focused
+  library startup tests were **18 passed / 1 failed**, with the failure reporting
+  **CODEX_DESKTOP_ACTIVE, PID 13772**. Full backend and fresh runtime behavior
+  remain unverified; push is withheld pending the required suite.
+- **What NOT to do again:** Do not discard either catalog contract during a
+  textual merge, silently relax decision policy, close the user's processes,
+  bypass lifecycle guards, or call a partial test run full verification.
+
+## 2026-10-01 - Re-audit approval protocol and separate authorization from verification
+
+- **What happened:** The follow-up audit of all `AGENTS.md` sections and its
+  working-tree diff found gaps in the new protocol and older factual ambiguities.
+  This corrects the immediately preceding approval-protocol entry's scope;
+  its original 47/47 result remains historical evidence.
+- **Root cause:** A single status mixed authorization with testing; presenting
+  a plan did not explicitly require waiting for approval. Minimized-window rules
+  conflicted, source tables mixed path roots, IPC names were described incorrectly,
+  and the generic `upstream` label could select the wrong reference repository.
+- **What we did:** Required explicit approval before ambiguous implementation,
+  separated decision fields, retained append-only history, and documented earlier
+  unapproved application edits. Corrected path/IPC/remote facts and clarified
+  minimized UIA precedence without changing the capture helper or application.
+  Extended the validator and added in-memory status regressions. Full findings,
+  reference-repository verdict, and approval scope are in the
+  [decision record](../decisions/2026-10-01-agent-approval-protocol.md).
+- **Evidence:** Validator **164/164** passed; status regressions **8/8** passed;
+  PowerShell parsing **2/2** passed; `git diff --check` passed. The first expanded
+  validator run failed one erroneous identifier check (**163 passed, 1 failed**),
+  corrected to the actual reconciliation export before the passing rerun.
+  No application tests, type checks, builds, or live runtime verification ran here.
+- **What NOT to do again:** Do not turn tested into approved, silently expand
+  scope, overwrite decision history, restore a minimized window under a generic
+  background-show allowance, or infer remote identity from its local name.
+
+## 2026-10-01 - Require explicit approval and decision records for agent changes
+
+- **What happened:** A prior audit made additional application behavior changes
+  while investigating Codex startup and model persistence, without an explicit
+  approval boundary for each non-obvious choice.
+- **Root cause:** The existing journal protocol recorded significant outcomes
+  but did not distinguish evidence from authorization or require a durable
+  decision record for ambiguous behavior.
+- **What we did:** Added an approval and decision-record protocol to `AGENTS.md`,
+  created `docs/decisions/README.md` and this
+  [decision record](../decisions/2026-10-01-agent-approval-protocol.md), and
+  corrected the documented schema version to 19 and resources path. The earlier
+  application edits remain unapproved dirty-tree changes.
+- **Evidence:** `scripts/validate-agents-md.ps1` passed with **47/47** checks;
+  `git diff --check` passed after the updates.
+- **What NOT to do again:** Do not treat an audit request, passing tests, runtime
+  evidence, or a model recommendation as approval for extra behavior. Ask first,
+  record the decision, and keep unapproved edits uncommitted.
+
+## 2026-09-30 - Correct wizard model publication after accidental disabled-row default
+
+- **What happened:** After the MultiRouter wizard refreshed a grouped-key provider, newly returned Sublyx models were present in the provider catalog but missing from the published Codex Desktop picker. The failure was introduced by `849a0915d` (`fix: update model handling and improve test coverage for Codex components`), which added `enabled: false` to every newly appended row in the wizard, shared catalog sync, and Codex provider form paths.
+- **Root cause:** `enabled !== false` is the inclusion invariant used by the wizard route builder and catalog projection. The new rows were persisted as disabled, so enabled-only reads omitted them from generated routes even though the fetch response and raw catalog contained them. This is separate from the `guardianv2` warning: `enforce_codex_guardian_v2_live_compatibility` repairs missing/incompatible live values to scalar `false` and does not filter model catalogs.
+- **What we did:** Removed the disabled default from newly fetched rows in all three append paths. Existing `enabled: false` rows remain persistent exclusions/tombstones. Added helper coverage for grouped-provider merge and a component regression covering fetch, source persistence, `启用并验证`, and `保存并发布`; the earlier opt-in entry remains historical and is corrected by this entry. Audited current `BigStrongSun/ccswitchmulti` (its wizard still uses `enabled !== false` and has no equivalent new-row opt-out) and `farion1231/cc-switch` (no equivalent MultiRouter wizard path); neither was copied blindly.
+- **Evidence:** Focused wizard/catalog tests passed **68/68**; adjacent provider-form/helper tests passed **118/118**; the final focused regression run passed **186/186**; the full frontend suite passed **197 files / 1,638 tests**; `pnpm typecheck` and `git diff --check` passed. Prettier passes for the helper/catalog/test files; the untouched baseline formatting in `CodexFormFields.tsx` is intentionally preserved. `cargo check --manifest-path src-tauri/Cargo.toml` passed, but the full Rust suite could not start because Windows denied removal of the existing `src-tauri/target/debug/cc-switch.exe` held by the running app. Live Desktop picker behavior and recovery of already-persisted disabled rows were not tested.
+- **What NOT to do again:** Do not encode a new fetched model as `enabled: false` unless the user explicitly excluded it. Do not blindly re-enable existing disabled rows: their provenance is unknown, so recover the affected catalog through explicit user selection or a separately audited migration. Do not attribute the `guardianv2` scalar-normalization warning to model publication.
+
 ## 2026-09-30 - Global switch write must not clobber the resolved listener port
 
 - **What happened:** Splitting the proxy lifecycle into "explicit global start writes `proxy_enabled`" and "internal recovery starts the listener only" introduced a regression: `start_global_locked` read `GlobalProxyConfig` *before* the listener bound, then wrote that stale struct back *after* it bound. With an ephemeral (`listen_port = 0`) configuration this reset the stored port to `0`, and `update_current_claude_desktop_provider_syncs_profile_when_proxy_takeover_is_active` began failing with "Claude Desktop 代理地址需要真实监听端口". Confirmed as a regression by running that test at `HEAD` (passed) and against the working tree (failed).
