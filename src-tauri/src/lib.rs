@@ -1452,7 +1452,7 @@ pub fn run() {
                         log::info!("Codex Desktop 已在运行，跳过启动门禁事务")
                     }
                     Ok(None) => {
-                        log::info!("跳过启动 Codex Desktop：启动意图已取消或所需代理已关闭")
+                        log::debug!("Codex Desktop 启动由生命周期门禁跳过；具体原因已由代理服务记录")
                     }
                     Err(error) => log::error!("Codex 启动门禁未通过，已阻止自动启动: {error}"),
                 }

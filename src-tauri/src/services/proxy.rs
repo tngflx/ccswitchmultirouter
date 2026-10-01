@@ -271,6 +271,48 @@ fn should_launch_codex_at_startup(
         && (launch_setting_enabled || (stopped_for_takeover && codex_takeover_requested))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CodexStartupLaunchSkipReason {
+    RecoverySuperseded,
+    StartupOwnershipUnavailable,
+    GlobalProxyDisabled,
+    DesktopLaunchDisabled,
+}
+
+impl CodexStartupLaunchSkipReason {
+    fn message(self) -> &'static str {
+        match self {
+            Self::RecoverySuperseded => "启动恢复已被显式代理切换取代",
+            Self::StartupOwnershipUnavailable => "检测到另一个 CCSwitchMulti 实例拥有代理生命周期",
+            Self::GlobalProxyDisabled => "全局代理未启用",
+            Self::DesktopLaunchDisabled => "设置 launchCodexDesktopWithCcswitch=false 且没有待恢复的 Desktop 生命周期",
+        }
+    }
+}
+
+fn codex_startup_launch_skip_reason(
+    startup_recovery_superseded: bool,
+    proxy_startup_allowed: bool,
+    proxy_enabled: bool,
+    launch_setting_enabled: bool,
+    stopped_for_takeover: bool,
+    codex_takeover_requested: bool,
+) -> Option<CodexStartupLaunchSkipReason> {
+    if startup_recovery_superseded {
+        return Some(CodexStartupLaunchSkipReason::RecoverySuperseded);
+    }
+    if !proxy_startup_allowed {
+        return Some(CodexStartupLaunchSkipReason::StartupOwnershipUnavailable);
+    }
+    if !proxy_enabled {
+        return Some(CodexStartupLaunchSkipReason::GlobalProxyDisabled);
+    }
+    if !launch_setting_enabled && !(stopped_for_takeover && codex_takeover_requested) {
+        return Some(CodexStartupLaunchSkipReason::DesktopLaunchDisabled);
+    }
+    None
+}
+
 impl ProxyService {
     pub fn new(db: Arc<Database>) -> Self {
         Self {
@@ -476,6 +518,10 @@ impl ProxyService {
             .startup_recovery_superseded
             .load(Ordering::SeqCst)
         {
+            log::info!(
+                "跳过启动 Codex Desktop：{}",
+                CodexStartupLaunchSkipReason::RecoverySuperseded.message()
+            );
             return Ok(None);
         }
         let proxy_enabled = self
@@ -490,7 +536,15 @@ impl ProxyService {
                 .get_proxy_config_for_app("codex")
                 .await
                 .is_ok_and(|config| config.enabled);
-        if !proxy_startup_allowed || !proxy_enabled {
+        if let Some(reason) = codex_startup_launch_skip_reason(
+            false,
+            proxy_startup_allowed,
+            proxy_enabled,
+            crate::settings::get_settings().launch_codex_desktop_with_ccswitch,
+            stopped_for_takeover,
+            codex_takeover_requested,
+        ) {
+            log::info!("跳过启动 Codex Desktop：{}", reason.message());
             return Ok(None);
         }
         let launch_setting_enabled = crate::settings::get_settings().launch_codex_desktop_with_ccswitch;
@@ -6551,6 +6605,29 @@ mod tests {
         assert!(!should_launch(false, true, true, true, true));
         assert!(!should_launch(true, false, true, true, true));
         assert!(!should_launch(true, true, false, true, false));
+    }
+
+    #[test]
+    fn startup_launch_skip_reason_reports_the_actual_gate() {
+        use super::{codex_startup_launch_skip_reason as reason, CodexStartupLaunchSkipReason};
+
+        assert_eq!(
+            reason(true, true, true, true, false, false),
+            Some(CodexStartupLaunchSkipReason::RecoverySuperseded)
+        );
+        assert_eq!(
+            reason(false, false, true, true, false, false),
+            Some(CodexStartupLaunchSkipReason::StartupOwnershipUnavailable)
+        );
+        assert_eq!(
+            reason(false, true, false, true, false, false),
+            Some(CodexStartupLaunchSkipReason::GlobalProxyDisabled)
+        );
+        assert_eq!(
+            reason(false, true, true, false, false, true),
+            Some(CodexStartupLaunchSkipReason::DesktopLaunchDisabled)
+        );
+        assert_eq!(reason(false, true, true, false, true, true), None);
     }
 
     #[tokio::test]
