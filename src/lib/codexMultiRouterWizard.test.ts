@@ -1,5 +1,9 @@
 import { describe, expect, it } from "vitest";
-import type { CodexModelReasoningCapability, Provider } from "@/types";
+import type {
+  CodexCatalogModel,
+  CodexModelReasoningCapability,
+  Provider,
+} from "@/types";
 import {
   buildCodexMultiRouterWizardPlan,
   buildWizardModelCatalog,
@@ -141,6 +145,50 @@ describe("mergeFetchedModelsIntoWizardProvider", () => {
       ],
     );
     expect(merged.settingsConfig.modelCatalog?.models).toHaveLength(1);
+  });
+
+  it("publishes every newly fetched grouped-provider model by default", () => {
+    const source: Provider = {
+      ...deepseekSource,
+      id: "sublyx",
+      name: "Sublyx",
+      settingsConfig: {
+        ...deepseekSource.settingsConfig,
+        modelCatalog: {
+          models: [
+            { model: "fallback-model", upstreamModel: "fallback-model" },
+          ],
+          spawnAgentModels: ["fallback-model"],
+        },
+      },
+    };
+    const refreshed = mergeFetchedModelsIntoWizardProvider(
+      source,
+      [
+        { id: "fallback-model", ownedBy: null },
+        { id: "group-model-a", ownedBy: null },
+        { id: "group-model-b", ownedBy: null },
+      ],
+      { preserveExistingSelection: true, appendNewModels: true },
+    );
+
+    expect(
+      refreshed.settingsConfig.modelCatalog?.models.map(
+        (model: CodexCatalogModel) => model.model,
+      ),
+    ).toEqual(["fallback-model", "group-model-a", "group-model-b"]);
+    expect(
+      refreshed.settingsConfig.modelCatalog?.models
+        .slice(1)
+        .every((model: CodexCatalogModel) => model.enabled !== false),
+    ).toBe(true);
+
+    const result = buildCodexMultiRouterWizardPlan([refreshed], [refreshed]);
+    const route = result.plan.settingsConfig.codexRouting?.routes?.[0];
+    expect(route?.modelSelection).toEqual({ mode: "all" });
+    expect(
+      result.persistedSourceProviders[0].settingsConfig.modelCatalog?.models,
+    ).toEqual(refreshed.settingsConfig.modelCatalog?.models);
   });
 });
 

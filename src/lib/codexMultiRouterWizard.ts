@@ -586,9 +586,6 @@ export function mergeFetchedModelsIntoWizardProvider(
     const nextModel = {
       ...(existing ?? {}),
       model: visibleModelId,
-      // A fetched row is new provider inventory, not an implicit user
-      // selection. Existing rows retain their current enabled state above.
-      ...(existing ? {} : { enabled: false }),
       upstreamModel: nonEmptyWizardModelField(
         existing?.upstreamModel,
         existing?.upstream_model,

@@ -841,9 +841,6 @@ function mergeFetchedModelsIntoCatalogRows(
       model,
       upstreamModel: model,
       displayName: model,
-      // A fetched model has no prior user selection. Keep it excluded until
-      // the user explicitly includes it in the catalog.
-      enabled: false,
       ...(contextWindowText ? { contextWindow: contextWindowText } : {}),
       ...capabilityPatch,
       ...(fetched.reasoning ? { reasoning: fetched.reasoning } : {}),

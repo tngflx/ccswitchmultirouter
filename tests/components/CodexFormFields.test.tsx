@@ -2153,11 +2153,11 @@ describe("CodexFormFields local model routing", () => {
       ).toEqual(fetchedReasoning);
       expect(
         latestCatalog().find((row) => row.model === "new")?.enabled,
-      ).toBe(false);
+      ).toBeUndefined();
     });
   });
 
-  it("does not change existing inclusion choices and excludes newly synced models", async () => {
+  it("does not change existing inclusion choices and includes newly synced models", async () => {
     vi.mocked(fetchModelsForConfig).mockResolvedValueOnce([
       { id: "included", ownedBy: null },
       { id: "excluded", ownedBy: null },
@@ -2182,7 +2182,6 @@ describe("CodexFormFields local model routing", () => {
       });
       expect(latestCatalog()[2]).toMatchObject({
         model: "new-model",
-        enabled: false,
       });
     });
   });
@@ -2429,7 +2428,7 @@ describe("CodexFormFields local model routing", () => {
         "free-model",
         "paid-model",
       ]);
-      expect(latestCatalog().every((model) => model.enabled === false)).toBe(
+      expect(latestCatalog().every((model) => model.enabled !== false)).toBe(
         true,
       );
     });
@@ -2780,7 +2779,7 @@ describe("CodexFormFields local model routing", () => {
     ).toBe(false);
     expect(
       latestCatalog().find((model) => model.model === "gamma-free")?.enabled,
-    ).toBe(false);
+    ).toBeUndefined();
     expect(
       latestCatalog().filter((model) => model.model === "alpha-free"),
     ).toHaveLength(1);

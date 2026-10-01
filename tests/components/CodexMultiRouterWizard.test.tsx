@@ -626,10 +626,13 @@ describe("CodexMultiRouterWizard", () => {
     expect(providersApi.update).toHaveBeenCalledTimes(1);
   });
 
-  it("fetches every enabled grouped credential without replacing the saved provider catalog", async () => {
+  it("publishes every model fetched from enabled grouped credentials", async () => {
     vi.mocked(fetchModelsForConfig)
       .mockResolvedValueOnce([{ id: "fallback-model", ownedBy: null }])
-      .mockResolvedValueOnce([{ id: "group-model", ownedBy: null }]);
+      .mockResolvedValueOnce([
+        { id: "group-model-a", ownedBy: null },
+        { id: "group-model-b", ownedBy: null },
+      ]);
     vi.mocked(providersApi.update).mockResolvedValueOnce(true);
     const source = provider({
       settingsConfig: {
@@ -674,16 +677,59 @@ describe("CodexMultiRouterWizard", () => {
       saved.settingsConfig.modelCatalog.models.map(
         (model: { model: string }) => model.model,
       ),
-    ).toEqual(["fallback-model", "stale-model", "group-model"]);
+    ).toEqual([
+      "fallback-model",
+      "stale-model",
+      "group-model-a",
+      "group-model-b",
+    ]);
     expect(
       saved.settingsConfig.modelCatalog.models.find(
-        (model: { model: string }) => model.model === "group-model",
-      ),
-    ).toMatchObject({ enabled: false });
+        (model: { model: string }) => model.model === "group-model-a",
+      )?.enabled,
+    ).not.toBe(false);
+    expect(
+      saved.settingsConfig.modelCatalog.models.find(
+        (model: { model: string }) => model.model === "group-model-b",
+      )?.enabled,
+    ).not.toBe(false);
     expect(saved.settingsConfig.modelCatalog.spawnAgentModels).toEqual([
       "fallback-model",
       "stale-model",
     ]);
+
+    fireEvent.click(screen.getByRole("button", { name: "启用并验证" }));
+    fireEvent.click(
+      screen.getAllByRole("button", { name: "保存并发布" }).at(-1)!,
+    );
+
+    await waitFor(() => expect(providersApi.add).toHaveBeenCalledTimes(1));
+    const publishedProvider = vi.mocked(providersApi.add).mock.calls[0][0];
+    const publishedRoute =
+      publishedProvider.settingsConfig.codexRouting.routes.find(
+        (route: { targetProviderId: string }) =>
+          route.targetProviderId === source.id,
+      );
+    expect(publishedRoute?.modelSelection).toEqual({ mode: "all" });
+
+    const publishedSource = vi
+      .mocked(providersApi.update)
+      .mock.calls.at(-1)?.[0];
+    expect(
+      publishedSource?.settingsConfig.modelCatalog?.models.map(
+        (model: { model: string }) => model.model,
+      ),
+    ).toEqual([
+      "fallback-model",
+      "stale-model",
+      "group-model-a",
+      "group-model-b",
+    ]);
+    expect(
+      publishedSource?.settingsConfig.modelCatalog?.models.every(
+        (model: { enabled?: boolean }) => model.enabled !== false,
+      ),
+    ).toBe(true);
   });
 
   it("keeps unmatched models when a wizard grouped-credential sync is partial", async () => {
@@ -781,8 +827,8 @@ describe("CodexMultiRouterWizard", () => {
     expect(
       savedProvider.settingsConfig.modelCatalog.models.find(
         (model: { model: string }) => model.model === "gpt-5.6-sol",
-      ),
-    ).toMatchObject({ enabled: false });
+      )?.enabled,
+    ).not.toBe(false);
     expect(fetchModelsForConfig).not.toHaveBeenCalled();
   });
 
@@ -952,10 +998,11 @@ describe("CodexMultiRouterWizard", () => {
     expect(
       savedProvider.settingsConfig.modelCatalog.models.find(
         (model: { model: string }) => model.model === "deepseek-reasoner",
-      ),
-    ).toMatchObject({ enabled: false });
+      )?.enabled,
+    ).not.toBe(false);
     expect(savedProvider.settingsConfig.modelCatalog.spawnAgentModels).toEqual([
       "deepseek-chat",
+      "deepseek-reasoner",
     ]);
   });
 
@@ -1390,6 +1437,55 @@ describe("CodexMultiRouterWizard", () => {
     expect(
       savedProvider.settingsConfig.codexRouting.routes[0].modelSelection,
     ).toEqual({ mode: "include", models: ["model-c", "model-a"] });
+  });
+
+  it("re-enables disabled source rows when following all models", async () => {
+    const source = provider({
+      id: "sublyx",
+      name: "Sublyx",
+      settingsConfig: {
+        base_url: "https://sublyx.example/v1",
+        auth: { OPENAI_API_KEY: "sk-test" },
+        modelCatalog: {
+          models: [
+            { model: "gpt-6-sol", enabled: false },
+            { model: "gpt-6-luna", enabled: true },
+          ],
+        },
+      },
+    });
+
+    renderWithQueryClient(
+      <CodexMultiRouterWizard
+        open
+        providers={[source]}
+        onOpenChange={vi.fn()}
+        onCreateProvider={vi.fn()}
+        onOpenWorkspace={vi.fn()}
+        onEnablePlan={vi.fn()}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "下一步" }));
+    fireEvent.click(screen.getByRole("button", { name: "下一步" }));
+    fireEvent.click(screen.getByRole("button", { name: "自动跟随全部模型" }));
+
+    expect(screen.getByLabelText("保留 gpt-6-sol")).toBeChecked();
+
+    fireEvent.click(screen.getByRole("button", { name: "启用并验证" }));
+    fireEvent.click(
+      screen.getAllByRole("button", { name: "保存并发布" }).at(-1)!,
+    );
+
+    await waitFor(() => expect(providersApi.add).toHaveBeenCalledTimes(1));
+    const updatedSource = vi
+      .mocked(providersApi.update)
+      .mock.calls.map(([candidate]) => candidate)
+      .find((candidate) => candidate.id === "sublyx");
+    expect(updatedSource?.settingsConfig.modelCatalog?.models).toEqual([
+      { model: "gpt-6-sol", enabled: true },
+      { model: "gpt-6-luna", enabled: true },
+    ]);
   });
 
   it("confirms and probes both Chat and Responses connectivity before recording pass state", async () => {

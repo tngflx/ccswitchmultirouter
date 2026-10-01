@@ -868,7 +868,7 @@ function reconcileCatalogModelOrderAfterFetch(
   const nextAvailableSet = new Set(nextAvailableModels);
   // A non-null order is an explicit user selection. Refreshes may add
   // inventory, but they must never implicitly add that inventory to the
-  // included route; the picker exposes new rows as disabled until selected.
+  // included route; users can opt new rows into the order explicitly.
   return currentOrder.filter((model) => nextAvailableSet.has(model));
 }
 
@@ -1335,6 +1335,31 @@ export function CodexMultiRouterWizard({
       );
       return base.filter((item) => item !== model.model);
     });
+  };
+
+  // An explicit "follow all" is also the recovery action for rows that were
+  // accidentally persisted disabled. Automatic refreshes still preserve
+  // explicit exclusions; only this user action re-enables every source row.
+  const followAllCatalogModels = () => {
+    setDraftSources((current) =>
+      current.map((provider) => {
+        const models = readRawWizardModelCatalog(provider).map((model) => ({
+          ...model,
+          enabled: true,
+        }));
+        return {
+          ...provider,
+          settingsConfig: {
+            ...provider.settingsConfig,
+            modelCatalog: {
+              ...(provider.settingsConfig?.modelCatalog ?? {}),
+              models,
+            },
+          },
+        };
+      }),
+    );
+    setCatalogModelOrder(null);
   };
 
   // 调整最终模型选择与顺序；schema v2 只把 all/include 策略写入 Router。
@@ -2568,7 +2593,7 @@ export function CodexMultiRouterWizard({
                   <Button
                     type="button"
                     variant="outline"
-                    onClick={() => setCatalogModelOrder(null)}
+                    onClick={followAllCatalogModels}
                   >
                     {t("codexWizard.select.followAllModels")}
                   </Button>
