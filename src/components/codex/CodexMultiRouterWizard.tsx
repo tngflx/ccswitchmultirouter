@@ -48,7 +48,7 @@ import { providersApi } from "@/lib/api/providers";
 import type { CodexMultiRouterMigrationPreview } from "@/lib/api/providers";
 import { codexSubagentV2Api } from "@/lib/api/codexSubagentV2";
 import {
-  fetchCodexOauthCachedModels,
+  fetchCodexOfficialFallbackModels,
   fetchCodexOauthModels,
   fetchModelsForConfig,
   probeCodexChatForConfig,
@@ -546,7 +546,9 @@ function mergeWizardDraftProviderSnapshot(
   const currentByIdentity = new Map(
     currentModels.map((model) => [
       `${model.model.trim().toLowerCase()}\u0000${(
-        model.upstreamModel ?? model.upstream_model ?? model.model
+        model.upstreamModel ??
+        model.upstream_model ??
+        model.model
       )
         .trim()
         .toLowerCase()}`,
@@ -557,7 +559,9 @@ function mergeWizardDraftProviderSnapshot(
     parentModels.map(
       (model) =>
         `${model.model.trim().toLowerCase()}\u0000${(
-          model.upstreamModel ?? model.upstream_model ?? model.model
+          model.upstreamModel ??
+          model.upstream_model ??
+          model.model
         )
           .trim()
           .toLowerCase()}`,
@@ -566,7 +570,9 @@ function mergeWizardDraftProviderSnapshot(
   const mergedModels = [
     ...parentModels.map((model) => {
       const key = `${model.model.trim().toLowerCase()}\u0000${(
-        model.upstreamModel ?? model.upstream_model ?? model.model
+        model.upstreamModel ??
+        model.upstream_model ??
+        model.model
       )
         .trim()
         .toLowerCase()}`;
@@ -577,15 +583,17 @@ function mergeWizardDraftProviderSnapshot(
     }),
     ...currentModels.filter((model) => {
       const key = `${model.model.trim().toLowerCase()}\u0000${(
-        model.upstreamModel ?? model.upstream_model ?? model.model
+        model.upstreamModel ??
+        model.upstream_model ??
+        model.model
       )
         .trim()
         .toLowerCase()}`;
       return !parentKeys.has(key);
     }),
   ];
-  const currentSpawnAgentModels = current.settingsConfig?.modelCatalog
-    ?.spawnAgentModels;
+  const currentSpawnAgentModels =
+    current.settingsConfig?.modelCatalog?.spawnAgentModels;
   const parentCatalog = parent.settingsConfig?.modelCatalog ?? {};
   return {
     ...parent,
@@ -1292,20 +1300,22 @@ export function CodexMultiRouterWizard({
       setDraftSources((current) =>
         current.map((provider) => {
           if (!matchingProviderIds.has(provider.id)) return provider;
-          const models = readRawWizardModelCatalog(provider).map((candidate) => {
-            const candidateModel = candidate.model.trim().toLowerCase();
-            const candidateUpstream = (
-              candidate.upstreamModel ??
-              candidate.upstream_model ??
-              candidate.model
-            )
-              .trim()
-              .toLowerCase();
-            return candidateModel === targetModel ||
-              candidateUpstream === targetUpstream
-              ? { ...candidate, enabled: checked }
-              : candidate;
-          });
+          const models = readRawWizardModelCatalog(provider).map(
+            (candidate) => {
+              const candidateModel = candidate.model.trim().toLowerCase();
+              const candidateUpstream = (
+                candidate.upstreamModel ??
+                candidate.upstream_model ??
+                candidate.model
+              )
+                .trim()
+                .toLowerCase();
+              return candidateModel === targetModel ||
+                candidateUpstream === targetUpstream
+                ? { ...candidate, enabled: checked }
+                : candidate;
+            },
+          );
           return {
             ...provider,
             settingsConfig: {
@@ -1326,9 +1336,7 @@ export function CodexMultiRouterWizard({
           .filter((item) => item.enabled !== false)
           .map((item) => item.model);
       if (checked) {
-        return base.includes(model.model)
-          ? base
-          : [...base, model.model];
+        return base.includes(model.model) ? base : [...base, model.model];
       }
       setDraftSpawnAgentModels((spawnModels) =>
         spawnModels.filter((item) => item !== model.model),
@@ -1586,7 +1594,7 @@ export function CodexMultiRouterWizard({
             const message = formatWizardError(error);
             let cacheFailureMessage: string | null = null;
             try {
-              const cachedModels = await fetchCodexOauthCachedModels();
+              const cachedModels = await fetchCodexOfficialFallbackModels();
               if (cachedModels.length > 0) {
                 // 在线 OAuth 目录失败时使用 Codex 本地官方缓存兜底，避免新建 official 源被写成 0 模型。
                 const nextProvider = mergeFetchedModelsIntoWizardProvider(
@@ -1831,10 +1839,7 @@ export function CodexMultiRouterWizard({
         { includeDisabled: true },
       ).models.map((model) => model.model);
       setCatalogModelOrder((current) =>
-        reconcileCatalogModelOrderAfterFetch(
-          current,
-          nextAvailableModels,
-        ),
+        reconcileCatalogModelOrderAfterFetch(current, nextAvailableModels),
       );
       setDraftSpawnAgentModels((current) => {
         const nextAvailableSet = new Set(nextAvailableModels);
@@ -2641,10 +2646,7 @@ export function CodexMultiRouterWizard({
                           className="h-4 w-4"
                           checked={kept}
                           onChange={(event) =>
-                            toggleCatalogModel(
-                              model,
-                              event.target.checked,
-                            )
+                            toggleCatalogModel(model, event.target.checked)
                           }
                           aria-label={t("codexWizard.select.keepModelAria", {
                             model: model.model,

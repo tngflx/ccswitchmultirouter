@@ -238,6 +238,10 @@ export const providersApi = {
     });
   },
 
+  async updateCodexBatch(providers: Provider[]): Promise<boolean> {
+    return await invoke("update_codex_providers", { providers });
+  },
+
   async inspectCodexMultiRouterProjection(
     providerId: string,
   ): Promise<CodexRoutingProjectionStatus> {

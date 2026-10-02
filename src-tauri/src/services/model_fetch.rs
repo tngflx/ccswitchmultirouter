@@ -11,10 +11,18 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 /// 获取到的模型信息
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FetchedModel {
     pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub canonical_slug: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slug: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub aliases: Vec<String>,
     pub owned_by: Option<String>,
     pub context_window: Option<u64>,
     pub input_modalities: Option<Vec<String>>,
@@ -67,32 +75,98 @@ struct ModelsResponse {
     error: Option<serde_json::Value>,
 }
 
-/// Extract model IDs from a vendor catalog, preferring Zhipu's `slug` and
-/// falling back to the OpenAI-compatible `id`. Ignore every other shape.
-fn catalog_model_ids(models: Option<serde_json::Value>) -> Vec<String> {
+/// Preserve object-shaped auxiliary catalogs instead of reducing them to IDs.
+/// Some gateways put their only stable identity in `slug`/`name`.
+fn catalog_model_entries(models: Option<serde_json::Value>) -> Vec<serde_json::Value> {
     let Some(serde_json::Value::Array(entries)) = models else {
         return Vec::new();
     };
     entries
         .iter()
-        .filter_map(|entry| {
-            ["slug", "id"].iter().find_map(|key| {
-                entry
-                    .get(*key)
-                    .and_then(serde_json::Value::as_str)
-                    .filter(|value| !value.is_empty())
-            })
+        .filter_map(|entry| match entry {
+            serde_json::Value::String(value) if !value.trim().is_empty() => {
+                Some(serde_json::json!({ "id": value.trim() }))
+            }
+            serde_json::Value::Object(_) => Some(entry.clone()),
+            _ => None,
         })
-        .map(str::to_owned)
         .collect()
 }
 
 #[derive(Debug, Deserialize)]
 struct ModelEntry {
-    id: String,
+    id: Option<String>,
     owned_by: Option<String>,
     #[serde(flatten)]
     extra: serde_json::Map<String, serde_json::Value>,
+}
+
+fn first_string_field(
+    obj: &serde_json::Map<String, serde_json::Value>,
+    keys: &[&str],
+) -> Option<String> {
+    keys.iter()
+        .find_map(|key| {
+            obj.get(*key)
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToString::to_string)
+        })
+}
+
+fn extract_model_aliases(obj: &serde_json::Map<String, serde_json::Value>) -> Vec<String> {
+    let mut aliases = Vec::new();
+    for key in ["aliases", "alias", "model_aliases", "modelAliases"] {
+        match obj.get(key) {
+            Some(serde_json::Value::Array(values)) => {
+                aliases.extend(values.iter().filter_map(|value| {
+                    value
+                        .as_str()
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                        .map(ToString::to_string)
+                }));
+            }
+            Some(serde_json::Value::String(value)) if !value.trim().is_empty() => {
+                aliases.push(value.trim().to_string());
+            }
+            _ => {}
+        }
+    }
+    aliases.sort_unstable();
+    aliases.dedup();
+    aliases
+}
+
+fn fetched_model_from_object(
+    obj: &serde_json::Map<String, serde_json::Value>,
+    owned_by: Option<&str>,
+    is_openrouter_catalog: bool,
+) -> Option<FetchedModel> {
+    let id = first_string_field(obj, &["id", "canonical_slug", "canonicalSlug", "slug", "name"])?;
+    let canonical_slug = first_string_field(obj, &["canonical_slug", "canonicalSlug"]);
+    let slug = first_string_field(obj, &["slug"]);
+    let name = first_string_field(obj, &["name"]);
+    let aliases = extract_model_aliases(obj);
+    let reasoning = extract_reasoning_capability(&id, obj, is_openrouter_catalog)
+        .or_else(|| maintained_reasoning_capability(&id));
+    Some(FetchedModel {
+        id,
+        canonical_slug,
+        slug,
+        name,
+        aliases,
+        owned_by: owned_by
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string)
+            .or_else(|| first_string_field(obj, &["owned_by", "ownedBy", "provider", "vendor"])),
+        context_window: extract_context_window(obj),
+        input_modalities: extract_input_modalities(obj),
+        supports_image: extract_supports_image(obj),
+        reasoning,
+    })
 }
 
 fn models_response_error(resp: &ModelsResponse) -> Option<String> {
@@ -274,36 +348,38 @@ pub async fn fetch_models(options: FetchModelsRequest<'_>) -> Result<Vec<Fetched
 
             let mut models: Vec<FetchedModel> = if let Some(data) = resp.data {
                 data.into_iter()
-                    .map(|m| FetchedModel {
-                        context_window: extract_context_window(&m.extra),
-                        reasoning: extract_reasoning_capability(
-                            &m.id,
-                            &m.extra,
+                    .filter_map(|m| {
+                        let mut object = m.extra;
+                        if let Some(id) = &m.id {
+                            object
+                                .entry("id".to_string())
+                                .or_insert_with(|| serde_json::Value::String(id.clone()));
+                        }
+                        let mut model = fetched_model_from_object(
+                            &object,
+                            m.owned_by.as_deref(),
                             is_openrouter_catalog,
-                        )
-                            .or_else(|| maintained_reasoning_capability(&m.id)),
-                        id: m.id,
-                        input_modalities: extract_input_modalities(&m.extra),
-                        owned_by: m.owned_by,
-                        supports_image: extract_supports_image(&m.extra),
+                        )?;
+                        if model.owned_by.is_none() {
+                            model.owned_by = m.owned_by;
+                        }
+                        Some(model)
                     })
                     .collect()
             } else {
-                catalog_model_ids(resp.models)
+                catalog_model_entries(resp.models)
                     .into_iter()
-                    .map(|id| FetchedModel {
-                        id,
-                        owned_by: None,
-                        context_window: None,
-                        input_modalities: None,
-                        supports_image: None,
-                        reasoning: None,
-                    })
+                    .filter_map(|entry| fetched_model_from_object(
+                        entry.as_object()?,
+                        None,
+                        is_openrouter_catalog,
+                    ))
                     .collect()
             };
 
             enrich_missing_context_windows(&client, url, &mut models).await;
             models.sort_by(|a, b| a.id.cmp(&b.id));
+            models.dedup_by(|a, b| a.id.eq_ignore_ascii_case(&b.id));
             return Ok(models);
         }
 
@@ -466,6 +542,25 @@ fn extract_reasoning_capability(
     );
     let entry = serde_json::Value::Object(entry);
     let has_explicit_contract = entry.pointer("/reasoning/upstream").is_some()
+        || entry
+            .get("reasoning")
+            .and_then(serde_json::Value::as_object)
+            .is_some_and(|reasoning| {
+                [
+                    "supported_efforts",
+                    "supportedEfforts",
+                    "supported_reasoning_levels",
+                    "supportedReasoningLevels",
+                    "supported_reasoning_efforts",
+                    "supportedReasoningEfforts",
+                ]
+                .iter()
+                .any(|key| reasoning.contains_key(*key))
+            })
+        || entry
+            .get("supported_parameters")
+            .or_else(|| entry.get("supportedParameters"))
+            .is_some()
         || [
             "supported_reasoning_levels",
             "supported_reasoning_efforts",
@@ -547,6 +642,10 @@ fn parse_volcengine_plan_model_entry(entry: &serde_json::Value) -> Option<Fetche
     {
         return Some(FetchedModel {
             id: model_id.to_string(),
+            canonical_slug: None,
+            slug: None,
+            name: None,
+            aliases: Vec::new(),
             owned_by: Some("volcengine".to_string()),
             context_window: None,
             input_modalities: None,
@@ -573,6 +672,10 @@ fn parse_volcengine_plan_model_entry(entry: &serde_json::Value) -> Option<Fetche
 
     Some(FetchedModel {
         id: id.to_string(),
+        canonical_slug: first_string_field(obj, &["canonical_slug", "canonicalSlug"]),
+        slug: first_string_field(obj, &["slug"]),
+        name: first_string_field(obj, &["name"]),
+        aliases: extract_model_aliases(obj),
         owned_by: Some("volcengine".to_string()),
         context_window: extract_context_window(obj),
         input_modalities: extract_input_modalities(obj),
@@ -1208,6 +1311,7 @@ fn ends_with_version_segment(url: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn test_candidates_plain_root() {
@@ -1428,9 +1532,9 @@ mod tests {
         let resp: ModelsResponse = serde_json::from_str(json).unwrap();
         let data = resp.data.unwrap();
         assert_eq!(data.len(), 2);
-        assert_eq!(data[0].id, "gpt-4");
+        assert_eq!(data[0].id.as_deref(), Some("gpt-4"));
         assert_eq!(data[0].owned_by.as_deref(), Some("openai"));
-        assert_eq!(data[1].id, "claude-3-sonnet");
+        assert_eq!(data[1].id.as_deref(), Some("claude-3-sonnet"));
     }
 
     #[test]
@@ -1438,7 +1542,7 @@ mod tests {
         let json = r#"{"object":"list","data":[{"id":"my-model","object":"model"}]}"#;
         let resp: ModelsResponse = serde_json::from_str(json).unwrap();
         let data = resp.data.unwrap();
-        assert_eq!(data[0].id, "my-model");
+        assert_eq!(data[0].id.as_deref(), Some("my-model"));
         assert!(data[0].owned_by.is_none());
     }
 
@@ -1447,7 +1551,10 @@ mod tests {
         let resp: ModelsResponse =
             serde_json::from_str(r#"{"models":[{"slug":"glm-5"},{"slug":"glm-5-flash"}]}"#)
                 .unwrap();
-        assert_eq!(catalog_model_ids(resp.models), ["glm-5", "glm-5-flash"]);
+        assert_eq!(
+            catalog_model_entries(resp.models),
+            vec![json!({"slug": "glm-5"}), json!({"slug": "glm-5-flash"})]
+        );
     }
 
     #[test]
@@ -1490,11 +1597,12 @@ mod tests {
             .into_iter()
             .map(|entry| FetchedModel {
                 context_window: extract_context_window(&entry.extra),
-                id: entry.id,
+                id: entry.id.expect("test model id"),
                 input_modalities: None,
                 owned_by: entry.owned_by,
                 supports_image: None,
                 reasoning: None,
+                ..Default::default()
             })
             .collect::<Vec<_>>();
 
@@ -1549,7 +1657,11 @@ mod tests {
         }))
         .unwrap();
         let entry = response.data.unwrap().into_iter().next().unwrap();
-        let reasoning = extract_reasoning_capability(&entry.id, &entry.extra, false)
+        let reasoning = extract_reasoning_capability(
+            entry.id.as_deref().expect("test model id"),
+            &entry.extra,
+            false,
+        )
             .expect("declared reasoning capability should be retained");
         assert_eq!(
             reasoning["supportedEfforts"],
@@ -1573,7 +1685,11 @@ mod tests {
         }))
         .expect("OpenRouter models response");
         let entry = response.data.unwrap().into_iter().next().unwrap();
-        let reasoning = extract_reasoning_capability(&entry.id, &entry.extra, true)
+        let reasoning = extract_reasoning_capability(
+            entry.id.as_deref().expect("test model id"),
+            &entry.extra,
+            true,
+        )
             .expect("OpenRouter reasoning must be retained");
         assert_eq!(
             reasoning["supportedEfforts"],
@@ -1583,7 +1699,47 @@ mod tests {
         assert_eq!(reasoning["upstream"]["format"], "object");
         assert_eq!(reasoning["upstream"]["parameter"], "reasoning.effort");
         assert_eq!(reasoning["upstream"]["effortMap"]["max"], "max");
-        assert!(extract_reasoning_capability(&entry.id, &entry.extra, false).is_none());
+        assert!(extract_reasoning_capability(
+            entry.id.as_deref().expect("test model id"),
+            &entry.extra,
+            false
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn openrouter_gpt_6_1_sol_preserves_all_live_effort_metadata() {
+        let response: ModelsResponse = serde_json::from_value(serde_json::json!({
+            "data": [{
+                "id": "openai/gpt-6.1-sol",
+                "canonical_slug": "openai/gpt-6.1-sol-20260929",
+                "supported_parameters": ["reasoning", "reasoning_effort"],
+                "reasoning": {
+                    "mandatory": true,
+                    "supported_efforts": ["max", "xhigh", "high", "medium", "low"],
+                    "default_effort": "medium"
+                }
+            }]
+        }))
+        .expect("OpenRouter gpt-6.1-sol response");
+        let entry = response.data.unwrap().into_iter().next().unwrap();
+        let reasoning = extract_reasoning_capability(
+            entry.id.as_deref().expect("test model id"),
+            &entry.extra,
+            true,
+        )
+        .expect("OpenRouter should expose the live reasoning contract");
+
+        assert_eq!(
+            reasoning["supportedEfforts"],
+            serde_json::json!(["max", "xhigh", "high", "medium", "low"])
+        );
+        assert_eq!(reasoning["defaultEffort"], "medium");
+        assert_eq!(reasoning["disableAllowed"], false);
+        assert_eq!(reasoning["upstream"]["format"], "object");
+        assert_eq!(reasoning["upstream"]["parameter"], "reasoning.effort");
+        assert_eq!(reasoning["upstream"]["effortMap"]["max"], "max");
+        assert_eq!(reasoning["upstream"]["effortMap"]["xhigh"], "xhigh");
     }
 
     #[test]
@@ -1882,6 +2038,7 @@ Coding 能力开源 SOTA，从代码生成走向工程交付 | 1M | 128K |
                 input_modalities: None,
                 supports_image: None,
                 reasoning: None,
+                ..Default::default()
             },
             FetchedModel {
                 id: "glm-5.1".to_string(),
@@ -1890,6 +2047,7 @@ Coding 能力开源 SOTA，从代码生成走向工程交付 | 1M | 128K |
                 input_modalities: None,
                 supports_image: None,
                 reasoning: None,
+                ..Default::default()
             },
         ];
 
@@ -1913,6 +2071,7 @@ Coding 能力开源 SOTA，从代码生成走向工程交付 | 1M | 128K |
                 input_modalities: Some(vec!["text".to_string()]),
                 supports_image: Some(false),
                 reasoning: None,
+                ..Default::default()
             },
             FetchedModel {
                 id: "gpt-5.6".to_string(),
@@ -1921,6 +2080,7 @@ Coding 能力开源 SOTA，从代码生成走向工程交付 | 1M | 128K |
                 input_modalities: None,
                 supports_image: None,
                 reasoning: None,
+                ..Default::default()
             },
         ];
         let entry = serde_json::json!({
@@ -1966,6 +2126,7 @@ Coding 能力开源 SOTA，从代码生成走向工程交付 | 1M | 128K |
                 input_modalities: None,
                 supports_image: None,
                 reasoning: None,
+                ..Default::default()
             },
             FetchedModel {
                 id: "text".into(),
@@ -1974,6 +2135,7 @@ Coding 能力开源 SOTA，从代码生成走向工程交付 | 1M | 128K |
                 input_modalities: Some(vec!["text".into()]),
                 supports_image: None,
                 reasoning: None,
+                ..Default::default()
             },
             FetchedModel {
                 id: "hy3-preview".into(),
@@ -1982,6 +2144,7 @@ Coding 能力开源 SOTA，从代码生成走向工程交付 | 1M | 128K |
                 input_modalities: None,
                 supports_image: None,
                 reasoning: None,
+                ..Default::default()
             },
         ];
         apply_missing_catalog_facts(&mut models, |id| lookup_models_dev_entry(entries, id));
@@ -2045,7 +2208,7 @@ Coding 能力开源 SOTA，从代码生成走向工程交付 | 1M | 128K |
     }
 
     #[test]
-    fn test_catalog_model_ids_prefers_slug_and_falls_back_to_id() {
+    fn test_catalog_model_entries_preserves_slug_and_falls_back_to_id() {
         let resp: ModelsResponse = serde_json::from_str(
             r#"{"models":[
                 {"slug":"glm-4.7"},
@@ -2057,8 +2220,14 @@ Coding 能力开源 SOTA，从代码生成走向工程交付 | 1M | 128K |
         )
         .unwrap();
         assert_eq!(
-            catalog_model_ids(resp.models),
-            vec!["glm-4.7".to_string(), "openai-shaped".to_string()]
+            catalog_model_entries(resp.models),
+            vec![
+                json!({"slug": "glm-4.7"}),
+                json!({"id": "openai-shaped"}),
+                json!({"name": "missing-id"}),
+                json!({"slug": 1}),
+                json!({}),
+            ]
         );
     }
 
@@ -2073,7 +2242,7 @@ Coding 能力开源 SOTA，从代码生成走向工程交付 | 1M | 128K |
         ] {
             let json = format!(r#"{{"data":[{{"id":"model-a"}}],"models":{models}}}"#);
             let resp: ModelsResponse = serde_json::from_str(&json).unwrap();
-            assert_eq!(resp.data.unwrap()[0].id, "model-a");
+            assert_eq!(resp.data.unwrap()[0].id.as_deref(), Some("model-a"));
         }
     }
 }

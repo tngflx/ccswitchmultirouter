@@ -1,4 +1,8 @@
 import type { CodexCatalogModel } from "@/types";
+import {
+  modelIdentityValues,
+  type ModelIdentityShape,
+} from "@/lib/modelIdentities";
 
 type RemoteBoundCatalogRow = Pick<
   CodexCatalogModel,
@@ -19,7 +23,7 @@ function explicitUpstreamModel(row: RemoteBoundCatalogRow): string {
  */
 export function pruneMissingRemoteCodexCatalogRows<
   T extends RemoteBoundCatalogRow,
-  Fetched extends { id: string },
+  Fetched extends ModelIdentityShape,
 >(
   rows: T[],
   fetchedModels: Fetched[],
@@ -43,7 +47,7 @@ export function pruneMissingRemoteCodexCatalogRows<
   removalSuppressed: boolean;
 } {
   const fetchedIdentities = new Set(
-    fetchedModels.map((model) => normalizedModelId(model.id)).filter(Boolean),
+    fetchedModels.flatMap((model) => modelIdentityValues(model)),
   );
   const removedModels: string[] = [];
   const boundRows = rows.filter((row) => explicitUpstreamModel(row));

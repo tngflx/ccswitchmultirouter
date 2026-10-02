@@ -102,6 +102,7 @@ import { ClaudeFormFields } from "./ClaudeFormFields";
 import { ClaudeDesktopProviderForm } from "./ClaudeDesktopProviderForm";
 import {
   CodexFormFields,
+  CodexFormSaveFeedback,
   type CodexProviderSplitSuggestion,
 } from "./CodexFormFields";
 import { CodexOfficialAuthSection } from "./CodexOfficialAuthSection";
@@ -260,7 +261,8 @@ export const normalizeCodexCatalogModelsForSave = (
       reasoning?.defaultEffort &&
       !reasoning.supportedEfforts.includes(reasoning.defaultEffort)
     ) {
-      throw new Error(
+      throw new CodexCatalogValidationError(
+        model,
         i18n.t("providerForm.reasoningErrors.defaultNotSupported", { model }),
       );
     }
@@ -269,7 +271,8 @@ export const normalizeCodexCatalogModelsForSave = (
       !reasoning.disableAllowed &&
       reasoning.supportedEfforts.includes("none")
     ) {
-      throw new Error(
+      throw new CodexCatalogValidationError(
+        model,
         i18n.t("providerForm.reasoningErrors.noneRequiresDisable", { model }),
       );
     }
@@ -284,7 +287,8 @@ export const normalizeCodexCatalogModelsForSave = (
     ) {
       for (const effort of reasoning.supportedEfforts) {
         if (!reasoning.upstream.effortMap?.[effort]) {
-          throw new Error(
+          throw new CodexCatalogValidationError(
+            model,
             i18n.t("providerForm.reasoningErrors.missingMap", {
               model,
               efforts: effort,
@@ -304,7 +308,8 @@ export const normalizeCodexCatalogModelsForSave = (
             target &&
             !reasoning.supportedEfforts.includes(target as CodexReasoningEffort)
           ) {
-            throw new Error(
+            throw new CodexCatalogValidationError(
+              model,
               i18n.t("providerForm.reasoningErrors.mapTargetInvalid", {
                 model,
                 source,
@@ -316,7 +321,8 @@ export const normalizeCodexCatalogModelsForSave = (
       }
     }
     if (item.codexUltra?.enabled && !item.codexUltra.providerEffort) {
-      throw new Error(
+      throw new CodexCatalogValidationError(
+        model,
         i18n.t("providerForm.reasoningErrors.ultraRequiresEffort", { model }),
       );
     }
@@ -367,6 +373,16 @@ export const normalizeCodexCatalogModelsForSave = (
 
   return normalized;
 };
+
+export class CodexCatalogValidationError extends Error {
+  constructor(
+    readonly model: string,
+    message: string,
+  ) {
+    super(message);
+    this.name = "CodexCatalogValidationError";
+  }
+}
 
 const normalizeCodexSpawnAgentModelsForSave = (
   selectedModels: string[],
@@ -737,6 +753,9 @@ function ProviderFormFull({
 
   // 软校验：收集"业务约束"类问题（空值/缺项），由用户决定是否仍要保存
   const [softIssues, setSoftIssues] = useState<string[] | null>(null);
+  const [codexCatalogValidationError, setCodexCatalogValidationError] =
+    useState<CodexCatalogValidationError | null>(null);
+  const [codexSaveError, setCodexSaveError] = useState<string | null>(null);
   const [pendingFormValues, setPendingFormValues] =
     useState<ProviderFormData | null>(null);
   const [
@@ -1512,6 +1531,9 @@ function ProviderFormFull({
     (appId === "claude" || appId === "codex") && category !== "official";
 
   const handleSubmit = async (values: ProviderFormData) => {
+    if (appId === "codex") {
+      setCodexSaveError(null);
+    }
     const overridesResult = shouldApplyLocalProxyRequestOverrides
       ? buildLocalProxyRequestOverrides(
           localProxyHeadersOverride,
@@ -1953,13 +1975,19 @@ function ProviderFormFull({
         }
         settingsConfig = JSON.stringify(configObj);
       } catch (err) {
-        if (err instanceof Error && err.message.includes("reasoning")) {
-          toast.error(
-            t("providerForm.invalidReasoningConfig", { message: err.message }),
-          );
+        if (err instanceof CodexCatalogValidationError) {
+          setCodexCatalogValidationError(err);
+          toast.error(err.message);
           return;
         }
-        settingsConfig = values.settingsConfig.trim();
+        const detail =
+          err instanceof Error
+            ? err.message
+            : t("providerForm.codexSaveBuildFailedDetail");
+        const message = t("providerForm.codexSaveBuildFailed", { detail });
+        setCodexSaveError(message);
+        toast.error(message);
+        return;
       }
     } else if (appId === "gemini") {
       try {
@@ -2285,7 +2313,21 @@ function ProviderFormFull({
 
     payload.meta = nextMeta;
 
-    await onSubmit(payload);
+    try {
+      await onSubmit(payload);
+      if (appId === "codex") {
+        setCodexCatalogValidationError(null);
+        setCodexSaveError(null);
+      }
+    } catch (error) {
+      if (appId === "codex") {
+        const message = t("providerForm.codexSaveUnconfirmed");
+        setCodexSaveError(message);
+        toast.error(message);
+        return;
+      }
+      throw error;
+    }
   };
 
   const shouldShowSpeedTest =
@@ -2647,6 +2689,12 @@ function ProviderFormFull({
           onSubmit={form.handleSubmit(handleSubmit)}
           className="space-y-6 glass rounded-xl p-6 border border-white/10"
         >
+          {appId === "codex" && (
+            <CodexFormSaveFeedback
+              catalogValidationError={codexCatalogValidationError}
+              saveError={codexSaveError}
+            />
+          )}
           {!initialData && (
             <ProviderPresetSelector
               selectedPresetId={selectedPresetId}
@@ -3048,7 +3096,19 @@ function ProviderFormFull({
                 catalogModels={codexCatalogModels}
                 presetCatalogModels={codexPresetBaseline}
                 knownCatalogModels={knownCodexCatalogModels}
-                onCatalogModelsChange={setCodexCatalogModels}
+                onCatalogModelsChange={(models) => {
+                  setCodexCatalogModels(models);
+                  setCodexSaveError(null);
+                  try {
+                    normalizeCodexCatalogModelsForSave(models);
+                    setCodexCatalogValidationError(null);
+                  } catch (error) {
+                    if (error instanceof CodexCatalogValidationError) {
+                      setCodexCatalogValidationError(error);
+                    }
+                  }
+                }}
+                catalogValidationError={codexCatalogValidationError}
                 spawnAgentModels={codexSpawnAgentModels}
                 onSpawnAgentModelsChange={setCodexSpawnAgentModels}
                 codexRouting={codexRouting}

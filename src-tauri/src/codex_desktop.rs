@@ -617,7 +617,18 @@ fn codex_model_entries_from_catalog_value(catalog: &Value) -> (Vec<String>, Vec<
 
 /// 从单个 catalog 条目中提取稳定模型名，兼容官方/旧版字段别名。
 fn codex_model_name(entry: &Value) -> Option<String> {
-    ["model", "slug", "id", "name"].into_iter().find_map(|key| {
+    [
+        "model",
+        "id",
+        "canonicalSlug",
+        "canonical_slug",
+        "upstreamModel",
+        "upstream_model",
+        "slug",
+        "name",
+    ]
+    .into_iter()
+    .find_map(|key| {
         entry
             .get(key)
             .and_then(Value::as_str)
@@ -634,8 +645,18 @@ fn project_codex_model_descriptor(
     display_style: Option<&str>,
 ) -> Value {
     let mut object = entry.as_object().cloned().unwrap_or_default();
-    for key in ["model", "slug", "id", "name"] {
-        object.insert(key.to_string(), Value::String(model_name.to_string()));
+    // `model` is the Codex routing key. Preserve every provider/native identity
+    // already present on the entry; only fill the routing key when a legacy
+    // catalog exposed an id/slug/name without a `model` field.
+    let has_model = object
+        .get("model")
+        .and_then(Value::as_str)
+        .is_some_and(|value| !value.trim().is_empty());
+    if !has_model {
+        object.insert(
+            "model".to_string(),
+            Value::String(model_name.to_string()),
+        );
     }
     let provider_name = provider_name_from_entry(&Value::Object(object.clone()));
     let compact_provider = crate::codex_multirouter::compact_codex_provider_label(&provider_name);
@@ -3022,6 +3043,41 @@ mod tests {
     }
 
     #[test]
+    fn catalog_projection_preserves_stable_identity_fields() {
+        let value = json!({
+            "models": [{
+                "model": "gpt-6.1-sol-relay",
+                "id": "openai/gpt-6.1-sol",
+                "canonicalSlug": "openai/gpt-6.1-sol-20260929",
+                "upstreamModel": "gpt-6.1-sol",
+                "slug": "gpt-6.1-sol",
+                "name": "GPT 6.1 Sol",
+                "aliases": ["gpt-6.1-sol-openrouter"],
+                "displayName": "GPT 6.1 Sol",
+                "providerName": "OpenRouter"
+            }]
+        });
+
+        let (names, models) = codex_model_entries_from_catalog_value(&value);
+
+        assert_eq!(names, vec!["gpt-6.1-sol-relay"]);
+        assert_eq!(models[0]["model"], "gpt-6.1-sol-relay");
+        assert_eq!(models[0]["id"], "openai/gpt-6.1-sol");
+        assert_eq!(
+            models[0]["canonicalSlug"],
+            "openai/gpt-6.1-sol-20260929"
+        );
+        assert_eq!(models[0]["upstreamModel"], "gpt-6.1-sol");
+        assert_eq!(models[0]["slug"], "gpt-6.1-sol");
+        assert_eq!(models[0]["name"], "GPT 6.1 Sol");
+        assert_eq!(
+            models[0]["aliases"],
+            json!(["gpt-6.1-sol-openrouter"])
+        );
+        assert_eq!(models[0]["displayName"], "[ORter] GPT 6.1 Sol");
+    }
+
+    #[test]
     fn catalog_projection_does_not_invent_unknown_reasoning_defaults() {
         let value = json!({
             "models": [{ "model": "unknown-third-party", "display_name": "Unknown" }]
@@ -3569,6 +3625,87 @@ JSON.stringify({
         assert_eq!(result["defaultEffort"], "high");
         assert_eq!(result["efforts"], json!(["low", "high"]));
         assert_eq!(result["levels"], json!(["low", "high"]));
+    }
+
+    #[test]
+    fn model_picker_matches_renderer_rows_by_canonical_slug() {
+        let result = run_model_picker_patch_core_probe_with_payload(
+            json!({
+                "defaultModel": "gpt-6.1-sol-relay",
+                "modelNames": ["gpt-6.1-sol-relay"],
+                "models": [{
+                    "model": "gpt-6.1-sol-relay",
+                    "id": "openai/gpt-6.1-sol",
+                    "canonicalSlug": "openai/gpt-6.1-sol-20260929",
+                    "supportedReasoningEfforts": [
+                        {"reasoningEffort": "max"},
+                        {"reasoningEffort": "xhigh"},
+                        {"reasoningEffort": "high"},
+                        {"reasoningEffort": "medium"},
+                        {"reasoningEffort": "low"}
+                    ],
+                    "defaultReasoningEffort": "medium"
+                }]
+            }),
+            r#"
+const models = [{
+  id: "openai/gpt-6.1-sol-20260929",
+  displayName: "GPT 6.1 Sol",
+}];
+patchModelArray(models);
+JSON.stringify({
+  model: models[0].model,
+  id: models[0].id,
+  canonicalSlug: models[0].canonicalSlug,
+  efforts: models[0].supportedReasoningEfforts.map((item) => item.reasoningEffort),
+  defaultEffort: models[0].defaultReasoningEffort,
+});
+"#,
+        );
+
+        assert_eq!(result["model"], "gpt-6.1-sol-relay");
+        assert_eq!(result["id"], "openai/gpt-6.1-sol");
+        assert_eq!(
+            result["canonicalSlug"],
+            "openai/gpt-6.1-sol-20260929"
+        );
+        assert_eq!(
+            result["efforts"],
+            json!(["max", "xhigh", "high", "medium", "low"])
+        );
+        assert_eq!(result["defaultEffort"], "medium");
+    }
+
+    #[test]
+    fn model_picker_matches_renderer_rows_by_alias() {
+        let result = run_model_picker_patch_core_probe_with_payload(
+            json!({
+                "defaultModel": "gpt-6.1-sol-relay",
+                "modelNames": ["gpt-6.1-sol-relay"],
+                "models": [{
+                    "model": "gpt-6.1-sol-relay",
+                    "aliases": ["gpt-6.1-sol-openrouter"],
+                    "supportedReasoningEfforts": [{"reasoningEffort": "high"}],
+                    "defaultReasoningEffort": "high"
+                }]
+            }),
+            r#"
+const models = [{
+  model: "gpt-6.1-sol-openrouter",
+  displayName: "GPT 6.1 Sol",
+}];
+patchModelArray(models);
+JSON.stringify({
+  model: models[0].model,
+  aliases: models[0].aliases,
+  efforts: models[0].supportedReasoningEfforts.map((item) => item.reasoningEffort),
+});
+"#,
+        );
+
+        assert_eq!(result["model"], "gpt-6.1-sol-relay");
+        assert_eq!(result["aliases"], json!(["gpt-6.1-sol-openrouter"]));
+        assert_eq!(result["efforts"], json!(["high"]));
     }
 
     #[test]

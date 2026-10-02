@@ -221,6 +221,12 @@ pub struct HotSwitchOutcome {
     pub logical_target_changed: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OfficialCodexCatalogProjectionOutcome {
+    Applied,
+    Skipped(&'static str),
+}
+
 #[derive(Debug, Clone, Default, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CodexAuthFacadeReprojectionOutcome {
@@ -1078,6 +1084,7 @@ impl ProxyService {
 
     /// 设置 AppHandle（在应用初始化时调用）
     pub fn set_app_handle(&self, handle: tauri::AppHandle) {
+        crate::services::codex_oauth_models::register_public_catalog_app_handle(handle.clone());
         futures::executor::block_on(async {
             *self.app_handle.write().await = Some(handle);
         });
@@ -1092,6 +1099,39 @@ impl ProxyService {
 
     pub(crate) async fn lock_codex_lifecycle(&self) -> tokio::sync::MutexGuard<'_, ()> {
         self.lifecycle_lock.lock().await
+    }
+
+    /// Reproject the official Codex catalog only while this instance owns an
+    /// active takeover. The same switch lock used by provider changes protects
+    /// the ownership check and the projection from a concurrent disable/switch.
+    pub(crate) async fn reproject_official_codex_catalog_if_owned(
+        &self,
+    ) -> Result<OfficialCodexCatalogProjectionOutcome, String> {
+        let _switch_guard = self.lock_switch_for_app("codex").await;
+        let takeover_enabled = self
+            .db
+            .get_proxy_config_for_app(AppType::Codex.as_str())
+            .await
+            .map_err(|error| format!("读取 Codex 接管状态失败: {error}"))?
+            .enabled;
+        let live_config = crate::codex_config::read_codex_config_text()
+            .map_err(|error| format!("读取 Codex 配置失败: {error}"))?;
+        if let Err(reason) = crate::codex_config::manual_official_catalog_projection_eligibility(
+            takeover_enabled,
+            &live_config,
+            &crate::codex_config::get_codex_config_dir(),
+        ) {
+            return Ok(OfficialCodexCatalogProjectionOutcome::Skipped(reason));
+        }
+
+        let Some(provider) = self.get_current_provider_for_app(&AppType::Codex)? else {
+            return Ok(OfficialCodexCatalogProjectionOutcome::Skipped(
+                "no_active_codex_provider",
+            ));
+        };
+        crate::services::provider::publish_codex_catalog_outputs_for_provider(&self.db, &provider)
+            .map_err(|error| format!("Codex 官方目录投影失败: {error}"))?;
+        Ok(OfficialCodexCatalogProjectionOutcome::Applied)
     }
 
     // Global live-file transactions use the same ordering as per-app switches:

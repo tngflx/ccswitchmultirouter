@@ -82,11 +82,17 @@ import type {
 } from "@/lib/api/providers";
 import { authApi, type CodexAccountPoolPolicy } from "@/lib/api/auth";
 import {
-  fetchCodexOauthCachedModels,
+  fetchCodexOfficialFallbackModels,
   fetchCodexOauthModels,
   fetchModelsForConfig,
+  refreshCodexOfficialModelCatalog,
+  type CodexOfficialCatalogRefreshResult,
   type FetchedModel,
 } from "@/lib/api/model-fetch";
+import {
+  modelBindingIdentityValues,
+  modelIdentityValues,
+} from "@/lib/modelIdentities";
 import type { CodexGuardianStatus, RequestHealthSnapshot } from "@/types/proxy";
 import { proxyApi } from "@/lib/api/proxy";
 import {
@@ -187,6 +193,45 @@ function tr(
   return typeof result === "string" && result.length > 0
     ? result
     : (options?.defaultValue ?? key);
+}
+
+function officialCatalogSourceLabel(source: string): string {
+  if (source === "openai_codex_models_json") {
+    return tr("codexRouterWorkspace.officialCatalogRefresh.sourceOpenAI");
+  }
+  if (source === "stale_cache") {
+    return tr("codexRouterWorkspace.officialCatalogRefresh.sourceStale");
+  }
+  if (source === "unavailable") {
+    return tr("codexRouterWorkspace.officialCatalogRefresh.sourceUnavailable");
+  }
+  return source;
+}
+
+function officialCatalogProjectionReasonLabel(reason: string): string {
+  const keys: Record<string, string> = {
+    refresh_not_fresh:
+      "codexRouterWorkspace.officialCatalogRefresh.reasonNotFresh",
+    takeover_not_active:
+      "codexRouterWorkspace.officialCatalogRefresh.reasonTakeover",
+    catalog_not_cc_switch_owned:
+      "codexRouterWorkspace.officialCatalogRefresh.reasonOwnership",
+    takeover_status_unavailable:
+      "codexRouterWorkspace.officialCatalogRefresh.reasonTakeoverStatus",
+    codex_config_unreadable:
+      "codexRouterWorkspace.officialCatalogRefresh.reasonConfig",
+    no_active_codex_provider:
+      "codexRouterWorkspace.officialCatalogRefresh.reasonProvider",
+    projection_outputs_unconfirmed:
+      "codexRouterWorkspace.officialCatalogRefresh.reasonUnconfirmed",
+  };
+  return tr(
+    keys[reason] ?? "codexRouterWorkspace.officialCatalogRefresh.reasonOther",
+    {
+      defaultValue: reason,
+      arg0: reason,
+    },
+  );
 }
 
 export type WorkspaceTab =
@@ -877,7 +922,7 @@ async function fetchProviderModelsWithFallback(
     };
   } catch (error) {
     const onlineErrorMessage = workspaceErrorMessage(error);
-    const cachedModels = await fetchCodexOauthCachedModels();
+    const cachedModels = await fetchCodexOfficialFallbackModels();
     return {
       models: cachedModels,
       usedCodexCache: cachedModels.length > 0,
@@ -1039,21 +1084,26 @@ export function providerWithFetchedModelCatalog(
     if (!id) continue;
     const index = models.findIndex((item) => item.model === id);
     if (index < 0) continue;
-    const identity = id.toLowerCase();
-    byVisibleModel.set(identity, index);
-    const upstreamModel = catalogDraftUpstreamModel(models[index]);
-    if (upstreamModel) {
-      byFetchedModel.set(upstreamModel.toLowerCase(), index);
+    for (const identity of modelBindingIdentityValues(models[index])) {
+      byFetchedModel.set(identity, index);
+      byVisibleModel.set(identity, index);
     }
   }
   const shouldAppendFetchedModels = currentCatalog.models.length === 0;
 
   for (const fetched of fetchedModels) {
-    const id = fetched.id.trim();
+    const id =
+      fetched.id?.trim() ||
+      fetched.canonicalSlug?.trim() ||
+      fetched.slug?.trim() ||
+      fetched.name?.trim() ||
+      fetched.aliases?.find((alias) => alias.trim())?.trim() ||
+      "";
     if (!id) continue;
-    const identity = id.toLowerCase();
-    const existingIndex =
-      byFetchedModel.get(identity) ?? byVisibleModel.get(identity);
+    const identities = modelIdentityValues(fetched);
+    const existingIndex = identities
+      .map((identity) => byFetchedModel.get(identity) ?? byVisibleModel.get(identity))
+      .find((index): index is number => index !== undefined);
     const contextWindow = resolveFetchedCodexModelContextWindow(fetched, {
       providerId: provider.id,
       providerName: provider.name,
@@ -1078,13 +1128,19 @@ export function providerWithFetchedModelCatalog(
             }
           : {}),
         ...(fetched.reasoning ? { reasoning: fetched.reasoning } : {}),
+        ...(fetched.canonicalSlug
+          ? { canonicalSlug: fetched.canonicalSlug }
+          : {}),
+        ...(fetched.slug ? { slug: fetched.slug } : {}),
+        ...(fetched.name ? { name: fetched.name } : {}),
+        ...(fetched.aliases?.length ? { aliases: [...fetched.aliases] } : {}),
       };
       continue;
     }
     if (!shouldAppendFetchedModels) continue;
     const nextModel: CodexCatalogModelDraft = {
       model: id,
-      upstreamModel: id,
+      upstreamModel: fetched.id || fetched.canonicalSlug || fetched.slug || id,
       displayName: id,
       // A provider refresh discovers inventory, not user-approved catalog
       // membership. Keep new rows excluded until the user opts them in.
@@ -1103,9 +1159,17 @@ export function providerWithFetchedModelCatalog(
           }
         : {}),
       ...(fetched.reasoning ? { reasoning: fetched.reasoning } : {}),
+      ...(fetched.canonicalSlug
+        ? { canonicalSlug: fetched.canonicalSlug }
+        : {}),
+      ...(fetched.slug ? { slug: fetched.slug } : {}),
+      ...(fetched.name ? { name: fetched.name } : {}),
+      ...(fetched.aliases?.length ? { aliases: [...fetched.aliases] } : {}),
     };
-    byFetchedModel.set(identity, models.length);
-    byVisibleModel.set(identity, models.length);
+    for (const identity of modelBindingIdentityValues(nextModel)) {
+      byFetchedModel.set(identity, models.length);
+      byVisibleModel.set(identity, models.length);
+    }
     models.push(nextModel);
   }
 
@@ -2562,9 +2626,8 @@ export function buildModelCatalogForRoutes(
 
   if (options?.pruneOutdatedModels) {
     const kept = new Set(
-      pruneOutdatedCodexCatalogModels(
-        candidates.map(({ model }) => model),
-      ).kept,
+      pruneOutdatedCodexCatalogModels(candidates.map(({ model }) => model))
+        .kept,
     );
     // Keep candidate metadata and route capabilities attached to each row while
     // dropping stale releases before the default provider ranking is applied.
@@ -5704,9 +5767,7 @@ export function ModelOrderTab({
         false,
       );
       if (updates.length > 0) {
-        for (const nextProvider of updates) {
-          await providersApi.update(nextProvider, "codex");
-        }
+        await providersApi.updateCodexBatch(updates);
         toast.success(
           tr("codexRouterWorkspace.hideModelSuccess", {
             defaultValue: "Hidden {{model}}; it can be restored below.",
@@ -6057,7 +6118,6 @@ export function ModelOrderTab({
           </div>
         </SortableContext>
       </DndContext>
-
     </section>
   );
 }
@@ -8996,6 +9056,12 @@ function StatusTab({
   const [isDiagnosing, setIsDiagnosing] = useState(false);
   const [modelPickerUnlockResult, setModelPickerUnlockResult] =
     useState<CodexModelPickerUnlockResult | null>(null);
+  const [isRefreshingOfficialCatalog, setIsRefreshingOfficialCatalog] =
+    useState(false);
+  const [officialCatalogRefreshResult, setOfficialCatalogRefreshResult] =
+    useState<CodexOfficialCatalogRefreshResult | null>(null);
+  const [officialCatalogRefreshError, setOfficialCatalogRefreshError] =
+    useState<string | null>(null);
 
   const { data: guardianStatus } = useQuery<CodexGuardianStatus | null>({
     queryKey: ["codexGuardianStatus"],
@@ -9225,6 +9291,28 @@ function StatusTab({
     }
   }
 
+  async function refreshOfficialCatalog() {
+    setIsRefreshingOfficialCatalog(true);
+    setOfficialCatalogRefreshError(null);
+    setOfficialCatalogRefreshResult(null);
+    try {
+      const result = await refreshCodexOfficialModelCatalog();
+      setOfficialCatalogRefreshResult(result);
+      if (result.projectionApplied) {
+        await queryClient.invalidateQueries({
+          queryKey: ["providers", "codex"],
+        });
+        await queryClient.invalidateQueries({
+          queryKey: ["codexMultiRouterProjection"],
+        });
+      }
+    } catch (error) {
+      setOfficialCatalogRefreshError(workspaceErrorMessage(error));
+    } finally {
+      setIsRefreshingOfficialCatalog(false);
+    }
+  }
+
   /// 手动同步 Codex JSONL 会话用量，让子 Agent 统计立即看到最新 token_count。
   async function syncCodexSessionUsage() {
     setIsSyncingSessionUsage(true);
@@ -9363,6 +9451,26 @@ function StatusTab({
                   {tr("codexRouterWorkspace.s322", {
                     defaultValue: "协议探测",
                   })}
+                </Button>
+                <Button
+                  size="sm"
+                  variant="outline"
+                  data-testid="codex-official-catalog-refresh"
+                  onClick={() => void refreshOfficialCatalog()}
+                  disabled={isRefreshingOfficialCatalog}
+                  className="gap-2 border-sky-300 bg-background/70 text-sky-700 hover:bg-sky-50 dark:border-sky-500/50 dark:bg-sky-500/10 dark:text-sky-100"
+                >
+                  <RefreshCw
+                    className={cn(
+                      "h-4 w-4",
+                      isRefreshingOfficialCatalog && "animate-spin",
+                    )}
+                  />
+                  {isRefreshingOfficialCatalog
+                    ? tr(
+                        "codexRouterWorkspace.officialCatalogRefresh.refreshing",
+                      )
+                    : tr("codexRouterWorkspace.officialCatalogRefresh.button")}
                 </Button>
                 <TooltipProvider delayDuration={200}>
                   <Tooltip>
@@ -9582,6 +9690,102 @@ function StatusTab({
           {validationRefreshMessage ? (
             <div className="mt-3 rounded-lg border border-slate-200 bg-slate-50 p-3 text-xs leading-5 text-slate-700 dark:border-slate-600/50 dark:bg-slate-900/60 dark:text-slate-200">
               {validationRefreshMessage}
+            </div>
+          ) : null}
+          {officialCatalogRefreshError ? (
+            <div
+              role="alert"
+              data-testid="codex-official-catalog-refresh-error"
+              className="mt-3 rounded-lg border border-rose-200 bg-rose-50 p-3 text-xs leading-5 text-rose-800 dark:border-rose-700/50 dark:bg-rose-950/25 dark:text-rose-100"
+            >
+              {tr("codexRouterWorkspace.officialCatalogRefresh.requestFailed", {
+                arg0: officialCatalogRefreshError,
+              })}
+            </div>
+          ) : null}
+          {officialCatalogRefreshResult ? (
+            <div
+              role="status"
+              data-testid="codex-official-catalog-refresh-result"
+              className={cn(
+                "mt-3 rounded-lg border p-3 text-xs leading-5",
+                officialCatalogRefreshResult.projectionApplied
+                  ? "border-emerald-200 bg-emerald-50 text-emerald-800 dark:border-emerald-700/50 dark:bg-emerald-950/25 dark:text-emerald-100"
+                  : "border-amber-200 bg-amber-50 text-amber-800 dark:border-amber-700/50 dark:bg-amber-950/25 dark:text-amber-100",
+              )}
+            >
+              <div className="font-semibold">
+                {officialCatalogRefreshResult.source === "unavailable" ||
+                officialCatalogRefreshResult.usedStaleCache
+                  ? tr("codexRouterWorkspace.officialCatalogRefresh.staleTitle")
+                  : officialCatalogRefreshResult.projectionApplied
+                    ? tr(
+                        "codexRouterWorkspace.officialCatalogRefresh.successTitle",
+                      )
+                    : officialCatalogRefreshResult.projectionReason ===
+                        "projection_outputs_unconfirmed"
+                      ? tr(
+                          "codexRouterWorkspace.officialCatalogRefresh.unconfirmedTitle",
+                        )
+                      : tr(
+                          "codexRouterWorkspace.officialCatalogRefresh.snapshotOnlyTitle",
+                        )}
+              </div>
+              <div>
+                {tr("codexRouterWorkspace.officialCatalogRefresh.summary", {
+                  arg0: officialCatalogSourceLabel(
+                    officialCatalogRefreshResult.source,
+                  ),
+                  arg1: officialCatalogRefreshResult.modelCount,
+                  arg2:
+                    officialCatalogRefreshResult.fetchedAt ??
+                    tr(
+                      "codexRouterWorkspace.officialCatalogRefresh.noTimestamp",
+                    ),
+                })}
+                {officialCatalogRefreshResult.usedStaleCache
+                  ? ` ${tr(
+                      "codexRouterWorkspace.officialCatalogRefresh.staleSuffix",
+                    )}`
+                  : ""}
+              </div>
+              {officialCatalogRefreshResult.refreshError ? (
+                <div>
+                  {tr(
+                    "codexRouterWorkspace.officialCatalogRefresh.upstreamError",
+                    { arg0: officialCatalogRefreshResult.refreshError },
+                  )}
+                </div>
+              ) : null}
+              {officialCatalogRefreshResult.projectionApplied ? (
+                <div>
+                  {tr(
+                    "codexRouterWorkspace.officialCatalogRefresh.projectionHint",
+                  )}
+                </div>
+              ) : officialCatalogRefreshResult.projectionReason ===
+                "projection_outputs_unconfirmed" ? (
+                <div>
+                  {tr(
+                    "codexRouterWorkspace.officialCatalogRefresh.unconfirmedHint",
+                  )}
+                </div>
+              ) : (
+                <div>
+                  {tr(
+                    "codexRouterWorkspace.officialCatalogRefresh.noProjection",
+                    {
+                      arg0: officialCatalogRefreshResult.projectionReason
+                        ? officialCatalogProjectionReasonLabel(
+                            officialCatalogRefreshResult.projectionReason,
+                          )
+                        : tr(
+                            "codexRouterWorkspace.officialCatalogRefresh.reasonOther",
+                          ),
+                    },
+                  )}
+                </div>
+              )}
             </div>
           ) : null}
           {guardianStatus?.active ? (

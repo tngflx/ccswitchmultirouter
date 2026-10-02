@@ -1,6 +1,10 @@
 import type { CodexCatalogModel } from "@/types";
 import { pruneMissingRemoteCodexCatalogRows } from "@/lib/codexCatalogReconciliation";
 import { resolveFetchedCodexModelContextWindow } from "@/utils/codexModelContext";
+import {
+  modelBindingIdentityValues,
+  modelIdentityValues,
+} from "@/lib/modelIdentities";
 
 export { pruneMissingRemoteCodexCatalogRows } from "@/lib/codexCatalogReconciliation";
 
@@ -12,6 +16,10 @@ interface RemoteModelMetadata {
 
 export interface FetchedCodexCatalogModel extends RemoteModelMetadata {
   id: string;
+  canonicalSlug?: string | null;
+  slug?: string | null;
+  name?: string | null;
+  aliases?: string[] | null;
   inputModalities?: string[] | null;
   supportsImage?: boolean | null;
   /** Provider-discovered reasoning metadata, including the upstream effort map. */
@@ -58,9 +66,7 @@ function rowExplicitUpstreamModel(row: CodexCatalogRowLike): string {
 }
 
 function rowIdentities(row: CodexCatalogRowLike): string[] {
-  const upstreamModel = catalogModelIdentity(rowExplicitUpstreamModel(row));
-  const identity = upstreamModel || catalogModelIdentity(row.model);
-  return identity ? [identity] : [];
+  return modelBindingIdentityValues(row);
 }
 
 function hasValue(value: unknown): boolean {
@@ -167,6 +173,37 @@ function refreshedCapabilityPatch(
   return patch;
 }
 
+function fetchedIdentityPatch(
+  row: Partial<CodexCatalogRowLike>,
+  fetched: FetchedCodexCatalogModel,
+  refresh: boolean,
+): Partial<CodexCatalogRowLike> {
+  const patch: Partial<CodexCatalogRowLike> = {};
+  const values: Array<
+    ["canonicalSlug" | "slug" | "name", string | null | undefined]
+  > = [
+    ["canonicalSlug", fetched.canonicalSlug],
+    ["slug", fetched.slug],
+    ["name", fetched.name],
+  ];
+  for (const [key, value] of values) {
+    const normalized = nonEmptyString(value);
+    if (normalized && (refresh || !hasValue(row[key]))) patch[key] = normalized;
+  }
+  if (Array.isArray(fetched.aliases) && fetched.aliases.length > 0) {
+    const aliases = fetched.aliases
+      .map(nonEmptyString)
+      .filter(Boolean);
+    if (
+      aliases.length > 0 &&
+      (refresh || !Array.isArray(row.aliases) || row.aliases.length === 0)
+    ) {
+      patch.aliases = aliases;
+    }
+  }
+  return patch;
+}
+
 /**
  * Reconcile remote /models results without destroying user intent.
  *
@@ -187,11 +224,9 @@ export function reconcileFetchedCodexCatalogRows<T extends CodexCatalogRowLike>(
   },
 ): CatalogSyncResult<T> {
   const next = [...rows];
-  const identityByIndex = new Map<number, string[]>();
   const identityToIndex = new Map<string, number>();
   next.forEach((row, index) => {
     const identities = rowIdentities(row);
-    identityByIndex.set(index, identities);
     for (const identity of identities) {
       // First row wins on legacy duplicates, preserving current order.
       if (!identityToIndex.has(identity)) identityToIndex.set(identity, index);
@@ -203,10 +238,17 @@ export function reconcileFetchedCodexCatalogRows<T extends CodexCatalogRowLike>(
   const updated: string[] = [];
 
   for (const fetched of fetchedModels) {
-    const model = fetched.id.trim();
-    if (!model) continue;
-    const identity = catalogModelIdentity(model);
-    const existingIndex = identityToIndex.get(identity);
+    const model =
+      nonEmptyString(fetched.id) ||
+      nonEmptyString(fetched.canonicalSlug) ||
+      nonEmptyString(fetched.slug) ||
+      nonEmptyString(fetched.name) ||
+      nonEmptyString(fetched.aliases?.[0]);
+    const fetchedIdentities = modelIdentityValues(fetched);
+    if (!model || fetchedIdentities.length === 0) continue;
+    const existingIndex = fetchedIdentities
+      .map((identity) => identityToIndex.get(identity))
+      .find((index): index is number => index !== undefined);
 
     if (existingIndex !== undefined) {
       const row = next[existingIndex];
@@ -225,7 +267,7 @@ export function reconcileFetchedCodexCatalogRows<T extends CodexCatalogRowLike>(
       // made a saved catalog lose models after an otherwise routine sync.
       if (
         !hasValue(rowExplicitUpstreamModel(row)) &&
-        catalogModelIdentity(row.model) !== identity
+        !fetchedIdentities.includes(catalogModelIdentity(row.model))
       ) {
         patch.upstreamModel = model;
       }
@@ -243,6 +285,10 @@ export function reconcileFetchedCodexCatalogRows<T extends CodexCatalogRowLike>(
         refreshExisting
           ? refreshedCapabilityPatch(row, fetched)
           : missingCapabilityPatch(row, fetched),
+      );
+      Object.assign(
+        patch,
+        fetchedIdentityPatch(row, fetched, refreshExisting),
       );
 
       const patchRecord = patch as Record<string, unknown>;
@@ -272,6 +318,7 @@ export function reconcileFetchedCodexCatalogRows<T extends CodexCatalogRowLike>(
       upstreamModel: model,
       displayName: model,
       ...(contextWindow ? { contextWindow: String(contextWindow) } : {}),
+      ...fetchedIdentityPatch({}, fetched, true),
       ...(Array.isArray(fetched.inputModalities) &&
       fetched.inputModalities.length > 0
         ? { inputModalities: [...fetched.inputModalities] }
@@ -283,14 +330,12 @@ export function reconcileFetchedCodexCatalogRows<T extends CodexCatalogRowLike>(
     };
     const capabilityPatch = missingCapabilityPatch(seed, fetched);
     const created = options.createRow({ ...seed, ...capabilityPatch });
-    const newIndex = next.length;
     next.push(created);
     added += 1;
     const identities = rowIdentities(created);
-    identityByIndex.set(newIndex, identities);
     for (const createdIdentity of identities) {
       if (!identityToIndex.has(createdIdentity)) {
-        identityToIndex.set(createdIdentity, newIndex);
+        identityToIndex.set(createdIdentity, next.length - 1);
       }
     }
   }

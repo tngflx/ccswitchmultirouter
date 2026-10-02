@@ -8,7 +8,7 @@ import { CODEX_MULTI_ROUTER_WIZARD_DISMISSED_KEY } from "@/lib/codexMultiRouterW
 import { providersApi } from "@/lib/api/providers";
 import { codexSubagentV2Api } from "@/lib/api/codexSubagentV2";
 import {
-  fetchCodexOauthCachedModels,
+  fetchCodexOfficialFallbackModels,
   fetchCodexOauthModels,
   fetchModelsForConfig,
   probeCodexChatForConfig,
@@ -53,7 +53,7 @@ vi.mock("@/lib/api/codexSubagentV2", () => ({
 }));
 
 vi.mock("@/lib/api/model-fetch", () => ({
-  fetchCodexOauthCachedModels: vi.fn(),
+  fetchCodexOfficialFallbackModels: vi.fn(),
   fetchCodexOauthModels: vi.fn(),
   fetchModelsForConfig: vi.fn(),
   probeCodexChatForConfig: vi.fn(),
@@ -101,7 +101,7 @@ function renderWithQueryClient(ui: ReactElement) {
 beforeEach(() => {
   localStorage.clear();
   vi.clearAllMocks();
-  vi.mocked(fetchCodexOauthCachedModels).mockResolvedValue([]);
+  vi.mocked(fetchCodexOfficialFallbackModels).mockResolvedValue([]);
   vi.mocked(codexSubagentV2Api.initializeProviderConfig).mockImplementation(
     async (providerId) => {
       const persisted = vi
@@ -873,7 +873,7 @@ describe("CodexMultiRouterWizard", () => {
     vi.mocked(fetchCodexOauthModels).mockRejectedValueOnce(
       new Error("error sending request for url"),
     );
-    vi.mocked(fetchCodexOauthCachedModels).mockResolvedValueOnce([
+    vi.mocked(fetchCodexOfficialFallbackModels).mockResolvedValueOnce([
       { id: "gpt-5.5", ownedBy: "Codex", contextWindow: 256000 },
       { id: "gpt-5.6-luna", ownedBy: "Codex", contextWindow: 256000 },
     ]);

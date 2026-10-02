@@ -150,6 +150,25 @@ describe("reconcileFetchedCodexCatalogRows", () => {
     expect(result.rows.map((row) => row.model)).toContain("gpt-5.6-sol-sublyx");
   });
 
+  it("does not prune a bound alias when the provider returns it only as an alias", () => {
+    const result = reconcileFetchedCodexCatalogRows(
+      [
+        { model: "friendly-gpt", upstreamModel: "friendly-gpt" },
+        { model: "stale", upstreamModel: "stale" },
+      ],
+      [{ id: "gpt-5.6", aliases: ["friendly-gpt"] }],
+      source,
+      {
+        appendNew: true,
+        createRow,
+        existingMetadataMode: "refresh",
+        removeMissingRemote: true,
+      },
+    );
+
+    expect(result.rows.map((row) => row.model)).toEqual(["friendly-gpt"]);
+  });
+
   it("keeps every catalog row when a refresh returns a truncated list", () => {
     const initial: CodexCatalogRowLike[] = [
       { model: "gpt-5.6-sol", upstreamModel: "gpt-5.6-sol" },

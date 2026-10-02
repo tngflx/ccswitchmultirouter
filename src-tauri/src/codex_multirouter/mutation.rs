@@ -1,8 +1,8 @@
 use super::active_codex_router_id;
 use super::compiler::{compile_v2, compile_v2_strict};
 use super::projection::{
-    build_projection_artifact, ensure_projection_with_publisher, CodexRoutingProjectionArtifact,
-    CodexRoutingProjectionStatus, ProjectionReadBack,
+    build_projection_artifact_from_providers, ensure_projection_with_publisher,
+    CodexRoutingProjectionArtifact, CodexRoutingProjectionStatus, ProjectionReadBack,
 };
 use super::schema::CodexRoutingDocument;
 use crate::database::Database;
@@ -83,6 +83,88 @@ pub fn apply_codex_provider_mutation_persist_only_with_profiles(
         |_| Ok(ProjectionReadBack::verified(String::new())),
         false,
     )
+}
+
+/// Persist several existing Codex providers as one domain mutation.
+///
+/// Catalog visibility changes can fan out to multiple route targets. Keeping
+/// preparation, validation, and the SQLite commit in one operation prevents a
+/// later invalid candidate or write failure from leaving earlier providers
+/// committed while the UI reports that the overall action failed.
+pub fn apply_codex_provider_mutations_persist_only(
+    db: &Database,
+    providers: Vec<Provider>,
+) -> Result<CodexProviderMutationOutcome, AppError> {
+    if providers.is_empty() {
+        return Ok(CodexProviderMutationOutcome {
+            projections: Vec::new(),
+        });
+    }
+
+    let mut staged = db
+        .get_all_providers("codex")?
+        .into_iter()
+        .collect::<HashMap<_, _>>();
+    let mut prepared = Vec::with_capacity(providers.len());
+    let mut seen_ids = HashSet::with_capacity(providers.len());
+
+    for mut provider in providers {
+        if !seen_ids.insert(provider.id.clone()) {
+            return Err(AppError::InvalidInput(format!(
+                "Codex provider batch contains duplicate id: {}",
+                provider.id
+            )));
+        }
+        if !staged.contains_key(&provider.id) {
+            return Err(AppError::InvalidInput(format!(
+                "Codex provider does not exist: {}",
+                provider.id
+            )));
+        }
+        remove_schema_v2_router_derived_catalog(&mut provider);
+        staged.insert(provider.id.clone(), provider.clone());
+        prepared.push(provider);
+    }
+
+    for provider in &mut prepared {
+        repair_stale_v2_route_aliases_from_providers(&staged, provider)?;
+        staged.insert(provider.id.clone(), provider.clone());
+    }
+
+    let mut affected_router_ids = BTreeSet::new();
+    for provider in &prepared {
+        let affected = validate_and_collect_affected_router_ids_from_providers(&staged, provider)?;
+        affected_router_ids.extend(affected.subagent_profiles);
+    }
+
+    // Reconcile derived Router state against the staged catalog before the
+    // transaction starts. Any compile or reconciliation error therefore leaves
+    // both the direct catalog edits and derived profiles untouched.
+    let provider_context =
+        crate::codex_config::ProviderClassificationContext::from_providers(staged.values());
+    let mut updates = prepared
+        .into_iter()
+        .map(|provider| (provider.id.clone(), provider))
+        .collect::<HashMap<_, _>>();
+    for router_id in affected_router_ids {
+        let router = staged.get(&router_id).cloned().ok_or_else(|| {
+            AppError::Message(format!("Codex MultiRouter provider not found: {router_id}"))
+        })?;
+        if let Some(router) =
+            reconcile_router_subagent_profile_from_providers(&router, &staged, &provider_context)?
+        {
+            staged.insert(router.id.clone(), router.clone());
+            updates.insert(router.id.clone(), router);
+        }
+    }
+
+    let mut updates = updates.into_values().collect::<Vec<_>>();
+    updates.sort_by(|left, right| left.id.cmp(&right.id));
+    db.save_providers_atomically("codex", &updates)?;
+
+    Ok(CodexProviderMutationOutcome {
+        projections: Vec::new(),
+    })
 }
 
 pub fn apply_codex_provider_mutation_with_profile(
@@ -198,6 +280,17 @@ where
 /// still points at it; leaving that alias in place makes strict compilation
 /// fail before the corrected plan can be saved.
 fn repair_stale_v2_route_aliases(db: &Database, provider: &mut Provider) -> Result<(), AppError> {
+    let providers = db
+        .get_all_providers("codex")?
+        .into_iter()
+        .collect::<HashMap<_, _>>();
+    repair_stale_v2_route_aliases_from_providers(&providers, provider)
+}
+
+fn repair_stale_v2_route_aliases_from_providers(
+    providers: &HashMap<String, Provider>,
+    provider: &mut Provider,
+) -> Result<(), AppError> {
     let Some(routing) = provider.settings_config.get_mut("codexRouting") else {
         return Ok(());
     };
@@ -207,11 +300,6 @@ fn repair_stale_v2_route_aliases(db: &Database, provider: &mut Provider) -> Resu
     else {
         return Ok(());
     };
-    let providers = db
-        .get_all_providers("codex")?
-        .into_iter()
-        .collect::<HashMap<_, _>>();
-
     for route in routes {
         let Some(target_id) = route
             .get("targetProviderId")
@@ -400,29 +488,49 @@ fn sync_router_subagent_profiles_from_provider_catalog(
     db: &Database,
     router_id: &str,
 ) -> Result<(), AppError> {
-    let mut router = db.get_provider_by_id(router_id, "codex")?.ok_or_else(|| {
+    let router = db.get_provider_by_id(router_id, "codex")?.ok_or_else(|| {
         AppError::Message(format!("Codex MultiRouter provider not found: {router_id}"))
     })?;
+    let providers = db
+        .get_all_providers("codex")?
+        .into_iter()
+        .collect::<HashMap<_, _>>();
+    let provider_context =
+        crate::codex_config::ProviderClassificationContext::from_providers(providers.values());
+    let Some(router) =
+        reconcile_router_subagent_profile_from_providers(&router, &providers, &provider_context)?
+    else {
+        return Ok(());
+    };
+    db.save_provider("codex", &router)
+}
+
+fn reconcile_router_subagent_profile_from_providers(
+    router: &Provider,
+    providers: &HashMap<String, Provider>,
+    provider_context: &crate::codex_config::ProviderClassificationContext,
+) -> Result<Option<Provider>, AppError> {
     let Some(current) = router
         .settings_config
         .pointer("/codexRouting/subagentV2")
         .cloned()
     else {
-        return Ok(());
+        return Ok(None);
     };
-    let effective = build_projection_artifact(db, router_id)?.projection_settings;
-    let provider_context = crate::codex_config::codex_provider_classification_context(db)?;
+    let effective =
+        build_projection_artifact_from_providers(router, providers)?.projection_settings;
     let reconciled = crate::codex_config::reconcile_codex_subagent_v2_for_candidate(
         &effective,
         crate::codex_config::CodexSubagentV2ReconcileAction::SyncCatalog,
         Some(&current),
-        Some(&provider_context),
+        Some(provider_context),
     )?;
     if reconciled == current {
-        return Ok(());
+        return Ok(None);
     }
+    let mut router = router.clone();
     router.settings_config["codexRouting"]["subagentV2"] = reconciled;
-    db.save_provider("codex", &router)
+    Ok(Some(router))
 }
 
 fn remove_schema_v2_router_derived_catalog(provider: &mut Provider) {
@@ -453,7 +561,13 @@ fn validate_and_collect_affected_router_ids(
         .into_iter()
         .collect::<HashMap<_, _>>();
     providers.insert(candidate.id.clone(), candidate.clone());
+    validate_and_collect_affected_router_ids_from_providers(&providers, candidate)
+}
 
+fn validate_and_collect_affected_router_ids_from_providers(
+    providers: &HashMap<String, Provider>,
+    candidate: &Provider,
+) -> Result<AffectedRouterIds, AppError> {
     let mut projection = Vec::new();
     let mut subagent_profiles = Vec::new();
     for router in providers.values() {
@@ -1147,6 +1261,76 @@ mod tests {
                 .expect("provider saved")
                 .name,
             updated.name
+        );
+    }
+
+    #[test]
+    fn provider_batch_validation_failure_does_not_commit_earlier_catalog_changes() {
+        let db = Database::memory().expect("memory db");
+        let mut first = target("openai_chat");
+        first.id = "provider-a".to_string();
+        let mut second = target("openai_responses");
+        second.id = "provider-b".to_string();
+        db.save_provider("codex", &first)
+            .expect("seed first provider");
+        db.save_provider("codex", &second)
+            .expect("seed second provider");
+
+        let mut first_update = first.clone();
+        first_update.name = "Provider A updated".to_string();
+        let invalid_second_update = router("provider-b", "missing-provider");
+
+        let error = apply_codex_provider_mutations_persist_only(
+            &db,
+            vec![first_update, invalid_second_update],
+        )
+        .expect_err("invalid later candidate must reject the whole batch");
+        assert!(
+            error.to_string().contains("target_provider_missing"),
+            "{error}"
+        );
+
+        let saved_first = db
+            .get_provider_by_id("provider-a", "codex")
+            .expect("read first provider")
+            .expect("first provider remains");
+        assert_eq!(
+            saved_first.name, first.name,
+            "the earlier provider must remain unchanged when a later candidate fails"
+        );
+    }
+
+    #[test]
+    fn provider_batch_reconciliation_failure_does_not_commit_catalog_changes() {
+        let db = Database::memory().expect("memory db");
+        let original = target("openai_chat");
+        db.save_provider("codex", &original)
+            .expect("seed target provider");
+        let mut malformed_router = router("router-a", "qwen");
+        malformed_router.settings_config["codexRouting"]["subagentV2"] = json!({
+            "schemaVersion": 2,
+            "selectionPolicy": "balanced",
+            "profiles": "not-an-object"
+        });
+        db.save_provider("codex", &malformed_router)
+            .expect("seed malformed router profile");
+
+        let mut updated = original.clone();
+        updated.name = "Updated Qwen".to_string();
+        let error = apply_codex_provider_mutations_persist_only(&db, vec![updated])
+            .expect_err("malformed derived profile must reject the batch before commit");
+        assert!(
+            error.to_string().contains("subagent"),
+            "unexpected reconciliation error: {error}"
+        );
+
+        let saved = db
+            .get_provider_by_id("qwen", "codex")
+            .expect("read target provider")
+            .expect("target provider remains");
+        assert_eq!(
+            saved.name, original.name,
+            "direct catalog edits must remain unchanged when derived reconciliation fails"
         );
     }
 

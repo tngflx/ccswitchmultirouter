@@ -3,9 +3,15 @@ import type { TFunction } from "i18next";
 import { toast } from "sonner";
 import type { CodexModelReasoningCapability } from "@/types";
 
+export { modelIdentityValues } from "@/lib/modelIdentities";
+
 export interface FetchedModel {
   id: string;
   ownedBy: string | null;
+  canonicalSlug?: string | null;
+  slug?: string | null;
+  name?: string | null;
+  aliases?: string[];
   contextWindow?: number | null;
   inputModalities?: string[] | null;
   supportsImage?: boolean | null;
@@ -129,13 +135,26 @@ export async function fetchXaiOauthModels(
   });
 }
 
-/**
- * 读取本地 Codex 官方模型缓存
- *
- * 只作为 ChatGPT OAuth 在线模型接口失败后的离线兜底，不触发登录态刷新或网络请求。
- */
-export async function fetchCodexOauthCachedModels(): Promise<FetchedModel[]> {
-  return invoke("get_codex_oauth_cached_models");
+/** 获取无需 OAuth 的可信官方目录回退（公共快照、可信本地缓存、打包目录）。 */
+export async function fetchCodexOfficialFallbackModels(): Promise<
+  FetchedModel[]
+> {
+  return invoke("get_codex_official_fallback_models");
+}
+
+export interface CodexOfficialCatalogRefreshResult {
+  source: string;
+  fetchedAt: string | null;
+  modelCount: number;
+  usedStaleCache: boolean;
+  projectionApplied: boolean;
+  projectionReason: string | null;
+  refreshError: string | null;
+}
+
+/** Force-refresh the official snapshot and report whether generated outputs were reprojected. */
+export async function refreshCodexOfficialModelCatalog(): Promise<CodexOfficialCatalogRefreshResult> {
+  return invoke("refresh_codex_official_model_catalog");
 }
 
 /**

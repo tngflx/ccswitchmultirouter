@@ -127,6 +127,10 @@ pub async fn get_xai_oauth_models(
         .into_iter()
         .map(|model| FetchedModel {
             id: model.id,
+            canonical_slug: None,
+            slug: None,
+            name: None,
+            aliases: Vec::new(),
             owned_by: model.owned_by,
             context_window: None,
             input_modalities: None,

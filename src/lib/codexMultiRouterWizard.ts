@@ -20,6 +20,7 @@ import {
   type HostedToolsConfig,
 } from "./hostedTools";
 import type { FetchedModel } from "@/lib/api/model-fetch";
+import { modelIdentityValues } from "@/lib/modelIdentities";
 import { extractCodexBaseUrl } from "@/utils/providerConfigUtils";
 import {
   codexPlanModelListAction,
@@ -464,13 +465,7 @@ function wizardModelUpstream(model: CodexCatalogModel): string {
 }
 
 function wizardModelIdentities(model: CodexCatalogModel): string[] {
-  return Array.from(
-    new Set(
-      [model.model, model.upstreamModel, model.upstream_model]
-        .map(normalizedWizardModelId)
-        .filter(Boolean),
-    ),
-  );
+  return modelIdentityValues(model);
 }
 
 /**
@@ -504,6 +499,14 @@ export function canonicalizeWizardProviderModels(
     }
     // Keep the first user-authored values, while filling missing metadata from
     // later duplicate rows returned by a provider/catalog migration.
+    const mergedAliases = Array.from(
+      new Set(
+        [...(existing.aliases ?? []), ...(raw.aliases ?? [])]
+          .filter((alias): alias is string => typeof alias === "string")
+          .map((alias) => alias.trim())
+          .filter(Boolean),
+      ),
+    );
     byIdentity.set(key, {
       ...raw,
       ...existing,
@@ -511,6 +514,11 @@ export function canonicalizeWizardProviderModels(
       ...(existing.upstreamModel || declaredUpstream
         ? { upstreamModel: existing.upstreamModel ?? upstream }
         : {}),
+      canonicalSlug: existing.canonicalSlug ?? raw.canonicalSlug,
+      canonical_slug: existing.canonical_slug ?? raw.canonical_slug,
+      slug: existing.slug ?? raw.slug,
+      name: existing.name ?? raw.name,
+      ...(mergedAliases.length > 0 ? { aliases: mergedAliases } : {}),
       displayName:
         existing.displayName ??
         existing.display_name ??
@@ -560,27 +568,27 @@ export function mergeFetchedModelsIntoWizardProvider(
   const byFetchedModel = new Map<string, string>();
   for (const model of existingModels) {
     byModel.set(normalizedWizardModelId(model.model), model);
-    const visibleModel = nonEmptyWizardModelField(model.model);
-    if (visibleModel) {
-      byFetchedModel.set(normalizedWizardModelId(visibleModel), model.model);
-    }
-    const upstreamModel = nonEmptyWizardModelField(
-      model.upstreamModel,
-      model.upstream_model,
-      model.model,
-    );
-    if (upstreamModel) {
-      byFetchedModel.set(normalizedWizardModelId(upstreamModel), model.model);
+    for (const identity of wizardModelIdentities(model)) {
+      byFetchedModel.set(identity, model.model);
     }
   }
   const shouldAppendFetchedModels =
     options.appendNewModels ??
     (!options.preserveExistingSelection || existingModels.length === 0);
   for (const fetched of fetchedModels) {
-    const modelId = fetched.id.trim();
+    const modelId =
+      fetched.id?.trim() ||
+      fetched.canonicalSlug?.trim() ||
+      fetched.slug?.trim() ||
+      fetched.name?.trim() ||
+      fetched.aliases?.find((alias) => alias.trim())?.trim() ||
+      "";
     if (!modelId) continue;
-    const fetchedIdentity = normalizedWizardModelId(modelId);
-    const visibleModelId = byFetchedModel.get(fetchedIdentity) ?? modelId;
+    const fetchedIdentities = modelIdentityValues(fetched);
+    const visibleModelId =
+      fetchedIdentities
+        .map((identity) => byFetchedModel.get(identity))
+        .find((value): value is string => Boolean(value)) ?? modelId;
     const existing = byModel.get(normalizedWizardModelId(visibleModelId));
     if (!existing && !shouldAppendFetchedModels) continue;
     const nextModel = {
@@ -589,6 +597,9 @@ export function mergeFetchedModelsIntoWizardProvider(
       upstreamModel: nonEmptyWizardModelField(
         existing?.upstreamModel,
         existing?.upstream_model,
+        fetched.id,
+        fetched.canonicalSlug,
+        fetched.slug,
         modelId,
       ),
       displayName: existing?.displayName ?? visibleModelId,
@@ -616,6 +627,12 @@ export function mergeFetchedModelsIntoWizardProvider(
       ...(fetched.reasoning !== undefined && fetched.reasoning !== null
         ? { reasoning: fetched.reasoning }
         : {}),
+      ...(fetched.canonicalSlug
+        ? { canonicalSlug: fetched.canonicalSlug }
+        : {}),
+      ...(fetched.slug ? { slug: fetched.slug } : {}),
+      ...(fetched.name ? { name: fetched.name } : {}),
+      ...(fetched.aliases?.length ? { aliases: [...fetched.aliases] } : {}),
     };
     byModel.set(normalizedWizardModelId(visibleModelId), nextModel);
     // Index every fetched identity as it is inserted so case-variant rows in

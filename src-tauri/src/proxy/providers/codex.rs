@@ -2756,8 +2756,15 @@ pub fn apply_codex_native_responses_reasoning_effort(
         return Ok(());
     };
     let Some(config) = resolve_codex_chat_reasoning_config(provider, body) else {
+        remove_unsupported_codex_native_responses_disable_effort(body, &requested_effort);
         return Ok(());
     };
+    if is_codex_reasoning_disable_effort(&requested_effort)
+        && !codex_native_responses_supports_disable(&config)
+    {
+        remove_unsupported_codex_native_responses_disable_effort(body, &requested_effort);
+        return Ok(());
+    }
     let Some(mapped) =
         super::transform_codex_chat::map_codex_reasoning_effort(&requested_effort, &config)?
     else {
@@ -2766,6 +2773,55 @@ pub fn apply_codex_native_responses_reasoning_effort(
 
     body["reasoning"]["effort"] = JsonValue::String(mapped.to_string());
     Ok(())
+}
+
+fn is_codex_reasoning_disable_effort(effort: &str) -> bool {
+    matches!(
+        effort.trim().to_ascii_lowercase().as_str(),
+        "none" | "off" | "disabled"
+    )
+}
+
+/// Native Responses providers do not share Codex's `none` value. Keep the
+/// client-side disable request only when the resolved provider contract
+/// explicitly maps/accepts it; unknown or non-disable-capable providers must
+/// receive their own default reasoning policy instead of an invented effort.
+fn codex_native_responses_supports_disable(config: &CodexChatReasoningConfig) -> bool {
+    if config.effort_param.as_deref() != Some("reasoning.effort") {
+        return false;
+    }
+    let explicitly_advertises_none = config
+        .effort_value_mode
+        .as_deref()
+        .and_then(|mode| mode.strip_prefix("capability|"))
+        .and_then(|mode| mode.split_once('|'))
+        .map(|(allowed, mappings)| {
+            allowed.split(',').any(|effort| effort == "none")
+                || mappings.split(',').any(|mapping| mapping == "none=none")
+        })
+        .unwrap_or(false);
+    explicitly_advertises_none || (config.effort_value_mode.is_none() && config.disable_contract)
+}
+
+fn remove_unsupported_codex_native_responses_disable_effort(
+    body: &mut JsonValue,
+    requested_effort: &str,
+) {
+    if !is_codex_reasoning_disable_effort(requested_effort) {
+        return;
+    }
+    let remove_reasoning = body
+        .get_mut("reasoning")
+        .and_then(JsonValue::as_object_mut)
+        .map(|reasoning| {
+            reasoning.remove("effort");
+            reasoning.is_empty()
+        })
+        .unwrap_or(false);
+    if remove_reasoning {
+        body.as_object_mut()
+            .map(|object| object.remove("reasoning"));
+    }
 }
 
 /// 把 Qwen/vLLM 运行时安全默认（输出预算下限）应用到能力派生配置。
@@ -7317,6 +7373,96 @@ wire_api = "chat"
             .expect("identity effort map should apply");
 
         assert_eq!(body["reasoning"]["effort"], "high");
+    }
+
+    #[test]
+    fn native_responses_drops_none_for_sublyx_when_reasoning_metadata_is_unknown() {
+        let provider = create_provider(json!({
+            "base_url": "https://api.sublyx.org/v1"
+        }));
+        let mut body = json!({
+            "model": "gpt-6.1-sol",
+            "input": "hello",
+            "reasoning": {"effort": "none"}
+        });
+
+        apply_codex_native_responses_reasoning_effort(&provider, &mut body)
+            .expect("unknown capability must fail open without an invented effort");
+
+        assert!(body.get("reasoning").is_none());
+    }
+
+    #[test]
+    fn native_responses_drops_none_when_declared_efforts_omit_disable() {
+        let provider = create_provider(json!({
+            "modelCatalog": {"models": [{
+                "model": "gpt-6.1-sol",
+                "reasoning": {
+                    "schemaVersion": 2,
+                    "supportStatus": "confirmed_supported",
+                    "controlKind": "graded",
+                    "supportedEfforts": ["low", "medium", "high", "xhigh", "max"],
+                    "defaultEffort": "medium",
+                    "disableAllowed": false,
+                    "upstream": {
+                        "format": "object",
+                        "parameter": "reasoning.effort",
+                        "effortMap": {
+                            "low": "low",
+                            "medium": "medium",
+                            "high": "high",
+                            "xhigh": "xhigh",
+                            "max": "max"
+                        }
+                    }
+                }
+            }]}
+        }));
+        let mut body = json!({
+            "model": "gpt-6.1-sol",
+            "reasoning": {"effort": "none"}
+        });
+
+        apply_codex_native_responses_reasoning_effort(&provider, &mut body)
+            .expect("a declared non-disable capability must not reject the request locally");
+
+        assert!(body.get("reasoning").is_none());
+    }
+
+    #[test]
+    fn native_responses_preserves_none_when_provider_explicitly_accepts_disable() {
+        let provider = create_provider(json!({
+            "modelCatalog": {"models": [{
+                "model": "gpt-6.1-sol",
+                "reasoning": {
+                    "schemaVersion": 2,
+                    "supportStatus": "confirmed_supported",
+                    "controlKind": "graded",
+                    "supportedEfforts": ["none", "low", "medium", "high"],
+                    "defaultEffort": "medium",
+                    "disableAllowed": true,
+                    "upstream": {
+                        "format": "object",
+                        "parameter": "reasoning.effort",
+                        "effortMap": {
+                            "none": "none",
+                            "low": "low",
+                            "medium": "medium",
+                            "high": "high"
+                        }
+                    }
+                }
+            }]}
+        }));
+        let mut body = json!({
+            "model": "gpt-6.1-sol",
+            "reasoning": {"effort": "none"}
+        });
+
+        apply_codex_native_responses_reasoning_effort(&provider, &mut body)
+            .expect("an explicit provider disable contract should be preserved");
+
+        assert_eq!(body["reasoning"]["effort"], "none");
     }
 
     #[test]

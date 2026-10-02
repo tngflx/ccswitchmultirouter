@@ -33,6 +33,7 @@ import en from "@/i18n/locales/en.json";
 import {
   fetchCodexOauthModels,
   fetchModelsForConfig,
+  refreshCodexOfficialModelCatalog,
   type FetchedModel,
 } from "@/lib/api/model-fetch";
 import type { CodexRoutingProjectionStatus } from "@/lib/api/providers";
@@ -137,6 +138,7 @@ vi.mock("@/lib/api", () => ({
   providersApi: {
     add: vi.fn(),
     update: vi.fn(),
+    updateCodexBatch: vi.fn(),
     getAll: vi.fn(),
     inspectCodexMultiRouterProjection: vi.fn(),
     retryCodexMultiRouterProjection: vi.fn(),
@@ -166,6 +168,7 @@ vi.mock("@/lib/api/auth", () => ({
 vi.mock("@/lib/api/model-fetch", () => ({
   fetchCodexOauthModels: vi.fn(),
   fetchModelsForConfig: vi.fn(),
+  refreshCodexOfficialModelCatalog: vi.fn(),
 }));
 
 vi.mock("@/lib/api/codexSubagentV2", () => ({
@@ -409,6 +412,7 @@ beforeEach(() => {
   requestLogsFixture.value = { data: [], isLoading: false };
   vi.mocked(fetchCodexOauthModels).mockReset();
   vi.mocked(fetchModelsForConfig).mockReset();
+  vi.mocked(refreshCodexOfficialModelCatalog).mockReset();
   vi.mocked(proxyApi.unlockCodexModelPicker).mockReset();
   vi.mocked(proxyApi.getRequestHealthDiagnostics).mockReset();
   vi.mocked(proxyApi.getRequestHealthDiagnostics).mockResolvedValue({
@@ -5824,6 +5828,102 @@ describe("Codex MultiRouter workspace route persistence helpers", () => {
 
     await user.click(requestHealthButton);
     expect(screen.getByDisplayValue("384")).toBeVisible();
+  });
+
+  it("refreshes the official catalog and reports confirmed projection", async () => {
+    const provider: Provider = {
+      id: "codex-refresh-provider",
+      name: "Refresh Provider",
+      category: "custom",
+      settingsConfig: {
+        modelCatalog: {
+          models: [{ model: "gpt-6-astra" }],
+        },
+      },
+    };
+    const plan = withEnabledProviderRoute(
+      createDraftRoutingPlan([provider], [provider]),
+      provider,
+    );
+    vi.mocked(refreshCodexOfficialModelCatalog).mockResolvedValueOnce({
+      source: "openai_codex_models_json",
+      fetchedAt: "2026-09-30T00:00:00Z",
+      modelCount: 7,
+      usedStaleCache: false,
+      projectionApplied: true,
+      projectionReason: null,
+      refreshError: null,
+    });
+
+    renderWorkspace(
+      React.createElement(CodexRouterWorkspacePage, {
+        providers: [provider, plan],
+        isProxyRunning: true,
+        isCodexTakeoverActive: true,
+        activeProviderId: plan.id,
+        initialProviderId: plan.id,
+        initialTab: "status",
+        onEditProvider: vi.fn(),
+        onDeletePlan: vi.fn(),
+        onCreateProvider: vi.fn(),
+      }),
+    );
+
+    const user = userEvent.setup();
+    await user.click(screen.getByTestId("codex-official-catalog-refresh"));
+
+    await waitFor(() =>
+      expect(refreshCodexOfficialModelCatalog).toHaveBeenCalledTimes(1),
+    );
+    await waitFor(() =>
+      expect(
+        screen.getByTestId("codex-official-catalog-refresh-result"),
+      ).toHaveTextContent(
+        "codexRouterWorkspace.officialCatalogRefresh.summary",
+      ),
+    );
+  });
+
+  it("reports a rejected official catalog refresh request without claiming projection", async () => {
+    const provider: Provider = {
+      id: "codex-refresh-error-provider",
+      name: "Refresh Error Provider",
+      category: "custom",
+      settingsConfig: { modelCatalog: { models: [{ model: "gpt-6-astra" }] } },
+    };
+    const plan = withEnabledProviderRoute(
+      createDraftRoutingPlan([provider], [provider]),
+      provider,
+    );
+    vi.mocked(refreshCodexOfficialModelCatalog).mockRejectedValueOnce(
+      new Error("request failed"),
+    );
+
+    renderWorkspace(
+      React.createElement(CodexRouterWorkspacePage, {
+        providers: [provider, plan],
+        isProxyRunning: true,
+        isCodexTakeoverActive: true,
+        activeProviderId: plan.id,
+        initialProviderId: plan.id,
+        initialTab: "status",
+        onEditProvider: vi.fn(),
+        onDeletePlan: vi.fn(),
+        onCreateProvider: vi.fn(),
+      }),
+    );
+
+    await userEvent
+      .setup()
+      .click(screen.getByTestId("codex-official-catalog-refresh"));
+
+    await waitFor(() =>
+      expect(
+        screen.getByTestId("codex-official-catalog-refresh-error"),
+      ).toHaveTextContent(
+        "codexRouterWorkspace.officialCatalogRefresh.requestFailed",
+      ),
+    );
   });
 
   it("shows stale projection details and lets the user resync with readable provider names", async () => {

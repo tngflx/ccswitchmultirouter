@@ -10,7 +10,7 @@ mod usage;
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::future::Future;
+use std::{future::Future, sync::Arc};
 
 use crate::app_config::AppType;
 use crate::database::{validate_cost_multiplier, validate_pricing_source};
@@ -34,6 +34,7 @@ pub(crate) use live::sanitize_claude_settings_for_live;
 pub(crate) use live::{
     build_codex_live_config_for_provider, build_effective_settings_with_common_config,
     normalize_provider_common_config_for_storage, provider_exists_in_live_config,
+    publish_codex_catalog_outputs_for_provider,
     strip_common_config_from_live_settings, sync_current_provider_for_app_to_live,
     write_codex_config_only_with_common_config, write_live_with_common_config,
 };
@@ -240,6 +241,38 @@ fn app_error_diagnostic_kind(error: &AppError) -> &'static str {
         AppError::AllProvidersCircuitOpen => "all_providers_circuit_open",
         AppError::NoProvidersConfigured => "no_providers_configured",
     }
+}
+
+fn schedule_codex_multirouter_projection_refresh(db: Arc<crate::database::Database>) {
+    tauri::async_runtime::spawn_blocking(move || {
+        let Ok(Some(router_id)) = crate::codex_multirouter::active_codex_router_id(&db) else {
+            return;
+        };
+        match crate::codex_multirouter::projection::ensure_codex_multirouter_projection(
+            &db, &router_id, false,
+        ) {
+            Ok(status)
+                if status.state
+                    == crate::codex_multirouter::projection::ProjectionState::Pending =>
+            {
+                log::warn!(
+                    "Codex MultiRouter background projection pending: router={} code={}",
+                    status.router_provider_id,
+                    status
+                        .last_error_code
+                        .as_deref()
+                        .unwrap_or("projection_pending")
+                );
+            }
+            Ok(_) => {}
+            Err(error) => {
+                log::warn!(
+                    "Codex MultiRouter background projection failed: router={} error={error}",
+                    router_id
+                );
+            }
+        }
+    });
 }
 
 /// 在同步的 provider 命令里安全等待异步代理任务。
@@ -4585,6 +4618,32 @@ impl ProviderService {
         Self::update_with_protocol_profile(state, app_type, original_id, provider, None)
     }
 
+    /// Atomically update several existing Codex providers.
+    ///
+    /// This is intentionally narrower than generic provider CRUD: it is for
+    /// catalog fan-out mutations where every provider already exists and all
+    /// rows must commit or none may commit.
+    pub fn update_codex_providers_atomically(
+        state: &AppState,
+        providers: Vec<Provider>,
+    ) -> Result<bool, AppError> {
+        if providers.is_empty() {
+            return Ok(true);
+        }
+        let prepared = providers
+            .into_iter()
+            .map(|provider| {
+                Self::prepare_provider_for_mutation(state, &AppType::Codex, provider)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        crate::codex_multirouter::mutation::apply_codex_provider_mutations_persist_only(
+            state.db.as_ref(),
+            prepared,
+        )?;
+        schedule_codex_multirouter_projection_refresh(state.db.clone());
+        Ok(true)
+    }
+
     pub(crate) fn update_with_protocol_profile(
         state: &AppState,
         app_type: AppType,
@@ -4872,36 +4931,7 @@ impl ProviderService {
                 protocol_profiles,
             )?
         };
-        let db = state.db.clone();
-        tauri::async_runtime::spawn_blocking(move || {
-            let Ok(Some(router_id)) = crate::codex_multirouter::active_codex_router_id(&db) else {
-                return;
-            };
-            match crate::codex_multirouter::projection::ensure_codex_multirouter_projection(
-                &db, &router_id, false,
-            ) {
-                Ok(status)
-                    if status.state
-                        == crate::codex_multirouter::projection::ProjectionState::Pending =>
-                {
-                    log::warn!(
-                        "Codex MultiRouter background projection pending: router={} code={}",
-                        status.router_provider_id,
-                        status
-                            .last_error_code
-                            .as_deref()
-                            .unwrap_or("projection_pending")
-                    );
-                }
-                Ok(_) => {}
-                Err(error) => {
-                    log::warn!(
-                        "Codex MultiRouter background projection failed: router={} error={error}",
-                        router_id
-                    );
-                }
-            }
-        });
+        schedule_codex_multirouter_projection_refresh(state.db.clone());
         if !outcome.projections.is_empty() {
             log::debug!(
                 "Codex MultiRouter provider mutation returned {} synchronous projection statuses",

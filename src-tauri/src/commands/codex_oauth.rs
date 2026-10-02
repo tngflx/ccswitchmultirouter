@@ -5,9 +5,9 @@
 //! 大部分认证命令通过通用 `auth_*` 命令（参见 `commands::auth`）暴露给前端，
 //! 此处定义 State wrapper 以及 Codex OAuth 专属的订阅额度和模型列表查询命令。
 
-use crate::proxy::providers::codex_oauth_auth::CodexAccountPoolPolicy;
-use crate::proxy::providers::codex_oauth_auth::CodexOAuthManager;
+use crate::proxy::providers::codex_oauth_auth::{CodexAccountPoolPolicy, CodexOAuthManager};
 use crate::services::model_fetch::FetchedModel;
+use crate::services::proxy::OfficialCodexCatalogProjectionOutcome;
 use crate::services::subscription::{query_codex_quota, CredentialStatus, SubscriptionQuota};
 use crate::store::AppState;
 use std::sync::Arc;
@@ -21,6 +21,18 @@ pub struct CodexAccountPoolQuotaStatus {
     remaining_percent: Option<f64>,
     queried_at: Option<i64>,
     error: Option<String>,
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ManualOfficialCatalogRefreshStatus {
+    source: String,
+    fetched_at: Option<String>,
+    model_count: usize,
+    used_stale_cache: bool,
+    projection_applied: bool,
+    projection_reason: Option<String>,
+    refresh_error: Option<String>,
 }
 
 fn quota_remaining_percent(quota: &SubscriptionQuota) -> Option<f64> {
@@ -202,11 +214,82 @@ pub async fn get_codex_oauth_models(
     crate::services::codex_oauth_models::fetch_models_with_token(&token, &id).await
 }
 
-/// 读取本地 Codex 官方模型缓存。
-///
-/// 该命令不触发 OAuth refresh，也不访问网络，只用于 MultiRouter 向导在
-/// `chatgpt.com/backend-api/codex/models` 网络层失败时保留最近一次官方模型目录。
+/// 读取官方模型来源链，必要时刷新独立公共快照，再返回可信本地目录。
 #[tauri::command]
-pub fn get_codex_oauth_cached_models() -> Result<Vec<FetchedModel>, String> {
-    crate::services::codex_oauth_models::fetch_cached_models_from_disk()
+pub async fn get_codex_official_fallback_models() -> Result<Vec<FetchedModel>, String> {
+    crate::services::codex_oauth_models::fetch_official_fallback_models().await
+}
+
+/// Force-refresh the public official catalog, then rebuild the generated Codex
+/// catalog only when the current live configuration is an active CCSM takeover.
+/// User-managed directories are intentionally left untouched.
+#[tauri::command]
+pub async fn refresh_codex_official_model_catalog(
+    state: State<'_, AppState>,
+) -> Result<ManualOfficialCatalogRefreshStatus, String> {
+    let refresh =
+        crate::services::codex_oauth_models::refresh_public_official_catalog_force().await;
+    let mut status = ManualOfficialCatalogRefreshStatus {
+        source: refresh.source,
+        fetched_at: refresh.fetched_at,
+        model_count: refresh.model_count,
+        used_stale_cache: refresh.used_stale_cache,
+        projection_applied: false,
+        projection_reason: None,
+        refresh_error: refresh.refresh_error,
+    };
+
+    if !refresh.refreshed {
+        status.projection_reason = Some("refresh_not_fresh".to_string());
+        return Ok(status);
+    }
+
+    match state
+        .proxy_service
+        .reproject_official_codex_catalog_if_owned()
+        .await
+    {
+        Ok(OfficialCodexCatalogProjectionOutcome::Applied) => {
+            status.projection_applied = true;
+        }
+        Ok(OfficialCodexCatalogProjectionOutcome::Skipped(reason)) => {
+            status.projection_reason = Some(reason.to_string());
+        }
+        Err(error) => {
+            log::warn!("official catalog refresh projection failed: {error}");
+            status.projection_reason = Some("projection_outputs_unconfirmed".to_string());
+            status.refresh_error.get_or_insert_with(|| {
+                "Official catalog refreshed, but CCSM generated outputs could not be confirmed"
+                    .to_string()
+            });
+        }
+    }
+    Ok(status)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn manual_catalog_refresh_status_serializes_frontend_contract() {
+        let value = serde_json::to_value(ManualOfficialCatalogRefreshStatus {
+            source: "openai_codex_models_json".to_string(),
+            fetched_at: Some("2026-09-23T00:00:00Z".to_string()),
+            model_count: 2,
+            used_stale_cache: false,
+            projection_applied: true,
+            projection_reason: None,
+            refresh_error: None,
+        })
+        .expect("serialize status");
+
+        assert_eq!(value["source"], "openai_codex_models_json");
+        assert_eq!(value["fetchedAt"], "2026-09-23T00:00:00Z");
+        assert_eq!(value["modelCount"], 2);
+        assert_eq!(value["usedStaleCache"], false);
+        assert_eq!(value["projectionApplied"], true);
+        assert!(value.get("projectionReason").is_some());
+        assert!(value.get("refreshError").is_some());
+    }
 }

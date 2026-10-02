@@ -5,6 +5,7 @@ import {
   buildCodexMultiRouterWizardPlan,
   buildWizardRoutesFromSources,
   canContinueAfterConnectivity,
+  canonicalizeWizardProviderModels,
   classifyWizardConnectivityResult,
   collectWizardModelNameCollisions,
   collectWizardRouteAliasSelectionIssues,
@@ -379,6 +380,67 @@ describe("codexMultiRouterWizard helpers", () => {
       displayName: "My GPT",
       contextWindow: 256000,
     });
+  });
+
+  it("fills identity metadata and unions aliases when canonicalizing duplicate rows", () => {
+    expect(
+      canonicalizeWizardProviderModels([
+        {
+          model: "Friendly GPT",
+          upstreamModel: "gpt-5",
+          canonicalSlug: undefined,
+          aliases: ["legacy-gpt"],
+        },
+        {
+          model: "friendly gpt",
+          upstreamModel: "GPT-5",
+          canonicalSlug: "gpt-5-canonical",
+          slug: "gpt-5",
+          name: "GPT 5",
+          aliases: ["gpt-5"],
+        },
+      ]),
+    ).toEqual([
+      expect.objectContaining({
+        model: "Friendly GPT",
+        upstreamModel: "gpt-5",
+        canonicalSlug: "gpt-5-canonical",
+        slug: "gpt-5",
+        name: "GPT 5",
+        aliases: ["legacy-gpt", "gpt-5"],
+      }),
+    ]);
+  });
+
+  it("matches existing wizard rows through canonical slugs and aliases", () => {
+    const source = provider({
+      settingsConfig: {
+        modelCatalog: {
+          models: [
+            {
+              model: "Friendly GPT",
+              upstreamModel: "gpt-5",
+              canonicalSlug: "gpt-5-canonical",
+              aliases: ["legacy-gpt"],
+              enabled: true,
+            },
+          ],
+        },
+      },
+    });
+
+    const merged = mergeFetchedModelsIntoWizardProvider(source, [
+      {
+        id: "gpt-5-canonical",
+        ownedBy: "provider",
+        aliases: ["legacy-gpt"],
+      },
+    ]);
+
+    expect(merged.settingsConfig.modelCatalog?.models).toHaveLength(1);
+    expect(merged.settingsConfig.modelCatalog?.models?.[0].model).toBe(
+      "Friendly GPT",
+    );
   });
 
   it("matches model order by visible or upstream identity without re-enabling excluded rows", () => {

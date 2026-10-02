@@ -9,7 +9,8 @@
 //! 2. 动态检测候选快照（TTL、只读元数据、禁止主动推理试探）；
 //! 3. CCSM 维护的版本化能力库（随应用打包的独立 JSON 资源）；
 //! 4. 内置清单（deepseek-v4 / k3）；
-//! 5. Codex 官方模型缓存（仅未知平台生效；OpenRouter/vLLM 等聚合平台不套用）；
+//! 5. Codex 官方模型缓存（仅明确识别为官方 OpenAI 平台时生效；
+//!    OpenRouter/vLLM/未知自定义网关不套用）；
 //! 6. Unknown（fail-closed）。
 //!
 //! 核心原则：缺失证据不是不存在的证据。`NotAdvertised`/`Unavailable`/`Invalid`
@@ -21,8 +22,9 @@ pub mod provider_metadata;
 use crate::provider::Provider;
 use crate::proxy::providers::codex_reasoning::{
     builtin_reasoning_capability_for_model, capability_fingerprint,
-    official_reasoning_capability_for_model, reasoning_capability_from_provider_model_entry,
-    resolve_reasoning_capability_from_settings, CapabilityConfidence,
+    official_reasoning_capability_for_model,
+    reasoning_capability_from_codex_inline_model_entry, resolve_reasoning_capability_from_settings,
+    CapabilityConfidence,
     CodexModelReasoningCapability, CodexModelReasoningUpstream, ReasoningControlKind,
     ReasoningSupportStatus,
 };
@@ -47,7 +49,7 @@ pub enum CapabilitySource {
     Library,
     /// 内置清单。
     Builtin,
-    /// Codex 官方模型缓存（仅未知平台生效；OpenRouter/vLLM 等聚合平台不套用）。
+    /// Codex 官方模型缓存（仅明确识别为官方 OpenAI 平台时生效）。
     Official,
     /// 无来源命中，fail-closed unknown。
     Unknown,
@@ -328,8 +330,8 @@ fn resolved_with_catalog_ultra_setting(
 /// 2. 动态检测候选快照（TTL、只读元数据）；
 /// 3. CCSM 维护的版本化能力库；
 /// 4. 内置清单（deepseek-v4 / k3）；
-/// 5. Codex 官方模型缓存（仅 `platform=None` 即未知平台生效；OpenRouter/vLLM
-///    等已知聚合平台有自己的推理接口，不得套用官方 OpenAI 形态）；
+/// 5. Codex 官方模型缓存（仅 `platform=Some("openai")` 生效；
+///    聚合平台和未知网关不得套用官方 OpenAI 形态）；
 /// 6. Unknown（fail-closed）。
 pub fn resolve_codex_model_capability_core(
     settings: &Value,
@@ -393,8 +395,12 @@ pub fn resolve_codex_model_capability_core(
         );
     }
 
-    // 6. Codex 官方模型缓存（仅未知平台生效）
-    if platform.is_none() {
+    // 6. Codex 官方模型缓存。
+    //
+    // A missing platform is not evidence of an official OpenAI endpoint. In
+    // particular, authenticated custom gateways such as Sublyx may expose
+    // OpenAI-shaped model IDs while supporting a different reasoning contract.
+    if platform == Some("openai") {
         if let Some(capability) = official_reasoning_capability_for_model(model, official_models) {
             return resolved_with_catalog_ultra_setting(
                 settings,
@@ -436,7 +442,9 @@ fn resolve_reasoning_capability_from_provider_config(
             if !matches_model {
                 continue;
             }
-            if let Some(capability) = reasoning_capability_from_provider_model_entry(&model_json) {
+            if let Some(capability) =
+                reasoning_capability_from_codex_inline_model_entry(&model_json)
+            {
                 return Some(capability);
             }
         }
@@ -452,6 +460,28 @@ pub fn snapshot_to_capability(
     snapshot: &ProviderCapabilitySnapshot,
 ) -> Option<CodexModelReasoningCapability> {
     let reasoning = snapshot.reasoning.as_ref()?;
+    let declared_wire_contract = match (
+        reasoning.upstream_format.as_deref(),
+        reasoning.upstream_parameter.as_deref(),
+    ) {
+        (Some(format), Some(parameter))
+            if matches!(
+                (format, parameter),
+                ("string", "reasoning_effort")
+                    | ("object", "reasoning")
+                    | ("object", "reasoning.effort")
+                    | ("boolean", "enable_thinking")
+                    | ("boolean", "enable_reasoning")
+                    | ("boolean", "thinking")
+            ) =>
+        {
+            Some((format.to_string(), parameter.to_string()))
+        }
+        // Budget-only and mandatory/no-control metadata can be useful without
+        // an effort wire contract. Keep those capabilities neutral so request
+        // conversion cannot accidentally inject a guessed effort parameter.
+        _ => None,
+    };
     let efforts: Vec<String> = reasoning
         .supported_efforts
         .iter()
@@ -478,6 +508,18 @@ pub fn snapshot_to_capability(
         return None;
     };
 
+    // Graded effort levels must carry an explicit, validated wire contract.
+    // For budget/mandatory/no-control declarations, `none` is intentional:
+    // it describes capability metadata without authorizing request injection.
+    let (upstream_format, upstream_parameter) = declared_wire_contract
+        .or_else(|| {
+            matches!(
+                control_kind,
+                ReasoningControlKind::Budget | ReasoningControlKind::None
+            )
+            .then(|| ("none".to_string(), "none".to_string()))
+        })?;
+
     let mut supported_efforts = graded_efforts.clone();
     if disable_allowed {
         supported_efforts.insert(0, "none".to_string());
@@ -492,14 +534,8 @@ pub fn snapshot_to_capability(
         default_effort: reasoning.default_effort.clone(),
         disable_allowed,
         upstream: CodexModelReasoningUpstream {
-            format: reasoning
-                .upstream_format
-                .clone()
-                .unwrap_or_else(|| "object".to_string()),
-            parameter: reasoning
-                .upstream_parameter
-                .clone()
-                .unwrap_or_else(|| "reasoning.effort".to_string()),
+            format: upstream_format,
+            parameter: upstream_parameter,
             effort_map: graded_efforts
                 .iter()
                 .map(|effort| (effort.clone(), effort.clone()))
@@ -772,6 +808,18 @@ mod tests {
         let capability = snapshot_to_capability(&snapshot).expect("budget snapshot");
         assert_eq!(capability.control_kind, Some(ReasoningControlKind::Budget));
         assert!(capability.supported_efforts.is_empty());
+        assert_eq!(capability.upstream.format, "none");
+        assert_eq!(capability.upstream.parameter, "none");
+        assert!(capability.upstream.effort_map.is_empty());
+        assert!(capability.validate().is_ok());
+    }
+
+    #[test]
+    fn snapshot_graded_without_wire_contract_is_not_routable() {
+        let mut snapshot = openrouter_detection_snapshot();
+        snapshot.reasoning.as_mut().unwrap().upstream_format = None;
+        snapshot.reasoning.as_mut().unwrap().upstream_parameter = None;
+        assert!(snapshot_to_capability(&snapshot).is_none());
     }
 
     #[test]
@@ -837,12 +885,18 @@ mod tests {
     }
 
     #[test]
-    fn resolver_core_official_source_for_unknown_platform() {
-        // platform=None（未知平台，含 OpenAI 直连与 catalog 投影）命中 official 来源。
+    fn resolver_core_official_source_for_official_openai_platform() {
+        // 只有明确识别为官方 OpenAI 平台时才命中 official 来源。
         let settings = json!({});
         let official = official_models_fixture();
-        let resolved =
-            resolve_codex_model_capability_core(&settings, None, "gpt-5.4", None, None, &official);
+        let resolved = resolve_codex_model_capability_core(
+            &settings,
+            Some("openai"),
+            "gpt-5.4",
+            None,
+            None,
+            &official,
+        );
         assert_eq!(resolved.source, CapabilitySource::Official);
         assert!(!resolved.fingerprint.is_empty());
         let capability = resolved.capability.expect("official capability");
@@ -858,10 +912,20 @@ mod tests {
     }
 
     #[test]
-    fn resolver_core_official_source_skipped_for_known_platform() {
-        // platform=openrouter（已知聚合平台）不套用官方 OpenAI 形态，落到 unknown。
+    fn resolver_core_official_source_skipped_for_unknown_or_aggregated_platform() {
+        // 未知平台与已知聚合平台都不套用官方 OpenAI 形态，落到 unknown。
         let settings = json!({});
         let official = official_models_fixture();
+        let unknown = resolve_codex_model_capability_core(
+            &settings,
+            None,
+            "gpt-5.4",
+            None,
+            None,
+            &official,
+        );
+        assert_eq!(unknown.source, CapabilitySource::Unknown);
+        assert!(unknown.capability.is_none());
         let resolved = resolve_codex_model_capability_core(
             &settings,
             Some("openrouter"),
@@ -894,7 +958,14 @@ mod tests {
         });
         let official = official_models_fixture();
         let resolved =
-            resolve_codex_model_capability_core(&settings, None, "gpt-5.4", None, None, &official);
+            resolve_codex_model_capability_core(
+                &settings,
+                Some("openai"),
+                "gpt-5.4",
+                None,
+                None,
+                &official,
+            );
         assert_eq!(resolved.source, CapabilitySource::UserConfig);
         let capability = resolved.capability.expect("user capability");
         assert_eq!(capability.supported_efforts, vec!["low", "high"]);
@@ -905,7 +976,14 @@ mod tests {
         // 官方缓存为空（fresh install）时，GPT 模型落到 unknown（fail-closed）。
         let settings = json!({});
         let resolved =
-            resolve_codex_model_capability_core(&settings, None, "gpt-5.4", None, None, &[]);
+            resolve_codex_model_capability_core(
+                &settings,
+                Some("openai"),
+                "gpt-5.4",
+                None,
+                None,
+                &[],
+            );
         assert_eq!(resolved.source, CapabilitySource::Unknown);
         assert!(resolved.capability.is_none());
     }

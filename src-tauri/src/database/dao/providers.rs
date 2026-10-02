@@ -238,6 +238,47 @@ impl Database {
                     .to_string(),
             ));
         }
+        let mut conn = lock_conn!(self.conn);
+        let tx = conn
+            .transaction()
+            .map_err(|e| AppError::Database(e.to_string()))?;
+
+        Self::save_provider_in_transaction(&tx, app_type, provider)?;
+
+        for record in records {
+            super::protocol_compatibility::save_protocol_compatibility_result_in_transaction(
+                &tx, record,
+            )?;
+        }
+
+        tx.commit().map_err(|e| AppError::Database(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Atomically persist several providers through the same row-writing path used by
+    /// ordinary provider saves. This is used by Codex catalog fan-out mutations so a
+    /// mid-batch validation or database error cannot leave only part of the catalog changed.
+    pub(crate) fn save_providers_atomically(
+        &self,
+        app_type: &str,
+        providers: &[Provider],
+    ) -> Result<(), AppError> {
+        let mut conn = lock_conn!(self.conn);
+        let tx = conn
+            .transaction()
+            .map_err(|e| AppError::Database(e.to_string()))?;
+        for provider in providers {
+            Self::save_provider_in_transaction(&tx, app_type, provider)?;
+        }
+        tx.commit().map_err(|e| AppError::Database(e.to_string()))?;
+        Ok(())
+    }
+
+    fn save_provider_in_transaction(
+        tx: &rusqlite::Transaction<'_>,
+        app_type: &str,
+        provider: &Provider,
+    ) -> Result<(), AppError> {
         // schema v2 路由上的 v1 继承字段（apiFormat/upstream/baseUrl 等）会让下一次
         // v2 编译 fail closed，子智能体保存等操作随之持续报错。在持久化边界统一剥离。
         let mut provider = provider.clone();
@@ -251,14 +292,9 @@ impl Database {
                 provider.id
             );
         }
-        let mut conn = lock_conn!(self.conn);
-        let tx = conn
-            .transaction()
-            .map_err(|e| AppError::Database(e.to_string()))?;
 
         let mut meta_clone = provider.meta.clone().unwrap_or_default();
         let endpoints = std::mem::take(&mut meta_clone.custom_endpoints);
-
         let existing: Option<(bool, bool)> = tx
             .query_row(
                 "SELECT is_current, in_failover_queue FROM providers WHERE id = ?1 AND app_type = ?2",
@@ -266,11 +302,14 @@ impl Database {
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .ok();
-
         let is_update = existing.is_some();
         let (is_current, in_failover_queue) =
             existing.unwrap_or((false, provider.in_failover_queue));
         let settings_config = normalize_provider_settings_config(provider.settings_config.clone());
+        let serialized_settings = serde_json::to_string(&settings_config)
+            .map_err(|e| AppError::Database(format!("Failed to serialize settings_config: {e}")))?;
+        let serialized_meta = serde_json::to_string(&meta_clone)
+            .map_err(|e| AppError::Database(format!("Failed to serialize meta: {e}")))?;
 
         if is_update {
             tx.execute(
@@ -290,9 +329,7 @@ impl Database {
                 WHERE id = ?13 AND app_type = ?14",
                 params![
                     provider.name,
-                    serde_json::to_string(&settings_config).map_err(|e| {
-                        AppError::Database(format!("Failed to serialize settings_config: {e}"))
-                    })?,
+                    serialized_settings,
                     provider.website_url,
                     provider.category,
                     provider.created_at,
@@ -300,9 +337,7 @@ impl Database {
                     provider.notes,
                     provider.icon,
                     provider.icon_color,
-                    serde_json::to_string(&meta_clone).map_err(|e| AppError::Database(format!(
-                        "Failed to serialize meta: {e}"
-                    )))?,
+                    serialized_meta,
                     is_current,
                     in_failover_queue,
                     provider.id,
@@ -320,8 +355,7 @@ impl Database {
                     provider.id,
                     app_type,
                     provider.name,
-                    serde_json::to_string(&settings_config)
-                        .map_err(|e| AppError::Database(format!("Failed to serialize settings_config: {e}")))?,
+                    serialized_settings,
                     provider.website_url,
                     provider.category,
                     provider.created_at,
@@ -329,8 +363,7 @@ impl Database {
                     provider.notes,
                     provider.icon,
                     provider.icon_color,
-                    serde_json::to_string(&meta_clone)
-                        .map_err(|e| AppError::Database(format!("Failed to serialize meta: {e}")))?,
+                    serialized_meta,
                     is_current,
                     in_failover_queue,
                 ],
@@ -346,14 +379,6 @@ impl Database {
                 .map_err(|e| AppError::Database(e.to_string()))?;
             }
         }
-
-        for record in records {
-            super::protocol_compatibility::save_protocol_compatibility_result_in_transaction(
-                &tx, record,
-            )?;
-        }
-
-        tx.commit().map_err(|e| AppError::Database(e.to_string()))?;
         Ok(())
     }
 

@@ -64,6 +64,8 @@ pub(crate) const CODEX_MANAGED_REQUEST_MAX_RETRIES: u64 = 2;
 pub(crate) const CODEX_MANAGED_STREAM_MAX_RETRIES: u64 = 5;
 const CODEX_MODELS_CACHE_FILENAME: &str = "models_cache.json";
 const CODEX_MODELS_CACHE_BACKUP_FILENAME: &str = "models_cache.cc-switch-backup.json";
+const CODEX_PUBLIC_OFFICIAL_MODELS_CACHE_FILENAME: &str = "codex-official-models-cache.json";
+const CODEX_PUBLIC_OFFICIAL_MODELS_CACHE_MAX_AGE_SECS: i64 = 6 * 60 * 60;
 const CC_SWITCH_CODEX_MODELS_CACHE_ETAG: &str = "cc-switch-model-catalog";
 
 #[cfg(target_os = "windows")]
@@ -1779,157 +1781,240 @@ pub fn codex_official_models_cache() -> Option<Vec<Value>> {
     let backup_path = get_codex_models_cache_backup_path();
     let existing_cache = read_json_file_if_exists(&cache_path).ok().flatten();
     let backup_cache = read_json_file_if_exists(&backup_path).ok().flatten();
+    let public_models = load_codex_public_official_models_cache();
     official_models_with_bundled_fallback(
         existing_cache.as_ref(),
         backup_cache.as_ref(),
+        load_codex_packaged_official_models().as_deref(),
+        public_models.as_deref(),
         load_codex_bundled_models().as_deref(),
     )
+}
+
+pub(crate) fn load_codex_packaged_official_models() -> Option<Vec<Value>> {
+    serde_json::from_str::<Value>(include_str!(
+        "resources/codex_official_models_fallback.json"
+    ))
+    .ok()?
+    .get("models")?
+    .as_array()
+    .cloned()
 }
 
 fn official_models_with_bundled_fallback(
     existing_cache: Option<&Value>,
     backup_cache: Option<&Value>,
+    packaged_models: Option<&[Value]>,
+    public_models: Option<&[Value]>,
     bundled_models: Option<&[Value]>,
 ) -> Option<Vec<Value>> {
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum ModelSource {
+        Packaged,
+        Cached,
+        Bundled,
+    }
+
+    let trusted_backup = backup_cache.filter(|cache| !codex_models_cache_is_cc_switch_owned(cache));
     let official_cache = match existing_cache {
-        Some(cache) if codex_models_cache_is_cc_switch_owned(cache) => backup_cache.or(Some(cache)),
+        Some(cache) if codex_models_cache_is_cc_switch_owned(cache) => trusted_backup,
         _ => existing_cache,
     };
-    let mut models = official_cache
+    let cached_models = official_cache
         .and_then(|cache| cache.get("models"))
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
+    let mut models = packaged_models
+        .map(|models| models.to_vec())
+        .unwrap_or_default();
     let mut model_indexes = HashMap::new();
+    let mut model_sources = vec![ModelSource::Packaged; models.len()];
     for (index, model) in models.iter().enumerate() {
         if let Some(model_id) = codex_model_stable_id(model) {
             model_indexes.insert(model_id, index);
         }
     }
+    // A successfully refreshed public snapshot is newer than the local Codex
+    // cache/backup. Keep local entries as offline fallback, then let explicit
+    // public fields replace stale same-slug metadata. Public entries may omit
+    // picker-only fields that are still present in a trusted local snapshot,
+    // so absence must not erase those fields.
+    for overlay in &cached_models {
+        let Some(model_id) = codex_model_stable_id(overlay) else {
+            continue;
+        };
+        if let Some(index) = model_indexes.get(&model_id).copied() {
+            models[index] = overlay.clone();
+            model_sources[index] = ModelSource::Cached;
+        } else {
+            model_indexes.insert(model_id, models.len());
+            models.push(overlay.clone());
+            model_sources.push(ModelSource::Cached);
+        }
+    }
     if let Some(bundled_models) = bundled_models {
-        for bundled in bundled_models {
-            let Some(model_id) = codex_model_stable_id(bundled) else {
+        for overlay in bundled_models {
+            let Some(model_id) = codex_model_stable_id(overlay) else {
                 continue;
             };
             if let Some(index) = model_indexes.get(&model_id).copied() {
-                models[index] = bundled.clone();
+                models[index] = overlay.clone();
+                model_sources[index] = ModelSource::Bundled;
             } else {
                 model_indexes.insert(model_id, models.len());
-                models.push(bundled.clone());
+                models.push(overlay.clone());
+                model_sources.push(ModelSource::Bundled);
             }
+        }
+    }
+    for overlay in public_models.into_iter().flatten() {
+        let Some(model_id) = codex_model_stable_id(overlay) else {
+            continue;
+        };
+        if let Some(index) = model_indexes.get(&model_id).copied() {
+            if model_sources[index] != ModelSource::Bundled {
+                models[index] = merge_public_official_model_metadata(&models[index], overlay);
+            }
+        } else {
+            model_indexes.insert(model_id, models.len());
+            models.push(overlay.clone());
+            model_sources.push(ModelSource::Cached);
         }
     }
     (!models.is_empty()).then_some(models)
 }
 
-/// Build a fallback reasoning index from inline `[model_providers.*].models[]` entries.
-/// Visible MultiRouter aliases frequently have no capability metadata of their own.
-fn codex_config_reasoning_capabilities(
-    config_text: &str,
-) -> std::collections::HashMap<
-    String,
-    crate::proxy::providers::codex_reasoning::CodexModelReasoningCapability,
-> {
-    let Ok(config) = toml::from_str::<toml::Value>(config_text) else {
-        return std::collections::HashMap::new();
+/// A public `models.json` entry is authoritative for fields it explicitly
+/// carries, while a missing key means the public schema did not make a claim.
+/// Preserve trusted local metadata in that latter case instead of treating an
+/// incomplete newer entry as a deletion.
+fn merge_public_official_model_metadata(existing: &Value, public: &Value) -> Value {
+    let (Some(existing), Some(public)) = (existing.as_object(), public.as_object()) else {
+        return public.clone();
     };
-    let Some(providers) = config
-        .get("model_providers")
-        .and_then(toml::Value::as_table)
+    let mut merged = existing.clone();
+    for (key, value) in public {
+        if value.is_null() && matches!(key.as_str(), "model_specialty" | "modelSpecialty") {
+            // The upstream catalog serializes this optional picker hint as
+            // null for many models. That is absence, not an explicit request
+            // to erase a richer trusted local value.
+            continue;
+        }
+        merged.insert(key.clone(), value.clone());
+    }
+    Value::Object(merged)
+}
+
+fn codex_public_official_models_cache_path() -> PathBuf {
+    crate::config::get_app_config_dir().join(CODEX_PUBLIC_OFFICIAL_MODELS_CACHE_FILENAME)
+}
+
+fn load_codex_public_official_models_cache() -> Option<Vec<Value>> {
+    let cache = read_json_file_if_exists(&codex_public_official_models_cache_path())
+        .ok()
+        .flatten()?;
+    let models = cache.get("models")?.as_array()?;
+    Some(
+        models
+            .iter()
+            .filter_map(crate::services::codex_oauth_models::sanitize_public_official_model)
+            .collect(),
+    )
+}
+
+/// Atomically replace the independent public official catalog snapshot.
+///
+/// This snapshot is deliberately separate from Codex's own `models_cache.json`
+/// so a failed refresh cannot destroy the last trusted local source and a
+/// public catalog update cannot be mistaken for a CCSM-owned live cache write.
+pub(crate) fn store_codex_public_official_models_cache(
+    models: &[Value],
+) -> Result<bool, AppError> {
+    let path = codex_public_official_models_cache_path();
+    let previous = read_json_file_if_exists(&path)
+        .ok()
+        .flatten()
+        .and_then(|cache| cache.get("models").and_then(Value::as_array).cloned())
+        .unwrap_or_default();
+    let changed =
+        crate::services::codex_oauth_models::public_catalog_models_changed(&previous, models);
+    let cache = json!({
+        "fetched_at": chrono::Utc::now().to_rfc3339(),
+        "models": models,
+    });
+    write_json_file(&path, &cache)?;
+    Ok(changed)
+}
+
+/// Read only the observable metadata of the independently owned public
+/// catalog snapshot. This does not fall back to Codex's cache/backup: callers
+/// use it to truthfully report whether an explicit public refresh retained an
+/// old public snapshot.
+pub(crate) fn codex_public_official_models_cache_snapshot() -> Option<(Option<String>, usize)> {
+    let cache = read_json_file_if_exists(&codex_public_official_models_cache_path())
+        .ok()
+        .flatten()?;
+    let models = cache.get("models")?.as_array()?;
+    (!models.is_empty()).then(|| {
+        (
+            cache
+                .get("fetched_at")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            models.len(),
+        )
+    })
+}
+
+/// 公开官方目录最多每六小时刷新一次。目录缺失、损坏或没有时间戳时允许刷新；
+/// 刷新失败仍由现有来源链保留最后一份可信目录，不会阻断本地投影。
+pub(crate) fn codex_public_official_models_cache_needs_refresh() -> bool {
+    let Some(cache) = read_json_file_if_exists(&codex_public_official_models_cache_path())
+        .ok()
+        .flatten()
     else {
-        return std::collections::HashMap::new();
+        return true;
     };
 
-    let mut result = std::collections::HashMap::new();
-    for provider in providers.values() {
-        let Some(models) = provider.get("models").and_then(toml::Value::as_array) else {
-            continue;
-        };
-        for model in models {
-            let Ok(model_json) = serde_json::to_value(model) else {
-                continue;
-            };
-            let Some(levels) = model_json
-                .get("supported_reasoning_levels")
-                .or_else(|| model_json.get("supported_reasoning_efforts"))
-                .or_else(|| model_json.get("supportedReasoningEfforts"))
-                .and_then(Value::as_array)
-            else {
-                continue;
-            };
-            let supported_efforts = levels
-                .iter()
-                .filter_map(|level| {
-                    level
-                        .as_str()
-                        .or_else(|| level.get("effort").and_then(Value::as_str))
-                        .or_else(|| level.get("reasoning_effort").and_then(Value::as_str))
-                        .or_else(|| level.get("reasoningEffort").and_then(Value::as_str))
-                        .map(str::trim)
-                        .filter(|effort| !effort.is_empty())
-                        .map(ToString::to_string)
-                })
-                .collect::<Vec<_>>();
-            if supported_efforts.is_empty() {
-                continue;
-            }
-            let default_effort = model_json
-                .get("default_reasoning_level")
-                .or_else(|| model_json.get("default_reasoning_effort"))
-                .or_else(|| model_json.get("defaultReasoningEffort"))
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|effort| !effort.is_empty())
-                .map(ToString::to_string);
-            let capability = crate::proxy::providers::codex_reasoning::CodexModelReasoningCapability {
-                schema_version: Some(2),
-                support_status: Some(crate::proxy::providers::codex_reasoning::ReasoningSupportStatus::ConfirmedSupported),
-                control_kind: Some(crate::proxy::providers::codex_reasoning::ReasoningControlKind::Graded),
-                supported: Some(true),
-                supported_efforts: supported_efforts.clone(),
-                default_effort,
-                disable_allowed: supported_efforts.iter().any(|effort| effort == "none"),
-                upstream: crate::proxy::providers::codex_reasoning::CodexModelReasoningUpstream {
-                    format: "string".to_string(),
-                    parameter: model_json
-                        .get("reasoning_parameter")
-                        .or_else(|| model_json.get("reasoningParameter"))
-                        .and_then(Value::as_str)
-                        .unwrap_or("reasoning_effort")
-                        .to_string(),
-                    effort_map: supported_efforts
-                        .iter()
-                        .map(|effort| (effort.clone(), effort.clone()))
-                        .collect(),
-                },
-                output_format: model_json
-                    .get("reasoning_output_format")
-                    .or_else(|| model_json.get("reasoningOutputFormat"))
-                    .and_then(Value::as_str)
-                    .map(ToString::to_string),
-                source: Some("provider_config".to_string()),
-                confidence: None,
-                fetched_at: None,
-                provider_key: None,
-                model_revision: None,
-                codex_ultra_orchestration: None,
-            };
-            if capability.validate().is_err() {
-                continue;
-            }
-            for field in ["model", "id", "slug", "upstreamModel", "upstream_model"] {
-                if let Some(identifier) = model_json
-                    .get(field)
-                    .and_then(Value::as_str)
-                    .map(str::trim)
-                    .filter(|identifier| !identifier.is_empty())
-                {
-                    result.insert(identifier.to_ascii_lowercase(), capability.clone());
-                }
-            }
-        }
+    if cache
+        .get("models")
+        .and_then(Value::as_array)
+        .is_none_or(Vec::is_empty)
+    {
+        return true;
     }
-    result
+    let Some(fetched_at) = cache.get("fetched_at").and_then(Value::as_str) else {
+        return true;
+    };
+    let Some(fetched_at) = chrono::DateTime::parse_from_rfc3339(fetched_at).ok() else {
+        return true;
+    };
+    chrono::Utc::now()
+        .signed_duration_since(fetched_at)
+        .num_seconds()
+        >= CODEX_PUBLIC_OFFICIAL_MODELS_CACHE_MAX_AGE_SECS
+}
+
+/// Platform evidence must come from the provider endpoint, never the model ID.
+fn codex_catalog_platform(settings: &Value, config_text: &str) -> Option<&'static str> {
+    let config_text = if config_text.trim().is_empty() {
+        settings.get("config").and_then(Value::as_str).unwrap_or("")
+    } else {
+        config_text
+    };
+    let provider_name = ["providerName", "provider_name", "provider", "name"]
+        .into_iter()
+        .find_map(|key| settings.get(key).and_then(Value::as_str));
+    let configured_base_url = extract_codex_base_url(config_text);
+    let base_url = ["base_url", "baseURL", "baseUrl"]
+        .into_iter()
+        .find_map(|key| settings.get(key).and_then(Value::as_str))
+        .or(configured_base_url.as_deref());
+    crate::reasoning_capabilities::provider_metadata::detect_platform_from_name_and_base_url(
+        provider_name,
+        base_url,
+    )
 }
 
 fn codex_catalog_model_specs(settings: &Value, config_text: &str) -> Vec<CodexCatalogModelSpec> {
@@ -1948,7 +2033,7 @@ fn codex_catalog_model_specs(settings: &Value, config_text: &str) -> Vec<CodexCa
     let mut seen = std::collections::HashSet::new();
     let mut specs = Vec::new();
     let official_models = codex_official_models_cache().unwrap_or_default();
-    let configured_reasoning = codex_config_reasoning_capabilities(config_text);
+    let platform = codex_catalog_platform(settings, config_text);
     let mut resolver_settings = settings.clone();
     if !config_text.trim().is_empty() {
         resolver_settings["config"] = json!(config_text);
@@ -2041,13 +2126,13 @@ fn codex_catalog_model_specs(settings: &Value, config_text: &str) -> Vec<CodexCa
             .filter(|text| !text.is_empty())
             .map(ToString::to_string);
         // P2：catalog 投影与请求/Sub-Agent/inspect 走同一 resolver 核心，保证同一模型
-        // 四层 fingerprint 一致。catalog 是 provider-agnostic 投影：platform=None
-        // （official 来源生效）、detection=None（静态投影不读 TTL 检测缓存）。
+        // 四层 fingerprint 一致。Platform evidence comes from the provider endpoint;
+        // unknown gateways must not inherit the official OpenAI reasoning contract.
         // 若 catalog 模型名是别名、上游模型名命中不同来源，则用上游名重试一次。
         let library = crate::reasoning_capabilities::catalog::global_library();
         let mut resolved = crate::reasoning_capabilities::resolve_codex_model_capability_core(
             &resolver_settings,
-            None,
+            platform,
             model,
             None,
             library.as_ref(),
@@ -2058,7 +2143,7 @@ fn codex_catalog_model_specs(settings: &Value, config_text: &str) -> Vec<CodexCa
                 let upstream_resolved =
                     crate::reasoning_capabilities::resolve_codex_model_capability_core(
                         &resolver_settings,
-                        None,
+                        platform,
                         upstream,
                         None,
                         library.as_ref(),
@@ -2069,27 +2154,7 @@ fn codex_catalog_model_specs(settings: &Value, config_text: &str) -> Vec<CodexCa
                 }
             }
         }
-        let reasoning = resolved
-            .capability
-            .or_else(|| {
-                // The wizard persists provider `/models` capability metadata
-                // on each catalog row. Keep that declaration in the same
-                // resolver path as live Codex config entries instead of
-                // silently dropping it during Sub-Agent V2 validation.
-                crate::proxy::providers::codex_reasoning::
-                    reasoning_capability_from_provider_model_entry(model_config)
-            })
-            .or_else(|| {
-                configured_reasoning
-                    .get(&model.to_ascii_lowercase())
-                    .cloned()
-            })
-            .or_else(|| {
-                upstream_model
-                    .as_deref()
-                    .and_then(|upstream| configured_reasoning.get(&upstream.to_ascii_lowercase()))
-                    .cloned()
-            });
+        let reasoning = resolved.capability;
         // Provider catalogs created before reasoning metadata was persisted do not
         // carry a `reasoning` object.  Keep the maintained exact-model fallback
         // in the catalog projection too, otherwise V2 profiles for DeepSeek V4
@@ -6222,6 +6287,124 @@ fn codex_models_cache_is_cc_switch_owned(cache: &Value) -> bool {
     cache.get("etag").and_then(|etag| etag.as_str()) == Some(CC_SWITCH_CODEX_MODELS_CACHE_ETAG)
 }
 
+fn codex_catalog_cache_publish_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
+
+fn capture_optional_file(path: &Path) -> Result<Option<Vec<u8>>, AppError> {
+    match fs::read(path) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(AppError::io(path, error)),
+    }
+}
+
+fn restore_optional_file(path: &Path, snapshot: Option<&[u8]>) -> Result<(), AppError> {
+    match snapshot {
+        Some(bytes) => atomic_write(path, bytes),
+        None if path.exists() => delete_file(path),
+        None => Ok(()),
+    }
+}
+
+fn capture_managed_agent_files(
+    agents_dir: &Path,
+) -> Result<HashMap<PathBuf, Vec<u8>>, AppError> {
+    let mut snapshot = HashMap::new();
+    if !agents_dir.exists() {
+        return Ok(snapshot);
+    }
+    for entry in fs::read_dir(agents_dir).map_err(|error| AppError::io(agents_dir, error))? {
+        let entry = entry.map_err(|error| AppError::io(agents_dir, error))?;
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("toml")
+            || !codex_agent_file_is_cc_switch_managed(&path)
+        {
+            continue;
+        }
+        snapshot.insert(
+            path.clone(),
+            fs::read(&path).map_err(|error| AppError::io(&path, error))?,
+        );
+    }
+    Ok(snapshot)
+}
+
+fn restore_managed_agent_files(
+    agents_dir: &Path,
+    snapshot: &HashMap<PathBuf, Vec<u8>>,
+) -> Result<(), AppError> {
+    if agents_dir.exists() {
+        for entry in fs::read_dir(agents_dir).map_err(|error| AppError::io(agents_dir, error))? {
+            let entry = entry.map_err(|error| AppError::io(agents_dir, error))?;
+            let path = entry.path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("toml")
+                || !codex_agent_file_is_cc_switch_managed(&path)
+                || snapshot.contains_key(&path)
+            {
+                continue;
+            }
+            delete_file(&path)?;
+        }
+    }
+    for (path, bytes) in snapshot {
+        atomic_write(path, bytes)?;
+    }
+    Ok(())
+}
+
+/// Publish generated catalog/cache/managed-agent files as a compensating
+/// transaction. Individual writes remain atomic; a dependent output failure
+/// restores all previously captured CCSM-owned bytes so callers cannot observe
+/// a mixed projection.
+fn publish_codex_catalog_and_models_cache_transactionally<F>(
+    catalog_path: &Path,
+    catalog: &Value,
+    cache_path: &Path,
+    backup_path: &Path,
+    agents_dir: &Path,
+    sync_outputs: F,
+) -> Result<(), AppError>
+where
+    F: FnOnce() -> Result<(), AppError>,
+{
+    let _guard = codex_catalog_cache_publish_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let catalog_before = capture_optional_file(catalog_path)?;
+    let cache_before = capture_optional_file(cache_path)?;
+    let backup_before = capture_optional_file(backup_path)?;
+    let agents_before = capture_managed_agent_files(agents_dir)?;
+
+    write_json_file(catalog_path, catalog)?;
+    if let Err(error) = sync_outputs() {
+        let rollback = [
+            (backup_path, backup_before.as_deref()),
+            (cache_path, cache_before.as_deref()),
+            (catalog_path, catalog_before.as_deref()),
+        ]
+        .into_iter()
+        .filter_map(|(path, snapshot)| restore_optional_file(path, snapshot).err())
+        .map(|rollback_error| rollback_error.to_string())
+        .chain(
+            restore_managed_agent_files(agents_dir, &agents_before)
+                .err()
+                .into_iter()
+                .map(|rollback_error| rollback_error.to_string()),
+        )
+        .collect::<Vec<_>>();
+        if rollback.is_empty() {
+            return Err(error);
+        }
+        return Err(AppError::Message(format!(
+            "Codex catalog/cache/agent projection failed: {error}; rollback also failed: {}",
+            rollback.join("; ")
+        )));
+    }
+    Ok(())
+}
+
 /// 读取可选 JSON 文件；文件不存在不是错误，解析失败才向上返回。
 fn read_json_file_if_exists(path: &Path) -> Result<Option<Value>, AppError> {
     if !path.exists() {
@@ -6622,7 +6805,13 @@ pub(crate) fn prepare_codex_config_text_with_model_catalog_without_provider_cont
     config_text: &str,
     profile: CodexCatalogToolProfile,
 ) -> Result<String, AppError> {
-    prepare_codex_config_text_with_model_catalog_impl(settings, config_text, profile, None)
+    prepare_codex_config_text_with_model_catalog_impl(
+        settings,
+        config_text,
+        profile,
+        None,
+        CatalogPublicationMode::Publish,
+    )
 }
 
 pub(crate) fn prepare_codex_config_text_with_model_catalog_and_provider_context(
@@ -6636,7 +6825,32 @@ pub(crate) fn prepare_codex_config_text_with_model_catalog_and_provider_context(
         config_text,
         profile,
         Some(provider_context),
+        CatalogPublicationMode::Publish,
     )
+}
+
+/// Build the same config projection used by the live writer without publishing
+/// any generated catalog, model cache, or managed agent files. Drift inspection
+/// and reconciliation use this boundary so reading expected state is pure.
+pub(crate) fn prepare_codex_config_text_with_model_catalog_and_provider_context_without_publication(
+    settings: &Value,
+    config_text: &str,
+    profile: CodexCatalogToolProfile,
+    provider_context: &ProviderClassificationContext,
+) -> Result<String, AppError> {
+    prepare_codex_config_text_with_model_catalog_impl(
+        settings,
+        config_text,
+        profile,
+        Some(provider_context),
+        CatalogPublicationMode::Inspect,
+    )
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CatalogPublicationMode {
+    Publish,
+    Inspect,
 }
 
 fn prepare_codex_config_text_with_model_catalog_impl(
@@ -6644,6 +6858,7 @@ fn prepare_codex_config_text_with_model_catalog_impl(
     config_text: &str,
     profile: CodexCatalogToolProfile,
     provider_context: Option<&ProviderClassificationContext>,
+    publication_mode: CatalogPublicationMode,
 ) -> Result<String, AppError> {
     let catalog_path = get_codex_model_catalog_path();
     let specs = codex_catalog_model_specs(settings, config_text);
@@ -6698,18 +6913,30 @@ fn prepare_codex_config_text_with_model_catalog_impl(
             codex_subagent_version(settings),
             provider_context,
         )?;
-        write_json_file(&catalog_path, &catalog)?;
-        sync_codex_models_cache_with_cc_switch_catalog(&catalog)?;
-        sync_codex_managed_agent_files_with_settings(
-            &specs,
-            codex_subagent_version(settings),
-            settings,
-            provider_context,
-        )?;
+        if publication_mode == CatalogPublicationMode::Publish {
+            publish_codex_catalog_and_models_cache_transactionally(
+                &catalog_path,
+                &catalog,
+                &get_codex_models_cache_path(),
+                &get_codex_models_cache_backup_path(),
+                &get_codex_agents_dir(),
+                || {
+                    sync_codex_models_cache_with_cc_switch_catalog(&catalog)?;
+                    sync_codex_managed_agent_files_with_settings(
+                        &specs,
+                        codex_subagent_version(settings),
+                        settings,
+                        provider_context,
+                    )
+                },
+            )?;
+        }
         Ok(config_text)
     } else {
-        restore_codex_models_cache_if_cc_switch_owned()?;
-        prune_stale_codex_managed_agent_files(&get_codex_agents_dir(), &HashSet::new())?;
+        if publication_mode == CatalogPublicationMode::Publish {
+            restore_codex_models_cache_if_cc_switch_owned()?;
+            prune_stale_codex_managed_agent_files(&get_codex_agents_dir(), &HashSet::new())?;
+        }
         let config_text = set_codex_model_catalog_projection_fields(config_text, None, None, None)?;
         let config_text = set_codex_native_web_search_field(
             &config_text,
@@ -6766,6 +6993,7 @@ fn publish_codex_multirouter_projection_impl(
             live_config,
             CodexCatalogToolProfile::NativeResponses,
             provider_context,
+            CatalogPublicationMode::Publish,
         )
     })?;
 
@@ -6986,6 +7214,24 @@ pub(crate) fn resolve_cc_switch_catalog_path(
     }
 
     Some(resolved)
+}
+
+/// The manual official-directory action may rebuild generated artifacts only
+/// when both takeover and the live CCSM-owned catalog pointer prove that this
+/// process owns the projection. A stale filename alone is deliberately not
+/// enough: users may keep a generated file after disabling takeover.
+pub(crate) fn manual_official_catalog_projection_eligibility(
+    takeover_enabled: bool,
+    config_text: &str,
+    config_dir: &Path,
+) -> Result<(), &'static str> {
+    if !takeover_enabled {
+        return Err("takeover_not_active");
+    }
+    resolve_cc_switch_catalog_path(config_text, config_dir)
+        .is_some()
+        .then_some(())
+        .ok_or("catalog_not_cc_switch_owned")
 }
 
 /// Pure reverse-parsing core: convert Codex catalog JSON text back into the
@@ -16923,6 +17169,8 @@ model_catalog_json = "cc-switch-model-catalog.json"
         let models = official_models_with_bundled_fallback(
             Some(&owned_cache),
             Some(&empty_backup),
+            None,
+            None,
             bundled.as_array().map(Vec::as_slice),
         )
         .expect("bundled official models must be used when the local backup is empty");
@@ -16953,6 +17201,8 @@ model_catalog_json = "cc-switch-model-catalog.json"
         let models = official_models_with_bundled_fallback(
             Some(&owned_cache),
             Some(&backup),
+            None,
+            None,
             bundled.as_array().map(Vec::as_slice),
         )
         .expect("bundled models must overlay a stale backup");
@@ -16965,6 +17215,374 @@ model_catalog_json = "cc-switch-model-catalog.json"
             models[0].get("service_tiers"),
             Some(&json!([{ "id": "new_tier" }])),
             "the current bundled official entry must override the stale backup field"
+        );
+    }
+
+    #[test]
+    fn catalog_cache_publish_rolls_back_all_outputs_when_cache_sync_fails() {
+        let temp = tempfile::tempdir().expect("temp output directory");
+        let catalog_path = temp.path().join("cc-switch-model-catalog.json");
+        let cache_path = temp.path().join("models_cache.json");
+        let backup_path = temp.path().join("models_cache.cc-switch-backup.json");
+        let agents_dir = temp.path().join("agents");
+        std::fs::create_dir_all(&agents_dir).expect("create agents directory");
+        let managed_agent_path = agents_dir.join("managed.toml");
+        let managed_agent_before = format!(
+            "{CC_SWITCH_MANAGED_AGENT_MARKER}\nname = \"managed\"\nmodel = \"old-model\"\nmodel_provider = \"codex_model_router_v2\"\n"
+        );
+        std::fs::write(&managed_agent_path, &managed_agent_before).expect("seed agent");
+        std::fs::write(&catalog_path, b"old-catalog").expect("seed catalog");
+        std::fs::write(&cache_path, b"old-cache").expect("seed cache");
+        std::fs::write(&backup_path, b"old-backup").expect("seed backup");
+
+        let error = publish_codex_catalog_and_models_cache_transactionally(
+            &catalog_path,
+            &json!({"models": [{"slug": "fresh"}]}),
+            &cache_path,
+            &backup_path,
+            &agents_dir,
+            || {
+                std::fs::write(&cache_path, b"new-cache-before-failure")
+                    .expect("simulate cache write");
+                std::fs::write(&backup_path, b"new-backup-before-failure")
+                    .expect("simulate backup write");
+                std::fs::write(
+                    &managed_agent_path,
+                    format!(
+                        "{CC_SWITCH_MANAGED_AGENT_MARKER}\nname = \"managed\"\nmodel = \"new-model\"\nmodel_provider = \"codex_model_router_v2\"\n"
+                    ),
+                )
+                .expect("simulate agent write");
+                Err(AppError::Message("cache sync failed".to_string()))
+            },
+        )
+        .expect_err("cache sync failure must roll back the projection");
+
+        assert!(error.to_string().contains("cache sync failed"));
+        assert_eq!(
+            std::fs::read(&catalog_path).expect("restored catalog"),
+            b"old-catalog"
+        );
+        assert_eq!(
+            std::fs::read(&cache_path).expect("restored cache"),
+            b"old-cache"
+        );
+        assert_eq!(
+            std::fs::read(&backup_path).expect("restored backup"),
+            b"old-backup"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&managed_agent_path).expect("restored agent"),
+            managed_agent_before
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn inspect_projection_does_not_publish_catalog_cache_or_agent_files() {
+        let _home = TestHomeGuard::new();
+        let catalog_path = get_codex_model_catalog_path();
+        let cache_path = get_codex_models_cache_path();
+        let backup_path = get_codex_models_cache_backup_path();
+        let agent_path = get_codex_agents_dir().join("qwen3.8.toml");
+        for path in [&catalog_path, &cache_path, &backup_path, &agent_path] {
+            std::fs::create_dir_all(path.parent().expect("output parent"))
+                .expect("create output parent");
+        }
+        std::fs::write(&catalog_path, b"existing-catalog").expect("seed catalog");
+        std::fs::write(&cache_path, b"existing-cache").expect("seed cache");
+        std::fs::write(&backup_path, b"existing-backup").expect("seed backup");
+        std::fs::write(&agent_path, b"existing-agent").expect("seed agent");
+
+        let settings = json!({
+            "modelCatalog": {
+                "models": [{
+                    "model": "qwen3.8",
+                    "displayName": "Qwen 3.8",
+                    "contextWindow": 262144
+                }]
+            },
+            "codexRouting": {
+                "schemaVersion": 2,
+                "enabled": true,
+                "subagentVersion": "v2"
+            }
+        });
+        let prepared =
+            prepare_codex_config_text_with_model_catalog_and_provider_context_without_publication(
+                &settings,
+                "model = \"qwen3.8\"\n",
+                CodexCatalogToolProfile::NativeResponses,
+                &ProviderClassificationContext::default(),
+            )
+            .expect("build inspection projection");
+
+        assert!(prepared.contains("model_catalog_json"));
+        assert_eq!(
+            std::fs::read(&catalog_path).expect("read catalog"),
+            b"existing-catalog"
+        );
+        assert_eq!(
+            std::fs::read(&cache_path).expect("read cache"),
+            b"existing-cache"
+        );
+        assert_eq!(
+            std::fs::read(&backup_path).expect("read backup"),
+            b"existing-backup"
+        );
+        assert_eq!(
+            std::fs::read(&agent_path).expect("read agent"),
+            b"existing-agent"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn storing_public_catalog_reports_semantic_changes_only() {
+        let _home = TestHomeGuard::new();
+        let initial = vec![
+            json!({
+                "slug": "gpt-6-sol",
+                "supported_reasoning_levels": ["low", "max"]
+            }),
+            json!({"slug": "gpt-6-luna", "context_window": 128000}),
+        ];
+        assert!(
+            store_codex_public_official_models_cache(&initial).expect("store initial catalog")
+        );
+
+        let reordered = vec![initial[1].clone(), initial[0].clone()];
+        assert!(
+            !store_codex_public_official_models_cache(&reordered)
+                .expect("store reordered catalog")
+        );
+
+        let changed = vec![
+            json!({
+                "slug": "gpt-6-sol",
+                "supported_reasoning_levels": ["low", "max", "ultra"]
+            }),
+            initial[1].clone(),
+        ];
+        assert!(
+            store_codex_public_official_models_cache(&changed).expect("store changed catalog")
+        );
+        assert_eq!(
+            load_codex_public_official_models_cache().expect("read public catalog"),
+            changed
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn persisted_public_catalog_is_sanitized_again_on_read() {
+        let _home = TestHomeGuard::new();
+        let path = codex_public_official_models_cache_path();
+        std::fs::create_dir_all(path.parent().expect("public cache parent"))
+            .expect("create public cache parent");
+        write_json_file(
+            &path,
+            &json!({
+                "models": [{
+                    "slug": "gpt-6-sol",
+                    "instructions": "untrusted prompt",
+                    "modelMessages": ["untrusted"]
+                }, {
+                    "name": "not a model"
+                }]
+            }),
+        )
+        .expect("seed persisted public cache");
+
+        let models = load_codex_public_official_models_cache().expect("load sanitized cache");
+        assert_eq!(models.len(), 2);
+        assert_eq!(models[0]["slug"], "gpt-6-sol");
+        assert!(models[0].get("instructions").is_none());
+        assert!(models[0].get("modelMessages").is_none());
+        assert_eq!(models[1]["name"], "not a model");
+    }
+
+    #[test]
+    fn refreshed_public_catalog_replaces_stale_same_slug_reasoning_metadata() {
+        let stale_backup = json!({
+            "models": [{
+                "slug": "gpt-6-sol",
+                "default_reasoning_level": "medium",
+                "supported_reasoning_levels": [{"effort": "low"}, {"effort": "medium"}, {"effort": "high"}, {"effort": "xhigh"}]
+            }]
+        });
+        let public = json!([
+            {
+                "slug": "gpt-6-sol",
+                "default_reasoning_level": "medium",
+                "supported_reasoning_levels": [{"effort": "low"}, {"effort": "medium"}, {"effort": "high"}, {"effort": "xhigh"}, {"effort": "max"}, {"effort": "ultra"}]
+            },
+            {
+                "slug": "gpt-6-luna",
+                "default_reasoning_level": "medium",
+                "supported_reasoning_levels": [{"effort": "low"}, {"effort": "medium"}, {"effort": "high"}, {"effort": "xhigh"}, {"effort": "max"}]
+            }
+        ]);
+
+        let models = official_models_with_bundled_fallback(
+            Some(&json!({"etag": CC_SWITCH_CODEX_MODELS_CACHE_ETAG, "models": []})),
+            Some(&stale_backup),
+            None,
+            public.as_array().map(Vec::as_slice),
+            None,
+        )
+        .expect("refreshed public catalog");
+        let efforts = |slug: &str| {
+            models
+                .iter()
+                .find(|model| codex_model_stable_id(model).as_deref() == Some(slug))
+                .expect("official model")["supported_reasoning_levels"]
+                .as_array()
+                .expect("levels")
+                .iter()
+                .filter_map(|level| level["effort"].as_str())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            efforts("gpt-6-sol"),
+            vec!["low", "medium", "high", "xhigh", "max", "ultra"]
+        );
+        assert_eq!(
+            efforts("gpt-6-luna"),
+            vec!["low", "medium", "high", "xhigh", "max"]
+        );
+    }
+
+    #[test]
+    fn public_catalog_overlay_preserves_local_picker_metadata_when_the_official_entry_omits_it() {
+        let local = json!({
+            "slug": "gpt-5.5",
+            "model_specialty": "coding",
+            "supported_reasoning_levels": [{"effort": "low"}]
+        });
+        let public = json!({
+            "slug": "gpt-5.5",
+            "supported_reasoning_levels": [{"effort": "low"}, {"effort": "high"}]
+        });
+
+        let merged = merge_public_official_model_metadata(&local, &public);
+        assert_eq!(merged["model_specialty"], "coding");
+        assert_eq!(
+            merged["supported_reasoning_levels"]
+                .as_array()
+                .expect("public capability")
+                .len(),
+            2,
+            "an explicitly supplied official capability wins over a stale local value"
+        );
+
+        let explicitly_updated = json!({
+            "slug": "gpt-5.5",
+            "model_specialty": "general"
+        });
+        assert_eq!(
+            merge_public_official_model_metadata(&local, &explicitly_updated)["model_specialty"],
+            "general",
+            "an explicitly supplied official picker field wins over a stale local value"
+        );
+        assert_eq!(
+            merge_public_official_model_metadata(
+                &local,
+                &json!({"slug": "gpt-5.5", "model_specialty": null})
+            )["model_specialty"],
+            "coding",
+            "the official optional null marker is not a destructive metadata claim"
+        );
+    }
+
+    #[test]
+    fn packaged_official_catalog_keeps_astra_available_without_new_codex_cli() {
+        let models = load_codex_packaged_official_models()
+            .expect("CCSM must ship an official fallback catalog");
+        let astra = models
+            .iter()
+            .find(|model| codex_model_stable_id(model).as_deref() == Some("gpt-6-astra"))
+            .expect("packaged official catalog must include Astra");
+        let efforts = astra["supported_reasoning_levels"]
+            .as_array()
+            .expect("Astra reasoning levels")
+            .iter()
+            .filter_map(|level| level.get("effort").and_then(Value::as_str))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            efforts,
+            vec!["low", "medium", "high", "xhigh", "max", "ultra"]
+        );
+        assert_eq!(
+            astra.get("default_reasoning_level").and_then(Value::as_str),
+            Some("low")
+        );
+    }
+
+    #[test]
+    fn packaged_official_catalog_never_overwrites_a_newer_cached_model() {
+        let cache = json!({
+            "models": [{
+                "slug": "gpt-6-astra",
+                "default_reasoning_level": "high",
+                "source_marker": "newer-cache"
+            }]
+        });
+        let packaged = json!([{
+            "slug": "gpt-6-astra",
+            "default_reasoning_level": "low",
+            "source_marker": "packaged-fallback"
+        }]);
+
+        let models = official_models_with_bundled_fallback(
+            Some(&cache),
+            None,
+            packaged.as_array().map(Vec::as_slice),
+            None,
+            None,
+        )
+        .expect("merged official models");
+
+        assert_eq!(
+            models[0].get("source_marker").and_then(Value::as_str),
+            Some("newer-cache")
+        );
+    }
+
+    #[test]
+    fn public_official_catalog_adds_future_ids_without_overriding_local_bundled_metadata() {
+        let public = json!([
+            {"slug": "aurora-code", "source_marker": "public"},
+            {"slug": "gpt-6-astra", "source_marker": "public"}
+        ]);
+        let bundled = json!([
+            {"slug": "gpt-6-astra", "source_marker": "bundled"}
+        ]);
+
+        let models = official_models_with_bundled_fallback(
+            None,
+            None,
+            None,
+            public.as_array().map(Vec::as_slice),
+            bundled.as_array().map(Vec::as_slice),
+        )
+        .expect("merged official models");
+        let ids = models
+            .iter()
+            .filter_map(codex_model_stable_id)
+            .collect::<Vec<_>>();
+
+        assert_eq!(ids.len(), 2);
+        assert!(ids.contains(&"aurora-code".to_string()));
+        assert!(ids.contains(&"gpt-6-astra".to_string()));
+        assert_eq!(
+            models
+                .iter()
+                .find(|model| codex_model_stable_id(model).as_deref() == Some("gpt-6-astra"))
+                .and_then(|model| model.get("source_marker"))
+                .and_then(Value::as_str),
+            Some("bundled")
         );
     }
 
@@ -17647,5 +18265,25 @@ wire_api = "responses"
             "matchPrefixes": ["gpt"]
         });
         assert!(codex_catalog_route_matches_model(&all, "gpt-5.4"));
+    }
+
+    #[test]
+    fn manual_official_catalog_refresh_only_projects_a_takeover_owned_catalog() {
+        let base = Path::new("C:/test/.codex");
+        let managed = "model_catalog_json = \"cc-switch-model-catalog.json\"";
+        let user_managed = "model_catalog_json = \"my-models.json\"";
+
+        assert_eq!(
+            manual_official_catalog_projection_eligibility(true, managed, base),
+            Ok(())
+        );
+        assert_eq!(
+            manual_official_catalog_projection_eligibility(false, managed, base),
+            Err("takeover_not_active")
+        );
+        assert_eq!(
+            manual_official_catalog_projection_eligibility(true, user_managed, base),
+            Err("catalog_not_cc_switch_owned")
+        );
     }
 }

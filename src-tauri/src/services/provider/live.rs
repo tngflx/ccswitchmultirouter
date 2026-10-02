@@ -870,6 +870,52 @@ pub(crate) fn build_codex_live_config_for_provider(
     db: &Database,
     provider: &Provider,
 ) -> Result<String, AppError> {
+    let inputs = build_codex_live_projection_inputs(db, provider)?;
+    let prepared =
+        crate::codex_config::prepare_codex_config_text_with_model_catalog_and_provider_context_without_publication(
+            &inputs.settings_for_live,
+            &inputs.config_text,
+            inputs.profile,
+            &inputs.provider_context,
+        )?;
+    if inputs.category.as_deref() == Some("official")
+        && crate::settings::unify_codex_session_history()
+    {
+        crate::codex_config::inject_codex_unified_session_bucket(&prepared)
+    } else {
+        Ok(prepared)
+    }
+}
+
+/// Publish only the generated Codex catalog/cache/managed-agent outputs for a
+/// provider. The live `config.toml` remains untouched; callers use this after
+/// validating that the current process owns the CCSM catalog pointer.
+pub(crate) fn publish_codex_catalog_outputs_for_provider(
+    db: &Database,
+    provider: &Provider,
+) -> Result<(), AppError> {
+    let inputs = build_codex_live_projection_inputs(db, provider)?;
+    crate::codex_config::prepare_codex_config_text_with_model_catalog_and_provider_context(
+        &inputs.settings_for_live,
+        &inputs.config_text,
+        inputs.profile,
+        &inputs.provider_context,
+    )
+    .map(|_| ())
+}
+
+struct CodexLiveProjectionInputs {
+    settings_for_live: Value,
+    config_text: String,
+    profile: crate::codex_config::CodexCatalogToolProfile,
+    provider_context: crate::codex_config::ProviderClassificationContext,
+    category: Option<String>,
+}
+
+fn build_codex_live_projection_inputs(
+    db: &Database,
+    provider: &Provider,
+) -> Result<CodexLiveProjectionInputs, AppError> {
     let mut effective_provider = provider.clone();
     effective_provider.settings_config =
         build_effective_settings_with_common_config(db, &AppType::Codex, provider)?;
@@ -901,23 +947,17 @@ pub(crate) fn build_codex_live_config_for_provider(
     let config_text = settings_for_live
         .get("config")
         .and_then(Value::as_str)
-        .unwrap_or("");
+        .unwrap_or("")
+        .to_string();
     let provider_context = crate::codex_config::codex_provider_classification_context(db)?;
     let profile = crate::proxy::providers::resolve_codex_catalog_tool_profile(&effective_provider);
-    let prepared =
-        crate::codex_config::prepare_codex_config_text_with_model_catalog_and_provider_context(
-            &settings_for_live,
-            config_text,
-            profile,
-            &provider_context,
-        )?;
-    if effective_provider.category.as_deref() == Some("official")
-        && crate::settings::unify_codex_session_history()
-    {
-        crate::codex_config::inject_codex_unified_session_bucket(&prepared)
-    } else {
-        Ok(prepared)
-    }
+    Ok(CodexLiveProjectionInputs {
+        settings_for_live,
+        config_text,
+        profile,
+        provider_context,
+        category: effective_provider.category,
+    })
 }
 
 pub(crate) fn strip_common_config_from_live_settings(

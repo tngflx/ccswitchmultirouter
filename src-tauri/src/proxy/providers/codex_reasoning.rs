@@ -736,85 +736,289 @@ pub fn reasoning_capability_from_model_entry(
     Some(capability)
 }
 
-/// Parse a reasoning declaration embedded in a Codex provider's inline
-/// `model_providers.*.models[]` entry.
+fn string_field<'a>(object: &'a serde_json::Map<String, Value>, keys: &[&str]) -> Option<&'a str> {
+    keys.iter().find_map(|key| {
+        object
+            .get(*key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+    })
+}
+
+fn value_field<'a>(
+    object: &'a serde_json::Map<String, Value>,
+    keys: &[&str],
+) -> Option<&'a Value> {
+    keys.iter().find_map(|key| object.get(*key))
+}
+
+fn string_list(value: Option<&Value>) -> Vec<String> {
+    value
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|item| {
+            item.as_str()
+                .or_else(|| item.get("effort").and_then(Value::as_str))
+                .or_else(|| item.get("reasoning_effort").and_then(Value::as_str))
+                .or_else(|| item.get("reasoningEffort").and_then(Value::as_str))
+        })
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+        .collect()
+}
+
+fn supported_parameters(model_entry: &serde_json::Map<String, Value>) -> Vec<String> {
+    string_list(value_field(
+        model_entry,
+        &["supported_parameters", "supportedParameters"],
+    ))
+    .into_iter()
+    .map(|parameter| parameter.to_ascii_lowercase())
+    .collect()
+}
+
+/// Resolve the exact upstream wire contract from declarations, never from a
+/// model name. OpenRouter currently advertises both `reasoning` and the legacy
+/// `reasoning_effort` parameter; its nested reasoning object is the stronger
+/// declaration for the object-shaped request.
+fn declared_reasoning_wire_contract(
+    model_entry: &serde_json::Map<String, Value>,
+    reasoning: Option<&serde_json::Map<String, Value>>,
+) -> Option<(String, String)> {
+    let explicit_parameter = reasoning
+        .and_then(|object| {
+            string_field(
+                object,
+                &[
+                    "reasoning_parameter",
+                    "reasoningParameter",
+                    "parameter",
+                ],
+            )
+        })
+        .or_else(|| {
+            string_field(
+                model_entry,
+                &[
+                    "reasoning_parameter",
+                    "reasoningParameter",
+                    "upstream_parameter",
+                    "upstreamParameter",
+                ],
+            )
+        });
+    let explicit_format = reasoning
+        .and_then(|object| string_field(object, &["reasoning_format", "reasoningFormat", "format"]))
+        .or_else(|| {
+            string_field(
+                model_entry,
+                &["reasoning_format", "reasoningFormat", "upstream_format", "upstreamFormat"],
+            )
+        });
+
+    let parameter = explicit_parameter.map(str::to_ascii_lowercase).or_else(|| {
+        let parameters = supported_parameters(model_entry);
+        let supports_object = parameters
+            .iter()
+            .any(|parameter| parameter == "reasoning" || parameter == "reasoning.effort");
+        let supports_string = parameters.iter().any(|parameter| {
+            parameter == "reasoning_effort" || parameter == "reasoning.effort_string"
+        });
+        let supports_boolean = parameters.iter().any(|parameter| {
+            parameter == "enable_thinking"
+                || parameter == "enable_reasoning"
+                || parameter == "thinking"
+        });
+
+        if supports_boolean && (supports_object || supports_string) {
+            return None;
+        }
+        if supports_object && supports_string {
+            // OpenRouter's response contains a nested reasoning declaration;
+            // prefer the object contract while preserving the advertised tiers.
+            if reasoning.is_some() {
+                return Some("reasoning.effort".to_string());
+            }
+            return None;
+        }
+        if supports_object {
+            return Some("reasoning.effort".to_string());
+        }
+        if supports_string {
+            return Some("reasoning_effort".to_string());
+        }
+        if supports_boolean {
+            return Some("enable_thinking".to_string());
+        }
+        None
+    })?;
+
+    let format = explicit_format
+        .map(|format| format.to_ascii_lowercase())
+        .or_else(|| match parameter.as_str() {
+            "reasoning_effort" | "reasoning.effort_string" => Some("string".to_string()),
+            "reasoning" | "reasoning.effort" => Some("object".to_string()),
+            "enable_thinking" | "enable_reasoning" | "thinking" => {
+                Some("boolean".to_string())
+            }
+            _ => None,
+        })?;
+
+    let normalized_parameter = match format.as_str() {
+        "string" if parameter == "reasoning_effort" => parameter,
+        "object" if parameter == "reasoning" || parameter == "reasoning.effort" => {
+            "reasoning.effort".to_string()
+        }
+        "boolean"
+            if parameter == "enable_thinking"
+                || parameter == "enable_reasoning"
+                || parameter == "thinking" =>
+        {
+            parameter
+        }
+        _ => return None,
+    };
+    Some((format, normalized_parameter))
+}
+
+/// Parse the provider-agnostic `/models` reasoning metadata contract.
 ///
-/// Codex stores these entries in TOML rather than CCSM's model catalog schema,
-/// so accept both the native `reasoning` object and the lightweight
-/// `supported_reasoning_levels`/`default_reasoning_level` form used by routed
-/// model definitions. The returned capability is normalized to the same
-/// validated shape consumed by the shared resolver.
+/// This is deliberately strict at the wire boundary: effort names are useful
+/// only when the response also declares how to send them. A model name,
+/// provider name, or mere presence of `supported_efforts` never supplies that
+/// missing contract.
 pub fn reasoning_capability_from_provider_model_entry(
     model_entry: &Value,
 ) -> Option<CodexModelReasoningCapability> {
-    if let Some(mut capability) = reasoning_capability_from_model_entry(model_entry) {
-        capability.source = Some("provider_config".to_string());
-        capability.confidence = Some(CapabilityConfidence::Authoritative);
-        return capability.validate().ok().map(|_| capability);
+    let object = model_entry.as_object()?;
+    let reasoning = object.get("reasoning").and_then(Value::as_object);
+    if reasoning.is_some_and(|value| value.contains_key("upstream")) {
+        return reasoning_capability_from_model_entry(model_entry).map(|mut capability| {
+            capability.source = Some("provider_config".to_string());
+            capability.confidence = Some(CapabilityConfidence::Authoritative);
+            capability
+        });
     }
 
-    let levels = model_entry
-        .get("supported_reasoning_levels")
-        .or_else(|| model_entry.get("supported_reasoning_efforts"))
-        .or_else(|| model_entry.get("supportedReasoningEfforts"))
-        .and_then(Value::as_array)?;
-    let supported_efforts = levels
-        .iter()
-        .filter_map(|level| {
-            level
-                .as_str()
-                .or_else(|| level.get("effort").and_then(Value::as_str))
-                .or_else(|| level.get("reasoning_effort").and_then(Value::as_str))
-                .or_else(|| level.get("reasoningEffort").and_then(Value::as_str))
+    let levels = reasoning
+        .and_then(|value| {
+            value_field(
+                value,
+                &[
+                    "supported_efforts",
+                    "supportedEfforts",
+                    "supported_reasoning_efforts",
+                    "supportedReasoningEfforts",
+                    "supported_reasoning_levels",
+                    "supportedReasoningLevels",
+                ],
+            )
         })
-        .map(str::trim)
-        .filter(|effort| !effort.is_empty())
-        .map(ToString::to_string)
-        .collect::<Vec<_>>();
-    if supported_efforts.is_empty() {
+        .or_else(|| {
+            value_field(
+                object,
+                &[
+                    "supported_reasoning_levels",
+                    "supported_reasoning_efforts",
+                    "supportedReasoningLevels",
+                    "supportedReasoningEfforts",
+                    "supported_efforts",
+                    "supportedEfforts",
+                ],
+            )
+        });
+    let supported_efforts = string_list(levels);
+    let default_effort = reasoning
+        .and_then(|value| {
+            string_field(
+                value,
+                &[
+                    "default_effort",
+                    "defaultEffort",
+                    "default_reasoning_level",
+                    "defaultReasoningLevel",
+                    "default_reasoning_effort",
+                    "defaultReasoningEffort",
+                ],
+            )
+        })
+        .or_else(|| {
+            string_field(
+                object,
+                &[
+                    "default_reasoning_level",
+                    "defaultReasoningLevel",
+                    "default_reasoning_effort",
+                    "defaultReasoningEffort",
+                    "default_effort",
+                    "defaultEffort",
+                ],
+            )
+        })
+        .map(ToString::to_string);
+    let mandatory = reasoning
+        .and_then(|value| value_field(value, &["mandatory"]))
+        .or_else(|| object.get("mandatory"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let _default_enabled = reasoning
+        .and_then(|value| value_field(value, &["default_enabled", "defaultEnabled"]))
+        .or_else(|| value_field(object, &["default_enabled", "defaultEnabled"]))
+        .and_then(Value::as_bool);
+    let supports_max_tokens = reasoning
+        .and_then(|value| value_field(value, &["supports_max_tokens", "supportsMaxTokens"]))
+        .or_else(|| value_field(object, &["supports_max_tokens", "supportsMaxTokens"]))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let (format, parameter) = declared_reasoning_wire_contract(object, reasoning)?;
+
+    if supported_efforts.is_empty() && !mandatory && !supports_max_tokens {
         return None;
     }
+    if let Some(default_effort) = default_effort.as_deref() {
+        if !supported_efforts
+            .iter()
+            .any(|effort| effort.eq_ignore_ascii_case(default_effort))
+        {
+            return None;
+        }
+    }
 
-    let default_effort = model_entry
-        .get("default_reasoning_level")
-        .or_else(|| model_entry.get("default_reasoning_effort"))
-        .or_else(|| model_entry.get("defaultReasoningEffort"))
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|effort| !effort.is_empty())
-        .map(ToString::to_string);
-    let format = model_entry
-        .get("reasoning_format")
-        .or_else(|| model_entry.get("reasoningFormat"))
-        .and_then(Value::as_str)
-        .unwrap_or("string")
-        .to_string();
-    let parameter = model_entry
-        .get("reasoning_parameter")
-        .or_else(|| model_entry.get("reasoningParameter"))
-        .and_then(Value::as_str)
-        .unwrap_or("reasoning_effort")
-        .to_string();
+    let disable_allowed = supported_efforts
+        .iter()
+        .any(|effort| effort.eq_ignore_ascii_case("none"));
+    let control_kind = if !supported_efforts.is_empty() {
+        ReasoningControlKind::Graded
+    } else if supports_max_tokens {
+        ReasoningControlKind::Budget
+    } else if mandatory {
+        ReasoningControlKind::None
+    } else {
+        return None;
+    };
+    let effort_map = supported_efforts
+        .iter()
+        .map(|effort| (effort.clone(), effort.clone()))
+        .collect();
     let capability = CodexModelReasoningCapability {
         schema_version: Some(2),
         support_status: Some(ReasoningSupportStatus::ConfirmedSupported),
-        control_kind: Some(ReasoningControlKind::Graded),
+        control_kind: Some(control_kind),
         supported: None,
-        supported_efforts: supported_efforts.clone(),
+        supported_efforts,
         default_effort,
-        disable_allowed: supported_efforts.iter().any(|effort| effort == "none"),
+        disable_allowed,
         upstream: CodexModelReasoningUpstream {
             format,
             parameter,
-            effort_map: supported_efforts
-                .iter()
-                .map(|effort| (effort.clone(), effort.clone()))
-                .collect(),
+            effort_map,
         },
-        output_format: model_entry
-            .get("reasoning_output_format")
-            .or_else(|| model_entry.get("reasoningOutputFormat"))
-            .and_then(Value::as_str)
+        output_format: reasoning
+            .and_then(|value| string_field(value, &["output_format", "outputFormat"]))
+            .or_else(|| string_field(object, &["output_format", "outputFormat"]))
             .map(ToString::to_string),
         source: Some("provider_config".to_string()),
         confidence: Some(CapabilityConfidence::Authoritative),
@@ -826,82 +1030,167 @@ pub fn reasoning_capability_from_provider_model_entry(
     capability.validate().ok().map(|_| capability)
 }
 
-/// OpenRouter's `/models` metadata names its levels differently from our
-/// persisted capability schema. Only the OpenRouter fetch boundary calls this.
+/// Parse Codex Desktop's inline `[[model_providers.*.models]]` contract.
+///
+/// Codex's TOML schema stores the reasoning declaration as flat fields such as
+/// `supported_reasoning_levels` and `default_reasoning_level`, while the shared
+/// provider/catalog parser consumes the strict nested wire contract. Normalize
+/// that one known boundary here, then reuse the same parser and validation path
+/// as `/models` responses. Unknown providers still require an explicit wire
+/// contract; only Codex's documented inline shape receives this normalization.
+pub fn reasoning_capability_from_codex_inline_model_entry(
+    model_entry: &Value,
+) -> Option<CodexModelReasoningCapability> {
+    let object = model_entry.as_object()?;
+    let has_flat_levels = [
+        "supported_reasoning_levels",
+        "supportedReasoningLevels",
+        "supported_reasoning_efforts",
+        "supportedReasoningEfforts",
+    ]
+    .iter()
+    .any(|key| object.contains_key(*key));
+    if !has_flat_levels {
+        return reasoning_capability_from_provider_model_entry(model_entry);
+    }
+
+    let mut normalized = model_entry.clone();
+    let normalized_object = normalized.as_object_mut()?;
+    let (has_nested_format, has_nested_parameter) = {
+        let reasoning = normalized_object
+            .entry("reasoning".to_string())
+            .or_insert_with(|| Value::Object(serde_json::Map::new()));
+        let reasoning = reasoning.as_object_mut()?;
+        for (target, aliases) in [
+            (
+                "supportedEfforts",
+                [
+                    "supported_reasoning_levels",
+                    "supportedReasoningLevels",
+                    "supported_reasoning_efforts",
+                    "supportedReasoningEfforts",
+                ]
+                .as_slice(),
+            ),
+            (
+                "defaultEffort",
+                [
+                    "default_reasoning_level",
+                    "defaultReasoningLevel",
+                    "default_reasoning_effort",
+                    "defaultReasoningEffort",
+                ]
+                .as_slice(),
+            ),
+        ] {
+            if reasoning.contains_key(target) {
+                continue;
+            }
+            if let Some(value) = aliases.iter().find_map(|key| object.get(*key)) {
+                reasoning.insert(target.to_string(), value.clone());
+            }
+        }
+        (
+            reasoning.contains_key("reasoning_format")
+                || reasoning.contains_key("reasoningFormat")
+                || reasoning.contains_key("format"),
+            reasoning.contains_key("reasoning_parameter")
+                || reasoning.contains_key("reasoningParameter")
+                || reasoning.contains_key("parameter"),
+        )
+    };
+    if !has_nested_format
+        && !normalized_object.contains_key("reasoning_format")
+        && !normalized_object.contains_key("reasoningFormat")
+        && !normalized_object.contains_key("upstream_format")
+        && !normalized_object.contains_key("upstreamFormat")
+    {
+        normalized_object.insert(
+            "reasoning_format".to_string(),
+            Value::String("string".to_string()),
+        );
+    }
+    if !has_nested_parameter
+        && !normalized_object.contains_key("reasoning_parameter")
+        && !normalized_object.contains_key("reasoningParameter")
+        && !normalized_object.contains_key("upstream_parameter")
+        && !normalized_object.contains_key("upstreamParameter")
+    {
+        normalized_object.insert(
+            "reasoning_parameter".to_string(),
+            Value::String("reasoning_effort".to_string()),
+        );
+    }
+    reasoning_capability_from_provider_model_entry(&normalized)
+}
+
+/// OpenRouter's `/models` metadata uses snake_case and exposes the same
+/// provider-agnostic contract as the generic parser. Keeping this wrapper
+/// preserves the call-site distinction while sharing all normalization and
+/// contradiction checks.
 pub fn reasoning_capability_from_openrouter_model_entry(
     model_entry: &Value,
 ) -> Option<CodexModelReasoningCapability> {
-    let repaired_entry = model_entry.get("reasoning").and_then(|reasoning| {
-        let object = reasoning.as_object()?;
-        if object.contains_key("upstream") {
-            return None;
-        }
-        let mut entry = model_entry.clone();
-        let reasoning = entry.get_mut("reasoning")?.as_object_mut()?;
-        let advertised_efforts = reasoning
-            .get("supported_efforts")
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default();
-        if advertised_efforts.is_empty() {
-            return None;
-        }
-        let efforts = advertised_efforts
+    let mut normalized = model_entry.clone();
+    let object = normalized.as_object_mut()?;
+    let has_top_level_wire_contract = [
+        "reasoning_parameter",
+        "reasoningParameter",
+        "upstream_parameter",
+        "upstreamParameter",
+        "reasoning_format",
+        "reasoningFormat",
+        "upstream_format",
+        "upstreamFormat",
+    ]
+    .iter()
+    .any(|key| object.contains_key(*key));
+    let reasoning_has_wire_contract = object
+        .get("reasoning")
+        .and_then(Value::as_object)
+        .is_some_and(|reasoning| {
+            [
+                "reasoning_parameter",
+                "reasoningParameter",
+                "parameter",
+                "reasoning_format",
+                "reasoningFormat",
+                "format",
+            ]
             .iter()
-            .filter_map(Value::as_str)
-            .map(|effort| Value::String(effort.to_string()))
-            .collect::<Vec<_>>();
-        let effort_map = advertised_efforts
-            .iter()
-            .filter_map(Value::as_str)
-            .map(|effort| (effort.to_string(), Value::String(effort.to_string())))
-            .collect::<serde_json::Map<_, _>>();
+            .any(|key| reasoning.contains_key(*key))
+        });
+    let reasoning = object.get_mut("reasoning").and_then(Value::as_object_mut)?;
+
+    // OpenRouter's catalog identifies graded reasoning through the nested
+    // `reasoning.supported_efforts` metadata, while older responses omit the
+    // separate parameter declaration. The platform contract is still exact:
+    // OpenRouter accepts the native `reasoning: { effort }` object. Normalize
+    // only this exact adapter boundary; generic providers must remain strict
+    // and never infer a wire format from effort names alone.
+    let has_efforts = [
+        "supported_efforts",
+        "supportedEfforts",
+        "supported_reasoning_efforts",
+        "supportedReasoningEfforts",
+        "supported_reasoning_levels",
+        "supportedReasoningLevels",
+    ]
+    .iter()
+    .any(|key| reasoning.contains_key(*key));
+    let has_wire_contract = reasoning_has_wire_contract || has_top_level_wire_contract;
+    if has_efforts && !has_wire_contract {
         reasoning.insert(
-            "supportedEfforts".to_string(),
-            Value::Array(efforts.clone()),
+            "reasoning_parameter".to_string(),
+            Value::String("reasoning.effort".to_string()),
         );
-        if !reasoning.contains_key("defaultEffort") {
-            if let Some(default) = reasoning.get("default_effort").cloned() {
-                reasoning.insert("defaultEffort".to_string(), default);
-            }
-        }
-        if !reasoning.contains_key("disableAllowed") {
-            reasoning.insert(
-                "disableAllowed".to_string(),
-                Value::Bool(efforts.iter().any(|effort| effort.as_str() == Some("none"))),
-            );
-        }
-        if !reasoning.contains_key("supportStatus") && !reasoning.contains_key("supported") {
-            reasoning.insert(
-                "supportStatus".to_string(),
-                Value::String("confirmed_supported".to_string()),
-            );
-        }
-        if !reasoning.contains_key("controlKind") {
-            reasoning.insert(
-                "controlKind".to_string(),
-                Value::String("graded".to_string()),
-            );
-        }
         reasoning.insert(
-            "upstream".to_string(),
-            serde_json::json!({
-                "format": "object",
-                "parameter": "reasoning.effort",
-                "effortMap": effort_map,
-            }),
+            "reasoning_format".to_string(),
+            Value::String("object".to_string()),
         );
-        Some(entry)
-    });
-    if let Some(mut capability) = repaired_entry
-        .as_ref()
-        .and_then(reasoning_capability_from_model_entry)
-    {
-        capability.source = Some("provider_config".to_string());
-        capability.confidence = Some(CapabilityConfidence::Authoritative);
-        return capability.validate().ok().map(|_| capability);
     }
-    None
+
+    reasoning_capability_from_provider_model_entry(&normalized)
 }
 
 pub fn resolve_reasoning_capability_from_settings(
@@ -919,7 +1208,10 @@ pub fn resolve_reasoning_capability_from_settings(
                 .filter_map(|field| entry.get(field).and_then(Value::as_str))
                 .any(|candidate| candidate.trim().eq_ignore_ascii_case(model.trim()))
         })
-        .and_then(reasoning_capability_from_model_entry)
+        .and_then(|entry| {
+            reasoning_capability_from_model_entry(entry)
+                .or_else(|| reasoning_capability_from_provider_model_entry(entry))
+        })
 }
 
 /// 从 Codex 官方模型缓存为指定 slug 构造 reasoning capability（P2：official 来源）。
@@ -930,8 +1222,8 @@ pub fn resolve_reasoning_capability_from_settings(
 /// 官方 GPT 模型走 OpenAI 顶层 `reasoning_effort` 字段，effort_map 用 identity。
 /// 任何校验失败都返回 None（保守降级为 Unknown，不产生虚假档位）。
 ///
-/// 该来源只适用于未知平台（platform=None，含 OpenAI 直连与 catalog 投影）；
-/// OpenRouter/vLLM 等已知聚合平台有自己的推理接口，不得套用官方 OpenAI 形态。
+/// 该来源只适用于明确识别为官方 OpenAI 的平台；未知网关和聚合平台
+/// 有自己的推理接口，不得仅凭 GPT 模型名套用官方 OpenAI 形态。
 pub fn official_reasoning_capability_for_model(
     model: &str,
     official_models: &[Value],
@@ -1334,6 +1626,44 @@ mod tests {
                 .get("none")
                 .map(String::as_str),
             Some("none")
+        );
+    }
+
+    #[test]
+    fn normalizes_codex_inline_reasoning_through_shared_parser() {
+        let entry = json!({
+            "id": "vendor-reasoning-model",
+            "supported_reasoning_levels": [
+                {"effort": "low"},
+                {"effort": "high"}
+            ],
+            "default_reasoning_level": "high"
+        });
+        let capability = reasoning_capability_from_codex_inline_model_entry(&entry)
+            .expect("Codex inline reasoning must use the shared parser");
+        assert_eq!(capability.supported_efforts, vec!["low", "high"]);
+        assert_eq!(capability.default_effort.as_deref(), Some("high"));
+        assert_eq!(capability.upstream.format, "string");
+        assert_eq!(capability.upstream.parameter, "reasoning_effort");
+        assert_eq!(capability.source.as_deref(), Some("provider_config"));
+        assert!(capability.validate().is_ok());
+    }
+
+    #[test]
+    fn codex_inline_explicit_conflicting_wire_contract_is_rejected() {
+        let entry = json!({
+            "id": "vendor-reasoning-model",
+            "supported_reasoning_levels": [{"effort": "low"}],
+            "reasoning": {
+                "upstream": {
+                    "format": "boolean",
+                    "parameter": "enable_thinking"
+                }
+            }
+        });
+        assert!(
+            reasoning_capability_from_codex_inline_model_entry(&entry).is_none(),
+            "explicit conflicting declarations must not be guessed over"
         );
     }
 

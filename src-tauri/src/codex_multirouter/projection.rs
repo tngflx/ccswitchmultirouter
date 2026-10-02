@@ -317,6 +317,17 @@ pub(crate) fn build_projection_artifact(
                 "Codex MultiRouter provider not found: {router_provider_id}"
             ))
         })?;
+    let providers = db
+        .get_all_providers("codex")?
+        .into_iter()
+        .collect::<HashMap<_, _>>();
+    build_projection_artifact_from_providers(&router, &providers)
+}
+
+pub(crate) fn build_projection_artifact_from_providers(
+    router: &Provider,
+    providers: &HashMap<String, Provider>,
+) -> Result<CodexRoutingProjectionArtifact, AppError> {
     let routing = router
         .settings_config
         .get("codexRouting")
@@ -328,10 +339,6 @@ pub(crate) fn build_projection_artifact(
             "Codex MultiRouter projection requires schemaVersion 2".to_string(),
         ));
     };
-    let providers = db
-        .get_all_providers("codex")?
-        .into_iter()
-        .collect::<HashMap<_, _>>();
     let compiled = compile_v2(&plan, &providers)
         .map_err(|error| AppError::Message(format!("{}: {}", error.code, error.message)))?;
     let projection_settings = projection_settings(&router, &compiled);
@@ -340,7 +347,7 @@ pub(crate) fn build_projection_artifact(
         .map(|(id, provider)| (id.clone(), provider.name.clone()))
         .collect();
     Ok(CodexRoutingProjectionArtifact {
-        router_provider_id: router.id,
+        router_provider_id: router.id.clone(),
         dependency_fingerprint: compiled.dependency_fingerprint.clone(),
         projection_settings,
         compiled,

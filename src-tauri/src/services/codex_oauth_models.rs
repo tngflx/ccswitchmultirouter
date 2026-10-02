@@ -5,17 +5,173 @@
 
 use crate::proxy::providers::{CODEX_OAUTH_CLIENT_VERSION, CODEX_OAUTH_ORIGINATOR};
 use crate::services::model_fetch::FetchedModel;
+use once_cell::sync::Lazy;
+use serde::Serialize;
 use serde_json::Value;
 use std::error::Error;
-use std::fs;
-use std::path::PathBuf;
-use std::time::Duration;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
+use tauri::Manager;
 
 const CODEX_OAUTH_MODELS_URL: &str = "https://chatgpt.com/backend-api/codex/models";
+const CODEX_PUBLIC_MODELS_URL: &str =
+    "https://raw.githubusercontent.com/openai/codex/main/codex-rs/models-manager/models.json";
 const CODEX_OAUTH_FETCH_TIMEOUT_SECS: u64 = 15;
+const CODEX_PUBLIC_MODELS_FETCH_TIMEOUT_SECS: u64 = 10;
+const CODEX_PUBLIC_MODELS_MAX_BYTES: u64 = 8 * 1024 * 1024;
+const CODEX_PUBLIC_MODELS_FAILURE_COOLDOWN_SECS: u64 = 60;
 const ERROR_BODY_MAX_CHARS: usize = 512;
-const CODEX_MODELS_CACHE_FILENAME: &str = "models_cache.json";
-const CODEX_MODELS_CACHE_BACKUP_FILENAME: &str = "models_cache.cc-switch-backup.json";
+
+static CODEX_PUBLIC_CATALOG_REFRESH_GATE: Lazy<Mutex<CatalogRefreshGate>> =
+    Lazy::new(|| Mutex::new(CatalogRefreshGate::default()));
+static CODEX_PUBLIC_CATALOG_REFRESH_COMPLETED: Lazy<
+    tokio::sync::broadcast::Sender<CatalogRefreshCompletion>,
+> =
+    Lazy::new(|| {
+        let (sender, _receiver) = tokio::sync::broadcast::channel(16);
+        sender
+    });
+static CODEX_PUBLIC_CATALOG_APP_HANDLE: std::sync::OnceLock<tauri::AppHandle> =
+    std::sync::OnceLock::new();
+
+pub(crate) fn register_public_catalog_app_handle(app_handle: tauri::AppHandle) {
+    let _ = CODEX_PUBLIC_CATALOG_APP_HANDLE.set(app_handle);
+}
+
+fn reproject_after_automatic_catalog_change() {
+    let Some(app_handle) = CODEX_PUBLIC_CATALOG_APP_HANDLE.get() else {
+        return;
+    };
+    let app_handle = app_handle.clone();
+    tauri::async_runtime::spawn(async move {
+        let Some(state) = app_handle.try_state::<crate::store::AppState>() else {
+            return;
+        };
+        match state
+            .proxy_service
+            .reproject_official_codex_catalog_if_owned()
+            .await
+        {
+            Ok(crate::services::proxy::OfficialCodexCatalogProjectionOutcome::Applied) => {
+                log::info!("automatically reprojected changed Codex official catalog")
+            }
+            Ok(crate::services::proxy::OfficialCodexCatalogProjectionOutcome::Skipped(reason)) => {
+                log::debug!("skipped automatic Codex catalog reprojection: {reason}")
+            }
+            Err(error) => {
+                log::warn!("automatic Codex catalog reprojection failed: {error}")
+            }
+        }
+    });
+}
+
+#[derive(Default)]
+struct CatalogRefreshGate {
+    in_flight: bool,
+    next_attempt_id: u64,
+    in_flight_attempt_id: Option<u64>,
+    retry_after: Option<Instant>,
+}
+
+impl CatalogRefreshGate {
+    fn try_start(&mut self, now: Instant) -> Option<u64> {
+        if self.in_flight
+            || self
+                .retry_after
+                .is_some_and(|retry_after| now < retry_after)
+        {
+            return None;
+        }
+        self.in_flight = true;
+        self.next_attempt_id = self.next_attempt_id.wrapping_add(1);
+        let attempt_id = self.next_attempt_id;
+        self.in_flight_attempt_id = Some(attempt_id);
+        Some(attempt_id)
+    }
+
+    fn try_start_forced(&mut self, _now: Instant) -> Option<u64> {
+        if self.in_flight {
+            return None;
+        }
+        self.in_flight = true;
+        self.next_attempt_id = self.next_attempt_id.wrapping_add(1);
+        let attempt_id = self.next_attempt_id;
+        self.in_flight_attempt_id = Some(attempt_id);
+        Some(attempt_id)
+    }
+
+    fn in_flight_attempt_id(&self) -> Option<u64> {
+        self.in_flight_attempt_id
+    }
+
+    fn finish(&mut self, now: Instant, succeeded: bool) {
+        self.in_flight = false;
+        self.in_flight_attempt_id = None;
+        self.retry_after = (!succeeded)
+            .then_some(now + Duration::from_secs(CODEX_PUBLIC_MODELS_FAILURE_COOLDOWN_SECS));
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CatalogRefreshCompletion {
+    attempt_id: u64,
+    succeeded: bool,
+}
+
+struct CatalogRefreshPermit {
+    finished: bool,
+    attempt_id: u64,
+}
+
+impl CatalogRefreshPermit {
+    fn try_acquire() -> Option<Self> {
+        let mut gate = CODEX_PUBLIC_CATALOG_REFRESH_GATE.lock().ok()?;
+        gate.try_start(Instant::now()).map(|attempt_id| Self {
+            finished: false,
+            attempt_id,
+        })
+    }
+
+    fn finish(mut self, succeeded: bool) {
+        if let Ok(mut gate) = CODEX_PUBLIC_CATALOG_REFRESH_GATE.lock() {
+            gate.finish(Instant::now(), succeeded);
+        }
+        self.finished = true;
+        let _ = CODEX_PUBLIC_CATALOG_REFRESH_COMPLETED.send(CatalogRefreshCompletion {
+            attempt_id: self.attempt_id,
+            succeeded,
+        });
+    }
+}
+
+impl Drop for CatalogRefreshPermit {
+    fn drop(&mut self) {
+        if !self.finished {
+            // Cancellation or unwinding between acquisition and completion
+            // must never leave refreshes permanently disabled. Treat it as a
+            // failed attempt so the normal short cooldown still applies.
+            if let Ok(mut gate) = CODEX_PUBLIC_CATALOG_REFRESH_GATE.lock() {
+                gate.finish(Instant::now(), false);
+            }
+            let _ = CODEX_PUBLIC_CATALOG_REFRESH_COMPLETED.send(CatalogRefreshCompletion {
+                attempt_id: self.attempt_id,
+                succeeded: false,
+            });
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OfficialCatalogRefreshResult {
+    pub source: String,
+    pub fetched_at: Option<String>,
+    pub model_count: usize,
+    pub used_stale_cache: bool,
+    #[serde(skip_serializing)]
+    pub refreshed: bool,
+    pub refresh_error: Option<String>,
+}
 
 /// 使用 ChatGPT OAuth access token 在线读取官方 Codex 模型列表。
 ///
@@ -111,52 +267,273 @@ fn format_codex_oauth_request_error(error: reqwest::Error) -> String {
     format!("Request failed: {error}; kind={kind}; {proxy_hint}; source={source_chain}")
 }
 
-/// 读取 Codex 本地模型缓存，作为 OAuth 在线获取失败时的离线兜底。
-///
-/// CCSwitchMulti 接管时会把原始 `models_cache.json` 备份到
-/// `models_cache.cc-switch-backup.json`，因此这里优先读取备份，避免把
-/// MultiRouter 合并进去的第三方模型误当作官方 Codex 模型。若没有任何可用缓存，
-/// 返回空列表而不是伪造静态模型。
-pub fn fetch_cached_models_from_disk() -> Result<Vec<FetchedModel>, String> {
-    let mut parse_errors = Vec::new();
-    for path in codex_oauth_model_cache_candidates() {
-        if !path.exists() {
-            continue;
-        }
-        let raw = match fs::read_to_string(&path) {
-            Ok(raw) => raw,
-            Err(error) => {
-                parse_errors.push(format!("Failed to read {}: {error}", path.display()));
-                continue;
-            }
-        };
-        let value: Value = match serde_json::from_str(&raw) {
-            Ok(value) => value,
-            Err(error) => {
-                parse_errors.push(format!("Failed to parse {}: {error}", path.display()));
-                continue;
-            }
-        };
-        let models = parse_cached_models(value);
-        if !models.is_empty() {
-            return Ok(models);
-        }
+/// 无需 OAuth 的官方目录入口：按 TTL 刷新公共快照，失败时继续使用可信旧快照。
+pub async fn fetch_official_fallback_models() -> Result<Vec<FetchedModel>, String> {
+    if let Err(error) = refresh_public_official_catalog_if_needed().await {
+        log::warn!(
+            "failed to refresh OpenAI public Codex model catalog; using stale cache: {error}"
+        );
     }
+    // The public fallback must consume the same authority chain used by
+    // catalog projection and reasoning resolution. Reading only the raw
+    // Codex cache files here would bypass the packaged/public snapshot after
+    // a successful refresh and could reintroduce CCSM-owned third-party rows.
+    Ok(parse_official_model_values(
+        &crate::codex_config::codex_official_models_cache().unwrap_or_default(),
+    ))
+}
 
-    if parse_errors.is_empty() {
-        Ok(Vec::new())
+/// 刷新独立的 OpenAI/Codex 公共目录快照；成功才原子替换缓存，失败保留旧快照。
+pub async fn refresh_public_official_catalog_if_needed() -> Result<bool, String> {
+    if !crate::codex_config::codex_public_official_models_cache_needs_refresh() {
+        return Ok(false);
+    }
+    let Some(permit) = CatalogRefreshPermit::try_acquire() else {
+        return Ok(false);
+    };
+    let result = if !crate::codex_config::codex_public_official_models_cache_needs_refresh() {
+        Ok(false)
     } else {
-        Err(parse_errors.join("; "))
+        match fetch_public_official_catalog_from_url(CODEX_PUBLIC_MODELS_URL).await {
+            Ok(models) => crate::codex_config::store_codex_public_official_models_cache(&models)
+                .map_err(|error| {
+                    format!("Failed to cache OpenAI public Codex model catalog: {error}")
+                }),
+            Err(error) => Err(error),
+        }
+    };
+    permit.finish(result.is_ok());
+    if result.as_ref().is_ok_and(|changed| *changed) {
+        reproject_after_automatic_catalog_change();
+    }
+    result
+}
+
+/// Explicitly refresh the public OpenAI/Codex catalog. Unlike the automatic
+/// path this ignores both the six-hour TTL and the short failure cooldown. A
+/// concurrent explicit caller waits for the in-flight request; if it failed,
+/// it owns a new forced attempt instead of presenting stale data as fresh.
+pub async fn refresh_public_official_catalog_force() -> OfficialCatalogRefreshResult {
+    loop {
+        // Subscribe before reading the gate. A broadcast receiver retains the
+        // exact completion outcome for this waiter, so a failed forced refresh
+        // cannot be mistaken for a still-fresh older snapshot.
+        let mut completed = CODEX_PUBLIC_CATALOG_REFRESH_COMPLETED.subscribe();
+        let (permit, in_flight_attempt_id) = {
+            let mut gate = match CODEX_PUBLIC_CATALOG_REFRESH_GATE.lock() {
+                Ok(gate) => gate,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            match gate.try_start_forced(Instant::now()) {
+                Some(attempt_id) => (
+                    Some(CatalogRefreshPermit {
+                        finished: false,
+                        attempt_id,
+                    }),
+                    None,
+                ),
+                None => (None, gate.in_flight_attempt_id()),
+            }
+        };
+
+        let Some(permit) = permit else {
+            let Some(in_flight_attempt_id) = in_flight_attempt_id else {
+                // The gate can only reject a forced attempt while another
+                // attempt is in flight. Recheck rather than reporting a
+                // fabricated completion if that invariant is ever violated.
+                continue;
+            };
+            loop {
+                match completed.recv().await {
+                    Ok(completion) if completion.attempt_id == in_flight_attempt_id => {
+                        if completion.succeeded {
+                            return public_catalog_snapshot_result(
+                                "openai_codex_models_json",
+                                false,
+                                true,
+                                None,
+                            );
+                        }
+                        // A failed attempt must be retried explicitly even
+                        // when the retained snapshot is still within its
+                        // automatic TTL.
+                        break;
+                    }
+                    Ok(_) => {
+                        // Automatic or unrelated forced completions do not
+                        // belong to this waiter.
+                        continue;
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_))
+                    | Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        // Reacquire the gate and either retry or wait on the
+                        // current attempt. The static sender normally cannot
+                        // close, but retrying remains safer than fabricating
+                        // success.
+                        break;
+                    }
+                }
+            }
+            continue;
+        };
+
+        let result: Result<OfficialCatalogRefreshResult, String> =
+            match fetch_public_official_catalog_from_url(CODEX_PUBLIC_MODELS_URL).await {
+                Ok(models) => crate::codex_config::store_codex_public_official_models_cache(&models)
+                    .map(|_| {
+                        public_catalog_snapshot_result(
+                            "openai_codex_models_json",
+                            false,
+                            true,
+                            None,
+                        )
+                    })
+                    .map_err(|error| {
+                        format!("Failed to cache OpenAI public Codex model catalog: {error}")
+                    }),
+                Err(error) => Err(error),
+            };
+        permit.finish(result.is_ok());
+
+        return match result {
+            Ok(outcome) => outcome,
+            Err(error) => public_catalog_snapshot_result(
+                "stale_cache",
+                true,
+                false,
+                Some(sanitize_public_catalog_error(&error)),
+            ),
+        };
     }
 }
 
-/// 返回本地官方模型缓存候选路径；备份优先，当前缓存作为兜底。
-fn codex_oauth_model_cache_candidates() -> Vec<PathBuf> {
-    let codex_dir = crate::codex_config::get_codex_config_dir();
-    vec![
-        codex_dir.join(CODEX_MODELS_CACHE_BACKUP_FILENAME),
-        codex_dir.join(CODEX_MODELS_CACHE_FILENAME),
-    ]
+fn public_catalog_snapshot_result(
+    source: &str,
+    used_stale_cache: bool,
+    refreshed: bool,
+    refresh_error: Option<String>,
+) -> OfficialCatalogRefreshResult {
+    public_catalog_result_from_snapshot(
+        crate::codex_config::codex_public_official_models_cache_snapshot(),
+        source,
+        used_stale_cache,
+        refreshed,
+        refresh_error,
+    )
+}
+
+fn public_catalog_result_from_snapshot(
+    snapshot: Option<(Option<String>, usize)>,
+    source: &str,
+    used_stale_cache: bool,
+    refreshed: bool,
+    refresh_error: Option<String>,
+) -> OfficialCatalogRefreshResult {
+    let has_snapshot = snapshot.is_some();
+    let (fetched_at, model_count) = snapshot.unwrap_or((None, 0));
+    OfficialCatalogRefreshResult {
+        source: if has_snapshot || refreshed {
+            source.to_string()
+        } else {
+            "unavailable".to_string()
+        },
+        fetched_at,
+        model_count,
+        used_stale_cache: used_stale_cache && has_snapshot,
+        refreshed,
+        refresh_error,
+    }
+}
+
+fn sanitize_public_catalog_error(error: &str) -> String {
+    // Do not expose transport diagnostics or response bodies at IPC. Either
+    // could acquire sensitive details if a proxy or HTTP implementation changes.
+    log::warn!("forced public Codex catalog refresh failed: {error}");
+    "Unable to refresh the official model catalog; the trusted cached snapshot was retained"
+        .to_string()
+}
+
+pub(crate) fn public_catalog_models_changed(previous: &[Value], next: &[Value]) -> bool {
+    let mut previous = previous.to_vec();
+    let mut next = next.to_vec();
+    let sort_key = |model: &Value| {
+        let id = ["slug", "model", "id"]
+            .iter()
+            .find_map(|field| model.get(*field).and_then(Value::as_str))
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        (id, model.to_string())
+    };
+    previous.sort_by_key(&sort_key);
+    next.sort_by_key(&sort_key);
+    previous != next
+}
+
+async fn fetch_public_official_catalog_from_url(url: &str) -> Result<Vec<Value>, String> {
+    let response = crate::proxy::http_client::get()
+        .get(url)
+        .header(reqwest::header::ACCEPT, "application/json")
+        .header(
+            reqwest::header::USER_AGENT,
+            concat!("CCSwitchMulti/", env!("CARGO_PKG_VERSION")),
+        )
+        .timeout(Duration::from_secs(CODEX_PUBLIC_MODELS_FETCH_TIMEOUT_SECS))
+        .send()
+        .await
+        .map_err(format_codex_oauth_request_error)?;
+
+    let status = response.status();
+    if !status.is_success() {
+        let body = truncate_body(response.text().await.unwrap_or_default());
+        return Err(format!("HTTP {status}: {body}"));
+    }
+    if response
+        .content_length()
+        .is_some_and(|length| length > CODEX_PUBLIC_MODELS_MAX_BYTES)
+    {
+        return Err("OpenAI public Codex model catalog exceeds 8 MiB".to_string());
+    }
+
+    let body = response
+        .bytes()
+        .await
+        .map_err(|error| format!("Failed to read public model catalog: {error}"))?;
+    if body.len() as u64 > CODEX_PUBLIC_MODELS_MAX_BYTES {
+        return Err("OpenAI public Codex model catalog exceeds 8 MiB".to_string());
+    }
+    let value: Value = serde_json::from_slice(&body)
+        .map_err(|error| format!("Failed to parse public model catalog: {error}"))?;
+    let models = value
+        .get("models")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "OpenAI public Codex model catalog has no models array".to_string())?;
+    let sanitized = models
+        .iter()
+        .filter_map(sanitize_public_official_model)
+        .collect::<Vec<_>>();
+    if parse_cached_models(serde_json::json!({ "models": sanitized })).is_empty() {
+        return Err("OpenAI public Codex model catalog has no usable models".to_string());
+    }
+    Ok(sanitized)
+}
+
+/// Public catalog entries may contain instruction-bearing fields intended for
+/// Codex's own runtime. They are not needed for the model picker and must not
+/// be copied into a CCSM-generated catalog.
+pub(crate) fn sanitize_public_official_model(model: &Value) -> Option<Value> {
+    let mut model = model.as_object()?.clone();
+    for field in [
+        "model_messages",
+        "modelMessages",
+        "base_instructions",
+        "baseInstructions",
+        "instructions",
+        "instructions_template",
+        "instructionsTemplate",
+    ] {
+        model.remove(field);
+    }
+    Some(Value::Object(model))
 }
 
 /// 从 Codex 缓存结构里解析官方模型，并剔除 MultiRouter 合并进去的第三方模型。
@@ -165,6 +542,10 @@ fn parse_cached_models(value: Value) -> Vec<FetchedModel> {
         .into_iter()
         .filter(|model| is_likely_codex_oauth_model_id(&model.id))
         .collect()
+}
+
+fn parse_official_model_values(models: &[Value]) -> Vec<FetchedModel> {
+    parse_cached_models(serde_json::json!({ "models": models }))
 }
 
 /// 判断缓存条目是否像官方 Codex/ChatGPT 模型。
@@ -220,6 +601,10 @@ fn push_model_entry(models: &mut Vec<FetchedModel>, entry: &Value, fallback_id: 
     if let Some(id) = entry.as_str().map(str::trim).filter(|id| !id.is_empty()) {
         models.push(FetchedModel {
             context_window: None,
+            canonical_slug: None,
+            slug: None,
+            name: None,
+            aliases: Vec::new(),
             id: id.to_string(),
             input_modalities: None,
             owned_by: Some("Codex".to_string()),
@@ -233,6 +618,10 @@ fn push_model_entry(models: &mut Vec<FetchedModel>, entry: &Value, fallback_id: 
         if let Some(id) = fallback_id.map(str::trim).filter(|id| !id.is_empty()) {
             models.push(FetchedModel {
                 context_window: None,
+                canonical_slug: None,
+                slug: None,
+                name: None,
+                aliases: Vec::new(),
                 id: id.to_string(),
                 input_modalities: None,
                 owned_by: Some("Codex".to_string()),
@@ -275,6 +664,10 @@ fn push_model_entry(models: &mut Vec<FetchedModel>, entry: &Value, fallback_id: 
 
     models.push(FetchedModel {
         context_window,
+        canonical_slug: string_field(obj, &["canonical_slug", "canonicalSlug"]),
+        slug: string_field(obj, &["slug"]),
+        name: string_field(obj, &["name"]),
+        aliases: aliases_field(obj),
         id,
         input_modalities,
         owned_by,
@@ -326,6 +719,28 @@ fn string_field(obj: &serde_json::Map<String, Value>, keys: &[&str]) -> Option<S
         .map(str::trim)
         .find(|value| !value.is_empty())
         .map(str::to_string)
+}
+
+fn aliases_field(obj: &serde_json::Map<String, Value>) -> Vec<String> {
+    let mut aliases = Vec::new();
+    for key in ["aliases", "alias", "model_aliases", "modelAliases"] {
+        match obj.get(key) {
+            Some(Value::Array(values)) => aliases.extend(values.iter().filter_map(|value| {
+                value
+                    .as_str()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(ToString::to_string)
+            })),
+            Some(Value::String(value)) if !value.trim().is_empty() => {
+                aliases.push(value.trim().to_string())
+            }
+            _ => {}
+        }
+    }
+    aliases.sort_unstable();
+    aliases.dedup();
+    aliases
 }
 
 /// 从 Codex OAuth 模型条目中提取上下文窗口。
@@ -468,6 +883,124 @@ mod tests {
             serialized.pointer("/reasoning/upstream/effortMap/none"),
             Some(&json!("low"))
         );
+    }
+
+    #[test]
+    fn forced_public_catalog_refresh_bypasses_failure_cooldown() {
+        let start = Instant::now();
+        let mut gate = CatalogRefreshGate::default();
+
+        assert!(gate.try_start(start).is_some());
+        gate.finish(start + Duration::from_secs(1), false);
+
+        assert!(
+            gate.try_start_forced(start + Duration::from_secs(2)).is_some(),
+            "an explicit user refresh must request upstream even during automatic retry cooldown"
+        );
+    }
+
+    #[tokio::test]
+    async fn enabled_manual_refresh_waiter_observes_failed_completion_and_retries() {
+        let (sender, _receiver) = tokio::sync::broadcast::channel(1);
+        let mut completed = sender.subscribe();
+        let start = Instant::now();
+        let mut gate = CatalogRefreshGate::default();
+
+        let attempt_id = gate.try_start(start).expect("start refresh");
+        gate.finish(start + Duration::from_secs(1), false);
+        sender
+            .send(CatalogRefreshCompletion {
+                attempt_id,
+                succeeded: false,
+            })
+            .expect("send failed refresh outcome");
+
+        assert_eq!(
+            completed.recv().await.expect("receive refresh outcome"),
+            CatalogRefreshCompletion {
+                attempt_id,
+                succeeded: false,
+            }
+        );
+        assert!(
+            gate.try_start_forced(start + Duration::from_secs(2)).is_some(),
+            "a failed forced refresh must be retried even when the retained snapshot is still fresh"
+        );
+    }
+
+    #[tokio::test]
+    async fn manual_refresh_waiter_ignores_unrelated_completion() {
+        let (sender, _receiver) = tokio::sync::broadcast::channel(4);
+        let mut completed = sender.subscribe();
+        let expected = CatalogRefreshCompletion {
+            attempt_id: 2,
+            succeeded: true,
+        };
+        sender
+            .send(CatalogRefreshCompletion {
+                attempt_id: 1,
+                succeeded: true,
+            })
+            .expect("send unrelated completion");
+        sender.send(expected).expect("send owned completion");
+
+        assert_eq!(
+            completed
+                .recv()
+                .await
+                .expect("receive unrelated completion")
+                .attempt_id,
+            1
+        );
+        assert_eq!(
+            completed
+                .recv()
+                .await
+                .expect("receive owned completion"),
+            expected
+        );
+    }
+
+    #[test]
+    fn public_catalog_change_detection_ignores_model_order_but_not_metadata() {
+        let original = vec![
+            json!({"slug": "gpt-6-sol", "supported_reasoning_levels": ["low", "max"]}),
+            json!({"slug": "gpt-6-luna", "context_window": 128000}),
+        ];
+        let reordered = vec![original[1].clone(), original[0].clone()];
+        let changed = vec![
+            json!({"slug": "gpt-6-sol", "supported_reasoning_levels": ["low", "max", "ultra"]}),
+            original[1].clone(),
+        ];
+
+        assert!(!public_catalog_models_changed(&original, &reordered));
+        assert!(public_catalog_models_changed(&original, &changed));
+    }
+
+    #[test]
+    fn failed_forced_refresh_reports_only_an_actual_stale_snapshot() {
+        let stale = public_catalog_result_from_snapshot(
+            Some((Some("2026-09-23T00:00:00Z".to_string()), 3)),
+            "stale_cache",
+            true,
+            false,
+            Some("refresh failed".to_string()),
+        );
+        assert_eq!(stale.source, "stale_cache");
+        assert!(stale.used_stale_cache);
+        assert_eq!(stale.model_count, 3);
+        assert!(!stale.refreshed);
+
+        let unavailable = public_catalog_result_from_snapshot(
+            None,
+            "stale_cache",
+            true,
+            false,
+            Some("refresh failed".to_string()),
+        );
+        assert_eq!(unavailable.source, "unavailable");
+        assert!(!unavailable.used_stale_cache);
+        assert_eq!(unavailable.model_count, 0);
     }
 
     #[test]

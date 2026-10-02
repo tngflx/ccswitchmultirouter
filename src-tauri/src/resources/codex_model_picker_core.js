@@ -56,21 +56,53 @@
     );
     return descriptor;
   };
+  const modelIdentityValues = (item) => {
+    if (!item || typeof item !== "object") return [];
+    const values = [];
+    const add = (candidate) => {
+      const normalized = normalizedIdentity(candidate);
+      if (normalized && !values.includes(normalized)) values.push(normalized);
+    };
+    for (const key of [
+      "model",
+      "id",
+      "upstreamModel",
+      "upstream_model",
+      "canonicalSlug",
+      "canonical_slug",
+      "slug",
+    ]) {
+      add(item[key]);
+    }
+    if (Array.isArray(item.aliases)) {
+      for (const alias of item.aliases) add(alias);
+    } else if (item.aliases && typeof item.aliases === "object") {
+      for (const [alias, target] of Object.entries(item.aliases)) {
+        add(alias);
+        add(target);
+      }
+    }
+    if (values.length === 0) add(item.name);
+    return values;
+  };
+  const modelIdentitySet = (item) => new Set(modelIdentityValues(item));
+  const identitiesIntersect = (left, right) => {
+    const rightSet = right instanceof Set ? right : modelIdentitySet(right);
+    return modelIdentityValues(left).some((identity) => rightSet.has(identity));
+  };
   const descriptorFor = (name) => {
     const payload = currentPayload();
     const normalizedName = normalizedIdentity(name);
     const existing = (payload.models || []).find(
-      (model) =>
-        model && normalizedIdentity(modelIdentity(model)) === normalizedName,
+      (model) => model && modelIdentityValues(model).includes(normalizedName),
     );
     const descriptor = normalizeReasoningDescriptor({
-      model: name,
-      id: name,
-      slug: name,
-      displayName: name,
-      hidden: false,
       ...(existing || {}),
-      name: existing?.displayName || existing?.display_name || name,
+      // The visible route name is the only identity synthesized here. Never
+      // fabricate id/slug/name from a display label when the upstream omitted it.
+      model: name,
+      displayName:
+        existing?.displayName || existing?.display_name || name,
       hidden: false,
     });
     const providerName =
@@ -86,17 +118,10 @@
     return descriptor;
   };
   const stringArray = (value) => Array.isArray(value) && value.every((item) => typeof item === "string");
-  const modelIdentity = (item) => {
-    if (!item || typeof item !== "object") return null;
-    for (const key of ["model", "id", "slug", "name"]) {
-      if (typeof item[key] === "string" && item[key].trim()) return item[key].trim();
-    }
-    return null;
-  };
   const modelArray = (value, allowEmpty = false) =>
     Array.isArray(value) &&
     (allowEmpty || value.length > 0) &&
-    value.every((item) => modelIdentity(item) !== null);
+    value.every((item) => modelIdentityValues(item).length > 0);
   const patchModelNameArray = (models) => {
     if (!stringArray(models)) return false;
     const names = modelNames();
@@ -115,39 +140,40 @@
   const patchModelArray = (models, allowEmpty = false) => {
     if (!modelArray(models, allowEmpty)) return false;
     const names = modelNames();
-    const existing = new Map();
-    for (const model of models) {
-      const identity = modelIdentity(model);
-      if (identity && typeof model.model !== "string") model.model = identity;
-      if (identity) existing.set(normalizedIdentity(identity), model);
-    }
+    const existing = models.slice();
+    const routedByName = new Map();
+    const used = new Set();
     let changed = false;
     for (const name of names) {
       const descriptor = descriptorFor(name);
-      const current = existing.get(normalizedIdentity(name));
+      const current = existing.find(
+        (model) => !used.has(model) && identitiesIntersect(model, descriptor),
+      );
       if (!current) {
         models.push(descriptor);
-        existing.set(normalizedIdentity(name), descriptor);
+        existing.push(descriptor);
+        routedByName.set(normalizedIdentity(name), descriptor);
         changed = true;
         continue;
       }
+      used.add(current);
       for (const [key, value] of Object.entries(descriptor)) {
         if (JSON.stringify(current[key]) !== JSON.stringify(value)) {
           current[key] = value;
           changed = true;
         }
       }
+      routedByName.set(normalizedIdentity(name), current);
     }
     // Keep routed models in catalog order (including provider groups) while retaining any
     // unrelated Codex entries after them. Mutate the original array so renderer references live.
-    const routed = names
-      .map((name) => existing.get(normalizedIdentity(name)))
+    const orderedRouted = names
+      .map((name) => routedByName.get(normalizedIdentity(name)))
       .filter(Boolean);
-    const routedNames = new Set(names.map(normalizedIdentity));
     const untouched = models.filter(
-      (model) => !routedNames.has(normalizedIdentity(modelIdentity(model))),
+      (model) => !orderedRouted.includes(model),
     );
-    const ordered = [...routed, ...untouched];
+    const ordered = [...orderedRouted, ...untouched];
     if (models.length !== ordered.length || models.some((model, index) => model !== ordered[index])) {
       models.splice(0, models.length, ...ordered);
       changed = true;

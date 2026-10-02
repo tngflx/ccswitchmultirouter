@@ -101,6 +101,15 @@ pub async fn update_provider(
     })
 }
 
+#[tauri::command]
+pub fn update_codex_providers(
+    state: State<'_, AppState>,
+    providers: Vec<Provider>,
+) -> Result<bool, String> {
+    ProviderService::update_codex_providers_atomically(state.inner(), providers)
+        .map_err(|error| error.to_string())
+}
+
 async fn resolve_automatic_probe_outcome<F, Fut>(
     provider: Provider,
     probe: F,

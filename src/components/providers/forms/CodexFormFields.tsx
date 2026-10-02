@@ -82,6 +82,10 @@ import {
   reconcileFetchedCodexCatalogRows,
 } from "./codexCatalogSync";
 import {
+  modelBindingIdentityValues,
+  modelIdentityValues,
+} from "@/lib/modelIdentities";
+import {
   buildCodexInputCapabilityReferenceMap,
   codexInputCapabilityPatch,
   codexInputCapabilityState,
@@ -367,6 +371,7 @@ interface CodexFormFieldsProps {
   presetCatalogModels?: CodexCatalogModel[];
   knownCatalogModels?: CodexCatalogModel[];
   onCatalogModelsChange?: (models: CodexCatalogModel[]) => void;
+  catalogValidationError?: { model: string; message: string } | null;
   spawnAgentModels?: string[];
   onSpawnAgentModelsChange?: (models: string[]) => void;
   codexRouting?: CodexRoutingConfig;
@@ -385,6 +390,43 @@ interface CodexFormFieldsProps {
   onLocalProxyHeadersOverrideChange: (value: string) => void;
   localProxyBodyOverride: string;
   onLocalProxyBodyOverrideChange: (value: string) => void;
+}
+
+export function CodexFormSaveFeedback({
+  catalogValidationError,
+  saveError,
+}: {
+  catalogValidationError?: { model: string; message: string } | null;
+  saveError?: string | null;
+}) {
+  const { t } = useTranslation();
+  if (!catalogValidationError && !saveError) return null;
+  return (
+    <div className="space-y-2">
+      {catalogValidationError && (
+        <div
+          role="alert"
+          className="rounded-md border border-destructive/50 bg-destructive/5 p-3 text-sm text-destructive"
+        >
+          {catalogValidationError.message}
+          <span className="mt-1 block text-xs">
+            {t("providerForm.codexSaveDraftPreserved")}
+          </span>
+        </div>
+      )}
+      {saveError && (
+        <div
+          role="alert"
+          className="rounded-md border border-destructive/50 bg-destructive/5 p-3 text-sm text-destructive"
+        >
+          {saveError}
+          <span className="mt-1 block text-xs">
+            {t("providerForm.codexSaveDraftPreserved")}
+          </span>
+        </div>
+      )}
+    </div>
+  );
 }
 
 function capabilityFromReasoningDetection(
@@ -791,20 +833,23 @@ function mergeFetchedModelsIntoCatalogRows(
     { row: CodexCatalogRow; index: number }
   >();
   next.forEach((row, index) => {
-    const upstreamModel = catalogModelIdentity(catalogRowUpstreamModel(row));
-    if (upstreamModel) {
-      rowByFetchedModel.set(upstreamModel, { row, index });
-    }
-    const visibleModel = catalogModelIdentity(row.model);
-    if (visibleModel && !rowByFetchedModel.has(visibleModel)) {
-      rowByFetchedModel.set(visibleModel, { row, index });
+    for (const identity of modelBindingIdentityValues(row)) {
+      if (!rowByFetchedModel.has(identity)) {
+        rowByFetchedModel.set(identity, { row, index });
+      }
     }
   });
 
   for (const fetched of fetchedModels) {
-    const model = fetched.id.trim();
+    const model =
+      fetched.id?.trim() ||
+      fetched.canonicalSlug?.trim() ||
+      fetched.slug?.trim() ||
+      fetched.name?.trim() ||
+      fetched.aliases?.find((alias) => alias.trim())?.trim() ||
+      "";
     if (!model) continue;
-    const modelIdentity = catalogModelIdentity(model);
+    const fetchedIdentities = modelIdentityValues(fetched);
     const contextWindow = resolveFetchedCodexModelContextWindow(fetched, {
       ...source,
       existingModels: rows,
@@ -818,7 +863,11 @@ function mergeFetchedModelsIntoCatalogRows(
         ? { supportsImage: fetched.supportsImage }
         : {}),
     };
-    const existing = rowByFetchedModel.get(modelIdentity);
+    const existing = fetchedIdentities
+      .map((identity) => rowByFetchedModel.get(identity))
+      .find((value): value is { row: CodexCatalogRow; index: number } =>
+        Boolean(value),
+      );
     if (existing) {
       const updatedRow = {
         ...existing.row,
@@ -829,12 +878,20 @@ function mergeFetchedModelsIntoCatalogRows(
         ...(!existing.row.reasoning && fetched.reasoning
           ? { reasoning: fetched.reasoning }
           : {}),
+        ...(fetched.canonicalSlug
+          ? { canonicalSlug: fetched.canonicalSlug }
+          : {}),
+        ...(fetched.slug ? { slug: fetched.slug } : {}),
+        ...(fetched.name ? { name: fetched.name } : {}),
+        ...(fetched.aliases?.length ? { aliases: [...fetched.aliases] } : {}),
       };
       next[existing.index] = updatedRow;
-      rowByFetchedModel.set(modelIdentity, {
-        row: updatedRow,
-        index: existing.index,
-      });
+      for (const identity of modelBindingIdentityValues(updatedRow)) {
+        rowByFetchedModel.set(identity, {
+          row: updatedRow,
+          index: existing.index,
+        });
+      }
       continue;
     }
     const row = createCatalogRow({
@@ -844,8 +901,16 @@ function mergeFetchedModelsIntoCatalogRows(
       ...(contextWindowText ? { contextWindow: contextWindowText } : {}),
       ...capabilityPatch,
       ...(fetched.reasoning ? { reasoning: fetched.reasoning } : {}),
+      ...(fetched.canonicalSlug
+        ? { canonicalSlug: fetched.canonicalSlug }
+        : {}),
+      ...(fetched.slug ? { slug: fetched.slug } : {}),
+      ...(fetched.name ? { name: fetched.name } : {}),
+      ...(fetched.aliases?.length ? { aliases: [...fetched.aliases] } : {}),
     });
-    rowByFetchedModel.set(modelIdentity, { row, index: next.length });
+    for (const identity of modelBindingIdentityValues(row)) {
+      rowByFetchedModel.set(identity, { row, index: next.length });
+    }
     next.push(row);
   }
 
@@ -963,6 +1028,7 @@ export function CodexFormFields({
   presetCatalogModels = EMPTY_CODEX_CATALOG_MODELS,
   knownCatalogModels = EMPTY_CODEX_CATALOG_MODELS,
   onCatalogModelsChange,
+  catalogValidationError = null,
   onProviderSplitSuggestionChange,
   speedTestEndpoints,
   customUserAgent,
@@ -1126,6 +1192,12 @@ export function CodexFormFields({
   const isChatFormat = apiFormat === "openai_chat";
   const isAnthropicFormat = apiFormat === "anthropic";
   const canEditCatalog = Boolean(onCatalogModelsChange);
+  useEffect(() => {
+    if (!catalogValidationError) return;
+    document
+      .getElementById("codex-catalog-validation-row")
+      ?.scrollIntoView({ behavior: "smooth", block: "center" });
+  }, [catalogValidationError]);
   const resolvedTrafficPolicy = useMemo(
     () => resolveCodexTrafficPolicy(codexBaseUrl, codexTrafficPolicy),
     [codexBaseUrl, codexTrafficPolicy],
@@ -1966,9 +2038,7 @@ export function CodexFormFields({
 
       catalogRowsRef.current = result.rows;
       setCatalogRows(result.rows);
-      const persistedRows = result.rows.map(
-        ({ rowId: _rowId, ...row }) => row,
-      );
+      const persistedRows = result.rows.map(({ rowId: _rowId, ...row }) => row);
       lastSentModelsRef.current = persistedRows;
       onCatalogModelsChange(persistedRows);
     },
@@ -3548,8 +3618,17 @@ export function CodexFormFields({
 
                   return (
                     <article
+                      id={
+                        catalogValidationError?.model === model
+                          ? "codex-catalog-validation-row"
+                          : undefined
+                      }
                       key={`reasoning:${row.rowId}`}
-                      className="space-y-3 rounded-md border bg-background p-3 text-xs"
+                      className={`space-y-3 rounded-md border bg-background p-3 text-xs ${
+                        catalogValidationError?.model === model
+                          ? "border-destructive ring-1 ring-destructive"
+                          : ""
+                      }`}
                     >
                       <CodexModelReasoningSummary
                         model={

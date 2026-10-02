@@ -387,6 +387,11 @@ export interface CodexCatalogModel {
   enabled?: boolean;
   upstreamModel?: string;
   upstream_model?: string;
+  canonicalSlug?: string;
+  canonical_slug?: string;
+  slug?: string;
+  name?: string;
+  aliases?: string[];
   displayName?: string;
   display_name?: string;
   providerName?: string;

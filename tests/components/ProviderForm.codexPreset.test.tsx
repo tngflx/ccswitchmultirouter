@@ -2,7 +2,11 @@ import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import type { ComponentProps } from "react";
 import { describe, expect, it, vi } from "vitest";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { ProviderForm } from "@/components/providers/forms/ProviderForm";
+import {
+  CodexCatalogValidationError,
+  normalizeCodexCatalogModelsForSave,
+  ProviderForm,
+} from "@/components/providers/forms/ProviderForm";
 import { configApi } from "@/lib/api";
 
 const codexCandidateApiMocks = vi.hoisted(() => ({
@@ -156,6 +160,7 @@ vi.mock("@/components/providers/forms/CodexFormFields", () => ({
       </button>
     </section>
   ),
+  CodexFormSaveFeedback: () => null,
   buildSplitCodexProviderSuggestionForFetchedModels: vi.fn(),
 }));
 
@@ -186,6 +191,49 @@ async function renderProviderForm(
 }
 
 describe("ProviderForm Codex preset selection", () => {
+  it("fails closed when a catalog draft cannot be normalized", () => {
+    expect(() =>
+      normalizeCodexCatalogModelsForSave([
+        {
+          model: "draft-model",
+          reasoning: {
+            supportStatus: "confirmed_supported",
+            supportedEfforts: ["high"],
+            defaultEffort: "low",
+            disableAllowed: true,
+            upstream: {
+              format: "string",
+              parameter: "reasoning_effort",
+              effortMap: { high: "high" },
+            },
+          },
+        },
+      ]),
+    ).toThrow(CodexCatalogValidationError);
+
+    try {
+      normalizeCodexCatalogModelsForSave([
+        {
+          model: "draft-model",
+          reasoning: {
+            supportStatus: "confirmed_supported",
+            supportedEfforts: ["high"],
+            defaultEffort: "low",
+            disableAllowed: true,
+            upstream: {
+              format: "string",
+              parameter: "reasoning_effort",
+              effortMap: { high: "high" },
+            },
+          },
+        },
+      ]);
+    } catch (error) {
+      expect(error).toBeInstanceOf(CodexCatalogValidationError);
+      expect((error as CodexCatalogValidationError).model).toBe("draft-model");
+    }
+  });
+
   it("keeps form controls unavailable until common configuration has loaded", async () => {
     let resolve!: (value: string) => void;
     vi.mocked(configApi.getCommonConfigSnippet).mockImplementation((app) =>
