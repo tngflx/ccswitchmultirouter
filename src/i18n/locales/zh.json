@@ -1436,6 +1436,7 @@
     "codexSaveUnconfirmed": "Codex 保存结果未确认。请刷新供应商列表并确认结果后再重试。",
     "codexSaveDraftPreserved": "当前草稿已保留，本次没有保存任何修改。",
     "subagentIncomplete": "Codex 子 Agent 配置未完成：存在已启用且可路由的模型没有声明推理能力，请先在模型目录中配置后再保存。",
+    "subagentIncompleteNamed": "Codex 子 Agent 配置未完成：{{models}} 已启用且可路由但未声明推理能力。请先在模型目录中声明其能力（或停用/排除这些模型），再保存。",
     "subagentValidationFailed": "Codex 子 Agent 配置校验失败：{{detail}}",
     "subagentValidationFallback": "请检查模型目录和 Sub-Agent 配置。",
     "reasoningErrors": {
@@ -3924,6 +3925,7 @@
     "modelSort": "模型排序",
     "topModelDefaultEffort": "首选模型默认推理强度",
     "topModelDefaultEffortHint": "当 {{model}} 排在第一位时，新会话使用此强度。",
+    "reasoningUnknown": "在提供商元数据可用前未知",
     "currentOrder": "当前顺序（可拖动）",
     "sortByModel": "模型名称",
     "sortByProvider": "按提供商分组",

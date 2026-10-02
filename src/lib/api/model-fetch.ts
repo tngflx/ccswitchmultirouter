@@ -46,6 +46,7 @@ export async function fetchModelsForConfig(
   modelsUrl?: string,
   customUserAgent?: string,
   volcengineModelList?: VolcengineModelListOptions,
+  requestedModelIds?: string[],
 ): Promise<FetchedModel[]> {
   return invoke("fetch_models_for_config", {
     request: {
@@ -57,6 +58,10 @@ export async function fetchModelsForConfig(
       volcengineModelListAction: volcengineModelList?.action,
       volcengineAccessKeyId: volcengineModelList?.accessKeyId,
       volcengineSecretAccessKey: volcengineModelList?.secretAccessKey,
+      requestedModelIds:
+        requestedModelIds && requestedModelIds.length > 0
+          ? requestedModelIds
+          : undefined,
     },
   });
 }

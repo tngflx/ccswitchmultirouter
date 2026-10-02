@@ -1436,6 +1436,7 @@
     "codexSaveUnconfirmed": "Codex 儲存結果未確認。請重新整理供應商清單並確認結果後再重試。",
     "codexSaveDraftPreserved": "目前草稿已保留，本次沒有儲存任何變更。",
     "subagentIncomplete": "Codex 子 Agent 配置未完成：存在已啟用且可路由的模型沒有宣告推理能力，請先在模型目錄中配置後再儲存。",
+    "subagentIncompleteNamed": "Codex 子 Agent 配置未完成：{{models}} 已啟用且可路由但未宣告推理能力。請先在模型目錄中宣告其能力（或停用/排除這些模型），再儲存。",
     "subagentValidationFailed": "Codex 子 Agent 配置校驗失敗：{{detail}}",
     "subagentValidationFallback": "請檢查模型目錄和 Sub-Agent 配置。",
     "reasoningErrors": {
@@ -3924,6 +3925,7 @@
     "modelSort": "模型排序",
     "topModelDefaultEffort": "首選模型預設推理強度",
     "topModelDefaultEffortHint": "當 {{model}} 排在第一位時，新工作階段使用此強度。",
+    "reasoningUnknown": "在提供者中繼資料可用前未知",
     "currentOrder": "目前順序（可拖曳）",
     "sortByModel": "模型名稱",
     "sortByProvider": "依提供商分組",

@@ -1235,6 +1235,54 @@ mod tests {
 
     #[test]
     #[serial]
+    fn provider_save_backfills_explicit_catalog_enabled() {
+        with_test_home(|state, _| {
+            let provider = Provider::with_id(
+                "codex-legacy-catalog-backfill".to_string(),
+                "Legacy catalog backfill".to_string(),
+                codex_settings("https://api.example.com/v1", "sk-test"),
+                None,
+            );
+            state
+                .db
+                .save_provider(AppType::Codex.as_str(), &provider)
+                .expect("seed provider with legacy unmarked catalog");
+
+            let mut updated = provider.clone();
+            updated.settings_config["modelCatalog"] = json!({
+                "models": [
+                    { "model": "legacy-unmarked", "contextWindow": 128000 },
+                    { "model": "legacy-excluded", "enabled": false, "contextWindow": 128000 },
+                    { "model": "legacy-included", "enabled": true, "contextWindow": 128000 }
+                ]
+            });
+            ProviderService::update(state, AppType::Codex, None, updated)
+                .expect("provider update must backfill explicit catalog inclusion");
+
+            let saved = state
+                .db
+                .get_provider_by_id("codex-legacy-catalog-backfill", AppType::Codex.as_str())
+                .expect("query saved provider")
+                .expect("provider persists");
+            let models = saved.settings_config["modelCatalog"]["models"]
+                .as_array()
+                .expect("catalog models array");
+            let enabled_of = |model: &str| {
+                models
+                    .iter()
+                    .find(|row| row["model"] == model)
+                    .and_then(|row| row["enabled"].as_bool())
+            };
+            // Legacy omission behaved as included; the backfill makes that
+            // explicit without ever flipping an existing declaration.
+            assert_eq!(enabled_of("legacy-unmarked"), Some(true));
+            assert_eq!(enabled_of("legacy-excluded"), Some(false));
+            assert_eq!(enabled_of("legacy-included"), Some(true));
+        });
+    }
+
+    #[test]
+    #[serial]
     fn force_repair_switch_backs_up_and_repairs_live_alias_and_provider_reasoning() {
         with_test_home(|state, _| {
             let live = r#"[agents]
@@ -4902,11 +4950,42 @@ impl ProviderService {
         mut provider: Provider,
     ) -> Result<Provider, AppError> {
         Self::normalize_provider_if_claude(app_type, &mut provider);
+        Self::stamp_explicit_codex_catalog_enabled(app_type, &mut provider);
         Self::validate_provider_settings(app_type, &provider)?;
         normalize_provider_common_config_for_storage(state.db.as_ref(), app_type, &mut provider)?;
         Self::normalize_usage_script_credential_overrides(app_type, &mut provider);
         Self::validate_codex_subagent_v2_provider_candidate(state, &provider)?;
         Ok(provider)
+    }
+
+    /// Make legacy catalog inclusion explicit at the save boundary.
+    ///
+    /// Catalog rows persisted before explicit inclusion existed carry no
+    /// `enabled` field, and every consumer reads a missing field as included
+    /// (`enabled !== false`). Those rows are the user's live routed inventory,
+    /// so the faithful backfill is an explicit `true` — never a silent
+    /// exclusion. Rows that already declare `enabled` (including `false`
+    /// tombstones) are untouched. Codex only: `modelCatalog` is a Codex
+    /// contract.
+    fn stamp_explicit_codex_catalog_enabled(app_type: &AppType, provider: &mut Provider) {
+        if *app_type != AppType::Codex {
+            return;
+        }
+        let Some(models) = provider
+            .settings_config
+            .pointer_mut("/modelCatalog/models")
+            .and_then(serde_json::Value::as_array_mut)
+        else {
+            return;
+        };
+        for model in models.iter_mut() {
+            let Some(row) = model.as_object_mut() else {
+                continue;
+            };
+            if !row.contains_key("enabled") {
+                row.insert("enabled".to_string(), serde_json::Value::Bool(true));
+            }
+        }
     }
 
     fn persist_provider_mutation(

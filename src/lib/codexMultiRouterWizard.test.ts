@@ -147,7 +147,7 @@ describe("mergeFetchedModelsIntoWizardProvider", () => {
     expect(merged.settingsConfig.modelCatalog?.models).toHaveLength(1);
   });
 
-  it("publishes every newly fetched grouped-provider model by default", () => {
+  it("keeps newly fetched grouped-provider models inventory-only until selected", () => {
     const source: Provider = {
       ...deepseekSource,
       id: "sublyx",
@@ -180,15 +180,64 @@ describe("mergeFetchedModelsIntoWizardProvider", () => {
     expect(
       refreshed.settingsConfig.modelCatalog?.models
         .slice(1)
-        .every((model: CodexCatalogModel) => model.enabled !== false),
+        .every((model: CodexCatalogModel) => model.enabled === false),
     ).toBe(true);
 
     const result = buildCodexMultiRouterWizardPlan([refreshed], [refreshed]);
     const route = result.plan.settingsConfig.codexRouting?.routes?.[0];
-    expect(route?.modelSelection).toEqual({ mode: "all" });
+    expect(route?.modelSelection).toEqual({
+      mode: "include",
+      models: ["fallback-model"],
+    });
     expect(
       result.persistedSourceProviders[0].settingsConfig.modelCatalog?.models,
     ).toEqual(refreshed.settingsConfig.modelCatalog?.models);
+  });
+
+  it("keeps a large fetched inventory from becoming the full routable catalog", () => {
+    const selectedModels = Array.from({ length: 9 }, (_, index) => ({
+      model: `sublyx-selected-${index + 1}`,
+      upstreamModel: `sublyx-selected-${index + 1}`,
+    }));
+    const fetchedModels = [
+      ...selectedModels.map(({ model }) => ({
+        id: model,
+        ownedBy: "sublyx",
+      })),
+      ...Array.from({ length: 25 }, (_, index) => ({
+        id: `sublyx-discovered-${index + 1}`,
+        ownedBy: "sublyx",
+      })),
+    ];
+    const source: Provider = {
+      ...deepseekSource,
+      id: "sublyx",
+      name: "Sublyx",
+      settingsConfig: {
+        ...deepseekSource.settingsConfig,
+        modelCatalog: { models: selectedModels },
+      },
+    };
+
+    const refreshed = mergeFetchedModelsIntoWizardProvider(
+      source,
+      fetchedModels,
+      { preserveExistingSelection: true, appendNewModels: true },
+    );
+    const result = buildCodexMultiRouterWizardPlan([refreshed], [refreshed]);
+    const route = result.plan.settingsConfig.codexRouting?.routes?.[0];
+    const persistedModels =
+      result.persistedSourceProviders[0].settingsConfig.modelCatalog?.models ??
+      [];
+
+    expect(persistedModels).toHaveLength(34);
+    expect(
+      persistedModels.filter((model: CodexCatalogModel) => model.enabled !== false),
+    ).toHaveLength(9);
+    expect(route?.modelSelection).toEqual({
+      mode: "include",
+      models: selectedModels.map((model) => model.model),
+    });
   });
 });
 

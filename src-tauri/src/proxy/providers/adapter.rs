@@ -46,6 +46,21 @@ pub trait ProviderAdapter: Send + Sync {
         self.extract_auth_for_model(provider, outbound_model.or(request_model))
     }
 
+    /// Resolve authentication for one request, allowing the adapter to reject
+    /// a request it cannot authenticate correctly.
+    ///
+    /// Adapters that support model-scoped credentials override this when a
+    /// scoped model must never fall back to the provider's main credential.
+    /// The default preserves the existing infallible behavior.
+    fn resolve_auth_for_request_model(
+        &self,
+        provider: &Provider,
+        request_model: Option<&str>,
+        outbound_model: Option<&str>,
+    ) -> Result<Option<AuthInfo>, ProxyError> {
+        Ok(self.extract_auth_for_request_model(provider, request_model, outbound_model))
+    }
+
     /// 构建请求 URL
     fn build_url(&self, base_url: &str, endpoint: &str) -> String;
 

@@ -3595,6 +3595,46 @@ JSON.stringify({
     }
 
     #[test]
+    fn model_picker_fallback_descriptor_keeps_renderer_identity_for_reasoning_choices() {
+        let result = run_model_picker_patch_core_probe_with_payload(
+            json!({
+                "defaultModel": "gpt-6.1-sol-relay",
+                "modelNames": ["gpt-6.1-sol-relay"],
+                "models": [{
+                    "model": "gpt-6.1-sol-relay",
+                    "defaultReasoningEffort": "medium",
+                    "supportedReasoningLevels": [
+                        {"effort": "low"},
+                        {"effort": "medium"},
+                        {"effort": "high"}
+                    ]
+                }]
+            }),
+            r#"
+const models = [];
+patchModelArray(models, true);
+JSON.stringify({
+  model: models[0].model,
+  id: models[0].id,
+  slug: models[0].slug,
+  name: models[0].name,
+  defaultEffort: models[0].defaultReasoningEffort,
+  efforts: models[0].supportedReasoningEfforts.map((item) => item.reasoningEffort),
+  levels: models[0].supportedReasoningLevels.map((item) => item.effort),
+});
+"#,
+        );
+
+        assert_eq!(result["model"], "gpt-6.1-sol-relay");
+        assert_eq!(result["id"], "gpt-6.1-sol-relay");
+        assert_eq!(result["slug"], "gpt-6.1-sol-relay");
+        assert_eq!(result["name"], "gpt-6.1-sol-relay");
+        assert_eq!(result["defaultEffort"], "medium");
+        assert_eq!(result["efforts"], json!(["low", "medium", "high"]));
+        assert_eq!(result["levels"], json!(["low", "medium", "high"]));
+    }
+
+    #[test]
     fn model_picker_patch_normalizes_reasoning_aliases_case_insensitively() {
         let result = run_model_picker_patch_core_probe_with_payload(
             json!({
@@ -3706,6 +3746,40 @@ JSON.stringify({
         assert_eq!(result["model"], "gpt-6.1-sol-relay");
         assert_eq!(result["aliases"], json!(["gpt-6.1-sol-openrouter"]));
         assert_eq!(result["efforts"], json!(["high"]));
+    }
+
+    #[test]
+    fn model_picker_keeps_grouped_api_key_alias_internal_and_uses_friendly_label() {
+        let result = run_model_picker_patch_core_probe_with_payload(
+            json!({
+                "defaultModel": "gpt-6-sol--ccg-7f3d2b1a",
+                "modelNames": ["gpt-6-sol--ccg-7f3d2b1a"],
+                "models": [{
+                    "model": "gpt-6-sol--ccg-7f3d2b1a",
+                    "upstreamModel": "gpt-6-sol",
+                    "apiKeyGroupId": "7f3d2b1a",
+                    "displayName": "GPT 6 Sol [Sublyx key]",
+                    "providerName": "Sublyx"
+                }]
+            }),
+            r#"
+const models = [{
+  model: "gpt-6-sol--ccg-7f3d2b1a",
+  displayName: "gpt-6-sol--ccg-7f3d2b1a",
+}];
+patchModelArray(models);
+JSON.stringify({
+  model: models[0].model,
+  displayName: models[0].displayName,
+  providerName: models[0].providerName,
+});
+"#,
+        );
+
+        assert_eq!(result["model"], "gpt-6-sol--ccg-7f3d2b1a");
+        assert_eq!(result["displayName"], "GPT 6 Sol [Sublyx key]");
+        assert_eq!(result["providerName"], "Sublyx");
+        assert_ne!(result["displayName"], result["model"]);
     }
 
     #[test]

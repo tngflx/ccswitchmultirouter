@@ -48,6 +48,27 @@ pub(crate) const CODEX_ACCOUNT_POOL_ENABLED: &str = "codexAccountPoolEnabled";
 const QWEN_VLLM_MIN_OUTPUT_TOKENS: u64 = 2_048;
 const RETIRED_QWEN_VLLM_DEFAULT_OUTPUT_TOKENS: u64 = 32_768;
 
+/// Marker the frontend appends when it generates a key-group-scoped catalog row.
+/// Must stay in sync with `GROUP_ALIAS_MARKER` in
+/// `src/components/providers/forms/codexApiKeyGroupRouting.ts`.
+const CODEX_API_KEY_GROUP_ALIAS_MARKER: &str = "--ccg-";
+
+/// Outcome of resolving a model-scoped API key.
+///
+/// `NotScoped` and `Unresolvable` are deliberately distinct. Both used to
+/// collapse into `None`, which made the caller fall back to the provider's
+/// main credential and silently authenticate a group-scoped model with the
+/// wrong identity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CodexGroupedKey {
+ /// The model is not bound to a key group; the provider credential applies.
+ NotScoped,
+ /// A scoped credential was selected.
+ Resolved(String),
+ /// The model is bound to a key group but no usable scoped credential exists.
+ Unresolvable(String),
+}
+
 /// Codex Desktop 看到的 MultiRouter 认证门面。
 ///
 /// 该枚举只描述 Codex 到 CCSM 本地代理这一跳如何携带认证，不描述最终上游
@@ -1004,6 +1025,71 @@ pub fn codex_route_target_provider_id(provider: &Provider) -> Option<&str> {
         .filter(|value| !value.is_empty())
 }
 
+/// Copy isolated key-group bindings from the target provider onto the Router's
+/// projected catalog.
+///
+/// The Router projection rebuilds every catalog row field by field and has no
+/// notion of key groups, so a projected `--ccg-` row carries the scoped name but
+/// no `apiKeyGroupId`. Materialization then replaces the target provider's own
+/// catalog with that projection, which would leave isolated credential
+/// resolution with no group to select. Restore the binding so a scoped model
+/// resolves its scoped credential instead of falling back to the provider key.
+fn restore_isolated_key_group_bindings(
+    mut projected_catalog: JsonValue,
+    target_settings: &JsonValue,
+) -> JsonValue {
+    let Some(target_rows) = target_settings
+        .get("modelCatalog")
+        .and_then(|catalog| catalog.get("models"))
+        .and_then(JsonValue::as_array)
+    else {
+        return projected_catalog;
+    };
+    let bindings = target_rows
+        .iter()
+        .filter_map(|row| {
+            let model = row.get("model").and_then(JsonValue::as_str)?.trim();
+            let group_id = row
+                .get("apiKeyGroupId")
+                .or_else(|| row.get("api_key_group_id"))
+                .and_then(JsonValue::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())?;
+            let generated = row
+                .get("apiKeyGroupGenerated")
+                .or_else(|| row.get("api_key_group_generated"))
+                .and_then(JsonValue::as_bool)
+                .unwrap_or(true);
+            Some((model.to_string(), (group_id.to_string(), generated)))
+        })
+        .collect::<HashMap<String, (String, bool)>>();
+    if bindings.is_empty() {
+        return projected_catalog;
+    }
+    let Some(rows) = projected_catalog
+        .get_mut("models")
+        .and_then(JsonValue::as_array_mut)
+    else {
+        return projected_catalog;
+    };
+    for row in rows.iter_mut() {
+        let Some(model) = row.get("model").and_then(JsonValue::as_str) else {
+            continue;
+        };
+        let Some((group_id, generated)) = bindings.get(model.trim()) else {
+            continue;
+        };
+        if let Some(entry) = row.as_object_mut() {
+            entry.insert(
+                "apiKeyGroupId".to_string(),
+                JsonValue::String(group_id.clone()),
+            );
+            entry.insert("apiKeyGroupGenerated".to_string(), JsonValue::Bool(*generated));
+        }
+    }
+    projected_catalog
+}
+
 /// 用 route 命中的真实目标 provider 作为底座，生成本次请求的 effective provider。
 ///
 /// route 引用已有供应商时，base_url、认证、apiFormat、reasoning 等转换配置都应该跟随
@@ -1050,7 +1136,10 @@ pub fn materialize_codex_routed_provider_from_target(
         .and_then(|settings| settings.get("modelCatalog"))
         .cloned()
     {
-        settings.insert("modelCatalog".to_string(), catalog);
+        settings.insert(
+            "modelCatalog".to_string(),
+            restore_isolated_key_group_bindings(catalog, &target_provider.settings_config),
+        );
     }
 
     if let Some(model_override) = route_settings
@@ -3176,13 +3265,31 @@ fn infer_codex_chat_reasoning_config(
         .to_ascii_lowercase();
     let name = provider.name.to_ascii_lowercase();
 
-    // 平台优先：聚合 / 托管平台的 reasoning 接口由平台的推理框架决定，而非模型官方实现，
-    // 因此先按平台标识（仅 name + base_url，不含 model 名）判定并覆盖模型规则。
-    if let Some(config) = infer_aggregator_platform_config(&name, &base_url) {
-        return Some(config);
-    }
-
     let haystack = format!("{name} {base_url} {model}");
+    let recognized_provider = [
+        "deepseek",
+        "stepfun",
+        "moonshot",
+        "kimi",
+        "glm",
+        "zhipu",
+        "z.ai",
+        "bigmodel.cn",
+        "dashscope",
+        "bailian",
+        "minimax",
+        "mimo",
+        "matrixminecraft",
+        "vllm",
+    ]
+    .iter()
+    .any(|token| name.contains(token) || base_url.contains(token));
+    let explicitly_recognized_model = model == "step-3.5-flash-2603";
+    if !recognized_provider && !explicitly_recognized_model {
+        // Generic gateways are intentionally unknown until explicit catalog
+        // metadata or authenticated `/models` data proves a wire contract.
+        return None;
+    }
 
     if haystack.contains("deepseek") {
         return Some(CodexChatReasoningConfig {
@@ -3297,55 +3404,6 @@ fn infer_codex_chat_reasoning_config(
             supports_thinking: Some(true),
             supports_effort: Some(false),
             thinking_param: Some("thinking".to_string()),
-            effort_param: Some("none".to_string()),
-            effort_value_mode: None,
-            min_output_tokens: None,
-            default_output_tokens: None,
-            output_format: Some("reasoning_content".to_string()),
-            disable_contract: false,
-        });
-    }
-
-    None
-}
-
-/// 聚合 / 托管平台的 reasoning 接口由平台决定：同一个模型在不同平台参数可能完全不同
-/// （DeepSeek 官方用 `thinking:{type}`、SiliconFlow 用 `enable_thinking`、
-/// OpenRouter 用原生 `reasoning:{effort}` 对象）。仅以平台标识（name / base_url）判定，
-/// 绝不掺入 model 名——model 名属于模型厂商，会把托管平台误判成模型官方接口。
-fn infer_aggregator_platform_config(
-    name: &str,
-    base_url: &str,
-) -> Option<CodexChatReasoningConfig> {
-    let platform = format!("{name} {base_url}");
-
-    // OpenRouter：用原生归一化对象 `reasoning: { effort }`（由 OpenRouter 翻译成各底层
-    // 模型的正确推理参数，比顶层 OpenAI 别名 reasoning_effort 覆盖面更全）。effort 走
-    // "openrouter" 值映射：枚举为 xhigh|high|medium|low|minimal，无 max——max 会触发
-    // `400 reasoning_effort: Invalid option`（见 openclaw#77350），故钳到 xhigh。
-    // 安全降级：不发 `thinking:{type}`（OpenRouter 不认该字段），避免误配导致请求被拒。
-    if platform.contains("openrouter") {
-        return Some(CodexChatReasoningConfig {
-            supports_thinking: Some(false),
-            supports_effort: Some(true),
-            thinking_param: Some("none".to_string()),
-            effort_param: Some("reasoning.effort".to_string()),
-            effort_value_mode: Some("openrouter".to_string()),
-            min_output_tokens: None,
-            default_output_tokens: None,
-            output_format: Some("auto".to_string()),
-            disable_contract: false,
-        });
-    }
-
-    // SiliconFlow：平台级统一 `enable_thinking`，思维回传 reasoning_content。
-    // 安全降级：不按 reasoning_effort 发 effort（平台用 thinking_budget 控制深度，
-    // 发 reasoning_effort 反而可能不被接受）。
-    if platform.contains("siliconflow") {
-        return Some(CodexChatReasoningConfig {
-            supports_thinking: Some(true),
-            supports_effort: Some(false),
-            thinking_param: Some("enable_thinking".to_string()),
             effort_param: Some("none".to_string()),
             effort_value_mode: None,
             min_output_tokens: None,
@@ -3617,6 +3675,19 @@ impl CodexAdapter {
             .filter(|group_id| !group_id.is_empty())
     }
 
+    /// Whether a model name is a generated key-group alias.
+    ///
+    /// This is the second scoping signal, independent of the catalog row. A
+    /// partially rewritten catalog can drop `apiKeyGroupId` while the
+    /// generated `--ccg-` name survives; treating that as "not scoped" is
+    /// exactly how a scoped model ends up on the provider's main credential.
+    fn is_generated_group_alias(request_model: &str) -> bool {
+        request_model
+            .trim()
+            .to_ascii_lowercase()
+            .contains(CODEX_API_KEY_GROUP_ALIAS_MARKER)
+    }
+
     fn group_keys(group: &JsonValue) -> Vec<&str> {
         group
             .get("apiKeys")
@@ -3703,42 +3774,82 @@ impl CodexAdapter {
         provider: &Provider,
         request_model: &str,
         outbound_model: &str,
-    ) -> Option<String> {
-        let groups = provider
+    ) -> CodexGroupedKey {
+        let Some(groups) = provider
             .settings_config
             .get("codexApiKeyGroups")
-            .or_else(|| provider.settings_config.get("codex_api_key_groups"))?
-            .as_array()?;
+            .or_else(|| provider.settings_config.get("codex_api_key_groups"))
+            .and_then(JsonValue::as_array)
+        else {
+            return CodexGroupedKey::NotScoped;
+        };
         let request_model = request_model.trim();
         let outbound_model = outbound_model.trim();
         if request_model.is_empty() || outbound_model.is_empty() {
-            return None;
+            return CodexGroupedKey::NotScoped;
         }
 
         if Self::grouped_key_mode(provider) == "isolated" {
-            let group_id = Self::catalog_api_key_group_id(provider, request_model)?;
-            let mut matching_groups = groups.iter().filter(|group| {
-                group.get("enabled").and_then(JsonValue::as_bool) != Some(false)
-                    && group
+            // Once a model is bound to a key group, the provider's main
+            // credential is a *different* identity, not an acceptable
+            // substitute. Resolving nothing here used to fall through to
+            // `extract_auth`, which silently sent a scoped model on the
+            // wrong key. Fail closed instead and name the model.
+            let Some(group_id) = Self::catalog_api_key_group_id(provider, request_model) else {
+                if Self::is_generated_group_alias(request_model) {
+                    return CodexGroupedKey::Unresolvable(format!(
+                        "model `{request_model}` is a key-group-scoped catalog alias but its \
+                         catalog row has no `apiKeyGroupId`; refusing to fall back to the \
+                         provider API key"
+                    ));
+                }
+                return CodexGroupedKey::NotScoped;
+            };
+            let mut matching_groups = groups
+                .iter()
+                .filter(|group| {
+                    group
                         .get("id")
                         .and_then(JsonValue::as_str)
                         .is_some_and(|candidate| candidate.trim() == group_id)
-            });
-            let group = matching_groups.next()?;
+                });
+            let Some(group) = matching_groups.next() else {
+                return CodexGroupedKey::Unresolvable(format!(
+                    "model `{request_model}` is bound to key group `{group_id}`, but that group \
+                     no longer exists"
+                ));
+            };
             if matching_groups.next().is_some() {
-                log::error!(
-                    "[CodexKeyGroup] duplicate isolated group id rejected: {}",
-                    group_id
-                );
-                return None;
+                return CodexGroupedKey::Unresolvable(format!(
+                    "model `{request_model}` is bound to key group `{group_id}`, but duplicate \
+                     groups share that id"
+                ));
+            }
+            if group.get("enabled").and_then(JsonValue::as_bool) == Some(false) {
+                return CodexGroupedKey::Unresolvable(format!(
+                    "model `{request_model}` is bound to key group `{group_id}`, but that group \
+                     is disabled"
+                ));
             }
             let keys = Self::group_keys(group);
+            if keys.is_empty() {
+                return CodexGroupedKey::Unresolvable(format!(
+                    "model `{request_model}` is bound to key group `{group_id}`, but that group \
+                     has no API keys"
+                ));
+            }
             log::debug!(
                 "[CodexKeyGroup] isolated model={} selected_group={}",
                 request_model,
                 group_id
             );
-            return Self::select_key_from_group(provider, group, &keys);
+            return match Self::select_key_from_group(provider, group, &keys) {
+                Some(key) => CodexGroupedKey::Resolved(key),
+                None => CodexGroupedKey::Unresolvable(format!(
+                    "model `{request_model}` is bound to key group `{group_id}`, but no usable \
+                     key was selected"
+                )),
+            };
         }
 
         let mut selected_specificity = 0;
@@ -3763,7 +3874,7 @@ impl CodexAdapter {
             }
         }
         if selected_groups.is_empty() {
-            return None;
+            return CodexGroupedKey::NotScoped;
         }
         let mut keys = self
             .extract_key(provider)
@@ -3778,7 +3889,7 @@ impl CodexAdapter {
         let mut seen_keys = std::collections::HashSet::new();
         keys.retain(|key| seen_keys.insert(key.clone()));
         if keys.is_empty() {
-            return None;
+            return CodexGroupedKey::NotScoped;
         }
         let cursor_key = format!(
             "{}:pooled:{}:{}",
@@ -3786,7 +3897,9 @@ impl CodexAdapter {
             selected_specificity,
             outbound_model.to_ascii_lowercase()
         );
-        let mut cursors = CODEX_API_KEY_GROUP_CURSORS.lock().ok()?;
+        let Ok(mut cursors) = CODEX_API_KEY_GROUP_CURSORS.lock() else {
+            return CodexGroupedKey::NotScoped;
+        };
         let cursor = cursors.entry(cursor_key).or_insert(0);
         let index = *cursor % keys.len();
         *cursor = cursor.wrapping_add(1);
@@ -3801,7 +3914,7 @@ impl CodexAdapter {
             outbound_model,
             group_ids
         );
-        Some(keys[index].clone())
+        CodexGroupedKey::Resolved(keys[index].clone())
     }
 }
 
@@ -3929,11 +4042,29 @@ impl ProviderAdapter for CodexAdapter {
         request_model: Option<&str>,
         outbound_model: Option<&str>,
     ) -> Option<AuthInfo> {
+        self.resolve_auth_for_request_model(provider, request_model, outbound_model)
+            .ok()
+            .flatten()
+    }
+
+    /// Resolve request auth, failing closed when a key-group-scoped model has
+    /// no usable scoped credential.
+    ///
+    /// Unlike [`Self::extract_auth_for_request_model`], an unresolvable group
+    /// binding is an error rather than a silent fallback to the provider's main
+    /// API key. The forwarder surfaces this as a 401 that names the model and
+    /// the reason, instead of an opaque upstream rejection.
+    fn resolve_auth_for_request_model(
+        &self,
+        provider: &Provider,
+        request_model: Option<&str>,
+        outbound_model: Option<&str>,
+    ) -> Result<Option<AuthInfo>, ProxyError> {
         if provider_uses_native_codex_auth(provider)
             || provider_is_managed_codex_oauth(provider)
             || provider.is_xai_oauth()
         {
-            return self.extract_auth(provider);
+            return Ok(self.extract_auth(provider));
         }
         let strategy = if codex_provider_uses_anthropic(provider)
             && provider
@@ -3946,13 +4077,19 @@ impl ProviderAdapter for CodexAdapter {
         } else {
             AuthStrategy::Bearer
         };
-        request_model
-            .zip(outbound_model.or(request_model))
-            .and_then(|(request_model, outbound_model)| {
-                self.extract_grouped_key(provider, request_model, outbound_model)
-            })
-            .map(|key| AuthInfo::new(key, strategy))
-            .or_else(|| self.extract_auth(provider))
+        let Some((request_model, outbound_model)) =
+            request_model.zip(outbound_model.or(request_model))
+        else {
+            return Ok(self.extract_auth(provider));
+        };
+        match self.extract_grouped_key(provider, request_model, outbound_model) {
+            CodexGroupedKey::Resolved(key) => Ok(Some(AuthInfo::new(key, strategy))),
+            CodexGroupedKey::NotScoped => Ok(self.extract_auth(provider)),
+            CodexGroupedKey::Unresolvable(reason) => {
+                log::error!("[CodexKeyGroup] refusing to authenticate scoped model: {reason}");
+                Err(ProxyError::AuthError(reason))
+            }
+        }
     }
 
     fn build_url(&self, base_url: &str, endpoint: &str) -> String {
@@ -4335,6 +4472,252 @@ mod tests {
                 .expect("group auth")
                 .api_key,
             "astra-key"
+        );
+    }
+
+    /// Build a Sublyx-shaped provider whose catalog carries one group-scoped
+    /// row, so the fail-closed cases can be exercised against realistic state.
+    fn sublyx_group_scoped_provider(catalog_row: serde_json::Value) -> Provider {
+        Provider::with_id(
+            "sublyx".to_string(),
+            "Sublyx".to_string(),
+            json!({
+                "auth": {"OPENAI_API_KEY": "primary-key"},
+                "codexApiKeyGroupMode": "isolated",
+                "codexApiKeyGroups": [{
+                    "id": "f2073c48",
+                    "label": "emergencyuse",
+                    "enabled": true,
+                    "strategy": "fixed",
+                    "apiKeys": ["group-key"],
+                    "models": ["gpt-6.1-sol"]
+                }],
+                "modelCatalog": {"models": [catalog_row]}
+            }),
+            None,
+        )
+    }
+
+    #[test]
+    fn scoped_model_with_lost_group_binding_fails_closed() {
+        // Regression: this row kept the generated `--ccg-` name but lost
+        // `apiKeyGroupId`. Resolution used to return `None`, which fell through
+        // to the provider's main key and silently authenticated a scoped model
+        // with the wrong identity.
+        let provider = sublyx_group_scoped_provider(json!({
+            "model": "gpt-6.1-sol--ccg-f2073c48",
+            "upstreamModel": "gpt-6.1-sol"
+        }));
+        let adapter = CodexAdapter::new();
+
+        let error = adapter
+            .resolve_auth_for_request_model(
+                &provider,
+                Some("gpt-6.1-sol--ccg-f2073c48"),
+                Some("gpt-6.1-sol"),
+            )
+            .expect_err("a scoped model without a resolvable group must not fall back");
+        let message = error.to_string();
+        assert!(
+            message.contains("gpt-6.1-sol--ccg-f2073c48"),
+            "error must name the offending model: {message}"
+        );
+        assert!(
+            message.contains("apiKeyGroupId"),
+            "error must name the missing binding: {message}"
+        );
+    }
+
+    #[test]
+    fn multirouter_projection_restores_the_target_key_group_binding() {
+        // Regression: the Router projection rebuilds catalog rows field by field
+        // and never emits `apiKeyGroupId`. Materialization replaces the target
+        // provider's catalog with that projection, so a projected `--ccg-` row
+        // arrived with a scoped name but no binding. Isolated resolution then
+        // had no group to select and failed closed, breaking the routed path
+        // that had been working.
+        let router = create_provider(json!({
+            "codexRouting": {
+                "enabled": true,
+                "routes": [{
+                    "id": "sublyx-astra",
+                    "label": "Sublyx Astra",
+                    "targetProviderId": "sublyx",
+                    "match": {"models": ["gpt-6.1-sol--ccg-f2073c48"]},
+                    "upstream": {
+                        "modelMap": {"gpt-6.1-sol--ccg-f2073c48": "gpt-6.1-sol"},
+                        "auth": {"source": "provider_config"}
+                    }
+                }]
+            },
+            // Mirrors the real projection: scoped name, no group binding.
+            "modelCatalog": {"models": [{
+                "model": "gpt-6.1-sol--ccg-f2073c48",
+                "upstreamModel": "gpt-6.1-sol",
+                "providerName": "Sublyx"
+            }]}
+        }));
+        let target = Provider::with_id(
+            "sublyx".to_string(),
+            "Sublyx".to_string(),
+            json!({
+                "auth": {"OPENAI_API_KEY": "primary-key"},
+                "codexApiKeyGroupMode": "isolated",
+                "codexApiKeyGroups": [{
+                    "id": "f2073c48",
+                    "label": "emergencyuse",
+                    "enabled": true,
+                    "strategy": "fixed",
+                    "apiKeys": ["group-key"],
+                    "models": ["gpt-6.1-sol"]
+                }],
+                "modelCatalog": {"models": [{
+                    "model": "gpt-6.1-sol--ccg-f2073c48",
+                    "upstreamModel": "gpt-6.1-sol",
+                    "apiKeyGroupId": "f2073c48",
+                    "apiKeyGroupGenerated": true
+                }]}
+            }),
+            None,
+        );
+        let routed = resolve_codex_model_routed_provider(
+            &router,
+            &json!({"model": "gpt-6.1-sol--ccg-f2073c48"}),
+        )
+        .expect("routed provider");
+        let materialized = materialize_codex_routed_provider_from_target(&routed, &target);
+        let adapter = CodexAdapter::new();
+
+        assert_eq!(
+            adapter
+                .resolve_auth_for_request_model(
+                    &materialized,
+                    Some("gpt-6.1-sol--ccg-f2073c48"),
+                    Some("gpt-6.1-sol"),
+                )
+                .expect("routed scoped model must resolve")
+                .expect("group auth")
+                .api_key,
+            "group-key"
+        );
+    }
+
+    #[test]
+    fn scoped_model_with_disabled_group_fails_closed() {
+        let mut provider = sublyx_group_scoped_provider(json!({
+            "model": "gpt-6.1-sol--ccg-f2073c48",
+            "upstreamModel": "gpt-6.1-sol",
+            "apiKeyGroupId": "f2073c48",
+            "apiKeyGroupGenerated": true
+        }));
+        provider.settings_config["codexApiKeyGroups"][0]["enabled"] = json!(false);
+        let adapter = CodexAdapter::new();
+
+        let error = adapter
+            .resolve_auth_for_request_model(
+                &provider,
+                Some("gpt-6.1-sol--ccg-f2073c48"),
+                Some("gpt-6.1-sol"),
+            )
+            .expect_err("a disabled group must not be used implicitly");
+        assert!(
+            error.to_string().contains("disabled"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn scoped_model_with_missing_group_fails_closed() {
+        let mut provider = sublyx_group_scoped_provider(json!({
+            "model": "gpt-6.1-sol--ccg-vanished",
+            "upstreamModel": "gpt-6.1-sol",
+            "apiKeyGroupId": "vanished",
+            "apiKeyGroupGenerated": true
+        }));
+        provider.settings_config["codexApiKeyGroups"] = json!([]);
+        let adapter = CodexAdapter::new();
+
+        let error = adapter
+            .resolve_auth_for_request_model(
+                &provider,
+                Some("gpt-6.1-sol--ccg-vanished"),
+                Some("gpt-6.1-sol"),
+            )
+            .expect_err("a binding to a deleted group must not fall back");
+        assert!(
+            error.to_string().contains("no longer exists"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn scoped_model_with_empty_group_keys_fails_closed() {
+        let mut provider = sublyx_group_scoped_provider(json!({
+            "model": "gpt-6.1-sol--ccg-f2073c48",
+            "upstreamModel": "gpt-6.1-sol",
+            "apiKeyGroupId": "f2073c48",
+            "apiKeyGroupGenerated": true
+        }));
+        provider.settings_config["codexApiKeyGroups"][0]["apiKeys"] = json!([]);
+        let adapter = CodexAdapter::new();
+
+        let error = adapter
+            .resolve_auth_for_request_model(
+                &provider,
+                Some("gpt-6.1-sol--ccg-f2073c48"),
+                Some("gpt-6.1-sol"),
+            )
+            .expect_err("a group without keys must not fall back");
+        assert!(
+            error.to_string().contains("no API keys"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn rebound_scoped_model_uses_the_group_key() {
+        let provider = sublyx_group_scoped_provider(json!({
+            "model": "gpt-6.1-sol--ccg-f2073c48",
+            "upstreamModel": "gpt-6.1-sol",
+            "apiKeyGroupId": "f2073c48",
+            "apiKeyGroupGenerated": true
+        }));
+        let adapter = CodexAdapter::new();
+
+        assert_eq!(
+            adapter
+                .resolve_auth_for_request_model(
+                    &provider,
+                    Some("gpt-6.1-sol--ccg-f2073c48"),
+                    Some("gpt-6.1-sol"),
+                )
+                .expect("rebound scoped model resolves")
+                .expect("group auth")
+                .api_key,
+            "group-key"
+        );
+    }
+
+    #[test]
+    fn unscoped_model_still_uses_the_provider_key() {
+        // The fail-closed rule must not break models that were never scoped.
+        let provider = sublyx_group_scoped_provider(json!({
+            "model": "gpt-6.1-sol",
+            "upstreamModel": "gpt-6.1-sol"
+        }));
+        let adapter = CodexAdapter::new();
+
+        assert_eq!(
+            adapter
+                .resolve_auth_for_request_model(
+                    &provider,
+                    Some("gpt-6.1-sol"),
+                    Some("gpt-6.1-sol"),
+                )
+                .expect("unscoped model resolves")
+                .expect("provider auth")
+                .api_key,
+            "primary-key"
         );
     }
 
@@ -7503,7 +7886,7 @@ wire_api = "chat"
     }
 
     #[test]
-    fn test_resolve_codex_chat_reasoning_openrouter_platform_overrides_model() {
+    fn test_resolve_codex_chat_reasoning_openrouter_without_metadata_is_unknown() {
         let provider = create_provider(json!({
             "config": r#"
 model_provider = "openrouter"
@@ -7516,17 +7899,13 @@ wire_api = "chat"
 "#
         }));
 
-        // 模型名含 "deepseek"，但平台是 OpenRouter —— 平台规则必须覆盖模型规则。
+        // OpenRouter's platform shape is not guessed from the gateway URL.
+        // Authenticated /models metadata or an explicit declaration is required.
         let config = resolve_codex_chat_reasoning_config(
             &provider,
             &json!({ "model": "deepseek/deepseek-chat-v3.1" }),
-        )
-        .unwrap();
-
-        assert_eq!(config.thinking_param.as_deref(), Some("none"));
-        assert_eq!(config.effort_param.as_deref(), Some("reasoning.effort"));
-        assert_eq!(config.effort_value_mode.as_deref(), Some("openrouter"));
-        assert_eq!(config.supports_effort, Some(true));
+        );
+        assert!(config.is_none());
     }
 
     #[test]
@@ -7566,7 +7945,7 @@ wire_api = "chat"
     }
 
     #[test]
-    fn test_resolve_codex_chat_reasoning_siliconflow_platform_overrides_minimax() {
+    fn test_resolve_codex_chat_reasoning_siliconflow_without_metadata_is_unknown() {
         let provider = create_provider(json!({
             "config": r#"
 model_provider = "siliconflow"
@@ -7579,16 +7958,13 @@ wire_api = "chat"
 "#
         }));
 
-        // 模型是 MiniMax（官方用 reasoning_split），但平台是 SiliconFlow —— 应走平台的 enable_thinking。
+        // The gateway must not inherit MiniMax or SiliconFlow heuristics without
+        // explicit metadata.
         let config = resolve_codex_chat_reasoning_config(
             &provider,
             &json!({ "model": "MiniMaxAI/MiniMax-M2.5" }),
-        )
-        .unwrap();
-
-        assert_eq!(config.thinking_param.as_deref(), Some("enable_thinking"));
-        assert_eq!(config.supports_effort, Some(false));
-        assert_eq!(config.output_format.as_deref(), Some("reasoning_content"));
+        );
+        assert!(config.is_none());
     }
     /// 验证 MultiRouter 的 modelCatalog 在路由物料化后仍可访问。
     ///

@@ -99,6 +99,11 @@ pub struct FetchModelsForConfigRequest {
     pub volcengine_model_list_action: Option<String>,
     pub volcengine_access_key_id: Option<String>,
     pub volcengine_secret_access_key: Option<String>,
+    /// Optional canonical IDs selected by the caller. The upstream `/models`
+    /// request remains provider-compatible, but the response is narrowed before
+    /// enrichment and crosses the IPC boundary.
+    #[serde(default)]
+    pub requested_model_ids: Option<Vec<String>>,
 }
 
 /// Codex 上游协议探测结果。
@@ -135,6 +140,7 @@ pub async fn fetch_models_for_config(
             access_key_id: request.volcengine_access_key_id.as_deref(),
             secret_access_key: request.volcengine_secret_access_key.as_deref(),
         },
+        requested_model_ids: request.requested_model_ids.as_deref(),
     })
     .await
 }

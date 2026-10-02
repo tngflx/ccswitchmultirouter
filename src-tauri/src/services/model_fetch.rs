@@ -43,6 +43,7 @@ pub struct FetchModelsRequest<'a> {
     pub models_url_override: Option<&'a str>,
     pub user_agent: Option<HeaderValue>,
     pub volcengine: VolcengineModelListRequest<'a>,
+    pub requested_model_ids: Option<&'a [String]>,
 }
 
 /// 火山 Agent/Coding Plan 模型枚举的管控面参数。
@@ -290,13 +291,14 @@ async fn fetch_volcengine_plan_models(
 /// 使用 OpenAI 兼容的 GET /v1/models 端点，按候选列表顺序尝试。
 pub async fn fetch_models(options: FetchModelsRequest<'_>) -> Result<Vec<FetchedModel>, String> {
     if let Some(action) = normalize_volcengine_model_list_action(options.volcengine.action)? {
-        return fetch_volcengine_plan_models(
+        let models = fetch_volcengine_plan_models(
             options.base_url,
             action,
             options.volcengine.access_key_id,
             options.volcengine.secret_access_key,
         )
-        .await;
+        .await?;
+        return Ok(filter_requested_models(models, options.requested_model_ids));
     }
 
     if options.api_key.is_empty() {
@@ -377,6 +379,7 @@ pub async fn fetch_models(options: FetchModelsRequest<'_>) -> Result<Vec<Fetched
                     .collect()
             };
 
+            filter_requested_models_in_place(&mut models, options.requested_model_ids);
             enrich_missing_context_windows(&client, url, &mut models).await;
             models.sort_by(|a, b| a.id.cmp(&b.id));
             models.dedup_by(|a, b| a.id.eq_ignore_ascii_case(&b.id));
@@ -397,6 +400,42 @@ pub async fn fetch_models(options: FetchModelsRequest<'_>) -> Result<Vec<Fetched
         "All candidates failed: {}",
         last_err.unwrap_or_else(|| "no candidates".to_string())
     ))
+}
+
+fn normalized_model_id(value: &str) -> String {
+    value.trim().to_ascii_lowercase()
+}
+
+fn model_matches_requested_ids(model: &FetchedModel, requested: &std::collections::HashSet<String>) -> bool {
+    std::iter::once(&model.id)
+        .chain(model.canonical_slug.iter())
+        .chain(model.slug.iter())
+        .chain(model.name.iter())
+        .chain(model.aliases.iter())
+        .map(|value| normalized_model_id(value))
+        .any(|value| !value.is_empty() && requested.contains(&value))
+}
+
+fn filter_requested_models_in_place(
+    models: &mut Vec<FetchedModel>,
+    requested_model_ids: Option<&[String]>,
+) {
+    let Some(ids) = requested_model_ids else { return };
+    let requested = ids
+        .iter()
+        .map(|id| normalized_model_id(id))
+        .filter(|id| !id.is_empty())
+        .collect::<std::collections::HashSet<_>>();
+    if requested.is_empty() { return; }
+    models.retain(|model| model_matches_requested_ids(model, &requested));
+}
+
+fn filter_requested_models(
+    mut models: Vec<FetchedModel>,
+    requested_model_ids: Option<&[String]>,
+) -> Vec<FetchedModel> {
+    filter_requested_models_in_place(&mut models, requested_model_ids);
+    models
 }
 
 /// 构造「模型列表端点」的候选 URL 列表
@@ -587,10 +626,7 @@ fn extract_reasoning_capability(
 }
 
 fn is_openrouter_catalog_url(url: &str) -> bool {
-    reqwest::Url::parse(url)
-        .ok()
-        .and_then(|parsed| parsed.host_str().map(str::to_owned))
-        .is_some_and(|host| host.eq_ignore_ascii_case("openrouter.ai"))
+    crate::reasoning_capabilities::provider_metadata::is_openrouter_endpoint(url)
 }
 
 /// Seed the same narrow, maintained exact-model fallback used by runtime
@@ -1312,6 +1348,44 @@ fn ends_with_version_segment(url: &str) -> bool {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    fn test_model(id: &str, canonical_slug: Option<&str>, aliases: &[&str]) -> FetchedModel {
+        FetchedModel {
+            id: id.to_string(),
+            canonical_slug: canonical_slug.map(str::to_string),
+            slug: None,
+            name: None,
+            aliases: aliases.iter().map(|value| (*value).to_string()).collect(),
+            owned_by: None,
+            context_window: None,
+            input_modalities: None,
+            supports_image: None,
+            reasoning: None,
+        }
+    }
+
+    #[test]
+    fn requested_model_filter_keeps_only_selected_canonical_or_alias_rows() {
+        let mut models = vec![
+            test_model(
+                "openai/gpt-6.1-sol",
+                Some("openai/gpt-6.1-sol-20260929"),
+                &["gpt-6.1-sol"],
+            ),
+            test_model("openai/gpt-5.6", None, &[]),
+        ];
+        let requested = vec!["OPENAI/GPT-6.1-SOL-20260929".to_string()];
+        filter_requested_models_in_place(&mut models, Some(&requested));
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].id, "openai/gpt-6.1-sol");
+    }
+
+    #[test]
+    fn empty_requested_model_filter_preserves_discovery_behavior() {
+        let mut models = vec![test_model("model-a", None, &[]), test_model("model-b", None, &[])];
+        filter_requested_models_in_place(&mut models, Some(&[]));
+        assert_eq!(models.len(), 2);
+    }
 
     #[test]
     fn test_candidates_plain_root() {

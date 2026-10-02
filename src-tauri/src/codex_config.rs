@@ -117,7 +117,6 @@ const CODEX_REASONING_EFFORTS: &[(&str, &str)] = &[
     ("high", "Greater reasoning depth for complex problems"),
     ("xhigh", "Extra high reasoning depth for complex problems"),
 ];
-const CODEX_DEFAULT_REASONING_EFFORT: &str = "medium";
 const DEEPSEEK_WINDOWS_EXECUTION_GUIDANCE: &str = "On Windows, use PowerShell syntax and minimal directed commands. For content, use `rg <pattern> <named-path>`; for file discovery, use `rg --files <named-path>`. Use narrow `-g` includes and excludes, including `-g '!node_modules/**'`, `-g '!.git/**'`, `-g '!target/**'`, `-g '!dist/**'`, and `-g '!generated/**'`. First identify a narrow source or test subtree; never recursively scan a user profile/home, drive root, or broad repository root.\nDo not use Unix-only commands such as `wc`, and do not assume `Select-String -Recurse` exists; if `rg` is unavailable, only after identifying a narrow target use `Get-ChildItem -LiteralPath <narrow-target> -File -Recurse | Select-String`.\nFor ordinary read-only inspection, call tools without escalation metadata or a justification.\nStop and report as soon as the requested evidence is sufficient; do not keep scanning merely to be exhaustive.";
 
 /// Codex model catalog 的工具配置画像。
@@ -2172,6 +2171,18 @@ fn codex_catalog_model_specs(settings: &Value, config_text: &str) -> Vec<CodexCa
                         upstream,
                     )
                 })
+            })
+            // DeepSeek gateway alias slugs (`deepseek-v4-pro-opencode-go`,
+            // `deepseek-flash-*`, ...) are the same model family as their
+            // canonical role. Without this indirection their rows project as
+            // "unknown" and enabled V2 profiles fail save-time validation even
+            // though the maintained list already declares the canonical model.
+            .or_else(|| {
+                deepseek_role_identity_for_model(model).and_then(|identity| {
+                    crate::proxy::providers::codex_reasoning::builtin_reasoning_capability_for_model(
+                        identity,
+                    )
+                })
             });
         let reasoning_fingerprint = resolved.fingerprint;
         let reasoning_source = resolved.source.as_str().to_string();
@@ -2989,16 +3000,42 @@ fn codex_provider_models_toml_array(
             })
             .and_then(Value::as_str)
             .unwrap_or(&spec.display_name);
-        let default_reasoning_effort = catalog_entry
+        let explicit_default_reasoning_effort = catalog_entry
             .and_then(|entry| {
                 entry
                     .get("default_reasoning_level")
+                    .or_else(|| entry.get("default_reasoning_effort"))
                     .or_else(|| entry.get("defaultReasoningEffort"))
             })
             .and_then(Value::as_str)
-            .unwrap_or(CODEX_DEFAULT_REASONING_EFFORT);
-        let supported_reasoning_levels =
-            catalog_entry.and_then(|entry| entry.get("supported_reasoning_levels"));
+            .or_else(|| {
+                spec.reasoning
+                    .as_ref()
+                    .and_then(|reasoning| reasoning.default_effort.as_deref())
+            });
+        let supported_reasoning_levels = catalog_entry
+            .and_then(|entry| {
+                entry
+                    .get("supported_reasoning_levels")
+                    .or_else(|| entry.get("supported_reasoning_efforts"))
+                    .or_else(|| entry.get("supportedReasoningLevels"))
+                    .or_else(|| entry.get("supportedReasoningEfforts"))
+            })
+            .filter(|value| value.as_array().is_some_and(|levels| !levels.is_empty()))
+            .cloned()
+            .or_else(|| {
+                spec.reasoning.as_ref().and_then(|reasoning| {
+                    (!reasoning.supported_efforts.is_empty()).then(|| {
+                        Value::Array(
+                            reasoning
+                                .supported_efforts
+                                .iter()
+                                .map(|effort| json!({ "effort": effort, "description": effort }))
+                                .collect(),
+                        )
+                    })
+                })
+            });
         let mut model = InlineTable::new();
         model.insert("model", spec.model.as_str().into());
         model.insert("slug", spec.model.as_str().into());
@@ -3026,31 +3063,35 @@ fn codex_provider_models_toml_array(
                 .unwrap_or(i64::MAX)
                 .into(),
         );
-        model.insert("default_reasoning_effort", default_reasoning_effort.into());
-        model.insert("default_reasoning_level", default_reasoning_effort.into());
-        model.insert("defaultReasoningEffort", default_reasoning_effort.into());
-        model.insert(
-            "supported_reasoning_levels",
-            codex_provider_reasoning_efforts_toml_array(supported_reasoning_levels, "effort"),
-        );
-        model.insert(
-            "supported_reasoning_efforts",
-            codex_provider_reasoning_efforts_toml_array(
-                supported_reasoning_levels,
-                "reasoning_effort",
-            ),
-        );
-        model.insert(
-            "supportedReasoningEfforts",
-            codex_provider_reasoning_efforts_toml_array(
-                supported_reasoning_levels,
-                "reasoningEffort",
-            ),
-        );
-        model.insert(
-            "supportedReasoningLevels",
-            codex_provider_reasoning_efforts_toml_array(supported_reasoning_levels, "effort"),
-        );
+        if let Some(default_reasoning_effort) = explicit_default_reasoning_effort {
+            model.insert("default_reasoning_effort", default_reasoning_effort.into());
+            model.insert("default_reasoning_level", default_reasoning_effort.into());
+            model.insert("defaultReasoningEffort", default_reasoning_effort.into());
+        }
+        if let Some(supported_reasoning_levels) = supported_reasoning_levels.as_ref() {
+            model.insert(
+                "supported_reasoning_levels",
+                codex_provider_reasoning_efforts_toml_array(Some(supported_reasoning_levels), "effort"),
+            );
+            model.insert(
+                "supported_reasoning_efforts",
+                codex_provider_reasoning_efforts_toml_array(
+                    Some(supported_reasoning_levels),
+                    "reasoning_effort",
+                ),
+            );
+            model.insert(
+                "supportedReasoningEfforts",
+                codex_provider_reasoning_efforts_toml_array(
+                    Some(supported_reasoning_levels),
+                    "reasoningEffort",
+                ),
+            );
+            model.insert(
+                "supportedReasoningLevels",
+                codex_provider_reasoning_efforts_toml_array(Some(supported_reasoning_levels), "effort"),
+            );
+        }
         if let Some(speed_tiers) = codex_provider_string_toml_array(
             catalog_entry.and_then(|entry| entry.get("additional_speed_tiers")),
         ) {
@@ -4297,6 +4338,10 @@ fn compile_configured_codex_subagent_roles(
 fn validate_codex_subagent_reasoning_completeness(
     compilation: &ConfiguredCodexSubagentCompilation,
 ) -> Result<(), AppError> {
+    // Report every offender in one error instead of failing on the first
+    // profile, so the user can fix the whole batch in one pass. Only catalog
+    // model names are listed; raw profile keys stay out of public errors.
+    let mut undeclared_models: Vec<String> = Vec::new();
     for (entry, compiled_status) in compilation
         .persisted
         .profiles
@@ -4324,12 +4369,28 @@ fn validate_codex_subagent_reasoning_completeness(
             crate::proxy::providers::codex_reasoning::builtin_reasoning_capability_for_model(
                 &profile.model,
             )
+            .or_else(|| {
+                // Symmetric case: the profile keeps the gateway alias slug
+                // while the maintained list declares only the canonical role
+                // (deepseek-v4-pro-opencode-go -> deepseek-v4-pro).
+                deepseek_role_identity_for_model(&profile.model).and_then(|identity| {
+                    crate::proxy::providers::codex_reasoning::builtin_reasoning_capability_for_model(
+                        identity,
+                    )
+                })
+            })
         });
         if capability_is_unknown && maintained_capability.as_ref().is_none_or(Option::is_none) {
-            return Err(AppError::InvalidInput(
-                "Codex subagent V2 configuration is incomplete (unknown_reasoning_capability_requires_declaration)".to_string(),
-            ));
+            undeclared_models.push(profile.model.clone());
         }
+    }
+    if !undeclared_models.is_empty() {
+        undeclared_models.sort();
+        undeclared_models.dedup();
+        return Err(AppError::InvalidInput(format!(
+            "Codex subagent V2 configuration is incomplete (unknown_reasoning_capability_requires_declaration): {}",
+            undeclared_models.join(", ")
+        )));
     }
     Ok(())
 }
@@ -9180,6 +9241,128 @@ mod tests {
         assert!(error
             .to_string()
             .contains("unknown_reasoning_capability_requires_declaration"));
+    }
+
+    #[test]
+    fn codex_subagent_v2_ignores_unknown_reasoning_for_excluded_catalog_model() {
+        let settings = codex_subagent_profile_status_settings(
+            "v2",
+            json!({
+                "private-model": codex_subagent_profile_status_profile("private-model", true)
+            }),
+            json!([{
+                "model": "private-model",
+                "enabled": false,
+                "contextWindow": 128000
+            }]),
+            json!([{
+                "id": "private-route",
+                "match": { "models": ["private-model"] },
+                "upstream": { "auth": { "source": "provider_config" } }
+            }]),
+        );
+
+        validate_codex_subagent_v2_candidate(&settings, None, true)
+            .expect("excluded inventory must not become a routable V2 candidate");
+    }
+
+    #[test]
+    fn codex_subagent_v2_save_accepts_deepseek_alias_via_canonical_maintained_capability() {
+        // Gateway alias rows carry no reasoning metadata and the resolver has
+        // never heard of the alias slug; the maintained canonical DeepSeek
+        // declaration must still satisfy validation through the role identity.
+        let settings = codex_subagent_profile_status_settings(
+            "v2",
+            json!({
+                "deepseek-v4-pro-opencode-go":
+                    codex_subagent_profile_status_profile("deepseek-v4-pro-opencode-go", true)
+            }),
+            json!([{ "model": "deepseek-v4-pro-opencode-go", "contextWindow": 128000 }]),
+            json!([{
+                "id": "deepseek-alias-route",
+                "match": { "models": ["deepseek-v4-pro-opencode-go"] },
+                "upstream": { "auth": { "source": "provider_config" } }
+            }]),
+        );
+
+        validate_codex_subagent_v2_candidate(&settings, None, true).expect(
+            "a DeepSeek alias profile must inherit the canonical maintained capability",
+        );
+    }
+
+    #[test]
+    fn codex_subagent_v2_save_accepts_alias_profile_via_canonical_catalog_capability() {
+        // Symmetric direction: the profile keeps the gateway alias slug while
+        // only the canonical model has a catalog row. The validate-path
+        // role-identity fallback must resolve the capability.
+        let settings = codex_subagent_profile_status_settings(
+            "v2",
+            json!({
+                "deepseek-flash-opencode-go":
+                    codex_subagent_profile_status_profile("deepseek-flash-opencode-go", true)
+            }),
+            json!([{ "model": "deepseek-v4-flash", "contextWindow": 128000 }]),
+            json!([{
+                "id": "deepseek-family-route",
+                "match": { "models": ["deepseek-v4-flash", "deepseek-flash-opencode-go"] },
+                "upstream": { "auth": { "source": "provider_config" } }
+            }]),
+        );
+
+        validate_codex_subagent_v2_candidate(&settings, None, true).expect(
+            "an alias profile must inherit the capability declared by its canonical catalog row",
+        );
+    }
+
+    #[test]
+    fn codex_subagent_v2_save_still_rejects_non_maintained_alias_family() {
+        // `deepseek-v4.1-*` is a different model family: no role identity and
+        // no maintained declaration, so strict validation must still reject it.
+        let settings = codex_subagent_profile_status_settings(
+            "v2",
+            json!({
+                "deepseek-v4.1-flash-opencode-go":
+                    codex_subagent_profile_status_profile("deepseek-v4.1-flash-opencode-go", true)
+            }),
+            json!([{ "model": "deepseek-v4.1-flash-opencode-go", "contextWindow": 128000 }]),
+            json!([{
+                "id": "deepseek-v41-route",
+                "match": { "models": ["deepseek-v4.1-flash-opencode-go"] },
+                "upstream": { "auth": { "source": "provider_config" } }
+            }]),
+        );
+
+        let error = validate_codex_subagent_v2_candidate(&settings, None, true)
+            .expect_err("non-maintained model families must stay strictly rejected");
+        assert!(error
+            .to_string()
+            .contains("unknown_reasoning_capability_requires_declaration"));
+    }
+
+    #[test]
+    fn codex_subagent_v2_capability_error_lists_offending_models() {
+        let settings = codex_subagent_profile_status_settings(
+            "v2",
+            json!({ "private-model": codex_subagent_profile_status_profile("private-model", true) }),
+            json!([{ "model": "private-model", "contextWindow": 128000 }]),
+            json!([{
+                "id": "private-route",
+                "match": { "models": ["private-model"] },
+                "upstream": { "auth": { "source": "provider_config" } }
+            }]),
+        );
+
+        let error = validate_codex_subagent_v2_candidate(&settings, None, true)
+            .expect_err("unknown reasoning capability must still block provider save");
+        let public_error = error.to_string();
+        assert!(public_error.contains("unknown_reasoning_capability_requires_declaration"));
+        // C: the diagnostic names the offending catalog model so the user can
+        // act on it, but never the raw profile key.
+        assert!(
+            public_error.contains("): private-model"),
+            "error should list offending models, got: {public_error}"
+        );
+        assert!(!public_error.contains("RAW_"));
     }
 
     #[test]

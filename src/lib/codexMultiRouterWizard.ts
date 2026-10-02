@@ -575,6 +575,11 @@ export function mergeFetchedModelsIntoWizardProvider(
   const shouldAppendFetchedModels =
     options.appendNewModels ??
     (!options.preserveExistingSelection || existingModels.length === 0);
+  // An empty catalog has no user selection to preserve, so the first
+  // discovery becomes the initial selected inventory. Once a catalog exists,
+  // newly discovered rows are inventory-only until the user enables them.
+  const disableNewModels =
+    options.preserveExistingSelection && existingModels.length > 0;
   for (const fetched of fetchedModels) {
     const modelId =
       fetched.id?.trim() ||
@@ -594,6 +599,9 @@ export function mergeFetchedModelsIntoWizardProvider(
     const nextModel = {
       ...(existing ?? {}),
       model: visibleModelId,
+      // Discovery is inventory-only. A newly returned gateway model must not
+      // become routable merely because the upstream listed it.
+      ...(!existing && disableNewModels ? { enabled: false } : {}),
       upstreamModel: nonEmptyWizardModelField(
         existing?.upstreamModel,
         existing?.upstream_model,
@@ -1249,7 +1257,7 @@ export function filterWizardProvidersByModelOrder(
     .filter((provider) => readWizardModelCatalog(provider).length > 0);
 }
 
-function canonicalWizardModelIds(provider: Provider): string[] {
+export function canonicalWizardModelIds(provider: Provider): string[] {
   return Array.from(
     new Set(
       readWizardModelCatalog(provider)
@@ -1375,6 +1383,7 @@ export function buildWizardRoutesFromSources(
   providers: Provider[],
   officialAuth?: CodexOfficialAuthConfig,
   existingRoutes: CodexRoutingRouteV2[] = [],
+  inventoryProviders: Provider[] = providers,
 ): CodexRoutingRouteV2[] {
   return providers.map((provider) => {
     const modelMap = buildWizardRouteModelMap(provider);
@@ -1382,6 +1391,14 @@ export function buildWizardRoutesFromSources(
       (route) => route.targetProviderId === provider.id,
     );
     const canonicalModels = wizardProviderModelIdentitySet(provider);
+    const inventoryProvider =
+      inventoryProviders.find((candidate) => candidate.id === provider.id) ??
+      provider;
+    const enabledModels = canonicalWizardModelIds(provider);
+    const inventoryModels = rawCanonicalWizardModelIds(inventoryProvider);
+    const includesEveryInventoryModel =
+      enabledModels.length === inventoryModels.length &&
+      inventoryModels.every((model) => enabledModels.includes(model));
     const aliases = { ...(modelMap ?? {}) };
     // A generated collision alias becomes part of the route contract on first
     // save. Keep that persisted spelling when the Provider is renamed later.
@@ -1413,7 +1430,9 @@ export function buildWizardRoutesFromSources(
       label: provider.name,
       enabled: true,
       targetProviderId: provider.id,
-      modelSelection: { mode: "all" },
+      modelSelection: includesEveryInventoryModel
+        ? { mode: "all" }
+        : { mode: "include", models: enabledModels },
       matchPrefixes: inferWizardRoutePrefixes(provider),
       aliases: Object.fromEntries(
         Object.entries(aliases).filter(
@@ -1886,6 +1905,7 @@ export function buildCodexMultiRouterWizardPlan(
     resolvedSources,
     officialAuth,
     existingRoutingV2?.routes ?? [],
+    fullCollisionResolvedSources,
   ).map((route) => {
     if (!options.catalogModelOrder) return route;
     const selectedSource = resolvedSources.find(

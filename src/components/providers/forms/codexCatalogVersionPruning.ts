@@ -63,10 +63,18 @@ export function parseRelease(model: CodexCatalogModel): Release | undefined {
   if (codename) suffix = suffix.slice(codename.length + 1);
   // Keep all other suffixes as branch boundaries, including unknown specialties.
   // Grok 4.20 is a named series, not semver minor 20; keep it independent.
+  // The GPT codename is a capability boundary, not a decoration: `gpt-6-astra`
+  // and `gpt-6-sol` are different models that happen to share a generation.
+  // Folding the codename into `identity` alone is not enough, because the
+  // keep/prune decision groups candidates by `branch`. Without it every
+  // codename collapses into `general` and retaining only the newest version
+  // silently deletes the other codenames' models.
   const branch =
     (family === "grok" && version[0] === 4 && version[1] === 20
       ? "4.20:"
-      : "") + (suffix || "general");
+      : "") +
+    (codename ? `${codename}:` : "") +
+    (suffix || "general");
   while (version.length > 1 && version.at(-1) === 0) version.pop();
   const scope = JSON.stringify([
     model.providerName || model.provider_name || "",

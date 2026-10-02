@@ -1436,6 +1436,7 @@
     "codexSaveUnconfirmed": "Codex の保存結果を確認できません。プロバイダー一覧を更新して結果を確認してから再試行してください。",
     "codexSaveDraftPreserved": "現在の下書きは保持され、今回の変更は保存されていません。",
     "subagentIncomplete": "Codex サブエージェントの設定が未完了です。ルーティング可能なモデルに推論機能が宣言されていません。保存前にモデルカタログで設定してください。",
+    "subagentIncompleteNamed": "Codex サブエージェントの設定が未完了です：{{models}} はルーティング可能かつ有効ですが、推論能力が宣言されていません。モデルカタログで能力を宣言（または無効化・除外）してから保存してください。",
     "subagentValidationFailed": "Codex サブエージェント設定の検証に失敗しました：{{detail}}",
     "subagentValidationFallback": "モデルカタログとサブエージェント設定を確認してください。",
     "reasoningErrors": {
@@ -3924,6 +3925,7 @@
     "modelSort": "モデルの並べ替え",
     "topModelDefaultEffort": "先頭モデルの既定推論強度",
     "topModelDefaultEffortHint": "{{model}} が先頭の場合、新しいセッションでこの強度を使用します。",
+    "reasoningUnknown": "プロバイダーのメタデータが利用可能になるまで不明",
     "currentOrder": "現在の順序（ドラッグ可能）",
     "sortByModel": "モデル名",
     "sortByProvider": "プロバイダーでグループ化",

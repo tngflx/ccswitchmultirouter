@@ -20,7 +20,7 @@ describe("recent catalog retention", () => {
     ];
     expect(keep(...names)).toEqual([names[0], names[1], names[4]]);
   });
-  it("removes older GPT releases when GPT 6 offerings are available", () => {
+  it("treats each GPT codename as its own release branch", () => {
     const names = [
       "gpt-6-astra",
       "gpt-6-astra:batch",
@@ -32,7 +32,37 @@ describe("recent catalog retention", () => {
       "gpt-5.5",
       "gpt-5.4",
     ];
-    expect(keep(...names)).toEqual(names.slice(0, 4));
+    // astra/sol/luna/terra are distinct capabilities, so a newer astra must not
+    // delete the sol/luna/terra lines. Only genuinely older releases of the same
+    // branch are pruned: gpt-5.4 loses to gpt-5.5 on the shared general branch.
+    expect(keep(...names)).toEqual([
+      "gpt-6-astra",
+      "gpt-6-astra:batch",
+      "gpt-6-astra-pro",
+      "gpt-6-astra-pro:batch",
+      "gpt-5.6-sol",
+      "gpt-5.6-luna",
+      "gpt-5.6-terra",
+      "gpt-5.5",
+    ]);
+  });
+
+  it("does not let a newer codename delete a different codename's models", () => {
+    // Regression: the codename used to be parsed into `identity` only, so every
+    // GPT codename shared `branch=general` and "keep the newest release per
+    // branch" silently removed every other codename.
+    expect(keep("gpt-6.1-sol", "gpt-6-astra", "gpt-6-luna", "gpt-6-terra")).toEqual(
+      ["gpt-6.1-sol", "gpt-6-astra", "gpt-6-luna", "gpt-6-terra"],
+    );
+  });
+
+  it("still prunes older releases inside a single codename branch", () => {
+    // Same codename, different versions: these are genuinely one branch, so the
+    // newest release wins and the older one is still pruned.
+    expect(keep("gpt-6.1-sol", "gpt-6-sol")).toEqual(["gpt-6.1-sol"]);
+    expect(keep("gpt-6.1-sol", "gpt-6-sol", "gpt-5.6-sol")).toEqual([
+      "gpt-6.1-sol",
+    ]);
   });
 
   it.each([
@@ -164,10 +194,15 @@ describe("recent catalog retention", () => {
       "gpt-5.4-pro",
       "gpt-5",
     ];
-    expect(keep(...names)).toEqual(["gpt-6-astra", "gpt-5.5-pro"]);
+    expect(keep(...names)).toEqual([
+      "gpt-6-astra",
+      "gpt-5.6-sol",
+      "gpt-5.5",
+      "gpt-5.5-pro",
+    ]);
   });
 
-  it("keeps the newest image model branch without retaining older GPT releases", () => {
+  it("keeps the newest image model branch and every GPT codename branch", () => {
     expect(
       keep(
         "gpt-6-astra",
@@ -182,6 +217,8 @@ describe("recent catalog retention", () => {
       ),
     ).toEqual([
       "gpt-6-astra",
+      "gpt-5.6-sol",
+      "gpt-5.6-terra",
       "gpt-5.4-image-2",
       "gpt-5-image",
       "gpt-image-2",

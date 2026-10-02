@@ -66,6 +66,7 @@ import {
   initialWizardSelectedSourceIds,
   buildWizardModelCatalog,
   canContinueAfterConnectivity,
+  canonicalWizardModelIds,
   classifyWizardDualProtocolConnectivityResult,
   classifyWizardConnectivityResult,
   collectWizardModelNameCollisions,
@@ -1572,7 +1573,6 @@ export function CodexMultiRouterWizard({
             const afterModels = readRawWizardModelCatalog(nextProvider);
             const diff = diffWizardModelCatalog(beforeModels, afterModels);
             const hasDiff = hasModelFetchDiff(diff);
-            await providersApi.update(nextProvider, "codex", undefined, true);
             nextSources.push(nextProvider);
             successCount += 1;
             setModelFetchCards((current) => ({
@@ -1608,12 +1608,6 @@ export function CodexMultiRouterWizard({
                 const afterModels = readRawWizardModelCatalog(nextProvider);
                 const diff = diffWizardModelCatalog(beforeModels, afterModels);
                 const hasDiff = hasModelFetchDiff(diff);
-                await providersApi.update(
-                  nextProvider,
-                  "codex",
-                  undefined,
-                  true,
-                );
                 nextSources.push(nextProvider);
                 successCount += 1;
                 recordWizardIssue({
@@ -1737,6 +1731,7 @@ export function CodexMultiRouterWizard({
                       secretAccessKey: config.volcengineSecretAccessKey ?? "",
                     }
                   : undefined,
+                canonicalWizardModelIds(provider),
               ),
             ),
           );
@@ -1769,7 +1764,6 @@ export function CodexMultiRouterWizard({
           const afterModels = readRawWizardModelCatalog(nextProvider);
           const diff = diffWizardModelCatalog(beforeModels, afterModels);
           const hasDiff = hasModelFetchDiff(diff);
-          await providersApi.update(nextProvider, "codex", undefined, true);
           nextSources.push(nextProvider);
           successCount += 1;
           setModelFetchCards((current) => ({

@@ -3168,9 +3168,27 @@ describe("Codex MultiRouter workspace route persistence helpers", () => {
       settingsConfig: {
         modelCatalog: {
           models: [
-            { model: "deepseek-v4-flash" },
-            { model: "deepseek-v4-pro" },
-            { model: "qwen3.8" },
+            {
+              model: "deepseek-v4-flash",
+              reasoning: {
+                supportedEfforts: ["none", "low", "medium", "high", "xhigh", "max"],
+                defaultEffort: "medium",
+              },
+            },
+            {
+              model: "deepseek-v4-pro",
+              reasoning: {
+                supportedEfforts: ["none", "low", "medium", "high", "xhigh", "max"],
+                defaultEffort: "medium",
+              },
+            },
+            {
+              model: "qwen3.8",
+              reasoning: {
+                supportedEfforts: ["none", "low", "medium", "high", "xhigh", "max"],
+                defaultEffort: "medium",
+              },
+            },
           ],
         },
       },
@@ -3185,9 +3203,27 @@ describe("Codex MultiRouter workspace route persistence helpers", () => {
         ...draftPlan.settingsConfig,
         modelCatalog: {
           models: [
-            { model: "deepseek-v4-pro" },
-            { model: "deepseek-v4-flash" },
-            { model: "qwen3.8" },
+            {
+              model: "deepseek-v4-pro",
+              reasoning: {
+                supportedEfforts: ["none", "low", "medium", "high", "xhigh", "max"],
+                defaultEffort: "medium",
+              },
+            },
+            {
+              model: "deepseek-v4-flash",
+              reasoning: {
+                supportedEfforts: ["none", "low", "medium", "high", "xhigh", "max"],
+                defaultEffort: "medium",
+              },
+            },
+            {
+              model: "qwen3.8",
+              reasoning: {
+                supportedEfforts: ["none", "low", "medium", "high", "xhigh", "max"],
+                defaultEffort: "medium",
+              },
+            },
           ],
           spawnAgentModels: ["deepseek-v4-pro", "deepseek-v4-flash"],
         },

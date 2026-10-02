@@ -5478,10 +5478,10 @@ export function ModelOrderTab({
     const declared = topModel?.reasoning?.supportedEfforts?.filter(
       (effort): effort is CodexReasoningEffort => effort !== "ultra",
     );
-    return declared?.length
-      ? declared
-      : ["none", "minimal", "low", "medium", "high", "xhigh", "max"];
+    return declared ?? [];
   }, [topModel]);
+  const effectiveConfiguredDefaultReasoningEffort =
+    configuredDefaultReasoningEffort ?? topModel?.reasoning?.defaultEffort;
   const fallbackProtocolCount = visibleDraftModels.filter(
     isCodexProtocolFallback,
   ).length;
@@ -5489,7 +5489,8 @@ export function ModelOrderTab({
     displayStyle !==
     (catalog.displayNameStyle ?? DEFAULT_CODEX_MODEL_DISPLAY_STYLE);
   const effortDirty =
-    defaultReasoningEffort !== (configuredDefaultReasoningEffort ?? "medium");
+    topReasoningEfforts.length > 0 &&
+    defaultReasoningEffort !== effectiveConfiguredDefaultReasoningEffort;
   const hasChanges =
     styleDirty ||
     effortDirty ||
@@ -5519,10 +5520,20 @@ export function ModelOrderTab({
             (right.sortIndex ?? Number.MAX_SAFE_INTEGER),
         ),
     );
-    setDefaultReasoningEffort(configuredDefaultReasoningEffort ?? "medium");
-  }, [selectedPlan?.id, catalogKey, configuredDefaultReasoningEffort]);
+    setDefaultReasoningEffort(
+      configuredDefaultReasoningEffort ??
+        topModel?.reasoning?.defaultEffort ??
+        "medium",
+    );
+  }, [
+    selectedPlan?.id,
+    catalogKey,
+    configuredDefaultReasoningEffort,
+    topModel?.reasoning?.defaultEffort,
+  ]);
 
   useEffect(() => {
+    if (topReasoningEfforts.length === 0) return;
     if (topReasoningEfforts.includes(defaultReasoningEffort)) return;
     const declaredDefault = topModel?.reasoning?.defaultEffort;
     setDefaultReasoningEffort(
@@ -5677,7 +5688,9 @@ export function ModelOrderTab({
                         .filter((model): model is string => Boolean(model)),
                 ),
                 modelDisplayStyle: displayStyle,
-                defaultReasoningEffort,
+                ...(topReasoningEfforts.length > 0
+                  ? { defaultReasoningEffort }
+                  : {}),
               },
             },
           },
@@ -5957,6 +5970,7 @@ export function ModelOrderTab({
           </span>
           <select
             value={defaultReasoningEffort}
+            disabled={topReasoningEfforts.length === 0}
             onChange={(event) =>
               setDefaultReasoningEffort(
                 event.target.value as CodexReasoningEffort,
@@ -5967,11 +5981,19 @@ export function ModelOrderTab({
             })}
             className="h-8 rounded border border-input bg-background px-2 text-sm text-foreground"
           >
-            {topReasoningEfforts.map((effort) => (
-              <option key={effort} value={effort}>
-                {effort}
+            {topReasoningEfforts.length > 0 ? (
+              topReasoningEfforts.map((effort) => (
+                <option key={effort} value={effort}>
+                  {effort}
+                </option>
+              ))
+            ) : (
+              <option value="" disabled>
+                {tr("codexRouterWorkspace.reasoningUnknown", {
+                  defaultValue: "Unknown until provider metadata is available",
+                })}
               </option>
-            ))}
+            )}
           </select>
           <span className="max-w-64 font-normal text-muted-foreground">
             {tr("codexRouterWorkspace.topModelDefaultEffortHint", {

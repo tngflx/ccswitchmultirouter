@@ -317,6 +317,9 @@ export function reconcileFetchedCodexCatalogRows<T extends CodexCatalogRowLike>(
       model,
       upstreamModel: model,
       displayName: model,
+      // A fetched model is inventory only. Inclusion is an explicit user
+      // action in the ProviderForm, so new rows must remain excluded.
+      enabled: false,
       ...(contextWindow ? { contextWindow: String(contextWindow) } : {}),
       ...fetchedIdentityPatch({}, fetched, true),
       ...(Array.isArray(fetched.inputModalities) &&

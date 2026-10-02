@@ -97,12 +97,17 @@
       (model) => model && modelIdentityValues(model).includes(normalizedName),
     );
     const descriptor = normalizeReasoningDescriptor({
+      // Codex's renderer matches model rows by id/slug/name before it reads
+      // supportedReasoningLevels. Injected routed rows therefore need the
+      // visible route name in every stable identity slot. Rich upstream
+      // identity remains authoritative when a row already exists.
+      id: existing?.id || existing?.model || existing?.slug || name,
+      slug: existing?.slug || existing?.model || existing?.id || name,
+      name: existing?.name || existing?.displayName || existing?.display_name || name,
       ...(existing || {}),
-      // The visible route name is the only identity synthesized here. Never
-      // fabricate id/slug/name from a display label when the upstream omitted it.
       model: name,
       displayName:
-        existing?.displayName || existing?.display_name || name,
+        existing?.displayName || existing?.display_name || existing?.name || name,
       hidden: false,
     });
     const providerName =

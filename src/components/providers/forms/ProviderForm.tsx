@@ -90,6 +90,7 @@ import {
   setCodexModelName as setCodexModelNameInConfig,
 } from "@/utils/providerConfigUtils";
 import { isNonNegativeDecimalString } from "@/types/usage";
+import { parseCodexSubagentCandidateError } from "@/lib/codexSubagentCandidateError";
 import { getCodexCustomTemplate } from "@/config/codexTemplates";
 import CodexConfigEditor from "./CodexConfigEditor";
 import { CommonConfigEditor } from "./CommonConfigEditor";
@@ -2047,13 +2048,17 @@ function ProviderFormFull({
         }
       } catch (error) {
         const detail = extractErrorMessage(error);
-        const message = detail.includes(
-          "unknown_reasoning_capability_requires_declaration",
-        )
-          ? t("providerForm.subagentIncomplete")
-          : t("providerForm.subagentValidationFailed", {
-              detail: detail || t("providerForm.subagentValidationFallback"),
-            });
+        const parsed = parseCodexSubagentCandidateError(detail);
+        const message =
+          parsed.kind === "incomplete"
+            ? parsed.models
+              ? t("providerForm.subagentIncompleteNamed", {
+                  models: parsed.models,
+                })
+              : t("providerForm.subagentIncomplete")
+            : t("providerForm.subagentValidationFailed", {
+                detail: detail || t("providerForm.subagentValidationFallback"),
+              });
         toast.error(message);
         return;
       }
@@ -2925,7 +2930,6 @@ function ProviderFormFull({
           {appId === "claude" && (
             <ClaudeFormFields
               providerId={providerId}
-              autoRefreshModels={isEditMode}
               shouldShowApiKey={
                 (category !== "cloud_provider" ||
                   hasApiKeyField(form.getValues("settingsConfig"), "claude")) &&
@@ -3033,7 +3037,6 @@ function ProviderFormFull({
               )}
               <CodexFormFields
                 providerId={providerId}
-                autoRefreshModels={isEditMode}
                 providerName={form.watch("name")}
                 isXaiOauthPreset={
                   presetProviderType === "xai_oauth" ||
@@ -3135,7 +3138,6 @@ function ProviderFormFull({
           {appId === "gemini" && (
             <GeminiFormFields
               providerId={providerId}
-              autoRefreshModels={isEditMode}
               shouldShowApiKey={shouldShowApiKey(
                 form.getValues("settingsConfig"),
                 isEditMode,
@@ -3165,7 +3167,6 @@ function ProviderFormFull({
           {appId === "opencode" && !isAnyOmoCategory && (
             <OpenCodeFormFields
               providerId={providerId}
-              autoRefreshModels={isEditMode}
               npm={opencodeForm.opencodeNpm}
               onNpmChange={opencodeForm.handleOpencodeNpmChange}
               apiKey={opencodeForm.opencodeApiKey}
@@ -3212,7 +3213,6 @@ function ProviderFormFull({
           {appId === "openclaw" && (
             <OpenClawFormFields
               providerId={providerId}
-              autoRefreshModels={isEditMode}
               baseUrl={openclawForm.openclawBaseUrl}
               onBaseUrlChange={openclawForm.handleOpenclawBaseUrlChange}
               apiKey={openclawForm.openclawApiKey}
@@ -3235,7 +3235,6 @@ function ProviderFormFull({
           {appId === "hermes" && (
             <HermesFormFields
               providerId={providerId}
-              autoRefreshModels={isEditMode}
               baseUrl={hermesForm.hermesBaseUrl}
               onBaseUrlChange={hermesForm.handleHermesBaseUrlChange}
               apiKey={hermesForm.hermesApiKey}

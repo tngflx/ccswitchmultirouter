@@ -102,6 +102,10 @@ pub struct ReasoningCapabilitySnapshot {
     pub upstream_format: Option<String>,
     /// 上游参数名。
     pub upstream_parameter: Option<String>,
+    /// Provider-native mapping from Codex effort names to upstream values.
+    /// `None` means the endpoint did not advertise a mapping.
+    #[serde(default)]
+    pub upstream_effort_map: Option<HashMap<String, String>>,
     /// reasoning 内容回传字段形态。
     pub output_format: Option<String>,
 }
@@ -538,7 +542,15 @@ pub fn snapshot_to_capability(
             parameter: upstream_parameter,
             effort_map: graded_efforts
                 .iter()
-                .map(|effort| (effort.clone(), effort.clone()))
+                .filter_map(|effort| {
+                    let mapped = reasoning
+                        .upstream_effort_map
+                        .as_ref()
+                        .and_then(|map| map.get(effort))
+                        .cloned()
+                        .unwrap_or_else(|| effort.clone());
+                    (!mapped.trim().is_empty()).then_some((effort.clone(), mapped))
+                })
                 .collect(),
         },
         output_format: reasoning.output_format.clone(),
@@ -624,6 +636,7 @@ mod tests {
                 supports_max_tokens: false,
                 upstream_format: Some("object".into()),
                 upstream_parameter: Some("reasoning.effort".into()),
+                upstream_effort_map: None,
                 output_format: Some("auto".into()),
             }),
         }
@@ -788,6 +801,29 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_preserves_provider_effort_map() {
+        let mut snapshot = openrouter_detection_snapshot();
+        snapshot.reasoning.as_mut().unwrap().upstream_effort_map = Some(
+            [
+                ("max".to_string(), "xhigh".to_string()),
+                ("high".to_string(), "high".to_string()),
+                ("low".to_string(), "low".to_string()),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        let capability = snapshot_to_capability(&snapshot).expect("valid mapped snapshot");
+        assert_eq!(
+            capability.upstream.effort_map.get("max").map(String::as_str),
+            Some("xhigh")
+        );
+        assert_eq!(
+            capability.upstream.effort_map.get("low").map(String::as_str),
+            Some("low")
+        );
+    }
+
+    #[test]
     fn snapshot_to_capability_budget_when_only_max_tokens() {
         let snapshot = ProviderCapabilitySnapshot {
             provider_key: "p".into(),
@@ -802,6 +838,7 @@ mod tests {
                 supports_max_tokens: true,
                 upstream_format: None,
                 upstream_parameter: None,
+                upstream_effort_map: None,
                 output_format: None,
             }),
         };

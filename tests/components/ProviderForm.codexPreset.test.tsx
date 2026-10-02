@@ -77,6 +77,7 @@ vi.mock("@/components/providers/forms/CodexConfigEditor", () => ({
 
 vi.mock("@/components/providers/forms/CodexFormFields", () => ({
   CodexFormFields: ({
+    autoRefreshModels,
     codexApiKey,
     codexBaseUrl,
     catalogModels,
@@ -89,6 +90,7 @@ vi.mock("@/components/providers/forms/CodexFormFields", () => ({
     onCodexTrafficPolicyChange,
   }: {
     codexApiKey: string;
+    autoRefreshModels?: boolean;
     codexBaseUrl: string;
     catalogModels?: Array<{
       model: string;
@@ -110,6 +112,9 @@ vi.mock("@/components/providers/forms/CodexFormFields", () => ({
     <section aria-label="codex-provider-details">
       <div data-testid="codex-api-key">{codexApiKey}</div>
       <div data-testid="codex-base-url">{codexBaseUrl}</div>
+      <div data-testid="codex-auto-refresh">
+        {autoRefreshModels ? "enabled" : "disabled"}
+      </div>
       <div data-testid="codex-takeover">
         {takeoverEnabled ? "enabled" : "disabled"}
       </div>
@@ -191,6 +196,25 @@ async function renderProviderForm(
 }
 
 describe("ProviderForm Codex preset selection", () => {
+  it("does not implicitly refresh model inventories while editing", async () => {
+    await renderProviderForm({
+      providerId: "codex-thirdparty",
+      initialData: {
+        name: "Third party",
+        category: "custom",
+        settingsConfig: {
+          auth: { OPENAI_API_KEY: "sk-test" },
+          config:
+            'model_provider = "thirdparty"\nmodel = "openrouter/gpt-6.1-sol"\n[model_providers.thirdparty]\nbase_url = "https://openrouter.ai/api/v1"\nwire_api = "responses"\n',
+        },
+      },
+    });
+
+    expect(screen.getByTestId("codex-auto-refresh")).toHaveTextContent(
+      "disabled",
+    );
+  });
+
   it("fails closed when a catalog draft cannot be normalized", () => {
     expect(() =>
       normalizeCodexCatalogModelsForSave([

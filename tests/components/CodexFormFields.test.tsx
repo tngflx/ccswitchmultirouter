@@ -1016,6 +1016,12 @@ describe("CodexFormFields local model routing", () => {
     await waitFor(() =>
       expect(harness.latestCatalog().map((r) => r.model)).toEqual([
         "gpt-6-astra",
+        // Each GPT codename is its own capability branch, so a newer astra
+        // must not delete the sol/terra/luna lines or the general gpt-5.5 row.
+        "gpt-5.6-sol",
+        "gpt-5.6-terra",
+        "gpt-5.6-luna",
+        "gpt-5.5",
         "glm-5.3",
       ]),
     );
@@ -2153,7 +2159,7 @@ describe("CodexFormFields local model routing", () => {
       ).toEqual(fetchedReasoning);
       expect(
         latestCatalog().find((row) => row.model === "new")?.enabled,
-      ).toBeUndefined();
+      ).toBe(false);
     });
   });
 
@@ -2428,7 +2434,7 @@ describe("CodexFormFields local model routing", () => {
         "free-model",
         "paid-model",
       ]);
-      expect(latestCatalog().every((model) => model.enabled !== false)).toBe(
+      expect(latestCatalog().every((model) => model.enabled === false)).toBe(
         true,
       );
     });
@@ -2779,7 +2785,7 @@ describe("CodexFormFields local model routing", () => {
     ).toBe(false);
     expect(
       latestCatalog().find((model) => model.model === "gamma-free")?.enabled,
-    ).toBeUndefined();
+    ).toBe(false);
     expect(
       latestCatalog().filter((model) => model.model === "alpha-free"),
     ).toHaveLength(1);

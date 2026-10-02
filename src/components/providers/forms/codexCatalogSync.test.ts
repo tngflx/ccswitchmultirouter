@@ -54,7 +54,7 @@ describe("reconcileFetchedCodexCatalogRows", () => {
     expect(result.updated).toEqual(["keep-me", "blocked-model"]);
     expect(result.rows[0].enabled).toBeUndefined();
     expect(result.rows[1].enabled).toBe(false);
-    expect(result.rows[2].enabled).toBeUndefined();
+    expect(result.rows[2].enabled).toBe(false);
     expect(result.rows[0].contextWindow).toBe("128000");
   });
 
@@ -259,7 +259,7 @@ describe("reconcileFetchedCodexCatalogRows", () => {
     expect(result.rows[0].displayName).toBe("Custom");
     expect(result.rows[0].enabled).toBe(true);
     expect(result.rows[1].enabled).toBe(false);
-    expect(result.rows[2].enabled).toBeUndefined();
+    expect(result.rows[2].enabled).toBe(false);
   });
 
   it("refreshes stale provider metadata without changing user-owned catalog fields", () => {

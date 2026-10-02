@@ -1,5 +1,212 @@
 # Engineering Journal (newest first)
 
+## 2026-10-01 - Restore Codex reasoning picker row identity
+
+- **What happened:** The Codex Desktop reasoning-effort selector remained absent for routed models injected into the renderer's model list.
+- **Root cause:** The fallback descriptor had been narrowed to `model` plus display metadata. Codex's renderer matches rows through stable `id`/`slug`/`name` aliases before reading `supportedReasoningLevels`, so newly injected rows could be ignored before their reasoning choices were considered.
+- **What we did:** Restored `id`, `slug`, and `name` aliases for injected routed rows while preserving richer upstream identity on existing rows. Unknown models still receive no fabricated reasoning default or supported-effort list.
+- **Evidence:** The new fallback identity regression passed; all 58 `codex_desktop::tests` passed; `pnpm typecheck`, 69 focused catalog tests, `node --check`, and `git diff --check` passed.
+- **What NOT to do again:** Do not remove renderer identity aliases from injected model rows while trying to avoid fabricated metadata. Identity completion and capability invention are separate concerns.
+- **Runtime limit:** Existing debug processes predate the source edit. The live Codex picker still requires the user to stop the current `pnpm dev` process and restart it before runtime verification.
+- **Related:** `docs/decisions/2026-10-01-codex-reasoning-picker-identity.md`
+
+## 2026-10-02 - Selected catalog stays bounded and reasoning metadata reaches picker
+
+- **What happened:** A provider discovery response containing 34 models could still be mistaken for a 34-model routable catalog even when only 9 provider rows were selected. Codex Desktop also appeared to lose the reasoning-effort selector for projected models.
+- **Root cause:** Discovery inventory and explicit user selection shared one model list, and route generation could use `all`; separately, reasoning capability metadata arrived in multiple nested/snake/camel shapes that the Desktop renderer did not consistently receive.
+- **What we did:** Existing catalogs now preserve newly fetched rows as disabled inventory tombstones; first discovery still adopts its fetched rows as the initial selection. Strict subsets generate `modelSelection: include` with canonical selected IDs. Catalog projection and the picker patch normalize reasoning aliases, preserve explicit defaults and supported efforts, and refuse to invent capability for unknown models.
+- **Evidence:** Large-inventory regression passed with 34 persisted rows, exactly 9 enabled rows, and a 9-model include route. Focused frontend suite passed 6 files/311 tests; full frontend suite passed 198 files/1,657 tests; Rust picker 11/11, projection 10/10, inline config 2/2, compiler 28/28; `cargo check`, `pnpm typecheck`, and `git diff --check` passed. A full Rust-suite attempt was blocked by the existing locked debug executable (`Access is denied`).
+- **What NOT to do again:** Never treat `/models` discovery as user approval, never emit route `all` over an explicit exclusion, and never restore a global reasoning default for an unknown model.
+- **Runtime limit:** Existing `cc-switch.exe` debug processes predate the source edits. A live desktop audit remains unverified until the user restarts the normal `pnpm dev` process.
+- **Related:** `docs/decisions/2026-10-02-codex-selected-catalog-and-reasoning-picker.md`
+
+## 2026-10-01 - MultiRouter fetch now scopes the response to selected models
+
+- **What happened:** The wizard still processed every model returned by a gateway even after fetched rows were marked disabled. OpenRouter responses of roughly 486 models were merged into the draft inventory.
+- **Root cause:** `refreshModelSources` passed the complete fetched array to `mergeFetchedModelsIntoWizardProvider`; the shared fetch command had no selected-model contract. Standard `/models` endpoints do not expose a portable server-side filter.
+- **What we did:** Added optional `requestedModelIds` to the typed frontend and Tauri request. The wizard derives enabled canonical IDs per provider. Rust filters by ID, canonical slug, slug, name, or alias immediately after parsing and before context/reasoning enrichment and IPC. Empty selections preserve explicit discovery behavior.
+- **Evidence:** Wizard utility/component tests 58/58, `pnpm typecheck`, model-fetch Rust tests 54/54, and `git diff --check` passed.
+- **What NOT to do again:** Do not add a fake generic `/models` query parameter or filter only after the full response has already been merged.
+- **Runtime limit:** The normal `pnpm dev` process was not rebuilt/restarted, so a live page-by-page desktop audit remains unverified.
+- **Related:** `docs/decisions/2026-10-01-multirouter-fetch-draft-boundary.md`
+
+## 2026-10-01 - MultiRouter fetch is draft-only and disabled inventory cannot route
+
+- **What happened:** The setup wizard fetched provider inventories and wrote each
+  source provider immediately. A generic gateway response could therefore be
+  persisted and routed as a full catalog, including hundreds of models.
+- **Root cause:** The fetch loop called `providersApi.update`, new fetched rows
+  omitted `enabled`, and route generation always emitted `modelSelection: all`.
+  Those three boundaries together converted discovery into routing.
+- **What we did:** Fetch now updates wizard draft state only; new rows are
+  explicit `enabled: false`; Save/Publish is the persistence boundary; and route
+  generation emits an explicit `include` list whenever disabled inventory exists.
+  Rust projection already filters disabled rows, so no second projection rewrite
+  was needed.
+- **Evidence:** Wizard library 21/21, component 37/37, `pnpm typecheck`, and
+  `git diff --check` passed. Rust compiler 28/28, projection 19/19, and model
+  fetch/reasoning 52/52 passed, including OpenRouter `gpt-6.1-sol` metadata.
+  Provider-service tests were partial: 53 passed and 10 were blocked by the
+  `CODEX_DESKTOP_ACTIVE` guard because Codex Desktop process 33440 is running.
+- **What NOT to do again:** Never treat a `/models` response as user approval,
+  and never use route `all` when the persisted provider inventory contains an
+  explicit exclusion.
+- **Related:** `docs/decisions/2026-10-01-multirouter-fetch-draft-boundary.md`
+
+## 2026-10-01 - Correction: the fail-closed fix did break the MultiRouter path
+
+- **What happened:** Asked whether all other models still function, I re-checked the routed path instead of only the Sublyx provider record and found that I had broken it. The earlier entry in this journal claimed the fail-closed rule could not affect the working MultiRouter path. **That claim was wrong and is retracted.**
+- **Root cause:** `projected_model_entry` in `codex_multirouter/projection.rs` rebuilds each catalog row field by field and never emits `apiKeyGroupId`. The live published catalog confirms it: a projected `--ccg-` row has `providerName` and `upstreamModel` but no group binding. `materialize_codex_routed_provider_from_target` then replaced the target provider's catalog with that projection, so routed requests lost the binding. The original re-audit missed this because it read only the Sublyx provider catalog and never checked the projection that routed traffic actually uses. The 200s at 19:49 came through `codex-multirouter::route::…`, while the 401s came direct to Sublyx — that split was the visible symptom I failed to follow up.
+- **What we did:** Added `restore_isolated_key_group_bindings` so materialization copies the target provider's `apiKeyGroupId`/`apiKeyGroupGenerated` onto matching projected rows. Fail-closed now finds the group instead of rejecting.
+- **Evidence:** `multirouter_projection_restores_the_target_key_group_binding` builds a router catalog with the scoped name and no binding — the real projection shape — and asserts the group key is selected; it fails without the fix. `cargo test --lib proxy::providers::codex::tests` 143/143; `cargo test --lib codex_multirouter` 106/106; `cargo test --lib proxy::` 1,966 passed / 9 failed (the same nine `CODEX_DESKTOP_ACTIVE` environmental failures, no new ones); `cargo check` passed.
+- **What NOT to do again:** When auditing a credential or model-binding change, trace the path the **routed** request actually takes, not just the provider record. A projection that rebuilds rows field by field silently drops every field it does not know about. Do not claim a fix is safe for a path you only inspected in one of its two entry points.
+- **Still unverified:** nothing here is live. The running `cc-switch.exe` predates all of this source, and the group key has never been observed authenticating successfully.
+- **Related:** `docs/decisions/2026-10-01-codex-key-group-fail-closed-and-catalog-repair.md`
+
+## 2026-10-01 - Fail closed on unresolvable Codex key groups; fix codename pruning
+
+- **What happened:** A re-audit of "Sublyx no longer has the 6.1 sol model" found three separate defects, not one. The Sublyx catalog never had a `gpt-6.1-*` row (no rotated backup ever did), so the client kept requesting a `gpt-6.1-sol--ccg-…` name that resolved to nothing; those requests returned `401 Invalid_API_key` from 21:21 on Oct 1, last success 19:49:59. Separately, `gpt-6-astra--ccg-…` failed identically, proving the fault was credential resolution rather than a missing model.
+- **Root cause:** (1) `CodexAdapter::extract_grouped_key` returned `None` whenever a scoped model had no resolvable group, and the caller fell through to `extract_auth`, silently authenticating a group-scoped model with the provider's **main** `OPENAI_API_KEY`. A row could reach that state by keeping its generated `--ccg-` name while losing `apiKeyGroupId`. (2) `codexApiKeyGroupRouting.ts` only treated a row as group-generated when `apiKeyGroupId`/`apiKeyGroupGenerated` was present, so such an orphan leaked into the editable base catalog and was never rebuilt. (3) `codexCatalogVersionPruning.ts` put the GPT codename in `identity` but not in `branch`, and the keep/prune decision groups by `branch` — so `gpt-6`, `gpt-6-sol`, `gpt-6-astra`, and `gpt-6.1-sol` all shared `branch=general` and only the newest survived. Running the real pruner over the live 116-row catalog removed 35 rows, including `gpt-6-sol-opencode-zen` and every `glm-4.x`.
+- **What we did:** Added a `CodexGroupedKey` tri-state so an unresolvable group is distinct from "not scoped", plus a `resolve_auth_for_request_model` trait method that returns `ProxyError::AuthError` naming the model and the reason instead of falling back; both forwarder call sites now propagate it. Taught the frontend builder to recognize a `--ccg-` name as group-generated so orphans are stripped and rebound from the group definition (and dropped when their group is disabled). Folded the codename into the pruning branch key. Repaired the Sublyx data in one transaction after backing up the DB: enabled the `emergencyuse` group, rebound the two orphaned rows, and added `gpt-6.1-sol` plus its alias.
+- **Evidence:** Full frontend suite passed **198 files / 1,656 tests**; `pnpm typecheck`, `cargo check`, and `git diff --check` passed. `cargo test --lib proxy::providers::codex::tests` passed **142/142** including six new fail-closed regressions. Pruning the real catalog now removes 30 rows instead of 35 and retains the codename rows.
+- **What NOT to do again:** Never let a scoped model fall back to the provider credential — a wrong identity is worse than a visible failure. Do not key "keep newest per branch" on anything that is not part of the branch. Do not treat a `--ccg-` name as an ordinary editable model.
+- **Honest limits:** `cargo test --lib proxy::` reported 1,965 passed / 9 failed; all 9 are `CODEX_DESKTOP_ACTIVE` panics from the live-process routing guard (Codex Desktop running), matching the documented environmental baseline and unrelated to this change. Runtime freshness is **not** established: the live `cc-switch.exe` predates this source, so `gpt-6.1-sol` will not appear in Codex Desktop until the app republishes the catalog. The group key has never been observed authenticating successfully — every prior 200 came from the fallback this change removes — so if that key is dead, requests will now fail loudly naming the group instead of silently using the wrong credential.
+- **Related:** `docs/decisions/2026-10-01-codex-key-group-fail-closed-and-catalog-repair.md`
+
+## 2026-10-01 - Stop implicit provider model inventory refresh
+
+- **What happened:** Editing a provider caused Codex/OpenRouter to request the
+  entire upstream `/models` inventory again, making a gateway response of
+  roughly 468-486 models appear to be continuously processed.
+- **Root cause:** `ProviderForm` passed `autoRefreshModels={isEditMode}` into
+  every provider form. Codex's refresh effect had `ttlMs: 0`, so each mount or
+  remount fetched immediately; this was separate from the explicit manual
+  fetch button and from catalog inclusion.
+- **What we did:** Removed the implicit auto-refresh props at the shared
+  `ProviderForm` boundary. Manual Fetch/Sync Models remains available, and
+  fetched rows remain inventory-only (`enabled: false`) until explicitly
+  included.
+- **Evidence:** `pnpm exec vitest run
+  tests/components/ProviderForm.codexPreset.test.tsx
+  tests/components/CodexFormFields.test.tsx
+  src/components/providers/forms/codexCatalogSync.test.ts --reporter=verbose`
+  passed (3 files / 101 tests); `pnpm typecheck` passed; `git diff --check`
+  passed.
+- **What NOT to do again:** Do not wire edit-mode mounting to a live gateway
+  inventory fetch. Do not interpret the raw fetched count as the curated
+  routed catalog, and do not remove the explicit inclusion boundary.
+
+## 2026-10-01 - Root-cause re-audit closed: capability aliases, legacy backfill, named diagnostics
+
+- **What happened:** The user challenged whether the fetch-selection fix was
+  really at root. The re-audit found the same save failure in the live log at
+  `19:58:01` and again at `21:17:30` — after that fix was saved — and read-only
+  DB inspection showed provider `codex-multirouter` with **114/114 catalog rows
+  lacking `enabled`**, plus three enabled DeepSeek-alias V2 profiles
+  (`deepseek-v4-pro-opencode-go`, `deepseek-v4-flash-opencode-go`,
+  `deepseek-flash-opencode-go`) resolving `supportKind=unknown` via the
+  read-only `ccsm reasoning inspect` CLI.
+- **Root cause:** Two independent producers: (1) legacy rows persisted during
+  the regressed window are still implicitly included and no code path repairs
+  them; (2) capability lookup is keyed by exact `profile.model` and the
+  maintained allowlist is exact-only, so `deepseek_role_identity_for_model`
+  aliases never inherit the canonical DeepSeek declaration — the selection fix
+  could only dodge the error by silently un-routing wanted models.
+- **What we did:** (A) role-identity fallback in both the catalog projection
+  (`codex_catalog_model_specs`) and `validate_codex_subagent_reasoning_completeness`,
+  strictly scoped to DeepSeek role families. (B) save-boundary backfill in
+  `ProviderService::prepare_provider_for_mutation` stamping explicit
+  `enabled: true` on unmarked Codex catalog rows (policy: legacy omission has
+  always behaved as included; explicit `false` tombstones untouched). (C) the
+  validation error now lists every offending catalog model after the stable
+  code (never profile keys), surfaced through a new `subagentIncompleteNamed`
+  message in all four locales. Approval: user "do all a b c"; see the
+  [decision record](../decisions/2026-10-01-subagent-capability-alias-explicit-catalog.md).
+- **Evidence:** Targeted Rust: `codex_subagent_v2_` **114/114** (4 new tests),
+  `codex_subagent` **154/154**, backfill test passed via the update path (the
+  `add` path trips the environmental `CODEX_DESKTOP_ACTIVE` guard). Full
+  frontend **198 files / 1,650 tests** passed; `pnpm typecheck`, `cargo check`,
+  Prettier on touched files, and `git diff --check` passed. Full
+  `cargo test --lib`: **3,953 passed / 21 failed / 6 ignored** — 18
+  `CODEX_DESKTOP_ACTIVE` (Codex Desktop PID 38272 running), 1 pre-existing
+  `PendingRetry` readback failure (documented in an earlier entry), and 2
+  pre-existing failures owned by the earlier reasoning/official-model batch
+  (`snapshot_preserves_provider_effort_map`, `model_catalog_syncs_codex_models_cache_for_custom_provider_picker`)
+  proven independent of this change. Full `cargo test` remains blocked by the
+  live `cc-switch.exe` lock (os error 5).
+- **What NOT to do again:** Do not certify "root cause fixed" from unit tests
+  alone — check the live log and the actual persisted DB state. Do not trust a
+  targeted filter (`codex_subagent_v2_`) as whole-module coverage; it silently
+  skipped the two failing tests above. Do not "fix" the capability error by
+  excluding wanted models — that converts a validation error into a silently
+  broken subagent feature.
+
+## 2026-10-01 - Verification correction for explicit catalog inclusion fix
+
+- **What happened:** The ProviderForm catalog inclusion fix and Codex Sub-Agent
+  V2 capability-boundary fix were verified after the resumed task; the earlier
+  journal entry still described verification as pending.
+- **Root cause:** The stale test expectations were the only focused frontend
+  failures. The remaining incomplete check was environmental: two live
+  `cc-switch.exe` processes held the normal debug binary, so Cargo could not
+  replace it for the full Rust suite.
+- **What we did:** Updated the two frontend assertions to require explicit
+  `enabled: false`, then retained the backend strict validation and disabled-row
+  route boundary.
+- **Evidence:** Focused frontend checks passed (7 files / 303 tests),
+  `pnpm typecheck` passed, the targeted Rust Sub-Agent V2 suite passed (110/110),
+  `cargo check` passed, the full frontend suite passed (197 files / 1,647 tests),
+  and `git diff --check` passed. Full `cargo test` was blocked by Windows
+  `Access is denied (os error 5)` while replacing
+  `src-tauri\\target\\debug\\cc-switch.exe`.
+- **What NOT to do again:** Do not kill live `cc-switch.exe` processes or create
+  an alternate Cargo target to bypass the lock; stop/restart the normal process
+  with user coordination, then rerun the full Rust suite.
+
+## 2026-10-01 - Restore explicit ProviderForm inclusion boundary
+
+- **What happened:** ProviderForm began including every model returned by a
+  provider refresh, and saving a Codex Sub-Agent V2 configuration then failed
+  with `unknown_reasoning_capability_requires_declaration` for an unexpected
+  model.
+- **Root cause:** `80ce178c1` removed `enabled: false` from newly fetched rows.
+  The established contract interprets omitted `enabled` as included, so
+  discovery silently became selection; the strict V2 validator then correctly
+  rejected the newly routable unknown model.
+- **What we did:** Restored explicit exclusion for newly appended rows in both
+  ProviderForm merge paths and shared reconciliation, excluded disabled rows at
+  the backend catalog/spec boundary, added the missing shared model-identity
+  helper required by current imports, and added frontend/Rust regressions.
+- **Evidence:** Verification is pending in this turn; the pre-fix
+  `pnpm typecheck` failed because `src/lib/modelIdentities.ts` was absent.
+  See [decision record](../decisions/2026-10-01-provider-catalog-inclusion.md).
+- **What NOT to do again:** Do not treat fetched inventory as user inclusion,
+  remove the explicit false default, or weaken unknown-capability validation to
+  hide an accidentally enabled row.
+
+## 2026-10-01 - Enforce provider reasoning capability contract
+
+- **What happened:** Codex model-picker reasoning controls became unreliable for
+  secondary/gateway routes, and grouped API-key aliases could surface as labels.
+- **Root cause:** Capability snapshots dropped provider effort mappings; picker
+  and outbound code fabricated defaults for unknown metadata; generic model-name
+  inference treated gateways as if they shared direct-provider contracts; and
+  picker dirty-state comparison treated an undeclared router default as a
+  change.
+- **What we did:** Preserved upstream effort maps, made authenticated metadata
+  authoritative, represented missing/unauthenticated metadata as unknown,
+  removed generic gateway inference, retained only explicit provider heuristics,
+  kept catalog declarations authoritative, and made picker labels use friendly
+  display names while retaining internal `--ccg-...` route keys.
+- **Evidence:** `cargo check` passed; `pnpm typecheck` passed; `git diff --check`
+  passed; targeted Rust reasoning/provider/model-fetch/desktop tests passed
+  (17 + 136 + 52 + 11); Codex workspace and wizard frontend tests passed
+  (153). Runtime freshness is pending a user restart of `pnpm dev`.
+- **What NOT to do again:** Do not infer unsupported capability from an
+  unauthenticated `/models` response, fabricate `medium` or a full effort
+  list, or expose isolated routing keys as picker-facing labels. See the
+  [decision record](../decisions/2026-10-01-reasoning-capability-contract.md).
+
 ## 2026-10-01 - User-directed delivery with blocked backend verification
 
 - **What happened:** After the pre-push blockers were disclosed, the user

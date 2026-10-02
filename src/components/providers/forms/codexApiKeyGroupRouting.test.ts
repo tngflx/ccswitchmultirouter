@@ -79,4 +79,66 @@ describe("Codex API key group routing", () => {
       ]),
     ).toEqual(catalog);
   });
+
+  it("treats a --ccg- row with a lost binding as generated, not as a base model", () => {
+    // Regression: a partially rewritten catalog kept the generated name but
+    // dropped `apiKeyGroupId`. It was then treated as an editable base model,
+    // so it was never rebuilt with a binding and the proxy could not resolve
+    // which credential it belonged to.
+    const orphaned = {
+      model: "gpt-5.6-sol--ccg-astra",
+      upstreamModel: "gpt-5.6-sol",
+    };
+    expect(baseCodexCatalogModels([...catalog, orphaned])).toEqual(catalog);
+  });
+
+  it("rebinds an orphaned --ccg- row from the group definition", () => {
+    const orphaned = {
+      model: "gpt-5.6-sol--ccg-astra",
+      upstreamModel: "gpt-5.6-sol",
+    };
+    const rebuilt = buildCodexApiKeyGroupCatalog(
+      [...catalog, orphaned],
+      [
+        {
+          id: "astra",
+          label: "Astra",
+          apiKeys: ["astra-key"],
+          models: ["gpt-5.6-sol"],
+          strategy: "fixed",
+        },
+      ],
+      "isolated",
+    );
+
+    expect(rebuilt).toHaveLength(2);
+    expect(rebuilt[1]).toMatchObject({
+      model: "gpt-5.6-sol--ccg-astra",
+      apiKeyGroupId: "astra",
+      apiKeyGroupGenerated: true,
+    });
+  });
+
+  it("drops a --ccg- row entirely when its group is disabled", () => {
+    // A disabled group must not keep a routable scoped row alive, otherwise the
+    // row survives with no resolvable credential.
+    const orphaned = {
+      model: "gpt-5.6-sol--ccg-astra",
+      upstreamModel: "gpt-5.6-sol",
+    };
+    expect(
+      buildCodexApiKeyGroupCatalog(
+        [...catalog, orphaned],
+        [
+          {
+            id: "astra",
+            apiKeys: ["astra-key"],
+            models: ["gpt-5.6-sol"],
+            enabled: false,
+          },
+        ],
+        "isolated",
+      ),
+    ).toEqual(catalog);
+  });
 });

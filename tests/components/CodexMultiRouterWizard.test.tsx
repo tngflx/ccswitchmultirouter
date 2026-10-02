@@ -623,10 +623,10 @@ describe("CodexMultiRouterWizard", () => {
 
     expect(await screen.findByText("无模型列表更新")).toBeInTheDocument();
     expect(fetchModelsForConfig).toHaveBeenCalledTimes(1);
-    expect(providersApi.update).toHaveBeenCalledTimes(1);
+    expect(providersApi.update).not.toHaveBeenCalled();
   });
 
-  it("publishes every model fetched from enabled grouped credentials", async () => {
+  it("keeps grouped-credential discovery inventory-only until publish", async () => {
     vi.mocked(fetchModelsForConfig)
       .mockResolvedValueOnce([{ id: "fallback-model", ownedBy: null }])
       .mockResolvedValueOnce([
@@ -671,32 +671,7 @@ describe("CodexMultiRouterWizard", () => {
     expect(
       vi.mocked(fetchModelsForConfig).mock.calls.map((call) => call[1]),
     ).toEqual(["sk-fallback", "sk-group"]);
-    await waitFor(() => expect(providersApi.update).toHaveBeenCalledTimes(1));
-    const saved = vi.mocked(providersApi.update).mock.calls[0][0];
-    expect(
-      saved.settingsConfig.modelCatalog.models.map(
-        (model: { model: string }) => model.model,
-      ),
-    ).toEqual([
-      "fallback-model",
-      "stale-model",
-      "group-model-a",
-      "group-model-b",
-    ]);
-    expect(
-      saved.settingsConfig.modelCatalog.models.find(
-        (model: { model: string }) => model.model === "group-model-a",
-      )?.enabled,
-    ).not.toBe(false);
-    expect(
-      saved.settingsConfig.modelCatalog.models.find(
-        (model: { model: string }) => model.model === "group-model-b",
-      )?.enabled,
-    ).not.toBe(false);
-    expect(saved.settingsConfig.modelCatalog.spawnAgentModels).toEqual([
-      "fallback-model",
-      "stale-model",
-    ]);
+    expect(providersApi.update).not.toHaveBeenCalled();
 
     fireEvent.click(screen.getByRole("button", { name: "启用并验证" }));
     fireEvent.click(
@@ -710,7 +685,10 @@ describe("CodexMultiRouterWizard", () => {
         (route: { targetProviderId: string }) =>
           route.targetProviderId === source.id,
       );
-    expect(publishedRoute?.modelSelection).toEqual({ mode: "all" });
+    expect(publishedRoute?.modelSelection).toEqual({
+      mode: "include",
+      models: ["fallback-model", "stale-model"],
+    });
 
     const publishedSource = vi
       .mocked(providersApi.update)
@@ -726,9 +704,11 @@ describe("CodexMultiRouterWizard", () => {
       "group-model-b",
     ]);
     expect(
-      publishedSource?.settingsConfig.modelCatalog?.models.every(
-        (model: { enabled?: boolean }) => model.enabled !== false,
-      ),
+      publishedSource?.settingsConfig.modelCatalog?.models
+        .filter((model: { model: string }) =>
+          ["group-model-a", "group-model-b"].includes(model.model),
+        )
+        .every((model: { enabled?: boolean }) => model.enabled === false),
     ).toBe(true);
   });
 
@@ -768,12 +748,7 @@ describe("CodexMultiRouterWizard", () => {
     );
 
     expect(await screen.findByText("模型列表同步不完整")).toBeVisible();
-    const saved = vi.mocked(providersApi.update).mock.calls[0][0];
-    expect(
-      saved.settingsConfig.modelCatalog.models.map(
-        (model: { model: string }) => model.model,
-      ),
-    ).toEqual(["fallback-model", "group-only-model"]);
+    expect(providersApi.update).not.toHaveBeenCalled();
   });
 
   it("refreshes saved official OAuth models without appending excluded models", async () => {
@@ -817,18 +792,8 @@ describe("CodexMultiRouterWizard", () => {
     await waitFor(() =>
       expect(fetchCodexOauthModels).toHaveBeenCalledWith("account-56"),
     );
-    await waitFor(() => expect(providersApi.update).toHaveBeenCalledTimes(1));
-    const savedProvider = vi.mocked(providersApi.update).mock.calls[0][0];
-    expect(
-      savedProvider.settingsConfig.modelCatalog.models.map(
-        (model: { model: string }) => model.model,
-      ),
-    ).toEqual(["gpt-5.5", "gpt-5.6-sol"]);
-    expect(
-      savedProvider.settingsConfig.modelCatalog.models.find(
-        (model: { model: string }) => model.model === "gpt-5.6-sol",
-      )?.enabled,
-    ).not.toBe(false);
+    expect(providersApi.update).not.toHaveBeenCalled();
+    expect(screen.getByText(/新增 1: gpt-5.6-sol/)).toBeInTheDocument();
     expect(fetchModelsForConfig).not.toHaveBeenCalled();
   });
 
@@ -908,12 +873,8 @@ describe("CodexMultiRouterWizard", () => {
     expect(
       screen.getByText(/OAuth 在线模型列表获取失败，已使用本地缓存/),
     ).toBeInTheDocument();
-    const savedProvider = vi.mocked(providersApi.update).mock.calls[0][0];
-    expect(
-      savedProvider.settingsConfig.modelCatalog.models.map(
-        (model: { model: string }) => model.model,
-      ),
-    ).toEqual(["gpt-5.5", "gpt-5.6-luna"]);
+    expect(providersApi.update).not.toHaveBeenCalled();
+    expect(screen.getByText(/新增 2/)).toBeInTheDocument();
   });
 
   it("excludes an unchecked provider from the generated MultiRouter plan", async () => {
@@ -988,22 +949,10 @@ describe("CodexMultiRouterWizard", () => {
       screen.getByRole("button", { name: "自动获取并写入模型列表" }),
     );
 
-    await waitFor(() => expect(providersApi.update).toHaveBeenCalledTimes(1));
-    const savedProvider = vi.mocked(providersApi.update).mock.calls[0][0];
+    expect(providersApi.update).not.toHaveBeenCalled();
     expect(
-      savedProvider.settingsConfig.modelCatalog.models.map(
-        (model: { model: string }) => model.model,
-      ),
-    ).toEqual(["deepseek-chat", "deepseek-reasoner"]);
-    expect(
-      savedProvider.settingsConfig.modelCatalog.models.find(
-        (model: { model: string }) => model.model === "deepseek-reasoner",
-      )?.enabled,
-    ).not.toBe(false);
-    expect(savedProvider.settingsConfig.modelCatalog.spawnAgentModels).toEqual([
-      "deepseek-chat",
-      "deepseek-reasoner",
-    ]);
+      await screen.findByText(/新增 1: deepseek-reasoner/),
+    ).toBeInTheDocument();
   });
 
   it("falls back to data-plane models for AgentPlan without AK/SK when API Key exists", async () => {
@@ -1050,8 +999,9 @@ describe("CodexMultiRouterWizard", () => {
         undefined,
         undefined,
         undefined,
+        ["ark-code-latest"],
       );
-      expect(providersApi.update).toHaveBeenCalledTimes(1);
+      expect(providersApi.update).not.toHaveBeenCalled();
     });
     expect(screen.getByText(/新增 1: doubao-seed-1\.6/)).toBeInTheDocument();
   });
@@ -1148,8 +1098,9 @@ describe("CodexMultiRouterWizard", () => {
           accessKeyId: "AKLTtest",
           secretAccessKey: "secret",
         },
+        ["ark-code-latest"],
       );
-      expect(providersApi.update).toHaveBeenCalledTimes(1);
+      expect(providersApi.update).not.toHaveBeenCalled();
     });
     expect(screen.getByText(/新增 1: doubao-seed-1\.6/)).toBeInTheDocument();
   });
@@ -1197,8 +1148,8 @@ describe("CodexMultiRouterWizard", () => {
       screen.getByRole("button", { name: "自动获取并写入模型列表" }),
     );
 
-    await waitFor(() => expect(providersApi.update).toHaveBeenCalledTimes(1));
-    expect(screen.getByText(/新增 1: model-c/)).toBeInTheDocument();
+    expect(providersApi.update).not.toHaveBeenCalled();
+    expect(await screen.findByText(/新增 1: model-c/)).toBeInTheDocument();
 
     fireEvent.click(screen.getByRole("button", { name: "选择模型并预览路由" }));
     await waitFor(() => {

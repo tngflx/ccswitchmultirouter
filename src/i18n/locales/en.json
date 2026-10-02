@@ -1436,6 +1436,7 @@
     "codexSaveUnconfirmed": "Codex save outcome is unconfirmed. Refresh the provider list and verify the result before retrying.",
     "codexSaveDraftPreserved": "Your current draft is preserved; no changes were saved.",
     "subagentIncomplete": "Codex Sub-Agent configuration incomplete: routable models are enabled without declared reasoning capabilities. Configure them in the model catalog before saving.",
+    "subagentIncompleteNamed": "Codex Sub-Agent configuration incomplete: {{models}} — routable models are enabled without a declared reasoning capability. Declare their capabilities in the model catalog (or disable/exclude them), then save.",
     "subagentValidationFailed": "Codex Sub-Agent configuration validation failed: {{detail}}",
     "subagentValidationFallback": "Please check the model catalog and Sub-Agent configuration.",
     "reasoningErrors": {
@@ -3924,6 +3925,7 @@
     "modelSort": "Sort models",
     "topModelDefaultEffort": "Top model default effort",
     "topModelDefaultEffortHint": "Used by new threads when {{model}} is first.",
+    "reasoningUnknown": "Unknown until provider metadata is available",
     "currentOrder": "Current order (drag)",
     "sortByModel": "Model name",
     "sortByProvider": "Provider grouping",

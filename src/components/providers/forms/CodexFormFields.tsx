@@ -898,6 +898,9 @@ function mergeFetchedModelsIntoCatalogRows(
       model,
       upstreamModel: model,
       displayName: model,
+      // Fetching discovers provider inventory; it does not grant permission
+      // to include a model in this provider's runtime catalog.
+      enabled: false,
       ...(contextWindowText ? { contextWindow: contextWindowText } : {}),
       ...capabilityPatch,
       ...(fetched.reasoning ? { reasoning: fetched.reasoning } : {}),

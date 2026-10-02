@@ -31,11 +31,20 @@ function groupMatchesModel(group: CodexApiKeyGroup, model: string): boolean {
 }
 
 function isGeneratedGroupModel(model: CodexCatalogModel): boolean {
-  return (
+  if (
     model.apiKeyGroupGenerated === true ||
     model.api_key_group_generated === true ||
     Boolean(model.apiKeyGroupId || model.api_key_group_id)
-  );
+  ) {
+    return true;
+  }
+  // A `--ccg-` name is only ever produced by `buildCodexApiKeyGroupCatalog`.
+  // When a row keeps that generated name but loses its binding fields, treating
+  // it as a base model leaks a half-scoped row into the catalog: it is never
+  // regenerated with a group binding, and the proxy then cannot resolve which
+  // credential it belongs to. Recognize the marker so the row is rebuilt from
+  // the group definition instead.
+  return (model.model ?? "").toLowerCase().includes(GROUP_ALIAS_MARKER);
 }
 
 export function normalizeCodexApiKeyGroupMode(

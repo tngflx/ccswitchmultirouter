@@ -48,7 +48,9 @@ pub fn detect_platform_from_name_and_base_url(
         base_url.unwrap_or_default()
     )
     .to_ascii_lowercase();
-    if platform.contains("openrouter") {
+    if platform.contains("openrouter")
+        || base_url.is_some_and(is_openrouter_endpoint)
+    {
         Some("openrouter")
     } else if platform.contains("vllm") {
         Some("vllm")
@@ -57,6 +59,26 @@ pub fn detect_platform_from_name_and_base_url(
     } else {
         None
     }
+}
+
+/// Exact OpenRouter endpoint classification shared by discovery and catalog
+/// fetch. A look-alike hostname must never receive OpenRouter's native
+/// `reasoning: { effort }` contract.
+pub fn is_openrouter_endpoint(url: &str) -> bool {
+    let Ok(parsed) = reqwest::Url::parse(url) else {
+        return false;
+    };
+    let Some(host) = parsed.host_str() else {
+        return false;
+    };
+    host.eq_ignore_ascii_case("openrouter.ai")
+        && {
+            let path = parsed.path().trim_end_matches('/');
+            path.is_empty()
+                || path.eq_ignore_ascii_case("/api")
+                || path.eq_ignore_ascii_case("/api/v1")
+                || path.eq_ignore_ascii_case("/api/v1/models")
+        }
 }
 
 /// 统一发现入口：按平台选择适配器。未知平台仍尝试其认证 `/models`
@@ -130,6 +152,18 @@ fn provider_api_key(provider: &Provider) -> Option<String> {
     }
 
     let settings = &provider.settings_config;
+    // Pair a Codex TOML endpoint with the credential stored for that same
+    // source before consulting generic/stale provider fields.
+    if let Some(config) = settings.get("config").and_then(Value::as_str) {
+        if let Some(api_key) = crate::codex_config::extract_codex_api_key(
+            settings.get("auth"),
+            Some(config),
+        ) {
+            if !api_key.trim().is_empty() {
+                return Some(api_key);
+            }
+        }
+    }
     first_string(
         Some(settings),
         &["api_key", "apiKey", "token", "access_token", "accessToken"],
@@ -151,11 +185,6 @@ fn provider_api_key(provider: &Provider) -> Option<String> {
                 "ANTHROPIC_AUTH_TOKEN",
             ],
         )
-    })
-    .or_else(|| {
-        let config = settings.get("config").and_then(Value::as_str)?;
-        let auth = settings.get("auth");
-        crate::codex_config::extract_codex_api_key(auth, Some(config))
     })
     .or_else(|| {
         // Keep the discovery path aligned with the app-wide credential
@@ -362,6 +391,8 @@ fn snapshot_from_capability(
                 .unwrap_or(false),
             upstream_format: Some(capability.upstream.format.clone()),
             upstream_parameter: Some(capability.upstream.parameter.clone()),
+            upstream_effort_map: (!capability.upstream.effort_map.is_empty())
+                .then(|| capability.upstream.effort_map.clone()),
             output_format: capability.output_format.clone(),
         }),
     }
