@@ -240,6 +240,7 @@ pub fn validate_v2(
                 .iter()
                 .map(|model| model.trim())
                 .filter(|model| !model.is_empty())
+                .map(str::to_ascii_lowercase)
                 .collect::<HashSet<_>>();
             if selected.is_empty() {
                 push_issue(
@@ -259,7 +260,7 @@ pub fn validate_v2(
             }
             for target in route.aliases.values() {
                 let Some(provider) = providers.get(route.target_provider_id.trim()) else {
-                    if !selected.contains(target.trim()) {
+                    if !selected.contains(&target.trim().to_ascii_lowercase()) {
                         push_issue(
                             &mut issues,
                             "alias_target_not_selected",
@@ -580,6 +581,28 @@ mod tests {
         validate_v2(&plan, &providers).expect(
             "visible catalog selection and upstream alias target should refer to the same model",
         );
+    }
+
+    #[test]
+    fn validation_rejects_case_insensitive_duplicate_include_models() {
+        let value = valid_plan(json!({
+            "id": "router-qwen",
+            "targetProviderId": "qwen",
+            "modelSelection": {
+                "mode": "include",
+                "models": ["QWEN3.8", " qwen3.8 "]
+            },
+            "aliases": {},
+            "authPolicy": {"source": "provider_config"}
+        }));
+        let CodexRoutingDocument::V2(plan) = CodexRoutingDocument::parse(&value).expect("parse v2")
+        else {
+            panic!("expected v2");
+        };
+        let issues = validate_v2(&plan, &providers()).expect_err("duplicate include models");
+        assert!(issues
+            .iter()
+            .any(|issue| issue.code == "include_models_duplicate_or_empty"));
     }
 
     #[test]

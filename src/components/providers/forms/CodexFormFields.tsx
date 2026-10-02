@@ -1102,10 +1102,10 @@ export function CodexFormFields({
     ],
   );
   const recordVerifiedModelList = useCallback(
-    (models: FetchedModel[]) => {
+    (models: FetchedModel[], identity = modelFetchIdentity) => {
       if (models.length > 0) {
         setVerifiedModelList({
-          identity: modelFetchIdentity,
+          identity,
           ids: models
             .map((model) => catalogModelIdentity(model.id))
             .filter(Boolean),
@@ -1944,13 +1944,38 @@ export function CodexFormFields({
     ],
   );
 
-  const autoModelRefreshKey = `provider-models:codex:${modelFetchIdentity}`;
+  const automaticRequestedModelIds = useMemo(
+    () =>
+      isXaiOauthPreset
+        ? []
+        : Array.from(
+            new Set(
+              catalogRows
+                .filter((row) => row.enabled !== false)
+                .flatMap(modelBindingIdentityValues),
+            ),
+          ).sort(),
+    [catalogRows, isXaiOauthPreset],
+  );
+  // A scoped observation must never share a request or diff baseline with
+  // unrestricted discovery, or with another enabled upstream selection.
+  const automaticModelDiscoverySkipped =
+    !isXaiOauthPreset &&
+    catalogRows.length > 0 &&
+    catalogRows.every((row) => row.enabled === false);
+  const automaticModelFetchIdentity = automaticRequestedModelIds.length
+    ? `${modelFetchIdentity}:catalog:${JSON.stringify(automaticRequestedModelIds)}`
+    : automaticModelDiscoverySkipped
+      ? `${modelFetchIdentity}:catalog:disabled`
+      : modelFetchIdentity;
+  const autoModelRefreshKey = `provider-models:codex:${automaticModelFetchIdentity}`;
 
   const autoFetchModels = useCallback(async (): Promise<FetchedModel[]> => {
     if (isXaiOauthPreset) {
       if (!isXaiOauthAuthenticated) return [];
       return fetchXaiOauthModels(selectedXaiAccountId ?? null);
     }
+    if (automaticModelDiscoverySkipped) return [];
 
     const keys = Array.from(
       new Set(
@@ -1992,6 +2017,9 @@ export function CodexFormFields({
                 secretAccessKey: planSecretAccessKey ?? "",
               }
             : undefined,
+          ...(automaticRequestedModelIds.length > 0
+            ? [automaticRequestedModelIds]
+            : []),
         ),
       ),
     );
@@ -2004,6 +2032,8 @@ export function CodexFormFields({
     }
     return Array.from(modelsByIdentity.values());
   }, [
+    automaticModelDiscoverySkipped,
+    automaticRequestedModelIds,
     codexApiKey,
     codexBaseUrl,
     customUserAgent,
@@ -2020,7 +2050,7 @@ export function CodexFormFields({
 
   const applyAutomaticCatalogRefresh = useCallback(
     (models: FetchedModel[]) => {
-      recordVerifiedModelList(models);
+      recordVerifiedModelList(models, automaticModelFetchIdentity);
       if (!onCatalogModelsChange || models.length === 0) return;
 
       // Background refreshes are allowed to hydrate metadata on rows already
@@ -2046,6 +2076,7 @@ export function CodexFormFields({
       onCatalogModelsChange(persistedRows);
     },
     [
+      automaticModelFetchIdentity,
       codexBaseUrl,
       onCatalogModelsChange,
       providerId,
@@ -2077,6 +2108,7 @@ export function CodexFormFields({
       Boolean(autoRefreshModels && providerId) &&
       ((isXaiOauthPreset && isXaiOauthAuthenticated) ||
         (!isXaiOauthPreset &&
+          !automaticModelDiscoverySkipped &&
           Boolean(codexBaseUrl) &&
           (Boolean(codexApiKey) ||
             enabledGroupedApiKeys.length > 0 ||
@@ -2092,7 +2124,7 @@ export function CodexFormFields({
             )))),
     fetcher: autoFetchModels,
     onSuccess: applyAutomaticCatalogRefresh,
-    snapshotKey: `codex:${modelFetchIdentity}`,
+    snapshotKey: `codex:${automaticModelFetchIdentity}`,
     onDiff: handleAutomaticModelDiff,
     ttlMs: 0,
   });
@@ -2752,7 +2784,8 @@ export function CodexFormFields({
   const pendingChatModels = pendingSplitRouting?.chatModels ?? [];
   const defaultModelIdentity = catalogModelIdentity(codexModel);
   const verifiedIds =
-    verifiedModelList?.identity === modelFetchIdentity
+    verifiedModelList?.identity === modelFetchIdentity ||
+    verifiedModelList?.identity === automaticModelFetchIdentity
       ? new Set(verifiedModelList.ids)
       : null;
   const defaultModelAvailable =

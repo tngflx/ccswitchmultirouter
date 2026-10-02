@@ -409,6 +409,9 @@ function renderCatalogHarness(
   let latestCatalog = initialCatalog;
   let latestApiKeyGroups = options.initialApiKeyGroups ?? [];
   let latestApiKeyGroupMode = options.initialApiKeyGroupMode ?? "isolated";
+  let updateCatalog: (catalog: CodexCatalogModel[]) => void = () => {
+    throw new Error("catalog harness is not mounted");
+  };
 
   function Harness() {
     const [catalog, setCatalog] = useState<CodexCatalogModel[]>(initialCatalog);
@@ -429,6 +432,7 @@ function renderCatalogHarness(
       onCatalogChange(next);
       setCatalog(next);
     };
+    updateCatalog = handleCatalogChange;
     const handleApiKeyGroupsChange = (next: CodexApiKeyGroup[]) => {
       latestApiKeyGroups = next;
       onApiKeyGroupsChange(next);
@@ -513,6 +517,9 @@ function renderCatalogHarness(
     latestCatalog: () => latestCatalog,
     latestApiKeyGroups: () => latestApiKeyGroups,
     latestApiKeyGroupMode: () => latestApiKeyGroupMode,
+    updateCatalog(next: CodexCatalogModel[]) {
+      act(() => updateCatalog(next));
+    },
   };
 }
 
@@ -749,12 +756,12 @@ describe("CodexFormFields local model routing", () => {
     const harness = renderCatalogHarness(
       [
         {
-          model: "old-remote",
-          upstreamModel: "old-remote",
+          model: "local-alias",
+          upstreamModel: "remote-model",
           enabled: true,
         },
         {
-          model: "manual-alias",
+          model: "disabled-model",
           enabled: false,
         },
       ],
@@ -762,12 +769,160 @@ describe("CodexFormFields local model routing", () => {
     );
 
     await waitFor(() => expect(fetchModelsForConfig).toHaveBeenCalledTimes(1));
+    expect(fetchModelsForConfig).toHaveBeenCalledWith(
+      "https://api.thirdparty.example/v1",
+      "sk-test",
+      false,
+      undefined,
+      "",
+      undefined,
+      ["remote-model"],
+    );
     await act(async () => {});
     expect(harness.latestCatalog()).toEqual([
-      { model: "old-remote", upstreamModel: "old-remote", enabled: true },
-      { model: "manual-alias", enabled: false },
+      { model: "local-alias", upstreamModel: "remote-model", enabled: true },
+      { model: "disabled-model", enabled: false },
     ]);
     expect(harness.onCatalogChange).not.toHaveBeenCalled();
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+  });
+
+  it("keeps automatic refresh unrestricted when the saved catalog is empty", async () => {
+    vi.mocked(fetchModelsForConfig).mockResolvedValue([]);
+    renderCatalogHarness([], { autoRefreshModels: true });
+
+    await waitFor(() => expect(fetchModelsForConfig).toHaveBeenCalledTimes(1));
+    expect(fetchModelsForConfig).toHaveBeenCalledWith(
+      "https://api.thirdparty.example/v1",
+      "sk-test",
+      false,
+      undefined,
+      "",
+      undefined,
+    );
+  });
+
+  it("skips automatic discovery for an all-disabled catalog but keeps manual Sync Models unrestricted", async () => {
+    vi.mocked(fetchModelsForConfig).mockResolvedValue([
+      { id: "new-model", ownedBy: null },
+    ]);
+    const models = [{ model: "excluded-model", enabled: false }];
+    const harness = renderCatalogHarness(models, { autoRefreshModels: true });
+    await act(async () => {});
+    expect(fetchModelsForConfig).not.toHaveBeenCalled();
+    expect(harness.onCatalogChange).not.toHaveBeenCalled();
+    expect(harness.latestCatalog()).toEqual(models);
+
+    fireEvent.click(screen.getByRole("button", { name: "Sync Models" }));
+    await waitFor(() => expect(fetchModelsForConfig).toHaveBeenCalledTimes(1));
+    expect(fetchModelsForConfig).toHaveBeenCalledWith(
+      "https://api.thirdparty.example/v1",
+      "sk-test",
+      false,
+      undefined,
+      "",
+      undefined,
+    );
+    await waitFor(() => expect(harness.latestCatalog()).toHaveLength(2));
+    expect(harness.latestCatalog()[0]).toMatchObject(models[0]);
+  });
+
+  it("ignores automatic responses while all rows are disabled and refreshes after re-enabling", async () => {
+    const earlier =
+      deferred<Awaited<ReturnType<typeof fetchModelsForConfig>>>();
+    const current =
+      deferred<Awaited<ReturnType<typeof fetchModelsForConfig>>>();
+    vi.mocked(fetchModelsForConfig)
+      .mockReturnValueOnce(earlier.promise)
+      .mockReturnValueOnce(current.promise);
+    const harness = renderCatalogHarness(
+      [{ model: "model-a", enabled: true }],
+      { autoRefreshModels: true },
+    );
+    await waitFor(() => expect(fetchModelsForConfig).toHaveBeenCalledTimes(1));
+    harness.updateCatalog([{ model: "model-a", enabled: false }]);
+    vi.mocked(harness.onCatalogChange).mockClear();
+    await act(async () => {
+      earlier.resolve([
+        { id: "model-a", ownedBy: null, contextWindow: 100000 },
+      ]);
+    });
+    expect(harness.latestCatalog()).toEqual([
+      { model: "model-a", enabled: false },
+    ]);
+    expect(harness.onCatalogChange).not.toHaveBeenCalled();
+    expect(fetchModelsForConfig).toHaveBeenCalledTimes(1);
+    harness.updateCatalog([{ model: "model-a", enabled: true }]);
+    await waitFor(() => expect(fetchModelsForConfig).toHaveBeenCalledTimes(2));
+    await act(async () => {
+      current.resolve([
+        { id: "model-a", ownedBy: null, contextWindow: 200000 },
+      ]);
+    });
+    await waitFor(() =>
+      expect(harness.latestCatalog()[0].contextWindow).toBe("200000"),
+    );
+    expect(
+      vi.mocked(fetchModelsForConfig).mock.calls.map((call) => call[6]),
+    ).toEqual([["model-a"], ["model-a"]]);
+  });
+
+  it("discards an automatic response when the enabled upstream scope changes in flight", async () => {
+    const older = deferred<Awaited<ReturnType<typeof fetchModelsForConfig>>>();
+    const newer = deferred<Awaited<ReturnType<typeof fetchModelsForConfig>>>();
+    vi.mocked(fetchModelsForConfig)
+      .mockReturnValueOnce(older.promise)
+      .mockReturnValueOnce(newer.promise);
+    const harness = renderCatalogHarness(
+      [{ model: "local-alias", upstreamModel: "model-a", enabled: true }],
+      { autoRefreshModels: true },
+    );
+    await waitFor(() => expect(fetchModelsForConfig).toHaveBeenCalledTimes(1));
+
+    harness.updateCatalog([
+      { model: "local-alias", upstreamModel: "model-b", enabled: true },
+    ]);
+    await waitFor(() => expect(fetchModelsForConfig).toHaveBeenCalledTimes(2));
+    expect(
+      vi.mocked(fetchModelsForConfig).mock.calls.map((call) => call[6]),
+    ).toEqual([["model-a"], ["model-b"]]);
+
+    await act(async () => {
+      older.resolve([{ id: "model-a", ownedBy: null, contextWindow: 100000 }]);
+    });
+    expect(document.getElementById("codexDefaultModel")).not.toHaveAttribute(
+      "aria-invalid",
+    );
+    expect(harness.latestCatalog()[0].contextWindow).toBeUndefined();
+
+    await act(async () => {
+      newer.resolve([{ id: "model-b", ownedBy: null, contextWindow: 200000 }]);
+    });
+    await waitFor(() =>
+      expect(harness.latestCatalog()[0].contextWindow).toBe("200000"),
+    );
+    expect(fetchModelsForConfig).toHaveBeenCalledTimes(2);
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+  });
+
+  it("does not compare unrestricted discovery with a scoped automatic response", async () => {
+    vi.mocked(fetchModelsForConfig)
+      .mockResolvedValueOnce([
+        { id: "model-a", ownedBy: null },
+        { id: "model-b", ownedBy: null },
+      ])
+      .mockResolvedValueOnce([{ id: "model-a", ownedBy: null }]);
+    const initial = renderCatalogHarness([{ model: "model-a" }]);
+    fireEvent.click(screen.getByRole("button", { name: "Sync Models" }));
+    await waitFor(() => expect(initial.latestCatalog()).toHaveLength(2));
+    initial.unmount();
+
+    renderCatalogHarness(
+      [{ model: "model-a" }, { model: "model-b", enabled: false }],
+      { autoRefreshModels: true },
+    );
+    await waitFor(() => expect(fetchModelsForConfig).toHaveBeenCalledTimes(2));
+    await act(async () => {});
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
   });
 
@@ -871,9 +1026,10 @@ describe("CodexFormFields local model routing", () => {
       undefined,
       modelRefreshCredentialFingerprint(""),
     ]);
-    rememberModelRefreshSnapshot(`codex:${modelFetchIdentity}`, [
-      { id: "old-model", ownedBy: "provider" },
-    ]);
+    rememberModelRefreshSnapshot(
+      `codex:${modelFetchIdentity}:catalog:["old-model"]`,
+      [{ id: "old-model", ownedBy: "provider" }],
+    );
     vi.mocked(fetchModelsForConfig).mockResolvedValue([
       { id: "new-model", ownedBy: "provider" },
     ]);
@@ -2157,9 +2313,9 @@ describe("CodexFormFields local model routing", () => {
       expect(
         latestCatalog().find((row) => row.model === "new")?.reasoning,
       ).toEqual(fetchedReasoning);
-      expect(
-        latestCatalog().find((row) => row.model === "new")?.enabled,
-      ).toBe(false);
+      expect(latestCatalog().find((row) => row.model === "new")?.enabled).toBe(
+        false,
+      );
     });
   });
 

@@ -1300,7 +1300,7 @@ describe("codexMultiRouterWizard helpers", () => {
     ]);
   });
 
-  it("collects duplicate upstream model collisions for state machine review", () => {
+  it("collects unresolved visible model collisions for state machine review", () => {
     const official = provider({
       id: "openai-official",
       name: "OpenAI Official",
@@ -1316,16 +1316,103 @@ describe("codexMultiRouterWizard helpers", () => {
       name: "Relay",
       settingsConfig: {
         modelCatalog: {
-          models: [{ model: "relay-gpt-5.5", upstreamModel: "gpt-5.5" }],
+          models: [{ model: " GPT-5.5 ", upstreamModel: "gpt-5.5" }],
         },
       },
     });
 
     expect(collectWizardModelNameCollisions([official, relay])).toEqual([
       {
-        upstreamModel: "gpt-5.5",
+        visibleModel: "gpt-5.5",
         providerIds: ["openai-official", "relay"],
         canonicalProviderIds: ["openai-official"],
+      },
+    ]);
+  });
+
+  it("does not report resolved Go/Zen aliases sharing an upstream model", () => {
+    const sources = ["go", "zen"].map((suffix) =>
+      provider({
+        id: suffix,
+        name: `OpenCode ${suffix}`,
+        settingsConfig: {
+          modelCatalog: {
+            models: [
+              {
+                model: `glm-5.3-flash-opencode-${suffix}`,
+                upstreamModel: "glm-5.3-flash",
+              },
+            ],
+          },
+        },
+      }),
+    );
+
+    expect(collectWizardModelNameCollisions(sources)).toEqual([]);
+    const resolved = resolveWizardModelNameCollisions(sources);
+    expect(collectWizardModelNameCollisions(resolved)).toEqual([]);
+    const routes = buildWizardRoutesFromSources(resolved);
+    for (const suffix of ["go", "zen"]) {
+      expect(
+        routes.find((route) => route.targetProviderId === suffix)?.aliases,
+      ).toEqual({ [`glm-5.3-flash-opencode-${suffix}`]: "glm-5.3-flash" });
+    }
+  });
+
+  it("reports one visible identity even when upstream targets differ", () => {
+    const sources = ["a", "b"].map((id) =>
+      provider({
+        id,
+        settingsConfig: {
+          modelCatalog: {
+            models: [{ model: "shared", upstreamModel: `upstream-${id}` }],
+          },
+        },
+      }),
+    );
+
+    expect(collectWizardModelNameCollisions(sources)).toEqual([
+      {
+        visibleModel: "shared",
+        providerIds: ["a", "b"],
+        canonicalProviderIds: [],
+      },
+    ]);
+    expect(
+      collectWizardModelNameCollisions(
+        resolveWizardModelNameCollisions(sources),
+      ),
+    ).toEqual([]);
+  });
+
+  it("counts each provider once for repeated visible catalog rows", () => {
+    const source = provider({
+      id: "a",
+      settingsConfig: {
+        modelCatalog: {
+          models: [
+            { model: "shared", upstreamModel: "upstream-a" },
+            { model: "SHARED", upstreamModel: "upstream-b" },
+          ],
+        },
+      },
+    });
+    expect(collectWizardModelNameCollisions([source, source])).toEqual([]);
+    expect(
+      collectWizardModelNameCollisions([
+        source,
+        provider({
+          id: "b",
+          settingsConfig: {
+            modelCatalog: { models: [{ model: "shared" }] },
+          },
+        }),
+      ]),
+    ).toEqual([
+      {
+        visibleModel: "shared",
+        providerIds: ["a", "b"],
+        canonicalProviderIds: [],
       },
     ]);
   });

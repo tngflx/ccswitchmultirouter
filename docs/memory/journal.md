@@ -1,5 +1,260 @@
 # Engineering Journal (newest first)
 
+## 2026-10-02 - Final catalogue-boundary verification
+
+- **What happened:** The automatic model-discovery regression and related
+  visible-name collision behavior were reverified after the root fixes.
+- **Root cause:** Automatic callers previously treated an omitted model scope as
+  unrestricted discovery; route identity normalization and collision detection
+  also used inconsistent identities at adjacent boundaries.
+- **What we did:** Kept enabled ProviderForm catalogue identities as the only
+  automatic refresh scope, skipped nonempty all-disabled catalogues, preserved
+  disabled rows, kept manual sync unrestricted, and resolved only genuine
+  visible-name conflicts. Restored Codex Desktop startup default-on and removed
+  only the approved inspection-created plan.
+- **Evidence:** `pnpm test:unit` passed 198 files / 1,678 tests;
+  `pnpm typecheck`, `git diff --check`, `cargo check --manifest-path
+  src-tauri/Cargo.toml`, and `cargo test --manifest-path
+  src-tauri/Cargo.toml --lib codex_multirouter` passed (108/108). The full Rust
+  suite was attempted but Cargo could not replace the normal debug executable
+  because running PIDs 20760 and 45100 hold it (`Access is denied`, OS error 5).
+  Runtime freshness is not verified until the user restarts the normal `pnpm
+  dev` process.
+- **What NOT to do again:** Do not infer runtime freshness from mocked tests or
+  an older live binary, and do not use an empty optional request scope for an
+  intentional all-disabled catalogue.
+- **Related:** `docs/decisions/2026-10-01-multirouter-fetch-draft-boundary.md`,
+  `docs/decisions/2026-10-02-all-disabled-automatic-catalogue.md`
+
+## 2026-10-02 - Correct inline reasoning test evidence
+
+- **What happened:** The earlier inline-reasoning entry recorded the focused
+  Rust test as blocked by the normal debug executable lock.
+- **Root cause:** That entry was written before Cargo completed the queued test
+  after the lock became available; it is stale evidence, not a source change.
+- **What we did:** Re-ran the exact compiler and catalog regression tests and
+  retained the normal target. Both passed, alongside the frontend typecheck.
+- **Evidence:** `cargo test --manifest-path src-tauri/Cargo.toml --lib
+  codex_multirouter::compiler::tests::codex_catalog_reasoning_resolves_provider_inline_model_alias -- --nocapture`
+  passed 1/1; the matching `codex_config` test passed 1/1; `pnpm typecheck`
+  passed. The full compiler-focused group passed 29/29 and the `codex_catalog`
+  group passed 5/5. The live Tauri/Codex Desktop picker remains unverified until the
+  user restarts the normal development process with this source loaded.
+- **What NOT to do again:** Do not leave a pre-lock test failure as the final
+  verification record after a queued rerun has completed.
+- **Related:** `docs/decisions/2026-10-02-multirouter-inline-reasoning-resolution.md`
+
+## 2026-10-02 - Restore inline reasoning capabilities in MultiRouter
+
+- **What happened:** Codex Desktop routed aliases with valid inline TOML
+  reasoning declarations still reached the picker with no usable effort list;
+  some persisted rows contained an empty reasoning placeholder.
+- **Root cause:** The MultiRouter compiler had its own narrower extractor and
+  never consulted the shared resolver against
+  `model_providers.*.models[]`. The downstream config writer then correctly
+  emitted an empty `supported_reasoning_levels` array for the compiler's
+  missing capability. An empty placeholder also blocked the fallback.
+- **What we did:** Kept valid model-row and provider-level declarations as the
+  precedence winners, treated an effort-less placeholder as absent, and
+  resolved visible/canonical/upstream identities through the shared resolver.
+  Unknown third-party models remain fail-closed; no generic GPT defaults were
+  added. This follows BigStrongSun's unified resolver architecture and closes
+  the remaining MultiRouter compiler divergence.
+- **Evidence:** `cargo check --manifest-path src-tauri/Cargo.toml` passed;
+  `pnpm typecheck` passed; Rust format check and `git diff --check` passed. The
+  focused compiler test compiled the crate but could not execute because Cargo
+  could not replace the normal-target `cc-switch.exe` locked by two running
+  processes (`Access is denied`).
+- **What NOT to do again:** Do not add picker-only reasoning fallbacks or infer
+  capabilities from GPT-shaped model IDs. Resolve inline declarations at the
+  shared compiler/resolver boundary and preserve the fail-closed contract.
+- **Related:** `docs/decisions/2026-10-02-multirouter-inline-reasoning-resolution.md`
+
+## 2026-10-02 - Scoped automatic catalogue and duplicate route identity audit
+
+- **What happened:** Automatic Codex model refresh could widen a ProviderForm
+  catalogue into unrestricted discovery, and route include selections could
+  reach Rust validation with duplicate identities differing only by case or
+  whitespace. The four-day functional commit range (`af372abd3` through
+  `e880d2482`) was reaudited at each changed ownership boundary.
+- **Root cause:** Automatic callers omitted the persisted enabled catalogue
+  identities; the fetch service therefore correctly interpreted the request as
+  unrestricted. Separately, frontend serialization and Rust validation used
+  different route-identity normalization rules.
+- **What we did:** Passed enabled catalogue identities through wizard,
+  workspace, and ProviderForm automatic requests; skipped nonempty all-disabled
+  saved catalogues; preserved unrestricted empty-bootstrap/manual-sync
+  behavior; resolved visible aliases that share one upstream while retaining
+  real visible-name conflicts; and normalized route include identities
+  case-insensitively at both serialization and validation boundaries.
+- **Evidence:** Affected frontend suite passed 6 files / 324 tests;
+  `pnpm typecheck`, targeted Prettier, and `git diff --check` passed. The
+  repository-wide Prettier check still reports three pre-existing committed
+  files. Rust targeted tests, `cargo check`, full suites, and runtime freshness
+  are pending because the normal debug executable is locked by PIDs 20760 and
+  45100; no process was killed.
+- **What NOT to do again:** Do not let an empty optional request argument stand
+  in for an intentional all-disabled catalogue, and do not validate persisted
+  route identities with a different normalization contract than the serializer.
+- **Related:** `docs/decisions/2026-10-02-all-disabled-automatic-catalogue.md`,
+  `docs/decisions/2026-10-02-route-selection-identity-normalization.md`,
+  `docs/decisions/2026-10-02-wizard-visible-name-collision-detector.md`
+
+## 2026-10-02 - Remove only the inspection-created empty plan
+
+- **What happened:** Earlier inspection accidentally created the empty,
+  unpublished `codex-multirouter-2` plan.
+- **Root cause:** An inspection action crossed the plan-creation boundary.
+- **What we did:** After the user's exact approval, deleted only that plan
+  through the existing background UIA deletion confirmation.
+- **Evidence:** Confirmation named "New Codex MultiRouter"; read-only SQLite
+  found the accidental row absent, the active `codex-multirouter` still current,
+  and its row SHA-256 unchanged at
+  `8ebe05d0fbb1d5f45a7bbcd142ea4d8045accc89788ed95eea2f27584ac6fdd1`.
+- **What NOT to do again:** Do not invoke creation or destructive controls to
+  explore an application. Inspection must remain read-only unless specifically
+  approved.
+- **Related:** `docs/decisions/2026-10-02-remove-inspection-created-empty-plan.md`
+
+## 2026-10-02 - Correct the startup-default regression verdict
+
+- **What happened:** The two earlier October 2 opt-in restoration entries were
+  wrong: September 29 documented default-on as deliberate and user-requested.
+- **Root cause:** The reaudit treated changed defaults as a regression without
+  checking the existing decision journal; the inherited default-off edits were
+  unapproved.
+- **What we did:** Following "Restore documented default-on", restored Rust and
+  frontend defaults to HEAD and retained regressions for missing/explicit values.
+- **Evidence:** Rust startup regression passed 1/1; settings hook passed 10/10;
+  combined focused frontend run passed 6 files / 317 tests and typecheck passed.
+  Full Rust and live startup verification remain outstanding.
+- **What NOT to do again:** Search the journal before reverting unusual behavior.
+  A test pass or audit request cannot approve a new startup policy.
+- **Related:** `docs/decisions/2026-10-02-restore-codex-desktop-startup-default.md`
+
+## 2026-10-02 - Fix visible collisions and automatic catalogue scope
+
+- **What happened:** Resolved Go/Zen aliases still produced a duplicate warning,
+  and automatic refresh counted/requested disabled inventory as active models.
+- **Root cause:** The detector grouped real upstream IDs instead of picker
+  identities. Automatic request, cache, snapshot, and displayed-count boundaries
+  did not consistently share the enabled catalogue scope. Earlier October 2
+  entries endorsing disabled refresh tombstones are superseded.
+- **What we did:** Detect only shared visible identities across distinct
+  providers; preserve upstream IDs and routing. Automatic standard refreshes
+  use enabled bindings and scope their request/cache/snapshot identities;
+  preserve disabled stored rows and manual/OAuth discovery behavior.
+- **Evidence:** Focused frontend run passed 6 files / 317 tests; typecheck,
+  targeted Prettier recheck, and diff check passed. Background Tauri Prepare UIA
+  showed distinct Go/Zen aliases with no false warning; the associated image was
+  of the provider list and is not Prepare-page evidence. Live exact request
+  contents, final suites, and the all-disabled decision remain outstanding.
+- **What NOT to do again:** Do not equate upstream sharing with picker collision,
+  raw inventory with active selection, or scoped refresh with manual discovery.
+- **Related:** `docs/decisions/2026-10-02-wizard-visible-name-collision-detector.md`,
+  `docs/decisions/2026-10-01-multirouter-fetch-draft-boundary.md`
+
+## 2026-10-02 - Fix the remaining ProviderForm automatic fetch producer
+
+- **What happened:** The live app still showed full provider inventories during
+  automatic model refresh after the wizard-side filter fix. The observed counts
+  remained larger than the saved ProviderForm catalogs.
+- **Root cause:** `CodexFormFields.autoFetchModels()` was a separate producer
+  from the MultiRouter wizard and called `fetchModelsForConfig` without
+  `requestedModelIds`. The backend filter existed, but this caller never gave it
+  the ProviderForm catalog boundary. Disabled rows were also omitted from the
+  request if the caller used only enabled-model helpers, which would prevent
+  metadata refresh for explicit tombstones.
+- **What we did:** Automatic standard-provider refresh now derives a stable,
+  deduplicated ID list from `modelBindingIdentityValues` for every persisted
+  catalog row, including disabled rows, and passes it as the optional seventh
+  fetch argument. Empty catalogs retain unrestricted bootstrap discovery. Manual
+  “Sync Models” and the provider-specific OAuth catalog path remain unchanged.
+- **Evidence:** `pnpm exec vitest run
+  tests/components/CodexFormFields.test.tsx --reporter=dot` passed **74/74**;
+  `cargo test --manifest-path src-tauri/Cargo.toml
+  services::model_fetch::tests --lib` passed **54/54**;
+  `pnpm typecheck`, `cargo check --manifest-path src-tauri/Cargo.toml`, and
+  `git diff --check` passed. Runtime freshness is still pending a user-directed
+  restart of the normal `pnpm dev` process; the existing `cc-switch.exe` was not
+  killed.
+- **What NOT to do again:** Do not assume the wizard is the only fetch producer.
+  Trace every automatic and manual caller through the typed IPC boundary before
+  claiming that a catalog filter is effective. Do not filter out disabled rows
+  when they are explicit ProviderForm bindings.
+- **Related:** `docs/decisions/2026-10-01-multirouter-fetch-draft-boundary.md`
+
+## 2026-10-02 - Startup-default regression verification completed
+
+- **What happened:** The recent-commit reaudit fix for Codex Desktop startup behavior was compiled and exercised after the source edit.
+- **Root cause:** `849a0915d` had changed missing/fresh `launch_codex_desktop_with_ccswitch` from opt-in to opt-out; the source now restores `false` while preserving explicit values.
+- **What we did:** Ran the focused settings regression and a normal-target Rust check; kept the live app untouched.
+- **Evidence:** `cargo test --manifest-path src-tauri/Cargo.toml settings::tests::codex_desktop_startup_is_opt_in_and_independent_from_auto_launch --lib` passed **1/1**; `cargo check --manifest-path src-tauri/Cargo.toml` passed. Full Rust suite remains blocked by the running `src-tauri\\target\\debug\\cc-switch.exe`; live UI freshness still requires a user-directed `pnpm dev` restart.
+- **What NOT to do again:** Do not report a full Rust pass from a targeted test, and do not kill the running executable or bypass the normal target directory.
+- **Related:** `docs/decisions/2026-10-02-restore-codex-desktop-startup-default.md`
+
+## 2026-10-02 - Restore Codex Desktop startup opt-in default
+
+- **What happened:** Recent-commit reaudit found that `849a0915d` changed the
+  missing-field and fresh-settings default for Codex Desktop startup from
+  opt-in to opt-out.
+- **Root cause:** The commit introduced a `serde(default = ...)` function and
+  changed `AppSettings::default()` to `true`, silently changing existing users'
+  startup behavior outside its model-handling scope.
+- **What we did:** Restored `false` for missing and fresh settings, retained
+  explicit persisted values, and restored the regression test covering
+  independence from `launch_on_startup`.
+- **Evidence:** Source edit applied; targeted Cargo test and `cargo check` are
+  pending because the normal debug executable is currently locked by the live
+  development process.
+- **What NOT to do again:** Do not change a persisted startup default in a
+  model-handling commit without an explicit migration decision and user-facing
+  approval.
+- **Related:** `docs/decisions/2026-10-02-restore-codex-desktop-startup-default.md`
+
+## 2026-10-02 - Automatic MultiRouter refresh honors ProviderForm catalogs
+
+- **What happened:** The wizard's automatic fetch displayed the complete upstream
+  `/models` inventory even when ProviderForm had a smaller persisted catalog (for
+  example, 21 or 30 fetched rows versus 6 catalog rows).
+- **Root cause:** The automatic wizard path passed only the enabled-model helper,
+  and the fetch response was not scoped to the complete persisted catalog before
+  it crossed the frontend/backend boundary. Disabled catalog rows are still
+  explicit ProviderForm bindings and must remain available for metadata refresh.
+- **What we did:** Added a catalog-ID helper that reads all persisted catalog
+  bindings, passed those IDs as `requestedModelIds` for standard automatic fetches,
+  and retained empty-catalog bootstrap discovery. The provider-form manual full
+  inventory action and OAuth catalog path remain unchanged. Corrected the component
+  regression fixture so it represents the backend-filtered response rather than
+  expecting an unrelated upstream model to be appended.
+- **Evidence:** Focused frontend tests passed **61/61**; `cargo test --manifest-path src-tauri/Cargo.toml services::model_fetch::tests --lib` passed **54/54**; `pnpm typecheck` passed; targeted Prettier check and `git diff --check` passed. Full frontend/backend suites and live UI verification were not run; the normal `pnpm dev` process must be restarted by the user before runtime freshness can be checked.
+- **What NOT to do again:** Do not pass the complete `/models` response into the
+  wizard merge when a ProviderForm catalog exists, and do not treat disabled
+  catalog tombstones as permission to discover or route unrelated models.
+- **Related:** `docs/decisions/2026-10-01-multirouter-fetch-draft-boundary.md`
+
+## 2026-10-02 - Catalog-boundary final verification
+
+- **What happened:** Final verification was run after the automatic MultiRouter
+  refresh fix.
+- **Root cause:** The automatic path had allowed an unrestricted upstream model
+  response to cross the ProviderForm catalog boundary; this is fixed by passing
+  persisted catalog IDs and filtering before merge/IPC.
+- **What we did:** Kept the fix scoped to automatic standard-provider refreshes,
+  retained disabled catalog tombstones for metadata refresh, and left explicit
+  manual inventory discovery and OAuth catalog authority unchanged.
+- **Evidence:** Affected frontend tests passed **178/178**; full frontend suite
+  passed **198 files / 1,660 tests**; Rust model-fetch tests passed **54/54**;
+  `cargo check --manifest-path src-tauri/Cargo.toml`, `pnpm typecheck`, targeted
+  Prettier, and `git diff --check` passed. The full Rust suite was attempted but
+  could not start because the normal `src-tauri/target/debug/cc-switch.exe` was
+  locked by the running app (`Access is denied`, OS error 5). No process was
+  killed and no alternate target was created. Live runtime verification remains
+  pending a user-directed `pnpm dev` restart.
+- **What NOT to do again:** Do not report the Rust full suite as passing when the
+  target is locked; do not bypass the normal target with an alternate build tree.
+- **Related:** `docs/decisions/2026-10-01-multirouter-fetch-draft-boundary.md`
+
 ## 2026-10-01 - Restore Codex reasoning picker row identity
 
 - **What happened:** The Codex Desktop reasoning-effort selector remained absent for routed models injected into the renderer's model list.

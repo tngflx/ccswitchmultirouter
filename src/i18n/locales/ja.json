@@ -4722,7 +4722,7 @@
       "clickToOpenConfig": "クリックで provider 設定ページを開く",
       "recalcAliases": "重名エイリアスを再計算",
       "aliasPolicyExplanation": "同名ポリシー：公式/サブスクリプションモデルは元の名前を保持し、中継やサードパーティモデルは gpt-5.4-mini-relay のようなエイリアスで表示されます。upstreamModel は引き続き実際の上流モデル名を指します。",
-      "collisionsDetected": "上流モデル名の重複が {{collisionCount}} 件検出されました。次へ進む際にまずエイリアスポリシーを適用し、その後ルートを生成します。"
+      "collisionsDetected": "表示モデル名の競合が {{collisionCount}} 件検出されました。次へ進む際にまずエイリアスポリシーを適用し、その後ルートを生成します。"
     },
     "preview": {
       "upstreamModel": "上流 {{model}}",
@@ -4858,6 +4858,7 @@
         "loadingOauth": "ChatGPT OAuth モデルリストを取得しローカルカタログを更新中",
         "loadingVolc": "火山 OpenAPI モデルリストを取得し保持カタログを更新中",
         "loadingModels": "/models を取得し保持カタログを更新中",
+        "allDisabled": "すべてのモデルが無効のため自動取得をスキップしました。既存のカタログは変更されません。",
         "noConfigMessage": "Base URL または API Key がないためオンライン読み取り不可。既存のモデルカタログを保持します。",
         "loadingOauthList": "ChatGPT OAuth 専用モデルリストを取得中...",
         "oauthUpdated": "OAuth カタログの取得に成功し、{{modelCount}} 個のモデルを書き込みました。",

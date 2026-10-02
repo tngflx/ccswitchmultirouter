@@ -66,7 +66,6 @@ import {
   initialWizardSelectedSourceIds,
   buildWizardModelCatalog,
   canContinueAfterConnectivity,
-  canonicalWizardModelIds,
   classifyWizardDualProtocolConnectivityResult,
   classifyWizardConnectivityResult,
   collectWizardModelNameCollisions,
@@ -87,6 +86,8 @@ import {
   readWizardProviderBaseUrl,
   resolveWizardModelNameCollisions,
   skippedWizardConnectivityResult,
+  wizardModelCatalogIds,
+  hasAllDisabledWizardModelCatalog,
   wizardRouteDisplayLabel,
   type WizardConnectivityResult,
   type WizardModelFetchConfig,
@@ -1506,19 +1507,27 @@ export function CodexMultiRouterWizard({
       Object.fromEntries(
         draftSources.map((provider) => {
           const config = getWizardModelFetchConfig(provider);
-          const existingCount = readRawWizardModelCatalog(provider).length;
           const isCatalogOnlyPlan = isWizardCatalogOnlyModelSource(provider);
           const isCodexOAuth = isWizardCodexOAuthSource(provider);
+          const allDisabled =
+            !isCodexOAuth && hasAllDisabledWizardModelCatalog(provider);
+          const existingCount = (
+            isCodexOAuth
+              ? readRawWizardModelCatalog(provider)
+              : readWizardModelCatalog(provider)
+          ).length;
           return [
             provider.id,
-            (config && !isCatalogOnlyPlan) || isCodexOAuth
+            (config && !isCatalogOnlyPlan && !allDisabled) || isCodexOAuth
               ? {
                   status: "loading",
-                  message: isCodexOAuth
-                    ? t("codexWizard.fetch.card.loadingOauth")
-                    : config?.volcengineModelListAction
-                      ? t("codexWizard.fetch.card.loadingVolc")
-                      : t("codexWizard.fetch.card.loadingModels"),
+                  message: allDisabled
+                    ? t("codexWizard.fetch.card.allDisabled")
+                    : isCodexOAuth
+                      ? t("codexWizard.fetch.card.loadingOauth")
+                      : config?.volcengineModelListAction
+                        ? t("codexWizard.fetch.card.loadingVolc")
+                        : t("codexWizard.fetch.card.loadingModels"),
                   modelCount: existingCount,
                 }
               : {
@@ -1542,9 +1551,11 @@ export function CodexMultiRouterWizard({
       const nextSources: Provider[] = [];
       for (const provider of draftSources) {
         const config = getWizardModelFetchConfig(provider);
-        const beforeModels = readRawWizardModelCatalog(provider);
         const isCatalogOnlyPlan = isWizardCatalogOnlyModelSource(provider);
         const isCodexOAuth = isWizardCodexOAuthSource(provider);
+        const beforeModels = isCodexOAuth
+          ? readRawWizardModelCatalog(provider)
+          : readWizardModelCatalog(provider);
         if (isCodexOAuth) {
           setModelFetchCards((current) => ({
             ...current,
@@ -1672,6 +1683,19 @@ export function CodexMultiRouterWizard({
           }
           continue;
         }
+        if (hasAllDisabledWizardModelCatalog(provider)) {
+          skippedCount += 1;
+          nextSources.push(provider);
+          setModelFetchCards((current) => ({
+            ...current,
+            [provider.id]: {
+              status: "skipped",
+              message: t("codexWizard.fetch.card.allDisabled"),
+              modelCount: 0,
+            },
+          }));
+          continue;
+        }
         if (isCatalogOnlyPlan) {
           skippedCount += 1;
           nextSources.push(provider);
@@ -1716,6 +1740,7 @@ export function CodexMultiRouterWizard({
             config.apiKeys && config.apiKeys.length > 0
               ? config.apiKeys
               : [config.apiKey];
+          const requestedModelIds = wizardModelCatalogIds(provider);
           const fetchResults = await Promise.allSettled(
             credentialKeys.map((apiKey) =>
               fetchModelsForConfig(
@@ -1731,7 +1756,7 @@ export function CodexMultiRouterWizard({
                       secretAccessKey: config.volcengineSecretAccessKey ?? "",
                     }
                   : undefined,
-                canonicalWizardModelIds(provider),
+                ...(requestedModelIds.length > 0 ? [requestedModelIds] : []),
               ),
             ),
           );
@@ -1758,10 +1783,10 @@ export function CodexMultiRouterWizard({
             fetchedModels,
             {
               preserveExistingSelection: true,
-              appendNewModels: true,
+              appendNewModels: readRawWizardModelCatalog(provider).length === 0,
             },
           );
-          const afterModels = readRawWizardModelCatalog(nextProvider);
+          const afterModels = readWizardModelCatalog(nextProvider);
           const diff = diffWizardModelCatalog(beforeModels, afterModels);
           const hasDiff = hasModelFetchDiff(diff);
           nextSources.push(nextProvider);

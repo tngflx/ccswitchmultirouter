@@ -4722,7 +4722,7 @@
       "clickToOpenConfig": "點擊開啟 provider 設定頁",
       "recalcAliases": "重新計算重名別名",
       "aliasPolicyExplanation": "同名策略：官方/訂閱模型保留原名；中轉站或第三方模型顯示成 gpt-5.4-mini-relay 這類別名，upstreamModel 仍指向真實上游模型名。",
-      "collisionsDetected": "偵測到 {{collisionCount}} 組上游模型重名。點擊下一步時會先套用別名策略，再產生路由。"
+      "collisionsDetected": "偵測到 {{collisionCount}} 組可見模型名稱衝突。點擊下一步時會先套用別名策略，再產生路由。"
     },
     "preview": {
       "upstreamModel": "上游 {{model}}",
@@ -4858,6 +4858,7 @@
         "loadingOauth": "正在讀取 ChatGPT OAuth 模型清單並更新本機目錄",
         "loadingVolc": "正在讀取火山 OpenAPI 模型清單並更新保留目錄",
         "loadingModels": "正在讀取 /models 並更新保留目錄",
+        "allDisabled": "所有模型均已停用，已略過自動取得；現有目錄保持不變。",
         "noConfigMessage": "缺少 Base URL 或 API Key，無法線上讀取；已保留現有模型目錄。",
         "loadingOauthList": "正在讀取 ChatGPT OAuth 專用模型清單...",
         "oauthUpdated": "OAuth 目錄讀取成功，已寫入 {{modelCount}} 個模型。",

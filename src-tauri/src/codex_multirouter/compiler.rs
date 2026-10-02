@@ -191,8 +191,16 @@ pub fn compile_v2(
             );
             let (api_format, api_format_source) =
                 effective_api_format(candidate.provider, candidate.model_entry);
-            let capability_summary =
-                effective_capability_summary(candidate.provider, candidate.model_entry);
+            let model_identities = [
+                candidate.visible_model.as_str(),
+                candidate.canonical_model.as_str(),
+                candidate.upstream_model.as_str(),
+            ];
+            let capability_summary = effective_capability_summary(
+                candidate.provider,
+                candidate.model_entry,
+                &model_identities,
+            );
             route_visible_models[candidate.route_index].push(visible_model.clone());
             model_catalog.push(CompiledCodexModel {
                 visible_model,
@@ -752,6 +760,7 @@ fn normalize_api_format(value: &str) -> String {
 fn effective_capability_summary(
     provider: &Provider,
     model_entry: &Value,
+    model_identities: &[&str],
 ) -> CodexModelCapabilitySummary {
     let (context_window, context_window_source) = value_with_source(
         u64_field(model_entry, &["contextWindow", "context_window"]),
@@ -776,13 +785,14 @@ fn effective_capability_summary(
         if raw.is_null() {
             return None;
         }
-        crate::proxy::providers::codex_reasoning::
-            reasoning_capability_from_provider_model_entry(model_entry)
-            .and_then(|capability| serde_json::to_value(capability).ok())
-            // Keep declared, non-secret metadata visible for legacy/partial rows whose
-            // capability is not complete enough for the strict runtime schema. These
-            // summaries are informational; runtime consumers still validate before use.
-            .or_else(|| Some(sanitize_capability_value(raw)))
+        crate::proxy::providers::codex_reasoning::reasoning_capability_from_provider_model_entry(
+            model_entry,
+        )
+        .and_then(|capability| serde_json::to_value(capability).ok())
+        // Keep declared, non-secret metadata visible for legacy/partial rows whose
+        // capability is not complete enough for the strict runtime schema. These
+        // summaries are informational; runtime consumers still validate before use.
+        .or_else(|| reasoning_value_has_signal(raw).then(|| sanitize_capability_value(raw)))
     });
     let provider_reasoning =
         value_field(&provider.settings_config, &["reasoning"]).and_then(|value| {
@@ -791,15 +801,23 @@ fn effective_capability_summary(
             // parser; the value itself remains normalized before projection.
             let mut entry = serde_json::json!({ "model": model_name(model_entry)? });
             entry["reasoning"] = value.clone();
-            crate::proxy::providers::codex_reasoning::
-                reasoning_capability_from_provider_model_entry(&entry)
-                .and_then(|capability| serde_json::to_value(capability).ok())
-                .or_else(|| Some(sanitize_capability_value(value)))
+            crate::proxy::providers::codex_reasoning::reasoning_capability_from_provider_model_entry(
+                &entry,
+            )
+            .and_then(|capability| serde_json::to_value(capability).ok())
+            .or_else(|| reasoning_value_has_signal(value).then(|| sanitize_capability_value(value)))
         });
+    let inline_reasoning = if model_reasoning.is_none() && provider_reasoning.is_none() {
+        resolve_inline_reasoning_capability(provider, model_identities)
+    } else {
+        None
+    };
     let (reasoning, reasoning_source) = if let Some(value) = model_reasoning {
         (Some(value), "provider_model".to_string())
     } else if let Some(value) = provider_reasoning {
         (Some(value), "provider".to_string())
+    } else if let Some((value, source)) = inline_reasoning {
+        (Some(value), source)
     } else {
         (None, "unknown".to_string())
     };
@@ -835,6 +853,82 @@ fn effective_capability_summary(
         reasoning_source,
         codex_cache_source,
     }
+}
+
+/// Resolve authoritative capability declarations from the provider's active
+/// Codex TOML after persisted model/provider metadata has been considered.
+///
+/// MultiRouter model rows may expose a route alias or only an upstream identity,
+/// while Codex's inline `model_providers.*.models[]` declaration uses the other
+/// spelling. Try all compiler-owned identities through the shared resolver so
+/// the catalog, request path, and picker consume one validated contract.
+fn resolve_inline_reasoning_capability(
+    provider: &Provider,
+    model_identities: &[&str],
+) -> Option<(Value, String)> {
+    model_identities
+        .iter()
+        .map(|model| model.trim())
+        .filter(|model| !model.is_empty())
+        .find_map(|model| {
+            let resolved = crate::reasoning_capabilities::resolve_codex_model_capability(
+                provider, model, None,
+            );
+            let capability = resolved.capability?;
+            let value = serde_json::to_value(capability).ok()?;
+            Some((value, resolved.source.as_str().to_string()))
+        })
+}
+
+/// A malformed but explicitly declared capability remains useful diagnostic
+/// metadata, but an empty placeholder must not suppress a better inline
+/// provider declaration. Treat status, control, defaults, wire metadata, and
+/// non-empty effort lists as signals; an empty effort list alone is not one.
+fn reasoning_value_has_signal(value: &Value) -> bool {
+    let Some(object) = value.as_object() else {
+        return false;
+    };
+    let has_non_empty_string = [
+        "supportStatus",
+        "support_status",
+        "controlKind",
+        "control_kind",
+        "defaultEffort",
+        "default_effort",
+        "defaultReasoningEffort",
+        "default_reasoning_effort",
+        "defaultReasoningLevel",
+        "default_reasoning_level",
+    ]
+    .into_iter()
+    .any(|key| {
+        object
+            .get(key)
+            .and_then(Value::as_str)
+            .is_some_and(|value| !value.trim().is_empty())
+    });
+    let has_non_empty_efforts = [
+        "supportedEfforts",
+        "supported_efforts",
+        "supportedReasoningEfforts",
+        "supported_reasoning_efforts",
+        "supportedReasoningLevels",
+        "supported_reasoning_levels",
+    ]
+    .into_iter()
+    .any(|key| {
+        object
+            .get(key)
+            .and_then(Value::as_array)
+            .is_some_and(|values| !values.is_empty())
+    });
+    let has_explicit_support = object.contains_key("supported")
+        || object.contains_key("upstream")
+        || object.contains_key("reasoning_format")
+        || object.contains_key("reasoningFormat")
+        || object.contains_key("reasoning_parameter")
+        || object.contains_key("reasoningParameter");
+    has_non_empty_string || has_non_empty_efforts || has_explicit_support
 }
 
 fn model_input_modalities(model_entry: &Value) -> Option<Vec<String>> {
@@ -1699,6 +1793,60 @@ mod tests {
                 .as_ref()
                 .and_then(|value| value.get("providerEffort")),
             Some(&json!("high"))
+        );
+    }
+
+    #[test]
+    fn codex_catalog_reasoning_resolves_provider_inline_model_alias() {
+        let mut provider = provider(
+            "sublyx",
+            "Sublyx",
+            "openai_responses",
+            json!([{
+                "model": "sublyx-visible-alias",
+                "upstreamModel": "gpt-6-astra",
+                "reasoning": {"supportedEfforts": []}
+            }]),
+        );
+        provider.settings_config["config"] = json!(
+            r#"
+model_provider = "sublyx"
+
+[model_providers.sublyx]
+name = "Sublyx"
+base_url = "https://api.sublyx.example/v1"
+
+[[model_providers.sublyx.models]]
+model = "gpt-6-astra"
+supported_reasoning_levels = [
+  { effort = "low", description = "Low" },
+  { effort = "high", description = "High" },
+]
+default_reasoning_level = "high"
+"#
+        );
+
+        let compiled = compile(
+            &plan(vec![route(
+                "router-sublyx",
+                "sublyx",
+                CodexModelSelection::All,
+            )]),
+            [provider],
+        );
+        let reasoning = compiled.model_catalog[0]
+            .capability_summary
+            .reasoning
+            .as_ref()
+            .expect("inline Codex reasoning declaration should be projected");
+
+        assert_eq!(reasoning["supportedEfforts"], json!(["low", "high"]));
+        assert_eq!(reasoning["defaultEffort"], "high");
+        assert_eq!(
+            compiled.model_catalog[0]
+                .capability_summary
+                .reasoning_source,
+            "provider_config"
         );
     }
 

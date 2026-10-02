@@ -4722,7 +4722,7 @@
       "clickToOpenConfig": "Click to open the provider configuration page",
       "recalcAliases": "Recompute duplicate-name aliases",
       "aliasPolicyExplanation": "Naming policy: official/subscription models keep their original names; relay or third-party models get an alias like gpt-5.4-mini-relay while upstreamModel still points at the real upstream model name.",
-      "collisionsDetected": "Detected {{collisionCount}} groups of duplicate upstream model names. Moving to the next step applies the alias policy before generating routes."
+      "collisionsDetected": "Detected {{collisionCount}} groups of conflicting visible model names. Moving to the next step applies the alias policy before generating routes."
     },
     "preview": {
       "upstreamModel": "Upstream {{model}}",
@@ -4858,6 +4858,7 @@
         "loadingOauth": "Fetching ChatGPT OAuth model list and refreshing local catalog",
         "loadingVolc": "Fetching Volcengine OpenAPI model list and refreshing kept catalog",
         "loadingModels": "Fetching /models and refreshing kept catalog",
+        "allDisabled": "All models are disabled; automatic discovery skipped and the existing catalog kept.",
         "noConfigMessage": "Missing Base URL or API key; cannot read online. Existing model catalog kept.",
         "loadingOauthList": "Fetching the ChatGPT OAuth model list...",
         "oauthUpdated": "OAuth catalog fetched successfully; wrote {{modelCount}} models.",

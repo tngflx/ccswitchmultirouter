@@ -71,7 +71,7 @@ export interface WizardConfigIssue {
 }
 
 export interface WizardModelNameCollision {
-  upstreamModel: string;
+  visibleModel: string;
   providerIds: string[];
   canonicalProviderIds: string[];
 }
@@ -683,29 +683,29 @@ function isCanonicalModelSource(provider: Provider): boolean {
   return isOfficialCodexSource(provider);
 }
 
-// 收集重名模型冲突，供向导进入“重名确认”状态并展示需要用户理解的别名策略。
+// Shared upstream IDs are valid once each provider has a distinct picker name.
 export function collectWizardModelNameCollisions(
   providers: Provider[],
 ): WizardModelNameCollision[] {
-  const ownersByUpstream = new Map<string, Provider[]>();
+  const ownersByVisibleModel = new Map<string, Map<string, Provider>>();
   for (const provider of providers) {
     for (const model of readWizardModelCatalog(provider).filter(
       isWizardModelEnabled,
     )) {
-      const upstream = wizardModelUpstream(model);
-      if (!upstream) continue;
-      const key = normalizedWizardModelId(upstream);
-      const owners = ownersByUpstream.get(key) ?? [];
-      owners.push(provider);
-      ownersByUpstream.set(key, owners);
+      const key = normalizedWizardModelId(model.model);
+      if (!key) continue;
+      const owners =
+        ownersByVisibleModel.get(key) ?? new Map<string, Provider>();
+      owners.set(provider.id, provider);
+      ownersByVisibleModel.set(key, owners);
     }
   }
-  return Array.from(ownersByUpstream.entries())
-    .filter(([, owners]) => owners.length > 1)
-    .map(([upstreamModel, owners]) => ({
-      upstreamModel,
-      providerIds: owners.map((owner) => owner.id),
-      canonicalProviderIds: owners
+  return Array.from(ownersByVisibleModel.entries())
+    .filter(([, owners]) => owners.size > 1)
+    .map(([visibleModel, owners]) => ({
+      visibleModel,
+      providerIds: Array.from(owners.keys()),
+      canonicalProviderIds: Array.from(owners.values())
         .filter(isCanonicalModelSource)
         .map((owner) => owner.id),
     }));
@@ -1266,6 +1266,28 @@ export function canonicalWizardModelIds(provider: Provider): string[] {
         .filter(Boolean),
     ),
   );
+}
+
+/**
+ * Return the active ProviderForm catalog bindings for automatic refreshes.
+ * Disabled rows remain persisted for editing, but they are not refresh targets
+ * and must not widen the model inventory fetched from the upstream provider.
+ * Callers must distinguish an empty bootstrap catalog from an all-disabled
+ * saved catalog before starting unrestricted discovery.
+ */
+export function wizardModelCatalogIds(provider: Provider): string[] {
+  return Array.from(
+    new Set(
+      readWizardModelCatalog(provider)
+        .map((model) => wizardModelUpstream(model))
+        .filter(Boolean),
+    ),
+  );
+}
+
+export function hasAllDisabledWizardModelCatalog(provider: Provider): boolean {
+  const models = readRawWizardModelCatalog(provider);
+  return models.length > 0 && models.every((model) => model.enabled === false);
 }
 
 function rawCanonicalWizardModelIds(provider: Provider): string[] {

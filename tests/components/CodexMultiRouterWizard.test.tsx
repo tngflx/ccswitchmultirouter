@@ -1,4 +1,10 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import {
+  act,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+} from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { describe, expect, it, vi, beforeEach } from "vitest";
 import type { ReactElement } from "react";
@@ -7,6 +13,7 @@ import { CodexMultiRouterWizard } from "@/components/codex/CodexMultiRouterWizar
 import { CODEX_MULTI_ROUTER_WIZARD_DISMISSED_KEY } from "@/lib/codexMultiRouterWizard";
 import { providersApi } from "@/lib/api/providers";
 import { codexSubagentV2Api } from "@/lib/api/codexSubagentV2";
+import { useCodexOauth } from "@/components/providers/forms/hooks/useCodexOauth";
 import {
   fetchCodexOfficialFallbackModels,
   fetchCodexOauthModels,
@@ -68,6 +75,33 @@ vi.mock("@/components/providers/forms/hooks/useCodexOauth", () => ({
   })),
 }));
 
+function emptyCodexOauth(): ReturnType<typeof useCodexOauth> {
+  return {
+    authStatus: undefined,
+    isLoadingStatus: false,
+    accounts: [],
+    hasAnyAccount: false,
+    isAuthenticated: false,
+    defaultAccountId: null,
+    migrationError: null,
+    authError: null,
+    pollingState: "idle",
+    deviceCode: null,
+    error: null,
+    isPolling: false,
+    isAddingAccount: false,
+    isRemovingAccount: false,
+    isSettingDefaultAccount: false,
+    startAuth: vi.fn(),
+    addAccount: vi.fn(),
+    cancelAuth: vi.fn(),
+    logout: vi.fn(),
+    removeAccount: vi.fn(),
+    setDefaultAccount: vi.fn(),
+    refetchStatus: vi.fn(),
+  };
+}
+
 vi.mock("@/components/providers/forms/CodexOAuthSection", () => ({
   CodexOAuthSection: () => (
     <div data-testid="wizard-codex-oauth-section">使用 ChatGPT 登录</div>
@@ -100,7 +134,11 @@ function renderWithQueryClient(ui: ReactElement) {
 
 beforeEach(() => {
   localStorage.clear();
-  vi.clearAllMocks();
+  // Reset one-shot implementations as well as call history. Tests that verify
+  // skipped discovery intentionally leave their queued fetcher untouched; a
+  // call-history-only reset would let that result leak into the next test.
+  vi.resetAllMocks();
+  vi.mocked(useCodexOauth).mockReturnValue(emptyCodexOauth());
   vi.mocked(fetchCodexOfficialFallbackModels).mockResolvedValue([]);
   vi.mocked(codexSubagentV2Api.initializeProviderConfig).mockImplementation(
     async (providerId) => {
@@ -141,6 +179,55 @@ beforeEach(() => {
 });
 
 describe("CodexMultiRouterWizard", () => {
+  it.each([true, false])(
+    "warns only about unresolved visible aliases (resolved=%s)",
+    (resolved) => {
+      const sources = ["go", "zen"].map((suffix) =>
+        provider({
+          id: suffix,
+          name: `OpenCode ${suffix}`,
+          settingsConfig: {
+            base_url: `https://${suffix}.example/v1`,
+            auth: { OPENAI_API_KEY: "sk-test" },
+            modelCatalog: {
+              models: [
+                {
+                  model: resolved
+                    ? `glm-5.3-flash-opencode-${suffix}`
+                    : "glm-5.3-flash",
+                  upstreamModel: "glm-5.3-flash",
+                },
+              ],
+            },
+          },
+        }),
+      );
+      renderWithQueryClient(
+        <CodexMultiRouterWizard
+          open
+          providers={sources}
+          onOpenChange={vi.fn()}
+          onCreateProvider={vi.fn()}
+          onOpenWorkspace={vi.fn()}
+          onEnablePlan={vi.fn()}
+        />,
+      );
+      fireEvent.click(screen.getByRole("button", { name: "下一步" }));
+      const warning = screen.queryByText(/检测到 1 组/);
+      if (resolved) {
+        expect(warning).not.toBeInTheDocument();
+      } else {
+        expect(warning).toBeInTheDocument();
+        fireEvent.click(
+          screen.getByRole("button", { name: "重新计算重名别名" }),
+        );
+        expect(screen.queryByText(/检测到 1 组/)).not.toBeInTheDocument();
+      }
+      expect(screen.getByText("glm-5.3-flash-opencode-go")).toBeVisible();
+      expect(screen.getByText("glm-5.3-flash-opencode-zen")).toBeVisible();
+    },
+  );
+
   it("writes collision aliases and upstream ids to source providers before publishing", async () => {
     const sources = [
       provider({
@@ -623,10 +710,104 @@ describe("CodexMultiRouterWizard", () => {
 
     expect(await screen.findByText("无模型列表更新")).toBeInTheDocument();
     expect(fetchModelsForConfig).toHaveBeenCalledTimes(1);
+    expect(fetchModelsForConfig).toHaveBeenCalledWith(
+      "https://api.deepseek.com/v1",
+      "sk-test",
+      false,
+      undefined,
+      undefined,
+      undefined,
+      ["deepseek-chat"],
+    );
     expect(providersApi.update).not.toHaveBeenCalled();
   });
 
-  it("keeps grouped-credential discovery inventory-only until publish", async () => {
+  it("scopes automatic refresh to enabled ProviderForm catalog rows", async () => {
+    vi.mocked(fetchModelsForConfig).mockResolvedValueOnce([
+      { id: "catalog-chat", ownedBy: null },
+      { id: "catalog-reasoner", ownedBy: null },
+    ]);
+    const source = provider({
+      settingsConfig: {
+        base_url: "https://catalog.example/v1",
+        auth: { OPENAI_API_KEY: "sk-catalog" },
+        modelCatalog: {
+          models: [
+            { model: "catalog-chat", upstreamModel: "catalog-chat" },
+            {
+              model: "catalog-reasoner",
+              upstreamModel: "catalog-reasoner",
+              enabled: false,
+            },
+          ],
+        },
+      },
+    });
+
+    renderWithQueryClient(
+      <CodexMultiRouterWizard
+        open
+        providers={[source]}
+        onOpenChange={vi.fn()}
+        onCreateProvider={vi.fn()}
+        onOpenWorkspace={vi.fn()}
+        onEnablePlan={vi.fn()}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "自动准备与验证" }));
+    fireEvent.click(
+      screen.getByRole("button", { name: "自动获取并写入模型列表" }),
+    );
+
+    await waitFor(() =>
+      expect(fetchModelsForConfig).toHaveBeenCalledWith(
+        "https://catalog.example/v1",
+        "sk-catalog",
+        false,
+        undefined,
+        undefined,
+        undefined,
+        ["catalog-chat"],
+      ),
+    );
+    expect(await screen.findByText("无模型列表更新")).toBeInTheDocument();
+  });
+
+  it("skips automatic discovery for an all-disabled saved catalog", async () => {
+    vi.mocked(fetchModelsForConfig).mockResolvedValueOnce([]);
+    const models = [{ model: "excluded-model", enabled: false }];
+    renderWithQueryClient(
+      <CodexMultiRouterWizard
+        open
+        providers={[
+          provider({
+            settingsConfig: {
+              baseUrl: "https://all-disabled.example/v1",
+              auth: { OPENAI_API_KEY: "sk-test" },
+              modelCatalog: { models },
+            },
+          }),
+        ]}
+        onOpenChange={vi.fn()}
+        onCreateProvider={vi.fn()}
+        onOpenWorkspace={vi.fn()}
+        onEnablePlan={vi.fn()}
+      />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "自动准备与验证" }));
+    fireEvent.click(
+      screen.getByRole("button", { name: "自动获取并写入模型列表" }),
+    );
+    await act(async () => {});
+    expect(fetchModelsForConfig).not.toHaveBeenCalled();
+    expect(providersApi.update).not.toHaveBeenCalled();
+    expect(
+      screen.getByText("所有模型均已停用，已跳过自动获取；现有目录保持不变。"),
+    ).toBeInTheDocument();
+  });
+
+  it("does not append unsolicited grouped-credential inventory to a saved catalog", async () => {
     vi.mocked(fetchModelsForConfig)
       .mockResolvedValueOnce([{ id: "fallback-model", ownedBy: null }])
       .mockResolvedValueOnce([
@@ -686,8 +867,7 @@ describe("CodexMultiRouterWizard", () => {
           route.targetProviderId === source.id,
       );
     expect(publishedRoute?.modelSelection).toEqual({
-      mode: "include",
-      models: ["fallback-model", "stale-model"],
+      mode: "all",
     });
 
     const publishedSource = vi
@@ -697,19 +877,63 @@ describe("CodexMultiRouterWizard", () => {
       publishedSource?.settingsConfig.modelCatalog?.models.map(
         (model: { model: string }) => model.model,
       ),
-    ).toEqual([
-      "fallback-model",
-      "stale-model",
-      "group-model-a",
-      "group-model-b",
+    ).toEqual(["fallback-model", "stale-model"]);
+  });
+
+  it("refreshes six active models without counting or enabling 24 inventory rows", async () => {
+    const activeModels = Array.from({ length: 6 }, (_, index) => ({
+      model: `alias-${index}`,
+      upstreamModel: `upstream-${index}`,
+      enabled: true,
+    }));
+    const disabledModels = Array.from({ length: 24 }, (_, index) => ({
+      model: `disabled-${index}`,
+      enabled: false,
+      contextWindow: 64000,
+    }));
+    const source = provider({
+      settingsConfig: {
+        baseUrl: "https://catalog.example/v1",
+        auth: { OPENAI_API_KEY: "sk-catalog" },
+        modelCatalog: { models: [...activeModels, ...disabledModels] },
+      },
+    });
+    vi.mocked(fetchModelsForConfig).mockImplementationOnce(
+      async (_url, _key, _full, _models, _ua, _plan, requestedIds) => {
+        expect(requestedIds).toEqual(
+          activeModels.map((row) => row.upstreamModel),
+        );
+        return requestedIds!.map((id) => ({ id, ownedBy: null }));
+      },
+    );
+    renderWithQueryClient(
+      <CodexMultiRouterWizard
+        open
+        providers={[source]}
+        onOpenChange={vi.fn()}
+        onCreateProvider={vi.fn()}
+        onOpenWorkspace={vi.fn()}
+        onEnablePlan={vi.fn()}
+      />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "自动准备与验证" }));
+    fireEvent.click(
+      screen.getByRole("button", { name: "自动获取并写入模型列表" }),
+    );
+    expect(await screen.findByText("无模型列表更新")).toBeInTheDocument();
+    expect(screen.getByText("6 个模型")).toBeInTheDocument();
+    expect(screen.queryByText("30 个模型")).not.toBeInTheDocument();
+    expect(providersApi.update).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "启用并验证" }));
+    fireEvent.click(
+      screen.getAllByRole("button", { name: "保存并发布" }).at(-1)!,
+    );
+    await waitFor(() => expect(providersApi.add).toHaveBeenCalledTimes(1));
+    const saved = vi.mocked(providersApi.update).mock.calls.at(-1)?.[0];
+    expect(saved?.settingsConfig.modelCatalog.models).toEqual([
+      ...activeModels.map((row) => expect.objectContaining(row)),
+      ...disabledModels,
     ]);
-    expect(
-      publishedSource?.settingsConfig.modelCatalog?.models
-        .filter((model: { model: string }) =>
-          ["group-model-a", "group-model-b"].includes(model.model),
-        )
-        .every((model: { enabled?: boolean }) => model.enabled === false),
-    ).toBe(true);
   });
 
   it("keeps unmatched models when a wizard grouped-credential sync is partial", async () => {
@@ -951,8 +1175,12 @@ describe("CodexMultiRouterWizard", () => {
 
     expect(providersApi.update).not.toHaveBeenCalled();
     expect(
-      await screen.findByText(/新增 1: deepseek-reasoner/),
+      await screen.findByText(/更新 1: deepseek-chat/),
     ).toBeInTheDocument();
+    expect(
+      screen.queryByText(/新增 1: deepseek-reasoner/),
+    ).not.toBeInTheDocument();
+    expect(screen.getByText("1 个模型")).toBeInTheDocument();
   });
 
   it("falls back to data-plane models for AgentPlan without AK/SK when API Key exists", async () => {
@@ -1003,7 +1231,10 @@ describe("CodexMultiRouterWizard", () => {
       );
       expect(providersApi.update).not.toHaveBeenCalled();
     });
-    expect(screen.getByText(/新增 1: doubao-seed-1\.6/)).toBeInTheDocument();
+    expect(await screen.findByText("无模型列表更新")).toBeInTheDocument();
+    expect(
+      screen.queryByText(/新增 1: doubao-seed-1\.6/),
+    ).not.toBeInTheDocument();
   });
 
   it("skips AgentPlan model fetch when both inference key and AK/SK are missing", async () => {
@@ -1102,10 +1333,13 @@ describe("CodexMultiRouterWizard", () => {
       );
       expect(providersApi.update).not.toHaveBeenCalled();
     });
-    expect(screen.getByText(/新增 1: doubao-seed-1\.6/)).toBeInTheDocument();
+    expect(await screen.findByText("无模型列表更新")).toBeInTheDocument();
+    expect(
+      screen.queryByText(/新增 1: doubao-seed-1\.6/),
+    ).not.toBeInTheDocument();
   });
 
-  it("keeps previous model selections while showing new fetched models excluded", async () => {
+  it("keeps previous model selections without appending unsolicited fetched models", async () => {
     vi.mocked(fetchModelsForConfig).mockResolvedValueOnce([
       { id: "model-a", ownedBy: null },
       { id: "model-b", ownedBy: null },
@@ -1149,17 +1383,14 @@ describe("CodexMultiRouterWizard", () => {
     );
 
     expect(providersApi.update).not.toHaveBeenCalled();
-    expect(await screen.findByText(/新增 1: model-c/)).toBeInTheDocument();
+    expect(await screen.findByText("无模型列表更新")).toBeInTheDocument();
 
     fireEvent.click(screen.getByRole("button", { name: "选择模型并预览路由" }));
     await waitFor(() => {
       expect(screen.getByLabelText("保留 model-a")).toBeChecked();
       expect(screen.getByLabelText("保留 model-b")).not.toBeChecked();
-      expect(screen.getByLabelText("保留 model-c")).not.toBeChecked();
+      expect(screen.queryByLabelText("保留 model-c")).not.toBeInTheDocument();
     });
-
-    fireEvent.click(screen.getByLabelText("保留 model-c"));
-    expect(screen.getByLabelText("保留 model-c")).toBeChecked();
   });
 
   it("opens a provider config page from the model fetch cards", () => {

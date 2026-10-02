@@ -103,6 +103,8 @@ import {
   readWizardCodexOAuthAccountId,
   readWizardProviderBaseUrl,
   resolveWizardModelNameCollisions,
+  wizardModelCatalogIds,
+  hasAllDisabledWizardModelCatalog,
 } from "@/lib/codexMultiRouterWizard";
 import {
   DEFAULT_HOSTED_TOOLS_CONFIG,
@@ -654,6 +656,7 @@ type ProviderModelFetchConfig = {
   volcengineSecretAccessKey?: string;
   codexOAuthAccountId?: string;
   useCodexOAuth?: boolean;
+  requestedModelIds?: string[];
   skipReason?: string;
 };
 
@@ -751,7 +754,15 @@ function buildProviderModelRefreshAttemptKey(
     hashSensitiveAttemptPart(fetchConfig.volcengineAccessKeyId ?? ""),
     hashSensitiveAttemptPart(fetchConfig.volcengineSecretAccessKey ?? ""),
     fetchConfig.useCodexOAuth ?? false,
+    Boolean(fetchConfig.skipReason),
     hashSensitiveAttemptPart(fetchConfig.codexOAuthAccountId ?? ""),
+    hashSensitiveAttemptPart(
+      (fetchConfig.requestedModelIds ?? [])
+        .map((modelId) => modelId.trim().toLowerCase())
+        .filter(Boolean)
+        .sort()
+        .join("\u0000"),
+    ),
   ].join("|");
 }
 
@@ -889,6 +900,9 @@ async function fetchProviderModelsWithFallback(
                 secretAccessKey: fetchConfig.volcengineSecretAccessKey ?? "",
               }
             : undefined,
+          ...(fetchConfig.requestedModelIds?.length
+            ? [fetchConfig.requestedModelIds]
+            : []),
         ),
       ),
     );
@@ -996,6 +1010,7 @@ function getProviderModelFetchConfig(
   const planModelListAction = codexPlanModelListAction(planFetchSource);
   const isCatalogOnlyPlan = isCodexCatalogOnlyPlanModelFetch(planFetchSource);
   const isOfficialLike = isWizardCodexOAuthSource(provider);
+  const requestedModelIds = wizardModelCatalogIds(provider);
 
   if (isOfficialLike) {
     return {
@@ -1005,6 +1020,14 @@ function getProviderModelFetchConfig(
       isFullUrl: false,
       useCodexOAuth: true,
       codexOAuthAccountId: readWizardCodexOAuthAccountId(provider),
+    };
+  }
+  if (hasAllDisabledWizardModelCatalog(provider)) {
+    return {
+      baseUrl,
+      apiKey,
+      isFullUrl: false,
+      skipReason: tr("codexWizard.fetch.card.allDisabled"),
     };
   }
   if (!baseUrl) {
@@ -1060,6 +1083,7 @@ function getProviderModelFetchConfig(
           volcengineSecretAccessKey: planFetchSource.secretAccessKey,
         }
       : {}),
+    ...(requestedModelIds.length > 0 ? { requestedModelIds } : {}),
   };
 }
 
@@ -1102,7 +1126,10 @@ export function providerWithFetchedModelCatalog(
     if (!id) continue;
     const identities = modelIdentityValues(fetched);
     const existingIndex = identities
-      .map((identity) => byFetchedModel.get(identity) ?? byVisibleModel.get(identity))
+      .map(
+        (identity) =>
+          byFetchedModel.get(identity) ?? byVisibleModel.get(identity),
+      )
       .find((index): index is number => index !== undefined);
     const contextWindow = resolveFetchedCodexModelContextWindow(fetched, {
       providerId: provider.id,
@@ -2265,15 +2292,24 @@ export function serializeCodexRouteV2(
         .filter(Boolean),
     ),
   );
+  const requestedIncludeModels =
+    route.modelSelection?.mode === "include"
+      ? route.modelSelection.models
+      : canonicalModels;
+  const normalizedIncludeModels = new Map<string, string>();
+  for (const model of requestedIncludeModels) {
+    const trimmed = model.trim();
+    const key = trimmed.toLowerCase();
+    if (key && !normalizedIncludeModels.has(key)) {
+      normalizedIncludeModels.set(key, trimmed);
+    }
+  }
   const modelSelection =
     route.modelSelection?.mode === "all"
       ? ({ mode: "all" } as const)
       : ({
           mode: "include" as const,
-          models:
-            route.modelSelection?.mode === "include"
-              ? route.modelSelection.models
-              : canonicalModels,
+          models: Array.from(normalizedIncludeModels.values()),
         } as const);
   const authPolicy: CodexRoutingAuth = route.authPolicy ??
     (route.upstream?.auth as CodexRoutingAuth | undefined) ?? {
@@ -3534,6 +3570,8 @@ export function CodexRouterWorkspacePage({
   const modelRefreshActiveAttemptKeysRef = useRef<Record<string, string>>({});
   // 记录已超时的 attempt，避免后台迟到的 IPC 继续把 loading/error 覆盖成 success。
   const modelRefreshTimedOutAttemptKeysRef = useRef<Set<string>>(new Set());
+  // A fresh token prevents an old promise from becoming current again after a route is disabled and re-enabled.
+  const modelRefreshAttemptSequenceRef = useRef(0);
   const queryClient = useQueryClient();
 
   /// 按下一版启用 Provider 集合同步失效旧刷新，避免路由保存窗口内迟到结果写回旧 catalog。
@@ -3555,7 +3593,9 @@ export function CodexRouterWorkspacePage({
     )) {
       if (enabledProviderIds.has(providerId)) continue;
       delete modelRefreshActiveAttemptKeysRef.current[providerId];
-      modelRefreshAttemptedKeysRef.current.delete(attemptKey);
+      modelRefreshAttemptedKeysRef.current.delete(
+        attemptKey.slice(0, attemptKey.lastIndexOf("#")),
+      );
       modelRefreshTimedOutAttemptKeysRef.current.delete(attemptKey);
     }
   }
@@ -3645,16 +3685,20 @@ export function CodexRouterWorkspacePage({
       enabledModelSourceIdsForRefresh.has(source.id),
     )) {
       const fetchConfig = getProviderModelFetchConfig(provider);
-      const attemptKey = buildProviderModelRefreshAttemptKey(
+      const dedupeKey = buildProviderModelRefreshAttemptKey(
         provider.id,
         fetchConfig,
       );
-      if (modelRefreshAttemptedKeysRef.current.has(attemptKey)) continue;
-      modelRefreshAttemptedKeysRef.current.add(attemptKey);
-      modelRefreshActiveAttemptKeysRef.current[provider.id] = attemptKey;
-      modelRefreshTimedOutAttemptKeysRef.current.delete(attemptKey);
-
       if (fetchConfig.skipReason) {
+        const previousAttemptKey =
+          modelRefreshActiveAttemptKeysRef.current[provider.id];
+        if (previousAttemptKey) {
+          delete modelRefreshActiveAttemptKeysRef.current[provider.id];
+          modelRefreshAttemptedKeysRef.current.delete(
+            previousAttemptKey.slice(0, previousAttemptKey.lastIndexOf("#")),
+          );
+          modelRefreshTimedOutAttemptKeysRef.current.delete(previousAttemptKey);
+        }
         setProviderModelRefreshStates((current) => ({
           ...current,
           [provider.id]: {
@@ -3664,6 +3708,11 @@ export function CodexRouterWorkspacePage({
         }));
         continue;
       }
+      if (modelRefreshAttemptedKeysRef.current.has(dedupeKey)) continue;
+      modelRefreshAttemptedKeysRef.current.add(dedupeKey);
+      const attemptKey = `${dedupeKey}#${++modelRefreshAttemptSequenceRef.current}`;
+      modelRefreshActiveAttemptKeysRef.current[provider.id] = attemptKey;
+      modelRefreshTimedOutAttemptKeysRef.current.delete(attemptKey);
 
       setProviderModelRefreshStates((current) => ({
         ...current,

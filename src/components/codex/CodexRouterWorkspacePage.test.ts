@@ -1166,6 +1166,22 @@ describe("Codex MultiRouter workspace route persistence helpers", () => {
     ).toEqual({ mode: "include", models: ["upstream-model"] });
   });
 
+  it("deduplicates include selections by case-insensitive upstream identity", () => {
+    expect(
+      serializeCodexRouteV2(
+        {
+          id: "duplicate-upstream-selection",
+          targetProviderId: "provider",
+          modelSelection: {
+            mode: "include",
+            models: ["GPT-5.5", " gpt-5.5 ", "GPT-5.6"],
+          },
+        },
+        0,
+      ).modelSelection,
+    ).toEqual({ mode: "include", models: ["GPT-5.5", "GPT-5.6"] });
+  });
+
   it("normalizes merged v2 routes that are missing modelSelection", () => {
     const plan = {
       id: "merged-router",
@@ -1864,6 +1880,7 @@ describe("Codex MultiRouter workspace route persistence helpers", () => {
       undefined,
       undefined,
       undefined,
+      ["stale-model"],
     );
     expect(fetchModelsForConfig).toHaveBeenCalledWith(
       "https://grouped-refresh.example/v1",
@@ -1872,6 +1889,7 @@ describe("Codex MultiRouter workspace route persistence helpers", () => {
       undefined,
       undefined,
       undefined,
+      ["stale-model"],
     );
     expect(fetchModelsForConfig).not.toHaveBeenCalledWith(
       "https://grouped-refresh.example/v1",
@@ -1897,6 +1915,184 @@ describe("Codex MultiRouter workspace route persistence helpers", () => {
         savedProvider?.settingsConfig?.modelCatalog?.spawnAgentModels,
       ).toEqual(["stale-model"]);
     });
+  });
+
+  it("scopes automatic refresh to the persisted provider catalog", async () => {
+    vi.mocked(fetchModelsForConfig).mockResolvedValueOnce([
+      { id: "catalog-chat", ownedBy: "gateway" },
+      { id: "catalog-reasoner", ownedBy: "gateway" },
+      { id: "unrequested-model", ownedBy: "gateway" },
+    ]);
+    const provider: Provider = {
+      id: "codex-catalog-bounded-refresh-source",
+      name: "Catalog Bounded Refresh Source",
+      category: "custom",
+      settingsConfig: {
+        baseUrl: "https://catalog-bounded.example/v1",
+        auth: { OPENAI_API_KEY: "catalog-bounded-key" },
+        modelCatalog: {
+          models: [
+            { model: "catalog-chat", upstreamModel: "catalog-chat" },
+            {
+              model: "catalog-reasoner",
+              upstreamModel: "catalog-reasoner",
+              enabled: false,
+            },
+          ],
+        },
+      },
+    };
+    const plan = withEnabledProviderRoute(
+      createDraftRoutingPlan([provider], [provider]),
+      provider,
+    );
+
+    renderWorkspace(
+      React.createElement(CodexRouterWorkspacePage, {
+        providers: [provider, plan],
+        isProxyRunning: true,
+        isCodexTakeoverActive: true,
+        activeProviderId: plan.id,
+        initialProviderId: plan.id,
+        initialTab: "routes",
+        onEditProvider: vi.fn(),
+        onDeletePlan: vi.fn(),
+        onCreateProvider: vi.fn(),
+      }),
+    );
+
+    await waitFor(() =>
+      expect(fetchModelsForConfig).toHaveBeenCalledWith(
+        "https://catalog-bounded.example/v1",
+        "catalog-bounded-key",
+        false,
+        undefined,
+        undefined,
+        undefined,
+        ["catalog-chat"],
+      ),
+    );
+    await waitFor(() => {
+      const savedProvider = vi
+        .mocked(providersApi.update)
+        .mock.calls.map(([updated]) => updated)
+        .find((updated) => updated.id === provider.id);
+      expect(
+        savedProvider?.settingsConfig?.modelCatalog?.models.map(
+          (model: { model: string }) => model.model,
+        ),
+      ).toEqual(["catalog-chat", "catalog-reasoner"]);
+    });
+  });
+
+  it("skips automatic discovery for an all-disabled saved catalog", async () => {
+    vi.mocked(fetchModelsForConfig).mockResolvedValueOnce([]);
+    const provider: Provider = {
+      id: "all-disabled-source",
+      name: "All Disabled Source",
+      category: "custom",
+      settingsConfig: {
+        baseUrl: "https://all-disabled.example/v1",
+        auth: { OPENAI_API_KEY: "sk-test" },
+        modelCatalog: { models: [{ model: "excluded-model", enabled: false }] },
+      },
+    };
+    const plan = withEnabledProviderRoute(
+      createDraftRoutingPlan([provider], [provider]),
+      provider,
+    );
+    renderWorkspace(
+      React.createElement(CodexRouterWorkspacePage, {
+        providers: [provider, plan],
+        isProxyRunning: true,
+        isCodexTakeoverActive: true,
+        activeProviderId: plan.id,
+        initialProviderId: plan.id,
+        initialTab: "routes",
+        onEditProvider: vi.fn(),
+        onDeletePlan: vi.fn(),
+        onCreateProvider: vi.fn(),
+      }),
+    );
+    await act(async () => {});
+    expect(fetchModelsForConfig).not.toHaveBeenCalled();
+    expect(providersApi.update).not.toHaveBeenCalled();
+  });
+
+  it("ignores earlier refreshes after disabling and re-enabling the same catalog scope", async () => {
+    const earlier = createDeferred<FetchedModel[]>();
+    const current = createDeferred<FetchedModel[]>();
+    vi.mocked(fetchModelsForConfig)
+      .mockReturnValueOnce(earlier.promise)
+      .mockReturnValueOnce(current.promise);
+    const provider: Provider = {
+      id: "catalog-toggle-source",
+      name: "Catalogue Toggle Source",
+      category: "custom",
+      settingsConfig: {
+        baseUrl: "https://catalog-toggle.example/v1",
+        auth: { OPENAI_API_KEY: "sk-test" },
+        modelCatalog: { models: [{ model: "model-a", enabled: true }] },
+      },
+    };
+    const plan = withEnabledProviderRoute(
+      createDraftRoutingPlan([provider], [provider]),
+      provider,
+    );
+    const props = {
+      providers: [provider, plan],
+      isProxyRunning: true,
+      isCodexTakeoverActive: true,
+      activeProviderId: plan.id,
+      initialProviderId: plan.id,
+      initialTab: "routes" as const,
+      onEditProvider: vi.fn(),
+      onDeletePlan: vi.fn(),
+      onCreateProvider: vi.fn(),
+    };
+    const client = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+    const view = (source: Provider) =>
+      React.createElement(
+        QueryClientProvider,
+        { client },
+        React.createElement(CodexRouterWorkspacePage, {
+          ...props,
+          providers: [source, plan],
+        }),
+      );
+    const { rerender } = render(view(provider));
+    await waitFor(() => expect(fetchModelsForConfig).toHaveBeenCalledTimes(1));
+    rerender(
+      view({
+        ...provider,
+        settingsConfig: {
+          ...provider.settingsConfig,
+          modelCatalog: { models: [{ model: "model-a", enabled: false }] },
+        },
+      }),
+    );
+    await act(async () => {});
+    expect(fetchModelsForConfig).toHaveBeenCalledTimes(1);
+    rerender(view(provider));
+    await waitFor(() => expect(fetchModelsForConfig).toHaveBeenCalledTimes(2));
+    await act(async () => {
+      earlier.resolve([
+        { id: "model-a", ownedBy: null, contextWindow: 100000 },
+      ]);
+    });
+    expect(providersApi.update).not.toHaveBeenCalled();
+    await act(async () => {
+      current.resolve([
+        { id: "model-a", ownedBy: null, contextWindow: 200000 },
+      ]);
+    });
+    await waitFor(() => expect(providersApi.update).toHaveBeenCalled());
+    expect(
+      vi.mocked(providersApi.update).mock.calls[0][0].settingsConfig
+        .modelCatalog.models[0].contextWindow,
+    ).toBe(200000);
   });
 
   it("keeps unmatched route-source models when one grouped credential refresh fails", async () => {
@@ -3171,21 +3367,42 @@ describe("Codex MultiRouter workspace route persistence helpers", () => {
             {
               model: "deepseek-v4-flash",
               reasoning: {
-                supportedEfforts: ["none", "low", "medium", "high", "xhigh", "max"],
+                supportedEfforts: [
+                  "none",
+                  "low",
+                  "medium",
+                  "high",
+                  "xhigh",
+                  "max",
+                ],
                 defaultEffort: "medium",
               },
             },
             {
               model: "deepseek-v4-pro",
               reasoning: {
-                supportedEfforts: ["none", "low", "medium", "high", "xhigh", "max"],
+                supportedEfforts: [
+                  "none",
+                  "low",
+                  "medium",
+                  "high",
+                  "xhigh",
+                  "max",
+                ],
                 defaultEffort: "medium",
               },
             },
             {
               model: "qwen3.8",
               reasoning: {
-                supportedEfforts: ["none", "low", "medium", "high", "xhigh", "max"],
+                supportedEfforts: [
+                  "none",
+                  "low",
+                  "medium",
+                  "high",
+                  "xhigh",
+                  "max",
+                ],
                 defaultEffort: "medium",
               },
             },
@@ -3206,21 +3423,42 @@ describe("Codex MultiRouter workspace route persistence helpers", () => {
             {
               model: "deepseek-v4-pro",
               reasoning: {
-                supportedEfforts: ["none", "low", "medium", "high", "xhigh", "max"],
+                supportedEfforts: [
+                  "none",
+                  "low",
+                  "medium",
+                  "high",
+                  "xhigh",
+                  "max",
+                ],
                 defaultEffort: "medium",
               },
             },
             {
               model: "deepseek-v4-flash",
               reasoning: {
-                supportedEfforts: ["none", "low", "medium", "high", "xhigh", "max"],
+                supportedEfforts: [
+                  "none",
+                  "low",
+                  "medium",
+                  "high",
+                  "xhigh",
+                  "max",
+                ],
                 defaultEffort: "medium",
               },
             },
             {
               model: "qwen3.8",
               reasoning: {
-                supportedEfforts: ["none", "low", "medium", "high", "xhigh", "max"],
+                supportedEfforts: [
+                  "none",
+                  "low",
+                  "medium",
+                  "high",
+                  "xhigh",
+                  "max",
+                ],
                 defaultEffort: "medium",
               },
             },

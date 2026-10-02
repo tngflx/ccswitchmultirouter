@@ -13,6 +13,8 @@ import {
   initialWizardSelectedSourceIds,
   mergeFetchedModelsIntoWizardProvider,
   resolveWizardModelNameCollisions,
+  wizardModelCatalogIds,
+  hasAllDisabledWizardModelCatalog,
 } from "./codexMultiRouterWizard";
 
 const deepseekSource: Provider = {
@@ -29,6 +31,47 @@ const deepseekSource: Provider = {
 };
 
 describe("mergeFetchedModelsIntoWizardProvider", () => {
+  it("distinguishes an all-disabled saved catalog from empty bootstrap and enabled rows", () => {
+    const withModels = (models: CodexCatalogModel[]): Provider => ({
+      ...deepseekSource,
+      settingsConfig: { modelCatalog: { models } },
+    });
+    expect(hasAllDisabledWizardModelCatalog(withModels([]))).toBe(false);
+    expect(
+      hasAllDisabledWizardModelCatalog(
+        withModels([{ model: "excluded", enabled: false }]),
+      ),
+    ).toBe(true);
+    expect(
+      hasAllDisabledWizardModelCatalog(
+        withModels([
+          { model: "enabled" },
+          { model: "excluded", enabled: false },
+        ]),
+      ),
+    ).toBe(false);
+  });
+  it("uses only enabled catalog bindings for automatic refresh", () => {
+    const source: Provider = {
+      ...deepseekSource,
+      settingsConfig: {
+        ...deepseekSource.settingsConfig,
+        modelCatalog: {
+          models: [
+            { model: "Visible chat", upstreamModel: "deepseek-chat" },
+            {
+              model: "Excluded reasoner",
+              upstreamModel: "deepseek-reasoner",
+              enabled: false,
+            },
+          ],
+        },
+      },
+    };
+
+    expect(wizardModelCatalogIds(source)).toEqual(["deepseek-chat"]);
+  });
+
   it("deduplicates case/whitespace variants without losing fetched metadata", () => {
     const models = canonicalizeWizardProviderModels([
       { model: " GPT-5 ", upstreamModel: "gpt-5" },
@@ -232,7 +275,9 @@ describe("mergeFetchedModelsIntoWizardProvider", () => {
 
     expect(persistedModels).toHaveLength(34);
     expect(
-      persistedModels.filter((model: CodexCatalogModel) => model.enabled !== false),
+      persistedModels.filter(
+        (model: CodexCatalogModel) => model.enabled !== false,
+      ),
     ).toHaveLength(9);
     expect(route?.modelSelection).toEqual({
       mode: "include",

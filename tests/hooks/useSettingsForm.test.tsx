@@ -51,6 +51,7 @@ describe("useSettingsForm Hook", () => {
     expect(settings.showInTray).toBe(true);
     expect(settings.minimizeToTrayOnClose).toBe(true);
     expect(settings.enableClaudePluginIntegration).toBe(false);
+    expect(settings.launchCodexDesktopWithCcswitch).toBe(true);
     expect(settings.claudeConfigDir).toBe("/Users/demo");
     expect(settings.codexConfigDir).toBeUndefined();
     expect(settings.language).toBe("en");
@@ -143,6 +144,7 @@ describe("useSettingsForm Hook", () => {
     });
 
     expect(result.current.settings?.showInTray).toBe(false);
+    expect(result.current.settings?.launchCodexDesktopWithCcswitch).toBe(true);
 
     changeLanguageSpy.mockClear();
     act(() => {
@@ -194,12 +196,44 @@ describe("useSettingsForm Hook", () => {
     expect(settings.showInTray).toBe(false);
     expect(settings.minimizeToTrayOnClose).toBe(false);
     expect(settings.enableClaudePluginIntegration).toBe(true);
+    expect(settings.launchCodexDesktopWithCcswitch).toBe(true);
     expect(settings.claudeConfigDir).toBe("/reset");
     expect(settings.codexConfigDir).toBeUndefined();
     expect(settings.language).toBe("zh");
     expect(result.current.initialLanguage).toBe("en");
     expect(changeLanguageSpy).toHaveBeenCalledWith("en");
   });
+
+  it.each([false, true])(
+    "preserves explicit Codex Desktop startup preference %s on load and reset",
+    (launchCodexDesktopWithCcswitch) => {
+      const savedSettings = {
+        showInTray: true,
+        minimizeToTrayOnClose: true,
+        language: "en" as const,
+        launchCodexDesktopWithCcswitch,
+      };
+      useSettingsQueryMock.mockReturnValue({
+        data: savedSettings,
+        isLoading: false,
+      });
+
+      const { result } = renderHook(() => useSettingsForm());
+      expect(result.current.settings?.launchCodexDesktopWithCcswitch).toBe(
+        launchCodexDesktopWithCcswitch,
+      );
+
+      act(() => {
+        result.current.updateSettings({
+          launchCodexDesktopWithCcswitch: !launchCodexDesktopWithCcswitch,
+        });
+        result.current.resetSettings(savedSettings);
+      });
+      expect(result.current.settings?.launchCodexDesktopWithCcswitch).toBe(
+        launchCodexDesktopWithCcswitch,
+      );
+    },
+  );
 
   it("should not call changeLanguage repeatedly when language is consistent in syncLanguage", async () => {
     useSettingsQueryMock.mockReturnValue({
