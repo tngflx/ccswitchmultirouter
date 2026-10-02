@@ -106,14 +106,13 @@ fn first_string_field(
     obj: &serde_json::Map<String, serde_json::Value>,
     keys: &[&str],
 ) -> Option<String> {
-    keys.iter()
-        .find_map(|key| {
-            obj.get(*key)
-                .and_then(serde_json::Value::as_str)
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(ToString::to_string)
-        })
+    keys.iter().find_map(|key| {
+        obj.get(*key)
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string)
+    })
 }
 
 fn extract_model_aliases(obj: &serde_json::Map<String, serde_json::Value>) -> Vec<String> {
@@ -145,7 +144,10 @@ fn fetched_model_from_object(
     owned_by: Option<&str>,
     is_openrouter_catalog: bool,
 ) -> Option<FetchedModel> {
-    let id = first_string_field(obj, &["id", "canonical_slug", "canonicalSlug", "slug", "name"])?;
+    let id = first_string_field(
+        obj,
+        &["id", "canonical_slug", "canonicalSlug", "slug", "name"],
+    )?;
     let canonical_slug = first_string_field(obj, &["canonical_slug", "canonicalSlug"]);
     let slug = first_string_field(obj, &["slug"]);
     let name = first_string_field(obj, &["name"]);
@@ -371,11 +373,9 @@ pub async fn fetch_models(options: FetchModelsRequest<'_>) -> Result<Vec<Fetched
             } else {
                 catalog_model_entries(resp.models)
                     .into_iter()
-                    .filter_map(|entry| fetched_model_from_object(
-                        entry.as_object()?,
-                        None,
-                        is_openrouter_catalog,
-                    ))
+                    .filter_map(|entry| {
+                        fetched_model_from_object(entry.as_object()?, None, is_openrouter_catalog)
+                    })
                     .collect()
             };
 
@@ -406,7 +406,10 @@ fn normalized_model_id(value: &str) -> String {
     value.trim().to_ascii_lowercase()
 }
 
-fn model_matches_requested_ids(model: &FetchedModel, requested: &std::collections::HashSet<String>) -> bool {
+fn model_matches_requested_ids(
+    model: &FetchedModel,
+    requested: &std::collections::HashSet<String>,
+) -> bool {
     std::iter::once(&model.id)
         .chain(model.canonical_slug.iter())
         .chain(model.slug.iter())
@@ -420,13 +423,17 @@ fn filter_requested_models_in_place(
     models: &mut Vec<FetchedModel>,
     requested_model_ids: Option<&[String]>,
 ) {
-    let Some(ids) = requested_model_ids else { return };
+    let Some(ids) = requested_model_ids else {
+        return;
+    };
     let requested = ids
         .iter()
         .map(|id| normalized_model_id(id))
         .filter(|id| !id.is_empty())
         .collect::<std::collections::HashSet<_>>();
-    if requested.is_empty() { return; }
+    if requested.is_empty() {
+        return;
+    }
     models.retain(|model| model_matches_requested_ids(model, &requested));
 }
 
@@ -1382,7 +1389,10 @@ mod tests {
 
     #[test]
     fn empty_requested_model_filter_preserves_discovery_behavior() {
-        let mut models = vec![test_model("model-a", None, &[]), test_model("model-b", None, &[])];
+        let mut models = vec![
+            test_model("model-a", None, &[]),
+            test_model("model-b", None, &[]),
+        ];
         filter_requested_models_in_place(&mut models, Some(&[]));
         assert_eq!(models.len(), 2);
     }
@@ -1736,7 +1746,7 @@ mod tests {
             &entry.extra,
             false,
         )
-            .expect("declared reasoning capability should be retained");
+        .expect("declared reasoning capability should be retained");
         assert_eq!(
             reasoning["supportedEfforts"],
             serde_json::json!(["low", "high", "max"])
@@ -1764,7 +1774,7 @@ mod tests {
             &entry.extra,
             true,
         )
-            .expect("OpenRouter reasoning must be retained");
+        .expect("OpenRouter reasoning must be retained");
         assert_eq!(
             reasoning["supportedEfforts"],
             serde_json::json!(["max", "high", "low"])
@@ -1818,7 +1828,9 @@ mod tests {
 
     #[test]
     fn openrouter_reasoning_conversion_requires_exact_catalog_host() {
-        assert!(is_openrouter_catalog_url("https://openrouter.ai/api/v1/models"));
+        assert!(is_openrouter_catalog_url(
+            "https://openrouter.ai/api/v1/models"
+        ));
         assert!(!is_openrouter_catalog_url(
             "https://openrouter.ai.example.com/api/v1/models"
         ));

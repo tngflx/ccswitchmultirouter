@@ -1,4 +1,4 @@
-﻿//! Schema 定义和迁移
+//! Schema 定义和迁移
 //!
 //! 负责数据库表结构的创建和版本迁移。
 
@@ -3701,13 +3701,9 @@ mod tests {
     }
 
     #[test]
-    fn migrate_v18_to_v19_adds_capacity_retry_and_preserves_app_defaults() -> Result<(), AppError>
-    {
+    fn migrate_v18_to_v19_adds_capacity_retry_and_preserves_app_defaults() -> Result<(), AppError> {
         let conn = Connection::open_in_memory()?;
-        conn.execute(
-            "CREATE TABLE proxy_config (app_type TEXT PRIMARY KEY)",
-            [],
-        )?;
+        conn.execute("CREATE TABLE proxy_config (app_type TEXT PRIMARY KEY)", [])?;
         conn.execute_batch(
             "INSERT INTO proxy_config (app_type) VALUES ('codex'), ('claude');
              PRAGMA user_version = 18;",

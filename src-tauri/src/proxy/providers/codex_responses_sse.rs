@@ -14,7 +14,7 @@
 //! `output_item_added` / `output_item_done` helpers.
 
 use bytes::Bytes;
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 
 /// Serialize one Responses SSE event with the standard `event:`/`data:` framing.
 pub(crate) fn sse_event(event: &str, data: Value) -> Bytes {
@@ -469,13 +469,9 @@ mod tests {
 
     #[test]
     fn function_call_argument_events() {
-        assert!(
-            body(&function_call_arguments_delta(1, "fc_x", "{\"a\":"))
-                .contains("\"type\":\"response.function_call_arguments.delta\"")
-        );
-        assert!(
-            body(&function_call_arguments_done(1, "fc_x", "{\"a\":1}"))
-                .contains("\"arguments\":\"{\\\"a\\\":1}\"")
-        );
+        assert!(body(&function_call_arguments_delta(1, "fc_x", "{\"a\":"))
+            .contains("\"type\":\"response.function_call_arguments.delta\""));
+        assert!(body(&function_call_arguments_done(1, "fc_x", "{\"a\":1}"))
+            .contains("\"arguments\":\"{\\\"a\\\":1}\""));
     }
 }

@@ -34,9 +34,9 @@ pub(crate) use live::sanitize_claude_settings_for_live;
 pub(crate) use live::{
     build_codex_live_config_for_provider, build_effective_settings_with_common_config,
     normalize_provider_common_config_for_storage, provider_exists_in_live_config,
-    publish_codex_catalog_outputs_for_provider,
-    strip_common_config_from_live_settings, sync_current_provider_for_app_to_live,
-    write_codex_config_only_with_common_config, write_live_with_common_config,
+    publish_codex_catalog_outputs_for_provider, strip_common_config_from_live_settings,
+    sync_current_provider_for_app_to_live, write_codex_config_only_with_common_config,
+    write_live_with_common_config,
 };
 
 // Internal re-exports
@@ -2776,19 +2776,22 @@ wire_api = "responses"
 
         let error = ProviderService::switch(&state, AppType::Codex, "deepseek")
             .expect_err("a provider switch must not enable a disabled global proxy");
-        assert!(error
-            .to_string()
-            .contains("全局代理已关闭"), "unexpected error: {error}");
-        assert!(!db
-            .get_global_proxy_config()
-            .await
-            .expect("read global proxy config")
-            .proxy_enabled);
-        assert!(!db
-            .get_proxy_config_for_app("codex")
-            .await
-            .expect("read Codex proxy config")
-            .enabled);
+        assert!(
+            error.to_string().contains("全局代理已关闭"),
+            "unexpected error: {error}"
+        );
+        assert!(
+            !db.get_global_proxy_config()
+                .await
+                .expect("read global proxy config")
+                .proxy_enabled
+        );
+        assert!(
+            !db.get_proxy_config_for_app("codex")
+                .await
+                .expect("read Codex proxy config")
+                .enabled
+        );
         assert!(!state.proxy_service.is_running().await);
         assert_eq!(
             std::fs::read_to_string(crate::codex_config::get_codex_config_path())
@@ -4680,9 +4683,7 @@ impl ProviderService {
         }
         let prepared = providers
             .into_iter()
-            .map(|provider| {
-                Self::prepare_provider_for_mutation(state, &AppType::Codex, provider)
-            })
+            .map(|provider| Self::prepare_provider_for_mutation(state, &AppType::Codex, provider))
             .collect::<Result<Vec<_>, _>>()?;
         crate::codex_multirouter::mutation::apply_codex_provider_mutations_persist_only(
             state.db.as_ref(),

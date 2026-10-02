@@ -2340,10 +2340,10 @@ async fn restore_proxy_state_on_startup(
         .is_ok_and(|config| config.proxy_enabled);
     let codex_takeover_enabled = global_proxy_enabled
         && state
-        .db
-        .get_proxy_config_for_app("codex")
-        .await
-        .is_ok_and(|config| config.enabled);
+            .db
+            .get_proxy_config_for_app("codex")
+            .await
+            .is_ok_and(|config| config.enabled);
     if codex_takeover_enabled {
         match state
             .proxy_service
@@ -2439,9 +2439,7 @@ async fn restore_proxy_state_on_startup(
                 .await
                 .is_ok_and(|config| config.enabled);
             if !still_enabled {
-                log::info!(
-                    "启动恢复停止 {app_type} 重试：用户已在恢复期间关闭该接管"
-                );
+                log::info!("启动恢复停止 {app_type} 重试：用户已在恢复期间关闭该接管");
                 cancelled_by_user = true;
                 break;
             }

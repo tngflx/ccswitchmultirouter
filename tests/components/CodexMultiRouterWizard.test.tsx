@@ -1621,7 +1621,7 @@ describe("CodexMultiRouterWizard", () => {
     ).toEqual({ mode: "include", models: ["model-c", "model-a"] });
   });
 
-  it("re-enables disabled source rows when following all models", async () => {
+  it("preserves disabled source rows when following all models", async () => {
     const source = provider({
       id: "sublyx",
       name: "Sublyx",
@@ -1652,7 +1652,8 @@ describe("CodexMultiRouterWizard", () => {
     fireEvent.click(screen.getByRole("button", { name: "下一步" }));
     fireEvent.click(screen.getByRole("button", { name: "自动跟随全部模型" }));
 
-    expect(screen.getByLabelText("保留 gpt-6-sol")).toBeChecked();
+    expect(screen.getByLabelText("保留 gpt-6-sol")).not.toBeChecked();
+    expect(screen.getByLabelText("保留 gpt-6-luna")).toBeChecked();
 
     fireEvent.click(screen.getByRole("button", { name: "启用并验证" }));
     fireEvent.click(
@@ -1665,8 +1666,8 @@ describe("CodexMultiRouterWizard", () => {
       .mock.calls.map(([candidate]) => candidate)
       .find((candidate) => candidate.id === "sublyx");
     expect(updatedSource?.settingsConfig.modelCatalog?.models).toEqual([
-      { model: "gpt-6-sol", enabled: true },
       { model: "gpt-6-luna", enabled: true },
+      { model: "gpt-6-sol", enabled: false },
     ]);
   });
 

@@ -791,7 +791,10 @@ mod tests {
 
         let report = inspect(&state).expect("inspect suspended route");
         assert_eq!(report.state, CodexConfigConsistencyState::NotApplicable);
-        assert_eq!(report.reason.as_deref(), Some("multirouter_takeover_inactive"));
+        assert_eq!(
+            report.reason.as_deref(),
+            Some("multirouter_takeover_inactive")
+        );
         assert!(report.actual_fingerprint.is_none());
     }
 

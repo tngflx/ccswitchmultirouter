@@ -284,7 +284,9 @@ fn managed_cli_process_is_running(tool: &str) -> bool {
             .args(["-NoProfile", "-NonInteractive", "-Command", &script])
             .creation_flags(CREATE_NO_WINDOW)
             .output()
-            .map(|output| codex_process_probe_indicates_running(output.status.success(), &output.stdout))
+            .map(|output| {
+                codex_process_probe_indicates_running(output.status.success(), &output.stdout)
+            })
             .unwrap_or(true);
     }
     #[cfg(not(target_os = "windows"))]
@@ -7423,9 +7425,8 @@ mod tests {
             ),
         ];
         for (path, expected) in cases {
-            let fixture = format!(
-                "@([pscustomobject]@{{Name='codex.exe';ExecutablePath='{path}'}})"
-            );
+            let fixture =
+                format!("@([pscustomobject]@{{Name='codex.exe';ExecutablePath='{path}'}})");
             let script = codex_cli_process_probe_command()
                 .replace("Get-CimInstance Win32_Process", &fixture);
             let output = std::process::Command::new("powershell")
@@ -7433,7 +7434,11 @@ mod tests {
                 .creation_flags(0x08000000)
                 .output()
                 .expect("PowerShell process probe fixture");
-            assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
             assert_eq!(
                 codex_process_probe_indicates_running(true, &output.stdout),
                 expected,

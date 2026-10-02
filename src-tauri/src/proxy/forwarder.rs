@@ -3607,8 +3607,7 @@ impl RequestForwarder {
             // The full set lives in `is_codex_client_fingerprint_header` so it stays in one
             // place. (HeaderName is lowercased by the http crate, so a direct match is safe.)
             if (strip_inbound_codex_version && key_str.eq_ignore_ascii_case("version"))
-                || (codex_responses_to_anthropic
-                    && is_codex_client_fingerprint_header(key_str))
+                || (codex_responses_to_anthropic && is_codex_client_fingerprint_header(key_str))
             {
                 continue;
             }
@@ -7301,8 +7300,8 @@ where
         let inspectable_quota_status = status == http::StatusCode::PAYMENT_REQUIRED
             || status == http::StatusCode::TOO_MANY_REQUESTS
             || status == http::StatusCode::FORBIDDEN;
-        let capacity_status = capacity_retry_enabled
-            && matches!(status.as_u16(), 429 | 500 | 502 | 503 | 504 | 529);
+        let capacity_status =
+            capacity_retry_enabled && matches!(status.as_u16(), 429 | 500 | 502 | 503 | 504 | 529);
         let retryable_status = inspectable_quota_status
             || (traffic_policy.rejection_retry_mode
                 == crate::provider::CodexRejectionRetryMode::OpencodeEndpointUnavailable
@@ -7322,9 +7321,10 @@ where
                 body_text.as_deref(),
             )
         {
-            let remaining = CODEX_RATE_LIMIT_TOTAL_DELAY_BUDGET
-                .saturating_sub(capacity_total_delay);
-            if capacity_retry_count >= super::providers::streaming_retry::CAPACITY_STREAM_MAX_RETRIES as usize
+            let remaining =
+                CODEX_RATE_LIMIT_TOTAL_DELAY_BUDGET.saturating_sub(capacity_total_delay);
+            if capacity_retry_count
+                >= super::providers::streaming_retry::CAPACITY_STREAM_MAX_RETRIES as usize
                 || remaining.is_zero()
             {
                 return Ok(rebuild_consumed_error_response(

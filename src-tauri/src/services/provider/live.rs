@@ -591,7 +591,9 @@ pub(crate) fn provider_uses_common_config(
     {
         Some(explicit) => explicit && has_snippet,
         None if matches!(app_type, AppType::Codex)
-            && crate::services::proxy::ProxyService::codex_provider_has_enabled_routing(Some(provider)) =>
+            && crate::services::proxy::ProxyService::codex_provider_has_enabled_routing(Some(
+                provider,
+            )) =>
         {
             // MultiRouter stores route/catalog state instead of a materialized
             // `settings_config.config`. Its live config is synthesized later, so
@@ -1609,13 +1611,13 @@ fn sync_current_provider_for_app_respecting_takeover(
     // compact/模型上下文，导致"live 显示 openai"和 compaction 失败。
     if matches!(app_type, AppType::Codex) {
         let has_enabled_routing =
-            crate::services::proxy::ProxyService::codex_provider_has_enabled_routing(Some(provider));
+            crate::services::proxy::ProxyService::codex_provider_has_enabled_routing(Some(
+                provider,
+            ));
         if has_enabled_routing {
-            let global_proxy_enabled = block_on_tauri_runtime(
-                state.db.get_global_proxy_config(),
-            )
-            .map_err(|e| AppError::Message(format!("读取全局代理状态失败: {e}")))?
-            .proxy_enabled;
+            let global_proxy_enabled = block_on_tauri_runtime(state.db.get_global_proxy_config())
+                .map_err(|e| AppError::Message(format!("读取全局代理状态失败: {e}")))?
+                .proxy_enabled;
             if !global_proxy_enabled {
                 log::info!(
                     "跳过 Codex MultiRouter 自动接管：全局代理已关闭 provider={}",

@@ -16,7 +16,7 @@ use super::transform_responses::{
 use crate::proxy::sse::{strip_sse_field, take_sse_block};
 use bytes::Bytes;
 use futures::stream::{Stream, StreamExt};
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 
 #[inline]
@@ -1563,8 +1563,8 @@ pub fn create_anthropic_sse_stream_from_responses<E: std::error::Error + Send + 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use futures::StreamExt;
     use futures::stream;
+    use futures::StreamExt;
     use std::collections::HashMap;
 
     async fn convert_stream_text(input: impl Into<Bytes>) -> String {

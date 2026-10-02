@@ -12,10 +12,10 @@ use crate::proxy::{
     error::ProxyError,
     json_canonical::canonical_json_string,
     tool_media::{
-        TOOL_RESULT_MEDIA_ATTACHED_MARKER, ToolMediaScope, strip_and_clamp_media_from_tool_value,
+        strip_and_clamp_media_from_tool_value, ToolMediaScope, TOOL_RESULT_MEDIA_ATTACHED_MARKER,
     },
 };
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 
 use super::reasoning_bridge::{
     anthropic_block_from_openai_reasoning_item, openai_reasoning_item_from_anthropic_block,
@@ -1467,12 +1467,10 @@ mod tests {
         let output = result["input"][0]["output"].as_array().unwrap();
 
         assert_eq!(output[0]["type"], "input_text");
-        assert!(
-            !output[0]["text"]
-                .as_str()
-                .unwrap()
-                .contains("MCP_RESPONSES_IMAGE_SENTINEL")
-        );
+        assert!(!output[0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("MCP_RESPONSES_IMAGE_SENTINEL"));
         assert_eq!(output[1]["type"], "input_image");
         assert_eq!(
             output[1]["image_url"],
@@ -1513,12 +1511,10 @@ mod tests {
             image["image_url"],
             "data:image/png;base64,STRING_RESPONSES_SENTINEL"
         );
-        assert!(
-            output
-                .iter()
-                .filter_map(|part| part.get("text").and_then(Value::as_str))
-                .all(|text| !text.contains("STRING_RESPONSES_SENTINEL"))
-        );
+        assert!(output
+            .iter()
+            .filter_map(|part| part.get("text").and_then(Value::as_str))
+            .all(|text| !text.contains("STRING_RESPONSES_SENTINEL")));
         let serialized = result.to_string();
         assert!(serialized.contains("[cc-switch: omitted 20000 bytes]"));
         assert!(!serialized.contains(&"A".repeat(64)));
@@ -1823,11 +1819,9 @@ mod tests {
         let anthropic = responses_to_anthropic(response).unwrap();
         let thinking = anthropic["content"][0].clone();
         assert_eq!(thinking["type"], "thinking");
-        assert!(
-            thinking["signature"]
-                .as_str()
-                .is_some_and(|value| value.starts_with("ccswitch-openai-reasoning-v1:"))
-        );
+        assert!(thinking["signature"]
+            .as_str()
+            .is_some_and(|value| value.starts_with("ccswitch-openai-reasoning-v1:")));
 
         let replay = anthropic_to_responses(
             json!({
@@ -2026,11 +2020,9 @@ mod tests {
         });
 
         let result = anthropic_to_responses(input, None, false, false).unwrap();
-        assert!(
-            result["input"][0]["content"][0]
-                .get("cache_control")
-                .is_none()
-        );
+        assert!(result["input"][0]["content"][0]
+            .get("cache_control")
+            .is_none());
     }
 
     #[test]
@@ -2313,17 +2305,13 @@ mod tests {
             .expect("include should be array");
 
         // 原有项必须保留
-        assert!(
-            includes
-                .iter()
-                .any(|v| v.as_str() == Some("something.else"))
-        );
+        assert!(includes
+            .iter()
+            .any(|v| v.as_str() == Some("something.else")));
         // marker 必须存在
-        assert!(
-            includes
-                .iter()
-                .any(|v| v.as_str() == Some("reasoning.encrypted_content"))
-        );
+        assert!(includes
+            .iter()
+            .any(|v| v.as_str() == Some("reasoning.encrypted_content")));
         // 不重复：marker 只出现一次
         let marker_count = includes
             .iter()

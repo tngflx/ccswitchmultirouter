@@ -2,15 +2,15 @@
 
 use super::{
     image_generation::{
-        HostedImageGenerationConfig, ImageGenerationArguments,
         result_from_openai_response as image_result_from_openai_response,
+        HostedImageGenerationConfig, ImageGenerationArguments,
     },
     web_search::{
-        HostedWebSearchConfig, WebSearchArguments, WebSearchResult, result_from_openai_response,
+        result_from_openai_response, HostedWebSearchConfig, WebSearchArguments, WebSearchResult,
     },
 };
 use crate::proxy::error::ProxyError;
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use std::time::Duration;
 
 const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com/v1";

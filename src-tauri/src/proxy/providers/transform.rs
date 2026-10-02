@@ -7,11 +7,11 @@ use crate::proxy::{
     error::ProxyError,
     json_canonical::canonical_json_string,
     tool_media::{
-        ToolMediaScope, chat_media_part_from_tool_part, flush_pending_chat_tool_media,
-        plan_chat_tool_output_media, queue_chat_tool_output_media,
+        chat_media_part_from_tool_part, flush_pending_chat_tool_media, plan_chat_tool_output_media,
+        queue_chat_tool_output_media, ToolMediaScope,
     },
 };
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 
 const ANTHROPIC_BILLING_HEADER_PREFIX: &str = "x-anthropic-billing-header:";
 
@@ -1250,18 +1250,14 @@ mod tests {
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[0]["role"], "tool");
         assert_eq!(messages[0]["tool_call_id"], "call_image");
-        assert!(
-            messages[0]["content"]
-                .as_str()
-                .unwrap()
-                .contains("tool result media moved")
-        );
-        assert!(
-            !messages[0]["content"]
-                .as_str()
-                .unwrap()
-                .contains("CLAUDE_CHAT_IMAGE_SENTINEL")
-        );
+        assert!(messages[0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("tool result media moved"));
+        assert!(!messages[0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("CLAUDE_CHAT_IMAGE_SENTINEL"));
         assert_eq!(messages[1]["role"], "user");
         assert_eq!(
             messages[1]["content"][0]["text"],
@@ -1269,11 +1265,9 @@ mod tests {
         );
         assert_eq!(messages[1]["content"][1]["type"], "image_url");
         assert!(messages[1]["content"][1].get("cache_control").is_none());
-        assert!(
-            messages[1]["content"][1]
-                .get("prompt_cache_breakpoint")
-                .is_none()
-        );
+        assert!(messages[1]["content"][1]
+            .get("prompt_cache_breakpoint")
+            .is_none());
         assert_eq!(
             messages[1]["content"][1]["image_url"]["url"],
             "data:image/png;base64,CLAUDE_CHAT_IMAGE_SENTINEL"
@@ -1340,16 +1334,12 @@ mod tests {
             result["messages"][0]["content"][0]["image_url"]["url"],
             "https://example.com/image.png"
         );
-        assert!(
-            result["messages"][0]["content"][0]
-                .get("cache_control")
-                .is_none()
-        );
-        assert!(
-            result["messages"][0]["content"][0]
-                .get("prompt_cache_breakpoint")
-                .is_none()
-        );
+        assert!(result["messages"][0]["content"][0]
+            .get("cache_control")
+            .is_none());
+        assert!(result["messages"][0]["content"][0]
+            .get("prompt_cache_breakpoint")
+            .is_none());
     }
 
     #[test]

@@ -143,5 +143,4 @@ mod tests {
         assert!(body["tools"][0]["function"]["parameters"]["allOf"].is_array());
         assert_eq!(body["tools"][1], json!({"type": "web_search"}));
     }
-
 }

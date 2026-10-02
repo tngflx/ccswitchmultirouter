@@ -48,9 +48,7 @@ pub fn detect_platform_from_name_and_base_url(
         base_url.unwrap_or_default()
     )
     .to_ascii_lowercase();
-    if platform.contains("openrouter")
-        || base_url.is_some_and(is_openrouter_endpoint)
-    {
+    if platform.contains("openrouter") || base_url.is_some_and(is_openrouter_endpoint) {
         Some("openrouter")
     } else if platform.contains("vllm") {
         Some("vllm")
@@ -71,14 +69,13 @@ pub fn is_openrouter_endpoint(url: &str) -> bool {
     let Some(host) = parsed.host_str() else {
         return false;
     };
-    host.eq_ignore_ascii_case("openrouter.ai")
-        && {
-            let path = parsed.path().trim_end_matches('/');
-            path.is_empty()
-                || path.eq_ignore_ascii_case("/api")
-                || path.eq_ignore_ascii_case("/api/v1")
-                || path.eq_ignore_ascii_case("/api/v1/models")
-        }
+    host.eq_ignore_ascii_case("openrouter.ai") && {
+        let path = parsed.path().trim_end_matches('/');
+        path.is_empty()
+            || path.eq_ignore_ascii_case("/api")
+            || path.eq_ignore_ascii_case("/api/v1")
+            || path.eq_ignore_ascii_case("/api/v1/models")
+    }
 }
 
 /// 统一发现入口：按平台选择适配器。未知平台仍尝试其认证 `/models`
@@ -106,7 +103,11 @@ fn base_url(provider: &Provider) -> Option<String> {
     // Codex providers persist the effective endpoint inside the TOML config
     // (`model_providers.<id>.base_url`). Prefer that value over generic
     // top-level fields so discovery reaches the same upstream that Codex uses.
-    if let Some(config_text) = provider.settings_config.get("config").and_then(Value::as_str) {
+    if let Some(config_text) = provider
+        .settings_config
+        .get("config")
+        .and_then(Value::as_str)
+    {
         if let Some(base_url) = crate::codex_config::extract_codex_base_url(config_text) {
             let base_url = base_url.trim();
             if !base_url.is_empty() {
@@ -155,10 +156,9 @@ fn provider_api_key(provider: &Provider) -> Option<String> {
     // Pair a Codex TOML endpoint with the credential stored for that same
     // source before consulting generic/stale provider fields.
     if let Some(config) = settings.get("config").and_then(Value::as_str) {
-        if let Some(api_key) = crate::codex_config::extract_codex_api_key(
-            settings.get("auth"),
-            Some(config),
-        ) {
+        if let Some(api_key) =
+            crate::codex_config::extract_codex_api_key(settings.get("auth"), Some(config))
+        {
             if !api_key.trim().is_empty() {
                 return Some(api_key);
             }
@@ -708,7 +708,10 @@ mod tests {
             base_url(&provider).as_deref(),
             Some("https://openrouter.ai/api/v1")
         );
-        assert_eq!(provider_api_key(&provider).as_deref(), Some("sk-openrouter"));
+        assert_eq!(
+            provider_api_key(&provider).as_deref(),
+            Some("sk-openrouter")
+        );
     }
 
     #[test]

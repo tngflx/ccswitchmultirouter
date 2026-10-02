@@ -28,18 +28,18 @@
 //! 长思考误判为断流。
 
 use super::codex_terminal::{
-    NativeResponsesEvidence, NativeResponsesTerminalDisposition, classify_native_responses_terminal,
+    classify_native_responses_terminal, NativeResponsesEvidence, NativeResponsesTerminalDisposition,
 };
 use super::streaming_responses::{
-    CAPACITY_STREAM_MARKER, RETRYABLE_STREAM_MARKER, anthropic_error_sse, anthropic_sse,
-    create_anthropic_sse_stream_from_responses,
+    anthropic_error_sse, anthropic_sse, create_anthropic_sse_stream_from_responses,
+    CAPACITY_STREAM_MARKER, RETRYABLE_STREAM_MARKER,
 };
 use crate::proxy::error::ProxyError;
 use crate::proxy::hyper_client::ProxyResponse;
 use crate::proxy::sse::{strip_sse_field, take_sse_block};
 use bytes::{Bytes, BytesMut};
 use futures::stream::{Stream, StreamExt};
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::future::Future;
 use std::pin::Pin;
@@ -227,12 +227,23 @@ pub(crate) fn is_capacity_error_payload(payload: &Value, status: Option<http::St
     if is_explicit_non_replayable_error_payload(payload) {
         return false;
     }
-    ["server_is_overloaded", "overloaded_error", "provider_capacity", "model_at_capacity", "capacity_exceeded"]
+    [
+        "server_is_overloaded",
+        "overloaded_error",
+        "provider_capacity",
+        "model_at_capacity",
+        "capacity_exceeded",
+    ]
+    .iter()
+    .any(|marker| kind.contains(marker))
+        || [
+            "selected model is at capacity",
+            "model is at capacity",
+            "servers are currently overloaded",
+            "currently experiencing high demand",
+        ]
         .iter()
-        .any(|marker| kind.contains(marker))
-        || ["selected model is at capacity", "model is at capacity", "servers are currently overloaded", "currently experiencing high demand"]
-            .iter()
-            .any(|marker| message.contains(marker))
+        .any(|marker| message.contains(marker))
         || (status.is_some_and(|status| status.is_server_error())
             && message.contains("capacity exhausted"))
 }
@@ -244,8 +255,7 @@ pub(crate) fn is_capacity_error_response(status: http::StatusCode, body: Option<
     let Some(body) = body.filter(|body| !body.trim().is_empty()) else {
         return false;
     };
-    let payload = serde_json::from_str::<Value>(body)
-        .unwrap_or_else(|_| json!({"message": body}));
+    let payload = serde_json::from_str::<Value>(body).unwrap_or_else(|_| json!({"message": body}));
     is_capacity_error_payload(&payload, Some(status))
 }
 
@@ -267,12 +277,30 @@ fn is_explicit_non_replayable_error_payload(payload: &Value) -> bool {
         .or_else(|| payload.get("message").and_then(Value::as_str))
         .unwrap_or("")
         .to_ascii_lowercase();
-    ["quota", "billing", "authentication", "unauthorized", "forbidden", "permission", "policy", "invalid_request", "invalid_parameter", "unsupported_parameter"]
+    [
+        "quota",
+        "billing",
+        "authentication",
+        "unauthorized",
+        "forbidden",
+        "permission",
+        "policy",
+        "invalid_request",
+        "invalid_parameter",
+        "unsupported_parameter",
+    ]
+    .iter()
+    .any(|marker| kind.contains(marker))
+        || [
+            "quota exhausted",
+            "insufficient quota",
+            "invalid token",
+            "authentication failed",
+            "request blocked by policy",
+            "unsupported parameter",
+        ]
         .iter()
-        .any(|marker| kind.contains(marker))
-        || ["quota exhausted", "insufficient quota", "invalid token", "authentication failed", "request blocked by policy", "unsupported parameter"]
-            .iter()
-            .any(|marker| message.contains(marker))
+        .any(|marker| message.contains(marker))
 }
 
 struct NativeResponsesSseErrorDiagnostic {
@@ -722,8 +750,7 @@ fn is_retryable_error_event(event: &ScannedEvent) -> bool {
 }
 
 fn is_capacity_error_event(event: &ScannedEvent) -> bool {
-    event.name == "error"
-        && event.raw.lines().any(|line| line == CAPACITY_STREAM_MARKER)
+    event.name == "error" && event.raw.lines().any(|line| line == CAPACITY_STREAM_MARKER)
 }
 
 fn retry_failure_reason(event: &ScannedEvent) -> String {
@@ -1506,7 +1533,10 @@ mod tests {
             http::StatusCode::SERVICE_UNAVAILABLE,
             Some(r#"{"error":{"type":"server_is_overloaded","message":"try later"}}"#),
         ));
-        assert!(!is_capacity_error_response(http::StatusCode::BAD_GATEWAY, None));
+        assert!(!is_capacity_error_response(
+            http::StatusCode::BAD_GATEWAY,
+            None
+        ));
         assert!(!is_capacity_error_response(
             http::StatusCode::SERVICE_UNAVAILABLE,
             Some(r#"{"error":{"type":"billing_error","message":"quota exhausted"}}"#),
@@ -1529,17 +1559,23 @@ mod tests {
         let out = collect(create_resilient_responses_sse_stream(
             first,
             Some(reconnector.with_capacity_retry(true)),
-        )).await;
+        ))
+        .await;
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         assert!(out.contains("recovered"), "{out}");
         assert!(!out.contains("model is at capacity"), "{out}");
 
         let (reconnector, calls) = scripted_reconnector(vec![]);
-        let first = ok_chunks(&[created().as_str(), text_delta("visible").as_str(), failure.as_str()]);
+        let first = ok_chunks(&[
+            created().as_str(),
+            text_delta("visible").as_str(),
+            failure.as_str(),
+        ]);
         let out = collect(create_resilient_responses_sse_stream(
             first,
             Some(reconnector.with_capacity_retry(true)),
-        )).await;
+        ))
+        .await;
         assert_eq!(calls.load(Ordering::SeqCst), 0);
         assert!(out.contains("visible"));
         assert!(out.contains("model is at capacity"));
@@ -1547,19 +1583,26 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn native_capacity_toggle_off_preserves_upstream_failure() {
-        let failure = sse("response.failed", json!({"type":"response.failed","response":{"error":{"type":"server_is_overloaded","message":"model is at capacity"}}}));
+        let failure = sse(
+            "response.failed",
+            json!({"type":"response.failed","response":{"error":{"type":"server_is_overloaded","message":"model is at capacity"}}}),
+        );
         let (reconnector, calls) = scripted_reconnector(vec![]);
         let out = collect(create_resilient_responses_sse_stream(
             ok_chunks(&[failure.as_str()]),
             Some(reconnector),
-        )).await;
+        ))
+        .await;
         assert_eq!(calls.load(Ordering::SeqCst), 0);
         assert!(out.contains("model is at capacity"));
     }
 
     #[tokio::test(start_paused = true)]
     async fn anthropic_conversion_retries_capacity_only_before_content() {
-        let failure = sse("response.failed", json!({"type":"response.failed","response":{"error":{"type":"server_is_overloaded","message":"model is at capacity"}}}));
+        let failure = sse(
+            "response.failed",
+            json!({"type":"response.failed","response":{"error":{"type":"server_is_overloaded","message":"model is at capacity"}}}),
+        );
         let recovered = [created(), text_delta("recovered"), completed()].concat();
         let (reconnector, calls) = scripted_reconnector(vec![Ok(streamed_response(&[&recovered]))]);
         let first = ok_chunks(&[created().as_str(), failure.as_str()]);
@@ -1573,7 +1616,11 @@ mod tests {
         assert!(!out.contains("model is at capacity"), "{out}");
 
         let (reconnector, calls) = scripted_reconnector(vec![]);
-        let first = ok_chunks(&[created().as_str(), text_delta("visible").as_str(), failure.as_str()]);
+        let first = ok_chunks(&[
+            created().as_str(),
+            text_delta("visible").as_str(),
+            failure.as_str(),
+        ]);
         let out = collect(create_resilient_anthropic_sse_stream_from_responses(
             first,
             Some(reconnector.with_capacity_retry(true)),
@@ -2449,8 +2496,17 @@ data: {"error":{"type":"upstream_down","message":"explicit upstream failure"}}
 
     #[tokio::test(start_paused = true)]
     async fn chat_retries_capacity_only_before_content() {
-        let failure = sse("error", json!({"error":{"type":"server_is_overloaded","message":"model is at capacity"}}));
-        let recovered = [chat_role(), chat_delta("recovered"), chat_finish(), "data: [DONE]\n\n".into()].concat();
+        let failure = sse(
+            "error",
+            json!({"error":{"type":"server_is_overloaded","message":"model is at capacity"}}),
+        );
+        let recovered = [
+            chat_role(),
+            chat_delta("recovered"),
+            chat_finish(),
+            "data: [DONE]\n\n".into(),
+        ]
+        .concat();
         let (reconnector, calls) = scripted_reconnector(vec![Ok(streamed_response(&[&recovered]))]);
         let first = ok_chunks(&[chat_role().as_str(), failure.as_str()]);
         let out = collect(create_resilient_chat_sse_stream_with_context(
@@ -2464,7 +2520,11 @@ data: {"error":{"type":"upstream_down","message":"explicit upstream failure"}}
         assert!(!out.contains("model is at capacity"), "{out}");
 
         let (reconnector, calls) = scripted_reconnector(vec![]);
-        let first = ok_chunks(&[chat_role().as_str(), chat_delta("visible").as_str(), failure.as_str()]);
+        let first = ok_chunks(&[
+            chat_role().as_str(),
+            chat_delta("visible").as_str(),
+            failure.as_str(),
+        ]);
         let out = collect(create_resilient_chat_sse_stream_with_context(
             first,
             Some(reconnector.with_capacity_retry(true)),

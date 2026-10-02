@@ -1347,28 +1347,9 @@ export function CodexMultiRouterWizard({
     });
   };
 
-  // An explicit "follow all" is also the recovery action for rows that were
-  // accidentally persisted disabled. Automatic refreshes still preserve
-  // explicit exclusions; only this user action re-enables every source row.
+  // Automatic follow uses the provider catalog's enabled flags. Keep disabled
+  // rows as explicit ProviderForm exclusions instead of mutating the catalog.
   const followAllCatalogModels = () => {
-    setDraftSources((current) =>
-      current.map((provider) => {
-        const models = readRawWizardModelCatalog(provider).map((model) => ({
-          ...model,
-          enabled: true,
-        }));
-        return {
-          ...provider,
-          settingsConfig: {
-            ...provider.settingsConfig,
-            modelCatalog: {
-              ...(provider.settingsConfig?.modelCatalog ?? {}),
-              models,
-            },
-          },
-        };
-      }),
-    );
     setCatalogModelOrder(null);
   };
 

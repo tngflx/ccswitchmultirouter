@@ -117,6 +117,7 @@ const CODEX_REASONING_EFFORTS: &[(&str, &str)] = &[
     ("high", "Greater reasoning depth for complex problems"),
     ("xhigh", "Extra high reasoning depth for complex problems"),
 ];
+const CODEX_DEFAULT_REASONING_EFFORT: &str = "medium";
 const DEEPSEEK_WINDOWS_EXECUTION_GUIDANCE: &str = "On Windows, use PowerShell syntax and minimal directed commands. For content, use `rg <pattern> <named-path>`; for file discovery, use `rg --files <named-path>`. Use narrow `-g` includes and excludes, including `-g '!node_modules/**'`, `-g '!.git/**'`, `-g '!target/**'`, `-g '!dist/**'`, and `-g '!generated/**'`. First identify a narrow source or test subtree; never recursively scan a user profile/home, drive root, or broad repository root.\nDo not use Unix-only commands such as `wc`, and do not assume `Select-String -Recurse` exists; if `rg` is unavailable, only after identifying a narrow target use `Get-ChildItem -LiteralPath <narrow-target> -File -Recurse | Select-String`.\nFor ordinary read-only inspection, call tools without escalation metadata or a justification.\nStop and report as soon as the requested evidence is sufficient; do not keep scanning merely to be exhaustive.";
 
 /// Codex model catalog 的工具配置画像。
@@ -1387,6 +1388,7 @@ fn apply_codex_model_reasoning_capability(
         "supported_reasoning_levels",
         "supported_reasoning_efforts",
         "supportedReasoningEfforts",
+        "supportedReasoningLevels",
     ] {
         entry_obj.remove(field);
     }
@@ -1507,6 +1509,13 @@ fn project_codex_desktop_model_fields(
             "supportedReasoningLevels".to_string(),
             supported_reasoning_levels,
         );
+    } else {
+        // A template may carry stale camelCase aliases from a previous
+        // capability resolution. Empty is authoritative here: do not leave
+        // an old picker slider visible when the resolved capability is empty.
+        entry_obj.remove("supported_reasoning_efforts");
+        entry_obj.remove("supportedReasoningEfforts");
+        entry_obj.remove("supportedReasoningLevels");
     }
     entry_obj.insert("visibility".to_string(), json!("list"));
     entry_obj.insert("show_in_picker".to_string(), json!(true));
@@ -1927,9 +1936,7 @@ fn load_codex_public_official_models_cache() -> Option<Vec<Value>> {
 /// This snapshot is deliberately separate from Codex's own `models_cache.json`
 /// so a failed refresh cannot destroy the last trusted local source and a
 /// public catalog update cannot be mistaken for a CCSM-owned live cache write.
-pub(crate) fn store_codex_public_official_models_cache(
-    models: &[Value],
-) -> Result<bool, AppError> {
+pub(crate) fn store_codex_public_official_models_cache(models: &[Value]) -> Result<bool, AppError> {
     let path = codex_public_official_models_cache_path();
     let previous = read_json_file_if_exists(&path)
         .ok()
@@ -2804,6 +2811,24 @@ fn codex_model_catalog_from_specs(
 /// Codex Desktop 的不同读取路径对 TOML provider model 的字段兼容度不同；
 /// 因此 inline model 同时写 snake_case 和 camelCase 两组字段，后续 app-server
 /// 无论是按 config schema 解析还是直接转成前端对象，都能保留 reasoning 菜单。
+fn codex_reasoning_effort_names(value: Option<&Value>) -> Vec<String> {
+    value
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|level| {
+            level
+                .as_str()
+                .or_else(|| level.get("effort").and_then(Value::as_str))
+                .or_else(|| level.get("reasoningEffort").and_then(Value::as_str))
+                .or_else(|| level.get("reasoning_effort").and_then(Value::as_str))
+        })
+        .map(str::trim)
+        .filter(|effort| !effort.is_empty())
+        .map(ToString::to_string)
+        .collect()
+}
+
 fn codex_provider_reasoning_efforts_toml_array(
     levels: Option<&Value>,
     key: &str,
@@ -2816,9 +2841,10 @@ fn codex_provider_reasoning_efforts_toml_array(
                 .iter()
                 .filter_map(|level| {
                     let effort = level
-                        .get("effort")
-                        .or_else(|| level.get("reasoningEffort"))
-                        .and_then(Value::as_str)?
+                        .as_str()
+                        .or_else(|| level.get("effort").and_then(Value::as_str))
+                        .or_else(|| level.get("reasoningEffort").and_then(Value::as_str))
+                        .or_else(|| level.get("reasoning_effort").and_then(Value::as_str))?
                         .trim();
                     if effort.is_empty() {
                         return None;
@@ -3000,7 +3026,7 @@ fn codex_provider_models_toml_array(
             })
             .and_then(Value::as_str)
             .unwrap_or(&spec.display_name);
-        let explicit_default_reasoning_effort = catalog_entry
+        let catalog_default_reasoning_effort = catalog_entry
             .and_then(|entry| {
                 entry
                     .get("default_reasoning_level")
@@ -3008,11 +3034,8 @@ fn codex_provider_models_toml_array(
                     .or_else(|| entry.get("defaultReasoningEffort"))
             })
             .and_then(Value::as_str)
-            .or_else(|| {
-                spec.reasoning
-                    .as_ref()
-                    .and_then(|reasoning| reasoning.default_effort.as_deref())
-            });
+            .map(str::trim)
+            .filter(|effort| !effort.is_empty());
         let supported_reasoning_levels = catalog_entry
             .and_then(|entry| {
                 entry
@@ -3035,7 +3058,47 @@ fn codex_provider_models_toml_array(
                         )
                     })
                 })
+            })
+            .or_else(|| {
+                codex_catalog_model_preserves_openai_service_tiers(&spec.model).then(|| {
+                    Value::Array(
+                        CODEX_REASONING_EFFORTS
+                            .iter()
+                            .map(|(effort, description)| {
+                                json!({ "effort": effort, "description": description })
+                            })
+                            .collect(),
+                    )
+                })
             });
+        let supported_reasoning_levels = supported_reasoning_levels
+            .filter(|levels| !codex_reasoning_effort_names(Some(levels)).is_empty());
+        let supported_efforts = codex_reasoning_effort_names(supported_reasoning_levels.as_ref());
+        let spec_default_reasoning_effort = spec
+            .reasoning
+            .as_ref()
+            .and_then(|reasoning| reasoning.default_effort.as_deref())
+            .map(str::trim)
+            .filter(|effort| !effort.is_empty());
+        let maintained_default_reasoning_effort =
+            codex_catalog_model_preserves_openai_service_tiers(&spec.model)
+                .then_some(CODEX_DEFAULT_REASONING_EFFORT);
+        let explicit_default_reasoning_effort = (!supported_efforts.is_empty()).then(|| {
+            [
+                catalog_default_reasoning_effort,
+                spec_default_reasoning_effort,
+                maintained_default_reasoning_effort,
+            ]
+            .into_iter()
+            .flatten()
+            .find(|candidate| {
+                supported_efforts
+                    .iter()
+                    .any(|effort| effort.eq_ignore_ascii_case(candidate))
+            })
+            .map(ToString::to_string)
+        });
+        let explicit_default_reasoning_effort = explicit_default_reasoning_effort.flatten();
         let mut model = InlineTable::new();
         model.insert("model", spec.model.as_str().into());
         model.insert("slug", spec.model.as_str().into());
@@ -3064,14 +3127,23 @@ fn codex_provider_models_toml_array(
                 .into(),
         );
         if let Some(default_reasoning_effort) = explicit_default_reasoning_effort {
-            model.insert("default_reasoning_effort", default_reasoning_effort.into());
-            model.insert("default_reasoning_level", default_reasoning_effort.into());
+            model.insert(
+                "default_reasoning_effort",
+                default_reasoning_effort.clone().into(),
+            );
+            model.insert(
+                "default_reasoning_level",
+                default_reasoning_effort.clone().into(),
+            );
             model.insert("defaultReasoningEffort", default_reasoning_effort.into());
         }
         if let Some(supported_reasoning_levels) = supported_reasoning_levels.as_ref() {
             model.insert(
                 "supported_reasoning_levels",
-                codex_provider_reasoning_efforts_toml_array(Some(supported_reasoning_levels), "effort"),
+                codex_provider_reasoning_efforts_toml_array(
+                    Some(supported_reasoning_levels),
+                    "effort",
+                ),
             );
             model.insert(
                 "supported_reasoning_efforts",
@@ -3089,7 +3161,10 @@ fn codex_provider_models_toml_array(
             );
             model.insert(
                 "supportedReasoningLevels",
-                codex_provider_reasoning_efforts_toml_array(Some(supported_reasoning_levels), "effort"),
+                codex_provider_reasoning_efforts_toml_array(
+                    Some(supported_reasoning_levels),
+                    "effort",
+                ),
             );
         }
         if let Some(speed_tiers) = codex_provider_string_toml_array(
@@ -6369,9 +6444,7 @@ fn restore_optional_file(path: &Path, snapshot: Option<&[u8]>) -> Result<(), App
     }
 }
 
-fn capture_managed_agent_files(
-    agents_dir: &Path,
-) -> Result<HashMap<PathBuf, Vec<u8>>, AppError> {
+fn capture_managed_agent_files(agents_dir: &Path) -> Result<HashMap<PathBuf, Vec<u8>>, AppError> {
     let mut snapshot = HashMap::new();
     if !agents_dir.exists() {
         return Ok(snapshot);
@@ -9285,9 +9358,8 @@ mod tests {
             }]),
         );
 
-        validate_codex_subagent_v2_candidate(&settings, None, true).expect(
-            "a DeepSeek alias profile must inherit the canonical maintained capability",
-        );
+        validate_codex_subagent_v2_candidate(&settings, None, true)
+            .expect("a DeepSeek alias profile must inherit the canonical maintained capability");
     }
 
     #[test]
@@ -14593,6 +14665,8 @@ openai_base_url = "http://127.0.0.1:15721/v1"
                 { "effort": "low", "description": "Fast" },
                 { "effort": "medium", "description": "Balanced" }
             ],
+            "supportedReasoningEfforts": [{ "reasoningEffort": "stale" }],
+            "supportedReasoningLevels": [{ "effort": "stale" }],
             "default_reasoning_level": "medium",
             "visibility": "hide",
             "supported_in_api": false
@@ -15000,7 +15074,9 @@ openai_base_url = "http://127.0.0.1:15721/v1"
         let entry = &catalog["models"][0];
         assert!(entry.get("default_reasoning_level").is_none());
         assert_eq!(entry.get("supported_reasoning_levels"), Some(&json!([])));
+        assert!(entry.get("supported_reasoning_efforts").is_none());
         assert!(entry.get("supportedReasoningEfforts").is_none());
+        assert!(entry.get("supportedReasoningLevels").is_none());
     }
 
     #[test]
@@ -15294,6 +15370,80 @@ base_url = "http://127.0.0.1:15721/v1"
             efforts,
             vec!["low", "medium", "high", "xhigh", "max", "ultra"]
         );
+    }
+
+    #[test]
+    fn codex_provider_inline_models_reconcile_default_with_final_reasoning_levels() {
+        let specs = vec![CodexCatalogModelSpec {
+            model: "custom-model".to_string(),
+            upstream_model: None,
+            display_name: "Custom Model".to_string(),
+            context_window: 128_000,
+            text_only: true,
+            is_default: true,
+            supports_parallel_tool_calls: None,
+            input_modalities: None,
+            base_instructions: None,
+            reasoning: Some(
+                crate::proxy::providers::codex_reasoning::CodexModelReasoningCapability {
+                    schema_version: Some(2),
+                    support_status: None,
+                    control_kind: None,
+                    supported: Some(true),
+                    supported_efforts: vec!["low".into(), "high".into()],
+                    default_effort: Some("high".into()),
+                    disable_allowed: false,
+                    upstream:
+                        crate::proxy::providers::codex_reasoning::CodexModelReasoningUpstream {
+                            format: "string".into(),
+                            parameter: "reasoning_effort".into(),
+                            effort_map: Default::default(),
+                        },
+                    output_format: None,
+                    source: Some("user".into()),
+                    confidence: None,
+                    fetched_at: None,
+                    provider_key: None,
+                    model_revision: None,
+                    codex_ultra_orchestration: None,
+                },
+            ),
+            reasoning_fingerprint: String::new(),
+            reasoning_source: "user_config".to_string(),
+            sort_index: None,
+        }];
+        let catalog = json!({
+            "models": [{
+                "slug": "custom-model",
+                "default_reasoning_level": "ultra",
+                "supported_reasoning_levels": [
+                    { "effort": "low" },
+                    { "effort": "high" }
+                ]
+            }]
+        });
+        let config = r#"model_provider = "codex_model_router_v2"
+
+[model_providers.codex_model_router_v2]
+base_url = "http://127.0.0.1:15721/v1"
+"#;
+
+        let projected = set_codex_model_catalog_projection_fields(
+            config,
+            Some(Path::new("catalog")),
+            Some(&specs),
+            Some(&catalog),
+        )
+        .expect("project catalog fields");
+        let parsed: toml::Value = toml::from_str(&projected).expect("parse projected config");
+        let model = parsed["model_providers"]["codex_model_router_v2"]["models"]
+            .as_array()
+            .and_then(|models| models.first())
+            .expect("inline model");
+
+        assert_eq!(model["default_reasoning_level"].as_str(), Some("high"));
+        assert_eq!(model["default_reasoning_effort"].as_str(), Some("high"));
+        assert_eq!(model["defaultReasoningEffort"].as_str(), Some("high"));
     }
 
     #[test]
@@ -17530,14 +17680,11 @@ model_catalog_json = "cc-switch-model-catalog.json"
             }),
             json!({"slug": "gpt-6-luna", "context_window": 128000}),
         ];
-        assert!(
-            store_codex_public_official_models_cache(&initial).expect("store initial catalog")
-        );
+        assert!(store_codex_public_official_models_cache(&initial).expect("store initial catalog"));
 
         let reordered = vec![initial[1].clone(), initial[0].clone()];
         assert!(
-            !store_codex_public_official_models_cache(&reordered)
-                .expect("store reordered catalog")
+            !store_codex_public_official_models_cache(&reordered).expect("store reordered catalog")
         );
 
         let changed = vec![
@@ -17547,9 +17694,7 @@ model_catalog_json = "cc-switch-model-catalog.json"
             }),
             initial[1].clone(),
         ];
-        assert!(
-            store_codex_public_official_models_cache(&changed).expect("store changed catalog")
-        );
+        assert!(store_codex_public_official_models_cache(&changed).expect("store changed catalog"));
         assert_eq!(
             load_codex_public_official_models_cache().expect("read public catalog"),
             changed

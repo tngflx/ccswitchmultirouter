@@ -779,8 +779,8 @@ fn effective_capability_summary(
     // Never project an arbitrary persisted `reasoning` object directly. Older
     // wizard/catalog versions stored partial declarations (for example only
     // `supportedEfforts`) which the Codex V2 parser rejects because `upstream`
-    // is missing. Normalize provider-model declarations through the shared
-    // validator so every emitted catalog entry has the complete contract.
+    // is missing. Invalid declarations are not effective capabilities: let the
+    // next authoritative source (provider config or inline TOML) win.
     let model_reasoning = value_field(model_entry, &["reasoning"]).and_then(|raw| {
         if raw.is_null() {
             return None;
@@ -789,10 +789,6 @@ fn effective_capability_summary(
             model_entry,
         )
         .and_then(|capability| serde_json::to_value(capability).ok())
-        // Keep declared, non-secret metadata visible for legacy/partial rows whose
-        // capability is not complete enough for the strict runtime schema. These
-        // summaries are informational; runtime consumers still validate before use.
-        .or_else(|| reasoning_value_has_signal(raw).then(|| sanitize_capability_value(raw)))
     });
     let provider_reasoning =
         value_field(&provider.settings_config, &["reasoning"]).and_then(|value| {
@@ -805,7 +801,6 @@ fn effective_capability_summary(
                 &entry,
             )
             .and_then(|capability| serde_json::to_value(capability).ok())
-            .or_else(|| reasoning_value_has_signal(value).then(|| sanitize_capability_value(value)))
         });
     let inline_reasoning = if model_reasoning.is_none() && provider_reasoning.is_none() {
         resolve_inline_reasoning_capability(provider, model_identities)
@@ -878,57 +873,6 @@ fn resolve_inline_reasoning_capability(
             let value = serde_json::to_value(capability).ok()?;
             Some((value, resolved.source.as_str().to_string()))
         })
-}
-
-/// A malformed but explicitly declared capability remains useful diagnostic
-/// metadata, but an empty placeholder must not suppress a better inline
-/// provider declaration. Treat status, control, defaults, wire metadata, and
-/// non-empty effort lists as signals; an empty effort list alone is not one.
-fn reasoning_value_has_signal(value: &Value) -> bool {
-    let Some(object) = value.as_object() else {
-        return false;
-    };
-    let has_non_empty_string = [
-        "supportStatus",
-        "support_status",
-        "controlKind",
-        "control_kind",
-        "defaultEffort",
-        "default_effort",
-        "defaultReasoningEffort",
-        "default_reasoning_effort",
-        "defaultReasoningLevel",
-        "default_reasoning_level",
-    ]
-    .into_iter()
-    .any(|key| {
-        object
-            .get(key)
-            .and_then(Value::as_str)
-            .is_some_and(|value| !value.trim().is_empty())
-    });
-    let has_non_empty_efforts = [
-        "supportedEfforts",
-        "supported_efforts",
-        "supportedReasoningEfforts",
-        "supported_reasoning_efforts",
-        "supportedReasoningLevels",
-        "supported_reasoning_levels",
-    ]
-    .into_iter()
-    .any(|key| {
-        object
-            .get(key)
-            .and_then(Value::as_array)
-            .is_some_and(|values| !values.is_empty())
-    });
-    let has_explicit_support = object.contains_key("supported")
-        || object.contains_key("upstream")
-        || object.contains_key("reasoning_format")
-        || object.contains_key("reasoningFormat")
-        || object.contains_key("reasoning_parameter")
-        || object.contains_key("reasoningParameter");
-    has_non_empty_string || has_non_empty_efforts || has_explicit_support
 }
 
 fn model_input_modalities(model_entry: &Value) -> Option<Vec<String>> {
@@ -1851,6 +1795,55 @@ default_reasoning_level = "high"
     }
 
     #[test]
+    fn malformed_model_reasoning_falls_through_to_inline_provider_capability() {
+        let mut provider = provider(
+            "sublyx",
+            "Sublyx",
+            "openai_responses",
+            json!([{
+                "model": "sublyx-visible-alias",
+                "upstreamModel": "gpt-6-astra",
+                "reasoning": { "upstream": {} }
+            }]),
+        );
+        provider.settings_config["config"] = json!(
+            r#"
+model_provider = "sublyx"
+
+[model_providers.sublyx]
+name = "Sublyx"
+base_url = "https://api.sublyx.example/v1"
+
+[[model_providers.sublyx.models]]
+model = "gpt-6-astra"
+supported_reasoning_levels = [
+  { effort = "low", description = "Low" },
+  { effort = "high", description = "High" },
+]
+default_reasoning_level = "high"
+"#
+        );
+
+        let compiled = compile(
+            &plan(vec![route(
+                "router-sublyx",
+                "sublyx",
+                CodexModelSelection::All,
+            )]),
+            [provider],
+        );
+        let summary = &compiled.model_catalog[0].capability_summary;
+        let reasoning = summary
+            .reasoning
+            .as_ref()
+            .expect("inline capability should replace malformed model metadata");
+
+        assert_eq!(reasoning["supportedEfforts"], json!(["low", "high"]));
+        assert_eq!(reasoning["defaultEffort"], "high");
+        assert_eq!(summary.reasoning_source, "provider_config");
+    }
+
+    #[test]
     fn chat_adapter_reasoning_is_not_projected_as_model_capability() {
         let mut provider = provider("qwen", "Qwen", "openai_chat", json!([{"model": "qwen3.8"}]));
         provider.settings_config["codexChatReasoning"] = json!({
@@ -2148,7 +2141,10 @@ default_reasoning_level = "high"
         assert!(!serialized.contains("nested-reasoning-secret"));
         assert!(!serialized.contains("private-session-key"));
         assert!(!serialized.contains("nested-cache-secret"));
-        assert!(serialized.contains("confirmed_supported"));
+        assert!(
+            !serialized.contains("confirmed_supported"),
+            "malformed reasoning must not become an effective capability"
+        );
         assert!(serialized.contains("auto_prefix_cache"));
     }
 }

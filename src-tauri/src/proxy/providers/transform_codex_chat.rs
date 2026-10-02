@@ -9,7 +9,7 @@ use super::codex_chat_common::{
     response_function_call_item, response_function_call_item_with_namespace,
     split_leading_think_block,
 };
-use super::codex_terminal::{ChatTerminalEvidence, TerminalDisposition, classify_chat_terminal};
+use super::codex_terminal::{classify_chat_terminal, ChatTerminalEvidence, TerminalDisposition};
 use super::hosted_tools::{
     image_generation::{self, HostedImageGenerationConfig, IMAGE_GENERATION_FUNCTION_NAME},
     web_search::{self, HostedWebSearchConfig},
@@ -23,14 +23,13 @@ use crate::proxy::{
         short_sha256_hex,
     },
     tool_media::{
-        TOOL_RESULT_MEDIA_MOVED_MARKER, ToolMediaScope, chat_audio_from_input_audio,
-        chat_file_from_input_file, flush_pending_chat_tool_media, normalize_chat_image_detail,
-        plan_chat_tool_output_media, queue_chat_tool_output_media,
-        strip_and_clamp_media_from_tool_value,
+        chat_audio_from_input_audio, chat_file_from_input_file, flush_pending_chat_tool_media,
+        normalize_chat_image_detail, plan_chat_tool_output_media, queue_chat_tool_output_media,
+        strip_and_clamp_media_from_tool_value, ToolMediaScope, TOOL_RESULT_MEDIA_MOVED_MARKER,
     },
 };
-use base64::{Engine as _, engine::general_purpose::STANDARD};
-use serde_json::{Value, json};
+use base64::{engine::general_purpose::STANDARD, Engine as _};
+use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 
 const EXTRA_CHAT_PASSTHROUGH_FIELDS: &[&str] = &[
@@ -3748,12 +3747,10 @@ mod tests {
         );
         assert_eq!(result["messages"][1]["role"], "tool");
         assert_eq!(result["messages"][1]["tool_call_id"], "call_tool_search_1");
-        assert!(
-            result["messages"][1]["content"]
-                .as_str()
-                .unwrap()
-                .contains("mcp__codex_apps__gmail")
-        );
+        assert!(result["messages"][1]["content"]
+            .as_str()
+            .unwrap()
+            .contains("mcp__codex_apps__gmail"));
     }
 
     #[test]
@@ -4859,11 +4856,9 @@ mod tests {
         .unwrap();
         let messages = result["messages"].as_array().unwrap();
 
-        assert!(
-            messages.iter().all(|message| {
-                message["role"] == "assistant" || message["content"].is_string()
-            })
-        );
+        assert!(messages
+            .iter()
+            .all(|message| { message["role"] == "assistant" || message["content"].is_string() }));
         assert_eq!(
             messages
                 .iter()
@@ -5109,12 +5104,10 @@ mod tests {
             .iter()
             .find(|message| message.get("role").and_then(Value::as_str) == Some("system"))
             .expect("restored system summary");
-        assert!(
-            system["content"]
-                .as_str()
-                .expect("system content")
-                .contains("compact summary")
-        );
+        assert!(system["content"]
+            .as_str()
+            .expect("system content")
+            .contains("compact summary"));
         assert_eq!(messages.last().unwrap()["role"], "user");
         assert_eq!(messages.last().unwrap()["content"], "continue");
     }
@@ -5136,12 +5129,10 @@ mod tests {
         let input = body["input"].as_array().expect("input");
         assert_eq!(input[0]["type"], "message");
         assert_eq!(input[0]["role"], "user");
-        assert!(
-            input[0]["content"][0]["text"]
-                .as_str()
-                .expect("summary text")
-                .contains("compact summary")
-        );
+        assert!(input[0]["content"][0]["text"]
+            .as_str()
+            .expect("summary text")
+            .contains("compact summary"));
         assert_eq!(input[1]["type"], "message");
     }
 
@@ -5238,12 +5229,10 @@ mod tests {
         let messages = result["messages"].as_array().unwrap();
 
         assert_eq!(messages[1]["role"], "tool");
-        assert!(
-            messages[1]["content"]
-                .as_str()
-                .unwrap()
-                .contains(TOOL_RESULT_MEDIA_MOVED_MARKER)
-        );
+        assert!(messages[1]["content"]
+            .as_str()
+            .unwrap()
+            .contains(TOOL_RESULT_MEDIA_MOVED_MARKER));
         assert_eq!(messages[2]["role"], "user");
         assert_eq!(messages[2]["content"][1]["type"], "image_url");
         assert_eq!(
@@ -5375,11 +5364,9 @@ mod tests {
         assert_eq!(content[0]["input_audio"]["format"], "mp3");
         assert_eq!(content[0]["input_audio"]["data"], "TVAz");
         assert_eq!(content[1]["text"], "[file omitted: unsupported file URL]");
-        assert!(
-            !result
-                .to_string()
-                .contains("https://example.test/report.pdf")
-        );
+        assert!(!result
+            .to_string()
+            .contains("https://example.test/report.pdf"));
     }
 
     #[test]
@@ -5860,18 +5847,14 @@ mod tests {
         assert_eq!(messages[2]["tool_call_id"], "call_2");
         assert!(messages[1]["content"].is_string());
         assert!(messages[2]["content"].is_string());
-        assert!(
-            !messages[1]["content"]
-                .as_str()
-                .unwrap()
-                .contains(&first_url)
-        );
-        assert!(
-            !messages[2]["content"]
-                .as_str()
-                .unwrap()
-                .contains(second_payload)
-        );
+        assert!(!messages[1]["content"]
+            .as_str()
+            .unwrap()
+            .contains(&first_url));
+        assert!(!messages[2]["content"]
+            .as_str()
+            .unwrap()
+            .contains(second_payload));
         assert_eq!(messages[3]["content"].as_array().unwrap().len(), 4);
         assert_eq!(
             messages[3]["content"][3]["image_url"]["url"],
@@ -6062,12 +6045,10 @@ mod tests {
             tool_content["content"][1]["text"],
             TOOL_RESULT_MEDIA_MOVED_MARKER
         );
-        assert!(
-            !messages[1]["content"]
-                .as_str()
-                .unwrap()
-                .contains("STRING_MCP_SENTINEL")
-        );
+        assert!(!messages[1]["content"]
+            .as_str()
+            .unwrap()
+            .contains("STRING_MCP_SENTINEL"));
         assert_eq!(
             messages[2]["content"][1]["image_url"]["url"],
             "data:image/png;base64,STRING_MCP_SENTINEL"
@@ -6352,12 +6333,10 @@ mod tests {
         let tool_content: Value = serde_json::from_str(tool_content_text).unwrap();
 
         assert_eq!(tool_content[1]["text"], long_text);
-        assert!(
-            tool_content[2]["data"]
-                .as_str()
-                .unwrap()
-                .starts_with("[cc-switch: omitted 20000 bytes]")
-        );
+        assert!(tool_content[2]["data"]
+            .as_str()
+            .unwrap()
+            .starts_with("[cc-switch: omitted 20000 bytes]"));
         assert!(!tool_content_text.contains(&data_url));
         assert!(!tool_content_text.contains("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"));
     }
@@ -6467,11 +6446,9 @@ mod tests {
         });
 
         assert_eq!(normalize_replayed_item_ids_for_openai(&mut body), 1);
-        assert!(
-            body["input"][0]["id"]
-                .as_str()
-                .is_some_and(|id| id.starts_with("msg_"))
-        );
+        assert!(body["input"][0]["id"]
+            .as_str()
+            .is_some_and(|id| id.starts_with("msg_")));
         assert_eq!(body["input"][1]["id"], "msg_official_unchanged");
     }
 
@@ -6496,11 +6473,9 @@ mod tests {
         });
 
         assert_eq!(normalize_replayed_item_ids_for_openai(&mut body), 1);
-        assert!(
-            body["input"][0]["id"]
-                .as_str()
-                .is_some_and(|id| id.starts_with("ws_"))
-        );
+        assert!(body["input"][0]["id"]
+            .as_str()
+            .is_some_and(|id| id.starts_with("ws_")));
         assert_eq!(body["input"][1]["id"], "ws_official_unchanged");
     }
 
@@ -6557,16 +6532,12 @@ mod tests {
 
         assert_eq!(normalize_replayed_item_ids_for_openai(&mut body), 3);
         assert!(body["input"][0].get("id").is_none());
-        assert!(
-            body["input"][1]["id"]
-                .as_str()
-                .is_some_and(|id| id.starts_with("fc_"))
-        );
-        assert!(
-            body["input"][2]["id"]
-                .as_str()
-                .is_some_and(|id| id.starts_with("ctc_"))
-        );
+        assert!(body["input"][1]["id"]
+            .as_str()
+            .is_some_and(|id| id.starts_with("fc_")));
+        assert!(body["input"][2]["id"]
+            .as_str()
+            .is_some_and(|id| id.starts_with("ctc_")));
     }
 
     #[test]

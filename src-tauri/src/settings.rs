@@ -1569,7 +1569,10 @@ mod tests {
         assert!(decoded.auto_update_codex_cli);
         assert_eq!(decoded.auto_update_cli_tools, vec!["claude", "gemini"]);
         let encoded = serde_json::to_value(decoded).expect("serialize update settings");
-        assert_eq!(encoded["autoUpdateCliTools"], serde_json::json!(["claude", "gemini"]));
+        assert_eq!(
+            encoded["autoUpdateCliTools"],
+            serde_json::json!(["claude", "gemini"])
+        );
     }
 
     #[test]

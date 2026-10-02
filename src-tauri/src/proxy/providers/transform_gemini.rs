@@ -8,9 +8,9 @@ use super::gemini_schema::build_gemini_function_declaration;
 use super::gemini_shadow::{GeminiAssistantTurn, GeminiShadowStore, GeminiToolCallMeta};
 use crate::proxy::error::ProxyError;
 use crate::proxy::tool_media::{
-    TOOL_RESULT_MEDIA_ATTACHED_MARKER, ToolMediaScope, strip_and_clamp_media_from_tool_value,
+    strip_and_clamp_media_from_tool_value, ToolMediaScope, TOOL_RESULT_MEDIA_ATTACHED_MARKER,
 };
-use serde_json::{Map, Value, json};
+use serde_json::{json, Map, Value};
 use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -1348,11 +1348,9 @@ mod tests {
             result["tools"][0]["functionDeclarations"][0]["name"],
             "get_weather"
         );
-        assert!(
-            result["tools"][0]["functionDeclarations"][0]
-                .get("parameters")
-                .is_some()
-        );
+        assert!(result["tools"][0]["functionDeclarations"][0]
+            .get("parameters")
+            .is_some());
         assert_eq!(
             result["contents"][0]["parts"][0]["functionCall"]["name"],
             "get_weather"
@@ -1406,18 +1404,14 @@ mod tests {
         let response = &parts[0]["functionResponse"]["response"]["content"];
 
         assert!(response.as_str().unwrap().contains("caption"));
-        assert!(
-            response
-                .as_str()
-                .unwrap()
-                .contains("tool result media attached")
-        );
-        assert!(
-            !response
-                .as_str()
-                .unwrap()
-                .contains("GEMINI_TOOL_IMAGE_SENTINEL")
-        );
+        assert!(response
+            .as_str()
+            .unwrap()
+            .contains("tool result media attached"));
+        assert!(!response
+            .as_str()
+            .unwrap()
+            .contains("GEMINI_TOOL_IMAGE_SENTINEL"));
         assert_eq!(
             parts[1]["text"],
             "[cc-switch: media output of tool call call_image]"
@@ -1514,11 +1508,9 @@ mod tests {
             remote_image
         );
         assert!(!result.to_string().contains("fileData"));
-        assert!(
-            !result
-                .to_string()
-                .contains(TOOL_RESULT_MEDIA_ATTACHED_MARKER)
-        );
+        assert!(!result
+            .to_string()
+            .contains(TOOL_RESULT_MEDIA_ATTACHED_MARKER));
     }
 
     #[test]
@@ -1560,11 +1552,9 @@ mod tests {
             malformed_image
         );
         assert!(!result.to_string().contains("inlineData"));
-        assert!(
-            !result
-                .to_string()
-                .contains(TOOL_RESULT_MEDIA_ATTACHED_MARKER)
-        );
+        assert!(!result
+            .to_string()
+            .contains(TOOL_RESULT_MEDIA_ATTACHED_MARKER));
     }
 
     #[test]
@@ -1653,12 +1643,10 @@ mod tests {
             function_response["parts"][0]["inlineData"]["data"],
             "GEMINI_3_IMAGE_SENTINEL"
         );
-        assert!(
-            !function_response["response"]["content"]
-                .as_str()
-                .unwrap()
-                .contains("GEMINI_3_IMAGE_SENTINEL")
-        );
+        assert!(!function_response["response"]["content"]
+            .as_str()
+            .unwrap()
+            .contains("GEMINI_3_IMAGE_SENTINEL"));
     }
 
     #[test]
@@ -1718,11 +1706,9 @@ mod tests {
         });
 
         let error = anthropic_to_gemini(input).unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("Unable to resolve Gemini functionResponse.name")
-        );
+        assert!(error
+            .to_string()
+            .contains("Unable to resolve Gemini functionResponse.name"));
     }
 
     #[test]
@@ -1933,12 +1919,10 @@ mod tests {
         let result = gemini_to_anthropic(input).unwrap();
         assert_eq!(result["stop_reason"], "refusal");
         assert_eq!(result["content"][0]["type"], "text");
-        assert!(
-            result["content"][0]["text"]
-                .as_str()
-                .unwrap()
-                .contains("SAFETY")
-        );
+        assert!(result["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("SAFETY"));
     }
 
     #[test]
@@ -2386,11 +2370,9 @@ mod tests {
                 .unwrap();
         // The assistant message was replayed from shadow; its synthesized id
         // must be absent from the upstream functionCall representation.
-        assert!(
-            result["contents"][0]["parts"][0]["functionCall"]
-                .get("id")
-                .is_none()
-        );
+        assert!(result["contents"][0]["parts"][0]["functionCall"]
+            .get("id")
+            .is_none());
         // And the tool_result round-trip must still resolve the name via the
         // shadow map even when the id is synthesized.
         assert_eq!(

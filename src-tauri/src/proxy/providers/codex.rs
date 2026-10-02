@@ -7,8 +7,8 @@
 
 use super::{AuthInfo, AuthStrategy, ProviderAdapter};
 use crate::codex_multirouter::compiler::{
-    CodexRoutingCompileError, CompiledCodexModel, CompiledCodexRoute, CompiledCodexRoutingPlan,
-    compile_provider_v2,
+    compile_provider_v2, CodexRoutingCompileError, CompiledCodexModel, CompiledCodexRoute,
+    CompiledCodexRoutingPlan,
 };
 use crate::codex_multirouter::schema::{
     CodexRouteAuthPolicy, CodexRouteAuthSource, CodexRoutingConfigV2,
@@ -22,8 +22,8 @@ use crate::proxy::providers::codex_oauth_auth::{CodexAccountPoolPolicy, NATIVE_C
 use crate::{
     database::Database,
     protocol_compatibility::{
-        PROBE_PROFILE_VERSION, ProbeReadiness, ProbeTargetKey, ProtocolCompatibilityRecord,
-        ReasoningProjection, TransportKind, endpoint::build_probe_url,
+        endpoint::build_probe_url, ProbeReadiness, ProbeTargetKey, ProtocolCompatibilityRecord,
+        ReasoningProjection, TransportKind, PROBE_PROFILE_VERSION,
     },
 };
 use regex::Regex;
@@ -61,12 +61,12 @@ const CODEX_API_KEY_GROUP_ALIAS_MARKER: &str = "--ccg-";
 /// wrong identity.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum CodexGroupedKey {
- /// The model is not bound to a key group; the provider credential applies.
- NotScoped,
- /// A scoped credential was selected.
- Resolved(String),
- /// The model is bound to a key group but no usable scoped credential exists.
- Unresolvable(String),
+    /// The model is not bound to a key group; the provider credential applies.
+    NotScoped,
+    /// A scoped credential was selected.
+    Resolved(String),
+    /// The model is bound to a key group but no usable scoped credential exists.
+    Unresolvable(String),
 }
 
 /// Codex Desktop 看到的 MultiRouter 认证门面。
@@ -1084,7 +1084,10 @@ fn restore_isolated_key_group_bindings(
                 "apiKeyGroupId".to_string(),
                 JsonValue::String(group_id.clone()),
             );
-            entry.insert("apiKeyGroupGenerated".to_string(), JsonValue::Bool(*generated));
+            entry.insert(
+                "apiKeyGroupGenerated".to_string(),
+                JsonValue::Bool(*generated),
+            );
         }
     }
     projected_catalog
@@ -3805,14 +3808,12 @@ impl CodexAdapter {
                 }
                 return CodexGroupedKey::NotScoped;
             };
-            let mut matching_groups = groups
-                .iter()
-                .filter(|group| {
-                    group
-                        .get("id")
-                        .and_then(JsonValue::as_str)
-                        .is_some_and(|candidate| candidate.trim() == group_id)
-                });
+            let mut matching_groups = groups.iter().filter(|group| {
+                group
+                    .get("id")
+                    .and_then(JsonValue::as_str)
+                    .is_some_and(|candidate| candidate.trim() == group_id)
+            });
             let Some(group) = matching_groups.next() else {
                 return CodexGroupedKey::Unresolvable(format!(
                     "model `{request_model}` is bound to key group `{group_id}`, but that group \
@@ -5394,13 +5395,11 @@ experimental_bearer_token = "PROXY_MANAGED"
             .expect("official route");
         let materialized = materialize_codex_routed_provider_from_target(&routed, &target);
 
-        assert!(
-            materialized
-                .meta
-                .as_ref()
-                .and_then(|meta| meta.provider_type.as_deref())
-                .is_none()
-        );
+        assert!(materialized
+            .meta
+            .as_ref()
+            .and_then(|meta| meta.provider_type.as_deref())
+            .is_none());
         assert_eq!(
             adapter.extract_base_url(&materialized).unwrap(),
             "https://chatgpt.com/backend-api/codex"
@@ -5443,13 +5442,11 @@ experimental_bearer_token = "PROXY_MANAGED"
             materialized.settings_config["codexNativeAuthPassthrough"],
             true
         );
-        assert!(
-            materialized
-                .meta
-                .as_ref()
-                .and_then(|meta| meta.provider_type.as_deref())
-                .is_none()
-        );
+        assert!(materialized
+            .meta
+            .as_ref()
+            .and_then(|meta| meta.provider_type.as_deref())
+            .is_none());
         assert!(CodexAdapter::new().extract_auth(&materialized).is_none());
     }
 
@@ -6372,13 +6369,11 @@ wire_api = "chat"
                 .and_then(|binding| binding.auth_provider.as_deref()),
             Some("codex_oauth")
         );
-        assert!(
-            routed
-                .meta
-                .as_ref()
-                .and_then(|m| m.auth_binding.as_ref())
-                .is_some()
-        );
+        assert!(routed
+            .meta
+            .as_ref()
+            .and_then(|m| m.auth_binding.as_ref())
+            .is_some());
         assert!(
             routed.settings_config.get("auth").is_none(),
             "managed auth route should not inline raw auth into settings"
@@ -7036,13 +7031,11 @@ wire_api = "anthropic"
             JsonValue::Bool(true)
         );
         assert!(effective.settings_config.get("auth").is_none());
-        assert!(
-            effective
-                .meta
-                .as_ref()
-                .and_then(|meta| meta.auth_binding.as_ref())
-                .is_none()
-        );
+        assert!(effective
+            .meta
+            .as_ref()
+            .and_then(|meta| meta.auth_binding.as_ref())
+            .is_none());
         assert_eq!(
             explain_codex_responses_upstream_protocol(&effective).protocol,
             CodexResponsesUpstreamProtocol::Responses
@@ -7677,12 +7670,10 @@ wire_api = "chat"
         let config = resolve_codex_chat_reasoning_config(&provider, &json!({"model":"glm-5.2"}))
             .expect("reasoning config");
         assert_eq!(config.effort_param.as_deref(), Some("reasoning_effort"));
-        assert!(
-            config
-                .effort_value_mode
-                .as_deref()
-                .is_some_and(|mode| mode.contains("medium=high") && mode.contains("xhigh=max"))
-        );
+        assert!(config
+            .effort_value_mode
+            .as_deref()
+            .is_some_and(|mode| mode.contains("medium=high") && mode.contains("xhigh=max")));
     }
 
     #[test]
@@ -7925,8 +7916,10 @@ wire_api = "chat"
         assert_eq!(config.effort_param.as_deref(), Some("reasoning.effort"));
         assert!(config.disable_contract);
         assert_eq!(
-            crate::proxy::providers::transform_codex_chat::map_codex_reasoning_effort("max", &config)
-                .expect("max remains OpenRouter's advertised max"),
+            crate::proxy::providers::transform_codex_chat::map_codex_reasoning_effort(
+                "max", &config
+            )
+            .expect("max remains OpenRouter's advertised max"),
             Some("max")
         );
         let outbound = crate::proxy::providers::transform_codex_chat::
@@ -8559,13 +8552,11 @@ wire_api = "responses"
                 .and_then(JsonValue::as_bool),
             Some(true)
         );
-        assert!(
-            native
-                .effective_provider
-                .settings_config
-                .get("auth")
-                .is_none()
-        );
+        assert!(native
+            .effective_provider
+            .settings_config
+            .get("auth")
+            .is_none());
         assert_eq!(
             managed
                 .effective_provider
@@ -8590,12 +8581,11 @@ wire_api = "responses"
                 .and_then(JsonValue::as_bool),
             Some(true)
         );
-        assert!(
-            pool.effective_provider
-                .settings_config
-                .get("auth")
-                .is_none()
-        );
+        assert!(pool
+            .effective_provider
+            .settings_config
+            .get("auth")
+            .is_none());
     }
 
     #[test]

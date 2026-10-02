@@ -2,17 +2,17 @@
 
 use super::{
     image_generation::{
-        self, HostedImageGenerationConfig, IMAGE_GENERATION_FUNCTION_NAME,
-        error_tool_content as image_error_tool_content,
-        result_to_tool_content as image_result_to_tool_content,
+        self, error_tool_content as image_error_tool_content,
+        result_to_tool_content as image_result_to_tool_content, HostedImageGenerationConfig,
+        IMAGE_GENERATION_FUNCTION_NAME,
     },
     openai_client::OpenAiHostedToolClient,
     web_search::{
-        HostedWebSearchConfig, WEB_SEARCH_FUNCTION_NAME, error_tool_content, parse_arguments,
-        query_hash, result_to_tool_content,
+        error_tool_content, parse_arguments, query_hash, result_to_tool_content,
+        HostedWebSearchConfig, WEB_SEARCH_FUNCTION_NAME,
     },
 };
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 
 pub(crate) const HOSTED_TOOL_LOOP_HEADER: &str = "x-cc-switch-hosted-tool-loop";
 pub(crate) const MAX_HOSTED_TOOL_ITERATIONS: usize = 3;
@@ -416,20 +416,16 @@ mod tests {
     #[test]
     fn hosted_tool_loop_config_is_empty_only_when_no_tools() {
         assert!(HostedToolLoopConfig::default().is_empty());
-        assert!(
-            !HostedToolLoopConfig {
-                web_search: Some(HostedWebSearchConfig::default()),
-                ..HostedToolLoopConfig::default()
-            }
-            .is_empty()
-        );
-        assert!(
-            !HostedToolLoopConfig {
-                image_generation: Some(HostedImageGenerationConfig::default()),
-                ..HostedToolLoopConfig::default()
-            }
-            .is_empty()
-        );
+        assert!(!HostedToolLoopConfig {
+            web_search: Some(HostedWebSearchConfig::default()),
+            ..HostedToolLoopConfig::default()
+        }
+        .is_empty());
+        assert!(!HostedToolLoopConfig {
+            image_generation: Some(HostedImageGenerationConfig::default()),
+            ..HostedToolLoopConfig::default()
+        }
+        .is_empty());
     }
 
     #[test]

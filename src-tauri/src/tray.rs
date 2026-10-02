@@ -543,9 +543,9 @@ fn handle_auto_click(app: &tauri::AppHandle, app_type: &AppType) -> Result<(), A
         // a desktop client.
         if *app_type == AppType::Codex {
             log::info!("[Tray] Auto 模式：通过显式 Codex 接管事务启用代理");
-            if let Err(e) = futures::executor::block_on(
-                proxy_service.set_codex_takeover_explicit(true, true),
-            ) {
+            if let Err(e) =
+                futures::executor::block_on(proxy_service.set_codex_takeover_explicit(true, true))
+            {
                 log::error!("[Tray] 执行 Codex 接管失败: {e}");
                 return Err(AppError::Message(format!("执行 Codex 接管失败: {e}")));
             }

@@ -22,9 +22,8 @@ pub mod provider_metadata;
 use crate::provider::Provider;
 use crate::proxy::providers::codex_reasoning::{
     builtin_reasoning_capability_for_model, capability_fingerprint,
-    official_reasoning_capability_for_model,
-    reasoning_capability_from_codex_inline_model_entry, resolve_reasoning_capability_from_settings,
-    CapabilityConfidence,
+    official_reasoning_capability_for_model, reasoning_capability_from_codex_inline_model_entry,
+    resolve_reasoning_capability_from_settings, CapabilityConfidence,
     CodexModelReasoningCapability, CodexModelReasoningUpstream, ReasoningControlKind,
     ReasoningSupportStatus,
 };
@@ -515,14 +514,13 @@ pub fn snapshot_to_capability(
     // Graded effort levels must carry an explicit, validated wire contract.
     // For budget/mandatory/no-control declarations, `none` is intentional:
     // it describes capability metadata without authorizing request injection.
-    let (upstream_format, upstream_parameter) = declared_wire_contract
-        .or_else(|| {
-            matches!(
-                control_kind,
-                ReasoningControlKind::Budget | ReasoningControlKind::None
-            )
-            .then(|| ("none".to_string(), "none".to_string()))
-        })?;
+    let (upstream_format, upstream_parameter) = declared_wire_contract.or_else(|| {
+        matches!(
+            control_kind,
+            ReasoningControlKind::Budget | ReasoningControlKind::None
+        )
+        .then(|| ("none".to_string(), "none".to_string()))
+    })?;
 
     let mut supported_efforts = graded_efforts.clone();
     if disable_allowed {
@@ -629,7 +627,7 @@ mod tests {
             fetched_at: 1_700_000_000_000,
             source: "openrouter_api".into(),
             reasoning: Some(ReasoningCapabilitySnapshot {
-                supported_efforts: vec!["max".into(), "high".into(), "low".into()],
+                supported_efforts: vec!["max".into(), "xhigh".into(), "high".into(), "low".into()],
                 default_effort: Some("high".into()),
                 mandatory: false,
                 default_enabled: Some(true),
@@ -814,11 +812,19 @@ mod tests {
         );
         let capability = snapshot_to_capability(&snapshot).expect("valid mapped snapshot");
         assert_eq!(
-            capability.upstream.effort_map.get("max").map(String::as_str),
+            capability
+                .upstream
+                .effort_map
+                .get("max")
+                .map(String::as_str),
             Some("xhigh")
         );
         assert_eq!(
-            capability.upstream.effort_map.get("low").map(String::as_str),
+            capability
+                .upstream
+                .effort_map
+                .get("low")
+                .map(String::as_str),
             Some("low")
         );
     }
@@ -953,14 +959,8 @@ mod tests {
         // 未知平台与已知聚合平台都不套用官方 OpenAI 形态，落到 unknown。
         let settings = json!({});
         let official = official_models_fixture();
-        let unknown = resolve_codex_model_capability_core(
-            &settings,
-            None,
-            "gpt-5.4",
-            None,
-            None,
-            &official,
-        );
+        let unknown =
+            resolve_codex_model_capability_core(&settings, None, "gpt-5.4", None, None, &official);
         assert_eq!(unknown.source, CapabilitySource::Unknown);
         assert!(unknown.capability.is_none());
         let resolved = resolve_codex_model_capability_core(
@@ -994,15 +994,14 @@ mod tests {
             }]}
         });
         let official = official_models_fixture();
-        let resolved =
-            resolve_codex_model_capability_core(
-                &settings,
-                Some("openai"),
-                "gpt-5.4",
-                None,
-                None,
-                &official,
-            );
+        let resolved = resolve_codex_model_capability_core(
+            &settings,
+            Some("openai"),
+            "gpt-5.4",
+            None,
+            None,
+            &official,
+        );
         assert_eq!(resolved.source, CapabilitySource::UserConfig);
         let capability = resolved.capability.expect("user capability");
         assert_eq!(capability.supported_efforts, vec!["low", "high"]);
@@ -1012,15 +1011,14 @@ mod tests {
     fn resolver_core_official_empty_cache_falls_to_unknown() {
         // 官方缓存为空（fresh install）时，GPT 模型落到 unknown（fail-closed）。
         let settings = json!({});
-        let resolved =
-            resolve_codex_model_capability_core(
-                &settings,
-                Some("openai"),
-                "gpt-5.4",
-                None,
-                None,
-                &[],
-            );
+        let resolved = resolve_codex_model_capability_core(
+            &settings,
+            Some("openai"),
+            "gpt-5.4",
+            None,
+            None,
+            &[],
+        );
         assert_eq!(resolved.source, CapabilitySource::Unknown);
         assert!(resolved.capability.is_none());
     }

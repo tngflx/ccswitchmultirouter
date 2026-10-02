@@ -746,10 +746,7 @@ fn string_field<'a>(object: &'a serde_json::Map<String, Value>, keys: &[&str]) -
     })
 }
 
-fn value_field<'a>(
-    object: &'a serde_json::Map<String, Value>,
-    keys: &[&str],
-) -> Option<&'a Value> {
+fn value_field<'a>(object: &'a serde_json::Map<String, Value>, keys: &[&str]) -> Option<&'a Value> {
     keys.iter().find_map(|key| object.get(*key))
 }
 
@@ -792,11 +789,7 @@ fn declared_reasoning_wire_contract(
         .and_then(|object| {
             string_field(
                 object,
-                &[
-                    "reasoning_parameter",
-                    "reasoningParameter",
-                    "parameter",
-                ],
+                &["reasoning_parameter", "reasoningParameter", "parameter"],
             )
         })
         .or_else(|| {
@@ -815,55 +808,60 @@ fn declared_reasoning_wire_contract(
         .or_else(|| {
             string_field(
                 model_entry,
-                &["reasoning_format", "reasoningFormat", "upstream_format", "upstreamFormat"],
+                &[
+                    "reasoning_format",
+                    "reasoningFormat",
+                    "upstream_format",
+                    "upstreamFormat",
+                ],
             )
         });
 
-    let parameter = explicit_parameter.map(str::to_ascii_lowercase).or_else(|| {
-        let parameters = supported_parameters(model_entry);
-        let supports_object = parameters
-            .iter()
-            .any(|parameter| parameter == "reasoning" || parameter == "reasoning.effort");
-        let supports_string = parameters.iter().any(|parameter| {
-            parameter == "reasoning_effort" || parameter == "reasoning.effort_string"
-        });
-        let supports_boolean = parameters.iter().any(|parameter| {
-            parameter == "enable_thinking"
-                || parameter == "enable_reasoning"
-                || parameter == "thinking"
-        });
+    let parameter = explicit_parameter
+        .map(str::to_ascii_lowercase)
+        .or_else(|| {
+            let parameters = supported_parameters(model_entry);
+            let supports_object = parameters
+                .iter()
+                .any(|parameter| parameter == "reasoning" || parameter == "reasoning.effort");
+            let supports_string = parameters.iter().any(|parameter| {
+                parameter == "reasoning_effort" || parameter == "reasoning.effort_string"
+            });
+            let supports_boolean = parameters.iter().any(|parameter| {
+                parameter == "enable_thinking"
+                    || parameter == "enable_reasoning"
+                    || parameter == "thinking"
+            });
 
-        if supports_boolean && (supports_object || supports_string) {
-            return None;
-        }
-        if supports_object && supports_string {
-            // OpenRouter's response contains a nested reasoning declaration;
-            // prefer the object contract while preserving the advertised tiers.
-            if reasoning.is_some() {
+            if supports_boolean && (supports_object || supports_string) {
+                return None;
+            }
+            if supports_object && supports_string {
+                // OpenRouter's response contains a nested reasoning declaration;
+                // prefer the object contract while preserving the advertised tiers.
+                if reasoning.is_some() {
+                    return Some("reasoning.effort".to_string());
+                }
+                return None;
+            }
+            if supports_object {
                 return Some("reasoning.effort".to_string());
             }
-            return None;
-        }
-        if supports_object {
-            return Some("reasoning.effort".to_string());
-        }
-        if supports_string {
-            return Some("reasoning_effort".to_string());
-        }
-        if supports_boolean {
-            return Some("enable_thinking".to_string());
-        }
-        None
-    })?;
+            if supports_string {
+                return Some("reasoning_effort".to_string());
+            }
+            if supports_boolean {
+                return Some("enable_thinking".to_string());
+            }
+            None
+        })?;
 
     let format = explicit_format
         .map(|format| format.to_ascii_lowercase())
         .or_else(|| match parameter.as_str() {
             "reasoning_effort" | "reasoning.effort_string" => Some("string".to_string()),
             "reasoning" | "reasoning.effort" => Some("object".to_string()),
-            "enable_thinking" | "enable_reasoning" | "thinking" => {
-                Some("boolean".to_string())
-            }
+            "enable_thinking" | "enable_reasoning" | "thinking" => Some("boolean".to_string()),
             _ => None,
         })?;
 
@@ -1340,11 +1338,9 @@ mod tests {
         let repaired = &settings["modelCatalog"]["models"][0]["reasoning"];
         assert_eq!(repaired["supportedEfforts"], json!(["low", "high", "max"]));
         assert_eq!(repaired["defaultEffort"], json!("high"));
-        assert!(
-            outcome
-                .repaired_models
-                .contains(&"deepseek-v4-flash".to_string())
-        );
+        assert!(outcome
+            .repaired_models
+            .contains(&"deepseek-v4-flash".to_string()));
         assert!(!outcome.warnings.is_empty());
     }
 
@@ -1369,11 +1365,9 @@ mod tests {
         assert_eq!(repaired["supportedEfforts"], json!(["low"]));
         assert_eq!(repaired["defaultEffort"], json!("low"));
         assert_eq!(repaired["source"], json!("user"));
-        assert!(
-            outcome
-                .repaired_models
-                .contains(&"private-model".to_string())
-        );
+        assert!(outcome
+            .repaired_models
+            .contains(&"private-model".to_string()));
     }
 
     fn deepseek_capability() -> CodexModelReasoningCapability {
@@ -1413,11 +1407,9 @@ mod tests {
             resolved.effort_map.get(&CodexReasoningEffort::Medium),
             Some(&CodexReasoningEffort::High)
         );
-        assert!(
-            !resolved
-                .codex_selectable_efforts
-                .contains(&CodexReasoningEffort::Ultra)
-        );
+        assert!(!resolved
+            .codex_selectable_efforts
+            .contains(&CodexReasoningEffort::Ultra));
     }
 
     #[test]
@@ -1434,11 +1426,9 @@ mod tests {
             efforts(&["low", "high", "max"]),
             "Ultra is a Codex orchestration mode, not a Provider-native effort"
         );
-        assert!(
-            resolved
-                .codex_selectable_efforts
-                .contains(&CodexReasoningEffort::Ultra)
-        );
+        assert!(resolved
+            .codex_selectable_efforts
+            .contains(&CodexReasoningEffort::Ultra));
         assert_eq!(
             resolved.effort_map.get(&CodexReasoningEffort::Ultra),
             Some(&CodexReasoningEffort::Max),
@@ -1993,17 +1983,13 @@ mod tests {
         .expect("parse");
         let resolved = resolve_subagent_reasoning_capability(Some(&capability));
         // provider_accepted_efforts 含 none（关闭契约需要）。
-        assert!(
-            resolved
-                .provider_accepted_efforts
-                .contains(&CodexReasoningEffort::None)
-        );
+        assert!(resolved
+            .provider_accepted_efforts
+            .contains(&CodexReasoningEffort::None));
         // codex_selectable_efforts 不含 none（none 是关闭，不是可选正向档位）。
-        assert!(
-            !resolved
-                .codex_selectable_efforts
-                .contains(&CodexReasoningEffort::None)
-        );
+        assert!(!resolved
+            .codex_selectable_efforts
+            .contains(&CodexReasoningEffort::None));
         assert_eq!(
             resolved.codex_selectable_efforts,
             vec![

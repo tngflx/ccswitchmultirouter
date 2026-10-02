@@ -355,13 +355,16 @@ the error recurs intermittently. Every CCSwitch write or restore of
     named fix authorizes that stated fix only; do not infer approval for extra
     behavior, migrations, recovery actions, cleanup, or policy changes.
 
-33. **Ask and wait before making an ambiguous behavioral decision.** Before editing code
-    when more than one reasonable behavior satisfies the request, present the
-    proposed behavior, affected boundary, alternatives, risks, and verification
-    plan. Wait for explicit user approval of that scope before implementing it;
-    silence, a progress update, or a prior broad approval is not consent for an
-    expanded scope. Do not use urgency, an existing dirty tree, passing tests,
-    or a model harness recommendation as implied approval.
+33. **Use judgment for behavioral scope.** Proceed without a separate approval
+    pause for routine, low-risk, reversible, common-sense fixes that are clearly
+    implied by the request. Ask and wait before making a materially ambiguous
+    or high-impact decision, including destructive or irreversible changes,
+    data migrations, security or privacy behavior, public-contract changes,
+    release or policy changes, or materially different user workflows. For
+    those cases, state the proposed behavior, affected boundary, alternatives,
+    risks, and verification plan, then wait for explicit approval. Do not use
+    urgency, an existing dirty tree, passing tests, or a model harness
+    recommendation as approval for an expanded scope.
 
 34. **Record every substantive decision.** Create or update
     `docs/decisions/YYYY-MM-DD-<slug>.md` before implementing a non-trivial

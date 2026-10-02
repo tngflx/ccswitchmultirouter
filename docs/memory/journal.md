@@ -1,5 +1,64 @@
 # Engineering Journal (newest first)
 
+## 2026-10-02 - Narrowed approval pauses to high-impact changes
+
+- **What happened:** Repository guidance required explicit approval before any
+  behavior with more than one reasonable implementation, including routine
+  low-risk fixes.
+- **Root cause:** The approval threshold was broader than the user's intended
+  workflow and interrupted common-sense implementation work.
+- **What we did:** Updated `AGENTS.md` rule 33 so routine, reversible,
+  clearly implied fixes proceed directly; approval remains required for
+  destructive, irreversible, security/privacy, migration, public-contract,
+  release/policy, and materially different workflow decisions.
+- **Evidence:** The rule text and decision record were reviewed after editing.
+- **What NOT to do again:** Do not request approval for ordinary low-risk fixes;
+  do not infer that this relaxed threshold authorizes destructive or materially
+  different behavior.
+- **Related:** `docs/decisions/2026-10-02-approval-threshold.md`
+
+## 2026-10-02 - Follow-all preserves ProviderForm exclusions
+
+- **What happened:** The Codex MultiRouter wizard's Follow all models action
+  re-enabled every persisted catalog row, including models explicitly disabled
+  in ProviderForm.
+- **Root cause:** The handler rewrote every raw catalog row to `enabled: true`
+  before switching to automatic route selection; Clear all only cleared the
+  route order and did not alter catalog exclusions.
+- **What we did:** Follow all now only switches to automatic follow mode. The
+  existing catalog `enabled` flags remain authoritative, so disabled rows stay
+  excluded and are preserved on save.
+- **Evidence:** The focused wizard regression passed 1/1, the wizard plus
+  helper suites passed 66/66, and `pnpm typecheck` passed.
+- **What NOT to do again:** Do not interpret automatic follow as permission to
+  mutate ProviderForm catalog tombstones; re-enabling an excluded model must be
+  an explicit model-level action.
+- **Related:** `docs/decisions/2026-10-02-follow-all-preserves-provider-exclusions.md`
+
+## 2026-10-02 - Restore maintained Codex catalogue reasoning metadata
+
+- **What happened:** The commit reaudit isolated a real picker regression in
+  `e880d2482`: maintained OpenAI catalogue rows lost the reasoning metadata that
+  Codex Desktop expects. A snapshot test also exposed an inconsistent fixture.
+- **Root cause:** The catalogue projection removed its maintained-model fallback,
+  so `gpt-5.5` emitted no `supported_reasoning_levels`; the fixture mapped
+  `max` to `xhigh` without listing `xhigh` as supported.
+- **What we did:** Restored the default `medium` effort and standard four-level
+  reasoning metadata only for models recognized by the existing maintained
+  OpenAI service-tier predicate. Kept unknown third-party models fail-closed and
+  corrected the fixture instead of weakening capability validation.
+- **Evidence:** The maintained picker regression, effort-map snapshot, and both
+  unknown-third-party guard tests passed 1/1 each; `cargo check --manifest-path
+  src-tauri/Cargo.toml`, `pnpm typecheck`, and the full frontend suite passed
+  (198 files / 1,678 tests). Full `cargo test --manifest-path
+  src-tauri/Cargo.toml` was blocked before execution while replacing the normal
+  debug executable (`Access is denied`, OS error 5); no process was killed.
+  Live runtime freshness remains pending a user-directed restart.
+- **What NOT to do again:** Do not remove maintained-model metadata fallbacks
+  without checking the generated Codex picker contract, and do not weaken
+  snapshot validation to accommodate an invalid fixture.
+- **Related:** `docs/decisions/2026-10-02-restore-codex-catalog-reasoning-contract.md`
+
 ## 2026-10-02 - Final catalogue-boundary verification
 
 - **What happened:** The automatic model-discovery regression and related

@@ -364,7 +364,11 @@ impl Database {
                 config.circuit_timeout_seconds as i32,
                 config.circuit_error_rate_threshold,
                 config.circuit_min_requests as i32,
-                if config.app_type == "codex" && config.capacity_retry_enabled { 1 } else { 0 },
+                if config.app_type == "codex" && config.capacity_retry_enabled {
+                    1
+                } else {
+                    0
+                },
             ],
         )
         .map_err(|e| AppError::Database(e.to_string()))?;
@@ -1074,15 +1078,35 @@ mod tests {
     async fn test_codex_capacity_retry_toggle_persists_without_affecting_other_apps(
     ) -> Result<(), AppError> {
         let db = Database::memory()?;
-        assert!(db.get_proxy_config_for_app("codex").await?.capacity_retry_enabled);
-        assert!(!db.get_proxy_config_for_app("claude").await?.capacity_retry_enabled);
+        assert!(
+            db.get_proxy_config_for_app("codex")
+                .await?
+                .capacity_retry_enabled
+        );
+        assert!(
+            !db.get_proxy_config_for_app("claude")
+                .await?
+                .capacity_retry_enabled
+        );
 
         db.set_codex_capacity_retry_enabled(false).await?;
-        assert!(!db.get_proxy_config_for_app("codex").await?.capacity_retry_enabled);
-        assert!(!db.get_proxy_config_for_app("claude").await?.capacity_retry_enabled);
+        assert!(
+            !db.get_proxy_config_for_app("codex")
+                .await?
+                .capacity_retry_enabled
+        );
+        assert!(
+            !db.get_proxy_config_for_app("claude")
+                .await?
+                .capacity_retry_enabled
+        );
 
         db.set_codex_capacity_retry_enabled(true).await?;
-        assert!(db.get_proxy_config_for_app("codex").await?.capacity_retry_enabled);
+        assert!(
+            db.get_proxy_config_for_app("codex")
+                .await?
+                .capacity_retry_enabled
+        );
         Ok(())
     }
 }

@@ -26,11 +26,10 @@ static CODEX_PUBLIC_CATALOG_REFRESH_GATE: Lazy<Mutex<CatalogRefreshGate>> =
     Lazy::new(|| Mutex::new(CatalogRefreshGate::default()));
 static CODEX_PUBLIC_CATALOG_REFRESH_COMPLETED: Lazy<
     tokio::sync::broadcast::Sender<CatalogRefreshCompletion>,
-> =
-    Lazy::new(|| {
-        let (sender, _receiver) = tokio::sync::broadcast::channel(16);
-        sender
-    });
+> = Lazy::new(|| {
+    let (sender, _receiver) = tokio::sync::broadcast::channel(16);
+    sender
+});
 static CODEX_PUBLIC_CATALOG_APP_HANDLE: std::sync::OnceLock<tauri::AppHandle> =
     std::sync::OnceLock::new();
 
@@ -379,18 +378,20 @@ pub async fn refresh_public_official_catalog_force() -> OfficialCatalogRefreshRe
 
         let result: Result<OfficialCatalogRefreshResult, String> =
             match fetch_public_official_catalog_from_url(CODEX_PUBLIC_MODELS_URL).await {
-                Ok(models) => crate::codex_config::store_codex_public_official_models_cache(&models)
-                    .map(|_| {
-                        public_catalog_snapshot_result(
-                            "openai_codex_models_json",
-                            false,
-                            true,
-                            None,
-                        )
-                    })
-                    .map_err(|error| {
-                        format!("Failed to cache OpenAI public Codex model catalog: {error}")
-                    }),
+                Ok(models) => {
+                    crate::codex_config::store_codex_public_official_models_cache(&models)
+                        .map(|_| {
+                            public_catalog_snapshot_result(
+                                "openai_codex_models_json",
+                                false,
+                                true,
+                                None,
+                            )
+                        })
+                        .map_err(|error| {
+                            format!("Failed to cache OpenAI public Codex model catalog: {error}")
+                        })
+                }
                 Err(error) => Err(error),
             };
         permit.finish(result.is_ok());
@@ -894,7 +895,8 @@ mod tests {
         gate.finish(start + Duration::from_secs(1), false);
 
         assert!(
-            gate.try_start_forced(start + Duration::from_secs(2)).is_some(),
+            gate.try_start_forced(start + Duration::from_secs(2))
+                .is_some(),
             "an explicit user refresh must request upstream even during automatic retry cooldown"
         );
     }
@@ -953,10 +955,7 @@ mod tests {
             1
         );
         assert_eq!(
-            completed
-                .recv()
-                .await
-                .expect("receive owned completion"),
+            completed.recv().await.expect("receive owned completion"),
             expected
         );
     }

@@ -17,7 +17,7 @@
 use super::{AuthInfo, AuthStrategy, ProviderAdapter, ProviderType};
 use crate::provider::Provider;
 use crate::proxy::error::ProxyError;
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 
 const ANTHROPIC_THINKING_PLACEHOLDER: &str = "tool call";
 const ANTHROPIC_REDACTED_THINKING_PLACEHOLDER: &str = "[redacted thinking]";
@@ -82,7 +82,11 @@ pub fn get_claude_api_format(provider: &Provider) -> &'static str {
         _ => false,
     };
 
-    if enabled { "openai_chat" } else { "anthropic" }
+    if enabled {
+        "openai_chat"
+    } else {
+        "anthropic"
+    }
 }
 
 pub fn claude_api_format_needs_transform(api_format: &str) -> bool {
@@ -2298,13 +2302,11 @@ mod tests {
                 })
             })
             .expect("assistant tool turn survives the conversion");
-        assert!(
-            !tool_turn["content"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|block| block["type"] == json!("thinking"))
-        );
+        assert!(!tool_turn["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|block| block["type"] == json!("thinking")));
 
         let changed = normalize_anthropic_messages_for_provider(&mut body, &provider, "anthropic");
         assert!(changed);

@@ -653,10 +653,7 @@ fn project_codex_model_descriptor(
         .and_then(Value::as_str)
         .is_some_and(|value| !value.trim().is_empty());
     if !has_model {
-        object.insert(
-            "model".to_string(),
-            Value::String(model_name.to_string()),
-        );
+        object.insert("model".to_string(), Value::String(model_name.to_string()));
     }
     let provider_name = provider_name_from_entry(&Value::Object(object.clone()));
     let compact_provider = crate::codex_multirouter::compact_codex_provider_label(&provider_name);
@@ -3063,17 +3060,11 @@ mod tests {
         assert_eq!(names, vec!["gpt-6.1-sol-relay"]);
         assert_eq!(models[0]["model"], "gpt-6.1-sol-relay");
         assert_eq!(models[0]["id"], "openai/gpt-6.1-sol");
-        assert_eq!(
-            models[0]["canonicalSlug"],
-            "openai/gpt-6.1-sol-20260929"
-        );
+        assert_eq!(models[0]["canonicalSlug"], "openai/gpt-6.1-sol-20260929");
         assert_eq!(models[0]["upstreamModel"], "gpt-6.1-sol");
         assert_eq!(models[0]["slug"], "gpt-6.1-sol");
         assert_eq!(models[0]["name"], "GPT 6.1 Sol");
-        assert_eq!(
-            models[0]["aliases"],
-            json!(["gpt-6.1-sol-openrouter"])
-        );
+        assert_eq!(models[0]["aliases"], json!(["gpt-6.1-sol-openrouter"]));
         assert_eq!(models[0]["displayName"], "[ORter] GPT 6.1 Sol");
     }
 
@@ -3705,10 +3696,7 @@ JSON.stringify({
 
         assert_eq!(result["model"], "gpt-6.1-sol-relay");
         assert_eq!(result["id"], "openai/gpt-6.1-sol");
-        assert_eq!(
-            result["canonicalSlug"],
-            "openai/gpt-6.1-sol-20260929"
-        );
+        assert_eq!(result["canonicalSlug"], "openai/gpt-6.1-sol-20260929");
         assert_eq!(
             result["efforts"],
             json!(["max", "xhigh", "high", "medium", "low"])
