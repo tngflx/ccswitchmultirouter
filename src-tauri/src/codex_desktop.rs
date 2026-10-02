@@ -728,50 +728,50 @@ fn project_reasoning_picker_aliases(object: &mut serde_json::Map<String, Value>)
                 })
         })
     });
-    if let Some(default_effort) = default_effort {
-        object.insert(
-            "defaultReasoningEffort".to_string(),
-            Value::String(default_effort),
-        );
-    }
-
-    let Some(levels) = [
+    let candidate_levels = [
         "supportedReasoningEfforts",
         "supportedReasoningLevels",
         "supported_reasoning_levels",
         "supported_reasoning_efforts",
     ]
     .into_iter()
-    .find_map(|key| object.get(key).and_then(Value::as_array))
-    .or_else(|| {
-        nested_reasoning.as_ref().and_then(|reasoning| {
-            ["supportedEfforts", "supported_efforts"]
-                .into_iter()
-                .find_map(|key| reasoning.get(key).and_then(Value::as_array))
-        })
-    }) else {
+    .filter_map(|key| object.get(key))
+    .chain(
+        nested_reasoning
+            .as_ref()
+            .into_iter()
+            .flat_map(|reasoning| ["supportedEfforts", "supported_efforts"].into_iter().filter_map(|key| reasoning.get(key))),
+    )
+    .find_map(normalize_reasoning_picker_levels);
+
+    let Some(normalized) = candidate_levels else {
+        for key in [
+            "defaultReasoningEffort",
+            "default_reasoning_level",
+            "default_reasoning_effort",
+            "supportedReasoningEfforts",
+            "supportedReasoningLevels",
+            "supported_reasoning_levels",
+            "supported_reasoning_efforts",
+        ] {
+            object.remove(key);
+        }
         return;
     };
 
-    let normalized = levels
-        .iter()
-        .filter_map(|level| {
-            let effort = level
-                .as_str()
-                .or_else(|| level.get("reasoningEffort").and_then(Value::as_str))
-                .or_else(|| level.get("reasoning_effort").and_then(Value::as_str))
-                .or_else(|| level.get("effort").and_then(Value::as_str))
-                .map(str::trim)
-                .filter(|value| !value.is_empty())?;
-            let description = level
-                .get("description")
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .unwrap_or(effort);
-            Some((effort.to_string(), description.to_string()))
-        })
-        .collect::<Vec<_>>();
+    let default_effort = default_effort
+        .filter(|effort| normalized.iter().any(|(candidate, _)| candidate == effort))
+        .or_else(|| normalized.first().map(|(effort, _)| effort.clone()));
+    object.remove("default_reasoning_level");
+    object.remove("default_reasoning_effort");
+    if let Some(default_effort) = default_effort {
+        object.insert(
+            "defaultReasoningEffort".to_string(),
+            Value::String(default_effort),
+        );
+    }
+    object.remove("supported_reasoning_levels");
+    object.remove("supported_reasoning_efforts");
 
     object.insert(
         "supportedReasoningEfforts".to_string(),
@@ -793,6 +793,34 @@ fn project_reasoning_picker_aliases(object: &mut serde_json::Map<String, Value>)
                 .collect(),
         ),
     );
+}
+
+fn normalize_reasoning_picker_levels(value: &Value) -> Option<Vec<(String, String)>> {
+    let levels = value.as_array()?;
+    let mut normalized = Vec::new();
+    for level in levels {
+        let Some(effort) = level
+            .as_str()
+            .or_else(|| level.get("reasoningEffort").and_then(Value::as_str))
+            .or_else(|| level.get("reasoning_effort").and_then(Value::as_str))
+            .or_else(|| level.get("effort").and_then(Value::as_str))
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            continue;
+        };
+        if normalized.iter().any(|(candidate, _)| candidate == effort) {
+            continue;
+        }
+        let description = level
+            .get("description")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or(effort);
+        normalized.push((effort.to_string(), description.to_string()));
+    }
+    (!normalized.is_empty()).then_some(normalized)
 }
 
 fn provider_name_from_entry(entry: &Value) -> String {
@@ -3113,6 +3141,64 @@ mod tests {
     }
 
     #[test]
+    fn catalog_projection_skips_empty_alias_and_reconciles_default() {
+        let value = json!({
+            "models": [{
+                "model": "mixed-reasoning-aliases",
+                "defaultReasoningEffort": "unsupported",
+                "supportedReasoningEfforts": [],
+                "supportedReasoningLevels": [
+                    {"effort": "low"},
+                    {"effort": "low", "description": "duplicate"},
+                    {"reasoning_effort": "high"}
+                ],
+                "supported_reasoning_efforts": [{"effort": "stale"}]
+            }]
+        });
+
+        let (_, models) = codex_model_entries_from_catalog_value(&value);
+
+        assert_eq!(models[0]["defaultReasoningEffort"], "low");
+        assert_eq!(
+            models[0]["supportedReasoningEfforts"],
+            json!([
+                {"reasoningEffort": "low", "description": "low"},
+                {"reasoningEffort": "high", "description": "high"}
+            ])
+        );
+        assert!(models[0].get("supported_reasoning_efforts").is_none());
+    }
+
+    #[test]
+    fn catalog_projection_clears_all_stale_reasoning_aliases_when_empty() {
+        let mut object = json!({
+            "model": "empty-reasoning-aliases",
+            "defaultReasoningEffort": "medium",
+            "default_reasoning_level": "high",
+            "supportedReasoningEfforts": [],
+            "supportedReasoningLevels": [],
+            "supported_reasoning_levels": [],
+            "supported_reasoning_efforts": []
+        })
+        .as_object()
+        .cloned()
+        .expect("object");
+
+        project_reasoning_picker_aliases(&mut object);
+
+        for key in [
+            "defaultReasoningEffort",
+            "default_reasoning_level",
+            "supportedReasoningEfforts",
+            "supportedReasoningLevels",
+            "supported_reasoning_levels",
+            "supported_reasoning_efforts",
+        ] {
+            assert!(object.get(key).is_none(), "stale alias remains: {key}");
+        }
+    }
+
+    #[test]
     fn catalog_projection_promotes_nested_multirouter_reasoning_for_desktop() {
         let value = json!({
             "models": [{
@@ -3656,6 +3742,85 @@ JSON.stringify({
         assert_eq!(result["defaultEffort"], "high");
         assert_eq!(result["efforts"], json!(["low", "high"]));
         assert_eq!(result["levels"], json!(["low", "high"]));
+    }
+
+    #[test]
+    fn model_picker_patch_skips_empty_alias_and_reconciles_default() {
+        let result = run_model_picker_patch_core_probe_with_payload(
+            json!({
+                "defaultModel": "mixed-reasoning-aliases",
+                "modelNames": ["mixed-reasoning-aliases"],
+                "models": [{
+                    "model": "mixed-reasoning-aliases",
+                    "defaultReasoningEffort": "unsupported",
+                    "supportedReasoningEfforts": [],
+                    "supportedReasoningLevels": [
+                        {"effort": "low"},
+                        {"effort": "low", "description": "duplicate"},
+                        {"reasoning_effort": "high"}
+                    ]
+                }]
+            }),
+            r#"
+const models = [];
+patchModelArray(models, true);
+JSON.stringify({
+  defaultEffort: models[0].defaultReasoningEffort,
+  efforts: models[0].supportedReasoningEfforts,
+  levels: models[0].supportedReasoningLevels,
+});
+"#,
+        );
+
+        assert_eq!(result["defaultEffort"], "low");
+        assert_eq!(
+            result["efforts"],
+            json!([
+                {"reasoningEffort": "low", "description": "low"},
+                {"reasoningEffort": "high", "description": "high"}
+            ])
+        );
+        assert_eq!(
+            result["levels"],
+            json!([
+                {"effort": "low", "description": "low"},
+                {"effort": "high", "description": "high"}
+            ])
+        );
+    }
+
+    #[test]
+    fn model_picker_patch_clears_empty_reasoning_aliases() {
+        let result = run_model_picker_patch_core_probe_with_payload(
+            json!({
+                "defaultModel": "empty-reasoning-aliases",
+                "modelNames": ["empty-reasoning-aliases"],
+                "models": [{
+                    "model": "empty-reasoning-aliases",
+                    "defaultReasoningEffort": "medium",
+                    "supportedReasoningEfforts": [],
+                    "supportedReasoningLevels": [],
+                    "supported_reasoning_levels": [],
+                    "supported_reasoning_efforts": []
+                }]
+            }),
+            r#"
+const models = [];
+patchModelArray(models, true);
+const descriptor = models[0];
+JSON.stringify({
+  keys: [
+    "defaultReasoningEffort",
+    "supportedReasoningEfforts",
+    "supportedReasoningLevels",
+    "supported_reasoning_levels",
+    "supported_reasoning_efforts",
+  ].filter((key) => Object.prototype.hasOwnProperty.call(descriptor, key)),
+});
+"#,
+        );
+
+        assert_eq!(result["keys"], json!([]));
     }
 
     #[test]

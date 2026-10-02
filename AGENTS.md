@@ -28,19 +28,6 @@ client-versus-proxy growth must have a regression test at the owning boundary.
 When no proxy inflation exists, state that clearly and preserve the evidence rather
 than changing unrelated request logic.
 
-6-C. **Summarize means manual coding-agent summarization; never use compaction for handoff.**
-When the user requests “summarize”, “summarize + new session”, or passover, do not
-call `thread/compact/start`, `/responses/compact`, native context compaction, or any
-other compaction endpoint as the summarization mechanism. Interrupt the blocked source
-turn only when necessary, wait for the source to become idle, then start one ordinary
-coding-agent turn with tools and file mutation explicitly forbidden. Require that turn
-to return a plain-text handoff summary containing the goal, decisions, changed areas,
-current state, failures, tests, and next action. Only after that summary text is
-successfully returned may the system create a fresh root session and pass the summary
-into it. A missing, empty, failed, or ambiguous summary must stop the handoff and
-must never fall back to compaction. Add a regression test that proves no compaction
-method or compaction endpoint is called.
-
 ## ALWAYS RECHECK
 
 7. **After ANY upstream merge:** grep for every function/field/import that our custom code depends on (`resolve_reasoning_content_mode`, `ReasoningContentMode`, `normalize_third_party_responses_reasoning_content_for_strict_schema`, `reasoning_content_mode` on ProviderMeta, LanguageSwitcher, etc.). Upstream may silently remove or rename them.
@@ -101,9 +88,9 @@ present an older binary as evidence for the new source.
 
 19. **Production and release artifacts MUST be built entirely by GitHub Actions.** Agents must never run `pnpm build`, `pnpm build:exe`, `pnpm release:local`, `pnpm tauri build`, or any release-mode Cargo build on a developer workstation for a release. This prohibition includes binaries, installers, bundles, signatures, checksums, and updater artifacts. Local `cargo check`, `cargo test`, frontend type checks, and frontend tests remain allowed because they do not produce release artifacts. Trigger the repository's release workflow and use only artifacts produced by that GitHub Actions run.
 
-20. **Before declaring a GitHub Actions production build successful, download or inspect the workflow-produced binary and verify that it embeds frontend assets:**
+20. **Before declaring a GitHub Actions production build successful, download the workflow-produced binary and verify that the downloaded artifact embeds frontend assets.** Do not build a replacement binary locally; the path below is only an example of where the downloaded artifact may be extracted:
     ```powershell
-    $bytes = [System.IO.File]::ReadAllBytes("src-tauri\target\release\cc-switch.exe")
+    $bytes = [System.IO.File]::ReadAllBytes("artifacts\cc-switch.exe")
     $text = [System.Text.Encoding]::ASCII.GetString($bytes)
     # Must return True — proves custom-protocol is active:
     $text.Contains("index-") # matches Vite hashed asset names embedded in binary
@@ -125,8 +112,6 @@ present an older binary as evidence for the new source.
     The helper locates the `cc-switch` process and renderer handle, captures the selected top-level window with read-only `PrintWindow` (`PW_RENDERFULLCONTENT`), and exits non-zero when the result is blank. `PrintWindow` success alone is not proof of page content; a hidden or minimized WebView2 compositor can return a uniform surface. For minimized windows, follow rule 22-E without restoring them; for hidden-to-tray windows, rule 22-C permits non-activating show plus semantic background automation. The helper itself does not restore/show windows, and its suggestion to ask the user is not a prohibition on these background fallbacks. Capture each audited page and verify its text/state through OCR, UI Automation, or DOM/CDP inspection; if only pixels were checked, say so. A blank capture means the window is not compositing, not that the page is empty.
 
 22-E. **Background UI Automation fallback for minimized WebView2.** When the capture helper reports that a minimized `cc-switch.exe` has no visible candidate, do not restore or activate it. Bind the existing top-level window through `System.Windows.Automation.AutomationElement::FromHandle` using the returned `MainWindowHandle`, locate the WebView2 `RootWebArea` (`AutomationId=RootWebArea`), and read its descendant controls and text. Navigate only with semantic `InvokePattern` or `SelectionItemPattern` actions on safe page/navigation controls, reacquiring the root and descendants after every action. This works while the window remains minimized and does not move focus or the user's cursor. Record each page and state observed. Do not use coordinate clicks, guessed indexes, or invoke destructive controls during an audit.
-
-22-F. **Live audit evidence (2026-09-23).** The minimized-window UIA path above was verified against `CCSwitchMulti` window handle `788824`: Settings General, Routing, Auth, Advanced, Usage Statistics, Skills, Prompts, Session Manager, and MCP Management were read without foregrounding. Opening Usage Statistics exposed and then, after the source fix, cleared a real `UsageTrendChart` hook-order crash. The root cause was a `useMemo` placed after the component's `isLoading` early return; hooks differed between loading and loaded renders. Keep all hooks before conditional returns and retain a regression test when changing this component.
 
 ## CODEBASE STRUCTURE
 
@@ -294,7 +279,7 @@ Verification scope and reporting are governed by rules 2, 8, 9, and 10. In pract
 - Don't mutate live CLI config files outside the dedicated writer modules.
 - Don't add IPC fields without `rename_all = "camelCase"`.
 - Don't add an i18n key to only one locale file — CI won't catch it; users will.
-- Follow production and release rules 18-22; do not restate or weaken them in local workflow notes.
+- Follow production and release rules 18-22-E; do not restate or weaken them in local workflow notes.
 
 ## COMMIT GUIDELINES
 
@@ -318,7 +303,7 @@ Verification scope and reporting are governed by rules 2, 8, 9, and 10. In pract
     - `codex_traffic_policy` module
     - `codexCatalogSync` module
 
-27-A. **Before proposing or implementing a new feature or fix, audit both reference repositories for relevant work:** inspect the current `BigStrongSun/ccswitchmulti` upstream and the original `farion1231/cc-switch` repository, including recent commits, open/closed pull requests, and nearby implementation history. Treat them as reference material, not automatic authority: understand the problem, ownership boundary, behavioral tradeoffs, and tests on each side before deciding whether to port, adapt, reject, or defer the change. Record the reference-repo verdict when it materially affects the design.
+27-A. **For changes with likely upstream overlap or architectural, protocol, or public-contract impact, audit both reference repositories for relevant work before proposing or implementing the change:** inspect the current `BigStrongSun/ccswitchmulti` upstream and the original `farion1231/cc-switch` repository, including recent commits, open/closed pull requests, and nearby implementation history. Treat them as reference material, not automatic authority: understand the problem, ownership boundary, behavioral tradeoffs, and tests on each side before deciding whether to port, adapt, reject, or defer the change. Routine local fixes with no plausible upstream overlap are exempt. Record the reference-repo verdict when it materially affects the design.
 
 ### Additional Documentation
 
@@ -357,13 +342,14 @@ the error recurs intermittently. Every CCSwitch write or restore of
 
 33. **Use judgment for behavioral scope.** Proceed without a separate approval
     pause for routine, low-risk, reversible, common-sense fixes that are clearly
-    implied by the request. Ask and wait before making a materially ambiguous
-    or high-impact decision, including destructive or irreversible changes,
-    data migrations, security or privacy behavior, public-contract changes,
-    release or policy changes, or materially different user workflows. For
-    those cases, state the proposed behavior, affected boundary, alternatives,
-    risks, and verification plan, then wait for explicit approval. Do not use
-    urgency, an existing dirty tree, passing tests, or a model harness
+    implied by the request. Ask and wait before making a high-impact or
+    irreversible decision, including destructive changes, data migrations,
+    security or privacy behavior, public-contract changes, release or policy
+    changes, or materially different user workflows. For those cases, state the
+    proposed behavior, affected boundary, alternatives, risks, and verification
+    plan, then wait for explicit approval. Ambiguity alone is not an approval
+    trigger; choose the conservative existing pattern for ordinary work. Do not
+    use urgency, an existing dirty tree, passing tests, or a model harness
     recommendation as approval for an expanded scope.
 
 34. **Record every substantive decision.** Create or update
@@ -388,9 +374,11 @@ the error recurs intermittently. Every CCSwitch write or restore of
 36. **Journal the outcome, not the permission.** Add a concise newest-first
     entry to `docs/memory/journal.md` for significant incidents, rejected or
     superseded decisions, and verification evidence, linking the decision
-    record. If an unapproved edit already exists, say so plainly, keep it
-    uncommitted, and ask whether to retain, revise, or revert it; do not claim
-    that application work is complete until the user decides. Inventory the
-    affected files and decisions with approval `not-approved` and implementation
-    `implemented`; do not invent approval from an earlier bug report. A request
-    to update these instructions does not approve earlier application edits.
+    record. If an edit is outside the requested scope or falls under a rule-33
+    approval category without approval, keep it uncommitted and ask whether to
+    retain, revise, or revert it; do not claim that work is complete until that
+    decision is made. Routine changes authorized by rule 33 may be implemented
+    without a separate approval pause; record approval as `not-approved` when
+    no separate approval was required, and never invent approval from an earlier
+    bug report. A request to update these instructions does not approve earlier
+    application edits.

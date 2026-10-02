@@ -1,5 +1,93 @@
 # Engineering Journal (newest first)
 
+## 2026-10-03 - Final verification of reasoning picker fix
+
+- **What happened:** The approved reasoning-capability fix reached the final
+  verification boundary.
+- **Root cause:** The renderer and injected picker paths had already been
+  normalized; remaining uncertainty was verification freshness, not another
+  compiler or schema mutation.
+- **What we did:** Ran the full frontend suite and retried the full Rust suite
+  without interrupting the live development app or creating an alternate build
+  target.
+- **Evidence:** `pnpm test:unit` passed **198 files / 1,678 tests**. The focused
+  Rust projection tests, `cargo check`, `pnpm typecheck`, and `git diff --check`
+  passed. Full `cargo test --manifest-path src-tauri/Cargo.toml` was blocked
+  before execution by `Access is denied (os error 5)` while replacing the live
+  `src-tauri\\target\\debug\\cc-switch.exe`.
+- **What NOT to do again:** Do not kill the app or its supervisor to force a
+  Rust test run; ask for a normal `pnpm dev` stop/restart, then rerun the Rust
+  suite and inspect the live picker.
+- **Related:** `docs/decisions/2026-10-02-restore-codex-catalog-reasoning-contract.md`
+
+## 2026-10-03 - Empty reasoning alias suppressed populated picker capabilities
+
+- **What happened:** Some Codex model-picker rows lost the reasoning slider even
+  though a populated effort alias was present in the same descriptor.
+- **Root cause:** The Rust renderer projection and injected picker core each
+  selected the first array-shaped alias, so an earlier `[]` won over a later
+  populated alias. They also independently preserved invalid defaults and stale
+  aliases, creating schema divergence between catalog and renderer paths.
+- **What we did:** Both boundaries now inspect aliases in authoritative order,
+  select the first non-empty valid list, normalize string/object effort forms,
+  deduplicate in order, validate the default against the final list, and clear
+  all stale aliases when no effort is selectable. Compatibility aliases remain
+  only as projections of that normalized list.
+- **Evidence:** Rust catalog projection tests passed **12/12**; model-picker
+  core probes passed **14/14**; `cargo check --manifest-path
+  src-tauri/Cargo.toml` passed; `pnpm typecheck` passed; `git diff --check`
+  passed. Live runtime freshness remains pending a user restart of `pnpm dev`.
+- **What NOT to do again:** Do not treat array presence or JavaScript truthiness
+  as capability evidence, and do not let each schema alias independently decide
+  the effective reasoning contract.
+- **Related:** `docs/decisions/2026-10-02-restore-codex-catalog-reasoning-contract.md`
+
+## 2026-10-03 - Corrected AGENTS policy conflicts and removed obsolete handoff rule
+
+- **What happened:** The full `AGENTS.md` reaudit found an impossible manual
+  handoff requirement, stale runtime-specific evidence, an ambiguous artifact
+  inspection path, an over-broad upstream-audit trigger, an incomplete
+  production-rule reference, and approval wording that conflicted with routine
+  fix autonomy.
+- **Root cause:** Later policy additions accumulated without reconciling their
+  scope, lifecycle, approval threshold, and independent decision-record status
+  fields.
+- **What we did:** Removed rule 6-C, clarified downloaded-artifact verification,
+  removed rule 22-F, corrected the production reference to 18-22-E, narrowed
+  rule 27-A to changes where upstream review is materially relevant, removed
+  ambiguity alone as an approval trigger, and aligned rule 36 with rule 33 and
+  the decision-record schema.
+- **Evidence:** Targeted `rg` checks confirmed the removed and revised text;
+  multiline matching confirmed ambiguity alone is not an approval trigger;
+  `git diff --check -- AGENTS.md docs/memory/journal.md` and a targeted
+  trailing-whitespace scan for all three documentation files passed. No
+  executable tests were run because this was documentation-only.
+- **What NOT to do again:** Do not require approval or reference-repository
+  audits for routine, clearly implied local fixes, and do not retain
+  historical runtime observations as mandatory policy.
+- **Related:** `docs/decisions/2026-10-03-agents-policy-consistency.md`
+
+## 2026-10-03 - Codex reasoning resolution and picker alias contract
+
+- **What happened:** The model-picker audit found malformed reasoning metadata
+  suppressing valid inline declarations, stale camelCase effort aliases surviving
+  an empty resolution, and inline TOML defaults that were not selectable.
+- **Root cause:** Compiler fallback treated malformed objects as effective
+  metadata; projection only rewrote aliases when levels were non-empty; inline
+  default selection happened before validating the final effort list.
+- **What we did:** Invalid declarations now fall through to the next
+  authoritative source. Empty capability projection removes stale reasoning
+  aliases. Inline TOML validates catalog, provider, and maintained defaults
+  against the resolved effort list and picks the first valid candidate.
+- **Evidence:** Compiler tests passed 30/30; inline model tests 3/3; stale
+  ModelInfo alias regression 1/1; shared reasoning tests 29/29; Desktop catalog
+  projection tests 10/10; `cargo check`, `pnpm typecheck`, and `git diff --check`
+  passed. Full suites and live picker freshness were not run in this turn.
+- **What NOT to do again:** Do not preserve malformed capability objects merely
+  as a diagnostic shortcut in the effective summary, and do not emit a default
+  effort without checking the final selectable list.
+- **Related:** `docs/decisions/2026-10-02-restore-codex-catalog-reasoning-contract.md`
+
 ## 2026-10-02 - Narrowed approval pauses to high-impact changes
 
 - **What happened:** Repository guidance required explicit approval before any

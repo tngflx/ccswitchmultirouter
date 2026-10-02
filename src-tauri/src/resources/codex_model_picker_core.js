@@ -15,36 +15,76 @@
   };
   const normalizeReasoningDescriptor = (descriptor) => {
     if (!descriptor || typeof descriptor !== "object") return descriptor;
-    const defaultEffort =
-      descriptor.defaultReasoningEffort ||
-      descriptor.default_reasoning_level ||
-      descriptor.default_reasoning_effort;
-    if (typeof defaultEffort === "string" && defaultEffort.trim()) {
-      descriptor.defaultReasoningEffort = defaultEffort.trim();
+    const defaultCandidates = [
+      descriptor.defaultReasoningEffort,
+      descriptor.default_reasoning_level,
+      descriptor.default_reasoning_effort,
+    ];
+    const nested = descriptor.reasoning;
+    if (nested && typeof nested === "object") {
+      defaultCandidates.push(
+        nested.defaultEffort,
+        nested.default_effort,
+        nested.defaultReasoningEffort,
+      );
     }
-    const source =
-      descriptor.supportedReasoningEfforts ||
-      descriptor.supportedReasoningLevels ||
-      descriptor.supported_reasoning_levels ||
-      descriptor.supported_reasoning_efforts;
-    if (!Array.isArray(source)) return descriptor;
-    const normalized = source
-      .map((level) => {
-        const effort =
-          typeof level === "string"
-            ? level
-            : level?.reasoningEffort ||
-              level?.reasoning_effort ||
-              level?.effort;
-        if (typeof effort !== "string" || !effort.trim()) return null;
-        const value = effort.trim();
-        const description =
-          typeof level?.description === "string" && level.description.trim()
-            ? level.description.trim()
-            : value;
-        return { effort: value, description };
+    const defaultEffort = defaultCandidates.find(
+      (value) => typeof value === "string" && value.trim(),
+    );
+    const sources = [
+      descriptor.supportedReasoningEfforts,
+      descriptor.supportedReasoningLevels,
+      descriptor.supported_reasoning_levels,
+      descriptor.supported_reasoning_efforts,
+      nested?.supportedEfforts,
+      nested?.supported_efforts,
+    ];
+    const normalized = sources
+      .map((source) => {
+        if (!Array.isArray(source)) return [];
+        const seen = new Set();
+        return source
+          .map((level) => {
+            const effort =
+              typeof level === "string"
+                ? level
+                : level?.reasoningEffort ||
+                  level?.reasoning_effort ||
+                  level?.effort;
+            if (typeof effort !== "string" || !effort.trim()) return null;
+            const value = effort.trim();
+            if (seen.has(value)) return null;
+            seen.add(value);
+            const description =
+              typeof level?.description === "string" && level.description.trim()
+                ? level.description.trim()
+                : value;
+            return { effort: value, description };
+          })
+          .filter(Boolean);
       })
-      .filter(Boolean);
+      .find((levels) => levels.length > 0);
+    if (!normalized) {
+      for (const key of [
+        "defaultReasoningEffort",
+        "default_reasoning_level",
+        "default_reasoning_effort",
+        "supportedReasoningEfforts",
+        "supportedReasoningLevels",
+        "supported_reasoning_levels",
+        "supported_reasoning_efforts",
+      ]) delete descriptor[key];
+      return descriptor;
+    }
+    const requestedDefault =
+      typeof defaultEffort === "string" ? defaultEffort.trim() : "";
+    descriptor.defaultReasoningEffort = normalized.some(
+      ({ effort }) => effort === requestedDefault,
+    )
+      ? requestedDefault
+      : normalized[0].effort;
+    delete descriptor.default_reasoning_level;
+    delete descriptor.default_reasoning_effort;
     descriptor.supportedReasoningEfforts = normalized.map(
       ({ effort, description }) => ({
         reasoningEffort: effort,
@@ -54,6 +94,8 @@
     descriptor.supportedReasoningLevels = normalized.map(
       ({ effort, description }) => ({ effort, description }),
     );
+    delete descriptor.supported_reasoning_levels;
+    delete descriptor.supported_reasoning_efforts;
     return descriptor;
   };
   const modelIdentityValues = (item) => {
