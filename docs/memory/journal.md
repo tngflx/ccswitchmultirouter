@@ -1,5 +1,25 @@
 # Engineering Journal
 
+## 2026-10-04 Centralized packaged Codex launcher identity
+
+What happened: the fresh refork's runtime refresh selected the first matching
+`Get-StartApps` AUMID and duplicated COM activation, so stable and Preview MSIX
+packages could launch the wrong shell. Root cause: launcher identity was not
+bound to the selected executable's manifest application. What we did: ported
+manifest-specific executable-to-AUMID matching into the existing Codex Desktop
+owner, reused that owner from runtime refresh, and retained executable fallback
+for standalone installs. Evidence: `cargo test --manifest-path
+src-tauri/Cargo.toml codex_desktop --lib` (51 passed), `cargo test
+--manifest-path src-tauri/Cargo.toml codex_runtime_refresh --lib` (42 passed, 1
+ignored), `cargo check --manifest-path src-tauri/Cargo.toml`, `pnpm typecheck`,
+and `git diff --check` passed. `cargo fmt --check` still reports the known
+pre-existing formatting differences in `codex_config.rs`, `services/proxy.rs`,
+and `services/provider/mod.rs`;
+no runtime freshness check was performed. What NOT to do again: do not select
+the first Start-menu AUMID when the executable identity is available, and do
+not add a second COM launcher owner. Related:
+`docs/decisions/2026-10-04-packaged-codex-launcher-port.md`.
+
 ## 2026-10-04 Ported shared auto model refresh primitive
 
 What happened: the fresh refork had independent manual model fetch handlers but

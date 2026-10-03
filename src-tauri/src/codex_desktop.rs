@@ -12,6 +12,9 @@ use sha2::{Digest, Sha256};
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
 
+#[path = "codex_windows_launch.rs"]
+mod windows_launch;
+
 pub(crate) const DEFAULT_CODEX_DEBUG_PORT: u16 = 9229;
 pub(crate) const CDP_HTTP_TIMEOUT: Duration = Duration::from_secs(2);
 const CDP_CONNECT_TIMEOUT: Duration = Duration::from_secs(4);
@@ -1789,6 +1792,12 @@ pub(crate) fn launch_codex_with_debug_port(
         .stderr(Stdio::null());
     #[cfg(target_os = "windows")]
     {
+        if let Some(aumid) = windows_launch::resolve_app_id(executable)? {
+            return windows_launch::activate(&aumid, Some(debug_port));
+        }
+    }
+    #[cfg(target_os = "windows")]
+    {
         use std::os::windows::process::CommandExt;
         command.creation_flags(0x08000000);
     }
@@ -1985,6 +1994,12 @@ pub(crate) fn relaunch_codex_desktop_after_takeover() -> Result<(), String> {
         .stderr(Stdio::null());
     #[cfg(target_os = "windows")]
     {
+        if let Some(aumid) = windows_launch::resolve_app_id(&executable)? {
+            return windows_launch::activate(&aumid, None);
+        }
+    }
+    #[cfg(target_os = "windows")]
+    {
         use std::os::windows::process::CommandExt;
         command.creation_flags(0x08000000);
     }
@@ -1994,6 +2009,19 @@ pub(crate) fn relaunch_codex_desktop_after_takeover() -> Result<(), String> {
             crate::codex_egress_timezone::mark_codex_timezone_applied();
         })
         .map_err(|error| format!("failed to relaunch {}: {error}", executable.display()))
+}
+
+#[cfg(target_os = "windows")]
+pub(crate) fn resolve_windows_codex_aumid() -> Result<Option<String>, String> {
+    let Some(executable) = resolve_codex_executable() else {
+        return Ok(None);
+    };
+    windows_launch::resolve_app_id(&executable)
+}
+
+#[cfg(target_os = "windows")]
+pub(crate) fn launch_windows_codex_aumid(aumid: &str, debug_port: u16) -> Result<(), String> {
+    windows_launch::activate(aumid, Some(debug_port))
 }
 
 /// 按常见安装位置寻找 Codex Desktop 可执行文件。

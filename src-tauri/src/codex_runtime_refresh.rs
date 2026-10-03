@@ -851,21 +851,6 @@ async fn query_refresh_targets() -> Result<CodexRuntimeRefreshTargets, String> {
     Ok(classify_refresh_targets(&processes))
 }
 
-#[cfg(target_os = "windows")]
-fn resolve_windows_codex_aumid() -> Option<String> {
-    let output = powershell_utf8_output(
-        r#"
-[Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false)
-Get-StartApps |
-  Where-Object { $_.AppID -match '^OpenAI\.Codex(?:\.Preview)?_.*!App$' } |
-  Select-Object -First 1 -ExpandProperty AppID
-"#,
-    )
-    .ok()?;
-    let aumid = output.lines().next()?.trim();
-    (!aumid.is_empty()).then(|| aumid.to_string())
-}
-
 fn select_launch_target(
     aumid: Option<String>,
     executable: Option<PathBuf>,
@@ -891,7 +876,9 @@ fn resolve_launch_target() -> Option<CodexRuntimeLaunchTarget> {
         crate::codex_egress_timezone::resolve_launch_timezone(&crate::settings::get_settings())
             .is_some();
     #[cfg(target_os = "windows")]
-    let aumid = resolve_windows_codex_aumid();
+    let aumid = crate::codex_desktop::resolve_windows_codex_aumid()
+        .ok()
+        .flatten();
     #[cfg(not(target_os = "windows"))]
     let aumid = None;
     select_launch_target(aumid, executable, timezone_injection_enabled)
@@ -1061,41 +1048,15 @@ fn force_terminate_process(_pid: u32) -> Result<(), String> {
     Err("codex_runtime_refresh_windows_only".to_string())
 }
 
-#[cfg(target_os = "windows")]
-fn launch_windows_aumid(aumid: &str) -> Result<(), String> {
-    use windows::core::HSTRING;
-    use windows::Win32::System::Com::{
-        CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_LOCAL_SERVER,
-        COINIT_APARTMENTTHREADED,
-    };
-    use windows::Win32::UI::Shell::{
-        ApplicationActivationManager, IApplicationActivationManager, AO_NONE,
-    };
-
-    let initialized = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED).is_ok() };
-    let result = (|| -> Result<(), String> {
-        let manager: IApplicationActivationManager =
-            unsafe { CoCreateInstance(&ApplicationActivationManager, None, CLSCTX_LOCAL_SERVER) }
-                .map_err(|error| format!("codex_aumid_activation_manager_failed: {error}"))?;
-        let arguments = HSTRING::from(format!(
-            "--remote-debugging-port={} --remote-allow-origins=http://127.0.0.1:{}",
-            crate::codex_desktop::DEFAULT_CODEX_DEBUG_PORT,
-            crate::codex_desktop::DEFAULT_CODEX_DEBUG_PORT
-        ));
-        unsafe { manager.ActivateApplication(&HSTRING::from(aumid), &arguments, AO_NONE) }
-            .map(|_| ())
-            .map_err(|error| format!("codex_aumid_activation_failed: {error}"))
-    })();
-    if initialized {
-        unsafe { CoUninitialize() };
-    }
-    result
-}
-
 fn launch_codex_target(target: &CodexRuntimeLaunchTarget) -> Result<(), String> {
     match target {
         #[cfg(target_os = "windows")]
-        CodexRuntimeLaunchTarget::WindowsAumid(aumid) => launch_windows_aumid(aumid),
+        CodexRuntimeLaunchTarget::WindowsAumid(aumid) => {
+            crate::codex_desktop::launch_windows_codex_aumid(
+                aumid,
+                crate::codex_desktop::DEFAULT_CODEX_DEBUG_PORT,
+            )
+        }
         CodexRuntimeLaunchTarget::DesktopExecutable(path) => {
             crate::codex_desktop::launch_codex_with_debug_port(
                 path,
