@@ -30,8 +30,12 @@ use crate::{
 };
 use regex::Regex;
 use serde_json::{Map, Value as JsonValue};
-use std::{collections::HashMap, sync::LazyLock};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::{LazyLock, Mutex},
+};
 use toml::Value as TomlValue;
+use uuid::Uuid;
 
 const CODEX_ROUTER_PARENT_PROVIDER_ID: &str = "codexRouterParentProviderId";
 const CODEX_ROUTER_PARENT_PROVIDER_NAME: &str = "codexRouterParentProviderName";
@@ -42,6 +46,17 @@ const CODEX_NATIVE_AUTH_PASSTHROUGH: &str = "codexNativeAuthPassthrough";
 pub(crate) const CODEX_ACCOUNT_POOL_ENABLED: &str = "codexAccountPoolEnabled";
 const QWEN_VLLM_MIN_OUTPUT_TOKENS: u64 = 2_048;
 const RETIRED_QWEN_VLLM_DEFAULT_OUTPUT_TOKENS: u64 = 32_768;
+const CODEX_API_KEY_GROUP_ALIAS_MARKER: &str = "--ccg-";
+
+static CODEX_API_KEY_GROUP_CURSORS: LazyLock<Mutex<HashMap<String, usize>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CodexGroupedKey {
+    NotScoped,
+    Resolved(String),
+    Unresolvable(String),
+}
 
 /// Codex Desktop 看到的 MultiRouter 认证门面。
 ///
@@ -1183,6 +1198,62 @@ pub fn codex_route_target_provider_id(provider: &Provider) -> Option<&str> {
         .filter(|value| !value.is_empty())
 }
 
+fn restore_isolated_key_group_bindings(
+    mut projected_catalog: JsonValue,
+    target_settings: &JsonValue,
+) -> JsonValue {
+    let Some(target_rows) = target_settings
+        .get("modelCatalog")
+        .and_then(|catalog| catalog.get("models"))
+        .and_then(JsonValue::as_array)
+    else {
+        return projected_catalog;
+    };
+    let bindings = target_rows
+        .iter()
+        .filter_map(|row| {
+            let model = row.get("model").and_then(JsonValue::as_str)?.trim();
+            let group_id = row
+                .get("apiKeyGroupId")
+                .or_else(|| row.get("api_key_group_id"))
+                .and_then(JsonValue::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())?;
+            let generated = row
+                .get("apiKeyGroupGenerated")
+                .or_else(|| row.get("api_key_group_generated"))
+                .and_then(JsonValue::as_bool)
+                .unwrap_or(true);
+            Some((model.to_string(), (group_id.to_string(), generated)))
+        })
+        .collect::<HashMap<_, _>>();
+    let Some(rows) = projected_catalog
+        .get_mut("models")
+        .and_then(JsonValue::as_array_mut)
+    else {
+        return projected_catalog;
+    };
+    for row in rows {
+        let Some(model) = row.get("model").and_then(JsonValue::as_str).map(str::trim) else {
+            continue;
+        };
+        let Some((group_id, generated)) = bindings.get(model) else {
+            continue;
+        };
+        if let Some(entry) = row.as_object_mut() {
+            entry.insert(
+                "apiKeyGroupId".to_string(),
+                JsonValue::String(group_id.clone()),
+            );
+            entry.insert(
+                "apiKeyGroupGenerated".to_string(),
+                JsonValue::Bool(*generated),
+            );
+        }
+    }
+    projected_catalog
+}
+
 /// 用 route 命中的真实目标 provider 作为底座，生成本次请求的 effective provider。
 ///
 /// route 引用已有供应商时，base_url、认证、apiFormat、reasoning 等转换配置都应该跟随
@@ -1229,7 +1300,10 @@ pub fn materialize_codex_routed_provider_from_target(
         .and_then(|settings| settings.get("modelCatalog"))
         .cloned()
     {
-        settings.insert("modelCatalog".to_string(), catalog);
+        settings.insert(
+            "modelCatalog".to_string(),
+            restore_isolated_key_group_bindings(catalog, &target_provider.settings_config),
+        );
     }
 
     if let Some(model_override) = route_settings
@@ -4056,6 +4130,281 @@ impl CodexAdapter {
 
         None
     }
+
+    fn third_party_auth_strategy(provider: &Provider) -> AuthStrategy {
+        if codex_provider_uses_anthropic(provider)
+            && provider
+                .meta
+                .as_ref()
+                .and_then(|meta| meta.api_key_field.as_deref())
+                .is_some_and(|field| field.eq_ignore_ascii_case("ANTHROPIC_API_KEY"))
+        {
+            AuthStrategy::Anthropic
+        } else {
+            AuthStrategy::Bearer
+        }
+    }
+
+    fn grouped_key_mode(provider: &Provider) -> &str {
+        provider
+            .settings_config
+            .get("codexApiKeyGroupMode")
+            .or_else(|| provider.settings_config.get("codex_api_key_group_mode"))
+            .and_then(JsonValue::as_str)
+            .filter(|mode| mode.eq_ignore_ascii_case("round_robin"))
+            .unwrap_or("isolated")
+    }
+
+    fn catalog_api_key_group_id<'a>(
+        provider: &'a Provider,
+        request_model: &str,
+    ) -> Option<&'a str> {
+        provider
+            .settings_config
+            .get("modelCatalog")
+            .and_then(|catalog| catalog.get("models"))
+            .and_then(JsonValue::as_array)
+            .and_then(|models| {
+                models.iter().find(|model| {
+                    model
+                        .get("model")
+                        .and_then(JsonValue::as_str)
+                        .is_some_and(|candidate| {
+                            candidate.trim().eq_ignore_ascii_case(request_model.trim())
+                        })
+                })
+            })
+            .and_then(|model| {
+                model
+                    .get("apiKeyGroupId")
+                    .or_else(|| model.get("api_key_group_id"))
+            })
+            .and_then(JsonValue::as_str)
+            .map(str::trim)
+            .filter(|group_id| !group_id.is_empty())
+    }
+
+    fn group_keys(group: &JsonValue) -> Vec<&str> {
+        group
+            .get("apiKeys")
+            .or_else(|| group.get("api_keys"))
+            .and_then(JsonValue::as_array)
+            .map(|keys| {
+                keys.iter()
+                    .filter_map(JsonValue::as_str)
+                    .map(str::trim)
+                    .filter(|key| !key.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn select_key_from_group(
+        provider: &Provider,
+        group: &JsonValue,
+        keys: &[&str],
+    ) -> Option<String> {
+        let group_id = group
+            .get("id")
+            .and_then(JsonValue::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or("default");
+        let strategy = group
+            .get("strategy")
+            .and_then(JsonValue::as_str)
+            .unwrap_or("round_robin");
+        let index = if strategy.eq_ignore_ascii_case("fixed") || keys.len() == 1 {
+            0
+        } else if strategy.eq_ignore_ascii_case("random") {
+            (Uuid::new_v4().as_u128() as usize) % keys.len()
+        } else {
+            let cursor_key = format!("{}:{group_id}", provider.id);
+            let mut cursors = CODEX_API_KEY_GROUP_CURSORS.lock().ok()?;
+            let cursor = cursors.entry(cursor_key).or_insert(0);
+            let index = *cursor % keys.len();
+            *cursor = cursor.wrapping_add(1);
+            index
+        };
+        keys.get(index).map(|key| (*key).to_string())
+    }
+
+    fn grouped_match_specificity(group: &JsonValue, model: &str) -> usize {
+        if group
+            .get("models")
+            .and_then(JsonValue::as_array)
+            .is_some_and(|models| {
+                models.iter().any(|value| {
+                    value
+                        .as_str()
+                        .is_some_and(|candidate| candidate.trim().eq_ignore_ascii_case(model))
+                })
+            })
+        {
+            return 1_000_000;
+        }
+        group
+            .get("prefixes")
+            .and_then(JsonValue::as_array)
+            .map(|prefixes| {
+                prefixes
+                    .iter()
+                    .filter_map(JsonValue::as_str)
+                    .map(str::trim)
+                    .filter(|prefix| {
+                        !prefix.is_empty()
+                            && model
+                                .get(..prefix.len())
+                                .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
+                    })
+                    .map(str::len)
+                    .max()
+                    .unwrap_or(0)
+            })
+            .filter(|length| *length > 0)
+            .map(|length| 100_000 + length)
+            .unwrap_or(0)
+    }
+
+    fn extract_grouped_key(
+        &self,
+        provider: &Provider,
+        request_model: &str,
+        outbound_model: &str,
+    ) -> CodexGroupedKey {
+        let Some(groups) = provider
+            .settings_config
+            .get("codexApiKeyGroups")
+            .or_else(|| provider.settings_config.get("codex_api_key_groups"))
+            .and_then(JsonValue::as_array)
+        else {
+            return CodexGroupedKey::NotScoped;
+        };
+        let request_model = request_model.trim();
+        let outbound_model = outbound_model.trim();
+        if request_model.is_empty() || outbound_model.is_empty() {
+            return CodexGroupedKey::NotScoped;
+        }
+
+        if Self::grouped_key_mode(provider) == "isolated" {
+            let Some(group_id) = Self::catalog_api_key_group_id(provider, request_model) else {
+                if request_model
+                    .to_ascii_lowercase()
+                    .contains(CODEX_API_KEY_GROUP_ALIAS_MARKER)
+                {
+                    return CodexGroupedKey::Unresolvable(format!(
+                        "model `{request_model}` is a key-group-scoped catalog alias but its catalog row has no `apiKeyGroupId`; refusing to fall back to the provider API key"
+                    ));
+                }
+                return CodexGroupedKey::NotScoped;
+            };
+            let mut matches = groups.iter().filter(|group| {
+                group
+                    .get("id")
+                    .and_then(JsonValue::as_str)
+                    .is_some_and(|candidate| candidate.trim() == group_id)
+            });
+            let Some(group) = matches.next() else {
+                return CodexGroupedKey::Unresolvable(format!(
+                    "model `{request_model}` is bound to key group `{group_id}`, but that group no longer exists"
+                ));
+            };
+            if matches.next().is_some() {
+                return CodexGroupedKey::Unresolvable(format!(
+                    "model `{request_model}` is bound to key group `{group_id}`, but duplicate groups share that id"
+                ));
+            }
+            if group.get("enabled").and_then(JsonValue::as_bool) == Some(false) {
+                return CodexGroupedKey::Unresolvable(format!(
+                    "model `{request_model}` is bound to key group `{group_id}`, but that group is disabled"
+                ));
+            }
+            let keys = Self::group_keys(group);
+            if keys.is_empty() {
+                return CodexGroupedKey::Unresolvable(format!(
+                    "model `{request_model}` is bound to key group `{group_id}`, but that group has no API keys"
+                ));
+            }
+            return Self::select_key_from_group(provider, group, &keys)
+                .map(CodexGroupedKey::Resolved)
+                .unwrap_or_else(|| {
+                    CodexGroupedKey::Unresolvable(format!(
+                        "model `{request_model}` is bound to key group `{group_id}`, but no usable key was selected"
+                    ))
+                });
+        }
+
+        let mut selected_specificity = 0;
+        let mut selected_groups = Vec::new();
+        for group in groups {
+            if group.get("enabled").and_then(JsonValue::as_bool) == Some(false)
+                || Self::group_keys(group).is_empty()
+            {
+                continue;
+            }
+            let specificity = Self::grouped_match_specificity(group, outbound_model);
+            if specificity == 0 {
+                continue;
+            }
+            if specificity > selected_specificity {
+                selected_specificity = specificity;
+                selected_groups.clear();
+                selected_groups.push(group);
+            } else if specificity == selected_specificity {
+                selected_groups.push(group);
+            }
+        }
+        if selected_groups.is_empty() {
+            return CodexGroupedKey::NotScoped;
+        }
+        let mut keys = self.extract_key(provider).into_iter().collect::<Vec<_>>();
+        keys.extend(
+            selected_groups
+                .iter()
+                .flat_map(|group| Self::group_keys(group))
+                .map(ToString::to_string),
+        );
+        let mut seen = HashSet::new();
+        keys.retain(|key| seen.insert(key.clone()));
+        if keys.is_empty() {
+            return CodexGroupedKey::NotScoped;
+        }
+        let cursor_key = format!(
+            "{}:pooled:{}:{}",
+            provider.id,
+            selected_specificity,
+            outbound_model.to_ascii_lowercase()
+        );
+        let Ok(mut cursors) = CODEX_API_KEY_GROUP_CURSORS.lock() else {
+            return CodexGroupedKey::NotScoped;
+        };
+        let cursor = cursors.entry(cursor_key).or_insert(0);
+        let index = *cursor % keys.len();
+        *cursor = cursor.wrapping_add(1);
+        CodexGroupedKey::Resolved(keys[index].clone())
+    }
+
+    pub(crate) fn resolve_auth_for_request_model(
+        &self,
+        provider: &Provider,
+        request_model: Option<&str>,
+        outbound_model: Option<&str>,
+    ) -> Result<Option<AuthInfo>, ProxyError> {
+        if let (Some(request_model), Some(outbound_model)) = (request_model, outbound_model) {
+            match self.extract_grouped_key(provider, request_model, outbound_model) {
+                CodexGroupedKey::Resolved(key) => {
+                    return Ok(Some(AuthInfo::new(
+                        key,
+                        Self::third_party_auth_strategy(provider),
+                    )));
+                }
+                CodexGroupedKey::Unresolvable(message) => {
+                    return Err(ProxyError::ConfigError(message));
+                }
+                CodexGroupedKey::NotScoped => {}
+            }
+        }
+        Ok(self.extract_auth(provider))
+    }
 }
 
 impl Default for CodexAdapter {
@@ -4162,21 +4511,7 @@ impl ProviderAdapter for CodexAdapter {
         //   ANTHROPIC_AUTH_TOKEN → Authorization: Bearer (default, AuthStrategy::Bearer)
         // The two are mutually exclusive to avoid a 401 from the gateway receiving
         // both auth headers at once. All other Codex upstreams stay pure Bearer.
-        let strategy = if codex_provider_uses_anthropic(provider) {
-            let uses_x_api_key = provider
-                .meta
-                .as_ref()
-                .and_then(|meta| meta.api_key_field.as_deref())
-                .map(|field| field.eq_ignore_ascii_case("ANTHROPIC_API_KEY"))
-                .unwrap_or(false);
-            if uses_x_api_key {
-                AuthStrategy::Anthropic
-            } else {
-                AuthStrategy::Bearer
-            }
-        } else {
-            AuthStrategy::Bearer
-        };
+        let strategy = Self::third_party_auth_strategy(provider);
         self.extract_key(provider)
             .map(|key| AuthInfo::new(key, strategy))
     }
@@ -9486,6 +9821,136 @@ wire_api = "responses"
             compatibility.history_replay,
             crate::protocol_compatibility::HistoryReplay::ResponsesReasoningTextContent
         );
+    }
+
+    #[test]
+    fn isolated_group_resolves_scoped_key_and_unscoped_model_uses_fallback() {
+        let provider = create_provider(json!({
+            "auth": {"OPENAI_API_KEY": "fallback-key"},
+            "codexApiKeyGroupMode": "isolated",
+            "codexApiKeyGroups": [{
+                "id": "astra",
+                "strategy": "fixed",
+                "apiKeys": ["astra-key"],
+                "models": ["upstream/astra"]
+            }],
+            "modelCatalog": {"models": [
+                {"model": "visible", "upstreamModel": "upstream/base"},
+                {
+                    "model": "visible--ccg-astra",
+                    "upstreamModel": "upstream/astra",
+                    "apiKeyGroupId": "astra",
+                    "apiKeyGroupGenerated": true
+                }
+            ]}
+        }));
+        let adapter = CodexAdapter::new();
+
+        assert_eq!(
+            adapter
+                .resolve_auth_for_request_model(
+                    &provider,
+                    Some("visible--ccg-astra"),
+                    Some("upstream/astra"),
+                )
+                .unwrap()
+                .unwrap()
+                .api_key,
+            "astra-key"
+        );
+        assert_eq!(
+            adapter
+                .resolve_auth_for_request_model(&provider, Some("visible"), Some("upstream/base"),)
+                .unwrap()
+                .unwrap()
+                .api_key,
+            "fallback-key"
+        );
+    }
+
+    #[test]
+    fn isolated_group_alias_without_binding_fails_closed() {
+        let provider = create_provider(json!({
+            "auth": {"OPENAI_API_KEY": "fallback-key"},
+            "codexApiKeyGroups": [{
+                "id": "astra",
+                "strategy": "fixed",
+                "apiKeys": ["astra-key"]
+            }],
+            "modelCatalog": {"models": [{
+                "model": "visible--ccg-astra",
+                "upstreamModel": "upstream/astra"
+            }]}
+        }));
+
+        let error = CodexAdapter::new()
+            .resolve_auth_for_request_model(
+                &provider,
+                Some("visible--ccg-astra"),
+                Some("upstream/astra"),
+            )
+            .expect_err("orphaned scoped alias must not use the fallback key");
+        assert!(error.to_string().contains("apiKeyGroupId"));
+    }
+
+    #[test]
+    fn pooled_group_prefers_exact_match_over_prefix_match() {
+        let mut provider = create_provider(json!({
+            "auth": {"OPENAI_API_KEY": "fallback-key"},
+            "codexApiKeyGroupMode": "round_robin",
+            "codexApiKeyGroups": [
+                {
+                    "id": "prefix",
+                    "apiKeys": ["prefix-key"],
+                    "prefixes": ["upstream/"]
+                },
+                {
+                    "id": "exact",
+                    "apiKeys": ["exact-key"],
+                    "models": ["upstream/astra"]
+                }
+            ]
+        }));
+        provider.id = "pooled-specificity-test".to_string();
+        let adapter = CodexAdapter::new();
+        let selected = (0..2)
+            .map(|_| {
+                adapter
+                    .resolve_auth_for_request_model(
+                        &provider,
+                        Some("visible"),
+                        Some("upstream/astra"),
+                    )
+                    .unwrap()
+                    .unwrap()
+                    .api_key
+            })
+            .collect::<HashSet<_>>();
+
+        assert_eq!(
+            selected,
+            HashSet::from(["fallback-key".to_string(), "exact-key".to_string()])
+        );
+        assert!(!selected.contains("prefix-key"));
+    }
+
+    #[test]
+    fn route_catalog_restores_target_group_binding() {
+        let restored = restore_isolated_key_group_bindings(
+            json!({"models": [{
+                "model": "visible--ccg-astra",
+                "upstreamModel": "upstream/astra"
+            }]}),
+            &json!({"modelCatalog": {"models": [{
+                "model": "visible--ccg-astra",
+                "upstreamModel": "upstream/astra",
+                "apiKeyGroupId": "astra",
+                "apiKeyGroupGenerated": true
+            }]}}),
+        );
+
+        assert_eq!(restored["models"][0]["apiKeyGroupId"], json!("astra"));
+        assert_eq!(restored["models"][0]["apiKeyGroupGenerated"], json!(true));
     }
 
     #[test]

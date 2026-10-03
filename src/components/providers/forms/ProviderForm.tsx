@@ -31,6 +31,8 @@ import type {
   ClaudeApiFormat,
   CodexApiFormat,
   CodexCatalogModel,
+  CodexApiKeyGroup,
+  CodexApiKeyGroupMode,
   CodexModelCatalogConfig,
   CodexRoutingConfig,
   CodexChatReasoning,
@@ -165,6 +167,10 @@ import {
   validateCodexOfficialAuthSelection,
 } from "./CodexOfficialAuthSection";
 import { openSettingsTab } from "@/lib/settingsNavigation";
+import {
+  buildCodexApiKeyGroupCatalog,
+  normalizeCodexApiKeyGroupMode,
+} from "./codexApiKeyGroupRouting";
 
 type PresetEntry = {
   id: string;
@@ -808,12 +814,14 @@ function ProviderFormFull({
     codexBaseUrl,
     codexModel,
     codexCatalogModels,
+    codexApiKeyGroups,
     codexSpawnAgentModels,
     codexRouting,
     codexAuthError,
     setCodexAuth,
     setCodexConfig,
     setCodexCatalogModels,
+    setCodexApiKeyGroups,
     setCodexSpawnAgentModels,
     setCodexRouting,
     handleCodexApiKeyChange,
@@ -822,6 +830,20 @@ function ProviderFormFull({
     handleCodexConfigChange: originalHandleCodexConfigChange,
     resetCodexConfig,
   } = useCodexConfigState({ initialData });
+
+  const [codexApiKeyGroupMode, setCodexApiKeyGroupMode] =
+    useState<CodexApiKeyGroupMode>(() =>
+      normalizeCodexApiKeyGroupMode(
+        initialData?.settingsConfig?.codexApiKeyGroupMode,
+      ),
+    );
+  useEffect(() => {
+    setCodexApiKeyGroupMode(
+      normalizeCodexApiKeyGroupMode(
+        initialData?.settingsConfig?.codexApiKeyGroupMode,
+      ),
+    );
+  }, [initialData]);
 
   const initialCodexApiFormat: CodexApiFormat =
     initialData?.meta?.apiFormat === "openai_chat"
@@ -1678,7 +1700,10 @@ function ProviderFormFull({
             }),
           );
         }
-        if (!isXaiOauthProvider && !codexApiKey.trim()) {
+        const hasGroupedCodexKey = codexApiKeyGroups.some((group) =>
+          group.enabled !== false && group.apiKeys.some((key) => key.trim()),
+        );
+        if (!isXaiOauthProvider && !codexApiKey.trim() && !hasGroupedCodexKey) {
           issues.push(
             t("providerForm.apiKeyRequired", {
               defaultValue: "非官方供应商请填写 API Key",
@@ -1796,6 +1821,21 @@ function ProviderFormFull({
         const normalizedCatalogModels = shouldPersistCodexCatalog
           ? normalizeCodexCatalogModelsForSave(codexCatalogModels)
           : [];
+        const normalizedApiKeyGroups: CodexApiKeyGroup[] = codexApiKeyGroups
+          .map((group) => ({
+            ...group,
+            id: group.id.trim(),
+            label: group.label?.trim() || undefined,
+            apiKeys: group.apiKeys.map((key) => key.trim()).filter(Boolean),
+            models: group.models?.map((model) => model.trim()).filter(Boolean),
+            prefixes: group.prefixes?.map((prefix) => prefix.trim()).filter(Boolean),
+          }))
+          .filter((group) => group.id && group.apiKeys.length > 0);
+        const projectedCatalogModels = buildCodexApiKeyGroupCatalog(
+          normalizedCatalogModels,
+          normalizedApiKeyGroups,
+          codexApiKeyGroupMode,
+        );
         const enabledCatalogModels = normalizedCatalogModels.filter(
           (item) => item.enabled !== false,
         );
@@ -1833,10 +1873,12 @@ function ProviderFormFull({
           config: string;
           modelCatalog?: CodexModelCatalogConfig;
           codexRouting?: CodexRoutingConfig;
+          codexApiKeyGroups?: CodexApiKeyGroup[];
+          codexApiKeyGroupMode?: CodexApiKeyGroupMode;
         };
-        if (normalizedCatalogModels.length > 0) {
+        if (projectedCatalogModels.length > 0) {
           configObj.modelCatalog = {
-            models: normalizedCatalogModels,
+            models: projectedCatalogModels,
             ...(normalizedSpawnAgentModels.length > 0
               ? { spawnAgentModels: normalizedSpawnAgentModels }
               : {}),
@@ -1844,6 +1886,10 @@ function ProviderFormFull({
         }
         if (shouldPersistCodexLocalConfig && hasCodexRouting) {
           configObj.codexRouting = codexRouting;
+        }
+        if (normalizedApiKeyGroups.length > 0) {
+          configObj.codexApiKeyGroups = normalizedApiKeyGroups;
+          configObj.codexApiKeyGroupMode = codexApiKeyGroupMode;
         }
         settingsConfig = JSON.stringify(configObj);
       } catch (err) {
@@ -2911,6 +2957,10 @@ function ProviderFormFull({
                 onXaiAccountSelect={setSelectedXaiAccountId}
                 codexApiKey={codexApiKey}
                 onApiKeyChange={handleCodexApiKeyChange}
+                apiKeyGroups={codexApiKeyGroups}
+                onApiKeyGroupsChange={setCodexApiKeyGroups}
+                apiKeyGroupMode={codexApiKeyGroupMode}
+                onApiKeyGroupModeChange={setCodexApiKeyGroupMode}
                 category={category}
                 shouldShowApiKeyLink={shouldShowCodexApiKeyLink}
                 websiteUrl={codexWebsiteUrl}

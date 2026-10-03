@@ -98,10 +98,20 @@ pub(crate) struct CodexThirdPartyRequestPolicy {
     credential_fingerprint: String,
     fingerprint: String,
     is_full_url: bool,
+    request_model: Option<String>,
+    outbound_model: Option<String>,
 }
 
 impl CodexThirdPartyRequestPolicy {
     pub(crate) fn compile(provider: &Provider) -> Result<Self, ProxyError> {
+        Self::compile_for_model(provider, None, None)
+    }
+
+    pub(crate) fn compile_for_model(
+        provider: &Provider,
+        request_model: Option<&str>,
+        outbound_model: Option<&str>,
+    ) -> Result<Self, ProxyError> {
         if provider.uses_managed_account_auth()
             || provider.category.as_deref() == Some("official")
             || super::is_codex_official_provider(provider)
@@ -117,9 +127,13 @@ impl CodexThirdPartyRequestPolicy {
         Url::parse(&base_url).map_err(|_| {
             ProxyError::ConfigError("Codex Provider base_url must be an absolute URL".to_string())
         })?;
-        let auth = adapter.extract_auth(provider).ok_or_else(|| {
-            ProxyError::ConfigError("Codex Provider is missing third-party authentication".into())
-        })?;
+        let auth = adapter
+            .resolve_auth_for_request_model(provider, request_model, outbound_model)?
+            .ok_or_else(|| {
+                ProxyError::ConfigError(
+                    "Codex Provider is missing third-party authentication".into(),
+                )
+            })?;
         let authentication_kind = format!("{:?}", auth.strategy).to_ascii_lowercase();
         let credential_fingerprint =
             sha256_hex(format!("{}:{}", authentication_kind, auth.api_key.trim()).as_bytes());
@@ -155,6 +169,8 @@ impl CodexThirdPartyRequestPolicy {
             credential_fingerprint,
             fingerprint,
             is_full_url,
+            request_model: request_model.map(ToString::to_string),
+            outbound_model: outbound_model.map(ToString::to_string),
         })
     }
 
@@ -163,7 +179,11 @@ impl CodexThirdPartyRequestPolicy {
             .meta
             .get_or_insert_with(ProviderMeta::default)
             .is_full_url = Some(is_full_url);
-        Self::compile(&self.provider)
+        Self::compile_for_model(
+            &self.provider,
+            self.request_model.as_deref(),
+            self.outbound_model.as_deref(),
+        )
     }
 
     pub(crate) fn prepare(

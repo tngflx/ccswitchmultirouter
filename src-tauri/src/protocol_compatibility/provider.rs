@@ -79,8 +79,12 @@ pub(crate) fn compile_provider_probe_candidate_for_model(
     let provider_id = string_field(&provider.settings_config, &["codexRouterParentProviderId"])
         .unwrap_or(provider.id.as_str());
     let route_id = string_field(&provider.settings_config, &["codexResolvedRouteId"]);
-    let request_policy =
-        CodexThirdPartyRequestPolicy::compile(provider).map_err(|error| error.to_string())?;
+    let request_policy = CodexThirdPartyRequestPolicy::compile_for_model(
+        provider,
+        Some(&public_model),
+        Some(&upstream_model),
+    )
+    .map_err(|error| error.to_string())?;
 
     ProbeCandidate::from_request_policy(
         Some(provider_id.to_string()),

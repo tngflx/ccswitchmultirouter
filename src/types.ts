@@ -440,7 +440,25 @@ export interface CodexCatalogModel {
   codex_cache?: CodexCacheConfig;
   // User-defined picker order. Lower values appear first in Codex.
   sortIndex?: number;
+  /** Optional model-scoped credential group binding. */
+  apiKeyGroupId?: string;
+  api_key_group_id?: string;
+  /** Marks rows projected from a credential group rather than user-authored. */
+  apiKeyGroupGenerated?: boolean;
+  api_key_group_generated?: boolean;
 }
+
+export interface CodexApiKeyGroup {
+  id: string;
+  label?: string;
+  apiKeys: string[];
+  models?: string[];
+  prefixes?: string[];
+  enabled?: boolean;
+  strategy?: "fixed" | "round_robin" | "random";
+}
+
+export type CodexApiKeyGroupMode = "isolated" | "round_robin";
 
 export type CodexCacheMode =
   | "openai_prompt_cache"

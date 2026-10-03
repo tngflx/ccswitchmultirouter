@@ -1730,3 +1730,65 @@ fn moonshot_schema_preserves_required_property_additional_properties_constraint(
         json!({"type": "string", "minLength": 2})
     );
 }
+
+fn grouped_provider() -> Provider {
+    let mut provider = third_party_provider("openai_responses");
+    provider.settings_config["codexApiKeyGroupMode"] = json!("isolated");
+    provider.settings_config["codexApiKeyGroups"] = json!([
+        {"id":"astra","apiKeys":["astra-secret"],"models":["upstream/model-v2"]},
+        {"id":"nova","apiKeys":["nova-secret"],"models":["upstream/model-v2"]}
+    ]);
+    provider.settings_config["modelCatalog"] = json!({"models": [
+        {"model":"visible-model--ccg-astra","upstreamModel":"upstream/model-v2","apiKeyGroupId":"astra","apiKeyGroupGenerated":true},
+        {"model":"visible-model--ccg-nova","upstreamModel":"upstream/model-v2","apiKeyGroupId":"nova","apiKeyGroupGenerated":true}
+    ]});
+    provider
+}
+
+#[test]
+fn grouped_credentials_change_policy_fingerprint_and_auth_headers() {
+    let provider = grouped_provider();
+    let astra = CodexThirdPartyRequestPolicy::compile_for_model(
+        &provider,
+        Some("visible-model--ccg-astra"),
+        Some("upstream/model-v2"),
+    )
+    .expect("astra policy compiles");
+    let nova = CodexThirdPartyRequestPolicy::compile_for_model(
+        &provider,
+        Some("visible-model--ccg-nova"),
+        Some("upstream/model-v2"),
+    )
+    .expect("nova policy compiles");
+
+    assert_ne!(
+        astra.credential_fingerprint(),
+        nova.credential_fingerprint()
+    );
+    let astra_headers = astra.auth_header_pairs();
+    let nova_headers = nova.auth_header_pairs();
+    assert!(astra_headers
+        .iter()
+        .any(|(name, value)| { name == AUTHORIZATION && value == "Bearer astra-secret" }));
+    assert!(nova_headers
+        .iter()
+        .any(|(name, value)| { name == AUTHORIZATION && value == "Bearer nova-secret" }));
+}
+
+#[test]
+fn grouped_credential_selection_survives_full_url_recompile() {
+    let provider = grouped_provider();
+    let policy = CodexThirdPartyRequestPolicy::compile_for_model(
+        &provider,
+        Some("visible-model--ccg-astra"),
+        Some("upstream/model-v2"),
+    )
+    .expect("group policy compiles");
+    let before = policy.auth_header_pairs();
+    let after = policy
+        .clone()
+        .with_full_url(true)
+        .expect("full URL policy compiles")
+        .auth_header_pairs();
+    assert_eq!(before, after);
+}

@@ -2691,6 +2691,15 @@ impl RequestForwarder {
             Some(api_format) => super::providers::claude_api_format_needs_transform(api_format),
             None => adapter.needs_transform(provider),
         };
+        let mut codex_credential_model = serde_json::json!({
+            "model": request_model_for_log,
+        });
+        super::providers::apply_codex_upstream_model(provider, &mut codex_credential_model);
+        let codex_upstream_model_for_policy = codex_credential_model
+            .get("model")
+            .and_then(Value::as_str)
+            .unwrap_or(&request_model_for_log)
+            .to_string();
         let codex_third_party_request_policy = if matches!(app_type, AppType::Codex)
             && adapter.name() == "Codex"
             && endpoint.contains("responses")
@@ -2700,7 +2709,13 @@ impl RequestForwarder {
             && !codex_responses_to_messages
             && !codex_responses_to_anthropic
         {
-            Some(super::providers::codex_request::CodexThirdPartyRequestPolicy::compile(provider)?)
+            Some(
+                super::providers::codex_request::CodexThirdPartyRequestPolicy::compile_for_model(
+                    provider,
+                    Some(&request_model_for_log),
+                    Some(&codex_upstream_model_for_policy),
+                )?,
+            )
         } else {
             None
         };
@@ -2710,12 +2725,10 @@ impl RequestForwarder {
             super::providers::codex_request::CodexRequestTransport::Responses
         };
         let codex_request_compatibility = codex_third_party_request_policy.as_ref().map(|_| {
-            let upstream_model = super::providers::codex_provider_upstream_model(provider)
-                .unwrap_or_else(|| request_model_for_log.clone());
             super::providers::resolve_codex_request_compatibility(
                 provider,
                 &request_model_for_log,
-                &upstream_model,
+                &codex_upstream_model_for_policy,
                 if codex_responses_to_chat {
                     crate::protocol_compatibility::TransportKind::OpenAiChat
                 } else {
