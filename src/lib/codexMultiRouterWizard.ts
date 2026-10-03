@@ -576,10 +576,9 @@ export function mergeFetchedModelsIntoWizardProvider(
     options.appendNewModels ??
     (!options.preserveExistingSelection || existingModels.length === 0);
   // An empty catalog has no user selection to preserve, so the first
-  // discovery becomes the initial selected inventory. Once a catalog exists,
-  // newly discovered rows are inventory-only until the user enables them.
-  const disableNewModels =
-    options.preserveExistingSelection && existingModels.length > 0;
+  // discovery becomes the initial selected inventory. Newly discovered rows
+  // are enabled by default; only an explicit persisted `enabled: false` keeps
+  // a model out of routing.
   for (const fetched of fetchedModels) {
     const modelId =
       fetched.id?.trim() ||
@@ -599,9 +598,6 @@ export function mergeFetchedModelsIntoWizardProvider(
     const nextModel = {
       ...(existing ?? {}),
       model: visibleModelId,
-      // Discovery is inventory-only. A newly returned gateway model must not
-      // become routable merely because the upstream listed it.
-      ...(!existing && disableNewModels ? { enabled: false } : {}),
       upstreamModel: nonEmptyWizardModelField(
         existing?.upstreamModel,
         existing?.upstream_model,
@@ -1695,13 +1691,7 @@ export function initialWizardCatalogModelOrder(
     for (const model of readWizardModelCatalog(source).filter(
       isWizardModelEnabled,
     )) {
-      const identities = [
-        model.model,
-        model.upstreamModel,
-        model.upstream_model,
-      ]
-        .filter((identity): identity is string => Boolean(identity?.trim()))
-        .map((identity) => identity.trim().toLowerCase());
+      const identities = wizardModelIdentities(model);
       if (selected && !identities.some((identity) => selected.has(identity))) {
         continue;
       }

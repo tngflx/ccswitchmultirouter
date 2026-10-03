@@ -92,6 +92,7 @@ import {
 import {
   modelBindingIdentityValues,
   modelIdentityValues,
+  type ModelIdentityShape,
 } from "@/lib/modelIdentities";
 import type { CodexGuardianStatus, RequestHealthSnapshot } from "@/types/proxy";
 import { proxyApi } from "@/lib/api/proxy";
@@ -436,6 +437,77 @@ function collectProviderCanonicalModelIds(provider?: Provider): string[] {
   return provider ? collectProviderModelIds(provider) : [];
 }
 
+function normalizedModelIdentity(value: unknown): string {
+  return typeof value === "string" ? value.trim().toLowerCase() : "";
+}
+
+function modelSelectionMatchesCatalogModel(
+  selectedModels: Iterable<string>,
+  catalogModel: ModelIdentityShape,
+): boolean {
+  const selected = new Set(
+    Array.from(selectedModels).map(normalizedModelIdentity).filter(Boolean),
+  );
+  return modelIdentityValues(catalogModel).some((identity) =>
+    selected.has(identity),
+  );
+}
+
+function providerHasModelIdentity(
+  provider: Provider,
+  modelIdentity: string,
+): boolean {
+  const normalized = normalizedModelIdentity(modelIdentity);
+  if (!normalized) return false;
+  const catalogModels = readCodexModelCatalog(provider).models.filter(
+    (model) => model.enabled !== false,
+  );
+  if (catalogModels.length > 0) {
+    return catalogModels.some((model) =>
+      modelIdentityValues(model).includes(normalized),
+    );
+  }
+  return collectProviderCanonicalModelIds(provider).some(
+    (model) => normalizedModelIdentity(model) === normalized,
+  );
+}
+
+function providerModelIdentityMatchesSelection(
+  provider: Provider | undefined,
+  selectedModels: Iterable<string>,
+  modelIdentity: string,
+): boolean {
+  const normalized = normalizedModelIdentity(modelIdentity);
+  if (!normalized) return false;
+  if (!provider) {
+    return Array.from(selectedModels).some(
+      (selected) => normalizedModelIdentity(selected) === normalized,
+    );
+  }
+  const catalogModel = readCodexModelCatalog(provider).models.find(
+    (model) =>
+      model.enabled !== false &&
+      modelIdentityValues(model).includes(normalized),
+  );
+  return catalogModel
+    ? modelSelectionMatchesCatalogModel(selectedModels, catalogModel)
+    : Array.from(selectedModels).some(
+        (selected) => normalizedModelIdentity(selected) === normalized,
+      );
+}
+
+function providerCanonicalModelMatchesSelection(
+  provider: Provider | undefined,
+  selectedModels: Iterable<string>,
+  canonicalModel: string,
+): boolean {
+  return providerModelIdentityMatchesSelection(
+    provider,
+    selectedModels,
+    canonicalModel,
+  );
+}
+
 // 编辑草稿必须保持持久化 route 的身份字段不变。展示名由渲染层解析，不能借
 // 创建草稿的机会写回 label，否则一次仅为查看/保存的 UI 操作会改变旧 route 的
 // 语义回退路径。
@@ -677,6 +749,10 @@ type CodexCatalogModelDraft = {
   enabled?: boolean;
   upstreamModel?: string;
   upstream_model?: string;
+  canonicalSlug?: string;
+  canonical_slug?: string;
+  slug?: string;
+  aliases?: string[];
   displayName?: string;
   display_name?: string;
   providerName?: string;
@@ -715,6 +791,9 @@ function catalogDraftUpstreamModel(model: {
   model?: string;
   upstreamModel?: string;
   upstream_model?: string;
+  canonicalSlug?: string;
+  canonical_slug?: string;
+  slug?: string;
 }): string {
   return (
     (typeof model.upstreamModel === "string" && model.upstreamModel.trim()
@@ -723,6 +802,13 @@ function catalogDraftUpstreamModel(model: {
     (typeof model.upstream_model === "string" && model.upstream_model.trim()
       ? model.upstream_model
       : "") ||
+    (typeof model.canonicalSlug === "string" && model.canonicalSlug.trim()
+      ? model.canonicalSlug
+      : "") ||
+    (typeof model.canonical_slug === "string" && model.canonical_slug.trim()
+      ? model.canonical_slug
+      : "") ||
+    (typeof model.slug === "string" && model.slug.trim() ? model.slug : "") ||
     model.model ||
     ""
   ).trim();
@@ -1169,9 +1255,6 @@ export function providerWithFetchedModelCatalog(
       model: id,
       upstreamModel: fetched.id || fetched.canonicalSlug || fetched.slug || id,
       displayName: id,
-      // A provider refresh discovers inventory, not user-approved catalog
-      // membership. Keep new rows excluded until the user opts them in.
-      enabled: false,
       ...(contextWindow ? { contextWindow } : {}),
       ...(fetched.inputModalities && fetched.inputModalities.length > 0
         ? {
@@ -1224,9 +1307,7 @@ export function providerWithCatalogModelVisibility(
   if (!target) return null;
   const models = readCodexModelCatalog(provider).models;
   const index = models.findIndex((model) =>
-    [model.model, model.upstreamModel, model.upstream_model].some(
-      (value) => value?.trim().toLowerCase() === target,
-    ),
+    modelIdentityValues(model).includes(target),
   );
   if (index < 0) return null;
   return {
@@ -1269,27 +1350,12 @@ export function providersWithCatalogModelVisibilityForRoutes(
       Object.entries(aliases).find(
         ([alias]) => alias.trim().toLowerCase() === targetIdentity,
       )?.[1] ?? target;
-    const canonicalIdentitySet = new Set(
-      readCodexModelCatalog(provider)
-        .models.filter((model) => model.enabled !== false)
-        .filter((model) =>
-          [model.model, model.upstreamModel, model.upstream_model].some(
-            (identity) =>
-              identity?.trim().toLowerCase() ===
-              canonicalModel.trim().toLowerCase(),
-          ),
-        )
-        .flatMap((model) =>
-          [model.model, model.upstreamModel, model.upstream_model]
-            .map((identity) => identity?.trim().toLowerCase())
-            .filter((identity): identity is string => Boolean(identity)),
-        ),
-    );
-    canonicalIdentitySet.add(canonicalModel.trim().toLowerCase());
     if (
       route.modelSelection?.mode === "include" &&
-      !route.modelSelection.models.some((model) =>
-        canonicalIdentitySet.has(model.trim().toLowerCase()),
+      !providerCanonicalModelMatchesSelection(
+        provider,
+        route.modelSelection.models,
+        canonicalModel,
       )
     ) {
       continue;
@@ -1958,6 +2024,15 @@ function catalogDraftFromSourceModel(
   return {
     model: id,
     ...(upstreamModel && upstreamModel !== id ? { upstreamModel } : {}),
+    ...(source?.canonicalSlug
+      ? { canonicalSlug: source.canonicalSlug }
+      : source?.canonical_slug
+        ? { canonical_slug: source.canonical_slug }
+        : {}),
+    ...(source?.slug ? { slug: source.slug } : {}),
+    ...(Array.isArray(source?.aliases) && source.aliases.length > 0
+      ? { aliases: [...source.aliases] }
+      : {}),
     ...(displayName ? { displayName } : {}),
     ...(providerName ? { providerName } : {}),
     ...(contextWindow ? { contextWindow } : {}),
@@ -2591,28 +2666,18 @@ export function buildModelCatalogForRoutes(
     const disabledTargetIdentities = new Set(
       targetCatalogModels
         .filter((catalogModel) => catalogModel.enabled === false)
-        .flatMap((catalogModel) => [
-          catalogModel.model,
-          catalogModel.upstreamModel,
-          catalogModel.upstream_model,
-        ])
-        .map((value) => value?.trim().toLowerCase())
-        .filter((value): value is string => Boolean(value)),
+        .flatMap((catalogModel) => modelIdentityValues(catalogModel)),
     );
-    const selectedModels = new Set(
+    const selectedModels =
       route.modelSelection?.mode === "include"
-        ? route.modelSelection.models.map((model) => model.trim().toLowerCase())
-        : [],
-    );
+        ? route.modelSelection.models
+        : [];
     const routableCatalogModels = targetCatalogModels.filter((catalogModel) => {
       if (catalogModel.enabled === false) return false;
       if (isSchemaV2) {
         return (
           route.modelSelection?.mode !== "include" ||
-          selectedModels.has(catalogModel.model.trim().toLowerCase()) ||
-          selectedModels.has(
-            catalogDraftUpstreamModel(catalogModel).toLowerCase(),
-          )
+          modelSelectionMatchesCatalogModel(selectedModels, catalogModel)
         );
       }
       return (
@@ -3070,6 +3135,9 @@ function routeProviderModelSyncSummary(
   provider?: Provider,
 ): string | null {
   if (!provider) return null;
+  const providerCatalogModels = readCodexModelCatalog(provider).models.filter(
+    (model) => model.enabled !== false,
+  );
   const providerModels = collectProviderCanonicalModelIds(provider);
   if (route.modelSelection?.mode !== "include") {
     return tr("codexRouterWorkspace.s050", {
@@ -3079,13 +3147,24 @@ function routeProviderModelSyncSummary(
     });
   }
 
-  const selected = new Set(
-    route.modelSelection.models.map((model) => model.trim()).filter(Boolean),
+  const selected = route.modelSelection.models;
+  const connected = providerModels.filter((model) =>
+    providerCanonicalModelMatchesSelection(provider, selected, model),
   );
-  const connected = providerModels.filter((model) => selected.has(model));
-  const excluded = providerModels.filter((model) => !selected.has(model));
-  const stale = Array.from(selected).filter(
-    (model) => !providerModels.includes(model),
+  const excluded = providerModels.filter(
+    (model) =>
+      !providerCanonicalModelMatchesSelection(provider, selected, model),
+  );
+  const stale = Array.from(selected).filter((model) =>
+    providerCatalogModels.length > 0
+      ? !providerCatalogModels.some((catalogModel) =>
+          modelSelectionMatchesCatalogModel([model], catalogModel),
+        )
+      : !providerModels.some(
+          (providerModel) =>
+            normalizedModelIdentity(providerModel) ===
+            normalizedModelIdentity(model),
+        ),
   );
   const parts = [
     tr("codexRouterWorkspace.s051", {
@@ -4300,20 +4379,11 @@ export function CodexRouterWorkspacePage({
         if (route.modelSelection?.mode === "all") return true;
         if (route.modelSelection?.mode === "include") {
           const target = routeTargetProvider(route, providersById);
-          const selected = new Set(
-            route.modelSelection.models.map((value) =>
-              value.trim().toLowerCase(),
-            ),
-          );
-          const normalizedTarget = aliasTarget.trim().toLowerCase();
-          if (selected.has(normalizedTarget)) return true;
           if (
-            readCodexModelCatalog(target ?? null).models.some(
-              (catalogModel) =>
-                catalogModel.enabled !== false &&
-                selected.has(catalogModel.model.trim().toLowerCase()) &&
-                catalogDraftUpstreamModel(catalogModel).toLowerCase() ===
-                  normalizedTarget,
+            providerModelIdentityMatchesSelection(
+              target,
+              route.modelSelection.models,
+              aliasTarget,
             )
           ) {
             return true;
@@ -4325,10 +4395,8 @@ export function CodexRouterWorkspacePage({
       return readCodexModelCatalog(target ?? null)
         .models.filter((catalogModel) => catalogModel.enabled !== false)
         .some((catalogModel) => {
-          const candidate = catalogModel.model?.trim();
-          const upstream = catalogDraftUpstreamModel(catalogModel);
-          return [candidate, upstream].some(
-            (value) => value?.toLowerCase() === model.toLowerCase(),
+          return modelIdentityValues(catalogModel).includes(
+            normalizedModelIdentity(model),
           );
         });
     });
@@ -7455,17 +7523,20 @@ function RouteCandidatePicker({
       const enabled = enabledIds.has(candidate.id);
       const draft =
         routeDraftsById[candidate.id] ?? createRoutePolicyDraft(candidate);
-      const canonicalModels = collectProviderCanonicalModelIds(
-        candidate.canonicalProvider,
-      );
-      const canonicalSet = new Set(canonicalModels);
       const aliasesResult = parseRouteAliases(draft.aliasesText);
       if (aliasesResult.error) {
         setRoutePolicyError(aliasesResult.error);
         return;
       }
       for (const upstreamModel of Object.values(aliasesResult.aliases)) {
-        if (enabled && !canonicalSet.has(upstreamModel)) {
+        if (
+          enabled &&
+          (!candidate.canonicalProvider ||
+            !providerHasModelIdentity(
+              candidate.canonicalProvider,
+              upstreamModel,
+            ))
+        ) {
           setRoutePolicyError(
             tr("codexRouterWorkspace.s193", {
               defaultValue: "别名目标“{{arg0}}”不在目标供应商的上游模型列表中",
@@ -7812,7 +7883,11 @@ function RouteCandidatePicker({
                                 defaultValue: "选择上游模型 {{arg0}}",
                                 arg0: model,
                               })}
-                              checked={modelSelection.models.includes(model)}
+                              checked={providerCanonicalModelMatchesSelection(
+                                candidate.canonicalProvider,
+                                modelSelection.models,
+                                model,
+                              )}
                               onChange={(event) =>
                                 updateRoutePolicyDraft(
                                   candidate.id,
@@ -7827,7 +7902,12 @@ function RouteCandidatePicker({
                                           new Set([...selection, model]),
                                         )
                                       : selection.filter(
-                                          (item) => item !== model,
+                                          (item) =>
+                                            !providerCanonicalModelMatchesSelection(
+                                              candidate.canonicalProvider,
+                                              [item],
+                                              model,
+                                            ),
                                         );
                                     return {
                                       ...current,

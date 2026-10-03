@@ -2867,7 +2867,7 @@ describe("Codex MultiRouter workspace route persistence helpers", () => {
     ).not.toBeInTheDocument();
   });
 
-  it("keeps newly fetched provider models excluded until explicitly enabled", async () => {
+  it("keeps newly fetched provider models routable by default", async () => {
     const refresh = createDeferred<FetchedModel[]>();
     vi.mocked(fetchModelsForConfig).mockReturnValueOnce(refresh.promise);
     const provider: Provider = {
@@ -2918,16 +2918,13 @@ describe("Codex MultiRouter workspace route persistence helpers", () => {
               savedProvider.settingsConfig?.modelCatalog?.models?.some(
                 (model: CodexCatalogModel) =>
                   model.model === "fresh-route-model" &&
-                  model.enabled === false,
+                  model.enabled !== false,
               ),
           ),
       ).toBe(true),
     );
 
-    expect(screen.queryByText("fresh-route-model")).not.toBeInTheDocument();
-    expect(
-      screen.getByText("未发现模型目录，保存后可在模型源补充目录"),
-    ).toBeInTheDocument();
+    expect(screen.getByText("fresh-route-model")).toBeInTheDocument();
   });
 
   it("updates the Provider catalog without mutating a stale MultiRouter projection", async () => {
@@ -4697,6 +4694,48 @@ describe("Codex MultiRouter workspace route persistence helpers", () => {
     ]);
   });
 
+  it("matches fixed route selections through the full Provider model identity set", () => {
+    const provider: Provider = {
+      id: "sublyx",
+      name: "Sublyx",
+      category: "custom",
+      settingsConfig: {
+        modelCatalog: {
+          models: [
+            {
+              model: "gpt-6.1-sol-sublyx",
+              canonicalSlug: "gpt-6.1-sol",
+              aliases: ["gpt-6.1-sol-latest"],
+            },
+          ],
+        },
+      },
+    };
+    const plan = createDraftRoutingPlan([provider], [provider]);
+    const route = normalizeCodexRouteForSave(
+      {
+        targetProviderId: provider.id,
+        modelSelection: { mode: "include", models: ["gpt-6.1-sol"] },
+        match: { models: ["gpt-6.1-sol-sublyx"], prefixes: [] },
+      },
+      0,
+      new Set<string>(),
+    );
+
+    expect(
+      buildModelCatalogForRoutes(
+        plan,
+        [route],
+        new Map([[provider.id, provider]]),
+      ).models,
+    ).toContainEqual(
+      expect.objectContaining({
+        model: "gpt-6.1-sol-sublyx",
+        canonicalSlug: "gpt-6.1-sol",
+      }),
+    );
+  });
+
   it("preserves isolated API key group identity in the MultiRouter catalog", () => {
     const provider: Provider = {
       id: "sublyx",
@@ -4934,7 +4973,7 @@ describe("Codex MultiRouter workspace route persistence helpers", () => {
     );
   });
 
-  it("keeps newly discovered models excluded when initializing an empty catalog", () => {
+  it("enables newly discovered models when initializing an empty catalog", () => {
     const provider: Provider = {
       id: "empty-catalog-source",
       name: "Empty Catalog Source",
@@ -4946,13 +4985,14 @@ describe("Codex MultiRouter workspace route persistence helpers", () => {
       { id: "new-model", ownedBy: null },
     ]);
 
-    expect(refreshed.settingsConfig?.modelCatalog?.models).toEqual([
+    const [model] = refreshed.settingsConfig?.modelCatalog?.models ?? [];
+    expect(model).toEqual(
       expect.objectContaining({
         model: "new-model",
         upstreamModel: "new-model",
-        enabled: false,
       }),
-    ]);
+    );
+    expect(model?.enabled).not.toBe(false);
   });
 
   it("preserves catalog model casing in projected spawn-agent candidates", () => {

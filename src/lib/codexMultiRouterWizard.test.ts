@@ -190,7 +190,7 @@ describe("mergeFetchedModelsIntoWizardProvider", () => {
     expect(merged.settingsConfig.modelCatalog?.models).toHaveLength(1);
   });
 
-  it("keeps newly fetched grouped-provider models inventory-only until selected", () => {
+  it("includes newly fetched grouped-provider models in the routable inventory by default", () => {
     const source: Provider = {
       ...deepseekSource,
       id: "sublyx",
@@ -223,21 +223,18 @@ describe("mergeFetchedModelsIntoWizardProvider", () => {
     expect(
       refreshed.settingsConfig.modelCatalog?.models
         .slice(1)
-        .every((model: CodexCatalogModel) => model.enabled === false),
+        .every((model: CodexCatalogModel) => model.enabled !== false),
     ).toBe(true);
 
     const result = buildCodexMultiRouterWizardPlan([refreshed], [refreshed]);
     const route = result.plan.settingsConfig.codexRouting?.routes?.[0];
-    expect(route?.modelSelection).toEqual({
-      mode: "include",
-      models: ["fallback-model"],
-    });
+    expect(route?.modelSelection).toEqual({ mode: "all" });
     expect(
       result.persistedSourceProviders[0].settingsConfig.modelCatalog?.models,
     ).toEqual(refreshed.settingsConfig.modelCatalog?.models);
   });
 
-  it("keeps a large fetched inventory from becoming the full routable catalog", () => {
+  it("persists a large fetched inventory without silently capping the catalog", () => {
     const selectedModels = Array.from({ length: 9 }, (_, index) => ({
       model: `sublyx-selected-${index + 1}`,
       upstreamModel: `sublyx-selected-${index + 1}`,
@@ -278,11 +275,8 @@ describe("mergeFetchedModelsIntoWizardProvider", () => {
       persistedModels.filter(
         (model: CodexCatalogModel) => model.enabled !== false,
       ),
-    ).toHaveLength(9);
-    expect(route?.modelSelection).toEqual({
-      mode: "include",
-      models: selectedModels.map((model) => model.model),
-    });
+    ).toHaveLength(34);
+    expect(route?.modelSelection).toEqual({ mode: "all" });
   });
 });
 

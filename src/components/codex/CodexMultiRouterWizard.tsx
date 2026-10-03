@@ -99,6 +99,7 @@ import {
 import type { WorkspaceTab } from "@/components/codex/CodexRouterWorkspacePage";
 import { codexCatalogOnlyPlanModelFetchMessage } from "@/utils/codexPlanModelFetch";
 import { useCodexOauth } from "@/components/providers/forms/hooks/useCodexOauth";
+import { modelIdentityValues } from "@/lib/modelIdentities";
 
 interface CodexMultiRouterWizardProps {
   open: boolean;
@@ -1270,29 +1271,13 @@ export function CodexMultiRouterWizard({
 
   // 切换最终模型池里的保留状态；第一次编辑时从当前完整列表复制一份显式顺序。
   const toggleCatalogModel = (model: CodexCatalogModel, checked: boolean) => {
-    const targetModel = model.model.trim().toLowerCase();
-    const targetUpstream = (
-      model.upstreamModel ??
-      model.upstream_model ??
-      model.model
-    )
-      .trim()
-      .toLowerCase();
+    const targetIdentities = new Set(modelIdentityValues(model));
     const matchingProviderIds = new Set(
       selectionResolvedSources
         .filter((provider) =>
           readRawWizardModelCatalog(provider).some((candidate) => {
-            const candidateModel = candidate.model.trim().toLowerCase();
-            const candidateUpstream = (
-              candidate.upstreamModel ??
-              candidate.upstream_model ??
-              candidate.model
-            )
-              .trim()
-              .toLowerCase();
-            return (
-              candidateModel === targetModel ||
-              candidateUpstream === targetUpstream
+            return modelIdentityValues(candidate).some((identity) =>
+              targetIdentities.has(identity),
             );
           }),
         )
@@ -1304,16 +1289,9 @@ export function CodexMultiRouterWizard({
           if (!matchingProviderIds.has(provider.id)) return provider;
           const models = readRawWizardModelCatalog(provider).map(
             (candidate) => {
-              const candidateModel = candidate.model.trim().toLowerCase();
-              const candidateUpstream = (
-                candidate.upstreamModel ??
-                candidate.upstream_model ??
-                candidate.model
+              return modelIdentityValues(candidate).some((identity) =>
+                targetIdentities.has(identity),
               )
-                .trim()
-                .toLowerCase();
-              return candidateModel === targetModel ||
-                candidateUpstream === targetUpstream
                 ? { ...candidate, enabled: checked }
                 : candidate;
             },

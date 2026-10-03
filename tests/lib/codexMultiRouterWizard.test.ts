@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import type { Provider } from "@/types";
+import type { CodexCatalogModel, Provider } from "@/types";
 import {
   applyWizardConnectivityApiFormatOverrides,
   buildCodexMultiRouterWizardPlan,
@@ -249,6 +249,38 @@ describe("codexMultiRouterWizard helpers", () => {
     ]);
   });
 
+  it("keeps explicit exclusions while enabling newly fetched inventory rows", () => {
+    const source = provider({
+      id: "mixed-selection-source",
+      settingsConfig: {
+        modelCatalog: {
+          models: [{ model: "kept-disabled", enabled: false }],
+        },
+      },
+    });
+
+    const refreshed = mergeFetchedModelsIntoWizardProvider(
+      source,
+      [
+        { id: "kept-disabled", ownedBy: null },
+        { id: "newly-fetched", ownedBy: null },
+      ],
+      { preserveExistingSelection: true, appendNewModels: true },
+    );
+    const models = refreshed.settingsConfig.modelCatalog.models;
+
+    expect(models).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ model: "kept-disabled", enabled: false }),
+        expect.objectContaining({ model: "newly-fetched" }),
+      ]),
+    );
+    expect(
+      models.find((model: CodexCatalogModel) => model.model === "newly-fetched")
+        ?.enabled,
+    ).not.toBe(false);
+  });
+
   it("never removes saved provider models during a wizard metadata refresh", () => {
     const source = provider({
       settingsConfig: {
@@ -312,6 +344,10 @@ describe("codexMultiRouterWizard helpers", () => {
         displayName: "second-model",
       },
     ]);
+
+    expect(
+      buildWizardRoutesFromSources([refreshed])[0]?.modelSelection,
+    ).toEqual({ mode: "all" });
   });
 
   it("preserves fetched official image capability in provider catalog", () => {

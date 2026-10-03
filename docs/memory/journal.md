@@ -1,5 +1,23 @@
 # Engineering Journal (newest first)
 
+## 2026-10-03 - Final verification correction for model catalogue fix
+
+- **What happened:** The stale wizard assertions were updated after the catalogue invariant changed from inventory-only fetched rows to enabled-by-default fetched rows.
+- **Root cause:** The previous test contract still expected nine selected rows and disabled discovery rows, which contradicted the root fix and caused the final frontend run to fail two assertions.
+- **What we did:** Updated the regression tests to require the complete fetched inventory, `enabled !== false` for newly discovered rows, and `mode: all` when no explicit exclusion exists. Preserved explicit disabled rows as the whitelist boundary.
+- **Evidence:** `pnpm test:unit` passed 198 files / 1,680 tests; `pnpm exec tsc --noEmit --pretty false` passed; changed-source/test/decision Prettier checks and `git diff --check` passed; `cargo check --manifest-path src-tauri/Cargo.toml` passed. `cargo test --manifest-path src-tauri/Cargo.toml` was blocked before tests ran because the live process locked `src-tauri/target/debug/cc-switch.exe` (`Access is denied`).
+- **What NOT to do again:** Do not kill the live development process or create an alternate Cargo target to bypass the lock; ask for a normal `pnpm dev` restart before runtime verification.
+- **Related:** `docs/decisions/2026-10-03-model-catalogue-identity.md`
+
+## 2026-10-03 - Unify MultiRouter model identity projections
+
+- **What happened:** `gpt-6.1-sol` could remain in a Provider catalogue and appear in the wizard while the routing workspace treated the route selection as stale or unchecked when the row used a visible alias, upstream binding, canonical slug, or alias.
+- **Root cause:** The database was not dropping the model. Schema-v2 `include` routes intentionally store a fixed whitelist, but workspace projection, sync counts, picker checkbox/toggle logic, alias validation, visibility updates, and preview matching used inconsistent raw visible-ID comparisons. The workspace also dropped canonical/alias metadata while rebuilding catalogue rows.
+- **What we did:** Kept fixed whitelist semantics and disabled-row exclusions. Routed all workspace matching through `modelIdentityValues`, preserved canonical/slug/alias metadata in the projected draft, made newly fetched inventory rows enabled by default, and updated wizard order reconciliation to use the same identity set. Added regressions for a `gpt-6.1-sol` canonical-slug alias and explicit-disabled versus newly fetched rows.
+- **Evidence:** Focused Vitest suites passed 3 files / 214 tests; `pnpm exec tsc --noEmit --pretty false`, Prettier checks for changed source/test/decision files, and `git diff --check` passed. Full frontend tests had already passed 198 files / 1,679 tests before this final test-contract update.
+- **What NOT to do again:** Do not convert existing `include` routes to `all` to hide catalogue mismatches, and do not add model-specific exceptions when the shared identity contract is the owning boundary.
+- **Related:** `docs/decisions/2026-10-03-model-catalogue-identity.md`
+
 ## 2026-10-02 - Narrowed approval pauses to high-impact changes
 
 - **What happened:** Repository guidance required explicit approval before any
