@@ -129,6 +129,7 @@ pub enum ReasoningSource {
 pub enum HistoryReplay {
     ChatReasoningContent,
     ResponsesReasoningTextContent,
+    ResponsesReasoningSummaryOnly,
     Omit,
     #[default]
     NativeOnly,

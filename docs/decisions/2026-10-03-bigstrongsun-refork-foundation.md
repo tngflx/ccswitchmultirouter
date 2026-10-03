@@ -56,6 +56,15 @@ Port order:
 - `cargo check --manifest-path src-tauri/Cargo.toml`: passed on the clean fresh foundation on 2026-10-03.
 - `pnpm install --frozen-lockfile`: passed on 2026-10-03.
 - `pnpm typecheck`: passed on the clean fresh foundation on 2026-10-03.
+- First provider-contract slice: legacy `reasoningContentMode` is retained for data
+  compatibility and translated into the canonical `HistoryReplay` request policy.
+- `cargo test --manifest-path src-tauri/Cargo.toml proxy::providers::codex_request_tests --lib`:
+  33 passed, 0 failed on 2026-10-03.
+- Focused metadata and compatibility resolver tests: 2 passed, 0 failed on 2026-10-03.
+- `pnpm test:unit --run src/lib/codexProtocolSettings.test.ts src/components/providers/forms/CodexProtocolAdvancedSettings.test.tsx tests/utils/providerMetaUtils.test.ts`:
+  3 files and 12 tests passed on 2026-10-03.
+- Post-slice `cargo check --manifest-path src-tauri/Cargo.toml`: passed on 2026-10-03.
+- Post-slice `pnpm typecheck`: passed on 2026-10-03.
 - Feature parity, data migration, targeted tests, full suites, and live runtime verification: not yet run.
 
 ## Open approval or runtime gaps
@@ -65,4 +74,5 @@ No additional approval is required for the requested fresh-refork migration. Des
 ## Status history (append-only)
 
 - 2026-10-03: Decision approved by the user's explicit fresh-refork and replacement instruction. Fresh target cloned and clean baseline compile/type checks passed; implementation marked in-progress and verification partial.
+- 2026-10-03: Ported the first provider/request contract slice. Canonical protocol settings own runtime behavior; legacy reasoning metadata is a compatibility input and is removed by canonical saves. Targeted backend/frontend tests and compile/type checks passed; overall migration remains in-progress.
 

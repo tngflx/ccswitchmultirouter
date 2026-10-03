@@ -13,6 +13,7 @@ import type {
   CodexReasoningProjection,
   CodexToolSchemaDialect,
 } from "@/types";
+import { useTranslation } from "react-i18next";
 
 interface CodexProtocolAdvancedSettingsProps {
   mode: CodexProtocolMode;
@@ -39,6 +40,8 @@ export function CodexProtocolAdvancedSettings({
   onToolSchemaDialectChange,
   onHistoryReplayChange,
 }: CodexProtocolAdvancedSettingsProps) {
+  const { t } = useTranslation();
+
   return (
     <div className="space-y-3 rounded-md border border-border-default p-3">
       <p className="text-xs leading-relaxed text-muted-foreground">
@@ -146,6 +149,9 @@ export function CodexProtocolAdvancedSettings({
                   <SelectItem value="native_only">原生 Responses</SelectItem>
                   <SelectItem value="responses_reasoning_text_content">
                     reasoning_text content 兼容
+                  </SelectItem>
+                  <SelectItem value="responses_reasoning_summary_only">
+                    {t("provider.codexHistoryReplaySummaryOnly")}
                   </SelectItem>
                   <SelectItem value="omit">不回放推理项</SelectItem>
                 </SelectContent>

@@ -142,6 +142,7 @@ export type CodexHistoryReplay =
   | "chat_reasoning_content"
   | "native_only"
   | "responses_reasoning_text_content"
+  | "responses_reasoning_summary_only"
   | "omit";
 
 export interface AuthBinding {
@@ -257,6 +258,8 @@ export interface ProviderMeta {
   codexReasoningProjection?: CodexReasoningProjection;
   codexToolSchemaDialect?: CodexToolSchemaDialect;
   codexHistoryReplay?: CodexHistoryReplay;
+  // Legacy CCSwitchMulti field. Canonical saves replace it with codexHistoryReplay.
+  reasoningContentMode?: string;
   // 通用认证绑定
   authBinding?: AuthBinding;
   // OpenAI Official 的非秘密认证所有权；Token 仍由 Desktop 或 CCSM OAuth 存储持有。

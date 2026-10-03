@@ -103,6 +103,7 @@
     "windowClose": "關閉視窗"
   },
   "provider": {
+    "codexHistoryReplaySummaryOnly": "僅摘要（嚴格 Responses）",
     "connectivityCheck": "檢測連通",
     "tabProvider": "供應商",
     "tabUniversal": "通用供應商",

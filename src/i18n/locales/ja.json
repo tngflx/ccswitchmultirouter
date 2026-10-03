@@ -103,6 +103,7 @@
     "windowClose": "ウィンドウを閉じる"
   },
   "provider": {
+    "codexHistoryReplaySummaryOnly": "要約のみ（厳格な Responses）",
     "connectivityCheck": "接続チェック",
     "tabProvider": "プロバイダー",
     "tabUniversal": "統一プロバイダー",

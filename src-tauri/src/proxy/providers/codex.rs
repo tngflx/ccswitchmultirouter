@@ -1675,6 +1675,7 @@ pub(crate) fn resolve_codex_request_compatibility(
         }
     }
 
+    let mut canonical_history_override = None;
     if provider.uses_manual_codex_protocol() {
         if let Some(dialect) = provider
             .meta
@@ -1684,12 +1685,18 @@ pub(crate) fn resolve_codex_request_compatibility(
         {
             compatibility.tool_schema_dialect = dialect;
         }
-        if let Some(history_replay) = provider
+        canonical_history_override = provider
             .meta
             .as_ref()
             .and_then(|meta| meta.codex_history_replay.as_deref())
-            .and_then(parse_history_replay)
-        {
+            .and_then(parse_history_replay);
+        if let Some(history_replay) = canonical_history_override {
+            compatibility.history_replay = history_replay;
+        }
+    }
+
+    if canonical_history_override.is_none() && transport == TransportKind::OpenAiResponses {
+        if let Some(history_replay) = legacy_reasoning_content_history_replay(provider) {
             compatibility.history_replay = history_replay;
         }
     }
@@ -1786,9 +1793,33 @@ fn parse_history_replay(value: &str) -> Option<HistoryReplay> {
         "responses_reasoning_text_content" | "reasoning_text_content" => {
             Some(HistoryReplay::ResponsesReasoningTextContent)
         }
+        "responses_reasoning_summary_only" | "reasoning_summary_only" => {
+            Some(HistoryReplay::ResponsesReasoningSummaryOnly)
+        }
         "omit" => Some(HistoryReplay::Omit),
         "native_only" | "native" => Some(HistoryReplay::NativeOnly),
         _ => None,
+    }
+}
+
+fn legacy_reasoning_content_history_replay(provider: &Provider) -> Option<HistoryReplay> {
+    let value = provider
+        .meta
+        .as_ref()
+        .and_then(|meta| meta.reasoning_content_mode.as_deref())
+        .or_else(|| {
+            provider
+                .settings_config
+                .get("reasoningContentMode")
+                .or_else(|| provider.settings_config.get("reasoning_content_mode"))
+                .and_then(JsonValue::as_str)
+        })?;
+
+    match value.trim().to_ascii_lowercase().as_str() {
+        "inject" | "inject_content" | "inject-content" | "deepseek" => {
+            Some(HistoryReplay::ResponsesReasoningTextContent)
+        }
+        _ => Some(HistoryReplay::ResponsesReasoningSummaryOnly),
     }
 }
 
@@ -9179,6 +9210,23 @@ wire_api = "responses"
             compatibility.history_replay,
             crate::protocol_compatibility::HistoryReplay::ResponsesReasoningTextContent
         );
+
+        let meta = provider.meta.as_mut().unwrap();
+        meta.codex_protocol_mode = Some(crate::provider::CodexProtocolMode::Manual);
+        meta.codex_history_replay = Some("omit".to_string());
+        let compatibility = resolve_codex_request_compatibility(
+            &provider,
+            "relay-model",
+            "relay-model",
+            TransportKind::OpenAiResponses,
+            &db,
+            100,
+        );
+        assert_eq!(
+            compatibility.history_replay,
+            crate::protocol_compatibility::HistoryReplay::Omit,
+            "canonical manual replay must win over imported legacy metadata"
+        );
     }
 
     #[test]
@@ -9397,6 +9445,46 @@ wire_api = "responses"
         assert_eq!(
             compatibility.history_replay,
             crate::protocol_compatibility::HistoryReplay::Omit
+        );
+    }
+
+    #[test]
+    fn legacy_reasoning_content_mode_maps_into_canonical_history_replay() {
+        let db = Database::memory().expect("memory database");
+        let mut provider = create_provider(json!({
+            "auth": {"OPENAI_API_KEY": "legacy-secret"},
+            "config": "model = \"relay-model\"\nbase_url = \"https://strict-relay.example/v1\"\nwire_api = \"responses\"\n"
+        }));
+        provider.meta = Some(ProviderMeta {
+            reasoning_content_mode: Some("passthrough".to_string()),
+            ..ProviderMeta::default()
+        });
+
+        let compatibility = resolve_codex_request_compatibility(
+            &provider,
+            "relay-model",
+            "relay-model",
+            TransportKind::OpenAiResponses,
+            &db,
+            100,
+        );
+        assert_eq!(
+            compatibility.history_replay,
+            crate::protocol_compatibility::HistoryReplay::ResponsesReasoningSummaryOnly
+        );
+
+        provider.meta.as_mut().unwrap().reasoning_content_mode = Some("inject_content".to_string());
+        let compatibility = resolve_codex_request_compatibility(
+            &provider,
+            "relay-model",
+            "relay-model",
+            TransportKind::OpenAiResponses,
+            &db,
+            100,
+        );
+        assert_eq!(
+            compatibility.history_replay,
+            crate::protocol_compatibility::HistoryReplay::ResponsesReasoningTextContent
         );
     }
 

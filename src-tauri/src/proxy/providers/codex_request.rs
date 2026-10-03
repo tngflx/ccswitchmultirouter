@@ -241,6 +241,11 @@ impl CodexThirdPartyRequestPolicy {
                 HistoryReplay::ResponsesReasoningTextContent => {
                     super::openai_compat::normalize_third_party_responses_reasoning_items(body)
                 }
+                HistoryReplay::ResponsesReasoningSummaryOnly => {
+                    super::openai_compat::normalize_third_party_responses_reasoning_summary_only(
+                        body,
+                    )
+                }
                 HistoryReplay::Omit => omit_responses_reasoning_items(body),
                 HistoryReplay::NativeOnly | HistoryReplay::ChatReasoningContent => body,
             };

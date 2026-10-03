@@ -1047,6 +1047,40 @@ fn reasoning_text_replay_is_opt_in_for_responses_dialect() {
 }
 
 #[test]
+fn reasoning_summary_only_replay_removes_content_but_preserves_summary_and_encryption() {
+    let policy = CodexThirdPartyRequestPolicy::compile(&third_party_provider("openai_responses"))
+        .expect("compile third-party request policy");
+
+    let body = json!({
+        "model": "visible-model",
+        "input": [{
+            "type": "reasoning",
+            "content": [{ "type": "reasoning_text", "text": "Use the strict dialect." }],
+            "encrypted_content": "opaque-replay",
+            "internal_chat_message_metadata_passthrough": { "kind": "desktop" }
+        }]
+    });
+    let prepared = policy
+        .prepare(
+            CodexRequestTransport::Responses,
+            body,
+            CodexRequestOptions {
+                history_replay: Some(HistoryReplay::ResponsesReasoningSummaryOnly),
+                ..CodexRequestOptions::default()
+            },
+        )
+        .expect("prepare summary-only replay request");
+
+    let item = &prepared.body["input"][0];
+    assert!(item.get("content").is_none());
+    assert_eq!(item["summary"][0]["text"], "Use the strict dialect.");
+    assert_eq!(item["encrypted_content"], "opaque-replay");
+    assert!(item
+        .get("internal_chat_message_metadata_passthrough")
+        .is_none());
+}
+
+#[test]
 fn moonshot_schema_requires_an_object_root_even_when_codex_omits_root_type() {
     let policy = CodexThirdPartyRequestPolicy::compile(&third_party_provider("openai_responses"))
         .expect("compile third-party request policy");

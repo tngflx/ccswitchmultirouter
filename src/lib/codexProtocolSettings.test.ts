@@ -84,6 +84,7 @@ describe("Codex protocol settings", () => {
       codexReasoningProjection: "reasoning_summary" as const,
       codexToolSchemaDialect: "moonshot_mfjs" as const,
       codexHistoryReplay: "omit" as const,
+      reasoningContentMode: "inject_content",
       customUserAgent: "keep-me",
     };
     expect(
@@ -163,6 +164,21 @@ describe("Codex protocol settings", () => {
       reasoningProjection: "none",
       toolSchemaDialect: "openai",
       historyReplay: "native_only",
+    });
+
+    expect(
+      readCodexProtocolSettings(
+        {
+          codexProtocolMode: "manual",
+          codexHistoryReplay: "responses_reasoning_summary_only",
+        },
+        "openai_responses",
+      ),
+    ).toEqual({
+      protocolMode: "manual",
+      reasoningProjection: "none",
+      toolSchemaDialect: "openai",
+      historyReplay: "responses_reasoning_summary_only",
     });
 
     expect(

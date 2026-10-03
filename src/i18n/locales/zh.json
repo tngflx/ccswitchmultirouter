@@ -103,6 +103,7 @@
     "windowClose": "关闭窗口"
   },
   "provider": {
+    "codexHistoryReplaySummaryOnly": "仅摘要（严格 Responses）",
     "connectivityCheck": "检测连通",
     "tabProvider": "供应商",
     "tabUniversal": "统一供应商",

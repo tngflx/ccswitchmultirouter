@@ -309,6 +309,40 @@ pub(crate) fn normalize_third_party_responses_reasoning_items(request_body: Valu
     Value::Object(body)
 }
 
+/// Adapt native Responses reasoning history for strict gateways that reject
+/// `reasoning.content` while still accepting summaries and encrypted replay data.
+pub(crate) fn normalize_third_party_responses_reasoning_summary_only(request_body: Value) -> Value {
+    let Value::Object(mut body) = request_body else {
+        return request_body;
+    };
+
+    let Some(items) = body.get_mut("input").and_then(Value::as_array_mut) else {
+        return Value::Object(body);
+    };
+
+    for item in items {
+        let Value::Object(object) = item else {
+            continue;
+        };
+        if object.get("type").and_then(Value::as_str) != Some("reasoning") {
+            continue;
+        }
+
+        let removed_content = object.remove("content");
+        if !codex_oauth_reasoning_summary_has_text(object.get("summary")) {
+            if let Some(summary) = removed_content
+                .as_ref()
+                .and_then(codex_oauth_reasoning_content_to_summary)
+            {
+                object.insert("summary".to_string(), summary);
+            }
+        }
+        object.remove("internal_chat_message_metadata_passthrough");
+    }
+
+    Value::Object(body)
+}
+
 /// 归一化单个 reasoning input item 以适配第三方原生 Responses 上游。
 ///
 /// 参数:

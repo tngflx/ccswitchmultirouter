@@ -47,6 +47,7 @@ export function readCodexProtocolSettings(
   const responsesHistory = [
     "native_only",
     "responses_reasoning_text_content",
+    "responses_reasoning_summary_only",
     "omit",
   ].includes(meta?.codexHistoryReplay ?? "")
     ? (meta?.codexHistoryReplay as CodexHistoryReplay)
@@ -71,6 +72,7 @@ export function buildCodexProtocolMeta(
     codexReasoningProjection: _projection,
     codexToolSchemaDialect: _schema,
     codexHistoryReplay: _history,
+    reasoningContentMode: _legacyHistory,
     ...base
   } = current ?? {};
   const protocolOverrides = Object.fromEntries(

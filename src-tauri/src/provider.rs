@@ -672,9 +672,17 @@ pub struct ProviderMeta {
     )]
     pub codex_tool_schema_dialect: Option<String>,
     /// Advanced-mode Responses reasoning-history replay dialect.
-    /// Supported values: native_only, responses_reasoning_text_content, omit.
+    /// Supported values: native_only, responses_reasoning_text_content,
+    /// responses_reasoning_summary_only, omit.
     #[serde(rename = "codexHistoryReplay", skip_serializing_if = "Option::is_none")]
     pub codex_history_replay: Option<String>,
+    /// Legacy CCSwitchMulti Responses reasoning replay setting.
+    /// New writes should use `codexHistoryReplay`; this remains for imported provider data.
+    #[serde(
+        rename = "reasoningContentMode",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub reasoning_content_mode: Option<String>,
     /// 通用认证绑定（provider_config / managed_account）
     ///
     /// 新代码应只写入该字段；githubAccountId 仅保留兼容读取。
@@ -1275,6 +1283,25 @@ mod tests {
         let value = serde_json::to_value(&meta).expect("serialize ProviderMeta");
 
         assert!(value.get("pricingModelSource").is_none());
+    }
+
+    #[test]
+    fn provider_meta_roundtrips_legacy_reasoning_content_mode() {
+        let meta = ProviderMeta {
+            reasoning_content_mode: Some("passthrough".to_string()),
+            ..ProviderMeta::default()
+        };
+
+        let value = serde_json::to_value(&meta).expect("serialize ProviderMeta");
+        assert_eq!(value["reasoningContentMode"], "passthrough");
+        assert!(value.get("reasoning_content_mode").is_none());
+
+        let decoded: ProviderMeta =
+            serde_json::from_value(value).expect("deserialize ProviderMeta");
+        assert_eq!(
+            decoded.reasoning_content_mode.as_deref(),
+            Some("passthrough")
+        );
     }
 
     #[test]

@@ -103,6 +103,7 @@
     "windowClose": "Close window"
   },
   "provider": {
+    "codexHistoryReplaySummaryOnly": "Summary only (strict Responses)",
     "connectivityCheck": "Connectivity check",
     "tabProvider": "Provider",
     "tabUniversal": "Universal",
