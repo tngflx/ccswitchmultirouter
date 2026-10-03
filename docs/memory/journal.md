@@ -1,5 +1,23 @@
 # Engineering Journal
 
+## 2026-10-03 Centralized Codex catalog reconciliation
+
+What happened: the fresh refork's Codex form had an inline merge that matched
+only one visible/upstream string and treated every fetched model as appendable.
+Root cause: identity aliases and remote metadata had no shared reconciliation
+owner, so refreshes could fail to hydrate equivalent rows or create duplicate
+inventory. What we did: added a pure identity-aware reconciliation utility and
+delegated the existing form merge helper to it; disabled/manual rows remain
+user-owned, metadata hydration is conservative, and newly discovered models are
+added as disabled inventory. Automatic refresh remains a separate lifecycle
+decision. Evidence: `pnpm typecheck`,
+`pnpm exec vitest run src/lib/codexCatalogReconciliation.test.ts` (3 tests), and
+`git diff --check` passed. Runtime freshness was not checked because no rebuilt
+desktop process was requested. What NOT to do again: do not copy the legacy
+Codex form or add a second persistence path when the fresh form already owns
+state and save behavior. Related:
+`docs/decisions/2026-10-03-codex-catalog-reconciliation-port.md`.
+
 ## 2026-10-03 Kept official Codex proxy sessions in stable history buckets
 
 What happened: the fresh refork still projected official Codex takeover through

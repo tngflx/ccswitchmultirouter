@@ -67,6 +67,7 @@ import {
   type CodexProtocolChoiceInput,
 } from "@/lib/protocol-lab/codex-overrides";
 import { resolveFetchedCodexModelContextWindow } from "@/utils/codexModelContext";
+import { reconcileFetchedCodexCatalogRows } from "@/lib/codexCatalogReconciliation";
 import {
   codexPlanModelListAction,
   codexCatalogOnlyPlanModelFetchMessage,
@@ -651,63 +652,17 @@ function mergeFetchedModelsIntoCatalogRows(
     websiteUrl?: string;
   } = {},
 ): CodexCatalogRow[] {
-  const next = [...rows];
-  const rowByFetchedModel = new Map<
-    string,
-    { row: CodexCatalogRow; index: number }
-  >();
-  next.forEach((row, index) => {
-    const upstreamModel = catalogRowUpstreamModel(row);
-    if (upstreamModel) {
-      rowByFetchedModel.set(upstreamModel, { row, index });
-    }
-    const visibleModel = row.model.trim();
-    if (visibleModel && !rowByFetchedModel.has(visibleModel)) {
-      rowByFetchedModel.set(visibleModel, { row, index });
-    }
-  });
-
-  for (const fetched of fetchedModels) {
-    const model = fetched.id.trim();
-    if (!model) continue;
-    const contextWindow = resolveFetchedCodexModelContextWindow(fetched, {
-      ...source,
-      existingModels: rows,
-    });
-    const contextWindowText = contextWindow ? String(contextWindow) : undefined;
-    const capabilityPatch: Partial<CodexCatalogModel> = {
-      ...(Array.isArray(fetched.inputModalities)
-        ? { inputModalities: [...fetched.inputModalities] }
-        : {}),
-      ...(typeof fetched.supportsImage === "boolean"
-        ? { supportsImage: fetched.supportsImage }
-        : {}),
-    };
-    const existing = rowByFetchedModel.get(model);
-    if (existing) {
-      const updatedRow = {
-        ...existing.row,
-        ...(!existing.row.contextWindow && contextWindowText
-          ? { contextWindow: contextWindowText }
-          : {}),
-        ...capabilityPatch,
-      };
-      next[existing.index] = updatedRow;
-      rowByFetchedModel.set(model, { row: updatedRow, index: existing.index });
-      continue;
-    }
-    const row = createCatalogRow({
-      model,
-      upstreamModel: model,
-      displayName: model,
-      ...(contextWindowText ? { contextWindow: contextWindowText } : {}),
-      ...capabilityPatch,
-    });
-    rowByFetchedModel.set(model, { row, index: next.length });
-    next.push(row);
-  }
-
-  return next;
+  const result = reconcileFetchedCodexCatalogRows(
+    rows,
+    fetchedModels,
+    source,
+    {
+      appendNew: true,
+      createRow: (seed) => createCatalogRow(seed),
+      existingMetadataMode: "fill-missing",
+    },
+  );
+  return result.rows;
 }
 
 export function CodexFormFields({
