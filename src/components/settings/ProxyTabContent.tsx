@@ -135,6 +135,19 @@ export function ProxyTabContent({
               onToggleProxy={handleToggleProxy}
               isProxyPending={isProxyPending}
             />
+            <div className="mt-4 border-t border-border/50 pt-4">
+              <ToggleRow
+                icon={<Zap className="h-4 w-4 text-sky-500" />}
+                title={t("settings.advanced.proxy.enableStreamRetry")}
+                description={t(
+                  "settings.advanced.proxy.enableStreamRetryDescription",
+                )}
+                checked={settings.enableStreamRetry ?? true}
+                onCheckedChange={(checked) =>
+                  void onAutoSave({ enableStreamRetry: checked })
+                }
+              />
+            </div>
           </AccordionContent>
         </AccordionItem>
 

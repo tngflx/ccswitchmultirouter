@@ -388,6 +388,8 @@
         "enableFeatureDescription": "开启后，主页面顶部将显示路由和故障转移开关",
         "enableFailoverToggle": "在主页面显示故障转移开关",
         "enableFailoverToggleDescription": "开启后，主页面顶部将独立显示故障转移开关",
+        "enableStreamRetry": "自动重连中断的 Responses 流",
+        "enableStreamRetryDescription": "在发送正文前，代理可使用同一份已定稿请求重连中断的 Responses 流。若供应商不接受流重放，可关闭此项。",
         "running": "运行中",
         "stopped": "已停止"
       },

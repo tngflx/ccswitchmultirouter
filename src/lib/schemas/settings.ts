@@ -34,6 +34,7 @@ export const settingsSchema = z.object({
     })
     .optional(),
   enableLocalProxy: z.boolean().optional(),
+  enableStreamRetry: z.boolean().optional(),
   usageDashboardRefreshIntervalMs: z.number().optional(),
   preserveCodexOfficialAuthOnSwitch: z.boolean().optional(),
   unifyCodexSessionHistory: z.boolean().optional(),

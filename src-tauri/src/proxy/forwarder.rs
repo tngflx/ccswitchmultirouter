@@ -4044,12 +4044,14 @@ impl RequestForwarder {
         // 在 headers/body 被移动之前捕获一份重放工厂，交给下游转换层做
         // 有界重连（见 providers::streaming_retry）。工厂只是重放同一
         // HTTP 请求；是否重试、重试多少次由转换层根据下游状态决定。
-        let stream_reconnect = if should_create_responses_stream_reconnector(
-            app_type,
-            endpoint,
-            request_is_streaming,
-            resolved_claude_api_format.as_deref(),
-        ) {
+        let stream_retry_enabled = crate::settings::get_settings().enable_stream_retry;
+        let stream_reconnect = if stream_retry_enabled
+            && should_create_responses_stream_reconnector(
+                app_type,
+                endpoint,
+                request_is_streaming,
+                resolved_claude_api_format.as_deref(),
+            ) {
             let first_byte_timeout = if self.streaming_first_byte_timeout.is_zero() {
                 timeout
             } else {

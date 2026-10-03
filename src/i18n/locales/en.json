@@ -383,6 +383,8 @@
         "enableFeatureDescription": "When enabled, the routing and failover toggles will appear at the top of the main page",
         "enableFailoverToggle": "Show Failover Toggle on Main Page",
         "enableFailoverToggleDescription": "When enabled, the failover toggle will appear independently at the top of the main page",
+        "enableStreamRetry": "Reconnect interrupted Responses streams",
+        "enableStreamRetryDescription": "Before semantic output is sent, the proxy may reconnect a dropped Responses stream using the same finalized request. Disable this for providers that reject replayed streams.",
         "running": "Running",
         "stopped": "Stopped"
       },

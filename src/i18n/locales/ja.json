@@ -383,6 +383,8 @@
         "enableFeatureDescription": "有効にすると、メインページ上部にルーティングとフェイルオーバーの切り替えが表示されます",
         "enableFailoverToggle": "メインページにフェイルオーバー切り替えを表示",
         "enableFailoverToggleDescription": "有効にすると、メインページ上部にフェイルオーバー切り替えが独立して表示されます",
+        "enableStreamRetry": "中断した Responses ストリームを再接続",
+        "enableStreamRetryDescription": "本文を送信する前に、プロキシは確定済みの同じリクエストで中断した Responses ストリームを再接続できます。再送を拒否するプロバイダーでは無効にしてください。",
         "running": "実行中",
         "stopped": "停止中"
       },

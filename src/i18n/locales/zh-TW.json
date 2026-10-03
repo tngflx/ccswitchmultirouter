@@ -383,6 +383,8 @@
         "enableFeatureDescription": "開啟後，主頁面頂部將顯示路由和故障轉移開關",
         "enableFailoverToggle": "在主頁面顯示故障轉移開關",
         "enableFailoverToggleDescription": "開啟後，主頁面頂部將獨立顯示故障轉移開關",
+        "enableStreamRetry": "自動重連中斷的 Responses 串流",
+        "enableStreamRetryDescription": "在傳送正文前，代理可使用同一份已定稿請求重連中斷的 Responses 串流。若供應商不接受串流重放，可關閉此項。",
         "running": "執行中",
         "stopped": "已停止"
       },

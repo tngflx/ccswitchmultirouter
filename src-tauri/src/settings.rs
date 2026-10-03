@@ -535,6 +535,9 @@ pub struct AppSettings {
     /// Whether to show the failover toggle independently on the main page
     #[serde(default)]
     pub enable_failover_toggle: bool,
+    /// Whether the proxy may reconnect a Responses stream before semantic output.
+    #[serde(default = "default_true")]
+    pub enable_stream_retry: bool,
     /// Whether to show the project profile switcher on the main page header
     #[serde(default = "default_show_profile_switcher")]
     pub show_profile_switcher: bool,
@@ -701,6 +704,7 @@ impl Default for AppSettings {
             usage_confirmed: None,
             usage_dashboard_refresh_interval_ms: None,
             enable_failover_toggle: false,
+            enable_stream_retry: true,
             show_profile_switcher: true,
             preserve_codex_official_auth_on_switch: false,
             unify_codex_session_history: false,
@@ -1500,5 +1504,17 @@ mod tests {
             !decoded.launch_codex_desktop_with_ccswitch,
             "enabling CCSwitchMulti auto-launch must not implicitly start Codex Desktop"
         );
+    }
+
+    #[test]
+    fn stream_retry_defaults_enabled_and_accepts_legacy_settings_payloads() {
+        let defaults = AppSettings::default();
+        assert!(defaults.enable_stream_retry);
+
+        let decoded: AppSettings = serde_json::from_value(serde_json::json!({
+            "enableStreamRetry": false,
+        }))
+        .expect("settings payload");
+        assert!(!decoded.enable_stream_retry);
     }
 }
