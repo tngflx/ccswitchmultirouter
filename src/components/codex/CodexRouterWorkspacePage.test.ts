@@ -4198,6 +4198,41 @@ describe("Codex MultiRouter workspace route persistence helpers", () => {
     );
   });
 
+  it("refreshes an aliased catalog row by its upstream identity", () => {
+    const source: Provider = {
+      id: "aliased-refresh-source",
+      name: "Aliased Refresh Source",
+      category: "custom",
+      settingsConfig: {
+        modelCatalog: {
+          models: [
+            {
+              model: "gpt-6.1-sol-sublyx",
+              upstreamModel: "gpt-6.1-sol",
+              canonicalSlug: "gpt-6.1-sol",
+            },
+          ],
+        },
+      },
+    };
+
+    const refreshed = providerWithFetchedModelCatalog(source, [
+      {
+        id: "GPT-6.1-SOL",
+        ownedBy: "OpenAI",
+        contextWindow: 256000,
+      },
+    ]);
+
+    expect(refreshed.settingsConfig?.modelCatalog?.models).toEqual([
+      expect.objectContaining({
+        model: "gpt-6.1-sol-sublyx",
+        upstreamModel: "gpt-6.1-sol",
+        contextWindow: 256000,
+      }),
+    ]);
+  });
+
   it("applies official reasoning metadata when refreshing an OAuth model", () => {
     const source: Provider = {
       id: "official-source",

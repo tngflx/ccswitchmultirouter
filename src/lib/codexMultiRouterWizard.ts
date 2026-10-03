@@ -26,6 +26,10 @@ import {
   isCodexVolcengineAgentPlanModelFetch,
 } from "@/utils/codexPlanModelFetch";
 import { normalizeCodexSubagentVersion } from "@/utils/codexSubagentVersion";
+import {
+  modelBindingIdentityValues,
+  modelIdentityValues,
+} from "@/lib/modelIdentities";
 
 export const CODEX_MULTI_ROUTER_WIZARD_DISMISSED_KEY =
   "ccswitchmulti.codexMultiRouterWizard.dismissed";
@@ -373,17 +377,9 @@ export function mergeFetchedModelsIntoWizardProvider(
   const byFetchedModel = new Map<string, string>();
   for (const model of existingModels) {
     byModel.set(model.model, model);
-    const visibleModel = model.model?.trim();
-    if (visibleModel) {
-      byFetchedModel.set(visibleModel, model.model);
-    }
-    const upstreamModel = (
-      model.upstreamModel ??
-      model.upstream_model ??
-      model.model
-    )?.trim();
-    if (upstreamModel) {
-      byFetchedModel.set(upstreamModel, model.model);
+    const visibleModel = model.model.trim();
+    for (const identity of modelBindingIdentityValues(model)) {
+      byFetchedModel.set(identity, visibleModel);
     }
   }
   const shouldAppendFetchedModels =
@@ -391,7 +387,10 @@ export function mergeFetchedModelsIntoWizardProvider(
   for (const fetched of fetchedModels) {
     const modelId = fetched.id.trim();
     if (!modelId) continue;
-    const visibleModelId = byFetchedModel.get(modelId) ?? modelId;
+    const visibleModelId =
+      modelIdentityValues(fetched)
+        .map((identity) => byFetchedModel.get(identity))
+        .find((value): value is string => Boolean(value)) ?? modelId;
     const existing = byModel.get(visibleModelId);
     if (!existing && !shouldAppendFetchedModels) continue;
     byModel.set(visibleModelId, {
@@ -418,6 +417,14 @@ export function mergeFetchedModelsIntoWizardProvider(
           }
         : {}),
     });
+    for (const identity of modelIdentityValues({
+      ...fetched,
+      model: visibleModelId,
+      upstreamModel:
+        existing?.upstreamModel ?? existing?.upstream_model ?? modelId,
+    })) {
+      byFetchedModel.set(identity, visibleModelId);
+    }
   }
   const models = Array.from(byModel.values());
   const allowedModels = new Set(models.map((model) => model.model));
@@ -458,8 +465,8 @@ export function collectWizardModelNameCollisions(
     for (const model of readWizardModelCatalog(provider).filter(
       isWizardModelEnabled,
     )) {
-      const upstream =
-        model.upstreamModel ?? model.upstream_model ?? model.model;
+      const identities = modelBindingIdentityValues(model);
+      const upstream = identities[0];
       if (!upstream) continue;
       const owners = ownersByUpstream.get(upstream) ?? [];
       owners.push(provider);
@@ -543,8 +550,7 @@ export function resolveWizardModelNameCollisions(
   const ownersByUpstream = new Map<string, Provider[]>();
   for (const provider of providers) {
     for (const model of readWizardModelCatalog(provider)) {
-      const upstream =
-        model.upstreamModel ?? model.upstream_model ?? model.model;
+      const upstream = modelBindingIdentityValues(model)[0];
       if (!upstream) continue;
       const owners = ownersByUpstream.get(upstream) ?? [];
       owners.push(provider);
@@ -1180,13 +1186,7 @@ export function initialWizardCatalogModelOrder(
           )
         : null;
     for (const model of readWizardModelCatalog(source)) {
-      const identities = [
-        model.model,
-        model.upstreamModel,
-        model.upstream_model,
-      ]
-        .filter((identity): identity is string => Boolean(identity?.trim()))
-        .map((identity) => identity.trim().toLowerCase());
+      const identities = modelIdentityValues(model);
       if (selected && !identities.some((identity) => selected.has(identity))) {
         continue;
       }

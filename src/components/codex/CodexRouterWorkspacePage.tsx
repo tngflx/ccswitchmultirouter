@@ -129,6 +129,10 @@ import {
   isCodexCatalogOnlyPlanModelFetch,
 } from "@/utils/codexPlanModelFetch";
 import { normalizeCodexSubagentVersion } from "@/utils/codexSubagentVersion";
+import {
+  modelBindingIdentityValues,
+  modelIdentityValues,
+} from "@/lib/modelIdentities";
 import { HostedToolsSwitchPanel } from "./HostedToolsSwitchPanel";
 import { CodexSubagentProfileEditor } from "./CodexSubagentProfileEditor";
 import { CodexEgressTimezoneStatusCard } from "./CodexEgressTimezoneStatusCard";
@@ -342,6 +346,65 @@ function routeAliasesText(aliases?: Record<string, string>): string {
 
 function collectProviderCanonicalModelIds(provider?: Provider): string[] {
   return provider ? collectProviderModelIds(provider) : [];
+}
+
+function normalizedModelIdentity(value: unknown): string {
+  return typeof value === "string" ? value.trim().toLowerCase() : "";
+}
+
+function modelSelectionMatchesCatalogModel(
+  selectedModels: Iterable<string>,
+  catalogModel: CodexCatalogModel,
+): boolean {
+  const selected = new Set(
+    Array.from(selectedModels).map(normalizedModelIdentity).filter(Boolean),
+  );
+  return modelIdentityValues(catalogModel).some((identity) =>
+    selected.has(identity),
+  );
+}
+
+function providerHasModelIdentity(
+  provider: Provider,
+  modelIdentity: string,
+): boolean {
+  const normalized = normalizedModelIdentity(modelIdentity);
+  if (!normalized) return false;
+  const catalogModels = readCodexModelCatalog(provider).models.filter(
+    (model) => model.enabled !== false,
+  );
+  if (catalogModels.length > 0) {
+    return catalogModels.some((model) =>
+      modelIdentityValues(model).includes(normalized),
+    );
+  }
+  return collectProviderCanonicalModelIds(provider).some(
+    (model) => normalizedModelIdentity(model) === normalized,
+  );
+}
+
+function providerModelIdentityMatchesSelection(
+  provider: Provider | undefined,
+  selectedModels: Iterable<string>,
+  modelIdentity: string,
+): boolean {
+  const normalized = normalizedModelIdentity(modelIdentity);
+  if (!normalized) return false;
+  if (!provider) {
+    return Array.from(selectedModels).some(
+      (selected) => normalizedModelIdentity(selected) === normalized,
+    );
+  }
+  const catalogModel = readCodexModelCatalog(provider).models.find(
+    (model) =>
+      model.enabled !== false &&
+      modelIdentityValues(model).includes(normalized),
+  );
+  return catalogModel
+    ? modelSelectionMatchesCatalogModel(selectedModels, catalogModel)
+    : Array.from(selectedModels).some(
+        (selected) => normalizedModelIdentity(selected) === normalized,
+      );
 }
 
 // 编辑草稿必须保持持久化 route 的身份字段不变。展示名由渲染层解析，不能借
@@ -567,6 +630,10 @@ type CodexCatalogModelDraft = {
   model: string;
   upstreamModel?: string;
   upstream_model?: string;
+  canonicalSlug?: string;
+  canonical_slug?: string;
+  slug?: string;
+  aliases?: string[] | Record<string, string>;
   displayName?: string;
   display_name?: string;
   contextWindow?: string | number;
@@ -598,10 +665,16 @@ function catalogDraftUpstreamModel(model: {
   model?: string;
   upstreamModel?: string;
   upstream_model?: string;
+  canonicalSlug?: string;
+  canonical_slug?: string;
+  slug?: string;
 }): string {
   return (
     model.upstreamModel ??
     model.upstream_model ??
+    model.canonicalSlug ??
+    model.canonical_slug ??
+    model.slug ??
     model.model ??
     ""
   ).trim();
@@ -854,6 +927,10 @@ export function providerWithFetchedModelCatalog(
       model: id ?? "",
       ...(model.upstreamModel ? { upstreamModel: model.upstreamModel } : {}),
       ...(model.upstream_model ? { upstream_model: model.upstream_model } : {}),
+      ...(model.canonicalSlug ? { canonicalSlug: model.canonicalSlug } : {}),
+      ...(model.canonical_slug ? { canonical_slug: model.canonical_slug } : {}),
+      ...(model.slug ? { slug: model.slug } : {}),
+      ...(model.aliases ? { aliases: model.aliases } : {}),
       ...(model.displayName ? { displayName: model.displayName } : {}),
       ...(model.display_name ? { display_name: model.display_name } : {}),
       ...(model.contextWindow ? { contextWindow: model.contextWindow } : {}),
@@ -889,10 +966,9 @@ export function providerWithFetchedModelCatalog(
     if (!id) continue;
     const index = models.findIndex((item) => item.model === id);
     if (index < 0) continue;
-    byVisibleModel.set(id, index);
-    const upstreamModel = catalogDraftUpstreamModel(models[index]);
-    if (upstreamModel) {
-      byFetchedModel.set(upstreamModel, index);
+    byVisibleModel.set(id.toLowerCase(), index);
+    for (const identity of modelBindingIdentityValues(models[index])) {
+      byFetchedModel.set(identity, index);
     }
   }
   const shouldAppendFetchedModels =
@@ -901,7 +977,11 @@ export function providerWithFetchedModelCatalog(
   for (const fetched of fetchedModels) {
     const id = fetched.id.trim();
     if (!id) continue;
-    const existingIndex = byFetchedModel.get(id) ?? byVisibleModel.get(id);
+    const existingIndex =
+      modelIdentityValues(fetched)
+        .map((identity) => byFetchedModel.get(identity))
+        .find((index): index is number => index !== undefined) ??
+      byVisibleModel.get(id.toLowerCase());
     const contextWindow = resolveFetchedCodexModelContextWindow(fetched, {
       providerId: provider.id,
       providerName: provider.name,
@@ -927,6 +1007,13 @@ export function providerWithFetchedModelCatalog(
           : {}),
         ...(fetched.reasoning ? { reasoning: fetched.reasoning } : {}),
       };
+      for (const identity of modelIdentityValues({
+        ...fetched,
+        model: models[existingIndex].model,
+        upstreamModel: catalogDraftUpstreamModel(models[existingIndex]),
+      })) {
+        byFetchedModel.set(identity, existingIndex);
+      }
       continue;
     }
     if (!shouldAppendFetchedModels) continue;
@@ -950,7 +1037,7 @@ export function providerWithFetchedModelCatalog(
       ...(fetched.reasoning ? { reasoning: fetched.reasoning } : {}),
     };
     byFetchedModel.set(id, models.length);
-    byVisibleModel.set(id, models.length);
+    byVisibleModel.set(id.toLowerCase(), models.length);
     models.push(nextModel);
   }
 
@@ -1548,6 +1635,13 @@ function catalogDraftFromSourceModel(
   return {
     model: id,
     ...(upstreamModel && upstreamModel !== id ? { upstreamModel } : {}),
+    ...(source?.canonicalSlug
+      ? { canonicalSlug: source.canonicalSlug }
+      : source?.canonical_slug
+        ? { canonical_slug: source.canonical_slug }
+        : {}),
+    ...(source?.slug ? { slug: source.slug } : {}),
+    ...(source?.aliases ? { aliases: source.aliases } : {}),
     ...(displayName ? { displayName } : {}),
     ...(contextWindow ? { contextWindow } : {}),
     ...(reasoning ? { reasoning } : {}),
@@ -2043,20 +2137,31 @@ export function normalizeCodexRoutesForVisibleModelAliases(
 /// 暴露了 route 不匹配的模型，Codex 选择器会让用户选到一个随后落入其他 route 的模型。
 function routeCanMatchVisibleCatalogModel(
   route: CodexRoute,
-  visibleModel: string,
+  catalogModel: string | CodexCatalogModel,
 ): boolean {
-  const model = visibleModel.trim();
+  const model =
+    typeof catalogModel === "string"
+      ? catalogModel.trim()
+      : catalogModel.model.trim();
   if (!model) return false;
-  const lowerModel = model.toLowerCase();
-  const exactModels = (route.match?.models ?? [])
-    .map((matchedModel) => matchedModel.trim().toLowerCase())
-    .filter(Boolean);
-  if (exactModels.includes(lowerModel)) {
+  const identities =
+    typeof catalogModel === "string"
+      ? [model.toLowerCase()]
+      : modelIdentityValues(catalogModel);
+  const exactModels = route.match?.models ?? [];
+  if (
+    exactModels.some((matchedModel) =>
+      identities.includes(normalizedModelIdentity(matchedModel)),
+    )
+  ) {
     return true;
   }
   const prefixMatched = (route.match?.prefixes ?? []).some((prefix) => {
     const normalizedPrefix = prefix.trim().toLowerCase();
-    return normalizedPrefix && lowerModel.startsWith(normalizedPrefix);
+    return (
+      normalizedPrefix &&
+      identities.some((identity) => identity.startsWith(normalizedPrefix))
+    );
   });
   if (!prefixMatched) return false;
   return route.modelSelection?.mode !== "include";
@@ -2125,7 +2230,7 @@ export function buildModelCatalogForRoutes(
         : targetCatalogModels.filter(
             (catalogModel) =>
               catalogModel.enabled !== false &&
-              routeCanMatchVisibleCatalogModel(route, catalogModel.model ?? ""),
+              routeCanMatchVisibleCatalogModel(route, catalogModel),
           );
     for (const catalogModel of routableCatalogModels) {
       const id = catalogModel.model?.trim();
@@ -2375,13 +2480,27 @@ function routeProviderModelSyncSummary(
     return `已接入 ${providerModels.length}/${providerModels.length} 个模型（自动跟随供应商）`;
   }
 
-  const selected = new Set(
-    route.modelSelection.models.map((model) => model.trim()).filter(Boolean),
+  const selected = route.modelSelection.models;
+  const providerCatalogModels = readCodexModelCatalog(provider).models.filter(
+    (model) => model.enabled !== false,
   );
-  const connected = providerModels.filter((model) => selected.has(model));
-  const excluded = providerModels.filter((model) => !selected.has(model));
-  const stale = Array.from(selected).filter(
-    (model) => !providerModels.includes(model),
+  const connected = providerModels.filter((model) =>
+    providerModelIdentityMatchesSelection(provider, selected, model),
+  );
+  const excluded = providerModels.filter(
+    (model) =>
+      !providerModelIdentityMatchesSelection(provider, selected, model),
+  );
+  const stale = selected.filter((model) =>
+    providerCatalogModels.length > 0
+      ? !providerCatalogModels.some((catalogModel) =>
+          modelSelectionMatchesCatalogModel([model], catalogModel),
+        )
+      : !providerModels.some(
+          (providerModel) =>
+            normalizedModelIdentity(providerModel) ===
+            normalizedModelIdentity(model),
+        ),
   );
   const parts = [`已接入 ${connected.length}/${providerModels.length} 个模型`];
   if (excluded.length > 0) parts.push(`尚未接入：${excluded.join(", ")}`);
@@ -5693,17 +5812,20 @@ function RouteCandidatePicker({
       const enabled = enabledIds.has(candidate.id);
       const draft =
         routeDraftsById[candidate.id] ?? createRoutePolicyDraft(candidate);
-      const canonicalModels = collectProviderCanonicalModelIds(
-        candidate.canonicalProvider,
-      );
-      const canonicalSet = new Set(canonicalModels);
       const aliasesResult = parseRouteAliases(draft.aliasesText);
       if (aliasesResult.error) {
         setRoutePolicyError(aliasesResult.error);
         return;
       }
       for (const upstreamModel of Object.values(aliasesResult.aliases)) {
-        if (enabled && !canonicalSet.has(upstreamModel)) {
+        if (
+          enabled &&
+          (!candidate.canonicalProvider ||
+            !providerHasModelIdentity(
+              candidate.canonicalProvider,
+              upstreamModel,
+            ))
+        ) {
           setRoutePolicyError(
             `别名目标“${upstreamModel}”不在目标供应商的上游模型列表中`,
           );
@@ -5986,7 +6108,11 @@ function RouteCandidatePicker({
                             <input
                               type="checkbox"
                               aria-label={`选择上游模型 ${model}`}
-                              checked={modelSelection.models.includes(model)}
+                              checked={providerModelIdentityMatchesSelection(
+                                candidate.canonicalProvider,
+                                modelSelection.models,
+                                model,
+                              )}
                               onChange={(event) =>
                                 updateRoutePolicyDraft(
                                   candidate.id,
@@ -6001,7 +6127,12 @@ function RouteCandidatePicker({
                                           new Set([...selection, model]),
                                         )
                                       : selection.filter(
-                                          (item) => item !== model,
+                                          (item) =>
+                                            !providerModelIdentityMatchesSelection(
+                                              candidate.canonicalProvider,
+                                              [item],
+                                              model,
+                                            ),
                                         );
                                     return {
                                       ...current,

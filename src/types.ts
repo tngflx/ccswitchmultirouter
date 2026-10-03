@@ -427,6 +427,10 @@ export interface CodexCatalogModel {
   enabled?: boolean;
   upstreamModel?: string;
   upstream_model?: string;
+  canonicalSlug?: string;
+  canonical_slug?: string;
+  slug?: string;
+  aliases?: string[] | Record<string, string>;
   displayName?: string;
   display_name?: string;
   contextWindow?: string | number;
