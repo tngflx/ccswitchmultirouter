@@ -655,6 +655,25 @@ pub async fn unlock_codex_model_picker() -> Result<CodexModelPickerUnlockResult,
     crate::codex_desktop::unlock_codex_model_picker().await
 }
 
+/// Relaunch Codex after an explicit provider switch using the takeover state
+/// left by the switch. Enabled takeover must complete the existing renderer
+/// injection; disabled takeover launches the plain Desktop shell.
+pub(crate) async fn relaunch_codex_desktop_for_takeover_state(enabled: bool) -> Result<(), String> {
+    if enabled {
+        let result = crate::codex_desktop::unlock_codex_model_picker().await?;
+        if result.injected {
+            Ok(())
+        } else {
+            Err(format!(
+                "Codex Desktop relaunched, but model-picker injection did not complete: {}",
+                result.message
+            ))
+        }
+    } else {
+        crate::codex_desktop::relaunch_codex_desktop_after_takeover()
+    }
+}
+
 /// 显式把 Codex 历史 provider 桶同步到 MultiRouter 的 `custom` 运行桶。
 ///
 /// 该命令会备份并重写本机 Codex session/jsonl 与 state sqlite；前端必须由用户主动触发，

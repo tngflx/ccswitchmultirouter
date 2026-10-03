@@ -1,5 +1,31 @@
 # Engineering Journal
 
+## 2026-10-04 Restored atomic Codex provider switch Desktop lifecycle
+
+What happened: the fresh BigStrongSun refork lacked the legacy explicit Codex
+provider action that stops Desktop, switches routing, and relaunches the shell.
+Root cause: the fresh foundation had separate provider, takeover, and Desktop
+launcher owners but no transaction joining them, and the catalog reconciliation
+port also exposed an incomplete shared row identity type. What we did: added a
+typed IPC command and API method, verified Desktop process filtering and safe
+termination, reused the existing takeover/injection launcher, and added a
+lock-held `ProviderService` switch entrypoint so the stop -> mutation -> relaunch
+sequence cannot race proxy toggles or reacquire its own mutex. The catalog row
+contract now includes shared identity fields and a stable seed type. Evidence:
+`cargo check --manifest-path src-tauri/Cargo.toml`; `cargo test
+--manifest-path src-tauri/Cargo.toml codex_desktop --lib` (49 passed);
+`cargo test --manifest-path src-tauri/Cargo.toml switch_provider_ --test
+provider_commands` (4 passed); `pnpm typecheck`; `pnpm exec vitest run
+src/lib/codexCatalogReconciliation.test.ts` (3 passed); and `git diff --check`
+passed. `cargo fmt --check --manifest-path src-tauri/Cargo.toml` still reports
+only pre-existing formatting differences in `codex_config.rs` and
+`services/proxy.rs`. Runtime freshness was not checked because no rebuilt
+desktop process was requested. What NOT to do again: do not call the normal
+lock-taking switch method from inside a lifecycle lock, do not terminate by
+process name without verified Desktop identity, and do not duplicate catalog
+identity or row-seed contracts. Related:
+`docs/decisions/2026-10-04-codex-provider-switch-desktop-lifecycle-port.md`.
+
 ## 2026-10-03 Centralized Codex catalog reconciliation
 
 What happened: the fresh refork's Codex form had an inline merge that matched

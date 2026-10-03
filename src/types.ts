@@ -431,6 +431,8 @@ export interface CodexCatalogModel {
   canonical_slug?: string;
   slug?: string;
   aliases?: string[] | Record<string, string>;
+  /** Optional upstream display/name identity returned by catalog probes. */
+  name?: string;
   displayName?: string;
   display_name?: string;
   contextWindow?: string | number;

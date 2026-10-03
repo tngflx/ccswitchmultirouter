@@ -1,7 +1,8 @@
 import type { CodexCatalogModel } from "@/types";
 import { modelIdentityValues, type ModelIdentityShape } from "@/lib/modelIdentities";
 
-export type CodexCatalogRowLike = CodexCatalogModel & { rowId?: string };
+export type CodexCatalogRowLike = CodexCatalogModel & ModelIdentityShape & { rowId?: string };
+export type CodexCatalogRowSeed = Partial<CodexCatalogModel> & Record<string, unknown>;
 
 export interface FetchedCodexCatalogModel extends ModelIdentityShape {
   id: string;
@@ -116,7 +117,7 @@ export function reconcileFetchedCodexCatalogRows<T extends CodexCatalogRowLike>(
   source: CodexCatalogSyncSource,
   options: {
     appendNew: boolean;
-    createRow: (seed: CodexCatalogRowLike) => T;
+    createRow: (seed: CodexCatalogRowSeed) => T;
     existingMetadataMode?: MetadataMode;
   },
 ): CatalogSyncResult<T> {

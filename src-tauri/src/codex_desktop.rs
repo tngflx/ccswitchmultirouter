@@ -1871,6 +1871,131 @@ pub(crate) fn detect_running_codex_main_process() -> Option<PathBuf> {
     }
 }
 
+/// List only verified Codex Desktop shells. CLI/app-server processes are
+/// intentionally excluded because they can share the `Codex.exe` name.
+#[cfg(target_os = "windows")]
+pub(crate) fn list_running_codex_desktop_process_ids() -> Result<Vec<u32>, String> {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x08000000;
+    let script = r#"
+Get-CimInstance Win32_Process -Filter "Name = 'Codex.exe' OR Name = 'ChatGPT.exe'" |
+  Where-Object {
+    if (-not $_.ExecutablePath -or $_.CommandLine -match ' --type=') { return $false }
+    $leaf = Split-Path -Leaf $_.ExecutablePath
+    $legacyCodex = $leaf -ceq 'Codex.exe'
+    $unifiedCodex = $leaf -ceq 'ChatGPT.exe' -and $_.ExecutablePath -match '\\WindowsApps\\OpenAI\.Codex(?:\.Preview)?_'
+    return $legacyCodex -or $unifiedCodex
+  } |
+  Select-Object -ExpandProperty ProcessId
+"#;
+    let output = Command::new("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-Command", script])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .map_err(|error| format!("failed to inspect Codex Desktop processes: {error}"))?;
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
+    }
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| line.trim().parse::<u32>().ok())
+        .collect())
+}
+
+#[cfg(not(target_os = "windows"))]
+pub(crate) fn list_running_codex_desktop_process_ids() -> Result<Vec<u32>, String> {
+    Ok(Vec::new())
+}
+
+/// Stop only the verified Desktop shells captured immediately before the
+/// switch. The wait prevents a new shell from racing the old WebView2 exit.
+#[cfg(target_os = "windows")]
+pub(crate) fn terminate_running_codex_desktop_processes(
+    expected_ids: &[u32],
+) -> Result<u32, String> {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x08000000;
+    let running = list_running_codex_desktop_process_ids()?;
+    let verified = expected_ids
+        .iter()
+        .copied()
+        .filter(|pid| running.contains(pid))
+        .collect::<Vec<_>>();
+    for pid in &verified {
+        let output = Command::new("taskkill")
+            .args(["/PID", &pid.to_string(), "/T", "/F"])
+            .creation_flags(CREATE_NO_WINDOW)
+            .output()
+            .map_err(|error| format!("failed to stop Codex Desktop PID {pid}: {error}"))?;
+        if !output.status.success() {
+            return Err(format!(
+                "failed to stop Codex Desktop PID {pid}: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+    }
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let remaining = list_running_codex_desktop_process_ids()?;
+        if remaining.is_empty() {
+            return Ok(verified.len() as u32);
+        }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "Codex Desktop processes did not exit after taskkill: {remaining:?}"
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+pub(crate) fn terminate_running_codex_desktop_processes(
+    _expected_ids: &[u32],
+) -> Result<u32, String> {
+    Ok(0)
+}
+
+/// Capture the executable before stopping it, since process discovery is no
+/// longer available after termination.
+pub(crate) fn stop_running_codex_desktop_for_managed_lifecycle() -> Result<u32, String> {
+    if let Some(executable) = detect_running_codex_main_process() {
+        remember_codex_desktop_executable(&executable)?;
+    }
+    let process_ids = list_running_codex_desktop_process_ids()?;
+    terminate_running_codex_desktop_processes(&process_ids)
+}
+
+/// Relaunch the plain Desktop shell after takeover has been disabled.
+pub(crate) fn relaunch_codex_desktop_after_takeover() -> Result<(), String> {
+    let executable = resolve_codex_executable()
+        .ok_or_else(|| "Codex Desktop executable was not found".to_string())?;
+    if detect_running_codex_main_process().is_some() {
+        return Err(
+            "Codex Desktop started again before its routing transition completed".to_string(),
+        );
+    }
+    let timezone =
+        crate::codex_egress_timezone::resolve_launch_timezone(&crate::settings::get_settings());
+    let mut command = Command::new(&executable);
+    apply_codex_launch_timezone(&mut command, timezone.as_deref());
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x08000000);
+    }
+    command
+        .spawn()
+        .map(|_| {
+            crate::codex_egress_timezone::mark_codex_timezone_applied();
+        })
+        .map_err(|error| format!("failed to relaunch {}: {error}", executable.display()))
+}
+
 /// 按常见安装位置寻找 Codex Desktop 可执行文件。
 pub(crate) fn resolve_codex_executable() -> Option<PathBuf> {
     detect_running_codex_main_process()

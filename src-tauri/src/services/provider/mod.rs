@@ -8115,11 +8115,29 @@ impl ProviderService {
     ///    d. Write target provider config to live files
     ///    e. Sync MCP configuration
     pub fn switch(state: &AppState, app_type: AppType, id: &str) -> Result<SwitchResult, AppError> {
+        Self::switch_impl(state, app_type, id, true)
+    }
+
+    /// Switch a provider while the caller already owns the app switch lock.
+    pub(crate) fn switch_locked(
+        state: &AppState,
+        app_type: AppType,
+        id: &str,
+    ) -> Result<SwitchResult, AppError> {
+        Self::switch_impl(state, app_type, id, false)
+    }
+
+    fn switch_impl(
+        state: &AppState,
+        app_type: AppType,
+        id: &str,
+        acquire_switch_lock: bool,
+    ) -> Result<SwitchResult, AppError> {
         if app_type == AppType::Pi {
             pi::enable(state, id)?;
             return Ok(SwitchResult::default());
         }
-        let mut result = Self::switch_inner(state, app_type.clone(), id)?;
+        let mut result = Self::switch_inner(state, app_type.clone(), id, acquire_switch_lock)?;
 
         // The device-level provider and active project snapshot are two views
         // of the same successful switch. Keep them aligned only after every
@@ -8152,6 +8170,7 @@ impl ProviderService {
         state: &AppState,
         app_type: AppType,
         id: &str,
+        acquire_switch_lock: bool,
     ) -> Result<SwitchResult, AppError> {
         // Check if provider exists
         let providers = state.db.get_all_providers(app_type.as_str())?;
@@ -8181,10 +8200,12 @@ impl ProviderService {
         // restore backup. Serialize them per app, then decide from the locked
         // current state so a just-started takeover cannot be overwritten by a
         // normal live write.
-        let _switch_guard = if matches!(
-            app_type,
-            AppType::Claude | AppType::Codex | AppType::Gemini | AppType::GrokBuild
-        ) {
+        let _switch_guard = if acquire_switch_lock
+            && matches!(
+                app_type,
+                AppType::Claude | AppType::Codex | AppType::Gemini | AppType::GrokBuild
+            )
+        {
             Some(block_on_tauri_runtime(
                 state.proxy_service.lock_switch_for_app(app_type.as_str()),
             ))

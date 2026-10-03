@@ -1,12 +1,13 @@
 import { describe, expect, it } from "vitest";
 import { reconcileFetchedCodexCatalogRows } from "./codexCatalogReconciliation";
+import type { CodexCatalogRowLike } from "./codexCatalogReconciliation";
 
-const createRow = (seed: Record<string, unknown>) => ({
+const createRow = (seed: Record<string, unknown>): CodexCatalogRowLike => ({
   model: String(seed.model ?? ""),
   displayName: String(seed.displayName ?? seed.model ?? ""),
   enabled: seed.enabled !== false,
   ...seed,
-});
+}) as CodexCatalogRowLike;
 
 describe("reconcileFetchedCodexCatalogRows", () => {
   it("matches aliases and preserves an explicit disabled choice", () => {
