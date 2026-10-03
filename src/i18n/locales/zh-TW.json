@@ -1537,7 +1537,25 @@
     "reasoningCapability": "推理",
     "editRoute": "編輯 route",
     "editRouteHint": "設定這條 route 的匹配規則、上游 API 格式、鑑權、模型映射與能力宣告。",
-    "noCommonConfigToApply": "通用設定片段為空或沒有可寫入的內容"
+    "noCommonConfigToApply": "通用設定片段為空或沒有可寫入的內容",
+    "trafficPolicy": {
+      "title": "流量策略",
+      "description": "限制本機並行請求，只重放已辨識且安全的上游拒絕。策略按 Provider 儲存。",
+      "useRecommended": "使用建議值",
+      "customize": "自訂",
+      "zenRecommended": "OpenCode Zen 建議：並行 4、429 重試 5 次、已辨識拒絕重試 2 次。",
+      "customActive": "自訂策略已啟用。",
+      "unknownSafe": "未知供應商預設使用保守值，啟用前請確認。",
+      "limitConcurrency": "限制並行",
+      "maxInFlight": "最大並行數",
+      "maxQueueWait": "佇列等待（毫秒）",
+      "rateLimitRetries": "429 重試次數",
+      "rejectionMode": "已辨識拒絕重放",
+      "disabled": "停用",
+      "opencodeSignature": "OpenCode endpoint unavailable",
+      "rejectionRetries": "拒絕重試次數",
+      "safetyWarning": "僅當供應商保證相同的推理前拒絕語義時啟用 OpenCode 簽名。任意 5xx 回應都不會重放。"
+    }
   },
   "geminiConfig": {
     "envFile": "環境變數 (.env)",

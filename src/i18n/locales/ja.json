@@ -1536,7 +1536,25 @@
     "reasoningCapability": "推論",
     "editRoute": "route を編集",
     "editRouteHint": "この route のマッチ条件、上流 API 形式、認証、モデル変換、能力を設定します。",
-    "noCommonConfigToApply": "共通設定スニペットが空か、書き込む内容がありません"
+    "noCommonConfigToApply": "共通設定スニペットが空か、書き込む内容がありません",
+    "trafficPolicy": {
+      "title": "トラフィックポリシー",
+      "description": "ローカルの同時実行数を制限し、安全性を確認できる上流拒否だけを再送します。Provider ごとの設定です。",
+      "useRecommended": "推奨値を使用",
+      "customize": "カスタマイズ",
+      "zenRecommended": "OpenCode Zen 推奨：同時実行 4、429 再試行 5 回、認識済み拒否の再試行 2 回。",
+      "customActive": "カスタムポリシーが有効です。",
+      "unknownSafe": "不明な Provider は有効化するまで保守的な既定値を使用します。",
+      "limitConcurrency": "同時実行数を制限",
+      "maxInFlight": "最大同時実行数",
+      "maxQueueWait": "キュー待機（ミリ秒）",
+      "rateLimitRetries": "429 再試行回数",
+      "rejectionMode": "認識済み拒否の再送",
+      "disabled": "無効",
+      "opencodeSignature": "OpenCode endpoint unavailable",
+      "rejectionRetries": "拒否の再試行回数",
+      "safetyWarning": "同じ推論前拒否の意味を保証する Provider の場合だけ OpenCode 署名を有効にしてください。任意の 5xx 応答は再送しません。"
+    }
   },
   "geminiConfig": {
     "envFile": "環境変数 (.env)",

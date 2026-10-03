@@ -587,6 +587,49 @@ impl LocalProxyRequestOverrides {
     }
 }
 
+/// Provider-specific handling for an upstream that explicitly rejects a Codex request
+/// before inference starts. Only the named OpenCode signature is eligible for replay.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CodexRejectionRetryMode {
+    #[default]
+    Disabled,
+    OpencodeEndpointUnavailable,
+}
+
+/// Persisted Codex admission and explicit-rejection retry policy.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct CodexTrafficPolicy {
+    #[serde(rename = "admissionEnabled", skip_serializing_if = "Option::is_none")]
+    pub admission_enabled: Option<bool>,
+    #[serde(rename = "maxInFlight", skip_serializing_if = "Option::is_none")]
+    pub max_in_flight: Option<u16>,
+    #[serde(rename = "maxQueueWaitMs", skip_serializing_if = "Option::is_none")]
+    pub max_queue_wait_ms: Option<u64>,
+    #[serde(
+        rename = "rateLimitMaxRetries",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub rate_limit_max_retries: Option<u8>,
+    #[serde(rename = "rejectionRetryMode", skip_serializing_if = "Option::is_none")]
+    pub rejection_retry_mode: Option<CodexRejectionRetryMode>,
+    #[serde(
+        rename = "rejectionMaxRetries",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub rejection_max_retries: Option<u8>,
+    #[serde(
+        rename = "rejectionInitialDelayMs",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub rejection_initial_delay_ms: Option<u64>,
+    #[serde(
+        rename = "rejectionMaxDelayMs",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub rejection_max_delay_ms: Option<u64>,
+}
+
 /// 供应商元数据
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ProviderMeta {
@@ -718,6 +761,9 @@ pub struct ProviderMeta {
     /// Codex OAuth FAST mode: inject `service_tier = "priority"` for ChatGPT Codex requests.
     #[serde(rename = "codexFastMode", skip_serializing_if = "Option::is_none")]
     pub codex_fast_mode: Option<bool>,
+    /// Provider-specific local concurrency and explicit-rejection retry policy.
+    #[serde(rename = "codexTrafficPolicy", skip_serializing_if = "Option::is_none")]
+    pub codex_traffic_policy: Option<CodexTrafficPolicy>,
     /// Codex Responses -> Chat Completions reasoning capability metadata.
     #[serde(rename = "codexChatReasoning", skip_serializing_if = "Option::is_none")]
     pub codex_chat_reasoning: Option<CodexChatReasoningConfig>,

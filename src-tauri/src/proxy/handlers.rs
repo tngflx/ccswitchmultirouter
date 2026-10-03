@@ -5213,6 +5213,7 @@ fn codex_proxy_error_code(error: &ProxyError) -> &'static str {
         ProxyError::ResponsePending(_) => "cc_switch_response_pending",
         ProxyError::NoAvailableProvider => "cc_switch_no_available_provider",
         ProxyError::AllProvidersCircuitOpen => "cc_switch_all_providers_circuit_open",
+        ProxyError::AdmissionQueueTimeout { .. } => "cc_switch_admission_queue_timeout",
         ProxyError::NoProvidersConfigured => "cc_switch_no_providers_configured",
         ProxyError::MaxRetriesExceeded => "cc_switch_max_retries_exceeded",
         ProxyError::ProviderUnhealthy(_) => "cc_switch_provider_unhealthy",

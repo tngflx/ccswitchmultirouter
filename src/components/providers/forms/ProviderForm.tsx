@@ -44,6 +44,7 @@ import type {
   CodexToolSchemaDialect,
   CodexHistoryReplay,
   ClaudeApiKeyField,
+  CodexTrafficPolicy,
 } from "@/types";
 import type { CodexProviderEditorSnapshot } from "@/lib/api/protocol-compatibility";
 import {
@@ -783,6 +784,9 @@ function ProviderFormFull({
   const [codexFastMode, setCodexFastMode] = useState<boolean>(
     () => initialData?.meta?.codexFastMode ?? false,
   );
+  const [codexTrafficPolicy, setCodexTrafficPolicy] = useState<
+    CodexTrafficPolicy | undefined
+  >(() => initialData?.meta?.codexTrafficPolicy);
   const [codexChatReasoning, setCodexChatReasoning] =
     useState<CodexChatReasoning>(
       () => initialData?.meta?.codexChatReasoning ?? {},
@@ -2114,6 +2118,10 @@ function ProviderFormFull({
           ? selectedGitHubAccountId
           : undefined,
       codexFastMode: isCodexOauthProvider ? codexFastMode : undefined,
+      codexTrafficPolicy:
+        appId === "codex" && category !== "official"
+          ? codexTrafficPolicy
+          : undefined,
       codexChatReasoning:
         appId === "codex" &&
         category !== "official" &&
@@ -2437,6 +2445,7 @@ function ProviderFormFull({
 
       resetCodexConfig(auth, config, preset.modelCatalog ?? []);
       setCodexChatReasoning(preset.codexChatReasoning ?? {});
+      setCodexTrafficPolicy(undefined);
       setCodexRouting({ enabled: false, defaultRouteId: "", routes: [] });
       setPromptCacheRouting(preset.promptCacheRouting ?? "auto");
       setCodexProtocolMode("auto");
@@ -2961,6 +2970,8 @@ function ProviderFormFull({
                 onApiKeyGroupsChange={setCodexApiKeyGroups}
                 apiKeyGroupMode={codexApiKeyGroupMode}
                 onApiKeyGroupModeChange={setCodexApiKeyGroupMode}
+                codexTrafficPolicy={codexTrafficPolicy}
+                onCodexTrafficPolicyChange={setCodexTrafficPolicy}
                 category={category}
                 shouldShowApiKeyLink={shouldShowCodexApiKeyLink}
                 websiteUrl={codexWebsiteUrl}

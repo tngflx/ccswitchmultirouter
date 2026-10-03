@@ -1544,7 +1544,25 @@
     "reasoningCapability": "推理",
     "editRoute": "编辑 route",
     "editRouteHint": "配置这条 route 的匹配规则、上游 API 格式、鉴权、模型映射和能力声明。",
-    "noCommonConfigToApply": "通用配置片段为空或没有可写入的内容"
+    "noCommonConfigToApply": "通用配置片段为空或没有可写入的内容",
+    "trafficPolicy": {
+      "title": "流量策略",
+      "description": "限制本地并发请求，仅重放已识别且安全的上游拒绝。策略按 Provider 保存。",
+      "useRecommended": "使用推荐值",
+      "customize": "自定义",
+      "zenRecommended": "OpenCode Zen 推荐：并发 4、429 重试 5 次、已识别拒绝重试 2 次。",
+      "customActive": "自定义策略已启用。",
+      "unknownSafe": "未知供应商默认使用保守值，启用前请确认。",
+      "limitConcurrency": "限制并发",
+      "maxInFlight": "最大并发数",
+      "maxQueueWait": "队列等待（毫秒）",
+      "rateLimitRetries": "429 重试次数",
+      "rejectionMode": "已识别拒绝重放",
+      "disabled": "禁用",
+      "opencodeSignature": "OpenCode endpoint unavailable",
+      "rejectionRetries": "拒绝重试次数",
+      "safetyWarning": "仅当供应商保证相同的推理前拒绝语义时启用 OpenCode 签名。任意 5xx 响应都不会重放。"
+    }
   },
   "geminiConfig": {
     "envFile": "环境变量 (.env)",

@@ -37,6 +37,13 @@ pub enum ProxyError {
     #[error("所有供应商已熔断，无可用渠道")]
     AllProvidersCircuitOpen,
 
+    #[error("Codex admission queue timed out for provider {provider_id} after {waited_ms}ms (limit {max_in_flight})")]
+    AdmissionQueueTimeout {
+        provider_id: String,
+        max_in_flight: usize,
+        waited_ms: u64,
+    },
+
     #[error("未配置供应商")]
     NoProvidersConfigured,
 
@@ -142,6 +149,9 @@ impl IntoResponse for ProxyError {
                     ProxyError::AllProvidersCircuitOpen => {
                         (StatusCode::SERVICE_UNAVAILABLE, self.to_string())
                     }
+                    ProxyError::AdmissionQueueTimeout { .. } => {
+                        (StatusCode::TOO_MANY_REQUESTS, self.to_string())
+                    }
                     ProxyError::NoProvidersConfigured => {
                         (StatusCode::SERVICE_UNAVAILABLE, self.to_string())
                     }
@@ -202,7 +212,10 @@ impl ProxyError {
     ///
     /// `ResponsePending` 的结果未知，不能用 `Retry-After` 暗示客户端自动重放。
     pub fn retry_after_secs(&self) -> Option<u64> {
-        None
+        match self {
+            ProxyError::AdmissionQueueTimeout { .. } => Some(1),
+            _ => None,
+        }
     }
 }
 

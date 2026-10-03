@@ -40,6 +40,9 @@ pub fn map_proxy_error_to_status(error: &ProxyError) -> u16 {
         // 所有供应商已熔断：503 Service Unavailable
         ProxyError::AllProvidersCircuitOpen => 503,
 
+        // Codex admission queue saturation: the request was not dispatched.
+        ProxyError::AdmissionQueueTimeout { .. } => 429,
+
         // 未配置供应商：503 Service Unavailable
         ProxyError::NoProvidersConfigured => 503,
 
@@ -135,6 +138,17 @@ mod tests {
     fn test_map_no_provider_error() {
         let error = ProxyError::NoAvailableProvider;
         assert_eq!(map_proxy_error_to_status(&error), 503);
+    }
+
+    #[test]
+    fn admission_timeout_is_retryable_client_saturation() {
+        let error = ProxyError::AdmissionQueueTimeout {
+            provider_id: "zen".to_string(),
+            max_in_flight: 4,
+            waited_ms: 30_000,
+        };
+        assert_eq!(map_proxy_error_to_status(&error), 429);
+        assert_eq!(error.retry_after_secs(), Some(1));
     }
 
     #[test]

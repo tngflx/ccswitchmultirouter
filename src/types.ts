@@ -213,6 +213,22 @@ export interface LocalProxyRequestOverrides {
   body?: Record<string, unknown>;
 }
 
+export type CodexRejectionRetryMode =
+  | "disabled"
+  | "opencode_endpoint_unavailable";
+
+/** Provider-specific admission and explicitly safe rejection replay policy. */
+export interface CodexTrafficPolicy {
+  admissionEnabled?: boolean;
+  maxInFlight?: number;
+  maxQueueWaitMs?: number;
+  rateLimitMaxRetries?: number;
+  rejectionRetryMode?: CodexRejectionRetryMode;
+  rejectionMaxRetries?: number;
+  rejectionInitialDelayMs?: number;
+  rejectionMaxDelayMs?: number;
+}
+
 // 供应商元数据（字段名与后端一致，保持 snake_case）
 export interface ProviderMeta {
   // 自定义端点：以 URL 为键，值为端点信息
@@ -278,6 +294,7 @@ export interface ProviderMeta {
   codexCache?: CodexCacheConfig;
   // Codex OAuth FAST mode: injects service_tier="priority" on ChatGPT Codex requests
   codexFastMode?: boolean;
+  codexTrafficPolicy?: CodexTrafficPolicy;
   // Codex Responses -> Chat Completions reasoning capability metadata
   codexChatReasoning?: CodexChatReasoning;
   // Stable CCSwitchMulti preset identity used to resolve maintained model capabilities.

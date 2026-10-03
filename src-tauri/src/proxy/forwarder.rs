@@ -54,7 +54,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tauri::Manager;
-use tokio::sync::RwLock;
+use tokio::sync::{OwnedSemaphorePermit, RwLock};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
 const PROXY_AUTH_PLACEHOLDER: &str = "PROXY_MANAGED";
@@ -188,6 +188,8 @@ pub struct ForwardResult {
     /// 活跃连接 RAII guard：随响应一起流转到 response_processor / handle_claude_transform，
     /// 最终被 move 进流式 body future（或非流式响应作用域），覆盖整个响应生命周期。
     pub(crate) connection_guard: Option<ActiveConnectionGuard>,
+    /// Codex admission permit retained until the response body is fully consumed.
+    pub(crate) admission_permit: Option<OwnedSemaphorePermit>,
     /// 流式 Responses 请求的上游重连工厂：下游转换层在流中断且尚未向客户端
     /// 转发实质内容时用它做有界自动重连（见 providers::streaming_retry）。
     pub(crate) stream_reconnect: Option<StreamReconnector>,
@@ -210,6 +212,7 @@ pub struct ForwardError {
 /// 不需要每条出口路径都手动调用。
 pub(crate) struct ActiveConnectionGuard {
     status: Arc<RwLock<ProxyStatus>>,
+    admission_permit: Option<OwnedSemaphorePermit>,
 }
 
 impl ActiveConnectionGuard {
@@ -218,7 +221,14 @@ impl ActiveConnectionGuard {
             let mut s = status.write().await;
             s.active_connections = s.active_connections.saturating_add(1);
         }
-        Self { status }
+        Self {
+            status,
+            admission_permit: None,
+        }
+    }
+
+    pub(crate) fn attach_admission_permit(&mut self, permit: Option<OwnedSemaphorePermit>) {
+        self.admission_permit = permit;
     }
 }
 
@@ -1137,6 +1147,8 @@ impl RequestForwarder {
         // 在流式 body 的 future 内才真正 drop。
         // Err 路径：guard 在函数 scope 内随返回值落地时自动 drop。
         result.map(|mut fr| {
+            let mut guard = guard;
+            guard.attach_admission_permit(fr.admission_permit.take());
             fr.connection_guard = Some(guard);
             fr
         })
@@ -1172,6 +1184,8 @@ impl RequestForwarder {
             )
             .await;
         result.map(|mut fr| {
+            let mut guard = guard;
+            guard.attach_admission_permit(fr.admission_permit.take());
             fr.connection_guard = Some(guard);
             fr
         })
@@ -1253,6 +1267,23 @@ impl RequestForwarder {
             if !allowed {
                 continue;
             }
+            let admission_permit = match self
+                .router
+                .acquire_codex_route_admission(provider, app_type_str)
+                .await
+            {
+                Ok(permit) => permit,
+                Err(timeout) => {
+                    return Err(ForwardError {
+                        error: ProxyError::AdmissionQueueTimeout {
+                            provider_id: timeout.provider_id,
+                            max_in_flight: timeout.max_in_flight,
+                            waited_ms: timeout.waited_ms,
+                        },
+                        provider: Some(provider.clone()),
+                    });
+                }
+            };
             attempted_providers += 1;
 
             {
@@ -1325,6 +1356,7 @@ impl RequestForwarder {
                         claude_api_format: None,
                         outbound_model,
                         connection_guard: None,
+                        admission_permit,
                         stream_reconnect: None,
                     });
                 }
@@ -1518,6 +1550,24 @@ impl RequestForwarder {
                 continue;
             }
 
+            let mut admission_permit = match self
+                .router
+                .acquire_codex_route_admission(provider, app_type_str)
+                .await
+            {
+                Ok(permit) => permit,
+                Err(timeout) => {
+                    return Err(ForwardError {
+                        error: ProxyError::AdmissionQueueTimeout {
+                            provider_id: timeout.provider_id,
+                            max_in_flight: timeout.max_in_flight,
+                            waited_ms: timeout.waited_ms,
+                        },
+                        provider: Some(provider.clone()),
+                    });
+                }
+            };
+
             // PRE-SEND 优化器：每个 provider 独立决定是否优化
             // clone body 以避免 Bedrock 优化字段泄漏到非 Bedrock provider（failover 场景）
             let mut provider_body =
@@ -1627,6 +1677,7 @@ impl RequestForwarder {
                         claude_api_format,
                         outbound_model,
                         connection_guard: None,
+                        admission_permit: admission_permit.take(),
                         stream_reconnect,
                     });
                 }
@@ -1742,6 +1793,7 @@ impl RequestForwarder {
                                         claude_api_format,
                                         outbound_model,
                                         connection_guard: None,
+                                        admission_permit: admission_permit.take(),
                                         stream_reconnect,
                                     });
                                 }
@@ -1902,6 +1954,7 @@ impl RequestForwarder {
                                             claude_api_format,
                                             outbound_model,
                                             connection_guard: None,
+                                            admission_permit: admission_permit.take(),
                                             stream_reconnect,
                                         });
                                     }
@@ -2073,6 +2126,7 @@ impl RequestForwarder {
                                         claude_api_format,
                                         outbound_model,
                                         connection_guard: None,
+                                        admission_permit: admission_permit.take(),
                                         stream_reconnect,
                                     });
                                 }
@@ -4128,6 +4182,7 @@ impl RequestForwarder {
             send_codex_request_with_rate_limit_retry(
                 adapter.name(),
                 self.capacity_retry_enabled,
+                super::codex_traffic_policy::resolve_codex_traffic_policy(provider),
                 send_once,
             )
             .await
@@ -7267,6 +7322,7 @@ where
 async fn send_codex_request_with_rate_limit_retry<F, Fut>(
     app_tag: &str,
     capacity_retry_enabled: bool,
+    traffic_policy: super::codex_traffic_policy::ResolvedCodexTrafficPolicy,
     mut send: F,
 ) -> Result<ProxyResponse, ProxyError>
 where
@@ -7277,6 +7333,7 @@ where
     let mut total_delay = Duration::ZERO;
     let mut capacity_retry_count = 0usize;
     let mut capacity_total_delay = Duration::ZERO;
+    let mut admission_retry_count = 0usize;
 
     loop {
         let response = send().await?;
@@ -7294,6 +7351,33 @@ where
         let mut response_headers = response.headers().clone();
         let retry_after = parse_retry_after_delay(&response_headers);
         let body_text = read_decoded_error_body(response).await?;
+
+        if status == http::StatusCode::SERVICE_UNAVAILABLE
+            && traffic_policy.rejection_retry_mode
+                == crate::provider::CodexRejectionRetryMode::OpencodeEndpointUnavailable
+        {
+            if is_retryable_opencode_admission_503(body_text.as_deref())
+                && admission_retry_count < traffic_policy.rejection_max_retries
+            {
+                let delay = retry_after
+                    .unwrap_or_else(|| traffic_policy.rejection_backoff(admission_retry_count))
+                    .min(traffic_policy.rejection_max_delay);
+                log::warn!(
+                    "[{app_tag}] recognized OpenCode endpoint-unavailable rejection; replaying Codex request {}/{} after {}ms",
+                    admission_retry_count + 1,
+                    traffic_policy.rejection_max_retries,
+                    delay.as_millis()
+                );
+                tokio::time::sleep(delay).await;
+                admission_retry_count += 1;
+                continue;
+            }
+            return Ok(rebuild_consumed_error_response(
+                status,
+                &mut response_headers,
+                body_text,
+            ));
+        }
         let terminal_quota = is_terminal_codex_quota_429(body_text.as_deref());
         let capacity = super::providers::streaming_retry::is_capacity_error_response(
             status,
@@ -7380,6 +7464,14 @@ where
         total_delay += delay;
         retry_count += 1;
     }
+}
+
+fn is_retryable_opencode_admission_503(body: Option<&str>) -> bool {
+    let Some(body) = body else {
+        return false;
+    };
+    let normalized = body.to_ascii_lowercase();
+    normalized.contains("upstream request failed") && normalized.contains("endpoint is unavailable")
 }
 
 fn parse_retry_after_delay(headers: &http::HeaderMap) -> Option<Duration> {
@@ -8705,6 +8797,17 @@ mod tests {
     use http::StatusCode;
     use serde_json::json;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    fn safe_test_codex_traffic_policy(
+    ) -> super::super::codex_traffic_policy::ResolvedCodexTrafficPolicy {
+        let provider = Provider::with_id(
+            "test".to_string(),
+            "test".to_string(),
+            json!({"base_url": "https://example.test"}),
+            None,
+        );
+        super::super::codex_traffic_policy::resolve_codex_traffic_policy(&provider)
+    }
 
     fn test_provider_with_type(provider_type: Option<&str>) -> Provider {
         Provider {
@@ -14044,27 +14147,32 @@ mod tests {
         let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let attempts_for_send = attempts.clone();
 
-        let result = send_codex_request_with_rate_limit_retry("test", true, || {
-            let attempts = attempts_for_send.clone();
-            async move {
-                let attempt = attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                if attempt == 0 {
-                    Ok(ProxyResponse::buffered(
+        let result = send_codex_request_with_rate_limit_retry(
+            "test",
+            true,
+            safe_test_codex_traffic_policy(),
+            || {
+                let attempts = attempts_for_send.clone();
+                async move {
+                    let attempt = attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    if attempt == 0 {
+                        Ok(ProxyResponse::buffered(
                         http::StatusCode::TOO_MANY_REQUESTS,
                         http::HeaderMap::new(),
                         Bytes::from_static(
                             br#"{"error":{"type":"rate_limit_exceeded","message":"slow down"}}"#,
                         ),
                     ))
-                } else {
-                    Ok(ProxyResponse::buffered(
-                        http::StatusCode::OK,
-                        http::HeaderMap::new(),
-                        Bytes::new(),
-                    ))
+                    } else {
+                        Ok(ProxyResponse::buffered(
+                            http::StatusCode::OK,
+                            http::HeaderMap::new(),
+                            Bytes::new(),
+                        ))
+                    }
                 }
-            }
-        })
+            },
+        )
         .await;
 
         assert!(result.is_ok());
@@ -14077,27 +14185,32 @@ mod tests {
         let attempts_for_send = attempts.clone();
         let started_at = tokio::time::Instant::now();
 
-        let result = send_codex_request_with_rate_limit_retry("test", true, || {
-            let attempts = attempts_for_send.clone();
-            async move {
-                let attempt = attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                if attempt == 0 {
-                    let mut headers = http::HeaderMap::new();
-                    headers.insert(http::header::RETRY_AFTER, "17".parse().unwrap());
-                    Ok(ProxyResponse::buffered(
-                        http::StatusCode::TOO_MANY_REQUESTS,
-                        headers,
-                        Bytes::from_static(br#"{"error":{"type":"rate_limit_exceeded"}}"#),
-                    ))
-                } else {
-                    Ok(ProxyResponse::buffered(
-                        http::StatusCode::OK,
-                        http::HeaderMap::new(),
-                        Bytes::new(),
-                    ))
+        let result = send_codex_request_with_rate_limit_retry(
+            "test",
+            true,
+            safe_test_codex_traffic_policy(),
+            || {
+                let attempts = attempts_for_send.clone();
+                async move {
+                    let attempt = attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    if attempt == 0 {
+                        let mut headers = http::HeaderMap::new();
+                        headers.insert(http::header::RETRY_AFTER, "17".parse().unwrap());
+                        Ok(ProxyResponse::buffered(
+                            http::StatusCode::TOO_MANY_REQUESTS,
+                            headers,
+                            Bytes::from_static(br#"{"error":{"type":"rate_limit_exceeded"}}"#),
+                        ))
+                    } else {
+                        Ok(ProxyResponse::buffered(
+                            http::StatusCode::OK,
+                            http::HeaderMap::new(),
+                            Bytes::new(),
+                        ))
+                    }
                 }
-            }
-        })
+            },
+        )
         .await;
 
         assert!(result.is_ok());
@@ -14112,7 +14225,7 @@ mod tests {
         let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let attempts_for_send = attempts.clone();
 
-        let result = send_codex_request_with_rate_limit_retry("test", true, || {
+        let result = send_codex_request_with_rate_limit_retry("test", true, safe_test_codex_traffic_policy(), || {
             let attempts = attempts_for_send.clone();
             async move {
                 attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -14139,7 +14252,7 @@ mod tests {
         let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let attempts_for_send = attempts.clone();
 
-        let result = send_codex_request_with_rate_limit_retry("test", true, || {
+        let result = send_codex_request_with_rate_limit_retry("test", true, safe_test_codex_traffic_policy(), || {
             let attempts = attempts_for_send.clone();
             async move {
                 if attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
@@ -14168,7 +14281,7 @@ mod tests {
         let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let attempts_for_send = attempts.clone();
 
-        let result = send_codex_request_with_rate_limit_retry("test", false, || {
+        let result = send_codex_request_with_rate_limit_retry("test", false, safe_test_codex_traffic_policy(), || {
             let attempts = attempts_for_send.clone();
             async move {
                 attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -14176,6 +14289,68 @@ mod tests {
                     http::StatusCode::SERVICE_UNAVAILABLE,
                     http::HeaderMap::new(),
                     Bytes::from_static(br#"{"error":{"type":"server_is_overloaded","message":"Please try again later"}}"#),
+                ))
+            }
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(result.status(), http::StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn codex_recognized_opencode_rejection_replays_with_explicit_policy() {
+        let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let attempts_for_send = attempts.clone();
+        let mut policy = safe_test_codex_traffic_policy();
+        policy.rejection_retry_mode =
+            crate::provider::CodexRejectionRetryMode::OpencodeEndpointUnavailable;
+        policy.rejection_max_retries = 1;
+        policy.rejection_initial_delay = Duration::from_millis(100);
+        policy.rejection_max_delay = Duration::from_millis(100);
+
+        let result = send_codex_request_with_rate_limit_retry("test", false, policy, || {
+            let attempts = attempts_for_send.clone();
+            async move {
+                if attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                    Ok(ProxyResponse::buffered(
+                        http::StatusCode::SERVICE_UNAVAILABLE,
+                        http::HeaderMap::new(),
+                        Bytes::from_static(b"upstream request failed: endpoint is unavailable"),
+                    ))
+                } else {
+                    Ok(ProxyResponse::buffered(
+                        http::StatusCode::OK,
+                        http::HeaderMap::new(),
+                        Bytes::new(),
+                    ))
+                }
+            }
+        })
+        .await;
+
+        assert!(result.is_ok());
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn codex_generic_503_is_not_replayed_by_rejection_policy() {
+        let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let attempts_for_send = attempts.clone();
+        let mut policy = safe_test_codex_traffic_policy();
+        policy.rejection_retry_mode =
+            crate::provider::CodexRejectionRetryMode::OpencodeEndpointUnavailable;
+        policy.rejection_max_retries = 2;
+
+        let result = send_codex_request_with_rate_limit_retry("test", false, policy, || {
+            let attempts = attempts_for_send.clone();
+            async move {
+                attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(ProxyResponse::buffered(
+                    http::StatusCode::SERVICE_UNAVAILABLE,
+                    http::HeaderMap::new(),
+                    Bytes::from_static(b"upstream request failed: temporary overload"),
                 ))
             }
         })

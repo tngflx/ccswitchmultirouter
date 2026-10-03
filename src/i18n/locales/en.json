@@ -1539,7 +1539,25 @@
     "reasoningCapability": "reasoning",
     "editRoute": "Edit route",
     "editRouteHint": "Configure matching, upstream API format, auth, model mapping, and capabilities for this route.",
-    "noCommonConfigToApply": "The common config snippet is empty or contains nothing to write"
+    "noCommonConfigToApply": "The common config snippet is empty or contains nothing to write",
+    "trafficPolicy": {
+      "title": "Traffic policy",
+      "description": "Limit local in-flight requests and replay only recognized upstream rejections. This policy is per provider.",
+      "useRecommended": "Use recommendation",
+      "customize": "Customize",
+      "zenRecommended": "OpenCode Zen recommendation: 4 in flight, 5 rate-limit retries, and 2 recognized rejection retries.",
+      "customActive": "Custom policy is active.",
+      "unknownSafe": "Unknown providers keep conservative defaults until you opt in.",
+      "limitConcurrency": "Limit concurrency",
+      "maxInFlight": "Max in flight",
+      "maxQueueWait": "Queue wait (ms)",
+      "rateLimitRetries": "429 retries",
+      "rejectionMode": "Recognized rejection replay",
+      "disabled": "Disabled",
+      "opencodeSignature": "OpenCode endpoint unavailable",
+      "rejectionRetries": "Rejection retries",
+      "safetyWarning": "Only enable the OpenCode signature when the provider guarantees the same pre-inference rejection semantics. Arbitrary 5xx responses are never replayed."
+    }
   },
   "geminiConfig": {
     "envFile": "Environment Variables (.env)",

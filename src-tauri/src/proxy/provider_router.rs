@@ -10,7 +10,18 @@ use crate::proxy::circuit_breaker::{AllowResult, CircuitBreaker, CircuitBreakerC
 use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use std::time::Instant;
+use tokio::sync::{OwnedSemaphorePermit, RwLock, Semaphore};
+use tokio::time::timeout;
+
+use super::codex_traffic_policy::resolve_codex_traffic_policy;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CodexAdmissionQueueTimeout {
+    pub provider_id: String,
+    pub max_in_flight: usize,
+    pub waited_ms: u64,
+}
 
 /// 供应商路由器
 pub struct ProviderRouter {
@@ -18,6 +29,9 @@ pub struct ProviderRouter {
     db: Arc<Database>,
     /// 熔断器管理器 - key 格式: "app_type:provider_id"
     circuit_breakers: Arc<RwLock<HashMap<String, Arc<CircuitBreaker>>>>,
+    /// Shared Codex admission gates. Permits are retained by the forwarder for the
+    /// complete response lifetime, including streamed bodies.
+    codex_route_admission: Arc<RwLock<HashMap<String, Arc<Semaphore>>>>,
 }
 
 impl ProviderRouter {
@@ -26,6 +40,57 @@ impl ProviderRouter {
         Self {
             db,
             circuit_breakers: Arc::new(RwLock::new(HashMap::new())),
+            codex_route_admission: Arc::new(RwLock::new(HashMap::new())),
+        }
+    }
+
+    pub async fn acquire_codex_route_admission(
+        &self,
+        provider: &Provider,
+        app_type: &str,
+    ) -> Result<Option<OwnedSemaphorePermit>, CodexAdmissionQueueTimeout> {
+        if app_type != "codex" {
+            return Ok(None);
+        }
+        let policy = resolve_codex_traffic_policy(provider);
+        if !policy.admission_enabled {
+            return Ok(None);
+        }
+        let max_in_flight = policy.max_in_flight;
+        let admission_target = policy.admission_key;
+        let key = format!("{app_type}:{admission_target}:limit={max_in_flight}");
+        let existing = {
+            let gates = self.codex_route_admission.read().await;
+            gates.get(&key).cloned()
+        };
+        let semaphore = if let Some(existing) = existing {
+            existing
+        } else {
+            let mut gates = self.codex_route_admission.write().await;
+            gates
+                .entry(key)
+                .or_insert_with(|| Arc::new(Semaphore::new(max_in_flight)))
+                .clone()
+        };
+        match semaphore.clone().try_acquire_owned() {
+            Ok(permit) => Ok(Some(permit)),
+            Err(tokio::sync::TryAcquireError::NoPermits) => {
+                let wait_started = Instant::now();
+                match timeout(policy.max_queue_wait, semaphore.acquire_owned()).await {
+                    Ok(Ok(permit)) => Ok(Some(permit)),
+                    Ok(Err(_)) | Err(_) => Err(CodexAdmissionQueueTimeout {
+                        provider_id: provider.id.clone(),
+                        max_in_flight,
+                        waited_ms: wait_started.elapsed().as_millis().min(u128::from(u64::MAX))
+                            as u64,
+                    }),
+                }
+            }
+            Err(tokio::sync::TryAcquireError::Closed) => Err(CodexAdmissionQueueTimeout {
+                provider_id: provider.id.clone(),
+                max_in_flight,
+                waited_ms: 0,
+            }),
         }
     }
 

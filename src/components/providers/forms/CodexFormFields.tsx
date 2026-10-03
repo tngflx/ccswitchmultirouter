@@ -88,12 +88,18 @@ import type {
   CodexReasoningProjection,
   CodexToolSchemaDialect,
   CodexHistoryReplay,
+  CodexTrafficPolicy,
   Provider,
   ProviderCategory,
 } from "@/types";
 import type { CodexProviderEditorSnapshot } from "@/lib/api/protocol-compatibility";
 import type { AppId } from "@/lib/api";
 import { codexSubagentV2Api } from "@/lib/api/codexSubagentV2";
+import {
+  customCodexTrafficPolicySeed,
+  normalizeCodexTrafficPolicy,
+  resolveCodexTrafficPolicy,
+} from "./codexTrafficPolicy";
 import type {
   CodexModelReasoningResolution,
   CodexReasoningDiscoveryOutcome,
@@ -235,6 +241,8 @@ interface CodexFormFieldsProps {
   onApiKeyGroupsChange?: (groups: CodexApiKeyGroup[]) => void;
   apiKeyGroupMode?: CodexApiKeyGroupMode;
   onApiKeyGroupModeChange?: (mode: CodexApiKeyGroupMode) => void;
+  codexTrafficPolicy?: CodexTrafficPolicy;
+  onCodexTrafficPolicyChange?: (value: CodexTrafficPolicy | undefined) => void;
   category?: ProviderCategory;
   shouldShowApiKeyLink: boolean;
   websiteUrl: string;
@@ -718,6 +726,8 @@ export function CodexFormFields({
   onApiKeyGroupsChange,
   apiKeyGroupMode = "isolated",
   onApiKeyGroupModeChange,
+  codexTrafficPolicy,
+  onCodexTrafficPolicyChange = () => undefined,
   category,
   shouldShowApiKeyLink,
   websiteUrl,
@@ -870,6 +880,21 @@ export function CodexFormFields({
   );
   const [catalogMountElement, setCatalogMountElement] =
     useState<HTMLDivElement | null>(null);
+  const resolvedTrafficPolicy = useMemo(
+    () => resolveCodexTrafficPolicy(codexBaseUrl, codexTrafficPolicy),
+    [codexBaseUrl, codexTrafficPolicy],
+  );
+  const updateTrafficPolicy = useCallback(
+    (patch: Partial<CodexTrafficPolicy>) => {
+      onCodexTrafficPolicyChange(
+        normalizeCodexTrafficPolicy({
+          ...(codexTrafficPolicy ?? customCodexTrafficPolicySeed(codexBaseUrl)),
+          ...patch,
+        }),
+      );
+    },
+    [codexBaseUrl, codexTrafficPolicy, onCodexTrafficPolicyChange],
+  );
 
   // 预设/编辑加载填充高级值后自动展开（仅从折叠→展开，不会自动折叠）；
   // xAI OAuth 托管预设的高级值都是预设自带的，无需展示，保持折叠
@@ -2994,6 +3019,138 @@ export function CodexFormFields({
                   onBodyJsonChange={onLocalProxyBodyOverrideChange}
                 />
               </div>
+            </div>
+
+            <div
+              className="space-y-3 rounded-md border border-border-default p-3"
+              aria-labelledby="codex-traffic-policy-title"
+            >
+              <div className="flex items-start justify-between gap-3">
+                <div className="space-y-1">
+                  <FormLabel id="codex-traffic-policy-title">
+                    {t("codexConfig.trafficPolicy.title", {
+                      defaultValue: "Traffic policy",
+                    })}
+                  </FormLabel>
+                  <p className="text-xs leading-relaxed text-muted-foreground">
+                    {t("codexConfig.trafficPolicy.description", {
+                      defaultValue:
+                        "Limit local in-flight requests and replay only recognized upstream rejections. This policy is per provider.",
+                    })}
+                  </p>
+                  <p className="text-xs text-muted-foreground">
+                    {resolvedTrafficPolicy.source === "recommended"
+                      ? t("codexConfig.trafficPolicy.zenRecommended", {
+                          defaultValue:
+                            "OpenCode Zen recommendation: 4 in flight, 5 rate-limit retries, and 2 recognized rejection retries.",
+                        })
+                      : resolvedTrafficPolicy.source === "custom"
+                        ? t("codexConfig.trafficPolicy.customActive", {
+                            defaultValue: "Custom policy is active.",
+                          })
+                        : t("codexConfig.trafficPolicy.unknownSafe", {
+                            defaultValue:
+                              "Unknown providers keep conservative defaults until you opt in.",
+                          })}
+                  </p>
+                </div>
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  onClick={() =>
+                    onCodexTrafficPolicyChange(
+                      codexTrafficPolicy
+                        ? undefined
+                        : customCodexTrafficPolicySeed(codexBaseUrl),
+                    )
+                  }
+                >
+                  {codexTrafficPolicy
+                    ? t("codexConfig.trafficPolicy.useRecommended", {
+                        defaultValue: "Use recommendation",
+                      })
+                    : t("codexConfig.trafficPolicy.customize", {
+                        defaultValue: "Customize",
+                      })}
+                </Button>
+              </div>
+              <div className="grid gap-3 md:grid-cols-2">
+                <label className="flex items-center justify-between gap-3 text-sm">
+                  <span>{t("codexConfig.trafficPolicy.limitConcurrency", { defaultValue: "Limit concurrency" })}</span>
+                  <Switch
+                    checked={resolvedTrafficPolicy.admissionEnabled}
+                    disabled={!codexTrafficPolicy}
+                    onCheckedChange={(checked) => updateTrafficPolicy({ admissionEnabled: checked })}
+                  />
+                </label>
+                <label className="space-y-1.5 text-sm">
+                  <span>{t("codexConfig.trafficPolicy.maxInFlight", { defaultValue: "Max in flight" })}</span>
+                  <Input
+                    type="number"
+                    min={1}
+                    max={64}
+                    value={resolvedTrafficPolicy.maxInFlight}
+                    disabled={!codexTrafficPolicy || !resolvedTrafficPolicy.admissionEnabled}
+                    onChange={(event) => updateTrafficPolicy({ maxInFlight: Number(event.target.value) })}
+                  />
+                </label>
+                <label className="space-y-1.5 text-sm">
+                  <span>{t("codexConfig.trafficPolicy.maxQueueWait", { defaultValue: "Queue wait (ms)" })}</span>
+                  <Input
+                    type="number"
+                    min={100}
+                    max={300000}
+                    value={resolvedTrafficPolicy.maxQueueWaitMs}
+                    disabled={!codexTrafficPolicy || !resolvedTrafficPolicy.admissionEnabled}
+                    onChange={(event) => updateTrafficPolicy({ maxQueueWaitMs: Number(event.target.value) })}
+                  />
+                </label>
+                <label className="space-y-1.5 text-sm">
+                  <span>{t("codexConfig.trafficPolicy.rateLimitRetries", { defaultValue: "429 retries" })}</span>
+                  <Input
+                    type="number"
+                    min={0}
+                    max={5}
+                    value={resolvedTrafficPolicy.rateLimitMaxRetries}
+                    disabled={!codexTrafficPolicy}
+                    onChange={(event) => updateTrafficPolicy({ rateLimitMaxRetries: Number(event.target.value) })}
+                  />
+                </label>
+              </div>
+              <div className="grid gap-3 md:grid-cols-3">
+                <label className="space-y-1.5 text-sm md:col-span-2">
+                  <span>{t("codexConfig.trafficPolicy.rejectionMode", { defaultValue: "Recognized rejection replay" })}</span>
+                  <Select
+                    value={resolvedTrafficPolicy.rejectionRetryMode}
+                    disabled={!codexTrafficPolicy}
+                    onValueChange={(value) => updateTrafficPolicy({ rejectionRetryMode: value as CodexTrafficPolicy["rejectionRetryMode"] })}
+                  >
+                    <SelectTrigger><SelectValue /></SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="disabled">{t("codexConfig.trafficPolicy.disabled", { defaultValue: "Disabled" })}</SelectItem>
+                      <SelectItem value="opencode_endpoint_unavailable">{t("codexConfig.trafficPolicy.opencodeSignature", { defaultValue: "OpenCode endpoint unavailable" })}</SelectItem>
+                    </SelectContent>
+                  </Select>
+                </label>
+                <label className="space-y-1.5 text-sm">
+                  <span>{t("codexConfig.trafficPolicy.rejectionRetries", { defaultValue: "Rejection retries" })}</span>
+                  <Input
+                    type="number"
+                    min={0}
+                    max={5}
+                    value={resolvedTrafficPolicy.rejectionMaxRetries}
+                    disabled={!codexTrafficPolicy || resolvedTrafficPolicy.rejectionRetryMode === "disabled"}
+                    onChange={(event) => updateTrafficPolicy({ rejectionMaxRetries: Number(event.target.value) })}
+                  />
+                </label>
+              </div>
+              <p className="text-xs leading-relaxed text-amber-700 dark:text-amber-300">
+                {t("codexConfig.trafficPolicy.safetyWarning", {
+                  defaultValue:
+                    "Only enable the OpenCode signature when the provider guarantees the same pre-inference rejection semantics. Arbitrary 5xx responses are never replayed.",
+                })}
+              </p>
             </div>
 
             {/* 仅自定义 Provider 可以退出 CCSwitchMulti 的目录管理；维护预设始终投影正确目录。 */}
