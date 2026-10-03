@@ -1,5 +1,23 @@
 # Engineering Journal
 
+## 2026-10-04 Ported shared auto model refresh primitive
+
+What happened: the fresh refork had independent manual model fetch handlers but
+no shared cache, request deduplication, or stale-result guard. Root cause: the
+legacy fork's reusable `useAutoModelRefresh` utility and its tests were absent
+from the new foundation. What we did: ported one shared hook with
+credential-scoped fingerprint support, TTL caching, in-flight request
+deduplication, invalidation epochs, optional local-storage snapshots, and
+non-destructive membership diff reporting. Provider forms remain the owners of
+fetch state; no duplicate fetch path was added. Evidence: `pnpm exec vitest run
+tests/hooks/useAutoModelRefresh.test.tsx` (4 passed), `pnpm typecheck`, focused
+Prettier checks, and `git diff --check` passed. Runtime freshness was not
+checked because no rebuilt desktop process was requested. What NOT to do again:
+do not copy legacy form integrations wholesale before confirming the fresh
+form's state owner, and do not treat an empty model response as proof that all
+saved models were removed. Related:
+`docs/decisions/2026-10-04-auto-model-refresh-port.md`.
+
 ## 2026-10-04 Restored atomic Codex provider switch Desktop lifecycle
 
 What happened: the fresh BigStrongSun refork lacked the legacy explicit Codex
