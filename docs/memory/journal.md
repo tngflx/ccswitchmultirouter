@@ -1,5 +1,25 @@
 # Engineering Journal
 
+## 2026-10-04 Ported model-specific key-group editor
+
+What happened: the fresh refork's grouped Codex credential UI could edit exact
+model IDs but could not discover models per group or target model prefixes.
+Root cause: the fresh form retained a simplified inline editor while the
+legacy fork had a reusable group model editor.
+
+What we did: recorded the ownership boundary and ported one reusable editor
+that delegates successful model discovery to the fresh form's existing catalog
+reconciliation owner. No second routing or catalog store was added.
+
+Evidence: `pnpm exec vitest run
+src/components/providers/forms/CodexKeyGroupModels.test.tsx` (5 passed),
+`pnpm typecheck`, Prettier checks on all changed files, and `git diff --check`
+passed. Runtime freshness was not checked because no rebuilt desktop process
+was requested.
+What NOT to do again: do not copy the legacy Codex form wholesale when the
+fresh form already owns catalog state and reconciliation. Related:
+`docs/decisions/2026-10-04-key-group-model-editor-port.md`.
+
 ## 2026-10-04 Centralized packaged Codex launcher identity
 
 What happened: the fresh refork's runtime refresh selected the first matching

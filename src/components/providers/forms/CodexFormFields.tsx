@@ -55,6 +55,7 @@ import { CodexProtocolAdvancedSettings } from "./CodexProtocolAdvancedSettings";
 import { CustomUserAgentField } from "./CustomUserAgentField";
 import { LocalProxyRequestOverridesField } from "./LocalProxyRequestOverridesField";
 import { CodexProviderReadinessSection } from "./CodexProviderReadinessSection";
+import { CodexKeyGroupModels } from "./CodexKeyGroupModels";
 import { CodexModelReasoningCard } from "./CodexModelReasoningCard";
 import { CodexModelReasoningEditor } from "./CodexModelReasoningEditor";
 import { CodexModelReasoningSummary } from "./CodexModelReasoningSummary";
@@ -652,16 +653,11 @@ function mergeFetchedModelsIntoCatalogRows(
     websiteUrl?: string;
   } = {},
 ): CodexCatalogRow[] {
-  const result = reconcileFetchedCodexCatalogRows(
-    rows,
-    fetchedModels,
-    source,
-    {
-      appendNew: true,
-      createRow: (seed) => createCatalogRow(seed),
-      existingMetadataMode: "fill-missing",
-    },
-  );
+  const result = reconcileFetchedCodexCatalogRows(rows, fetchedModels, source, {
+    appendNew: true,
+    createRow: (seed) => createCatalogRow(seed),
+    existingMetadataMode: "fill-missing",
+  });
   return result.rows;
 }
 
@@ -865,6 +861,8 @@ export function CodexFormFields({
   const [catalogRows, setCatalogRows] = useState<CodexCatalogRow[]>(() =>
     catalogModels.map((m) => createCatalogRow(m)),
   );
+  const apiKeyGroupsRef = useRef(apiKeyGroups);
+  apiKeyGroupsRef.current = apiKeyGroups;
   const hasLegacyMixedProtocolCatalog = useMemo(() => {
     let hasResponses = false;
     let hasChat = false;
@@ -2871,7 +2869,9 @@ export function CodexFormFields({
                 <div className="space-y-3 border-t border-border-default pt-3">
                   <div className="flex items-center justify-between gap-3">
                     <div>
-                      <FormLabel>{t("codexConfig.apiKeyGroupsTitle")}</FormLabel>
+                      <FormLabel>
+                        {t("codexConfig.apiKeyGroupsTitle")}
+                      </FormLabel>
                       <p className="text-xs text-muted-foreground">
                         {t("codexConfig.apiKeyGroupsHint")}
                       </p>
@@ -2883,7 +2883,11 @@ export function CodexFormFields({
                       onClick={() =>
                         onApiKeyGroupsChange([
                           ...apiKeyGroups,
-                          { id: `group-${apiKeyGroups.length + 1}`, apiKeys: [], strategy: "fixed" },
+                          {
+                            id: `group-${apiKeyGroups.length + 1}`,
+                            apiKeys: [],
+                            strategy: "fixed",
+                          },
                         ])
                       }
                     >
@@ -2892,7 +2896,10 @@ export function CodexFormFields({
                     </Button>
                   </div>
                   {apiKeyGroups.map((group, index) => (
-                    <div key={`${group.id}-${index}`} className="space-y-2 rounded-md border p-3">
+                    <div
+                      key={`${group.id}-${index}`}
+                      className="space-y-2 rounded-md border p-3"
+                    >
                       <div className="grid gap-2 md:grid-cols-[1fr_1fr_auto]">
                         <Input
                           value={group.id}
@@ -2909,7 +2916,10 @@ export function CodexFormFields({
                           aria-label={t("codexConfig.apiKeyGroupKey")}
                           placeholder={t("codexConfig.apiKeyGroupKey")}
                           onChange={(event) => {
-                            const apiKeys = event.target.value.split(",").map((key) => key.trim()).filter(Boolean);
+                            const apiKeys = event.target.value
+                              .split(",")
+                              .map((key) => key.trim())
+                              .filter(Boolean);
                             const next = [...apiKeyGroups];
                             next[index] = { ...group, apiKeys };
                             onApiKeyGroupsChange(next);
@@ -2920,20 +2930,40 @@ export function CodexFormFields({
                           variant="ghost"
                           size="icon"
                           aria-label={t("codexConfig.apiKeyGroupRemove")}
-                          onClick={() => onApiKeyGroupsChange(apiKeyGroups.filter((_, item) => item !== index))}
+                          onClick={() =>
+                            onApiKeyGroupsChange(
+                              apiKeyGroups.filter((_, item) => item !== index),
+                            )
+                          }
                         >
                           <Trash2 className="h-4 w-4" />
                         </Button>
                       </div>
-                      <Input
-                        value={(group.models ?? []).join(", ")}
-                        aria-label={t("codexConfig.apiKeyGroupModels")}
-                        placeholder={t("codexConfig.apiKeyGroupModels")}
-                        onChange={(event) => {
-                          const models = event.target.value.split(",").map((model) => model.trim()).filter(Boolean);
-                          const next = [...apiKeyGroups];
-                          next[index] = { ...group, models };
+                      <CodexKeyGroupModels
+                        group={group}
+                        baseUrl={codexBaseUrl}
+                        isFullUrl={isFullUrl}
+                        customUserAgent={customUserAgent}
+                        onChange={(nextGroup) => {
+                          const next = apiKeyGroupsRef.current.map((item) =>
+                            item.id === group.id ? nextGroup : item,
+                          );
+                          apiKeyGroupsRef.current = next;
                           onApiKeyGroupsChange(next);
+                        }}
+                        onModelsFetched={(models) => {
+                          const mergedRows = mergeFetchedModelsIntoCatalogRows(
+                            catalogRowsRef.current,
+                            models,
+                            {
+                              providerId,
+                              providerName,
+                              baseUrl: codexBaseUrl,
+                              websiteUrl,
+                            },
+                          );
+                          catalogRowsRef.current = mergedRows;
+                          setCatalogRows(mergedRows);
                         }}
                       />
                       <div className="flex items-center gap-2">
@@ -2946,16 +2976,31 @@ export function CodexFormFields({
                             onApiKeyGroupsChange(next);
                           }}
                         />
-                        <span className="text-xs text-muted-foreground">{t("codexConfig.apiKeyGroupEnabled")}</span>
+                        <span className="text-xs text-muted-foreground">
+                          {t("codexConfig.apiKeyGroupEnabled")}
+                        </span>
                       </div>
                     </div>
                   ))}
                   {apiKeyGroups.length > 0 && onApiKeyGroupModeChange ? (
-                    <Select value={apiKeyGroupMode} onValueChange={(value) => onApiKeyGroupModeChange(value as CodexApiKeyGroupMode)}>
-                      <SelectTrigger aria-label={t("codexConfig.apiKeyGroupMode")}><SelectValue /></SelectTrigger>
+                    <Select
+                      value={apiKeyGroupMode}
+                      onValueChange={(value) =>
+                        onApiKeyGroupModeChange(value as CodexApiKeyGroupMode)
+                      }
+                    >
+                      <SelectTrigger
+                        aria-label={t("codexConfig.apiKeyGroupMode")}
+                      >
+                        <SelectValue />
+                      </SelectTrigger>
                       <SelectContent>
-                        <SelectItem value="isolated">{t("codexConfig.apiKeyGroupModeIsolated")}</SelectItem>
-                        <SelectItem value="round_robin">{t("codexConfig.apiKeyGroupModeRoundRobin")}</SelectItem>
+                        <SelectItem value="isolated">
+                          {t("codexConfig.apiKeyGroupModeIsolated")}
+                        </SelectItem>
+                        <SelectItem value="round_robin">
+                          {t("codexConfig.apiKeyGroupModeRoundRobin")}
+                        </SelectItem>
                       </SelectContent>
                     </Select>
                   ) : null}
@@ -3032,71 +3077,137 @@ export function CodexFormFields({
               </div>
               <div className="grid gap-3 md:grid-cols-2">
                 <label className="flex items-center justify-between gap-3 text-sm">
-                  <span>{t("codexConfig.trafficPolicy.limitConcurrency", { defaultValue: "Limit concurrency" })}</span>
+                  <span>
+                    {t("codexConfig.trafficPolicy.limitConcurrency", {
+                      defaultValue: "Limit concurrency",
+                    })}
+                  </span>
                   <Switch
                     checked={resolvedTrafficPolicy.admissionEnabled}
                     disabled={!codexTrafficPolicy}
-                    onCheckedChange={(checked) => updateTrafficPolicy({ admissionEnabled: checked })}
+                    onCheckedChange={(checked) =>
+                      updateTrafficPolicy({ admissionEnabled: checked })
+                    }
                   />
                 </label>
                 <label className="space-y-1.5 text-sm">
-                  <span>{t("codexConfig.trafficPolicy.maxInFlight", { defaultValue: "Max in flight" })}</span>
+                  <span>
+                    {t("codexConfig.trafficPolicy.maxInFlight", {
+                      defaultValue: "Max in flight",
+                    })}
+                  </span>
                   <Input
                     type="number"
                     min={1}
                     max={64}
                     value={resolvedTrafficPolicy.maxInFlight}
-                    disabled={!codexTrafficPolicy || !resolvedTrafficPolicy.admissionEnabled}
-                    onChange={(event) => updateTrafficPolicy({ maxInFlight: Number(event.target.value) })}
+                    disabled={
+                      !codexTrafficPolicy ||
+                      !resolvedTrafficPolicy.admissionEnabled
+                    }
+                    onChange={(event) =>
+                      updateTrafficPolicy({
+                        maxInFlight: Number(event.target.value),
+                      })
+                    }
                   />
                 </label>
                 <label className="space-y-1.5 text-sm">
-                  <span>{t("codexConfig.trafficPolicy.maxQueueWait", { defaultValue: "Queue wait (ms)" })}</span>
+                  <span>
+                    {t("codexConfig.trafficPolicy.maxQueueWait", {
+                      defaultValue: "Queue wait (ms)",
+                    })}
+                  </span>
                   <Input
                     type="number"
                     min={100}
                     max={300000}
                     value={resolvedTrafficPolicy.maxQueueWaitMs}
-                    disabled={!codexTrafficPolicy || !resolvedTrafficPolicy.admissionEnabled}
-                    onChange={(event) => updateTrafficPolicy({ maxQueueWaitMs: Number(event.target.value) })}
+                    disabled={
+                      !codexTrafficPolicy ||
+                      !resolvedTrafficPolicy.admissionEnabled
+                    }
+                    onChange={(event) =>
+                      updateTrafficPolicy({
+                        maxQueueWaitMs: Number(event.target.value),
+                      })
+                    }
                   />
                 </label>
                 <label className="space-y-1.5 text-sm">
-                  <span>{t("codexConfig.trafficPolicy.rateLimitRetries", { defaultValue: "429 retries" })}</span>
+                  <span>
+                    {t("codexConfig.trafficPolicy.rateLimitRetries", {
+                      defaultValue: "429 retries",
+                    })}
+                  </span>
                   <Input
                     type="number"
                     min={0}
                     max={5}
                     value={resolvedTrafficPolicy.rateLimitMaxRetries}
                     disabled={!codexTrafficPolicy}
-                    onChange={(event) => updateTrafficPolicy({ rateLimitMaxRetries: Number(event.target.value) })}
+                    onChange={(event) =>
+                      updateTrafficPolicy({
+                        rateLimitMaxRetries: Number(event.target.value),
+                      })
+                    }
                   />
                 </label>
               </div>
               <div className="grid gap-3 md:grid-cols-3">
                 <label className="space-y-1.5 text-sm md:col-span-2">
-                  <span>{t("codexConfig.trafficPolicy.rejectionMode", { defaultValue: "Recognized rejection replay" })}</span>
+                  <span>
+                    {t("codexConfig.trafficPolicy.rejectionMode", {
+                      defaultValue: "Recognized rejection replay",
+                    })}
+                  </span>
                   <Select
                     value={resolvedTrafficPolicy.rejectionRetryMode}
                     disabled={!codexTrafficPolicy}
-                    onValueChange={(value) => updateTrafficPolicy({ rejectionRetryMode: value as CodexTrafficPolicy["rejectionRetryMode"] })}
+                    onValueChange={(value) =>
+                      updateTrafficPolicy({
+                        rejectionRetryMode:
+                          value as CodexTrafficPolicy["rejectionRetryMode"],
+                      })
+                    }
                   >
-                    <SelectTrigger><SelectValue /></SelectTrigger>
+                    <SelectTrigger>
+                      <SelectValue />
+                    </SelectTrigger>
                     <SelectContent>
-                      <SelectItem value="disabled">{t("codexConfig.trafficPolicy.disabled", { defaultValue: "Disabled" })}</SelectItem>
-                      <SelectItem value="opencode_endpoint_unavailable">{t("codexConfig.trafficPolicy.opencodeSignature", { defaultValue: "OpenCode endpoint unavailable" })}</SelectItem>
+                      <SelectItem value="disabled">
+                        {t("codexConfig.trafficPolicy.disabled", {
+                          defaultValue: "Disabled",
+                        })}
+                      </SelectItem>
+                      <SelectItem value="opencode_endpoint_unavailable">
+                        {t("codexConfig.trafficPolicy.opencodeSignature", {
+                          defaultValue: "OpenCode endpoint unavailable",
+                        })}
+                      </SelectItem>
                     </SelectContent>
                   </Select>
                 </label>
                 <label className="space-y-1.5 text-sm">
-                  <span>{t("codexConfig.trafficPolicy.rejectionRetries", { defaultValue: "Rejection retries" })}</span>
+                  <span>
+                    {t("codexConfig.trafficPolicy.rejectionRetries", {
+                      defaultValue: "Rejection retries",
+                    })}
+                  </span>
                   <Input
                     type="number"
                     min={0}
                     max={5}
                     value={resolvedTrafficPolicy.rejectionMaxRetries}
-                    disabled={!codexTrafficPolicy || resolvedTrafficPolicy.rejectionRetryMode === "disabled"}
-                    onChange={(event) => updateTrafficPolicy({ rejectionMaxRetries: Number(event.target.value) })}
+                    disabled={
+                      !codexTrafficPolicy ||
+                      resolvedTrafficPolicy.rejectionRetryMode === "disabled"
+                    }
+                    onChange={(event) =>
+                      updateTrafficPolicy({
+                        rejectionMaxRetries: Number(event.target.value),
+                      })
+                    }
                   />
                 </label>
               </div>
