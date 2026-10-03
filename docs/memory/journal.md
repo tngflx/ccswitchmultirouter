@@ -1,5 +1,26 @@
 # Engineering Journal
 
+## 2026-10-03 Kept official Codex proxy sessions in stable history buckets
+
+What happened: the fresh refork still projected official Codex takeover through
+the legacy `cc-switch-official` provider, while the migration target requires
+native `openai` history when unified history is disabled and the shared
+`custom` bucket when it is enabled. Root cause: route projection and auth-facade
+classification assumed every official takeover had a named provider table;
+the built-in `openai` route has only a top-level `openai_base_url`. What we did:
+made `codex_config` the sole owner of projection/detection/cleanup, removed only
+CC Switch-owned legacy residue, adapted service projection for native versus
+managed official auth, and taught account-pool reprojection to recognize the
+built-in route. Evidence: official-route tests (6), projection tests (2),
+account-pool reprojection (1), and takeover false-positive test (1) passed;
+`cargo check --manifest-path src-tauri/Cargo.toml`, `pnpm typecheck`, and
+`git diff --check` passed. `pnpm format:check` failed only on six pre-existing
+provider-form files outside this change. Runtime freshness was not checked
+because no rebuilt desktop process was requested. What NOT to do again: do not
+restore a second legacy route builder or classify a missing
+`[model_providers.openai]` table as managed without checking the top-level route
+marker. Related: `docs/decisions/2026-10-03-codex-official-history-bucket-port.md`.
+
 ## 2026-10-03 Restored the refork language quick switcher
 
 What happened: the fresh refork had a Settings-page language control but had

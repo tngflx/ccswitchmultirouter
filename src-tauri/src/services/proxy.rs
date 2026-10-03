@@ -4408,8 +4408,10 @@ impl ProxyService {
         let is_multirouter = Self::codex_provider_has_enabled_routing(Some(&provider));
         let provider_id = if is_multirouter {
             crate::codex_config::CC_SWITCH_CODEX_ROUTER_MODEL_PROVIDER_ID
+        } else if crate::settings::unify_codex_session_history() {
+            crate::codex_config::CC_SWITCH_CODEX_MODEL_PROVIDER_ID
         } else {
-            crate::codex_config::CC_SWITCH_CODEX_OFFICIAL_PROXY_PROVIDER_ID
+            "openai"
         };
         let current = Self::legacy_codex_multirouter_auth_facade(&current_doc, provider_id);
         let base_url = crate::codex_config::extract_codex_base_url(config_text)
@@ -4427,7 +4429,7 @@ impl ProxyService {
             .map_err(|error| format!("解析重投影后的 Codex config.toml 失败: {error}"))?;
         if is_multirouter {
             Self::apply_codex_multirouter_auth_facade_to_doc(&mut updated_doc, provider_id, target);
-        } else {
+        } else if crate::settings::unify_codex_session_history() {
             Self::apply_codex_auth_facade_to_doc(&mut updated_doc, provider_id, target, None);
         }
         live["config"] = json!(updated_doc.to_string());
@@ -4625,29 +4627,55 @@ impl ProxyService {
                 providers_by_id,
                 pool_policy,
             );
-            let facade = match classified {
-                crate::proxy::providers::CodexMultiRouterAuthFacade::LegacyPreserved => {
-                    let previous = toml_str.parse::<DocumentMut>().ok();
-                    previous
-                        .as_ref()
-                        .map(|doc| {
-                            Self::legacy_codex_multirouter_auth_facade(
-                                doc,
-                                crate::codex_config::CC_SWITCH_CODEX_OFFICIAL_PROXY_PROVIDER_ID,
+            // Native official login can stay on built-in `openai` when unified
+            // history is disabled. Managed OAuth still needs a named route so
+            // the proxy-owned bearer placeholder remains the auth source.
+            let use_custom_route = crate::settings::unify_codex_session_history()
+                || matches!(
+                    classified,
+                    crate::proxy::providers::CodexMultiRouterAuthFacade::FullyManaged
+                );
+            if use_custom_route {
+                doc["model_provider"] = toml_edit::value(
+                    crate::codex_config::CC_SWITCH_CODEX_MODEL_PROVIDER_ID,
+                );
+                let mut providers = doc
+                    .as_table_mut()
+                    .remove("model_providers")
+                    .and_then(|item| item.into_table().ok())
+                    .unwrap_or_else(toml_edit::Table::new);
+                providers.insert(
+                    crate::codex_config::CC_SWITCH_CODEX_MODEL_PROVIDER_ID,
+                    toml_edit::Item::Table(crate::codex_config::codex_official_provider_table(
+                        Some(proxy_url),
+                        false,
+                    )),
+                );
+                doc["model_providers"] = toml_edit::Item::Table(providers);
+                let facade = match classified {
+                    crate::proxy::providers::CodexMultiRouterAuthFacade::LegacyPreserved => {
+                        let previous = toml_str.parse::<DocumentMut>().ok();
+                        previous
+                            .as_ref()
+                            .map(|doc| {
+                                Self::legacy_codex_multirouter_auth_facade(
+                                    doc,
+                                    crate::codex_config::CC_SWITCH_CODEX_MODEL_PROVIDER_ID,
+                                )
+                            })
+                            .unwrap_or(
+                                crate::proxy::providers::CodexMultiRouterAuthFacade::FullyManaged,
                             )
-                        })
-                        .unwrap_or(
-                            crate::proxy::providers::CodexMultiRouterAuthFacade::FullyManaged,
-                        )
-                }
-                facade => facade,
-            };
-            Self::apply_codex_auth_facade_to_doc(
-                &mut doc,
-                crate::codex_config::CC_SWITCH_CODEX_OFFICIAL_PROXY_PROVIDER_ID,
-                facade,
-                None,
-            );
+                    }
+                    facade => facade,
+                };
+                Self::apply_codex_auth_facade_to_doc(
+                    &mut doc,
+                    crate::codex_config::CC_SWITCH_CODEX_MODEL_PROVIDER_ID,
+                    facade,
+                    None,
+                );
+            }
             return Ok(doc.to_string());
         }
 
@@ -4787,6 +4815,17 @@ impl ProxyService {
         doc: &DocumentMut,
         provider_id: &str,
     ) -> crate::proxy::providers::CodexMultiRouterAuthFacade {
+        // Native official routing uses Codex's built-in `openai` bucket, which
+        // intentionally has no `[model_providers.openai]` table. Its top-level
+        // local base URL is the ownership marker for the native facade.
+        if provider_id == "openai"
+            && doc
+                .get("openai_base_url")
+                .and_then(|value| value.as_str())
+                .is_some()
+        {
+            return crate::proxy::providers::CodexMultiRouterAuthFacade::NativeMixed;
+        }
         let provider = doc
             .get("model_providers")
             .and_then(|providers| providers.get(provider_id));
@@ -9243,7 +9282,9 @@ supports_websockets = false
         assert_eq!(outcome.facade.as_deref(), Some("native_mixed"));
         let live = std::fs::read_to_string(crate::codex_config::get_codex_config_path())
             .expect("read projected live config");
-        assert!(live.contains("requires_openai_auth = true"));
+        assert!(live.contains("openai_base_url = \"http://127.0.0.1:15721/v1\""));
+        assert!(!live.contains("model_provider = \"custom\""));
+        assert!(!live.contains("requires_openai_auth = true"));
         assert!(!live.contains("experimental_bearer_token"));
         assert_eq!(
             std::fs::read(crate::codex_config::get_codex_auth_path()).expect("read auth bytes"),
@@ -9267,6 +9308,7 @@ supports_websockets = false
         assert_eq!(outcome.facade.as_deref(), Some("fully_managed"));
         let live = std::fs::read_to_string(crate::codex_config::get_codex_config_path())
             .expect("read managed projected live config");
+        assert!(live.contains("model_provider = \"custom\""));
         assert!(live.contains("requires_openai_auth = true"));
         assert!(live.contains("experimental_bearer_token = \"PROXY_MANAGED\""));
         assert_eq!(
@@ -9293,20 +9335,9 @@ supports_websockets = false
         )
         .expect("apply official proxy config");
         let parsed: toml::Value = toml::from_str(&output).expect("valid official route");
-        let route_id = crate::codex_config::CC_SWITCH_CODEX_OFFICIAL_PROXY_PROVIDER_ID;
-        let route = &parsed["model_providers"][route_id];
-        let historical_custom =
-            &parsed["model_providers"][crate::codex_config::CC_SWITCH_CODEX_MODEL_PROVIDER_ID];
-
-        assert_eq!(parsed["model_provider"].as_str(), Some(route_id));
-        assert_eq!(route["base_url"].as_str(), Some(proxy_url));
-        assert_eq!(route["requires_openai_auth"].as_bool(), Some(true));
-        assert_eq!(historical_custom["base_url"].as_str(), Some(proxy_url));
-        assert_eq!(
-            historical_custom["requires_openai_auth"].as_bool(),
-            Some(true),
-            "historical custom-bucket tasks must retain native Codex authentication"
-        );
+        assert!(parsed.get("model_provider").is_none());
+        assert_eq!(parsed["openai_base_url"].as_str(), Some(proxy_url));
+        assert!(parsed.get("model_providers").is_none());
         assert!(parsed.get("experimental_bearer_token").is_none());
     }
 
@@ -9335,7 +9366,7 @@ supports_websockets = false
         .expect("apply managed official proxy config");
         let parsed: toml::Value = toml::from_str(&output).expect("valid official route");
         let route = &parsed["model_providers"]
-            [crate::codex_config::CC_SWITCH_CODEX_OFFICIAL_PROXY_PROVIDER_ID];
+            [crate::codex_config::CC_SWITCH_CODEX_MODEL_PROVIDER_ID];
 
         assert_eq!(route["requires_openai_auth"].as_bool(), Some(true));
         assert_eq!(
