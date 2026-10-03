@@ -5,23 +5,18 @@ import en from "./locales/en.json";
 import ja from "./locales/ja.json";
 import zh from "./locales/zh.json";
 import zhTW from "./locales/zh-TW.json";
+import {
+  DEFAULT_LANGUAGE,
+  parseSupportedLanguage,
+  type SupportedLanguage,
+} from "./language";
 
-type Language = "zh" | "zh-TW" | "en" | "ja";
-
-const DEFAULT_LANGUAGE: Language = "zh";
-
-const getInitialLanguage = (): Language => {
+const getInitialLanguage = (): SupportedLanguage => {
   if (typeof window !== "undefined") {
     try {
       const stored = window.localStorage.getItem("language");
-      if (
-        stored === "zh" ||
-        stored === "zh-TW" ||
-        stored === "en" ||
-        stored === "ja"
-      ) {
-        return stored;
-      }
+      const storedLanguage = parseSupportedLanguage(stored);
+      if (storedLanguage) return storedLanguage;
     } catch (error) {
       console.warn("[i18n] Failed to read stored language preference", error);
     }
@@ -33,32 +28,7 @@ const getInitialLanguage = (): Language => {
         navigator.languages?.[0]?.toLowerCase())
       : undefined;
 
-  if (navigatorLang === "zh") {
-    return "zh";
-  }
-
-  if (
-    navigatorLang?.startsWith("zh-tw") ||
-    navigatorLang?.startsWith("zh-hk") ||
-    navigatorLang?.startsWith("zh-mo") ||
-    navigatorLang?.startsWith("zh-hant")
-  ) {
-    return "zh-TW";
-  }
-
-  if (navigatorLang?.startsWith("zh")) {
-    return "zh";
-  }
-
-  if (navigatorLang?.startsWith("ja")) {
-    return "ja";
-  }
-
-  if (navigatorLang?.startsWith("en")) {
-    return "en";
-  }
-
-  return DEFAULT_LANGUAGE;
+  return parseSupportedLanguage(navigatorLang) ?? DEFAULT_LANGUAGE;
 };
 
 const resources = {

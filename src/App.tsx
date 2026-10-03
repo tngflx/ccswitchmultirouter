@@ -81,6 +81,7 @@ import { AddProviderDialog } from "@/components/providers/AddProviderDialog";
 import { EditProviderDialog } from "@/components/providers/EditProviderDialog";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { SettingsPage } from "@/components/settings/SettingsPage";
+import { LanguageSwitcher } from "@/components/settings/LanguageSwitcher";
 import { OPEN_SETTINGS_TAB_EVENT } from "@/lib/settingsNavigation";
 import { UpdateBadge } from "@/components/UpdateBadge";
 import { CCSWITCHMULTI_REPOSITORY_URL } from "@/config/productLinks";
@@ -1890,6 +1891,7 @@ function App() {
                 className="flex shrink-0 items-center gap-1.5"
                 style={{ WebkitAppRegion: "no-drag" } as any}
               >
+                <LanguageSwitcher />
                 {currentView === "prompts" && promptPrimaryAction && (
                   <Button
                     variant="ghost"

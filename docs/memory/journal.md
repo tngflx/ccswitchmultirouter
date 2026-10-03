@@ -1,5 +1,22 @@
 # Engineering Journal
 
+## 2026-10-03 Restored the refork language quick switcher
+
+What happened: the fresh refork had a Settings-page language control but had
+lost the legacy header quick switcher, and unknown or missing language values
+fell back to Chinese. Root cause: language parsing was duplicated between the
+i18n bootstrap and settings form, while the header had no owner in the fresh
+shell. What we did: added one shared supported-language parser with English as
+the default, adapted the header switcher to the existing settings mutation,
+and made optimistic language changes roll back i18n and local storage when the
+save fails. Existing Settings ownership remains unchanged. Evidence: focused
+language/parser/settings tests passed (17), dependent App and Settings tests
+passed (38), `pnpm typecheck`, Prettier checks, and `git diff --check` passed.
+Runtime freshness was not checked because no rebuilt desktop process was
+requested. What NOT to do again: do not add another language normalization or
+independent persistence API beside the shared contract. Related:
+`docs/decisions/2026-10-03-language-switcher-port.md`.
+
 ## 2026-10-03 Ported the stream retry setting into the refork
 
 What happened: the fresh refork already had bounded Responses stream reconnection, but users could not disable that replay behavior. Root cause: the retry owner existed without the fork's persisted `enable_stream_retry` control. What we did: added the default-on compatibility setting, typed frontend state and all four locale strings, a proxy settings toggle, and a gate around only the existing Responses reconnect factory. Capacity replay and transport retry remain separate. Deliberately did not port legacy aggressive continuation because the fresh architecture has no matching client-session owner. Evidence: focused Rust settings test passed (1), `cargo check`, `cargo fmt --check`, `pnpm typecheck`, frontend Prettier, and `git diff --check` passed. Runtime freshness was not checked because no rebuilt desktop process was requested. What NOT to do again: do not gate unrelated retry policies with this setting or add a second continuation owner. Related: `docs/decisions/2026-10-03-stream-retry-setting-port.md`.

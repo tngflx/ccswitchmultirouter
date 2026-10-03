@@ -1,12 +1,11 @@
 import { Button } from "@/components/ui/button";
+import type { SupportedLanguage } from "@/i18n/language";
 import { cn } from "@/lib/utils";
 import { useTranslation } from "react-i18next";
 
-type LanguageOption = "zh" | "zh-TW" | "en" | "ja";
-
 interface LanguageSettingsProps {
-  value: LanguageOption;
-  onChange: (value: LanguageOption) => void;
+  value: SupportedLanguage;
+  onChange: (value: SupportedLanguage) => void;
 }
 
 export function LanguageSettings({ value, onChange }: LanguageSettingsProps) {

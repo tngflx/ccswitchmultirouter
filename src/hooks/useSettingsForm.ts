@@ -1,48 +1,16 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useSettingsQuery } from "@/lib/query";
+import {
+  DEFAULT_LANGUAGE,
+  normalizeLanguage,
+  parseSupportedLanguage,
+  type SupportedLanguage,
+} from "@/i18n/language";
 import type { Settings } from "@/types";
 
-type Language = "zh" | "zh-TW" | "en" | "ja";
-
 export type SettingsFormState = Omit<Settings, "language"> & {
-  language: Language;
-};
-
-const normalizeLanguage = (lang?: string | null): Language => {
-  if (!lang) return "zh";
-  const normalized = lang.toLowerCase().replace(/_/g, "-");
-
-  if (normalized === "zh") {
-    return "zh";
-  }
-
-  if (
-    normalized === "zh-tw" ||
-    normalized.startsWith("zh-hant") ||
-    normalized.startsWith("zh-hk") ||
-    normalized.startsWith("zh-mo")
-  ) {
-    return "zh-TW";
-  }
-
-  if (normalized === "en" || normalized === "ja") {
-    return normalized;
-  }
-
-  if (normalized.startsWith("zh")) {
-    return "zh";
-  }
-
-  return "zh";
-};
-
-const isSupportedLanguage = (lang?: string | null): boolean => {
-  if (!lang) return false;
-  const normalized = lang.toLowerCase().replace(/_/g, "-");
-  return (
-    normalized === "en" || normalized === "ja" || normalized.startsWith("zh")
-  );
+  language: SupportedLanguage;
 };
 
 const sanitizeDir = (value?: string | null): string | undefined => {
@@ -54,11 +22,11 @@ const sanitizeDir = (value?: string | null): string | undefined => {
 export interface UseSettingsFormResult {
   settings: SettingsFormState | null;
   isLoading: boolean;
-  initialLanguage: Language;
+  initialLanguage: SupportedLanguage;
   updateSettings: (updates: Partial<SettingsFormState>) => void;
   resetSettings: (serverData: Settings | null) => void;
-  readPersistedLanguage: () => Language;
-  syncLanguage: (lang: Language) => void;
+  readPersistedLanguage: () => SupportedLanguage;
+  syncLanguage: (lang: SupportedLanguage) => void;
 }
 
 /**
@@ -77,20 +45,19 @@ export function useSettingsForm(): UseSettingsFormResult {
     null,
   );
 
-  const initialLanguageRef = useRef<Language>("zh");
+  const initialLanguageRef = useRef<SupportedLanguage>(DEFAULT_LANGUAGE);
 
-  const readPersistedLanguage = useCallback((): Language => {
+  const readPersistedLanguage = useCallback((): SupportedLanguage => {
     if (typeof window !== "undefined") {
       const stored = window.localStorage.getItem("language");
-      if (isSupportedLanguage(stored)) {
-        return normalizeLanguage(stored);
-      }
+      const storedLanguage = parseSupportedLanguage(stored);
+      if (storedLanguage) return storedLanguage;
     }
     return normalizeLanguage(i18n.language);
   }, [i18n]);
 
   const syncLanguage = useCallback(
-    (lang: Language) => {
+    (lang: SupportedLanguage) => {
       const current = normalizeLanguage(i18n.language);
       if (current !== lang) {
         void i18n.changeLanguage(lang);

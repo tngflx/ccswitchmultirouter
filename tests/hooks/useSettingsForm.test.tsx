@@ -118,6 +118,19 @@ describe("useSettingsForm Hook", () => {
     expect(changeLanguageSpy).not.toHaveBeenCalled();
   });
 
+  it("should fall back to english for an unknown language", () => {
+    useSettingsQueryMock.mockReturnValue({
+      data: null,
+      isLoading: false,
+    });
+    (i18n as any).language = "unsupported-locale";
+
+    const { result } = renderHook(() => useSettingsForm());
+
+    expect(result.current.initialLanguage).toBe("en");
+    expect(result.current.readPersistedLanguage()).toBe("en");
+  });
+
   it("should update fields and sync language when language changes in updateSettings", () => {
     useSettingsQueryMock.mockReturnValue({
       data: null,
