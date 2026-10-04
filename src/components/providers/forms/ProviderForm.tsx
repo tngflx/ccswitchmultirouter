@@ -14,6 +14,7 @@ import {
 } from "@/lib/requestOverrides";
 import { normalizeCodexChatReasoningForSave } from "@/lib/codexChatReasoning";
 export { normalizeCodexChatReasoningForSave } from "@/lib/codexChatReasoning";
+import { parseCodexSubagentCandidateError } from "@/lib/codexSubagentCandidateError";
 import {
   buildCodexProtocolMeta,
   readCodexProtocolSettings,
@@ -146,6 +147,7 @@ import {
 } from "./hooks";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { useSettingsQuery } from "@/lib/query";
+import { useProvidersQuery } from "@/lib/query/queries";
 import {
   CLAUDE_DEFAULT_CONFIG,
   CODEX_DEFAULT_CONFIG,
@@ -1084,6 +1086,28 @@ function ProviderFormFull({
   const effectiveCodexMenuProjection =
     isMaintainedCodexPreset || codexTakeoverEnabled;
 
+  const { data: codexProvidersData } = useProvidersQuery("codex");
+  const codexCapabilityProviders =
+    appId === "codex" ? (codexProvidersData?.providers ?? {}) : {};
+  const knownCodexCatalogModels = useMemo(() => {
+    if (appId !== "codex") return [];
+    const maintainedModels = codexProviderPresets.flatMap(
+      (preset) => preset.modelCatalog ?? [],
+    );
+    const savedModels = Object.values(codexCapabilityProviders).flatMap(
+      (provider) => {
+        const settings = provider.settingsConfig as
+          | Record<string, unknown>
+          | undefined;
+        const catalog = settings?.modelCatalog;
+        if (!catalog || typeof catalog !== "object") return [];
+        const models = (catalog as { models?: unknown }).models;
+        return Array.isArray(models) ? (models as CodexCatalogModel[]) : [];
+      },
+    );
+    return [...maintainedModels, ...savedModels];
+  }, [appId, codexCapabilityProviders]);
+
   const {
     templateValues,
     templateValueEntries,
@@ -1704,8 +1728,9 @@ function ProviderFormFull({
             }),
           );
         }
-        const hasGroupedCodexKey = codexApiKeyGroups.some((group) =>
-          group.enabled !== false && group.apiKeys.some((key) => key.trim()),
+        const hasGroupedCodexKey = codexApiKeyGroups.some(
+          (group) =>
+            group.enabled !== false && group.apiKeys.some((key) => key.trim()),
         );
         if (!isXaiOauthProvider && !codexApiKey.trim() && !hasGroupedCodexKey) {
           issues.push(
@@ -1832,7 +1857,9 @@ function ProviderFormFull({
             label: group.label?.trim() || undefined,
             apiKeys: group.apiKeys.map((key) => key.trim()).filter(Boolean),
             models: group.models?.map((model) => model.trim()).filter(Boolean),
-            prefixes: group.prefixes?.map((prefix) => prefix.trim()).filter(Boolean),
+            prefixes: group.prefixes
+              ?.map((prefix) => prefix.trim())
+              .filter(Boolean),
           }))
           .filter((group) => group.id && group.apiKeys.length > 0);
         const projectedCatalogModels = buildCodexApiKeyGroupCatalog(
@@ -1968,11 +1995,17 @@ function ProviderFormFull({
         }
       } catch (error) {
         const detail = extractErrorMessage(error);
-        const message = detail.includes(
-          "unknown_reasoning_capability_requires_declaration",
-        )
-          ? "Codex 子 Agent 配置未完成：存在已启用且可路由的模型没有声明推理能力，请先在模型目录中配置后再保存。"
-          : `Codex 子 Agent 配置校验失败：${detail || "请检查模型目录和 Sub-Agent 配置。"}`;
+        const parsed = parseCodexSubagentCandidateError(detail);
+        const message =
+          parsed.kind === "incomplete"
+            ? parsed.models
+              ? t("providerForm.subagentIncompleteNamed", {
+                  models: parsed.models,
+                })
+              : t("providerForm.subagentIncomplete")
+            : t("providerForm.subagentValidationFailed", {
+                detail: detail || t("providerForm.subagentValidationFallback"),
+              });
         toast.error(message);
         return;
       }
@@ -3027,6 +3060,7 @@ function ProviderFormFull({
                 }
                 catalogModels={codexCatalogModels}
                 presetCatalogModels={codexPresetBaseline}
+                knownCatalogModels={knownCodexCatalogModels}
                 onCatalogModelsChange={(models) => {
                   setCodexCatalogModels(models);
                   try {

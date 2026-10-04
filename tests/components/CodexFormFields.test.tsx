@@ -1700,6 +1700,7 @@ describe("CodexFormFields local model routing", () => {
           displayName: "gpt-5.5",
           upstreamModel: "gpt-5.5",
           contextWindow: "272000",
+          enabled: false,
         },
       ]);
     });
@@ -1749,6 +1750,7 @@ describe("CodexFormFields local model routing", () => {
           contextWindow: "",
           inputModalities: ["text", "image"],
           supportsImage: true,
+          enabled: false,
         },
       ]);
     });

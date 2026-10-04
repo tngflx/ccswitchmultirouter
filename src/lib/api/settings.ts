@@ -49,6 +49,27 @@ export interface RepairableCodexPlugin {
   repairAction?: "registerMarketplace" | "enableAndRegister" | "enable";
 }
 
+export interface CodexBrowserIntegrationHealth {
+  pluginInstalled: boolean;
+  pluginEnabled: boolean;
+  browserFamily?: string;
+  browserName?: string;
+  browserInstalled: boolean;
+  browserRunning: boolean;
+  extensionInstalled: boolean;
+  extensionEnabled: boolean;
+  nativeHostCorrect: boolean;
+  storeUrl?: string;
+  extensionManagementUrl?: string;
+  problems: string[];
+}
+
+export interface CodexPluginHealthReport {
+  repairablePlugins: RepairableCodexPlugin[];
+  browser: CodexBrowserIntegrationHealth;
+  diagnosticsError?: string;
+}
+
 export interface ConfigTransferResult {
   success: boolean;
   message: string;
@@ -401,6 +422,10 @@ export const settingsApi = {
 
   async detectCodexPluginRegistration(): Promise<RepairableCodexPlugin[]> {
     return await invoke("detect_codex_plugin_registration");
+  },
+
+  async inspectCodexPluginHealth(): Promise<CodexPluginHealthReport> {
+    return await invoke("inspect_codex_plugin_health");
   },
 
   async repairCodexPluginRegistration(

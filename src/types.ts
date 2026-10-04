@@ -1,4 +1,5 @@
 import type { CodexSubagentV2Config } from "./types/codexSubagentV2";
+import type { RequestHealthConfig } from "./types/proxy";
 
 export type ProviderCategory =
   | "official" // 官方
@@ -717,6 +718,11 @@ export interface Settings {
   enableFailoverToggle?: boolean;
   // Whether the proxy may reconnect a Responses stream before semantic output
   enableStreamRetry?: boolean;
+  // Stream recovery policy. `enableStreamRetry` remains for older settings files.
+  streamRetryMode?: "off" | "safe" | "aggressive";
+  // Maximum semantic continuation attempts in aggressive mode (1-3).
+  streamRetryMaxAttempts?: number;
+  requestHealth?: RequestHealthConfig;
   showProfileSwitcher?: boolean;
   // Preserve Codex ChatGPT login in auth.json when switching third-party providers
   preserveCodexOfficialAuthOnSwitch?: boolean;

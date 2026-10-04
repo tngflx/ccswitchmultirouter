@@ -20,6 +20,7 @@ import type {
   CodexHistoryVisibilityRepairOptions,
   CodexHistoryVisibilityRepairOutcome,
   CodexGuardianStatus,
+  RequestHealthSnapshot,
 } from "@/types/proxy";
 
 export const proxyApi = {
@@ -43,6 +44,10 @@ export const proxyApi = {
   // 获取代理服务器状态
   async getProxyStatus(): Promise<ProxyStatus> {
     return invoke("get_proxy_status");
+  },
+
+  async getRequestHealthDiagnostics(): Promise<RequestHealthSnapshot> {
+    return invoke("get_request_health_diagnostics");
   },
 
   async diagnoseCodexMultiRouter(

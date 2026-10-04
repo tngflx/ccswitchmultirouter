@@ -292,6 +292,16 @@ export const handlers = [
     );
   }),
 
+  http.post(`${TAURI_ENDPOINT}/purge_archived_sessions`, () =>
+    success({
+      attempted: 0,
+      deleted: 0,
+      failed: 0,
+      indexCleanupWarnings: 0,
+      errors: [],
+    }),
+  ),
+
   // MCP APIs
   http.post(`${TAURI_ENDPOINT}/get_mcp_config`, async ({ request }) => {
     const { app } = await withJson<{ app: AppId }>(request);

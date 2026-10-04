@@ -1,8 +1,15 @@
 import type { CodexCatalogModel } from "@/types";
-import { modelIdentityValues, type ModelIdentityShape } from "@/lib/modelIdentities";
+import { resolveFetchedCodexModelContextWindow } from "@/utils/codexModelContext";
+import {
+  modelBindingIdentityValues,
+  modelIdentityValues,
+  type ModelIdentityShape,
+} from "@/lib/modelIdentities";
 
-export type CodexCatalogRowLike = CodexCatalogModel & ModelIdentityShape & { rowId?: string };
-export type CodexCatalogRowSeed = Partial<CodexCatalogModel> & Record<string, unknown>;
+export type CodexCatalogRowLike = CodexCatalogModel &
+  ModelIdentityShape & { rowId?: string };
+export type CodexCatalogRowSeed = Partial<CodexCatalogModel> &
+  Record<string, unknown>;
 
 export interface FetchedCodexCatalogModel extends ModelIdentityShape {
   id: string;
@@ -28,39 +35,66 @@ export interface CatalogSyncResult<T extends CodexCatalogRowLike> {
   added: number;
   hydrated: number;
   updated: string[];
+  removed: number;
+  removedModels: string[];
+  removalSuppressed: boolean;
 }
 
-type MetadataMode = "fill-missing" | "refresh";
+export type ExistingCatalogMetadataMode = "fill-missing" | "refresh";
 
-const text = (value: unknown): string =>
-  typeof value === "string" ? value.trim() : "";
+export function catalogModelIdentity(value: unknown): string {
+  return typeof value === "string" ? value.trim().toLowerCase() : "";
+}
 
-const identity = (value: unknown): string => text(value).toLowerCase();
+function nonEmptyString(value: unknown): string {
+  return typeof value === "string" ? value.trim() : "";
+}
+
+function rowExplicitUpstreamModel(row: CodexCatalogRowLike): string {
+  return (
+    nonEmptyString(row.upstreamModel) || nonEmptyString(row.upstream_model)
+  );
+}
 
 function rowIdentities(row: CodexCatalogRowLike): string[] {
-  return modelIdentityValues(row);
-}
-
-function explicitUpstream(row: CodexCatalogRowLike): string {
-  return identity(row.upstreamModel ?? row.upstream_model);
+  return modelBindingIdentityValues(row);
 }
 
 function hasValue(value: unknown): boolean {
   return value !== undefined && value !== null && value !== "";
 }
 
-function fetchedModelName(fetched: FetchedCodexCatalogModel): string {
-  return (
-    text(fetched.id) ||
-    text(fetched.canonicalSlug) ||
-    text(fetched.slug) ||
-    text(fetched.name) ||
-    text(fetched.aliases?.find((alias) => text(alias)))
-  );
+function missingCapabilityPatch(
+  row: CodexCatalogRowLike,
+  fetched: FetchedCodexCatalogModel,
+): Partial<CodexCatalogRowLike> {
+  const patch: Partial<CodexCatalogRowLike> = {};
+  const fetchedModalities = fetched.inputModalities?.length
+    ? [...fetched.inputModalities]
+    : undefined;
+  const fetchedImage =
+    typeof fetched.supportsImage === "boolean"
+      ? fetched.supportsImage
+      : fetchedModalities?.some((value) => value.toLowerCase() === "image");
+  if (fetchedModalities) patch.inputModalities = fetchedModalities;
+  if (typeof fetchedImage === "boolean") patch.supportsImage = fetchedImage;
+  if (!row.reasoning && fetched.reasoning) patch.reasoning = fetched.reasoning;
+  return patch;
 }
 
-function identityPatch(
+function refreshedCapabilityPatch(
   row: CodexCatalogRowLike,
+  fetched: FetchedCodexCatalogModel,
+): Partial<CodexCatalogRowLike> {
+  const patch = missingCapabilityPatch(row, fetched);
+  if (fetched.reasoning && row.reasoning?.source !== "user") {
+    patch.reasoning = fetched.reasoning;
+  }
+  return patch;
+}
+
+function fetchedIdentityPatch(
+  row: Partial<CodexCatalogRowLike>,
   fetched: FetchedCodexCatalogModel,
   refresh: boolean,
 ): Partial<CodexCatalogRowLike> {
@@ -70,47 +104,61 @@ function identityPatch(
     ["slug", fetched.slug],
     ["name", fetched.name],
   ] as const) {
-    const normalized = text(value);
+    const normalized = nonEmptyString(value);
     if (normalized && (refresh || !hasValue(row[key]))) patch[key] = normalized;
   }
-  if (Array.isArray(fetched.aliases) && fetched.aliases.length > 0) {
-    const aliases = fetched.aliases.map(text).filter(Boolean);
-    if (aliases.length > 0 && (refresh || !Array.isArray(row.aliases) || row.aliases.length === 0)) {
+  if (fetched.aliases?.length) {
+    const aliases = fetched.aliases.map(nonEmptyString).filter(Boolean);
+    if (
+      aliases.length > 0 &&
+      (refresh || !Array.isArray(row.aliases) || row.aliases.length === 0)
+    ) {
       patch.aliases = aliases;
     }
   }
   return patch;
 }
 
-function capabilityPatch(
-  row: CodexCatalogRowLike,
-  fetched: FetchedCodexCatalogModel,
-  refresh: boolean,
-): Partial<CodexCatalogRowLike> {
-  const patch: Partial<CodexCatalogRowLike> = {};
-  const modalities = Array.isArray(fetched.inputModalities) && fetched.inputModalities.length > 0
-    ? [...fetched.inputModalities]
-    : undefined;
-  const supportsImage = typeof fetched.supportsImage === "boolean"
-    ? fetched.supportsImage
-    : modalities?.some((modality) => modality.toLowerCase() === "image");
-
-  if (refresh || !hasValue(row.inputModalities ?? row.input_modalities)) {
-    if (modalities) patch.inputModalities = modalities;
-  }
-  if (typeof supportsImage === "boolean" && (refresh || !hasValue(row.supportsImage ?? row.supports_image ?? row.vision))) {
-    patch.supportsImage = supportsImage;
-  }
-  if (!hasValue(row.textOnly ?? row.text_only) && typeof supportsImage === "boolean") {
-    patch.textOnly = !supportsImage;
-  }
-  if (fetched.reasoning && (refresh ? row.reasoning?.source !== "user" : !row.reasoning)) {
-    patch.reasoning = fetched.reasoning;
-  }
-  return patch;
+/** Remove explicitly remote-bound rows absent from a complete authoritative fetch. */
+export function pruneMissingRemoteCodexCatalogRows<
+  T extends CodexCatalogRowLike,
+  Fetched extends ModelIdentityShape,
+>(
+  rows: T[],
+  fetchedModels: Fetched[],
+  options?: { maxRemovalRatio?: number },
+): Pick<
+  CatalogSyncResult<T>,
+  "rows" | "removed" | "removedModels" | "removalSuppressed"
+> {
+  const fetchedIdentities = new Set(
+    fetchedModels.flatMap((model) => modelIdentityValues(model)),
+  );
+  const boundRows = rows.filter((row) => rowExplicitUpstreamModel(row));
+  const removedModels: string[] = [];
+  const candidates = rows.filter((row) => {
+    const upstream = catalogModelIdentity(rowExplicitUpstreamModel(row));
+    if (!upstream || fetchedIdentities.has(upstream)) return true;
+    removedModels.push(row.model);
+    return false;
+  });
+  const maxRemovalRatio = options?.maxRemovalRatio ?? 0;
+  const removalSuppressed =
+    maxRemovalRatio > 0 &&
+    boundRows.length > 0 &&
+    removedModels.length > 0 &&
+    removedModels.length / boundRows.length > maxRemovalRatio;
+  return removalSuppressed
+    ? { rows, removed: 0, removedModels, removalSuppressed: true }
+    : {
+        rows: candidates,
+        removed: removedModels.length,
+        removedModels,
+        removalSuppressed: false,
+      };
 }
 
-/** Merge a fetched inventory while preserving user-owned catalog decisions. */
+/** Reconcile remote /models results without destroying user intent. */
 export function reconcileFetchedCodexCatalogRows<T extends CodexCatalogRowLike>(
   rows: T[],
   fetchedModels: FetchedCodexCatalogModel[],
@@ -118,68 +166,125 @@ export function reconcileFetchedCodexCatalogRows<T extends CodexCatalogRowLike>(
   options: {
     appendNew: boolean;
     createRow: (seed: CodexCatalogRowSeed) => T;
-    existingMetadataMode?: MetadataMode;
+    existingMetadataMode?: ExistingCatalogMetadataMode;
+    removeMissingRemote?: boolean;
+    maxRemovalRatio?: number;
   },
 ): CatalogSyncResult<T> {
-  void source;
+  // Preserve the row-layer representation (notably string context windows) while
+  // matching identities through the shared model identity contract.
   const next = [...rows];
   const identityToIndex = new Map<string, number>();
   next.forEach((row, index) => {
-    for (const value of rowIdentities(row)) {
-      if (!identityToIndex.has(value)) identityToIndex.set(value, index);
+    for (const identity of rowIdentities(row)) {
+      if (!identityToIndex.has(identity)) identityToIndex.set(identity, index);
     }
   });
-
-  let added = 0;
   let hydrated = 0;
+  let added = 0;
   const updated: string[] = [];
   const refresh = options.existingMetadataMode === "refresh";
 
   for (const fetched of fetchedModels) {
-    const model = fetchedModelName(fetched);
-    if (!model) continue;
+    const model =
+      nonEmptyString(fetched.id) ||
+      nonEmptyString(fetched.canonicalSlug) ||
+      nonEmptyString(fetched.slug) ||
+      nonEmptyString(fetched.name) ||
+      nonEmptyString(fetched.aliases?.[0]);
     const fetchedIdentities = modelIdentityValues(fetched);
+    if (!model || fetchedIdentities.length === 0) continue;
     const existingIndex = fetchedIdentities
-      .map((value) => identityToIndex.get(value))
-      .find((value): value is number => value !== undefined);
+      .map((identity) => identityToIndex.get(identity))
+      .find((index): index is number => index !== undefined);
     if (existingIndex !== undefined) {
       const row = next[existingIndex];
-      const patch: Partial<CodexCatalogRowLike> = {
-        ...identityPatch(row, fetched, refresh),
-        ...capabilityPatch(row, fetched, refresh),
-      };
-      if (fetched.contextWindow && (refresh || !hasValue(row.contextWindow ?? row.context_window))) {
-        patch.contextWindow = String(fetched.contextWindow);
-      }
-      if (!hasValue(explicitUpstream(row)) && !fetchedIdentities.includes(identity(row.model))) {
+      const contextWindow = resolveFetchedCodexModelContextWindow(fetched, {
+        ...source,
+        existingModels: rows,
+      });
+      const patch: Partial<CodexCatalogRowLike> = {};
+      if (
+        !hasValue(rowExplicitUpstreamModel(row)) &&
+        !fetchedIdentities.includes(catalogModelIdentity(row.model))
+      ) {
         patch.upstreamModel = model;
       }
-      const changed = Object.entries(patch).filter(
-        ([key, value]) => JSON.stringify(row[key as keyof CodexCatalogRowLike]) !== JSON.stringify(value),
+      if (
+        contextWindow &&
+        (refresh || !hasValue(row.contextWindow ?? row.context_window)) &&
+        String(row.contextWindow ?? row.context_window ?? "") !==
+          String(contextWindow)
+      ) {
+        patch.contextWindow = String(contextWindow);
+      }
+      Object.assign(
+        patch,
+        refresh
+          ? refreshedCapabilityPatch(row, fetched)
+          : missingCapabilityPatch(row, fetched),
       );
-      if (changed.length > 0) {
-        const updatedRow = { ...row, ...Object.fromEntries(changed) } as T;
+      Object.assign(patch, fetchedIdentityPatch(row, fetched, refresh));
+      const patchRecord = patch as Record<string, unknown>;
+      const rowRecord = row as Record<string, unknown>;
+      for (const [key, value] of Object.entries(patchRecord)) {
+        if (JSON.stringify(rowRecord[key]) === JSON.stringify(value))
+          delete patchRecord[key];
+      }
+      if (Object.keys(patch).length > 0) {
+        const updatedRow = { ...row, ...patch } as T;
         next[existingIndex] = updatedRow;
-        for (const value of rowIdentities(updatedRow)) identityToIndex.set(value, existingIndex);
+        for (const identity of rowIdentities(updatedRow))
+          identityToIndex.set(identity, existingIndex);
         hydrated += 1;
         updated.push(model);
       }
       continue;
     }
     if (!options.appendNew) continue;
-    const created = options.createRow({
+    const contextWindow = resolveFetchedCodexModelContextWindow(fetched, {
+      ...source,
+      existingModels: rows,
+    });
+    const seed: CodexCatalogRowSeed = {
       model,
       upstreamModel: model,
       displayName: model,
       enabled: false,
-      ...(fetched.contextWindow ? { contextWindow: String(fetched.contextWindow) } : {}),
-      ...identityPatch({ model } as CodexCatalogModel, fetched, true),
-      ...capabilityPatch({ model } as CodexCatalogModel, fetched, true),
+      ...(contextWindow ? { contextWindow: String(contextWindow) } : {}),
+      ...fetchedIdentityPatch({}, fetched, true),
+      ...(fetched.inputModalities?.length
+        ? { inputModalities: [...fetched.inputModalities] }
+        : {}),
+      ...(typeof fetched.supportsImage === "boolean"
+        ? { supportsImage: fetched.supportsImage }
+        : {}),
+      ...(fetched.reasoning ? { reasoning: fetched.reasoning } : {}),
+    };
+    const created = options.createRow({
+      ...seed,
+      ...missingCapabilityPatch(seed as CodexCatalogRowLike, fetched),
     });
     next.push(created);
-    for (const value of rowIdentities(created)) identityToIndex.set(value, next.length - 1);
+    for (const identity of rowIdentities(created)) {
+      if (!identityToIndex.has(identity))
+        identityToIndex.set(identity, next.length - 1);
+    }
     added += 1;
   }
 
-  return { rows: next, added, hydrated, updated };
+  const authoritativeResult = options.removeMissingRemote
+    ? pruneMissingRemoteCodexCatalogRows(next, fetchedModels, {
+        maxRemovalRatio: options.maxRemovalRatio,
+      })
+    : { rows: next, removed: 0, removedModels: [], removalSuppressed: false };
+  return {
+    rows: authoritativeResult.rows,
+    added,
+    hydrated,
+    updated,
+    removed: authoritativeResult.removed,
+    removedModels: authoritativeResult.removedModels,
+    removalSuppressed: authoritativeResult.removalSuppressed,
+  };
 }

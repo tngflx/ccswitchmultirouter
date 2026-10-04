@@ -81,6 +81,40 @@ describe("useSettingsForm Hook", () => {
     expect(changeLanguageSpy).toHaveBeenCalledWith("ja");
   });
 
+  it("normalizes legacy stream retry settings and attempt bounds", async () => {
+    useSettingsQueryMock.mockReturnValue({
+      data: {
+        enableStreamRetry: false,
+        streamRetryMode: "safe",
+        streamRetryMaxAttempts: 99,
+        language: "en",
+      },
+      isLoading: false,
+    });
+
+    const { result } = renderHook(() => useSettingsForm());
+
+    await waitFor(() => {
+      expect(result.current.settings?.streamRetryMode).toBe("off");
+    });
+
+    expect(result.current.settings?.streamRetryMaxAttempts).toBe(3);
+
+    act(() => {
+      result.current.resetSettings({
+        showInTray: true,
+        minimizeToTrayOnClose: true,
+        enableStreamRetry: true,
+        streamRetryMode: "aggressive",
+        streamRetryMaxAttempts: -4,
+        language: "en",
+      });
+    });
+
+    expect(result.current.settings?.streamRetryMode).toBe("aggressive");
+    expect(result.current.settings?.streamRetryMaxAttempts).toBe(1);
+  });
+
   it("should support traditional chinese language preference aliases", async () => {
     useSettingsQueryMock.mockReturnValue({
       data: {

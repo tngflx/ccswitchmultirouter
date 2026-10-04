@@ -11,6 +11,7 @@ import {
   Search,
   Play,
   Trash2,
+  ArchiveX,
   MessageSquare,
   Clock,
   FileClock,
@@ -83,6 +84,13 @@ const SESSION_LIST_VIEW_MODE_STORAGE_KEY =
   "cc-switch.sessionManager.listViewMode";
 const SESSION_GROUP_EXPANSION_STORAGE_KEY =
   "cc-switch.sessionManager.groupExpansionState";
+
+const isArchivedCodexSession = (session: SessionMeta) =>
+  session.providerId === "codex" &&
+  session.sourcePath
+    ?.replace(/\\/g, "/")
+    .split("/")
+    .includes("archived_sessions");
 
 type ProviderFilter =
   | "all"
@@ -226,6 +234,8 @@ export function SessionManagerPage({
     () => new Set(),
   );
   const [isBatchDeleting, setIsBatchDeleting] = useState(false);
+  const [isPurgingArchived, setIsPurgingArchived] = useState(false);
+  const [purgeArchivedDialogOpen, setPurgeArchivedDialogOpen] = useState(false);
   const [selectionMode, setSelectionMode] = useState(false);
   const searchInputRef = useRef<HTMLInputElement | null>(null);
 
@@ -373,7 +383,58 @@ export function SessionManagerPage({
       selectedSession?.sourcePath,
     );
   const deleteSessionMutation = useDeleteSessionMutation();
-  const isDeleting = deleteSessionMutation.isPending || isBatchDeleting;
+  const isDeleting =
+    deleteSessionMutation.isPending || isBatchDeleting || isPurgingArchived;
+  const archivedCodexSessionCount = useMemo(
+    () => sessions.filter(isArchivedCodexSession).length,
+    [sessions],
+  );
+
+  const handlePurgeArchived = async () => {
+    if (!isCodexManager || archivedCodexSessionCount === 0 || isDeleting) {
+      return;
+    }
+
+    setPurgeArchivedDialogOpen(false);
+    setIsPurgingArchived(true);
+    try {
+      const result = await sessionsApi.purgeArchived("codex");
+      await queryClient.invalidateQueries({ queryKey: ["sessions"] });
+
+      if (result.deleted > 0) {
+        toast.success(
+          t("sessionManager.purgeArchivedSuccess", {
+            count: result.deleted,
+          }),
+        );
+      }
+      if (result.indexCleanupWarnings > 0) {
+        toast.error(
+          t("sessionManager.purgeArchivedWarnings", {
+            count: result.indexCleanupWarnings,
+          }),
+        );
+      }
+      if (result.failed > 0) {
+        toast.error(
+          t("sessionManager.purgeArchivedFailed", {
+            attempted: result.attempted,
+            failed: result.failed,
+          }),
+          { description: result.errors[0] },
+        );
+      }
+    } catch (error) {
+      toast.error(
+        t("sessionManager.purgeArchivedRequestFailed", {
+          defaultValue: "Failed to delete archived Codex sessions",
+        }),
+        { description: extractErrorMessage(error) },
+      );
+    } finally {
+      setIsPurgingArchived(false);
+    }
+  };
 
   const virtualizer = useVirtualizer({
     count: messages.length,
@@ -990,6 +1051,37 @@ export function SessionManagerPage({
                                 : t("sessionManager.manageBatchTooltip", {
                                     defaultValue: "批量管理",
                                   })}
+                            </TooltipContent>
+                          </Tooltip>
+                        )}
+                        {isCodexManager && archivedCodexSessionCount > 0 && (
+                          <Tooltip>
+                            <TooltipTrigger asChild>
+                              <Button
+                                variant="outline"
+                                size="sm"
+                                className="h-7 gap-1.5 border-destructive/40 px-2 text-destructive hover:bg-destructive/10 hover:text-destructive"
+                                aria-label={t(
+                                  "sessionManager.purgeArchivedTooltip",
+                                  {
+                                    defaultValue:
+                                      "Delete all archived Codex sessions",
+                                  },
+                                )}
+                                disabled={isDeleting}
+                                onClick={() => setPurgeArchivedDialogOpen(true)}
+                              >
+                                <ArchiveX className="size-3.5" />
+                                <span className="text-xs">
+                                  {archivedCodexSessionCount}
+                                </span>
+                              </Button>
+                            </TooltipTrigger>
+                            <TooltipContent>
+                              {t("sessionManager.purgeArchivedTooltip", {
+                                defaultValue:
+                                  "Delete all archived Codex sessions",
+                              })}
                             </TooltipContent>
                           </Tooltip>
                         )}
@@ -1889,6 +1981,27 @@ export function SessionManagerPage({
           if (!isDeleting) {
             setDeleteTargets(null);
           }
+        }}
+      />
+      <ConfirmDialog
+        isOpen={purgeArchivedDialogOpen}
+        title={t("sessionManager.purgeArchivedConfirmTitle", {
+          defaultValue: "Delete all archived Codex sessions",
+        })}
+        message={t("sessionManager.purgeArchivedConfirmMessage", {
+          defaultValue:
+            "This will permanently delete every archived Codex session ({{count}} currently visible in Session Manager). Every session will be attempted even if another deletion fails.\n\nThis action cannot be undone.",
+          count: archivedCodexSessionCount,
+        })}
+        confirmText={t("sessionManager.purgeArchivedConfirmAction", {
+          defaultValue: "Delete all archived",
+        })}
+        cancelText={t("common.cancel", { defaultValue: "Cancel" })}
+        variant="destructive"
+        pending={isPurgingArchived}
+        onConfirm={() => void handlePurgeArchived()}
+        onCancel={() => {
+          if (!isPurgingArchived) setPurgeArchivedDialogOpen(false);
         }}
       />
     </TooltipProvider>

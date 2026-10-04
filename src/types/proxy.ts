@@ -54,6 +54,85 @@ export interface ProxyTakeoverStatus {
   hermes: boolean;
 }
 
+export type RequestOptimizationMode = "off" | "diagnose" | "safe";
+export type RequestHealthReviewMode =
+  | "off"
+  | "first_large_request"
+  | "sustained_growth";
+
+export interface RequestHealthConfig {
+  enabled: boolean;
+  optimizationMode: RequestOptimizationMode;
+  largeRequestThresholdBytes: number;
+  maxCodexInputTokens: number;
+  reviewTimeoutSeconds: number;
+  reviewMode: RequestHealthReviewMode;
+  summarizeAndRestartEnabled: boolean;
+  windowsNotificationsEnabled: boolean;
+  windowsNotificationSnoozeHours: number;
+  windowsNotificationsSnoozedUntilMs: number | null;
+}
+
+export interface RequestHealthFinding {
+  code: string;
+  severity: string;
+  count: number;
+  detail: string;
+}
+
+export interface RequestHealthBreakdown {
+  category: string;
+  itemCount: number;
+  bytes: number;
+}
+
+export interface RequestHealthDiagnostic {
+  generatedAt: string;
+  traceId: string | null;
+  sessionId: string;
+  appType: string;
+  providerId: string;
+  providerName: string;
+  model: string;
+  endpoint: string;
+  clientRequestBytes: number;
+  originalBytes: number;
+  optimizedBytes: number;
+  bytesRemoved: number;
+  thresholdBytes: number;
+  thresholdExceeded: boolean;
+  estimatedInputTokens: number;
+  maxInputTokens: number;
+  tokenLimitExceeded: boolean;
+  blocked: boolean;
+  reviewAction?: string;
+  itemCount: number;
+  largestItemBytes: number;
+  largestItemCategory: string | null;
+  mediaBytes: number;
+  mediaItems: number;
+  mediaDominated: boolean;
+  dominantCategory: string | null;
+  recommendedAction: string;
+  optimizationMode: RequestOptimizationMode;
+  optimizationApplied: boolean;
+  compactionRequest: boolean;
+  compactionRecommended: boolean;
+  sessionClientProvided: boolean;
+  actualInputTokens?: number;
+  cachedInputTokens?: number;
+  freshInputTokens?: number;
+  cacheHitRatio?: number;
+  anomaly?: RequestHealthFinding;
+  findings: RequestHealthFinding[];
+  breakdown: RequestHealthBreakdown[];
+}
+
+export interface RequestHealthSnapshot {
+  config: RequestHealthConfig;
+  diagnostics: RequestHealthDiagnostic[];
+}
+
 export type CodexDiagnosticStatus = "pass" | "warn" | "fail" | "info";
 
 export interface CodexDiagnosticCheck {

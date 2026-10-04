@@ -10,6 +10,7 @@ import { useTranslation } from "react-i18next";
 import type { AppId } from "@/lib/api";
 import { useSubscriptionQuota } from "@/lib/query/subscription";
 import type { QuotaTier, SubscriptionQuota } from "@/types/subscription";
+import { formatRelativeTime } from "@/utils/usageRelativeTime";
 
 interface SubscriptionQuotaFooterProps {
   appId: AppId;
@@ -87,21 +88,6 @@ function formatResetTime(
 
 /** 不需要在 inline 模式显示的 tier */
 const HIDDEN_INLINE_TIERS = new Set(["seven_day_sonnet"]);
-
-/** 格式化相对时间（与 UsageFooter 一致） */
-function formatRelativeTime(
-  timestamp: number,
-  now: number,
-  t: (key: string, options?: { count?: number }) => string,
-): string {
-  const diff = Math.floor((now - timestamp) / 1000);
-  if (diff < 60) return t("usage.justNow");
-  if (diff < 3600)
-    return t("usage.minutesAgo", { count: Math.floor(diff / 60) });
-  if (diff < 86400)
-    return t("usage.hoursAgo", { count: Math.floor(diff / 3600) });
-  return t("usage.daysAgo", { count: Math.floor(diff / 86400) });
-}
 
 /** 判断 reset credit 是否处于可用状态。 */
 function isAvailableResetCredit(status: string | null | undefined): boolean {

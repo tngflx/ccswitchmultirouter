@@ -1,0 +1,55 @@
+{
+  "settings": {
+    "modelCatalog": ["model_catalog"],
+    "contextWindow": ["context_window", "modelContextWindow"],
+    "inputModalities": ["input_modalities"],
+    "apiFormat": ["api_format"],
+    "apiFormatSource": ["api_format_source"],
+    "codexCache": ["codex_cache"]
+  },
+  "catalog": {
+    "displayNameStyle": ["display_name_style"],
+    "spawnAgentModels": ["spawn_agent_models"]
+  },
+  "model": {
+    "upstreamModel": ["upstream_model"],
+    "canonicalSlug": ["canonical_slug"],
+    "displayName": ["display_name"],
+    "providerName": ["provider_name"],
+    "contextWindow": ["context_window"],
+    "inputModalities": ["input_modalities"],
+    "textOnly": ["text_only"],
+    "supportsImage": ["supports_image", "vision"],
+    "supportsParallelToolCalls": ["supports_parallel_tool_calls"],
+    "baseInstructions": ["base_instructions"],
+    "apiFormat": ["api_format"],
+    "apiFormatSource": ["api_format_source"],
+    "codexCache": ["codex_cache"],
+    "apiKeyGroupId": ["api_key_group_id"],
+    "apiKeyGroupGenerated": ["api_key_group_generated"],
+    "sortIndex": ["sort_index"],
+    "codexUltra": ["codex_ultra"]
+  },
+  "reasoning": {
+    "schemaVersion": ["schema_version"],
+    "supportStatus": ["support_status"],
+    "controlKind": ["control_kind"],
+    "supportedEfforts": ["supported_efforts"],
+    "defaultEffort": ["default_effort"],
+    "disableAllowed": ["disable_allowed"],
+    "outputFormat": ["output_format"],
+    "fetchedAt": ["fetched_at"],
+    "providerKey": ["provider_key"],
+    "modelRevision": ["model_revision"],
+    "codexUltraOrchestration": ["codex_ultra_orchestration"]
+  },
+  "upstream": { "effortMap": ["effort_map"] },
+  "cache": {
+    "cacheMode": ["cache_mode"],
+    "supportsPromptCacheKey": ["supports_prompt_cache_key"],
+    "supportsPromptCacheRetention": ["supports_prompt_cache_retention"],
+    "promptCacheKey": ["prompt_cache_key"],
+    "promptCacheRetention": ["prompt_cache_retention"],
+    "usageFields": ["usage_fields"]
+  }
+}

@@ -376,6 +376,51 @@ describe("SessionManagerPage", () => {
     deleteManySpy.mockRestore();
   });
 
+  it("exposes a dedicated archived-session purge flow", async () => {
+    setSessionFixtures(
+      [
+        {
+          providerId: "codex",
+          sessionId: "archived-session-1",
+          title: "Archived Session",
+          projectDir: "/mock/codex",
+          sourcePath:
+            "C:\\Users\\test\\.codex\\archived_sessions\\archived-session-1.jsonl",
+          resumeCommand: "codex resume archived-session-1",
+        },
+      ],
+      {},
+    );
+    const purgeSpy = vi.spyOn(sessionsApi, "purgeArchived").mockResolvedValue({
+      attempted: 1,
+      deleted: 1,
+      failed: 0,
+      indexCleanupWarnings: 0,
+      errors: [],
+    });
+
+    renderPage();
+
+    const purgeButton = await screen.findByRole("button", {
+      name: /Delete all archived Codex sessions/i,
+    });
+    fireEvent.click(purgeButton);
+
+    const dialog = screen.getByTestId("confirm-dialog");
+    expect(dialog).toHaveTextContent("Delete all archived Codex sessions");
+    fireEvent.click(
+      within(dialog).getByRole("button", {
+        name: /Delete all archived/i,
+      }),
+    );
+
+    await waitFor(() => expect(purgeSpy).toHaveBeenCalledWith("codex"));
+    expect(toastSuccessMock).toHaveBeenCalled();
+    expect(toastErrorMock).not.toHaveBeenCalled();
+
+    purgeSpy.mockRestore();
+  });
+
   it("keeps the exit batch mode button visible when search hides all sessions", async () => {
     renderPage();
 

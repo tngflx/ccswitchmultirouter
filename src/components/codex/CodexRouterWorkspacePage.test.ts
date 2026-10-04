@@ -3169,6 +3169,45 @@ describe("Codex MultiRouter workspace route persistence helpers", () => {
     ]);
   });
 
+  it("prunes outdated releases only for an explicit model-order reset", () => {
+    const source: Provider = {
+      id: "catalog-source",
+      name: "Catalog source",
+      category: "custom",
+      settingsConfig: {
+        modelCatalog: {
+          models: [
+            { model: "gpt-5.4" },
+            { model: "gpt-5.5" },
+            { model: "custom-alias" },
+          ],
+        },
+      },
+    };
+    const plan = createDraftRoutingPlan([source], [source]);
+    const route = {
+      id: "catalog-route",
+      enabled: true,
+      targetProviderId: source.id,
+      modelSelection: { mode: "all" as const },
+      match: { models: [], prefixes: [] },
+    };
+    const providers = new Map([[source.id, source]]);
+
+    expect(
+      buildModelCatalogForRoutes(plan, [route], providers).models.map(
+        (model) => model.model,
+      ),
+    ).toEqual(["gpt-5.4", "gpt-5.5", "custom-alias"]);
+    const resetCatalog = buildModelCatalogForRoutes(plan, [route], providers, {
+      pruneOutdatedModels: true,
+    });
+    expect(resetCatalog.models.map((model) => model.model)).toEqual([
+      "gpt-5.5",
+      "custom-alias",
+    ]);
+  });
+
   it("aliases duplicate provider models when saving manual multirouter routes", async () => {
     const official: Provider = {
       id: "codex-official",

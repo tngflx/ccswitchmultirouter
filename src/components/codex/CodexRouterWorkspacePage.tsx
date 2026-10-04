@@ -133,6 +133,7 @@ import {
   modelBindingIdentityValues,
   modelIdentityValues,
 } from "@/lib/modelIdentities";
+import { pruneOutdatedCodexCatalogModels } from "@/lib/codexCatalogVersionPruning";
 import { HostedToolsSwitchPanel } from "./HostedToolsSwitchPanel";
 import { CodexSubagentProfileEditor } from "./CodexSubagentProfileEditor";
 import { CodexEgressTimezoneStatusCard } from "./CodexEgressTimezoneStatusCard";
@@ -2187,6 +2188,7 @@ export function buildModelCatalogForRoutes(
   plan: Provider,
   routes: CodexRoute[],
   providersById: Map<string, Provider>,
+  options?: { pruneOutdatedModels?: boolean },
 ): CodexModelCatalogDraft {
   const routing = readCodexRouting(plan);
   const isSchemaV2 = routing?.schemaVersion === 2;
@@ -2262,15 +2264,20 @@ export function buildModelCatalogForRoutes(
     : !isSchemaV2 && Array.isArray(existingCatalog?.spawnAgentModels)
       ? (existingCatalog.spawnAgentModels as string[])
       : [];
-  const modelIds = Array.from(byModel.keys());
+  const projectedModels = Array.from(byModel.values());
+  const models = options?.pruneOutdatedModels
+    ? pruneOutdatedCodexCatalogModels(projectedModels).kept
+    : projectedModels;
+  const modelIds = models.map((model) => model.model);
+  const modelIdSet = new Set(modelIds);
   const spawnAgentModels = existingSpawnAgentModels
-    .filter((model) => byModel.has(model))
+    .filter((model) => modelIdSet.has(model))
     .concat(
       modelIds.filter((model) => !existingSpawnAgentModels.includes(model)),
     )
     .slice(0, 5);
   return {
-    models: Array.from(byModel.values()),
+    models,
     spawnAgentModels,
   };
 }
@@ -4477,13 +4484,19 @@ function ModelOrderTab({
     setMessage(null);
     setError(null);
     try {
-      const models = (reset ? catalog.models : draftModels).map(
-        (model, index) => {
-          const rest = { ...model };
-          delete rest.sortIndex;
-          return reset ? rest : { ...rest, sortIndex: index };
-        },
-      );
+      const sourceModels = reset
+        ? buildModelCatalogForRoutes(
+            selectedPlan,
+            selectedRoutes.map(({ route }) => route),
+            providersById,
+            { pruneOutdatedModels: true },
+          ).models
+        : draftModels;
+      const models = sourceModels.map((model, index) => {
+        const rest = { ...model };
+        delete rest.sortIndex;
+        return reset ? rest : { ...rest, sortIndex: index };
+      });
       const updates = new Map<string, Provider>();
       for (const [sortIndex, projectedModel] of models.entries()) {
         const visibleModel = projectedModel.model?.trim();

@@ -11,6 +11,7 @@ import {
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Badge } from "@/components/ui/badge";
 import { ProxyPanel } from "@/components/proxy";
+import { StreamRetryToggle } from "@/components/proxy/StreamRetryToggle";
 import { AutoFailoverConfigPanel } from "@/components/proxy/AutoFailoverConfigPanel";
 import { FailoverQueueManager } from "@/components/proxy/FailoverQueueManager";
 import { RectifierConfigPanel } from "@/components/settings/RectifierConfigPanel";
@@ -136,16 +137,11 @@ export function ProxyTabContent({
               isProxyPending={isProxyPending}
             />
             <div className="mt-4 border-t border-border/50 pt-4">
-              <ToggleRow
-                icon={<Zap className="h-4 w-4 text-sky-500" />}
-                title={t("settings.advanced.proxy.enableStreamRetry")}
-                description={t(
-                  "settings.advanced.proxy.enableStreamRetryDescription",
-                )}
-                checked={settings.enableStreamRetry ?? true}
-                onCheckedChange={(checked) =>
-                  void onAutoSave({ enableStreamRetry: checked })
-                }
+              <StreamRetryToggle
+                mode={settings.streamRetryMode}
+                enableStreamRetry={settings.enableStreamRetry}
+                maxAttempts={settings.streamRetryMaxAttempts}
+                onChange={onAutoSave}
               />
             </div>
           </AccordionContent>

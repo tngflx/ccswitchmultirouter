@@ -6,15 +6,19 @@ import type {
 
 const GROUP_ALIAS_MARKER = "--ccg-";
 
-const normalized = (value: string | undefined) => value?.trim().toLowerCase() ?? "";
+const normalized = (value: string | undefined) =>
+  value?.trim().toLowerCase() ?? "";
 
 const modelUpstreamName = (model: CodexCatalogModel) =>
-  model.upstreamModel?.trim() || model.upstream_model?.trim() || model.model.trim();
+  model.upstreamModel?.trim() ||
+  model.upstream_model?.trim() ||
+  model.model.trim();
 
 const groupMatchesModel = (group: CodexApiKeyGroup, model: string) => {
   const candidate = normalized(model);
   if (!candidate) return false;
-  if ((group.models ?? []).some((item) => normalized(item) === candidate)) return true;
+  if ((group.models ?? []).some((item) => normalized(item) === candidate))
+    return true;
   return (group.prefixes ?? []).some((prefix) => {
     const value = normalized(prefix);
     return Boolean(value) && candidate.startsWith(value);
@@ -27,7 +31,9 @@ const isGeneratedGroupModel = (model: CodexCatalogModel) =>
   Boolean(model.apiKeyGroupId || model.api_key_group_id) ||
   model.model.toLowerCase().includes(GROUP_ALIAS_MARKER);
 
-export function normalizeCodexApiKeyGroupMode(value: unknown): CodexApiKeyGroupMode {
+export function normalizeCodexApiKeyGroupMode(
+  value: unknown,
+): CodexApiKeyGroupMode {
   return value === "round_robin" ? "round_robin" : "isolated";
 }
 

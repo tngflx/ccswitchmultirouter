@@ -7,7 +7,11 @@ export type {
   RecoveryOutcomeKind,
   RecoverySeverity,
 } from "./settings";
-export type { RepairableCodexPlugin } from "./settings";
+export type {
+  CodexBrowserIntegrationHealth,
+  CodexPluginHealthReport,
+  RepairableCodexPlugin,
+} from "./settings";
 export { backupsApi } from "./settings";
 export { mcpApi } from "./mcp";
 export { profilesApi } from "./profiles";

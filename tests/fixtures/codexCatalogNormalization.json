@@ -1,0 +1,203 @@
+[
+  {
+    "name": "provider defaults share the capability contract without absorbing model overrides",
+    "input": {
+      "context_window": "256K",
+      "input_modalities": ["text", "image"],
+      "api_format": "openai_chat",
+      "codex_cache": {
+        "cache_mode": "unknown",
+        "supports_prompt_cache_key": false
+      },
+      "model_catalog": {
+        "models": [
+          {
+            "model": "private",
+            "context_window": "1M",
+            "codex_cache": { "supports_prompt_cache_key": true }
+          }
+        ]
+      }
+    },
+    "expected": {
+      "contextWindow": 256000,
+      "inputModalities": ["text", "image"],
+      "apiFormat": "openai_chat",
+      "codexCache": { "cacheMode": "unknown", "supportsPromptCacheKey": false },
+      "modelCatalog": {
+        "models": [
+          {
+            "model": "private",
+            "contextWindow": 1000000,
+            "codexCache": { "supportsPromptCacheKey": true }
+          }
+        ]
+      }
+    }
+  },
+  {
+    "name": "blank strings fall back to legacy bindings but false and empty arrays remain explicit",
+    "input": {
+      "modelCatalog": {
+        "models": [
+          {
+            "model": "Friendly GPT",
+            "upstreamModel": "  ",
+            "upstream_model": "GPT-5",
+            "inputModalities": [],
+            "input_modalities": ["image"],
+            "supportsImage": false,
+            "supports_image": true
+          }
+        ]
+      }
+    },
+    "expected": {
+      "modelCatalog": {
+        "models": [
+          {
+            "model": "Friendly GPT",
+            "upstreamModel": "GPT-5",
+            "inputModalities": [],
+            "supportsImage": false
+          }
+        ]
+      }
+    }
+  },
+  {
+    "name": "aliases and explicit exclusions retain canonical precedence",
+    "input": {
+      "model_catalog": {
+        "spawn_agent_models": ["visible"],
+        "models": [
+          {
+            "model": "visible",
+            "upstream_model": "canonical",
+            "canonical_slug": "vendor/canonical",
+            "name": "Display only",
+            "enabled": false,
+            "supportsImage": false,
+            "supports_image": true,
+            "vision": true,
+            "context_window": "1M",
+            "sort_index": 3,
+            "codex_cache": {
+              "cache_mode": "unknown",
+              "supports_prompt_cache_key": false
+            },
+            "future": { "retained": true }
+          }
+        ]
+      },
+      "futureSettings": 1
+    },
+    "expected": {
+      "modelCatalog": {
+        "spawnAgentModels": ["visible"],
+        "models": [
+          {
+            "model": "visible",
+            "upstreamModel": "canonical",
+            "canonicalSlug": "vendor/canonical",
+            "name": "Display only",
+            "enabled": false,
+            "supportsImage": false,
+            "contextWindow": 1000000,
+            "sortIndex": 3,
+            "codexCache": {
+              "cacheMode": "unknown",
+              "supportsPromptCacheKey": false
+            },
+            "future": { "retained": true }
+          }
+        ]
+      },
+      "futureSettings": 1
+    }
+  },
+  {
+    "name": "legacy reasoning upgrades without fabricating levels",
+    "input": {
+      "modelCatalog": {
+        "models": [
+          {
+            "model": "private",
+            "reasoning": {
+              "supported": true,
+              "supported_efforts": ["low", "high"],
+              "default_effort": "max",
+              "upstream": {
+                "format": "object",
+                "parameter": "reasoning.effort",
+                "effort_map": { "max": "high" }
+              },
+              "source": "user",
+              "futureEvidence": "kept"
+            }
+          }
+        ]
+      }
+    },
+    "expected": {
+      "modelCatalog": {
+        "models": [
+          {
+            "model": "private",
+            "reasoning": {
+              "schemaVersion": 2,
+              "supportStatus": "confirmed_supported",
+              "controlKind": "graded",
+              "supportedEfforts": ["low", "high"],
+              "defaultEffort": "low",
+              "disableAllowed": false,
+              "upstream": {
+                "format": "reasoning_object",
+                "parameter": "reasoning.effort",
+                "effortMap": { "max": "high", "low": "low", "high": "high" }
+              },
+              "source": "user",
+              "futureEvidence": "kept"
+            }
+          }
+        ]
+      }
+    }
+  },
+  {
+    "name": "unknown and absent capabilities never inherit graded defaults",
+    "input": {
+      "modelCatalog": {
+        "models": [
+          { "model": "no-declaration" },
+          {
+            "model": "unknown",
+            "reasoning": {
+              "upstream": { "format": "none", "parameter": "" },
+              "supportedEfforts": [],
+              "defaultEffort": "medium"
+            }
+          }
+        ]
+      }
+    },
+    "expected": {
+      "modelCatalog": {
+        "models": [
+          { "model": "no-declaration" },
+          {
+            "model": "unknown",
+            "reasoning": {
+              "schemaVersion": 2,
+              "supportStatus": "unknown",
+              "controlKind": "none",
+              "disableAllowed": false,
+              "upstream": { "format": "none", "parameter": "" },
+              "supportedEfforts": []
+            }
+          }
+        ]
+      }
+    }
+  }
+]

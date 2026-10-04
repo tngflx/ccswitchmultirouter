@@ -19,6 +19,19 @@ const sanitizeDir = (value?: string | null): string | undefined => {
   return trimmed.length > 0 ? trimmed : undefined;
 };
 
+const normalizeStreamRetryMode = (
+  mode: Settings["streamRetryMode"],
+  legacyEnabled: boolean | undefined,
+): NonNullable<Settings["streamRetryMode"]> => {
+  if (legacyEnabled === false && (mode === undefined || mode === "safe")) {
+    return "off";
+  }
+  return mode ?? "safe";
+};
+
+const normalizeStreamRetryMaxAttempts = (value: number | undefined): number =>
+  Math.min(3, Math.max(1, value ?? 3));
+
 export interface UseSettingsFormResult {
   settings: SettingsFormState | null;
   isLoading: boolean;
@@ -90,6 +103,13 @@ export function useSettingsForm(): UseSettingsFormResult {
         data.preserveCodexOfficialAuthOnSwitch ?? false,
       unifyCodexSessionHistory: data.unifyCodexSessionHistory ?? false,
       enableStreamRetry: data.enableStreamRetry ?? true,
+      streamRetryMode: normalizeStreamRetryMode(
+        data.streamRetryMode,
+        data.enableStreamRetry,
+      ),
+      streamRetryMaxAttempts: normalizeStreamRetryMaxAttempts(
+        data.streamRetryMaxAttempts,
+      ),
       claudeConfigDir: sanitizeDir(data.claudeConfigDir),
       codexConfigDir: sanitizeDir(data.codexConfigDir),
       geminiConfigDir: sanitizeDir(data.geminiConfigDir),
@@ -120,6 +140,8 @@ export function useSettingsForm(): UseSettingsFormResult {
             preserveCodexOfficialAuthOnSwitch: false,
             unifyCodexSessionHistory: false,
             enableStreamRetry: true,
+            streamRetryMode: "safe",
+            streamRetryMaxAttempts: 3,
             language: readPersistedLanguage(),
           } as SettingsFormState);
 
@@ -164,6 +186,13 @@ export function useSettingsForm(): UseSettingsFormResult {
           serverData.preserveCodexOfficialAuthOnSwitch ?? false,
         unifyCodexSessionHistory: serverData.unifyCodexSessionHistory ?? false,
         enableStreamRetry: serverData.enableStreamRetry ?? true,
+        streamRetryMode: normalizeStreamRetryMode(
+          serverData.streamRetryMode,
+          serverData.enableStreamRetry,
+        ),
+        streamRetryMaxAttempts: normalizeStreamRetryMaxAttempts(
+          serverData.streamRetryMaxAttempts,
+        ),
         claudeConfigDir: sanitizeDir(serverData.claudeConfigDir),
         codexConfigDir: sanitizeDir(serverData.codexConfigDir),
         geminiConfigDir: sanitizeDir(serverData.geminiConfigDir),

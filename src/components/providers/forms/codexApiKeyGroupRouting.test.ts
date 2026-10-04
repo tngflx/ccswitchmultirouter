@@ -15,7 +15,11 @@ describe("Codex API key group routing", () => {
 
   it("projects isolated aliases and removes stale projections", () => {
     const group = { id: "astra", apiKeys: ["key"], models: ["gpt-5.6-sol"] };
-    const projected = buildCodexApiKeyGroupCatalog(catalog, [group], "isolated");
+    const projected = buildCodexApiKeyGroupCatalog(
+      catalog,
+      [group],
+      "isolated",
+    );
     expect(projected[1]).toMatchObject({
       model: "gpt-5.6-sol--ccg-astra",
       apiKeyGroupId: "astra",
@@ -26,9 +30,15 @@ describe("Codex API key group routing", () => {
 
   it("does not project aliases for pooled mode or disabled groups", () => {
     const group = { id: "astra", apiKeys: ["key"], models: ["gpt-5.6-sol"] };
-    expect(buildCodexApiKeyGroupCatalog(catalog, [group], "round_robin")).toEqual(catalog);
     expect(
-      buildCodexApiKeyGroupCatalog(catalog, [{ ...group, enabled: false }], "isolated"),
+      buildCodexApiKeyGroupCatalog(catalog, [group], "round_robin"),
+    ).toEqual(catalog);
+    expect(
+      buildCodexApiKeyGroupCatalog(
+        catalog,
+        [{ ...group, enabled: false }],
+        "isolated",
+      ),
     ).toEqual(catalog);
   });
 });

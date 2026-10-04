@@ -354,9 +354,9 @@ export function useCodexConfigState({ initialData }: UseCodexConfigStateProps) {
   const [codexCatalogModels, setCodexCatalogModels] = useState<
     CodexCatalogModel[]
   >(() => initialState.catalogModels);
-  const [codexApiKeyGroups, setCodexApiKeyGroups] = useState<CodexApiKeyGroup[]>(
-    () => initialState.apiKeyGroups,
-  );
+  const [codexApiKeyGroups, setCodexApiKeyGroups] = useState<
+    CodexApiKeyGroup[]
+  >(() => initialState.apiKeyGroups);
   const [codexSpawnAgentModels, setCodexSpawnAgentModels] = useState<string[]>(
     () => initialState.spawnAgentModels,
   );

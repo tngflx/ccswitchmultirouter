@@ -56,6 +56,7 @@ import { CustomUserAgentField } from "./CustomUserAgentField";
 import { LocalProxyRequestOverridesField } from "./LocalProxyRequestOverridesField";
 import { CodexProviderReadinessSection } from "./CodexProviderReadinessSection";
 import { CodexKeyGroupModels } from "./CodexKeyGroupModels";
+import { CodexCatalogViewport } from "./CodexCatalogViewport";
 import { CodexModelReasoningCard } from "./CodexModelReasoningCard";
 import { CodexModelReasoningEditor } from "./CodexModelReasoningEditor";
 import { CodexModelReasoningSummary } from "./CodexModelReasoningSummary";
@@ -69,6 +70,12 @@ import {
 } from "@/lib/protocol-lab/codex-overrides";
 import { resolveFetchedCodexModelContextWindow } from "@/utils/codexModelContext";
 import { reconcileFetchedCodexCatalogRows } from "@/lib/codexCatalogReconciliation";
+import {
+  buildCodexInputCapabilityReferenceMap,
+  codexInputCapabilityPatch,
+  codexInputCapabilityState,
+  hydrateCodexInputCapabilities,
+} from "./codexInputCapability";
 import {
   codexPlanModelListAction,
   codexCatalogOnlyPlanModelFetchMessage,
@@ -306,6 +313,9 @@ interface CodexFormFieldsProps {
   catalogModels?: CodexCatalogModel[];
   // Current maintained preset baseline, used only for explicit override/restore.
   presetCatalogModels?: CodexCatalogModel[];
+  // Maintained and saved catalog inventory used only to hydrate missing,
+  // unambiguous input-capability metadata.
+  knownCatalogModels?: CodexCatalogModel[];
   onCatalogModelsChange?: (models: CodexCatalogModel[]) => void;
   catalogValidationError?: { model: string; message: string } | null;
   saveError?: string | null;
@@ -433,7 +443,9 @@ function createCatalogRow(seed?: Partial<CodexCatalogModel>): CodexCatalogRow {
       ? { inputModalities: [...inputModalities] }
       : {}),
     ...(supportsImage !== undefined ? { supportsImage } : {}),
-    ...(seed?.textOnly !== undefined ? { textOnly: seed.textOnly } : {}),
+    ...((seed?.textOnly ?? seed?.text_only) !== undefined
+      ? { textOnly: seed?.textOnly ?? seed?.text_only }
+      : {}),
     ...(seed?.baseInstructions
       ? { baseInstructions: seed.baseInstructions }
       : {}),
@@ -446,31 +458,17 @@ function createCatalogRow(seed?: Partial<CodexCatalogModel>): CodexCatalogRow {
   };
 }
 
-function catalogInputCapabilityPatch(
-  supportsImage: boolean,
-): Pick<CodexCatalogModel, "inputModalities" | "supportsImage" | "textOnly"> {
-  return {
-    inputModalities: supportsImage ? ["text", "image"] : ["text"],
-    supportsImage,
-    textOnly: !supportsImage,
-  };
-}
-
 function catalogSupportsImage(model: CodexCatalogModel): boolean {
-  const modalities = model.inputModalities ?? model.input_modalities ?? [];
-  return (
-    model.supportsImage === true ||
-    model.supports_image === true ||
-    model.vision === true ||
-    modalities.some((modality) => modality.toLowerCase() === "image")
-  );
+  return codexInputCapabilityState(model) === "text_image";
 }
 
 // 读取 catalog 行的真实上游模型名；为空时回退到可见模型名，兼容旧配置。
 function catalogRowUpstreamModel(
   row: Pick<CodexCatalogModel, "model" | "upstreamModel" | "upstream_model">,
 ): string {
-  return (row.upstreamModel ?? row.upstream_model ?? row.model ?? "").trim();
+  return (
+    (row.upstreamModel ?? row.upstream_model ?? "").trim() || row.model.trim()
+  );
 }
 
 // Compares rows (with rowId) to incoming models (without) by data fields only,
@@ -726,6 +724,7 @@ export function CodexFormFields({
   onProtocolProbeReceiptIdsChange = ignoreProtocolProbeReceiptIds,
   catalogModels = [],
   presetCatalogModels = [],
+  knownCatalogModels = [],
   onCatalogModelsChange,
   catalogValidationError = null,
   saveError = null,
@@ -858,8 +857,19 @@ export function CodexFormFields({
     }
   }, [hasAnyAdvancedValue, isXaiOauthPreset]);
 
+  const inputCapabilityReferences = useMemo(
+    () =>
+      buildCodexInputCapabilityReferenceMap([
+        presetCatalogModels,
+        knownCatalogModels,
+      ]),
+    [knownCatalogModels, presetCatalogModels],
+  );
   const [catalogRows, setCatalogRows] = useState<CodexCatalogRow[]>(() =>
-    catalogModels.map((m) => createCatalogRow(m)),
+    hydrateCodexInputCapabilities(
+      catalogModels.map((model) => createCatalogRow(model)),
+      inputCapabilityReferences,
+    ),
   );
   const apiKeyGroupsRef = useRef(apiKeyGroups);
   apiKeyGroupsRef.current = apiKeyGroups;
@@ -877,6 +887,14 @@ export function CodexFormFields({
   const [expandedReasoningRowId, setExpandedReasoningRowId] = useState<
     string | null
   >(null);
+  const [visibleReasoningModels, setVisibleReasoningModels] = useState<
+    string[]
+  >([]);
+
+  const catalogViewportItems = useMemo(
+    () => catalogRows.map((row, index) => ({ row, index })),
+    [catalogRows],
+  );
 
   const reasoningSettingsConfig = useMemo(
     () => ({ modelCatalog: { models: catalogRows } }),
@@ -895,9 +913,10 @@ export function CodexFormFields({
   );
 
   useEffect(() => {
+    const visibleModelSet = new Set(visibleReasoningModels);
     const models = catalogRows
       .map((row) => catalogRowUpstreamModel(row) || row.model.trim())
-      .filter(Boolean);
+      .filter((model) => model && visibleModelSet.has(model));
     if (models.length === 0) {
       setReasoningResolutions({});
       return;
@@ -936,7 +955,31 @@ export function CodexFormFields({
     return () => {
       cancelled = true;
     };
-  }, [catalogRows, providerId, reasoningSettingsConfig]);
+  }, [
+    catalogRows,
+    providerId,
+    reasoningSettingsConfig,
+    visibleReasoningModels,
+  ]);
+
+  const handleVisibleReasoningItemsChange = useCallback(
+    (items: { row: CodexCatalogRow; index: number }[]) => {
+      const next = Array.from(
+        new Set(
+          items
+            .map(({ row }) => catalogRowUpstreamModel(row) || row.model.trim())
+            .filter(Boolean),
+        ),
+      );
+      setVisibleReasoningModels((current) =>
+        current.length === next.length &&
+        current.every((model, index) => model === next[index])
+          ? current
+          : next,
+      );
+    },
+    [],
+  );
   const catalogRowsRef = useRef<CodexCatalogRow[]>(catalogRows);
   const modelMappingSectionRef = useRef<HTMLDivElement | null>(null);
   const fetchModelsButtonRef = useRef<HTMLButtonElement | null>(null);
@@ -1107,15 +1150,21 @@ export function CodexFormFields({
     catalogPropKeyRef.current = incomingCatalogKey;
 
     setCatalogRows((current) => {
+      // A local row edit intentionally diverges from the previous prop until
+      // the child -> parent effect emits it. Rebuilding here would erase that
+      // edit before it can cross the controlled boundary. Only a changed prop
+      // (preset switch / parent load) owns row reconstruction.
+      if (!isExternalCatalogChange) return current;
       if (catalogRowsMatchModels(current, catalogModels)) return current;
-      if (isExternalCatalogChange) {
-        skipCatalogEchoRef.current = true;
-      }
-      return catalogModels.map((m) => createCatalogRow(m));
+      skipCatalogEchoRef.current = true;
+      return hydrateCodexInputCapabilities(
+        catalogModels.map((model) => createCatalogRow(model)),
+        inputCapabilityReferences,
+      );
     });
     // 同步更新 ref，避免父组件传入新数据时子→父 effect 误判为本地修改
     lastSentModelsRef.current = catalogModels;
-  }, [catalogModels]);
+  }, [catalogModels, inputCapabilityReferences]);
 
   // 子 → 父：rowId 是视图层概念，不应进入持久化数据；剥离后再回传。
   // 注意：依赖数组不包含 catalogModels，避免父→子更新触发子→父回调形成循环。
@@ -1962,292 +2011,311 @@ export function CodexFormFields({
             </p>
           ) : (
             <div className="space-y-3">
-              {catalogRows.map((row, index) => {
-                const model = row.model.trim();
-                const probeModel = catalogRowUpstreamModel(row) || model;
-                const reasoningResolution = reasoningResolutions[probeModel];
-                const presetReasoning =
-                  presetReasoningByModel.get(model) ??
-                  presetReasoningByModel.get(catalogRowUpstreamModel(row));
-                const isBuiltinReasoning = row.reasoning?.source === "builtin";
-                const isUserPresetOverride =
-                  Boolean(presetReasoning) && row.reasoning?.source === "user";
-                const reasoningSourceMode: CodexReasoningCapabilitySourceMode =
-                  isBuiltinReasoning
-                    ? "builtin"
-                    : row.reasoning
-                      ? "manual"
-                      : "automatic";
-                const isReasoningEditorExpanded =
-                  expandedReasoningRowId === row.rowId;
-                const reasoningSourceLabel = isBuiltinReasoning
-                  ? "CCSM 受维护声明"
-                  : isUserPresetOverride
-                    ? "用户声明（已覆盖维护值）"
-                    : row.reasoning
-                      ? "用户声明"
-                      : reasoningResolution?.source === "detection"
-                        ? "自动检测"
-                        : reasoningResolution?.source === "library"
-                          ? "维护能力库"
-                          : "自动发现或服务端默认";
-                const selectableEfforts =
-                  reasoningResolution?.resolved.codexSelectableEfforts ??
-                  row.reasoning?.supportedEfforts ??
-                  [];
-                const defaultEffort =
-                  reasoningResolution?.resolved.providerDefaultEffort ??
-                  row.reasoning?.defaultEffort;
-                const discoveredReasoning = reasoningResolution?.capability
-                  ? (reasoningResolution.capability as unknown as CodexModelReasoningCapability)
-                  : undefined;
+              <CodexCatalogViewport
+                items={catalogViewportItems}
+                compact={catalogRows.length > 20}
+                selected={new Set()}
+                onSelect={() => undefined}
+                showSelection={false}
+                onVisibleItemsChange={handleVisibleReasoningItemsChange}
+              >
+                {({ row, index }) => {
+                  const model = row.model.trim();
+                  const probeModel = catalogRowUpstreamModel(row) || model;
+                  const reasoningResolution = reasoningResolutions[probeModel];
+                  const presetReasoning =
+                    presetReasoningByModel.get(model) ??
+                    presetReasoningByModel.get(catalogRowUpstreamModel(row));
+                  const isBuiltinReasoning =
+                    row.reasoning?.source === "builtin";
+                  const isUserPresetOverride =
+                    Boolean(presetReasoning) &&
+                    row.reasoning?.source === "user";
+                  const reasoningSourceMode: CodexReasoningCapabilitySourceMode =
+                    isBuiltinReasoning
+                      ? "builtin"
+                      : row.reasoning
+                        ? "manual"
+                        : "automatic";
+                  const isReasoningEditorExpanded =
+                    expandedReasoningRowId === row.rowId;
+                  const reasoningSourceLabel = isBuiltinReasoning
+                    ? "CCSM 受维护声明"
+                    : isUserPresetOverride
+                      ? "用户声明（已覆盖维护值）"
+                      : row.reasoning
+                        ? "用户声明"
+                        : reasoningResolution?.source === "detection"
+                          ? "自动检测"
+                          : reasoningResolution?.source === "library"
+                            ? "维护能力库"
+                            : "自动发现或服务端默认";
+                  const selectableEfforts =
+                    reasoningResolution?.resolved.codexSelectableEfforts ??
+                    row.reasoning?.supportedEfforts ??
+                    [];
+                  const defaultEffort =
+                    reasoningResolution?.resolved.providerDefaultEffort ??
+                    row.reasoning?.defaultEffort;
+                  const discoveredReasoning = reasoningResolution?.capability
+                    ? (reasoningResolution.capability as unknown as CodexModelReasoningCapability)
+                    : undefined;
 
-                return (
-                  <article
-                    id={
-                      catalogValidationError?.model === model
-                        ? "codex-catalog-validation-row"
-                        : undefined
-                    }
-                    key={`reasoning:${row.rowId}`}
-                    className={`space-y-3 rounded-md border bg-background p-3 text-xs ${catalogValidationError?.model === model ? "border-destructive ring-1 ring-destructive" : ""}`}
-                  >
-                    <CodexModelReasoningSummary
-                      model={row.displayName?.trim() || model || "未命名模型"}
-                      source={reasoningSourceLabel}
-                      selectableEfforts={selectableEfforts}
-                      defaultEffort={defaultEffort}
-                      ultraEnabled={row.codexUltra?.enabled === true}
-                      ultraEffort={row.codexUltra?.providerEffort}
-                      ultraEfforts={
-                        reasoningResolution?.resolved.providerAcceptedEfforts ??
-                        []
+                  return (
+                    <article
+                      id={
+                        catalogValidationError?.model === model
+                          ? "codex-catalog-validation-row"
+                          : undefined
                       }
-                      onUltraChange={(codexUltra) =>
-                        handleUpdateCatalogRow(index, { codexUltra })
-                      }
-                      expanded={isReasoningEditorExpanded}
-                      onToggle={() =>
-                        setExpandedReasoningRowId((current) =>
-                          current === row.rowId ? null : row.rowId,
-                        )
-                      }
-                    />
+                      key={`reasoning:${row.rowId}`}
+                      className={`space-y-3 rounded-md border bg-background p-3 text-xs ${catalogValidationError?.model === model ? "border-destructive ring-1 ring-destructive" : ""}`}
+                    >
+                      <CodexModelReasoningSummary
+                        model={row.displayName?.trim() || model || "未命名模型"}
+                        source={reasoningSourceLabel}
+                        selectableEfforts={selectableEfforts}
+                        defaultEffort={defaultEffort}
+                        ultraEnabled={row.codexUltra?.enabled === true}
+                        ultraEffort={row.codexUltra?.providerEffort}
+                        ultraEfforts={
+                          reasoningResolution?.resolved
+                            .providerAcceptedEfforts ?? []
+                        }
+                        onUltraChange={(codexUltra) =>
+                          handleUpdateCatalogRow(index, { codexUltra })
+                        }
+                        expanded={isReasoningEditorExpanded}
+                        onToggle={() =>
+                          setExpandedReasoningRowId((current) =>
+                            current === row.rowId ? null : row.rowId,
+                          )
+                        }
+                      />
 
-                    {isReasoningEditorExpanded && (
-                      <>
-                        <label className="grid min-w-52 gap-1">
-                          <span className="font-medium">能力来源</span>
-                          <select
-                            className="rounded-md border bg-background px-3 py-2"
-                            value={reasoningSourceMode}
-                            aria-label={`${model || "模型"}推理能力来源`}
-                            onChange={(event) =>
-                              handleUpdateCatalogRow(index, {
-                                reasoning: applyCodexReasoningCapabilitySource(
-                                  event.target
-                                    .value as CodexReasoningCapabilitySourceMode,
-                                  row.reasoning,
-                                  presetReasoning,
-                                  discoveredReasoning,
-                                ),
-                              })
-                            }
-                          >
-                            <option value="automatic">自动发现</option>
-                            <option value="builtin" disabled={!presetReasoning}>
-                              使用 CCSM 受维护声明
-                            </option>
-                            <option value="manual">手动声明</option>
-                          </select>
-                          {reasoningSourceMode === "automatic" ? (
-                            <span className="text-muted-foreground">
-                              自动发现会按当前
-                              Provider、模型和已验证声明解析能力；它不会写入本模型配置。需要调整档位、映射或开启
-                              Ultra 时，请按当前结果创建用户覆盖。
-                            </span>
-                          ) : null}
-                        </label>
+                      {isReasoningEditorExpanded && (
+                        <>
+                          <label className="grid min-w-52 gap-1">
+                            <span className="font-medium">能力来源</span>
+                            <select
+                              className="rounded-md border bg-background px-3 py-2"
+                              value={reasoningSourceMode}
+                              aria-label={`${model || "模型"}推理能力来源`}
+                              onChange={(event) =>
+                                handleUpdateCatalogRow(index, {
+                                  reasoning:
+                                    applyCodexReasoningCapabilitySource(
+                                      event.target
+                                        .value as CodexReasoningCapabilitySourceMode,
+                                      row.reasoning,
+                                      presetReasoning,
+                                      discoveredReasoning,
+                                    ),
+                                })
+                              }
+                            >
+                              <option value="automatic">自动发现</option>
+                              <option
+                                value="builtin"
+                                disabled={!presetReasoning}
+                              >
+                                使用 CCSM 受维护声明
+                              </option>
+                              <option value="manual">手动声明</option>
+                            </select>
+                            {reasoningSourceMode === "automatic" ? (
+                              <span className="text-muted-foreground">
+                                自动发现会按当前
+                                Provider、模型和已验证声明解析能力；它不会写入本模型配置。需要调整档位、映射或开启
+                                Ultra 时，请按当前结果创建用户覆盖。
+                              </span>
+                            ) : null}
+                          </label>
 
-                        {reasoningResolution ? (
-                          <CodexModelReasoningCard
-                            resolution={reasoningResolution}
-                            hasBuiltinPreset={Boolean(presetReasoning)}
-                            redetecting={
-                              redetectingReasoningModel === probeModel
-                            }
-                            onRedetect={async () => {
-                              setRedetectingReasoningModel(probeModel);
-                              try {
-                                const outcome =
-                                  await codexSubagentV2Api.triggerModelReasoningDetection(
-                                    reasoningDetectionProvider,
-                                    probeModel,
-                                  );
-                                if (
-                                  typeof outcome === "object" &&
-                                  "found" in outcome
-                                ) {
-                                  const next =
-                                    await codexSubagentV2Api.resolveModelReasoningCapability(
-                                      reasoningSettingsConfig,
-                                      providerId ?? "codex-draft",
+                          {reasoningResolution ? (
+                            <CodexModelReasoningCard
+                              resolution={reasoningResolution}
+                              hasBuiltinPreset={Boolean(presetReasoning)}
+                              redetecting={
+                                redetectingReasoningModel === probeModel
+                              }
+                              onRedetect={async () => {
+                                setRedetectingReasoningModel(probeModel);
+                                try {
+                                  const outcome =
+                                    await codexSubagentV2Api.triggerModelReasoningDetection(
+                                      reasoningDetectionProvider,
                                       probeModel,
                                     );
-                                  setReasoningResolutions((current) => ({
-                                    ...current,
-                                    [probeModel]: next,
-                                  }));
-                                  toast.success("已更新模型推理能力检测结果");
-                                } else {
+                                  if (
+                                    typeof outcome === "object" &&
+                                    "found" in outcome
+                                  ) {
+                                    const next =
+                                      await codexSubagentV2Api.resolveModelReasoningCapability(
+                                        reasoningSettingsConfig,
+                                        providerId ?? "codex-draft",
+                                        probeModel,
+                                      );
+                                    setReasoningResolutions((current) => ({
+                                      ...current,
+                                      [probeModel]: next,
+                                    }));
+                                    toast.success("已更新模型推理能力检测结果");
+                                  } else {
+                                    toast.info(
+                                      "未获得可采纳的模型推理能力声明，继续使用服务端默认。",
+                                    );
+                                  }
+                                } catch (error) {
+                                  console.error(
+                                    "[CodexFormFields] reasoning detection failed",
+                                    error,
+                                  );
+                                  toast.error("模型推理能力检测失败");
+                                } finally {
+                                  setRedetectingReasoningModel(null);
+                                }
+                              }}
+                              onAdoptDetection={() => {
+                                const detected = reasoningResolution.detection
+                                  ? capabilityFromReasoningDetection({
+                                      found: reasoningResolution.detection,
+                                    })
+                                  : undefined;
+                                if (!detected) {
                                   toast.info(
-                                    "未获得可采纳的模型推理能力声明，继续使用服务端默认。",
+                                    "当前检测结果没有可采纳的推理档位声明。",
+                                  );
+                                  return;
+                                }
+                                handleUpdateCatalogRow(index, {
+                                  reasoning: detected,
+                                });
+                                toast.success("已采用检测到的推理能力");
+                              }}
+                              onManualDeclare={() =>
+                                handleUpdateCatalogRow(index, {
+                                  reasoning:
+                                    applyCodexReasoningCapabilitySource(
+                                      "manual",
+                                      row.reasoning,
+                                      presetReasoning,
+                                      discoveredReasoning,
+                                    ),
+                                })
+                              }
+                              onCustomizeEffective={
+                                !row.reasoning && discoveredReasoning
+                                  ? () =>
+                                      handleUpdateCatalogRow(index, {
+                                        reasoning:
+                                          applyCodexReasoningCapabilitySource(
+                                            "manual",
+                                            row.reasoning,
+                                            presetReasoning,
+                                            discoveredReasoning,
+                                          ),
+                                      })
+                                  : undefined
+                              }
+                              onRestoreBuiltin={() =>
+                                handleUpdateCatalogRow(index, {
+                                  reasoning:
+                                    applyCodexReasoningCapabilitySource(
+                                      "builtin",
+                                      row.reasoning,
+                                      presetReasoning,
+                                    ),
+                                })
+                              }
+                            />
+                          ) : (
+                            <p className="text-muted-foreground">
+                              正在读取该模型的统一推理能力解析结果…
+                            </p>
+                          )}
+
+                          {isUserPresetOverride ? (
+                            <Button
+                              type="button"
+                              variant="ghost"
+                              size="sm"
+                              onClick={() =>
+                                handleUpdateCatalogRow(index, {
+                                  reasoning:
+                                    applyCodexReasoningCapabilitySource(
+                                      "builtin",
+                                      row.reasoning,
+                                      presetReasoning,
+                                    ),
+                                })
+                              }
+                            >
+                              恢复内置默认
+                            </Button>
+                          ) : null}
+                          {isBuiltinReasoning && row.reasoning ? (
+                            <Button
+                              type="button"
+                              variant="outline"
+                              size="sm"
+                              onClick={() =>
+                                handleUpdateCatalogRow(index, {
+                                  reasoning:
+                                    applyCodexReasoningCapabilitySource(
+                                      "manual",
+                                      row.reasoning,
+                                      presetReasoning,
+                                    ),
+                                })
+                              }
+                            >
+                              创建高级覆盖
+                            </Button>
+                          ) : null}
+
+                          {row.reasoning ? (
+                            <CodexModelReasoningEditor
+                              model={model || "模型"}
+                              capability={row.reasoning}
+                              readOnly={isBuiltinReasoning}
+                              onChange={(reasoning) =>
+                                handleUpdateCatalogRow(index, { reasoning })
+                              }
+                            />
+                          ) : null}
+
+                          <details>
+                            <summary className="cursor-pointer text-muted-foreground">
+                              专家 JSON
+                            </summary>
+                            <Textarea
+                              key={`reasoning-json:${row.rowId}:${JSON.stringify(row.reasoning)}`}
+                              className="mt-2 min-h-28 font-mono text-xs"
+                              defaultValue={
+                                row.reasoning
+                                  ? JSON.stringify(row.reasoning, null, 2)
+                                  : ""
+                              }
+                              onBlur={(event) => {
+                                if (!isBuiltinReasoning) {
+                                  handleUpdateCatalogReasoningJson(
+                                    index,
+                                    event.target.value,
                                   );
                                 }
-                              } catch (error) {
-                                console.error(
-                                  "[CodexFormFields] reasoning detection failed",
-                                  error,
-                                );
-                                toast.error("模型推理能力检测失败");
-                              } finally {
-                                setRedetectingReasoningModel(null);
-                              }
-                            }}
-                            onAdoptDetection={() => {
-                              const detected = reasoningResolution.detection
-                                ? capabilityFromReasoningDetection({
-                                    found: reasoningResolution.detection,
-                                  })
-                                : undefined;
-                              if (!detected) {
-                                toast.info(
-                                  "当前检测结果没有可采纳的推理档位声明。",
-                                );
-                                return;
-                              }
-                              handleUpdateCatalogRow(index, {
-                                reasoning: detected,
-                              });
-                              toast.success("已采用检测到的推理能力");
-                            }}
-                            onManualDeclare={() =>
-                              handleUpdateCatalogRow(index, {
-                                reasoning: applyCodexReasoningCapabilitySource(
-                                  "manual",
-                                  row.reasoning,
-                                  presetReasoning,
-                                  discoveredReasoning,
-                                ),
-                              })
-                            }
-                            onCustomizeEffective={
-                              !row.reasoning && discoveredReasoning
-                                ? () =>
-                                    handleUpdateCatalogRow(index, {
-                                      reasoning:
-                                        applyCodexReasoningCapabilitySource(
-                                          "manual",
-                                          row.reasoning,
-                                          presetReasoning,
-                                          discoveredReasoning,
-                                        ),
-                                    })
-                                : undefined
-                            }
-                            onRestoreBuiltin={() =>
-                              handleUpdateCatalogRow(index, {
-                                reasoning: applyCodexReasoningCapabilitySource(
-                                  "builtin",
-                                  row.reasoning,
-                                  presetReasoning,
-                                ),
-                              })
-                            }
-                          />
-                        ) : (
-                          <p className="text-muted-foreground">
-                            正在读取该模型的统一推理能力解析结果…
-                          </p>
-                        )}
-
-                        {isUserPresetOverride ? (
-                          <Button
-                            type="button"
-                            variant="ghost"
-                            size="sm"
-                            onClick={() =>
-                              handleUpdateCatalogRow(index, {
-                                reasoning: applyCodexReasoningCapabilitySource(
-                                  "builtin",
-                                  row.reasoning,
-                                  presetReasoning,
-                                ),
-                              })
-                            }
-                          >
-                            恢复内置默认
-                          </Button>
-                        ) : null}
-                        {isBuiltinReasoning && row.reasoning ? (
-                          <Button
-                            type="button"
-                            variant="outline"
-                            size="sm"
-                            onClick={() =>
-                              handleUpdateCatalogRow(index, {
-                                reasoning: applyCodexReasoningCapabilitySource(
-                                  "manual",
-                                  row.reasoning,
-                                  presetReasoning,
-                                ),
-                              })
-                            }
-                          >
-                            创建高级覆盖
-                          </Button>
-                        ) : null}
-
-                        {row.reasoning ? (
-                          <CodexModelReasoningEditor
-                            model={model || "模型"}
-                            capability={row.reasoning}
-                            readOnly={isBuiltinReasoning}
-                            onChange={(reasoning) =>
-                              handleUpdateCatalogRow(index, { reasoning })
-                            }
-                          />
-                        ) : null}
-
-                        <details>
-                          <summary className="cursor-pointer text-muted-foreground">
-                            专家 JSON
-                          </summary>
-                          <Textarea
-                            key={`reasoning-json:${row.rowId}:${JSON.stringify(row.reasoning)}`}
-                            className="mt-2 min-h-28 font-mono text-xs"
-                            defaultValue={
-                              row.reasoning
-                                ? JSON.stringify(row.reasoning, null, 2)
-                                : ""
-                            }
-                            onBlur={(event) => {
-                              if (!isBuiltinReasoning) {
-                                handleUpdateCatalogReasoningJson(
-                                  index,
-                                  event.target.value,
-                                );
-                              }
-                            }}
-                            readOnly={isBuiltinReasoning}
-                            aria-label={`${model || "模型"}推理能力 JSON`}
-                          />
-                        </details>
-                      </>
-                    )}
-                  </article>
-                );
-              })}
+                              }}
+                              readOnly={isBuiltinReasoning}
+                              aria-label={`${model || "模型"}推理能力 JSON`}
+                            />
+                          </details>
+                        </>
+                      )}
+                    </article>
+                  );
+                }}
+              </CodexCatalogViewport>
             </div>
           )}
         </section>
@@ -2577,278 +2645,317 @@ export function CodexFormFields({
                       <span />
                     </div>
 
-                    {catalogRows.map((row, index) => {
-                      const model = row.model.trim();
-                      const presetCatalogModel =
-                        presetCatalogByModel.get(model) ??
-                        presetCatalogByModel.get(catalogRowUpstreamModel(row));
-                      const supportsImage = catalogSupportsImage(row);
-                      const presetDeclaresInputCapability = Boolean(
-                        presetCatalogModel &&
-                          (presetCatalogModel.inputModalities !== undefined ||
-                            presetCatalogModel.input_modalities !== undefined ||
-                            presetCatalogModel.supportsImage !== undefined ||
-                            presetCatalogModel.supports_image !== undefined ||
-                            presetCatalogModel.vision !== undefined ||
-                            presetCatalogModel.textOnly !== undefined ||
-                            presetCatalogModel.text_only !== undefined),
-                      );
+                    <CodexCatalogViewport
+                      items={catalogViewportItems}
+                      compact={catalogRows.length > 20}
+                      selected={new Set()}
+                      onSelect={() => undefined}
+                      onToggleEnabled={(rowId, enabled) => {
+                        const index = catalogRows.findIndex(
+                          (row) => row.rowId === rowId,
+                        );
+                        if (index >= 0) {
+                          handleUpdateCatalogRow(index, { enabled });
+                        }
+                      }}
+                    >
+                      {({ row, index }) => {
+                        const model = row.model.trim();
+                        const presetCatalogModel =
+                          presetCatalogByModel.get(model) ??
+                          presetCatalogByModel.get(
+                            catalogRowUpstreamModel(row),
+                          );
+                        const supportsImage = catalogSupportsImage(row);
+                        const presetDeclaresInputCapability = Boolean(
+                          presetCatalogModel &&
+                            (presetCatalogModel.inputModalities !== undefined ||
+                              presetCatalogModel.input_modalities !==
+                                undefined ||
+                              presetCatalogModel.supportsImage !== undefined ||
+                              presetCatalogModel.supports_image !== undefined ||
+                              presetCatalogModel.vision !== undefined ||
+                              presetCatalogModel.textOnly !== undefined ||
+                              presetCatalogModel.text_only !== undefined),
+                        );
 
-                      return (
-                        <div
-                          key={row.rowId}
-                          className="grid grid-cols-1 gap-2 rounded-md border border-transparent p-1 md:grid-cols-[88px_1fr_1fr_1fr_132px_150px_76px_36px]"
-                        >
-                          <label className="flex h-9 items-center gap-2 text-xs text-muted-foreground">
-                            <input
-                              type="checkbox"
-                              className="h-4 w-4 rounded border-border-default"
-                              checked
-                              onChange={(event) => {
-                                if (!event.target.checked) {
-                                  handleRemoveCatalogRow(index);
-                                }
-                              }}
-                              aria-label={t("codexConfig.keepCatalogModel", {
-                                model: row.model || row.displayName || "",
-                                defaultValue: `保留 ${row.model || row.displayName || "这个模型"}`,
+                        return (
+                          <div
+                            key={row.rowId}
+                            className="grid grid-cols-1 gap-2 rounded-md border border-transparent p-1 md:grid-cols-[88px_1fr_1fr_1fr_132px_150px_76px_36px]"
+                          >
+                            <label className="flex h-9 items-center gap-2 text-xs text-muted-foreground">
+                              <input
+                                type="checkbox"
+                                className="h-4 w-4 rounded border-border-default"
+                                checked
+                                onChange={(event) => {
+                                  if (!event.target.checked) {
+                                    handleRemoveCatalogRow(index);
+                                  }
+                                }}
+                                aria-label={t("codexConfig.keepCatalogModel", {
+                                  model: row.model || row.displayName || "",
+                                  defaultValue: `保留 ${row.model || row.displayName || "这个模型"}`,
+                                })}
+                              />
+                              <span className="md:hidden">
+                                {t("codexConfig.keepCatalogModelColumn", {
+                                  defaultValue: "保留",
+                                })}
+                              </span>
+                            </label>
+                            <Input
+                              value={row.displayName ?? ""}
+                              onChange={(event) =>
+                                handleUpdateCatalogRow(index, {
+                                  displayName: event.target.value,
+                                })
+                              }
+                              placeholder={t(
+                                "codexConfig.catalogDisplayNamePlaceholder",
+                                {
+                                  defaultValue: "例如: DeepSeek V4 Flash",
+                                },
+                              )}
+                              aria-label={t(
+                                "codexConfig.catalogColumnDisplay",
+                                {
+                                  defaultValue: "菜单显示名",
+                                },
+                              )}
+                            />
+                            <Input
+                              value={row.model}
+                              onChange={(event) =>
+                                handleUpdateCatalogRow(index, {
+                                  model: event.target.value,
+                                })
+                              }
+                              placeholder={t(
+                                "codexConfig.catalogModelPlaceholder",
+                                {
+                                  defaultValue: "例如: gpt-5.5-thirdparty",
+                                },
+                              )}
+                              aria-label={t("codexConfig.catalogColumnModel", {
+                                defaultValue: "候选模型名",
                               })}
                             />
-                            <span className="md:hidden">
-                              {t("codexConfig.keepCatalogModelColumn", {
-                                defaultValue: "保留",
-                              })}
-                            </span>
-                          </label>
-                          <Input
-                            value={row.displayName ?? ""}
-                            onChange={(event) =>
-                              handleUpdateCatalogRow(index, {
-                                displayName: event.target.value,
-                              })
-                            }
-                            placeholder={t(
-                              "codexConfig.catalogDisplayNamePlaceholder",
-                              {
-                                defaultValue: "例如: DeepSeek V4 Flash",
-                              },
-                            )}
-                            aria-label={t("codexConfig.catalogColumnDisplay", {
-                              defaultValue: "菜单显示名",
-                            })}
-                          />
-                          <Input
-                            value={row.model}
-                            onChange={(event) =>
-                              handleUpdateCatalogRow(index, {
-                                model: event.target.value,
-                              })
-                            }
-                            placeholder={t(
-                              "codexConfig.catalogModelPlaceholder",
-                              {
-                                defaultValue: "例如: gpt-5.5-thirdparty",
-                              },
-                            )}
-                            aria-label={t("codexConfig.catalogColumnModel", {
-                              defaultValue: "候选模型名",
-                            })}
-                          />
-                          <div className="space-y-1">
-                            <div className="flex gap-1">
-                              <Input
-                                value={
-                                  row.upstreamModel ?? row.upstream_model ?? ""
-                                }
-                                onChange={(event) =>
-                                  handleUpdateCatalogRow(index, {
-                                    upstreamModel: event.target.value,
-                                  })
-                                }
-                                placeholder={t(
-                                  "codexConfig.catalogUpstreamModelPlaceholder",
-                                  {
-                                    defaultValue: "留空则使用候选模型名",
-                                  },
-                                )}
-                                aria-label={t(
-                                  "codexConfig.catalogColumnUpstreamModel",
-                                  {
-                                    defaultValue: "上游模型名",
-                                  },
-                                )}
-                                className="flex-1"
-                              />
-                              {fetchedModels.length > 0 && (
-                                <ModelDropdown
-                                  models={fetchedModels}
-                                  onSelect={(id) =>
-                                    handleSelectFetchedCatalogModel(
-                                      index,
-                                      id,
-                                      row.model,
-                                      row.displayName,
-                                    )
+                            <div className="space-y-1">
+                              <div className="flex gap-1">
+                                <Input
+                                  value={
+                                    row.upstreamModel ??
+                                    row.upstream_model ??
+                                    ""
                                   }
+                                  onChange={(event) =>
+                                    handleUpdateCatalogRow(index, {
+                                      upstreamModel: event.target.value,
+                                    })
+                                  }
+                                  placeholder={t(
+                                    "codexConfig.catalogUpstreamModelPlaceholder",
+                                    {
+                                      defaultValue: "留空则使用候选模型名",
+                                    },
+                                  )}
+                                  aria-label={t(
+                                    "codexConfig.catalogColumnUpstreamModel",
+                                    {
+                                      defaultValue: "上游模型名",
+                                    },
+                                  )}
+                                  className="flex-1"
                                 />
+                                {fetchedModels.length > 0 && (
+                                  <ModelDropdown
+                                    models={fetchedModels}
+                                    onSelect={(id) =>
+                                      handleSelectFetchedCatalogModel(
+                                        index,
+                                        id,
+                                        row.model,
+                                        row.displayName,
+                                      )
+                                    }
+                                  />
+                                )}
+                              </div>
+                            </div>
+                            <Input
+                              type="number"
+                              min={1}
+                              inputMode="numeric"
+                              value={row.contextWindow ?? ""}
+                              onChange={(event) =>
+                                handleUpdateCatalogRow(index, {
+                                  contextWindow: event.target.value.replace(
+                                    /[^\d]/g,
+                                    "",
+                                  ),
+                                })
+                              }
+                              placeholder={t(
+                                "codexConfig.contextWindowPlaceholder",
+                                {
+                                  defaultValue: "例如: 128000",
+                                },
                               )}
-                            </div>
-                          </div>
-                          <Input
-                            type="number"
-                            min={1}
-                            inputMode="numeric"
-                            value={row.contextWindow ?? ""}
-                            onChange={(event) =>
-                              handleUpdateCatalogRow(index, {
-                                contextWindow: event.target.value.replace(
-                                  /[^\d]/g,
-                                  "",
-                                ),
-                              })
-                            }
-                            placeholder={t(
-                              "codexConfig.contextWindowPlaceholder",
-                              {
-                                defaultValue: "例如: 128000",
-                              },
-                            )}
-                            aria-label={t("codexConfig.catalogColumnContext", {
-                              defaultValue: "上下文窗口",
-                            })}
-                          />
-                          <select
-                            className="h-9 rounded-md border border-border-default bg-background px-2 text-xs text-foreground"
-                            aria-label={`${model || "模型"} 协议选择`}
-                            value={
-                              protocolOverrides[
-                                normalizeCodexPublicModelKey(model)
-                              ] ?? "follow_auto"
-                            }
-                            onChange={(event) =>
-                              onProtocolOverridesChange(
-                                setCodexProtocolOverride(
-                                  protocolOverrides,
-                                  model,
-                                  event.target
-                                    .value as CodexProtocolChoiceInput,
-                                ),
-                              )
-                            }
-                          >
-                            <option value="follow_auto">跟随自动</option>
-                            <option value="openai_responses">Responses</option>
-                            <option value="openai_chat">Chat</option>
-                          </select>
-                          <div className="flex h-9 items-center gap-1">
-                            <Button
-                              type="button"
-                              variant="ghost"
-                              size="icon"
-                              className="h-8 w-8 text-muted-foreground"
-                              disabled={index <= 0}
-                              onClick={() => handleMoveCatalogRow(index, -1)}
-                              title={t("common.moveUp", {
-                                defaultValue: "上移",
-                              })}
+                              aria-label={t(
+                                "codexConfig.catalogColumnContext",
+                                {
+                                  defaultValue: "上下文窗口",
+                                },
+                              )}
+                            />
+                            <select
+                              className="h-9 rounded-md border border-border-default bg-background px-2 text-xs text-foreground"
+                              aria-label={`${model || "模型"} 协议选择`}
+                              value={
+                                protocolOverrides[
+                                  normalizeCodexPublicModelKey(model)
+                                ] ?? "follow_auto"
+                              }
+                              onChange={(event) =>
+                                onProtocolOverridesChange(
+                                  setCodexProtocolOverride(
+                                    protocolOverrides,
+                                    model,
+                                    event.target
+                                      .value as CodexProtocolChoiceInput,
+                                  ),
+                                )
+                              }
                             >
-                              <ArrowUp className="h-4 w-4" />
-                            </Button>
-                            <Button
-                              type="button"
-                              variant="ghost"
-                              size="icon"
-                              className="h-8 w-8 text-muted-foreground"
-                              disabled={index >= catalogRows.length - 1}
-                              onClick={() => handleMoveCatalogRow(index, 1)}
-                              title={t("common.moveDown", {
-                                defaultValue: "下移",
-                              })}
-                            >
-                              <ArrowDown className="h-4 w-4" />
-                            </Button>
-                          </div>
-                          <Button
-                            type="button"
-                            variant="ghost"
-                            size="icon"
-                            className="h-9 w-9 text-muted-foreground hover:text-destructive"
-                            onClick={() => handleRemoveCatalogRow(index)}
-                            title={t("common.delete", { defaultValue: "删除" })}
-                          >
-                            <Trash2 className="h-4 w-4" />
-                          </Button>
-                          <fieldset
-                            className="col-span-full flex flex-wrap items-center gap-2 border-t border-border-default pt-2 text-xs"
-                            aria-label={`${model || "模型"} 输入能力`}
-                          >
-                            <legend className="mr-1 font-medium">
-                              输入能力
-                            </legend>
-                            <div
-                              className="inline-flex overflow-hidden rounded-md border"
-                              role="radiogroup"
-                              aria-label={`${model || "模型"} 输入能力选择`}
-                            >
-                              <Button
-                                type="button"
-                                size="sm"
-                                variant={supportsImage ? "default" : "ghost"}
-                                className="rounded-none"
-                                aria-pressed={supportsImage}
-                                aria-label={`${model || "模型"} 文本与图像`}
-                                onClick={() =>
-                                  handleUpdateCatalogRow(
-                                    index,
-                                    catalogInputCapabilityPatch(true),
-                                  )
-                                }
-                              >
-                                文本与图像
-                              </Button>
-                              <Button
-                                type="button"
-                                size="sm"
-                                variant={!supportsImage ? "default" : "ghost"}
-                                className="rounded-none border-l"
-                                aria-pressed={!supportsImage}
-                                aria-label={`${model || "模型"} 仅文本`}
-                                onClick={() =>
-                                  handleUpdateCatalogRow(
-                                    index,
-                                    catalogInputCapabilityPatch(false),
-                                  )
-                                }
-                              >
-                                仅文本
-                              </Button>
-                            </div>
-                            <span className="text-muted-foreground">
-                              保存后覆盖当前 Provider 的预设，不需要等待发布。
-                            </span>
-                            {presetDeclaresInputCapability &&
-                            presetCatalogModel ? (
+                              <option value="follow_auto">跟随自动</option>
+                              <option value="openai_responses">
+                                Responses
+                              </option>
+                              <option value="openai_chat">Chat</option>
+                            </select>
+                            <div className="flex h-9 items-center gap-1">
                               <Button
                                 type="button"
                                 variant="ghost"
-                                size="sm"
-                                aria-label={`${model || "模型"} 恢复 CCSM 输入能力预设`}
-                                onClick={() =>
-                                  handleUpdateCatalogRow(
-                                    index,
-                                    catalogInputCapabilityPatch(
-                                      catalogSupportsImage(presetCatalogModel),
-                                    ),
-                                  )
-                                }
+                                size="icon"
+                                className="h-8 w-8 text-muted-foreground"
+                                disabled={index <= 0}
+                                onClick={() => handleMoveCatalogRow(index, -1)}
+                                title={t("common.moveUp", {
+                                  defaultValue: "上移",
+                                })}
                               >
-                                恢复 CCSM 预设
+                                <ArrowUp className="h-4 w-4" />
                               </Button>
-                            ) : null}
-                          </fieldset>
-                        </div>
-                      );
-                    })}
+                              <Button
+                                type="button"
+                                variant="ghost"
+                                size="icon"
+                                className="h-8 w-8 text-muted-foreground"
+                                disabled={index >= catalogRows.length - 1}
+                                onClick={() => handleMoveCatalogRow(index, 1)}
+                                title={t("common.moveDown", {
+                                  defaultValue: "下移",
+                                })}
+                              >
+                                <ArrowDown className="h-4 w-4" />
+                              </Button>
+                            </div>
+                            <Button
+                              type="button"
+                              variant="ghost"
+                              size="icon"
+                              className="h-9 w-9 text-muted-foreground hover:text-destructive"
+                              onClick={() => handleRemoveCatalogRow(index)}
+                              title={t("common.delete", {
+                                defaultValue: "删除",
+                              })}
+                            >
+                              <Trash2 className="h-4 w-4" />
+                            </Button>
+                            <fieldset
+                              className="col-span-full flex flex-wrap items-center gap-2 border-t border-border-default pt-2 text-xs"
+                              aria-label={`${model || "模型"} 输入能力`}
+                            >
+                              <legend className="mr-1 font-medium">
+                                输入能力
+                              </legend>
+                              <div
+                                className="inline-flex overflow-hidden rounded-md border"
+                                role="radiogroup"
+                                aria-label={`${model || "模型"} 输入能力选择`}
+                              >
+                                <Button
+                                  type="button"
+                                  size="sm"
+                                  variant={supportsImage ? "default" : "ghost"}
+                                  className="rounded-none"
+                                  aria-pressed={supportsImage}
+                                  aria-label={`${model || "模型"} 文本与图像`}
+                                  onClick={() =>
+                                    handleUpdateCatalogRow(
+                                      index,
+                                      codexInputCapabilityPatch(
+                                        "text_image",
+                                        row,
+                                      ),
+                                    )
+                                  }
+                                >
+                                  文本与图像
+                                </Button>
+                                <Button
+                                  type="button"
+                                  size="sm"
+                                  variant={!supportsImage ? "default" : "ghost"}
+                                  className="rounded-none border-l"
+                                  aria-pressed={!supportsImage}
+                                  aria-label={`${model || "模型"} 仅文本`}
+                                  onClick={() =>
+                                    handleUpdateCatalogRow(
+                                      index,
+                                      codexInputCapabilityPatch(
+                                        "text_only",
+                                        row,
+                                      ),
+                                    )
+                                  }
+                                >
+                                  仅文本
+                                </Button>
+                              </div>
+                              <span className="text-muted-foreground">
+                                保存后覆盖当前 Provider 的预设，不需要等待发布。
+                              </span>
+                              {presetDeclaresInputCapability &&
+                              presetCatalogModel ? (
+                                <Button
+                                  type="button"
+                                  variant="ghost"
+                                  size="sm"
+                                  aria-label={`${model || "模型"} 恢复 CCSM 输入能力预设`}
+                                  onClick={() =>
+                                    handleUpdateCatalogRow(
+                                      index,
+                                      codexInputCapabilityPatch(
+                                        catalogSupportsImage(presetCatalogModel)
+                                          ? "text_image"
+                                          : "text_only",
+                                        presetCatalogModel,
+                                      ),
+                                    )
+                                  }
+                                >
+                                  恢复 CCSM 预设
+                                </Button>
+                              ) : null}
+                            </fieldset>
+                          </div>
+                        );
+                      }}
+                    </CodexCatalogViewport>
                   </div>
                 )}
               </div>,
