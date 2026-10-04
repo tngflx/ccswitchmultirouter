@@ -31,6 +31,11 @@ pub enum ProxyError {
     #[error("请求转发失败: {0}")]
     ForwardFailed(String),
 
+    /// Request-health preflight deliberately stopped dispatch until the user
+    /// or the Codex Desktop handoff flow resolves the review condition.
+    #[error("请求健康检查已阻止上游发送: {0}")]
+    RequestHealthBlocked(String),
+
     #[error("无可用的Provider")]
     NoAvailableProvider,
 
@@ -143,6 +148,7 @@ impl IntoResponse for ProxyError {
                         (StatusCode::INTERNAL_SERVER_ERROR, self.to_string())
                     }
                     ProxyError::ForwardFailed(_) => (StatusCode::BAD_GATEWAY, self.to_string()),
+                    ProxyError::RequestHealthBlocked(_) => (StatusCode::CONFLICT, self.to_string()),
                     ProxyError::NoAvailableProvider => {
                         (StatusCode::SERVICE_UNAVAILABLE, self.to_string())
                     }

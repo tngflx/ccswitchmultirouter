@@ -8204,8 +8204,7 @@ impl ProviderService {
             && matches!(
                 app_type,
                 AppType::Claude | AppType::Codex | AppType::Gemini | AppType::GrokBuild
-            )
-        {
+            ) {
             Some(block_on_tauri_runtime(
                 state.proxy_service.lock_switch_for_app(app_type.as_str()),
             ))
@@ -8376,10 +8375,20 @@ impl ProviderService {
         };
 
         let mut repaired_provider = original_provider.clone();
-        let reasoning_repair =
+        let mut reasoning_repair =
+            crate::proxy::providers::codex_reasoning::restore_maintained_reasoning_capabilities(
+                &mut repaired_provider.settings_config,
+            );
+        let invalid_reasoning_repair =
             crate::proxy::providers::codex_reasoning::repair_invalid_reasoning_capabilities(
                 &mut repaired_provider.settings_config,
             );
+        reasoning_repair
+            .repaired_models
+            .extend(invalid_reasoning_repair.repaired_models);
+        reasoning_repair
+            .warnings
+            .extend(invalid_reasoning_repair.warnings);
         state
             .db
             .save_provider(AppType::Codex.as_str(), &repaired_provider)?;

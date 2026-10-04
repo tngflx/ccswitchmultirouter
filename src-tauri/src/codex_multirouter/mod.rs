@@ -1,3 +1,4 @@
+pub(crate) mod catalog;
 pub mod compiler;
 pub mod migration;
 pub mod mutation;

@@ -1897,6 +1897,54 @@ fn legacy_reasoning_content_history_replay(provider: &Provider) -> Option<Histor
     }
 }
 
+/// Compatibility resolver for callers that still name the legacy reasoning
+/// policy directly. Request transformation remains owned by `HistoryReplay`.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReasoningContentMode {
+    Passthrough,
+    InjectContent,
+}
+
+impl ReasoningContentMode {
+    #[allow(dead_code)]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Passthrough => "passthrough",
+            Self::InjectContent => "inject_content",
+        }
+    }
+}
+
+#[allow(dead_code)]
+pub fn resolve_reasoning_content_mode(provider: &Provider) -> ReasoningContentMode {
+    let configured = provider
+        .meta
+        .as_ref()
+        .and_then(|meta| meta.reasoning_content_mode.as_deref())
+        .or_else(|| {
+            provider
+                .settings_config
+                .get("reasoningContentMode")
+                .or_else(|| provider.settings_config.get("reasoning_content_mode"))
+                .and_then(JsonValue::as_str)
+        });
+    if let Some(value) = configured {
+        return match value.trim().to_ascii_lowercase().as_str() {
+            "inject" | "inject_content" | "inject-content" | "deepseek" => {
+                ReasoningContentMode::InjectContent
+            }
+            _ => ReasoningContentMode::Passthrough,
+        };
+    }
+    if provider_codex_base_url(provider)
+        .is_some_and(|base_url| base_url.to_ascii_lowercase().contains("api.deepseek.com"))
+    {
+        return ReasoningContentMode::InjectContent;
+    }
+    ReasoningContentMode::Passthrough
+}
+
 pub(crate) fn resolve_codex_chat_protocol_target(
     provider: &Provider,
     public_model: &str,
@@ -4672,6 +4720,48 @@ mod tests {
             icon_color: None,
             in_failover_queue: false,
         }
+    }
+
+    #[test]
+    fn reasoning_content_mode_explicit_inject_overrides_default() {
+        let provider = create_provider(json!({
+            "base_url": "https://gateway.example/v1",
+            "reasoningContentMode": "inject_content"
+        }));
+        assert_eq!(
+            resolve_reasoning_content_mode(&provider),
+            ReasoningContentMode::InjectContent
+        );
+    }
+
+    #[test]
+    fn reasoning_content_mode_explicit_passthrough_is_preserved() {
+        let provider = create_provider(json!({
+            "base_url": "https://api.deepseek.com/v1",
+            "reasoning_content_mode": "passthrough"
+        }));
+        assert_eq!(
+            resolve_reasoning_content_mode(&provider),
+            ReasoningContentMode::Passthrough
+        );
+    }
+
+    #[test]
+    fn reasoning_content_mode_auto_injects_deepseek_only() {
+        let deepseek = create_provider(json!({
+            "base_url": "https://api.deepseek.com/v1"
+        }));
+        let unknown = create_provider(json!({
+            "base_url": "https://gateway.example/v1"
+        }));
+        assert_eq!(
+            resolve_reasoning_content_mode(&deepseek),
+            ReasoningContentMode::InjectContent
+        );
+        assert_eq!(
+            resolve_reasoning_content_mode(&unknown),
+            ReasoningContentMode::Passthrough
+        );
     }
 
     fn multirouter_with_routes(
@@ -9546,6 +9636,7 @@ wire_api = "responses"
             crate::protocol_compatibility::HistoryReplay::ResponsesReasoningTextContent
         );
 
+        provider.meta = Some(ProviderMeta::default());
         let meta = provider.meta.as_mut().unwrap();
         meta.codex_protocol_mode = Some(crate::provider::CodexProtocolMode::Manual);
         meta.codex_history_replay = Some("omit".to_string());

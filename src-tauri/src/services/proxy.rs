@@ -4636,9 +4636,8 @@ impl ProxyService {
                     crate::proxy::providers::CodexMultiRouterAuthFacade::FullyManaged
                 );
             if use_custom_route {
-                doc["model_provider"] = toml_edit::value(
-                    crate::codex_config::CC_SWITCH_CODEX_MODEL_PROVIDER_ID,
-                );
+                doc["model_provider"] =
+                    toml_edit::value(crate::codex_config::CC_SWITCH_CODEX_MODEL_PROVIDER_ID);
                 let mut providers = doc
                     .as_table_mut()
                     .remove("model_providers")
@@ -7120,7 +7119,17 @@ wire_api = "responses"
         assert!(crate::codex_config::codex_config_has_official_proxy_route(
             &official_live
         ));
-        assert!(official_live.contains("requires_openai_auth = true"));
+        let official_doc =
+            toml::from_str::<toml::Value>(&official_live).expect("parse official takeover config");
+        let official_base_url = official_doc
+            .get("openai_base_url")
+            .and_then(toml::Value::as_str)
+            .expect("built-in openai route base URL");
+        assert!(
+            official_base_url.starts_with("http://127.0.0.1:")
+                && official_base_url.ends_with("/v1"),
+            "default official takeover uses Codex's built-in openai bucket: {official_base_url}"
+        );
         assert!(!official_live.contains(PROXY_TOKEN_PLACEHOLDER));
 
         service
@@ -9365,8 +9374,8 @@ supports_websockets = false
         )
         .expect("apply managed official proxy config");
         let parsed: toml::Value = toml::from_str(&output).expect("valid official route");
-        let route = &parsed["model_providers"]
-            [crate::codex_config::CC_SWITCH_CODEX_MODEL_PROVIDER_ID];
+        let route =
+            &parsed["model_providers"][crate::codex_config::CC_SWITCH_CODEX_MODEL_PROVIDER_ID];
 
         assert_eq!(route["requires_openai_auth"].as_bool(), Some(true));
         assert_eq!(

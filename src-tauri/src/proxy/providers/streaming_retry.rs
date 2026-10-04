@@ -79,6 +79,8 @@ pub(crate) type ConnectFn = Box<dyn Fn() -> ConnectFuture + Send + Sync>;
 pub struct StreamReconnector {
     connect: ConnectFn,
     first_byte_timeout: Duration,
+    max_retries: u32,
+    capacity_retry_enabled: bool,
 }
 
 /// 上游原生 Responses SSE 的最小排障关联信息。
@@ -97,7 +99,31 @@ impl StreamReconnector {
         Self {
             connect,
             first_byte_timeout,
+            max_retries: RESPONSES_STREAM_MAX_RETRIES,
+            capacity_retry_enabled: false,
         }
+    }
+
+    pub fn with_max_retries(mut self, max_retries: u32) -> Self {
+        self.max_retries = max_retries;
+        self
+    }
+
+    pub fn with_capacity_retry(mut self, enabled: bool) -> Self {
+        self.capacity_retry_enabled = enabled;
+        self
+    }
+
+    fn retry_limit_for(&self, capacity_error: bool) -> u32 {
+        if capacity_error && self.capacity_retry_enabled && self.max_retries > 0 {
+            self.max_retries.max(CAPACITY_STREAM_MAX_RETRIES)
+        } else {
+            self.max_retries
+        }
+    }
+
+    fn retry_limit(&self) -> u32 {
+        self.max_retries
     }
 
     pub(crate) async fn connect(&self) -> Result<ProxyResponse, ProxyError> {
@@ -251,7 +277,8 @@ pub(crate) fn create_capacity_resilient_upstream_sse_stream(
                 yield Ok(capacity_block);
                 break;
             };
-            if capacity_attempt >= CAPACITY_STREAM_MAX_RETRIES {
+            let retry_limit = reconnector.retry_limit_for(true);
+            if capacity_attempt >= retry_limit {
                 yield Ok(capacity_block);
                 break;
             }
@@ -880,9 +907,9 @@ pub(crate) fn create_resilient_responses_sse_stream_with_context(
                     &mut transport_attempt
                 };
                 let retry_limit = if retrying_capacity {
-                    CAPACITY_STREAM_MAX_RETRIES
+                        reconnector.retry_limit_for(true)
                 } else {
-                    RESPONSES_STREAM_MAX_RETRIES
+                    reconnector.retry_limit_for(false)
                 };
                 if *attempt >= retry_limit {
                     let message = if retrying_capacity {
@@ -903,11 +930,11 @@ pub(crate) fn create_resilient_responses_sse_stream_with_context(
                 *attempt += 1;
                 if retrying_capacity {
                     log::warn!(
-                        "[Codex/Responses] upstream capacity pressure before semantic output; reconnecting (attempt {attempt}/{CAPACITY_STREAM_MAX_RETRIES})"
+                        "[Codex/Responses] upstream capacity pressure before semantic output; reconnecting (attempt {attempt}/{retry_limit})"
                     );
                 } else {
                     log::warn!(
-                        "[Codex/Responses] upstream stream dropped before semantic output ({reason}); reconnecting (attempt {attempt}/{RESPONSES_STREAM_MAX_RETRIES})"
+                        "[Codex/Responses] upstream stream dropped before semantic output ({reason}); reconnecting (attempt {attempt}/{retry_limit})"
                     );
                 }
                 if created_forwarded {
@@ -1197,7 +1224,8 @@ pub(crate) fn create_resilient_anthropic_sse_stream_from_responses_with_web_sear
             };
 
             loop {
-                if attempt >= RESPONSES_STREAM_MAX_RETRIES {
+                let retry_limit = reconnector.retry_limit();
+                if attempt >= retry_limit {
                     log::error!(
                         "[Claude/Responses] stream failed after {attempt} reconnect attempt(s): {reason}"
                     );
@@ -1211,7 +1239,7 @@ pub(crate) fn create_resilient_anthropic_sse_stream_from_responses_with_web_sear
                 }
                 attempt += 1;
                 log::warn!(
-                    "[Claude/Responses] upstream stream dropped before any content reached the client ({reason}); reconnecting (attempt {attempt}/{RESPONSES_STREAM_MAX_RETRIES})"
+                    "[Claude/Responses] upstream stream dropped before any content reached the client ({reason}); reconnecting (attempt {attempt}/{retry_limit})"
                 );
                 if message_start_forwarded {
                     // 喂一下下游的空闲计时器（Anthropic 协议允许任意时刻出现 ping）。

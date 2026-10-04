@@ -1081,6 +1081,39 @@ fn reasoning_summary_only_replay_removes_content_but_preserves_summary_and_encry
 }
 
 #[test]
+fn response_replay_finalization_is_idempotent_for_every_policy() {
+    let policy = CodexThirdPartyRequestPolicy::compile(&third_party_provider("openai_responses"))
+        .expect("compile third-party request policy");
+
+    for history_replay in [
+        HistoryReplay::ResponsesReasoningTextContent,
+        HistoryReplay::ResponsesReasoningSummaryOnly,
+        HistoryReplay::Omit,
+        HistoryReplay::NativeOnly,
+    ] {
+        let options = CodexRequestOptions {
+            history_replay: Some(history_replay),
+            ..CodexRequestOptions::default()
+        };
+        let protocol_body = policy
+            .prepare_protocol_body(
+                CodexRequestTransport::Responses,
+                realistic_codex_tool_request(),
+                &options,
+            )
+            .expect("prepare protocol body");
+        let once = policy
+            .finalize_body(CodexRequestTransport::Responses, protocol_body, &options)
+            .expect("finalize request once");
+        let twice = policy
+            .finalize_body(CodexRequestTransport::Responses, once.clone(), &options)
+            .expect("finalize request twice");
+
+        assert_eq!(once, twice, "history replay policy: {history_replay:?}");
+    }
+}
+
+#[test]
 fn moonshot_schema_requires_an_object_root_even_when_codex_omits_root_type() {
     let policy = CodexThirdPartyRequestPolicy::compile(&third_party_provider("openai_responses"))
         .expect("compile third-party request policy");

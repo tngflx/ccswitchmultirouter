@@ -278,6 +278,15 @@ pub async fn get_proxy_status(state: tauri::State<'_, AppState>) -> Result<Proxy
     state.proxy_service.get_status().await
 }
 
+/// 获取最近的请求健康诊断；诊断只保留结构、大小和脱敏路由标识。
+#[tauri::command]
+pub async fn get_request_health_diagnostics(
+) -> Result<crate::proxy::request_health::RequestHealthSnapshot, String> {
+    Ok(crate::proxy::request_health::snapshot(
+        crate::settings::get_settings().request_health,
+    ))
+}
+
 /// 运行 Codex MultiRouter 一键诊断。
 ///
 /// 该命令只读取本机配置、探测本地代理端口和读取本地 router 日志；不会向真实上游发送

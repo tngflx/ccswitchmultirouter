@@ -77,6 +77,102 @@ const CODEX_RAW_ROUTE_RESOLUTION_ATTEMPTED: &str = "codexRawRouteResolutionAttem
 const CODEX_RAW_ROUTING_CONFIGURED: &str = "codexRawRoutingConfigured";
 const CODEX_RAW_ROUTE_MISSED: &str = "codexRawRouteMissed";
 
+/// Exact decoded JSON bytes observed by the local handler before parsing or
+/// protocol conversion. Internal callers that do not pass through a handler
+/// fall back to measuring the supplied JSON value.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ClientRequestBodyBytes(pub usize);
+
+fn client_request_body_bytes(extensions: &Extensions, body: &Value) -> usize {
+    extensions.get::<ClientRequestBodyBytes>().map_or_else(
+        || serde_json::to_vec(body).map_or(0, |bytes| bytes.len()),
+        |size| size.0,
+    )
+}
+
+/// Owns one finalized upstream entity. Every ordinary send and replay clones
+/// these already-finalized bytes; no retry path reserializes request history.
+#[derive(Clone, Debug)]
+struct FinalizedRequestPayload {
+    client_json_bytes: usize,
+    transformed_json: Arc<[u8]>,
+    wire_body: Arc<[u8]>,
+}
+
+impl FinalizedRequestPayload {
+    fn from_transformed_json(
+        client_json_bytes: usize,
+        transformed_json: Vec<u8>,
+        headers: &mut http::HeaderMap,
+        zstd_enabled: bool,
+    ) -> Result<Self, ProxyError> {
+        let transformed_json_copy = Arc::from(transformed_json.clone());
+        let wire_body =
+            encode_codex_official_upstream_body(headers, transformed_json, zstd_enabled)?;
+        Ok(Self {
+            client_json_bytes,
+            transformed_json: transformed_json_copy,
+            wire_body: Arc::from(wire_body),
+        })
+    }
+
+    fn transformed_json(&self) -> &[u8] {
+        self.transformed_json.as_ref()
+    }
+
+    fn transformed_len(&self) -> usize {
+        self.transformed_json.len()
+    }
+
+    fn wire_body(&self) -> &[u8] {
+        self.wire_body.as_ref()
+    }
+
+    fn replay_body(&self) -> Vec<u8> {
+        self.wire_body.to_vec()
+    }
+
+    fn wire_len(&self) -> usize {
+        self.wire_body.len()
+    }
+
+    fn wire_hash(&self) -> String {
+        super::request_health::wire_body_hash(self.wire_body())
+    }
+}
+
+fn append_request_body_accounting_event(
+    trace_id: &str,
+    session_id: &str,
+    provider_id: &str,
+    variant: &str,
+    payload: &FinalizedRequestPayload,
+) {
+    super::codex_router_log::append_event(
+        "request_body_accounting",
+        &[
+            ("trace", trace_id.to_string()),
+            ("session", session_id.to_string()),
+            ("provider", provider_id.to_string()),
+            ("payload_variant", variant.to_string()),
+            (
+                "client_request_bytes",
+                payload.client_json_bytes.to_string(),
+            ),
+            (
+                "post_transform_request_bytes",
+                payload.transformed_len().to_string(),
+            ),
+            ("retry_replay_request_bytes", payload.wire_len().to_string()),
+            (
+                "upstream_wire_request_bytes",
+                payload.wire_len().to_string(),
+            ),
+            ("wire_body_hash", payload.wire_hash()),
+        ],
+    );
+}
+
 #[expect(
     clippy::too_many_arguments,
     reason = "the hosted-loop stream adapter receives one explicit production request context"
@@ -270,6 +366,8 @@ pub struct RequestForwarder {
     session_id: String,
     /// Session ID 是否由客户端提供；生成值不能作为上游缓存身份。
     session_client_provided: bool,
+    /// Request-health correlation id shared by all provider attempts for one client request.
+    request_health_trace: String,
     /// 是否允许保留可信本地 Codex 客户端提供的 first-party originator。
     preserve_codex_client_originator: bool,
     codex_desktop_reasoning: bool,
@@ -390,6 +488,7 @@ fn classify_codex_pool_attempt(error: &ProxyError) -> CodexPoolAttemptOutcome {
         | ProxyError::ForwardFailed(_)
         | ProxyError::ProviderUnhealthy(_)
         | ProxyError::StreamIdleTimeout(_) => CodexPoolAttemptOutcome::Transient { status: None },
+        ProxyError::RequestHealthBlocked(_) => CodexPoolAttemptOutcome::Neutral,
         ProxyError::UpstreamError {
             status: 400 | 405 | 406 | 413 | 414 | 415 | 422 | 501,
             ..
@@ -929,6 +1028,7 @@ impl RequestForwarder {
         current_provider_id_at_start: String,
         session_id: String,
         session_client_provided: bool,
+        request_health_trace: String,
         preserve_codex_client_originator: bool,
         codex_desktop_reasoning: bool,
         streaming_first_byte_timeout: u64,
@@ -955,6 +1055,7 @@ impl RequestForwarder {
             current_provider_id_at_start,
             session_id,
             session_client_provided,
+            request_health_trace,
             preserve_codex_client_originator,
             codex_desktop_reasoning,
             rectifier_config,
@@ -2323,6 +2424,7 @@ impl RequestForwarder {
         ),
         ProxyError,
     > {
+        let client_request_bytes = client_request_body_bytes(extensions, body);
         // enforce 只约束经过本机代理的 Codex 请求；未接入 CCSwitchMulti 的原生
         // 客户端无法被本地进程拦截，不能把该策略误描述为账号级强制控制。
         if matches!(app_type, AppType::Codex) {
@@ -2344,7 +2446,7 @@ impl RequestForwarder {
             }
         }
         let codex_trace_id =
-            matches!(app_type, AppType::Codex).then(|| uuid::Uuid::new_v4().to_string());
+            matches!(app_type, AppType::Codex).then(|| self.request_health_trace.clone());
         let route_started_at = std::time::Instant::now();
         let request_model_for_log = body
             .get("model")
@@ -3230,6 +3332,83 @@ impl RequestForwarder {
         {
             outbound_model = Some(m.to_string());
         }
+        let request_health_config = crate::settings::get_settings().request_health;
+        let request_health_app_type = format!("{app_type:?}").to_ascii_lowercase();
+        let request_health_diagnostic = super::request_health::inspect_and_optimize(
+            &mut filtered_body,
+            &request_health_config,
+            super::request_health::RequestHealthContext {
+                trace_id: codex_trace_id.as_deref(),
+                session_id: &self.session_id,
+                app_type: &request_health_app_type,
+                provider_id: &provider.id,
+                provider_name: &provider.name,
+                model: outbound_model
+                    .as_deref()
+                    .unwrap_or(request_model_for_log.as_str()),
+                endpoint: &effective_endpoint,
+                client_request_bytes,
+                compaction_request: codex_request_metadata.request_kind == "compaction",
+                session_client_provided: self.session_client_provided,
+            },
+        );
+        if let (Some(trace_id), Some(diagnostic)) = (
+            codex_trace_id.as_deref(),
+            request_health_diagnostic.as_ref(),
+        ) {
+            super::codex_router_log::append_event(
+                "request_health",
+                &[
+                    ("trace", trace_id.to_string()),
+                    ("session", self.session_id.clone()),
+                    ("model", diagnostic.model.clone()),
+                    ("provider", provider.id.clone()),
+                    ("endpoint", effective_endpoint.clone()),
+                    (
+                        "client_request_bytes",
+                        diagnostic.client_request_bytes.to_string(),
+                    ),
+                    ("request_bytes", diagnostic.optimized_bytes.to_string()),
+                    (
+                        "proxy_size_delta_bytes",
+                        (diagnostic.optimized_bytes as i128
+                            - diagnostic.client_request_bytes as i128)
+                            .to_string(),
+                    ),
+                    ("original_bytes", diagnostic.original_bytes.to_string()),
+                    ("bytes_removed", diagnostic.bytes_removed.to_string()),
+                    (
+                        "transformed_request_bytes",
+                        diagnostic.optimized_bytes.to_string(),
+                    ),
+                    ("item_count", diagnostic.item_count.to_string()),
+                    ("media_bytes", diagnostic.media_bytes.to_string()),
+                    ("media_items", diagnostic.media_items.to_string()),
+                    ("media_dominated", diagnostic.media_dominated.to_string()),
+                    (
+                        "largest_item_bytes",
+                        diagnostic.largest_item_bytes.to_string(),
+                    ),
+                    (
+                        "threshold_exceeded",
+                        diagnostic.threshold_exceeded.to_string(),
+                    ),
+                    (
+                        "orphaned_tool_outputs",
+                        diagnostic
+                            .findings
+                            .iter()
+                            .find(|finding| finding.code == "orphaned_tool_output")
+                            .map_or(0, |finding| finding.count)
+                            .to_string(),
+                    ),
+                    (
+                        "compaction_recommended",
+                        diagnostic.compaction_recommended.to_string(),
+                    ),
+                ],
+            );
+        }
         log_prompt_cache_trace(
             app_type,
             provider,
@@ -3883,15 +4062,6 @@ impl RequestForwarder {
             }
         }
 
-        // 序列化请求体。GET/HEAD 是 idempotent/safe 方法，按 HTTP 语义不应携带 body；
-        // 强行附带 JSON body 会让某些上游（如 Google Gemini 的 models.list）拒绝请求。
-        let mut body_bytes = if matches!(method, &http::Method::GET | &http::Method::HEAD) {
-            Vec::new()
-        } else {
-            serde_json::to_vec(&filtered_body).map_err(|e| {
-                ProxyError::Internal(format!("Failed to serialize request body: {e}"))
-            })?
-        };
         // 确保 content-type 存在
         if !ordered_headers.contains_key(http::header::CONTENT_TYPE) {
             ordered_headers.insert(
@@ -3945,12 +4115,18 @@ impl RequestForwarder {
                 super::providers::openai_compat::normalize_codex_responses_lite_fallback_request(
                     filtered_body,
                 );
-            body_bytes = serde_json::to_vec(&filtered_body).map_err(|error| {
-                ProxyError::Internal(format!(
-                    "Failed to serialize cached Responses-Lite fallback body: {error}"
-                ))
-            })?;
         }
+
+        // GET/HEAD are idempotent/safe methods and must not carry the JSON body
+        // used for routing. For every other method, serialize exactly once after
+        // the final provider/request-health mutation.
+        let transformed_json = if matches!(method, &http::Method::GET | &http::Method::HEAD) {
+            Vec::new()
+        } else {
+            serde_json::to_vec(&filtered_body).map_err(|error| {
+                ProxyError::Internal(format!("Failed to serialize request body: {error}"))
+            })?
+        };
 
         let zstd_compress_codex_official_upstream = should_zstd_compress_codex_official_upstream(
             app_type,
@@ -3962,12 +4138,181 @@ impl RequestForwarder {
                 || codex_responses_to_messages
                 || codex_responses_to_anthropic,
         );
-        body_bytes = encode_codex_official_upstream_body(
+        let payload = FinalizedRequestPayload::from_transformed_json(
+            client_request_bytes,
+            transformed_json,
             &mut ordered_headers,
-            body_bytes,
             zstd_compress_codex_official_upstream,
         )?;
-        let request_bytes_len = body_bytes.len();
+        let request_bytes_len = payload.wire_len();
+
+        if let Some(trace_id) = codex_trace_id.as_deref() {
+            let variant = if responses_lite_fallback_cached {
+                "responses_lite_cached_fallback"
+            } else {
+                "primary"
+            };
+            append_request_body_accounting_event(
+                trace_id,
+                &self.session_id,
+                &provider.id,
+                variant,
+                &payload,
+            );
+        }
+
+        if matches!(app_type, AppType::Codex) {
+            let review_dispatch_scope = format!("{}|{}|{}", provider.id, method.as_str(), url);
+            let review_result = super::request_health::review_before_upstream(
+                &request_health_config,
+                codex_trace_id.as_deref().unwrap_or_default(),
+                &self.session_id,
+                self.session_client_provided,
+                outbound_model
+                    .as_deref()
+                    .unwrap_or(request_model_for_log.as_str()),
+                payload.transformed_json(),
+                payload.wire_body(),
+                &review_dispatch_scope,
+                codex_request_metadata.request_kind == "compaction",
+            )
+            .await;
+            if let Err(error) = &review_result {
+                if let Some(trace_id) = codex_trace_id.as_deref() {
+                    super::request_health::mark_blocked(trace_id);
+                    super::codex_router_log::append_event(
+                        "request_health_review_blocked",
+                        &[
+                            ("trace", trace_id.to_string()),
+                            ("session", self.session_id.clone()),
+                            ("provider", provider.id.clone()),
+                            ("wire_body_hash", payload.wire_hash()),
+                            ("client_request_bytes", client_request_bytes.to_string()),
+                            (
+                                "diagnostic_request_bytes",
+                                request_health_diagnostic
+                                    .as_ref()
+                                    .map_or(0, |diagnostic| diagnostic.optimized_bytes)
+                                    .to_string(),
+                            ),
+                            (
+                                "transformed_request_bytes",
+                                payload.transformed_len().to_string(),
+                            ),
+                            ("wire_request_bytes", request_bytes_len.to_string()),
+                            ("reason", error.clone()),
+                        ],
+                    );
+                }
+                return Err(ProxyError::RequestHealthBlocked(error.to_string()));
+            }
+            if matches!(
+                review_result,
+                Ok(super::request_health::PreflightReviewOutcome::SummarizeAndRestart)
+            ) {
+                if let Some(trace_id) = codex_trace_id.as_deref() {
+                    super::request_health::mark_blocked(trace_id);
+                    super::request_health::mark_review_action_for_session(
+                        &self.session_id,
+                        "summarize_requested",
+                    );
+                    super::codex_router_log::append_event(
+                        "request_health_summarize_restart_requested",
+                        &[
+                            ("trace", trace_id.to_string()),
+                            ("session", self.session_id.clone()),
+                            ("provider", provider.id.clone()),
+                            ("wire_body_hash", payload.wire_hash()),
+                        ],
+                    );
+                }
+                let session_id = self.session_id.clone();
+                let Some(summary_handoff_guard) =
+                    super::request_health::begin_summary_handoff(&session_id)
+                else {
+                    return Err(ProxyError::RequestHealthBlocked(
+                        "A summary handoff is already in progress for this Codex session"
+                            .to_string(),
+                    ));
+                };
+                tokio::spawn(async move {
+                    let _summary_handoff_guard = summary_handoff_guard;
+                    match crate::codex_desktop::summarize_and_restart_codex_session(&session_id)
+                        .await
+                    {
+                        Ok(result) => {
+                            super::request_health::mark_review_action_for_session(
+                                &session_id,
+                                "summarize_completed",
+                            );
+                            #[cfg(target_os = "windows")]
+                            super::request_health::notify_summarize_restart_result(
+                                &session_id,
+                                Some(&result.new_thread_id),
+                                None,
+                            );
+                            log::info!(
+                                "[RequestHealth] Summary handoff completed; fresh session {} -> {} on CDP port {}",
+                                session_id,
+                                result.new_thread_id,
+                                result.debug_port
+                            );
+                            super::codex_router_log::append_event(
+                                "request_health_summarize_restart_completed",
+                                &[
+                                    ("session", session_id),
+                                    ("new_session", result.new_thread_id),
+                                    ("handoff_turn", result.handoff_turn_id),
+                                    ("debug_port", result.debug_port.to_string()),
+                                    ("target", result.target_id),
+                                ],
+                            );
+                        }
+                        Err(error) => {
+                            super::request_health::mark_review_action_for_session(
+                                &session_id,
+                                "summarize_failed",
+                            );
+                            #[cfg(target_os = "windows")]
+                            super::request_health::notify_summarize_restart_result(
+                                &session_id,
+                                None,
+                                Some(&error),
+                            );
+                            log::error!(
+                                "[RequestHealth] Summary/fresh-session action failed for {}: {}",
+                                session_id,
+                                error
+                            );
+                            super::codex_router_log::append_event(
+                                "request_health_summarize_restart_failed",
+                                &[("session", session_id), ("reason", error)],
+                            );
+                        }
+                    }
+                });
+                return Err(ProxyError::RequestHealthBlocked(
+                    "The oversized request was blocked; a summary handoff into a fresh Codex session was requested"
+                        .to_string(),
+                ));
+            }
+            if matches!(
+                review_result,
+                Ok(super::request_health::PreflightReviewOutcome::ContinueOnce)
+            ) {
+                if let Some(trace_id) = codex_trace_id.as_deref() {
+                    super::codex_router_log::append_event(
+                        "request_health_review_approved",
+                        &[
+                            ("trace", trace_id.to_string()),
+                            ("session", self.session_id.clone()),
+                            ("provider", provider.id.clone()),
+                            ("wire_body_hash", payload.wire_hash()),
+                        ],
+                    );
+                }
+            }
+        }
 
         // 日志目标 URL 的脱敏分两种情形：
         // - 有已知密钥(log_secrets 非空)：记录脱敏后的完整 URL，剥 userinfo/query
@@ -4044,86 +4389,91 @@ impl RequestForwarder {
         // 在 headers/body 被移动之前捕获一份重放工厂，交给下游转换层做
         // 有界重连（见 providers::streaming_retry）。工厂只是重放同一
         // HTTP 请求；是否重试、重试多少次由转换层根据下游状态决定。
-        let stream_retry_enabled = crate::settings::get_settings().enable_stream_retry;
-        let stream_reconnect = if stream_retry_enabled
-            && should_create_responses_stream_reconnector(
-                app_type,
-                endpoint,
-                request_is_streaming,
-                resolved_claude_api_format.as_deref(),
-            ) {
-            let first_byte_timeout = if self.streaming_first_byte_timeout.is_zero() {
-                timeout
-            } else {
-                self.streaming_first_byte_timeout
-            };
-            let connect: super::providers::streaming_retry::ConnectFn =
-                if is_socks_proxy || !preserve_exact_header_case {
-                    let url = url.clone();
-                    let method = method.clone();
-                    let headers = ordered_headers.clone();
-                    let body = body_bytes.clone();
-                    Box::new(move || {
+        let stream_retry_budget = crate::settings::get_settings()
+            .stream_retry_budget(super::providers::streaming_retry::RESPONSES_STREAM_MAX_RETRIES);
+        let build_stream_reconnect =
+            |replay_headers: http::HeaderMap, replay_payload: FinalizedRequestPayload| {
+                if stream_retry_budget == 0
+                    || !should_create_responses_stream_reconnector(
+                        app_type,
+                        endpoint,
+                        request_is_streaming,
+                        resolved_claude_api_format.as_deref(),
+                    )
+                {
+                    return None;
+                }
+                let first_byte_timeout = if self.streaming_first_byte_timeout.is_zero() {
+                    timeout
+                } else {
+                    self.streaming_first_byte_timeout
+                };
+                let connect: super::providers::streaming_retry::ConnectFn =
+                    if is_socks_proxy || !preserve_exact_header_case {
                         let url = url.clone();
                         let method = method.clone();
-                        let headers = headers.clone();
-                        let body = body.clone();
-                        Box::pin(async move {
-                            let client = super::http_client::get();
-                            let mut request = client
-                                .request(method, &url)
-                                .timeout(std::time::Duration::from_secs(24 * 60 * 60));
-                            for (key, value) in &headers {
-                                request = request.header(key, value);
-                            }
-                            let response = request
-                                .body(body)
-                                .send()
-                                .await
-                                .map_err(map_reqwest_send_error)?;
-                            Ok(ProxyResponse::Reqwest(response))
+                        Box::new(move || {
+                            let url = url.clone();
+                            let method = method.clone();
+                            let headers = replay_headers.clone();
+                            let body = replay_payload.replay_body();
+                            Box::pin(async move {
+                                let client = super::http_client::get();
+                                let mut request = client
+                                    .request(method, &url)
+                                    .timeout(std::time::Duration::from_secs(24 * 60 * 60));
+                                for (key, value) in &headers {
+                                    request = request.header(key, value);
+                                }
+                                let response = request
+                                    .body(body)
+                                    .send()
+                                    .await
+                                    .map_err(map_reqwest_send_error)?;
+                                Ok(ProxyResponse::Reqwest(response))
+                            })
                         })
-                    })
-                } else {
-                    let url = url.clone();
-                    let target_for_log = target_for_log.clone();
-                    let method = method.clone();
-                    let headers = ordered_headers.clone();
-                    let extensions = extensions.clone();
-                    let body = body_bytes.clone();
-                    let upstream_proxy_url = upstream_proxy_url.clone();
-                    Box::new(move || {
+                    } else {
                         let url = url.clone();
                         let target_for_log = target_for_log.clone();
                         let method = method.clone();
-                        let headers = headers.clone();
                         let extensions = extensions.clone();
-                        let body = body.clone();
                         let upstream_proxy_url = upstream_proxy_url.clone();
-                        Box::pin(async move {
-                            let uri: http::Uri = url.parse().map_err(|e| {
-                                ProxyError::ForwardFailed(format!(
-                                    "Invalid upstream URL ({target_for_log}): {e}"
-                                ))
-                            })?;
-                            super::hyper_client::send_request(
-                                uri,
-                                &target_for_log,
-                                method,
-                                headers,
-                                extensions,
-                                body,
-                                timeout,
-                                upstream_proxy_url.as_deref(),
-                            )
-                            .await
+                        Box::new(move || {
+                            let url = url.clone();
+                            let target_for_log = target_for_log.clone();
+                            let method = method.clone();
+                            let headers = replay_headers.clone();
+                            let extensions = extensions.clone();
+                            let body = replay_payload.replay_body();
+                            let upstream_proxy_url = upstream_proxy_url.clone();
+                            Box::pin(async move {
+                                let uri: http::Uri = url.parse().map_err(|e| {
+                                    ProxyError::ForwardFailed(format!(
+                                        "Invalid upstream URL ({target_for_log}): {e}"
+                                    ))
+                                })?;
+                                super::hyper_client::send_request(
+                                    uri,
+                                    &target_for_log,
+                                    method,
+                                    headers,
+                                    extensions,
+                                    body,
+                                    timeout,
+                                    upstream_proxy_url.as_deref(),
+                                )
+                                .await
+                            })
                         })
-                    })
-                };
-            Some(StreamReconnector::new(connect, first_byte_timeout))
-        } else {
-            None
-        };
+                    };
+                Some(
+                    StreamReconnector::new(connect, first_byte_timeout)
+                        .with_max_retries(stream_retry_budget)
+                        .with_capacity_retry(self.capacity_retry_enabled),
+                )
+            };
+        let mut stream_reconnect = build_stream_reconnect(ordered_headers.clone(), payload.clone());
 
         let upstream_started_at = std::time::Instant::now();
         if let Some(trace_id) = codex_trace_id.as_deref() {
@@ -4177,7 +4527,7 @@ impl RequestForwarder {
 
         let send_once = || {
             send_upstream_request_with_transport_retry(adapter.name(), || {
-                send_upstream_request(ordered_headers.clone(), body_bytes.clone())
+                send_upstream_request(ordered_headers.clone(), payload.replay_body())
             })
         };
         let mut response = if matches!(app_type, AppType::Codex) {
@@ -4292,37 +4642,59 @@ impl RequestForwarder {
                         "Failed to serialize Responses-Lite fallback body: {error}"
                     ))
                 })?;
-                let retry_body_bytes = encode_codex_official_upstream_body(
-                    &mut retry_headers,
+                let retry_payload = FinalizedRequestPayload::from_transformed_json(
+                    client_request_bytes,
                     retry_body_bytes,
+                    &mut retry_headers,
                     zstd_compress_codex_official_upstream,
                 )?;
-                response = send_upstream_request(retry_headers, retry_body_bytes)
-                    .await
-                    .inspect_err(|err| {
-                        if let Some(trace_id) = codex_trace_id.as_deref() {
-                            let transport = if is_socks_proxy || !preserve_exact_header_case {
-                                "reqwest"
-                            } else {
-                                "hyper"
-                            };
-                            super::codex_router_log::append_event(
-                                "upstream_send_error",
-                                &[
-                                    ("trace", trace_id.to_string()),
-                                    ("session", self.session_id.clone()),
-                                    ("model", request_model_for_log.clone()),
-                                    ("provider", provider.id.clone()),
-                                    ("transport", transport.to_string()),
-                                    (
-                                        "elapsed_ms",
-                                        upstream_started_at.elapsed().as_millis().to_string(),
-                                    ),
-                                    ("error", err.to_string()),
-                                ],
-                            );
-                        }
-                    })?;
+                if let Some(trace_id) = codex_trace_id.as_deref() {
+                    append_request_body_accounting_event(
+                        trace_id,
+                        &self.session_id,
+                        &provider.id,
+                        "responses_lite_fallback",
+                        &retry_payload,
+                    );
+                }
+                let retry_send_once = || {
+                    send_upstream_request_with_transport_retry(adapter.name(), || {
+                        send_upstream_request(retry_headers.clone(), retry_payload.replay_body())
+                    })
+                };
+                response = send_codex_request_with_rate_limit_retry(
+                    adapter.name(),
+                    self.capacity_retry_enabled,
+                    super::codex_traffic_policy::resolve_codex_traffic_policy(provider),
+                    retry_send_once,
+                )
+                .await
+                .inspect_err(|err| {
+                    if let Some(trace_id) = codex_trace_id.as_deref() {
+                        let transport = if is_socks_proxy || !preserve_exact_header_case {
+                            "reqwest"
+                        } else {
+                            "hyper"
+                        };
+                        super::codex_router_log::append_event(
+                            "upstream_send_error",
+                            &[
+                                ("trace", trace_id.to_string()),
+                                ("session", self.session_id.clone()),
+                                ("model", request_model_for_log.clone()),
+                                ("provider", provider.id.clone()),
+                                ("transport", transport.to_string()),
+                                (
+                                    "elapsed_ms",
+                                    upstream_started_at.elapsed().as_millis().to_string(),
+                                ),
+                                ("error", err.to_string()),
+                            ],
+                        );
+                    }
+                })?;
+                stream_reconnect =
+                    build_stream_reconnect(retry_headers.clone(), retry_payload.clone());
                 status = response.status();
                 if let Some(trace_id) = codex_trace_id.as_deref() {
                     super::codex_router_log::append_event(
@@ -5810,6 +6182,7 @@ impl RequestForwarder {
             // 网络和上游错误：都应该尝试下一个供应商
             ProxyError::Timeout(_) => ErrorCategory::Retryable,
             ProxyError::ResponsePending(_) => ErrorCategory::NonRetryable,
+            ProxyError::RequestHealthBlocked(_) => ErrorCategory::NonRetryable,
             ProxyError::ForwardFailed(_) => ErrorCategory::Retryable,
             ProxyError::ProviderUnhealthy(_) => ErrorCategory::Retryable,
             // 上游 HTTP 错误：按状态码分桶。
@@ -9575,6 +9948,7 @@ mod tests {
             current_provider_id_at_start: String::new(),
             session_id: String::new(),
             session_client_provided: false,
+            request_health_trace: String::new(),
             preserve_codex_client_originator: false,
             codex_desktop_reasoning: false,
             rectifier_config: RectifierConfig::default(),
@@ -9898,6 +10272,7 @@ mod tests {
             current_provider_id_at_start: String::new(),
             session_id: String::new(),
             session_client_provided: false,
+            request_health_trace: String::new(),
             preserve_codex_client_originator: false,
             codex_desktop_reasoning: false,
             rectifier_config: RectifierConfig::default(),
@@ -10382,6 +10757,7 @@ mod tests {
             current_provider_id_at_start: String::new(),
             session_id: String::new(),
             session_client_provided: false,
+            request_health_trace: String::new(),
             preserve_codex_client_originator: false,
             codex_desktop_reasoning: false,
             rectifier_config: RectifierConfig::default(),
@@ -10447,6 +10823,7 @@ mod tests {
             current_provider_id_at_start: String::new(),
             session_id: String::new(),
             session_client_provided: false,
+            request_health_trace: String::new(),
             preserve_codex_client_originator: false,
             codex_desktop_reasoning: false,
             rectifier_config: RectifierConfig::default(),
@@ -10557,6 +10934,7 @@ mod tests {
             current_provider_id_at_start: String::new(),
             session_id: String::new(),
             session_client_provided: false,
+            request_health_trace: String::new(),
             preserve_codex_client_originator: false,
             codex_desktop_reasoning: false,
             rectifier_config: RectifierConfig::default(),
@@ -10648,6 +11026,7 @@ mod tests {
             current_provider_id_at_start: String::new(),
             session_id: String::new(),
             session_client_provided: false,
+            request_health_trace: String::new(),
             preserve_codex_client_originator: false,
             codex_desktop_reasoning: false,
             rectifier_config: RectifierConfig::default(),
@@ -11097,6 +11476,78 @@ mod tests {
             zstd::stream::decode_all(std::io::Cursor::new(encoded))
                 .expect("decode official request"),
             original
+        );
+    }
+
+    #[test]
+    fn client_request_accounting_preserves_exact_decoded_json_size() {
+        let compact = br#"{"model":"gpt-test","input":[]}"#;
+        let spaced = br#"{ "model": "gpt-test", "input": [ ] }"#;
+        let compact_json: Value = serde_json::from_slice(compact).expect("parse compact JSON");
+        let spaced_json: Value = serde_json::from_slice(spaced).expect("parse spaced JSON");
+        assert_eq!(compact_json, spaced_json);
+
+        let mut compact_extensions = Extensions::new();
+        compact_extensions.insert(ClientRequestBodyBytes(compact.len()));
+        let mut spaced_extensions = Extensions::new();
+        spaced_extensions.insert(ClientRequestBodyBytes(spaced.len()));
+
+        assert_eq!(
+            client_request_body_bytes(&compact_extensions, &compact_json),
+            compact.len()
+        );
+        assert_eq!(
+            client_request_body_bytes(&spaced_extensions, &spaced_json),
+            spaced.len()
+        );
+        assert_ne!(compact.len(), spaced.len());
+    }
+
+    #[test]
+    fn finalized_payload_accounts_for_transform_wire_and_identical_replays() {
+        let client_json_bytes = 47;
+        let mut transformed = json!({
+            "model": "gpt-test",
+            "input": "x".repeat(2_048)
+        });
+        transformed["providerPolicy"] = json!({"historyReplay": "summary_only"});
+        let transformed_json =
+            serde_json::to_vec(&transformed).expect("serialize transformed JSON");
+        let mut headers = HeaderMap::new();
+
+        let payload = FinalizedRequestPayload::from_transformed_json(
+            client_json_bytes,
+            transformed_json.clone(),
+            &mut headers,
+            true,
+        )
+        .expect("finalize request payload");
+
+        assert_eq!(payload.client_json_bytes, client_json_bytes);
+        assert_eq!(payload.transformed_json(), transformed_json);
+        assert_eq!(payload.transformed_len(), transformed_json.len());
+        assert_eq!(
+            headers
+                .get(http::header::CONTENT_ENCODING)
+                .and_then(|value| value.to_str().ok()),
+            Some("zstd")
+        );
+        assert_eq!(
+            zstd::stream::decode_all(std::io::Cursor::new(payload.wire_body()))
+                .expect("decode finalized wire body"),
+            transformed_json
+        );
+
+        let initial_send = payload.replay_body();
+        let transport_retry = payload.replay_body();
+        let rejection_retry = payload.replay_body();
+        let stream_reconnect = payload.replay_body();
+        assert_eq!(transport_retry, initial_send);
+        assert_eq!(rejection_retry, initial_send);
+        assert_eq!(stream_reconnect, initial_send);
+        assert_eq!(
+            payload.wire_hash(),
+            super::super::request_health::wire_body_hash(&initial_send)
         );
     }
 
@@ -13733,6 +14184,7 @@ mod tests {
             current_provider_id_at_start: String::new(),
             session_id: String::new(),
             session_client_provided: false,
+            request_health_trace: String::new(),
             preserve_codex_client_originator: false,
             codex_desktop_reasoning: false,
             rectifier_config: RectifierConfig::default(),

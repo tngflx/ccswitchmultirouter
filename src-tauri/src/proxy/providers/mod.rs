@@ -99,6 +99,10 @@ pub use codex::{
     should_convert_codex_responses_to_anthropic, should_convert_codex_responses_to_chat,
     should_convert_codex_responses_to_messages, CodexMultiRouterAuthFacade, ResolvedCodexRoute,
 };
+// These names are an intentionally dormant compatibility surface. Production
+// request preparation remains owned by HistoryReplay.
+#[allow(unused_imports)]
+pub use codex::{resolve_reasoning_content_mode, ReasoningContentMode};
 pub use gemini::GeminiAdapter;
 
 /// 供应商类型枚举

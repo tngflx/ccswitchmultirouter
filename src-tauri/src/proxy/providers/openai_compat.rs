@@ -343,6 +343,16 @@ pub(crate) fn normalize_third_party_responses_reasoning_summary_only(request_bod
     Value::Object(body)
 }
 
+/// Compatibility name retained for fork consumers. The fresh request builder
+/// owns strict-schema replay through `HistoryReplay::ResponsesReasoningSummaryOnly`;
+/// this adapter deliberately delegates to that existing normalizer.
+#[allow(dead_code)]
+pub(crate) fn normalize_third_party_responses_reasoning_content_for_strict_schema(
+    request_body: Value,
+) -> Value {
+    normalize_third_party_responses_reasoning_summary_only(request_body)
+}
+
 /// 归一化单个 reasoning input item 以适配第三方原生 Responses 上游。
 ///
 /// 参数:
@@ -2807,6 +2817,59 @@ mod tests {
             .is_none());
         // 非 reasoning item 不受影响
         assert_eq!(input[1]["role"], "user");
+    }
+
+    #[test]
+    fn strict_schema_compatibility_adapter_delegates_to_summary_normalizer() {
+        let body = json!({
+            "input": [{
+                "type": "reasoning",
+                "content": [{ "type": "reasoning_text", "text": "keep this" }],
+                "summary": [],
+                "encrypted_content": "opaque"
+            }]
+        });
+        let normalized = normalize_third_party_responses_reasoning_content_for_strict_schema(body);
+        assert_eq!(
+            normalized["input"][0]["summary"],
+            json!([
+                { "type": "summary_text", "text": "keep this" }
+            ])
+        );
+        assert!(normalized["input"][0].get("content").is_none());
+        assert_eq!(normalized["input"][0]["encrypted_content"], "opaque");
+    }
+
+    #[test]
+    fn reasoning_summary_only_normalization_is_idempotent() {
+        let body = json!({
+            "input": [{
+                "type": "reasoning",
+                "content": [
+                    { "type": "reasoning_text", "text": "First part." },
+                    { "type": "reasoning_text", "text": "Second part." }
+                ],
+                "summary": [],
+                "encrypted_content": "opaque",
+                "internal_chat_message_metadata_passthrough": { "kind": "desktop" }
+            }]
+        });
+
+        let once = normalize_third_party_responses_reasoning_summary_only(body);
+        let twice = normalize_third_party_responses_reasoning_summary_only(once.clone());
+
+        assert_eq!(once, twice);
+        assert!(once["input"][0].get("content").is_none());
+        assert!(once["input"][0]
+            .get("internal_chat_message_metadata_passthrough")
+            .is_none());
+        assert_eq!(
+            once["input"][0]["summary"],
+            json!([
+                { "type": "summary_text", "text": "First part." },
+                { "type": "summary_text", "text": "Second part." }
+            ])
+        );
     }
 
     #[test]

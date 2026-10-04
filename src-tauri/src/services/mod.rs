@@ -1,5 +1,7 @@
+pub mod auto_sync;
 pub mod balance;
 pub mod codex_oauth_models;
+pub mod codex_plugin_health;
 pub mod codex_plugin_registry;
 pub mod coding_plan;
 pub mod config;

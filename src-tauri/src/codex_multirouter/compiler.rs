@@ -140,7 +140,15 @@ pub fn compile_v2(
     plan: &CodexRoutingConfigV2,
     providers: &HashMap<String, Provider>,
 ) -> Result<CompiledCodexRoutingPlan, CodexRoutingCompileError> {
-    if let Err(issues) = validate_v2(plan, providers) {
+    let providers = providers
+        .iter()
+        .map(|(id, provider)| {
+            let mut provider = provider.clone();
+            crate::codex_multirouter::catalog::normalize_settings(&mut provider.settings_config);
+            (id.clone(), provider)
+        })
+        .collect::<HashMap<_, _>>();
+    if let Err(issues) = validate_v2(plan, &providers) {
         let issue = issues
             .first()
             .expect("validation returned an empty issue list");
@@ -151,7 +159,7 @@ pub fn compile_v2(
     }
 
     let mut warnings = Vec::new();
-    let candidates = collect_candidates(plan, providers, &mut warnings)?;
+    let candidates = collect_candidates(plan, &providers, &mut warnings)?;
     let collision_counts = canonical_collision_counts(&candidates);
     let canonical_owners = canonical_owner_counts(&candidates);
     let mut used_visible = HashSet::new();
@@ -254,7 +262,7 @@ pub fn compile_v2(
             spawn_agent_models.push(model.clone());
         }
     }
-    let dependency_fingerprint = dependency_fingerprint(plan, providers, &model_catalog)?;
+    let dependency_fingerprint = dependency_fingerprint(plan, &providers, &model_catalog)?;
 
     Ok(CompiledCodexRoutingPlan {
         routes,
@@ -984,6 +992,35 @@ mod tests {
 
         assert_eq!(compiled.model_catalog[0].api_format, "openai_responses");
         assert_eq!(compiled.model_catalog[0].api_format_source, "provider");
+    }
+
+    #[test]
+    fn compiler_normalizes_legacy_catalog_aliases_before_validation() {
+        let provider = provider(
+            "legacy",
+            "Legacy",
+            "openai_responses",
+            json!([{
+                "model": "legacy-visible",
+                "upstream_model": "legacy-upstream",
+                "context_window": "128K"
+            }]),
+        );
+        let compiled = compile(
+            &plan(vec![route(
+                "router-legacy",
+                "legacy",
+                CodexModelSelection::All,
+            )]),
+            [provider],
+        );
+
+        assert_eq!(compiled.visible_models, vec!["legacy-visible"]);
+        assert_eq!(compiled.model_catalog[0].upstream_model, "legacy-upstream");
+        assert_eq!(
+            compiled.model_catalog[0].capability_summary.context_window,
+            Some(128_000)
+        );
     }
 
     #[test]

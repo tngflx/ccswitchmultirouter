@@ -422,6 +422,57 @@ pub fn capability_fingerprint(capability: &CodexModelReasoningCapability) -> Str
 /// Exact DeepSeek V4 model IDs use the maintained built-in declaration. Unknown models keep
 /// their own declared levels and merely choose the first valid level when their default is
 /// invalid; they never inherit GPT or DeepSeek capabilities.
+///
+/// This helper is intentionally limited to the explicit force-repair workflow. The ordinary
+/// catalogue normalizer may have already made a formerly invalid built-in declaration parse as
+/// valid (for example, by selecting the first supported effort), so force repair needs a way to
+/// restore the maintained declaration without changing normal persistence semantics.
+pub fn restore_maintained_reasoning_capabilities(
+    settings: &mut Value,
+) -> ReasoningCapabilityRepairOutcome {
+    let mut outcome = ReasoningCapabilityRepairOutcome::default();
+    let Some(models) = settings
+        .get_mut("modelCatalog")
+        .and_then(|catalog| catalog.get_mut("models"))
+        .and_then(Value::as_array_mut)
+    else {
+        return outcome;
+    };
+
+    for entry in models {
+        let model = ["model", "id", "slug", "upstreamModel", "upstream_model"]
+            .into_iter()
+            .find_map(|field| entry.get(field).and_then(Value::as_str))
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        let is_builtin = entry
+            .get("reasoning")
+            .and_then(Value::as_object)
+            .and_then(|reasoning| reasoning.get("source"))
+            .and_then(Value::as_str)
+            .is_some_and(|source| source == "builtin");
+        let Some(builtin) = builtin_reasoning_capability_for_model(&model) else {
+            continue;
+        };
+        if !is_builtin {
+            continue;
+        }
+        let builtin_value = serde_json::to_value(builtin)
+            .expect("built-in reasoning capability must be serializable");
+        if entry.get("reasoning") == Some(&builtin_value) {
+            continue;
+        }
+        entry["reasoning"] = builtin_value;
+        outcome.repaired_models.push(model.clone());
+        outcome.warnings.push(format!(
+            "Restored maintained reasoning capability for {model} during force repair"
+        ));
+    }
+
+    outcome
+}
+
 pub fn repair_invalid_reasoning_capabilities(
     settings: &mut Value,
 ) -> ReasoningCapabilityRepairOutcome {
@@ -1022,6 +1073,40 @@ mod tests {
             .repaired_models
             .contains(&"deepseek-v4-flash".to_string()));
         assert!(!outcome.warnings.is_empty());
+    }
+
+    #[test]
+    fn force_repair_restores_builtin_after_catalog_normalization() {
+        let mut settings = json!({
+            "modelCatalog": {"models": [{
+                "model": "deepseek-v4-flash",
+                "reasoning": {
+                    "schemaVersion": 2,
+                    "supportStatus": "confirmed_supported",
+                    "controlKind": "graded",
+                    "supportedEfforts": ["low", "high", "max"],
+                    "defaultEffort": "low",
+                    "disableAllowed": true,
+                    "upstream": {
+                        "format": "string",
+                        "parameter": "reasoning_effort",
+                        "effortMap": {
+                            "low": "low",
+                            "high": "high",
+                            "max": "max"
+                        }
+                    },
+                    "source": "builtin"
+                }
+            }]}
+        });
+
+        let outcome = restore_maintained_reasoning_capabilities(&mut settings);
+        assert_eq!(
+            settings["modelCatalog"]["models"][0]["reasoning"]["defaultEffort"],
+            json!("high")
+        );
+        assert_eq!(outcome.repaired_models, vec!["deepseek-v4-flash"]);
     }
 
     #[test]

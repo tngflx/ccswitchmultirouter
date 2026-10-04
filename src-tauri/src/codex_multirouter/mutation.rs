@@ -160,6 +160,7 @@ pub(crate) fn prepare_codex_provider_mutation(
     mut provider: Provider,
     profiles: &[ProtocolCompatibilityRecord],
 ) -> Result<PreparedCodexProviderMutation, AppError> {
+    crate::codex_multirouter::catalog::normalize_settings(&mut provider.settings_config);
     remove_schema_v2_router_derived_catalog(&mut provider);
     let affected = validate_and_collect_affected_router_ids(db, &provider)?;
     let profiles = materialize_equivalent_router_protocol_profiles(

@@ -2253,7 +2253,7 @@ fn push_env_codex_cli_candidates(candidates: &mut Vec<PathBuf>, seen: &mut HashS
     }
 }
 
-fn codex_cli_candidates() -> Vec<PathBuf> {
+pub(crate) fn codex_cli_candidates() -> Vec<PathBuf> {
     let mut candidates = Vec::new();
     let mut seen = HashSet::new();
 
@@ -8115,29 +8115,27 @@ pub fn set_codex_respect_system_proxy(
 
 /// Whether a live Codex config is the official route projected by CC Switch.
 pub fn codex_config_has_official_proxy_route(config_text: &str) -> bool {
-    config_text
-        .parse::<DocumentMut>()
-        .ok()
-        .is_some_and(|doc| {
-            let active = doc.get("model_provider").and_then(Item::as_str);
-            if active == Some(CC_SWITCH_CODEX_OFFICIAL_PROXY_PROVIDER_ID) {
-                return true;
-            }
-            active == Some(CC_SWITCH_CODEX_MODEL_PROVIDER_ID)
-                && doc
-                    .get("model_providers")
-                    .and_then(Item::as_table_like)
-                    .and_then(|providers| providers.get(CC_SWITCH_CODEX_MODEL_PROVIDER_ID))
-                    .is_some_and(|item| {
-                        item.as_table_like()
-                            .is_some_and(|table| table_matches_codex_official_proxy_provider(table, None))
+    config_text.parse::<DocumentMut>().ok().is_some_and(|doc| {
+        let active = doc.get("model_provider").and_then(Item::as_str);
+        if active == Some(CC_SWITCH_CODEX_OFFICIAL_PROXY_PROVIDER_ID) {
+            return true;
+        }
+        active == Some(CC_SWITCH_CODEX_MODEL_PROVIDER_ID)
+            && doc
+                .get("model_providers")
+                .and_then(Item::as_table_like)
+                .and_then(|providers| providers.get(CC_SWITCH_CODEX_MODEL_PROVIDER_ID))
+                .is_some_and(|item| {
+                    item.as_table_like().is_some_and(|table| {
+                        table_matches_codex_official_proxy_provider(table, None)
                     })
-                || matches!(active, Some("openai") | None)
-                    && doc
-                        .get("openai_base_url")
-                        .and_then(Item::as_str)
-                        .is_some_and(codex_base_url_is_local_proxy)
-        })
+                })
+            || matches!(active, Some("openai") | None)
+                && doc
+                    .get("openai_base_url")
+                    .and_then(Item::as_str)
+                    .is_some_and(codex_base_url_is_local_proxy)
+    })
 }
 
 /// Whether the active Codex route is a CC Switch official route for the exact
@@ -8162,7 +8160,9 @@ pub fn codex_config_routes_official_to_proxy(config_text: &str, proxy_base_url: 
             .and_then(Item::as_table_like)
             .and_then(|providers| providers.get(CC_SWITCH_CODEX_MODEL_PROVIDER_ID))
             .and_then(Item::as_table_like)
-            .is_some_and(|table| table_matches_codex_official_proxy_provider(table, Some(expected))),
+            .is_some_and(|table| {
+                table_matches_codex_official_proxy_provider(table, Some(expected))
+            }),
         Some("openai") | None => doc
             .get("openai_base_url")
             .and_then(Item::as_str)
@@ -12112,8 +12112,7 @@ command = "example"
         assert_eq!(doc["model_provider"].as_str(), Some("custom"));
         assert!(doc.get("openai_base_url").is_none());
         assert_eq!(
-            doc["model_providers"][CC_SWITCH_CODEX_MODEL_PROVIDER_ID]["base_url"]
-                .as_str(),
+            doc["model_providers"][CC_SWITCH_CODEX_MODEL_PROVIDER_ID]["base_url"].as_str(),
             Some("http://127.0.0.1:15721/v1")
         );
         assert_eq!(

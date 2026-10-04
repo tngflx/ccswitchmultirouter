@@ -18,10 +18,26 @@ fn normalize_provider_settings_config(value: serde_json::Value) -> serde_json::V
     }
 }
 
+fn normalize_settings_for_app(app_type: &str, mut value: serde_json::Value) -> serde_json::Value {
+    value = normalize_provider_settings_config(value);
+    if app_type == crate::app_config::AppType::Codex.as_str() {
+        crate::codex_multirouter::catalog::normalize_settings(&mut value);
+    }
+    value
+}
+
 /// 解析 SQLite 中的供应商配置，并保证返回值符合 Provider 的对象契约。
 fn parse_provider_settings_config(settings_config_str: &str) -> serde_json::Value {
     let parsed = serde_json::from_str(settings_config_str).unwrap_or(serde_json::Value::Null);
     normalize_provider_settings_config(parsed)
+}
+
+fn parse_provider_settings_config_for_app(
+    app_type: &str,
+    settings_config_str: &str,
+) -> serde_json::Value {
+    let parsed = serde_json::from_str(settings_config_str).unwrap_or(serde_json::Value::Null);
+    normalize_settings_for_app(app_type, parsed)
 }
 
 fn codex_route_ids(settings_config: &serde_json::Value) -> HashSet<String> {
@@ -136,7 +152,8 @@ pub(super) fn save_provider_in_transaction(
         .optional()
         .map_err(|error| AppError::Database(error.to_string()))?;
     let is_update = existing.is_some();
-    let mut settings_config = normalize_provider_settings_config(provider.settings_config.clone());
+    let mut settings_config =
+        normalize_settings_for_app(app_type, provider.settings_config.clone());
     if app_type == crate::app_config::AppType::Codex.as_str()
         && crate::codex_multirouter::schema::strip_v2_route_inherited_fields(&mut settings_config)
     {
@@ -148,7 +165,7 @@ pub(super) fn save_provider_in_transaction(
     let (is_current, in_failover_queue, removed_route_ids) = match existing {
         Some((is_current, in_failover_queue, previous_settings)) => {
             let removed_route_ids = if app_type == "codex" {
-                let previous = parse_provider_settings_config(&previous_settings);
+                let previous = parse_provider_settings_config_for_app(app_type, &previous_settings);
                 codex_route_ids(&previous)
                     .difference(&codex_route_ids(&settings_config))
                     .cloned()
@@ -254,7 +271,8 @@ impl Database {
                 let meta_str: String = row.get(10)?;
                 let in_failover_queue: bool = row.get(11)?;
 
-                let settings_config = parse_provider_settings_config(&settings_config_str);
+                let settings_config =
+                    parse_provider_settings_config_for_app(app_type, &settings_config_str);
                 let meta: ProviderMeta = serde_json::from_str(&meta_str).unwrap_or_default();
 
                 Ok((
@@ -360,7 +378,8 @@ impl Database {
                 let meta_str: String = row.get(9)?;
                 let in_failover_queue: bool = row.get(10)?;
 
-                let settings_config = parse_provider_settings_config(&settings_config_str);
+                let settings_config =
+                    parse_provider_settings_config_for_app(app_type, &settings_config_str);
                 let meta: ProviderMeta = serde_json::from_str(&meta_str).unwrap_or_default();
 
                 Ok(Provider {
@@ -717,10 +736,13 @@ impl Database {
         conn.execute(
             "UPDATE providers SET settings_config = ?1 WHERE id = ?2 AND app_type = ?3",
             params![
-                serde_json::to_string(&normalize_provider_settings_config(settings_config.clone()))
-                    .map_err(|e| AppError::Database(format!(
-                        "Failed to serialize settings_config: {e}"
-                    )))?,
+                serde_json::to_string(&normalize_settings_for_app(
+                    app_type,
+                    settings_config.clone()
+                ))
+                .map_err(|e| AppError::Database(format!(
+                    "Failed to serialize settings_config: {e}"
+                )))?,
                 provider_id,
                 app_type
             ],
@@ -759,7 +781,8 @@ impl Database {
                 }
                 other => AppError::Database(other.to_string()),
             })?;
-        let mut settings_config = parse_provider_settings_config(&settings_config_str);
+        let mut settings_config =
+            parse_provider_settings_config_for_app("codex", &settings_config_str);
         let subagent_v2 = mutate(&settings_config)?;
         let settings = settings_config.as_object_mut().ok_or_else(|| {
             AppError::Database("Provider settings normalization failed".to_string())
@@ -933,7 +956,8 @@ impl Database {
                 Err(e) => return Err(AppError::Database(e.to_string())),
             };
 
-        let settings_config = parse_provider_settings_config(&settings_config_str);
+        let settings_config =
+            parse_provider_settings_config_for_app(app_type, &settings_config_str);
         let meta: crate::provider::ProviderMeta = if meta_str.trim().is_empty() {
             crate::provider::ProviderMeta::default()
         } else {

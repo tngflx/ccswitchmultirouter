@@ -2,6 +2,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Output};
 use std::process::{Command, Stdio};
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 use std::time::Instant;
 
@@ -21,8 +22,103 @@ const CDP_CONNECT_TIMEOUT: Duration = Duration::from_secs(4);
 const CDP_COMMAND_TIMEOUT: Duration = Duration::from_secs(4);
 const MODEL_PICKER_PATCH_KEY: &str = "__ccSwitchCodexAppCompatibilityV9";
 const REMEMBERED_CODEX_DESKTOP_EXECUTABLE_FILENAME: &str = "codex-desktop-executable.json";
+static CODEX_REQUEST_HEALTH_WARNINGS: OnceLock<Mutex<HashMap<String, CodexRequestHealthWarning>>> =
+    OnceLock::new();
+static CODEX_REQUEST_HEALTH_WARNING_SYNC: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 #[cfg(any(target_os = "macos", test))]
 const CODEX_DESKTOP_BUNDLE_IDENTIFIER: &str = "com.openai.codex";
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct CodexRequestHealthWarning {
+    pub token: String,
+    pub title: String,
+    pub detail: String,
+    pub instruction: String,
+    pub expires_at_ms: u64,
+}
+
+fn codex_request_health_warnings() -> &'static Mutex<HashMap<String, CodexRequestHealthWarning>> {
+    CODEX_REQUEST_HEALTH_WARNINGS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn codex_request_health_warning_sync_lock() -> &'static tokio::sync::Mutex<()> {
+    CODEX_REQUEST_HEALTH_WARNING_SYNC.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
+pub(crate) fn show_codex_request_health_warning(warning: CodexRequestHealthWarning) {
+    codex_request_health_warnings()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(warning.token.clone(), warning);
+    spawn_codex_request_health_warning_sync();
+}
+
+pub(crate) fn hide_codex_request_health_warning(token: &str) {
+    if codex_request_health_warnings()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .remove(token)
+        .is_some()
+    {
+        spawn_codex_request_health_warning_sync();
+    }
+}
+
+fn spawn_codex_request_health_warning_sync() {
+    tauri::async_runtime::spawn(async {
+        if let Err(error) = sync_codex_request_health_warnings().await {
+            log::debug!("[RequestHealth] Codex advisory warning was not injected: {error}");
+        }
+    });
+}
+
+async fn sync_codex_request_health_warnings() -> Result<usize, String> {
+    let _sync_guard = codex_request_health_warning_sync_lock().lock().await;
+    let mut warnings = codex_request_health_warnings()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .values()
+        .cloned()
+        .collect::<Vec<_>>();
+    warnings.sort_by(|left, right| left.token.cmp(&right.token));
+    let warnings_json = serde_json::to_string(&warnings)
+        .map_err(|error| format!("Failed to serialize Codex Request Health warnings: {error}"))?;
+    let script = format!(
+        r#"(() => {{
+          const state = window[{patch_key:?}];
+          if (!state || typeof state.syncRequestHealthWarnings !== "function") return false;
+          state.syncRequestHealthWarnings({warnings_json});
+          return true;
+        }})()"#,
+        patch_key = MODEL_PICKER_PATCH_KEY,
+    );
+    let mut updated_targets = 0usize;
+    for port in candidate_debug_ports(DEFAULT_CODEX_DEBUG_PORT) {
+        let targets = match list_cdp_targets(port).await {
+            Ok(targets) => targets,
+            Err(_) => continue,
+        };
+        let targets = match pick_codex_page_targets(&targets, port) {
+            Ok(targets) => targets,
+            Err(_) => continue,
+        };
+        for target in targets {
+            let Some(websocket_url) = target.web_socket_debugger_url.as_deref() else {
+                continue;
+            };
+            let evaluation = evaluate_cdp_expression(websocket_url, &script).await?;
+            if evaluation
+                .pointer("/result/result/value")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            {
+                updated_targets += 1;
+            }
+        }
+    }
+    Ok(updated_targets)
+}
 /// Codex App 历史目录与模型兼容层安装命令的执行结果。
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -98,6 +194,7 @@ pub(crate) struct CdpTarget {
 }
 
 /// 尝试为当前或新启动的 Codex App 安装 renderer 兼容层。
+/// Summary/restart handoff core for oversized Codex sessions.
 ///
 /// 副作用：
 /// - 若发现已开放 CDP 的 Codex renderer，会触发新版历史目录同步并修复模型菜单；
@@ -837,116 +934,7 @@ fn cdp_command_result(response: Value, method: &str) -> Result<Value, String> {
 /// 先通过明确的模型门特征；不能把 React Fiber、Intl context 或普通 API 对象当成模型
 /// 容器遍历和改写。
 fn model_picker_patch_core_script() -> &'static str {
-    r#"
-  const currentPayload = () => state.payload || {};
-  const modelNames = () => {
-    const payload = currentPayload();
-    return Array.from(new Set([payload.defaultModel, ...(payload.modelNames || [])].filter((name) => typeof name === "string" && name.trim()).map((name) => name.trim())));
-  };
-  const descriptorFor = (name) => {
-    const payload = currentPayload();
-    const existing = (payload.models || []).find((model) => model && model.model === name);
-    return {
-      model: name,
-      id: name,
-      slug: name,
-      name,
-      displayName: name,
-      hidden: false,
-      ...(existing || {}),
-      hidden: false,
-    };
-  };
-  const stringArray = (value) => Array.isArray(value) && value.every((item) => typeof item === "string");
-  const modelArray = (value, allowEmpty = false) => Array.isArray(value) && (allowEmpty || value.length > 0) && value.every((item) => item && typeof item === "object" && typeof item.model === "string");
-  const patchModelNameArray = (models) => {
-    if (!stringArray(models)) return false;
-    let changed = false;
-    for (const name of modelNames()) {
-      if (!models.includes(name)) {
-        models.push(name);
-        changed = true;
-      }
-    }
-    return changed;
-  };
-  const patchModelArray = (models, allowEmpty = false) => {
-    if (!modelArray(models, allowEmpty)) return false;
-    const names = modelNames();
-    const existing = new Map(models.map((model) => [model.model, model]));
-    let changed = false;
-    for (const model of models) {
-      if (names.includes(model.model) && model.hidden !== false) {
-        model.hidden = false;
-        changed = true;
-      }
-    }
-    for (const name of names) {
-      if (!existing.has(name)) {
-        models.push(descriptorFor(name));
-        changed = true;
-      }
-    }
-    return changed;
-  };
-  const removeHiddenNames = (container, key) => {
-    if (!Array.isArray(container?.[key])) return false;
-    const names = new Set(modelNames());
-    const before = container[key].length;
-    container[key] = container[key].filter((name) => !names.has(name));
-    return before !== container[key].length;
-  };
-  const patchNameSet = (setLike) => {
-    if (!(setLike instanceof Set)) return false;
-    let changed = false;
-    for (const name of modelNames()) {
-      if (!setLike.has(name)) {
-        setLike.add(name);
-        changed = true;
-      }
-    }
-    return changed;
-  };
-  const patchModelContainer = (value) => {
-    if (!value || typeof value !== "object") return false;
-    const looksLikeModelGate = "availableModels" in value || "available_models" in value || "useHiddenModels" in value || "use_hidden_models" in value || "defaultModel" in value || "default_model" in value;
-    if (!looksLikeModelGate) return false;
-
-    let changed = false;
-    if (patchModelArray(value.models, "defaultModel" in value || "availableModels" in value || "available_models" in value)) changed = true;
-    if (patchModelNameArray(value.models)) changed = true;
-    if (patchModelArray(value.data)) changed = true;
-    if (patchModelArray(value.result)) changed = true;
-    if (patchModelArray(value.pages?.[0]?.data)) changed = true;
-    if (patchModelArray(value.result?.data)) changed = true;
-    if (patchModelArray(value.result?.models)) changed = true;
-    if (patchModelArray(value.message?.result?.data)) changed = true;
-    if (patchModelArray(value.message?.result?.models)) changed = true;
-    if (patchNameSet(value.availableModels)) changed = true;
-    if (patchNameSet(value.available_models)) changed = true;
-    if (patchModelNameArray(value.availableModels)) changed = true;
-    if (patchModelNameArray(value.available_models)) changed = true;
-    if (removeHiddenNames(value, "hiddenModels")) changed = true;
-    if (removeHiddenNames(value, "hidden_models")) changed = true;
-    if ("useHiddenModels" in value && value.useHiddenModels !== false) {
-      value.useHiddenModels = false;
-      changed = true;
-    }
-    if ("use_hidden_models" in value && value.use_hidden_models !== false) {
-      value.use_hidden_models = false;
-      changed = true;
-    }
-    if ("default_model" in value && typeof value.default_model === "string" && modelNames().length && !modelNames().includes(value.default_model)) {
-      value.default_model = modelNames()[0];
-      changed = true;
-    }
-    if ("defaultModel" in value && value.defaultModel == null && modelNames().length > 0) {
-      value.defaultModel = descriptorFor(modelNames()[0]);
-      changed = true;
-    }
-    return changed;
-  };
-"#
+    include_str!("resources/codex_model_picker_core.js")
 }
 
 /// The V5 renderer patch accidentally added model-whitelist fields to every
@@ -1175,6 +1163,658 @@ fn app_server_module_client_discovery_core_script() -> &'static str {
 "#
 }
 
+fn request_health_warning_core_script() -> &'static str {
+    r###"
+  const requestHealthWarningStorageKey = "ccswitch-request-health-warnings-v1";
+  const requestHealthWarningContainerId = "ccswitch-request-health-warning-container";
+  const readStoredRequestHealthWarnings = () => {
+    try {
+      const stored = JSON.parse(localStorage.getItem(requestHealthWarningStorageKey) || "[]");
+      return Array.isArray(stored) ? stored : [];
+    } catch { return []; }
+  };
+  const renderRequestHealthWarnings = (warnings) => {
+    const now = Date.now();
+    const active = (Array.isArray(warnings) ? warnings : [])
+      .filter((warning) => warning && String(warning.token || "").trim() && Number(warning.expiresAtMs) > now)
+      .sort((left, right) => Number(left.expiresAtMs) - Number(right.expiresAtMs));
+    try {
+      if (active.length) localStorage.setItem(requestHealthWarningStorageKey, JSON.stringify(active));
+      else localStorage.removeItem(requestHealthWarningStorageKey);
+    } catch {}
+    let container = document.getElementById(requestHealthWarningContainerId);
+    if (!active.length) {
+      container?.remove();
+      if (state.requestHealthWarningExpiryTimer) clearTimeout(state.requestHealthWarningExpiryTimer);
+      state.requestHealthWarningExpiryTimer = null;
+      return { active: 0 };
+    }
+    if (!container) {
+      container = document.createElement("section");
+      container.id = requestHealthWarningContainerId;
+      container.setAttribute("role", "status");
+      container.setAttribute("aria-live", "assertive");
+      Object.assign(container.style, { position: "fixed", top: "16px", right: "16px", zIndex: "2147483647", display: "grid", gap: "8px", width: "min(420px, calc(100vw - 32px))", maxHeight: "calc(100vh - 32px)", overflowY: "auto", pointerEvents: "none", fontFamily: "system-ui, sans-serif" });
+      (document.body || document.documentElement).appendChild(container);
+    }
+    const activeTokens = new Set(active.map((warning) => String(warning.token)));
+    for (const existing of container.querySelectorAll("[data-ccswitch-request-health-token]")) {
+      if (!activeTokens.has(String(existing.getAttribute("data-ccswitch-request-health-token")))) existing.remove();
+    }
+    for (const warning of active) {
+      const token = String(warning.token);
+      let card = Array.from(container.querySelectorAll("[data-ccswitch-request-health-token]")).find((candidate) => candidate.getAttribute("data-ccswitch-request-health-token") === token);
+      if (!card) {
+        card = document.createElement("article");
+        card.setAttribute("data-ccswitch-request-health-token", token);
+        Object.assign(card.style, { border: "1px solid rgba(245, 158, 11, .65)", borderRadius: "10px", background: "rgba(24, 24, 27, .96)", color: "#fafafa", boxShadow: "0 18px 48px rgba(0,0,0,.38)", padding: "12px 14px", lineHeight: "1.4", pointerEvents: "none" });
+        container.appendChild(card);
+      }
+      card.replaceChildren();
+      const title = document.createElement("strong");
+      title.textContent = String(warning.title || "Request paused for approval");
+      const detail = document.createElement("div");
+      detail.textContent = String(warning.detail || "");
+      const instruction = document.createElement("div");
+      instruction.textContent = String(warning.instruction || "");
+      Object.assign(instruction.style, { marginTop: "7px", fontSize: "12px", fontWeight: "600", color: "#fbbf24" });
+      card.append(title, detail, instruction);
+    }
+    if (state.requestHealthWarningExpiryTimer) clearTimeout(state.requestHealthWarningExpiryTimer);
+    const nextExpiry = Math.min(...active.map((warning) => Number(warning.expiresAtMs)));
+    state.requestHealthWarningExpiryTimer = setTimeout(() => renderRequestHealthWarnings(readStoredRequestHealthWarnings()), Math.max(50, nextExpiry - now + 25));
+    return { active: active.length };
+  };
+  state.syncRequestHealthWarnings = (warnings) => renderRequestHealthWarnings(warnings);
+  renderRequestHealthWarnings(readStoredRequestHealthWarnings());
+"###
+}
+
+///
+/// The fresh refork discovers app-server clients from the same patched client
+/// registry used by routing compatibility. This core only owns the handoff
+/// workflow and never touches rollout files or the proxy request history.
+fn summary_handoff_core_script() -> &'static str {
+    r#"
+  const rememberHandoffClient = (client) => {
+    if (!client || typeof client.sendRequest !== "function") return;
+    state.appServerClients = Array.isArray(state.appServerClients) ? state.appServerClients : [];
+    if (!state.appServerClients.includes(client)) state.appServerClients.push(client);
+  };
+  const readExactHandoffThread = async (client, threadId, includeTurns) => {
+    const response = await client.sendRequest("thread/read", { threadId, includeTurns });
+    const thread = response?.thread || response;
+    const returnedThreadId = String(thread?.id || "").trim();
+    if (returnedThreadId !== threadId) {
+      throw new Error(returnedThreadId
+        ? `Codex returned the wrong task ${returnedThreadId} instead of ${threadId}`
+        : `Codex did not return task ${threadId}`);
+    }
+    return thread;
+  };
+  const discoverHandoffClients = async () => {
+    try { await installAppServerPatch(); } catch (error) { recordFailure(error); }
+    const clients = (Array.isArray(state.appServerClients) ? state.appServerClients : [])
+      .filter((client, index, array) => client && typeof client.sendRequest === "function" && array.indexOf(client) === index);
+    if (!clients.length) throw new Error("Codex Desktop request client was not found");
+    return clients;
+  };
+  const extractAssistantText = (value, seen = new WeakSet()) => {
+    if (!value || typeof value !== "object") return [];
+    if (seen.has(value)) return [];
+    seen.add(value);
+    if (Array.isArray(value)) return value.flatMap((item) => extractAssistantText(item, seen));
+    const type = String(value.type || "").toLowerCase();
+    const role = String(value.role || "").toLowerCase();
+    const own = (role === "assistant" || type === "agentmessage" || type === "assistant_message")
+      ? [value.text, value.content].flatMap((item) => typeof item === "string" ? [item] : extractAssistantText(item, seen)).filter(Boolean)
+      : [];
+    return [...own, ...Object.values(value).flatMap((item) => extractAssistantText(item, seen))];
+  };
+  const runSummarizeSession = async (threadId) => {
+    const normalizedThreadId = String(threadId || "").trim();
+    if (!normalizedThreadId) throw new Error("A Codex thread id is required");
+    const clients = await discoverHandoffClients();
+    let lastError = null;
+    for (const client of clients) {
+      let mutationAttempted = false;
+      try {
+        const idleDeadline = Date.now() + 30000;
+        let before = null;
+        const interrupted = new Set();
+        while (Date.now() < idleDeadline) {
+          before = await readExactHandoffThread(client, normalizedThreadId, true);
+          if (String(before?.status?.type || "") !== "active") break;
+          const active = [...(before?.turns || [])].reverse().find((turn) => String(turn?.status || "") === "inProgress");
+          const activeTurnId = String(active?.id || "").trim();
+          if (activeTurnId && !interrupted.has(activeTurnId)) {
+            interrupted.add(activeTurnId);
+            mutationAttempted = true;
+            await client.sendRequest("turn/interrupt", { threadId: normalizedThreadId, turnId: activeTurnId });
+          }
+          await new Promise((resolve) => setTimeout(resolve, 250));
+        }
+        if (String(before?.status?.type || "") === "active") throw new Error("Timed out interrupting the source turn");
+        mutationAttempted = true;
+        const started = await client.sendRequest("turn/start", {
+          threadId: normalizedThreadId,
+          input: [{ type: "text", text: [
+            "[CCSwitch internal request: manual-summary-v1]",
+            "Create a faithful handoff summary of this coding session for a fresh session.",
+            "Do not call tools, inspect files, change files, or continue implementation; summarize only the conversation already present.",
+            "Return plain text with these headings on separate lines: Goal; Decisions and rationale; Changed files or areas; Current state; Failures and unresolved issues; Tests and verification; Not tested; Exact next action.",
+            "Never claim a test ran unless the conversation records its result, and preserve recorded failures and user constraints."
+          ].join(" ") }],
+        });
+        const summaryTurnId = String(started?.turn?.id || started?.turnId || started?.turn_id || "").trim();
+        if (!summaryTurnId) throw new Error("Codex did not return the manual summary turn id");
+        const deadline = Date.now() + 120000;
+        while (Date.now() < deadline) {
+          await new Promise((resolve) => setTimeout(resolve, 750));
+          const current = await readExactHandoffThread(client, normalizedThreadId, true);
+          const turn = (current?.turns || []).find((candidate) => candidate?.id === summaryTurnId);
+          const status = String(turn?.status || "").toLowerCase();
+          if (status === "completed") {
+            const summary = [...new Set(extractAssistantText(turn))].map((value) => String(value).trim()).filter(Boolean).join("\n").trim();
+            if (!summary) throw new Error("Codex completed without a manual handoff summary");
+            return { summary };
+          }
+          if (status === "failed" || status === "interrupted") throw new Error(`Manual summary turn ${status}`);
+        }
+        throw new Error("Timed out waiting for the manual handoff summary");
+      } catch (error) {
+        if (mutationAttempted) throw error;
+        lastError = error;
+      }
+    }
+    throw lastError || new Error("Codex Desktop could not summarize the session");
+  };
+  const verifyFreshHandoff = (thread, source, newThreadId, phase) => {
+    if (String(thread?.id || "").trim() !== newThreadId) throw new Error(`Codex returned the wrong fresh task during ${phase}`);
+    if (String(thread?.projectId || "").trim() !== String(source.projectId || "").trim()) throw new Error(`Fresh session ${phase} changed project ownership`);
+    if (source.cwd && String(thread?.cwd || "").replace(/\//g, "\\").replace(/\\+$/, "").toLowerCase() !== String(source.cwd).replace(/\//g, "\\").replace(/\\+$/, "").toLowerCase()) throw new Error(`Fresh session ${phase} changed workspace`);
+    for (const field of ["model", "modelProvider", "reasoningEffort"]) {
+      if (source[field] != null && JSON.stringify(thread?.[field]) !== JSON.stringify(source[field])) throw new Error(`Fresh session ${phase} changed ${field}`);
+    }
+    return String(thread?.name || "").trim();
+  };
+  const runFreshSessionFromSummary = async (sourceThreadId, summary) => {
+    const sourceId = String(sourceThreadId || "").trim();
+    const handoffSummary = String(summary || "").trim();
+    if (!sourceId) throw new Error("A Codex source thread id is required");
+    if (!handoffSummary) throw new Error("The manual handoff summary is empty");
+    const clients = await discoverHandoffClients();
+    let lastError = null;
+    for (const client of clients) {
+      let mutationAttempted = false;
+      try {
+        const source = await readExactHandoffThread(client, sourceId, false);
+        const startParams = { config: { model_reasoning_effort: String(source?.reasoningEffort || "medium") } };
+        for (const key of ["cwd", "model", "modelProvider"]) if (source?.[key]) startParams[key] = source[key];
+        mutationAttempted = true;
+        const started = await client.sendRequest("thread/start", startParams);
+        let fresh = started?.thread || started;
+        const newThreadId = String(fresh?.id || started?.threadId || started?.thread_id || "").trim();
+        if (!newThreadId || newThreadId === sourceId) throw new Error("Codex did not create a fresh root session");
+        if (fresh?.forkedFromId || fresh?.forked_from_id) throw new Error("Codex created a fork instead of a fresh root session");
+        fresh = await readExactHandoffThread(client, newThreadId, false);
+        let freshName = verifyFreshHandoff(fresh, source, newThreadId, "before acknowledgement");
+        if (!freshName) {
+          await client.sendRequest("thread/name/set", { threadId: newThreadId, name: `Handoff - ${String(source?.name || "continued task").trim()}`.slice(0, 120) });
+          fresh = await readExactHandoffThread(client, newThreadId, false);
+          freshName = verifyFreshHandoff(fresh, source, newThreadId, "after naming");
+        }
+        const acknowledged = await client.sendRequest("turn/start", {
+          threadId: newThreadId,
+          input: [{ type: "text", text: [
+            "Fresh-session handoff from an oversized prior task.",
+            "Use the summary below as reference context only. Do not execute its action items or call tools in this acknowledgement turn; wait for the user's next instruction.",
+            handoffSummary,
+          ].join("\n") }],
+        });
+        const turnId = String(acknowledged?.turn?.id || acknowledged?.turnId || acknowledged?.turn_id || "").trim();
+        if (!turnId) throw new Error("Codex did not return the fresh-session handoff turn id");
+        const deadline = Date.now() + 120000;
+        while (Date.now() < deadline) {
+          await new Promise((resolve) => setTimeout(resolve, 750));
+          const current = await readExactHandoffThread(client, newThreadId, true);
+          const turn = (current?.turns || []).find((candidate) => candidate?.id === turnId);
+          const status = String(turn?.status || "").toLowerCase();
+          if (status === "completed") {
+            freshName = verifyFreshHandoff(current, source, newThreadId, "after acknowledgement") || freshName;
+            try { await triggerLocalThreadCatalogSync(); } catch (error) { recordFailure(error); }
+            return { newThreadId, turnId, name: freshName };
+          }
+          if (status === "failed" || status === "interrupted") throw new Error(`Fresh-session handoff turn ${status}`);
+        }
+        throw new Error("Timed out waiting for the fresh-session handoff");
+      } catch (error) {
+        if (mutationAttempted) throw error;
+        lastError = error;
+      }
+    }
+    throw lastError || new Error("Codex Desktop could not create the fresh handoff session");
+  };
+  state.summarizeJobs = state.summarizeJobs || {};
+  state.startSummarizeSession = (threadId) => {
+    const id = String(threadId || "").trim();
+    if (!id) throw new Error("A Codex thread id is required");
+    const existing = Object.entries(state.summarizeJobs).find(([, job]) => job?.threadId === id && job?.status === "pending");
+    if (existing) return { started: true, jobId: existing[0] };
+    const jobId = `${id}:${Date.now()}:${Math.random().toString(16).slice(2)}`;
+    state.summarizeJobs[jobId] = { status: "pending", threadId: id };
+    void runSummarizeSession(id).then((result) => { state.summarizeJobs[jobId] = { ...state.summarizeJobs[jobId], ...result, status: "completed" }; }, (error) => { state.summarizeJobs[jobId] = { ...state.summarizeJobs[jobId], status: "failed", reason: String(error?.message || error) }; });
+    return { started: true, jobId };
+  };
+  state.readSummarizeJob = (jobId) => state.summarizeJobs[String(jobId || "")] || null;
+  state.freshSessionJobs = state.freshSessionJobs || {};
+  state.startFreshSessionFromSummary = (sourceThreadId, summary) => {
+    const sourceId = String(sourceThreadId || "").trim();
+    const handoffSummary = String(summary || "").trim();
+    if (!sourceId) throw new Error("A Codex source thread id is required");
+    if (!handoffSummary) throw new Error("The manual handoff summary is empty");
+    const existing = Object.entries(state.freshSessionJobs).find(([, job]) => job?.sourceThreadId === sourceId && job?.status === "pending");
+    if (existing) return { started: true, jobId: existing[0] };
+    const jobId = `${sourceId}:${Date.now()}:${Math.random().toString(16).slice(2)}`;
+    state.freshSessionJobs[jobId] = { status: "pending", sourceThreadId: sourceId };
+    void runFreshSessionFromSummary(sourceId, handoffSummary).then((result) => { state.freshSessionJobs[jobId] = { ...state.freshSessionJobs[jobId], ...result, status: "completed" }; }, (error) => { state.freshSessionJobs[jobId] = { ...state.freshSessionJobs[jobId], status: "failed", reason: String(error?.message || error) }; });
+    return { started: true, jobId };
+  };
+  state.readFreshSessionJob = (jobId) => state.freshSessionJobs[String(jobId || "")] || null;
+"#
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct CodexSummarizeRestartResult {
+    pub new_thread_id: String,
+    pub handoff_turn_id: String,
+    pub debug_port: u16,
+    pub target_id: String,
+}
+
+/// Coordinate the renderer-owned summary and fresh-root handoff without
+/// duplicating app-server or rollout persistence logic in Rust.
+pub(crate) async fn summarize_and_restart_codex_session(
+    thread_id: &str,
+) -> Result<CodexSummarizeRestartResult, String> {
+    if thread_id.trim().is_empty() {
+        return Err("A Codex thread id is required".to_string());
+    }
+    let thread_id_json =
+        serde_json::to_string(thread_id).map_err(|error| format!("Invalid thread id: {error}"))?;
+    let start_script = format!(
+        r#"(() => {{
+          const state = window[{patch_key:?}];
+          if (!state || typeof state.startSummarizeSession !== 'function') return {{started:false, reason:'Codex compatibility layer is not ready'}};
+          try {{ return state.startSummarizeSession({thread_id_json}); }} catch (error) {{ return {{started:false, reason:String(error?.message || error)}}; }}
+        }})()"#,
+        patch_key = MODEL_PICKER_PATCH_KEY,
+    );
+    let mut diagnostics = Vec::new();
+    for port in candidate_debug_ports(DEFAULT_CODEX_DEBUG_PORT) {
+        let targets = match list_cdp_targets(port).await {
+            Ok(targets) => targets,
+            Err(error) => {
+                diagnostics.push(format!("port {port}: {error}"));
+                continue;
+            }
+        };
+        let targets = match pick_codex_page_targets(&targets, port) {
+            Ok(targets) => targets,
+            Err(error) => {
+                diagnostics.push(format!("port {port}: {error}"));
+                continue;
+            }
+        };
+        for target in targets {
+            let Some(websocket_url) = target.web_socket_debugger_url.as_deref() else {
+                continue;
+            };
+            let started = match evaluate_cdp_expression(websocket_url, &start_script).await {
+                Ok(value) => value
+                    .pointer("/result/result/value")
+                    .cloned()
+                    .unwrap_or(Value::Null),
+                Err(error) => {
+                    diagnostics.push(format!("target {}: {error}", target.id));
+                    continue;
+                }
+            };
+            let job_id = started
+                .get("jobId")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            if !started
+                .get("started")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+                || job_id.is_empty()
+            {
+                diagnostics.push(format!(
+                    "target {}: {}",
+                    target.id,
+                    started
+                        .get("reason")
+                        .and_then(Value::as_str)
+                        .unwrap_or("Codex Desktop did not start manual summarization")
+                ));
+                continue;
+            }
+            let job_id_json = serde_json::to_string(&job_id)
+                .map_err(|error| format!("Invalid summary job id: {error}"))?;
+            let poll_script = format!(
+                r#"(() => {{
+                  const state = window[{patch_key:?}];
+                  return state && typeof state.readSummarizeJob === 'function' ? state.readSummarizeJob({job_id_json}) : null;
+                }})()"#,
+                patch_key = MODEL_PICKER_PATCH_KEY,
+            );
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(130);
+            let summary = loop {
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(format!(
+                        "target {}: timed out waiting for Codex summary",
+                        target.id
+                    ));
+                }
+                tokio::time::sleep(Duration::from_millis(750)).await;
+                let value = evaluate_cdp_expression(websocket_url, &poll_script).await?;
+                let value = value
+                    .pointer("/result/result/value")
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                match value.get("status").and_then(Value::as_str) {
+                    Some("completed") => {
+                        break value
+                            .get("summary")
+                            .and_then(Value::as_str)
+                            .filter(|s| !s.trim().is_empty())
+                            .unwrap_or_default()
+                            .to_string()
+                    }
+                    Some("failed") => {
+                        return Err(value
+                            .get("reason")
+                            .and_then(Value::as_str)
+                            .unwrap_or("Codex Desktop summary failed")
+                            .to_string())
+                    }
+                    _ => {}
+                }
+            };
+            if summary.is_empty() {
+                return Err(format!(
+                    "target {}: summary completed without text",
+                    target.id
+                ));
+            }
+            let summary_json = serde_json::to_string(&summary)
+                .map_err(|error| format!("Invalid handoff summary: {error}"))?;
+            let fresh_script = format!(
+                r#"(() => {{
+                  const state = window[{patch_key:?}];
+                  if (!state || typeof state.startFreshSessionFromSummary !== 'function') return {{started:false, reason:'Fresh-session bridge is not ready'}};
+                  try {{ return state.startFreshSessionFromSummary({thread_id_json}, {summary_json}); }} catch (error) {{ return {{started:false, reason:String(error?.message || error)}}; }}
+                }})()"#,
+                patch_key = MODEL_PICKER_PATCH_KEY,
+            );
+            let fresh = evaluate_cdp_expression(websocket_url, &fresh_script).await?;
+            let fresh = fresh
+                .pointer("/result/result/value")
+                .cloned()
+                .unwrap_or(Value::Null);
+            let fresh_job_id = fresh
+                .get("jobId")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if !fresh
+                .get("started")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+                || fresh_job_id.is_empty()
+            {
+                return Err(fresh
+                    .get("reason")
+                    .and_then(Value::as_str)
+                    .unwrap_or("Codex did not start the fresh-session handoff")
+                    .to_string());
+            }
+            let fresh_job_json = serde_json::to_string(fresh_job_id)
+                .map_err(|error| format!("Invalid fresh-session job id: {error}"))?;
+            let fresh_poll_script = format!(
+                r#"(() => {{
+                  const state = window[{patch_key:?}];
+                  return state && typeof state.readFreshSessionJob === 'function' ? state.readFreshSessionJob({fresh_job_json}) : null;
+                }})()"#,
+                patch_key = MODEL_PICKER_PATCH_KEY,
+            );
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(130);
+            loop {
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(format!(
+                        "target {}: timed out waiting for fresh-session handoff",
+                        target.id
+                    ));
+                }
+                tokio::time::sleep(Duration::from_millis(750)).await;
+                let value = evaluate_cdp_expression(websocket_url, &fresh_poll_script).await?;
+                let value = value
+                    .pointer("/result/result/value")
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                match value.get("status").and_then(Value::as_str) {
+                    Some("completed") => {
+                        let new_thread_id = value
+                            .get("newThreadId")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_string();
+                        let handoff_turn_id = value
+                            .get("turnId")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_string();
+                        if new_thread_id.is_empty() || handoff_turn_id.is_empty() {
+                            return Err(
+                                "Fresh-session handoff completed without thread and turn ids"
+                                    .to_string(),
+                            );
+                        }
+                        return Ok(CodexSummarizeRestartResult {
+                            new_thread_id,
+                            handoff_turn_id,
+                            debug_port: port,
+                            target_id: target.id,
+                        });
+                    }
+                    Some("failed") => {
+                        return Err(value
+                            .get("reason")
+                            .and_then(Value::as_str)
+                            .unwrap_or("Fresh-session handoff failed")
+                            .to_string())
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    Err(if diagnostics.is_empty() {
+        "No Codex Desktop CDP target was found".to_string()
+    } else {
+        diagnostics.join("; ")
+    })
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct CodexContinuationResult {
+    pub submitted: bool,
+    pub debug_port: Option<u16>,
+    pub target_id: Option<String>,
+    pub message: String,
+}
+
+/// Find a Codex Desktop renderer and submit a literal `continue` message.
+///
+/// The script deliberately uses user-visible DOM affordances rather than React
+/// internals. It refuses to submit while another turn is generating and returns
+/// an explicit diagnostic when the composer cannot be identified.
+pub(crate) async fn submit_codex_continuation() -> Result<CodexContinuationResult, String> {
+    let attempted_ports = candidate_debug_ports(DEFAULT_CODEX_DEBUG_PORT);
+    let script = r#"(async () => {
+      const visible = (el) => {
+        if (!el) return false;
+        const s = getComputedStyle(el);
+        const r = el.getBoundingClientRect();
+        return s.visibility !== 'hidden' && s.display !== 'none' && r.width > 0 && r.height > 0;
+      };
+      const busy = () => [...document.querySelectorAll('button,[role="button"]')].some((el) => {
+        const label = `${el.getAttribute('aria-label') || ''} ${el.getAttribute('title') || ''}`.trim();
+        const text = `${el.textContent || ''}`.trim();
+        return visible(el) && (/^(stop|cancel|interrupt)( generating| response)?$/i.test(label)
+          || /^(stop|cancel|interrupt)$/i.test(text));
+      });
+      if (busy()) return { submitted:false, reason:'Codex is still generating' };
+      const composer = [...document.querySelectorAll('textarea,[contenteditable="true"],[role="textbox"]')]
+        .filter(visible)
+        .find((el) => !el.matches('[disabled],[readonly]'));
+      if (!composer) return { submitted:false, reason:'Codex composer was not found' };
+      composer.focus();
+      if (composer instanceof HTMLTextAreaElement || composer instanceof HTMLInputElement) {
+        const prototype = composer instanceof HTMLTextAreaElement
+          ? HTMLTextAreaElement.prototype
+          : HTMLInputElement.prototype;
+        const setter = Object.getOwnPropertyDescriptor(prototype, 'value')?.set;
+        if (setter) setter.call(composer, 'continue'); else composer.value = 'continue';
+        composer.dispatchEvent(new InputEvent('input', {bubbles:true, inputType:'insertText', data:'continue'}));
+        composer.dispatchEvent(new Event('change', {bubbles:true}));
+      } else {
+        composer.textContent = 'continue';
+        composer.dispatchEvent(new InputEvent('input', {bubbles:true, inputType:'insertText', data:'continue'}));
+      }
+      const form = composer.closest('form');
+      const submit = form?.querySelector('button[type="submit"],button[aria-label*="send" i],button[aria-label*="submit" i]')
+        || [...document.querySelectorAll('button')].find((el) => visible(el) && /(send|submit)/i.test(`${el.getAttribute('aria-label') || ''} ${el.textContent || ''}`));
+      let method = 'enter';
+      if (submit && !submit.disabled) {
+        submit.click();
+        method = 'button';
+      } else {
+        composer.dispatchEvent(new KeyboardEvent('keydown', {key:'Enter', code:'Enter', bubbles:true, cancelable:true}));
+        composer.dispatchEvent(new KeyboardEvent('keyup', {key:'Enter', code:'Enter', bubbles:true, cancelable:true}));
+      }
+      await new Promise((resolve) => setTimeout(resolve, 750));
+      const value = composer instanceof HTMLTextAreaElement || composer instanceof HTMLInputElement
+        ? composer.value
+        : composer.textContent;
+      const accepted = `${value || ''}`.trim().toLowerCase() !== 'continue' || busy();
+      return accepted
+        ? {submitted:true, method}
+        : {submitted:false, reason:'Codex did not accept the continuation'};
+    })()"#;
+    let mut diagnostics = Vec::new();
+    for port in attempted_ports.iter().copied() {
+        let targets = match list_cdp_targets(port).await {
+            Ok(value) => value,
+            Err(error) => {
+                diagnostics.push(format!("port {port}: {error}"));
+                continue;
+            }
+        };
+        let targets = match pick_codex_page_targets(&targets, port) {
+            Ok(value) => value,
+            Err(error) => {
+                diagnostics.push(format!("port {port}: {error}"));
+                continue;
+            }
+        };
+        for target in targets {
+            let Some(ws) = target.web_socket_debugger_url.as_deref() else {
+                continue;
+            };
+            let (socket, _) =
+                match tokio::time::timeout(CDP_CONNECT_TIMEOUT, connect_async(ws)).await {
+                    Ok(Ok(value)) => value,
+                    Ok(Err(error)) => {
+                        diagnostics.push(format!(
+                            "target {}: failed to connect Codex Desktop CDP: {error}",
+                            target.id
+                        ));
+                        continue;
+                    }
+                    Err(_) => {
+                        diagnostics.push(format!(
+                            "target {}: timed out connecting Codex Desktop CDP",
+                            target.id
+                        ));
+                        continue;
+                    }
+                };
+            let mut session = CdpSession::new(socket);
+            let evaluation = match session
+                .send_command(
+                    1,
+                    "Runtime.evaluate",
+                    json!({
+                        "expression": script, "awaitPromise": true, "returnByValue": true,
+                        "allowUnsafeEvalBlockedByCSP": true
+                    }),
+                )
+                .await
+            {
+                Ok(value) => value,
+                Err(error) => {
+                    diagnostics.push(format!("target {}: {error}", target.id));
+                    continue;
+                }
+            };
+            if let Some(exception) = evaluation
+                .get("result")
+                .and_then(|result| result.get("exceptionDetails"))
+            {
+                diagnostics.push(format!(
+                    "target {}: CDP evaluation failed: {exception}",
+                    target.id
+                ));
+                continue;
+            }
+            let value = evaluation
+                .pointer("/result/result/value")
+                .cloned()
+                .unwrap_or(Value::Null);
+            let submitted = value
+                .get("submitted")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let message = value
+                .get("reason")
+                .and_then(Value::as_str)
+                .unwrap_or(if submitted {
+                    "Continuation submitted"
+                } else {
+                    "Continuation was not submitted"
+                })
+                .to_string();
+            if submitted {
+                return Ok(CodexContinuationResult {
+                    submitted,
+                    debug_port: Some(port),
+                    target_id: Some(target.id),
+                    message,
+                });
+            }
+            diagnostics.push(format!("target {}: {message}", target.id));
+        }
+    }
+    Err(if diagnostics.is_empty() {
+        "No Codex Desktop CDP target was found".to_string()
+    } else {
+        diagnostics.join("; ")
+    })
+}
+
 /// 构造 renderer 注入脚本：触发新版本地历史目录同步，并修复模型白名单和缓存。
 fn build_model_picker_unlock_script(catalog: &CodexModelCatalogProjection) -> String {
     let payload = serde_json::to_string(catalog).unwrap_or_else(|_| "{}".to_string());
@@ -1183,6 +1823,8 @@ fn build_model_picker_unlock_script(catalog: &CodexModelCatalogProjection) -> St
     let request_normalization_core = app_server_request_normalization_core_script();
     let history_lineage_hydration_core = history_lineage_hydration_core_script();
     let module_client_discovery_core = app_server_module_client_discovery_core_script();
+    let request_health_warning_core = request_health_warning_core_script();
+    let summary_handoff_core = summary_handoff_core_script();
     format!(
         r#"
 (async () => {{
@@ -1219,6 +1861,8 @@ fn build_model_picker_unlock_script(catalog: &CodexModelCatalogProjection) -> St
 {request_normalization_core}
 {history_lineage_hydration_core}
 {module_client_discovery_core}
+{request_health_warning_core}
+{summary_handoff_core}
   const patchStatsigConfig = (name, config, repairLegacyPollution = false) => {{
     const prepared = prepareStatsigDynamicConfig(name, config, repairLegacyPollution);
     config = prepared.config;
@@ -1413,6 +2057,8 @@ fn build_model_picker_unlock_script(catalog: &CodexModelCatalogProjection) -> St
   }};
   const patchRequestClient = (client) => {{
     if (!client || typeof client.sendRequest !== "function") return false;
+    state.appServerClients = Array.isArray(state.appServerClients) ? state.appServerClients : [];
+    if (!state.appServerClients.includes(client)) state.appServerClients.push(client);
     if (!appServerRequestClientNeedsPatch(client)) return true;
     try {{
       const original = client.__ccSwitchOriginalSendRequest || client.sendRequest.bind(client);
@@ -3734,6 +4380,115 @@ JSON.stringify({
 
         assert_eq!(result["hasDefault"], false);
         assert_eq!(result["hasEfforts"], false);
+    }
+
+    #[test]
+    fn model_picker_matches_renderer_rows_by_canonical_slug_and_alias() {
+        let result = run_model_picker_patch_core_probe_with_payload(
+            json!({
+                "defaultModel": "gpt-6.1-sol-relay",
+                "modelNames": ["gpt-6.1-sol-relay"],
+                "models": [{
+                    "model": "gpt-6.1-sol-relay",
+                    "id": "openai/gpt-6.1-sol",
+                    "canonicalSlug": "openai/gpt-6.1-sol-20260929",
+                    "aliases": ["gpt-6.1-sol-openrouter"],
+                    "supportedReasoningEfforts": [{"reasoningEffort": "high"}],
+                    "defaultReasoningEffort": "high"
+                }]
+            }),
+            r#"
+const models = [{id: "openai/gpt-6.1-sol-20260929", displayName: "GPT 6.1 Sol"}];
+patchModelArray(models);
+JSON.stringify({
+  model: models[0].model,
+  id: models[0].id,
+  canonicalSlug: models[0].canonicalSlug,
+  aliases: models[0].aliases,
+  efforts: models[0].supportedReasoningEfforts.map((item) => item.reasoningEffort),
+});
+"#,
+        );
+
+        assert_eq!(result["model"], "gpt-6.1-sol-relay");
+        assert_eq!(result["id"], "openai/gpt-6.1-sol");
+        assert_eq!(result["canonicalSlug"], "openai/gpt-6.1-sol-20260929");
+        assert_eq!(result["aliases"], json!(["gpt-6.1-sol-openrouter"]));
+        assert_eq!(result["efforts"], json!(["high"]));
+    }
+
+    #[test]
+    fn model_picker_normalizes_reasoning_aliases_and_deduplicates_levels() {
+        let result = run_model_picker_patch_core_probe_with_payload(
+            json!({
+                "defaultModel": "mixed-reasoning-aliases",
+                "modelNames": ["mixed-reasoning-aliases"],
+                "models": [{
+                    "model": "mixed-reasoning-aliases",
+                    "default_reasoning_level": "unsupported",
+                    "supportedReasoningLevels": [
+                        {"effort": "low"},
+                        {"effort": "low", "description": "duplicate"},
+                        {"reasoning_effort": "high"}
+                    ]
+                }]
+            }),
+            r#"
+const models = [];
+patchModelArray(models, true);
+JSON.stringify({
+  defaultEffort: models[0].defaultReasoningEffort,
+  efforts: models[0].supportedReasoningEfforts,
+  levels: models[0].supportedReasoningLevels,
+});
+"#,
+        );
+
+        assert_eq!(result["defaultEffort"], "low");
+        assert_eq!(
+            result["efforts"],
+            json!([
+                {"reasoningEffort": "low", "description": "low"},
+                {"reasoningEffort": "high", "description": "high"}
+            ])
+        );
+        assert_eq!(
+            result["levels"],
+            json!([
+                {"effort": "low", "description": "low"},
+                {"effort": "high", "description": "high"}
+            ])
+        );
+    }
+
+    #[test]
+    fn model_picker_preserves_grouped_key_display_and_provider_labels() {
+        let result = run_model_picker_patch_core_probe_with_payload(
+            json!({
+                "defaultModel": "gpt-6-sol--ccg-7f3d2b1a",
+                "modelNames": ["gpt-6-sol--ccg-7f3d2b1a"],
+                "models": [{
+                    "model": "gpt-6-sol--ccg-7f3d2b1a",
+                    "upstreamModel": "gpt-6-sol",
+                    "apiKeyGroupId": "7f3d2b1a",
+                    "displayName": "GPT 6 Sol [Sublyx key]",
+                    "providerName": "Sublyx"
+                }]
+            }),
+            r#"
+const models = [{model: "gpt-6-sol--ccg-7f3d2b1a", displayName: "gpt-6-sol--ccg-7f3d2b1a"}];
+patchModelArray(models);
+JSON.stringify({
+  model: models[0].model,
+  displayName: models[0].displayName,
+  providerName: models[0].providerName,
+});
+"#,
+        );
+
+        assert_eq!(result["model"], "gpt-6-sol--ccg-7f3d2b1a");
+        assert_eq!(result["displayName"], "GPT 6 Sol [Sublyx key]");
+        assert_eq!(result["providerName"], "Sublyx");
     }
 
     /// 回归：模型解锁器不能再给 React Intl 的 formats/defaultFormats/formatters

@@ -176,6 +176,9 @@ pub fn plan_codex_provider_set(
     existing_providers: &HashMap<String, Provider>,
     now: i64,
 ) -> Result<PreparedCodexProviderSetMutation, CodexProviderSetError> {
+    let mut normalized_source = source.clone();
+    crate::codex_multirouter::catalog::normalize_settings(&mut normalized_source.settings_config);
+    let source = &normalized_source;
     let catalog = source_catalog(source)?;
     let mut blocked = Vec::new();
     let mut selections = Vec::new();
@@ -387,6 +390,9 @@ pub fn plan_manual_codex_provider_set(
     existing_providers: &HashMap<String, Provider>,
     now: i64,
 ) -> Result<PreparedCodexProviderSetMutation, CodexProviderSetError> {
+    let mut normalized_source = source.clone();
+    crate::codex_multirouter::catalog::normalize_settings(&mut normalized_source.settings_config);
+    let source = &normalized_source;
     let mut provider = source.clone();
     remove_provider_set_fields(&mut provider);
     normalize_provider_transport(&mut provider, transport)?;

@@ -22,6 +22,98 @@ fn default_true() -> bool {
     true
 }
 
+fn default_stream_retry_max_attempts() -> u32 {
+    3
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum StreamRetryMode {
+    Off,
+    Safe,
+    Aggressive,
+}
+
+fn default_stream_retry_mode() -> StreamRetryMode {
+    StreamRetryMode::Safe
+}
+
+fn default_large_request_threshold_bytes() -> u32 {
+    384 * 1024
+}
+
+fn default_max_codex_input_tokens() -> u32 {
+    200_000
+}
+
+fn default_request_health_review_timeout_seconds() -> u32 {
+    60
+}
+
+fn default_request_health_notification_snooze_hours() -> u32 {
+    4
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum RequestOptimizationMode {
+    Off,
+    Diagnose,
+    #[default]
+    Safe,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum RequestHealthReviewMode {
+    Off,
+    #[default]
+    FirstLargeRequest,
+    SustainedGrowth,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RequestHealthConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub optimization_mode: RequestOptimizationMode,
+    #[serde(default = "default_large_request_threshold_bytes")]
+    pub large_request_threshold_bytes: u32,
+    #[serde(default = "default_max_codex_input_tokens")]
+    pub max_codex_input_tokens: u32,
+    #[serde(default = "default_request_health_review_timeout_seconds")]
+    pub review_timeout_seconds: u32,
+    #[serde(default)]
+    pub review_mode: RequestHealthReviewMode,
+    #[serde(default = "default_true", alias = "compactAndRestartEnabled")]
+    pub summarize_and_restart_enabled: bool,
+    #[serde(default = "default_true")]
+    pub windows_notifications_enabled: bool,
+    #[serde(default = "default_request_health_notification_snooze_hours")]
+    pub windows_notification_snooze_hours: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub windows_notifications_snoozed_until_ms: Option<i64>,
+}
+
+impl Default for RequestHealthConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            optimization_mode: RequestOptimizationMode::Safe,
+            large_request_threshold_bytes: default_large_request_threshold_bytes(),
+            max_codex_input_tokens: default_max_codex_input_tokens(),
+            review_timeout_seconds: default_request_health_review_timeout_seconds(),
+            review_mode: RequestHealthReviewMode::FirstLargeRequest,
+            summarize_and_restart_enabled: true,
+            windows_notifications_enabled: true,
+            windows_notification_snooze_hours: default_request_health_notification_snooze_hours(),
+            windows_notifications_snoozed_until_ms: None,
+        }
+    }
+}
+
 /// 主页面显示的应用配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -535,9 +627,18 @@ pub struct AppSettings {
     /// Whether to show the failover toggle independently on the main page
     #[serde(default)]
     pub enable_failover_toggle: bool,
-    /// Whether the proxy may reconnect a Responses stream before semantic output.
+    /// Legacy compatibility switch. New UI writes `stream_retry_mode`; false maps to Off.
     #[serde(default = "default_true")]
     pub enable_stream_retry: bool,
+    /// Proxy stream recovery policy: off, safe, or aggressive.
+    #[serde(default = "default_stream_retry_mode")]
+    pub stream_retry_mode: StreamRetryMode,
+    /// Maximum aggressive recovery attempts after the original request (1..=3).
+    #[serde(default = "default_stream_retry_max_attempts")]
+    pub stream_retry_max_attempts: u32,
+    /// Provider-neutral request size diagnostics and conservative JSON cleanup.
+    #[serde(default)]
+    pub request_health: RequestHealthConfig,
     /// Whether to show the project profile switcher on the main page header
     #[serde(default = "default_show_profile_switcher")]
     pub show_profile_switcher: bool,
@@ -705,6 +806,9 @@ impl Default for AppSettings {
             usage_dashboard_refresh_interval_ms: None,
             enable_failover_toggle: false,
             enable_stream_retry: true,
+            stream_retry_mode: StreamRetryMode::Safe,
+            stream_retry_max_attempts: default_stream_retry_max_attempts(),
+            request_health: RequestHealthConfig::default(),
             show_profile_switcher: true,
             preserve_codex_official_auth_on_switch: false,
             unify_codex_session_history: false,
@@ -747,6 +851,34 @@ impl Default for AppSettings {
 }
 
 impl AppSettings {
+    /// Effective policy after accounting for settings written by pre-tier versions.
+    pub fn stream_retry_mode_effective(&self) -> StreamRetryMode {
+        if !self.enable_stream_retry && self.stream_retry_mode == StreamRetryMode::Safe {
+            StreamRetryMode::Off
+        } else {
+            self.stream_retry_mode
+        }
+    }
+
+    /// Transparent proxy reconnect budget. This is deliberately separate from the
+    /// logical continuation budget: both Safe and Aggressive keep the normal
+    /// pre-semantic reconnect protection.
+    pub fn stream_retry_budget(&self, safe_budget: u32) -> u32 {
+        match self.stream_retry_mode_effective() {
+            StreamRetryMode::Off => 0,
+            StreamRetryMode::Safe | StreamRetryMode::Aggressive => safe_budget,
+        }
+    }
+
+    /// Number of post-semantic logical turn recoveries. Only Aggressive may type
+    /// and submit a continuation through Codex Desktop.
+    pub fn stream_recovery_budget(&self) -> u32 {
+        match self.stream_retry_mode_effective() {
+            StreamRetryMode::Aggressive => self.stream_retry_max_attempts.clamp(1, 3),
+            StreamRetryMode::Off | StreamRetryMode::Safe => 0,
+        }
+    }
+
     fn settings_path() -> Option<PathBuf> {
         // settings.json 保留用于旧版本迁移和无数据库场景
         Some(
@@ -967,6 +1099,30 @@ pub fn update_settings(mut new_settings: AppSettings) -> Result<(), AppError> {
     save_settings_file(&new_settings)?;
     *guard = new_settings;
     Ok(())
+}
+
+pub fn snooze_request_health_windows_notifications() -> Result<(), AppError> {
+    mutate_settings(|settings| {
+        let hours = settings
+            .request_health
+            .windows_notification_snooze_hours
+            .clamp(1, 24);
+        settings.request_health.windows_notifications_enabled = true;
+        settings
+            .request_health
+            .windows_notifications_snoozed_until_ms = Some(
+            chrono::Utc::now()
+                .timestamp_millis()
+                .saturating_add(i64::from(hours).saturating_mul(60 * 60 * 1000)),
+        );
+    })
+}
+
+pub fn request_health_windows_notifications_active(config: &RequestHealthConfig) -> bool {
+    config.windows_notifications_enabled
+        && config
+            .windows_notifications_snoozed_until_ms
+            .is_none_or(|until| chrono::Utc::now().timestamp_millis() >= until)
 }
 
 fn mutate_settings<F, R>(mutator: F) -> Result<R, AppError>
@@ -1510,11 +1666,33 @@ mod tests {
     fn stream_retry_defaults_enabled_and_accepts_legacy_settings_payloads() {
         let defaults = AppSettings::default();
         assert!(defaults.enable_stream_retry);
+        assert_eq!(
+            defaults.stream_retry_mode_effective(),
+            StreamRetryMode::Safe
+        );
+        assert_eq!(defaults.stream_retry_budget(5), 5);
+        assert_eq!(defaults.stream_recovery_budget(), 0);
 
         let decoded: AppSettings = serde_json::from_value(serde_json::json!({
             "enableStreamRetry": false,
         }))
         .expect("settings payload");
         assert!(!decoded.enable_stream_retry);
+        assert_eq!(decoded.stream_retry_mode_effective(), StreamRetryMode::Off);
+        assert_eq!(decoded.stream_retry_budget(5), 0);
+    }
+
+    #[test]
+    fn aggressive_retry_keeps_safe_reconnects_and_clamps_continuations() {
+        for (configured, expected) in [(0, 1), (1, 1), (2, 2), (3, 3), (99, 3)] {
+            let settings = AppSettings {
+                enable_stream_retry: true,
+                stream_retry_mode: StreamRetryMode::Aggressive,
+                stream_retry_max_attempts: configured,
+                ..AppSettings::default()
+            };
+            assert_eq!(settings.stream_retry_budget(5), 5);
+            assert_eq!(settings.stream_recovery_budget(), expected);
+        }
     }
 }

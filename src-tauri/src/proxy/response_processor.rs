@@ -263,6 +263,13 @@ pub async fn handle_non_streaming(
         if let Ok(json_value) = serde_json::from_slice::<Value>(&body_bytes) {
             // 解析使用量
             if let Some(usage) = (parser_config.response_parser)(&json_value) {
+                if ctx.app_type_str == "codex" {
+                    crate::proxy::request_health::record_usage(
+                        &ctx.request_health_trace,
+                        usage.input_tokens,
+                        usage.cache_read_tokens,
+                    );
+                }
                 // 归因优先级：usage 解析出的模型 → 响应 model 字段 → 映射后的出站
                 // 模型（路由接管真值）→ 客户端请求模型。空字符串视为缺失。
                 let model = usage
@@ -542,6 +549,7 @@ pub(crate) fn create_usage_collector(
     let stream_parser = parser_config.stream_parser;
     let model_extractor = parser_config.model_extractor;
     let session_id = ctx.session_id.clone();
+    let request_health_trace = ctx.request_health_trace.clone();
 
     Some(SseUsageCollector::new(
         start_time,
@@ -556,6 +564,13 @@ pub(crate) fn create_usage_collector(
                 status_code
             };
             if let Some(usage) = stream_parser(&events) {
+                if app_type_str == "codex" {
+                    crate::proxy::request_health::record_usage(
+                        &request_health_trace,
+                        usage.input_tokens,
+                        usage.cache_read_tokens,
+                    );
+                }
                 let model = model_extractor(&events, &fallback_model);
                 let latency_ms = start_time.elapsed().as_millis() as u64;
 

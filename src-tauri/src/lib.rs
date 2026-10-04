@@ -15,6 +15,7 @@ mod codex_guardian;
 pub mod codex_history_migration;
 pub mod codex_multirouter;
 pub mod codex_runtime_refresh;
+mod codex_session_coordination;
 mod codex_startup;
 mod codex_state_db;
 pub(crate) mod codex_subagent_profiles;
@@ -54,6 +55,8 @@ pub mod watchdog;
 mod tray;
 mod usage_events;
 mod usage_script;
+#[cfg(target_os = "windows")]
+mod windows_window_icon;
 
 pub use app_config::{AppType, InstalledSkill, McpApps, McpServer, MultiAppConfig, SkillApps};
 pub use codex_config::{
@@ -358,6 +361,11 @@ pub fn run() {
     panic_hook::setup_panic_hook();
 
     let mut builder = tauri::Builder::default();
+
+    #[cfg(target_os = "windows")]
+    {
+        builder = builder.plugin(windows_window_icon::init());
+    }
 
     #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
     {
@@ -1606,6 +1614,7 @@ pub fn run() {
             commands::is_claude_plugin_applied,
             commands::detect_codex_plugin_registration,
             commands::repair_codex_plugin_registration,
+            commands::inspect_codex_plugin_health,
             commands::apply_claude_onboarding_skip,
             commands::clear_claude_onboarding_skip,
             // Claude MCP management
@@ -1767,6 +1776,7 @@ pub fn run() {
             commands::force_release_proxy_port_and_restore_takeover,
             commands::restore_configured_proxy_listener,
             commands::get_proxy_status,
+            commands::get_request_health_diagnostics,
             commands::diagnose_codex_multirouter,
             commands::unlock_codex_model_picker,
             commands::get_codex_guardian_status,
@@ -1844,6 +1854,7 @@ pub fn run() {
             commands::get_session_messages,
             commands::delete_session,
             commands::delete_sessions,
+            commands::purge_archived_sessions,
             commands::launch_session_terminal,
             commands::get_tool_versions,
             commands::run_tool_lifecycle_action,
