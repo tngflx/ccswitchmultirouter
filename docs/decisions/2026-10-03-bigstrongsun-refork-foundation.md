@@ -71,8 +71,17 @@ Port order:
 
 No additional approval is required for the requested fresh-refork migration. Destructive replacement of the legacy checkout, force-push, release, or production-data migration remains gated on final verification and an explicit cutover step. The legacy dirty working tree must not be overwritten.
 
+## Current status (2026-10-05)
+
+- Approval: approved (unchanged)
+- Implementation: in-progress; ported source batch is complete, controlled cutover remains
+- Verification: source verification passed; first parallel full-Rust attempt was blocked by the Windows paging-file limit, then the serial rerun passed
+- Runtime freshness: not-checked; the fresh desktop process has not been rebuilt and restarted
+- Cutover: not-started; remote `main` replacement and legacy checkout preservation remain pending
+
 ## Status history (append-only)
 
 - 2026-10-03: Decision approved by the user's explicit fresh-refork and replacement instruction. Fresh target cloned and clean baseline compile/type checks passed; implementation marked in-progress and verification partial.
 - 2026-10-03: Ported the first provider/request contract slice. Canonical protocol settings own runtime behavior; legacy reasoning metadata is a compatibility input and is removed by canonical saves. Targeted backend/frontend tests and compile/type checks passed; overall migration remains in-progress.
+- 2026-10-05: Ported the remaining approved source slices into the fresh owners, rechecked the required fork-specific identifiers, and completed source-level verification. `cargo fmt --manifest-path src-tauri/Cargo.toml --all -- --check`, `cargo check --manifest-path src-tauri/Cargo.toml`, `pnpm format:check`, `pnpm typecheck`, targeted Vitest (44 tests), and full Vitest (1,744 tests) passed. The first parallel `cargo test` attempt hit Windows paging-file exhaustion (`os error 1455`); the required full suite was rerun with `CARGO_BUILD_JOBS=1` and `--test-threads=1` and exited 0 with no test failures. Runtime freshness and cutover remain pending.
 

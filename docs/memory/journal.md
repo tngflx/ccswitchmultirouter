@@ -1,5 +1,309 @@
 # Engineering Journal
 
+## 2026-10-05 Completed source verification for the fresh refork migration
+
+What happened: the approved fresh-refork port batch reached its source-level
+verification boundary. The initial parallel full Rust command could not finish
+because Windows exhausted the paging file while compiling tests (`os error
+1455`), producing invalid metadata and cascading crate-load errors.
+
+Root cause: verification parallelism exceeded the available Windows paging
+capacity; the compiler diagnostics did not identify a source failure.
+
+What we did: reran the unchanged full Rust suite with one Cargo build job and
+one test thread, then retained the existing frontend and targeted verification
+results. We did not weaken or skip tests, create an alternate target directory,
+or change source to mask the environment failure.
+
+Evidence: `cargo test --manifest-path src-tauri/Cargo.toml -- --test-threads=1`
+with `CARGO_BUILD_JOBS=1` exited 0 across the full unit and integration suite;
+`cargo fmt --manifest-path src-tauri/Cargo.toml --all -- --check`, `cargo check
+--manifest-path src-tauri/Cargo.toml`, `pnpm format:check`, and `pnpm typecheck`
+passed; full Vitest passed (1,744 tests); and `git diff --check` passed. The
+fresh desktop runtime was not rebuilt or inspected, and the remote/physical
+cutover was not performed.
+
+What NOT to do again: do not interpret paging-file exhaustion as a source test
+failure, do not bypass the full suite with a second build target, and do not
+claim runtime freshness or replacement cutover from source-only evidence.
+
+Related decision: `docs/decisions/2026-10-03-bigstrongsun-refork-foundation.md`.
+
+## 2026-10-05 Classified remaining legacy-only candidates
+
+What happened: the fresh refork still had no direct counterparts for the
+legacy global-loading/deferred-render layer, the generic common-config loader,
+or the monolithic Codex compatibility template.
+
+Root cause: these files came from the legacy fork's incremental UI and CDP
+patches, while the fresh architecture uses app-specific config hooks and a
+standalone model-picker core. BigStrongSun's current history also removed dead
+common-config plumbing.
+
+What we did: rejected the generic common-config hook and compatibility
+template as duplicate owners; deferred global loading/deferred rendering
+because the fresh tree has no consumers or upstream equivalent; and recorded
+the rationale in `docs/decisions/2026-10-05-legacy-only-audit.md`.
+
+Evidence: fresh-tree searches confirmed none of the four legacy source modules
+are referenced; `git show upstream/main:src/components/providers/forms/hooks/useLoadCommonConfigSnippet.ts`
+confirmed the helper is absent upstream; and the reference history inspection
+found the deliberate common-config cleanup in commit `69ff69dd7`.
+
+What NOT to do again: do not copy legacy-only files solely because their paths
+are missing. First establish a current fresh consumer and a single ownership
+boundary, then port only the behavior that remains required.
+
+## 2026-10-05 Added visible-only Codex catalog rendering
+
+What happened: the fresh refork's Codex form rendered every catalog row in the
+reasoning and model-mapping editors and resolved reasoning for the entire
+catalog. Root cause: the fresh architecture had not yet adopted the legacy
+viewport's explicit page and expansion boundary.
+
+What we did: added `CodexCatalogViewport` with stable row-ID pagination,
+explicit expansion, visible-row callbacks, and disabled-inventory controls;
+wrapped both catalog surfaces; and limited reasoning resolution to visible
+rows. Existing catalog reconciliation, persistence, protocol overrides, and
+input-capability ownership remain in `CodexFormFields` and its current helpers.
+
+Evidence: `pnpm exec vitest run
+tests/components/CodexCatalogViewport.test.tsx` passed (2/2);
+`pnpm exec vitest run tests/components/CodexFormFields.test.tsx
+tests/components/CodexCatalogViewport.test.tsx` passed (42/42);
+`pnpm typecheck` passed; targeted Prettier checks passed; and `git diff --check`
+passed. Runtime freshness was not checked because the refork desktop process
+has not been rebuilt and restarted. Related decision:
+`docs/decisions/2026-10-05-codex-catalog-viewport-port.md`.
+
+What NOT to do again: do not reintroduce direct full-catalog maps or move
+catalog persistence and reasoning policy into the viewport renderer.
+
+## 2026-10-05 Restored takeover activation feedback in the refork header
+
+What happened: the fresh refork kept the proxy/takeover state and color change
+but had lost the legacy header's one-shot activation feedback. Root cause: the
+visual transition component was not ported even though `App.tsx` already owned
+all required state.
+
+What we did: added `RoutingActivationBrand`, gated its transition on resolved
+proxy/takeover status, keyed it by active app context, and kept all IPC and
+state ownership in `App.tsx`.
+
+Evidence: `pnpm exec vitest run
+tests/components/RoutingActivationBrand.test.tsx` passed (2/2);
+`pnpm typecheck` passed; targeted Prettier checks passed; and `git diff
+--check` passed. Runtime freshness was not checked because the refork desktop
+process has not been rebuilt and restarted. Related decision:
+`docs/decisions/2026-10-05-routing-activation-brand-port.md`.
+
+What NOT to do again: do not move proxy status ownership into a visual header
+component or animate the initial resolved state as though it were a new
+activation.
+
+## 2026-10-05 Consolidated auto-sync coordination and restored Windows taskbar icon
+
+What happened: the fresh refork had duplicate suppression, debounce, dirty-signal,
+and worker-loop implementations in WebDAV and S3 auto-sync, and it lacked the
+legacy fork's explicit large Windows taskbar icon assignment. Root cause: the
+refork port retained transport modules as independent copies instead of separating
+shared coordination mechanics from transport-specific upload behavior; AppUserModelID
+alone did not restore the native `ICON_BIG` assignment.
+
+What we did: added a transport-neutral `services::auto_sync::AutoSyncState` with
+one static instance per transport, preserving independent suppression and status
+contracts while removing duplicated queue/worker logic. Added and registered the
+Windows-only `WM_SETICON(ICON_BIG)` plugin without changing AppUserModelID setup.
+
+Evidence: `cargo test --manifest-path src-tauri/Cargo.toml --lib auto_sync` passed
+(13/13); `cargo test --manifest-path src-tauri/Cargo.toml --lib windows_window_icon`
+passed (1/1); `cargo check --manifest-path src-tauri/Cargo.toml` passed; and
+`git diff --check` passed. Runtime freshness was not checked because the refork
+desktop process has not been rebuilt and restarted. Related decisions:
+`docs/decisions/2026-10-05-auto-sync-coordination-port.md` and
+`docs/decisions/2026-10-05-windows-taskbar-icon-port.md`.
+
+What NOT to do again: do not duplicate coordination mechanics inside each sync
+transport, merge transport suppression state globally, or add a second Codex
+compatibility injector when the refork already owns equivalent inline cores.
+
+## 2026-10-05 Ported Codex catalog normalization into the refork
+
+What happened: the fresh refork accepted the shared Codex catalog contract at
+the renderer boundary, but imported or persisted legacy aliases could still
+reach SQLite and MultiRouter compilation in noncanonical form. Root cause: the
+normalization owner stopped at the frontend adapter, leaving provider DAO and
+compiler inputs inconsistent.
+
+What we did: added the pure idempotent normalizer under
+`codex_multirouter::catalog`; applied it only to Codex provider DAO
+read/write/direct-update boundaries; and normalized cloned provider inputs
+before compiler validation, mutation planning, and provider-set planning. The
+normalizer covers catalog aliases, context-window token strings, modalities,
+reasoning metadata, and cache metadata. Non-Codex settings, remote
+reconciliation, route pruning, and route projection remain owned by their
+existing layers.
+
+Evidence: `cargo check --manifest-path src-tauri/Cargo.toml` passed; focused
+Rust tests passed (catalog 1/1, compiler 20/20, provider DAO 7/7,
+provider-set 23/23); `pnpm typecheck` passed; affected Vitest suites passed
+(7 files, 52/52 tests); and `git diff --check` passed. Runtime freshness was
+not checked because the refork desktop process has not been rebuilt and
+restarted.
+
+What NOT to do again: do not normalize only in React, copy the legacy DAO into
+every caller, or create a second owner for reconciliation, route projection,
+or pruning. Related:
+`docs/decisions/2026-10-05-codex-catalog-normalization-port.md`.
+
+## 2026-10-05 Ported Codex catalog version pruning
+
+What happened: the fresh refork preserved the full reconciled Codex catalog
+when users explicitly reset model order, while the legacy fork removed stale
+recognized releases from each model branch. Root cause: version pruning was a
+projection concern that had been omitted when catalog reconciliation was
+centralized in the refork.
+
+What we did: added a pure shared pruning utility and made the route compiler
+apply it only for explicit model-order reset. The utility keeps the newest
+release per capability branch, treats GPT codenames and specialized offerings
+independently, compares dated snapshots only within the same release identity
+and date width, preserves unknown aliases, provider namespaces, input order,
+and object identity, and filters spawn-agent candidates against the pruned
+model set. Ordinary projection and persistence remain unchanged.
+
+Evidence: `pnpm exec vitest run tests/lib/codexCatalogVersionPruning.test.ts
+--reporter=dot` passed (6/6); the focused compiler/reset run passed (22/22);
+the combined pruning/compiler assertions passed (8/8); `pnpm typecheck` and
+`git diff --check` passed; and targeted Prettier formatting was applied and
+checked. Runtime freshness was not checked because the refork desktop process
+has not been rebuilt and restarted.
+
+What NOT to do again: do not prune every catalog projection, copy pruning into
+the provider form, or introduce a second reconciliation owner. Related:
+`docs/decisions/2026-10-05-codex-catalog-version-pruning-port.md`.
+
+## 2026-10-04 Ported Codex plugin/browser health diagnostics
+
+What happened: the fresh refork exposed Codex personal-plugin registration
+repair but had no browser integration health report or Settings panel. Root
+cause: the legacy fork bundled browser/plugin checks beside registration
+detection, while the refork already had a newer registration owner that should
+not be duplicated. What we did: added a read-only browser diagnostics service
+that delegates registration detection to `codex_plugin_registry`, probes the
+bundled Browser plugin scripts, exposes typed IPC/API contracts, adds an
+Advanced Settings panel with explicit repair actions, and localizes all new
+strings in `en`, `zh`, `zh-TW`, and `ja`.
+
+Evidence: `pnpm exec vitest run
+tests/components/CodexPluginHealthPanel.test.tsx` passed (2/2); `cargo test
+--manifest-path src-tauri/Cargo.toml --lib
+services::codex_plugin_health::tests` passed (2/2); `cargo check
+--manifest-path src-tauri/Cargo.toml` passed; `pnpm typecheck` passed;
+targeted Prettier checks, new-module `rustfmt --check`, and `git diff --check`
+passed. The Rust test build emitted two unrelated existing warnings. Whole
+crate `cargo fmt --check` still reports known formatting differences outside
+this feature. No rebuilt runtime was inspected.
+
+What NOT to do again: do not copy the legacy plugin registry into the refork,
+automatically install browser extensions/native hosts, or claim live health
+without rebuilding and restarting the refork app. Related:
+`docs/decisions/2026-10-04-codex-plugin-health-port.md`.
+
+## 2026-10-04 Ported Codex session deletion coordination
+
+What happened: the fresh refork deleted local Codex rollout files but did not
+notify the Codex app-server, and it lacked the legacy confirmed purge for
+archived rollouts. Root cause: local provider deletion and Codex's persisted
+thread catalog are separate ownership boundaries. What we did: retained the
+fresh multi-provider Session Manager and Pi discovery, added one focused
+`thread/delete` app-server coordinator, kept catalog cleanup best effort after
+validated local deletion, and restored an all-items-attempted archived purge
+through typed IPC and a confirmed Codex-only UI action. Evidence: coordination
+tests passed 1/1, session-manager tests 6/6, Codex provider tests 21/21, the
+Session Manager component suite 18/18, `cargo check` and `pnpm typecheck`
+passed, and targeted formatting checks passed. One initial frontend assertion
+failed because the test i18n harness used the English default-value fallback;
+the assertion was corrected and the suite rerun. Whole-tree `cargo fmt --check`
+still reports known upstream/toolchain formatting drift outside this port. No
+rebuilt runtime was inspected. What NOT to do again: do not treat rollout-file
+deletion as sufficient catalog cleanup, mutate Codex state databases directly,
+or replace the fresh Session Manager with the legacy component. Related:
+`docs/decisions/2026-10-04-codex-session-deletion-coordination.md`.
+
+## 2026-10-04 Finalized four-point request-body accounting
+
+What happened: the request-health port initially observed parsed/transformed
+JSON but did not prove what exact client bytes arrived, what immutable bytes
+each retry replayed, or what compressed bytes reached the upstream transport.
+Root cause: request measurement and retry construction were distributed across
+handlers, provider transforms, Responses-Lite fallback, rejection retry, and
+stream reconnect. What we did: attached exact decoded byte counts before JSON
+parsing; introduced one finalized payload owning transformed JSON and optional
+zstd wire bytes; made ordinary, rejection, transport, and stream retries clone
+that payload; separately finalized Responses-Lite fallback; and kept semantic
+review independent from wire-byte approval/hash accounting. This also fixed the
+fallback reconnect path so it replays the accepted fallback variant rather than
+the rejected primary body. Evidence: `cargo check` passed; request-health tests
+passed 17/17; OpenAI compatibility tests 38/38; Codex request-policy tests 36/36;
+forwarder tests 183/183; focused frontend tests 5/5; and `pnpm typecheck` passed.
+One initial unscoped targeted Cargo invocation failed before tests with stale
+multi-target `E0460`/`E0463` artifacts; library-scoped verification passed, and
+the full Rust suite remains for the final migration boundary. No live refork
+runtime was rebuilt or inspected. What NOT to do again: do not reserialize or
+restore request history inside a retry, hash semantic JSON while sending a
+different compressed entity, or let fallback reconnect retain the rejected
+primary variant. Related:
+`docs/decisions/2026-10-04-request-health-port.md`.
+
+## 2026-10-04 Ported bounded Codex Desktop turn recovery
+
+What happened: the fresh refork already reconnected Responses streams before
+semantic output but lacked the legacy fork's bounded Desktop continuation after
+an interrupted turn. Root cause: transparent HTTP replay and semantic Desktop
+continuation are different recovery layers, and copying the legacy handler
+would have created duplicate retry ownership. What we did: kept immutable
+pre-semantic replay in `streaming_retry.rs`; added a session-scoped final-stream
+observer for verified Codex Desktop requests; excluded compaction; added a CDP
+composer submission operation to the existing Desktop owner; and replaced the
+Boolean UI with one SettingsPage-controlled Off/Safe/Aggressive selector that
+also persists the legacy compatibility flag. Evidence: `cargo check
+--manifest-path src-tauri/Cargo.toml` passed without library warnings; recovery
+tests passed 8/8; Codex Desktop tests passed 51/51; the two focused retry-policy
+tests passed; the prior handler identity test passed 1/1 and streaming retry
+tests passed 45/45; focused frontend tests passed 12/12; and `pnpm typecheck`
+passed. The full suites and live Desktop runtime remain untested at this stage.
+What NOT to do again: do not merge semantic continuation into transparent
+stream replay, accept External API identity spoofing, or give a settings widget
+its own full-object save path. Related:
+`docs/decisions/2026-10-04-codex-desktop-turn-recovery-port.md`.
+
+## 2026-10-04 Ported reasoning and catalog compatibility into fresh refork
+
+What happened: the fresh foundation had the canonical Codex request and
+catalog owners, but lacked the legacy compatibility names and several catalog
+sync safeguards. Root cause: the legacy fork exposed adapters and form-local
+reconciliation while the fresh architecture had already centralized those
+responsibilities under `HistoryReplay`, OpenAI compatibility normalization,
+and `codexCatalogReconciliation.ts`.
+
+What we did: added thin `ReasoningContentMode` and strict-schema normalizer
+adapters over the existing request owners; moved catalog schema normalization,
+identity binding, context inference, capability hydration, refresh policy, and
+safe missing-row removal into the central reconciliation module; and reduced
+`codexCatalogSync.ts` to re-exports so there is one owner.
+
+Evidence: `cargo check --manifest-path src-tauri/Cargo.toml` passed;
+three reasoning-mode Rust tests and one strict-schema adapter Rust test passed;
+`pnpm vitest run src/lib/codexCatalogReconciliation.test.ts` passed (6 tests);
+`pnpm typecheck` passed; and `git diff --check` passed. Runtime freshness was
+not checked because no rebuilt desktop process was requested. Related decisions:
+`docs/decisions/2026-10-04-reasoning-compatibility-adapters.md` and
+`docs/decisions/2026-10-04-catalog-reconciliation-port.md`.
+
+What NOT to do again: do not copy legacy request branches or form helpers into
+the fresh refork when the new architecture already has a canonical owner.
+
 ## 2026-10-04 Ported model-specific key-group editor
 
 What happened: the fresh refork's grouped Codex credential UI could edit exact
@@ -83,6 +387,50 @@ lock-taking switch method from inside a lifecycle lock, do not terminate by
 process name without verified Desktop identity, and do not duplicate catalog
 identity or row-seed contracts. Related:
 `docs/decisions/2026-10-04-codex-provider-switch-desktop-lifecycle-port.md`.
+
+## 2026-10-05 Consolidated usage relative-time formatting
+
+What happened: three fresh-refork quota/usage footers each implemented the
+same relative-time thresholds. Root cause: the display formatter had no shared
+utility owner. What we did: added `utils/usageRelativeTime.ts`, switched
+`UsageFooter`, `CopilotQuotaFooter`, and `SubscriptionQuotaFooter` to import it,
+and ported boundary tests. Evidence: `pnpm exec vitest run
+tests/lib/usageRelativeTime.test.ts` (7 tests), `pnpm typecheck`, Prettier,
+and `git diff --check` passed. Runtime freshness was not checked because no
+rebuilt desktop process was requested. What NOT to do again: do not duplicate
+the `usage.*` threshold logic in another footer; keep session-specific labels
+in the session formatter. Related:
+`docs/decisions/2026-10-05-usage-relative-time-consolidation.md`.
+
+## 2026-10-05 Extracted Codex Sub-Agent validation diagnostics
+
+What happened: the fresh provider form parsed the Sub-Agent V2 validation code
+inline and discarded optional offending-model details. Root cause: the backend
+diagnostic boundary had no reusable parser in the refork. What we did: added
+the tested parser from the legacy feature, adapted the form to existing
+translated incomplete/validation messages, and kept backend validation as the
+authority. Evidence: focused parser and `ProviderForm.codexPreset` suites (23
+tests), `pnpm typecheck`, Prettier, and `git diff --check` passed. Runtime
+freshness was not checked because no rebuilt desktop process was requested.
+What NOT to do again: do not move validation into UI parsing or hardcode a
+second error-code check in another form. Related:
+`docs/decisions/2026-10-05-codex-subagent-error-parser-port.md`.
+
+## 2026-10-05 Consolidated models.dev catalog ownership
+
+What happened: the fresh refork's automatic-sync dialog and manual pricing
+picker duplicated the same models.dev query, flattening, provider sorting,
+filtering, and visible-row bounds. Root cause: the catalog view contract had no
+shared hook, so two dialogs independently owned one cache key and matching
+behavior. What we did: added `useModelsDevCatalog` with caller-specific row
+limits and an `enabled` gate, then adapted both dialogs while retaining their
+selection and persistence ownership. Evidence: `pnpm exec vitest run
+tests/components/ModelsDevPickerDialog.test.ts tests/components/ModelsDevAutoSyncPanel.test.tsx
+tests/hooks/useModelsDevCatalog.test.tsx` (24 tests), `pnpm typecheck`,
+Prettier checks, and `git diff --check` passed. Runtime freshness was not
+checked because no rebuilt desktop process was requested. What NOT to do again:
+do not copy either dialog wholesale or add another models.dev query/filter
+owner. Related: `docs/decisions/2026-10-05-models-dev-catalog-hook-port.md`.
 
 ## 2026-10-03 Centralized Codex catalog reconciliation
 
