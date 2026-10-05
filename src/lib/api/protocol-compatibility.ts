@@ -11,22 +11,13 @@ import type { CodexRoutingProjectionStatus } from "./providers";
 export type CodexProtocolTransport = "open_ai_responses" | "open_ai_chat";
 export type CodexEffectiveTransport = CodexProtocolTransport | "mixed";
 export type CodexProtocolProbeStage =
-  | "baseline"
-  | "streaming"
-  | "reasoning"
-  | "forced_tool"
-  | "continuation";
+  "baseline" | "streaming" | "reasoning" | "forced_tool" | "continuation";
 export type CodexProtocolProbeStageStatus =
-  | "passed"
-  | "unsupported"
-  | "failed"
-  | "skipped";
+  "passed" | "unsupported" | "failed" | "skipped";
 export type CodexProtocolProbeReadiness = "verified" | "partial" | "unverified";
 export type CodexProtocolProbeScope = "automatic_models" | "all_enabled_models";
 export type CodexCompatibilityRule =
-  | "tool_schema"
-  | "reasoning_text_replay"
-  | "omit_reasoning";
+  "tool_schema" | "reasoning_text_replay" | "omit_reasoning";
 export type CodexAdaptationTrigger =
   | "explicit_tool_schema_rejection"
   | "ambiguous_request_rejection"
@@ -158,8 +149,7 @@ export interface CodexProtocolProbeTokenUsage {
   totalTokens: number;
 }
 
-export interface CodexProtocolProbeUsageSummary
-  extends CodexProtocolProbeTokenUsage {
+export interface CodexProtocolProbeUsageSummary extends CodexProtocolProbeTokenUsage {
   reportedResponses: number;
   successfulResponses: number;
   estimatedCostUsd: string | null;
@@ -287,15 +277,9 @@ export interface UniversalProviderSetCommitOutcome {
 
 export type CodexProviderPersistence = "single" | "split" | "legacy_mixed";
 export type CodexAdaptationStatus =
-  | "not_tested"
-  | "ready"
-  | "partial"
-  | "failed"
-  | "stale";
+  "not_tested" | "ready" | "partial" | "failed" | "stale";
 export type CodexProtocolChoice =
-  | "follow_auto"
-  | "openai_responses"
-  | "openai_chat";
+  "follow_auto" | "openai_responses" | "openai_chat";
 
 export interface CodexProviderModelAdaptation {
   publicModel: string;

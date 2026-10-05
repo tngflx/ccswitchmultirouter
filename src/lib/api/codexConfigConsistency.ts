@@ -1,21 +1,13 @@
 import { invoke } from "@tauri-apps/api/core";
 
 export type CodexConfigConsistencyState =
-  | "consistent"
-  | "external_drift"
-  | "not_applicable"
-  | "unavailable";
+  "consistent" | "external_drift" | "not_applicable" | "unavailable";
 
 export type CodexConfigConsistencyAction =
-  | "apply_ccsm"
-  | "keep_codex"
-  | "later";
+  "apply_ccsm" | "keep_codex" | "later";
 
 export type CodexConfigRuntimeActivationState =
-  | "not_running"
-  | "current"
-  | "restart_required"
-  | "unknown";
+  "not_running" | "current" | "restart_required" | "unknown";
 
 export interface CodexConfigRuntimeActivation {
   state: CodexConfigRuntimeActivationState;

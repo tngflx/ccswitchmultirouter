@@ -299,8 +299,7 @@ export function EditProviderDialog({
 
       const codexRouting = updatedProvider.settingsConfig.codexRouting;
       const protocolSet = updatedProvider.settingsConfig.codexProtocolSet as
-        | { role?: unknown }
-        | undefined;
+        { role?: unknown } | undefined;
       const isGeneratedFacade = protocolSet?.role === "facade";
       const authSource = updatedProvider.meta?.authBinding?.source;
       const isEligibleCodexLogicalSource =

@@ -5,8 +5,8 @@ export function isCodexProtocolSetMember(provider: Provider): boolean {
   const marker = provider.settingsConfig?.codexProtocolSet;
   return Boolean(
     marker &&
-      typeof marker === "object" &&
-      (marker.role === "facade" || marker.role === "leaf"),
+    typeof marker === "object" &&
+    (marker.role === "facade" || marker.role === "leaf"),
   );
 }
 
@@ -15,7 +15,7 @@ export function isUserCodexRoutingPlan(provider: Provider): boolean {
   const routing = provider.settingsConfig?.codexRouting;
   return Boolean(
     routing &&
-      typeof routing === "object" &&
-      (routing.enabled !== false || (routing.routes?.length ?? 0) > 0),
+    typeof routing === "object" &&
+    (routing.enabled !== false || (routing.routes?.length ?? 0) > 0),
   );
 }

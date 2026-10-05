@@ -1,7 +1,5 @@
 export type CodexSubagentV2SelectionPolicy =
-  | "balanced"
-  | "official_first"
-  | "third_party_first";
+  "balanced" | "official_first" | "third_party_first";
 
 export type CodexSubagentTaskStrength =
   | "long_context_reading"
@@ -17,22 +15,13 @@ export type CodexSubagentTaskStrength =
 
 export type CodexSubagentOptimization = "speed" | "balanced" | "quality";
 export type CodexSubagentWriteScope =
-  | "read_only"
-  | "bounded_changes"
-  | "complex_changes";
+  "read_only" | "bounded_changes" | "complex_changes";
 export type CodexSubagentPreference = "preferred" | "eligible" | "fallback";
 export type CodexSubagentExplicitReasoningEffort =
-  | "minimal"
-  | "low"
-  | "medium"
-  | "high"
-  | "xhigh"
-  | "max"
-  | "ultra";
+  "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | "ultra";
 
 export type CodexSubagentReasoningEffort =
-  | "none"
-  | CodexSubagentExplicitReasoningEffort;
+  "none" | CodexSubagentExplicitReasoningEffort;
 
 export interface CodexSubagentReasoningCapability {
   supportKind: "effort_levels" | "boolean_only" | "unsupported" | "unknown";
@@ -63,24 +52,15 @@ export type CodexSubagentReasoningCapabilities = Record<
 
 /** 三态支持状态（模型推理能力 schema v2）。 */
 export type CodexReasoningSupportStatus =
-  | "confirmed_supported"
-  | "confirmed_unsupported"
-  | "unknown";
+  "confirmed_supported" | "confirmed_unsupported" | "unknown";
 
 /** 控制形态（模型推理能力 schema v2），与支持状态相互独立。 */
 export type CodexReasoningControlKind =
-  | "none"
-  | "boolean"
-  | "graded"
-  | "budget"
-  | "unknown";
+  "none" | "boolean" | "graded" | "budget" | "unknown";
 
 /** 能力声明的证据等级。 */
 export type CodexReasoningCapabilityConfidence =
-  | "authoritative"
-  | "verified"
-  | "maintained"
-  | "inferred";
+  "authoritative" | "verified" | "maintained" | "inferred";
 
 export interface CodexModelReasoningUpstream {
   format: string;
@@ -282,11 +262,7 @@ export type CodexSubagentNonGenerationReason = Exclude<
 export type CodexSubagentFieldSource = "automatic" | "override";
 
 export type CodexSubagentInputModalitySource =
-  | "profile_explicit"
-  | "route"
-  | "catalog"
-  | "name_registry"
-  | "unknown";
+  "profile_explicit" | "route" | "catalog" | "name_registry" | "unknown";
 
 export interface CodexSubagentModalityDeclaration {
   source: CodexSubagentInputModalitySource;
@@ -332,9 +308,7 @@ export interface CodexSubagentProfileStatus {
 export interface CodexSubagentProfileStatuses {
   mode: "v1" | "v2";
   generationSource:
-    | "legacy_managed_roles"
-    | "configured_profiles"
-    | "inactive_v1";
+    "legacy_managed_roles" | "configured_profiles" | "inactive_v1";
   profiles: CodexSubagentProfileStatus[];
   warnings: string[];
 }

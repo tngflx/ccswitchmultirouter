@@ -114,8 +114,7 @@ export function buildCodexProtocolMeta(
   };
 }
 
-export interface CodexProtocolProbeProviderDraftInput
-  extends CodexManualProtocolSettings {
+export interface CodexProtocolProbeProviderDraftInput extends CodexManualProtocolSettings {
   providerId?: string;
   providerName: string;
   baseUrl: string;

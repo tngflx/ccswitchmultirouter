@@ -98,10 +98,7 @@ function compareVersions(left: number[], right: number[]): number {
 }
 
 export type CatalogPruningReason =
-  | "unclassified"
-  | "recent-release"
-  | "older-release"
-  | "older-snapshot";
+  "unclassified" | "recent-release" | "older-release" | "older-snapshot";
 
 export type CatalogPruningDecision<
   T extends CodexCatalogModel = CodexCatalogModel,

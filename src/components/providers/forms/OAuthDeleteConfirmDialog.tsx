@@ -2,8 +2,7 @@ import { useTranslation } from "react-i18next";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 
 export type OAuthDeleteTarget =
-  | { kind: "account"; accountId: string; label: string }
-  | { kind: "all" };
+  { kind: "account"; accountId: string; label: string } | { kind: "all" };
 
 interface OAuthDeleteConfirmDialogProps {
   target: OAuthDeleteTarget | null;

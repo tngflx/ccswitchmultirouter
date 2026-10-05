@@ -134,12 +134,7 @@ interface WizardIssue {
 }
 
 type ModelFetchCardStatus =
-  | "idle"
-  | "loading"
-  | "updated"
-  | "unchanged"
-  | "skipped"
-  | "error";
+  "idle" | "loading" | "updated" | "unchanged" | "skipped" | "error";
 
 interface ModelFetchDiff {
   added: string[];

@@ -316,8 +316,8 @@ function readInitialCodexState(
         (group): group is CodexApiKeyGroup =>
           Boolean(
             group &&
-              typeof group === "object" &&
-              Array.isArray((group as { apiKeys?: unknown }).apiKeys),
+            typeof group === "object" &&
+            Array.isArray((group as { apiKeys?: unknown }).apiKeys),
           ),
       )
     : [];

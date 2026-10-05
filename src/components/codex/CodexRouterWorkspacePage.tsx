@@ -7384,11 +7384,11 @@ function StatusTab({
   });
   const configReady = Boolean(
     isProxyRunning &&
-      isCodexTakeoverActive &&
-      selectedPlan &&
-      activeProviderId === selectedPlan.id &&
-      routeEnabled &&
-      hasEnabledRoutes,
+    isCodexTakeoverActive &&
+    selectedPlan &&
+    activeProviderId === selectedPlan.id &&
+    routeEnabled &&
+    hasEnabledRoutes,
   );
   const trafficVerified = currentRouteForwardOk;
   const linkOnline = Boolean(runtimeStatus.running && trafficVerified);

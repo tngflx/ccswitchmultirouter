@@ -56,9 +56,7 @@ export interface ProxyTakeoverStatus {
 
 export type RequestOptimizationMode = "off" | "diagnose" | "safe";
 export type RequestHealthReviewMode =
-  | "off"
-  | "first_large_request"
-  | "sustained_growth";
+  "off" | "first_large_request" | "sustained_growth";
 
 export interface RequestHealthConfig {
   enabled: boolean;

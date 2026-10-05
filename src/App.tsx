@@ -1347,8 +1347,7 @@ function App() {
   const handleSwitchProviderFromList = (provider: Provider) => {
     if (activeApp === "codex" && isRoutingPlan(provider)) {
       const routing = provider.settingsConfig?.codexRouting as
-        | { schemaVersion?: number }
-        | undefined;
+        { schemaVersion?: number } | undefined;
       if (routing?.schemaVersion !== 2) {
         handleEditCodexMultiRouter(provider);
         return;

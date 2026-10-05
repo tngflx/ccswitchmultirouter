@@ -130,9 +130,7 @@ const PROVIDER_REASONING_EFFORT_CHOICES: CodexReasoningEffort[] = [
 const ignoreProtocolProbeReceiptIds = (_receiptIds: string[]) => undefined;
 
 export type CodexReasoningCapabilitySourceMode =
-  | "automatic"
-  | "builtin"
-  | "manual";
+  "automatic" | "builtin" | "manual";
 
 export function applyCodexReasoningCapabilitySource(
   mode: CodexReasoningCapabilitySourceMode,
@@ -2669,14 +2667,13 @@ export function CodexFormFields({
                         const supportsImage = catalogSupportsImage(row);
                         const presetDeclaresInputCapability = Boolean(
                           presetCatalogModel &&
-                            (presetCatalogModel.inputModalities !== undefined ||
-                              presetCatalogModel.input_modalities !==
-                                undefined ||
-                              presetCatalogModel.supportsImage !== undefined ||
-                              presetCatalogModel.supports_image !== undefined ||
-                              presetCatalogModel.vision !== undefined ||
-                              presetCatalogModel.textOnly !== undefined ||
-                              presetCatalogModel.text_only !== undefined),
+                          (presetCatalogModel.inputModalities !== undefined ||
+                            presetCatalogModel.input_modalities !== undefined ||
+                            presetCatalogModel.supportsImage !== undefined ||
+                            presetCatalogModel.supports_image !== undefined ||
+                            presetCatalogModel.vision !== undefined ||
+                            presetCatalogModel.textOnly !== undefined ||
+                            presetCatalogModel.text_only !== undefined),
                         );
 
                         return (

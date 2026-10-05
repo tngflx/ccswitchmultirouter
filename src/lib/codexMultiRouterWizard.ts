@@ -105,8 +105,7 @@ export function readWizardCodexOAuthAccountId(
       })
     | undefined;
   const authBinding = (meta?.authBinding ?? meta?.auth_binding) as
-    | { accountId?: string; account_id?: string }
-    | undefined;
+    { accountId?: string; account_id?: string } | undefined;
   const accountId = authBinding?.accountId ?? authBinding?.account_id;
   return typeof accountId === "string" && accountId.trim()
     ? accountId.trim()
@@ -1128,8 +1127,7 @@ export function initialWizardSelectedSourceIds(
 ): string[] {
   const availableIds = sourceProviders.map((provider) => provider.id);
   const routing = existingPlan?.settingsConfig?.codexRouting as
-    | CodexRoutingConfigV2
-    | undefined;
+    CodexRoutingConfigV2 | undefined;
   if (routing?.schemaVersion !== 2) return availableIds;
 
   const routedProviderIds = new Set(
@@ -1143,8 +1141,7 @@ export function initialWizardCatalogModelOrder(
   sourceProviders: Provider[],
 ): string[] | null {
   const routing = existingPlan?.settingsConfig?.codexRouting as
-    | CodexRoutingConfigV2
-    | undefined;
+    CodexRoutingConfigV2 | undefined;
   if (routing?.schemaVersion !== 2) {
     return existingPlan?.settingsConfig?.modelCatalog
       ? readWizardModelCatalog(existingPlan).map((model) => model.model)
@@ -1342,8 +1339,7 @@ export function buildCodexMultiRouterWizardPlan(
     })
     .filter((provider) => readWizardModelCatalog(provider).length > 0);
   const existingRouting = existingPlan?.settingsConfig?.codexRouting as
-    | CodexRoutingConfig
-    | undefined;
+    CodexRoutingConfig | undefined;
   const existingRoutingV2 =
     (existingRouting as { schemaVersion?: unknown } | undefined)
       ?.schemaVersion === 2

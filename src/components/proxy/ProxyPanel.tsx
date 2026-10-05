@@ -48,9 +48,9 @@ export function listenerRecoveryButtonState(
 ): { enabled: boolean; detail: string } {
   const enabled = Boolean(
     takeoverStatus?.claude ||
-      takeoverStatus?.codex ||
-      takeoverStatus?.gemini ||
-      takeoverStatus?.grokbuild,
+    takeoverStatus?.codex ||
+    takeoverStatus?.gemini ||
+    takeoverStatus?.grokbuild,
   );
   return enabled
     ? {

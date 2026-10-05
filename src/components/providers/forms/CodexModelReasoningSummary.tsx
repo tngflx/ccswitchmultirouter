@@ -82,8 +82,7 @@ export function CodexModelReasoningSummary({
             onUltraChange({
               enabled: ultraEnabled,
               providerEffort: (event.target.value || undefined) as
-                | CodexReasoningEffort
-                | undefined,
+                CodexReasoningEffort | undefined,
             })
           }
         >

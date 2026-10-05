@@ -22,9 +22,7 @@ import { invalidatePiProviderCaches } from "@/lib/query/pi";
 export interface UpdateProviderMutationResult {
   provider: Provider;
   tePublishStatus?:
-    | "stored_not_published"
-    | "stored_and_published"
-    | "stored_publish_failed";
+    "stored_not_published" | "stored_and_published" | "stored_publish_failed";
 }
 import {
   CODEX_OFFICIAL_PROVIDER_ID,

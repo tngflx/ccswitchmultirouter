@@ -1,10 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 
 export type CodexTimezoneMatch =
-  | "exact"
-  | "offset_match"
-  | "mismatch"
-  | "unknown";
+  "exact" | "offset_match" | "mismatch" | "unknown";
 
 export interface CodexEgressTimezoneDetection {
   targetHost: string;

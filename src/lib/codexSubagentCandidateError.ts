@@ -9,8 +9,7 @@ export const CODEX_SUBAGENT_UNKNOWN_REASONING_CODE =
   "unknown_reasoning_capability_requires_declaration";
 
 export type CodexSubagentCandidateError =
-  | { kind: "incomplete"; models: string | null }
-  | { kind: "other" };
+  { kind: "incomplete"; models: string | null } | { kind: "other" };
 
 export function parseCodexSubagentCandidateError(
   detail: string,

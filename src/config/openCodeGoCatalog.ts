@@ -1,20 +1,10 @@
 export type OpenCodeGoProtocol = "responses" | "messages" | "chat";
 
 export type OpenCodeGoInputModality =
-  | "text"
-  | "image"
-  | "audio"
-  | "video"
-  | "pdf";
+  "text" | "image" | "audio" | "video" | "pdf";
 
 export type OpenCodeGoReasoningEffort =
-  | "none"
-  | "minimal"
-  | "low"
-  | "medium"
-  | "high"
-  | "xhigh"
-  | "max";
+  "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
 
 export interface OpenCodeGoModel {
   id: string;
