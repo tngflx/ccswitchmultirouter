@@ -26,12 +26,6 @@ fn normalize_settings_for_app(app_type: &str, mut value: serde_json::Value) -> s
     value
 }
 
-/// 解析 SQLite 中的供应商配置，并保证返回值符合 Provider 的对象契约。
-fn parse_provider_settings_config(settings_config_str: &str) -> serde_json::Value {
-    let parsed = serde_json::from_str(settings_config_str).unwrap_or(serde_json::Value::Null);
-    normalize_provider_settings_config(parsed)
-}
-
 fn parse_provider_settings_config_for_app(
     app_type: &str,
     settings_config_str: &str,
@@ -1486,14 +1480,17 @@ mod tests {
     fn provider_settings_config_parser_only_returns_objects() {
         for raw_config in ["null", "[]", "\"legacy\"", "not-json"] {
             assert_eq!(
-                parse_provider_settings_config(raw_config),
+                parse_provider_settings_config_for_app("claude", raw_config),
                 json!({}),
                 "non-object config {raw_config:?} should normalize to an empty object"
             );
         }
 
         assert_eq!(
-            parse_provider_settings_config(r#"{"env":{"ANTHROPIC_API_KEY":"sk-test"}}"#),
+            parse_provider_settings_config_for_app(
+                "claude",
+                r#"{"env":{"ANTHROPIC_API_KEY":"sk-test"}}"#,
+            ),
             json!({"env":{"ANTHROPIC_API_KEY":"sk-test"}})
         );
     }

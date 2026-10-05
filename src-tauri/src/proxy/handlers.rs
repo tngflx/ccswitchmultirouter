@@ -3261,13 +3261,15 @@ async fn handle_responses_for_app(
                 response,
                 stream_reconnect,
             },
-            &ctx,
-            &state,
-            is_stream,
-            is_codex_v2_compaction,
-            connection_guard,
-            codex_tool_context,
-            recovery_context,
+            CodexChatToResponsesTransformContext {
+                ctx: &ctx,
+                state: &state,
+                is_stream,
+                is_compaction: is_codex_v2_compaction,
+                connection_guard,
+                tool_context: codex_tool_context,
+                recovery_context,
+            },
         )
         .await;
     }
@@ -3565,13 +3567,15 @@ async fn handle_responses_compact_for_app(
                 response,
                 stream_reconnect,
             },
-            &ctx,
-            &state,
-            is_stream,
-            is_codex_v2_compaction,
-            connection_guard,
-            codex_tool_context,
-            None,
+            CodexChatToResponsesTransformContext {
+                ctx: &ctx,
+                state: &state,
+                is_stream,
+                is_compaction: is_codex_v2_compaction,
+                connection_guard,
+                tool_context: codex_tool_context,
+                recovery_context: None,
+            },
         )
         .await;
     }
@@ -3933,20 +3937,33 @@ struct CodexTransformUpstream {
     stream_reconnect: Option<StreamReconnector>,
 }
 
-async fn handle_codex_chat_to_responses_transform(
-    upstream: CodexTransformUpstream,
-    ctx: &RequestContext,
-    state: &ProxyState,
+struct CodexChatToResponsesTransformContext<'a> {
+    ctx: &'a RequestContext,
+    state: &'a ProxyState,
     is_stream: bool,
     is_compaction: bool,
     connection_guard: Option<ActiveConnectionGuard>,
     tool_context: transform_codex_chat::CodexToolContext,
     recovery_context: Option<TurnRecoveryContext>,
+}
+
+async fn handle_codex_chat_to_responses_transform(
+    upstream: CodexTransformUpstream,
+    transform: CodexChatToResponsesTransformContext<'_>,
 ) -> Result<axum::response::Response, ProxyError> {
     let CodexTransformUpstream {
         response,
         stream_reconnect,
     } = upstream;
+    let CodexChatToResponsesTransformContext {
+        ctx,
+        state,
+        is_stream,
+        is_compaction,
+        connection_guard,
+        tool_context,
+        recovery_context,
+    } = transform;
     let status = response.status();
     let hosted_tool_loop_response = response.headers().contains_key(HOSTED_TOOL_LOOP_HEADER);
     let hosted_tool_stream_response = response

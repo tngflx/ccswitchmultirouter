@@ -164,6 +164,7 @@ pub fn compile_v2(
     let canonical_owners = canonical_owner_counts(&candidates);
     let mut used_visible = HashSet::new();
     let mut model_catalog = Vec::new();
+    let official_models = crate::codex_config::codex_official_models_cache().unwrap_or_default();
     let mut route_visible_models = vec![Vec::new(); plan.routes.len()];
 
     for candidate in candidates {
@@ -204,8 +205,11 @@ pub fn compile_v2(
             );
             let (api_format, api_format_source) =
                 effective_api_format(candidate.provider, candidate.model_entry);
-            let capability_summary =
-                effective_capability_summary(candidate.provider, candidate.model_entry);
+            let capability_summary = effective_capability_summary(
+                candidate.provider,
+                candidate.model_entry,
+                &official_models,
+            );
             route_visible_models[candidate.route_index].push(visible_model.clone());
             model_catalog.push(CompiledCodexModel {
                 visible_model,
@@ -615,6 +619,7 @@ fn normalize_api_format(value: &str) -> String {
 fn effective_capability_summary(
     provider: &Provider,
     model_entry: &Value,
+    official_models: &[Value],
 ) -> CodexModelCapabilitySummary {
     let (context_window, context_window_source) = value_with_source(
         u64_field(model_entry, &["contextWindow", "context_window"]),
@@ -642,10 +647,34 @@ fn effective_capability_summary(
             .and_then(|meta| meta.codex_chat_reasoning.as_ref())
             .and_then(|reasoning| serde_json::to_value(reasoning).ok())
     });
-    let (reasoning, reasoning_source) = value_with_source(
-        value_field(model_entry, &["reasoning"]).cloned(),
-        provider_reasoning,
-    );
+    let (reasoning, reasoning_source) = if let Some(reasoning) =
+        value_field(model_entry, &["reasoning"]).cloned()
+    {
+        (Some(reasoning), "provider_model".to_string())
+    } else if let Some(reasoning) = provider_reasoning {
+        (Some(reasoning), "provider".to_string())
+    } else if let Some(upstream) = string_field(model_entry, &["upstreamModel", "upstream_model"]) {
+        let resolved = crate::reasoning_capabilities::resolve_codex_model_capability_core(
+            &provider.settings_config,
+            None,
+            upstream,
+            None,
+            None,
+            official_models,
+        );
+        if resolved.source == crate::reasoning_capabilities::CapabilitySource::Official {
+            (
+                resolved
+                    .capability
+                    .and_then(|capability| serde_json::to_value(capability).ok()),
+                "official".to_string(),
+            )
+        } else {
+            (None, "unknown".to_string())
+        }
+    } else {
+        (None, "unknown".to_string())
+    };
     let provider_cache = value_field(&provider.settings_config, &["codexCache", "codex_cache"])
         .cloned()
         .or_else(|| {
@@ -1375,6 +1404,39 @@ mod tests {
                 .and_then(|value| value.get("providerEffort")),
             Some(&json!("high"))
         );
+    }
+
+    #[test]
+    fn upstream_official_capability_populates_routed_reasoning_without_inventing_custom_models() {
+        let provider = provider(
+            "sublyx",
+            "Sublyx",
+            "openai_chat",
+            json!([{
+                "model": "gpt-5.6-sol-sublyx",
+                "upstreamModel": "gpt-5.6-sol"
+            }]),
+        );
+        let entry = &provider.settings_config["modelCatalog"]["models"][0];
+        let official = vec![json!({
+            "slug": "gpt-5.6-sol",
+            "supported_reasoning_levels": ["low", "medium", "high"],
+            "default_reasoning_level": "medium"
+        })];
+        let summary = effective_capability_summary(&provider, entry, &official);
+        assert_eq!(summary.reasoning_source, "official");
+        assert_eq!(
+            summary
+                .reasoning
+                .as_ref()
+                .and_then(|value| value.get("supportedEfforts")),
+            Some(&json!(["low", "medium", "high"]))
+        );
+
+        let unknown = json!({"model": "vendor-custom", "upstreamModel": "vendor-custom"});
+        let unknown_summary = effective_capability_summary(&provider, &unknown, &official);
+        assert_eq!(unknown_summary.reasoning_source, "unknown");
+        assert!(unknown_summary.reasoning.is_none());
     }
 
     #[test]
