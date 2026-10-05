@@ -84,3 +84,15 @@ not automatically included. Neither feature parity nor cutover is called 100%.
 
 Related: `2026-10-03-bigstrongsun-refork-foundation.md`,
 `2026-10-05-fork-identity-cutover.md`, and `docs/memory/journal.md`.
+
+## October 6 publication-gate update
+
+The committed dependency and formatter tree now passes the full frontend suite
+(225 files / 1,752 tests), `pnpm typecheck`, upgraded `pnpm format:check`, the
+workflow ownership tests (2 files / 6 tests), and `git diff --check`.
+The full normal-target Cargo suite was attempted and exited 101 before tests
+because the user's running `pnpm dev` still locks
+`src-tauri/target/debug/cc-switch.exe`. The process was not killed and no
+alternate target was used. The user must stop that process before the backend
+rerun. Remote `origin/main` remains
+`641d53c8113ddb5564b3154dd6f75c17570a450e`; publication is still pending.

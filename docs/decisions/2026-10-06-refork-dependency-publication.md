@@ -156,3 +156,10 @@ fresh-checkout `pnpm dev` and leave it stopped for the normal-target rerun.
   remaining full rerun is pending. Current implementation is implemented for
   this source slice, verification is partial, runtime freshness is not-checked
   for the final installed dependency graph, and main publication is pending.
+- 2026-10-06: Removed the missed pnpm 9.15.0 pin from
+  `supplemental-linux-release.yml`; the direct workflow/identity run then passed
+  2 files / 6 tests. On the committed tree, the full frontend run passed
+  225 files / 1,752 tests, `pnpm typecheck`, upgraded `pnpm format:check`,
+  workflow-test formatting, and `git diff --check` all passed. Full Cargo
+  testing remains blocked by the running normal-target executable; no process
+  was killed and no alternate target was used.

@@ -1,3 +1,32 @@
+## 2026-10-06 — Committed dependency tree passes frontend gates; backend lock remains
+
+What happened: the approved dependency upgrades and formatter-compatible source
+tree were committed on the fresh-refork `main`; the first final frontend run
+caught and fixed a stale pnpm 9.15.0 installer pin in the supplemental Linux
+workflow.
+
+Root cause: three release workflows independently owned pnpm versions, and the
+Linux workflow was not included in the initial edit.
+
+What we did: removed competing pins so all release workflows consume
+`package.json`'s pnpm 12.9.1 declaration, regenerated the policy-valid lockfile
+with PostCSS 8.5.28, and applied Prettier 3.9.9 only to the 46 AST-audited
+files.
+
+Evidence: direct workflow/identity tests passed (2 files / 6 tests); full
+frontend passed (225 files / 1,752 tests); `pnpm typecheck`, `pnpm format:check`,
+workflow-test formatting, and `git diff --check` passed. Full Cargo testing
+exited 101 before tests because Windows denied removal of the running normal
+target `cc-switch.exe`. The remote `origin/main` is still
+`641d53c8113ddb5564b3154dd6f75c17570a450e`; publication has not occurred.
+
+What NOT to do again: do not infer a clean publication gate from library-only
+Cargo results, and do not bypass the running app with a process kill or
+alternate target directory.
+
+Related decisions: `docs/decisions/2026-10-06-refork-dependency-publication.md`
+and `docs/decisions/2026-10-06-github-main-refork-cutover.md`.
+
 ## 2026-10-06 — Final frontend regressions fixed; GitHub cutover still gated
 
 - **What happened:** Final verification initially exposed two frontend failures;
