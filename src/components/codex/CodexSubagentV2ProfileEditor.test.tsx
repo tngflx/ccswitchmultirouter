@@ -2298,9 +2298,9 @@ describe("Codex Sub-Agent V2 searchable Accordion workspace", () => {
     });
 
     expect(triggers[0]).toHaveAttribute("aria-controls");
-    expect(triggers[1]).toHaveAttribute("aria-controls");
-    expect(triggers[0].getAttribute("aria-controls")).not.toBe(
-      triggers[1].getAttribute("aria-controls"),
+    const flashPanelId = triggers[0].getAttribute("aria-controls")!;
+    expect(document.getElementById(flashPanelId)).toBe(
+      screen.getByRole("region", { name: "deepseek-v4-flash 子 Agent 配置" }),
     );
     expect(flashSwitch).toHaveAccessibleName(
       "启用 deepseek-v4-flash 作为 V2 子 Agent",
@@ -2315,6 +2315,12 @@ describe("Codex Sub-Agent V2 searchable Accordion workspace", () => {
     await user.keyboard("{Enter}");
     expect(triggers[0]).toHaveAttribute("aria-expanded", "false");
     expect(triggers[1]).toHaveAttribute("aria-expanded", "true");
+    expect(triggers[1]).toHaveAttribute("aria-controls");
+    const proPanelId = triggers[1].getAttribute("aria-controls")!;
+    expect(proPanelId).not.toBe(flashPanelId);
+    expect(document.getElementById(proPanelId)).toBe(
+      screen.getByRole("region", { name: "deepseek-v4-pro 子 Agent 配置" }),
+    );
 
     expect(
       screen.getByRole("button", { name: "编辑 deepseek-v4-pro" }),
