@@ -138,7 +138,6 @@ jobs:
         if: runner.os != 'Windows' || runner.arch != 'ARM64'
         uses: pnpm/action-setup@v6
         with:
-          version: 10.12.3
           run_install: false
 
       - name: Setup pnpm (Windows ARM64)
