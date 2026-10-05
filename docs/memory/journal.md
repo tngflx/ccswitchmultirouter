@@ -1,3 +1,35 @@
+## 2026-10-06 — Final frontend regressions fixed; GitHub cutover still gated
+
+- **What happened:** Final verification initially exposed two frontend failures;
+  after scoped fixes, all 224 files / 1,747 tests passed. The requested GitHub
+  main replacement still has not occurred.
+- **Root cause:** A language-specific i18n wrapper changed effect dependencies,
+  allowing the unchanged settings query snapshot to overwrite a reset/draft.
+  The Accordion test assumed a collapsed Radix trigger exposed `aria-controls`,
+  although the installed primitive only does so while expanded.
+- **What we did:** Guarded query-to-form initialization by snapshot identity and
+  marked the observed snapshot consumed on reset. Added three regression tests
+  and checked actual expanded trigger/panel IDs and accessible regions without
+  changing the production primitive. Recorded the exact-lease main replacement
+  decision; preserved the dirty legacy checkout and unrelated dependency edits.
+- **Evidence:** Targeted frontend passed (7 files / 173 tests); full frontend
+  passed (224 / 1,747); typecheck and diff check passed. Committed Prettier 3.6.2
+  passed source formatting, but upgraded 3.9.9 `pnpm format:check` failed on 46
+  existing files. Library-only Cargo testing passed 4,364, failed 0, ignored 9.
+  **Correction to October 5 entries:** 4,373 is total library tests, not 4,373
+  passed. Current full Cargo testing exited 101 before tests because the running
+  app locks `src-tauri/target/debug/cc-switch.exe`; integration verification is
+  not complete at this boundary. Refork foundation ancestry check passed, but
+  freshly fetched remote main is still `641d53c8113ddb5564b3154dd6f75c17570a450e`.
+- **What NOT to do again:** Do not equate library-only results with full backend
+  verification, silently publish unowned dependency updates, kill the running
+  app, bypass its lock with another target directory, or infer 100% migration
+  coverage from green tests.
+
+Related decisions:
+`docs/decisions/2026-10-06-refork-final-frontend-regressions.md`,
+`docs/decisions/2026-10-06-github-main-refork-cutover.md`.
+
 ## 2026-10-05 — Final source verification for refork foundation and public identity
 
 - **What happened:** The fresh BigStrongSun-based refork completed the source-level

@@ -84,4 +84,15 @@ No additional approval is required for the requested fresh-refork migration. Des
 - 2026-10-03: Decision approved by the user's explicit fresh-refork and replacement instruction. Fresh target cloned and clean baseline compile/type checks passed; implementation marked in-progress and verification partial.
 - 2026-10-03: Ported the first provider/request contract slice. Canonical protocol settings own runtime behavior; legacy reasoning metadata is a compatibility input and is removed by canonical saves. Targeted backend/frontend tests and compile/type checks passed; overall migration remains in-progress.
 - 2026-10-05: Ported the remaining approved source slices into the fresh owners, rechecked the required fork-specific identifiers, and completed source-level verification. `cargo fmt --manifest-path src-tauri/Cargo.toml --all -- --check`, `cargo check --manifest-path src-tauri/Cargo.toml`, `pnpm format:check`, `pnpm typecheck`, targeted Vitest (44 tests), and full Vitest (1,744 tests) passed. The first parallel `cargo test` attempt hit Windows paging-file exhaustion (`os error 1455`); the required full suite was rerun with `CARGO_BUILD_JOBS=1` and `--test-threads=1` and exited 0 with no test failures. Runtime freshness and cutover remain pending.
+- 2026-10-06: Rechecked foundation ancestry (passed) and fetched origin. Remote
+  main remains `641d53c8113ddb5564b3154dd6f75c17570a450e`; cutover has not happened.
+  The latest full frontend rerun passed 224 files / 1,747 tests after two scoped
+  regression fixes. The library-only backend run passed 4,364 tests with 9
+  ignored; this is not a successful current full integration run. The full
+  Cargo command exited 101 because the running fresh-refork executable is
+  locked. Unexplained dependency updates also prevent treating the tested
+  working tree as the committed publication tree. Approval for the requested
+  GitHub main replacement is now explicitly recorded in
+  `2026-10-06-github-main-refork-cutover.md`. Implementation remains in-progress,
+  verification partial, and runtime freshness not-checked for the newest edits.
 

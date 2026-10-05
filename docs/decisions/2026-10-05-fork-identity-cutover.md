@@ -50,3 +50,17 @@ key is added to the repository.
   files, 1,744 tests), and `git diff --check`.
 - Runtime freshness: not checked; runtime must be rebuilt/restarted after the
   public identity cutover.
+
+## October 6 evidence correction and publication status
+
+The earlier "4,373 unit tests" wording must not be read as 4,373 passed tests.
+The current library run reports 4,364 passed, 0 failed, and 9 ignored (4,373
+total). Its success is library-only: the current full backend/integration
+command exited 101 on the running executable's Windows file lock.
+
+Public identity implementation remains complete, but GitHub main replacement
+has not occurred. Current frontend evidence is 224 files / 1,747 tests passed
+and typecheck passed, using the installed uncommitted dependency upgrades.
+Their Prettier 3.9.9 format check failed; the committed Prettier 3.6.2 check
+passed. These are different toolchains, not interchangeable verification.
+See `2026-10-06-github-main-refork-cutover.md` for the remaining publication gates.

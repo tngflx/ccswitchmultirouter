@@ -48,3 +48,15 @@ second parser or infer from arbitrary model-name substrings.
   tests).
 - Runtime freshness: requires user to rebuild/restart the normal refork `pnpm dev`
   process before live Desktop verification.
+
+## October 6 evidence correction
+
+The prior "4,373 unit tests" wording counts the current library suite's total,
+not its passed tests: the latest library run passed 4,364, failed 0, and ignored
+9. Current full backend/integration verification is blocked by the running
+fresh-refork executable (Access is denied, exit 101).
+
+The final frontend rerun passed 224 files / 1,747 tests, and typecheck passed.
+No comprehensive live reasoning-picker verification is claimed. Newer
+uncommitted legacy catalog/alias work remains owned by the separate reasoning
+chat and has not been automatically ported or overwritten.
