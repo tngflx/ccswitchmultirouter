@@ -847,7 +847,7 @@ const QuotaCollaborationPanel: React.FC<{
             title="打开多设备协作教程"
             onClick={() =>
               void settingsApi.openExternal(
-                "https://github.com/BigStrongSun/ccswitchmulti/blob/main/docs/guides/codex-multi-device-quota-collaboration-zh.md",
+                "https://github.com/tngflx/ccswitchmultirouter/blob/main/docs/guides/codex-multi-device-quota-collaboration-zh.md",
               )
             }
           >

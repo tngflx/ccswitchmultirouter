@@ -65,9 +65,9 @@
       }
     },
     "updater": {
-      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEFFRjYwQUIyRkRBRDUyNEUKUldST1VxMzlzZ3IycmlGQzBEeThsWGs4UkFUS0JnVWRQcEZoVnNzbSsrbDNoZGh2UkVHZkNTbTgK",
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDk5MjI5Q0Y1QUFBOEI2ODQKUldTRXRxaXE5WndpbVUyekJaRHMwcjJkczdrNU1FR1lrdzJJMi92OFl2ODRCRDhBM3dFRHZYeFIK",
       "endpoints": [
-        "https://github.com/BigStrongSun/ccswitchmulti/releases/latest/download/latest.json"
+        "https://github.com/tngflx/ccswitchmultirouter/releases/latest/download/latest.json"
       ]
     }
   }

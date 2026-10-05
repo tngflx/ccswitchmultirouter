@@ -4,10 +4,10 @@
 
 ### 面向八类 Agent 工具的 Provider 管理与 Codex 多模型路由工具
 
-[![Version](https://img.shields.io/github/v/release/BigStrongSun/ccswitchmulti?color=blue&label=version)](https://github.com/BigStrongSun/ccswitchmulti/releases)
-[![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey.svg)](https://github.com/BigStrongSun/ccswitchmulti/releases)
+[![Version](https://img.shields.io/github/v/release/tngflx/ccswitchmultirouter?color=blue&label=version)](https://github.com/tngflx/ccswitchmultirouter/releases)
+[![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey.svg)](https://github.com/tngflx/ccswitchmultirouter/releases)
 [![Built with Tauri](https://img.shields.io/badge/built%20with-Tauri%202-orange.svg)](https://tauri.app/)
-[![Downloads](https://img.shields.io/github/downloads/BigStrongSun/ccswitchmulti/total)](https://github.com/BigStrongSun/ccswitchmulti/releases/latest)
+[![Downloads](https://img.shields.io/github/downloads/tngflx/ccswitchmultirouter/total)](https://github.com/tngflx/ccswitchmultirouter/releases/latest)
 
 English | [中文](README_ZH.md) | [日本語](README_JA.md) | [Deutsch](README_DE.md) | [Changelog](CHANGELOG.md)
 
@@ -25,7 +25,7 @@ English | [中文](README_ZH.md) | [日本語](README_JA.md) | [Deutsch](README_
 
 CCSwitchMulti 是面向 Codex 多模型工作流维护的桌面工具。它提供 Provider 数据库、本地代理、MCP/Skills 同步、会话管理、云同步和 Tauri 跨平台结构，同时加入 Codex MultiRouter 工作流，让多个模型来源可以合并到同一个 Codex Provider 后面使用。
 
-使用 `BigStrongSun/ccswitchmulti` 发布版本时，请先阅读本节，因为这里记录的是 CCSwitchMulti 的核心能力、实现边界和使用注意事项。
+使用 `tngflx/ccswitchmultirouter` 发布版本时，请先阅读本节，因为这里记录的是 CCSwitchMulti 的核心能力、实现边界和使用注意事项。
 
 ### Codex 多路由配置说明书
 
@@ -99,7 +99,7 @@ Codex MultiRouter 不是简单地把 Codex 切到某一个第三方 Provider。C
 
 ### 使用注意
 
-- 需要 CCSwitchMulti 能力时，请使用 [BigStrongSun/ccswitchmulti](https://github.com/BigStrongSun/ccswitchmulti/releases) 的发布版本。
+- 需要 CCSwitchMulti 能力时，请使用 [tngflx/ccswitchmultirouter](https://github.com/tngflx/ccswitchmultirouter/releases) 的发布版本。
 - Codex 使用 `OpenAI Multi-Model Router` 时必须保持 CCSwitchMulti 运行，因为 Codex 请求会经过本地 takeover 代理。
 - 修改 router 模型目录、路由规则或 takeover 状态后，需要完整退出并重新打开 Codex Desktop；已经运行的 Codex app-server 可能继续持有旧的模型管理器缓存。
 - 修改目标 Provider 的协议、地址或模型能力不需要重新创建 Route；保存 Provider 后可直接发起下一次请求，并在诊断或 `codex-router.log` 中核对新的 `effective_endpoint`。模型菜单本身仍可能需要重启 Codex Desktop 才刷新。
@@ -122,7 +122,7 @@ Codex MultiRouter 不是简单地把 Codex 切到某一个第三方 Provider。C
 
 ### macOS 未签名版本的打开方法
 
-当前 CCSwitchMulti 的 macOS 通用版本尚未使用 Apple Developer ID 签名和 notarization。从 [Releases](https://github.com/BigStrongSun/ccswitchmulti/releases) 下载 `CCSwitchMulti-v<version>-macOS.dmg` 或 `CCSwitchMulti-v<version>-macOS.zip` 后，如果系统提示“应用已损坏”“无法验证开发者”或“Apple 无法检查此 App 是否包含恶意软件”，请先把 `CCSwitchMulti.app` 放入“应用程序”文件夹。
+当前 CCSwitchMulti 的 macOS 通用版本尚未使用 Apple Developer ID 签名和 notarization。从 [Releases](https://github.com/tngflx/ccswitchmultirouter/releases) 下载 `CCSwitchMulti-v<version>-macOS.dmg` 或 `CCSwitchMulti-v<version>-macOS.zip` 后，如果系统提示“应用已损坏”“无法验证开发者”或“Apple 无法检查此 App 是否包含恶意软件”，请先把 `CCSwitchMulti.app` 放入“应用程序”文件夹。
 
 优先尝试 Apple 提供的图形界面流程：先打开一次应用，然后进入“系统设置 → 隐私与安全性”，在 CCSwitchMulti 的提示旁选择“仍要打开 / Open Anyway”。
 

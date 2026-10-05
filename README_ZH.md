@@ -4,10 +4,10 @@
 
 ### Claude Code、Claude Desktop、Codex、Gemini CLI、Grok Build、OpenCode、OpenClaw 和 Hermes Agent 的全方位管理工具，内置 Codex 多模型路由
 
-[![Version](https://img.shields.io/github/v/release/BigStrongSun/ccswitchmulti?color=blue&label=version)](https://github.com/BigStrongSun/ccswitchmulti/releases)
-[![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey.svg)](https://github.com/BigStrongSun/ccswitchmulti/releases)
+[![Version](https://img.shields.io/github/v/release/tngflx/ccswitchmultirouter?color=blue&label=version)](https://github.com/tngflx/ccswitchmultirouter/releases)
+[![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey.svg)](https://github.com/tngflx/ccswitchmultirouter/releases)
 [![Built with Tauri](https://img.shields.io/badge/built%20with-Tauri%202-orange.svg)](https://tauri.app/)
-[![Downloads](https://img.shields.io/github/downloads/BigStrongSun/ccswitchmulti/total)](https://github.com/BigStrongSun/ccswitchmulti/releases/latest)
+[![Downloads](https://img.shields.io/github/downloads/tngflx/ccswitchmultirouter/total)](https://github.com/tngflx/ccswitchmultirouter/releases/latest)
 
 [English](README.md) | 中文 | [日本語](README_JA.md) | [Deutsch](README_DE.md) | [更新日志](CHANGELOG.md)
 
@@ -569,7 +569,7 @@ pnpm test:unit --coverage
 
 ## Star History
 
-[![Star History Chart](https://api.star-history.com/svg?repos=BigStrongSun/ccswitchmulti&type=Date)](https://www.star-history.com/#BigStrongSun/ccswitchmulti&Date)
+[![Star History Chart](https://api.star-history.com/svg?repos=tngflx/ccswitchmultirouter&type=Date)](https://www.star-history.com/#tngflx/ccswitchmultirouter&Date)
 
 ## License
 

@@ -1374,7 +1374,7 @@ function App() {
     );
     if (shouldOpenHome) {
       await settingsApi.openExternal(
-        "https://github.com/BigStrongSun/ccswitchmulti",
+        "https://github.com/tngflx/ccswitchmultirouter",
       );
     }
   };

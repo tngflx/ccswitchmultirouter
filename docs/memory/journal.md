@@ -1,3 +1,38 @@
+## 2026-10-05 — Final source verification for refork foundation and public identity
+
+- **What happened:** The fresh BigStrongSun-based refork completed the source-level
+  migration boundary, including routed reasoning inheritance, clippy root fixes,
+  and the public identity cutover to `tngflx/ccswitchmultirouter`.
+- **Root cause:** The remaining failures were not broad migration gaps: the
+  compiler did not resolve explicit official `upstreamModel` aliases for routed
+  reasoning, two clippy findings exposed dead/overloaded ownership, and the fresh
+  tree still pointed release/update links at the upstream repository.
+- **What we did:** Reused the shared official reasoning resolver at the compiler
+  boundary, removed the dead parser and consolidated transform context, restored
+  the matching MultiRouter updater endpoint/public key, updated public links and
+  release metadata, and kept upstream attribution separate from release identity.
+- **Evidence:** `cargo fmt --manifest-path src-tauri/Cargo.toml --all -- --check`,
+  `cargo clippy --manifest-path src-tauri/Cargo.toml -j 1 -- -D warnings`, and
+  `cargo check --manifest-path src-tauri/Cargo.toml` passed. Full Rust tests passed
+  with `CARGO_BUILD_JOBS=1 cargo test --manifest-path src-tauri/Cargo.toml --
+  --test-threads=1` (4,373 unit tests plus all integration tests, 0 failures).
+  `pnpm format:check`, `pnpm typecheck`, and `pnpm test:unit` passed (224 files,
+  1,744 tests). Targeted updater/identity tests passed (3/3), and `git diff --check`
+  passed. Fork-specific identifier audit found all required identifiers.
+- **What NOT to do again:** Do not claim 100% completion from source tests alone.
+  The fresh runtime still needs a user-authorized stop/restart of `pnpm dev` from
+  `H:\repos\ccswitchmulti-refork` before non-disruptive runtime inspection, and
+  the guarded remote `main` replacement must wait until that freshness check and
+  final diff/remote audit are complete.
+
+## 2026-10-05 — routed Codex reasoning picker root fix
+
+- **What happened:** Fresh-refork routed provider rows (for example Sublyx aliases) reached Codex Desktop with an empty reasoning-effort list.
+- **Root cause:** MultiRouter copied only inline `modelCatalog.models[].reasoning`; it never resolved an explicit `upstreamModel` through the existing shared capability resolver. Router `defaultReasoningEffort` was only a preference and did not provide capability evidence.
+- **What we did:** At the compiler boundary, reused the shared resolver and official cache only for explicit upstream aliases, preserving canonical schema and fail-closed behavior for unknown custom models. Added regression coverage.
+- **Evidence:** `cargo check --manifest-path src-tauri/Cargo.toml -j 1` passed; `pnpm typecheck` passed. Targeted cargo test was attempted but could not execute because Windows paging-file exhaustion corrupted/made metadata unloadable (OS error 1455); no test result was claimed.
+- **What NOT to do again:** Do not add UI-only defaults or generic model-name inference; do not make custom providers inherit official capabilities without an explicit upstream alias and resolver source.
+
 # Engineering Journal
 
 ## 2026-10-05 Completed source verification for the fresh refork migration
