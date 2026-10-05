@@ -208,7 +208,12 @@ describe("useSettingsForm Hook", () => {
     });
 
     changeLanguageSpy.mockClear();
-    (i18n as any).language = "zh";
+    act(() => {
+      result.current.updateSettings({ language: "zh" });
+    });
+    expect(result.current.settings?.language).toBe("zh");
+    expect(changeLanguageSpy).toHaveBeenCalledWith("zh");
+    changeLanguageSpy.mockClear();
 
     act(() => {
       result.current.resetSettings({
@@ -259,5 +264,75 @@ describe("useSettingsForm Hook", () => {
     });
 
     expect(changeLanguageSpy).not.toHaveBeenCalled();
+  });
+
+  it("preserves local drafts across language rerenders of the same query snapshot", () => {
+    const saved = {
+      showInTray: true,
+      minimizeToTrayOnClose: true,
+      language: "en" as const,
+    };
+    useSettingsQueryMock.mockReturnValue({ data: saved, isLoading: false });
+    const { result, rerender } = renderHook(() => useSettingsForm());
+
+    act(() => {
+      result.current.updateSettings({ showInTray: false, language: "ja" });
+    });
+    rerender();
+
+    expect(result.current.settings?.showInTray).toBe(false);
+    expect(result.current.settings?.language).toBe("ja");
+    expect(result.current.initialLanguage).toBe("en");
+  });
+
+  it("applies a newer query snapshot after an explicit reset", () => {
+    const saved = {
+      showInTray: true,
+      minimizeToTrayOnClose: true,
+      language: "en" as const,
+    };
+    useSettingsQueryMock.mockReturnValue({ data: saved, isLoading: false });
+    const { result, rerender } = renderHook(() => useSettingsForm());
+
+    act(() => {
+      result.current.resetSettings({ ...saved, showInTray: false });
+    });
+    rerender();
+    expect(result.current.settings?.showInTray).toBe(false);
+
+    useSettingsQueryMock.mockReturnValue({
+      data: { ...saved, language: "ja", claudeConfigDir: " /new-server " },
+      isLoading: false,
+    });
+    rerender();
+
+    expect(result.current.settings?.showInTray).toBe(true);
+    expect(result.current.settings?.language).toBe("ja");
+    expect(result.current.settings?.claudeConfigDir).toBe("/new-server");
+    expect(result.current.initialLanguage).toBe("ja");
+  });
+
+  it("keeps a pre-hydration reset until an actual query snapshot arrives", () => {
+    useSettingsQueryMock.mockReturnValue({ data: null, isLoading: true });
+    const { result, rerender } = renderHook(() => useSettingsForm());
+
+    act(() => {
+      result.current.resetSettings({
+        showInTray: false,
+        minimizeToTrayOnClose: false,
+        language: "ja",
+      });
+    });
+    rerender();
+    expect(result.current.settings?.showInTray).toBe(false);
+    expect(result.current.settings?.language).toBe("ja");
+
+    useSettingsQueryMock.mockReturnValue({
+      data: { showInTray: true, minimizeToTrayOnClose: true, language: "en" },
+      isLoading: false,
+    });
+    rerender();
+    expect(result.current.settings?.showInTray).toBe(true);
+    expect(result.current.initialLanguage).toBe("en");
   });
 });

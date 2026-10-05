@@ -59,6 +59,7 @@ export function useSettingsForm(): UseSettingsFormResult {
   );
 
   const initialLanguageRef = useRef<SupportedLanguage>(DEFAULT_LANGUAGE);
+  const lastAppliedDataRef = useRef<Settings | null>(null);
 
   const readPersistedLanguage = useCallback((): SupportedLanguage => {
     if (typeof window !== "undefined") {
@@ -81,7 +82,8 @@ export function useSettingsForm(): UseSettingsFormResult {
 
   // 初始化设置数据
   useEffect(() => {
-    if (!data) return;
+    if (!data || data === lastAppliedDataRef.current) return;
+    lastAppliedDataRef.current = data;
 
     const normalizedLanguage = normalizeLanguage(
       data.language ?? readPersistedLanguage(),
@@ -202,10 +204,13 @@ export function useSettingsForm(): UseSettingsFormResult {
         language: normalizedLanguage,
       };
 
+      // Language synchronization can rerender this hook before the query
+      // publishes a newer snapshot. Do not let that stale snapshot undo reset.
+      lastAppliedDataRef.current = data ?? serverData;
       setSettingsState(normalized);
       syncLanguage(initialLanguageRef.current);
     },
-    [readPersistedLanguage, syncLanguage],
+    [data, readPersistedLanguage, syncLanguage],
   );
 
   return {
