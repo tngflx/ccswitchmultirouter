@@ -91,41 +91,44 @@ export function CodexModelReasoningEditor({
   return (
     <div className="space-y-4 text-xs">
       <label className="grid gap-1">
-        <span className="font-medium">控制方式</span>
+        <span className="font-medium">Control mode</span>
         <select
           className="rounded-md border bg-background px-3 py-2"
-          aria-label={`${model} 推理控制方式`}
+          aria-label={`${model} reasoning control`}
           value={capability.controlKind ?? (isGraded ? "graded" : "unknown")}
           disabled={readOnly}
           onChange={(event) =>
             updateControlKind(event.target.value as CodexReasoningControlKind)
           }
         >
-          <option value="graded">分档推理（effort）</option>
-          <option value="boolean">仅开关推理</option>
-          <option value="budget">推理 token 预算</option>
-          <option value="none">不支持推理</option>
-          <option value="unknown">尚未确认</option>
+          <option value="graded">Graded reasoning (effort)</option>
+          <option value="boolean">Reasoning toggle only</option>
+          <option value="budget">Reasoning token budget</option>
+          <option value="none">Reasoning unsupported</option>
+          <option value="unknown">Unconfirmed</option>
         </select>
         <span className="text-muted-foreground">
-          根据 Provider 对该模型公开的真实控制方式选择；不确定时保持“尚未确认”。
+          Select the actual control mode exposed by the provider for this model;
+          keep it “Unconfirmed” when unknown.
         </span>
       </label>
 
       {isGraded ? (
         <>
           <fieldset className="space-y-2 rounded-md border p-3">
-            <legend className="px-1 font-medium">Provider 原生能力</legend>
+            <legend className="px-1 font-medium">
+              Native provider capability
+            </legend>
             <p className="text-muted-foreground">
-              只勾选该 Provider API 对当前模型实际接受的档位，不是 Codex
-              的通用档位全集。
+              Select only the levels this provider API actually accepts for the
+              model, not the complete Codex level set.
             </p>
             <div className="flex flex-wrap gap-3">
               {capability.supportedEfforts.map((effort) => (
                 <label key={effort} className="flex items-center gap-1">
                   <input
                     type="checkbox"
-                    aria-label={`Provider 原生档位 ${effort}`}
+                    aria-label={`Provider-native effort ${effort}`}
                     checked
                     disabled={readOnly}
                     onChange={() => {
@@ -159,10 +162,10 @@ export function CodexModelReasoningEditor({
             </div>
             {addableEfforts.length ? (
               <label className="grid max-w-xs gap-1">
-                <span>添加 Provider 档位</span>
+                <span>Add provider level</span>
                 <select
                   className="rounded-md border bg-background px-3 py-2"
-                  aria-label="添加 Provider 原生档位"
+                  aria-label="Add native provider level"
                   value=""
                   disabled={readOnly}
                   onChange={(event) => {
@@ -182,7 +185,7 @@ export function CodexModelReasoningEditor({
                     });
                   }}
                 >
-                  <option value="">选择要添加的档位…</option>
+                  <option value="">Select a level to add…</option>
                   {addableEfforts.map((effort) => (
                     <option key={effort} value={effort}>
                       {effort}
@@ -194,10 +197,10 @@ export function CodexModelReasoningEditor({
           </fieldset>
 
           <label className="grid gap-1">
-            <span className="font-medium">Provider 默认档位</span>
+            <span className="font-medium">Provider default level</span>
             <select
               className="rounded-md border bg-background px-3 py-2"
-              aria-label={`${model} Provider 默认档位`}
+              aria-label={`${model} provider default effort`}
               value={capability.defaultEffort ?? ""}
               disabled={readOnly}
               onChange={(event) =>
@@ -208,7 +211,7 @@ export function CodexModelReasoningEditor({
                 })
               }
             >
-              <option value="">未声明</option>
+              <option value="">Not declared</option>
               {capability.supportedEfforts.map((effort) => (
                 <option key={effort} value={effort}>
                   {effort}
@@ -216,17 +219,18 @@ export function CodexModelReasoningEditor({
               ))}
             </select>
             <span className="text-muted-foreground">
-              Codex 没有显式指定强度时使用；必须属于上面勾选的原生档位。
+              Used when Codex does not specify an explicit level; it must be one
+              of the native levels selected above.
             </span>
           </label>
 
           <fieldset className="space-y-2 rounded-md border p-3">
-            <legend className="px-1 font-medium">上游传参</legend>
+            <legend className="px-1 font-medium">Upstream parameter</legend>
             <label className="grid gap-1">
-              <span>参数形态</span>
+              <span>Parameter shape</span>
               <select
                 className="rounded-md border bg-background px-3 py-2"
-                aria-label={`${model} 上游参数形态`}
+                aria-label={`${model} upstream parameter format`}
                 value={capability.upstream.format}
                 disabled={readOnly}
                 onChange={(event) => {
@@ -246,15 +250,15 @@ export function CodexModelReasoningEditor({
                   });
                 }}
               >
-                <option value="string">顶层字符串参数</option>
-                <option value="reasoning_object">reasoning 对象</option>
+                <option value="string">Top-level string parameter</option>
+                <option value="reasoning_object">reasoning object</option>
               </select>
             </label>
             <label className="grid gap-1">
-              <span>上游参数名</span>
+              <span>Upstream parameter name</span>
               <input
                 className="rounded-md border bg-background px-3 py-2"
-                aria-label={`${model} 上游参数名`}
+                aria-label={`${model} upstream parameter name`}
                 value={capability.upstream.parameter}
                 readOnly={readOnly}
                 onChange={(event) =>
@@ -270,20 +274,23 @@ export function CodexModelReasoningEditor({
                 }
               />
               <span className="text-muted-foreground">
-                例如：reasoning_effort（顶层字符串）或
-                reasoning.effort（对象字段）。
+                Example: reasoning_effort (top-level string) or reasoning.effort
+                (object field).
               </span>
             </label>
           </fieldset>
 
           <fieldset
             className="space-y-2 rounded-md border p-3"
-            aria-label={`${model} Codex 到 Provider 映射`}
+            aria-label={`${model} Codex-to-provider mapping`}
           >
-            <legend className="px-1 font-medium">Codex → Provider 映射</legend>
+            <legend className="px-1 font-medium">
+              Codex → provider mapping
+            </legend>
             <p className="text-muted-foreground">
-              同名档位会自动生成恒等映射；只有名称不同或需要降档时才需要修改。
-              保存时当前模型的每个可选档位都必须有有效目标。
+              Same-named levels receive an identity mapping automatically; edit
+              only when names differ or a downgrade is needed. Every selectable
+              level for the model must have a valid target when saving.
             </p>
             <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-3">
               {capability.supportedEfforts.map((effort) => (
@@ -295,7 +302,7 @@ export function CodexModelReasoningEditor({
                   <span>→</span>
                   <select
                     className="rounded border bg-background px-2 py-1"
-                    aria-label={`${effort} 映射目标`}
+                    aria-label={`${effort} mapping target`}
                     value={completedMap[effort] ?? ""}
                     disabled={readOnly}
                     onChange={(event) =>
@@ -325,7 +332,8 @@ export function CodexModelReasoningEditor({
         </>
       ) : (
         <p className="rounded-md border bg-muted/30 p-3 text-muted-foreground">
-          当前控制方式不使用 effort 档位，因此不需要填写 Codex → Provider 映射。
+          This control mode does not use effort levels, so no Codex → provider
+          mapping is required.
         </p>
       )}
 
@@ -338,7 +346,7 @@ export function CodexModelReasoningEditor({
             update({ ...capability, disableAllowed: event.target.checked })
           }
         />
-        Provider 支持显式关闭推理
+        Provider supports explicitly disabling reasoning
       </label>
     </div>
   );

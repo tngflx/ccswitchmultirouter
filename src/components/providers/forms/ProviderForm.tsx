@@ -273,7 +273,7 @@ export const normalizeCodexCatalogModelsForSave = (
     ) {
       throw new CodexCatalogValidationError(
         model,
-        `${model}：默认推理强度必须包含在该模型支持的推理强度中`,
+        `${model}: The default reasoning effort must be included in the model's supported efforts`,
       );
     }
     if (
@@ -283,7 +283,7 @@ export const normalizeCodexCatalogModelsForSave = (
     ) {
       throw new CodexCatalogValidationError(
         model,
-        `${model}：包含“关闭推理”档时，必须允许关闭推理`,
+        `${model}: A model that includes disabling reasoning must allow reasoning to be disabled`,
       );
     }
     if (
@@ -299,7 +299,7 @@ export const normalizeCodexCatalogModelsForSave = (
         if (!reasoning.upstream.effortMap?.[effort]) {
           throw new CodexCatalogValidationError(
             model,
-            `${model}：推理强度映射缺少 ${effort} 档`,
+            `${model}: Reasoning-effort mapping is missing ${effort}`,
           );
         }
       }
@@ -317,7 +317,7 @@ export const normalizeCodexCatalogModelsForSave = (
           ) {
             throw new CodexCatalogValidationError(
               model,
-              `${model}：${source} 档映射到的 ${target} 不在该模型支持的推理强度中`,
+              `${model}: Mapping target ${target} for ${source} is not supported by the model`,
             );
           }
         }
@@ -326,7 +326,7 @@ export const normalizeCodexCatalogModelsForSave = (
     if (item.codexUltra?.enabled && !item.codexUltra.providerEffort) {
       throw new CodexCatalogValidationError(
         model,
-        `${model}：已解锁 Ultra 档，但尚未选择对应的供应商推理强度。请完成此项后再保存；当前所有修改均未保存。`,
+        `${model}: Ultra is unlocked but no provider reasoning effort is selected. Complete this before saving; none of the changes were saved.`,
       );
     }
 
@@ -2275,8 +2275,8 @@ function ProviderFormFull({
       if (appId === "codex") {
         const message = t("providerForm.codexConfigInvalidNotSaved", {
           defaultValue: isCodexProviderSetCancelled(error)
-            ? "操作已取消，未保存。当前草稿仍保留，可继续编辑后重试。"
-            : "保存结果未确认。后端可能已写入，但后续同步失败；请刷新核对状态，核对前避免重复修改 API Key。当前草稿仍保留。",
+            ? "Operation canceled; nothing was saved. The current draft is preserved so you can edit and retry."
+            : "Save result was not confirmed. The backend may have written the data, but follow-up synchronization failed. Refresh to verify the state and avoid changing the API Key again until then. The current draft is preserved.",
         });
         setCodexSaveError(message);
         toast.error(message);

@@ -30,12 +30,16 @@ describe("CodexModelReasoningEditor", () => {
       />,
     );
 
-    expect(screen.getByText("Provider 原生能力")).toBeInTheDocument();
-    expect(screen.getByText("Provider 默认档位")).toBeInTheDocument();
-    expect(screen.getByText("上游传参")).toBeInTheDocument();
-    expect(screen.getByText("Codex → Provider 映射")).toBeInTheDocument();
-    expect(screen.getByText(/同名档位会自动生成恒等映射/)).toBeInTheDocument();
-    expect(screen.getByText(/例如：reasoning_effort/)).toBeInTheDocument();
+    expect(screen.getByText("Native provider capability")).toBeInTheDocument();
+    expect(screen.getByText("Provider default level")).toBeInTheDocument();
+    expect(screen.getByText("Upstream parameter")).toBeInTheDocument();
+    expect(screen.getByText("Codex → provider mapping")).toBeInTheDocument();
+    expect(
+      screen.getByText(
+        /Same-named levels receive an identity mapping automatically/,
+      ),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/Example: reasoning_effort/)).toBeInTheDocument();
   });
 
   it("shows mapping rows only for this model's Provider-native efforts", () => {
@@ -49,15 +53,19 @@ describe("CodexModelReasoningEditor", () => {
     );
 
     const mapping = screen.getByRole("group", {
-      name: "qwen3.8 Codex 到 Provider 映射",
+      name: "qwen3.8 Codex-to-provider mapping",
     });
-    expect(within(mapping).getByLabelText("low 映射目标")).toHaveValue("low");
-    expect(within(mapping).getByLabelText("medium 映射目标")).toHaveValue(
+    expect(within(mapping).getByLabelText("low mapping target")).toHaveValue(
+      "low",
+    );
+    expect(within(mapping).getByLabelText("medium mapping target")).toHaveValue(
       "medium",
     );
-    expect(within(mapping).getByLabelText("high 映射目标")).toHaveValue("high");
-    expect(within(mapping).queryByLabelText("xhigh 映射目标")).toBeNull();
-    expect(screen.queryByLabelText("Provider 原生档位 xhigh")).toBeNull();
+    expect(within(mapping).getByLabelText("high mapping target")).toHaveValue(
+      "high",
+    );
+    expect(within(mapping).queryByLabelText("xhigh mapping target")).toBeNull();
+    expect(screen.queryByLabelText("Provider-native effort xhigh")).toBeNull();
   });
 
   it("fills the identity mapping when a native effort is selected", () => {
@@ -78,7 +86,7 @@ describe("CodexModelReasoningEditor", () => {
       />,
     );
 
-    fireEvent.change(screen.getByLabelText("添加 Provider 原生档位"), {
+    fireEvent.change(screen.getByLabelText("Add native provider level"), {
       target: { value: "high" },
     });
     expect(onChange).toHaveBeenCalledWith(
@@ -114,8 +122,10 @@ describe("CodexModelReasoningEditor", () => {
     );
 
     expect(
-      screen.queryByRole("checkbox", { name: "启用 Codex Ultra 编排" }),
+      screen.queryByRole("checkbox", {
+        name: "Enable Codex Ultra orchestration",
+      }),
     ).toBeNull();
-    expect(screen.queryByText("Codex Ultra 编排")).toBeNull();
+    expect(screen.queryByText("Codex Ultra orchestration")).toBeNull();
   });
 });

@@ -46,10 +46,19 @@ vi.mock("@/lib/api/codexSubagentV2", () => ({
   },
 }));
 
-vi.mock("react-i18next", () => ({
+vi.mock("react-i18next", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("react-i18next")>()),
   useTranslation: () => ({
-    t: (_key: string, options?: { defaultValue?: string }) =>
-      options?.defaultValue ?? _key,
+    t: (
+      _key: string,
+      options?: Record<string, unknown> & { defaultValue?: string },
+    ) => {
+      const template = options?.defaultValue ?? _key;
+      if (typeof template !== "string") return template;
+      return template.replace(/\{\{(\w+)\}\}/g, (_match, name: string) =>
+        String(options?.[name] ?? `{{${name}}}`),
+      );
+    },
   }),
 }));
 
@@ -431,7 +440,7 @@ function renderCatalogHarness(
 
   const renderResult = render(<Harness />);
   if (options.openAdvancedOptions ?? true) {
-    fireEvent.click(screen.getByRole("button", { name: "高级选项" }));
+    fireEvent.click(screen.getByRole("button", { name: "Advanced settings" }));
   }
 
   return {
@@ -622,7 +631,7 @@ function renderAutoSplitHarness() {
   }
 
   const renderResult = render(<Harness />);
-  fireEvent.click(screen.getByRole("button", { name: "高级选项" }));
+  fireEvent.click(screen.getByRole("button", { name: "Advanced settings" }));
 
   return {
     ...renderResult,
@@ -688,17 +697,25 @@ describe("CodexFormFields local model routing", () => {
     });
     await waitForReasoningResolution();
 
-    expect(screen.getByText("自动适配 · Responses + Chat")).toBeInTheDocument();
-    expect(screen.getByText("gpt-5.5：Responses")).toBeInTheDocument();
-    expect(screen.getByText("qwen3.8：Chat")).toBeInTheDocument();
-    expect(screen.getByText(/证据时间/)).toBeInTheDocument();
-    expect(screen.getByText("可加入 MultiRouter")).toBeInTheDocument();
-
-    fireEvent.click(screen.getByRole("button", { name: "查看已保存探测详情" }));
     expect(
-      await screen.findByRole("heading", { name: "Codex 兼容性深度探测" }),
+      screen.getByText("Automatic adaptation · Responses + Chat"),
     ).toBeInTheDocument();
-    expect(screen.getAllByText("查看字段映射与生效方式")).toHaveLength(4);
+    expect(screen.getByText(/gpt-5\.5:\s*Responses/)).toBeInTheDocument();
+    expect(screen.getByText(/qwen3\.8:\s*Chat/)).toBeInTheDocument();
+    expect(screen.getByText(/Evidence time/)).toBeInTheDocument();
+    expect(screen.getByText("Ready for MultiRouter")).toBeInTheDocument();
+
+    fireEvent.click(
+      screen.getByRole("button", { name: "View saved probe details" }),
+    );
+    expect(
+      await screen.findByRole("heading", {
+        name: "Codex deep compatibility probe",
+      }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getAllByText("View field mappings and runtime behavior"),
+    ).toHaveLength(4);
     expect(preflightCodexProviderProtocolCompatibility).not.toHaveBeenCalled();
   });
 
@@ -710,7 +727,7 @@ describe("CodexFormFields local model routing", () => {
       },
     );
 
-    fireEvent.change(screen.getByLabelText("qwen3.8 协议选择"), {
+    fireEvent.change(screen.getByLabelText("qwen3.8 protocol selection"), {
       target: { value: "openai_responses" },
     });
 
@@ -730,7 +747,7 @@ describe("CodexFormFields local model routing", () => {
       },
     );
 
-    fireEvent.change(screen.getByLabelText("候选模型名"), {
+    fireEvent.change(screen.getByLabelText("Candidate model name"), {
       target: { value: "qwen3.8-coder" },
     });
 
@@ -752,10 +769,12 @@ describe("CodexFormFields local model routing", () => {
     await waitForReasoningResolution();
 
     expect(
-      screen.getByText("旧版混合协议配置，需重新验证并迁移"),
+      screen.getByText(
+        "Legacy mixed-protocol configuration; revalidation and migration required",
+      ),
     ).toBeInTheDocument();
     expect(
-      screen.getByText(/保存时会重新执行双协议深度探测/),
+      screen.getByText(/reruns the dual-protocol deep probe/),
     ).toBeInTheDocument();
   });
 
@@ -765,20 +784,26 @@ describe("CodexFormFields local model routing", () => {
     });
     await waitForReasoningResolution();
 
-    expect(screen.getByText("模型目录明细")).toBeInTheDocument();
+    expect(screen.getByText("Model catalog details")).toBeInTheDocument();
     expect(
-      screen.getByRole("heading", { name: "模型推理能力" }),
+      screen.getByRole("heading", { name: "Model reasoning capabilities" }),
     ).toBeInTheDocument();
     fireEvent.click(
-      screen.getByRole("button", { name: "配置 qwen3.8 的推理能力" }),
+      screen.getByRole("button", {
+        name: "Configure reasoning capabilities for qwen3.8",
+      }),
     );
-    expect(screen.getByLabelText("qwen3.8推理能力来源")).toBeInTheDocument();
-    expect(screen.queryByText(/Codex 推理能力（/)).not.toBeInTheDocument();
+    expect(
+      screen.getByLabelText("qwen3.8 reasoning capability source"),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByText(/Codex reasoning capability \(/),
+    ).not.toBeInTheDocument();
     expect(
       screen
-        .getByText("模型目录明细")
+        .getByText("Model catalog details")
         .compareDocumentPosition(
-          screen.getByRole("heading", { name: "模型推理能力" }),
+          screen.getByRole("heading", { name: "Model reasoning capabilities" }),
         ) & Node.DOCUMENT_POSITION_FOLLOWING,
     ).toBeTruthy();
   });
@@ -796,13 +821,13 @@ describe("CodexFormFields local model routing", () => {
 
     expect(
       screen.getByRole("button", {
-        name: "deepseek-v4-flash-vision-exp 文本与图像",
+        name: "deepseek-v4-flash-vision-exp Text and image",
       }),
     ).toHaveAttribute("aria-pressed", "true");
 
     fireEvent.click(
       screen.getByRole("button", {
-        name: "deepseek-v4-flash-vision-exp 仅文本",
+        name: "deepseek-v4-flash-vision-exp Text only",
       }),
     );
     await waitFor(() => {
@@ -817,7 +842,7 @@ describe("CodexFormFields local model routing", () => {
 
     fireEvent.click(
       screen.getByRole("button", {
-        name: "deepseek-v4-flash-vision-exp 恢复 CCSM 输入能力预设",
+        name: "deepseek-v4-flash-vision-exp restore CCSM input capability preset",
       }),
     );
     await waitFor(() => {
@@ -870,21 +895,23 @@ describe("CodexFormFields local model routing", () => {
 
     fireEvent.click(
       screen.getByRole("button", {
-        name: "配置 deepseek-v4-flash 的推理能力",
+        name: "Configure reasoning capabilities for deepseek-v4-flash",
       }),
     );
 
     expect(
-      await screen.findByText(/自动发现会按当前 Provider、模型和已验证声明/),
+      await screen.findByText(
+        /Automatic discovery resolves capabilities from the current provider, model, and verified declarations/,
+      ),
     ).toBeInTheDocument();
     fireEvent.click(
       screen.getByRole("checkbox", {
-        name: "解锁 deepseek-v4-flash 的 Ultra 档",
+        name: "Unlock Ultra for deepseek-v4-flash",
       }),
     );
     fireEvent.change(
       screen.getByRole("combobox", {
-        name: "deepseek-v4-flash Ultra 对应的 Provider 推理强度",
+        name: "Provider reasoning effort used by deepseek-v4-flash Ultra",
       }),
       { target: { value: "high" } },
     );
@@ -903,20 +930,26 @@ describe("CodexFormFields local model routing", () => {
     renderCatalogHarness([{ model: "qwen3.8" }]);
     await waitFor(() => expect(reasoningApiMocks.resolve).toHaveBeenCalled());
     fireEvent.click(
-      screen.getByRole("button", { name: "配置 qwen3.8 的推理能力" }),
+      screen.getByRole("button", {
+        name: "Configure reasoning capabilities for qwen3.8",
+      }),
     );
 
     expect(
-      await screen.findByText("未知（使用服务端默认）"),
+      await screen.findByText("Unknown (using server default)"),
     ).toBeInTheDocument();
     expect(
-      screen.getByText("使用服务端默认（不发送推理参数）。"),
+      screen.getByText(
+        "Uses the server default (no reasoning parameter is sent).",
+      ),
     ).toBeInTheDocument();
 
-    fireEvent.click(screen.getByRole("button", { name: "手动声明" }));
+    fireEvent.click(screen.getByRole("button", { name: "Declare manually" }));
 
     await waitFor(() => {
-      expect(screen.getByLabelText("qwen3.8推理能力 JSON")).not.toHaveValue("");
+      expect(
+        screen.getByLabelText("qwen3.8 reasoning capability JSON"),
+      ).not.toHaveValue("");
     });
   });
 
@@ -931,11 +964,15 @@ describe("CodexFormFields local model routing", () => {
     );
     const { latestCatalog } = renderCatalogHarness([{ model: "qwen3.8" }]);
     fireEvent.click(
-      screen.getByRole("button", { name: "配置 qwen3.8 的推理能力" }),
+      screen.getByRole("button", {
+        name: "Configure reasoning capabilities for qwen3.8",
+      }),
     );
 
-    expect(await screen.findByText("采用检测结果")).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: "采用检测结果" }));
+    expect(await screen.findByText("Use detected result")).toBeInTheDocument();
+    fireEvent.click(
+      screen.getByRole("button", { name: "Use detected result" }),
+    );
 
     await waitFor(() => {
       expect(latestCatalog()[0].reasoning).toEqual(
@@ -990,13 +1027,15 @@ describe("CodexFormFields local model routing", () => {
     });
     renderCatalogHarness([{ model: "qwen3.8" }]);
     fireEvent.click(
-      screen.getByRole("button", { name: "配置 qwen3.8 的推理能力" }),
+      screen.getByRole("button", {
+        name: "Configure reasoning capabilities for qwen3.8",
+      }),
     );
 
     expect(
-      await screen.findByRole("button", { name: "重新检测" }),
+      await screen.findByRole("button", { name: "Detect again" }),
     ).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: "重新检测" }));
+    fireEvent.click(screen.getByRole("button", { name: "Detect again" }));
 
     await waitFor(() => {
       expect(reasoningApiMocks.trigger).toHaveBeenCalledWith(
@@ -1007,7 +1046,7 @@ describe("CodexFormFields local model routing", () => {
         "qwen3.8",
       );
     });
-    expect(await screen.findByText("支持推理")).toBeInTheDocument();
+    expect(await screen.findByText("Reasoning supported")).toBeInTheDocument();
   });
 
   it("keeps built-in reasoning read-only until an explicit override and restores the preset", async () => {
@@ -1033,30 +1072,40 @@ describe("CodexFormFields local model routing", () => {
 
     fireEvent.click(
       screen.getByRole("button", {
-        name: "配置 deepseek-v4-pro 的推理能力",
+        name: "Configure reasoning capabilities for deepseek-v4-pro",
       }),
     );
-    const textarea = screen.getByLabelText("deepseek-v4-pro推理能力 JSON");
+    const textarea = screen.getByLabelText(
+      "deepseek-v4-pro reasoning capability JSON",
+    );
     expect(textarea).toHaveAttribute("readonly");
-    expect(screen.getByText("能力来源：CCSM 受维护声明")).toBeInTheDocument();
+    expect(
+      screen.getByText(/Capability source:\s*CCSM-maintained declaration/),
+    ).toBeInTheDocument();
 
-    fireEvent.click(screen.getByRole("button", { name: "创建高级覆盖" }));
+    fireEvent.click(
+      screen.getByRole("button", { name: "Create advanced override" }),
+    );
     await waitFor(() => {
       expect(latestCatalog()[0].reasoning?.source).toBe("user");
     });
     expect(
-      screen.getByLabelText("deepseek-v4-pro推理能力 JSON"),
+      screen.getByLabelText("deepseek-v4-pro reasoning capability JSON"),
     ).not.toHaveAttribute("readonly");
     expect(
-      screen.getByText("能力来源：用户声明（已覆盖维护值）"),
+      screen.getByText(
+        /Capability source:\s*User declaration \(overrides maintained value\)/,
+      ),
     ).toBeInTheDocument();
 
-    fireEvent.click(screen.getByRole("button", { name: "恢复内置默认" }));
+    fireEvent.click(
+      screen.getByRole("button", { name: "Restore built-in default" }),
+    );
     await waitFor(() => {
       expect(latestCatalog()[0].reasoning).toEqual(builtinReasoning);
     });
     expect(
-      screen.getByLabelText("deepseek-v4-pro推理能力 JSON"),
+      screen.getByLabelText("deepseek-v4-pro reasoning capability JSON"),
     ).toHaveAttribute("readonly");
   });
   it("syncs relay models without inferring protocols or suggesting provider splits", async () => {
@@ -1072,12 +1121,14 @@ describe("CodexFormFields local model routing", () => {
       onApiFormatChange,
     } = renderAutoSplitHarness();
 
-    fireEvent.click(screen.getByRole("button", { name: "同步模型" }));
+    fireEvent.click(screen.getByRole("button", { name: "Sync models" }));
 
     await waitFor(() => {
       expect(latestCatalog()).toHaveLength(2);
     });
-    expect(screen.queryByText("检测到混合协议模型")).not.toBeInTheDocument();
+    expect(
+      screen.queryByText("different models selected different protocols"),
+    ).not.toBeInTheDocument();
     expect(latestCatalog()).toEqual([
       expect.objectContaining({ model: "gpt-5.5" }),
       expect.objectContaining({ model: "qwen3.6" }),
@@ -1095,7 +1146,7 @@ describe("CodexFormFields local model routing", () => {
       { model: "gpt-5.5", displayName: "Third-party GPT" },
     ]);
 
-    fireEvent.change(screen.getByLabelText("候选模型名"), {
+    fireEvent.change(screen.getByLabelText("Candidate model name"), {
       target: { value: "gpt-5.5-thirdparty" },
     });
 
@@ -1122,16 +1173,22 @@ describe("CodexFormFields local model routing", () => {
       { shouldShowSpeedTest: true },
     );
 
-    fireEvent.click(screen.getByRole("button", { name: "验证连接" }));
-    expect(screen.getByText("确认测试 Chat / Responses")).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: "确认测试" }));
+    fireEvent.click(
+      screen.getByRole("button", { name: "Validate connection" }),
+    );
+    expect(
+      screen.getByText("Confirm Chat / Responses probe"),
+    ).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Confirm probe" }));
 
     expect(
-      await screen.findByRole("heading", { name: "Codex 兼容性深度探测" }),
+      await screen.findByRole("heading", {
+        name: "Codex deep compatibility probe",
+      }),
     ).toBeInTheDocument();
 
     await waitFor(() => {
-      expect(screen.getByText("可加入 MultiRouter")).toBeInTheDocument();
+      expect(screen.getByText("Ready for MultiRouter")).toBeInTheDocument();
     });
     expect(onApiFormatChange).not.toHaveBeenCalled();
     expect(preflightCodexProviderProtocolCompatibility).toHaveBeenCalledWith(
@@ -1170,14 +1227,18 @@ describe("CodexFormFields local model routing", () => {
       },
     );
 
-    fireEvent.click(screen.getByRole("button", { name: "验证连接" }));
-    fireEvent.click(screen.getByRole("button", { name: "确认测试" }));
+    fireEvent.click(
+      screen.getByRole("button", { name: "Validate connection" }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Confirm probe" }));
 
     expect(await screen.findByRole("alert")).toHaveTextContent(
-      "后端没有返回已启用模型 qwen3.8 的探测结果",
+      "The backend returned no probe result for enabled model(s): qwen3.8",
     );
     expect(
-      screen.queryByText("已完成 0 个模型：Verified 0，Partial 0，Failed 0。"),
+      screen.queryByText(
+        "Completed 0 models: Verified 0, Partial 0, Failed 0.",
+      ),
     ).not.toBeInTheDocument();
     expect(preflightCodexProviderProtocolCompatibility).toHaveBeenCalledWith(
       expect.anything(),
@@ -1199,11 +1260,13 @@ describe("CodexFormFields local model routing", () => {
       { shouldShowSpeedTest: true },
     );
 
-    fireEvent.click(screen.getByRole("button", { name: "验证连接" }));
-    fireEvent.click(screen.getByRole("button", { name: "确认测试" }));
+    fireEvent.click(
+      screen.getByRole("button", { name: "Validate connection" }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Confirm probe" }));
 
     await waitFor(() => {
-      expect(screen.getByText("可加入 MultiRouter")).toBeInTheDocument();
+      expect(screen.getByText("Ready for MultiRouter")).toBeInTheDocument();
     });
     expect(onApiFormatChange).not.toHaveBeenCalled();
   });
@@ -1242,8 +1305,10 @@ describe("CodexFormFields local model routing", () => {
       },
     );
 
-    fireEvent.click(screen.getByRole("button", { name: "验证连接" }));
-    fireEvent.click(screen.getByRole("button", { name: "确认测试" }));
+    fireEvent.click(
+      screen.getByRole("button", { name: "Validate connection" }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Confirm probe" }));
 
     await waitFor(() => {
       expect(preflightCodexProviderProtocolCompatibility).toHaveBeenCalled();
@@ -1305,8 +1370,10 @@ describe("CodexFormFields local model routing", () => {
       { shouldShowSpeedTest: true },
     );
 
-    fireEvent.click(screen.getByRole("button", { name: "验证连接" }));
-    fireEvent.click(screen.getByRole("button", { name: "确认测试" }));
+    fireEvent.click(
+      screen.getByRole("button", { name: "Validate connection" }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Confirm probe" }));
 
     await waitFor(() => {
       expect(preflightCodexProviderProtocolCompatibility).toHaveBeenCalled();
@@ -1338,18 +1405,24 @@ describe("CodexFormFields local model routing", () => {
     const { updateIdentity } = renderReadinessIdentityHarness();
 
     const validateCurrentIdentity = async () => {
-      fireEvent.click(screen.getByRole("button", { name: "验证连接" }));
-      fireEvent.click(screen.getByRole("button", { name: "确认测试" }));
-      expect(await screen.findByText("可加入 MultiRouter")).toBeInTheDocument();
-      fireEvent.click(screen.getByRole("button", { name: "关闭" }));
+      fireEvent.click(
+        screen.getByRole("button", { name: "Validate connection" }),
+      );
+      fireEvent.click(screen.getByRole("button", { name: "Confirm probe" }));
+      expect(
+        await screen.findByText("Ready for MultiRouter"),
+      ).toBeInTheDocument();
+      fireEvent.click(screen.getByRole("button", { name: "Close" }));
     };
     const expectInvalidated = async () => {
       await waitFor(() => {
         expect(
-          screen.queryByText("可加入 MultiRouter"),
+          screen.queryByText("Ready for MultiRouter"),
         ).not.toBeInTheDocument();
       });
-      expect(screen.getByText("建议先验证连接")).toBeInTheDocument();
+      expect(
+        screen.getByText("Validate the connection first"),
+      ).toBeInTheDocument();
     };
 
     await validateCurrentIdentity();
@@ -1401,15 +1474,17 @@ describe("CodexFormFields local model routing", () => {
       },
     );
 
-    expect(screen.getByText("可加入 MultiRouter")).toBeInTheDocument();
+    expect(screen.getByText("Ready for MultiRouter")).toBeInTheDocument();
 
     updateIdentity({ baseUrl: "https://changed.example/v1" });
 
     await waitFor(() => {
-      expect(screen.getByText("建议先验证连接")).toBeInTheDocument();
+      expect(
+        screen.getByText("Validate the connection first"),
+      ).toBeInTheDocument();
     });
-    expect(screen.queryByText("可加入 MultiRouter")).not.toBeInTheDocument();
-    expect(screen.getByText(/已过期/)).toBeInTheDocument();
+    expect(screen.queryByText("Ready for MultiRouter")).not.toBeInTheDocument();
+    expect(screen.getByText(/expired/)).toBeInTheDocument();
   });
 
   it("retains probe evidence when manual mode overrides the final protocol", async () => {
@@ -1423,9 +1498,13 @@ describe("CodexFormFields local model routing", () => {
     const { updateIdentity, onProtocolProbeReceiptIdsChange } =
       renderReadinessIdentityHarness();
 
-    fireEvent.click(screen.getByRole("button", { name: "验证连接" }));
-    fireEvent.click(screen.getByRole("button", { name: "确认测试" }));
-    expect(await screen.findByText("可加入 MultiRouter")).toBeInTheDocument();
+    fireEvent.click(
+      screen.getByRole("button", { name: "Validate connection" }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Confirm probe" }));
+    expect(
+      await screen.findByText("Ready for MultiRouter"),
+    ).toBeInTheDocument();
     onProtocolProbeReceiptIdsChange.mockClear();
 
     updateIdentity({
@@ -1443,7 +1522,7 @@ describe("CodexFormFields local model routing", () => {
     });
 
     await waitFor(() => {
-      expect(screen.getByText("可加入 MultiRouter")).toBeInTheDocument();
+      expect(screen.getByText("Ready for MultiRouter")).toBeInTheDocument();
     });
     expect(onProtocolProbeReceiptIdsChange).not.toHaveBeenCalledWith([]);
   });
@@ -1459,8 +1538,10 @@ describe("CodexFormFields local model routing", () => {
     );
     const { updateIdentity } = renderReadinessIdentityHarness();
 
-    fireEvent.click(screen.getByRole("button", { name: "验证连接" }));
-    fireEvent.click(screen.getByRole("button", { name: "确认测试" }));
+    fireEvent.click(
+      screen.getByRole("button", { name: "Validate connection" }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Confirm probe" }));
     await waitFor(() => {
       expect(preflightCodexProviderProtocolCompatibility).toHaveBeenCalledTimes(
         1,
@@ -1469,10 +1550,14 @@ describe("CodexFormFields local model routing", () => {
 
     updateIdentity({ baseUrl: "https://new.example/v1" });
     await waitFor(() =>
-      expect(screen.getByRole("button", { name: "验证连接" })).toBeEnabled(),
+      expect(
+        screen.getByRole("button", { name: "Validate connection" }),
+      ).toBeEnabled(),
     );
-    fireEvent.click(screen.getByRole("button", { name: "验证连接" }));
-    fireEvent.click(screen.getByRole("button", { name: "确认测试" }));
+    fireEvent.click(
+      screen.getByRole("button", { name: "Validate connection" }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Confirm probe" }));
 
     await act(async () => {
       newProbe.resolve(
@@ -1482,7 +1567,9 @@ describe("CodexFormFields local model routing", () => {
       );
       await Promise.resolve();
     });
-    expect(await screen.findByText("可加入 MultiRouter")).toBeInTheDocument();
+    expect(
+      await screen.findByText("Ready for MultiRouter"),
+    ).toBeInTheDocument();
 
     await act(async () => {
       oldProbe.resolve(
@@ -1494,7 +1581,7 @@ describe("CodexFormFields local model routing", () => {
     });
 
     await waitFor(() => {
-      expect(screen.getByText("可加入 MultiRouter")).toBeInTheDocument();
+      expect(screen.getByText("Ready for MultiRouter")).toBeInTheDocument();
       expect(screen.queryByRole("alert")).not.toBeInTheDocument();
     });
   });
@@ -1527,8 +1614,10 @@ describe("CodexFormFields local model routing", () => {
       },
     );
 
-    fireEvent.click(screen.getByRole("button", { name: "验证连接" }));
-    fireEvent.click(screen.getByRole("button", { name: "确认测试" }));
+    fireEvent.click(
+      screen.getByRole("button", { name: "Validate connection" }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Confirm probe" }));
 
     await waitFor(() =>
       expect(onProtocolProbeReceiptIdsChange).toHaveBeenLastCalledWith([
@@ -1545,19 +1634,23 @@ describe("CodexFormFields local model routing", () => {
     expect(latestCatalog()[0]).not.toHaveProperty("apiFormat");
     expect(latestCatalog()[1]).not.toHaveProperty("apiFormat");
     expect(latestCatalog()[2]).not.toHaveProperty("apiFormat");
-    expect(screen.queryByText("检测到混合协议模型")).not.toBeInTheDocument();
     expect(
-      screen.getByText(/存在 Partial\/Failed 模型.*不能自动保存/),
+      screen.queryByText("different models selected different protocols"),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.getByText(
+        /some models are Partial\/Failed, so automatic saving is unavailable/,
+      ),
     ).toBeInTheDocument();
     expect(onApiFormatChange).not.toHaveBeenCalled();
     expect(
-      screen.getByRole("article", { name: "gpt-5.5 探测进度" }),
-    ).toHaveTextContent("已选 Responses");
+      screen.getByRole("article", { name: "gpt-5.5 probe progress" }),
+    ).toHaveTextContent("Selected Responses");
     expect(
-      screen.getByRole("article", { name: "qwen3.6 探测进度" }),
-    ).toHaveTextContent("已选 Chat Completions");
+      screen.getByRole("article", { name: "qwen3.6 probe progress" }),
+    ).toHaveTextContent("Selected Chat Completions");
     expect(
-      screen.getByRole("article", { name: "glm-4.5 探测进度" }),
+      screen.getByRole("article", { name: "glm-4.5 probe progress" }),
     ).toHaveTextContent("Failed");
   });
 
@@ -1581,11 +1674,19 @@ describe("CodexFormFields local model routing", () => {
         { providerName: "Relay", shouldShowSpeedTest: true },
       );
 
-    fireEvent.click(screen.getByRole("button", { name: "验证连接" }));
-    fireEvent.click(screen.getByRole("button", { name: "确认测试" }));
+    fireEvent.click(
+      screen.getByRole("button", { name: "Validate connection" }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Confirm probe" }));
 
-    expect(await screen.findByText("可加入 MultiRouter")).toBeInTheDocument();
-    expect(screen.getByText(/保存时将自动拆分/)).toBeInTheDocument();
+    expect(
+      await screen.findByText("Ready for MultiRouter"),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText(
+        /Saving will split them into two same-protocol providers/,
+      ),
+    ).toBeInTheDocument();
     expect(onApiFormatChange).not.toHaveBeenCalled();
     expect(onProtocolProbeReceiptIdsChange).toHaveBeenLastCalledWith([
       "receipt-gpt-5.5",
@@ -1614,12 +1715,14 @@ describe("CodexFormFields local model routing", () => {
       { shouldShowSpeedTest: true },
     );
 
-    fireEvent.click(screen.getByRole("button", { name: "验证连接" }));
-    fireEvent.click(screen.getByRole("button", { name: "确认测试" }));
+    fireEvent.click(
+      screen.getByRole("button", { name: "Validate connection" }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Confirm probe" }));
 
     await waitFor(() => {
       expect(
-        screen.getByRole("article", { name: "qwen3.8 探测进度" }),
+        screen.getByRole("article", { name: "qwen3.8 probe progress" }),
       ).toHaveTextContent("Partial");
     });
     expect(latestCatalog()).toEqual([
@@ -1639,15 +1742,23 @@ describe("CodexFormFields local model routing", () => {
     await waitForReasoningResolution();
 
     await act(async () => {
-      fireEvent.click(screen.getByRole("button", { name: "高级选项" }));
-      fireEvent.click(screen.getByRole("button", { name: "验证连接" }));
+      fireEvent.click(
+        screen.getByRole("button", { name: "Advanced settings" }),
+      );
+      fireEvent.click(
+        screen.getByRole("button", { name: "Validate connection" }),
+      );
     });
 
     expect(
-      screen.getByText("已打开验证确认框；如果没有看到弹窗，请按 Esc 后重试。"),
+      screen.getByText(
+        "The probe confirmation dialog is open; if you do not see it, press Esc and try again.",
+      ),
     ).toBeVisible();
     expect(screen.getByRole("dialog")).toHaveClass("z-[200]");
-    expect(screen.getByText("确认测试 Chat / Responses")).toBeInTheDocument();
+    expect(
+      screen.getByText("Confirm Chat / Responses probe"),
+    ).toBeInTheDocument();
   });
 
   it("keeps catalog fetch and edit controls available when Codex menu mapping is off", async () => {
@@ -1657,13 +1768,13 @@ describe("CodexFormFields local model routing", () => {
       openAdvancedOptions: false,
     });
 
-    fireEvent.click(screen.getByRole("button", { name: "高级选项" }));
+    fireEvent.click(screen.getByRole("button", { name: "Advanced settings" }));
 
     const fetchButton = screen.getByRole("button", {
-      name: "同步模型",
+      name: "Sync models",
     });
     const probeButton = screen.getByRole("button", {
-      name: "验证连接",
+      name: "Validate connection",
     });
 
     expect(fetchButton).toBeVisible();
@@ -1671,14 +1782,16 @@ describe("CodexFormFields local model routing", () => {
     expect(fetchButton.compareDocumentPosition(probeButton)).toBe(
       Node.DOCUMENT_POSITION_FOLLOWING,
     );
-    expect(screen.getByText("在 Codex /model 菜单中显示")).toBeInTheDocument();
-    expect(screen.getByText("模型目录明细")).toBeInTheDocument();
+    expect(
+      screen.getByText("Show in the Codex /model menu"),
+    ).toBeInTheDocument();
+    expect(screen.getByText("Model catalog details")).toBeInTheDocument();
 
-    fireEvent.click(screen.getByRole("button", { name: "添加模型" }));
+    fireEvent.click(screen.getByRole("button", { name: "Add model" }));
 
     await waitFor(() => {
-      expect(screen.getByLabelText("候选模型名")).toBeInTheDocument();
-      expect(screen.getByLabelText("上下文窗口")).toBeInTheDocument();
+      expect(screen.getByLabelText("Candidate model name")).toBeInTheDocument();
+      expect(screen.getByLabelText("Context window")).toBeInTheDocument();
     });
   });
 
@@ -1691,7 +1804,7 @@ describe("CodexFormFields local model routing", () => {
       takeoverEnabled: false,
     });
 
-    fireEvent.click(screen.getByRole("button", { name: "同步模型" }));
+    fireEvent.click(screen.getByRole("button", { name: "Sync models" }));
 
     await waitFor(() => {
       expect(latestCatalog()).toEqual([
@@ -1731,7 +1844,7 @@ describe("CodexFormFields local model routing", () => {
       },
     ]);
 
-    fireEvent.click(screen.getByRole("button", { name: "同步模型" }));
+    fireEvent.click(screen.getByRole("button", { name: "Sync models" }));
 
     await waitFor(() => {
       expect(latestCatalog()).toEqual([
@@ -1759,16 +1872,18 @@ describe("CodexFormFields local model routing", () => {
   it("points users to fetch models when protocol probing has no catalog", async () => {
     renderCatalogHarness([], { shouldShowSpeedTest: true });
 
-    fireEvent.click(screen.getByRole("button", { name: "验证连接" }));
+    fireEvent.click(
+      screen.getByRole("button", { name: "Validate connection" }),
+    );
 
     expect(await screen.findByRole("status")).toHaveTextContent(
-      "请先在“模型与兼容性”同步模型，或在高级设置中启用/添加至少一个模型后再验证。",
+      "Sync models in “Models and compatibility” first, or enable/add at least one model in Advanced settings before validating.",
     );
     expect(
-      screen.queryByText("确认测试 Chat / Responses"),
+      screen.queryByText("Confirm Chat / Responses probe"),
     ).not.toBeInTheDocument();
     const fetchButton = screen.getByRole("button", {
-      name: "同步模型",
+      name: "Sync models",
     });
     expect(fetchButton).toHaveClass("border-blue-500");
     await waitFor(() =>
@@ -1789,13 +1904,15 @@ describe("CodexFormFields local model routing", () => {
       { shouldShowSpeedTest: true },
     );
 
-    fireEvent.click(screen.getByRole("button", { name: "验证连接" }));
+    fireEvent.click(
+      screen.getByRole("button", { name: "Validate connection" }),
+    );
 
     expect(await screen.findByRole("status")).toHaveTextContent(
-      "启用/添加至少一个模型后再验证",
+      "Sync models in “Models and compatibility” first, or enable/add at least one model in Advanced settings before validating.",
     );
     expect(
-      screen.queryByText("确认测试 Chat / Responses"),
+      screen.queryByText("Confirm Chat / Responses probe"),
     ).not.toBeInTheDocument();
     expect(preflightCodexProviderProtocolCompatibility).not.toHaveBeenCalled();
   });
@@ -1808,14 +1925,18 @@ describe("CodexFormFields local model routing", () => {
       shouldShowSpeedTest: true,
     });
 
-    fireEvent.click(screen.getByRole("button", { name: "验证连接" }));
-    fireEvent.click(screen.getByRole("button", { name: "确认测试" }));
+    fireEvent.click(
+      screen.getByRole("button", { name: "Validate connection" }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Confirm probe" }));
 
     expect(await screen.findByRole("alert")).toHaveTextContent(
-      "探测中断：backend timeout",
+      "Probe interrupted: backend timeout",
     );
-    fireEvent.click(screen.getByRole("button", { name: "关闭" }));
-    expect(screen.getByRole("button", { name: "验证连接" })).toBeEnabled();
+    fireEvent.click(screen.getByRole("button", { name: "Close" }));
+    expect(
+      screen.getByRole("button", { name: "Validate connection" }),
+    ).toBeEnabled();
   });
 
   it("merges fetched models by upstream model without overwriting a visible alias", async () => {
@@ -1830,7 +1951,7 @@ describe("CodexFormFields local model routing", () => {
       },
     ]);
 
-    fireEvent.click(screen.getByRole("button", { name: "同步模型" }));
+    fireEvent.click(screen.getByRole("button", { name: "Sync models" }));
 
     await waitFor(() => {
       expect(latestCatalog()).toEqual([
@@ -1858,7 +1979,7 @@ describe("CodexFormFields local model routing", () => {
       },
     );
 
-    fireEvent.click(screen.getByRole("button", { name: "同步模型" }));
+    fireEvent.click(screen.getByRole("button", { name: "Sync models" }));
 
     await waitFor(() => {
       expect(fetchModelsForConfig).toHaveBeenCalledWith(
@@ -1888,7 +2009,7 @@ describe("CodexFormFields local model routing", () => {
     );
     await waitForReasoningResolution();
 
-    fireEvent.click(screen.getByRole("button", { name: "同步模型" }));
+    fireEvent.click(screen.getByRole("button", { name: "Sync models" }));
 
     expect(fetchModelsForConfig).not.toHaveBeenCalled();
     expect(latestCatalog()).toEqual([
@@ -1911,7 +2032,7 @@ describe("CodexFormFields local model routing", () => {
       },
     );
 
-    fireEvent.click(screen.getByRole("button", { name: "同步模型" }));
+    fireEvent.click(screen.getByRole("button", { name: "Sync models" }));
 
     await waitFor(() => {
       expect(fetchModelsForConfig).toHaveBeenCalledWith(
@@ -1940,7 +2061,7 @@ describe("CodexFormFields local model routing", () => {
       { model: "model-c", upstreamModel: "model-c" },
     ]);
 
-    fireEvent.click(screen.getByLabelText("保留 model-b"));
+    fireEvent.click(screen.getByLabelText("Keep model-b"));
 
     await waitFor(() => {
       expect(latestCatalog().map((model) => model.model)).toEqual([
@@ -1949,7 +2070,7 @@ describe("CodexFormFields local model routing", () => {
       ]);
     });
 
-    fireEvent.click(screen.getAllByTitle("上移")[1]);
+    fireEvent.click(screen.getAllByTitle("Move up")[1]);
 
     await waitFor(() => {
       expect(latestCatalog().map((model) => model.model)).toEqual([
@@ -1979,9 +2100,9 @@ describe("CodexFormFields local model routing", () => {
       ],
     });
 
-    expect(screen.queryByText("Codex 多模型路由")).not.toBeInTheDocument();
+    expect(screen.queryByText("Codex MultiRouter")).not.toBeInTheDocument();
     expect(
-      screen.queryByRole("button", { name: "添加路由" }),
+      screen.queryByRole("button", { name: "Add route" }),
     ).not.toBeInTheDocument();
     expect(latestRouting()).toMatchObject({
       enabled: true,
@@ -1998,23 +2119,29 @@ describe("CodexFormFields local model routing", () => {
     });
 
     expect(
-      screen.queryByText("在 Codex /model 菜单中显示"),
+      screen.queryByText("Show in the Codex /model menu"),
     ).not.toBeInTheDocument();
 
-    fireEvent.click(screen.getByRole("button", { name: "高级选项" }));
+    fireEvent.click(screen.getByRole("button", { name: "Advanced settings" }));
 
-    const overrides = screen.getByText("本地代理请求覆盖");
-    const projection = screen.getByText("在 Codex /model 菜单中显示");
+    const overrides = screen.getByText("Local proxy request overrides", {
+      exact: true,
+    });
+    const projection = screen.getByText("Show in the Codex /model menu");
     expect(projection).toBeInTheDocument();
     expect(
       overrides.compareDocumentPosition(projection) &
         Node.DOCUMENT_POSITION_FOLLOWING,
     ).toBeTruthy();
     expect(
-      screen.getByText(/它不控制 Provider、代理或 MultiRouter 是否可用/),
+      screen.getByText(
+        /It does not control provider, proxy, or MultiRouter availability/,
+      ),
     ).toBeInTheDocument();
     expect(
-      screen.getByText(/仅当你要使用自己维护的 model_catalog_json 时关闭/),
+      screen.getByText(
+        /disable it only when maintaining your own model_catalog_json/,
+      ),
     ).toBeInTheDocument();
   });
 
@@ -2024,10 +2151,10 @@ describe("CodexFormFields local model routing", () => {
       openAdvancedOptions: false,
     });
 
-    fireEvent.click(screen.getByRole("button", { name: "高级选项" }));
+    fireEvent.click(screen.getByRole("button", { name: "Advanced settings" }));
 
     expect(
-      screen.queryByText("在 Codex /model 菜单中显示"),
+      screen.queryByText("Show in the Codex /model menu"),
     ).not.toBeInTheDocument();
   });
 });

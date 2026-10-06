@@ -12,7 +12,7 @@ describe("CodexModelReasoningSummary", () => {
       <div>
         <CodexModelReasoningSummary
           model="qwen3.8"
-          source="自动发现"
+          source="Automatic detection"
           selectableEfforts={["low", "medium", "high"]}
           defaultEffort="medium"
           ultraEnabled={false}
@@ -23,7 +23,7 @@ describe("CodexModelReasoningSummary", () => {
         />
         <CodexModelReasoningSummary
           model="qwen3.8-coder"
-          source="用户声明"
+          source="User declaration"
           selectableEfforts={["low", "high"]}
           defaultEffort="high"
           ultraEnabled
@@ -38,26 +38,28 @@ describe("CodexModelReasoningSummary", () => {
 
     expect(screen.getByText("qwen3.8")).toBeInTheDocument();
     expect(screen.getByText("qwen3.8-coder")).toBeInTheDocument();
-    expect(screen.getAllByText("配置推理能力")).toHaveLength(2);
+    expect(screen.getAllByText("Configure reasoning")).toHaveLength(2);
     expect(
-      screen.getByText("Codex 档位：low / medium / high"),
+      screen.getByText("Codex levels: low / medium / high"),
     ).toBeInTheDocument();
     expect(
-      screen.getByRole("checkbox", { name: "解锁 qwen3.8 的 Ultra 档" }),
+      screen.getByRole("checkbox", { name: "Unlock Ultra for qwen3.8" }),
     ).not.toBeChecked();
     expect(
       screen.getByRole("checkbox", {
-        name: "解锁 qwen3.8-coder 的 Ultra 档",
+        name: "Unlock Ultra for qwen3.8-coder",
       }),
     ).toBeChecked();
 
     fireEvent.click(
-      screen.getByRole("button", { name: "配置 qwen3.8 的推理能力" }),
+      screen.getByRole("button", {
+        name: "Configure reasoning capabilities for qwen3.8",
+      }),
     );
     expect(onToggle).toHaveBeenCalledOnce();
 
     fireEvent.click(
-      screen.getByRole("checkbox", { name: "解锁 qwen3.8 的 Ultra 档" }),
+      screen.getByRole("checkbox", { name: "Unlock Ultra for qwen3.8" }),
     );
     expect(onUltraChange).toHaveBeenNthCalledWith(1, {
       enabled: true,
@@ -72,7 +74,7 @@ describe("CodexModelReasoningSummary", () => {
     render(
       <CodexModelReasoningSummary
         model="glm-4.5"
-        source="自动发现或服务端默认"
+        source="Automatic discovery or server default"
         selectableEfforts={[]}
         ultraEnabled={false}
         ultraEfforts={[]}
@@ -83,7 +85,7 @@ describe("CodexModelReasoningSummary", () => {
     );
 
     const unlock = screen.getByRole("checkbox", {
-      name: "解锁 glm-4.5 的 Ultra 档",
+      name: "Unlock Ultra for glm-4.5",
     });
     expect(unlock).toBeEnabled();
 
@@ -96,7 +98,7 @@ describe("CodexModelReasoningSummary", () => {
     expect(onToggle).toHaveBeenCalledOnce();
     expect(
       screen.getByText(
-        "需要先确认该模型可接收的推理强度；已为你展开推理能力配置，完成后才能保存。",
+        "First confirm that this model accepts reasoning levels. The capability editor is open; complete it before saving.",
       ),
     ).toBeInTheDocument();
   });

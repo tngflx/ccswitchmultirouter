@@ -165,7 +165,9 @@ export function validateCodexReasoningCapabilityDraft(
     !Array.isArray(capability.supportedEfforts) ||
     capability.supportedEfforts.some((effort) => !allowed.has(effort))
   ) {
-    throw new Error("支持的推理强度包含未知档位，或包含仅供 Codex 使用的档位");
+    throw new Error(
+      "Supported reasoning efforts contain an unknown or Codex-only level",
+    );
   }
   // schema v2 用 supportStatus；legacy 数据用 supported。至少声明其一，
   // 同时存在时不得矛盾。
@@ -173,7 +175,7 @@ export function validateCodexReasoningCapabilityDraft(
     capability.supportStatus === undefined &&
     typeof capability.supported !== "boolean"
   ) {
-    throw new Error("必须声明该模型是否支持推理");
+    throw new Error("The model must declare whether it supports reasoning");
   }
   if (
     capability.supportStatus !== undefined &&
@@ -181,27 +183,31 @@ export function validateCodexReasoningCapabilityDraft(
     (capability.supportStatus === "confirmed_supported") !==
       capability.supported
   ) {
-    throw new Error("新旧推理支持状态相互冲突");
+    throw new Error("Legacy and current reasoning support states conflict");
   }
   if (
     capability.defaultEffort !== undefined &&
     !capability.supportedEfforts.includes(capability.defaultEffort)
   ) {
-    throw new Error("默认推理强度不是供应商支持的档位");
+    throw new Error(
+      "The default reasoning effort is not supported by the provider",
+    );
   }
   if (typeof capability.disableAllowed !== "boolean") {
-    throw new Error("是否允许关闭推理必须是布尔值");
+    throw new Error("Whether reasoning can be disabled must be a boolean");
   }
   if (
     !capability.upstream ||
     typeof capability.upstream.parameter !== "string" ||
     !capability.upstream.parameter.trim()
   ) {
-    throw new Error("上游推理参数名不能为空");
+    throw new Error("The upstream reasoning parameter name cannot be empty");
   }
   for (const target of Object.values(capability.upstream.effortMap ?? {})) {
     if (target && !capability.supportedEfforts.includes(target)) {
-      throw new Error(`映射目标 ${target} 不是供应商支持的推理强度`);
+      throw new Error(
+        `Mapping target ${target} is not supported by the provider`,
+      );
     }
   }
   const requiresEffortMap =
@@ -218,13 +224,17 @@ export function validateCodexReasoningCapabilityDraft(
       (effort) => !capability.upstream.effortMap?.[effort],
     );
     if (missing.length > 0) {
-      throw new Error(`推理强度映射缺少 ${missing.join(", ")} 档`);
+      throw new Error(
+        `Reasoning-effort mapping is missing ${missing.join(", ")}`,
+      );
     }
   }
   if (capability.codexUltraOrchestration?.enabled) {
     const ultraTarget = capability.upstream.effortMap?.max;
     if (!ultraTarget || !capability.supportedEfforts.includes(ultraTarget)) {
-      throw new Error("解锁 Ultra 档需要有效的 max 到供应商推理强度映射");
+      throw new Error(
+        "Unlocking Ultra requires a valid max-to-provider reasoning-effort mapping",
+      );
     }
   }
 }
@@ -351,7 +361,8 @@ export function CodexFormSaveFeedback({
         >
           {catalogValidationError.message}
           <span className="mt-1 block text-xs">
-            API Key、端点及其他修改仍保留在当前草稿中，但本次所有修改均未保存。
+            API Key, endpoint, and other edits remain in the current draft, but
+            none of these changes were saved.
           </span>
         </div>
       )}
@@ -362,7 +373,8 @@ export function CodexFormSaveFeedback({
         >
           {saveError}
           <span className="mt-1 block text-xs">
-            API Key 和其他输入仍保留在当前草稿中，不会显示在此错误提示中。
+            API Key and other inputs remain in the current draft and are not
+            shown in this error.
           </span>
         </div>
       )}
@@ -1126,7 +1138,7 @@ export function CodexFormFields({
     bindProtocolProbeIdentity(readinessIdentity);
     setProtocolProbeTone("warning");
     setProtocolProbeSummary(
-      "请先在“模型与兼容性”同步模型，或在高级设置中启用/添加至少一个模型后再验证。",
+      "Sync models in “Models and compatibility” first, or enable/add at least one model in Advanced settings before validating.",
     );
     setShouldHighlightFetchModels(true);
     window.setTimeout(() => {
@@ -1215,7 +1227,7 @@ export function CodexFormFields({
       if (!isXaiOauthAuthenticated) {
         toast.error(
           t("xaiOauth.loginRequired", {
-            defaultValue: "请先登录 xAI 账号",
+            defaultValue: "Sign in to your xAI account first",
           }),
         );
         return;
@@ -1371,7 +1383,9 @@ export function CodexFormFields({
       });
     if (probeModels.length === 0) {
       setIsProtocolProbeConfirmOpen(false);
-      toast.warning("请先点击“获取模型列表”，或手动添加至少一个模型。");
+      toast.warning(
+        "Click “Fetch model list” first, or add at least one model manually.",
+      );
       revealModelCatalogFetchAction();
       return;
     }
@@ -1391,7 +1405,7 @@ export function CodexFormFields({
     setProtocolProbeOutcome(null);
     setProtocolProbeError("");
     setProtocolProbeSummary(
-      `正在深度测试 ${probeModels.length} 个模型的 Responses / Chat、SSE、思考内容、工具调用和工具续轮。`,
+      `Deep-testing ${probeModels.length} model(s) across Responses / Chat, SSE, reasoning content, tool calls, and tool continuations.`,
     );
     try {
       const defaultModel =
@@ -1437,7 +1451,7 @@ export function CodexFormFields({
         .filter((model) => !returnedModels.has(model));
       if (missingModels.length > 0) {
         throw new Error(
-          `后端没有返回已启用模型 ${missingModels.join("、")} 的探测结果`,
+          `The backend returned no probe result for enabled model(s): ${missingModels.join(", ")}`,
         );
       }
       setProtocolProbeOutcome(outcome);
@@ -1467,14 +1481,14 @@ export function CodexFormFields({
         (record) => record.result.readiness === "partial",
       ).length;
       const failed = outcome.records.length - verified - partial;
-      const resultCounts = `Verified ${verified}，Partial ${partial}，Failed ${failed}`;
+      const resultCounts = `Verified ${verified}, Partial ${partial}, Failed ${failed}`;
 
       if (allResponses) {
         const resultIdentity = buildReadinessIdentityFor(
           catalogRowsRef.current,
         );
         bindProtocolProbeIdentity(resultIdentity);
-        const summary = `深度探测完成：全部模型选择 Responses；${resultCounts}。`;
+        const summary = `Deep probe complete: all models selected Responses; ${resultCounts}.`;
         const tone = failed > 0 || partial > 0 ? "warning" : "success";
         setProtocolProbeTone(tone);
         setProtocolProbeSummary(summary);
@@ -1490,7 +1504,7 @@ export function CodexFormFields({
           catalogRowsRef.current,
         );
         bindProtocolProbeIdentity(resultIdentity);
-        const summary = `深度探测完成：全部模型选择 Chat Completions；${resultCounts}。`;
+        const summary = `Deep probe complete: all models selected Chat Completions; ${resultCounts}.`;
         const tone = failed > 0 || partial > 0 ? "warning" : "success";
         setProtocolProbeTone(tone);
         setProtocolProbeSummary(summary);
@@ -1511,8 +1525,8 @@ export function CodexFormFields({
         );
       const summary =
         allVerified && hasMixedVerifiedTransports
-          ? `深度探测完成：不同模型选择了不同协议；${resultCounts}。保存时将自动拆分为两个同协议 Provider，并仍作为一个模型源使用。`
-          : `深度探测完成：存在 Partial/Failed 模型，当前不能自动保存；${resultCounts}。请查看失败阶段并重试。`;
+          ? `Deep probe complete: different models selected different protocols; ${resultCounts}. Saving will split them into two same-protocol providers while keeping them as one model source.`
+          : `Deep probe complete: some models are Partial/Failed, so automatic saving is unavailable; ${resultCounts}. Review the failed stages and retry.`;
       const resultIdentity = buildReadinessIdentityFor(catalogRowsRef.current);
       bindProtocolProbeIdentity(resultIdentity);
       const tone = allVerified
@@ -1533,7 +1547,7 @@ export function CodexFormFields({
       if (!ownsCurrentIdentity()) return;
       onProtocolProbeReceiptIdsChange([]);
       const detail = error instanceof Error ? error.message : String(error);
-      const summary = `协议测试中断：${detail}`;
+      const summary = `Protocol probe interrupted: ${detail}`;
       bindProtocolProbeIdentity(probeIdentity);
       setProtocolProbeTone("error");
       setProtocolProbeSummary(summary);
@@ -1626,7 +1640,9 @@ export function CodexFormFields({
       try {
         const reasoning = JSON.parse(trimmed) as CodexCatalogModel["reasoning"];
         if (!reasoning) {
-          throw new Error("推理能力配置必须是一个对象");
+          throw new Error(
+            "Reasoning capability configuration must be an object",
+          );
         }
         validateCodexReasoningCapabilityDraft(reasoning);
         handleUpdateCatalogRow(index, {
@@ -1634,7 +1650,7 @@ export function CodexFormFields({
         });
       } catch (error) {
         toast.error(
-          `推理能力 JSON 无效，未修改草稿：${error instanceof Error ? error.message : String(error)}`,
+          `Invalid reasoning capability JSON; the draft was not changed: ${error instanceof Error ? error.message : String(error)}`,
         );
       }
     },
@@ -1751,26 +1767,32 @@ export function CodexFormFields({
       >
         <DialogContent className="max-w-lg" zIndex="top">
           <DialogHeader>
-            <DialogTitle>确认测试 Chat / Responses</DialogTitle>
+            <DialogTitle>Confirm Chat / Responses probe</DialogTitle>
             <DialogDescription className="space-y-2 text-left">
               <span className="block">
-                这个测试会帮助判断当前 provider 应该选择 Responses 还是 Chat
-                Completions。它会对当前模型目录里的模型发送真实请求，会消耗模型
-                Token 并可能产生费用，也可能触发限流；完成后会显示上游已报告的
-                Token 和费用估算。
+                This probe helps determine whether the provider should use
+                Responses or Chat Completions. It sends real requests to models
+                in the current catalog, consumes tokens, may incur charges or
+                rate limits, and shows upstream-reported token usage and
+                estimated cost when complete.
               </span>
               <span className="block">
-                如果还没有模型目录，请先到上方“模型目录与上下文”点击“获取模型列表”，或手动添加至少一个模型。
+                If there is no model catalog yet, click “Fetch model list” in
+                “Model catalog and context” above, or add at least one model
+                manually.
               </span>
               <span className="block">
-                每个模型会分别测试对应的 Responses 和 Chat Completions
-                endpoint，并依次测试基础响应、SSE
-                流式、思考内容、强制工具调用和工具结果续轮；每个模型最多发送 8
-                次小请求，单次输出上限为 128。
+                Each model is tested against its Responses and Chat Completions
+                endpoints for a baseline response, SSE streaming, reasoning
+                content, forced tool calls, and tool-result continuation. Up to
+                8 small requests are sent per model, with a maximum output of
+                128 tokens per request.
               </span>
               <span className="block">
-                页面会实时显示当前模型、协议和失败阶段。都不通时通常不是协议本身的问题，也可能是
-                API Key、Base URL、模型权限、额度、网络、限流或上游故障。
+                The page shows the current model, protocol, and failed stage in
+                real time. If neither endpoint works, the issue may be the API
+                Key, Base URL, model permissions, quota, network, rate limits,
+                or an upstream outage rather than the protocol itself.
               </span>
             </DialogDescription>
           </DialogHeader>
@@ -1780,10 +1802,10 @@ export function CodexFormFields({
               variant="outline"
               onClick={() => setIsProtocolProbeConfirmOpen(false)}
             >
-              取消
+              Cancel
             </Button>
             <Button type="button" onClick={handleProtocolProbe}>
-              确认测试
+              Confirm probe
             </Button>
           </DialogFooter>
         </DialogContent>
@@ -1814,11 +1836,11 @@ export function CodexFormFields({
             transport === "open_ai_chat" ? "Chat Completions" : "Responses";
           if (readiness === "verified") {
             toast.success(
-              `${model} 已选择 ${transportName}，保存 Provider 后生效。`,
+              `${model} selected ${transportName}; it takes effect after saving the provider.`,
             );
           } else {
             toast.warning(
-              `${model} 将手动使用 ${transportName}；已保留探测到的能力缺口，保存 Provider 后生效。`,
+              `${model} will use ${transportName} manually; detected capability gaps are retained and the choice takes effect after saving the provider.`,
             );
           }
         }}
@@ -1836,12 +1858,15 @@ export function CodexFormFields({
           <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
           <div className="space-y-1">
             <div className="text-sm font-medium">
-              旧版混合协议配置，需重新验证并迁移
+              Legacy mixed-protocol configuration; revalidation and migration
+              required
             </div>
             <p className="text-xs leading-relaxed opacity-90">
-              当前模型目录仍保存逐模型协议。普通模式保存时会重新执行双协议深度探测，并归一为一个单协议
-              Provider
-              或一个门面加两个内部同协议叶子；完成迁移前仍以顶层协议为准。
+              The current catalog still stores a protocol per model. A normal
+              save reruns the dual-protocol deep probe and normalizes the result
+              into one single-protocol provider, or one facade with two
+              same-protocol internal leaves; the top-level protocol remains
+              authoritative until migration completes.
             </p>
           </div>
         </div>
@@ -1869,10 +1894,11 @@ export function CodexFormFields({
           partnerPromotionKey={partnerPromotionKey}
           placeholder={{
             official: t("providerForm.codexOfficialNoApiKey", {
-              defaultValue: "官方供应商无需 API Key",
+              defaultValue: "Official providers do not require an API Key",
             }),
             thirdParty: t("providerForm.codexApiKeyAutoFill", {
-              defaultValue: "输入 API Key，将自动填充到配置",
+              defaultValue:
+                "Enter an API Key; it will be filled into the configuration automatically",
             }),
           }}
         />
@@ -1897,7 +1923,9 @@ export function CodexFormFields({
       {category !== "official" && onModelChange && (
         <div className="space-y-1.5">
           <FormLabel htmlFor="codexDefaultModel">
-            {t("codexConfig.defaultModelLabel", { defaultValue: "默认模型" })}
+            {t("codexConfig.defaultModelLabel", {
+              defaultValue: "Default model",
+            })}
           </FormLabel>
           <div className="flex gap-1">
             <Input
@@ -1905,7 +1933,7 @@ export function CodexFormFields({
               value={codexModel}
               onChange={(event) => onModelChange(event.target.value)}
               placeholder={t("codexConfig.defaultModelPlaceholder", {
-                defaultValue: "例如: gpt-5.6",
+                defaultValue: "Example: gpt-5.6",
               })}
             />
             {fetchedModels.length > 0 && (
@@ -1918,7 +1946,7 @@ export function CodexFormFields({
           <p className="text-xs leading-relaxed text-muted-foreground">
             {t("codexConfig.defaultModelHint", {
               defaultValue:
-                "Codex 默认请求的模型，随时可改，无需等待预设更新。",
+                "The model Codex requests by default. Change it at any time without waiting for a preset update.",
             })}
           </p>
         </div>
@@ -1958,7 +1986,7 @@ export function CodexFormFields({
             bindProtocolProbeIdentity(readinessIdentity);
             setProtocolProbeTone("muted");
             setProtocolProbeSummary(
-              "已打开验证确认框；如果没有看到弹窗，请按 Esc 后重试。",
+              "The probe confirmation dialog is open; if you do not see it, press Esc and try again.",
             );
             setIsProtocolProbeConfirmOpen(true);
           }}
@@ -1994,18 +2022,20 @@ export function CodexFormFields({
               id="codex-model-reasoning-title"
               className="text-sm font-semibold text-foreground"
             >
-              模型推理能力
+              Model reasoning capabilities
             </h3>
             <p className="text-xs leading-relaxed text-muted-foreground">
-              每个模型独立配置。这里决定 Codex
-              可以选择哪些推理档位，以及请求最终如何发送给
-              Provider；能力不完整时会在保存 Provider 前阻止并指出缺失项。
+              Configure each model independently. This determines which
+              reasoning efforts Codex can select and how requests are sent to
+              the provider; incomplete capabilities block provider saves and
+              identify the missing fields.
             </p>
           </div>
 
           {catalogRows.length === 0 ? (
             <p className="rounded-md border border-dashed p-3 text-xs text-muted-foreground">
-              暂无模型。请先在上方同步模型，或在高级选项的模型目录明细中添加模型。
+              No models yet. Sync models above or add one in the model catalog
+              details under Advanced settings.
             </p>
           ) : (
             <div className="space-y-3">
@@ -2038,16 +2068,16 @@ export function CodexFormFields({
                   const isReasoningEditorExpanded =
                     expandedReasoningRowId === row.rowId;
                   const reasoningSourceLabel = isBuiltinReasoning
-                    ? "CCSM 受维护声明"
+                    ? "CCSM-maintained declaration"
                     : isUserPresetOverride
-                      ? "用户声明（已覆盖维护值）"
+                      ? "User declaration (overrides maintained value)"
                       : row.reasoning
-                        ? "用户声明"
+                        ? "User declaration"
                         : reasoningResolution?.source === "detection"
-                          ? "自动检测"
+                          ? "Automatic detection"
                           : reasoningResolution?.source === "library"
-                            ? "维护能力库"
-                            : "自动发现或服务端默认";
+                            ? "Maintained capability catalog"
+                            : "Automatic discovery or server default";
                   const selectableEfforts =
                     reasoningResolution?.resolved.codexSelectableEfforts ??
                     row.reasoning?.supportedEfforts ??
@@ -2070,7 +2100,9 @@ export function CodexFormFields({
                       className={`space-y-3 rounded-md border bg-background p-3 text-xs ${catalogValidationError?.model === model ? "border-destructive ring-1 ring-destructive" : ""}`}
                     >
                       <CodexModelReasoningSummary
-                        model={row.displayName?.trim() || model || "未命名模型"}
+                        model={
+                          row.displayName?.trim() || model || "Unnamed model"
+                        }
                         source={reasoningSourceLabel}
                         selectableEfforts={selectableEfforts}
                         defaultEffort={defaultEffort}
@@ -2094,11 +2126,13 @@ export function CodexFormFields({
                       {isReasoningEditorExpanded && (
                         <>
                           <label className="grid min-w-52 gap-1">
-                            <span className="font-medium">能力来源</span>
+                            <span className="font-medium">
+                              Capability source
+                            </span>
                             <select
                               className="rounded-md border bg-background px-3 py-2"
                               value={reasoningSourceMode}
-                              aria-label={`${model || "模型"}推理能力来源`}
+                              aria-label={`${model || "Model"} reasoning capability source`}
                               onChange={(event) =>
                                 handleUpdateCatalogRow(index, {
                                   reasoning:
@@ -2112,20 +2146,25 @@ export function CodexFormFields({
                                 })
                               }
                             >
-                              <option value="automatic">自动发现</option>
+                              <option value="automatic">
+                                Automatic discovery
+                              </option>
                               <option
                                 value="builtin"
                                 disabled={!presetReasoning}
                               >
-                                使用 CCSM 受维护声明
+                                Use the CCSM-maintained declaration
                               </option>
-                              <option value="manual">手动声明</option>
+                              <option value="manual">Manual declaration</option>
                             </select>
                             {reasoningSourceMode === "automatic" ? (
                               <span className="text-muted-foreground">
-                                自动发现会按当前
-                                Provider、模型和已验证声明解析能力；它不会写入本模型配置。需要调整档位、映射或开启
-                                Ultra 时，请按当前结果创建用户覆盖。
+                                Automatic discovery resolves capabilities from
+                                the current provider, model, and verified
+                                declarations; it does not write to this model
+                                configuration. Create a user override when you
+                                need to adjust efforts, mappings, or enable
+                                Ultra.
                               </span>
                             ) : null}
                           </label>
@@ -2159,10 +2198,12 @@ export function CodexFormFields({
                                       ...current,
                                       [probeModel]: next,
                                     }));
-                                    toast.success("已更新模型推理能力检测结果");
+                                    toast.success(
+                                      "Updated model reasoning capability detection result",
+                                    );
                                   } else {
                                     toast.info(
-                                      "未获得可采纳的模型推理能力声明，继续使用服务端默认。",
+                                      "No usable model reasoning declaration was found; continuing with the server default.",
                                     );
                                   }
                                 } catch (error) {
@@ -2170,7 +2211,9 @@ export function CodexFormFields({
                                     "[CodexFormFields] reasoning detection failed",
                                     error,
                                   );
-                                  toast.error("模型推理能力检测失败");
+                                  toast.error(
+                                    "Model reasoning capability detection failed",
+                                  );
                                 } finally {
                                   setRedetectingReasoningModel(null);
                                 }
@@ -2183,14 +2226,16 @@ export function CodexFormFields({
                                   : undefined;
                                 if (!detected) {
                                   toast.info(
-                                    "当前检测结果没有可采纳的推理档位声明。",
+                                    "The current detection result has no usable reasoning-effort declaration.",
                                   );
                                   return;
                                 }
                                 handleUpdateCatalogRow(index, {
                                   reasoning: detected,
                                 });
-                                toast.success("已采用检测到的推理能力");
+                                toast.success(
+                                  "Detected reasoning capabilities adopted",
+                                );
                               }}
                               onManualDeclare={() =>
                                 handleUpdateCatalogRow(index, {
@@ -2230,7 +2275,8 @@ export function CodexFormFields({
                             />
                           ) : (
                             <p className="text-muted-foreground">
-                              正在读取该模型的统一推理能力解析结果…
+                              Reading the unified reasoning capability result
+                              for this model…
                             </p>
                           )}
 
@@ -2250,7 +2296,7 @@ export function CodexFormFields({
                                 })
                               }
                             >
-                              恢复内置默认
+                              Restore built-in default
                             </Button>
                           ) : null}
                           {isBuiltinReasoning && row.reasoning ? (
@@ -2269,13 +2315,13 @@ export function CodexFormFields({
                                 })
                               }
                             >
-                              创建高级覆盖
+                              Create advanced override
                             </Button>
                           ) : null}
 
                           {row.reasoning ? (
                             <CodexModelReasoningEditor
-                              model={model || "模型"}
+                              model={model || "Model"}
                               capability={row.reasoning}
                               readOnly={isBuiltinReasoning}
                               onChange={(reasoning) =>
@@ -2286,7 +2332,7 @@ export function CodexFormFields({
 
                           <details>
                             <summary className="cursor-pointer text-muted-foreground">
-                              专家 JSON
+                              Expert JSON
                             </summary>
                             <Textarea
                               key={`reasoning-json:${row.rowId}:${JSON.stringify(row.reasoning)}`}
@@ -2305,7 +2351,7 @@ export function CodexFormFields({
                                 }
                               }}
                               readOnly={isBuiltinReasoning}
-                              aria-label={`${model || "模型"}推理能力 JSON`}
+                              aria-label={`${model || "Model"} reasoning capability JSON`}
                             />
                           </details>
                         </>
@@ -2319,7 +2365,7 @@ export function CodexFormFields({
         </section>
       )}
 
-      {/* 高级选项只保留手动协议、请求覆盖和模型目录明细。 */}
+      {/* Advanced settings只Keep手动协议、请求覆盖和Model catalog details。 */}
       {category !== "official" && (
         <Collapsible
           open={advancedExpanded}
@@ -2339,7 +2385,7 @@ export function CodexFormFields({
                 <ChevronRight className="h-4 w-4" />
               )}
               {t("providerForm.advancedOptionsToggle", {
-                defaultValue: "高级选项",
+                defaultValue: "Advanced settings",
               })}
             </Button>
           </CollapsibleTrigger>
@@ -2347,20 +2393,20 @@ export function CodexFormFields({
             <p className="mt-1 ml-1 text-xs text-muted-foreground">
               {t("codexConfig.advancedSectionHint", {
                 defaultValue:
-                  "包含模型目录、协议检测、上游格式、Codex 菜单映射、思考能力与自定义 User-Agent；Chat Completions 供应商需走本地代理转换。",
+                  "Includes the model catalog, protocol detection, upstream format, Codex menu mapping, reasoning capabilities, and custom User-Agent; Chat Completions providers use local proxy conversion.",
               })}
             </p>
           )}
           <CollapsibleContent className="space-y-3 pt-3">
-            {/* 上游格式与协议探测沿用 shouldShowSpeedTest 门控，
+            {/* Upstream format与协议探测沿用 shouldShowSpeedTest 门控，
                 cloud_provider 保持不可切换；xAI OAuth 托管预设格式固定为 Responses。 */}
             {shouldShowSpeedTest && !isXaiOauthPreset && (
               <div className="space-y-3">
-                {/* 上游格式 —— 顶层独立选择，与路由开关解耦 */}
+                {/* Upstream format —— 顶层独立选择，与路由开关解耦 */}
                 <div className="space-y-1.5">
                   <FormLabel htmlFor="codex-upstream-format">
                     {t("codexConfig.upstreamFormatLabel", {
-                      defaultValue: "上游格式",
+                      defaultValue: "Upstream format",
                     })}
                   </FormLabel>
                   <Select
@@ -2378,17 +2424,18 @@ export function CodexFormFields({
                     <SelectContent>
                       <SelectItem value="openai_chat">
                         {t("codexConfig.upstreamFormatChat", {
-                          defaultValue: "Chat Completions（需本地代理转换）",
+                          defaultValue:
+                            "Chat Completions (local proxy conversion required)",
                         })}
                       </SelectItem>
                       <SelectItem value="openai_responses">
                         {t("codexConfig.upstreamFormatResponses", {
-                          defaultValue: "Responses（原生）",
+                          defaultValue: "Responses (native)",
                         })}
                       </SelectItem>
                       <SelectItem value="anthropic">
                         {t("codexConfig.upstreamFormatAnthropic", {
-                          defaultValue: "Anthropic Messages（需开启路由）",
+                          defaultValue: "Anthropic Messages (routing required)",
                         })}
                       </SelectItem>
                     </SelectContent>
@@ -2396,7 +2443,7 @@ export function CodexFormFields({
                   <p className="text-xs leading-relaxed text-muted-foreground">
                     {t("codexConfig.upstreamFormatHint", {
                       defaultValue:
-                        "供应商原生是 Responses API 就选 Responses；使用 Chat Completions 协议就选 Chat；只提供 Anthropic Messages 时选择 Anthropic。后两者均需本地代理转换。",
+                        "Choose Responses for a native Responses API provider, Chat for Chat Completions, or Anthropic when only Anthropic Messages is available. The latter two require local proxy conversion.",
                     })}
                   </p>
                   {isAnthropicFormat && (
@@ -2482,7 +2529,11 @@ export function CodexFormFields({
                     </div>
                   )}
                   <div className="rounded-md border border-amber-500/30 bg-amber-500/10 p-3 text-xs leading-relaxed text-amber-900 dark:text-amber-200">
-                    上游格式通常由维护预设或主流程的连接验证确定。只有自动识别不正确时才在这里手动覆盖；验证会发送真实模型请求，可能产生少量额度或流量消耗。
+                    The upstream format is usually determined by a maintained
+                    preset or the main connection-validation flow. Override it
+                    here only when automatic detection is wrong; validation
+                    sends real model requests and may consume a small amount of
+                    quota or traffic.
                   </div>
                   {(apiFormat === "openai_chat" ||
                     apiFormat === "openai_responses") && (
@@ -2515,32 +2566,36 @@ export function CodexFormFields({
                   )}
                 >
                   <summary className="cursor-pointer text-sm font-medium text-foreground">
-                    旧版兼容兜底
+                    Legacy compatibility fallback
                   </summary>
                   <div className="space-y-3 pt-2">
                     <div className="space-y-1">
                       <p className="text-xs leading-relaxed text-muted-foreground">
-                        这是一份旧 Provider
-                        级推理配置：它会影响所有未单独配置模型推理能力的模型。请优先使用上方“模型推理能力”为每个模型声明能力；这里只保留对既有配置的兼容编辑。
+                        This is a legacy provider-level reasoning configuration
+                        that affects models without their own model-level
+                        capability declaration. Prefer declaring capabilities
+                        per model under “Model reasoning capabilities”; this
+                        section remains only for compatibility editing of
+                        existing configurations.
                       </p>
                     </div>
                     <div className="flex items-center justify-between gap-4">
                       <div className="space-y-1">
                         <FormLabel>
                           {t("codexConfig.reasoningModeToggle", {
-                            defaultValue: "支持思考模式",
+                            defaultValue: "Supports thinking mode",
                           })}
                         </FormLabel>
                         <p className="text-xs leading-relaxed text-muted-foreground">
-                          旧配置：为没有模型级声明的 Chat 模型启用 thinking
-                          开关。
+                          Legacy setting: enable the thinking switch for Chat
+                          models without a model-level declaration.
                         </p>
                       </div>
                       <Switch
                         checked={supportsThinking}
                         onCheckedChange={handleReasoningThinkingChange}
                         aria-label={t("codexConfig.reasoningModeToggle", {
-                          defaultValue: "支持思考模式",
+                          defaultValue: "Supports thinking mode",
                         })}
                       />
                     </div>
@@ -2548,19 +2603,19 @@ export function CodexFormFields({
                       <div className="space-y-1">
                         <FormLabel>
                           {t("codexConfig.reasoningEffortToggle", {
-                            defaultValue: "支持思考等级",
+                            defaultValue: "Supports thinking levels",
                           })}
                         </FormLabel>
                         <p className="text-xs leading-relaxed text-muted-foreground">
-                          旧配置：为没有模型级声明的 Chat 模型启用 effort
-                          参数转换。
+                          Legacy setting: enable effort parameter conversion for
+                          Chat models without a model-level declaration.
                         </p>
                       </div>
                       <Switch
                         checked={supportsEffort}
                         onCheckedChange={handleReasoningEffortChange}
                         aria-label={t("codexConfig.reasoningEffortToggle", {
-                          defaultValue: "支持思考等级",
+                          defaultValue: "Supports thinking levels",
                         })}
                       />
                     </div>
@@ -2569,7 +2624,7 @@ export function CodexFormFields({
               )}
           </CollapsibleContent>
 
-          {/* 模型映射 / 模型目录 —— 与「路由接管」解耦，常驻显示（可编辑即渲染）。
+          {/* Model映射 / Model目录 —— 与「路由接管」解耦，常驻显示（可编辑即渲染）。
                 填了才生成 catalog：Chat 模式生成兼容路由、原生 Responses 生成
                 model-catalogs.json；留空则不生成。排在自定义 UA 之前。 */}
           {catalogMountElement &&
@@ -2587,20 +2642,20 @@ export function CodexFormFields({
                   <div className="flex items-center justify-between gap-3">
                     <FormLabel>
                       {t("codexConfig.modelMappingTitle", {
-                        defaultValue: "模型目录明细",
+                        defaultValue: "Model catalog details",
                       })}
                     </FormLabel>
                     {renderCatalogActionButtons(
                       handleAddCatalogRow,
                       t("codexConfig.addCatalogModel", {
-                        defaultValue: "添加模型",
+                        defaultValue: "Add model",
                       }),
                     )}
                   </div>
                   <p className="text-xs leading-relaxed text-muted-foreground">
                     {t("codexConfig.modelMappingHint", {
                       defaultValue:
-                        "这里保存候选模型、真实上游模型和上下文窗口。开启“在 Codex /model 菜单中显示”后，菜单显示名和上游模型名才会参与 Codex 菜单映射；关闭时仍会作为目录元数据保存。",
+                        "This stores candidate models, real upstream model names, and context windows. When “Show in the Codex /model menu” is enabled, the menu label and upstream model name participate in Codex menu mapping; when disabled, they are still saved as catalog metadata.",
                     })}
                   </p>
                 </div>
@@ -2611,33 +2666,33 @@ export function CodexFormFields({
                     <div className="hidden grid-cols-[88px_1fr_1fr_1fr_132px_150px_76px_36px] gap-2 px-1 text-xs font-medium text-muted-foreground md:grid">
                       <span>
                         {t("codexConfig.keepCatalogModelColumn", {
-                          defaultValue: "保留",
+                          defaultValue: "Keep",
                         })}
                       </span>
                       <span>
                         {t("codexConfig.catalogColumnDisplay", {
-                          defaultValue: "菜单显示名",
+                          defaultValue: "Menu display name",
                         })}
                       </span>
                       <span>
                         {t("codexConfig.catalogColumnModel", {
-                          defaultValue: "候选模型名",
+                          defaultValue: "Candidate model name",
                         })}
                       </span>
                       <span>
                         {t("codexConfig.catalogColumnUpstreamModel", {
-                          defaultValue: "上游模型名",
+                          defaultValue: "Upstream model name",
                         })}
                       </span>
                       <span>
                         {t("codexConfig.catalogColumnContext", {
-                          defaultValue: "上下文窗口",
+                          defaultValue: "Context window",
                         })}
                       </span>
-                      <span>协议覆盖</span>
+                      <span>Protocol override</span>
                       <span>
                         {t("codexConfig.catalogOrderColumn", {
-                          defaultValue: "顺序",
+                          defaultValue: "Order",
                         })}
                       </span>
                       <span />
@@ -2693,12 +2748,12 @@ export function CodexFormFields({
                                 }}
                                 aria-label={t("codexConfig.keepCatalogModel", {
                                   model: row.model || row.displayName || "",
-                                  defaultValue: `保留 ${row.model || row.displayName || "这个模型"}`,
+                                  defaultValue: `Keep ${row.model || row.displayName || "this model"}`,
                                 })}
                               />
                               <span className="md:hidden">
                                 {t("codexConfig.keepCatalogModelColumn", {
-                                  defaultValue: "保留",
+                                  defaultValue: "Keep",
                                 })}
                               </span>
                             </label>
@@ -2712,13 +2767,13 @@ export function CodexFormFields({
                               placeholder={t(
                                 "codexConfig.catalogDisplayNamePlaceholder",
                                 {
-                                  defaultValue: "例如: DeepSeek V4 Flash",
+                                  defaultValue: "Example: DeepSeek V4 Flash",
                                 },
                               )}
                               aria-label={t(
                                 "codexConfig.catalogColumnDisplay",
                                 {
-                                  defaultValue: "菜单显示名",
+                                  defaultValue: "Menu display name",
                                 },
                               )}
                             />
@@ -2732,11 +2787,11 @@ export function CodexFormFields({
                               placeholder={t(
                                 "codexConfig.catalogModelPlaceholder",
                                 {
-                                  defaultValue: "例如: gpt-5.5-thirdparty",
+                                  defaultValue: "Example: gpt-5.5-thirdparty",
                                 },
                               )}
                               aria-label={t("codexConfig.catalogColumnModel", {
-                                defaultValue: "候选模型名",
+                                defaultValue: "Candidate model name",
                               })}
                             />
                             <div className="space-y-1">
@@ -2755,13 +2810,14 @@ export function CodexFormFields({
                                   placeholder={t(
                                     "codexConfig.catalogUpstreamModelPlaceholder",
                                     {
-                                      defaultValue: "留空则使用候选模型名",
+                                      defaultValue:
+                                        "Leave blank to use the candidate model name",
                                     },
                                   )}
                                   aria-label={t(
                                     "codexConfig.catalogColumnUpstreamModel",
                                     {
-                                      defaultValue: "上游模型名",
+                                      defaultValue: "Upstream model name",
                                     },
                                   )}
                                   className="flex-1"
@@ -2797,19 +2853,19 @@ export function CodexFormFields({
                               placeholder={t(
                                 "codexConfig.contextWindowPlaceholder",
                                 {
-                                  defaultValue: "例如: 128000",
+                                  defaultValue: "Example: 128000",
                                 },
                               )}
                               aria-label={t(
                                 "codexConfig.catalogColumnContext",
                                 {
-                                  defaultValue: "上下文窗口",
+                                  defaultValue: "Context window",
                                 },
                               )}
                             />
                             <select
                               className="h-9 rounded-md border border-border-default bg-background px-2 text-xs text-foreground"
-                              aria-label={`${model || "模型"} 协议选择`}
+                              aria-label={`${model || "Model"} protocol selection`}
                               value={
                                 protocolOverrides[
                                   normalizeCodexPublicModelKey(model)
@@ -2826,7 +2882,9 @@ export function CodexFormFields({
                                 )
                               }
                             >
-                              <option value="follow_auto">跟随自动</option>
+                              <option value="follow_auto">
+                                Follow automatic selection
+                              </option>
                               <option value="openai_responses">
                                 Responses
                               </option>
@@ -2841,7 +2899,7 @@ export function CodexFormFields({
                                 disabled={index <= 0}
                                 onClick={() => handleMoveCatalogRow(index, -1)}
                                 title={t("common.moveUp", {
-                                  defaultValue: "上移",
+                                  defaultValue: "Move up",
                                 })}
                               >
                                 <ArrowUp className="h-4 w-4" />
@@ -2854,7 +2912,7 @@ export function CodexFormFields({
                                 disabled={index >= catalogRows.length - 1}
                                 onClick={() => handleMoveCatalogRow(index, 1)}
                                 title={t("common.moveDown", {
-                                  defaultValue: "下移",
+                                  defaultValue: "Move down",
                                 })}
                               >
                                 <ArrowDown className="h-4 w-4" />
@@ -2867,22 +2925,22 @@ export function CodexFormFields({
                               className="h-9 w-9 text-muted-foreground hover:text-destructive"
                               onClick={() => handleRemoveCatalogRow(index)}
                               title={t("common.delete", {
-                                defaultValue: "删除",
+                                defaultValue: "Delete",
                               })}
                             >
                               <Trash2 className="h-4 w-4" />
                             </Button>
                             <fieldset
                               className="col-span-full flex flex-wrap items-center gap-2 border-t border-border-default pt-2 text-xs"
-                              aria-label={`${model || "模型"} 输入能力`}
+                              aria-label={`${model || "Model"} Input capability`}
                             >
                               <legend className="mr-1 font-medium">
-                                输入能力
+                                Input capability
                               </legend>
                               <div
                                 className="inline-flex overflow-hidden rounded-md border"
                                 role="radiogroup"
-                                aria-label={`${model || "模型"} 输入能力选择`}
+                                aria-label={`${model || "Model"} input capability selection`}
                               >
                                 <Button
                                   type="button"
@@ -2890,7 +2948,7 @@ export function CodexFormFields({
                                   variant={supportsImage ? "default" : "ghost"}
                                   className="rounded-none"
                                   aria-pressed={supportsImage}
-                                  aria-label={`${model || "模型"} 文本与图像`}
+                                  aria-label={`${model || "Model"} Text and image`}
                                   onClick={() =>
                                     handleUpdateCatalogRow(
                                       index,
@@ -2901,7 +2959,7 @@ export function CodexFormFields({
                                     )
                                   }
                                 >
-                                  文本与图像
+                                  Text and image
                                 </Button>
                                 <Button
                                   type="button"
@@ -2909,7 +2967,7 @@ export function CodexFormFields({
                                   variant={!supportsImage ? "default" : "ghost"}
                                   className="rounded-none border-l"
                                   aria-pressed={!supportsImage}
-                                  aria-label={`${model || "模型"} 仅文本`}
+                                  aria-label={`${model || "Model"} Text only`}
                                   onClick={() =>
                                     handleUpdateCatalogRow(
                                       index,
@@ -2920,11 +2978,12 @@ export function CodexFormFields({
                                     )
                                   }
                                 >
-                                  仅文本
+                                  Text only
                                 </Button>
                               </div>
                               <span className="text-muted-foreground">
-                                保存后覆盖当前 Provider 的预设，不需要等待发布。
+                                Saving overrides the current provider preset; no
+                                release update is required.
                               </span>
                               {presetDeclaresInputCapability &&
                               presetCatalogModel ? (
@@ -2932,7 +2991,7 @@ export function CodexFormFields({
                                   type="button"
                                   variant="ghost"
                                   size="sm"
-                                  aria-label={`${model || "模型"} 恢复 CCSM 输入能力预设`}
+                                  aria-label={`${model || "Model"} restore CCSM input capability preset`}
                                   onClick={() =>
                                     handleUpdateCatalogRow(
                                       index,
@@ -2945,7 +3004,7 @@ export function CodexFormFields({
                                     )
                                   }
                                 >
-                                  恢复 CCSM 预设
+                                  Restore CCSM preset
                                 </Button>
                               ) : null}
                             </fieldset>
@@ -3331,13 +3390,13 @@ export function CodexFormFields({
                   <div className="space-y-1.5">
                     <FormLabel>
                       {t("codexConfig.localRoutingToggle", {
-                        defaultValue: "在 Codex /model 菜单中显示",
+                        defaultValue: "Show in the Codex /model menu",
                       })}
                     </FormLabel>
                     <p className="text-xs leading-relaxed text-muted-foreground">
                       {t("codexConfig.localRoutingDescription", {
                         defaultValue:
-                          "开启后，CCSwitchMulti 会生成 Codex 启动时加载的模型目录，让这里配置的模型、显示名、上下文窗口和推理档位出现在 /model 中，并把显示名映射到真实上游模型。它不控制 Provider、代理或 MultiRouter 是否可用；仅当你要使用自己维护的 model_catalog_json 时关闭。",
+                          "When enabled, CCSwitchMulti generates the model catalog loaded by Codex at startup, exposing these models, display names, context windows, and reasoning efforts in /model and mapping display names to real upstream models. It does not control provider, proxy, or MultiRouter availability; disable it only when maintaining your own model_catalog_json.",
                       })}
                     </p>
                     <p
@@ -3351,11 +3410,11 @@ export function CodexFormFields({
                       {takeoverEnabled
                         ? t("codexConfig.localRoutingOnHint", {
                             defaultValue:
-                              "推荐保持开启。模型目录会在下次 Codex 启动时加载。",
+                              "Keeping this enabled is recommended. The model catalog loads the next time Codex starts.",
                           })
                         : t("codexConfig.localRoutingOffHint", {
                             defaultValue:
-                              "当前已关闭：Provider 和直接指定的真实模型仍可使用，目录数据也会继续保存，但 Codex /model 不再获得这些模型、别名、上下文窗口和推理档位。仅当你要使用自己维护的 model_catalog_json 时关闭。",
+                              "Currently disabled: the provider and directly specified real models still work, and catalog data continues to be saved, but Codex /model no longer receives these models, aliases, context windows, or reasoning efforts. Disable it only when maintaining your own model_catalog_json.",
                           })}
                     </p>
                   </div>
@@ -3363,7 +3422,7 @@ export function CodexFormFields({
                     checked={takeoverEnabled}
                     onCheckedChange={onTakeoverEnabledChange}
                     aria-label={t("codexConfig.localRoutingToggle", {
-                      defaultValue: "在 Codex /model 菜单中显示",
+                      defaultValue: "Show in the Codex /model menu",
                     })}
                   />
                 </div>

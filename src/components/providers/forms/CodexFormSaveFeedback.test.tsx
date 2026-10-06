@@ -9,14 +9,17 @@ describe("CodexFormSaveFeedback", () => {
       <CodexFormSaveFeedback
         catalogValidationError={{
           model: "deepseek",
-          message: "deepseek：Ultra 尚未选择供应商推理强度",
+          message:
+            "deepseek: Ultra is unlocked but no provider reasoning effort is selected",
         }}
       />,
     );
 
-    expect(screen.getByRole("alert")).toHaveTextContent("Ultra 尚未选择");
     expect(screen.getByRole("alert")).toHaveTextContent(
-      "API Key、端点及其他修改仍保留在当前草稿中，但本次所有修改均未保存。",
+      "Ultra is unlocked but no provider reasoning effort is selected",
+    );
+    expect(screen.getByRole("alert")).toHaveTextContent(
+      "API Key, endpoint, and other edits remain in the current draft, but none of these changes were saved.",
     );
   });
 
@@ -31,21 +34,33 @@ describe("CodexFormSaveFeedback", () => {
 
   it("does not claim a rejected backend save was not written", () => {
     render(
-      <CodexFormSaveFeedback saveError="保存结果未确认。后端可能已写入，但后续同步失败；请刷新核对状态，核对前避免重复修改 API Key。当前草稿仍保留。" />,
+      <CodexFormSaveFeedback saveError="Save result was not confirmed. The backend may have written the data, but follow-up synchronization failed. Refresh to verify the state and avoid changing the API Key again until then. The current draft is preserved." />,
     );
 
-    expect(screen.getByRole("alert")).toHaveTextContent("保存结果未确认");
-    expect(screen.getByRole("alert")).toHaveTextContent("后端可能已写入");
-    expect(screen.getByRole("alert")).toHaveTextContent("刷新核对状态");
-    expect(screen.getByRole("alert")).toHaveTextContent("避免重复修改 API Key");
+    expect(screen.getByRole("alert")).toHaveTextContent(
+      "Save result was not confirmed",
+    );
+    expect(screen.getByRole("alert")).toHaveTextContent(
+      "The backend may have written the data",
+    );
+    expect(screen.getByRole("alert")).toHaveTextContent(
+      "Refresh to verify the state",
+    );
+    expect(screen.getByRole("alert")).toHaveTextContent(
+      "avoid changing the API Key again",
+    );
   });
 
   it("shows canceled Codex saves as definitely not saved", () => {
     render(
-      <CodexFormSaveFeedback saveError="操作已取消，未保存。当前草稿仍保留，可继续编辑后重试。" />,
+      <CodexFormSaveFeedback saveError="Operation canceled; nothing was saved. The current draft is preserved so you can edit and retry." />,
     );
 
-    expect(screen.getByRole("alert")).toHaveTextContent("操作已取消，未保存");
-    expect(screen.getByRole("alert")).toHaveTextContent("当前草稿仍保留");
+    expect(screen.getByRole("alert")).toHaveTextContent(
+      "Operation canceled; nothing was saved",
+    );
+    expect(screen.getByRole("alert")).toHaveTextContent(
+      "The current draft is preserved",
+    );
   });
 });

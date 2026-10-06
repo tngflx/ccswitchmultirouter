@@ -17,20 +17,20 @@ import type {
  */
 
 const CONTROL_KIND_LABEL: Record<CodexReasoningControlKind, string> = {
-  none: "无控制",
-  boolean: "布尔开关",
-  graded: "分档 effort",
-  budget: "token 预算",
-  unknown: "未知",
+  none: "No control",
+  boolean: "Boolean toggle",
+  graded: "Effort levels",
+  budget: "Token budget",
+  unknown: "Unknown",
 };
 
 const SOURCE_LABEL: Record<string, string> = {
-  user: "用户声明",
-  detection: "自动检测",
-  library: "维护能力库",
-  builtin: "内置预设",
-  official: "官方模型",
-  unknown: "未知",
+  user: "User declaration",
+  detection: "Automatic detection",
+  library: "Maintained capability library",
+  builtin: "Built-in preset",
+  official: "Official model",
+  unknown: "Unknown",
 };
 
 export type CodexReasoningCardStatus = "supported" | "unsupported" | "unknown";
@@ -58,9 +58,9 @@ export function reasoningCardStatus(
 
 export const REASONING_STATUS_LABEL: Record<CodexReasoningCardStatus, string> =
   {
-    supported: "支持推理",
-    unsupported: "不支持推理",
-    unknown: "未知（使用服务端默认）",
+    supported: "Reasoning supported",
+    unsupported: "Reasoning unsupported",
+    unknown: "Unknown (using server default)",
   };
 
 /** 控制类型：优先用声明的 controlKind，否则由 resolved.supportKind 推导。 */
@@ -89,20 +89,20 @@ export function describeFinalBehavior(
   const parameter = resolution.capability?.upstream?.parameter;
   switch (resolved.supportKind) {
     case "effort_levels": {
-      const selectable = resolved.codexSelectableEfforts.join(" / ") || "无";
-      const def = resolved.providerDefaultEffort ?? "模型默认";
-      const param = parameter ? `（参数 ${parameter}）` : "";
-      return `按档位发送 reasoning effort${param}；Codex 可选：${selectable}；默认：${def}。`;
+      const selectable = resolved.codexSelectableEfforts.join(" / ") || "None";
+      const def = resolved.providerDefaultEffort ?? "Model default";
+      const param = parameter ? ` (parameter ${parameter})` : "";
+      return `Sends reasoning effort by level${param}; Codex options: ${selectable}; default: ${def}.`;
     }
     case "boolean_only": {
-      const param = parameter ? `（参数 ${parameter}）` : "";
-      return `发送布尔开关${param}，不区分档位。`;
+      const param = parameter ? ` (parameter ${parameter})` : "";
+      return `Sends a boolean toggle${param}; levels are not distinguished.`;
     }
     case "unsupported":
-      return "不发送推理参数（模型不支持推理）。";
+      return "Does not send a reasoning parameter (the model does not support reasoning).";
     case "unknown":
     default:
-      return "使用服务端默认（不发送推理参数）。";
+      return "Uses the server default (no reasoning parameter is sent).";
   }
 }
 
@@ -116,7 +116,8 @@ function formatFetchedAt(ms: number): string {
 }
 
 function EffortList({ efforts }: { efforts: string[] }) {
-  if (!efforts.length) return <span className="text-muted-foreground">无</span>;
+  if (!efforts.length)
+    return <span className="text-muted-foreground">None</span>;
   return (
     <span className="flex flex-wrap gap-1">
       {efforts.map((e) => (
@@ -177,7 +178,7 @@ export function CodexModelReasoningCard({
   return (
     <div className="space-y-3 rounded-md border bg-muted/30 p-3">
       <div className="flex items-center justify-between gap-2">
-        <span className="font-medium">最终生效能力</span>
+        <span className="font-medium">Effective capability</span>
         <span
           className={
             "rounded-full px-2 py-0.5 text-[11px] " +
@@ -193,41 +194,41 @@ export function CodexModelReasoningCard({
       </div>
 
       <dl className="grid grid-cols-1 gap-2 sm:grid-cols-2">
-        <Field label="控制类型">{CONTROL_KIND_LABEL[controlKind]}</Field>
-        <Field label="能力来源">
+        <Field label="Control type">{CONTROL_KIND_LABEL[controlKind]}</Field>
+        <Field label="Capability source">
           {SOURCE_LABEL[resolution.source] ?? resolution.source}
         </Field>
-        <Field label="能力指纹">
+        <Field label="Capability fingerprint">
           <code
             className="font-mono text-[11px]"
-            title={resolution.fingerprint || "未生成"}
+            title={resolution.fingerprint || "Not generated"}
           >
             {resolution.fingerprint
               ? `${resolution.fingerprint.slice(0, 16)}…`
-              : "未生成（未知能力）"}
+              : "Not generated (unknown capability)"}
           </code>
         </Field>
         {detection ? (
-          <Field label="核验时间">
+          <Field label="Verified at">
             {formatFetchedAt(detection.fetchedAt)}
             <span className="ml-1 text-muted-foreground">
-              （{detection.source}）
+              ({detection.source})
             </span>
           </Field>
         ) : null}
-        <Field label="Provider 原生档位">
+        <Field label="Provider-native levels">
           <EffortList efforts={resolved.providerAcceptedEfforts} />
         </Field>
-        <Field label="Codex 可选档位">
+        <Field label="Codex selectable levels">
           <EffortList efforts={resolved.codexSelectableEfforts} />
         </Field>
-        <Field label="默认值">
-          {resolved.providerDefaultEffort ?? "模型默认"}
+        <Field label="Default">
+          {resolved.providerDefaultEffort ?? "Model default"}
         </Field>
-        <Field label="关闭能力">
-          {resolved.disableAllowed ? "可关闭（none）" : "不可关闭"}
+        <Field label="Disable">
+          {resolved.disableAllowed ? "Allowed (none)" : "Not allowed"}
         </Field>
-        <Field label="映射">
+        <Field label="Mapping">
           {Object.keys(resolved.effortMap).length ? (
             <span className="font-mono text-[11px]">
               {Object.entries(resolved.effortMap)
@@ -235,21 +236,22 @@ export function CodexModelReasoningCard({
                 .join("，")}
             </span>
           ) : (
-            <span className="text-muted-foreground">恒等</span>
+            <span className="text-muted-foreground">Identity</span>
           )}
         </Field>
       </dl>
 
       <div className="rounded-md border bg-background p-2">
-        <div className="text-muted-foreground">最终行为</div>
+        <div className="text-muted-foreground">Effective behavior</div>
         <div>{describeFinalBehavior(resolution)}</div>
       </div>
 
       {onCustomizeEffective ? (
         <div className="flex flex-wrap items-center justify-between gap-2 rounded-md border border-primary/30 bg-primary/5 p-2">
           <p className="text-muted-foreground">
-            当前是自动发现的结果，会随来源变化。需要调整 Provider
-            能力或档位映射时可创建用户覆盖。
+            This is an automatically discovered result and may change with its
+            source. Create a user override when you need to adjust Provider
+            capabilities or level mappings.
           </p>
           <Button
             type="button"
@@ -257,7 +259,7 @@ export function CodexModelReasoningCard({
             size="sm"
             onClick={onCustomizeEffective}
           >
-            按当前结果自定义
+            Customize from current result
           </Button>
         </div>
       ) : null}
@@ -265,7 +267,8 @@ export function CodexModelReasoningCard({
       {isUnknown ? (
         <div className="space-y-2">
           <p className="text-muted-foreground">
-            当前未读到该模型的推理能力声明，默认使用服务端默认。可执行以下动作：
+            No reasoning capability declaration was found for this model, so the
+            server default is used. You can:
           </p>
           <div className="flex flex-wrap gap-2">
             <Button
@@ -275,7 +278,7 @@ export function CodexModelReasoningCard({
               onClick={onRedetect}
               disabled={redetecting}
             >
-              {redetecting ? "检测中…" : "重新检测"}
+              {redetecting ? "Detecting…" : "Detect again"}
             </Button>
             {resolution.hasDetectionCandidate ? (
               <Button
@@ -284,7 +287,7 @@ export function CodexModelReasoningCard({
                 size="sm"
                 onClick={onAdoptDetection}
               >
-                采用检测结果
+                Use detected result
               </Button>
             ) : null}
             <Button
@@ -293,7 +296,7 @@ export function CodexModelReasoningCard({
               size="sm"
               onClick={onManualDeclare}
             >
-              手动声明
+              Declare manually
             </Button>
             {hasBuiltinPreset ? (
               <Button
@@ -302,7 +305,7 @@ export function CodexModelReasoningCard({
                 size="sm"
                 onClick={onRestoreBuiltin}
               >
-                恢复内置值
+                Restore built-in value
               </Button>
             ) : null}
           </div>

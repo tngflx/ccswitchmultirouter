@@ -52,7 +52,9 @@ describe("Codex catalog reasoning capability persistence", () => {
     }
     expect(caught).toBeInstanceOf(CodexCatalogValidationError);
     expect(caught).toHaveProperty("model", "deepseek");
-    expect((caught as Error).message).toContain("当前所有修改均未保存");
+    expect((caught as Error).message).toContain(
+      "none of the changes were saved",
+    );
 
     expect(
       normalizeCodexCatalogModelsForSave([
@@ -154,7 +156,7 @@ describe("Codex catalog reasoning capability persistence", () => {
           },
         },
       ]),
-    ).toThrow(/默认推理强度必须包含在该模型支持的推理强度中/);
+    ).toThrow(/The default reasoning effort must be included/);
   });
 
   it("rejects expert JSON mappings before they can mutate the draft", () => {
@@ -171,7 +173,7 @@ describe("Codex catalog reasoning capability persistence", () => {
         },
         source: "user",
       }),
-    ).toThrow(/映射目标 max 不是供应商支持的推理强度/);
+    ).toThrow(/Mapping target max is not supported by the provider/);
   });
 
   it("automatically fills identity mappings for every Provider-native effort", () => {
@@ -203,7 +205,7 @@ describe("Codex catalog reasoning capability persistence", () => {
         },
         source: "user",
       }),
-    ).toThrow(/推理强度映射缺少 low, medium, high 档/);
+    ).toThrow(/Reasoning-effort mapping is missing low, medium, high/);
 
     const [saved] = normalizeCodexCatalogModelsForSave([
       {
@@ -279,6 +281,6 @@ describe("Codex catalog reasoning capability persistence", () => {
         },
         source: "user",
       }),
-    ).toThrow(/仅供 Codex 使用/);
+    ).toThrow(/unknown or Codex-only level/);
   });
 });

@@ -2,6 +2,25 @@ import { Button } from "@/components/ui/button";
 import type { CodexReasoningEffort } from "@/types";
 import { useState } from "react";
 
+const CAPABILITY_SOURCE_LABELS: Record<string, string> = {
+  automatic: "Automatic discovery or server default",
+  detection: "Automatic detection",
+  library: "Maintained capability catalog",
+  builtin: "CCSM-maintained declaration",
+  user: "User declaration",
+  自动发现: "Automatic detection",
+  用户声明: "User declaration",
+  自动发现或服务端默认: "Automatic discovery or server default",
+  "CCSM 受维护声明": "CCSM-maintained declaration",
+  "用户声明（已覆盖维护值）": "User declaration (overrides maintained value)",
+};
+
+function formatCapabilitySource(source: string): string {
+  return (
+    CAPABILITY_SOURCE_LABELS[source] ?? (source || "Unknown capability source")
+  );
+}
+
 export interface CodexModelReasoningSummaryProps {
   model: string;
   source: string;
@@ -30,7 +49,8 @@ export function CodexModelReasoningSummary({
   expanded,
   onToggle,
 }: CodexModelReasoningSummaryProps) {
-  const displayModel = model || "未命名模型";
+  const displayModel = model || "Unnamed model";
+  const displaySource = formatCapabilitySource(source);
   const [requestedUltraSetup, setRequestedUltraSetup] = useState(false);
 
   return (
@@ -39,12 +59,14 @@ export function CodexModelReasoningSummary({
         <p className="font-medium text-foreground">{displayModel}</p>
       </div>
       <div className="space-y-1 border-t pt-3 lg:border-l lg:border-t-0 lg:pl-3 lg:pt-0">
-        <p className="text-muted-foreground">能力来源：{source}</p>
         <p className="text-muted-foreground">
-          Codex 档位：{selectableEfforts.join(" / ") || "未声明"}
+          Capability source: {displaySource}
         </p>
         <p className="text-muted-foreground">
-          默认值：{defaultEffort ?? "模型默认"}
+          Codex levels: {selectableEfforts.join(" / ") || "Not declared"}
+        </p>
+        <p className="text-muted-foreground">
+          Default: {defaultEffort ?? "Model default"}
         </p>
       </div>
       <div className="space-y-1 border-t pt-3 lg:border-l lg:border-t-0 lg:pl-3 lg:pt-0">
@@ -52,7 +74,7 @@ export function CodexModelReasoningSummary({
         <label className="flex items-center gap-2 font-medium">
           <input
             type="checkbox"
-            aria-label={`解锁 ${displayModel} 的 Ultra 档`}
+            aria-label={`Unlock Ultra for ${displayModel}`}
             checked={ultraEnabled}
             onChange={(event) => {
               setRequestedUltraSetup(
@@ -71,11 +93,11 @@ export function CodexModelReasoningSummary({
               });
             }}
           />
-          解锁 Ultra 档
+          Unlock Ultra
         </label>
         <select
           className="w-full rounded border bg-background px-2 py-1"
-          aria-label={`${displayModel} Ultra 对应的 Provider 推理强度`}
+          aria-label={`Provider reasoning effort used by ${displayModel} Ultra`}
           value={ultraEffort ?? ""}
           disabled={!ultraEnabled || ultraEfforts.length === 0}
           onChange={(event) =>
@@ -86,7 +108,7 @@ export function CodexModelReasoningSummary({
             })
           }
         >
-          <option value="">选择 Provider 强度…</option>
+          <option value="">Select provider level…</option>
           {ultraEfforts.map((effort) => (
             <option key={effort} value={effort}>
               {effort}
@@ -95,20 +117,20 @@ export function CodexModelReasoningSummary({
         </select>
         <p className="text-muted-foreground">
           {requestedUltraSetup || (ultraEnabled && ultraEfforts.length === 0)
-            ? "需要先确认该模型可接收的推理强度；已为你展开推理能力配置，完成后才能保存。"
+            ? "First confirm that this model accepts reasoning levels. The capability editor is open; complete it before saving."
             : ultraEnabled && ultraEffort
-              ? `已解锁，使用 ${ultraEffort}`
-              : "独立于能力来源；解锁后请选择强度"}
+              ? `Unlocked; uses ${ultraEffort}`
+              : "Independent of the capability source; select a level after unlocking"}
         </p>
       </div>
       <Button
         type="button"
         variant={expanded ? "secondary" : "outline"}
         size="sm"
-        aria-label={`${expanded ? "收起" : "配置"} ${displayModel} 的推理能力`}
+        aria-label={`${expanded ? "Collapse" : "Configure"} reasoning capabilities for ${displayModel}`}
         onClick={onToggle}
       >
-        {expanded ? "收起配置" : "配置推理能力"}
+        {expanded ? "Collapse configuration" : "Configure reasoning"}
       </Button>
     </div>
   );
