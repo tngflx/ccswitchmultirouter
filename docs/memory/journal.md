@@ -1,3 +1,83 @@
+## 2026-10-06 - Current full frontend gate narrowed to protected reasoning task
+
+What happened: reran the full frontend suite on the latest adapted refork tree
+after the model-order, retry, and localization continuations.
+
+Root cause: the remaining failures are in the concurrent reasoning/form schema
+work, not in the newly ported model-order, retry, or timezone paths. The current
+tree also leaves the four protected reasoning sources unformatted while that task
+is active.
+
+What we did: preserved the protected files unchanged, recorded the exact
+current gate result, and did not weaken assertions or translate tests around the
+active schema task.
+
+Evidence: `pnpm test:unit` exited 1 with 231 passed / 5 failed files and
+1,843 passed / 13 failed tests. `pnpm format:check` exited 1 only for
+`CodexFormFields.tsx`, `CodexModelReasoningCard.tsx`,
+`CodexModelReasoningEditor.tsx`, and `CodexModelReasoningSummary.tsx`.
+The targeted model-order and egress runs passed 2 files / 118 tests;
+`pnpm typecheck`, `cargo check`, `cargo fmt -- --check`, and `git diff --check`
+passed. The full normal-target Cargo suite and runtime freshness remain blocked
+by the two running refork `cc-switch.exe` processes. `origin/main` remains
+`641d53c8113ddb5564b3154dd6f75c17570a450e`; no publication occurred.
+
+What NOT to do again: do not edit, format, stage, or claim green coverage for
+the protected reasoning files while their concurrent task is active, and do not
+publish until the actual final tree passes the full gates.
+
+## 2026-10-06 - Status observability placement corrected
+
+What happened: the dedicated Status subviews were correct, but the MultiRouter
+workspace header still mounted a second stream-retry toggle.
+
+Root cause: the retry control had been added both to the global Providers header
+and to the workspace header, while the live activity feed was intended to remain
+only in the dedicated Stream retry status subview.
+
+What we did: removed the workspace-header duplicate, kept the global main-page
+control, and added a test assertion that Link status contains no retry activity
+or workspace retry toggle while Stream retry contains exactly one activity panel.
+
+Evidence: targeted placement test passed; stream-retry/settings dependents passed
+3 files / 21 tests; `pnpm typecheck`, scoped Prettier, and `git diff --check`
+passed. The full workspace file was 115 passed / 1 failed on an unrelated
+localization assertion for `Codex egress environment monitoring`. Runtime
+freshness still requires the user to restart `pnpm dev`; full suites were not run.
+
+What NOT to do again: do not mount stream-retry controls in both the global
+header and the MultiRouter workspace, or treat the Link status view as the live
+retry event feed. Related:
+`docs/decisions/2026-10-06-status-observability-placement.md`.
+
+## 2026-10-06 - Timezone localization verified; refork cutover still gated
+
+What happened: completed the timezone presentation-owner correction and closed the
+remaining locale-key gap found by the parity audit.
+
+Root cause: the egress status/settings owners had been translated mechanically but
+still bypassed i18n for status helpers, privacy text, controls, comparison messages,
+runtime summaries, and one Codex save-warning fallback.
+
+What we did: routed both timezone components through the four-locale resources and
+added `providerForm.codexConfigInvalidNotSaved` to `en`, `zh`, `zh-TW`, and `ja`.
+Preserved raw IPs, IANA identifiers, offsets, diagnostics, interval values, API
+calls, explicit save/apply behavior, and the protected reasoning/schema task.
+
+Evidence: timezone targeted run passed 4 files / 18 tests; `pnpm typecheck`,
+`cargo check`, `cargo fmt -- --check`, and `git diff --check` passed. Backend
+library tests passed 4,379 / 4,379 with 9 ignored. The current full frontend
+baseline remains 229 passed files / 4 failed files and 1,834 passed / 9 failed
+tests, all in protected reasoning/form consumers; `pnpm format:check` remains
+blocked by those same four files. Full Cargo and runtime freshness were not
+verified because existing `cc-switch.exe` processes hold the normal target and
+the user has not restarted `pnpm dev`. `origin/main` was not changed.
+
+What NOT to do again: do not stage or reformat the protected reasoning/form files,
+claim the refork cutover is published before the final green gate, or treat a
+targeted locale run as proof of full-suite readiness. Related:
+`docs/decisions/2026-10-06-localization-and-docs-consolidation.md`.
+
 ## 2026-10-06 - Four-hour dev runner checks pass; runtime awaits restart
 
 What happened: rechecked the delayed dev lifecycle before its separate scoped
@@ -21,35 +101,6 @@ active-target cleanup, competing dev launch, or release build.
 What NOT to do again: do not leave Tauri's own watcher active alongside a delayed
 scheduler, treat 5 GB as a hard size cap, or verify new source with an old binary.
 Related: `docs/decisions/2026-10-06-delayed-dev-runner-port.md`.
-
-## 2026-10-06 — Refork dev target bloat traced to missing Cargo profile bounds
-
-What happened: the freshly ported delayed runner correctly measured and cleaned
-the refork target at 44.39 GB, but the next startup still rebuilt a 7.39 GB
-debug target and then stopped on a Tauri plugin-version mismatch.
-
-Root cause: the refork had omitted the old checkout's `[profile.dev]` and
-`[profile.test]` settings (`incremental = false`, `debug = 0`), allowing Windows
-debug dependency/PDB generations to accumulate. Separately,
-`@tauri-apps/plugin-process` was materialized at 2.4.0 while the Rust crate was
-2.3.1.
-
-What we did: restored the old profile bounds, kept the guarded 5 GB Cargo
-target maintenance, and aligned `package.json` plus `pnpm-lock.yaml` to
-`@tauri-apps/plugin-process` 2.3.1. Stream-retry files were left untouched in
-this pass.
-
-Evidence: old checkout target measured 4.33 GiB; refork post-clean breakdown was
-`debug/deps` 5.75 GiB, `debug/build` 1.07 GiB, and `cc_switch.pdb` 0.48 GiB.
-`cargo metadata` passed; delayed-runner and cleanup tests passed 50/50; syntax
-and diff checks passed. Offline pnpm verification was blocked by missing local
-metadata for `@vitejs/plugin-react`.
-
-What NOT to do again: do not treat a size-threshold cleaner as the size-control
-itself; restore the Cargo profile bounds before repeated local Tauri builds, and
-do not run the refork until the JS and Rust Tauri plugin minor versions align.
-
-Related decision: `docs/decisions/2026-10-06-delayed-dev-runner-port.md`.
 
 ## 2026-10-06 - Retry consumer checks pass; shared fixture typecheck remains open
 
@@ -132,6 +183,60 @@ a reason to remove retry. Related:
 `docs/decisions/2026-10-06-stream-retry-warning-cleanup.md` and
 `docs/decisions/2026-10-06-anthropic-upstream-stream-retry.md`.
 
+## 2026-10-06 — Existing Model order drag owner verified with real sensor tests
+
+What happened: after the cleanup, audited the requested Model order page against
+the old checkout. The refork already has real pointer and keyboard dragging;
+the previous tests did not exercise those interaction paths.
+
+Root cause: missing sensor-level regression evidence made the existing port easy
+to mistake for a missing feature. No absent drag handler was found in the tested
+source. Live Tauri behavior is still unknown.
+
+What we did: added eight actual-sensor regressions without mocking dnd-kit or
+calling drag handlers directly. Covered pointer/keyboard reorder, cancel/no-op,
+Save failure/retry and reload through the existing source-Provider contract.
+Kept one `sortIndex` owner and preserved route/default/Sub-Agent policy and model
+metadata; did not add duplicate production code.
+
+Evidence: sensor-only run passed 8/8; the related seven-file run passed 294/294,
+including all 100 workspace tests. Typecheck, owned-test formatting and diff
+check exited 0. Global formatting remains red in four protected concurrent-task
+files. Full suites, Rust checks and live runtime were not tested; no commit,
+push or cutover occurred.
+
+What NOT to do again: do not assume visible drag handles prove working sensors,
+copy the old workspace wholesale, or call mocked Save/remount evidence a real
+database or desktop-runtime test. Related:
+`docs/decisions/2026-10-06-model-order-drag-audit.md`.
+
+## 2026-10-06 — English-UI/docs cleanup source batch completed
+
+What happened: finished the preceding cleanup before continuing the Model order
+request, including universal-preset suggestions and TE saved-but-not-published
+warnings. Consolidated historical root notes remain in one archive.
+
+Root cause: parent-page localization had missed child owners; changing the
+translation function in form initialization could also overwrite unsaved drafts.
+
+What we did: used shared, explicitly scoped translators, preserved existing names,
+metadata, drafts and save outcomes, restored meaningful consumer assertions, and
+removed nine known generated root reports. Protected reasoning/schema files and
+other concurrent-task work were not edited.
+
+Evidence: combined targeted frontend run exited 0 (37 files / 611 tests passed,
+0 failed); fresh typecheck and diff check exited 0; archive comparison preserved
+91/91 unique source contents with 0 mismatches. Repository formatting still fails
+on the four protected Codex form/reasoning files. Full suites, Rust checks and live
+Tauri freshness were not tested here; no commit, push or checkout cutover occurred.
+
+What NOT to do again: do not equate scoped source completion with a green shared
+delivery gate, reset form drafts on locale changes, or claim 100% migration from
+component tests. Continue only a test-only audit of the already-present Model
+order sensors while the concurrent formatting gate remains red; production drag
+changes remain deferred. Related:
+`docs/decisions/2026-10-06-localization-and-docs-consolidation.md`.
+
 ## 2026-10-06 — Anthropic raw-stream retry loop completed and verified
 
 What happened: the remaining refork stream-retry gap was in the raw
@@ -200,6 +305,64 @@ What NOT to do again: do not hide the retry control only in Settings, do not
 create a second replay owner, and do not claim runtime behavior from a stale
 desktop binary. Related:
 `docs/decisions/2026-10-06-codex-stream-retry-observability.md`.
+
+## 2026-10-06 — Localization/docs batch verification completed with formatting follow-up
+
+What happened: finished the previous batch before starting the requested model-order
+drag-and-drop port. The remaining Codex form assertions were adapted to the rendered
+English labels, two stale references to deleted root note filenames were rewritten,
+and temporary scan/test artifacts were removed.
+
+Root cause: the UI intentionally renders model/provenance labels with nested
+formatting and a capability-source prefix, so exact-text assertions no longer
+matched the accessible text; the documentation consolidation left two textual
+references to old root filenames.
+
+What we did: changed the assertions to whitespace-tolerant/complete accessible-text
+matchers and kept the fresh-refork architecture untouched. The reasoning-effort
+schema task was not edited.
+
+Evidence: `tests/components/CodexFormFields.test.tsx` passed 40/40; the focused
+five-file component batch passed 64/64; `pnpm typecheck` passed; `git diff --check`
+passed; the stale-reference scan returned no remaining references outside the
+archive. `pnpm format:check` failed and listed 23 changed frontend files with
+Prettier differences. Full suites and runtime freshness were not tested.
+
+What NOT to do again: do not claim the localization/docs batch is fully verified
+while the repository-wide formatting gate is red. The remaining four formatting
+failures are in the concurrent reasoning-effort task and must be resolved by that
+task owner before final delivery; do not reformat those files here or begin the
+drag-and-drop port until the shared gate is green. Related:
+`docs/decisions/2026-10-06-localization-and-docs-consolidation.md`.
+
+## 2026-10-06 — Refork dev target bloat traced to missing Cargo profile bounds
+
+What happened: the freshly ported delayed runner correctly measured and cleaned
+the refork target at 44.39 GB, but the next startup still rebuilt a 7.39 GB
+debug target and then stopped on a Tauri plugin-version mismatch.
+
+Root cause: the refork had omitted the old checkout's `[profile.dev]` and
+`[profile.test]` settings (`incremental = false`, `debug = 0`), allowing Windows
+debug dependency/PDB generations to accumulate. Separately,
+`@tauri-apps/plugin-process` was materialized at 2.4.0 while the Rust crate was
+2.3.1.
+
+What we did: restored the old profile bounds, kept the guarded 5 GB Cargo
+target maintenance, and aligned `package.json` plus `pnpm-lock.yaml` to
+`@tauri-apps/plugin-process` 2.3.1. Stream-retry files were left untouched in
+this pass.
+
+Evidence: old checkout target measured 4.33 GiB; refork post-clean breakdown was
+`debug/deps` 5.75 GiB, `debug/build` 1.07 GiB, and `cc_switch.pdb` 0.48 GiB.
+`cargo metadata` passed; delayed-runner and cleanup tests passed 50/50; syntax
+and diff checks passed. Offline pnpm verification was blocked by missing local
+metadata for `@vitejs/plugin-react`.
+
+What NOT to do again: do not treat a size-threshold cleaner as the size-control
+itself; restore the Cargo profile bounds before repeated local Tauri builds, and
+do not run the refork until the JS and Rust Tauri plugin minor versions align.
+
+Related decision: `docs/decisions/2026-10-06-delayed-dev-runner-port.md`.
 
 ## 2026-10-06 — Committed dependency tree passes frontend gates; backend lock remains
 
@@ -279,7 +442,7 @@ Related decisions:
   `cargo clippy --manifest-path src-tauri/Cargo.toml -j 1 -- -D warnings`, and
   `cargo check --manifest-path src-tauri/Cargo.toml` passed. Full Rust tests passed
   with `CARGO_BUILD_JOBS=1 cargo test --manifest-path src-tauri/Cargo.toml --
-  --test-threads=1` (4,373 unit tests plus all integration tests, 0 failures).
+--test-threads=1` (4,373 unit tests plus all integration tests, 0 failures).
   `pnpm format:check`, `pnpm typecheck`, and `pnpm test:unit` passed (224 files,
   1,744 tests). Targeted updater/identity tests passed (3/3), and `git diff --check`
   passed. Fork-specific identifier audit found all required identifiers.
@@ -810,3 +973,31 @@ What happened: legacy providers used `reasoningContentMode` to choose DeepSeek-s
 ## 2026-10-03 BigStrongSun replacement foundation started
 
 What happened: the user approved replacing the legacy fork foundation with a fresh BigStrongSun refork and adapting distinctive behavior incrementally. Root cause: the legacy branch had diverged across hundreds of files and retained older save/probe ownership, while BigStrongSun now provides provider-set and protocol-lab boundaries. What we did: cloned `BigStrongSun/ccswitchmulti` at `b4741ade`, retained the dirty legacy checkout at `641d53c8` as read-only migration evidence, and recorded a single-owner, deletion-gated port strategy in `docs/decisions/2026-10-03-bigstrongsun-refork-foundation.md`. Evidence: clean-foundation `cargo check` passed, `pnpm install --frozen-lockfile` passed, and `pnpm typecheck` passed. What NOT to do again: do not bulk replay legacy commits or create parallel save/probe orchestration in the fresh foundation.
+
+# 2026-10-06 — English-first bootstrap and root-note consolidation
+
+What happened: the fresh-refork frontend still exposed Chinese metadata and
+could start in the host OS locale on a first run; 91 internal Markdown notes
+also remained at repository root.
+
+Root cause: the HTML shell and i18n bootstrap retained legacy Chinese defaults,
+while historical notes had accumulated outside the repository's structured
+`docs/` ownership model.
+
+What we did: changed the shell metadata to English, made persisted language the
+only non-default startup override, filled the seven missing `zh-TW`/`ja`
+locale keys, and consolidated all 91 root engineering notes into
+`docs/memory/root-notes-archive.md`. A small root `memory.md` compatibility
+pointer preserves historical links. Standard README/license/release files were
+left at root.
+
+Evidence: archive contains all 91 former note files and is 1,747,281 bytes;
+locale parity audit is expected to report zero missing keys after the edits.
+UI-wide Chinese fallback cleanup remains in progress and has not been claimed
+complete.
+
+What NOT to do again: do not mass-replace CJK in comments, provider names,
+locale data, or tests; do not use Codex-native memory as a substitute for
+versioned project evidence.
+
+## 2026-10-06 — Committed dependency tree passes frontend gates; backend lock remains

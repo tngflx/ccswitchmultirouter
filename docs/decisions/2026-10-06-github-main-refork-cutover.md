@@ -96,3 +96,50 @@ because the user's running `pnpm dev` still locks
 alternate target was used. The user must stop that process before the backend
 rerun. Remote `origin/main` remains
 `641d53c8113ddb5564b3154dd6f75c17570a450e`; publication is still pending.
+
+## October 6 adapted-order continuation gate correction
+
+The later localization/order tree supersedes the earlier green frontend tree.
+Its final frontend run failed: 17 failed / 216 passed files and 54 failed /
+1,775 passed tests. `pnpm format:check` failed on the four protected
+reasoning/form files. The normal-target full Cargo command exited 101:
+`failed to remove file H:\repos\ccswitchmulti-refork\src-tauri\target\debug\cc-switch.exe`,
+`Access is denied. (os error 5)`. The app was not killed and no alternate
+target was created; the user has been asked to stop their existing `pnpm dev`
+before the final backend rerun.
+
+Passing source gates for this tree: `cargo check`, `pnpm typecheck`,
+`cargo fmt -- --check`, and `git diff --check`. Targeted tests passed:
+9 frontend files / 443 tests, 130 router library tests, and 245 catalog
+configuration tests. The two backend test-fixture warnings remain. The
+latest running binary predates the source; live workflow freshness is not
+verified. Publication remains pending; no cutover or 100% parity is claimed.
+
+## October 6 current-tree gate update
+
+The latest full frontend command exited 1: 229 passed / 4 failed files,
+1,834 passed / 9 failed tests. Remaining failures are protected reasoning/form
+consumers; their ownership is not released. Formatting still fails on four
+protected source files. Fresh source/type/format checks otherwise passed.
+The normal-target backend library command passed 4,379 tests, failed 0 and
+ignored 9, retaining two existing test-fixture warnings. Library-only evidence
+does not substitute for the blocked full backend/integration command.
+
+An additional presentation audit found hardcoded English in attributable
+localization edits. Four-locale correction is in progress under the existing
+localization decision. Both observed refork app processes still predate current
+source; no fresh runtime or publication is claimed. Approval remains for an
+exact-lease replacement of remote main only after the final actual-tree gates.
+
+## October 6 current-tree regression correction
+
+The latest full frontend rerun narrowed the failures to the concurrent protected
+reasoning/form task: 231 files passed and 5 failed, with 1,843 tests passed and
+13 failed. `pnpm format:check` reports only the four protected reasoning source
+files. This supersedes the immediately preceding 229/4-file, 1,834/9-test
+snapshot as the current evidence; that earlier result remains above for audit
+history. The model-order and egress targeted run passed 2 files / 118 tests,
+while `pnpm typecheck`, `cargo check`, `cargo fmt -- --check`, and
+`git diff --check` passed. No publication is authorized until the protected task
+releases its files, the user restarts the normal refork `pnpm dev`, and the
+complete final gates pass.

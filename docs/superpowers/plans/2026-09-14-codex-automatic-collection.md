@@ -8,7 +8,8 @@
 
 **Tech Stack:** Rust / Tauri v2 / SQLite / React / TanStack Query / Vitest.
 
-**Spec:** 根目录 memory-2026-09-14-codex-traffic-observability.md 的自动采集现状更正及本轮用户批准。
+**Spec:** `docs/memory/root-notes-archive.md` 中归档的 Codex traffic
+observability 章节，以及本轮用户批准。
 
 ## Global Constraints
 - 仅在 bigstrongsun/codex-traffic-observability 隔离 worktree 开发；保留主树所有无关修改。
