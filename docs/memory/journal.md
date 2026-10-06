@@ -1,3 +1,56 @@
+## 2026-10-06 - Four-hour dev runner checks pass; runtime awaits restart
+
+What happened: rechecked the delayed dev lifecycle before its separate scoped
+commit, preserving the retry commit and unrelated shared-checkout changes.
+
+Root cause: direct Tauri watching bypassed the requested delay; missing Cargo
+dev/test profile bounds and mismatched process-plugin minors caused the earlier
+target growth and startup rejection.
+
+What we did: retained the old supervised no-watch lifecycle with a four-hour
+quiet period, bounded dev/test artifact settings, guarded 5 GB maintenance
+threshold, and aligned plugin versions. Initial startup still builds normally.
+
+Evidence: fresh runner/prune tests passed 50/50; production `cargo check` passed
+without warnings; `pnpm typecheck` passed, superseding the previous shared
+fixture failure. Scoped script/manifest/decision formatting passed. Earlier
+offline lockfile metadata and baseline lockfile formatting failures remain;
+full suites and live runtime were not verified. No push, app restart,
+active-target cleanup, competing dev launch, or release build.
+
+What NOT to do again: do not leave Tauri's own watcher active alongside a delayed
+scheduler, treat 5 GB as a hard size cap, or verify new source with an old binary.
+Related: `docs/decisions/2026-10-06-delayed-dev-runner-port.md`.
+
+## 2026-10-06 — Refork dev target bloat traced to missing Cargo profile bounds
+
+What happened: the freshly ported delayed runner correctly measured and cleaned
+the refork target at 44.39 GB, but the next startup still rebuilt a 7.39 GB
+debug target and then stopped on a Tauri plugin-version mismatch.
+
+Root cause: the refork had omitted the old checkout's `[profile.dev]` and
+`[profile.test]` settings (`incremental = false`, `debug = 0`), allowing Windows
+debug dependency/PDB generations to accumulate. Separately,
+`@tauri-apps/plugin-process` was materialized at 2.4.0 while the Rust crate was
+2.3.1.
+
+What we did: restored the old profile bounds, kept the guarded 5 GB Cargo
+target maintenance, and aligned `package.json` plus `pnpm-lock.yaml` to
+`@tauri-apps/plugin-process` 2.3.1. Stream-retry files were left untouched in
+this pass.
+
+Evidence: old checkout target measured 4.33 GiB; refork post-clean breakdown was
+`debug/deps` 5.75 GiB, `debug/build` 1.07 GiB, and `cc_switch.pdb` 0.48 GiB.
+`cargo metadata` passed; delayed-runner and cleanup tests passed 50/50; syntax
+and diff checks passed. Offline pnpm verification was blocked by missing local
+metadata for `@vitejs/plugin-react`.
+
+What NOT to do again: do not treat a size-threshold cleaner as the size-control
+itself; restore the Cargo profile bounds before repeated local Tauri builds, and
+do not run the refork until the JS and Rust Tauri plugin minor versions align.
+
+Related decision: `docs/decisions/2026-10-06-delayed-dev-runner-port.md`.
+
 ## 2026-10-06 - Retry consumer checks pass; shared fixture typecheck remains open
 
 What happened: finished the pending handler run and refreshed the retry's

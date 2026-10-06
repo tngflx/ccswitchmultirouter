@@ -145,6 +145,17 @@ windows-sys = { version = "0.61", features = [
 objc2 = "0.6"
 objc2-app-kit = { version = "0.3", features = ["NSColor"] }
 
+# This crate is large enough that Windows incremental state and PDB generations
+# grow by multiple gigabytes per build. Keep local development bounded;
+# temporarily opt into symbols with CARGO_PROFILE_DEV_DEBUG=1 when needed.
+[profile.dev]
+incremental = false
+debug = 0
+
+[profile.test]
+incremental = false
+debug = 0
+
 # Optimize release binary size to help reduce AppImage footprint
 [profile.release]
 codegen-units = 1
