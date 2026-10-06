@@ -1,3 +1,34 @@
+## 2026-10-06 - Refork parity and English-first UI continuation committed
+
+What happened: committed the remaining non-protected refork adaptation batch as
+`4ad51756` (`feat(refork): complete port parity and localization`).
+
+Root cause: the fresh BigStrongSun foundation still needed the legacy router
+projection/model-order behavior, drag-and-drop workspace parity, localized
+provider/proxy/session/settings surfaces, and regression coverage adapted to the
+new ownership boundaries.
+
+What we did: finalized router-owned catalog projection and model-order
+preferences, preserved pointer and keyboard drag/drop behavior, localized the
+remaining user-facing fallback strings across the four locales, and added
+contract/regression tests. The concurrent reasoning/schema files and their
+consumer test remain intentionally unstaged.
+
+Evidence: `pnpm typecheck` passed; `cargo check --manifest-path
+src-tauri/Cargo.toml` passed; `cargo fmt --manifest-path src-tauri/Cargo.toml --
+--check` passed; `git diff --cached --check` passed before commit. The full
+frontend suite currently reports 231 passed / 5 failed files and 1,843 passed /
+13 failed tests, all in the protected reasoning/schema task. `pnpm
+format:check` reports only the four protected reasoning sources. The full Cargo
+suite was attempted and failed only because running `cc-switch.exe` processes
+held `src-tauri/target/debug/cc-switch.exe`; no process was killed. `origin/main`
+is still `641d53c8113ddb5564b3154dd6f75c17570a450e`; publication is pending the
+protected task and final gates.
+
+What NOT to do again: do not stage or reformat the protected reasoning files,
+kill the user's running development binaries, or force-publish before the full
+frontend/backend gates and remote SHA verification are green.
+
 ## 2026-10-06 - Current full frontend gate narrowed to protected reasoning task
 
 What happened: reran the full frontend suite on the latest adapted refork tree
