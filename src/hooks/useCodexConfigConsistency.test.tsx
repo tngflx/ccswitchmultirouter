@@ -379,7 +379,7 @@ describe("useCodexConfigConsistency", () => {
         await vi.advanceTimersByTimeAsync(31_000);
       });
       expect(result.current.refresh.phase).toBe("failed");
-      expect(result.current.refresh.error).toContain("卡死");
+      expect(result.current.refresh.error).toContain("may be stalled");
 
       await act(async () => {
         resolveRefresh({

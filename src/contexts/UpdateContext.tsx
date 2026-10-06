@@ -9,6 +9,7 @@ import React, {
 import type { UpdateInfo } from "../lib/updater";
 import { checkForUpdate } from "../lib/updater";
 import { extractErrorMessage } from "../utils/errorUtils";
+import i18n from "@/i18n";
 
 interface UpdateContextValue {
   // 更新状态
@@ -92,7 +93,12 @@ export function UpdateProvider({ children }: { children: React.ReactNode }) {
       }
     } catch (err) {
       console.error("检查更新失败:", err);
-      setError(extractErrorMessage(err) || "检查更新失败");
+      setError(
+        extractErrorMessage(err) ||
+          i18n.t("errors.updateCheckFailed", {
+            defaultValue: "Failed to check for updates",
+          }),
+      );
       setHasUpdate(false);
       throw err; // 抛出错误让调用方处理
     } finally {

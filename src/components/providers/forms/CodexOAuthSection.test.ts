@@ -134,18 +134,24 @@ describe("Codex OAuth 账号池认证门面", () => {
     renderSection();
 
     await screen.findByRole("spinbutton", {
-      name: /managed@example.com.*保留额度/,
+      name: /managed@example.com.*reserve threshold/,
     });
-    expect(await screen.findByText("Codex Desktop 当前登录")).toBeVisible();
+    expect(
+      await screen.findByText("Codex Desktop signed-in account"),
+    ).toBeVisible();
     expect(screen.getAllByText("managed@example.com").length).toBeGreaterThan(
       0,
     );
-    expect(screen.getByText("CCSM 托管默认账号")).toBeVisible();
-    expect(screen.getByText("当前 Codex 路由认证来源")).toBeVisible();
+    expect(screen.getByText("CCSM-managed default account")).toBeVisible();
+    expect(
+      screen.getByText("Current Codex route authentication source"),
+    ).toBeVisible();
     expect(screen.getByText("OpenAI Official")).toBeVisible();
-    expect(screen.getAllByText(/Desktop 当前登录/).length).toBeGreaterThan(1);
+    expect(
+      screen.getAllByText(/Desktop signed-in account/).length,
+    ).toBeGreaterThan(1);
     expect(screen.getByText("Managed fallback")).toBeVisible();
-    expect(screen.getByText(/CCSM 托管：second@example\.com/)).toBeVisible();
+    expect(screen.getByText(/CCSM-managed: second@example\.com/)).toBeVisible();
   });
 
   it("仅在账号池启用且 Desktop 项启用时展示混合认证", () => {
@@ -158,10 +164,10 @@ describe("Codex OAuth 账号池认证门面", () => {
       { accountId: "managed", enabled: true, reservePercent: 5 },
     ];
     expect(codexAccountPoolFacadeLabel({ enabled: true, entries })).toBe(
-      "Desktop / 混合认证",
+      "Desktop / hybrid authentication",
     );
     expect(codexAccountPoolFacadeLabel({ enabled: false, entries })).toBe(
-      "CCSM 托管认证",
+      "CCSM-managed authentication",
     );
     expect(
       codexAccountPoolFacadeLabel({
@@ -172,7 +178,7 @@ describe("Codex OAuth 账号池认证门面", () => {
             : entry,
         ),
       }),
-    ).toBe("CCSM 托管认证");
+    ).toBe("CCSM-managed authentication");
   });
 
   it("只有门面发生变化时提示完全重启 Codex", () => {
@@ -183,7 +189,7 @@ describe("Codex OAuth 账号池认证门面", () => {
         codexRestartRequired: true,
         facade: "native_mixed",
       }),
-    ).toContain("完全退出并重启 Codex");
+    ).toContain("Fully quit and restart Codex");
     expect(
       codexPoolFacadeRestartMessage({
         applied: true,
@@ -191,7 +197,7 @@ describe("Codex OAuth 账号池认证门面", () => {
         codexRestartRequired: true,
         facade: "native_mixed",
       }),
-    ).not.toContain("当前 MultiRouter");
+    ).not.toContain("current MultiRouter");
     expect(
       codexPoolFacadeRestartMessage({
         applied: true,
@@ -204,8 +210,14 @@ describe("Codex OAuth 账号池认证门面", () => {
 
   it("说明 OpenAI Official 可独立使用账号池且 Router 仅继承设置", async () => {
     renderSection();
-    expect(await screen.findByText(/无需启用 MultiRouter/)).toBeVisible();
-    expect(screen.getByText(/官方模型会继承同一设置/)).toBeVisible();
+    expect(
+      await screen.findByText(/does not require MultiRouter/),
+    ).toBeVisible();
+    expect(
+      screen.getByText(
+        /official models in MultiRouter inherit the same setting/,
+      ),
+    ).toBeVisible();
   });
 
   it("编辑账号池草稿不会并发持久化，点击保存只提交最终值一次", async () => {
@@ -213,13 +225,15 @@ describe("Codex OAuth 账号池认证门面", () => {
     renderSection();
 
     const reserveInput = await screen.findByRole("spinbutton", {
-      name: /managed@example.com.*保留额度/,
+      name: /managed@example.com.*reserve threshold/,
     });
     fireEvent.change(reserveInput, { target: { value: "1" } });
     fireEvent.change(reserveInput, { target: { value: "10" } });
 
     expect(mocks.setPolicy).not.toHaveBeenCalled();
-    await user.click(screen.getByRole("button", { name: "保存账号池设置" }));
+    await user.click(
+      screen.getByRole("button", { name: "Save account-pool settings" }),
+    );
 
     await waitFor(() => expect(mocks.setPolicy).toHaveBeenCalledTimes(1));
     expect(mocks.setPolicy.mock.calls[0]?.[0]).toEqual(
@@ -245,24 +259,26 @@ describe("Codex OAuth 账号池认证门面", () => {
     renderSection();
 
     const reserveInput = await screen.findByRole("spinbutton", {
-      name: /managed@example.com.*保留额度/,
+      name: /managed@example.com.*reserve threshold/,
     });
     fireEvent.change(reserveInput, { target: { value: "10" } });
     const saveButton = screen.getByRole("button", {
-      name: "保存账号池设置",
+      name: "Save account-pool settings",
     });
     await user.click(saveButton);
 
     await waitFor(() => expect(saveButton).toBeDisabled());
     expect(reserveInput).toBeDisabled();
     expect(
-      screen.getByRole("switch", { name: "ChatGPT 账号自动切换" }),
+      screen.getByRole("switch", {
+        name: "Automatic ChatGPT account switching",
+      }),
     ).toBeDisabled();
     screen
-      .getAllByTitle("上移")
+      .getAllByTitle("Move up")
       .forEach((button) => expect(button).toBeDisabled());
     screen
-      .getAllByTitle("下移")
+      .getAllByTitle("Move down")
       .forEach((button) => expect(button).toBeDisabled());
 
     resolveSave?.({
@@ -277,11 +293,13 @@ describe("Codex OAuth 账号池认证门面", () => {
     renderSection();
 
     expect(
-      await screen.findByText(/与已登录账号 managed@example.com 相同，已合并/),
+      await screen.findByText(
+        /Matches the signed-in account managed@example.com and was merged/,
+      ),
     ).toBeVisible();
     expect(
       screen.getAllByRole("spinbutton", {
-        name: /managed@example.com.*保留额度/,
+        name: /managed@example.com.*reserve threshold/,
       }),
     ).toHaveLength(1);
   });
@@ -305,7 +323,7 @@ describe("Codex OAuth 账号池认证门面", () => {
     expect(await screen.findAllByText("managed@example.com")).not.toHaveLength(
       0,
     );
-    expect(screen.queryByText(/相同，已合并/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/and was merged/)).not.toBeInTheDocument();
   });
 
   it("点击移除账号时先确认，确认后才调用删除", async () => {
@@ -313,7 +331,7 @@ describe("Codex OAuth 账号池认证门面", () => {
     renderSection();
 
     await screen.findAllByText("managed@example.com");
-    const removeButtons = screen.getAllByTitle("移除账号");
+    const removeButtons = screen.getAllByTitle("Remove account");
     await user.click(removeButtons[0]);
 
     expect(mocks.removeAccount).not.toHaveBeenCalled();
@@ -329,7 +347,7 @@ describe("Codex OAuth 账号池认证门面", () => {
     renderSection();
 
     await user.click(
-      await screen.findByRole("button", { name: "注销所有账号" }),
+      await screen.findByRole("button", { name: "Sign out all accounts" }),
     );
     expect(mocks.logout).not.toHaveBeenCalled();
     await user.click(screen.getByRole("button", { name: "取消" }));

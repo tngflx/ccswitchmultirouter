@@ -39,6 +39,7 @@ pub struct CompiledCodexModel {
     pub upstream_model: String,
     pub display_name: String,
     pub target_provider_id: String,
+    pub target_provider_name: String,
     pub route_id: String,
     pub api_format: String,
     pub api_format_source: String,
@@ -217,12 +218,24 @@ pub fn compile_v2(
                 upstream_model: candidate.upstream_model.clone(),
                 display_name: model_display_name(candidate.model_entry, &candidate.canonical_model),
                 target_provider_id: candidate.provider.id.clone(),
+                target_provider_name: candidate.provider.name.clone(),
                 route_id: candidate.route_id.to_string(),
                 api_format,
                 api_format_source,
-                sort_index: model_sort_index(candidate.model_entry),
+                sort_index: None,
                 capability_summary,
             });
+        }
+    }
+
+    apply_router_model_order(plan, &mut model_catalog);
+    if let Some(effort) = supported_router_default_effort(plan, &model_catalog) {
+        if let Some(reasoning) = model_catalog
+            .first_mut()
+            .and_then(|model| model.capability_summary.reasoning.as_mut())
+            .and_then(Value::as_object_mut)
+        {
+            reasoning.insert("defaultEffort".to_string(), Value::String(effort));
         }
     }
 
@@ -466,10 +479,107 @@ fn model_display_name(model_entry: &Value, canonical_model: &str) -> String {
         .unwrap_or_else(|| canonical_model.to_string())
 }
 
-fn model_sort_index(model_entry: &Value) -> Option<usize> {
-    value_field(model_entry, &["sortIndex", "sort_index"])
-        .and_then(Value::as_u64)
-        .and_then(|value| usize::try_from(value).ok())
+fn apply_router_model_order(plan: &CodexRoutingConfigV2, models: &mut [CompiledCodexModel]) {
+    let Some(order) = plan.extensions.get("modelOrder").and_then(Value::as_array) else {
+        return;
+    };
+    let visible = models
+        .iter()
+        .map(|model| model.visible_model.to_ascii_lowercase())
+        .collect::<HashSet<_>>();
+    let mut ranks = HashMap::new();
+    for (rank, id) in order
+        .iter()
+        .filter_map(Value::as_str)
+        .map(str::trim)
+        .enumerate()
+    {
+        let key = id.to_ascii_lowercase();
+        if visible.contains(&key) {
+            ranks.entry(key).or_insert(rank);
+        }
+    }
+    for (rank, id) in order
+        .iter()
+        .filter_map(Value::as_str)
+        .map(str::trim)
+        .enumerate()
+    {
+        let key = id.to_ascii_lowercase();
+        if key.is_empty() || visible.contains(&key) {
+            continue;
+        }
+        let identities = models
+            .iter()
+            .filter(|model| {
+                model.canonical_model.eq_ignore_ascii_case(&key)
+                    || model.upstream_model.eq_ignore_ascii_case(&key)
+            })
+            .collect::<Vec<_>>();
+        let suffix_matches = models
+            .iter()
+            .filter(|model| {
+                let source = if model.target_provider_name.trim().is_empty() {
+                    &model.target_provider_id
+                } else {
+                    &model.target_provider_name
+                };
+                let suffix = label_suffix(source);
+                suffix.len() >= 2
+                    && key.strip_suffix(&format!("-{suffix}")).is_some_and(|stem| {
+                        model.canonical_model.eq_ignore_ascii_case(stem)
+                            || model.upstream_model.eq_ignore_ascii_case(stem)
+                    })
+            })
+            .collect::<Vec<_>>();
+        let matches = if identities.len() == 1 {
+            &identities
+        } else {
+            &suffix_matches
+        };
+        if let [model] = matches.as_slice() {
+            ranks
+                .entry(model.visible_model.to_ascii_lowercase())
+                .or_insert(rank);
+        }
+    }
+    if ranks.is_empty() {
+        return;
+    }
+    models.sort_by_key(|model| {
+        ranks
+            .get(&model.visible_model.to_ascii_lowercase())
+            .copied()
+            .unwrap_or(usize::MAX)
+    });
+    for (index, model) in models.iter_mut().enumerate() {
+        model.sort_index = Some(index);
+    }
+}
+
+/// A preference selects among declared efforts; it must never invent a tier.
+pub(crate) fn supported_router_default_effort(
+    plan: &CodexRoutingConfigV2,
+    models: &[CompiledCodexModel],
+) -> Option<String> {
+    let requested = plan.extensions.get("defaultReasoningEffort")?.as_str()?;
+    if !matches!(
+        requested,
+        "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max"
+    ) {
+        return None;
+    }
+    let declared = models
+        .first()?
+        .capability_summary
+        .reasoning
+        .as_ref()?
+        .get("supportedEfforts")?
+        .as_array()?;
+    declared
+        .iter()
+        .any(|effort| effort.as_str() == Some(requested))
+        .then(|| requested.to_string())
 }
 
 fn canonical_collision_counts(candidates: &[ModelCandidate<'_>]) -> HashMap<String, usize> {
@@ -544,6 +654,10 @@ fn provider_name_suffix(provider: &Provider) -> String {
     } else {
         provider.name.as_str()
     };
+    label_suffix(source)
+}
+
+fn label_suffix(source: &str) -> String {
     let mut suffix = String::new();
     let mut previous_dash = false;
     for character in source.trim().chars().flat_map(char::to_lowercase) {
@@ -870,6 +984,10 @@ fn dependency_fingerprint(
         "schemaVersion": plan.schema_version,
         "enabled": plan.enabled,
         "defaultRouteId": plan.default_route_id,
+        "modelOrder": plan.extensions.get("modelOrder"),
+        "modelDisplayStyle": plan.extensions.get("modelDisplayStyle"),
+        "defaultReasoningEffort": plan.extensions.get("defaultReasoningEffort"),
+        "spawnAgentModels": plan.spawn_agent_models,
         "routes": plan.routes,
     });
     let effective_models =
@@ -1510,9 +1628,132 @@ mod tests {
                 sort_changed,
             ],
         );
-        assert_ne!(
+        assert_eq!(
             forward.dependency_fingerprint,
             sort_compiled.dependency_fingerprint
+        );
+    }
+
+    #[test]
+    fn router_order_is_independent_and_survives_catalog_rebuilds() {
+        let source = provider(
+            "source",
+            "Source",
+            "openai_responses",
+            json!([{"model": "a", "sortIndex": 0}, {"model": "b", "sortIndex": 1}, {"model": "new"}]),
+        );
+        let baseline = plan(vec![route(
+            "source-route",
+            "source",
+            CodexModelSelection::All,
+        )]);
+        let mut ordered = baseline.clone();
+        ordered
+            .extensions
+            .insert("modelOrder".into(), json!(["b", "removed", "a", "b"]));
+        let compiled = compile(&ordered, [source.clone()]);
+        assert_eq!(compiled.visible_models, vec!["b", "a", "new"]);
+        assert_eq!(
+            compiled
+                .model_catalog
+                .iter()
+                .map(|model| model.sort_index)
+                .collect::<Vec<_>>(),
+            vec![Some(0), Some(1), Some(2)]
+        );
+        let other = compile(&baseline, [source.clone()]);
+        assert_eq!(other.visible_models, vec!["a", "b", "new"]);
+        assert!(other
+            .model_catalog
+            .iter()
+            .all(|model| model.sort_index.is_none()));
+        assert_ne!(
+            compiled.dependency_fingerprint,
+            other.dependency_fingerprint
+        );
+        ordered
+            .extensions
+            .insert("modelDisplayStyle".into(), json!("model"));
+        assert_ne!(
+            compiled.dependency_fingerprint,
+            compile(&ordered, [source]).dependency_fingerprint
+        );
+    }
+
+    #[test]
+    fn router_order_recovers_unique_identity_but_exact_names_take_precedence() {
+        let source = provider(
+            "source",
+            "Source",
+            "openai_responses",
+            json!([{"model": "alias", "upstreamModel": "wire"}, {"model": "b"}]),
+        );
+        let mut plan = plan(vec![route(
+            "source-route",
+            "source",
+            CodexModelSelection::All,
+        )]);
+        plan.extensions
+            .insert("modelOrder".into(), json!(["WIRE", "b", "ALIAS"]));
+        assert_eq!(
+            compile(&plan, [source.clone()]).visible_models,
+            vec!["b", "alias"]
+        );
+        plan.extensions
+            .insert("modelOrder".into(), json!(["WIRE-SOURCE"]));
+        assert_eq!(compile(&plan, [source]).visible_models, vec!["alias", "b"]);
+    }
+
+    #[test]
+    fn router_default_effort_is_only_selected_from_first_models_declared_tiers() {
+        let source = provider(
+            "source",
+            "Source",
+            "openai_responses",
+            json!([{"model": "custom", "reasoning": {
+                "supportedEfforts": ["low", "high"], "defaultEffort": "low"
+            }}, {"model": "unknown"}]),
+        );
+        let mut plan = plan(vec![route(
+            "source-route",
+            "source",
+            CodexModelSelection::All,
+        )]);
+        plan.extensions
+            .insert("defaultReasoningEffort".into(), json!("high"));
+        let compiled = compile(&plan, [source.clone()]);
+        assert_eq!(
+            supported_router_default_effort(&plan, &compiled.model_catalog),
+            Some("high".into())
+        );
+        assert_eq!(
+            compiled.model_catalog[0]
+                .capability_summary
+                .reasoning
+                .as_ref()
+                .unwrap()["defaultEffort"],
+            "high"
+        );
+        plan.extensions
+            .insert("defaultReasoningEffort".into(), json!("xhigh"));
+        let unsupported = compile(&plan, [source.clone()]);
+        assert_eq!(
+            supported_router_default_effort(&plan, &unsupported.model_catalog),
+            None
+        );
+        assert_eq!(
+            unsupported.model_catalog[0]
+                .capability_summary
+                .reasoning
+                .as_ref()
+                .unwrap()["defaultEffort"],
+            "low"
+        );
+        plan.extensions
+            .insert("modelOrder".into(), json!(["unknown", "custom"]));
+        assert_eq!(
+            supported_router_default_effort(&plan, &compile(&plan, [source]).model_catalog),
+            None
         );
     }
 
@@ -1560,7 +1801,6 @@ mod tests {
             }]),
             json!([{"model": "qwen3.8", "apiFormat": "openai_chat"}]),
             json!([{"model": "qwen3.8", "upstreamModel": "qwen3.8-202608"}]),
-            json!([{"model": "qwen3.8", "sortIndex": 4}]),
             json!([{"model": "qwen3.8", "enabled": false}]),
             json!([{"model": "qwen3.8"}, {"model": "qwen3.9"}]),
         ];

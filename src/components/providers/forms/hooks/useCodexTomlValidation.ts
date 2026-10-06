@@ -1,5 +1,6 @@
 import { useState, useCallback, useEffect, useRef } from "react";
 import TOML from "smol-toml";
+import i18n from "@/i18n";
 
 /**
  * Codex config.toml 格式校验 Hook
@@ -27,7 +28,11 @@ export function useCodexTomlValidation() {
       return true;
     } catch (error) {
       const errorMessage =
-        error instanceof Error ? error.message : "TOML 格式错误";
+        error instanceof Error
+          ? error.message
+          : i18n.t("configValidation.invalidToml", {
+              defaultValue: "Invalid TOML syntax",
+            });
       setConfigError(errorMessage);
       return false;
     }

@@ -94,10 +94,10 @@ describe("CodexProtocolProbeProgressDialog", () => {
       />,
     );
 
-    expect(screen.getByText(/正在验证模型 0\/2/)).toBeInTheDocument();
+    expect(screen.getByText(/Validating models 0\/2/)).toBeInTheDocument();
     expect(
-      screen.getByRole("article", { name: "deepseek-v4 探测进度" }),
-    ).toHaveTextContent("等待开始");
+      screen.getByRole("article", { name: "deepseek-v4 probe progress" }),
+    ).toHaveTextContent("Waiting to start");
   });
 
   it("shows each model, transport, and deep-probe stage while probing", () => {
@@ -141,22 +141,22 @@ describe("CodexProtocolProbeProgressDialog", () => {
     );
 
     expect(
-      screen.getByRole("heading", { name: "Codex 兼容性深度探测" }),
+      screen.getByRole("heading", { name: "Codex deep compatibility probe" }),
     ).toBeInTheDocument();
-    const modelCard = screen.getByRole("article", { name: "qwen3.8 探测进度" });
+    const modelCard = screen.getByRole("article", { name: "qwen3.8 probe progress" });
     expect(within(modelCard).getByText("Responses")).toBeInTheDocument();
-    expect(within(modelCard).getByText("基础响应")).toBeInTheDocument();
-    expect(within(modelCard).getByText("流式 SSE")).toBeInTheDocument();
-    expect(within(modelCard).getByText("思考内容")).toBeInTheDocument();
-    expect(within(modelCard).getByText("工具调用")).toBeInTheDocument();
-    expect(within(modelCard).getByText("工具续轮")).toBeInTheDocument();
-    expect(within(modelCard).getByText("上游原生摘要")).toBeInTheDocument();
-    expect(within(modelCard).getByText("检测中")).toBeInTheDocument();
+    expect(within(modelCard).getByText("Baseline response")).toBeInTheDocument();
+    expect(within(modelCard).getByText("Streaming SSE")).toBeInTheDocument();
+    expect(within(modelCard).getByText("Reasoning content")).toBeInTheDocument();
+    expect(within(modelCard).getByText("Tool call")).toBeInTheDocument();
+    expect(within(modelCard).getByText("Tool continuation")).toBeInTheDocument();
+    expect(within(modelCard).getByText("Native upstream summary")).toBeInTheDocument();
+    expect(within(modelCard).getByText("Checking")).toBeInTheDocument();
   });
 
   it.each([
-    { baseline: "failed" as const, expected: "已跳过", rejected: "不支持" },
-    { baseline: "passed" as const, expected: "不支持", rejected: "已跳过" },
+    { baseline: "failed" as const, expected: "Skipped", rejected: "Unsupported" },
+    { baseline: "passed" as const, expected: "Unsupported", rejected: "Skipped" },
   ])(
     "maps reasoning with no content from a $baseline baseline to $expected",
     ({ baseline, expected, rejected }) => {
@@ -175,9 +175,9 @@ describe("CodexProtocolProbeProgressDialog", () => {
       );
 
       const modelCard = screen.getByRole("article", {
-        name: "qwen3.8 探测进度",
+        name: "qwen3.8 probe progress",
       });
-      const reasoningRows = within(modelCard).getAllByText("思考内容");
+      const reasoningRows = within(modelCard).getAllByText("Reasoning content");
       for (const label of reasoningRows) {
         const row = label.parentElement;
         expect(row).toHaveTextContent(expected);
@@ -207,10 +207,10 @@ describe("CodexProtocolProbeProgressDialog", () => {
     );
 
     const modelCard = screen.getByRole("article", {
-      name: "qwen3.8 探测进度",
+      name: "qwen3.8 probe progress",
     });
     expect(
-      within(modelCard).getByText("HTTP 521 · 上游不可达"),
+      within(modelCard).getByText("HTTP 521 · Upstream unreachable"),
     ).toBeInTheDocument();
     expect(modelCard).not.toHaveTextContent("private upstream response body");
     expect(modelCard).not.toHaveTextContent("https://");
@@ -248,6 +248,6 @@ describe("CodexProtocolProbeProgressDialog", () => {
       />,
     );
 
-    expect(screen.getByText("HTTP 521 · 上游不可达")).toBeInTheDocument();
+    expect(screen.getByText("HTTP 521 · Upstream unreachable")).toBeInTheDocument();
   });
 });

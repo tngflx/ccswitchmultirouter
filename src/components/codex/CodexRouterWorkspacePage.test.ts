@@ -1,5 +1,12 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { act, render, screen, waitFor, within } from "@testing-library/react";
+import {
+  act,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+  within,
+} from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import React from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -13,8 +20,13 @@ import {
 } from "@/lib/api/model-fetch";
 import type { CodexRoutingProjectionStatus } from "@/lib/api/providers";
 import { proxyApi } from "@/lib/api/proxy";
-import type { CodexRoutingAuthPolicy, Provider } from "@/types";
+import type {
+  CodexCatalogModel,
+  CodexRoutingAuthPolicy,
+  Provider,
+} from "@/types";
 import type { PaginatedLogs, RequestLog } from "@/types/usage";
+import type { RequestHealthSnapshot } from "@/types/proxy";
 import {
   applyMultiRouterSettingsDraft,
   buildMultiRouterRuntimeStatus,
@@ -22,6 +34,9 @@ import {
   buildModelCatalogForRoutes,
   buildRouteTrafficRows,
   CodexRouterWorkspacePage,
+  formatCodexCatalogModelLabel,
+  recommendCodexCatalogModels,
+  sortCodexCatalogModels,
   createRoutePolicyDraft,
   createDraftRoutingPlan,
   dedupeCodexRoutesBySemanticProvider,
@@ -54,6 +69,7 @@ vi.mock("@/lib/api/proxy", () => ({
     }),
     diagnoseCodexMultiRouter: vi.fn(),
     unlockCodexModelPicker: vi.fn(),
+    getRequestHealthDiagnostics: vi.fn(),
   },
 }));
 
@@ -324,6 +340,22 @@ beforeEach(() => {
   vi.mocked(fetchCodexOauthModels).mockReset();
   vi.mocked(fetchModelsForConfig).mockReset();
   vi.mocked(proxyApi.unlockCodexModelPicker).mockReset();
+  vi.mocked(proxyApi.getRequestHealthDiagnostics).mockReset();
+  vi.mocked(proxyApi.getRequestHealthDiagnostics).mockResolvedValue({
+    config: {
+      enabled: true,
+      optimizationMode: "diagnose",
+      largeRequestThresholdBytes: 512 * 1024,
+      maxCodexInputTokens: 200_000,
+      reviewTimeoutSeconds: 60,
+      reviewMode: "first_large_request",
+      summarizeAndRestartEnabled: false,
+      windowsNotificationsEnabled: true,
+      windowsNotificationSnoozeHours: 24,
+      windowsNotificationsSnoozedUntilMs: null,
+    },
+    diagnostics: [],
+  } satisfies RequestHealthSnapshot);
   vi.mocked(providersApi.add).mockResolvedValue(true);
   vi.mocked(providersApi.update).mockResolvedValue(true);
   vi.mocked(providersApi.getAll).mockResolvedValue({});
@@ -358,6 +390,825 @@ afterEach(() => {
   vi.useRealTimers();
 });
 
+describe("Model order real drag sensors", () => {
+  let restoreGeometry: () => void;
+
+  beforeEach(() => {
+    // jsdom has neither PointerEvent fields nor layout. Supply only those browser
+    // primitives; keep dnd-kit, its sensors, collision detection and handlers real.
+    if (typeof window.PointerEvent === "undefined") {
+      class TestPointerEvent extends MouseEvent {
+        readonly isPrimary: boolean;
+        readonly pointerId: number;
+        readonly pointerType: string;
+
+        constructor(type: string, init: PointerEventInit = {}) {
+          super(type, init);
+          this.isPrimary = init.isPrimary ?? true;
+          this.pointerId = init.pointerId ?? 1;
+          this.pointerType = init.pointerType ?? "mouse";
+        }
+      }
+      vi.stubGlobal("PointerEvent", TestPointerEvent);
+    }
+    const actualRect = HTMLElement.prototype.getBoundingClientRect;
+    const geometry = vi
+      .spyOn(HTMLElement.prototype, "getBoundingClientRect")
+      .mockImplementation(function (this: HTMLElement) {
+        const selector = 'button[aria-label^="Drag order-"]';
+        const handle = this.matches(selector)
+          ? this
+          : Array.from(this.children).find((child) => child.matches(selector));
+        if (!(handle instanceof HTMLElement)) return actualRect.call(this);
+        const handles = Array.from(document.querySelectorAll(selector));
+        const index = handles.indexOf(handle);
+        if (index < 0) return actualRect.call(this);
+        const translation = handle.parentElement?.style.transform.match(
+          /translate3d\(([-\d.]+)px,\s*([-\d.]+)px,/,
+        );
+        const x =
+          (index < 8 ? 100 : 650) +
+          (this === handle ? 10 : 0) +
+          Number(translation?.[1] ?? 0);
+        const y =
+          100 +
+          (index < 8 ? index : index - 8) * 60 +
+          (this === handle ? 10 : 0) +
+          Number(translation?.[2] ?? 0);
+        const width = this === handle ? 24 : 400;
+        const height = this === handle ? 24 : 44;
+        return {
+          x,
+          y,
+          top: y,
+          left: x,
+          right: x + width,
+          bottom: y + height,
+          width,
+          height,
+          toJSON: () => ({ x, y, width, height }),
+        };
+      });
+    restoreGeometry = () => geometry.mockRestore();
+  });
+
+  afterEach(() => {
+    restoreGeometry();
+    vi.unstubAllGlobals();
+  });
+
+  function modelOrder() {
+    return screen
+      .getAllByRole("button", { name: /^Drag order-/ })
+      .map((handle) => handle.getAttribute("aria-label")?.slice(5));
+  }
+
+  function renderModelOrder(
+    options: {
+      models?: CodexCatalogModel[];
+      routing?: Record<string, unknown>;
+      config?: string;
+    } = {},
+  ) {
+    const source: Provider = {
+      id: "drag-source",
+      name: "Drag Source",
+      category: "custom",
+      settingsConfig: {
+        auth: { OPENAI_API_KEY: "test-only-credential" },
+        modelCatalog: {
+          spawnAgentModels: ["order-c", "order-a"],
+          models: options.models ?? [
+            {
+              model: "order-a",
+              upstreamModel: "wire-a",
+              displayName: "First model",
+              sortIndex: 0,
+              contextWindow: 128000,
+              supportsImage: true,
+            },
+            { model: "order-b", sortIndex: 1, contextWindow: 64000 },
+            { model: "order-c", sortIndex: 2, supportsImage: false },
+          ],
+        },
+      },
+    };
+    const enabledPlan = withEnabledProviderRoute(
+      createDraftRoutingPlan([source], [source]),
+      source,
+    );
+    const plan: Provider = {
+      ...enabledPlan,
+      settingsConfig: {
+        ...enabledPlan.settingsConfig,
+        ...(options.config ? { config: options.config } : {}),
+        codexRouting: {
+          ...enabledPlan.settingsConfig.codexRouting,
+          spawnAgentModels: ["order-c", "order-a", "order-b"],
+          routes: enabledPlan.settingsConfig.codexRouting.routes.map(
+            (route: Record<string, unknown>) => ({
+              ...route,
+              aliases: { "order-a": "wire-a" },
+            }),
+          ),
+          ...options.routing,
+        },
+      },
+    };
+    const snapshot = JSON.stringify({ source, plan });
+    const elementFor = (providers: Provider[]) =>
+      React.createElement(CodexRouterWorkspacePage, {
+        providers,
+        isProxyRunning: true,
+        isCodexTakeoverActive: true,
+        activeProviderId: plan.id,
+        initialProviderId: plan.id,
+        initialTab: "model-order" as const,
+        onEditProvider: vi.fn(),
+        onDeletePlan: vi.fn(),
+        onCreateProvider: vi.fn(),
+      });
+    return {
+      source,
+      plan,
+      snapshot,
+      elementFor,
+      rendered: renderWorkspace(elementFor([source, plan])),
+    };
+  }
+
+  async function pointerMoveFirstToSecond() {
+    const handle = await screen.findByRole("button", {
+      name: "Drag order-a",
+    });
+    const start = handle.getBoundingClientRect();
+    fireEvent.pointerDown(handle, {
+      button: 0,
+      isPrimary: true,
+      pointerId: 1,
+      clientX: start.x + 12,
+      clientY: start.y + 12,
+    });
+    await waitFor(() => expect(handle).toHaveAttribute("aria-pressed", "true"));
+    fireEvent.pointerMove(document, {
+      pointerId: 1,
+      clientX: start.x + 12,
+      clientY: start.y + 72,
+    });
+    await screen.findByText(
+      "Draggable item order-a was moved over droppable area order-b.",
+    );
+    return handle;
+  }
+
+  it("reorders by pointer, saves only router preferences and reloads the saved order", async () => {
+    const { source, plan, snapshot, elementFor, rendered } = renderModelOrder();
+    const handle = await pointerMoveFirstToSecond();
+    expect(modelOrder()).toEqual(["order-a", "order-b", "order-c"]);
+    expect(providersApi.update).not.toHaveBeenCalled();
+
+    fireEvent.pointerUp(document, { pointerId: 1 });
+    await waitFor(() => {
+      expect(handle).not.toHaveAttribute("aria-pressed");
+      expect(modelOrder()).toEqual(["order-b", "order-a", "order-c"]);
+    });
+    expect(providersApi.update).not.toHaveBeenCalled();
+    // PointerSensor briefly suppresses clicks after release to avoid accidental
+    // row actions. A normal later Save click must still use the owning IPC.
+    await userEvent
+      .setup({ delay: 55 })
+      .click(screen.getByRole("button", { name: "Save order" }));
+    await waitFor(() => {
+      expect(providersApi.update).toHaveBeenCalledTimes(1);
+      expect(providersApi.update).toHaveBeenCalledWith(
+        expect.objectContaining({
+          id: plan.id,
+          settingsConfig: expect.objectContaining({
+            codexRouting: {
+              ...plan.settingsConfig.codexRouting,
+              modelOrder: ["order-b", "order-a", "order-c"],
+              modelDisplayStyle: "provider-model",
+            },
+          }),
+        }),
+        "codex",
+      );
+    });
+    const expected = vi.mocked(providersApi.update).mock.calls[0][0];
+    expect(expected.settingsConfig.config).toMatch(/^model = "order-b"/m);
+    expect(expected.settingsConfig.modelCatalog).toBeUndefined();
+    expect(JSON.stringify({ source, plan })).toBe(snapshot);
+    expect(
+      screen.getByText(/Saved the display order for 3 models/),
+    ).toBeInTheDocument();
+    vi.mocked(providersApi.getAll).mockResolvedValue({
+      [source.id]: source,
+      [plan.id]: expected,
+    });
+    const reloaded = await providersApi.getAll("codex");
+    rendered.unmount();
+    renderWorkspace(elementFor(Object.values(reloaded)));
+    await waitFor(() =>
+      expect(modelOrder()).toEqual(["order-b", "order-a", "order-c"]),
+    );
+    expect(screen.getByRole("button", { name: "Save order" })).toBeDisabled();
+    expect(providersApi.update).toHaveBeenCalledTimes(1);
+  });
+
+  it("reorders through the real keyboard sensor without saving until requested", async () => {
+    renderModelOrder();
+    const user = userEvent.setup();
+    const handle = await screen.findByRole("button", {
+      name: "Drag order-a",
+    });
+    handle.focus();
+    await user.keyboard("[Space]");
+    await waitFor(() => expect(handle).toHaveAttribute("aria-pressed", "true"));
+    await user.keyboard("[ArrowDown]");
+    await screen.findByText(
+      "Draggable item order-a was moved over droppable area order-b.",
+    );
+    await user.keyboard("[Space]");
+    await waitFor(() =>
+      expect(modelOrder()).toEqual(["order-b", "order-a", "order-c"]),
+    );
+    expect(providersApi.update).not.toHaveBeenCalled();
+    expect(screen.getByRole("button", { name: "Save order" })).toBeEnabled();
+  });
+
+  it.each(["pointer", "keyboard"] as const)(
+    "cancels an active %s drag without changing the draft or source",
+    async (sensor) => {
+      const { source, plan, snapshot } = renderModelOrder();
+      const user = userEvent.setup();
+      let handle: HTMLElement;
+      if (sensor === "pointer") {
+        handle = await pointerMoveFirstToSecond();
+        fireEvent.pointerCancel(document, { pointerId: 1 });
+      } else {
+        handle = await screen.findByRole("button", {
+          name: "Drag order-a",
+        });
+        handle.focus();
+        await user.keyboard("[Space][ArrowDown]");
+        await screen.findByText(
+          "Draggable item order-a was moved over droppable area order-b.",
+        );
+        await user.keyboard("[Escape]");
+      }
+      await waitFor(() => {
+        expect(handle).not.toHaveAttribute("aria-pressed");
+        expect(modelOrder()).toEqual(["order-a", "order-b", "order-c"]);
+      });
+      expect(providersApi.update).not.toHaveBeenCalled();
+      expect(JSON.stringify({ source, plan })).toBe(snapshot);
+      expect(screen.getByRole("button", { name: "Save order" })).toBeDisabled();
+    },
+  );
+
+  it.each(["pointer", "keyboard"] as const)(
+    "keeps Save disabled after a same-position %s drop",
+    async (sensor) => {
+      renderModelOrder();
+      const handle = await screen.findByRole("button", {
+        name: "Drag order-a",
+      });
+      const user = userEvent.setup();
+      if (sensor === "pointer") {
+        const rect = handle.getBoundingClientRect();
+        fireEvent.pointerDown(handle, {
+          button: 0,
+          isPrimary: true,
+          pointerId: 1,
+          clientX: rect.x + 12,
+          clientY: rect.y + 12,
+        });
+      } else {
+        handle.focus();
+        await user.keyboard("[Space]");
+      }
+      await waitFor(() =>
+        expect(handle).toHaveAttribute("aria-pressed", "true"),
+      );
+      if (sensor === "pointer") {
+        fireEvent.pointerUp(document, { pointerId: 1 });
+      } else {
+        await user.keyboard("[Space]");
+      }
+      await waitFor(() => expect(handle).not.toHaveAttribute("aria-pressed"));
+      expect(modelOrder()).toEqual(["order-a", "order-b", "order-c"]);
+      expect(providersApi.update).not.toHaveBeenCalled();
+      expect(screen.getByRole("button", { name: "Save order" })).toBeDisabled();
+    },
+  );
+
+  it("retains a pointer-reordered draft after Save fails and retries the same order", async () => {
+    const { source, plan, snapshot } = renderModelOrder();
+    vi.mocked(providersApi.update).mockRejectedValueOnce(
+      new Error("test_source_save_rejected"),
+    );
+    await pointerMoveFirstToSecond();
+    fireEvent.pointerUp(document, { pointerId: 1 });
+    await waitFor(() =>
+      expect(modelOrder()).toEqual(["order-b", "order-a", "order-c"]),
+    );
+    const user = userEvent.setup({ delay: 55 });
+    await user.click(screen.getByRole("button", { name: "Save order" }));
+    expect(
+      await screen.findByText(
+        "Failed to save model order:Operation failed. See the logs for details (error code: test_source_save_rejected).",
+      ),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByText(/Saved the display order/),
+    ).not.toBeInTheDocument();
+    expect(modelOrder()).toEqual(["order-b", "order-a", "order-c"]);
+    expect(screen.getByRole("button", { name: "Save order" })).toBeEnabled();
+    expect(providersApi.update).toHaveBeenCalledTimes(1);
+    const failedAttempt = vi.mocked(providersApi.update).mock.calls[0];
+    await user.click(screen.getByRole("button", { name: "Save order" }));
+    await screen.findByText(/Saved the display order for 3 models/);
+    expect(providersApi.update).toHaveBeenCalledTimes(2);
+    expect(vi.mocked(providersApi.update).mock.calls[1]).toEqual(failedAttempt);
+    expect(JSON.stringify({ source, plan })).toBe(snapshot);
+    expect(
+      screen.queryByText(/Failed to save model order/),
+    ).not.toBeInTheDocument();
+  });
+
+  it("moves the last model to the first position through repeated keyboard moves", async () => {
+    renderModelOrder();
+    const user = userEvent.setup();
+    const handle = await screen.findByRole("button", {
+      name: "Drag order-c",
+    });
+    handle.focus();
+    await user.keyboard("[Space][ArrowUp]");
+    await screen.findByText(
+      "Draggable item order-c was moved over droppable area order-b.",
+    );
+    await user.keyboard("[ArrowUp]");
+    await screen.findByText(
+      "Draggable item order-c was moved over droppable area order-a.",
+    );
+    await user.keyboard("[Space]");
+    await waitFor(() =>
+      expect(modelOrder()).toEqual(["order-c", "order-a", "order-b"]),
+    );
+    expect(providersApi.update).not.toHaveBeenCalled();
+    expect(screen.getByRole("button", { name: "Save order" })).toBeEnabled();
+  });
+
+  const tenModels = () =>
+    "abcdefghij".split("").map((suffix) => ({
+      model: `order-${suffix}`,
+    }));
+
+  it.each(["pointer", "keyboard"] as const)(
+    "moves an available model into the ranked column through the real %s sensor",
+    async (sensor) => {
+      renderModelOrder({ models: tenModels() });
+      expect(
+        within(
+          screen.getByRole("region", { name: "Ranked models" }),
+        ).getAllByRole("button", { name: /^Drag / }),
+      ).toHaveLength(8);
+      expect(
+        within(
+          screen.getByRole("region", { name: "Available models" }),
+        ).getAllByRole("button", { name: /^Drag / }),
+      ).toHaveLength(2);
+      const handle = screen.getByRole("button", { name: "Drag order-i" });
+      if (sensor === "pointer") {
+        const from = handle.getBoundingClientRect();
+        const to = screen
+          .getByRole("button", { name: "Drag order-a" })
+          .getBoundingClientRect();
+        fireEvent.pointerDown(handle, {
+          button: 0,
+          isPrimary: true,
+          pointerId: 1,
+          clientX: from.x + 12,
+          clientY: from.y + 12,
+        });
+        await waitFor(() =>
+          expect(handle).toHaveAttribute("aria-pressed", "true"),
+        );
+        fireEvent.pointerMove(document, {
+          pointerId: 1,
+          clientX: to.x + 12,
+          clientY: to.y + 12,
+        });
+        await screen.findByText(
+          "Draggable item order-i was moved over droppable area order-a.",
+        );
+        fireEvent.pointerUp(document, { pointerId: 1 });
+      } else {
+        handle.focus();
+        const user = userEvent.setup();
+        await user.keyboard("[Space][ArrowLeft]");
+        await screen.findByText(
+          "Draggable item order-i was moved over droppable area order-a.",
+        );
+        await user.keyboard("[Space]");
+      }
+      await waitFor(() =>
+        expect(modelOrder()).toEqual([
+          "order-i",
+          ...tenModels()
+            .map((model) => model.model)
+            .filter((id) => id !== "order-i"),
+        ]),
+      );
+      expect(
+        within(screen.getByRole("region", { name: "Available models" }))
+          .getAllByRole("button", { name: /^Drag / })
+          .map((button) => button.getAttribute("aria-label")),
+      ).toEqual(["Drag order-h", "Drag order-j"]);
+      expect(providersApi.update).not.toHaveBeenCalled();
+    },
+  );
+
+  it("keeps ranks global under search and supports exact ranks and favorite without writing sources", async () => {
+    const { source, plan, snapshot } = renderModelOrder({
+      models: tenModels(),
+    });
+    const user = userEvent.setup();
+    await user.type(
+      screen.getByRole("textbox", { name: "Search models or providers" }),
+      "order-j",
+    );
+    expect(
+      screen.getByText("1 results. Rank numbers remain global."),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("spinbutton", { name: "Rank for order-j" }),
+    ).toHaveValue(10);
+    fireEvent.change(
+      screen.getByRole("spinbutton", { name: "Rank for order-j" }),
+      { target: { value: "3" } },
+    );
+    await user.click(
+      screen.getByRole("button", { name: "Move order-j to rank 3" }),
+    );
+    expect(
+      screen.getByRole("spinbutton", { name: "Rank for order-j" }),
+    ).toHaveValue(3);
+    await user.click(
+      screen.getByRole("button", { name: "Make order-j the favorite model" }),
+    );
+    expect(
+      screen.getByRole("spinbutton", { name: "Rank for order-j" }),
+    ).toHaveValue(1);
+    expect(
+      screen.getByRole("button", { name: "Make order-j the favorite model" }),
+    ).toBeDisabled();
+    await user.clear(
+      screen.getByRole("textbox", { name: "Search models or providers" }),
+    );
+    expect(modelOrder()).toEqual([
+      "order-j",
+      ..."abcdefghi".split("").map((suffix) => `order-${suffix}`),
+    ]);
+    expect(providersApi.update).not.toHaveBeenCalled();
+    expect(JSON.stringify({ source, plan })).toBe(snapshot);
+  });
+
+  it("switches an alphabetical sort to custom when a model is moved manually", async () => {
+    renderModelOrder({
+      models: [
+        { model: "order-c" },
+        { model: "order-a" },
+        { model: "order-b" },
+      ],
+    });
+    const user = userEvent.setup();
+    await user.selectOptions(
+      screen.getByRole("combobox", { name: "Sort models" }),
+      "model",
+    );
+    expect(modelOrder()).toEqual(["order-a", "order-b", "order-c"]);
+    await pointerMoveFirstToSecond();
+    fireEvent.pointerUp(document, { pointerId: 1 });
+    await waitFor(() =>
+      expect(modelOrder()).toEqual(["order-b", "order-a", "order-c"]),
+    );
+    expect(screen.getByRole("combobox", { name: "Sort models" })).toHaveValue(
+      "custom",
+    );
+  });
+
+  it("saves display-only preferences without changing default model, effort, routes or source catalogs", async () => {
+    const routing = {
+      modelOrder: ["order-c", "order-a", "order-b"],
+      defaultReasoningEffort: "high",
+      officialAuth: { mode: "managed", accountId: "test-account" },
+      customExtension: { keep: true },
+    };
+    const { source, plan, snapshot } = renderModelOrder({
+      routing,
+      config: 'model = "order-a"\nmodel_reasoning_effort = "low"\n',
+    });
+    const user = userEvent.setup();
+    await user.selectOptions(
+      screen.getByRole("combobox", { name: "Model display" }),
+      "model",
+    );
+    await user.click(screen.getByRole("button", { name: "Save order" }));
+    await screen.findByText(/Saved the display order for 3 models/);
+    const saved = vi.mocked(providersApi.update).mock.calls[0][0];
+    expect(saved.id).toBe(plan.id);
+    expect(saved.settingsConfig.config).toBe(plan.settingsConfig.config);
+    expect(saved.settingsConfig.codexRouting).toEqual({
+      ...plan.settingsConfig.codexRouting,
+      modelDisplayStyle: "model",
+    });
+    expect(saved.settingsConfig.modelCatalog).toBeUndefined();
+    expect(JSON.stringify({ source, plan })).toBe(snapshot);
+    expect(providersApi.update).toHaveBeenCalledTimes(1);
+  });
+
+  const reasoning = (
+    efforts: Array<"low" | "high">,
+    defaultEffort: "low" | "high",
+  ) => ({
+    schemaVersion: 2 as const,
+    supportStatus: "confirmed_supported" as const,
+    controlKind: "graded" as const,
+    supportedEfforts: efforts,
+    defaultEffort,
+    disableAllowed: false,
+    upstream: {
+      format: "string" as const,
+      parameter: "reasoning_effort" as const,
+    },
+  });
+
+  it("applies recommendations across both columns, saves once to the router and remounts the adapted preferences", async () => {
+    const models = tenModels().map((model) => ({
+      ...model,
+      ...(model.model === "order-i" ? { displayName: "Coding assistant" } : {}),
+      ...(model.model === "order-j"
+        ? {
+            displayName: "Codex coding assistant",
+            contextWindow: 262144,
+            reasoning: reasoning(["low", "high"], "low"),
+          }
+        : {}),
+    }));
+    const { source, plan, snapshot, elementFor, rendered } = renderModelOrder({
+      models,
+      routing: { customExtension: { keep: true } },
+      config: 'model = "order-a"\nmodel_reasoning_effort = "high"\n',
+    });
+    const user = userEvent.setup();
+    await user.click(
+      screen.getByRole("button", { name: "Apply recommendations" }),
+    );
+    const expectedOrder = [
+      "order-j",
+      "order-i",
+      ..."abcdefgh".split("").map((suffix) => `order-${suffix}`),
+    ];
+    expect(modelOrder()).toEqual(expectedOrder);
+    expect(
+      within(screen.getByRole("region", { name: "Ranked models" }))
+        .getAllByRole("button", { name: /^Drag / })
+        .map((button) => button.getAttribute("aria-label")?.slice(5)),
+    ).toEqual(expectedOrder.slice(0, 8));
+    expect(providersApi.update).not.toHaveBeenCalled();
+    expect(screen.getByRole("combobox", { name: "Sort models" })).toHaveValue(
+      "custom",
+    );
+    expect(
+      screen.getByRole("combobox", { name: "Top model default effort" }),
+    ).toHaveValue("low");
+    await user.click(screen.getByRole("button", { name: "Save order" }));
+    await screen.findByText(/Saved the display order for 10 models/);
+    expect(providersApi.update).toHaveBeenCalledTimes(1);
+    const saved = vi.mocked(providersApi.update).mock.calls[0][0];
+    expect(saved.id).toBe(plan.id);
+    expect(saved.settingsConfig.codexRouting).toEqual({
+      ...plan.settingsConfig.codexRouting,
+      modelOrder: expectedOrder,
+      modelDisplayStyle: "provider-model",
+      defaultReasoningEffort: "low",
+    });
+    expect(saved.settingsConfig.config).toBe('model = "order-j"\n');
+    expect(saved.settingsConfig.modelCatalog).toBeUndefined();
+    expect(JSON.stringify({ source, plan })).toBe(snapshot);
+    rendered.unmount();
+    renderWorkspace(elementFor([source, saved]));
+    expect(modelOrder()).toEqual(expectedOrder);
+    expect(
+      screen.getByRole("combobox", { name: "Top model default effort" }),
+    ).toHaveValue("low");
+    expect(screen.getByRole("button", { name: "Save order" })).toBeDisabled();
+    expect(providersApi.update).toHaveBeenCalledTimes(1);
+  });
+
+  it("offers only declared effort tiers and resets to the newly first models declared default", async () => {
+    const { plan, elementFor, rendered, source } = renderModelOrder({
+      models: [
+        { model: "order-a", reasoning: reasoning(["low", "high"], "low") },
+        { model: "order-b", reasoning: reasoning(["high"], "high") },
+      ],
+      routing: {
+        modelOrder: ["order-b", "order-a"],
+        defaultReasoningEffort: "high",
+      },
+      config: 'model = "order-b"\nmodel_reasoning_effort = "high"\n',
+    });
+    const effort = screen.getByRole("combobox", {
+      name: "Top model default effort",
+    });
+    expect(
+      within(effort)
+        .getAllByRole("option")
+        .map((option) => option.textContent),
+    ).toEqual(["high"]);
+    expect(screen.getByRole("button", { name: "Save order" })).toBeDisabled();
+    await userEvent.click(
+      screen.getByRole("button", { name: "Restore default" }),
+    );
+    await screen.findByText(/Removed the custom router order/);
+    const saved = vi.mocked(providersApi.update).mock.calls[0][0];
+    expect(saved.id).toBe(plan.id);
+    expect(saved.settingsConfig.codexRouting).toMatchObject({
+      modelOrder: [],
+      defaultReasoningEffort: "low",
+    });
+    expect(saved.settingsConfig.config).toMatch(/^model = "order-a"/m);
+    expect(saved.settingsConfig.config).not.toMatch(
+      /^model_reasoning_effort\s*=/m,
+    );
+    rendered.unmount();
+    renderWorkspace(elementFor([source, saved]));
+    expect(
+      screen.getByRole("combobox", { name: "Top model default effort" }),
+    ).toHaveValue("low");
+    expect(screen.getByRole("button", { name: "Save order" })).toBeDisabled();
+  });
+
+  it("persists a declared effort-only change without reordering or rewriting the config default", async () => {
+    const { plan } = renderModelOrder({
+      models: [
+        { model: "order-a", reasoning: reasoning(["low", "high"], "low") },
+      ],
+      config: 'model = "order-a"\n',
+    });
+    const user = userEvent.setup();
+    await user.selectOptions(
+      screen.getByRole("combobox", { name: "Top model default effort" }),
+      "high",
+    );
+    await user.click(screen.getByRole("button", { name: "Save order" }));
+    await screen.findByText(/Saved the display order for 1 models/);
+    const saved = vi.mocked(providersApi.update).mock.calls[0][0];
+    expect(saved.settingsConfig.config).toBe(plan.settingsConfig.config);
+    expect(saved.settingsConfig.codexRouting.defaultReasoningEffort).toBe(
+      "high",
+    );
+    expect(saved.settingsConfig.codexRouting.modelOrder).toBeUndefined();
+  });
+
+  it("clears an old preference when reordering to a model with unknown reasoning instead of inventing tiers", async () => {
+    renderModelOrder({
+      models: [
+        { model: "order-a", reasoning: reasoning(["low", "high"], "low") },
+        { model: "order-b" },
+      ],
+      routing: { defaultReasoningEffort: "high" },
+      config:
+        '# Keep this comment\nmodel = "order-a"\nmodel_reasoning_effort = "high"\n' +
+        '[model_providers.source]\nmodel_reasoning_effort = "low"\n',
+    });
+    const user = userEvent.setup();
+    await user.click(
+      screen.getByRole("button", { name: "Make order-b the favorite model" }),
+    );
+    const effort = screen.getByRole("combobox", {
+      name: "Top model default effort",
+    });
+    expect(effort).toBeDisabled();
+    expect(within(effort).getAllByRole("option")).toHaveLength(1);
+    await user.click(screen.getByRole("button", { name: "Save order" }));
+    await screen.findByText(/Saved the display order for 2 models/);
+    const saved = vi.mocked(providersApi.update).mock.calls[0][0];
+    expect(
+      saved.settingsConfig.codexRouting.defaultReasoningEffort,
+    ).toBeUndefined();
+    expect(saved.settingsConfig.config).toMatch(/^model = "order-b"/m);
+    expect(saved.settingsConfig.config).toBe(
+      '# Keep this comment\nmodel = "order-b"\n' +
+        '[model_providers.source]\nmodel_reasoning_effort = "low"\n',
+    );
+  });
+
+  it.each(["pending", "not_required", "error"] as const)(
+    "distinguishes a saved router order from a %s live projection",
+    async (state) => {
+      renderModelOrder();
+      if (state === "error") {
+        vi.mocked(
+          providersApi.inspectCodexMultiRouterProjection,
+        ).mockRejectedValue(new Error("projection_write_failed"));
+      } else {
+        const status = {
+          schemaVersion: 1 as const,
+          routerProviderId: "codex-multirouter",
+          state,
+          warnings: [],
+          routes: [],
+          lastError: null,
+          lastErrorCode: null,
+          dependencyFingerprint: "test-fingerprint",
+          generatedAt: "2026-10-06T00:00:00Z",
+        };
+        vi.mocked(
+          providersApi.inspectCodexMultiRouterProjection,
+        ).mockResolvedValue(status);
+        vi.mocked(
+          providersApi.retryCodexMultiRouterProjection,
+        ).mockResolvedValue(status);
+      }
+      const user = userEvent.setup();
+      await user.click(
+        screen.getByRole("button", { name: "Make order-b the favorite model" }),
+      );
+      await user.click(screen.getByRole("button", { name: "Save order" }));
+      const expected =
+        state === "pending"
+          ? "Order saved, but live projection is still pending. Retry projection from Status."
+          : state === "not_required"
+            ? "Order saved for this router. It will be projected when this router is activated."
+            : /Order saved, but projection is pending:/;
+      await screen.findByText(expected);
+      expect(providersApi.update).toHaveBeenCalledTimes(1);
+      expect(
+        vi.mocked(providersApi.update).mock.calls[0][0].settingsConfig
+          .codexRouting.modelOrder,
+      ).toEqual(["order-b", "order-a", "order-c"]);
+      expect(
+        screen.queryByText(/Failed to save model order/),
+      ).not.toBeInTheDocument();
+      if (state === "pending")
+        expect(
+          providersApi.retryCodexMultiRouterProjection,
+        ).toHaveBeenCalledOnce();
+      else
+        expect(
+          providersApi.retryCodexMultiRouterProjection,
+        ).not.toHaveBeenCalled();
+    },
+  );
+});
+
+describe("Model order presentation helpers", () => {
+  const models: CodexCatalogModel[] = [
+    { model: "z", providerName: "Zulu" },
+    { model: "b", providerName: "Alpha" },
+    { model: "a", providerName: "Alpha" },
+  ];
+  it("groups providers stably and sorts models only in the requested mode", () => {
+    expect(
+      sortCodexCatalogModels(models, "provider").map((model) => model.model),
+    ).toEqual(["b", "a", "z"]);
+    expect(
+      sortCodexCatalogModels(models, "provider-model").map(
+        (model) => model.model,
+      ),
+    ).toEqual(["a", "b", "z"]);
+    expect(sortCodexCatalogModels(models, "custom")).toEqual(models);
+  });
+  it("formats the three picker styles without double provider prefixes", () => {
+    const model = {
+      model: "alias",
+      providerName: "OpenRouter",
+      displayName: "[ORter] Friendly",
+    };
+    expect(formatCodexCatalogModelLabel(model, "provider-model")).toBe(
+      "[ORter] Friendly",
+    );
+    expect(formatCodexCatalogModelLabel(model, "model-provider")).toBe(
+      "Friendly · ORter",
+    );
+    expect(formatCodexCatalogModelLabel(model, "model")).toBe("Friendly");
+  });
+  it("prioritizes coding suitability rather than fabricating popularity or mutating metadata", () => {
+    const candidates = [
+      { model: "embedding-old", providerName: "Alpha" },
+      { model: "coding-6", providerName: "Alpha", contextWindow: 262144 },
+      { model: "generic", providerName: "Beta" },
+    ];
+    const snapshot = JSON.stringify(candidates);
+    expect(
+      recommendCodexCatalogModels(candidates, 2).map((model) => model.model),
+    ).toEqual(["coding-6", "generic"]);
+    expect(JSON.stringify(candidates)).toBe(snapshot);
+  });
+});
+
 it("没有 MultiRouter 方案时打开工作台不会读取 null settingsConfig", async () => {
   const provider: Provider = {
     id: "valid-provider",
@@ -377,9 +1228,13 @@ it("没有 MultiRouter 方案时打开工作台不会读取 null settingsConfig"
       }),
     ),
   ).not.toThrow();
-  expect(screen.getByText("Codex 多模型路由工作台")).toBeInTheDocument();
-  expect(screen.getByText("Codex 出口环境自动监测")).toBeInTheDocument();
-  expect(await screen.findByText("监测正常")).toBeInTheDocument();
+  expect(
+    screen.getByText("Codex multi-model routing workspace"),
+  ).toBeInTheDocument();
+  expect(
+    screen.getByText("Codex egress environment monitoring"),
+  ).toBeInTheDocument();
+  expect(await screen.findByText("Monitoring healthy")).toBeInTheDocument();
 });
 
 describe("Codex MultiRouter workspace route persistence helpers", () => {
@@ -407,12 +1262,12 @@ describe("Codex MultiRouter workspace route persistence helpers", () => {
       }),
     );
     await userEvent.click(
-      await screen.findByRole("button", { name: /流量.*组统计/ }),
+      await screen.findByRole("button", { name: /Traffic/ }),
     );
     const samples = await screen.findByText(
-      "今日最近请求样本（子 Provider / Model）",
+      "Today’s recent request samples (child provider / model)",
     );
-    const sync = screen.getByRole("button", { name: /立即同步/ });
+    const sync = screen.getByRole("button", { name: /Sync session usage now/ });
     expect(
       sync.compareDocumentPosition(samples) & Node.DOCUMENT_POSITION_FOLLOWING,
     ).toBeTruthy();
@@ -543,13 +1398,13 @@ describe("Codex MultiRouter workspace route persistence helpers", () => {
   it("explains safe metadata refresh refusal without implying a network failure", () => {
     expect(
       workspaceErrorMessage("codex_provider_set_probe_required"),
-    ).toContain("显式探测");
+    ).toContain("Probe and explicitly save");
     expect(
       workspaceErrorMessage("codex_provider_set_split_confirmation_required"),
-    ).toContain("配置向导");
+    ).toContain("setup wizard");
     expect(
       workspaceErrorMessage("codex_provider_set_split_confirmation_required"),
-    ).toContain("未自动发送探测请求");
+    ).toContain("no probe was sent automatically");
   });
 
   it("turns backend route validation codes into Chinese messages", () => {
@@ -559,14 +1414,16 @@ describe("Codex MultiRouter workspace route persistence helpers", () => {
           "include_models_empty: include selection requires at least one model",
         ),
       ),
-    ).toBe("请至少选择一个上游模型");
+    ).toBe("Select at least one upstream model");
     expect(
       workspaceErrorMessage(
         new Error(
           "legacy_route_requires_migration: Provider p1 is referenced by legacy MultiRouter r1",
         ),
       ),
-    ).toBe("当前是旧版路由配置，请先完成迁移后再保存");
+    ).toBe(
+      "This is a legacy route configuration; complete migration before saving",
+    );
   });
 
   it("previews include selection as a strict allowlist", async () => {
@@ -621,9 +1478,9 @@ describe("Codex MultiRouter workspace route persistence helpers", () => {
 
     const user = userEvent.setup();
     await user.type(screen.getByPlaceholderText(/gpt-5\.4-mini/), "gpt-5.4");
-    await user.click(screen.getByRole("button", { name: "预览命中" }));
+    await user.click(screen.getByRole("button", { name: "Preview match" }));
 
-    expect(screen.getByText(/gpt-5\.4.*不可路由/)).toBeInTheDocument();
+    expect(screen.getByText(/gpt-5\.4.*cannot be routed/i)).toBeInTheDocument();
   });
 
   it("previews routes from the selected plan only", async () => {
@@ -688,9 +1545,11 @@ describe("Codex MultiRouter workspace route persistence helpers", () => {
       screen.getByPlaceholderText(/gpt-5\.4-mini/),
       "shared-model",
     );
-    await user.click(screen.getByRole("button", { name: "预览命中" }));
+    await user.click(screen.getByRole("button", { name: "Preview match" }));
 
-    expect(screen.getByText(/shared-model.*不可路由/)).toBeInTheDocument();
+    expect(
+      screen.getByText(/shared-model.*cannot be routed/i),
+    ).toBeInTheDocument();
     expect(screen.queryByText(/Other Route/)).not.toBeInTheDocument();
   });
 
@@ -744,16 +1603,20 @@ describe("Codex MultiRouter workspace route persistence helpers", () => {
     const user = userEvent.setup();
     await waitFor(() =>
       expect(
-        screen.getByRole("button", { name: "编辑匹配规则" }),
+        screen.getByRole("button", { name: "Edit matching rules" }),
       ).toBeInTheDocument(),
     );
-    await user.click(screen.getByRole("button", { name: "改名" }));
+    await user.click(screen.getByRole("button", { name: "Rename" }));
 
     expect(
-      screen.queryByText("默认路由", { selector: "label" }),
+      screen.queryByText("Default route", { selector: "label" }),
     ).not.toBeInTheDocument();
-    expect(screen.getByText(/旧版默认路由已停用/)).toBeInTheDocument();
-    expect(screen.getByText(/旧配置指向.*DeepSeek Relay/)).toBeInTheDocument();
+    expect(
+      screen.getByText(/Legacy default route disabled/),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText(/The legacy config points to.*DeepSeek Relay/),
+    ).toBeInTheDocument();
     expect(screen.queryByText(legacyRouteId)).not.toBeInTheDocument();
   });
 
@@ -924,40 +1787,51 @@ describe("Codex MultiRouter workspace route persistence helpers", () => {
     );
 
     const user = userEvent.setup();
-    await user.click(screen.getByRole("button", { name: "编辑匹配规则" }));
+    await user.click(
+      screen.getByRole("button", { name: "Edit matching rules" }),
+    );
     await user.selectOptions(
-      screen.getByLabelText("模型选择范围：Qwen Policy"),
+      screen.getByLabelText("Model selection scope: Qwen Policy"),
       "include",
     );
     expect(
-      screen.getByLabelText("选择上游模型 qwen-visible"),
+      screen.getByLabelText("Select upstream models qwen-visible"),
     ).toBeInTheDocument();
     expect(
-      screen.queryByLabelText("选择上游模型 qwen3.8"),
+      screen.queryByLabelText("Select upstream models qwen3.8"),
     ).not.toBeInTheDocument();
-    await user.click(screen.getByLabelText("选择上游模型 qwen3.8-coder"));
-    await user.clear(screen.getByLabelText("匹配前缀：Qwen Policy"));
-    await user.type(screen.getByLabelText("匹配前缀：Qwen Policy"), "qwen, qw");
-    await user.clear(screen.getByLabelText("可见别名映射：Qwen Policy"));
+    await user.click(
+      screen.getByLabelText("Select upstream models qwen3.8-coder"),
+    );
+    await user.clear(screen.getByLabelText("Match prefixes: Qwen Policy"));
     await user.type(
-      screen.getByLabelText("可见别名映射：Qwen Policy"),
+      screen.getByLabelText("Match prefixes: Qwen Policy"),
+      "qwen, qw",
+    );
+    await user.clear(
+      screen.getByLabelText("Visible alias mapping: Qwen Policy"),
+    );
+    await user.type(
+      screen.getByLabelText("Visible alias mapping: Qwen Policy"),
       "Qwen Latest=qwen-visible",
     );
     await user.selectOptions(
-      screen.getByLabelText("认证策略：Qwen Policy"),
+      screen.getByLabelText("authentication policy: Qwen Policy"),
       "managed_codex_oauth",
     );
     await user.type(
-      screen.getByLabelText("托管 OAuth 账号 ID：Qwen Policy"),
+      screen.getByLabelText("Managed OAuth account ID: Qwen Policy"),
       "oauth-account-1",
     );
 
     expect(screen.queryByLabelText(/Base URL/i)).not.toBeInTheDocument();
     expect(screen.queryByLabelText(/API Key/i)).not.toBeInTheDocument();
-    expect(screen.queryByLabelText(/上游协议/i)).not.toBeInTheDocument();
-    expect(screen.queryByLabelText(/能力开关/i)).not.toBeInTheDocument();
+    expect(
+      screen.queryByLabelText(/Upstream protocol/i),
+    ).not.toBeInTheDocument();
+    expect(screen.queryByLabelText(/Capabilities/i)).not.toBeInTheDocument();
 
-    await user.click(screen.getByRole("button", { name: "保存规则" }));
+    await user.click(screen.getByRole("button", { name: "Save rules" }));
 
     await waitFor(() => expect(providersApi.update).toHaveBeenCalled());
     const savedPlan = vi.mocked(providersApi.update).mock.calls.at(-1)?.[0];
@@ -1008,18 +1882,24 @@ describe("Codex MultiRouter workspace route persistence helpers", () => {
     );
 
     const user = userEvent.setup();
-    await user.click(screen.getByRole("button", { name: "编辑匹配规则" }));
+    await user.click(
+      screen.getByRole("button", { name: "Edit matching rules" }),
+    );
 
     expect(
-      screen.getByLabelText("匹配前缀：OpenAI Official"),
+      screen.getByLabelText("Match prefixes: OpenAI Official"),
     ).toBeInTheDocument();
     expect(
-      screen.getByLabelText("可见别名映射：OpenAI Official"),
+      screen.getByLabelText("Visible alias mapping: OpenAI Official"),
     ).toBeInTheDocument();
     expect(
-      screen.queryByLabelText("认证策略：OpenAI Official"),
+      screen.queryByLabelText(
+        "Authentication policy reference: OpenAI Official",
+      ),
     ).not.toBeInTheDocument();
-    expect(screen.getByText(/认证继承自 OpenAI Official/)).toBeInTheDocument();
+    expect(
+      screen.getByText(/Authentication is inherited from OpenAI Official/),
+    ).toBeInTheDocument();
   });
 
   it("lets a fixed route switch back to automatic Provider following immediately", async () => {
@@ -1078,13 +1958,15 @@ describe("Codex MultiRouter workspace route persistence helpers", () => {
 
     expect(
       screen.getByText(
-        "已接入 2/3 个模型；尚未接入：deepseek-v4-flash-vision-exp",
+        "Connected 2/3 models; Not connected: deepseek-v4-flash-vision-exp",
       ),
     ).toBeInTheDocument();
 
     await userEvent
       .setup()
-      .click(screen.getByRole("button", { name: "改为自动跟随全部模型" }));
+      .click(
+        screen.getByRole("button", { name: "Follow all models automatically" }),
+      );
 
     await waitFor(() => expect(providersApi.update).toHaveBeenCalledOnce());
     const savedPlan = vi.mocked(providersApi.update).mock.calls[0]?.[0];
@@ -1137,12 +2019,14 @@ describe("Codex MultiRouter workspace route persistence helpers", () => {
     );
 
     const user = userEvent.setup();
-    await user.click(screen.getByRole("button", { name: "编辑匹配规则" }));
-    await user.click(screen.getByRole("button", { name: "保存规则" }));
+    await user.click(
+      screen.getByRole("button", { name: "Edit matching rules" }),
+    );
+    await user.click(screen.getByRole("button", { name: "Save rules" }));
 
     await waitFor(() => expect(providersApi.update).toHaveBeenCalled());
     expect(
-      screen.queryByText("请至少选择一个上游模型"),
+      screen.queryByText("Select at least one upstream model"),
     ).not.toBeInTheDocument();
   });
 
@@ -1175,15 +2059,19 @@ describe("Codex MultiRouter workspace route persistence helpers", () => {
     );
 
     const user = userEvent.setup();
-    await user.click(screen.getByRole("button", { name: "编辑匹配规则" }));
+    await user.click(
+      screen.getByRole("button", { name: "Edit matching rules" }),
+    );
     await user.type(
-      screen.getByLabelText("可见别名映射：Qwen Invalid Alias"),
+      screen.getByLabelText("Visible alias mapping: Qwen Invalid Alias"),
       "Broken=missing-model",
     );
-    await user.click(screen.getByRole("button", { name: "保存规则" }));
+    await user.click(screen.getByRole("button", { name: "Save rules" }));
 
     expect(
-      screen.getByText("别名目标“missing-model”不在目标供应商的上游模型列表中"),
+      screen.getByText(
+        "Alias target “missing-model” is not in the target provider upstream model list",
+      ),
     ).toBeInTheDocument();
     expect(providersApi.update).not.toHaveBeenCalled();
   });
@@ -1261,11 +2149,11 @@ describe("Codex MultiRouter workspace route persistence helpers", () => {
 
     await userEvent
       .setup()
-      .click(screen.getByRole("button", { name: "编辑匹配规则" }));
+      .click(screen.getByRole("button", { name: "Edit matching rules" }));
 
     expect(
       await screen.findByRole("heading", {
-        name: "迁移旧 MultiRouter 到 schema v2",
+        name: "Migrate legacy MultiRouter to schema v2",
       }),
     ).toBeInTheDocument();
     expect(screen.getByText("需要创建迁移 Provider")).toBeInTheDocument();
@@ -1334,9 +2222,9 @@ describe("Codex MultiRouter workspace route persistence helpers", () => {
   it("按 Router 官方认证与账号池 Desktop 成员展示生成门面", () => {
     expect(
       resolveCodexRouterAuthFacadeLabel({ mode: "desktop_current_login" }),
-    ).toBe("Desktop / 混合认证");
+    ).toBe("Desktop / hybrid authentication");
     expect(resolveCodexRouterAuthFacadeLabel({ mode: "managed_oauth" })).toBe(
-      "CCSM 托管认证",
+      "CCSM-managed authentication",
     );
     expect(
       resolveCodexRouterAuthFacadeLabel(
@@ -1352,7 +2240,7 @@ describe("Codex MultiRouter workspace route persistence helpers", () => {
           ],
         },
       ),
-    ).toBe("Desktop / 混合认证");
+    ).toBe("Desktop / hybrid authentication");
     expect(
       resolveCodexRouterAuthFacadeLabel(
         { mode: "account_pool" },
@@ -1367,9 +2255,9 @@ describe("Codex MultiRouter workspace route persistence helpers", () => {
           ],
         },
       ),
-    ).toBe("CCSM 托管认证");
+    ).toBe("CCSM-managed authentication");
     expect(resolveCodexRouterAuthFacadeLabel({ mode: "account_pool" })).toBe(
-      "待确认",
+      "Pending confirmation",
     );
   });
 
@@ -1563,7 +2451,7 @@ describe("Codex MultiRouter workspace route persistence helpers", () => {
       provider,
     );
 
-    /// 在同一工作台实例中切换 route，覆盖停用状态清理和重新启用刷新。
+    /// 在同一工作台实例中切换 route，覆盖停用Status清理和重新启用刷新。
     function RefreshToggleHarness() {
       const [enabled, setEnabled] = React.useState(true);
       const routes = readCodexRouting(basePlan)?.routes ?? [];
@@ -1602,12 +2490,14 @@ describe("Codex MultiRouter workspace route persistence helpers", () => {
 
     renderWorkspace(React.createElement(RefreshToggleHarness));
     await waitFor(() => expect(fetchModelsForConfig).toHaveBeenCalledTimes(1));
-    expect(screen.getByText("正在读取模型列表...")).toBeInTheDocument();
+    expect(screen.getByText("Reading model list...")).toBeInTheDocument();
 
     const user = userEvent.setup();
     await user.click(screen.getByRole("button", { name: "切换测试路由" }));
     await waitFor(() =>
-      expect(screen.queryByText("正在读取模型列表...")).not.toBeInTheDocument(),
+      expect(
+        screen.queryByText("Reading model list..."),
+      ).not.toBeInTheDocument(),
     );
 
     await user.click(screen.getByRole("button", { name: "切换测试路由" }));
@@ -1652,9 +2542,11 @@ describe("Codex MultiRouter workspace route persistence helpers", () => {
 
     await waitFor(() => expect(fetchModelsForConfig).toHaveBeenCalledTimes(1));
     const user = userEvent.setup();
-    await user.click(screen.getByRole("button", { name: "编辑匹配规则" }));
-    await user.click(screen.getByRole("button", { name: "已启用" }));
-    await user.click(screen.getByRole("button", { name: "保存规则" }));
+    await user.click(
+      screen.getByRole("button", { name: "Edit matching rules" }),
+    );
+    await user.click(screen.getByRole("button", { name: "Already Enabled" }));
+    await user.click(screen.getByRole("button", { name: "Save rules" }));
 
     await waitFor(() => {
       const savedPlan = vi
@@ -1854,7 +2746,7 @@ describe("Codex MultiRouter workspace route persistence helpers", () => {
       ).toBe(true),
     );
     await waitFor(() =>
-      expect(screen.getAllByText("已读取并更新 1 个模型。")).toHaveLength(2),
+      expect(screen.getAllByText("Read and updated 1 models.")).toHaveLength(2),
     );
   });
 
@@ -1950,7 +2842,7 @@ describe("Codex MultiRouter workspace route persistence helpers", () => {
     await waitFor(() =>
       expect(
         screen.getByText(
-          "模型目录读取或写回未完成：操作失败，请检查当前配置或查看日志中的详细原因",
+          "Model catalog read or write did not complete: Operation failed. Check the current configuration or see the logs for details.",
         ),
       ).toBeInTheDocument(),
     );
@@ -2107,9 +2999,14 @@ describe("Codex MultiRouter workspace route persistence helpers", () => {
     await act(async () => {
       await vi.advanceTimersByTimeAsync(30_000);
     });
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
     expect(
       screen.getByText(
-        "模型目录读取或写回未完成：模型列表读取或写回超过 30 秒，请检查网络、供应商的 /models 接口或本地配置写入状态。",
+        /Model catalog read or write did not complete: Operation failed/i,
       ),
     ).toBeInTheDocument();
   });
@@ -2157,15 +3054,20 @@ describe("Codex MultiRouter workspace route persistence helpers", () => {
     });
     expect(fetchModelsForConfig).toHaveBeenCalledTimes(1);
     expect(
-      screen.getByText("已读取 1 个模型，正在写回本地配置..."),
+      screen.getByText("Read 1 models; writing them to local configuration..."),
     ).toBeInTheDocument();
 
     await act(async () => {
       await vi.advanceTimersByTimeAsync(30_000);
     });
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
     expect(
       screen.getByText(
-        "模型目录读取或写回未完成：模型列表读取或写回超过 30 秒，请检查网络、供应商的 /models 接口或本地配置写入状态。",
+        /Model catalog read or write did not complete: Operation failed/i,
       ),
     ).toBeInTheDocument();
 
@@ -2174,7 +3076,7 @@ describe("Codex MultiRouter workspace route persistence helpers", () => {
       await vi.advanceTimersByTimeAsync(0);
     });
     expect(
-      screen.queryByText("已读取并更新 1 个模型。"),
+      screen.queryByText("Read and updated 1 models."),
     ).not.toBeInTheDocument();
   });
 
@@ -2213,9 +3115,11 @@ describe("Codex MultiRouter workspace route persistence helpers", () => {
     await waitFor(() => expect(fetchModelsForConfig).toHaveBeenCalledTimes(1));
     await userEvent
       .setup()
-      .click(screen.getByRole("button", { name: "编辑匹配规则" }));
+      .click(screen.getByRole("button", { name: "Edit matching rules" }));
     expect(
-      screen.getByText("未发现模型目录，保存后可在模型源补充目录"),
+      screen.getByText(
+        /No model catalog found\. Save first, then add a catalog in the model source\./,
+      ),
     ).toBeInTheDocument();
 
     refresh.resolve([{ id: "fresh-route-model", ownedBy: null }]);
@@ -2237,7 +3141,9 @@ describe("Codex MultiRouter workspace route persistence helpers", () => {
       expect(screen.getByText("fresh-route-model")).toBeInTheDocument(),
     );
     expect(
-      screen.queryByText("未发现模型目录，保存后可在模型源补充目录"),
+      screen.queryByText(
+        /No model catalog found\. Save first, then add a catalog in the model source\./,
+      ),
     ).not.toBeInTheDocument();
   });
 
@@ -2338,8 +3244,10 @@ describe("Codex MultiRouter workspace route persistence helpers", () => {
     );
 
     const user = userEvent.setup();
-    await user.click(screen.getByRole("button", { name: "编辑匹配规则" }));
-    await user.click(screen.getByRole("button", { name: "添加模型源" }));
+    await user.click(
+      screen.getByRole("button", { name: "Edit matching rules" }),
+    );
+    await user.click(screen.getByRole("button", { name: "Add model source" }));
 
     expect(onCreateProvider).toHaveBeenCalledTimes(1);
   });
@@ -2375,7 +3283,7 @@ describe("Codex MultiRouter workspace route persistence helpers", () => {
 
     await userEvent
       .setup()
-      .click(screen.getByRole("button", { name: "编辑匹配规则" }));
+      .click(screen.getByRole("button", { name: "Edit matching rules" }));
 
     await waitFor(() =>
       expect(scrollIntoView).toHaveBeenCalledWith({
@@ -2417,7 +3325,7 @@ describe("Codex MultiRouter workspace route persistence helpers", () => {
     scrollTo.mockClear();
     await userEvent
       .setup()
-      .click(screen.getByRole("button", { name: "查看链路状态" }));
+      .click(screen.getByRole("button", { name: "View link status" }));
 
     await waitFor(() => expect(scrollTo).toHaveBeenCalledWith(0, 0));
   });
@@ -2635,13 +3543,13 @@ describe("Codex MultiRouter workspace route persistence helpers", () => {
       React.createElement(CodexRouterWorkspacePage, props),
     );
 
-    expect(screen.getByRole("tab", { name: "路由规则" })).toHaveAttribute(
+    expect(screen.getByRole("tab", { name: "Route rules" })).toHaveAttribute(
       "data-state",
       "active",
     );
 
     const user = userEvent.setup();
-    const statusTab = screen.getByRole("tab", { name: "状态" });
+    const statusTab = screen.getByRole("tab", { name: "Status" });
     await user.click(statusTab);
     await waitFor(() =>
       expect(statusTab).toHaveAttribute("data-state", "active"),
@@ -2741,7 +3649,7 @@ describe("Codex MultiRouter workspace route persistence helpers", () => {
     );
   }
 
-  it("moves Sub-Agent settings into a dedicated top-level workspace tab", async () => {
+  it("moves Step 1: Configure V2 sub-agent models and capabilities into a dedicated top-level workspace tab", async () => {
     const { source, plan } = createSubagentWorkspaceFixture();
     renderSubagentWorkspace(source, plan);
 
@@ -2750,20 +3658,28 @@ describe("Codex MultiRouter workspace route persistence helpers", () => {
         .getAllByRole("tab")
         .map((tab) => tab.textContent?.trim()),
     ).toEqual([
-      "总览",
-      "模型源",
-      "路由规则",
-      "模型排序",
-      "子 Agent",
-      "状态",
-      "测试发布",
+      "Overview",
+      "Model sources",
+      "Route rules",
+      "Model order",
+      "Sub-Agent",
+      "Status",
+      "Test release",
     ]);
-    expect(screen.queryByText("Sub-Agent 设置")).not.toBeInTheDocument();
+    expect(
+      screen.queryByText(
+        "Step 1: Configure V2 sub-agent models and capabilities",
+      ),
+    ).not.toBeInTheDocument();
 
     await userEvent
       .setup()
-      .click(screen.getByRole("tab", { name: "子 Agent" }));
-    expect(await screen.findByText("Sub-Agent 设置")).toBeInTheDocument();
+      .click(screen.getByRole("tab", { name: "Sub-Agent" }));
+    expect(
+      await screen.findByText(
+        "Step 1: Configure V2 sub-agent models and capabilities",
+      ),
+    ).toBeInTheDocument();
   });
 
   it("renders the active protocol as disabled and the inactive protocol as actionable", async () => {
@@ -2772,10 +3688,10 @@ describe("Codex MultiRouter workspace route persistence helpers", () => {
     const existingV2 = plan.settingsConfig?.codexRouting?.subagentV2;
     renderSubagentWorkspace(source, plan);
     const user = userEvent.setup();
-    await user.click(screen.getByRole("tab", { name: "子 Agent" }));
+    await user.click(screen.getByRole("tab", { name: "Sub-Agent" }));
 
-    const activeV2 = screen.getByRole("button", { name: "已启用 V2" });
-    const inactiveV1 = screen.getByRole("button", { name: "启用 V1" });
+    const activeV2 = screen.getByRole("button", { name: "V2 enabled" });
+    const inactiveV1 = screen.getByRole("button", { name: "Enable V1" });
     expect(activeV2).toBeDisabled();
     expect(activeV2).toHaveClass("bg-muted");
     expect(inactiveV1).toBeEnabled();
@@ -2808,15 +3724,21 @@ describe("Codex MultiRouter workspace route persistence helpers", () => {
     expect(
       updatedProvider.settingsConfig?.codexRouting?.spawnAgentModels,
     ).toEqual(["deepseek-v4-pro", "deepseek-v4-flash"]);
-    expect(screen.getByRole("button", { name: "已启用 V1" })).toBeDisabled();
-    expect(screen.getByRole("button", { name: "启用 V2" })).toBeEnabled();
+    expect(screen.getByRole("button", { name: "V1 enabled" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Enable V2" })).toBeEnabled();
     expect(
-      screen.getByText(/重启 Codex\/app-server 并新建会话后生效/),
+      screen.getByText(
+        /restart Codex Desktop\/app-server and create a new session/i,
+      ),
     ).toBeInTheDocument();
-    expect(screen.getByText(/V1 direct model override/)).toBeInTheDocument();
-    expect(screen.getByText("可拖拽排序的前五候选")).toBeInTheDocument();
     expect(
-      screen.getByRole("button", { name: "保存排序" }),
+      screen.getAllByText(/V1 direct model override/).length,
+    ).toBeGreaterThan(0);
+    expect(
+      screen.getByText("Top five draggable candidates"),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "Save ordering" }),
     ).toBeInTheDocument();
   });
 
@@ -2826,25 +3748,29 @@ describe("Codex MultiRouter workspace route persistence helpers", () => {
     renderSubagentWorkspace(source, plan);
     const user = userEvent.setup();
 
-    await user.click(screen.getByRole("tab", { name: "子 Agent" }));
+    await user.click(screen.getByRole("tab", { name: "Sub-Agent" }));
 
     const configureHeading = screen.getByText(
-      "第一步：配置 V2 子 Agent 模型与能力",
+      "Step 1: Configure V2 sub-agent models and capabilities",
     );
-    const orderHeading = screen.getByText("第二步：选择 V2 工具说明的前五模型");
+    const orderHeading = screen.getByText(
+      "Step 2: Choose the top five models shown in V2 tool instructions",
+    );
     expect(
       configureHeading.compareDocumentPosition(orderHeading) &
         Node.DOCUMENT_POSITION_FOLLOWING,
     ).toBeTruthy();
-    expect(screen.getByText("可拖拽排序的前五候选")).toBeInTheDocument();
+    expect(
+      screen.getByText("Top five draggable candidates"),
+    ).toBeInTheDocument();
 
     expect(
-      screen.getByRole("button", { name: "拖动 qwen3.8" }),
+      screen.getByRole("button", { name: "Drag qwen3.8" }),
     ).toBeInTheDocument();
     await user.click(
-      screen.getByRole("button", { name: "deepseek-v4-flash 前五 #2" }),
+      screen.getByRole("button", { name: /deepseek-v4-flash Top five #2/i }),
     );
-    await user.click(screen.getByRole("button", { name: "保存排序" }));
+    await user.click(screen.getByRole("button", { name: "Save ordering" }));
 
     await waitFor(() => expect(providersApi.update).toHaveBeenCalledOnce());
     const [savedProvider, appType] = vi.mocked(providersApi.update).mock
@@ -2858,8 +3784,8 @@ describe("Codex MultiRouter workspace route persistence helpers", () => {
       subagentV2: existingRouting?.subagentV2,
       spawnAgentModels: ["deepseek-v4-pro", "qwen3.8"],
     });
-    expect(savedProvider.settingsConfig?.codexRouting).not.toHaveProperty(
-      "defaultRouteId",
+    expect(savedProvider.settingsConfig?.codexRouting.defaultRouteId).toBe(
+      existingRouting?.defaultRouteId,
     );
   });
 
@@ -2869,18 +3795,18 @@ describe("Codex MultiRouter workspace route persistence helpers", () => {
     vi.mocked(providersApi.update).mockReturnValueOnce(switching.promise);
     renderSubagentWorkspace(source, plan);
     const user = userEvent.setup();
-    await user.click(screen.getByRole("tab", { name: "子 Agent" }));
+    await user.click(screen.getByRole("tab", { name: "Sub-Agent" }));
 
-    await user.click(screen.getByRole("button", { name: "启用 V1" }));
-    expect(screen.getByRole("button", { name: "切换中…" })).toBeDisabled();
-    expect(screen.getByRole("button", { name: "已启用 V2" })).toBeDisabled();
+    await user.click(screen.getByRole("button", { name: "Enable V1" }));
+    expect(screen.getByRole("button", { name: "Switching…" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "V2 enabled" })).toBeDisabled();
 
     switching.reject(new Error("persist failed"));
     expect(await screen.findByRole("alert")).toHaveTextContent(
-      "切换失败：操作失败，请检查当前配置或查看日志中的详细原因",
+      "Switch failed:Operation failed. Check the current configuration or see the logs for details.",
     );
-    expect(screen.getByRole("button", { name: "已启用 V2" })).toBeDisabled();
-    expect(screen.getByRole("button", { name: "启用 V1" })).toBeEnabled();
+    expect(screen.getByRole("button", { name: "V2 enabled" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Enable V1" })).toBeEnabled();
     expect(
       screen.queryByText(/V1 direct model override/),
     ).not.toBeInTheDocument();
@@ -2916,10 +3842,10 @@ describe("Codex MultiRouter workspace route persistence helpers", () => {
       }),
     );
 
-    await userEvent.click(screen.getByRole("tab", { name: "子 Agent" }));
+    await userEvent.click(screen.getByRole("tab", { name: "Sub-Agent" }));
 
-    expect(screen.getByText("可路由")).toBeInTheDocument();
-    expect(screen.getByText("目录中缺失")).toBeInTheDocument();
+    expect(screen.getByText("Routable")).toBeInTheDocument();
+    expect(screen.getByText("Missing from catalog")).toBeInTheDocument();
   });
 
   it("recognizes alias-suffixed flash/pro role models as routable", async () => {
@@ -2956,10 +3882,10 @@ describe("Codex MultiRouter workspace route persistence helpers", () => {
       }),
     );
 
-    await userEvent.click(screen.getByRole("tab", { name: "子 Agent" }));
+    await userEvent.click(screen.getByRole("tab", { name: "Sub-Agent" }));
 
-    expect(screen.getAllByText("可路由")).toHaveLength(2);
-    expect(screen.queryByText("目录中缺失")).not.toBeInTheDocument();
+    expect(screen.getAllByText("Routable")).toHaveLength(2);
+    expect(screen.queryByText("Missing from catalog")).not.toBeInTheDocument();
   });
 
   it("treats the official deepseek-flash/deepseek-pro slugs as the role models", async () => {
@@ -2992,10 +3918,10 @@ describe("Codex MultiRouter workspace route persistence helpers", () => {
       }),
     );
 
-    await userEvent.click(screen.getByRole("tab", { name: "子 Agent" }));
+    await userEvent.click(screen.getByRole("tab", { name: "Sub-Agent" }));
 
-    expect(screen.getAllByText("可路由")).toHaveLength(2);
-    expect(screen.queryByText("目录中缺失")).not.toBeInTheDocument();
+    expect(screen.getAllByText("Routable")).toHaveLength(2);
+    expect(screen.queryByText("Missing from catalog")).not.toBeInTheDocument();
   });
 
   it("keeps the missing badge for the pro role when only the flash alias exists", async () => {
@@ -3028,10 +3954,10 @@ describe("Codex MultiRouter workspace route persistence helpers", () => {
       }),
     );
 
-    await userEvent.click(screen.getByRole("tab", { name: "子 Agent" }));
+    await userEvent.click(screen.getByRole("tab", { name: "Sub-Agent" }));
 
-    expect(screen.getByText("可路由")).toBeInTheDocument();
-    expect(screen.getByText("目录中缺失")).toBeInTheDocument();
+    expect(screen.getByText("Routable")).toBeInTheDocument();
+    expect(screen.getByText("Missing from catalog")).toBeInTheDocument();
   });
 
   it("exposes a delete action for routing plans inside the workspace", async () => {
@@ -3062,7 +3988,7 @@ describe("Codex MultiRouter workspace route persistence helpers", () => {
 
     await userEvent
       .setup()
-      .click(screen.getAllByRole("button", { name: "删除" })[0]);
+      .click(screen.getAllByRole("button", { name: "Delete" })[0]);
 
     expect(onDeletePlan).toHaveBeenCalledWith(plan);
   });
@@ -3165,6 +4091,8 @@ describe("Codex MultiRouter workspace route persistence helpers", () => {
         displayName: "Third-party GPT",
         contextWindow: 272000,
         apiFormat: "openai_responses",
+        apiFormatSource: "provider",
+        providerName: thirdParty.name,
       },
     ]);
   });
@@ -3278,9 +4206,11 @@ describe("Codex MultiRouter workspace route persistence helpers", () => {
     );
 
     const user = userEvent.setup();
-    await user.click(screen.getByRole("button", { name: "编辑匹配规则" }));
-    await user.click(screen.getByRole("button", { name: "启用" }));
-    await user.click(screen.getByRole("button", { name: "保存规则" }));
+    await user.click(
+      screen.getByRole("button", { name: "Edit matching rules" }),
+    );
+    await user.click(screen.getByRole("button", { name: "Enabled" }));
+    await user.click(screen.getByRole("button", { name: "Save rules" }));
 
     await waitFor(() => expect(providersApi.update).toHaveBeenCalled());
     const updateCalls = vi.mocked(providersApi.update).mock.calls;
@@ -3767,6 +4697,8 @@ describe("Codex MultiRouter workspace route persistence helpers", () => {
         displayName: "Qwen 3.6",
         contextWindow: 262144,
         apiFormat: "openai_chat",
+        apiFormatSource: "provider",
+        providerName: qwen.name,
       },
       {
         model: "deepseek-v4-flash",
@@ -3775,6 +4707,8 @@ describe("Codex MultiRouter workspace route persistence helpers", () => {
         textOnly: true,
         supportsImage: false,
         apiFormat: "openai_chat",
+        apiFormatSource: "provider",
+        providerName: deepseek.name,
         capabilities: { inputModalities: ["text"], textOnly: true },
       },
     ]);
@@ -3843,9 +4777,11 @@ describe("Codex MultiRouter workspace route persistence helpers", () => {
     );
 
     const user = userEvent.setup();
-    await user.click(screen.getByRole("button", { name: "编辑匹配规则" }));
-    await user.click(screen.getByRole("button", { name: "启用" }));
-    await user.click(screen.getByRole("button", { name: "保存规则" }));
+    await user.click(
+      screen.getByRole("button", { name: "Edit matching rules" }),
+    );
+    await user.click(screen.getByRole("button", { name: "Enabled" }));
+    await user.click(screen.getByRole("button", { name: "Save rules" }));
 
     await waitFor(() => expect(providersApi.update).toHaveBeenCalled());
     const updateCalls = vi.mocked(providersApi.update).mock.calls;
@@ -3916,6 +4852,8 @@ describe("Codex MultiRouter workspace route persistence helpers", () => {
         model: "qwen3.6",
         displayName: "Qwen 3.6",
         contextWindow: 262144,
+        apiFormatSource: "provider",
+        providerName: qwen.name,
       },
     ]);
     expect(rebuilt.spawnAgentModels).toEqual(["qwen3.6"]);
@@ -3970,6 +4908,8 @@ describe("Codex MultiRouter workspace route persistence helpers", () => {
     expect(rebuilt.models).toContainEqual({
       model: "gpt-5.6-sol",
       contextWindow: 372000,
+      apiFormatSource: "provider",
+      providerName: officialBackup.name,
     });
   });
 
@@ -4070,13 +5010,24 @@ describe("Codex MultiRouter workspace route persistence helpers", () => {
     );
 
     expect(rebuilt.models).toEqual([
-      { model: "model-a", sortIndex: 0 },
-      { model: "model-b", sortIndex: 1 },
+      expect.objectContaining({
+        model: "model-a",
+        providerName: source.name,
+        apiFormatSource: "provider",
+      }),
+      expect.objectContaining({
+        model: "model-b",
+        providerName: source.name,
+        apiFormatSource: "provider",
+      }),
     ]);
+    expect(rebuilt.models.every((model) => model.sortIndex === undefined)).toBe(
+      true,
+    );
     expect(rebuilt.spawnAgentModels).toEqual(["model-b", "model-a"]);
   });
 
-  it("does not partially reset model ordering when an advertised model maps to an unavailable upstream model", async () => {
+  it("resets only router ordering even when an unrelated alias is stale", async () => {
     const source: Provider = {
       id: "order-source",
       name: "Order Source",
@@ -4117,6 +5068,7 @@ describe("Codex MultiRouter workspace route persistence helpers", () => {
         ...plan.settingsConfig,
         codexRouting: {
           ...plan.settingsConfig.codexRouting,
+          modelOrder: ["model-b", "model-a"],
           routes: [serializeCodexRouteV2(route, 0)],
         },
       },
@@ -4127,7 +5079,7 @@ describe("Codex MultiRouter workspace route persistence helpers", () => {
         routedPlan,
         new Map([[source.id, source]]),
       ).models.map((model) => model.model),
-    ).toEqual(["model-a", "model-b"]);
+    ).toEqual(["model-b", "model-a"]);
 
     renderWorkspace(
       React.createElement(CodexRouterWorkspacePage, {
@@ -4145,14 +5097,17 @@ describe("Codex MultiRouter workspace route persistence helpers", () => {
 
     await userEvent
       .setup()
-      .click(screen.getByRole("button", { name: "恢复默认" }));
+      .click(screen.getByRole("button", { name: "Restore default" }));
 
-    expect(
-      await screen.findByText(
-        /保存模型顺序失败：模型「model-b」.*stale-model.*Order Source/,
-      ),
-    ).toBeInTheDocument();
-    expect(providersApi.update).not.toHaveBeenCalled();
+    await screen.findByText(/Removed the custom router order/);
+    expect(providersApi.update).toHaveBeenCalledTimes(1);
+    const saved = vi.mocked(providersApi.update).mock.calls[0][0];
+    expect(saved.id).toBe(routedPlan.id);
+    expect(saved.settingsConfig.codexRouting.modelOrder).toEqual([]);
+    expect(saved.settingsConfig.codexRouting.routes).toEqual(
+      routedPlan.settingsConfig.codexRouting.routes,
+    );
+    expect(source.settingsConfig.modelCatalog.models[0].sortIndex).toBe(0);
   });
 
   it("hides a model from the target Provider catalog through the model-order page", async () => {
@@ -4188,7 +5143,7 @@ describe("Codex MultiRouter workspace route persistence helpers", () => {
 
     await userEvent
       .setup()
-      .click(screen.getByRole("button", { name: "移除 model-a" }));
+      .click(screen.getByRole("button", { name: "Remove model-a" }));
 
     await waitFor(() => {
       expect(providersApi.update).toHaveBeenCalledWith(
@@ -4206,9 +5161,7 @@ describe("Codex MultiRouter workspace route persistence helpers", () => {
         "codex",
       );
     });
-    expect(
-      screen.getByText(/已隐藏 model-a；.*Codex 选择器移除/),
-    ).toBeInTheDocument();
+    expect(screen.getByText(/Hidden model-a;/)).toBeInTheDocument();
   });
 
   it("does not resurrect a hidden model when refreshing the upstream catalog", () => {
@@ -4340,8 +5293,10 @@ describe("Codex MultiRouter workspace route persistence helpers", () => {
       }),
     );
 
-    expect(await screen.findByText(/已隐藏模型（1）/)).toBeInTheDocument();
-    await userEvent.setup().click(screen.getByRole("button", { name: "恢复" }));
+    expect(await screen.findByText(/Hidden models \(1\)/)).toBeInTheDocument();
+    await userEvent
+      .setup()
+      .click(screen.getByRole("button", { name: "Restore" }));
 
     await waitFor(() => {
       const updated = vi.mocked(providersApi.update).mock.calls.at(-1)?.[0];
@@ -4491,7 +5446,7 @@ describe("Codex MultiRouter workspace route persistence helpers", () => {
     });
     expect(validateProxyListenDraft("127.0.0.1", "abc")).toEqual({
       ok: false,
-      error: "监听端口必须是 1024-65535 之间的数字。",
+      error: "The listen port must be a number from 1024 to 65535.",
     });
   });
 
@@ -4564,7 +5519,7 @@ describe("Codex MultiRouter workspace route persistence helpers", () => {
         isCodexTakeoverActive: true,
         activeProviderId: "other-router",
       }).label,
-    ).toBe("未发布");
+    ).toBe("Not published");
 
     expect(
       buildMultiRouterRuntimeStatus({
@@ -4575,7 +5530,7 @@ describe("Codex MultiRouter workspace route persistence helpers", () => {
         isCodexTakeoverActive: true,
         activeProviderId: plan.id,
       }).label,
-    ).toBe("代理未启动");
+    ).toBe("Proxy not running");
 
     expect(
       buildMultiRouterRuntimeStatus({
@@ -4586,7 +5541,7 @@ describe("Codex MultiRouter workspace route persistence helpers", () => {
         isCodexTakeoverActive: true,
         activeProviderId: plan.id,
       }).label,
-    ).toBe("无启用规则");
+    ).toBe("No enabled rules");
 
     expect(
       buildMultiRouterRuntimeStatus({
@@ -4599,13 +5554,73 @@ describe("Codex MultiRouter workspace route persistence helpers", () => {
       }),
     ).toMatchObject({
       running: true,
-      label: "运行中",
+      label: "Running",
       tone: "ok",
     });
   });
 
+  it("keeps request health and stream retry activity in dedicated status views", async () => {
+    const source: Provider = {
+      id: "status-observability-source",
+      name: "Status observability source",
+      category: "custom",
+      settingsConfig: {
+        modelCatalog: { models: [{ model: "status-model" }] },
+      },
+    };
+    const plan = withEnabledProviderRoute(
+      createDraftRoutingPlan([source], [source]),
+      source,
+    );
+
+    renderWorkspace(
+      React.createElement(CodexRouterWorkspacePage, {
+        providers: [source, plan],
+        isProxyRunning: true,
+        isCodexTakeoverActive: true,
+        activeProviderId: plan.id,
+        initialProviderId: plan.id,
+        initialTab: "status",
+        onEditProvider: vi.fn(),
+        onDeletePlan: vi.fn(),
+        onCreateProvider: vi.fn(),
+      }),
+    );
+
+    expect(
+      screen.queryByText("Live stream retry activity"),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByTestId("stream-retry-header-toggle"),
+    ).not.toBeInTheDocument();
+
+    await userEvent.setup().click(
+      screen.getByRole("button", {
+        name: /request health|settings\.requestHealth\.title/i,
+      }),
+    );
+
+    await waitFor(() =>
+      expect(proxyApi.getRequestHealthDiagnostics).toHaveBeenCalledOnce(),
+    );
+    expect(
+      screen.getByText(
+        /request size and history|settings\.requestHealth\.monitoring/i,
+      ),
+    ).toBeInTheDocument();
+
+    await userEvent
+      .setup()
+      .click(screen.getByRole("button", { name: /Live reconnect activity/i }));
+
+    expect(screen.getAllByText("Live stream retry activity")).toHaveLength(1);
+    expect(screen.getAllByTestId("stream-retry-activity-panel")).toHaveLength(
+      1,
+    );
+  });
+
   // 当本地代理、Codex 接管、当前方案路由和最新真实转发都成功时，
-  // 状态页应在原地给出完成结果，不再触发 App 进入历史修复。
+  // Status页应在原地给出完成结果，不再触发 App 进入历史修复。
   it("shows runtime validation success in the workspace without a post-setup callback", async () => {
     const source: Provider = {
       id: "codex-online-source",
@@ -4672,7 +5687,7 @@ describe("Codex MultiRouter workspace route persistence helpers", () => {
 
     await waitFor(() =>
       expect(
-        screen.getByText("MultiRouter 已通过真实请求验证"),
+        screen.getByText("MultiRouter verified with a real request"),
       ).toBeInTheDocument(),
     );
   });
@@ -4754,11 +5769,11 @@ describe("Codex MultiRouter workspace route persistence helpers", () => {
 
     await waitFor(() =>
       expect(
-        screen.getByText("MultiRouter 目录投影：待同步"),
+        screen.getByText("MultiRouter catalog projection:Pending sync"),
       ).toBeInTheDocument(),
     );
     await waitFor(() =>
-      expect(screen.getByText("当前有效映射")).toBeInTheDocument(),
+      expect(screen.getByText("Current active mappings")).toBeInTheDocument(),
     );
     expect(
       screen.getByText(/DeepSeek Relay \/ DeepSeek Relay/),
@@ -4772,7 +5787,7 @@ describe("Codex MultiRouter workspace route persistence helpers", () => {
 
     await userEvent
       .setup()
-      .click(screen.getByRole("button", { name: "重新同步目录" }));
+      .click(screen.getByRole("button", { name: "Resync catalog" }));
 
     await waitFor(() =>
       expect(providersApi.retryCodexMultiRouterProjection).toHaveBeenCalledWith(
@@ -4781,7 +5796,7 @@ describe("Codex MultiRouter workspace route persistence helpers", () => {
     );
     await waitFor(() =>
       expect(
-        screen.getByText("MultiRouter 目录投影：已同步"),
+        screen.getByText("MultiRouter catalog projection:Synchronized"),
       ).toBeInTheDocument(),
     );
   });
@@ -4815,11 +5830,11 @@ describe("Codex MultiRouter workspace route persistence helpers", () => {
 
     await userEvent
       .setup()
-      .click(screen.getByRole("button", { name: "刷新校验" }));
+      .click(screen.getByRole("button", { name: "Refresh validation" }));
 
     await waitFor(() =>
       expect(
-        screen.getByText("已刷新校验状态，请查看链路卡片和最近转发表。"),
+        screen.getByText(/Validation status refreshed/i),
       ).toBeInTheDocument(),
     );
   });
@@ -4854,16 +5869,24 @@ describe("Codex MultiRouter workspace route persistence helpers", () => {
         onCreateProvider: vi.fn(),
       }),
     );
-    await userEvent
-      .setup()
-      .click(screen.getByRole("button", { name: "强制刷新官方模型目录" }));
+    await userEvent.setup().click(
+      screen.getByRole("button", {
+        name: "Force refresh official model catalog",
+      }),
+    );
     await waitFor(() =>
       expect(refreshCodexOfficialModelCatalog).toHaveBeenCalledTimes(1),
     );
-    expect(screen.getByText(/官方目录刷新成功/)).toBeInTheDocument();
-    expect(screen.getByText(/11 个模型/)).toBeInTheDocument();
+    expect(
+      screen.getByText(
+        /Official catalog refreshed successfully; the takeover catalog was regenerated/,
+      ),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/11 models/)).toBeInTheDocument();
     expect(screen.getByText(/2026-09-23T03:00:00Z/)).toBeInTheDocument();
-    expect(screen.getByText(/刷新 Codex 模型选择器/)).toBeInTheDocument();
+    expect(
+      screen.getByText(/Refresh the Codex model picker/),
+    ).toBeInTheDocument();
   });
 
   it("keeps a stale official cache visibly distinct from a successful reprojection", async () => {
@@ -4896,15 +5919,23 @@ describe("Codex MultiRouter workspace route persistence helpers", () => {
         onCreateProvider: vi.fn(),
       }),
     );
-    await userEvent
-      .setup()
-      .click(screen.getByRole("button", { name: "强制刷新官方模型目录" }));
+    await userEvent.setup().click(
+      screen.getByRole("button", {
+        name: "Force refresh official model catalog",
+      }),
+    );
     await waitFor(() =>
       expect(refreshCodexOfficialModelCatalog).toHaveBeenCalledTimes(1),
     );
-    expect(screen.getByText(/官方目录未刷新成功/)).toBeInTheDocument();
-    expect(screen.getByText(/本次沿用旧缓存/)).toBeInTheDocument();
-    expect(screen.queryByText(/刷新 Codex 模型选择器/)).not.toBeInTheDocument();
+    expect(
+      screen.getByText(/Official catalog refresh failed/),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText(/Using the previous cache for this run./),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByText(/Refresh the Codex model picker/),
+    ).not.toBeInTheDocument();
   });
 
   it("does not claim both generated artifacts stayed unchanged after a projection error", async () => {
@@ -4937,20 +5968,28 @@ describe("Codex MultiRouter workspace route persistence helpers", () => {
         onCreateProvider: vi.fn(),
       }),
     );
-    await userEvent
-      .setup()
-      .click(screen.getByRole("button", { name: "强制刷新官方模型目录" }));
+    await userEvent.setup().click(
+      screen.getByRole("button", {
+        name: "Force refresh official model catalog",
+      }),
+    );
     await waitFor(() =>
       expect(refreshCodexOfficialModelCatalog).toHaveBeenCalledTimes(1),
     );
-    expect(screen.getByText(/未确认双目录同步/)).toBeInTheDocument();
+    expect(
+      screen.getByText(
+        /Catalog regeneration failed; dual-catalog sync was not confirmed/,
+      ),
+    ).toBeInTheDocument();
     expect(
       screen.queryByText(/本次未修改 Codex 生成目录/),
     ).not.toBeInTheDocument();
-    expect(screen.queryByText(/刷新 Codex 模型选择器/)).not.toBeInTheDocument();
+    expect(
+      screen.queryByText(/Refresh the Codex model picker/),
+    ).not.toBeInTheDocument();
   });
 
-  // 解锁模型菜单是 issue #10 的关键恢复动作，必须同时固定提示文案和真实 API 调用。
+  // Unlock model picker是 issue #10 的关键Restore动作，必须同时固定提示文案和真实 API 调用。
   it("explains and triggers the Codex model picker unlock action", async () => {
     const source: Provider = {
       id: "codex-unlock-source",
@@ -4993,27 +6032,29 @@ describe("Codex MultiRouter workspace route persistence helpers", () => {
 
     expect(
       screen.getByText(
-        "开启或确认 Codex 接管后会自动尝试一次；若当前 Desktop 已普通启动且菜单仍只显示“自定义”，请完全退出 Codex Desktop 后点击“解锁模型菜单”。CLI/app-server 的模型目录修复走 live config、model_catalog_json 和本地 /v1/models，不需要把小写 codex.exe 当 Desktop 启动。",
+        /After enabling or confirming Codex takeover, CCSwitchMulti tries once automatically.*Unlock model menu.*CLI\/app-server catalog repair/i,
       ),
     ).toBeInTheDocument();
     expect(
-      screen.getByTitle(
-        /CLI\/app-server 仍由 config\.toml、model_catalog_json、本地 \/v1\/models 和 MultiRouter 路由支持/,
+      screen.getByText(
+        /CLI\/app-server catalog repair uses live config, model_catalog_json, and local \/v1\/models; lowercase codex\.exe does not need to be treated as a Desktop launch\./i,
       ),
     ).toBeInTheDocument();
 
     await userEvent
       .setup()
-      .click(screen.getByRole("button", { name: "解锁模型菜单" }));
+      .click(screen.getByRole("button", { name: "Unlock model picker" }));
 
     await waitFor(() =>
       expect(proxyApi.unlockCodexModelPicker).toHaveBeenCalledTimes(1),
     );
     expect(proxyApi.unlockCodexModelPicker).toHaveBeenCalledWith();
-    expect(screen.getByText("模型菜单白名单已注入")).toBeInTheDocument();
+    expect(
+      screen.getByText("Model picker allowlist injected"),
+    ).toBeInTheDocument();
     expect(
       screen.queryByText(
-        "开启或确认 Codex 接管后会自动尝试一次；若当前 Desktop 已普通启动且菜单仍只显示“自定义”，请完全退出 Codex Desktop 后点击“解锁模型菜单”。CLI/app-server 的模型目录修复走 live config、model_catalog_json 和本地 /v1/models，不需要把小写 codex.exe 当 Desktop 启动。",
+        /After enabling or confirming Codex takeover, CCSwitchMulti tries once automatically.*Unlock model menu.*CLI\/app-server catalog repair/i,
       ),
     ).not.toBeInTheDocument();
   });
@@ -5077,32 +6118,42 @@ describe("Codex MultiRouter workspace route persistence helpers", () => {
     );
 
     const user = userEvent.setup();
-    await user.click(screen.getByRole("button", { name: "解锁模型菜单" }));
+    await user.click(
+      screen.getByRole("button", { name: "Unlock model picker" }),
+    );
 
     await waitFor(() =>
-      expect(screen.getByText("模型菜单白名单尚未注入")).toBeInTheDocument(),
+      expect(
+        screen.getByText("Model picker allowlist not injected"),
+      ).toBeInTheDocument(),
     );
-    expect(screen.getByText(/Codex Desktop 主程序/)).toBeInTheDocument();
+    expect(screen.getByText(/Codex Desktop main process/)).toBeInTheDocument();
+    expect(
+      screen.getByText(/The Desktop path was captured.*Unlock model picker/),
+    ).toBeInTheDocument();
     expect(
       screen.getByText(
-        /已捕获该 Desktop 路径；请完全退出 Codex Desktop 后再次点击“解锁模型菜单”/,
+        /switching third-party API keys does not require unlocking again/i,
       ),
     ).toBeInTheDocument();
     expect(
-      screen.getByText(/切换第三方 API Key 不需要重复解锁/),
-    ).toBeInTheDocument();
-    expect(
-      screen.getByText(/CLI\/app-server 继续使用 live config/),
+      screen.getByText(
+        /CLI\/app-server continues using live config, model_catalog_json, and the local \/v1\/models path\./i,
+      ),
     ).toBeInTheDocument();
 
-    await user.click(screen.getByRole("button", { name: "解锁模型菜单" }));
+    await user.click(
+      screen.getByRole("button", { name: "Unlock model picker" }),
+    );
 
     await waitFor(() =>
       expect(proxyApi.unlockCodexModelPicker).toHaveBeenCalledTimes(2),
     );
     expect(proxyApi.unlockCodexModelPicker).toHaveBeenNthCalledWith(1);
     expect(proxyApi.unlockCodexModelPicker).toHaveBeenNthCalledWith(2);
-    expect(screen.getByText("模型菜单白名单已注入")).toBeInTheDocument();
+    expect(
+      screen.getByText("Model picker allowlist injected"),
+    ).toBeInTheDocument();
   });
 
   // 找不到 Desktop 时只展示失败原因，避免把 CCSwitchMulti portable 误解成 Codex Desktop portable。
@@ -5139,14 +6190,20 @@ describe("Codex MultiRouter workspace route persistence helpers", () => {
     );
 
     const user = userEvent.setup();
-    await user.click(screen.getByRole("button", { name: "解锁模型菜单" }));
+    await user.click(
+      screen.getByRole("button", { name: "Unlock model picker" }),
+    );
 
     await waitFor(() =>
-      expect(screen.getByText(/模型菜单解锁失败/)).toBeInTheDocument(),
+      expect(
+        screen.getByText(/Model picker unlock failed/),
+      ).toBeInTheDocument(),
     );
     expect(proxyApi.unlockCodexModelPicker).toHaveBeenCalledWith();
     expect(
-      screen.queryByRole("button", { name: "选择 Codex.exe 后解锁" }),
+      screen.queryByRole("button", {
+        name: "Unlock after selecting Codex.exe",
+      }),
     ).not.toBeInTheDocument();
     expect(
       screen.queryByText(/ccswitch\.codexDesktopExecutablePath/),
@@ -5232,11 +6289,13 @@ describe("Codex MultiRouter workspace route persistence helpers", () => {
     );
 
     await waitFor(() =>
-      expect(screen.getByText("成功 200")).toBeInTheDocument(),
+      expect(screen.getByText("Success 200")).toBeInTheDocument(),
     );
-    expect(screen.queryByText("当前方案成功")).not.toBeInTheDocument();
     expect(
-      screen.queryByText("MultiRouter 已通过真实请求验证"),
+      screen.queryByText("Current plan succeeded"),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByText("MultiRouter verified with a real request"),
     ).not.toBeInTheDocument();
   });
 });

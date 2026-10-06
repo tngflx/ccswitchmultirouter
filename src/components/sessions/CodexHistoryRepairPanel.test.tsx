@@ -34,12 +34,18 @@ describe("CodexHistoryRepairPanel 分页历史说明", () => {
       />,
     );
 
-    expect(screen.getByText("分页 Provider 原文保留")).toBeInTheDocument();
     expect(
-      screen.getByText(/分页历史不会改写 rollout Provider 字节/),
+      screen.getByText("Paginated provider payload preserved"),
     ).toBeInTheDocument();
     expect(
-      screen.getByText(/当前 live Provider 兼容层接管/),
+      screen.getByText(
+        /Paginated history does not rewrite rollout provider bytes/,
+      ),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText(
+        /the current live provider compatibility layer takes over on restore/,
+      ),
     ).toBeInTheDocument();
   });
 });

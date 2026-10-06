@@ -1,3 +1,4 @@
+import i18n from "@/i18n";
 export interface CodexPlanModelFetchSource {
   baseUrl?: string | null;
   partnerPromotionKey?: string | null;
@@ -118,10 +119,22 @@ export function codexCatalogOnlyPlanModelFetchMessage(
 ): string {
   if (isCodexVolcengineAgentPlanModelFetch(source)) {
     return hasModelCatalog
-      ? "火山 AgentPlan 当前缺少可用于在线获取模型列表的推理 API Key 或火山 AK/SK，已保留内置 modelCatalog。"
-      : "火山 AgentPlan 当前缺少推理 API Key 和火山 AK/SK；请先填写 API Key，或在用量查询里配置 AccessKey ID / SecretAccessKey。";
+      ? i18n.t("codexModelFetch.volcCatalog", {
+          defaultValue:
+            "Volcengine AgentPlan has no inference API key or AK/SK for fetching models online. The built-in modelCatalog was preserved.",
+        })
+      : i18n.t("codexModelFetch.volcCredentials", {
+          defaultValue:
+            "Volcengine AgentPlan has no inference API key or AK/SK. Enter an API key or configure AccessKey ID / SecretAccessKey in usage settings.",
+        });
   }
   return hasModelCatalog
-    ? "当前 Plan 的模型枚举不开放 OpenAI /models，已保留内置 modelCatalog。"
-    : "当前 Plan 的模型枚举不开放 OpenAI /models，请手动添加模型或重新选择预设恢复 modelCatalog。";
+    ? i18n.t("codexModelFetch.catalogPreserved", {
+        defaultValue:
+          "This plan does not expose OpenAI /models. The built-in modelCatalog was preserved.",
+      })
+    : i18n.t("codexModelFetch.catalogMissing", {
+        defaultValue:
+          "This plan does not expose OpenAI /models. Add models manually or reselect a preset to restore modelCatalog.",
+      });
 }

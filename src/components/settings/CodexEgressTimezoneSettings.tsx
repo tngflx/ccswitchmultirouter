@@ -1,4 +1,6 @@
 import { useState } from "react";
+import { useTranslation } from "react-i18next";
+import type { TFunction } from "i18next";
 import { Clock3, Loader2, Network, TriangleAlert } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
@@ -18,17 +20,17 @@ interface CodexEgressTimezoneSettingsProps {
   ) => boolean | void | Promise<boolean | void>;
 }
 
-function comparisonLabel(report: CodexEgressTimezoneDetection) {
+function comparisonLabel(t: TFunction, report: CodexEgressTimezoneDetection) {
   if (report.timezoneMatch === "exact") {
-    return "IANA 时区和当前 UTC 偏移都一致。";
+    return t("codexEgressTimezone.comparison.exact");
   }
   if (report.timezoneMatch === "offset_match") {
-    return "IANA 名称不同，但当前 UTC 偏移相同；这不等于已确认存在时区冲突。";
+    return t("codexEgressTimezone.comparison.offsetMatch");
   }
   if (report.timezoneMatch === "mismatch") {
-    return "IANA 时区和当前 UTC 偏移均不一致。若要尝试对齐，请显式启用探测结果。";
+    return t("codexEgressTimezone.comparison.mismatch");
   }
-  return "无法识别当前应用时区，不能自动判断是否一致。";
+  return t("codexEgressTimezone.comparison.unknown");
 }
 
 function locationLabel(report: CodexEgressTimezoneDetection) {
@@ -45,6 +47,7 @@ export function CodexEgressTimezoneSettings({
   value = { mode: "off" },
   onChange,
 }: CodexEgressTimezoneSettingsProps) {
+  const { t } = useTranslation();
   const [report, setReport] = useState<CodexEgressTimezoneDetection | null>(
     null,
   );
@@ -100,7 +103,8 @@ export function CodexEgressTimezoneSettings({
         const status = await codexEgressTimezoneApi.triggerAutomaticProbe();
         if (status.state === "error") {
           setError(
-            status.lastError || "出口时区探测失败，已保留最近一次有效配置。",
+            status.lastError ||
+              t("codexEgressTimezone.errors.detectionFallback"),
           );
         }
       }
@@ -125,7 +129,7 @@ export function CodexEgressTimezoneSettings({
   const saveManual = async () => {
     const timezone = manualTimezone.trim();
     if (!looksLikeIanaTimezone(timezone)) {
-      setError("请输入 IANA 时区，例如 Asia/Taipei 或 America/Los_Angeles。");
+      setError(t("codexEgressTimezone.errors.invalidManual"));
       return;
     }
     setError("");
@@ -150,34 +154,32 @@ export function CodexEgressTimezoneSettings({
         <div className="space-y-1">
           <div className="flex items-center gap-2">
             <Clock3 className="h-4 w-4 text-sky-500" />
-            <h3 className="text-sm font-medium">Codex 出口时区自动监测</h3>
+            <h3 className="text-sm font-medium">
+              {t("codexEgressTimezone.settings.title")}
+            </h3>
           </div>
           <p className="max-w-3xl text-xs text-muted-foreground">
-            自动模式会在启动前、转发网络波动、睡眠/网络恢复和定时周期检查真实出口；不会阻塞模型请求，也不会修改
-            Windows 系统时区。启动 Codex 时通过子进程 TZ 应用结果；CDP
-            仅用于可选的页面 renderer 同步和验证。
+            {t("codexEgressTimezone.settings.description")}
           </p>
         </div>
         <span className="rounded-full border px-2 py-1 text-xs text-muted-foreground">
           {value.mode === "off"
-            ? "已关闭"
-            : `${value.mode === "auto" ? "已开启自动监测" : "手动"} · ${activeTimezone ?? "未配置"}`}
+            ? t("codexEgressTimezone.settings.modeDisabled")
+            : `${value.mode === "auto" ? t("codexEgressTimezone.settings.modeAuto") : t("codexEgressTimezone.settings.modeManual")} · ${activeTimezone ?? t("codexEgressTimezone.values.notConfigured")}`}
         </span>
       </div>
 
       <div className="rounded-md border border-amber-500/30 bg-amber-500/10 p-3 text-xs text-amber-800 dark:text-amber-200">
         <div className="flex gap-2">
           <TriangleAlert className="mt-0.5 h-4 w-4 shrink-0" />
-          <p>
-            没有官方证据证明时区不一致一定导致模型降级；该开关只用于复现和验证社区报告，默认关闭，不会自动改动你的运行环境。
-          </p>
+          <p>{t("codexEgressTimezone.settings.disclaimer")}</p>
         </div>
       </div>
 
       <div className="flex flex-wrap gap-2">
         {value.mode === "off" && (
           <Button type="button" onClick={() => void enableAutomatic()}>
-            开启自动监测
+            {t("codexEgressTimezone.controls.enableAutomatic")}
           </Button>
         )}
         <Button
@@ -191,14 +193,16 @@ export function CodexEgressTimezoneSettings({
           ) : (
             <Network className="mr-2 h-4 w-4" />
           )}
-          {detecting ? "探测中" : "探测出口时区"}
+          {detecting
+            ? t("codexEgressTimezone.controls.detecting")
+            : t("codexEgressTimezone.controls.detect")}
         </Button>
         <Button
           type="button"
           variant="outline"
           onClick={() => setManualVisible((shown) => !shown)}
         >
-          手动设置
+          {t("codexEgressTimezone.controls.manualSettings")}
         </Button>
         <Button
           type="button"
@@ -209,7 +213,9 @@ export function CodexEgressTimezoneSettings({
           {inspectingRuntime && (
             <Loader2 className="mr-2 h-4 w-4 animate-spin" />
           )}
-          {inspectingRuntime ? "检查中" : "检查运行中 Codex 页面"}
+          {inspectingRuntime
+            ? t("codexEgressTimezone.controls.checkingRuntime")
+            : t("codexEgressTimezone.controls.inspectRuntime")}
         </Button>
         {value.mode !== "off" && (
           <Button
@@ -217,14 +223,16 @@ export function CodexEgressTimezoneSettings({
             variant="ghost"
             onClick={() => onChange({ ...value, mode: "off" })}
           >
-            关闭时区注入
+            {t("codexEgressTimezone.controls.disable")}
           </Button>
         )}
       </div>
 
       {value.mode === "auto" && (
         <div className="max-w-xs space-y-1">
-          <Label htmlFor="codex-egress-monitor-interval">自动检测周期</Label>
+          <Label htmlFor="codex-egress-monitor-interval">
+            {t("codexEgressTimezone.interval.label")}
+          </Label>
           <select
             id="codex-egress-monitor-interval"
             className="h-9 w-full rounded-md border border-input bg-background px-3 text-sm"
@@ -236,27 +244,29 @@ export function CodexEgressTimezoneSettings({
               })
             }
           >
-            <option value={5}>5 分钟</option>
-            <option value={15}>15 分钟（推荐）</option>
-            <option value={30}>30 分钟</option>
-            <option value={60}>60 分钟</option>
+            <option value={5}>{t("codexEgressTimezone.interval.five")}</option>
+            <option value={15}>
+              {t("codexEgressTimezone.interval.fifteen")}
+            </option>
+            <option value={30}>
+              {t("codexEgressTimezone.interval.thirty")}
+            </option>
+            <option value={60}>
+              {t("codexEgressTimezone.interval.sixty")}
+            </option>
           </select>
           <p className="text-xs text-muted-foreground">
-            这是正常网络下的兜底周期；检测到 Codex
-            转发连接失败或系统长时间休眠恢复时会提前检查，最短触发间隔为 90 秒。
+            {t("codexEgressTimezone.interval.help")}
           </p>
         </div>
       )}
 
       <p className="text-xs text-muted-foreground">
-        探测会访问 chatgpt.com/cdn-cgi/trace，并把该站点实际看到的公网出口 IP
-        发送给 ipwho.is 查询 IANA 时区；不会发送 API Key、Cookie 或对话内容。
+        {t("codexEgressTimezone.privacy.trace")}
       </p>
 
       <p className="text-xs text-muted-foreground">
-        出口检测与自动监测不需要 CDP。“检查运行中 Codex 页面”才会通过 CDP 读取
-        renderer 的实际时区；app-server 只有在由 CCSM 直接拉起时才会继承
-        TZ，因此完整应用新时区仍需安全刷新 Codex。
+        {t("codexEgressTimezone.privacy.cdp")}
       </p>
 
       {error && (
@@ -270,15 +280,29 @@ export function CodexEgressTimezoneSettings({
 
       {runtime && (
         <p className="rounded-md border border-border-default bg-background/70 p-2 text-xs">
-          运行中的 Codex renderer：{runtime.runtimeTimezone} (
-          {runtime.runtimeUtcOffset})
           {runtime.matchesConfigured === true
-            ? "，与当前配置一致。"
+            ? t("codexEgressTimezone.runtime.matches", {
+                timezone: runtime.runtimeTimezone,
+                offset: runtime.runtimeUtcOffset,
+              })
             : runtime.timezoneMatch === "offset_match"
-              ? `，IANA 名称与配置 ${runtime.configuredTimezone} 不同，但当前 UTC 偏移相同。`
+              ? t("codexEgressTimezone.runtime.offsetMatch", {
+                  timezone: runtime.runtimeTimezone,
+                  offset: runtime.runtimeUtcOffset,
+                  configured: runtime.configuredTimezone,
+                })
               : runtime.matchesConfigured === false
-                ? `，与当前配置 ${runtime.configuredTimezone ?? "关闭"} 不一致；请完全退出 Codex 后由 CCSM 重新拉起。`
-                : "；当前未启用时区注入。"}
+                ? t("codexEgressTimezone.runtime.mismatch", {
+                    timezone: runtime.runtimeTimezone,
+                    offset: runtime.runtimeUtcOffset,
+                    configured:
+                      runtime.configuredTimezone ??
+                      t("codexEgressTimezone.values.disabled"),
+                  })
+                : t("codexEgressTimezone.runtime.disabled", {
+                    timezone: runtime.runtimeTimezone,
+                    offset: runtime.runtimeUtcOffset,
+                  })}
         </p>
       )}
 
@@ -287,35 +311,41 @@ export function CodexEgressTimezoneSettings({
           <div className="grid gap-2 sm:grid-cols-2">
             <p>
               <span className="text-muted-foreground">
-                当前系统/CCSM 时区：
+                {t("codexEgressTimezone.report.currentTimezone")}
               </span>
               <strong>{report.currentTimezone}</strong> (
               {report.currentUtcOffset})
             </p>
             <p>
-              <span className="text-muted-foreground">ChatGPT 出口时区：</span>
+              <span className="text-muted-foreground">
+                {t("codexEgressTimezone.report.egressTimezone")}
+              </span>
               <strong>{report.egressTimezone}</strong> ({report.egressUtcOffset}
               )
             </p>
             <p>
-              <span className="text-muted-foreground">出口位置：</span>
-              {locationLabel(report) || "未知"}
+              <span className="text-muted-foreground">
+                {t("codexEgressTimezone.report.egressLocation")}
+              </span>
+              {locationLabel(report) || t("codexEgressTimezone.values.unknown")}
             </p>
             <p>
-              <span className="text-muted-foreground">公网出口：</span>
+              <span className="text-muted-foreground">
+                {t("codexEgressTimezone.report.publicEgress")}
+              </span>
               {report.egressIp}
             </p>
           </div>
-          <p className="font-medium">{comparisonLabel(report)}</p>
+          <p className="font-medium">{comparisonLabel(t, report)}</p>
           {report.dnsUsesNonPublicAddress && (
             <p className="rounded bg-sky-500/10 p-2 text-sky-800 dark:text-sky-200">
-              DNS 返回 {report.dnsAddresses.join("、")}，属于透明代理常见的
-              fake-IP；CCSM 不会拿它做地理定位，而是使用 chatgpt.com
-              实际看到的公网出口。
+              {t("codexEgressTimezone.report.dnsWarning", {
+                addresses: report.dnsAddresses.join(", "),
+              })}
             </p>
           )}
           <Button type="button" onClick={applyDetection}>
-            使用探测结果
+            {t("codexEgressTimezone.controls.applyDetection")}
           </Button>
         </div>
       )}
@@ -323,7 +353,9 @@ export function CodexEgressTimezoneSettings({
       {manualVisible && (
         <div className="flex flex-col gap-2 rounded-lg border bg-background/70 p-3 sm:flex-row sm:items-end">
           <div className="flex-1 space-y-1">
-            <Label htmlFor="codex-manual-timezone">IANA 时区</Label>
+            <Label htmlFor="codex-manual-timezone">
+              {t("codexEgressTimezone.manual.label")}
+            </Label>
             <Input
               id="codex-manual-timezone"
               value={manualTimezone}
@@ -332,7 +364,7 @@ export function CodexEgressTimezoneSettings({
             />
           </div>
           <Button type="button" onClick={saveManual}>
-            保存手动时区
+            {t("codexEgressTimezone.controls.saveManual")}
           </Button>
         </div>
       )}

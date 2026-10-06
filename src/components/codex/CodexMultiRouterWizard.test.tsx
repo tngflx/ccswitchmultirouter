@@ -125,12 +125,16 @@ describe("CodexMultiRouterWizard", () => {
       settingsConfig: { modelCatalog: { models: [{ model: "gpt-5.6" }] } },
     };
     renderWizard([official]);
-    fireEvent.click(screen.getByRole("button", { name: "路由确认" }));
-    expect(screen.queryByText("官方 ChatGPT 认证方式")).not.toBeInTheDocument();
-    expect(screen.getByText(/OpenAI Official 的认证设置/)).toBeVisible();
+    fireEvent.click(screen.getByRole("button", { name: "Review routing" }));
+    expect(
+      screen.queryByText("Official ChatGPT authentication"),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.getByText(/Official routes use OpenAI Official authentication/),
+    ).toBeVisible();
   });
 
-  it.each(["关闭", "打开状态页完成验收"])(
+  it.each(["Accept later", "Open the status page to finish acceptance"])(
     "dismisses the acceptance overlay through %s without claiming acceptance",
     async (button) => {
       const plan: Provider = {
@@ -149,13 +153,18 @@ describe("CodexMultiRouterWizard", () => {
         onOpenChange,
         onOpenWorkspace,
       });
-      fireEvent.click(screen.getByRole("button", { name: "保存并启用" }));
-      fireEvent.click(screen.getByRole("button", { name: "启用这个多路路由" }));
-      await screen.findByText("状态机：enabled");
+      fireEvent.click(screen.getByRole("button", { name: "Save and enable" }));
+      fireEvent.click(
+        screen.getByRole("button", { name: "Enable this multi-route plan" }),
+      );
+      await screen.findByText("State machine:enabled");
       fireEvent.click(screen.getByRole("button", { name: button }));
       expect(onOpenChange).toHaveBeenCalledWith(false);
-      expect(screen.getByText("状态机：enabled")).toBeInTheDocument();
-      if (button === "打开状态页完成验收") {
+      expect(screen.getByText("State machine:enabled")).toBeInTheDocument();
+      expect(
+        screen.queryByText("State machine:completed"),
+      ).not.toBeInTheDocument();
+      if (button === "Open the status page to finish acceptance") {
         expect(onOpenWorkspace).toHaveBeenCalledWith(plan, "status");
       }
     },
@@ -263,18 +272,22 @@ describe("CodexMultiRouterWizard", () => {
       renderWizard([source, plan], { mode: "edit", planId: plan.id });
       await waitFor(() =>
         expect(
-          screen.getByRole("button", { name: "选择模型" }),
+          screen.getByRole("button", { name: "Choose models" }),
         ).not.toHaveAttribute("data-read-only"),
       );
-      fireEvent.click(screen.getByRole("button", { name: "协议深探测" }));
-      fireEvent.click(screen.getByRole("button", { name: "下一步" }));
-      expect(screen.getByText("第 7 / 13 步")).toBeInTheDocument();
-      fireEvent.click(screen.getByRole("button", { name: "保存并启用" }));
-      fireEvent.click(screen.getByRole("button", { name: "保存并发布" }));
+      fireEvent.click(
+        screen.getByRole("button", { name: "Protocol deep probe" }),
+      );
+      fireEvent.click(screen.getByRole("button", { name: "Next" }));
+      expect(screen.getByText("Step 7 of 13")).toBeInTheDocument();
+      fireEvent.click(screen.getByRole("button", { name: "Save and enable" }));
+      fireEvent.click(screen.getByRole("button", { name: "Save and publish" }));
       if (failFirstPrepare) {
         await screen.findByText("candidate-invalid");
-        await screen.findByText("状态机：saveFailed");
-        fireEvent.click(screen.getByRole("button", { name: "保存并发布" }));
+        await screen.findByText("State machine:saveFailed");
+        fireEvent.click(
+          screen.getByRole("button", { name: "Save and publish" }),
+        );
       }
       await waitFor(() =>
         expect(commitCodexProviderSetBatch).toHaveBeenCalled(),
@@ -285,13 +298,13 @@ describe("CodexMultiRouterWizard", () => {
       expect(
         preflightCodexProviderProtocolCompatibility.mock.calls.length,
       ).toBe(probeCalls);
-      await screen.findByText("状态机：published");
+      await screen.findByText("State machine:published");
       restoreCodexProviderProtocolEvidence.mockResolvedValueOnce({
         ...restoredOutcome,
         receiptIds: ["restored-again"],
       });
       const commits = commitCodexProviderSetBatch.mock.calls.length;
-      fireEvent.click(screen.getByRole("button", { name: "保存并发布" }));
+      fireEvent.click(screen.getByRole("button", { name: "Save and publish" }));
       await waitFor(() =>
         expect(commitCodexProviderSetBatch.mock.calls.length).toBe(commits + 1),
       );
@@ -305,14 +318,22 @@ describe("CodexMultiRouterWizard", () => {
       expect(
         preflightCodexProviderProtocolCompatibility.mock.calls.length,
       ).toBe(probeCalls);
-      fireEvent.click(screen.getByRole("button", { name: "协议深探测" }));
+      fireEvent.click(
+        screen.getByRole("button", { name: "Protocol deep probe" }),
+      );
       expect(
-        screen.getByRole("button", { name: "重新进行兼容性深度探测" }),
+        screen.getByRole("button", {
+          name: "Run compatibility deep probe again",
+        }),
       ).toBeEnabled();
       fireEvent.click(
-        screen.getByRole("button", { name: "重新进行兼容性深度探测" }),
+        screen.getByRole("button", {
+          name: "Run compatibility deep probe again",
+        }),
       );
-      expect(screen.getByRole("button", { name: "确认测试" })).toBeVisible();
+      expect(
+        screen.getByRole("button", { name: "Confirm test" }),
+      ).toBeVisible();
     },
   );
   it("keeps later steps gated when persisted evidence is missing without starting a probe", async () => {
@@ -346,14 +367,15 @@ describe("CodexMultiRouterWizard", () => {
     restoreCodexProviderProtocolEvidence.mockResolvedValueOnce(null);
     const calls = preflightCodexProviderProtocolCompatibility.mock.calls.length;
     renderWizard([source, plan], { mode: "edit", planId: plan.id });
-    fireEvent.click(screen.getByRole("button", { name: "协议深探测" }));
-    await screen.findByText(/已检查保存记录：复用 0/);
-    expect(screen.getByRole("button", { name: "选择模型" })).toHaveAttribute(
-      "data-read-only",
-      "true",
+    fireEvent.click(
+      screen.getByRole("button", { name: "Protocol deep probe" }),
     );
+    await screen.findByText(/Saved records checked: reusing 0/);
     expect(
-      screen.getByRole("button", { name: "开始兼容性深度探测" }),
+      screen.getByRole("button", { name: "Choose models" }),
+    ).toHaveAttribute("data-read-only", "true");
+    expect(
+      screen.getByRole("button", { name: "Start compatibility deep probe" }),
     ).toBeEnabled();
     expect(preflightCodexProviderProtocolCompatibility.mock.calls.length).toBe(
       calls,
@@ -429,15 +451,21 @@ describe("CodexMultiRouterWizard", () => {
 
     try {
       renderWizard([source, plan], { mode: "edit", planId: plan.id });
-      fireEvent.click(screen.getByRole("button", { name: "协议深探测" }));
-      await screen.findByText(/已检查保存记录：复用 1/);
+      fireEvent.click(
+        screen.getByRole("button", { name: "Protocol deep probe" }),
+      );
+      await screen.findByText(/Saved records checked: reusing 1/);
       const restoreCallsBeforeRefresh =
         restoreCodexProviderProtocolEvidence.mock.calls.length;
       const probeCallsBeforeRefresh =
         preflightCodexProviderProtocolCompatibility.mock.calls.length;
 
-      fireEvent.click(screen.getByRole("button", { name: "同步模型目录" }));
-      fireEvent.click(screen.getByRole("button", { name: "自动获取模型列表" }));
+      fireEvent.click(
+        screen.getByRole("button", { name: "Sync model catalogs" }),
+      );
+      fireEvent.click(
+        screen.getByRole("button", { name: "Fetch model lists automatically" }),
+      );
 
       await waitFor(() =>
         expect(restoreCodexProviderProtocolEvidence.mock.calls.length).toBe(
@@ -448,7 +476,7 @@ describe("CodexMultiRouterWizard", () => {
         preflightCodexProviderProtocolCompatibility.mock.calls.length,
       ).toBe(probeCallsBeforeRefresh);
       expect(
-        screen.getByRole("button", { name: "选择模型" }),
+        screen.getByRole("button", { name: "Choose models" }),
       ).not.toHaveAttribute("data-read-only", "true");
     } finally {
       fetchSpy.mockRestore();
@@ -544,13 +572,14 @@ describe("CodexMultiRouterWizard", () => {
         ],
       }),
     );
-    expect(screen.getByRole("button", { name: "选择模型" })).toHaveAttribute(
-      "data-read-only",
-      "true",
-    );
-    fireEvent.click(screen.getByRole("button", { name: "协议深探测" }));
     expect(
-      screen.getByRole("button", { name: "开始兼容性深度探测" }),
+      screen.getByRole("button", { name: "Choose models" }),
+    ).toHaveAttribute("data-read-only", "true");
+    fireEvent.click(
+      screen.getByRole("button", { name: "Protocol deep probe" }),
+    );
+    expect(
+      screen.getByRole("button", { name: "Start compatibility deep probe" }),
     ).toBeEnabled();
   });
   it("does not mark a new draft enabled when the previous target finishes enabling", async () => {
@@ -573,17 +602,19 @@ describe("CodexMultiRouterWizard", () => {
       planId: plan.id,
       onEnablePlan,
     });
-    fireEvent.click(screen.getByRole("button", { name: "保存并启用" }));
-    fireEvent.click(screen.getByRole("button", { name: "启用这个多路路由" }));
+    fireEvent.click(screen.getByRole("button", { name: "Save and enable" }));
+    fireEvent.click(
+      screen.getByRole("button", { name: "Enable this multi-route plan" }),
+    );
     expect(onEnablePlan).toHaveBeenCalledWith(plan);
     rerenderWizard(false);
     rerenderWizard(true, [plan], { mode: "create" });
-    const statusBefore = screen.getByText(/状态机：/).textContent;
+    const statusBefore = screen.getByText(/State machine:/).textContent;
     await act(async () => {
       completeEnable();
     });
-    expect(screen.queryByText("状态机：enabled")).not.toBeInTheDocument();
-    expect(screen.getByText(/状态机：/).textContent).toBe(statusBefore);
+    expect(screen.queryByText("State machine:enabled")).not.toBeInTheDocument();
+    expect(screen.getByText(/State machine:/).textContent).toBe(statusBefore);
   });
 
   it("isolates an edited plan from a new draft and ignores its late model fetch", async () => {
@@ -647,20 +678,28 @@ describe("CodexMultiRouterWizard", () => {
       mode: "edit",
       planId: plan.id,
     });
-    fireEvent.click(screen.getByRole("button", { name: "同步模型目录" }));
-    fireEvent.click(screen.getByRole("button", { name: "自动获取模型列表" }));
+    fireEvent.click(
+      screen.getByRole("button", { name: "Sync model catalogs" }),
+    );
+    fireEvent.click(
+      screen.getByRole("button", { name: "Fetch model lists automatically" }),
+    );
     expect(fetchSpy).toHaveBeenCalled();
     rerenderWizard(false);
     rerenderWizard(true, providers, { mode: "create" });
     await act(async () => {
       finishFetch([{ id: "late-model", ownedBy: null }]);
     });
-    fireEvent.click(screen.getByRole("button", { name: "协议深探测" }));
-    fireEvent.click(screen.getByRole("button", { name: "开始兼容性深度探测" }));
-    fireEvent.click(screen.getByRole("button", { name: "确认测试" }));
-    await screen.findByText("状态机：connectivityPartial");
-    fireEvent.click(screen.getByRole("button", { name: "保存并启用" }));
-    fireEvent.click(screen.getByRole("button", { name: "保存并发布" }));
+    fireEvent.click(
+      screen.getByRole("button", { name: "Protocol deep probe" }),
+    );
+    fireEvent.click(
+      screen.getByRole("button", { name: "Start compatibility deep probe" }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Confirm test" }));
+    await screen.findByText("State machine:connectivityPartial");
+    fireEvent.click(screen.getByRole("button", { name: "Save and enable" }));
+    fireEvent.click(screen.getByRole("button", { name: "Save and publish" }));
     await waitFor(() => expect(commitCodexProviderSetBatch).toHaveBeenCalled());
     const [sources, router] = commitCodexProviderSetBatch.mock.calls.at(-1)!;
     expect(router.id).not.toBe(plan.id);
@@ -701,10 +740,14 @@ describe("CodexMultiRouterWizard", () => {
       </QueryClientProvider>
     );
     const { rerender } = render(view(true));
-    fireEvent.click(screen.getByRole("button", { name: "协议深探测" }));
+    fireEvent.click(
+      screen.getByRole("button", { name: "Protocol deep probe" }),
+    );
     rerender(view(false));
     rerender(view(true));
-    expect(screen.getByRole("heading", { name: "协议深探测" })).toBeVisible();
+    expect(
+      screen.getByRole("heading", { name: "Protocol deep probe" }),
+    ).toBeVisible();
   });
 
   it("can exclude a failed model and save verified receipts without probing again", async () => {
@@ -764,24 +807,32 @@ describe("CodexMultiRouterWizard", () => {
       status: "committed",
     }));
     const { rerenderWizard } = renderWizard([source]);
-    fireEvent.click(screen.getByRole("button", { name: "协议深探测" }));
-    fireEvent.click(screen.getByRole("button", { name: "开始兼容性深度探测" }));
-    fireEvent.click(screen.getByRole("button", { name: "确认测试" }));
-    await screen.findByText("状态机：connectivityFailed");
-    fireEvent.click(screen.getByRole("button", { name: "关闭" }));
+    fireEvent.click(
+      screen.getByRole("button", { name: "Protocol deep probe" }),
+    );
+    fireEvent.click(
+      screen.getByRole("button", { name: "Start compatibility deep probe" }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Confirm test" }));
+    await screen.findByText("State machine:connectivityFailed");
+    fireEvent.click(screen.getByRole("button", { name: "Close" }));
     rerenderWizard(false);
     rerenderWizard(true, [{ ...source, name: "Renamed Probe" }]);
-    expect(screen.getByRole("heading", { name: "协议深探测" })).toBeVisible();
     expect(
-      screen.getByRole("checkbox", { name: "保留 Mixed Probe / bad" }),
+      screen.getByRole("heading", { name: "Protocol deep probe" }),
+    ).toBeVisible();
+    expect(
+      screen.getByRole("checkbox", { name: "Keep Mixed Probe / bad" }),
     ).toBeChecked();
     fireEvent.click(
-      screen.getByRole("checkbox", { name: "保留 Mixed Probe / bad" }),
+      screen.getByRole("checkbox", { name: "Keep Mixed Probe / bad" }),
     );
-    fireEvent.click(screen.getByRole("button", { name: "下一步" }));
-    expect(screen.getByRole("heading", { name: "选择模型" })).toBeVisible();
-    fireEvent.click(screen.getByRole("button", { name: "保存并启用" }));
-    fireEvent.click(screen.getByRole("button", { name: "保存并发布" }));
+    fireEvent.click(screen.getByRole("button", { name: "Next" }));
+    expect(
+      screen.getByRole("heading", { name: "Choose models" }),
+    ).toBeVisible();
+    fireEvent.click(screen.getByRole("button", { name: "Save and enable" }));
+    fireEvent.click(screen.getByRole("button", { name: "Save and publish" }));
     await waitFor(() => expect(commitCodexProviderSetBatch).toHaveBeenCalled());
     const sources = commitCodexProviderSetBatch.mock.calls.at(-1)![0];
     expect(sources[0].provider.name).toBe("Renamed Probe");
@@ -796,13 +847,13 @@ describe("CodexMultiRouterWizard", () => {
     expect(
       source.settingsConfig.modelCatalog.models[1].enabled,
     ).toBeUndefined();
-    await screen.findByText("状态机：published");
+    await screen.findByText("State machine:published");
     const committed =
       await commitCodexProviderSetBatch.mock.results.at(-1)!.value;
     // A query can still render its previous snapshot before the save refetch arrives.
     rerenderWizard(true, [{ ...source, name: "Renamed Probe" }]);
     expect(
-      screen.getByRole("button", { name: "启用这个多路路由" }),
+      screen.getByRole("button", { name: "Enable this multi-route plan" }),
     ).toBeEnabled();
     rerenderWizard(true, [
       ...committed.sourceSnapshots.map(
@@ -811,9 +862,11 @@ describe("CodexMultiRouterWizard", () => {
       committed.router,
     ]);
     expect(
-      screen.getByRole("button", { name: "启用这个多路路由" }),
+      screen.getByRole("button", { name: "Enable this multi-route plan" }),
     ).toBeEnabled();
-    expect(screen.queryByText("当前步骤暂不可编辑")).not.toBeInTheDocument();
+    expect(
+      screen.queryByText("This step cannot be edited yet"),
+    ).not.toBeInTheDocument();
     const savedSource = committed.sourceSnapshots[0].logicalProvider;
     rerenderWizard(true, [
       {
@@ -826,7 +879,7 @@ describe("CodexMultiRouterWizard", () => {
       committed.router,
     ]);
     expect(
-      screen.getByRole("button", { name: "启用这个多路路由" }),
+      screen.getByRole("button", { name: "Enable this multi-route plan" }),
     ).toBeDisabled();
   });
 
@@ -844,10 +897,14 @@ describe("CodexMultiRouterWizard", () => {
     const a = makeSource("source-a");
     const b = makeSource("source-b");
     const { rerenderWizard } = renderWizard([a, b]);
-    fireEvent.click(screen.getByRole("button", { name: "协议深探测" }));
-    fireEvent.click(screen.getByRole("button", { name: "开始兼容性深度探测" }));
-    fireEvent.click(screen.getByRole("button", { name: "确认测试" }));
-    await screen.findByText("状态机：connectivityPartial");
+    fireEvent.click(
+      screen.getByRole("button", { name: "Protocol deep probe" }),
+    );
+    fireEvent.click(
+      screen.getByRole("button", { name: "Start compatibility deep probe" }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Confirm test" }));
+    await screen.findByText("State machine:connectivityPartial");
     rerenderWizard(false);
     const changed = {
       ...a,
@@ -857,24 +914,34 @@ describe("CodexMultiRouterWizard", () => {
       },
     };
     rerenderWizard(true, [changed, b]);
-    fireEvent.click(screen.getByRole("button", { name: "协议深探测" }));
+    fireEvent.click(
+      screen.getByRole("button", { name: "Protocol deep probe" }),
+    );
     expect(
-      screen.getByText(/模型源配置已修改，旧探测结果已失效/),
+      screen.getByText(
+        /The model source changed, so previous probe results are stale/,
+      ),
     ).toBeVisible();
     expect(
-      screen.getByRole("checkbox", { name: "保留 source-b / *" }),
+      screen.getByRole("checkbox", { name: "Keep source-b / *" }),
     ).toBeChecked();
-    fireEvent.click(screen.getByRole("button", { name: "取消所有失败模型" }));
     fireEvent.click(
-      screen.getByRole("checkbox", { name: "保留 source-b / *" }),
+      screen.getByRole("button", { name: "Deselect all failed models" }),
     );
-    fireEvent.click(screen.getByRole("button", { name: "下一步" }));
-    expect(screen.getByRole("heading", { name: "协议深探测" })).toBeVisible();
     fireEvent.click(
-      screen.getByRole("checkbox", { name: "保留 source-b / *" }),
+      screen.getByRole("checkbox", { name: "Keep source-b / *" }),
     );
-    fireEvent.click(screen.getByRole("button", { name: "下一步" }));
-    expect(screen.getByRole("heading", { name: "选择模型" })).toBeVisible();
+    fireEvent.click(screen.getByRole("button", { name: "Next" }));
+    expect(
+      screen.getByRole("heading", { name: "Protocol deep probe" }),
+    ).toBeVisible();
+    fireEvent.click(
+      screen.getByRole("checkbox", { name: "Keep source-b / *" }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Next" }));
+    expect(
+      screen.getByRole("heading", { name: "Choose models" }),
+    ).toBeVisible();
   });
 
   it("turns a missing batch probe source into a named failure instead of an all-zero summary", () => {
@@ -901,7 +968,8 @@ describe("CodexMultiRouterWizard", () => {
         providerName: "Qwen Local",
         status: "fail",
         canContinue: false,
-        detail: "后端没有返回该模型源的兼容性探测结果。",
+        detail:
+          "The backend returned no compatibility result for this model source.",
       }),
     ]);
   });
@@ -929,7 +997,7 @@ describe("CodexMultiRouterWizard", () => {
       screen.queryByRole("button", { name: /Sub-Agent V1/ }),
     ).not.toBeInTheDocument();
     expect(
-      screen.getByRole("button", { name: "Sub-Agent 与工具" }),
+      screen.getByRole("button", { name: "Sub-Agent and tools" }),
     ).toBeVisible();
   });
 
@@ -950,24 +1018,26 @@ describe("CodexMultiRouterWizard", () => {
     ]);
 
     for (const pageName of [
-      "开始配置",
-      "环境检查",
-      "模型源就绪",
-      "选择模型源",
-      "同步模型目录",
-      "协议深探测",
-      "选择模型",
-      "模型顺序",
-      "推理设置",
-      "Sub-Agent 与工具",
-      "路由确认",
-      "保存并启用",
-      "真实请求验收",
+      "Start setup",
+      "Environment check",
+      "Model source readiness",
+      "Choose model sources",
+      "Sync model catalogs",
+      "Protocol deep probe",
+      "Choose models",
+      "Model order",
+      "Reasoning settings",
+      "Sub-Agent and tools",
+      "Review routing",
+      "Save and enable",
+      "Real-request acceptance",
     ]) {
       expect(screen.getByRole("button", { name: pageName })).toBeVisible();
     }
     expect(
-      screen.getByText(/最终确认前不会启用或覆盖当前 Codex/),
+      screen.getByText(
+        /Current Codex configuration is not enabled or overwritten before final confirmation./,
+      ),
     ).toBeVisible();
   });
 
@@ -987,14 +1057,18 @@ describe("CodexMultiRouterWizard", () => {
       },
     ]);
 
-    fireEvent.click(screen.getByRole("button", { name: "协议深探测" }));
+    fireEvent.click(
+      screen.getByRole("button", { name: "Protocol deep probe" }),
+    );
 
-    const contract = screen.getByText(/每个普通 Provider\/模型会分别验证/);
-    expect(contract).toHaveTextContent("流式 SSE");
-    expect(contract).toHaveTextContent("推理语义");
-    expect(contract).toHaveTextContent("强制工具调用");
-    expect(contract).toHaveTextContent("工具结果续接");
-    expect(screen.queryByText(/浅探测|1024/)).not.toBeInTheDocument();
+    const contract = screen.getByText(
+      /Each standard provider\/model verifies Responses and Chat/,
+    );
+    expect(contract).toHaveTextContent("streaming SSE");
+    expect(contract).toHaveTextContent("reasoning semantics");
+    expect(contract).toHaveTextContent("forced tool calls");
+    expect(contract).toHaveTextContent("tool-result continuation");
+    expect(screen.queryByText(/shallow probe|1024/)).not.toBeInTheDocument();
   });
 
   it("previews a blocked future page without mutating workflow progress", () => {
@@ -1013,14 +1087,18 @@ describe("CodexMultiRouterWizard", () => {
       },
     ]);
 
-    expect(screen.getByText("状态机：opened")).toBeVisible();
+    expect(screen.getByText("State machine:opened")).toBeVisible();
 
-    fireEvent.click(screen.getByRole("button", { name: "保存并启用" }));
+    fireEvent.click(screen.getByRole("button", { name: "Save and enable" }));
 
-    expect(screen.getByRole("heading", { name: "保存并启用" })).toBeVisible();
-    expect(screen.getByText("当前步骤暂不可编辑")).toBeVisible();
-    expect(screen.getByText("状态机：opened")).toBeVisible();
-    expect(screen.queryByText("状态机：enablePrompt")).not.toBeInTheDocument();
+    expect(
+      screen.getByRole("heading", { name: "Save and enable" }),
+    ).toBeVisible();
+    expect(screen.getByText("This step cannot be edited yet")).toBeVisible();
+    expect(screen.getByText("State machine:opened")).toBeVisible();
+    expect(
+      screen.queryByText("State machine:enablePrompt"),
+    ).not.toBeInTheDocument();
   });
 
   it("counts only automatic models in the deep-probe progress denominator", async () => {
@@ -1067,23 +1145,35 @@ describe("CodexMultiRouterWizard", () => {
       },
     ]);
 
-    fireEvent.click(screen.getByRole("button", { name: "协议深探测" }));
-    fireEvent.click(screen.getByRole("button", { name: "开始兼容性深度探测" }));
-    fireEvent.click(screen.getByRole("button", { name: "确认测试" }));
+    fireEvent.click(
+      screen.getByRole("button", { name: "Protocol deep probe" }),
+    );
+    fireEvent.click(
+      screen.getByRole("button", { name: "Start compatibility deep probe" }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Confirm test" }));
 
-    expect(await screen.findByText(/正在验证模型 0\/2/)).toBeInTheDocument();
-    expect(screen.queryByText(/正在验证模型 0\/5/)).not.toBeInTheDocument();
+    expect(
+      await screen.findByText(/Validating models 0\/2;/),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByText(/Validating models 0\/5;/),
+    ).not.toBeInTheDocument();
     unmount();
   });
 
   it("keeps the final save entry visible when no model source exists", () => {
     renderWizard([]);
 
-    fireEvent.click(screen.getByRole("button", { name: "保存并启用" }));
+    fireEvent.click(screen.getByRole("button", { name: "Save and enable" }));
 
-    expect(screen.getByRole("button", { name: "保存并发布" })).toBeVisible();
-    expect(screen.getByText(/尚未选择模型源，保存入口仍保留/)).toBeVisible();
-    expect(screen.getByText("当前步骤暂不可编辑")).toBeVisible();
+    expect(
+      screen.getByRole("button", { name: "Save and publish" }),
+    ).toBeVisible();
+    expect(
+      screen.getByText(/No model source is selected\. Return to/),
+    ).toBeVisible();
+    expect(screen.getByText("This step cannot be edited yet")).toBeVisible();
   });
 
   it("coalesces rapid saves and updates the same plan after the first save", async () => {
@@ -1152,12 +1242,16 @@ describe("CodexMultiRouterWizard", () => {
     };
 
     renderWizard([source]);
-    fireEvent.click(screen.getByRole("button", { name: "协议深探测" }));
-    fireEvent.click(screen.getByRole("button", { name: "开始兼容性深度探测" }));
-    fireEvent.click(screen.getByRole("button", { name: "确认测试" }));
-    await screen.findByText("状态机：connectivityPartial");
-    fireEvent.click(screen.getByRole("button", { name: "保存并启用" }));
-    const saveButton = screen.getByRole("button", { name: "保存并发布" });
+    fireEvent.click(
+      screen.getByRole("button", { name: "Protocol deep probe" }),
+    );
+    fireEvent.click(
+      screen.getByRole("button", { name: "Start compatibility deep probe" }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Confirm test" }));
+    await screen.findByText("State machine:connectivityPartial");
+    fireEvent.click(screen.getByRole("button", { name: "Save and enable" }));
+    const saveButton = screen.getByRole("button", { name: "Save and publish" });
 
     fireEvent.click(saveButton);
     fireEvent.click(saveButton);
@@ -1183,10 +1277,10 @@ describe("CodexMultiRouterWizard", () => {
       projectionErrorCode: null,
     });
     await waitFor(() =>
-      expect(screen.getByText("状态机：published")).toBeVisible(),
+      expect(screen.getByText("State machine:published")).toBeVisible(),
     );
 
-    fireEvent.click(screen.getByRole("button", { name: "保存并发布" }));
+    fireEvent.click(screen.getByRole("button", { name: "Save and publish" }));
     await waitFor(() =>
       expect(commitCodexProviderSetBatch).toHaveBeenCalledTimes(2),
     );
@@ -1216,9 +1310,9 @@ describe("CodexMultiRouterWizard", () => {
       },
     ]);
 
-    expect(screen.queryByText("子 Agent 候选")).not.toBeInTheDocument();
+    expect(screen.queryByText("Sub-Agent candidates")).not.toBeInTheDocument();
     expect(
-      screen.queryByText(/选择并排序最多 5 个子 Agent 候选模型/),
+      screen.queryByText(/Choose and order up to 5 Sub-Agent candidate models/),
     ).not.toBeInTheDocument();
   });
 
@@ -1241,9 +1335,9 @@ describe("CodexMultiRouterWizard", () => {
       { mode: "edit", planId: "router-b" },
     );
 
-    expect(screen.getByText("正在编辑：目标方案 B")).toBeVisible();
+    expect(screen.getByText("Editing: 目标方案 B")).toBeVisible();
     expect(screen.getByText("router-b")).toBeVisible();
-    expect(screen.queryByText("正在编辑：旧方案 A")).not.toBeInTheDocument();
+    expect(screen.queryByText("Editing: 旧方案 A")).not.toBeInTheDocument();
   });
 
   it("selects only the Providers referenced by an existing schema-v2 plan", () => {
@@ -1281,16 +1375,20 @@ describe("CodexMultiRouterWizard", () => {
 
     renderWizard([used, unused, plan], { mode: "edit", planId: plan.id });
 
-    fireEvent.click(screen.getByRole("button", { name: "选择模型源" }));
-    expect(screen.getByText(/已选择 1 \/ 2/)).toBeVisible();
+    fireEvent.click(
+      screen.getByRole("button", { name: "Choose model sources" }),
+    );
+    expect(
+      screen.getByText(/Selected 1 \/ 2 Codex providers as sources/),
+    ).toBeVisible();
     expect(
       screen.getByRole("checkbox", {
-        name: "使用 Used source 作为模型源",
+        name: "Use Used source as a model source",
       }),
     ).toBeChecked();
     expect(
       screen.getByRole("checkbox", {
-        name: "使用 Unused source 作为模型源",
+        name: "Use Unused source as a model source",
       }),
     ).not.toBeChecked();
   });
@@ -1324,7 +1422,7 @@ describe("CodexMultiRouterWizard", () => {
 
     expect(
       await screen.findByRole("heading", {
-        name: "编辑前迁移旧 MultiRouter",
+        name: "Migrate legacy MultiRouter before editing",
       }),
     ).toBeVisible();
     expect(providersApi.getCodexMultiRouterRevision).toHaveBeenCalledWith(
@@ -1348,13 +1446,15 @@ describe("CodexMultiRouterWizard", () => {
       },
     ]);
 
-    fireEvent.click(screen.getByRole("button", { name: "选择模型源" }));
+    fireEvent.click(
+      screen.getByRole("button", { name: "Choose model sources" }),
+    );
     expect(screen.queryByText("OpenAI Hosted Tools")).not.toBeInTheDocument();
     expect(
-      screen.queryByLabelText("Third party source API 格式"),
+      screen.queryByLabelText("Third party source API format"),
     ).not.toBeInTheDocument();
     expect(
-      screen.getByRole("button", { name: "配置 Third party source" }),
+      screen.getByRole("button", { name: "Configure Third party source" }),
     ).toBeVisible();
   });
 
@@ -1381,12 +1481,16 @@ describe("CodexMultiRouterWizard", () => {
       },
     ]);
 
-    fireEvent.click(screen.getByRole("button", { name: "模型源就绪" }));
-    expect(screen.getByText(/认证：API Key 已配置/)).toBeVisible();
-    expect(screen.getByText(/模型目录：1 个/)).toBeVisible();
-    expect(screen.getByText(/协议：openai_responses/)).toBeVisible();
-    expect(screen.getByText(/能力：1\/1 个模型有能力摘要/)).toBeVisible();
-    expect(screen.getByText(/工具\/投影：/)).toBeVisible();
+    fireEvent.click(
+      screen.getByRole("button", { name: "Model source readiness" }),
+    );
+    expect(screen.getByText(/Auth: API key configured/)).toBeVisible();
+    expect(screen.getByText(/Model catalog: 1/)).toBeVisible();
+    expect(screen.getByText(/Protocol: openai_responses/)).toBeVisible();
+    expect(
+      screen.getByText(/Capabilities: 1\/1 models have capability summaries/),
+    ).toBeVisible();
+    expect(screen.getByText(/Tools\/projection:/)).toBeVisible();
   });
 
   it("reviews schema v2 route policy without inherited endpoint, protocol, or capabilities", () => {
@@ -1412,11 +1516,11 @@ describe("CodexMultiRouterWizard", () => {
       },
     ]);
 
-    fireEvent.click(screen.getByRole("button", { name: "路由确认" }));
+    fireEvent.click(screen.getByRole("button", { name: "Review routing" }));
 
     const providerBadge = screen.getByTitle("Provider ID: qwen-provider");
     expect(providerBadge).toHaveTextContent("Qwen Provider");
-    expect(screen.getByText(/Route 不保存这些字段/)).toBeVisible();
+    expect(screen.getByText(/routes do not store these fields/)).toBeVisible();
     expect(screen.queryByText("openai_chat")).not.toBeInTheDocument();
     expect(screen.queryByText("openai_responses")).not.toBeInTheDocument();
     expect(
@@ -1458,10 +1562,10 @@ describe("CodexMultiRouterWizard", () => {
     );
     const view = render(wizard([source]));
 
-    fireEvent.click(screen.getByRole("button", { name: "选择模型" }));
+    fireEvent.click(screen.getByRole("button", { name: "Choose models" }));
     expect(
       screen.queryByRole("checkbox", {
-        name: "保留 deepseek-v4-flash-vision-exp",
+        name: "Keep deepseek-v4-flash-vision-exp",
       }),
     ).not.toBeInTheDocument();
 
@@ -1489,7 +1593,7 @@ describe("CodexMultiRouterWizard", () => {
 
     expect(
       screen.getByRole("checkbox", {
-        name: "保留 deepseek-v4-flash-vision-exp",
+        name: "Keep deepseek-v4-flash-vision-exp",
       }),
     ).toBeChecked();
     expect(screen.getAllByText("1000000 ctx")).toHaveLength(3);

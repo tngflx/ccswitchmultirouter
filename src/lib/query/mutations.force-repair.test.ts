@@ -16,8 +16,8 @@ describe("provider switch force repair action", () => {
       t: (_key, fallback) => fallback,
     });
 
-    expect(options.action?.label).toBe("复制");
-    expect(options.cancel?.label).toBe("强制覆盖");
+    expect(options.action?.label).toBe("Copy");
+    expect(options.cancel?.label).toBe("Force repair");
     options.action?.onClick();
     await options.cancel?.onClick();
     expect(copy).toHaveBeenCalledWith(
@@ -36,7 +36,7 @@ describe("provider switch force repair action", () => {
       t: (_key, fallback) => fallback,
     });
 
-    expect(options.action?.label).toBe("复制");
+    expect(options.action?.label).toBe("Copy");
     expect(options.cancel).toBeUndefined();
   });
 });

@@ -19,7 +19,7 @@ describe("CodexCompatibilitySummary", () => {
       />,
     );
     expect(
-      screen.queryByText(/上游没有可展示的推理正文/),
+      screen.queryByText(/The upstream returned no displayable reasoning text/),
     ).not.toBeInTheDocument();
   });
   it("does not call native opaque reasoning repaired or invent visible thinking", () => {
@@ -37,12 +37,18 @@ describe("CodexCompatibilitySummary", () => {
         selected
       />,
     );
-    expect(screen.getByText("本次检查通过")).toBeInTheDocument();
-    expect(screen.queryByText("适配后通过")).not.toBeInTheDocument();
+    expect(screen.getByText("This check passed")).toBeInTheDocument();
     expect(
-      screen.getByText(/不会生成、解密或伪造思考内容/),
+      screen.queryByText("Passed after adaptation"),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.getByText(
+        /does not generate, decrypt, or fabricate thinking content/,
+      ),
     ).toBeInTheDocument();
-    expect(screen.getByText(/不是当前配置已生效的凭证/)).toBeInTheDocument();
+    expect(
+      screen.getByText(/not proof that the current configuration is active/),
+    ).toBeInTheDocument();
   });
   it("does not infer a repair from an in-flight baseline request", () => {
     render(
@@ -59,10 +65,14 @@ describe("CodexCompatibilitySummary", () => {
         selected={false}
       />,
     );
-    expect(screen.getByText("正在检测响应与协议差异")).toBeInTheDocument();
-    expect(screen.queryByText("正在自动适配并重试")).not.toBeInTheDocument();
     expect(
-      screen.queryByText(/上游使用 Chat 响应结构/),
+      screen.getByText("Checking response and protocol differences"),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByText("Automatically adapting and retrying"),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByText(/The upstream uses the Chat response shape/),
     ).not.toBeInTheDocument();
   });
 });

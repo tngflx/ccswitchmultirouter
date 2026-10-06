@@ -223,7 +223,7 @@ export function useProviderActions(
           });
         } else if (isCodexRouterProvider) {
           proxyRequiredReason = t("notifications.proxyReasonCodexRouter", {
-            defaultValue: "使用 Codex 多模型路由",
+            defaultValue: "Use Codex multi-model routing",
           });
         } else if (isOAuthProviderType(provider.meta?.providerType)) {
           // 托管 OAuth（codex_oauth / xai_oauth 等）：凭据由本地代理注入，
@@ -329,29 +329,31 @@ export function useProviderActions(
         const shouldShowSuccess = !proxyRequiredReason || activeApp === "codex";
         if (shouldShowSuccess) {
           let messageKey = "notifications.switchSuccess";
-          let defaultMessage = "切换成功";
+          let defaultMessage = "Switched successfully";
           if (activeApp === "codex") {
             messageKey = isCodexRouterProvider
               ? "notifications.codexRouterRestartRequired"
               : "notifications.codexRestartRequired";
             defaultMessage = isCodexRouterProvider
-              ? "已启用 Codex Multi Router，请保持 CC Switch 运行，并完全重启或新开 Codex 会话后生效"
-              : "切换成功，请重启客户端以生效";
+              ? "Codex MultiRouter is enabled. Keep CC Switch running, then fully restart Codex or open a new session."
+              : "Switched successfully. Restart your client to apply the change.";
           } else if (activeApp === "grokbuild") {
             messageKey = "notifications.grokBuildRestartRequired";
-            defaultMessage = "切换成功，请重启 Grok Build 以生效";
+            defaultMessage =
+              "Switched successfully. Restart Grok Build to apply the change.";
           } else if (activeApp === "claude-desktop") {
             if (provider.meta?.claudeDesktopMode === "proxy") {
               messageKey = "notifications.claudeDesktopProxyRestartRequired";
               defaultMessage =
-                "切换成功，请保持 CC Switch 运行，并重启 Claude Desktop 后生效";
+                "Switched successfully. Keep CC Switch running and restart Claude Desktop to apply the change.";
             } else {
               messageKey = "notifications.claudeDesktopRestartRequired";
-              defaultMessage = "切换成功，重启 Claude Desktop 后生效";
+              defaultMessage =
+                "Switched successfully. Restart Claude Desktop to apply the change.";
             }
           } else if (activeApp === "opencode" || activeApp === "openclaw") {
             messageKey = "notifications.addToConfigSuccess";
-            defaultMessage = "已添加到配置";
+            defaultMessage = "Added to configuration";
           }
           toast.success(t(messageKey, { defaultValue: defaultMessage }), {
             closeButton: true,
@@ -361,7 +363,11 @@ export function useProviderActions(
         return { ok: true, result };
       } catch (error) {
         // 错误提示由 mutation 处理
-        const detail = extractErrorMessage(error) || "切换供应商失败";
+        const detail =
+          extractErrorMessage(error) ||
+          t("notifications.switchFailed", {
+            defaultValue: "Failed to switch provider",
+          });
         return {
           ok: false,
           error: error instanceof Error ? error : new Error(detail),

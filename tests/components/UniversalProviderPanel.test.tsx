@@ -211,7 +211,7 @@ describe("UniversalProviderPanel Provider Set persistence", () => {
       "confirm_manual",
     );
     expect(toastMocks.success).toHaveBeenCalledWith(
-      expect.stringContaining("未经深度验证"),
+      expect.stringContaining("has not been deeply verified"),
     );
   });
 
@@ -222,7 +222,9 @@ describe("UniversalProviderPanel Provider Set persistence", () => {
       screen.getByRole("button", { name: "invoke-save-and-sync" }),
     );
     expect(protocolMocks.preflight).not.toHaveBeenCalled();
-    fireEvent.click(await screen.findByRole("button", { name: "确认测试" }));
+    fireEvent.click(
+      await screen.findByRole("button", { name: "Confirm test" }),
+    );
 
     await waitFor(() => expect(callbackOutcome.resolved).toHaveBeenCalled());
     expect(protocolMocks.preflight).toHaveBeenCalledWith(
@@ -272,13 +274,15 @@ describe("UniversalProviderPanel Provider Set persistence", () => {
     fireEvent.click(
       screen.getByRole("button", { name: "invoke-save-and-sync" }),
     );
-    fireEvent.click(await screen.findByRole("button", { name: "确认测试" }));
+    fireEvent.click(
+      await screen.findByRole("button", { name: "Confirm test" }),
+    );
 
     await waitFor(() => expect(callbackOutcome.resolved).toHaveBeenCalled());
     expect(toastMocks.warning).toHaveBeenCalledWith(
-      expect.stringContaining("已保存"),
+      expect.stringContaining("was saved"),
       expect.objectContaining({
-        action: expect.objectContaining({ label: "重新投影" }),
+        action: expect.objectContaining({ label: "Reproject" }),
       }),
     );
     expect(toastMocks.success).not.toHaveBeenCalled();
@@ -331,7 +335,9 @@ describe("UniversalProviderPanel Provider Set persistence", () => {
     fireEvent.click(
       screen.getByRole("button", { name: "invoke-save-and-sync" }),
     );
-    fireEvent.click(await screen.findByRole("button", { name: "确认测试" }));
+    fireEvent.click(
+      await screen.findByRole("button", { name: "Confirm test" }),
+    );
 
     await waitFor(() => expect(callbackOutcome.resolved).toHaveBeenCalled());
     expect(protocolMocks.commit).toHaveBeenCalledTimes(1);
@@ -342,7 +348,7 @@ describe("UniversalProviderPanel Provider Set persistence", () => {
       "accept_auto",
     );
     expect(
-      screen.queryByRole("button", { name: "确认按协议拆分" }),
+      screen.queryByRole("button", { name: "Confirm split" }),
     ).not.toBeInTheDocument();
     expect(apiMocks.saveAndSync).not.toHaveBeenCalled();
   });
@@ -370,14 +376,16 @@ describe("UniversalProviderPanel Provider Set persistence", () => {
     fireEvent.click(
       screen.getByRole("button", { name: "invoke-save-and-sync" }),
     );
-    fireEvent.click(await screen.findByRole("button", { name: "确认测试" }));
+    fireEvent.click(
+      await screen.findByRole("button", { name: "Confirm test" }),
+    );
 
     const dialog = await screen.findByRole("dialog", {
-      name: "暂时无法保存",
+      name: "Cannot save yet",
     });
     expect(protocolMocks.commit).not.toHaveBeenCalled();
     fireEvent.click(
-      within(dialog).getByRole("button", { name: "返回调整模型" }),
+      within(dialog).getByRole("button", { name: "Back to adjust models" }),
     );
 
     await waitFor(() => expect(callbackOutcome.rejected).toHaveBeenCalled());
@@ -393,17 +401,21 @@ describe("UniversalProviderPanel Provider Set persistence", () => {
     fireEvent.click(
       screen.getByRole("button", { name: "invoke-save-and-sync" }),
     );
-    fireEvent.click(await screen.findByRole("button", { name: "确认测试" }));
+    fireEvent.click(
+      await screen.findByRole("button", { name: "Confirm test" }),
+    );
 
     const dialog = await screen.findByRole("dialog", {
-      name: "Codex 兼容性深度探测",
+      name: "Codex deep compatibility probe",
     });
     expect(within(dialog).getByRole("alert")).toHaveTextContent(
       "database failure",
     );
     expect(callbackOutcome.rejected).not.toHaveBeenCalled();
 
-    fireEvent.click(within(dialog).getByRole("button", { name: "重新探测" }));
+    fireEvent.click(
+      within(dialog).getByRole("button", { name: "Probe again" }),
+    );
 
     await waitFor(() => expect(callbackOutcome.resolved).toHaveBeenCalled());
     expect(protocolMocks.preflight).toHaveBeenCalledTimes(2);

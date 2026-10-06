@@ -4,6 +4,7 @@ import { Button } from "@/components/ui/button";
 import type { ManagedAuthAccount } from "@/lib/api/auth";
 import type { CodexOfficialAuthMigrationStatus } from "@/lib/api/providers";
 import type { CodexOfficialAuthConfig, CodexOfficialAuthMode } from "@/types";
+import i18n from "@/i18n";
 
 interface CodexOfficialAuthSectionProps {
   value: CodexOfficialAuthConfig;
@@ -22,7 +23,12 @@ export function validateCodexOfficialAuthSelection(
   const usable = accounts.some(
     (account) => account.id === accountId && !account.requires_reauth,
   );
-  return usable ? null : "所选 CCSM OAuth 账号不存在或需要重新登录";
+  return usable
+    ? null
+    : i18n.t("codexProviderUi.accountUnavailable", {
+        defaultValue:
+          "The selected CCSM OAuth account is missing or requires sign-in again",
+      });
 }
 
 export function CodexOfficialAuthSection({

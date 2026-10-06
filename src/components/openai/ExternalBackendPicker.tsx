@@ -8,6 +8,8 @@ import {
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
+import { useTranslation } from "react-i18next";
+import type { TFunction } from "i18next";
 import type { ExternalOpenAIAPIBackendOption } from "@/types/proxy";
 import {
   describeBackendTarget,
@@ -26,11 +28,11 @@ export function ExternalBackendPicker({
   selectedKey: string;
   onSelect: (key: string) => void;
 }) {
+  const { t } = useTranslation();
   if (groups.length === 0) {
     return (
       <div className="rounded-lg border border-dashed border-border bg-muted/40 p-5 text-sm text-muted-foreground dark:border-slate-700 dark:bg-slate-950/40 dark:text-slate-400">
-        还没有可作为 OpenAI-compatible API 的服务来源。先添加 OpenAI-compatible
-        模型源，或配置 OpenAI 官方登录。
+        {t("externalApi.source.empty")}
       </div>
     );
   }
@@ -44,7 +46,7 @@ export function ExternalBackendPicker({
               {group.label}
             </div>
             <Badge className={groupBadgeClass(group.tone)}>
-              {group.options.length} 个来源
+              {t("externalApi.source.count", { count: group.options.length })}
             </Badge>
           </div>
           <div className="grid gap-2 xl:grid-cols-2">
@@ -76,7 +78,8 @@ function BackendSourceCard({
   selected: boolean;
   onSelect: () => void;
 }) {
-  const details = describeBackendTarget(option);
+  const { t } = useTranslation();
+  const details = describeBackendTarget(option, t);
   const Icon = option.isManagedOAuth
     ? LockKeyhole
     : option.backendType === "codex_router_route" ||
@@ -105,7 +108,7 @@ function BackendSourceCard({
               {option.label}
             </div>
             <div className="mt-1 truncate text-xs text-muted-foreground dark:text-slate-400">
-              {displayBackendDescription(option.description)}
+              {displayBackendDescription(option.description, t)}
             </div>
           </div>
         </div>
@@ -122,7 +125,11 @@ function BackendSourceCard({
               : "bg-muted text-muted-foreground dark:bg-slate-500/15 dark:text-slate-300"
           }
         >
-          {option.available ? "可接入" : "需补配置"}
+          {t(
+            option.available
+              ? "externalApi.source.available"
+              : "externalApi.source.needsSetup",
+          )}
         </Badge>
         <Badge variant="outline">{details.kind}</Badge>
         <Badge variant="outline">{details.modelSource}</Badge>
@@ -130,7 +137,7 @@ function BackendSourceCard({
 
       {!option.available && option.error && (
         <div className="mt-2 rounded-md border border-amber-200 bg-amber-50 px-2 py-1.5 text-xs leading-5 text-amber-800 dark:border-amber-500/30 dark:bg-amber-500/10 dark:text-amber-100">
-          {translateBackendError(option.error)}
+          {translateBackendError(option.error, t)}
         </div>
       )}
     </button>
@@ -147,22 +154,42 @@ export function SelectedBackendSummary({
   description: BackendTargetDescription;
   hasDraftChanges: boolean;
 }) {
+  const { t } = useTranslation();
   return (
     <div className="rounded-lg border border-blue-200 bg-blue-50/70 p-4 dark:border-blue-700/40 dark:bg-blue-950/15">
       <div className="mb-3 flex items-center justify-between gap-2">
         <div className="text-sm font-semibold text-foreground dark:text-slate-100">
-          对外服务来源
+          {t("externalApi.source.summary")}
         </div>
         <Badge variant={hasDraftChanges ? "outline" : "secondary"}>
-          {hasDraftChanges ? "待保存" : "已保存"}
+          {t(
+            hasDraftChanges
+              ? "externalApi.source.pending"
+              : "externalApi.source.saved",
+          )}
         </Badge>
       </div>
       <div className="space-y-2 text-xs text-muted-foreground dark:text-slate-400">
-        <SummaryLine label="来源" value={backend?.label ?? "未选择"} />
-        <SummaryLine label="类型" value={description.kind} />
-        <SummaryLine label="路径" value={description.protocol} />
-        <SummaryLine label="认证" value={description.auth} />
-        <SummaryLine label="模型" value={description.modelSource} />
+        <SummaryLine
+          label={t("externalApi.source.label")}
+          value={backend?.label ?? t("externalApi.source.notSelected")}
+        />
+        <SummaryLine
+          label={t("externalApi.source.kind")}
+          value={description.kind}
+        />
+        <SummaryLine
+          label={t("externalApi.source.path")}
+          value={description.protocol}
+        />
+        <SummaryLine
+          label={t("externalApi.source.auth")}
+          value={description.auth}
+        />
+        <SummaryLine
+          label={t("externalApi.source.model")}
+          value={description.modelSource}
+        />
       </div>
       <div className="mt-3 flex flex-wrap gap-1.5">
         {description.compatibility.map((item) => (
@@ -173,7 +200,7 @@ export function SelectedBackendSummary({
       </div>
       {backend && !backend.available && (
         <Button disabled className="mt-3 w-full">
-          当前来源需要补配置，不能启用
+          {t("externalApi.source.cannotEnable")}
         </Button>
       )}
     </div>
@@ -246,23 +273,23 @@ function cardToneClass(
   return selected ? selectedClasses : idleClasses;
 }
 
-function translateBackendError(error: string): string {
+function translateBackendError(error: string, t: TFunction): string {
   if (error.includes("native protocol")) {
-    return "这是 Claude/Gemini 等原生协议配置，不能直接伪装成 OpenAI v1 API。";
+    return t("externalApi.source.errors.native");
   }
   if (error.includes("no usable base URL or credential")) {
-    return "缺少可用的 Base URL 或凭据。补齐后才能作为第三方 Agent 的模型来源。";
+    return t("externalApi.source.errors.credentials");
   }
   if (error.includes("route needs managed OAuth")) {
-    return "这条路由缺少托管 OAuth、路由 API Key 或可继承的模型源凭据。";
+    return t("externalApi.source.errors.routeAuth");
   }
   if (error.includes("route target provider not found")) {
-    return "这条路由引用的目标 Provider 已不存在，请回到 MultiRouter 修复或删除该路由。";
+    return t("externalApi.source.errors.routeMissing");
   }
   if (
     error.includes("route target provider has no usable base URL or credential")
   ) {
-    return "这条路由引用的目标 Provider 缺少可用的 Base URL 或凭据。";
+    return t("externalApi.source.errors.routeCredentials");
   }
   return error;
 }

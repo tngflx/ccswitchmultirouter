@@ -1,7 +1,9 @@
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { I18nextProvider } from "react-i18next";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { codexEgressTimezoneApi } from "@/lib/api/codexEgressTimezone";
+import { createLocalizedTestI18n } from "../../../tests/utils/localizedTestI18n";
 import { CodexEgressTimezoneStatusCard } from "./CodexEgressTimezoneStatusCard";
 
 vi.mock("@/lib/api/codexEgressTimezone", () => ({
@@ -30,14 +32,21 @@ describe("CodexEgressTimezoneStatusCard", () => {
       restartRequired: false,
     });
 
-    render(<CodexEgressTimezoneStatusCard />);
+    const i18n = await createLocalizedTestI18n();
+    render(
+      <I18nextProvider i18n={i18n}>
+        <CodexEgressTimezoneStatusCard />
+      </I18nextProvider>,
+    );
 
     expect(
-      await screen.findByText("Codex 出口环境自动监测"),
+      await screen.findByText("Codex egress environment monitoring"),
     ).toBeInTheDocument();
-    expect(screen.getByText("监测正常")).toBeInTheDocument();
+    expect(screen.getByText("Monitoring healthy")).toBeInTheDocument();
     expect(screen.getByText(/Asia\/Taipei/)).toBeInTheDocument();
-    expect(screen.getByText(/每 15 分钟/)).toBeInTheDocument();
+    expect(
+      screen.getByText(/fallback check every 15 minutes/),
+    ).toBeInTheDocument();
   });
 
   it("shows a safe-refresh warning and can recheck without requiring CDP", async () => {
@@ -60,22 +69,27 @@ describe("CodexEgressTimezoneStatusCard", () => {
       restartRequired,
     );
 
+    const i18n = await createLocalizedTestI18n();
     render(
-      <CodexEgressTimezoneStatusCard onOpenCodexStatus={onOpenCodexStatus} />,
+      <I18nextProvider i18n={i18n}>
+        <CodexEgressTimezoneStatusCard onOpenCodexStatus={onOpenCodexStatus} />
+      </I18nextProvider>,
     );
     expect(
-      await screen.findByText("出口已变化，需要刷新 Codex"),
+      await screen.findByText("Egress changed; refresh Codex"),
     ).toBeInTheDocument();
 
-    fireEvent.click(screen.getByRole("button", { name: "打开安全刷新" }));
+    fireEvent.click(screen.getByRole("button", { name: "Open safe refresh" }));
     expect(onOpenCodexStatus).toHaveBeenCalledOnce();
 
-    fireEvent.click(screen.getByRole("button", { name: "立即检测" }));
+    fireEvent.click(screen.getByRole("button", { name: "Check now" }));
     await waitFor(() =>
       expect(
         codexEgressTimezoneApi.triggerAutomaticProbe,
       ).toHaveBeenCalledOnce(),
     );
-    expect(screen.getByText(/检测本身不依赖 CDP/)).toBeInTheDocument();
+    expect(
+      screen.getByText(/Detection does not depend on CDP/),
+    ).toBeInTheDocument();
   });
 });

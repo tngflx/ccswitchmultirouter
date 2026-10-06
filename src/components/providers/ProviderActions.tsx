@@ -273,13 +273,15 @@ export function ProviderActions({
           type="button"
           size="sm"
           variant="outline"
-          aria-label="认证设置"
+          aria-label={t("codexProviderUi.authSettings", {
+            defaultValue: "Authentication settings",
+          })}
           onClick={onOfficialAuthSettings}
           className="opacity-100 gap-1.5 whitespace-nowrap"
         >
           <ShieldCheck className="h-4 w-4" />
           {t("codexOfficialAuth.settingsAction", {
-            defaultValue: "认证设置",
+            defaultValue: "Authentication settings",
           })}
         </Button>
       ) : null}

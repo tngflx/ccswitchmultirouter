@@ -119,7 +119,7 @@ describe("CodexOAuthSection", () => {
     });
 
     renderWithQueryClient(<CodexOAuthSection />);
-    screen.getByRole("button", { name: "重新认证" }).click();
+    screen.getByRole("button", { name: "Re-authenticate" }).click();
 
     expect(mocks.reauthAccount).toHaveBeenCalledWith("legacy-local-id");
   });
@@ -149,7 +149,9 @@ describe("CodexOAuthSection", () => {
     renderWithQueryClient(<CodexOAuthSection />);
 
     expect(
-      screen.getByText("该 ChatGPT 账号已经存在，无需重复添加。"),
+      screen.getByText(
+        "This ChatGPT account already exists; it does not need to be added again.",
+      ),
     ).toBeInTheDocument();
     expect(
       screen.queryByText("codex_oauth_duplicate_account"),

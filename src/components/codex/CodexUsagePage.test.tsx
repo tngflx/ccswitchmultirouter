@@ -174,19 +174,25 @@ describe("CodexUsagePage", () => {
 
     render(<CodexUsagePage />);
 
-    expect(screen.getByText("Codex 用量与重置额度")).toBeInTheDocument();
-    expect(screen.getByText("使用引导")).toBeInTheDocument();
-    expect(screen.getByText("从 Codex 工具栏进入")).toBeInTheDocument();
-    expect(screen.getByText("按窗口和到期时间决策")).toBeInTheDocument();
-    expect(screen.getByText("5 小时窗口")).toBeInTheDocument();
-    expect(screen.getByText("每周窗口")).toBeInTheDocument();
-    expect(screen.getByText("已存 reset 额度")).toBeInTheDocument();
-    expect(screen.getByText("2 个可用")).toBeInTheDocument();
-    expect(screen.getByText("Banked reset")).toBeInTheDocument();
-    expect(screen.getByText(/Reset credit 明细读取不完整/)).toBeInTheDocument();
-    expect(screen.getByText("本地消耗节奏")).toBeInTheDocument();
     expect(
-      screen.getByText(/暂无可分析的本地 Codex 使用记录/),
+      screen.getByText("Codex usage and reset credits"),
+    ).toBeInTheDocument();
+    expect(screen.getByText("Quick guide")).toBeInTheDocument();
+    expect(screen.getByText("Open from the Codex toolbar")).toBeInTheDocument();
+    expect(
+      screen.getByText("Decide using windows and expiry"),
+    ).toBeInTheDocument();
+    expect(screen.getByText("5-hour window")).toBeInTheDocument();
+    expect(screen.getByText("Weekly window")).toBeInTheDocument();
+    expect(screen.getByText("Stored reset credits")).toBeInTheDocument();
+    expect(screen.getByText("2 available")).toBeInTheDocument();
+    expect(screen.getByText("Banked reset")).toBeInTheDocument();
+    expect(
+      screen.getByText(/Reset credit details are incomplete/),
+    ).toBeInTheDocument();
+    expect(screen.getByText("Local usage pace")).toBeInTheDocument();
+    expect(
+      screen.getByText(/No local Codex usage records are available/),
     ).toBeInTheDocument();
   });
 
@@ -206,7 +212,7 @@ describe("CodexUsagePage", () => {
 
     render(<CodexUsagePage />);
 
-    expect(screen.getByText("Codex 登录不可用")).toBeInTheDocument();
+    expect(screen.getByText("Codex login unavailable")).toBeInTheDocument();
     expect(screen.getByText("未找到 Codex 登录文件")).toBeInTheDocument();
   });
 
@@ -259,11 +265,15 @@ describe("CodexUsagePage", () => {
 
     render(<CodexUsagePage />);
 
-    expect(screen.getByText("当前消耗速度")).toBeInTheDocument();
-    expect(screen.getByText("近 7 天模型分布")).toBeInTheDocument();
+    expect(screen.getByText("Current usage pace")).toBeInTheDocument();
+    expect(
+      screen.getByText("Model distribution over the last 7 days"),
+    ).toBeInTheDocument();
     expect(screen.getByText("gpt-5.6-terra")).toBeInTheDocument();
-    expect(screen.getByText("本地日志口径")).toBeInTheDocument();
-    expect(screen.getByText(/按当前节奏可能提前耗尽/)).toBeInTheDocument();
+    expect(screen.getByText("Local log scope")).toBeInTheDocument();
+    expect(
+      screen.getByText(/May deplete before reset at the current pace/),
+    ).toBeInTheDocument();
   });
 
   it("guides an unconfigured device and saves enforce only after acknowledgement", async () => {
@@ -285,18 +295,24 @@ describe("CodexUsagePage", () => {
     render(<CodexUsagePage />);
 
     expect(
-      screen.getByText("先在设置中启用 WebDAV 或 S3，才能同步其它设备。"),
+      screen.getByText(
+        "Enable WebDAV or S3 in Settings before syncing other devices.",
+      ),
     ).toBeInTheDocument();
     expect(
-      screen.getByText("1. 每台设备启用相同的 WebDAV 或 S3"),
+      screen.getByText("1. Enable the same WebDAV or S3 on each device"),
     ).toBeInTheDocument();
 
-    await user.click(screen.getByRole("button", { name: "约束" }));
-    expect(screen.getByText("启用约束模式？")).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Enforce" }));
+    expect(screen.getByText("Enable enforce mode?")).toBeInTheDocument();
     expect(
-      screen.getByText(/未经过 CCSwitchMulti 网关的请求不受此策略控制/),
+      screen.getByText(
+        /Native Codex App, CLI, or other requests outside this gateway are unaffected/,
+      ),
     ).toBeInTheDocument();
-    await user.click(screen.getByRole("button", { name: "我了解，启用约束" }));
+    await user.click(
+      screen.getByRole("button", { name: "I understand; enable enforce" }),
+    );
 
     await waitFor(() => {
       expect(mockedSettingsApi.save).toHaveBeenCalledWith(

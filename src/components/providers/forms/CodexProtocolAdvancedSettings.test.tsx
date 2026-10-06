@@ -20,9 +20,13 @@ describe("CodexProtocolAdvancedSettings", () => {
       />,
     );
 
-    expect(screen.getByText(/自动测试 Responses 与 Chat/)).toBeInTheDocument();
-    expect(screen.queryByText("工具 Schema")).not.toBeInTheDocument();
-    expect(screen.queryByText("Responses 历史续轮")).not.toBeInTheDocument();
+    expect(
+      screen.getByText(/CCSM tests Responses and Chat/),
+    ).toBeInTheDocument();
+    expect(screen.queryByText("Tool schema")).not.toBeInTheDocument();
+    expect(
+      screen.queryByText("Responses history continuation"),
+    ).not.toBeInTheDocument();
   });
 
   it("shows protocol-specific manual controls and an explicit risk warning", () => {
@@ -42,15 +46,25 @@ describe("CodexProtocolAdvancedSettings", () => {
       />,
     );
 
-    expect(screen.getByText("工具 Schema")).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("combobox", { name: "最终使用协议" }));
+    expect(screen.getByText("Tool schema")).toBeInTheDocument();
+    fireEvent.click(
+      screen.getByRole("combobox", { name: "Protocol used at runtime" }),
+    );
     fireEvent.click(screen.getByText("Responses"));
     expect(onApiFormatChange).toHaveBeenCalledWith("openai_responses");
-    expect(screen.getByText("Chat 推理展示")).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("combobox", { name: "Chat 推理展示" }));
-    expect(screen.queryByText("上游原生摘要")).not.toBeInTheDocument();
-    expect(screen.getByText(/固定写入 reasoning_content/)).toBeInTheDocument();
-    expect(screen.getByText(/可能造成 HTTP 400/)).toBeInTheDocument();
+    expect(screen.getByText("Chat reasoning display")).toBeInTheDocument();
+    fireEvent.click(
+      screen.getByRole("combobox", { name: "Chat reasoning display" }),
+    );
+    expect(
+      screen.queryByText("Native upstream summary"),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.getByText(
+        /Chat history continuation always writes reasoning_content/,
+      ),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/may cause HTTP 400/)).toBeInTheDocument();
 
     rerender(
       <CodexProtocolAdvancedSettings
@@ -66,7 +80,11 @@ describe("CodexProtocolAdvancedSettings", () => {
         onHistoryReplayChange={vi.fn()}
       />,
     );
-    expect(screen.getByText("Responses 历史续轮")).toBeInTheDocument();
-    expect(screen.queryByText("Chat 推理展示")).not.toBeInTheDocument();
+    expect(
+      screen.getByText("Responses history continuation"),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByText("Chat reasoning display"),
+    ).not.toBeInTheDocument();
   });
 });

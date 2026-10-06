@@ -230,11 +230,13 @@ describe("ProviderList Component", () => {
       />,
     );
 
-    fireEvent.click(screen.getByRole("button", { name: "配置多路模型" }));
+    fireEvent.click(
+      screen.getByRole("button", { name: "Configure multi-model routing" }),
+    );
 
     expect(handleStartWizard).toHaveBeenCalledTimes(1);
     expect(
-      screen.getByRole("button", { name: "切回 OpenAI 官方" }),
+      screen.getByRole("button", { name: "Switch back to OpenAI official" }),
     ).toBeInTheDocument();
   });
 
@@ -264,11 +266,13 @@ describe("ProviderList Component", () => {
     expect(
       screen.getByTestId("provider-card-codex-openai"),
     ).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: "配置多路模型" }));
+    fireEvent.click(
+      screen.getByRole("button", { name: "Configure multi-model routing" }),
+    );
 
     expect(handleStartWizard).toHaveBeenCalledTimes(1);
     expect(
-      screen.getByRole("button", { name: "切回 OpenAI 官方" }),
+      screen.getByRole("button", { name: "Switch back to OpenAI official" }),
     ).toBeInTheDocument();
   });
 

@@ -798,7 +798,9 @@ describe("ProviderForm Codex preset selection", () => {
         "glm-5.3,glm-5-turbo",
       );
     });
-    fireEvent.click(screen.getByRole("button", { name: "自定义模型源" }));
+    fireEvent.click(
+      screen.getByRole("button", { name: "Custom model source" }),
+    );
     expect(screen.getByTestId("codex-takeover")).toHaveTextContent("enabled");
     expect(
       screen.getByTestId("codex-menu-projection-editability"),

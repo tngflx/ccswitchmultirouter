@@ -45,41 +45,44 @@ export function CodexProtocolAdvancedSettings({
   return (
     <div className="space-y-3 rounded-md border border-border-default p-3">
       <p className="text-xs leading-relaxed text-muted-foreground">
-        这里编辑的是 CCSM
-        的协议与字段适配规则，不是修改模型服务本身或历史响应正文。
-        实际发现的差异、自动处理内容和验证结果，请查看探测详情中的“自动兼容处理”；
-        只有保存并启用后，后续请求才按最终配置处理。手动修改规则后需要重新验证。
+        Edit CCSM protocol and field adaptation rules here; this does not modify
+        the model service or historical response text. Review “Automatic
+        compatibility handling” in the probe details for detected differences,
+        automatic adaptations, and verification results. Changes apply to later
+        requests only after the provider is saved and enabled; re-run
+        verification after changing rules manually.
       </p>
       <div className="space-y-1.5">
-        <Label>协议配置方式</Label>
+        <Label>Protocol configuration</Label>
         <Select value={mode} onValueChange={onModeChange}>
-          <SelectTrigger aria-label="协议配置方式">
+          <SelectTrigger aria-label="Protocol configuration">
             <SelectValue />
           </SelectTrigger>
           <SelectContent>
-            <SelectItem value="auto">自动探测（推荐）</SelectItem>
-            <SelectItem value="manual">手动覆盖（高级）</SelectItem>
+            <SelectItem value="auto">Automatic probe (recommended)</SelectItem>
+            <SelectItem value="manual">Manual override (advanced)</SelectItem>
           </SelectContent>
         </Select>
       </div>
 
       {mode === "auto" ? (
         <p className="text-xs leading-relaxed text-muted-foreground">
-          保存前会自动测试 Responses 与 Chat、流式响应、工具调用和历史续轮；
-          “自动推荐”来自探测证据，最终保存时采用能够完成真实 Codex
-          工作流的协议。
+          Before saving, CCSM tests Responses and Chat, streaming, tool calls,
+          and history continuation. The automatic recommendation comes from
+          probe evidence; saving selects the protocol that can complete a real
+          Codex workflow.
         </p>
       ) : (
         <div className="space-y-3">
           <div className="space-y-1.5">
-            <Label>最终使用协议</Label>
+            <Label>Protocol used at runtime</Label>
             <Select
               value={apiFormat}
               onValueChange={(value) =>
                 onApiFormatChange(value as CodexApiFormat)
               }
             >
-              <SelectTrigger aria-label="最终使用协议">
+              <SelectTrigger aria-label="Protocol used at runtime">
                 <SelectValue />
               </SelectTrigger>
               <SelectContent>
@@ -88,24 +91,25 @@ export function CodexProtocolAdvancedSettings({
               </SelectContent>
             </Select>
             <p className="text-xs leading-relaxed text-muted-foreground">
-              这里仅覆盖最终保存和运行时使用的协议，不会改写或删除 Responses /
-              Chat 的独立探测证据与自动推荐。
+              This overrides only the protocol saved and used at runtime; it
+              does not rewrite or delete the independent Responses/Chat probe
+              evidence or automatic recommendation.
             </p>
           </div>
 
           <div className="space-y-1.5">
-            <Label>工具 Schema</Label>
+            <Label>Tool schema</Label>
             <Select
               value={toolSchemaDialect}
               onValueChange={onToolSchemaDialectChange}
             >
-              <SelectTrigger aria-label="工具 Schema">
+              <SelectTrigger aria-label="Tool schema">
                 <SelectValue />
               </SelectTrigger>
               <SelectContent>
                 <SelectItem value="openai">OpenAI JSON Schema</SelectItem>
                 <SelectItem value="moonshot_mfjs">
-                  Moonshot MFJS（Kimi）
+                  Moonshot MFJS (Kimi)
                 </SelectItem>
               </SelectContent>
             </Select>
@@ -114,55 +118,57 @@ export function CodexProtocolAdvancedSettings({
           {apiFormat === "openai_chat" ? (
             <>
               <div className="space-y-1.5">
-                <Label>Chat 推理展示</Label>
+                <Label>Chat reasoning display</Label>
                 <Select
                   value={reasoningProjection}
                   onValueChange={onReasoningProjectionChange}
                 >
-                  <SelectTrigger aria-label="Chat 推理展示">
+                  <SelectTrigger aria-label="Chat reasoning display">
                     <SelectValue />
                   </SelectTrigger>
                   <SelectContent>
                     <SelectItem value="raw_reasoning_text">
-                      原始推理正文
+                      Raw reasoning text
                     </SelectItem>
-                    <SelectItem value="none">不展示推理</SelectItem>
+                    <SelectItem value="none">Hide reasoning</SelectItem>
                   </SelectContent>
                 </Select>
               </div>
               <p className="text-xs text-muted-foreground">
-                Chat 历史续轮固定写入
-                reasoning_content，避免把展示字段与续轮字段混用。
+                Chat history continuation always writes reasoning_content so
+                display fields are not mixed with continuation fields.
               </p>
             </>
           ) : (
             <div className="space-y-1.5">
-              <Label>Responses 历史续轮</Label>
+              <Label>Responses history continuation</Label>
               <Select
                 value={historyReplay}
                 onValueChange={onHistoryReplayChange}
               >
-                <SelectTrigger aria-label="Responses 历史续轮">
+                <SelectTrigger aria-label="Responses history continuation">
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent>
-                  <SelectItem value="native_only">原生 Responses</SelectItem>
+                  <SelectItem value="native_only">Native Responses</SelectItem>
                   <SelectItem value="responses_reasoning_text_content">
-                    reasoning_text content 兼容
+                    reasoning_text content compatibility
                   </SelectItem>
                   <SelectItem value="responses_reasoning_summary_only">
                     {t("provider.codexHistoryReplaySummaryOnly")}
                   </SelectItem>
-                  <SelectItem value="omit">不回放推理项</SelectItem>
+                  <SelectItem value="omit">
+                    Do not replay reasoning items
+                  </SelectItem>
                 </SelectContent>
               </Select>
             </div>
           )}
 
           <div className="rounded-md border border-amber-500/30 bg-amber-500/10 p-3 text-xs leading-relaxed text-amber-900 dark:text-amber-200">
-            已完成的自动探测会继续保留；如果没有对应协议的 Verified
-            证据，手动覆盖可能造成 HTTP
-            400/422、工具续轮失败，或推理内容不可见。
+            Completed automatic probes are retained. Without Verified evidence
+            for the selected protocol, a manual override may cause HTTP 400/422
+            responses, tool-continuation failures, or invisible reasoning.
           </div>
         </div>
       )}

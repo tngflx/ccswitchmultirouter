@@ -332,13 +332,17 @@ export function ProviderCard({
       ? null
       : adaptationSummary.persistence === "split" ||
           adaptationSummary.effectiveTransport === "mixed"
-        ? "自动适配 · Responses + Chat"
+        ? t("codexProviderUi.autoAdapted", {
+            defaultValue: "Auto-adapted · Responses + Chat",
+          })
         : adaptationSummary.effectiveTransport === "open_ai_responses"
           ? "Responses"
           : adaptationSummary.effectiveTransport === "open_ai_chat"
             ? "Chat"
             : adaptationSummary.persistence === "legacy_mixed"
-              ? "旧版混合协议"
+              ? t("codexProviderUi.legacyMixed", {
+                  defaultValue: "Legacy mixed protocol",
+                })
               : null;
   // xAI OAuth (SuperGrok 反代)：额度经自管 OAuth token 自动显示，与 codex_oauth 同构
   const isXaiOauth = provider.meta?.providerType === PROVIDER_TYPES.XAI_OAUTH;

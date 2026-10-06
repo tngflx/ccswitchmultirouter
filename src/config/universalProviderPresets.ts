@@ -11,6 +11,7 @@ import type {
   UniversalProviderModels,
 } from "@/types";
 import { deepClone } from "@/utils/deepClone";
+import type { TFunction } from "i18next";
 
 /**
  * 统一供应商预设接口
@@ -118,8 +119,26 @@ export function createUniversalProviderFromPreset(
 /**
  * 获取预设的显示名称（用于 UI）
  */
-export function getPresetDisplayName(preset: UniversalProviderPreset): string {
-  return preset.name;
+export function getPresetDisplayName(
+  preset: UniversalProviderPreset,
+  t: TFunction,
+): string {
+  return preset.providerType === "custom_gateway"
+    ? t("universalProvider.presets.customGateway")
+    : preset.name;
+}
+
+export function getPresetDescription(
+  preset: UniversalProviderPreset,
+  t: TFunction,
+): string | undefined {
+  if (preset.providerType === "newapi") {
+    return t("universalProvider.presets.newapiDescription");
+  }
+  if (preset.providerType === "custom_gateway") {
+    return t("universalProvider.presets.customGatewayDescription");
+  }
+  return preset.description;
 }
 
 /**

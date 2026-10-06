@@ -22,13 +22,10 @@ const getInitialLanguage = (): SupportedLanguage => {
     }
   }
 
-  const navigatorLang =
-    typeof navigator !== "undefined"
-      ? (navigator.language?.toLowerCase() ??
-        navigator.languages?.[0]?.toLowerCase())
-      : undefined;
-
-  return parseSupportedLanguage(navigatorLang) ?? DEFAULT_LANGUAGE;
+  // English is the predictable first-run language. Users can opt into a
+  // locale from Settings; do not let the host OS silently switch a fresh
+  // install into Chinese or another locale before the app is configured.
+  return DEFAULT_LANGUAGE;
 };
 
 const resources = {
@@ -48,14 +45,13 @@ const resources = {
 
 i18n.use(initReactI18next).init({
   resources,
-  lng: getInitialLanguage(), // 根据本地存储或系统语言选择默认语言
-  fallbackLng: "en", // 如果缺少中文翻译则退回英文
+  lng: getInitialLanguage(),
+  fallbackLng: "en",
 
   interpolation: {
-    escapeValue: false, // React 已经默认转义
+    escapeValue: false,
   },
 
-  // 开发模式下显示调试信息
   debug: false,
 });
 

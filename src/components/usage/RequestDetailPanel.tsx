@@ -43,10 +43,12 @@ export function RequestDetailPanel({
       <Dialog open onOpenChange={onClose}>
         <DialogContent className="max-w-2xl">
           <DialogHeader>
-            <DialogTitle>{t("usage.requestDetail", "请求详情")}</DialogTitle>
+            <DialogTitle>
+              {t("usage.requestDetail", "Request details")}
+            </DialogTitle>
           </DialogHeader>
           <div className="text-center text-muted-foreground">
-            {t("usage.requestNotFound", "请求未找到")}
+            {t("usage.requestNotFound", "Request not found")}
           </div>
         </DialogContent>
       </Dialog>
@@ -61,25 +63,27 @@ export function RequestDetailPanel({
     <Dialog open onOpenChange={onClose}>
       <DialogContent className="max-w-2xl max-h-[80vh] overflow-y-auto">
         <DialogHeader>
-          <DialogTitle>{t("usage.requestDetail", "请求详情")}</DialogTitle>
+          <DialogTitle>
+            {t("usage.requestDetail", "Request details")}
+          </DialogTitle>
         </DialogHeader>
 
         <div className="space-y-4">
-          {/* 基本信息 */}
+          {/* Basic information */}
           <div className="rounded-lg border p-4">
             <h3 className="mb-3 font-semibold">
-              {t("usage.basicInfo", "基本信息")}
+              {t("usage.basicInfo", "Basic information")}
             </h3>
             <dl className="grid grid-cols-2 gap-3 text-sm">
               <div>
                 <dt className="text-muted-foreground">
-                  {t("usage.requestId", "请求ID")}
+                  {t("usage.requestId", "Request ID")}
                 </dt>
                 <dd className="font-mono">{request.requestId}</dd>
               </div>
               <div>
                 <dt className="text-muted-foreground">
-                  {t("usage.time", "时间")}
+                  {t("usage.time", "Time")}
                 </dt>
                 <dd>
                   {new Date(request.createdAt * 1000).toLocaleString(
@@ -89,11 +93,12 @@ export function RequestDetailPanel({
               </div>
               <div>
                 <dt className="text-muted-foreground">
-                  {t("usage.provider", "供应商")}
+                  {t("usage.provider", "Provider")}
                 </dt>
                 <dd className="text-sm">
                   <span className="font-medium">
-                    {request.providerName || t("usage.unknownProvider", "未知")}
+                    {request.providerName ||
+                      t("usage.unknownProvider", "Unknown")}
                   </span>
                   <span className="ml-2 font-mono text-xs text-muted-foreground">
                     {request.providerId}
@@ -102,20 +107,20 @@ export function RequestDetailPanel({
               </div>
               <div>
                 <dt className="text-muted-foreground">
-                  {t("usage.appType", "应用类型")}
+                  {t("usage.appType", "App type")}
                 </dt>
                 <dd>{request.appType}</dd>
               </div>
               <div>
                 <dt className="text-muted-foreground">
-                  {t("usage.model", "模型")}
+                  {t("usage.model", "Model")}
                 </dt>
                 <dd className="font-mono">{request.model}</dd>
                 {request.requestModel &&
                   request.requestModel !== request.model && (
                     <>
                       <dt className="mt-1 text-muted-foreground">
-                        {t("usage.requestModel", "请求模型")}
+                        {t("usage.requestModel", "Request model")}
                       </dt>
                       <dd className="font-mono text-xs">
                         {request.requestModel}
@@ -126,7 +131,7 @@ export function RequestDetailPanel({
                   request.pricingModel !== request.model && (
                     <>
                       <dt className="mt-1 text-muted-foreground">
-                        {t("usage.pricingModel", "计价模型")}
+                        {t("usage.pricingModel", "Pricing model")}
                       </dt>
                       <dd className="font-mono text-xs">
                         {request.pricingModel}
@@ -136,7 +141,7 @@ export function RequestDetailPanel({
               </div>
               <div>
                 <dt className="text-muted-foreground">
-                  {t("usage.status", "状态")}
+                  {t("usage.status", "Status")}
                 </dt>
                 <dd>
                   <span
@@ -153,21 +158,21 @@ export function RequestDetailPanel({
             </dl>
           </div>
 
-          {/* Token 使用量 */}
+          {/* Token usage */}
           <div className="rounded-lg border p-4">
             <h3 className="mb-3 font-semibold">
-              {t("usage.tokenUsage", "Token 使用量")}
+              {t("usage.tokenUsage", "Token usage")}
             </h3>
             <dl className="grid grid-cols-2 gap-3 text-sm">
               <div>
                 <dt className="text-muted-foreground">
-                  {t("usage.inputTokens", "输入 Tokens")}
+                  {t("usage.inputTokens", "Input tokens")}
                 </dt>
                 <dd className="font-mono">
                   {freshInput.toLocaleString()}
                   {isCacheInclusive && (
                     <span className="ml-2 text-xs text-muted-foreground/70 font-normal">
-                      ({t("usage.rawInputLabel", "原始")}:{" "}
+                      ({t("usage.rawInputLabel", "raw")}:{" "}
                       {request.inputTokens.toLocaleString()})
                     </span>
                   )}
@@ -175,7 +180,7 @@ export function RequestDetailPanel({
               </div>
               <div>
                 <dt className="text-muted-foreground">
-                  {t("usage.outputTokens", "输出 Tokens")}
+                  {t("usage.outputTokens", "Output tokens")}
                 </dt>
                 <dd className="font-mono">
                   {request.outputTokens.toLocaleString()}
@@ -183,7 +188,7 @@ export function RequestDetailPanel({
               </div>
               <div>
                 <dt className="text-muted-foreground">
-                  {t("usage.cacheReadTokens", "缓存读取")}
+                  {t("usage.cacheReadTokens", "Cache read")}
                 </dt>
                 <dd className="font-mono">
                   {request.cacheReadTokens.toLocaleString()}
@@ -191,7 +196,7 @@ export function RequestDetailPanel({
               </div>
               <div>
                 <dt className="text-muted-foreground">
-                  {t("usage.cacheCreationTokens", "缓存写入")}
+                  {t("usage.cacheCreationTokens", "Cache creation")}
                 </dt>
                 <dd className="font-mono">
                   {request.cacheCreationTokens.toLocaleString()}
@@ -199,7 +204,7 @@ export function RequestDetailPanel({
               </div>
               <div className="col-span-2">
                 <dt className="text-muted-foreground">
-                  {t("usage.totalTokens", "总计")}
+                  {t("usage.totalTokens", "Total")}
                 </dt>
                 <dd className="text-lg font-semibold">
                   {(freshInput + request.outputTokens).toLocaleString()}
@@ -208,17 +213,17 @@ export function RequestDetailPanel({
             </dl>
           </div>
 
-          {/* 成本明细 */}
+          {/* Cost breakdown */}
           <div className="rounded-lg border p-4">
             <h3 className="mb-3 font-semibold">
-              {t("usage.costBreakdown", "成本明细")}
+              {t("usage.costBreakdown", "Cost breakdown")}
             </h3>
             <dl className="grid grid-cols-2 gap-3 text-sm">
               <div>
                 <dt className="text-muted-foreground">
-                  {t("usage.inputCost", "输入成本")}
+                  {t("usage.inputCost", "Input cost")}
                   <span className="ml-1 text-xs">
-                    ({t("usage.baseCost", "基础")})
+                    ({t("usage.baseCost", "base")})
                   </span>
                 </dt>
                 <dd className="font-mono">
@@ -227,9 +232,9 @@ export function RequestDetailPanel({
               </div>
               <div>
                 <dt className="text-muted-foreground">
-                  {t("usage.outputCost", "输出成本")}
+                  {t("usage.outputCost", "Output cost")}
                   <span className="ml-1 text-xs">
-                    ({t("usage.baseCost", "基础")})
+                    ({t("usage.baseCost", "base")})
                   </span>
                 </dt>
                 <dd className="font-mono">
@@ -238,9 +243,9 @@ export function RequestDetailPanel({
               </div>
               <div>
                 <dt className="text-muted-foreground">
-                  {t("usage.cacheReadCost", "缓存读取成本")}
+                  {t("usage.cacheReadCost", "Cache read cost")}
                   <span className="ml-1 text-xs">
-                    ({t("usage.baseCost", "基础")})
+                    ({t("usage.baseCost", "base")})
                   </span>
                 </dt>
                 <dd className="font-mono">
@@ -249,21 +254,21 @@ export function RequestDetailPanel({
               </div>
               <div>
                 <dt className="text-muted-foreground">
-                  {t("usage.cacheCreationCost", "缓存写入成本")}
+                  {t("usage.cacheCreationCost", "Cache creation cost")}
                   <span className="ml-1 text-xs">
-                    ({t("usage.baseCost", "基础")})
+                    ({t("usage.baseCost", "base")})
                   </span>
                 </dt>
                 <dd className="font-mono">
                   ${parseFloat(request.cacheCreationCostUsd).toFixed(6)}
                 </dd>
               </div>
-              {/* 显示成本倍率（如果不等于1） */}
+              {/* Show the cost multiplier when it is not 1 */}
               {request.costMultiplier &&
                 parseFloat(request.costMultiplier) !== 1 && (
                   <div className="col-span-2 border-t pt-3">
                     <dt className="text-muted-foreground">
-                      {t("usage.costMultiplier", "成本倍率")}
+                      {t("usage.costMultiplier", "Cost multiplier")}
                     </dt>
                     <dd className="font-mono">×{request.costMultiplier}</dd>
                   </div>
@@ -272,11 +277,11 @@ export function RequestDetailPanel({
                 className={`col-span-2 ${request.costMultiplier && parseFloat(request.costMultiplier) !== 1 ? "" : "border-t"} pt-3`}
               >
                 <dt className="text-muted-foreground">
-                  {t("usage.totalCost", "总成本")}
+                  {t("usage.totalCost", "Total cost")}
                   {request.costMultiplier &&
                     parseFloat(request.costMultiplier) !== 1 && (
                       <span className="ml-1 text-xs">
-                        ({t("usage.withMultiplier", "含倍率")})
+                        ({t("usage.withMultiplier", "with multiplier")})
                       </span>
                     )}
                 </dt>
@@ -286,33 +291,33 @@ export function RequestDetailPanel({
                   }`}
                 >
                   {unpriced
-                    ? t("usage.unpriced", "未定价")
+                    ? t("usage.unpriced", "Unpriced")
                     : `$${parseFloat(request.totalCostUsd).toFixed(6)}`}
                 </dd>
               </div>
             </dl>
           </div>
 
-          {/* 性能信息 */}
+          {/* Performance */}
           <div className="rounded-lg border p-4">
             <h3 className="mb-3 font-semibold">
-              {t("usage.performance", "性能信息")}
+              {t("usage.performance", "Performance")}
             </h3>
             <dl className="grid grid-cols-2 gap-3 text-sm">
               <div>
                 <dt className="text-muted-foreground">
-                  {t("usage.latency", "延迟")}
+                  {t("usage.latency", "Latency")}
                 </dt>
                 <dd className="font-mono">{request.latencyMs}ms</dd>
               </div>
             </dl>
           </div>
 
-          {/* 错误信息 */}
+          {/* Error information */}
           {request.errorMessage && (
             <div className="rounded-lg border border-red-200 bg-red-50 p-4">
               <h3 className="mb-2 font-semibold text-red-800">
-                {t("usage.errorMessage", "错误信息")}
+                {t("usage.errorMessage", "Error information")}
               </h3>
               <p className="text-sm text-red-700">{request.errorMessage}</p>
             </div>

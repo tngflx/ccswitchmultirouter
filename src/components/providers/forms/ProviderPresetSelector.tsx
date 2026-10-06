@@ -25,6 +25,7 @@ import type { HermesProviderPreset } from "@/config/hermesProviderPresets";
 import type { ProviderCategory } from "@/types";
 import {
   universalProviderPresets,
+  getPresetDisplayName as getUniversalPresetDisplayName,
   type UniversalProviderPreset,
 } from "@/config/universalProviderPresets";
 import { ProviderIcon } from "@/components/ProviderIcon";
@@ -246,7 +247,7 @@ export function ProviderPresetSelector({
     if (isCodexRouterSourceMode) {
       return t("codexMultiRouter.sourcePickerHint", {
         defaultValue:
-          "先选择一个模型源，预设会自动填充端点、协议和模型目录；只有预设不覆盖你的服务时才使用自定义模型源。",
+          "Select a model source first. Presets fill in endpoints, protocols, and the model catalog. Use a custom source only when no preset covers your service.",
       });
     }
 
@@ -352,7 +353,7 @@ export function ProviderPresetSelector({
         <FormLabel>
           {isCodexRouterSourceMode
             ? t("codexMultiRouter.sourcePickerLabel", {
-                defaultValue: "选择模型源",
+                defaultValue: "Select model sources",
               })
             : t("providerPreset.label")}
         </FormLabel>
@@ -444,7 +445,7 @@ export function ProviderPresetSelector({
           <span className="truncate">
             {isCodexRouterSourceMode
               ? t("codexMultiRouter.customSource", {
-                  defaultValue: "自定义模型源",
+                  defaultValue: "Custom model source",
                 })
               : t("providerPreset.custom")}
           </span>
@@ -543,7 +544,9 @@ export function ProviderPresetSelector({
                 size={14}
                 className="flex-shrink-0"
               />
-              <span className="truncate">{preset.name}</span>
+              <span className="truncate">
+                {getUniversalPresetDisplayName(preset, t)}
+              </span>
               <span className="absolute -top-1 -right-1 flex items-center gap-0.5 rounded-full bg-gradient-to-r from-indigo-500 to-purple-500 px-1.5 py-0.5 text-[10px] font-bold text-white shadow-md">
                 <Layers className="h-2.5 w-2.5" />
               </span>

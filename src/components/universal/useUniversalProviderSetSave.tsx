@@ -1,6 +1,7 @@
 import { useCallback, useMemo } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
+import { useTranslation } from "react-i18next";
 
 import { CodexProtocolProbeProgressDialog } from "@/components/providers/forms/CodexProtocolProbeProgressDialog";
 import { CodexProviderSetPreviewDialog } from "@/components/providers/forms/CodexProviderSetPreviewDialog";
@@ -39,6 +40,7 @@ interface UseUniversalProviderSetSaveOptions {
 export function useUniversalProviderSetSave({
   onCommitted,
 }: UseUniversalProviderSetSaveOptions = {}) {
+  const { t } = useTranslation();
   const queryClient = useQueryClient();
   const adapter = useMemo(() => createUniversalCodexProtocolLabAdapter(), []);
   const workflow = useProtocolLabWorkflow(adapter);
@@ -57,7 +59,10 @@ export function useUniversalProviderSetSave({
         refreshes,
       );
       toast.warning(
-        "模型源已保存，但部分页面未能立即刷新；重新打开对应页面即可恢复。",
+        t("providerSet.viewsRefreshFailed", {
+          defaultValue:
+            "The model source was saved, but some pages could not refresh. Reopen those pages to restore them.",
+        }),
       );
     }
     try {
@@ -68,10 +73,13 @@ export function useUniversalProviderSetSave({
         error,
       );
       toast.warning(
-        "模型源已保存，但托盘菜单刷新失败；重新打开应用后会自动恢复。",
+        t("providerSet.trayRefreshFailed", {
+          defaultValue:
+            "The model source was saved, but the tray menu could not refresh. Reopen the app to restore it.",
+        }),
       );
     }
-  }, [onCommitted, queryClient]);
+  }, [onCommitted, queryClient, t]);
 
   const persistUniversalProviderSet = useCallback(
     async (
@@ -145,24 +153,32 @@ export function useUniversalProviderSetSave({
       >
         <DialogContent className="max-w-lg" zIndex="top">
           <DialogHeader>
-            <DialogTitle>确认测试 Chat / Responses</DialogTitle>
+            <DialogTitle>
+              {t("providerSet.confirmTitle", {
+                defaultValue: "Confirm Chat / Responses test",
+              })}
+            </DialogTitle>
             <DialogDescription className="space-y-2 text-left">
               <span className="block">
-                “保存并同步”会先对 Codex 模型发送少量真实请求，分别验证
-                Responses 与 Chat Completions，然后以同一原子事务保存最终配置。
+                {t("providerSet.universalConsent", {
+                  defaultValue:
+                    "Save and sync first tests the Codex model with real Responses and Chat Completions requests, then saves the final configuration in one atomic transaction.",
+                })}
               </span>
               <span className="block">
-                测试可能产生少量额度或流量消耗。认证、限流、网络、HTTP 521
-                和其他 5xx 会单独显示为可用性问题，不会据此推荐错误协议。
+                {t("providerSet.universalProbeWarning", {
+                  defaultValue:
+                    "Tests may consume a small amount of quota or traffic. Authentication, rate-limit, network, HTTP 521, and other 5xx errors are reported separately as availability problems and will not recommend an incorrect protocol.",
+                })}
               </span>
             </DialogDescription>
           </DialogHeader>
           <DialogFooter>
             <Button type="button" variant="outline" onClick={handleBack}>
-              取消
+              {t("providerSet.cancel", { defaultValue: "Cancel" })}
             </Button>
             <Button type="button" onClick={() => void workflow.confirmProbe()}>
-              确认测试
+              {t("providerSet.confirm", { defaultValue: "Confirm test" })}
             </Button>
           </DialogFooter>
         </DialogContent>

@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { Loader2, RefreshCw, Save } from "lucide-react";
 import { toast } from "sonner";
+import { useTranslation } from "react-i18next";
 
 import JsonEditor from "@/components/JsonEditor";
 import { Button } from "@/components/ui/button";
@@ -14,32 +15,38 @@ const DEFAULT_CODEX_GLOBAL_CONFIG = `# Shared Codex configuration
 # Settings here are available to Codex providers that apply the common config.`;
 
 export function CodexGlobalConfigSettings() {
+  const { t } = useTranslation();
   const [value, setValue] = useState("");
   const [isLoading, setIsLoading] = useState(true);
   const [isLoaded, setIsLoaded] = useState(false);
   const [isSaving, setIsSaving] = useState(false);
-  const [error, setError] = useState("");
+  const [error, setError] = useState<{
+    operation: "load" | "save";
+    message: string;
+  } | null>(null);
   const [loadAttempt, setLoadAttempt] = useState(0);
 
   useEffect(() => {
     let active = true;
     setIsLoading(true);
     setIsLoaded(false);
-    setError("");
+    setError(null);
     configApi
       .getCommonConfigSnippet("codex")
       .then((snippet) => {
         if (!active) return;
         setValue(snippet?.trim() ? snippet : DEFAULT_CODEX_GLOBAL_CONFIG);
         setIsLoaded(true);
-        setError("");
+        setError(null);
       })
       .catch((loadError) => {
         if (!active) return;
         setIsLoaded(false);
-        setError(
-          `加载 Codex 全局配置失败：${loadError instanceof Error ? loadError.message : String(loadError)}`,
-        );
+        setError({
+          operation: "load",
+          message:
+            loadError instanceof Error ? loadError.message : String(loadError),
+        });
       })
       .finally(() => {
         if (active) setIsLoading(false);
@@ -52,14 +59,15 @@ export function CodexGlobalConfigSettings() {
   async function save() {
     if (!isLoaded) return;
     setIsSaving(true);
-    setError("");
+    setError(null);
     try {
       await configApi.setCommonConfigSnippet("codex", value);
-      toast.success("Codex 全局配置已保存");
+      toast.success(t("codexGlobalConfig.saved"));
     } catch (saveError) {
-      const message = `保存 Codex 全局配置失败：${saveError instanceof Error ? saveError.message : String(saveError)}`;
-      setError(message);
-      toast.error(message);
+      const message =
+        saveError instanceof Error ? saveError.message : String(saveError);
+      setError({ operation: "save", message });
+      toast.error(t("codexGlobalConfig.saveError", { error: message }));
     } finally {
       setIsSaving(false);
     }
@@ -72,7 +80,7 @@ export function CodexGlobalConfigSettings() {
         className="flex items-center gap-2 text-sm text-muted-foreground"
       >
         <Loader2 className="h-4 w-4 animate-spin" />
-        正在加载 Codex 全局配置…
+        {t("codexGlobalConfig.loading")}
       </div>
     );
   }
@@ -81,7 +89,10 @@ export function CodexGlobalConfigSettings() {
     return (
       <div className="space-y-3 rounded-md border border-destructive/30 bg-destructive/5 p-4">
         <p role="alert" className="text-sm text-destructive">
-          {error}
+          {error &&
+            t(`codexGlobalConfig.${error.operation}Error`, {
+              error: error.message,
+            })}
         </p>
         <Button
           type="button"
@@ -90,7 +101,7 @@ export function CodexGlobalConfigSettings() {
           onClick={() => setLoadAttempt((attempt) => attempt + 1)}
         >
           <RefreshCw className="h-4 w-4" />
-          重试加载
+          {t("codexGlobalConfig.retry")}
         </Button>
       </div>
     );
@@ -100,25 +111,24 @@ export function CodexGlobalConfigSettings() {
     <div className="space-y-4">
       <div className="rounded-lg border border-blue-500/20 bg-blue-500/5 p-4">
         <p className="text-sm font-medium text-foreground">
-          跨 Provider 的 Codex 行为
+          {t("codexGlobalConfig.sharedBehavior")}
         </p>
         <p className="mt-1 text-xs leading-relaxed text-muted-foreground">
-          在这里维护 Goal mode 和共享 TOML。API Key、Base
-          URL、模型目录与路由规则仍属于各自的 Provider 或 MultiRouter。
+          {t("codexGlobalConfig.description")}
         </p>
       </div>
 
       <label className="flex items-start justify-between gap-4 rounded-md border border-border-default p-3">
         <span className="space-y-1">
           <span className="block text-sm font-medium text-foreground">
-            启用 Goal mode
+            {t("codexGlobalConfig.goalMode")}
           </span>
           <span className="block text-xs leading-relaxed text-muted-foreground">
-            写入共享 Codex TOML；不再要求在每一个 Provider 配置页重复设置。
+            {t("codexGlobalConfig.goalModeDescription")}
           </span>
         </span>
         <input
-          aria-label="启用 Goal mode"
+          aria-label={t("codexGlobalConfig.goalMode")}
           type="checkbox"
           checked={isCodexGoalModeEnabled(value)}
           onChange={(event) =>
@@ -135,9 +145,11 @@ export function CodexGlobalConfigSettings() {
           className="text-sm font-medium text-foreground"
           htmlFor="codex-global-config"
         >
-          Codex 全局 TOML
+          {t("codexGlobalConfig.toml")}
         </label>
         <JsonEditor
+          id="codex-global-config"
+          ariaLabel={t("codexGlobalConfig.toml")}
           value={value}
           onChange={setValue}
           placeholder={DEFAULT_CODEX_GLOBAL_CONFIG}
@@ -150,7 +162,9 @@ export function CodexGlobalConfigSettings() {
 
       {error && (
         <p role="alert" className="text-sm text-destructive">
-          {error}
+          {t(`codexGlobalConfig.${error.operation}Error`, {
+            error: error.message,
+          })}
         </p>
       )}
 
@@ -166,7 +180,7 @@ export function CodexGlobalConfigSettings() {
           ) : (
             <Save className="h-4 w-4" />
           )}
-          保存 Codex 全局配置
+          {t("codexGlobalConfig.save")}
         </Button>
       </div>
     </div>

@@ -144,14 +144,14 @@ describe("CodexHistoryRepairPanel", () => {
         .mockReset()
         .mockRejectedValue(error);
       render(<CodexHistoryRepairPanel />);
-      fireEvent.click(screen.getByRole("button", { name: "确认修复" }));
+      fireEvent.click(screen.getByRole("button", { name: "Confirm repair" }));
       await waitFor(() => expect(toast.error).toHaveBeenCalled());
       const message = vi.mocked(toast.error).mock.calls.at(-1)?.[0];
       expect(message).toContain(error);
-      expect(message).not.toContain("后再点");
+      expect(message).not.toContain("then click again");
       if (immutable) {
-        expect(message).toContain("不支持");
-        expect(message).toContain("退出或重启");
+        expect(message).toContain("cannot rewrite them");
+        expect(message).toContain("Exiting or restarting Codex");
       } else {
         expect(message).toBe(error);
       }
@@ -171,7 +171,7 @@ describe("CodexHistoryRepairPanel", () => {
       .mockReset()
       .mockRejectedValue(error);
     render(<CodexHistoryRepairPanel />);
-    fireEvent.click(screen.getByRole("button", { name: "确认修复" }));
+    fireEvent.click(screen.getByRole("button", { name: "Confirm repair" }));
     await waitFor(() => expect(toast.error).toHaveBeenCalledWith(error));
   });
 
@@ -226,10 +226,10 @@ describe("CodexHistoryRepairPanel", () => {
       }),
     );
     expect(
-      screen.getByPlaceholderText("勾选后填写项目路径；不勾选则修复所有项目"),
+      screen.getByPlaceholderText("Enter a project path when enabled; otherwise repair all projects"),
     ).toHaveValue("");
     expect(
-      screen.getByText(/未限制项目；会跨项目读取并修复/),
+      screen.getByText(/No project limit; matching records across projects will be read and repaired/),
     ).toBeInTheDocument();
   });
 
@@ -243,12 +243,12 @@ describe("CodexHistoryRepairPanel", () => {
     });
     vi.mocked(proxyApi.listCodexHistorySessions).mockClear();
 
-    fireEvent.click(screen.getByRole("checkbox", { name: "只修复单个项目" }));
+    fireEvent.click(screen.getByRole("checkbox", { name: "Repair one project only" }));
     fireEvent.change(
-      screen.getByPlaceholderText("勾选后填写项目路径；不勾选则修复所有项目"),
+      screen.getByPlaceholderText("Enter a project path when enabled; otherwise repair all projects"),
       { target: { value: "C:\\Users\\sunda\\Documents\\Project A" } },
     );
-    fireEvent.click(screen.getByRole("button", { name: "刷新记录" }));
+    fireEvent.click(screen.getByRole("button", { name: "Refresh records" }));
 
     await waitFor(() => {
       expect(proxyApi.listCodexHistorySessions).toHaveBeenCalledWith(
@@ -267,7 +267,7 @@ describe("CodexHistoryRepairPanel", () => {
     await waitFor(() => {
       expect(proxyApi.listCodexHistorySessions).toHaveBeenCalledTimes(1);
     });
-    fireEvent.click(screen.getByRole("button", { name: "确认修复" }));
+    fireEvent.click(screen.getByRole("button", { name: "Confirm repair" }));
 
     await waitFor(() => {
       expect(proxyApi.repairCodexHistoryVisibility).toHaveBeenCalledTimes(2);
@@ -282,7 +282,7 @@ describe("CodexHistoryRepairPanel", () => {
       }),
     );
     expect(confirmSpy).toHaveBeenCalledWith(
-      expect.stringContaining("请先完全退出 Codex / ChatGPT App"),
+      expect.stringContaining("Before confirming repair, fully exit the Codex / ChatGPT app."),
     );
     expect(confirmSpy).toHaveBeenCalledWith(
       expect.stringContaining("thread_settings_applied"),

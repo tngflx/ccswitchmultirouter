@@ -41,26 +41,26 @@ const TASK_STRENGTHS: Array<{
   value: CodexSubagentTaskStrength;
   label: string;
 }> = [
-  { value: "long_context_reading", label: "长上下文阅读" },
-  { value: "repository_exploration", label: "仓库探索" },
-  { value: "evidence_collection", label: "证据收集" },
-  { value: "summarization", label: "总结归纳" },
-  { value: "complex_debugging", label: "复杂调试" },
-  { value: "architecture_design", label: "架构设计" },
-  { value: "bounded_implementation", label: "有限实现" },
-  { value: "complex_implementation", label: "复杂实现" },
-  { value: "testing", label: "测试验证" },
-  { value: "high_risk_review", label: "高风险审查" },
+  { value: "long_context_reading", label: "Long-context reading" },
+  { value: "repository_exploration", label: "Repository exploration" },
+  { value: "evidence_collection", label: "Evidence collection" },
+  { value: "summarization", label: "Summarization" },
+  { value: "complex_debugging", label: "Complex debugging" },
+  { value: "architecture_design", label: "Architecture design" },
+  { value: "bounded_implementation", label: "Bounded implementation" },
+  { value: "complex_implementation", label: "Complex implementation" },
+  { value: "testing", label: "Testing and validation" },
+  { value: "high_risk_review", label: "High-risk review" },
 ];
 
 type ProfileFilter = "enabled" | "draft" | "unroutable" | "all";
 type ProfileTone = "enabled-routable" | "draft" | "unroutable";
 
 const PROFILE_FILTERS: Array<{ value: ProfileFilter; label: string }> = [
-  { value: "enabled", label: "已启用" },
-  { value: "draft", label: "待配置" },
-  { value: "unroutable", label: "不可路由" },
-  { value: "all", label: "全部" },
+  { value: "enabled", label: "Enabled" },
+  { value: "draft", label: "Not configured" },
+  { value: "unroutable", label: "Unroutable" },
+  { value: "all", label: "All" },
 ];
 
 const EXPLICIT_REASONING_EFFORTS = new Set([
@@ -116,13 +116,19 @@ function evaluateMutationResult(
 ): string {
   const verification = result.verification;
   if (!verification) {
-    throw new Error("后端未返回 Codex Agent 文件写入验证结果。");
+    throw new Error(
+      "Backend did not return Codex Agent file-write verification.",
+    );
   }
   if (!verification.databasePersisted) {
-    throw new Error("后端未确认 V2 子 Agent 配置已写入数据库。");
+    throw new Error(
+      "Backend did not confirm that the V2 sub-agent configuration was written to the database.",
+    );
   }
   if (verification.activation !== "restart_codex_and_start_new_session") {
-    throw new Error("后端返回的 Codex Agent 激活条件不一致。");
+    throw new Error(
+      "Backend returned inconsistent Codex Agent activation conditions.",
+    );
   }
 
   switch (result.projection?.status) {
@@ -133,9 +139,11 @@ function evaluateMutationResult(
           (file) => file.exists && file.contentMatches,
         );
       if (verification.roleFilesStatus !== "verified" || !filesVerified) {
-        throw new Error("Codex Agent 文件写入后回读校验失败。");
+        throw new Error(
+          "Codex Agent file read-back verification failed after writing.",
+        );
       }
-      return "数据库与 Codex Agent 文件均已写入并回读验证；重启 Codex/app-server 并新建会话后生效";
+      return "Database and Codex Agent file were written and read back successfully; restart Codex/app-server and create a new session to apply";
     }
     case "not_required":
       if (
@@ -143,20 +151,26 @@ function evaluateMutationResult(
         !Array.isArray(verification.roleFiles) ||
         verification.roleFiles.length !== 0
       ) {
-        throw new Error("非当前方案的 Codex Agent 文件验证状态不一致。");
+        throw new Error(
+          "Codex Agent file verification is inconsistent for a non-active plan.",
+        );
       }
-      return "数据库已保存；当前方案未激活，因此未改写 Codex Agent 文件";
+      return "Database saved; the current plan is inactive, so the Codex Agent file was not changed";
     case "pending_retry":
       if (
         verification.roleFilesStatus !== "pending_retry" ||
         !Array.isArray(verification.roleFiles) ||
         verification.roleFiles.length !== 0
       ) {
-        throw new Error("Codex Agent 待重试状态未通过后端一致性检查。");
+        throw new Error(
+          "Codex Agent pending-retry state failed backend consistency checks.",
+        );
       }
-      return "数据库已保存；Codex Agent 文件投影待自动重试";
+      return "Database saved; Codex Agent file projection is pending an automatic retry";
     default:
-      throw new Error("后端未返回明确的 Codex Agent 投影状态。");
+      throw new Error(
+        "Backend did not return a clear Codex Agent projection state.",
+      );
   }
 }
 
@@ -345,9 +359,10 @@ function inferredInputModalities(
 }
 
 function formatInputModalities(modalities?: string[]): string {
-  if (!modalities || modalities.length === 0) return "未知";
-  if (modalities.some((m) => m.toLowerCase() === "image")) return "文本+图像";
-  return "纯文本";
+  if (!modalities || modalities.length === 0) return "Unknown";
+  if (modalities.some((m) => m.toLowerCase() === "image"))
+    return "Text + image";
+  return "Text only";
 }
 
 function formatModalitySource(
@@ -355,15 +370,15 @@ function formatModalitySource(
 ): string {
   switch (source) {
     case "profile_explicit":
-      return "profile 显式声明";
+      return "Explicit profile declaration";
     case "route":
-      return "路由能力";
+      return "Route capability";
     case "catalog":
-      return "模型目录";
+      return "Model catalog";
     case "name_registry":
-      return "内置模型名注册表";
+      return "Built-in model name registry";
     case "unknown":
-      return "未知（无来源声明）";
+      return "Unknown (no source declaration)";
   }
 }
 
@@ -433,7 +448,7 @@ function nicknameError(profiles: Record<string, unknown>) {
       unique.size !== values.length ||
       values.some((value) => !/^[A-Za-z0-9 _-]+$/.test(value))
     ) {
-      return "昵称候选需为 1 至 3 个不重复的 ASCII 字母、数字、空格、短横线或下划线";
+      return "Nickname candidates must be 1–3 unique ASCII letters, digits, spaces, hyphens, or underscores";
     }
   }
   return null;
@@ -449,7 +464,7 @@ function strengthError(profiles: Record<string, unknown>) {
           new Set(profile.questionnaire.taskStrengths).size !==
             profile.questionnaire.taskStrengths.length)),
   )
-    ? "每个模型需选择 1 至 5 项不重复的任务优势"
+    ? "Choose 1–5 unique task strengths for each model"
     : null;
 }
 
@@ -649,7 +664,9 @@ export function CodexSubagentProfileEditor({
   ) {
     const nextConfig = readPersistedConfig(nextProvider);
     if (!nextConfig) {
-      throw new Error("后端未返回已保存的 V2 子 Agent 能力配置。");
+      throw new Error(
+        "Backend did not return the saved V2 sub-agent capability configuration.",
+      );
     }
     backendAdoptedPersistedKey.current = {
       providerId: nextProvider.id,
@@ -680,7 +697,7 @@ export function CodexSubagentProfileEditor({
       );
       await adoptBackendProvider(nextProvider);
       setSaveMessage(
-        `V2 子 Agent 能力配置已初始化；${evaluateMutationResult(nextProvider)}`,
+        `V2 sub-agent capability configuration initialized;${evaluateMutationResult(nextProvider)}`,
       );
     } catch (error) {
       setSaveError(error instanceof Error ? error.message : String(error));
@@ -705,14 +722,14 @@ export function CodexSubagentProfileEditor({
       await adoptBackendProvider(nextProvider);
       const actionMessage =
         action === "sync_catalog"
-          ? "已修复缺失的模型档案；已有设置保持不变"
+          ? "Missing model profiles repaired; existing settings were preserved"
           : action === "remove_all_invalid"
-            ? "无效能力配置已删除"
+            ? "Invalid capability configuration deleted"
             : action === "prune_unroutable"
-              ? "已删除模型目录中不存在的失效配置"
-              : "无效能力配置已从模型目录恢复";
+              ? "Removed invalid configurations for models no longer in the catalog"
+              : "Invalid capability configurations restored from the model catalog";
       setSaveMessage(
-        `${actionMessage}；${evaluateMutationResult(nextProvider)}`,
+        `${actionMessage}; ${evaluateMutationResult(nextProvider)}`,
       );
     } catch (error) {
       setSaveError(error instanceof Error ? error.message : String(error));
@@ -743,7 +760,9 @@ export function CodexSubagentProfileEditor({
   function repairProfile(profileKey: string) {
     const replacement = defaultProfileForModel(profileKey);
     if (!replacement) {
-      setSaveError("此无效能力配置无法安全修复。");
+      setSaveError(
+        "This invalid capability configuration cannot be repaired safely.",
+      );
       return;
     }
     setSaveMessage(null);
@@ -833,9 +852,9 @@ export function CodexSubagentProfileEditor({
             incompleteReasoning
               .map(
                 (profile) =>
-                  `${profile.profileKey ?? profile.model ?? "V2 profile"}：推理能力未配置，请先在模型目录中声明能力后再保存。`,
+                  `${profile.profileKey ?? profile.model ?? "V2 profile"}: Reasoning capability is not configured. Declare it in the model catalog before saving.`,
               )
-              .join("；"),
+              .join("; "),
           );
         }
         if (
@@ -843,7 +862,9 @@ export function CodexSubagentProfileEditor({
             (profile) => !isUsableProfile(profile),
           )
         ) {
-          throw new Error("存在无效能力配置，无法保存。");
+          throw new Error(
+            "Invalid capability configurations exist; cannot save.",
+          );
         }
         const details = blocking.flatMap((profile) => profile.warnings);
         throw new Error(
@@ -851,9 +872,9 @@ export function CodexSubagentProfileEditor({
             blocking
               .map(
                 (profile) =>
-                  `${profile.profileKey ?? profile.model ?? "V2 profile"}：${profile.status}`,
+                  `${profile.profileKey ?? profile.model ?? "V2 profile"}: ${profile.status}`,
               )
-              .join("；"),
+              .join("; "),
         );
       }
       const result = await persist(draft);
@@ -869,11 +890,11 @@ export function CodexSubagentProfileEditor({
     return (
       <section className="rounded-lg border border-emerald-200 bg-emerald-50/50 p-4 dark:border-emerald-700/50 dark:bg-emerald-950/20">
         <p className="text-sm text-muted-foreground">
-          当前方案仍使用兼容的 legacy managed
-          roles。初始化后才会持久化显式问卷输入。
+          The current plan still uses compatibility legacy managed roles.
+          Explicit questionnaire input is persisted after initialization.
         </p>
         <Button className="mt-3" onClick={initialize} disabled={isSaving}>
-          初始化 V2 子 Agent 能力配置
+          Initialize V2 sub-agent capabilities
         </Button>
         {saveError ? (
           <p className="mt-2 text-sm text-rose-600">{saveError}</p>
@@ -970,11 +991,11 @@ export function CodexSubagentProfileEditor({
         >
           <div className="flex items-center gap-2 text-blue-900 dark:text-blue-100">
             <SlidersHorizontal aria-hidden="true" className="h-4 w-4" />
-            <h3 className="text-sm font-semibold">选择策略</h3>
+            <h3 className="text-sm font-semibold">Selection policy</h3>
           </div>
           <label className="grid gap-1 text-sm">
             <span className="font-medium text-blue-950 dark:text-blue-100">
-              第三方子 Agent 选择策略
+              Third-party sub-agent selection policy
             </span>
             <select
               className="rounded-md border border-blue-200 bg-background/90 px-3 py-2 dark:border-blue-500/35 dark:bg-slate-950/60"
@@ -989,9 +1010,9 @@ export function CodexSubagentProfileEditor({
                 });
               }}
             >
-              <option value="balanced">均衡</option>
-              <option value="official_first">官方优先</option>
-              <option value="third_party_first">第三方优先</option>
+              <option value="balanced">Balanced</option>
+              <option value="official_first">Official first</option>
+              <option value="third_party_first">Third-party first</option>
             </select>
           </label>
 
@@ -1001,7 +1022,7 @@ export function CodexSubagentProfileEditor({
               className="grid gap-1 text-sm"
             >
               <span className="font-medium text-blue-950 dark:text-blue-100">
-                搜索子 Agent 模型
+                Search sub-agent models
               </span>
               <span className="relative">
                 <Search
@@ -1013,7 +1034,7 @@ export function CodexSubagentProfileEditor({
                   type="search"
                   value={profileSearch}
                   onChange={(event) => setProfileSearch(event.target.value)}
-                  placeholder="模型、角色名或 Provider 类型"
+                  placeholder="Model, role name, or provider type"
                   className="border-blue-200 bg-background/90 pl-9 dark:border-blue-500/35 dark:bg-slate-950/60"
                 />
               </span>
@@ -1021,7 +1042,7 @@ export function CodexSubagentProfileEditor({
             <div
               className="flex flex-wrap gap-2"
               role="group"
-              aria-label="子 Agent 模型筛选"
+              aria-label="Sub-agent model filter"
             >
               {PROFILE_FILTERS.map((filter) => (
                 <Button
@@ -1058,11 +1079,13 @@ export function CodexSubagentProfileEditor({
               onClick={() => reconcile("sync_catalog", draft)}
             >
               <Database aria-hidden="true" className="h-4 w-4" />
-              修复缺失的模型档案
+              Repair missing model profiles
             </Button>
             <p className="max-w-2xl text-xs leading-5 text-cyan-900/75 dark:text-cyan-100/75">
-              正常情况下，新模型会在 Provider
-              保存时自动加入并默认关闭；这里只用于修复历史配置或异常中断造成的缺失，已有问卷和手工设置不会被覆盖。
+              Normally, new models are added automatically when the provider is
+              saved and disabled by default. Use this only to repair missing
+              entries caused by historical config or interrupted operations;
+              existing questionnaires and manual settings are preserved.
             </p>
           </div>
           {reconciliableProfileCount > 0 ? (
@@ -1072,7 +1095,8 @@ export function CodexSubagentProfileEditor({
                 variant="outline"
                 onClick={() => reconcile("remove_all_invalid", draft)}
               >
-                删除全部无效能力配置（{reconciliableProfileCount} 项）
+                Delete all invalid capability configurations (
+                {reconciliableProfileCount} items)
               </Button>
               <Button
                 type="button"
@@ -1081,8 +1105,8 @@ export function CodexSubagentProfileEditor({
                   reconcile("recover_all_invalid_from_catalog", draft)
                 }
               >
-                从模型目录恢复全部无效能力配置（
-                {reconciliableProfileCount} 项）
+                Restore all invalid capability configurations from the model
+                catalog ({reconciliableProfileCount} items)
               </Button>
             </div>
           ) : null}
@@ -1094,11 +1118,13 @@ export function CodexSubagentProfileEditor({
                 className="border-amber-300 bg-background/85 text-amber-800 hover:bg-amber-100 dark:border-amber-500/40 dark:bg-amber-950/30 dark:text-amber-100 dark:hover:bg-amber-500/20"
                 onClick={() => reconcile("prune_unroutable", draft)}
               >
-                与目录同步：删除已失效模型（{unroutableProfileCount} 项）
+                Sync with catalog: delete unavailable models (
+                {unroutableProfileCount} items)
               </Button>
               <p className="max-w-2xl text-xs leading-5 text-amber-900/75 dark:text-amber-100/75">
-                这些配置的模型已不在当前 MultiRouter
-                模型目录中。同步后会删除它们；若模型重新加入目录，可再次添加。
+                The models in these configurations are no longer in the current
+                MultiRouter catalog. Syncing deletes them; add them again if the
+                models return to the catalog.
               </p>
             </div>
           ) : null}
@@ -1113,15 +1139,18 @@ export function CodexSubagentProfileEditor({
               aria-expanded={showOfficialProfiles}
               onClick={() => setShowOfficialProfiles((current) => !current)}
             >
-              <span>官方模型（高级） · {officialProfileCount} 个</span>
+              <span>
+                Official models (advanced) · {officialProfileCount} profiles
+              </span>
               <span className="text-xs text-muted-foreground">
-                {showOfficialProfiles ? "收起" : "查看"}
+                {showOfficialProfiles ? "Collapse" : "View"}
               </span>
             </Button>
             {showOfficialProfiles ? (
               <p className="px-2 pt-2 text-xs leading-5 text-muted-foreground">
-                官方模型通常不需要创建固定角色，Codex
-                内置角色会继承当前官方模型。仅在你明确需要锁定某个官方模型时才启用这里的配置。
+                Official models usually do not need fixed roles; Codex built-in
+                roles inherit the current official model. Enable this only when
+                you explicitly need to pin an official model.
               </p>
             ) : null}
           </div>
@@ -1155,19 +1184,22 @@ export function CodexSubagentProfileEditor({
                     effort !== "none" && EXPLICIT_REASONING_EFFORTS.has(effort),
                 );
                 const reasoningPolicyOptions: Array<[string, string]> = [
-                  ["delegated", "允许主 Agent / spawn 指定"],
+                  ["delegated", "Allow the parent agent / spawn to specify"],
                 ];
                 if (reasoningCapability?.providerDefaultEffort) {
                   reasoningPolicyOptions.push([
                     "model_default",
-                    "使用模型默认（固定）",
+                    "Use model default (fixed)",
                   ]);
                 }
                 if (selectableFixedEfforts.length > 0) {
-                  reasoningPolicyOptions.push(["fixed", "固定档位"]);
+                  reasoningPolicyOptions.push(["fixed", "Fixed effort"]);
                 }
                 if (reasoningCapability?.disableAllowed) {
-                  reasoningPolicyOptions.push(["disabled", "关闭推理"]);
+                  reasoningPolicyOptions.push([
+                    "disabled",
+                    "Disable reasoning",
+                  ]);
                 }
                 const profileTone = profileToneFor(profile, status);
                 const overrides = profile.overrides ?? {};
@@ -1196,7 +1228,7 @@ export function CodexSubagentProfileEditor({
                     <div className="flex items-center gap-3">
                       <div className="min-w-0 flex-1">
                         <AccordionTrigger
-                          aria-label={`配置 ${profile.model}`}
+                          aria-label={`Configure ${profile.model}`}
                           className="py-3 hover:no-underline"
                         >
                           <ProfileSummary
@@ -1210,7 +1242,7 @@ export function CodexSubagentProfileEditor({
                         type="button"
                         size="sm"
                         variant="outline"
-                        aria-label={`编辑 ${profile.model}`}
+                        aria-label={`Edit ${profile.model}`}
                         onClick={() => setOpenProfileKey(profileKey)}
                         // 真不可路由（编译状态 Unroutable）一律禁止编辑；
                         // 未启用的可路由 profile（编译状态 Disabled）必须可编辑，
@@ -1218,11 +1250,11 @@ export function CodexSubagentProfileEditor({
                         disabled={isSaving || status?.status === "unroutable"}
                         className="shrink-0"
                       >
-                        编辑
+                        Edit
                       </Button>
                       <label className="flex shrink-0 items-center gap-2 text-xs">
                         <Switch
-                          aria-label={`启用 ${profile.model} 作为 V2 子 Agent`}
+                          aria-label={`Enable ${profile.model} as a V2 sub-agent`}
                           checked={profile.enabled}
                           // 用 status.status 区分"未启用（disabled）"与"真不可路由
                           // （unroutable）"：未启用 profile 的后端编译状态是 Disabled，
@@ -1237,7 +1269,7 @@ export function CodexSubagentProfileEditor({
                             }))
                           }
                         />
-                        {profile.enabled ? "已启用" : "未启用"}
+                        {profile.enabled ? "Enabled" : "Disabled"}
                       </label>
                     </div>
                     <AccordionContent
@@ -1249,14 +1281,14 @@ export function CodexSubagentProfileEditor({
                         id={`codex-subagent-${profileIndex}-region-label`}
                         className="sr-only"
                       >
-                        {profile.model} 子 Agent 配置
+                        {profile.model} sub-agent configuration
                       </span>
                       <fieldset
                         className="grid gap-3 rounded-lg border border-sky-200 bg-sky-50/60 p-3 dark:border-sky-500/40 dark:bg-sky-950/20"
-                        aria-label="任务优势"
+                        aria-label="Task strengths"
                       >
                         <legend className="px-1 text-sm font-semibold text-sky-900 dark:text-sky-100">
-                          任务优势
+                          Task strengths
                         </legend>
                         <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-5">
                           {TASK_STRENGTHS.map((strength) => (
@@ -1286,7 +1318,7 @@ export function CodexSubagentProfileEditor({
                                     selected.length >= 5
                                   ) {
                                     setStrengthLimitMessage(
-                                      "任务优势最多选择 5 项",
+                                      "Choose at most 5 task strengths",
                                     );
                                     return;
                                   }
@@ -1315,7 +1347,7 @@ export function CodexSubagentProfileEditor({
 
                       <div className="grid gap-3 sm:grid-cols-2">
                         <QuestionnaireSelect
-                          label="输入能力"
+                          label="Input capability"
                           value={
                             effectiveInputModalities?.[1] === "image"
                               ? "text_and_image"
@@ -1324,9 +1356,9 @@ export function CodexSubagentProfileEditor({
                                 : "unknown"
                           }
                           options={[
-                            ["unknown", "未声明"],
-                            ["text_only", "仅文本"],
-                            ["text_and_image", "文本与图像"],
+                            ["unknown", "Undeclared"],
+                            ["text_only", "Text only"],
+                            ["text_and_image", "Text and image"],
                           ]}
                           onChange={(value) =>
                             updateProfile(profileKey, (current) => {
@@ -1345,12 +1377,12 @@ export function CodexSubagentProfileEditor({
                           }
                         />
                         <QuestionnaireSelect
-                          label="优化目标"
+                          label="Optimization target"
                           value={profile.questionnaire.optimization}
                           options={[
-                            ["speed", "速度"],
-                            ["balanced", "均衡"],
-                            ["quality", "质量"],
+                            ["speed", "Speed"],
+                            ["balanced", "Balanced"],
+                            ["quality", "Quality"],
                           ]}
                           onChange={(value) =>
                             updateProfile(profileKey, (current) => ({
@@ -1364,12 +1396,12 @@ export function CodexSubagentProfileEditor({
                           }
                         />
                         <QuestionnaireSelect
-                          label="写入范围"
+                          label="Write scope"
                           value={profile.questionnaire.writeScope}
                           options={[
-                            ["read_only", "只读"],
-                            ["bounded_changes", "有限修改"],
-                            ["complex_changes", "复杂修改"],
+                            ["read_only", "Read-only"],
+                            ["bounded_changes", "Bounded changes"],
+                            ["complex_changes", "Complex changes"],
                           ]}
                           onChange={(value) =>
                             updateProfile(profileKey, (current) => ({
@@ -1383,12 +1415,12 @@ export function CodexSubagentProfileEditor({
                           }
                         />
                         <QuestionnaireSelect
-                          label="模型偏好"
+                          label="Model preference"
                           value={profile.questionnaire.preference}
                           options={[
-                            ["preferred", "优先"],
-                            ["eligible", "可用"],
-                            ["fallback", "后备"],
+                            ["preferred", "Preferred"],
+                            ["eligible", "Eligible"],
+                            ["fallback", "Fallback"],
                           ]}
                           onChange={(value) =>
                             updateProfile(profileKey, (current) => ({
@@ -1402,7 +1434,7 @@ export function CodexSubagentProfileEditor({
                           }
                         />
                         <QuestionnaireSelect
-                          label="推理策略"
+                          label="Reasoning policy"
                           value={profile.reasoning.policy}
                           options={reasoningPolicyOptions}
                           onChange={(value) =>
@@ -1448,20 +1480,20 @@ export function CodexSubagentProfileEditor({
                               aria-hidden="true"
                               className="h-4 w-4"
                             />
-                            高级字段
+                            Advanced fields
                           </Button>
                         </CollapsibleTrigger>
                         <CollapsibleContent className="mt-3 space-y-3 rounded-lg border border-violet-200 bg-violet-50/55 p-3 dark:border-violet-500/35 dark:bg-violet-950/20">
                           <OverrideField
                             id={`codex-subagent-${profileIndex}-role-name`}
-                            label="角色名称"
+                            label="Role name"
                             value={
                               overrides.roleName ??
                               preview?.requestedRoleName ??
                               ""
                             }
                             automatic={overrides.roleName === undefined}
-                            restoreLabel="恢复角色名称自动值"
+                            restoreLabel="Restore automatic role name"
                             onChange={(value) =>
                               setOverride(profileKey, "roleName", value)
                             }
@@ -1471,14 +1503,14 @@ export function CodexSubagentProfileEditor({
                           />
                           <OverrideField
                             id={`codex-subagent-${profileIndex}-description`}
-                            label="角色描述"
+                            label="Role description"
                             value={
                               overrides.description ??
                               preview?.description ??
                               ""
                             }
                             automatic={overrides.description === undefined}
-                            restoreLabel="恢复角色描述自动值"
+                            restoreLabel="Restore automatic role description"
                             multiline
                             onChange={(value) =>
                               setOverride(profileKey, "description", value)
@@ -1489,7 +1521,7 @@ export function CodexSubagentProfileEditor({
                           />
                           <OverrideField
                             id={`codex-subagent-${profileIndex}-developer-instructions`}
-                            label="开发者指令"
+                            label="Developer instructions"
                             value={
                               overrides.developerInstructions ??
                               preview?.developerInstructions ??
@@ -1498,7 +1530,7 @@ export function CodexSubagentProfileEditor({
                             automatic={
                               overrides.developerInstructions === undefined
                             }
-                            restoreLabel="恢复开发者指令自动值"
+                            restoreLabel="Restore automatic developer instructions"
                             multiline
                             onChange={(value) =>
                               setOverride(
@@ -1516,12 +1548,12 @@ export function CodexSubagentProfileEditor({
                           />
                           <OverrideField
                             id={`codex-subagent-${profileIndex}-nickname-candidates`}
-                            label="昵称候选"
+                            label="Nickname candidates"
                             value={nicknameValue}
                             automatic={
                               overrides.nicknameCandidates === undefined
                             }
-                            restoreLabel="恢复昵称候选自动值"
+                            restoreLabel="Restore automatic nickname candidates"
                             onChange={(value) => {
                               setNicknameDrafts((current) => ({
                                 ...current,
@@ -1542,12 +1574,12 @@ export function CodexSubagentProfileEditor({
                               <label
                                 htmlFor={`codex-subagent-${profileIndex}-model-reasoning`}
                               >
-                                模型推理强度
+                                Model reasoning effort
                               </label>
                               <span className="text-xs text-muted-foreground">
                                 {profile.reasoning.policy === "fixed"
-                                  ? "固定"
-                                  : "未固定"}
+                                  ? "Fixed"
+                                  : "Not fixed"}
                               </span>
                             </span>
                             <div className="flex gap-2">
@@ -1573,7 +1605,7 @@ export function CodexSubagentProfileEditor({
                               >
                                 {profile.reasoning.policy !== "fixed" ? (
                                   <option value="" disabled>
-                                    等待后端能力
+                                    Waiting for backend capability
                                   </option>
                                 ) : null}
                                 {selectableFixedEfforts.map((effort) => (
@@ -1592,7 +1624,7 @@ export function CodexSubagentProfileEditor({
                                   }))
                                 }
                               >
-                                允许主 Agent / spawn 指定
+                                Allow the parent agent / spawn to specify
                               </Button>
                             </div>
                           </div>
@@ -1607,7 +1639,7 @@ export function CodexSubagentProfileEditor({
                             className="border-cyan-200 bg-cyan-50 text-cyan-800 hover:bg-cyan-100 dark:border-cyan-500/40 dark:bg-cyan-950/25 dark:text-cyan-100 dark:hover:bg-cyan-500/20"
                           >
                             <Code2 aria-hidden="true" className="h-4 w-4" />
-                            生成结果与 TOML
+                            Generated result and TOML
                           </Button>
                         </CollapsibleTrigger>
                         <CollapsibleContent className="mt-3 space-y-3 rounded-lg border border-cyan-200 bg-cyan-50/55 p-3 dark:border-cyan-500/35 dark:bg-cyan-950/20">
@@ -1632,7 +1664,9 @@ export function CodexSubagentProfileEditor({
           </Accordion>
         ) : (
           <div className="rounded-lg border border-dashed bg-background/70 p-6 text-center">
-            <p className="text-sm font-medium">没有符合条件的子 Agent 模型</p>
+            <p className="text-sm font-medium">
+              No sub-agent models match the filters
+            </p>
             <Button
               type="button"
               variant="outline"
@@ -1642,23 +1676,23 @@ export function CodexSubagentProfileEditor({
                 setProfileFilter("all");
               }}
             >
-              清除筛选
+              Clear filters
             </Button>
           </div>
         )}
 
         {invalidProfileEntries.length > 0 ? (
           <section
-            aria-label="需要处理"
+            aria-label="Needs attention"
             className="space-y-3 rounded-lg border border-rose-300 bg-rose-50/40 p-3 dark:bg-rose-950/15"
           >
             <h3 className="text-sm font-semibold text-rose-800 dark:text-rose-100">
-              需要处理
+              Needs attention
             </h3>
             <div className="grid gap-3 lg:grid-cols-2">
               {invalidProfileEntries.map(([profileKey], index) => {
                 const ordinal = index + 1;
-                const title = `无效能力配置 ${ordinal}`;
+                const title = `Invalid capability configuration ${ordinal}`;
                 return (
                   <section
                     key={profileKey}
@@ -1667,7 +1701,8 @@ export function CodexSubagentProfileEditor({
                   >
                     <div className="font-medium">{title}</div>
                     <p className="text-sm text-rose-700">
-                      持久化的 profile 结构无效，原始条目尚未被修改。
+                      The persisted profile structure is invalid; the original
+                      entry has not been modified.
                     </p>
                     <ProfileBackendOutput status={undefined} />
                     <Button
@@ -1675,7 +1710,7 @@ export function CodexSubagentProfileEditor({
                       variant="outline"
                       onClick={() => repairProfile(profileKey)}
                     >
-                      修复无效能力配置 {ordinal}
+                      Repair invalid capability configuration {ordinal}
                     </Button>
                   </section>
                 );
@@ -1698,7 +1733,9 @@ export function CodexSubagentProfileEditor({
       ) : null}
       {statuses ? (
         <div className="space-y-2 rounded-lg border border-indigo-200 bg-indigo-50/65 p-4 text-sm text-indigo-950 dark:border-indigo-500/35 dark:bg-indigo-950/20 dark:text-indigo-100">
-          <p className="font-medium">生成来源：{statuses.generationSource}</p>
+          <p className="font-medium">
+            Generation source:{statuses.generationSource}
+          </p>
           {unassignedStatuses.map((status, index) => (
             <ProfileBackendOutput key={`unassigned-${index}`} status={status} />
           ))}
@@ -1731,14 +1768,14 @@ export function CodexSubagentProfileEditor({
                 : "text-emerald-800 dark:text-emerald-100",
           )}
         >
-          {isDirty ? "有未保存更改" : "所有更改均已保存"}
+          {isDirty ? "Unsaved changes" : "All changes saved"}
         </span>
         <Button
           className="bg-blue-600 text-white hover:bg-blue-500"
           onClick={save}
           disabled={isSaving || !isDirty}
         >
-          {isSaving ? "保存中…" : "保存 V2 子 Agent 配置"}
+          {isSaving ? "Saving…" : "Save V2 sub-agent configuration"}
         </Button>
         {saveMessage ? (
           <span
@@ -1780,7 +1817,8 @@ function ReasoningCapabilitySummary({
   if (!capability) {
     return (
       <div className="rounded-md border border-amber-200 bg-amber-50/70 p-3 text-xs text-amber-900 dark:border-amber-500/35 dark:bg-amber-950/20 dark:text-amber-100">
-        正在读取后端解析后的推理能力；未确认前不会启用固定档位或关闭推理。
+        Reading reasoning capabilities parsed by the backend; fixed effort or
+        disabled reasoning will not be applied until confirmed.
       </div>
     );
   }
@@ -1788,50 +1826,53 @@ function ReasoningCapabilitySummary({
   const mappings = capability.codexSelectableEfforts
     .filter((effort) => effort !== "none" && capability.effortMap[effort])
     .map((effort) => `${effort}→${capability.effortMap[effort]}`)
-    .join("，");
+    .join(", ");
   const behavior =
     policy.policy === "delegated"
-      ? "由主 Agent、spawn 参数或 Codex 默认值决定"
+      ? "Determined by the parent agent, spawn parameters, or Codex defaults"
       : policy.policy === "model_default"
-        ? `固定为模型当前默认 ${capability.providerDefaultEffort ?? "未声明"}`
+        ? `Fixed to the model’s current default ${capability.providerDefaultEffort ?? "Undeclared"}`
         : policy.policy === "fixed"
-          ? `固定 ${policy.effort}；主 Agent 无法覆盖`
-          : "关闭推理；上游将使用已确认的 Provider 关闭语义";
+          ? `Fixed at ${policy.effort}; the parent agent cannot override it`
+          : "Reasoning disabled; the upstream uses the provider’s confirmed disabled semantics";
   const ultraEnabled = capability.codexUltraOrchestrationEnabled;
 
   return (
     <div className="space-y-1 rounded-md border border-indigo-200 bg-indigo-50/70 p-3 text-xs text-indigo-950 dark:border-indigo-500/35 dark:bg-indigo-950/20 dark:text-indigo-100">
       <p>
-        能力来源：{capability.source ?? "未声明"}（{capability.confidence}）
+        Capability source:{capability.source ?? "Undeclared"} (
+        {capability.confidence})
       </p>
       <p>
-        Provider 原生档位：
-        {capability.providerAcceptedEfforts.join(" / ") || "未声明"}
+        Provider-native efforts:
+        {capability.providerAcceptedEfforts.join(" / ") || "Undeclared"}
       </p>
       <p>
-        Codex 可选档位：
-        {capability.codexSelectableEfforts.join(" / ") || "未确认"}
+        Codex-selectable efforts:
+        {capability.codexSelectableEfforts.join(" / ") || "Unconfirmed"}
       </p>
-      <p>模型默认：{capability.providerDefaultEffort ?? "未声明"}</p>
-      <p>允许关闭：{capability.disableAllowed ? "是" : "否"}</p>
-      {mappings ? <p>映射：{mappings}</p> : null}
+      <p>Model default:{capability.providerDefaultEffort ?? "Undeclared"}</p>
+      <p>Disable allowed:{capability.disableAllowed ? "Yes" : "No"}</p>
+      {mappings ? <p>Mapping:{mappings}</p> : null}
       {ultraEnabled ? (
         <p>
-          Ultra 已启用：这是 Codex V2 的“最大推理 + 主动 Sub-Agent 委派”模式；
-          第三方 Provider 实际接收 {capability.effortMap.ultra ?? "max"}。
+          Ultra enabled: this is Codex V2’s “maximum reasoning + active
+          sub-agent delegation” mode; The third-party provider receives{" "}
+          {capability.effortMap.ultra ?? "max"}.
         </p>
       ) : (
         <p>
-          Ultra 未启用：若父 Agent 使用
-          Ultra，当前角色应使用模型默认或固定兼容档位，
-          或在该模型的推理能力中启用 Codex Ultra 编排。
+          Ultra disabled: if the parent agent uses Ultra, the current role
+          should use the model default or a fixed compatible effort, or enable
+          Codex Ultra orchestration in the model’s reasoning capabilities.
         </p>
       )}
       <p className="font-medium">{behavior}</p>
       {capability.supportKind === "unknown" ? (
         <p className="font-medium text-rose-700 dark:text-rose-300">
-          推理能力未配置，当前可路由角色无法保存。请先在 Provider
-          模型目录中声明能力，或完成只读能力检测并采用检测结果。
+          Reasoning capability is not configured; the current routable role
+          cannot be saved. First declare it in the provider model catalog, or
+          complete a read-only capability probe and adopt its result.
         </p>
       ) : null}
     </div>
@@ -1848,9 +1889,9 @@ function ProfileSummary({
   status?: CodexSubagentProfileStatus;
 }) {
   const preferenceLabels = {
-    preferred: "优先",
-    eligible: "可用",
-    fallback: "后备",
+    preferred: "Preferred",
+    eligible: "Eligible",
+    fallback: "Fallback",
   } as const;
   const providerKind = status?.providerKind ?? preview?.providerKind;
   const reasoning =
@@ -1877,7 +1918,7 @@ function ProfileSummary({
               : "border-violet-200 bg-violet-100/80 text-violet-800 dark:border-violet-500/40 dark:bg-violet-500/15 dark:text-violet-100"
           }
         >
-          {providerKind === "official" ? "官方" : "第三方"}
+          {providerKind === "official" ? "Official" : "Third-party"}
         </Badge>
         <Badge
           variant="outline"
@@ -1887,7 +1928,7 @@ function ProfileSummary({
               : "border-emerald-200 bg-emerald-100/80 text-emerald-800 dark:border-emerald-500/40 dark:bg-emerald-500/15 dark:text-emerald-100"
           }
         >
-          {status?.status === "unroutable" ? "不可路由" : "可路由"}
+          {status?.status === "unroutable" ? "Unroutable" : "Routable"}
         </Badge>
         <Badge
           variant="outline"
@@ -1897,7 +1938,7 @@ function ProfileSummary({
               : "border-amber-200 bg-amber-100/80 text-amber-800 dark:border-amber-500/40 dark:bg-amber-500/15 dark:text-amber-100"
           }
         >
-          {profile.enabled ? "已启用" : "待配置"}
+          {profile.enabled ? "Enabled" : "Not configured"}
         </Badge>
         <Badge
           variant="outline"
@@ -1909,13 +1950,13 @@ function ProfileSummary({
           variant="outline"
           className="border-sky-200 bg-sky-100/70 text-sky-800 dark:border-sky-500/40 dark:bg-sky-500/15 dark:text-sky-100"
         >
-          推理 {reasoning}
+          Reasoning {reasoning}
         </Badge>
         <Badge
           variant="outline"
           className="border-indigo-200 bg-indigo-100/70 text-indigo-800 dark:border-indigo-500/40 dark:bg-indigo-500/15 dark:text-indigo-100"
         >
-          {hasOverrides ? "含手工覆盖" : "自动生成"}
+          {hasOverrides ? "Manual overrides" : "Auto-generated"}
         </Badge>
         {strengthLabels.map((label) => (
           <Badge
@@ -1954,34 +1995,40 @@ function ProfileBackendOutput({
   return (
     <div
       role="region"
-      aria-label={`${profileKey ?? "未识别 profile"} 后端预览状态`}
+      aria-label={`${profileKey ?? "Unrecognized profile"} backend preview status`}
       className="space-y-2 rounded-lg border border-cyan-200 bg-cyan-50/65 p-3 text-sm text-cyan-950 dark:border-cyan-500/35 dark:bg-cyan-950/20 dark:text-cyan-100"
     >
       {status ? (
         <>
           <p>
             {profileKey
-              ? `${profileKey}：${status.status}`
-              : `生成状态：${status.status}`}
+              ? `${profileKey}: ${status.status}`
+              : `Generation status:${status.status}`}
           </p>
-          <p>生成状态：{status.status}</p>
+          <p>Generation status:{status.status}</p>
           <p>
-            Provider 类型：
-            {status.providerKind ?? preview?.providerKind ?? "未知"}
+            Provider type:
+            {status.providerKind ?? preview?.providerKind ?? "Unknown"}
           </p>
-          <p>可路由：{status.routable ? "是" : "否"}</p>
+          <p>Routable:{status.routable ? "Yes" : "No"}</p>
           <p>
-            已启用：
-            {(status.enabled ?? profile?.enabled) ? "是" : "否"}
+            Enabled:
+            {(status.enabled ?? profile?.enabled) ? "Yes" : "No"}
           </p>
           {status.fieldSources ? (
             <>
-              <p>角色名称来源：{status.fieldSources.roleName}</p>
-              <p>角色描述来源：{status.fieldSources.description}</p>
-              <p>开发者指令来源：{status.fieldSources.developerInstructions}</p>
-              <p>昵称候选来源：{status.fieldSources.nicknameCandidates}</p>
+              <p>Role name source:{status.fieldSources.roleName}</p>
+              <p>Role description source:{status.fieldSources.description}</p>
               <p>
-                模型推理强度来源：
+                Developer instructions source:
+                {status.fieldSources.developerInstructions}
+              </p>
+              <p>
+                Nickname candidates source:
+                {status.fieldSources.nicknameCandidates}
+              </p>
+              <p>
+                Model reasoning effort source:
                 {status.fieldSources.modelReasoningEffort}
               </p>
             </>
@@ -1989,18 +2036,18 @@ function ProfileBackendOutput({
           {status.inputModality ? (
             <>
               <p>
-                输入能力：
+                Input capability:
                 {formatInputModalities(status.inputModality.modalities)}
-                （来源：{formatModalitySource(status.inputModality.source)}）
+                (source:{formatModalitySource(status.inputModality.source)})
               </p>
               {status.inputModality.declarations.length > 0 ? (
                 <div className="space-y-0.5 rounded-md border border-cyan-200/70 bg-background/45 px-2 py-1.5 text-xs dark:border-cyan-500/25 dark:bg-slate-950/25">
-                  <p className="font-medium">判定链</p>
+                  <p className="font-medium">Decision chain</p>
                   {status.inputModality.declarations.map((declaration) => (
                     <p key={declaration.source}>
-                      {formatModalitySource(declaration.source)}：
+                      {formatModalitySource(declaration.source)}:
                       {formatInputModalities(declaration.declared)}
-                      {declaration.adopted ? "（采用）" : ""}
+                      {declaration.adopted ? "(adopted)" : ""}
                     </p>
                   ))}
                 </div>
@@ -2013,15 +2060,15 @@ function ProfileBackendOutput({
             </>
           ) : null}
           {status.roleFilePath ? <p>{status.roleFilePath}</p> : null}
-          {status.model ? <p>模型：{status.model}</p> : null}
+          {status.model ? <p>Model:{status.model}</p> : null}
           {status.modelProvider ? (
-            <p>模型 Provider：{status.modelProvider}</p>
+            <p>Model provider:{status.modelProvider}</p>
           ) : null}
           {status.modelReasoningEffort ? (
-            <p>推理强度：{status.modelReasoningEffort}</p>
+            <p>Reasoning effort:{status.modelReasoningEffort}</p>
           ) : null}
           {status.nonGenerationReason ? (
-            <p>未生成原因：{status.nonGenerationReason}</p>
+            <p>Why not generated:{status.nonGenerationReason}</p>
           ) : null}
         </>
       ) : null}
@@ -2029,12 +2076,12 @@ function ProfileBackendOutput({
       {requestedRoleName || effectiveRoleName ? (
         <div className="grid gap-2 md:grid-cols-2">
           <div>
-            <span className="font-medium">请求角色名</span>
-            <div>{requestedRoleName ?? "后端未返回"}</div>
+            <span className="font-medium">Requested role name</span>
+            <div>{requestedRoleName ?? "Backend did not return"}</div>
           </div>
           <div>
-            <span className="font-medium">实际角色名</span>
-            <div>{effectiveRoleName ?? "后端未返回"}</div>
+            <span className="font-medium">Effective role name</span>
+            <div>{effectiveRoleName ?? "Backend did not return"}</div>
           </div>
         </div>
       ) : null}
@@ -2056,7 +2103,9 @@ function ProfileBackendOutput({
           </pre>
         </>
       ) : (
-        <p className="text-xs text-muted-foreground">后端预览不可用。</p>
+        <p className="text-xs text-muted-foreground">
+          Backend preview unavailable.
+        </p>
       )}
 
       {warnings.map((warning) => (
@@ -2138,7 +2187,7 @@ function OverrideField({
       <span className="flex items-center justify-between gap-2">
         <label htmlFor={id}>{label}</label>
         <span className="text-xs text-muted-foreground">
-          {automatic ? "自动" : "手工覆盖"}
+          {automatic ? "Automatic" : "Manual override"}
         </span>
       </span>
       <div className="flex gap-2">

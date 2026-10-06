@@ -596,12 +596,12 @@ function App() {
   const handleDisableOmo = () => {
     disableOmoMutation.mutate(undefined, {
       onSuccess: () => {
-        toast.success(t("omo.disabled", { defaultValue: "OMO 已停用" }));
+        toast.success(t("omo.disabled", { defaultValue: "OMO disabled" }));
       },
       onError: (error: Error) => {
         toast.error(
           t("omo.disableFailed", {
-            defaultValue: "停用 OMO 失败: {{error}}",
+            defaultValue: "Failed to disable OMO: {{error}}",
             error: extractErrorMessage(error),
           }),
         );
@@ -613,12 +613,12 @@ function App() {
   const handleDisableOmoSlim = () => {
     disableOmoSlimMutation.mutate(undefined, {
       onSuccess: () => {
-        toast.success(t("omo.disabled", { defaultValue: "OMO 已停用" }));
+        toast.success(t("omo.disabled", { defaultValue: "OMO disabled" }));
       },
       onError: (error: Error) => {
         toast.error(
           t("omo.disableFailed", {
-            defaultValue: "停用 OMO 失败: {{error}}",
+            defaultValue: "Failed to disable OMO: {{error}}",
             error: extractErrorMessage(error),
           }),
         );
@@ -723,23 +723,26 @@ function App() {
         if (!active || plugins.length === 0) return;
         const plugin = plugins[0];
         toast.warning(
-          `检测到 Codex 插件 ${plugin.name}@${plugin.version} 尚未登记到个人 marketplace。`,
+          `Codex plugin ${plugin.name}@${plugin.version} is not registered in your personal marketplace.`,
           {
             duration: Infinity,
             closeButton: true,
             action: {
-              label: "修复登记",
+              label: "Fix registration",
               onClick: () => {
                 void settingsApi
                   .repairCodexPluginRegistration(plugin.id)
                   .then(() => {
-                    toast.success(`Codex 插件 ${plugin.name} 登记已修复。`, {
-                      closeButton: true,
-                    });
+                    toast.success(
+                      `Codex plugin ${plugin.name} registration fixed.`,
+                      {
+                        closeButton: true,
+                      },
+                    );
                   })
                   .catch((error) => {
                     toast.error(
-                      `Codex 插件 ${plugin.name} 登记修复失败：${extractErrorMessage(error)}`,
+                      `Failed to fix Codex plugin ${plugin.name} registration: ${extractErrorMessage(error)}`,
                       { closeButton: true },
                     );
                   });
@@ -766,7 +769,7 @@ function App() {
       toast.warning(
         t("notifications.proxyOfficialWarning", {
           name: payload.providerName,
-          defaultValue: `当前供应商 ${payload.providerName} 是官方供应商，建议切换到第三方供应商后再使用代理接管`,
+          defaultValue: `The current provider ${payload.providerName} is official. Switch to a third-party provider before enabling proxy takeover.`,
         }),
         { duration: 8000 },
       );
@@ -848,7 +851,9 @@ function App() {
         const migrated = await invoke<boolean>("get_migration_result");
         if (migrated) {
           toast.success(
-            t("migration.success", { defaultValue: "配置迁移成功" }),
+            t("migration.success", {
+              defaultValue: "Configuration migrated successfully",
+            }),
             { closeButton: true },
           );
         }
@@ -985,7 +990,7 @@ function App() {
       const detail =
         extractErrorMessage(error) ||
         t("notifications.openLinkFailed", {
-          defaultValue: "链接打开失败",
+          defaultValue: "Failed to open link",
         });
       toast.error(detail);
     }
@@ -1028,7 +1033,7 @@ function App() {
 
     if (!fallbackProvider) {
       throw new Error(
-        "删除当前 MultiRouter 前需要至少保留一个普通 Codex provider 作为 fallback。",
+        "Keep at least one regular Codex provider as a fallback before deleting the current MultiRouter.",
       );
     }
 
@@ -1036,7 +1041,7 @@ function App() {
     await queryClient.invalidateQueries({ queryKey: ["providers", "codex"] });
     await queryClient.invalidateQueries({ queryKey: ["proxyStatus"] });
     toast.info(
-      `已先切换到 ${fallbackProvider.name}，正在删除当前 MultiRouter。`,
+      `Switched to ${fallbackProvider.name}; deleting the current MultiRouter.`,
       { closeButton: true },
     );
   };
@@ -1082,9 +1087,9 @@ function App() {
       }
       toast.success(
         activeApp === "pi"
-          ? t("pi.provider.removed", { defaultValue: "已从 Pi 移除" })
+          ? t("pi.provider.removed", { defaultValue: "Removed from Pi" })
           : t("notifications.removeFromConfigSuccess", {
-              defaultValue: "已从配置移除",
+              defaultValue: "Removed from configuration",
             }),
         { closeButton: true },
       );
@@ -1168,7 +1173,8 @@ function App() {
         const errorMessage = extractErrorMessage(error);
         toast.error(
           t("provider.duplicateLiveIdsLoadFailed", {
-            defaultValue: "读取配置中的供应商标识失败，请先修复配置后再试",
+            defaultValue:
+              "Failed to read the provider identifier from configuration. Fix the configuration and try again.",
           }) + (errorMessage ? `: ${errorMessage}` : ""),
         );
         return;
@@ -1203,10 +1209,10 @@ function App() {
           console.error("[App] Failed to update sort order", error);
           toast.error(
             t("provider.sortUpdateFailed", {
-              defaultValue: "排序更新失败",
+              defaultValue: "Failed to update ordering",
             }),
           );
-          return; // 如果排序更新失败，不继续添加
+          return; // Do not continue adding when ordering update fails.
         }
       }
     }
@@ -1226,7 +1232,7 @@ function App() {
       });
       toast.success(
         t("provider.terminalOpened", {
-          defaultValue: "终端已打开",
+          defaultValue: "Terminal opened",
         }),
       );
     } catch (error) {
@@ -1234,7 +1240,7 @@ function App() {
       const errorMessage = extractErrorMessage(error);
       toast.error(
         t("provider.terminalOpenFailed", {
-          defaultValue: "打开终端失败",
+          defaultValue: "Failed to open terminal",
         }) + (errorMessage ? `: ${errorMessage}` : ""),
       );
     }
@@ -1362,16 +1368,19 @@ function App() {
 
   // 历史修复写入完成后，先提示重启 Codex，再征求点赞并用默认浏览器打开 CCSwitchMulti 仓库。
   const handleCodexHistoryRepairCompleted = async () => {
-    toast.success("历史记录修复已完成。请完整重启 Codex 后再继续使用。", {
-      closeButton: true,
-      duration: 10000,
-    });
+    toast.success(
+      "History repair completed. Fully restart Codex before continuing.",
+      {
+        closeButton: true,
+        duration: 10000,
+      },
+    );
     const shouldOpenHome = window.confirm(
       [
-        "历史记录修复已完成，请完整重启 Codex，让侧边栏和模型状态重新加载。",
+        "History repair completed. Fully restart Codex so the sidebar and model state reload.",
         "",
-        "如果 CCSwitchMulti 这套 MultiRouter 配置帮到了你，可以帮我在 GitHub 仓库点个 Star 吗？",
-        "点击“确定”会用默认浏览器打开 CCSwitchMulti 的 GitHub 仓库页面。",
+        "If this CCSwitchMulti MultiRouter configuration helped, please star the GitHub repository.",
+        "Click “Confirm” to open the CCSwitchMulti GitHub repository in your default browser.",
       ].join("\n"),
     );
     if (shouldOpenHome) {
@@ -1384,7 +1393,7 @@ function App() {
   const notifyWindowControlError = (error: unknown) => {
     toast.error(
       t("notifications.windowControlFailed", {
-        defaultValue: "窗口控制失败：{{error}}",
+        defaultValue: "Window control failed: {{error}}",
         error: extractErrorMessage(error),
       }),
     );
@@ -1781,7 +1790,7 @@ function App() {
                   {currentView === "agents" && t("agents.title")}
                   {currentView === "universal" &&
                     t("universalProvider.title", {
-                      defaultValue: "统一供应商",
+                      defaultValue: "Universal provider",
                     })}
                   {currentView === "sessions" && t("sessionManager.title")}
                   {currentView === "workspace" && t("workspace.title")}
@@ -1790,9 +1799,10 @@ function App() {
                   {currentView === "openclawAgents" &&
                     t("openclaw.agents.title")}
                   {currentView === "hermesMemory" && t("hermes.memory.title")}
-                  {currentView === "codexRouter" && "Codex 多模型路由"}
-                  {currentView === "codexUsage" && "Codex 用量与重置额度"}
-                  {currentView === "openaiApi" && "第三方 Agent API"}
+                  {currentView === "codexRouter" && "Codex multi-model routing"}
+                  {currentView === "codexUsage" &&
+                    "Codex usage and reset credits"}
+                  {currentView === "openaiApi" && "Third-party Agent API"}
                 </h1>
               </div>
             ) : (
@@ -1833,7 +1843,7 @@ function App() {
                       setCurrentView("settings");
                     }}
                     title={t("usage.title", {
-                      defaultValue: "使用统计",
+                      defaultValue: "Usage statistics",
                     })}
                     className="hover:bg-black/5 dark:hover:bg-white/5"
                   >
@@ -2162,7 +2172,7 @@ function App() {
                                       openCodexRouterWorkspace(null, "status")
                                     }
                                     className="text-muted-foreground hover:text-foreground hover:bg-black/5 dark:hover:bg-white/5 w-8 px-2"
-                                    title="Codex 多模型路由"
+                                    title="Codex multi-model routing"
                                   >
                                     <RouteIcon className="w-4 h-4" />
                                   </Button>
@@ -2171,7 +2181,7 @@ function App() {
                                     size="sm"
                                     onClick={() => setCurrentView("codexUsage")}
                                     className="text-muted-foreground hover:text-foreground hover:bg-black/5 dark:hover:bg-white/5 w-8 px-2"
-                                    title="Codex 用量与重置额度"
+                                    title="Codex usage and reset credits"
                                   >
                                     <BarChart2 className="w-4 h-4" />
                                   </Button>
@@ -2195,7 +2205,7 @@ function App() {
                                 size="sm"
                                 onClick={() => setCurrentView("openaiApi")}
                                 className="text-muted-foreground hover:text-foreground hover:bg-black/5 dark:hover:bg-white/5 w-8 px-2"
-                                title="第三方 Agent API"
+                                title="Third-party Agent API"
                               >
                                 <Network className="w-4 h-4" />
                               </Button>
@@ -2302,7 +2312,7 @@ function App() {
               });
             } catch (error) {
               toast.error(
-                `新增模型源后刷新失败：${extractErrorMessage(error)}`,
+                `Failed to refresh after adding the model source: ${extractErrorMessage(error)}`,
                 { closeButton: true },
               );
             }
@@ -2325,11 +2335,12 @@ function App() {
           <DialogHeader>
             <DialogTitle className="flex items-center gap-2">
               <RouteIcon className="h-5 w-5 text-primary" />
-              配置多路模型
+              Configure multi-model routing
             </DialogTitle>
             <DialogDescription className="leading-6">
-              先明确是创建独立的新方案，还是编辑一条已有方案。打开此窗口时会重新读取
-              Provider 数据，避免沿用上次向导草稿。
+              First choose whether to create a separate plan or edit an existing
+              one. Opening this dialog reloads provider data so an old wizard
+              draft is not reused.
             </DialogDescription>
           </DialogHeader>
 
@@ -2341,20 +2352,22 @@ function App() {
             >
               <div className="flex items-center gap-2 font-medium">
                 <Plus className="h-4 w-4 text-blue-500" />
-                创建新配置
+                Create new configuration
               </div>
               <p className="mt-2 text-sm leading-6 text-muted-foreground">
-                从空白方案开始选择模型源。不会覆盖任何已有 MultiRouter。
+                Start from a blank plan and choose model sources. Existing
+                MultiRouters are not overwritten.
               </p>
             </button>
 
             <div className="rounded-xl border border-violet-500/25 bg-gradient-to-r from-violet-500/10 via-background to-fuchsia-500/10 p-4 shadow-sm">
               <div className="flex items-center gap-2 font-medium">
                 <Wrench className="h-4 w-4 text-violet-500" />
-                编辑旧配置
+                Edit existing configuration
               </div>
               <p className="mt-2 text-sm leading-6 text-muted-foreground">
-                选择明确的方案后再进入向导；方案名称和 ID 会始终显示在顶部。
+                Choose a specific plan before entering the wizard; its name and
+                ID remain visible at the top.
               </p>
               <div className="mt-3 max-h-40 space-y-2 overflow-y-auto pr-1">
                 {codexRoutingPlans.length > 0 ? (
@@ -2374,13 +2387,13 @@ function App() {
                         </span>
                       </span>
                       <span className="shrink-0 text-xs text-violet-600 dark:text-violet-300">
-                        编辑
+                        {t("common.edit")}
                       </span>
                     </button>
                   ))
                 ) : (
                   <div className="rounded-lg border border-dashed border-border/70 px-3 py-3 text-xs text-muted-foreground">
-                    暂无已有 MultiRouter，请先创建新配置。
+                    No MultiRouter exists yet. Create a new configuration first.
                   </div>
                 )}
               </div>
@@ -2392,14 +2405,14 @@ function App() {
               variant="outline"
               onClick={() => setIsCodexMultiRouterEntryChoiceOpen(false)}
             >
-              暂不配置
+              Not now
             </Button>
             <Button
               variant="outline"
               onClick={handleOpenCodexMultiRouterWorkspaceDirectly}
             >
               <LayoutDashboard className="mr-2 h-4 w-4" />
-              直接打开工作台
+              Open workspace directly
             </Button>
           </DialogFooter>
         </DialogContent>
@@ -2526,15 +2539,15 @@ function App() {
           <DialogHeader>
             <DialogTitle className="flex items-center gap-2">
               <Shield className="h-5 w-5 text-amber-500" />
-              Codex 本地路由已开启
+              Codex local routing is enabled
             </DialogTitle>
             <DialogDescription className="leading-6">
-              您正在使用本地路由功能，将由 ccsm 接管所有 codex
-              流量，所以不要在使用 codex 时关闭本软件。
+              Local routing is active; ccsm handles all Codex traffic, so keep
+              this app running while using Codex.
             </DialogDescription>
           </DialogHeader>
           <DialogFooter>
-            <Button onClick={codexLocalRoutingNotice.dismiss}>我知道了</Button>
+            <Button onClick={codexLocalRoutingNotice.dismiss}>Got it</Button>
           </DialogFooter>
         </DialogContent>
       </Dialog>

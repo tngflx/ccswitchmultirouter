@@ -4,7 +4,8 @@ import { describe, expect, it, vi } from "vitest";
 import { ProviderCard } from "@/components/providers/ProviderCard";
 import type { Provider } from "@/types";
 
-vi.mock("react-i18next", () => ({
+vi.mock("react-i18next", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("react-i18next")>()),
   useTranslation: () => ({
     t: (_key: string, options?: { defaultValue?: string }) =>
       options?.defaultValue ?? _key,
@@ -80,7 +81,7 @@ describe("ProviderCard Codex adaptation marker", () => {
     );
 
     expect(
-      screen.getByText("自动适配 · Responses + Chat"),
+      screen.getByText("Auto-adapted · Responses + Chat"),
     ).toBeInTheDocument();
     expect(screen.queryByText("MultiRouter")).not.toBeInTheDocument();
   });
@@ -107,7 +108,7 @@ describe("ProviderCard Codex adaptation marker", () => {
 
     expect(screen.getByText("MultiRouter")).toBeInTheDocument();
     expect(
-      screen.queryByText("自动适配 · Responses + Chat"),
+      screen.queryByText("Auto-adapted · Responses + Chat"),
     ).not.toBeInTheDocument();
   });
 });

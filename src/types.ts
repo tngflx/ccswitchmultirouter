@@ -406,6 +406,8 @@ export interface CodexCatalogModel {
   name?: string;
   displayName?: string;
   display_name?: string;
+  providerName?: string;
+  provider_name?: string;
   contextWindow?: string | number;
   context_window?: string | number;
   inputModalities?: string[];
@@ -430,6 +432,8 @@ export interface CodexCatalogModel {
   // Provider defaults remain authoritative when these fields are absent.
   apiFormat?: CodexApiFormat;
   api_format?: CodexApiFormat;
+  apiFormatSource?: string;
+  api_format_source?: string;
   codexCache?: CodexCacheConfig;
   codex_cache?: CodexCacheConfig;
   // User-defined picker order. Lower values appear first in Codex.
@@ -476,7 +480,11 @@ export interface CodexCacheConfig {
 export interface CodexModelCatalogConfig {
   models: CodexCatalogModel[];
   spawnAgentModels?: string[];
+  displayNameStyle?: CodexModelDisplayStyle;
 }
+
+export type CodexModelDisplayStyle =
+  "model" | "model-provider" | "provider-model";
 
 export type CodexSubagentVersion = "v1" | "v2";
 
@@ -529,6 +537,9 @@ export interface CodexRoutingConfig {
   officialAuth?: CodexOfficialAuthConfig;
   subagentVersion?: CodexSubagentVersion;
   subagentV2?: CodexSubagentV2Config;
+  modelOrder?: string[];
+  modelDisplayStyle?: CodexModelDisplayStyle;
+  defaultReasoningEffort?: CodexReasoningEffort;
   routes?: CodexRoutingRoute[];
 }
 
@@ -550,9 +561,13 @@ export interface CodexRoutingConfigV2 {
   schemaVersion: 2;
   enabled?: boolean;
   defaultRouteId?: string;
+  officialAuth?: CodexOfficialAuthConfig;
   subagentVersion?: CodexSubagentVersion;
   subagentV2?: CodexSubagentV2Config;
   spawnAgentModels?: string[];
+  modelOrder?: string[];
+  modelDisplayStyle?: CodexModelDisplayStyle;
+  defaultReasoningEffort?: CodexReasoningEffort;
   routes: CodexRoutingRouteV2[];
 }
 

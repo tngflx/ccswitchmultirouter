@@ -280,7 +280,7 @@ export function SessionManagerPage({
       groupSessionsByProviderAndDirectory(
         filteredSessions,
         t("sessionManager.unknownDirectory", {
-          defaultValue: "未知目录",
+          defaultValue: "Unknown directory",
         }),
       ),
     [filteredSessions, t],
@@ -371,10 +371,10 @@ export function SessionManagerPage({
   const listViewModeLabel =
     listViewMode === "grouped"
       ? t("sessionManager.viewModeGrouped", {
-          defaultValue: "分类",
+          defaultValue: "Grouped",
         })
       : t("sessionManager.viewModeFlat", {
-          defaultValue: "列表",
+          defaultValue: "List",
         });
 
   const { data: messages = [], isLoading: isLoadingMessages } =
@@ -517,7 +517,9 @@ export function SessionManagerPage({
     (content: string) => {
       void handleCopy(
         content,
-        t("sessionManager.messageCopied", { defaultValue: "已复制消息内容" }),
+        t("sessionManager.messageCopied", {
+          defaultValue: "Message content copied",
+        }),
       );
     },
     [handleCopy, t],
@@ -623,7 +625,7 @@ export function SessionManagerPage({
       if (deletedKeys.length > 0) {
         toast.success(
           t("sessionManager.batchDeleteSuccess", {
-            defaultValue: "已删除 {{count}} 个会话",
+            defaultValue: "Deleted {{count}} sessions",
             count: deletedKeys.length,
           }),
         );
@@ -632,7 +634,7 @@ export function SessionManagerPage({
       if (failedErrors.length > 0) {
         toast.error(
           t("sessionManager.batchDeleteFailed", {
-            defaultValue: "{{failed}} 个会话删除失败",
+            defaultValue: "Failed to delete {{failed}} sessions",
             failed: failedErrors.length,
           }),
           {
@@ -644,7 +646,7 @@ export function SessionManagerPage({
       toast.error(
         extractErrorMessage(error) ||
           t("sessionManager.batchDeleteRequestFailed", {
-            defaultValue: "批量删除失败，请稍后重试",
+            defaultValue: "Bulk delete failed. Please try again.",
           }),
       );
     } finally {
@@ -830,7 +832,7 @@ export function SessionManagerPage({
         checked={selectionState.checked}
         disabled={selectionState.selectableCount === 0}
         aria-label={t("sessionManager.selectProviderGroupForBatch", {
-          defaultValue: "选择 {{provider}} 供应商分组内会话",
+          defaultValue: "Select sessions in the {{provider}} provider group",
           provider: providerLabel,
         })}
         onClick={(event) => event.stopPropagation()}
@@ -855,7 +857,7 @@ export function SessionManagerPage({
         checked={selectionState.checked}
         disabled={selectionState.selectableCount === 0}
         aria-label={t("sessionManager.selectDirectoryGroupForBatch", {
-          defaultValue: "选择 {{directory}} 目录分组内会话",
+          defaultValue: "Select sessions in the {{directory}} directory group",
           directory: directoryGroup.label,
         })}
         onClick={(event) => event.stopPropagation()}
@@ -935,7 +937,7 @@ export function SessionManagerPage({
             )}
           {/* 主内容区域 - 左右分栏 */}
           <div className="flex-1 overflow-hidden grid gap-4 md:grid-cols-[320px_1fr]">
-            {/* 左侧会话列表 */}
+            {/* 左侧会话List */}
             <Card className="flex flex-col flex-1 min-h-0 overflow-hidden">
               <CardHeader className="py-2 px-3 border-b">
                 {isSearchOpen ? (
@@ -983,7 +985,7 @@ export function SessionManagerPage({
                             aria-label={t(
                               "sessionManager.exitBatchModeTooltip",
                               {
-                                defaultValue: "退出批量管理",
+                                defaultValue: "Exit bulk management",
                               },
                             )}
                             onClick={exitSelectionMode}
@@ -993,7 +995,7 @@ export function SessionManagerPage({
                         </TooltipTrigger>
                         <TooltipContent>
                           {t("sessionManager.exitBatchModeTooltip", {
-                            defaultValue: "退出批量管理",
+                            defaultValue: "Exit bulk management",
                           })}
                         </TooltipContent>
                       </Tooltip>
@@ -1026,10 +1028,10 @@ export function SessionManagerPage({
                                 aria-label={
                                   selectionMode
                                     ? t("sessionManager.exitBatchModeTooltip", {
-                                        defaultValue: "退出批量管理",
+                                        defaultValue: "Exit bulk management",
                                       })
                                     : t("sessionManager.manageBatchTooltip", {
-                                        defaultValue: "批量管理",
+                                        defaultValue: "Bulk manage",
                                       })
                                 }
                                 onClick={() => {
@@ -1046,10 +1048,10 @@ export function SessionManagerPage({
                             <TooltipContent>
                               {selectionMode
                                 ? t("sessionManager.exitBatchModeTooltip", {
-                                    defaultValue: "退出批量管理",
+                                    defaultValue: "Exit bulk management",
                                   })
                                 : t("sessionManager.manageBatchTooltip", {
-                                    defaultValue: "批量管理",
+                                    defaultValue: "Bulk manage",
                                   })}
                             </TooltipContent>
                           </Tooltip>
@@ -1098,13 +1100,13 @@ export function SessionManagerPage({
                                 aria-label={t(
                                   "sessionManager.viewModeTooltip",
                                   {
-                                    defaultValue: "查看方式",
+                                    defaultValue: "View mode",
                                   },
                                 )}
                               >
                                 <span className="sr-only">
                                   {t("sessionManager.viewModeTooltip", {
-                                    defaultValue: "查看方式",
+                                    defaultValue: "View mode",
                                   })}
                                 </span>
                                 {listViewMode === "grouped" ? (
@@ -1122,7 +1124,7 @@ export function SessionManagerPage({
                                 <List className="size-3.5" />
                                 <span>
                                   {t("sessionManager.viewModeFlat", {
-                                    defaultValue: "列表",
+                                    defaultValue: "List",
                                   })}
                                 </span>
                               </div>
@@ -1132,7 +1134,7 @@ export function SessionManagerPage({
                                 <ListTree className="size-3.5" />
                                 <span>
                                   {t("sessionManager.viewModeGrouped", {
-                                    defaultValue: "分类",
+                                    defaultValue: "Grouped",
                                   })}
                                 </span>
                               </div>
@@ -1149,7 +1151,7 @@ export function SessionManagerPage({
                                 aria-label={t(
                                   "sessionManager.collapseAllGroups",
                                   {
-                                    defaultValue: "全部收起",
+                                    defaultValue: "Collapse all",
                                   },
                                 )}
                                 onClick={handleCollapseAllGroups}
@@ -1159,7 +1161,7 @@ export function SessionManagerPage({
                             </TooltipTrigger>
                             <TooltipContent>
                               {t("sessionManager.collapseAllGroups", {
-                                defaultValue: "全部收起",
+                                defaultValue: "Collapse all",
                               })}
                             </TooltipContent>
                           </Tooltip>
@@ -1199,13 +1201,13 @@ export function SessionManagerPage({
                                 aria-label={t(
                                   "sessionManager.providerFilterTooltip",
                                   {
-                                    defaultValue: "供应商筛选",
+                                    defaultValue: "Provider filter",
                                   },
                                 )}
                               >
                                 <span className="sr-only">
                                   {t("sessionManager.providerFilterTooltip", {
-                                    defaultValue: "供应商筛选",
+                                    defaultValue: "Provider filter",
                                   })}
                                 </span>
                                 <ProviderIcon
@@ -1337,7 +1339,7 @@ export function SessionManagerPage({
                           }}
                         >
                           <FileClock className="size-3.5" />
-                          <span className="truncate">历史修复</span>
+                          <span className="truncate">History repair</span>
                         </Button>
                         <Button
                           type="button"
@@ -1352,7 +1354,7 @@ export function SessionManagerPage({
                           }}
                         >
                           <MessageSquare className="size-3.5" />
-                          <span className="truncate">会话浏览</span>
+                          <span className="truncate">Session browser</span>
                         </Button>
                       </div>
                     )}
@@ -1361,13 +1363,13 @@ export function SessionManagerPage({
                         <div className="flex items-center gap-2 text-xs text-muted-foreground">
                           <Badge variant="outline" className="text-xs">
                             {t("sessionManager.selectedCount", {
-                              defaultValue: "已选 {{count}} 项",
+                              defaultValue: "{{count}} selected",
                               count: selectedDeletableSessions.length,
                             })}
                           </Badge>
                           <span className="truncate">
                             {t("sessionManager.batchModeHint", {
-                              defaultValue: "勾选要删除的会话",
+                              defaultValue: "Select sessions to delete",
                             })}
                           </span>
                         </div>
@@ -1382,10 +1384,10 @@ export function SessionManagerPage({
                               >
                                 {allFilteredSelected
                                   ? t("sessionManager.clearFilteredSelection", {
-                                      defaultValue: "取消全选",
+                                      defaultValue: "Clear selection",
                                     })
                                   : t("sessionManager.selectAllFiltered", {
-                                      defaultValue: "全选当前",
+                                      defaultValue: "Select all visible",
                                     })}
                               </Button>
                             )}
@@ -1396,7 +1398,7 @@ export function SessionManagerPage({
                               onClick={() => setSelectedSessionKeys(new Set())}
                             >
                               {t("sessionManager.clearSelection", {
-                                defaultValue: "清空已选",
+                                defaultValue: "Clear selection",
                               })}
                             </Button>
                           </div>
@@ -1414,10 +1416,10 @@ export function SessionManagerPage({
                             <span className="text-xs">
                               {isBatchDeleting
                                 ? t("sessionManager.batchDeleting", {
-                                    defaultValue: "删除中...",
+                                    defaultValue: "Deleting…",
                                   })
                                 : t("sessionManager.deleteSelected", {
-                                    defaultValue: "批量删除",
+                                    defaultValue: "Bulk delete",
                                   })}
                             </span>
                           </Button>
@@ -1477,7 +1479,7 @@ export function SessionManagerPage({
                                       "sessionManager.toggleProviderGroup",
                                       {
                                         defaultValue:
-                                          "展开或折叠 {{provider}} 供应商分组",
+                                          "Expand or collapse the {{provider}} provider group",
                                         provider: providerLabel,
                                       },
                                     )}
@@ -1540,7 +1542,7 @@ export function SessionManagerPage({
                                                 "sessionManager.toggleDirectoryGroup",
                                                 {
                                                   defaultValue:
-                                                    "展开或折叠 {{directory}} 目录分组",
+                                                    "Expand or collapse the {{directory}} directory group",
                                                   directory:
                                                     directoryGroup.label,
                                                 },
@@ -1568,7 +1570,7 @@ export function SessionManagerPage({
                                                         "sessionManager.unknownDirectory",
                                                         {
                                                           defaultValue:
-                                                            "未知目录",
+                                                            "Unknown directory",
                                                         },
                                                       )}
                                                   </p>
@@ -1721,7 +1723,7 @@ export function SessionManagerPage({
                                       void handleCopy(
                                         selectedSession.sourcePath!,
                                         t("sessionManager.sourceFileCopied", {
-                                          defaultValue: "源文件路径已复制",
+                                          defaultValue: "Source path copied",
                                         }),
                                       )
                                     }
@@ -1763,7 +1765,7 @@ export function SessionManagerPage({
                                   <Play className="size-3.5" />
                                   <span className="hidden sm:inline">
                                     {t("sessionManager.resume", {
-                                      defaultValue: "恢复会话",
+                                      defaultValue: "Restore session",
                                     })}
                                   </span>
                                 </Button>
@@ -1771,10 +1773,12 @@ export function SessionManagerPage({
                               <TooltipContent>
                                 {selectedSession.resumeCommand
                                   ? t("sessionManager.resumeTooltip", {
-                                      defaultValue: "在终端中恢复此会话",
+                                      defaultValue:
+                                        "Restore this session in a terminal",
                                     })
                                   : t("sessionManager.noResumeCommand", {
-                                      defaultValue: "此会话无法恢复",
+                                      defaultValue:
+                                        "This session cannot be restored",
                                     })}
                               </TooltipContent>
                             </Tooltip>
@@ -1796,17 +1800,18 @@ export function SessionManagerPage({
                                 <span className="hidden sm:inline">
                                   {isDeleting
                                     ? t("sessionManager.deleting", {
-                                        defaultValue: "删除中...",
+                                        defaultValue: "Deleting…",
                                       })
                                     : t("sessionManager.delete", {
-                                        defaultValue: "删除会话",
+                                        defaultValue: "Delete session",
                                       })}
                                 </span>
                               </Button>
                             </TooltipTrigger>
                             <TooltipContent>
                               {t("sessionManager.deleteTooltip", {
-                                defaultValue: "永久删除此本地会话记录",
+                                defaultValue:
+                                  "Permanently delete this local session record",
                               })}
                             </TooltipContent>
                           </Tooltip>
@@ -1837,7 +1842,7 @@ export function SessionManagerPage({
                             </TooltipTrigger>
                             <TooltipContent>
                               {t("sessionManager.copyCommand", {
-                                defaultValue: "复制命令",
+                                defaultValue: "Copy command",
                               })}
                             </TooltipContent>
                           </Tooltip>
@@ -1845,17 +1850,17 @@ export function SessionManagerPage({
                       )}
                     </CardHeader>
 
-                    {/* 消息列表区域 */}
+                    {/* 消息List区域 */}
                     <CardContent className="flex-1 min-h-0 p-0">
                       <div className="flex h-full min-w-0">
-                        {/* 消息列表 */}
+                        {/* 消息List */}
                         <div className="flex-1 min-w-0 flex flex-col">
                           <div className="px-4 pt-4 pb-2 min-w-0">
                             <div className="flex items-center gap-2">
                               <MessageSquare className="size-4 text-muted-foreground" />
                               <span className="text-sm font-medium">
                                 {t("sessionManager.conversationHistory", {
-                                  defaultValue: "对话记录",
+                                  defaultValue: "Conversation",
                                 })}
                               </span>
                               <Badge variant="secondary" className="text-xs">
@@ -1943,23 +1948,23 @@ export function SessionManagerPage({
         title={
           deleteTargets && deleteTargets.length > 1
             ? t("sessionManager.batchDeleteConfirmTitle", {
-                defaultValue: "批量删除会话",
+                defaultValue: "Bulk delete sessions",
               })
             : t("sessionManager.deleteConfirmTitle", {
-                defaultValue: "删除会话",
+                defaultValue: "Delete session",
               })
         }
         message={
           deleteTargets && deleteTargets.length > 1
             ? t("sessionManager.batchDeleteConfirmMessage", {
                 defaultValue:
-                  "将永久删除已选中的 {{count}} 个本地会话记录。\n\n此操作不可恢复。",
+                  "This will permanently delete the {{count}} selected local session records.\n\nThis action cannot be undone.",
                 count: deleteTargets.length,
               })
             : deleteTargets?.[0]
               ? t("sessionManager.deleteConfirmMessage", {
                   defaultValue:
-                    "将永久删除本地会话“{{title}}”\nSession ID: {{sessionId}}\n\n此操作不可恢复。",
+                    "This will permanently delete the local session “{{title}}”\nSession ID: {{sessionId}}\n\nThis action cannot be undone.",
                   title: formatSessionTitle(deleteTargets[0]),
                   sessionId: deleteTargets[0].sessionId,
                 })
@@ -1968,13 +1973,13 @@ export function SessionManagerPage({
         confirmText={
           deleteTargets && deleteTargets.length > 1
             ? t("sessionManager.batchDeleteConfirmAction", {
-                defaultValue: "删除所选会话",
+                defaultValue: "Delete selected sessions",
               })
             : t("sessionManager.deleteConfirmAction", {
-                defaultValue: "删除会话",
+                defaultValue: "Delete session",
               })
         }
-        cancelText={t("common.cancel", { defaultValue: "取消" })}
+        cancelText={t("common.cancel", { defaultValue: "Cancel" })}
         variant="destructive"
         onConfirm={() => void handleDeleteConfirm()}
         onCancel={() => {

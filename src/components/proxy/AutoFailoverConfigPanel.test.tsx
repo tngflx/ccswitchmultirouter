@@ -53,7 +53,9 @@ describe("AutoFailoverConfigPanel capacity retry", () => {
   it("shows the dedicated enabled switch only for Codex", () => {
     const { rerender } = render(<AutoFailoverConfigPanel appType="codex" />);
     expect(
-      screen.getByRole("switch", { name: "模型容量错误自动续跑" }),
+      screen.getByRole("switch", {
+        name: "Automatically retry model-capacity errors",
+      }),
     ).toBeChecked();
 
     vi.mocked(useAppProxyConfig).mockReturnValue({
@@ -63,17 +65,21 @@ describe("AutoFailoverConfigPanel capacity retry", () => {
     } as ReturnType<typeof useAppProxyConfig>);
     rerender(<AutoFailoverConfigPanel appType="claude" />);
     expect(
-      screen.queryByRole("switch", { name: "模型容量错误自动续跑" }),
+      screen.queryByRole("switch", {
+        name: "Automatically retry model-capacity errors",
+      }),
     ).not.toBeInTheDocument();
   });
 
   it("persists only the capacity field immediately", async () => {
     render(<AutoFailoverConfigPanel appType="codex" />);
-    fireEvent.change(screen.getByLabelText("最大重试次数"), {
+    fireEvent.change(screen.getByLabelText("Maximum retries"), {
       target: { value: "9" },
     });
     fireEvent.click(
-      screen.getByRole("switch", { name: "模型容量错误自动续跑" }),
+      screen.getByRole("switch", {
+        name: "Automatically retry model-capacity errors",
+      }),
     );
 
     await waitFor(() =>

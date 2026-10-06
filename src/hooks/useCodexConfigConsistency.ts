@@ -1,3 +1,4 @@
+import i18n from "@/i18n";
 import { useCallback, useEffect, useRef, useState } from "react";
 
 import {
@@ -175,8 +176,10 @@ export function useCodexConfigConsistency(): CodexConfigConsistencyState {
           ? {
               ...current,
               phase: "failed",
-              error:
-                "后台刷新超过 30 秒没有返回任何进度，任务可能已经卡死。请返回后重试；若提示任务仍在运行，请重启 CCSM。",
+              error: i18n.t("codexRuntimeUi.stalled", {
+                defaultValue:
+                  "Background refresh has reported no progress for over 30 seconds and may be stalled. Go back and retry. If it still reports a running task, restart CCSM.",
+              }),
             }
           : current,
       );
@@ -281,7 +284,12 @@ export function useCodexConfigConsistency(): CodexConfigConsistencyState {
           close();
         }
       } catch (cause) {
-        setError(extractErrorMessage(cause) || "Codex 配置处理失败");
+        setError(
+          extractErrorMessage(cause) ||
+            i18n.t("codexRuntimeUi.configFailed", {
+              defaultValue: "Codex configuration processing failed",
+            }),
+        );
       } finally {
         setPending(false);
       }
@@ -303,7 +311,12 @@ export function useCodexConfigConsistency(): CodexConfigConsistencyState {
         close();
       }
     } catch (cause) {
-      setError(extractErrorMessage(cause) || "Codex 配置检测失败");
+      setError(
+        extractErrorMessage(cause) ||
+          i18n.t("codexRuntimeUi.configCheckFailed", {
+            defaultValue: "Codex configuration check failed",
+          }),
+      );
     } finally {
       setPending(false);
     }
@@ -330,8 +343,13 @@ export function useCodexConfigConsistency(): CodexConfigConsistencyState {
           progress: null,
           result: null,
           error: preflight.supported
-            ? "未找到可用的 Codex Desktop 启动入口"
-            : "当前平台暂不支持自动刷新 Codex 状态",
+            ? i18n.t("codexRuntimeUi.launcherMissing", {
+                defaultValue: "No usable Codex Desktop launcher was found",
+              })
+            : i18n.t("codexRuntimeUi.unsupported", {
+                defaultValue:
+                  "Automatic Codex status refresh is not supported on this platform",
+              }),
           logs: [],
           lastProgressAt: null,
           stageStartedAt: null,
@@ -354,7 +372,11 @@ export function useCodexConfigConsistency(): CodexConfigConsistencyState {
         preflight: null,
         progress: null,
         result: null,
-        error: extractErrorMessage(cause) || "Codex 运行状态检查失败",
+        error:
+          extractErrorMessage(cause) ||
+          i18n.t("codexRuntimeUi.runtimeCheckFailed", {
+            defaultValue: "Codex runtime status check failed",
+          }),
         logs: [],
         lastProgressAt: null,
         stageStartedAt: null,
@@ -397,7 +419,11 @@ export function useCodexConfigConsistency(): CodexConfigConsistencyState {
         preflight: null,
         progress: null,
         result: null,
-        error: extractErrorMessage(cause) || "Codex 状态检查失败",
+        error:
+          extractErrorMessage(cause) ||
+          i18n.t("codexRuntimeUi.statusCheckFailed", {
+            defaultValue: "Codex status check failed",
+          }),
         logs: [],
         lastProgressAt: null,
         stageStartedAt: null,
@@ -441,7 +467,11 @@ export function useCodexConfigConsistency(): CodexConfigConsistencyState {
       setRefresh((current) => ({
         ...current,
         phase: "failed",
-        error: extractErrorMessage(cause) || "Codex 状态刷新失败",
+        error:
+          extractErrorMessage(cause) ||
+          i18n.t("codexRuntimeUi.refreshFailed", {
+            defaultValue: "Codex status refresh failed",
+          }),
       }));
     }
   }, [refresh.phase, refresh.preflight]);
@@ -489,7 +519,11 @@ export function useCodexConfigConsistency(): CodexConfigConsistencyState {
               outcome: "completed_with_warnings",
               rendererCompatibilityStatus: "warning",
               rendererCompatibilityMessage:
-                extractErrorMessage(cause) || "Codex 历史查询兼容层重试失败",
+                extractErrorMessage(cause) ||
+                i18n.t("codexRuntimeUi.historyRetryFailed", {
+                  defaultValue:
+                    "Codex history-query compatibility retry failed",
+                }),
             }
           : null,
       }));

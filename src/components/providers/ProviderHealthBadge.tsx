@@ -24,7 +24,7 @@ export function ProviderHealthBadge({
     if (consecutiveFailures === 0) {
       return {
         labelKey: "health.operational",
-        labelFallback: "正常",
+        labelFallback: "Operational",
         status: ProviderHealthStatus.Healthy,
         color: "bg-green-500",
         // 使用更深/柔和的背景色，去除可能的白色内容感
@@ -34,7 +34,7 @@ export function ProviderHealthBadge({
     } else if (isHealthy !== false) {
       return {
         labelKey: "health.degraded",
-        labelFallback: "降级",
+        labelFallback: "Degraded",
         status: ProviderHealthStatus.Degraded,
         color: "bg-yellow-500",
         bgColor: "bg-yellow-500/10",
@@ -43,7 +43,7 @@ export function ProviderHealthBadge({
     } else {
       return {
         labelKey: "health.circuitOpen",
-        labelFallback: "熔断",
+        labelFallback: "Circuit open",
         status: ProviderHealthStatus.Failed,
         color: "bg-red-500",
         bgColor: "bg-red-500/10",
@@ -67,7 +67,7 @@ export function ProviderHealthBadge({
       )}
       title={t("health.consecutiveFailures", {
         count: consecutiveFailures,
-        defaultValue: `连续失败 ${consecutiveFailures} 次`,
+        defaultValue: `Consecutive failures: ${consecutiveFailures}`,
       })}
     >
       <div className={cn("w-2 h-2 rounded-full", statusConfig.color)} />

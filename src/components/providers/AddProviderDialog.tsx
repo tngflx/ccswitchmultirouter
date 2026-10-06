@@ -102,20 +102,37 @@ export function AddProviderDialog({
             (projection) => projection.state === "pending",
           );
           toast.warning(
-            "统一供应商已保存，但 Codex 当前配置待刷新；其他应用配置不受影响。",
+            t("providerSet.universalProjectionPending", {
+              defaultValue:
+                "The universal provider was saved, but the current Codex configuration needs refreshing. Other apps are unaffected.",
+            }),
             hasRetryTarget
               ? {
                   action: {
-                    label: "重新投影",
+                    label: t("providerSet.reproject", {
+                      defaultValue: "Reproject",
+                    }),
                     onClick: () => {
                       void retryProjection(outcome)
-                        .then(() => toast.success("Codex 当前配置已重新投影"))
+                        .then(() =>
+                          toast.success(
+                            t("providerSet.reprojected", {
+                              defaultValue:
+                                "Current Codex configuration reprojected",
+                            }),
+                          ),
+                        )
                         .catch((error) => {
                           console.error(
                             "Failed to retry Universal Provider Set projection",
                             error,
                           );
-                          toast.error("重新投影失败，请稍后再试");
+                          toast.error(
+                            t("providerSet.reprojectFailed", {
+                              defaultValue:
+                                "Reprojection failed. Try again later.",
+                            }),
+                          );
                         });
                     },
                   },
@@ -438,7 +455,7 @@ export function AddProviderDialog({
           <Plus className="h-4 w-4 mr-2" />
           {isCodexRouterEntry
             ? t("codexMultiRouter.addSource", {
-                defaultValue: "添加模型源",
+                defaultValue: "Add model source",
               })
             : t("universalProvider.add")}
         </Button>
@@ -451,7 +468,7 @@ export function AddProviderDialog({
       title={
         isCodexRouterEntry
           ? t("codexMultiRouter.createTitle", {
-              defaultValue: "创建多路路由",
+              defaultValue: "Create multi-model routing",
             })
           : t("provider.addNewProvider")
       }
@@ -464,23 +481,24 @@ export function AddProviderDialog({
         <div className="rounded-lg border border-primary/20 bg-primary/5 p-4 text-sm text-muted-foreground">
           <div className="font-medium text-foreground">
             {t("codexMultiRouter.guideTitle", {
-              defaultValue: "多路路由创建方式",
+              defaultValue: "How to create multi-model routing",
             })}
           </div>
           <div className="mt-2 grid gap-2 md:grid-cols-3">
             <div>
               {t("codexMultiRouter.guideStepSelect", {
-                defaultValue: "1. 先选择或接入模型源。",
+                defaultValue: "1. Select or connect model sources.",
               })}
             </div>
             <div>
               {t("codexMultiRouter.guideStepSync", {
-                defaultValue: "2. 同步后自动生成 Codex 可用配置。",
+                defaultValue:
+                  "2. Sync to generate a usable Codex configuration.",
               })}
             </div>
             <div>
               {t("codexMultiRouter.guideStepRules", {
-                defaultValue: "3. 再到路由规则里调整模型分流。",
+                defaultValue: "3. Adjust model routing in route rules.",
               })}
             </div>
           </div>
@@ -496,14 +514,14 @@ export function AddProviderDialog({
             <TabsTrigger value="app-specific">
               {isCodexRouterEntry
                 ? t("codexMultiRouter.singleSourceTab", {
-                    defaultValue: "单独接入模型源",
+                    defaultValue: "Connect a single model source",
                   })
                 : `${t(`apps.${appId}`)} ${t("provider.tabProvider")}`}
             </TabsTrigger>
             <TabsTrigger value="universal">
               {isCodexRouterEntry
                 ? t("codexMultiRouter.sourceTab", {
-                    defaultValue: "选择模型源",
+                    defaultValue: "Select model sources",
                   })
                 : t("provider.tabUniversal")}
             </TabsTrigger>

@@ -14,6 +14,8 @@ import type { UniversalProvider, UniversalProviderModels } from "@/types";
 import {
   universalProviderPresets,
   createUniversalProviderFromPreset,
+  getPresetDisplayName,
+  getPresetDescription,
   type UniversalProviderPreset,
 } from "@/config/universalProviderPresets";
 import { deepClone } from "@/utils/deepClone";
@@ -39,6 +41,8 @@ export function UniversalProviderFormModal({
   const isDarkMode = useDarkMode();
   const { t } = useTranslation();
   const isEditMode = !!editingProvider;
+  const presetTranslatorRef = useRef(t);
+  presetTranslatorRef.current = t;
 
   // 表单状态
   const [selectedPreset, setSelectedPreset] =
@@ -92,7 +96,7 @@ export function UniversalProviderFormModal({
       // 新建模式：使用传入的预设或默认选择第一个预设
       const defaultPreset = initialPreset || universalProviderPresets[0];
       setSelectedPreset(defaultPreset);
-      setName(defaultPreset.name);
+      setName(getPresetDisplayName(defaultPreset, presetTranslatorRef.current));
       setBaseUrl("");
       setApiKey("");
       setWebsiteUrl(defaultPreset.websiteUrl || "");
@@ -109,14 +113,14 @@ export function UniversalProviderFormModal({
     (preset: UniversalProviderPreset) => {
       setSelectedPreset(preset);
       if (!isEditMode) {
-        setName(preset.name);
+        setName(getPresetDisplayName(preset, t));
         setClaudeEnabled(preset.defaultApps.claude);
         setCodexEnabled(preset.defaultApps.codex);
         setGeminiEnabled(preset.defaultApps.gemini);
         setModels(deepClone(preset.defaultModels));
       }
     },
-    [isEditMode],
+    [isEditMode, t],
   );
 
   // 更新模型配置
@@ -349,13 +353,13 @@ wire_api = "responses"`;
                     name={preset.name}
                     size={16}
                   />
-                  {preset.name}
+                  {getPresetDisplayName(preset, t)}
                 </button>
               ))}
             </div>
             {selectedPreset?.description && (
               <p className="text-xs text-muted-foreground">
-                {selectedPreset.description}
+                {getPresetDescription(selectedPreset, t)}
               </p>
             )}
           </div>

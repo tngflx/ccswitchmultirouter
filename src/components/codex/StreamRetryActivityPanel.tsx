@@ -32,7 +32,10 @@ export function StreamRetryActivityPanel() {
   const activities = useStreamRetryActivity();
 
   return (
-    <section className="rounded-lg border border-amber-200 bg-amber-50/60 p-4 dark:border-amber-700/40 dark:bg-amber-950/10">
+    <section
+      data-testid="stream-retry-activity-panel"
+      className="rounded-lg border border-amber-200 bg-amber-50/60 p-4 dark:border-amber-700/40 dark:bg-amber-950/10"
+    >
       <div className="flex min-w-0 items-start gap-3">
         <RadioTower className="mt-0.5 h-5 w-5 shrink-0 text-amber-600 dark:text-amber-300" />
         <div className="min-w-0">

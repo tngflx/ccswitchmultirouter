@@ -1,4 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
+import { useTranslation } from "react-i18next";
+import type { TFunction } from "i18next";
 import {
   Clock3,
   Loader2,
@@ -13,37 +15,82 @@ import {
   type CodexEgressMonitorStatus,
 } from "@/lib/api/codexEgressTimezone";
 
-function stateLabel(status: CodexEgressMonitorStatus) {
+function translate(
+  t: TFunction,
+  key: string,
+  defaultValue: string,
+  options?: Record<string, unknown>,
+) {
+  return t(key, { ...options, defaultValue });
+}
+
+function stateLabel(t: TFunction, status: CodexEgressMonitorStatus) {
   switch (status.state) {
     case "disabled":
-      return "尚未开启";
+      return translate(t, "codexEgressTimezone.status.disabled", "Not enabled");
     case "not_tested":
-      return "等待首次检测";
+      return translate(
+        t,
+        "codexEgressTimezone.status.notTested",
+        "Waiting for first check",
+      );
     case "checking":
-      return "正在检测出口";
+      return translate(
+        t,
+        "codexEgressTimezone.status.checking",
+        "Checking egress",
+      );
     case "ready":
-      return "监测正常";
+      return translate(
+        t,
+        "codexEgressTimezone.status.ready",
+        "Monitoring healthy",
+      );
     case "restart_required":
-      return "出口已变化，需要刷新 Codex";
+      return translate(
+        t,
+        "codexEgressTimezone.status.restartRequired",
+        "Egress changed; refresh Codex",
+      );
     case "error":
-      return "自动检测失败";
+      return translate(
+        t,
+        "codexEgressTimezone.status.error",
+        "Automatic check failed",
+      );
   }
 }
 
-function triggerLabel(trigger?: string) {
+function triggerLabel(t: TFunction, trigger?: string) {
   switch (trigger) {
     case "startup":
-      return "启动前检查";
+      return translate(
+        t,
+        "codexEgressTimezone.trigger.startup",
+        "Startup check",
+      );
     case "periodic":
-      return "定时检查";
+      return translate(
+        t,
+        "codexEgressTimezone.trigger.periodic",
+        "Scheduled check",
+      );
     case "proxy_failure":
-      return "转发波动触发";
+      return translate(
+        t,
+        "codexEgressTimezone.trigger.proxyFailure",
+        "Proxy failure trigger",
+      );
     case "network_resume":
-      return "网络/睡眠恢复触发";
+      return translate(
+        t,
+        "codexEgressTimezone.trigger.networkResume",
+        "Network/sleep recovery trigger",
+      );
     case "manual":
-      return "手动检查";
+      return translate(t, "codexEgressTimezone.trigger.manual", "Manual check");
     default:
-      return "尚无记录";
+      return translate(t, "codexEgressTimezone.trigger.none", "No record");
   }
 }
 
@@ -54,6 +101,7 @@ interface CodexEgressTimezoneStatusCardProps {
 export function CodexEgressTimezoneStatusCard({
   onOpenCodexStatus,
 }: CodexEgressTimezoneStatusCardProps) {
+  const { t } = useTranslation();
   const [status, setStatus] = useState<CodexEgressMonitorStatus | null>(null);
   const [loading, setLoading] = useState(true);
   const [requestError, setRequestError] = useState("");
@@ -107,26 +155,65 @@ export function CodexEgressTimezoneStatusCard({
             ) : (
               <Network className="h-4 w-4 text-emerald-500" />
             )}
-            Codex 出口环境自动监测
+            {translate(
+              t,
+              "codexEgressTimezone.statusCard.title",
+              "Codex egress environment monitoring",
+            )}
             <span className="rounded-full border bg-background/70 px-2 py-0.5 text-xs font-normal">
               {loading && !status
-                ? "读取中"
+                ? translate(
+                    t,
+                    "codexEgressTimezone.statusCard.loading",
+                    "Loading",
+                  )
                 : status
-                  ? stateLabel(status)
-                  : "不可用"}
+                  ? stateLabel(t, status)
+                  : translate(
+                      t,
+                      "codexEgressTimezone.statusCard.unavailable",
+                      "Unavailable",
+                    )}
             </span>
           </div>
           <p className="text-xs leading-5 text-muted-foreground">
             {status?.state === "disabled"
-              ? "请在设置 → 常规中开启“跟随出口自动监测”。开启后会在启动、转发波动、网络恢复和定时周期自动检查。"
+              ? translate(
+                  t,
+                  "codexEgressTimezone.statusCard.descriptionDisabled",
+                  "Enable “Automatic egress monitoring” in Settings → General. It checks at startup, after proxy or network recovery, and on the configured schedule.",
+                )
               : status?.detectedTimezone
-                ? `当前出口 ${status.detectedEgressIp ?? "未知"} · ${status.detectedTimezone}；${triggerLabel(status.lastTrigger)}，每 ${status.monitorIntervalMinutes} 分钟兜底检查。`
-                : "尚未取得出口时区；自动监测不会阻塞模型请求。"}
+                ? translate(
+                    t,
+                    "codexEgressTimezone.statusCard.descriptionDetected",
+                    "Current egress {{ip}} · {{timezone}}; {{trigger}}, with a fallback check every {{minutes}} minutes.",
+                    {
+                      ip:
+                        status.detectedEgressIp ??
+                        translate(
+                          t,
+                          "codexEgressTimezone.values.unknown",
+                          "unknown",
+                        ),
+                      timezone: status.detectedTimezone,
+                      trigger: triggerLabel(t, status.lastTrigger),
+                      minutes: status.monitorIntervalMinutes,
+                    },
+                  )
+                : translate(
+                    t,
+                    "codexEgressTimezone.statusCard.descriptionNoTimezone",
+                    "No egress timezone has been detected; automatic monitoring does not block model requests.",
+                  )}
           </p>
           {warning && (
             <p className="text-xs font-medium text-amber-800 dark:text-amber-200">
-              新结果已经保存，但运行中的 app-server 仍使用旧 TZ。CCSM
-              不会强制结束任务，请在没有运行任务时使用 Codex 状态页的安全刷新。
+              {translate(
+                t,
+                "codexEgressTimezone.statusCard.warning",
+                "A new result is saved, but the running app-server still uses the old TZ. CCSM will not force-stop tasks; use the safe refresh on the Codex status page when no task is running.",
+              )}
             </p>
           )}
           {(requestError || status?.lastError) && (
@@ -140,13 +227,21 @@ export function CodexEgressTimezoneStatusCard({
           )}
           <p className="flex items-center gap-1 text-[11px] text-muted-foreground">
             <Clock3 className="h-3 w-3" />
-            检测本身不依赖 CDP；CDP 只用于可选的 Codex 页面时区同步和验证。
+            {translate(
+              t,
+              "codexEgressTimezone.statusCard.cdpNote",
+              "Detection does not depend on CDP; CDP is only used for optional Codex page timezone synchronization and verification.",
+            )}
           </p>
         </div>
         <div className="flex flex-wrap gap-2">
           {warning && onOpenCodexStatus && (
             <Button type="button" size="sm" onClick={onOpenCodexStatus}>
-              打开安全刷新
+              {translate(
+                t,
+                "codexEgressTimezone.statusCard.openSafeRefresh",
+                "Open safe refresh",
+              )}
             </Button>
           )}
           <Button
@@ -161,7 +256,11 @@ export function CodexEgressTimezoneStatusCard({
             ) : (
               <RefreshCw className="mr-2 h-4 w-4" />
             )}
-            立即检测
+            {translate(
+              t,
+              "codexEgressTimezone.statusCard.checkNow",
+              "Check now",
+            )}
           </Button>
         </div>
       </div>

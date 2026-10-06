@@ -17,7 +17,6 @@ import {
   HardDriveDownload,
   FlaskConical,
   Code2,
-  ShieldCheck,
   Puzzle,
 } from "lucide-react";
 import { toast } from "sonner";
@@ -37,7 +36,6 @@ import {
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Button } from "@/components/ui/button";
 import { settingsApi } from "@/lib/api";
-import { proxyApi } from "@/lib/api/proxy";
 import { LanguageSettings } from "@/components/settings/LanguageSettings";
 import { ThemeSettings } from "@/components/settings/ThemeSettings";
 import { WindowSettings } from "@/components/settings/WindowSettings";
@@ -60,7 +58,6 @@ import { LogConfigPanel } from "@/components/settings/LogConfigPanel";
 import { AuthCenterPanel } from "@/components/settings/AuthCenterPanel";
 import { CodexAuthSettings } from "@/components/settings/CodexAuthSettings";
 import { CodexGlobalConfigSettings } from "@/components/settings/CodexGlobalConfigSettings";
-import { RequestHealthPanel } from "@/components/settings/RequestHealthPanel";
 import { CodexPluginHealthPanel } from "@/components/settings/CodexPluginHealthPanel";
 import { useInstalledSkills } from "@/hooks/useSkills";
 import { useSettings } from "@/hooks/useSettings";
@@ -68,7 +65,6 @@ import { useImportExport } from "@/hooks/useImportExport";
 import { useTranslation } from "react-i18next";
 import type { SettingsFormState } from "@/hooks/useSettings";
 import type { EnvInjectionSettings as EnvInjectionSettingsValue } from "@/types";
-import type { RequestHealthSnapshot } from "@/types/proxy";
 
 interface SettingsDialogProps {
   open: boolean;
@@ -121,9 +117,6 @@ export function SettingsPage({
 
   const [activeTab, setActiveTab] = useState<string>("general");
   const [showRestartPrompt, setShowRestartPrompt] = useState(false);
-  const [requestHealthSnapshot, setRequestHealthSnapshot] =
-    useState<RequestHealthSnapshot>();
-  const [requestHealthLoading, setRequestHealthLoading] = useState(false);
   const tabScrollContainerRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -132,26 +125,6 @@ export function SettingsPage({
       resetStatus();
     }
   }, [open, resetStatus, defaultTab]);
-
-  const refreshRequestHealth = useCallback(async () => {
-    setRequestHealthLoading(true);
-    try {
-      setRequestHealthSnapshot(await proxyApi.getRequestHealthDiagnostics());
-    } catch (error) {
-      console.error(
-        "[SettingsPage] Failed to load request-health diagnostics",
-        error,
-      );
-    } finally {
-      setRequestHealthLoading(false);
-    }
-  }, []);
-
-  useEffect(() => {
-    if (open && activeTab === "advanced" && settings) {
-      void refreshRequestHealth();
-    }
-  }, [activeTab, open, refreshRequestHealth, settings]);
 
   useEffect(() => {
     if (requiresRestart) {
@@ -391,33 +364,6 @@ export function SettingsPage({
                       className="w-full space-y-4"
                     >
                       <AccordionItem
-                        value="requestHealth"
-                        className="rounded-xl glass-card overflow-hidden"
-                      >
-                        <AccordionTrigger className="px-6 py-4 hover:no-underline hover:bg-muted/50 data-[state=open]:bg-muted/50">
-                          <div className="flex items-center gap-3">
-                            <ShieldCheck className="h-5 w-5 text-cyan-500" />
-                            <div className="text-left">
-                              <h3 className="text-base font-semibold">
-                                {t("settings.requestHealth.title")}
-                              </h3>
-                              <p className="text-sm text-muted-foreground font-normal">
-                                {t("settings.requestHealth.monitoring")}
-                              </p>
-                            </div>
-                          </div>
-                        </AccordionTrigger>
-                        <AccordionContent className="px-6 pb-6 pt-4 border-t border-border/50">
-                          <RequestHealthPanel
-                            snapshot={requestHealthSnapshot}
-                            isRefreshing={requestHealthLoading}
-                            onRefresh={() => void refreshRequestHealth()}
-                            onSaved={() => void refreshRequestHealth()}
-                          />
-                        </AccordionContent>
-                      </AccordionItem>
-
-                      <AccordionItem
                         value="codexPluginHealth"
                         className="rounded-xl glass-card overflow-hidden"
                       >
@@ -627,10 +573,10 @@ export function SettingsPage({
                             <Code2 className="h-5 w-5 text-violet-500" />
                             <div className="text-left">
                               <h3 className="text-base font-semibold">
-                                Codex 全局配置
+                                {t("codexGlobalConfig.title")}
                               </h3>
                               <p className="text-sm font-normal text-muted-foreground">
-                                管理 Goal mode 和跨 Provider 共享的 Codex TOML
+                                {t("codexGlobalConfig.subtitle")}
                               </p>
                             </div>
                           </div>

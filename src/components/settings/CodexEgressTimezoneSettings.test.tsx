@@ -1,7 +1,9 @@
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { I18nextProvider } from "react-i18next";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { codexEgressTimezoneApi } from "@/lib/api/codexEgressTimezone";
+import { createLocalizedTestI18n } from "../../../tests/utils/localizedTestI18n";
 import { CodexEgressTimezoneSettings } from "./CodexEgressTimezoneSettings";
 
 vi.mock("@/lib/api/codexEgressTimezone", () => ({
@@ -29,14 +31,19 @@ describe("CodexEgressTimezoneSettings", () => {
       restartRequired: false,
     });
     const onChange = vi.fn().mockResolvedValue(true);
+    const i18n = await createLocalizedTestI18n();
     render(
-      <CodexEgressTimezoneSettings
-        value={{ mode: "off" }}
-        onChange={onChange}
-      />,
+      <I18nextProvider i18n={i18n}>
+        <CodexEgressTimezoneSettings
+          value={{ mode: "off" }}
+          onChange={onChange}
+        />
+      </I18nextProvider>,
     );
 
-    fireEvent.click(screen.getByRole("button", { name: "开启自动监测" }));
+    fireEvent.click(
+      screen.getByRole("button", { name: "Enable automatic monitoring" }),
+    );
 
     await waitFor(() =>
       expect(onChange).toHaveBeenCalledWith(
@@ -57,13 +64,18 @@ describe("CodexEgressTimezoneSettings", () => {
       monitorIntervalMinutes: 15,
       restartRequired: false,
     });
+    const i18n = await createLocalizedTestI18n();
     render(
-      <CodexEgressTimezoneSettings
-        value={{ mode: "off" }}
-        onChange={vi.fn().mockResolvedValue(true)}
-      />,
+      <I18nextProvider i18n={i18n}>
+        <CodexEgressTimezoneSettings
+          value={{ mode: "off" }}
+          onChange={vi.fn().mockResolvedValue(true)}
+        />
+      </I18nextProvider>,
     );
-    fireEvent.click(screen.getByRole("button", { name: "开启自动监测" }));
+    fireEvent.click(
+      screen.getByRole("button", { name: "Enable automatic monitoring" }),
+    );
     expect(await screen.findByRole("alert")).toHaveTextContent(
       "ChatGPT egress trace: timeout",
     );
@@ -89,32 +101,51 @@ describe("CodexEgressTimezoneSettings", () => {
     });
     const onChange = vi.fn().mockResolvedValue(true);
 
+    const i18n = await createLocalizedTestI18n();
     render(
-      <CodexEgressTimezoneSettings
-        value={{ mode: "off" }}
-        onChange={onChange}
-      />,
+      <I18nextProvider i18n={i18n}>
+        <CodexEgressTimezoneSettings
+          value={{ mode: "off" }}
+          onChange={onChange}
+        />
+      </I18nextProvider>,
     );
 
-    expect(screen.getByText("Codex 出口时区自动监测")).toBeInTheDocument();
-    expect(screen.getByText(/不会修改 Windows 系统时区/)).toBeInTheDocument();
     expect(
-      screen.getByText(/没有官方证据证明时区不一致一定导致模型降级/),
+      screen.getByText("Codex egress timezone monitoring"),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText(
+        /does not block model requests or change the Windows system timezone/,
+      ),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText(
+        /There is no official evidence that a timezone mismatch causes model degradation/,
+      ),
     ).toBeInTheDocument();
 
-    fireEvent.click(screen.getByRole("button", { name: "探测出口时区" }));
+    fireEvent.click(
+      screen.getByRole("button", { name: "Detect egress timezone" }),
+    );
 
     expect(await screen.findByText("Asia/Taipei")).toBeInTheDocument();
     expect(screen.getByText("Asia/Shanghai")).toBeInTheDocument();
     expect(
-      screen.getByText(/IANA 名称不同，但当前 UTC 偏移相同/),
+      screen.getByText(
+        /The IANA names differ, but the current UTC offset matches/,
+      ),
     ).toBeInTheDocument();
     expect(
-      screen.getByText(/DNS 返回 198\.18\.0\.14.*fake-IP.*不会拿它做地理定位/),
+      screen.getByText(
+        /DNS returned 198\.18\.0\.14.*fake IP.*does not geolocate it/,
+      ),
     ).toBeInTheDocument();
     expect(screen.getByText(/2407:cdc0:…/)).toBeInTheDocument();
 
-    fireEvent.click(screen.getByRole("button", { name: "使用探测结果" }));
+    fireEvent.click(
+      screen.getByRole("button", { name: "Apply detection result" }),
+    );
     await waitFor(() =>
       expect(onChange).toHaveBeenCalledWith(
         expect.objectContaining({
@@ -129,29 +160,36 @@ describe("CodexEgressTimezoneSettings", () => {
     vi.mocked(codexEgressTimezoneApi.detect).mockRejectedValue(
       "ChatGPT egress trace: timeout",
     );
-    fireEvent.click(screen.getByRole("button", { name: "探测出口时区" }));
+    fireEvent.click(
+      screen.getByRole("button", { name: "Detect egress timezone" }),
+    );
     expect(await screen.findByRole("alert")).toHaveTextContent(
       "ChatGPT egress trace: timeout",
     );
     expect(
-      screen.queryByRole("button", { name: "使用探测结果" }),
+      screen.queryByRole("button", { name: "Apply detection result" }),
     ).not.toBeInTheDocument();
   });
 
   it("supports an explicit IANA timezone override without touching the system timezone", async () => {
     const onChange = vi.fn().mockResolvedValue(true);
+    const i18n = await createLocalizedTestI18n();
     render(
-      <CodexEgressTimezoneSettings
-        value={{ mode: "off" }}
-        onChange={onChange}
-      />,
+      <I18nextProvider i18n={i18n}>
+        <CodexEgressTimezoneSettings
+          value={{ mode: "off" }}
+          onChange={onChange}
+        />
+      </I18nextProvider>,
     );
 
-    fireEvent.click(screen.getByRole("button", { name: "手动设置" }));
-    fireEvent.change(screen.getByLabelText("IANA 时区"), {
+    fireEvent.click(screen.getByRole("button", { name: "Manual settings" }));
+    fireEvent.change(screen.getByLabelText("IANA time zone"), {
       target: { value: "America/Los_Angeles" },
     });
-    fireEvent.click(screen.getByRole("button", { name: "保存手动时区" }));
+    fireEvent.click(
+      screen.getByRole("button", { name: "Save manual timezone" }),
+    );
 
     await waitFor(() =>
       expect(codexEgressTimezoneApi.validate).toHaveBeenCalledWith(
@@ -170,19 +208,24 @@ describe("CodexEgressTimezoneSettings", () => {
 
   it("lets automatic mode choose a bounded periodic fallback interval", async () => {
     const onChange = vi.fn().mockResolvedValue(true);
+    const i18n = await createLocalizedTestI18n();
     render(
-      <CodexEgressTimezoneSettings
-        value={{
-          mode: "auto",
-          detectedTimezone: "Asia/Taipei",
-          monitorIntervalMinutes: 15,
-        }}
-        onChange={onChange}
-      />,
+      <I18nextProvider i18n={i18n}>
+        <CodexEgressTimezoneSettings
+          value={{
+            mode: "auto",
+            detectedTimezone: "Asia/Taipei",
+            monitorIntervalMinutes: 15,
+          }}
+          onChange={onChange}
+        />
+      </I18nextProvider>,
     );
 
-    expect(screen.getByText(/已开启自动监测/)).toBeInTheDocument();
-    fireEvent.change(screen.getByLabelText("自动检测周期"), {
+    expect(
+      screen.getByText(/Automatic monitoring enabled/),
+    ).toBeInTheDocument();
+    fireEvent.change(screen.getByLabelText("Automatic check interval"), {
       target: { value: "30" },
     });
 
@@ -201,18 +244,23 @@ describe("CodexEgressTimezoneSettings", () => {
       new Error("未知的 IANA 时区: America/Fake"),
     );
     const onChange = vi.fn().mockResolvedValue(true);
+    const i18n = await createLocalizedTestI18n();
     render(
-      <CodexEgressTimezoneSettings
-        value={{ mode: "off" }}
-        onChange={onChange}
-      />,
+      <I18nextProvider i18n={i18n}>
+        <CodexEgressTimezoneSettings
+          value={{ mode: "off" }}
+          onChange={onChange}
+        />
+      </I18nextProvider>,
     );
 
-    fireEvent.click(screen.getByRole("button", { name: "手动设置" }));
-    fireEvent.change(screen.getByLabelText("IANA 时区"), {
+    fireEvent.click(screen.getByRole("button", { name: "Manual settings" }));
+    fireEvent.change(screen.getByLabelText("IANA time zone"), {
       target: { value: "America/Fake" },
     });
-    fireEvent.click(screen.getByRole("button", { name: "保存手动时区" }));
+    fireEvent.click(
+      screen.getByRole("button", { name: "Save manual timezone" }),
+    );
 
     expect(await screen.findByRole("alert")).toHaveTextContent(
       "未知的 IANA 时区: America/Fake",
@@ -229,24 +277,29 @@ describe("CodexEgressTimezoneSettings", () => {
       timezoneMatch: "exact",
     });
 
+    const i18n = await createLocalizedTestI18n();
     render(
-      <CodexEgressTimezoneSettings
-        value={{ mode: "auto", detectedTimezone: "Asia/Taipei" }}
-        onChange={vi.fn()}
-      />,
+      <I18nextProvider i18n={i18n}>
+        <CodexEgressTimezoneSettings
+          value={{ mode: "auto", detectedTimezone: "Asia/Taipei" }}
+          onChange={vi.fn()}
+        />
+      </I18nextProvider>,
     );
 
     fireEvent.click(
-      screen.getByRole("button", { name: "检查运行中 Codex 页面" }),
+      screen.getByRole("button", { name: "Inspect running Codex page" }),
     );
 
     expect(
       await screen.findByText(
-        "运行中的 Codex renderer：Asia/Taipei (+08:00)，与当前配置一致。",
+        "Running Codex renderer: Asia/Taipei (+08:00), matching the current configuration.",
       ),
     ).toBeInTheDocument();
     expect(
-      screen.getByText(/app-server 只有在由 CCSM 直接拉起时才会继承 TZ/),
+      screen.getByText(
+        /app-server inherits TZ only when CCSM launches it directly/,
+      ),
     ).toBeInTheDocument();
   });
 });

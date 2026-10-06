@@ -63,11 +63,11 @@ async function handleConfigLoadError(
       path,
       detail,
       defaultValue:
-        "无法读取配置文件：\n{{path}}\n\n错误详情：\n{{detail}}\n\n请手动检查 JSON 是否有效，或从同目录的备份文件（如 config.json.bak）恢复。\n\n应用将退出以便您进行修复。",
+        "Unable to read the configuration file:\n{{path}}\n\nError details:\n{{detail}}\n\nCheck that the JSON is valid, or restore it from a backup in the same directory (such as config.json.bak).\n\nThe application will exit so you can repair it.",
     }),
     {
       title: i18n.t("errors.configLoadFailedTitle", {
-        defaultValue: "配置加载失败",
+        defaultValue: "Configuration loading failed",
       }),
       kind: "error",
     },

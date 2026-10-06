@@ -59,13 +59,13 @@ export function createProviderSwitchFailureToastOptions({
 }: CreateProviderSwitchFailureToastOptionsInput): ProviderSwitchFailureToastOptions {
   return {
     action: {
-      label: t("common.copy", "复制"),
+      label: t("common.copy", "Copy"),
       onClick: () => copy(detail),
     },
     ...(appId === "codex"
       ? {
           cancel: {
-            label: t("notifications.forceRepair", "强制覆盖"),
+            label: t("notifications.forceRepair", "Force repair"),
             onClick: () => forceRepair(providerId),
           },
         }
@@ -231,10 +231,9 @@ export const useAddProviderMutation = (appId: AppId) => {
         "tePublishStatus" in provider &&
         provider.tePublishStatus === "stored_publish_failed"
       ) {
-        toast.warning(
-          "TE Provider 已保存，但 OpenClaw 配置发布失败；请检查配置后重试。",
-          { closeButton: true },
-        );
+        toast.warning(t("notifications.teProviderSavePublishFailed"), {
+          closeButton: true,
+        });
       } else {
         toast.success(
           t("notifications.providerAdded", { defaultValue: "供应商已添加" }),
@@ -245,7 +244,7 @@ export const useAddProviderMutation = (appId: AppId) => {
         appId,
         t("notifications.codexProjectionPending", {
           defaultValue:
-            "Provider 已保存，但当前 MultiRouter 尚未同步到 Codex。请到 MultiRouter 工作台查看并重试。",
+            "The provider was saved, but MultiRouter has not synced to Codex yet. Review and retry in the MultiRouter workspace.",
         }),
       );
     },
@@ -319,10 +318,9 @@ export const useUpdateProviderMutation = (appId: AppId) => {
         await invalidateHermesProviderCaches(queryClient);
       }
       if (result.tePublishStatus === "stored_publish_failed") {
-        toast.warning(
-          "TE Provider 已更新，但 OpenClaw 配置发布失败；请检查配置后重试。",
-          { closeButton: true },
-        );
+        toast.warning(t("notifications.teProviderUpdatePublishFailed"), {
+          closeButton: true,
+        });
       } else {
         toast.success(
           t("notifications.updateSuccess", { defaultValue: "供应商更新成功" }),
@@ -333,7 +331,7 @@ export const useUpdateProviderMutation = (appId: AppId) => {
         appId,
         t("notifications.codexProjectionPending", {
           defaultValue:
-            "Provider 已保存，但当前 MultiRouter 尚未同步到 Codex。请到 MultiRouter 工作台查看并重试。",
+            "The provider was saved, but MultiRouter has not synced to Codex yet. Review and retry in the MultiRouter workspace.",
         }),
       );
     },
@@ -518,7 +516,7 @@ export const useSwitchProviderMutation = (appId: AppId) => {
           const confirmed = window.confirm(
             t("notifications.forceRepairConfirm", {
               defaultValue:
-                "将先备份当前 Codex 配置，再修复旧字段并用该供应商重建 CCSM 托管配置。MCP、项目和用户自定义配置会保留。是否继续？",
+                "Back up the current Codex configuration, repair legacy fields, and rebuild CCSM-managed configuration with this provider? MCP, projects, and user customizations will be preserved.",
             }),
           );
           if (!confirmed) return;
@@ -542,11 +540,12 @@ export const useSwitchProviderMutation = (appId: AppId) => {
             });
             toast.success(
               t("notifications.forceRepairSuccess", {
-                defaultValue: "Codex 配置已修复并切换成功",
+                defaultValue:
+                  "Codex configuration repaired and provider switched",
               }),
               {
                 description: t("notifications.forceRepairBackup", {
-                  defaultValue: "原配置已备份到：{{path}}",
+                  defaultValue: "Original configuration backed up to: {{path}}",
                   path: outcome.backupDirectory,
                 }),
                 duration: 10000,
@@ -555,7 +554,7 @@ export const useSwitchProviderMutation = (appId: AppId) => {
           } catch (repairError) {
             toast.error(
               t("notifications.forceRepairFailed", {
-                defaultValue: "强制覆盖失败",
+                defaultValue: "Force repair failed",
               }),
               {
                 description:

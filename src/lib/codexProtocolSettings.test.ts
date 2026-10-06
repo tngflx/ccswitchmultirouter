@@ -75,7 +75,7 @@ describe("Codex protocol settings", () => {
         toolSchemaDialect: "openai",
         historyReplay: "native_only",
       }),
-    ).toThrow(/请求覆盖格式错误/);
+    ).toThrow(/Invalid local proxy request overrides/);
   });
 
   it("clears manual fields in auto mode and writes only legal manual combinations", () => {

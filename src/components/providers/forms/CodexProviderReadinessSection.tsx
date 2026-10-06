@@ -72,7 +72,7 @@ export function CodexProviderReadinessSection({
       .find((model) => model.model.trim() === configuredDefault)
       ?.model.trim() ||
     enabledModels[0]?.model.trim() ||
-    (configuredModels.length > 0 ? "尚未启用" : "尚未选择");
+    (configuredModels.length > 0 ? "Not enabled" : "Not selected");
   const hasModels = enabledModels.length > 0;
   const evidenceExpired =
     adaptation?.status === "stale" ||
@@ -86,29 +86,29 @@ export function CodexProviderReadinessSection({
   const ready = hasModels && validationPassed;
   const readinessLabel =
     configuredModels.length === 0
-      ? "需要同步模型"
+      ? "Sync models"
       : !hasModels
-        ? "需要启用模型"
+        ? "Enable a model"
         : ready
-          ? "可加入 MultiRouter"
+          ? "Ready for MultiRouter"
           : validationTone === "error"
-            ? "连接验证失败"
-            : "建议先验证连接";
+            ? "Connection validation failed"
+            : "Validate the connection first";
   const effectiveProtocolLabel = adaptation
     ? adaptation.persistence === "split" ||
       adaptation.effectiveTransport === "mixed"
-      ? "自动适配 · Responses + Chat"
+      ? "Automatic adaptation · Responses + Chat"
       : adaptation.effectiveTransport === "open_ai_responses"
         ? "Responses"
         : adaptation.effectiveTransport === "open_ai_chat"
           ? "Chat"
           : adaptation.persistence === "legacy_mixed"
-            ? "旧版混合协议"
+            ? "Legacy mixed protocol"
             : apiFormatLabel(apiFormat)
     : apiFormatLabel(apiFormat);
   const evidenceTime = adaptation?.testedAt
     ? new Date(adaptation.testedAt * 1000).toLocaleString()
-    : "尚未验证";
+    : "Not validated";
   const hasPersistedEvidence = Boolean(
     adaptation?.models.some((model) => model.responses || model.chat),
   );
@@ -125,11 +125,11 @@ export function CodexProviderReadinessSection({
             id="codex-model-readiness-title"
             className="text-sm font-semibold text-foreground"
           >
-            模型与兼容性
+            Models and compatibility
           </h3>
           <p className="text-xs leading-relaxed text-muted-foreground">
-            同步这个模型源可用的模型，并验证它能否被 Codex 和 MultiRouter
-            正常使用。
+            Sync the models available from this source and verify that Codex and
+            MultiRouter can use them successfully.
           </p>
         </div>
         <div className="flex flex-wrap items-center gap-2">
@@ -150,7 +150,7 @@ export function CodexProviderReadinessSection({
             ) : (
               <Download className="h-3.5 w-3.5" />
             )}
-            同步模型
+            Sync models
           </Button>
           <Button
             type="button"
@@ -159,15 +159,15 @@ export function CodexProviderReadinessSection({
             className="h-8 gap-1"
             disabled={isValidatingConnection}
             onClick={onValidateConnection}
-            aria-label="验证连接"
-            title="向 Responses 与 Chat 发送真实请求，验证 SSE、推理、工具调用和工具续轮"
+            aria-label="Validate connection"
+            title="Send real Requests to Responses and Chat to validate SSE, reasoning, tool calls, and tool continuations"
           >
             {isValidatingConnection ? (
               <Loader2 className="h-3.5 w-3.5 animate-spin" />
             ) : (
               <Route className="h-3.5 w-3.5" />
             )}
-            兼容性深度探测
+            Deep compatibility probe
           </Button>
           {hasPersistedEvidence && onViewCompatibilityDetails && (
             <Button
@@ -178,7 +178,7 @@ export function CodexProviderReadinessSection({
               onClick={onViewCompatibilityDetails}
             >
               <Eye className="h-3.5 w-3.5" />
-              查看已保存探测详情
+              View saved probe details
             </Button>
           )}
         </div>
@@ -188,53 +188,58 @@ export function CodexProviderReadinessSection({
         <div className="rounded-md border border-border-default bg-background/70 p-3">
           <div className="flex items-center gap-2 text-xs text-muted-foreground">
             <Server className="h-3.5 w-3.5" />
-            模型目录
+            Model catalog
           </div>
           <p className="mt-1 text-sm font-medium text-foreground">
             {configuredModels.length === 0
-              ? "尚未同步"
+              ? "Not synced"
               : disabledModelCount > 0
-                ? `${enabledModels.length} 个已启用，${disabledModelCount} 个已停用`
-                : `${enabledModels.length} 个模型`}
+                ? `${enabledModels.length} enabled, ${disabledModelCount} disabled`
+                : `${enabledModels.length} models`}
           </p>
         </div>
         <div className="rounded-md border border-border-default bg-background/70 p-3">
-          <p className="text-xs text-muted-foreground">默认模型</p>
+          <p className="text-xs text-muted-foreground">Default model</p>
           <p className="mt-1 truncate text-sm font-medium text-foreground">
             {selectedModel}
           </p>
         </div>
         <div className="rounded-md border border-border-default bg-background/70 p-3">
-          <p className="text-xs text-muted-foreground">实际协议</p>
+          <p className="text-xs text-muted-foreground">Effective protocol</p>
           <p className="mt-1 text-sm font-medium text-foreground">
             {effectiveProtocolLabel}
           </p>
         </div>
         <div className="rounded-md border border-border-default bg-background/70 p-3">
-          <p className="text-xs text-muted-foreground">兼容性证据</p>
+          <p className="text-xs text-muted-foreground">
+            Compatibility evidence
+          </p>
           <p className="mt-1 text-sm font-medium text-foreground">
-            {adaptation ? `${adaptation.models.length} 个模型` : "尚未读取"}
+            {adaptation ? `${adaptation.models.length} models` : "Not loaded"}
           </p>
           <p className="mt-1 text-[11px] leading-relaxed text-muted-foreground">
-            证据时间：{evidenceTime}
-            {evidenceExpired ? " · 已过期" : ""}
+            Evidence time: {evidenceTime}
+            {evidenceExpired ? " · expired" : ""}
           </p>
         </div>
       </div>
 
       {adaptation && adaptation.models.length > 0 && (
-        <div className="flex flex-wrap gap-2" aria-label="模型实际协议">
+        <div
+          className="flex flex-wrap gap-2"
+          aria-label="Effective model protocol"
+        >
           {adaptation.models.map((model) => (
             <span
               key={model.publicModel}
               className="rounded-full border border-border-default bg-background px-2.5 py-1 text-xs text-foreground"
             >
-              {model.publicModel}：
+              {model.publicModel}:
               {model.effectiveTransport === "open_ai_responses"
                 ? "Responses"
                 : model.effectiveTransport === "open_ai_chat"
                   ? "Chat"
-                  : "未确认"}
+                  : "Unconfirmed"}
             </span>
           ))}
         </div>
@@ -243,11 +248,11 @@ export function CodexProviderReadinessSection({
       <div className="rounded-md border border-border-default bg-background/70 p-3">
         <div className="flex flex-wrap items-center justify-between gap-2">
           <div className="space-y-1">
-            <p className="text-xs font-medium text-foreground">就绪状态</p>
+            <p className="text-xs font-medium text-foreground">Readiness</p>
             <p className="text-xs leading-relaxed text-muted-foreground">
               {isMaintainedPreset
-                ? "协议、上下文、推理档位与 /model 目录由 CCSwitchMulti 维护。"
-                : "兼容性深度探测会自动检测 Chat 与 Responses；只有自动检测失败时才需要在高级设置中手动覆盖。"}
+                ? "Protocol, context, reasoning levels, and the /model catalog are maintained by CCSwitchMulti."
+                : "The deep compatibility probe checks Chat and Responses automatically; use an advanced override only when automatic detection fails."}
             </p>
           </div>
           <span
@@ -266,7 +271,7 @@ export function CodexProviderReadinessSection({
         </div>
         {isMaintainedPreset && (
           <p className="mt-2 text-xs font-medium text-blue-700 dark:text-blue-300">
-            由 CCSwitchMulti 维护
+            Maintained by CCSwitchMulti
           </p>
         )}
         {validationSummary && (

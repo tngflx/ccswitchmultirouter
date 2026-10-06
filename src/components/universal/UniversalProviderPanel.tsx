@@ -87,20 +87,36 @@ export function UniversalProviderPanel({
         (projection) => projection.state === "pending",
       );
       toast.warning(
-        "统一供应商已保存，但 Codex 当前配置待刷新；其他应用配置不受影响。",
+        t("providerSet.universalProjectionPending", {
+          defaultValue:
+            "The universal provider was saved, but the current Codex configuration needs refreshing. Other apps are unaffected.",
+        }),
         hasRetryTarget
           ? {
               action: {
-                label: "重新投影",
+                label: t("providerSet.reproject", {
+                  defaultValue: "Reproject",
+                }),
                 onClick: () => {
                   void retryProjection(outcome)
-                    .then(() => toast.success("Codex 当前配置已重新投影"))
+                    .then(() =>
+                      toast.success(
+                        t("providerSet.reprojected", {
+                          defaultValue:
+                            "Current Codex configuration reprojected",
+                        }),
+                      ),
+                    )
                     .catch((error) => {
                       console.error(
                         "Failed to retry Universal Provider Set projection",
                         error,
                       );
-                      toast.error("重新投影失败，请稍后再试");
+                      toast.error(
+                        t("providerSet.reprojectFailed", {
+                          defaultValue: "Reprojection failed. Try again later.",
+                        }),
+                      );
                     });
                 },
               },
@@ -108,7 +124,7 @@ export function UniversalProviderPanel({
           : undefined,
       );
     },
-    [persistUniversalProviderSet, retryProjection],
+    [persistUniversalProviderSet, retryProjection, t],
   );
 
   // 保存并同步供应商
@@ -122,7 +138,10 @@ export function UniversalProviderPanel({
         notifyCommitOutcome(
           outcome,
           saveUnverified
-            ? "已保存并同步；Codex 配置未经深度验证，可稍后主动测试"
+            ? t("providerSet.universalUnverified", {
+                defaultValue:
+                  "Saved and synced; Codex configuration has not been deeply verified. You can test it later.",
+              })
             : t("universalProvider.savedAndSynced", {
                 defaultValue: "已保存并同步到所有应用",
               }),
@@ -222,7 +241,10 @@ export function UniversalProviderPanel({
         notifyCommitOutcome(
           outcome,
           duplicated.apps.codex
-            ? "统一供应商已复制并同步；Codex 配置未经深度验证，可稍后主动测试"
+            ? t("providerSet.duplicateUnverified", {
+                defaultValue:
+                  "Universal provider duplicated and synced; Codex configuration has not been deeply verified. You can test it later.",
+              })
             : t("universalProvider.duplicatedAndSynced", {
                 defaultValue: "统一供应商已复制并同步",
               }),
@@ -286,7 +308,7 @@ export function UniversalProviderPanel({
         <div className="rounded-lg border border-primary/20 bg-primary/5 p-3 text-sm text-muted-foreground">
           {t("codexMultiRouter.sourcePanelDescription", {
             defaultValue:
-              "选择已有模型源并同步到 Codex，或添加新的统一模型源。多路路由会基于这些已接入的模型源继续配置分流规则。",
+              "Select an existing source and sync it to Codex, or add a new universal source. Multi-model routing uses these connected sources for route rules.",
           })}
         </div>
       )}

@@ -247,7 +247,9 @@ describe("AddProviderDialog", () => {
       />,
     );
 
-    await user.click(screen.getByRole("tab", { name: "单独接入模型源" }));
+    await user.click(
+      screen.getByRole("tab", { name: "Connect a single model source" }),
+    );
     expect(providerFormProbe.providerId).toEqual(expect.any(String));
     expect(providerFormProbe.providerId).not.toBe("codex-draft");
     await user.click(screen.getByRole("button", { name: "common.add" }));
@@ -291,7 +293,9 @@ describe("AddProviderDialog", () => {
         onSubmit={vi.fn()}
       />,
     );
-    await user.click(screen.getByRole("tab", { name: "单独接入模型源" }));
+    await user.click(
+      screen.getByRole("tab", { name: "Connect a single model source" }),
+    );
     await user.click(screen.getByRole("button", { name: "common.add" }));
 
     await waitFor(() =>
@@ -310,7 +314,7 @@ describe("AddProviderDialog", () => {
     );
     expect(universalProtocolMocks.preflightCodex).not.toHaveBeenCalled();
     expect(
-      screen.queryByRole("button", { name: "确认测试" }),
+      screen.queryByRole("button", { name: "Confirm test" }),
     ).not.toBeInTheDocument();
   });
 
@@ -341,7 +345,9 @@ describe("AddProviderDialog", () => {
         onSubmit={vi.fn()}
       />,
     );
-    await user.click(screen.getByRole("tab", { name: "单独接入模型源" }));
+    await user.click(
+      screen.getByRole("tab", { name: "Connect a single model source" }),
+    );
     await user.click(screen.getByRole("button", { name: "common.add" }));
 
     await waitFor(() =>
@@ -400,7 +406,9 @@ describe("AddProviderDialog", () => {
       />,
     );
 
-    await user.click(screen.getByRole("tab", { name: "单独接入模型源" }));
+    await user.click(
+      screen.getByRole("tab", { name: "Connect a single model source" }),
+    );
     await user.click(screen.getByRole("button", { name: "common.add" }));
     await waitFor(() =>
       expect(universalProtocolMocks.commitCodex).toHaveBeenCalledWith(
@@ -411,7 +419,7 @@ describe("AddProviderDialog", () => {
       ),
     );
     expect(
-      screen.queryByRole("button", { name: "确认按协议拆分" }),
+      screen.queryByRole("button", { name: "Confirm split" }),
     ).not.toBeInTheDocument();
     expect(universalProtocolMocks.commitCodex).toHaveBeenCalledOnce();
     expect(handleSubmit).not.toHaveBeenCalled();
@@ -430,12 +438,12 @@ describe("AddProviderDialog", () => {
       />,
     );
 
-    fireEvent.click(screen.getByRole("button", { name: "添加模型源" }));
+    fireEvent.click(screen.getByRole("button", { name: "Add model source" }));
     fireEvent.click(
       screen.getByRole("button", { name: "submit-universal-provider" }),
     );
     fireEvent.click(
-      screen.getAllByRole("button", { name: "确认测试" }).at(-1)!,
+      screen.getAllByRole("button", { name: "Confirm test" }).at(-1)!,
     );
 
     await waitFor(() =>

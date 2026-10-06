@@ -1,4 +1,5 @@
 import React, { useEffect, useState } from "react";
+import { useTranslation } from "react-i18next";
 import {
   AlertCircle,
   ArrowRight,
@@ -51,9 +52,9 @@ const TODAY_RANGE = { preset: "today" } as const;
 const SEVEN_DAY_RANGE = { preset: "7d" } as const;
 
 const TIER_LABELS: Record<string, string> = {
-  five_hour: "5 小时窗口",
-  seven_day: "每周窗口",
-  weekly_limit: "每周窗口",
+  five_hour: "5-hour window",
+  seven_day: "Weekly window",
+  weekly_limit: "Weekly window",
 };
 
 interface UsageWindowCardProps {
@@ -129,10 +130,10 @@ function clampPercent(value: number): number {
 
 /** 根据已用百分比返回容量状态文案。 */
 function describeCapacity(utilization: number): string {
-  if (utilization >= 95) return "接近耗尽";
-  if (utilization >= 75) return "偏紧";
-  if (utilization >= 50) return "正常";
-  return "充足";
+  if (utilization >= 95) return "Nearly exhausted";
+  if (utilization >= 75) return "Tight";
+  if (utilization >= 50) return "Normal";
+  return "Healthy";
 }
 
 /** 根据已用百分比返回页面上的语义颜色。 */
@@ -153,9 +154,9 @@ function capacityBarTone(utilization: number): string {
 
 /** 把 ISO 时间格式化为本地可读时间；无效或缺失时返回兜底文案。 */
 function formatDateTime(value: string | null | undefined): string {
-  if (!value) return "未返回";
+  if (!value) return "Not returned";
   const date = new Date(value);
-  if (Number.isNaN(date.getTime())) return "无法解析";
+  if (Number.isNaN(date.getTime())) return "Unable to parse";
   return date.toLocaleString(undefined, {
     month: "short",
     day: "numeric",
@@ -166,7 +167,7 @@ function formatDateTime(value: string | null | undefined): string {
 
 /** 把毫秒时间戳格式化为最近刷新时间。 */
 function formatCheckedAt(value: number | null | undefined): string {
-  if (!value) return "尚未刷新";
+  if (!value) return "Not refreshed yet";
   return new Date(value).toLocaleString(undefined, {
     month: "short",
     day: "numeric",
@@ -239,28 +240,29 @@ function getWindowRecommendation(
   const hoursUntilReset = getHoursUntil(tier.resetsAt);
   if (!forecast || hoursUntilReset === null) {
     return {
-      title: "等待更多窗口数据",
-      detail: "官方尚未提供足够的有效窗口读数，暂不显示耗尽预测。",
+      title: "Waiting for more window data",
+      detail:
+        "The official service has not provided enough valid window readings to show a depletion forecast.",
       tone: "warn",
     };
   }
   if (forecast.depletesBeforeReset) {
     return {
-      title: "按当前节奏可能提前耗尽",
-      detail: `预计 ${formatDateTime(forecast.depletionAt?.toISOString())} 用尽，建议降低并发或把轻量任务切到其它模型。`,
+      title: "May deplete before reset at the current pace",
+      detail: `Expected to deplete around ${formatDateTime(forecast.depletionAt?.toISOString())}; reduce concurrency or move lightweight work to another model.`,
       tone: "risk",
     };
   }
   if (forecast.percentPerHour >= 15) {
     return {
-      title: "消耗节奏偏快",
-      detail: `重置前约剩 ${Math.ceil(hoursUntilReset)} 小时；优先避免大上下文重复提交。`,
+      title: "Usage pace is fast",
+      detail: `About ${Math.ceil(hoursUntilReset)} hours remain before reset; avoid resubmitting large contexts.`,
       tone: "warn",
     };
   }
   return {
-    title: "当前节奏可覆盖至重置",
-    detail: `按已过周期平均速度估算，仍会在 ${formatDateTime(tier.resetsAt)} 前保有余量。`,
+    title: "Current pace should last until reset",
+    detail: `At the average pace so far, capacity should remain through ${formatDateTime(tier.resetsAt)}.`,
     tone: "ok",
   };
 }
@@ -292,44 +294,44 @@ function resetCreditUrgency(expiresAt: string | null | undefined): {
 } {
   if (!expiresAt) {
     return {
-      label: "无到期记录",
+      label: "No expiry record",
       className: "text-muted-foreground",
     };
   }
   const expiresAtMs = new Date(expiresAt).getTime();
   if (Number.isNaN(expiresAtMs)) {
     return {
-      label: "到期时间异常",
+      label: "Invalid expiry time",
       className: "text-amber-600 dark:text-amber-400",
     };
   }
   const hoursLeft = (expiresAtMs - Date.now()) / (1000 * 60 * 60);
   if (hoursLeft <= 0) {
     return {
-      label: "已过期",
+      label: "Expired",
       className: "text-red-600 dark:text-red-400",
     };
   }
   if (hoursLeft <= 24) {
     return {
-      label: "今天到期",
+      label: "Expires today",
       className: "text-red-600 dark:text-red-400",
     };
   }
   if (hoursLeft <= 72) {
     return {
-      label: "即将到期",
+      label: "Expiring soon",
       className: "text-amber-600 dark:text-amber-400",
     };
   }
   if (hoursLeft <= 24 * 7) {
     return {
-      label: "本周到期",
+      label: "Expires this week",
       className: "text-blue-600 dark:text-blue-400",
     };
   }
   return {
-    label: "可用",
+    label: "Available",
     className: "text-emerald-600 dark:text-emerald-400",
   };
 }
@@ -382,40 +384,40 @@ const UsageGuidePanel: React.FC = () => (
   <section className={`rounded-lg border p-4 ${USAGE_PAGE_COLORS.guide}`}>
     <div className="mb-3 flex items-center gap-2 text-sm font-semibold">
       <Info className="h-4 w-4" />
-      使用引导
+      Quick guide
     </div>
     <div className="grid gap-3 lg:grid-cols-3">
       <GuideStep
         index={1}
-        title="从 Codex 工具栏进入"
-        detail="主界面先切到 Codex，再点多模型路由旁边的柱状图按钮。"
+        title="Open from the Codex toolbar"
+        detail="Switch the main view to Codex, then click the chart button beside multi-model routing."
       />
       <GuideStep
         index={2}
-        title="先刷新当前登录"
-        detail="页面读取本机 Codex Desktop / CLI 登录；刷新只重新查询，不兑换 reset。"
+        title="Refresh the current login first"
+        detail="This page reads the local Codex Desktop / CLI login; refresh only queries again and does not redeem resets."
       />
       <GuideStep
         index={3}
-        title="按窗口和到期时间决策"
-        detail="先看 5 小时与每周剩余额度，再看 reset 是否临近到期。"
+        title="Decide using windows and expiry"
+        detail="Check the 5-hour and weekly remaining capacity, then check whether reset credits are near expiry."
       />
     </div>
     <div className="mt-3 grid gap-2 lg:grid-cols-3">
       <UsageReadingHint
         tone="ok"
-        title="绿色 / 蓝色"
-        detail="容量还可用，适合继续工作或保留 reset。"
+        title="Green / blue"
+        detail="Capacity is available; continue working or preserve the reset."
       />
       <UsageReadingHint
         tone="warn"
-        title="黄色 / 红色"
-        detail="窗口偏紧；如果刷新还远，优先规划 reset 或等待。"
+        title="Yellow / red"
+        detail="The window is tight; if reset is not soon, plan usage or wait."
       />
       <UsageReadingHint
         tone="info"
-        title="到期提示"
-        detail="今天到期、即将到期、本周到期会单独标出，避免 reset 白白过期。"
+        title="Expiry alerts"
+        detail="Expiring today, soon, or this week is highlighted so reset credits are not wasted."
       />
     </div>
   </section>
@@ -454,14 +456,14 @@ const UsageWindowCard: React.FC<UsageWindowCardProps> = ({ tier }) => {
         <div>
           <div className="text-sm font-semibold text-foreground">{label}</div>
           <div className="mt-1 text-xs text-muted-foreground">
-            重置时间：{formatDateTime(tier.resetsAt)}
+            Reset time: {formatDateTime(tier.resetsAt)}
           </div>
         </div>
         <div className={`text-right ${capacityTone(used)}`}>
           <div className="text-2xl font-semibold tabular-nums">
             {Math.round(remaining)}%
           </div>
-          <div className="text-xs font-medium">剩余</div>
+          <div className="text-xs font-medium">Remaining</div>
         </div>
       </div>
 
@@ -477,7 +479,7 @@ const UsageWindowCard: React.FC<UsageWindowCardProps> = ({ tier }) => {
       <div className="mt-3 flex items-center justify-between text-xs">
         <span className={capacityTone(used)}>{describeCapacity(used)}</span>
         <span className="text-muted-foreground tabular-nums">
-          已用 {Math.round(used)}%
+          Used {Math.round(used)}%
         </span>
       </div>
 
@@ -500,10 +502,10 @@ const UsageWindowCard: React.FC<UsageWindowCardProps> = ({ tier }) => {
         {forecast && (
           <div className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1 border-t border-current/10 pt-2 text-[11px] text-muted-foreground">
             <span className="tabular-nums">
-              平均 {forecast.percentPerHour.toFixed(1)}% / 小时
+              Average {forecast.percentPerHour.toFixed(1)}% / hour
             </span>
             <span>
-              置信度：{forecast.confidence === "medium" ? "中" : "低"}
+              Confidence: {forecast.confidence === "medium" ? "medium" : "low"}
             </span>
           </div>
         )}
@@ -544,31 +546,33 @@ const LocalUsageAnalytics: React.FC<{
           <LineChart className="mt-0.5 h-4 w-4 text-violet-700 dark:text-violet-300" />
           <div>
             <h3 className="text-base font-semibold text-foreground">
-              本地消耗节奏
+              Local usage pace
             </h3>
             <p className="mt-1 text-xs leading-5 text-muted-foreground">
-              来自本机已同步的 Codex 会话与代理日志，仅用于识别 token
-              和模型消耗趋势，不换算官方窗口额度。
+              From locally synced Codex sessions and proxy logs; used only to
+              identify token and model usage trends, not to convert official
+              window capacity.
             </p>
           </div>
         </div>
         <span className="inline-flex w-fit items-center gap-1 rounded-md border border-violet-200 bg-white/80 px-2 py-1 text-xs text-violet-800 dark:border-violet-800/70 dark:bg-slate-950/35 dark:text-violet-200">
           <Database className="h-3.5 w-3.5" />
-          本地日志口径
+          Local log scope
         </span>
       </div>
 
       {isLoading && !summary ? (
         <div className="flex items-center gap-2 py-6 text-sm text-muted-foreground">
           <LoaderCircle className="h-4 w-4 animate-spin" />
-          正在汇总本地 Codex 使用记录...
+          Summarizing local Codex usage...
         </div>
       ) : !summary || summary.totalRequests === 0 ? (
         <div
           className={`mt-4 rounded-md border border-dashed px-3 py-4 text-sm text-muted-foreground ${USAGE_PAGE_COLORS.analyticsInset}`}
         >
-          暂无可分析的本地 Codex 使用记录。完成一次 Codex
-          会话同步或通过本机代理发起请求后，这里会显示 token 速度和模型分布。
+          No local Codex usage records are available. Complete a Codex session
+          sync or make a request through the local proxy to see token pace and
+          model distribution.
         </div>
       ) : (
         <>
@@ -576,48 +580,58 @@ const LocalUsageAnalytics: React.FC<{
             <div
               className={`rounded-md border p-3 ${USAGE_PAGE_COLORS.analyticsInset}`}
             >
-              <div className="text-xs text-muted-foreground">今日 token</div>
+              <div className="text-xs text-muted-foreground">
+                Today's tokens
+              </div>
               <div className="mt-1 text-xl font-semibold tabular-nums">
                 {formatTokens(summary.realTotalTokens)}
               </div>
               <div className="mt-1 text-xs text-muted-foreground">
-                {summary.totalRequests} 次请求
+                {summary.totalRequests} requests
               </div>
             </div>
             <div
               className={`rounded-md border p-3 ${USAGE_PAGE_COLORS.analyticsInset}`}
             >
-              <div className="text-xs text-muted-foreground">当前消耗速度</div>
+              <div className="text-xs text-muted-foreground">
+                Current usage pace
+              </div>
               <div className="mt-1 text-xl font-semibold tabular-nums">
                 {formatTokens(tokensPerHour)}
                 <span className="ml-1 text-xs font-medium text-muted-foreground">
-                  token / 小时
+                  token / hour
                 </span>
               </div>
               <div className="mt-1 text-xs text-muted-foreground">
-                按今日已过时间平均
+                Average over elapsed time today
               </div>
             </div>
             <div
               className={`rounded-md border p-3 ${USAGE_PAGE_COLORS.analyticsInset}`}
             >
-              <div className="text-xs text-muted-foreground">缓存命中率</div>
+              <div className="text-xs text-muted-foreground">
+                Cache hit rate
+              </div>
               <div className="mt-1 text-xl font-semibold tabular-nums">
                 {cachePercent}%
               </div>
               <div className="mt-1 text-xs text-muted-foreground">
-                {cachePercent < 30 ? "重复上下文可优先复用" : "上下文复用正常"}
+                {cachePercent < 30
+                  ? "Reuse repeated context first"
+                  : "Context reuse is normal"}
               </div>
             </div>
             <div
               className={`rounded-md border p-3 ${USAGE_PAGE_COLORS.analyticsInset}`}
             >
-              <div className="text-xs text-muted-foreground">请求成功率</div>
+              <div className="text-xs text-muted-foreground">
+                Request success rate
+              </div>
               <div className="mt-1 text-xl font-semibold tabular-nums">
                 {Math.round(summary.successRate)}%
               </div>
               <div className="mt-1 text-xs text-muted-foreground">
-                已计入成功请求
+                Successful requests counted
               </div>
             </div>
           </div>
@@ -630,15 +644,15 @@ const LocalUsageAnalytics: React.FC<{
               <div className="min-w-0 text-sm">
                 <div className="font-semibold text-foreground">
                   {highBurn
-                    ? "建议先降低高上下文任务密度"
-                    : "本地 token 节奏处于可观察范围"}
+                    ? "Reduce high-context task density first"
+                    : "Local token pace is within an observable range"}
                 </div>
                 <p className="mt-1 leading-5 text-muted-foreground">
                   {highBurn
-                    ? `当前约 ${formatTokens(tokensPerHour)} token / 小时。将大任务拆分、避免重复粘贴长上下文，并把轻量任务分配到低成本模型可降低消耗。`
+                    ? `About ${formatTokens(tokensPerHour)} tokens/hour. Split large tasks, avoid pasting long contexts repeatedly, and move lightweight tasks to lower-cost models to reduce usage.`
                     : heavyModel
-                      ? `${heavyModel.model} 是近 7 天 token 消耗最多的模型，占展示模型总量约 ${Math.round((heavyModel.totalTokens / Math.max(topModelsTotalTokens, 1)) * 100)}%。`
-                      : "继续积累本地会话记录后，可获得模型级别的消耗建议。"}
+                      ? `${heavyModel.model} used the most tokens in the last 7 days, about ${Math.round((heavyModel.totalTokens / Math.max(topModelsTotalTokens, 1)) * 100)}% of displayed model usage.`
+                      : "Keep collecting local session records to unlock model-level usage recommendations."}
                 </p>
               </div>
             </div>
@@ -647,7 +661,7 @@ const LocalUsageAnalytics: React.FC<{
           <div className="mt-4">
             <div className="mb-2 flex items-center gap-2 text-sm font-semibold">
               <BarChart3 className="h-4 w-4 text-violet-700 dark:text-violet-300" />
-              近 7 天模型分布
+              Model distribution over the last 7 days
             </div>
             {topModels.length > 0 ? (
               <div className="divide-y rounded-md border bg-white/70 dark:divide-slate-700/70 dark:bg-slate-950/20">
@@ -679,7 +693,7 @@ const LocalUsageAnalytics: React.FC<{
                         {formatTokens(item.totalTokens)} token
                       </div>
                       <div className="text-right text-xs text-muted-foreground tabular-nums">
-                        {item.requestCount} 次请求
+                        {item.requestCount} requests
                       </div>
                     </div>
                   );
@@ -687,7 +701,7 @@ const LocalUsageAnalytics: React.FC<{
               </div>
             ) : (
               <div className="text-sm text-muted-foreground">
-                本地日志没有返回可展示的模型级 token 记录。
+                Local logs returned no model-level token records to display.
               </div>
             )}
           </div>
@@ -728,7 +742,7 @@ const QuotaCollaborationPanel: React.FC<{
     nextMode: "observe" | "enforce" = mode,
   ) => {
     if (!settings) {
-      toast.error("设置尚未加载完成，请稍后重试。");
+      toast.error("Settings are not loaded yet; try again shortly.");
       return;
     }
     setIsSaving(true);
@@ -752,10 +766,10 @@ const QuotaCollaborationPanel: React.FC<{
           queryKey: ["usage", "quota-collaboration"],
         }),
       ]);
-      toast.success("多设备协作设置已保存。");
+      toast.success("Multi-device collaboration settings saved.");
     } catch (error) {
       toast.error(
-        `保存多设备协作设置失败：${error instanceof Error ? error.message : "未知错误"}`,
+        `Failed to save multi-device collaboration settings: ${error instanceof Error ? error.message : "Unknown error"}`,
       );
     } finally {
       setIsSaving(false);
@@ -773,7 +787,7 @@ const QuotaCollaborationPanel: React.FC<{
       <section className={`rounded-lg border p-5 ${USAGE_PAGE_COLORS.card}`}>
         <div className="flex items-center gap-2 text-sm text-muted-foreground">
           <LoaderCircle className="h-4 w-4 animate-spin" />
-          正在读取多设备协作缓存...
+          Loading multi-device collaboration cache...
         </div>
       </section>
     );
@@ -796,11 +810,12 @@ const QuotaCollaborationPanel: React.FC<{
           <MonitorSmartphone className="mt-0.5 h-4 w-4 text-emerald-700 dark:text-emerald-300" />
           <div>
             <h3 className="text-base font-semibold text-foreground">
-              多设备额度协作
+              Multi-device quota collaboration
             </h3>
             <p className="mt-1 text-xs leading-5 text-muted-foreground">
-              官方窗口是同一 Codex 账号的总量；下表只汇总已接入 CCSwitchMulti
-              的设备 token，不把两种口径相互换算。
+              Official windows are totals for the same Codex account; this table
+              only summarizes device tokens connected to CCSwitchMulti and does
+              not convert between the two measures.
             </p>
           </div>
         </div>
@@ -812,7 +827,7 @@ const QuotaCollaborationPanel: React.FC<{
           }`}
         >
           <ShieldCheck className="h-3.5 w-3.5" />
-          {isEnforcing ? "约束模式" : "观测模式"}
+          {isEnforcing ? "Enforce mode" : "Observe mode"}
         </span>
       </div>
       <div className="mt-3">
@@ -827,24 +842,27 @@ const QuotaCollaborationPanel: React.FC<{
           <RefreshCw
             className={`h-3.5 w-3.5 ${isSyncing ? "animate-spin" : ""}`}
           />
-          同步设备报告
+          Sync device reports
         </Button>
       </div>
 
       <div className={`mt-4 rounded-md border p-3 ${USAGE_PAGE_COLORS.inset}`}>
         <div className="flex flex-wrap items-center justify-between gap-2">
           <div>
-            <h4 className="text-sm font-semibold text-foreground">协作设置</h4>
+            <h4 className="text-sm font-semibold text-foreground">
+              Collaboration settings
+            </h4>
             <p className="mt-0.5 text-xs text-muted-foreground">
-              每台设备都使用同一 WebDAV 或 S3 目录；设备名称只影响列表显示。
+              Each device uses the same WebDAV or S3 directory; the device name
+              only affects display.
             </p>
           </div>
           <Button
             type="button"
             size="icon"
             variant="ghost"
-            aria-label="打开多设备协作教程"
-            title="打开多设备协作教程"
+            aria-label="Open the multi-device collaboration guide"
+            title="Open the multi-device collaboration guide"
             onClick={() =>
               void settingsApi.openExternal(
                 "https://github.com/tngflx/ccswitchmultirouter/blob/main/docs/guides/codex-multi-device-quota-collaboration-zh.md",
@@ -856,17 +874,17 @@ const QuotaCollaborationPanel: React.FC<{
         </div>
         <div className="mt-3 grid gap-3 md:grid-cols-[minmax(0,1fr)_auto]">
           <div className="space-y-1.5">
-            <Label htmlFor="quota-collaboration-device-name">设备名称</Label>
+            <Label htmlFor="quota-collaboration-device-name">Device name</Label>
             <Input
               id="quota-collaboration-device-name"
               value={deviceName}
               maxLength={64}
-              placeholder="例如：办公室 Windows"
+              placeholder="For example: Office Windows"
               onChange={(event) => setDeviceName(event.target.value)}
             />
           </div>
           <div className="space-y-1.5">
-            <Label>协作模式</Label>
+            <Label>Collaboration mode</Label>
             <div className="flex rounded-md border p-1">
               <Button
                 type="button"
@@ -874,7 +892,7 @@ const QuotaCollaborationPanel: React.FC<{
                 variant={mode === "observe" ? "default" : "ghost"}
                 onClick={() => setMode("observe")}
               >
-                观测
+                Observe
               </Button>
               <Button
                 type="button"
@@ -884,7 +902,7 @@ const QuotaCollaborationPanel: React.FC<{
                   if (mode !== "enforce") setConfirmEnforceOpen(true);
                 }}
               >
-                约束
+                Enforce
               </Button>
             </div>
           </div>
@@ -893,7 +911,7 @@ const QuotaCollaborationPanel: React.FC<{
           <div className="mt-3 grid gap-2 md:grid-cols-[minmax(0,1fr)_96px] md:items-end">
             <div className="space-y-1.5">
               <Label htmlFor="quota-collaboration-threshold">
-                窗口剩余阈值
+                Window remaining threshold
               </Label>
               <input
                 id="quota-collaboration-threshold"
@@ -906,7 +924,7 @@ const QuotaCollaborationPanel: React.FC<{
               />
             </div>
             <Input
-              aria-label="窗口剩余阈值百分比"
+              aria-label="Window remaining threshold percentage"
               type="number"
               min="1"
               max="90"
@@ -926,11 +944,11 @@ const QuotaCollaborationPanel: React.FC<{
             onClick={() => void saveCollaborationSettings()}
             disabled={!settings || isSaving}
           >
-            {isSaving ? "保存中..." : "保存协作设置"}
+            {isSaving ? "Saving..." : "Save collaboration settings"}
           </Button>
           {!overview?.configured ? (
             <span className="text-xs text-amber-700 dark:text-amber-300">
-              先在设置中启用 WebDAV 或 S3，才能同步其它设备。
+              Enable WebDAV or S3 in Settings before syncing other devices.
             </span>
           ) : null}
         </div>
@@ -940,22 +958,22 @@ const QuotaCollaborationPanel: React.FC<{
         <li
           className={`rounded-md border px-3 py-2 ${USAGE_PAGE_COLORS.inset}`}
         >
-          1. 每台设备启用相同的 WebDAV 或 S3
+          1. Enable the same WebDAV or S3 on each device
         </li>
         <li
           className={`rounded-md border px-3 py-2 ${USAGE_PAGE_COLORS.inset}`}
         >
-          2. 每台设备刷新一次官方额度
+          2. Refresh official quota on each device
         </li>
         <li
           className={`rounded-md border px-3 py-2 ${USAGE_PAGE_COLORS.inset}`}
         >
-          3. 分别点击同步设备报告
+          3. Click Sync device reports on each device
         </li>
         <li
           className={`rounded-md border px-3 py-2 ${USAGE_PAGE_COLORS.inset}`}
         >
-          4. 返回任意设备确认列表已汇总
+          4. Return to any device and confirm the list is aggregated
         </li>
       </ol>
 
@@ -969,18 +987,20 @@ const QuotaCollaborationPanel: React.FC<{
         <div
           className={`mt-4 rounded-md border border-dashed px-3 py-4 text-sm text-muted-foreground ${USAGE_PAGE_COLORS.inset}`}
         >
-          当前只有本机缓存。完成一次官方额度刷新后会生成本机报告；配置协作同步后，其他设备会出现在这里。
+          Only the local cache is available. Refresh official quota once to
+          create a local report; synced devices appear here after collaboration
+          is configured.
         </div>
       ) : (
         <>
           <div className="mt-4 overflow-x-auto rounded-md border">
             <div className="min-w-[620px] divide-y">
               <div className="grid grid-cols-[minmax(150px,1fr)_110px_110px_80px_130px] gap-3 bg-slate-50 px-3 py-2 text-xs font-medium text-muted-foreground dark:bg-slate-900/50">
-                <span>设备</span>
-                <span className="text-right">今日 token</span>
-                <span className="text-right">7 天 token</span>
-                <span className="text-right">请求</span>
-                <span className="text-right">最后上报</span>
+                <span>Device</span>
+                <span className="text-right">Today's tokens</span>
+                <span className="text-right">7-day tokens</span>
+                <span className="text-right">Requests</span>
+                <span className="text-right">Last report</span>
               </div>
               {reports.map((report) => (
                 <div
@@ -989,7 +1009,9 @@ const QuotaCollaborationPanel: React.FC<{
                 >
                   <div className="min-w-0 truncate font-medium">
                     {report.deviceName}
-                    {report.deviceId === overview?.deviceId ? "（本机）" : ""}
+                    {report.deviceId === overview?.deviceId
+                      ? "(this device)"
+                      : ""}
                   </div>
                   <span className="text-right tabular-nums">
                     {formatTokens(report.todayTokens)}
@@ -1010,9 +1032,9 @@ const QuotaCollaborationPanel: React.FC<{
             </div>
           </div>
           <div className="mt-3 flex flex-wrap gap-x-4 gap-y-1 text-xs text-muted-foreground">
-            <span>已覆盖 {reports.length} 台设备</span>
-            <span>今日合计 {formatTokens(todayTokens)} token</span>
-            <span>7 天合计 {formatTokens(weekTokens)} token</span>
+            <span>{reports.length} devices covered</span>
+            <span>Today total: {formatTokens(todayTokens)} tokens</span>
+            <span>7-day total: {formatTokens(weekTokens)} tokens</span>
           </div>
         </>
       )}
@@ -1020,17 +1042,17 @@ const QuotaCollaborationPanel: React.FC<{
         className={`mt-4 rounded-md border px-3 py-2.5 text-xs leading-5 ${isEnforcing ? USAGE_PAGE_COLORS.warning : USAGE_PAGE_COLORS.inset}`}
       >
         {isEnforcing
-          ? `窗口剩余不高于 ${Math.round(overview?.enforceRemainingPercent ?? 20)}% 时，本机网关会拒绝继续转发 Codex 请求。未经过 CCSwitchMulti 的原生 Codex App 仍不受此策略控制。`
-          : "观测模式不会拦截请求。约束模式只对经过 CCSwitchMulti 网关的实例生效。"}
+          ? `When official window capacity is at or below ${Math.round(overview?.enforceRemainingPercent ?? 20)}%, the local gateway will stop forwarding Codex requests. Native Codex App instances outside CCSwitchMulti are unaffected.`
+          : "Observe mode does not block requests. Enforce mode applies only to instances using the CCSwitchMulti gateway."}
       </div>
       <ConfirmDialog
         isOpen={confirmEnforceOpen}
-        title="启用约束模式？"
+        title="Enable enforce mode?"
         message={
-          "当官方窗口剩余不高于阈值时，本机 CCSwitchMulti 网关会拒绝继续转发 Codex 请求。\n\n直接使用原生 Codex App、CLI 或其它未经过 CCSwitchMulti 网关的请求不受此策略控制，仍会消耗同一账号额度。"
+          "When official window capacity falls below the threshold, the local CCSwitchMulti gateway will stop forwarding Codex requests.\n\nNative Codex App, CLI, or other requests outside this gateway are unaffected and still consume the same account quota."
         }
-        confirmText="我了解，启用约束"
-        cancelText="保持观测"
+        confirmText="I understand; enable enforce"
+        cancelText="Keep observe"
         variant="info"
         onConfirm={confirmEnforce}
         onCancel={() => setConfirmEnforceOpen(false)}
@@ -1052,7 +1074,7 @@ const ResetCreditRow: React.FC<ResetCreditRowProps> = ({ credit, index }) => {
           {credit.title || `Reset ${index + 1}`}
         </div>
         <div className="text-xs text-muted-foreground">
-          状态：{credit.status ?? "unknown"}
+          Status: {credit.status ?? "unknown"}
         </div>
       </div>
       <div className="text-xs text-muted-foreground tabular-nums">
@@ -1076,7 +1098,7 @@ function renderQuotaProblem(
       <div
         className={`rounded-lg border p-6 text-sm text-muted-foreground ${USAGE_PAGE_COLORS.card}`}
       >
-        正在读取本机 Codex 登录状态...
+        Reading local Codex login status...
       </div>
     );
   }
@@ -1091,11 +1113,13 @@ function renderQuotaProblem(
 
   if (!isCredentialProblem && quota.success) return null;
 
-  const title = isCredentialProblem ? "Codex 登录不可用" : "额度查询失败";
+  const title = isCredentialProblem
+    ? "Codex login unavailable"
+    : "Quota query failed";
   const detail =
     quota.credentialMessage ||
     quota.error ||
-    "请确认 Codex Desktop / CLI 已登录，然后刷新。";
+    "Confirm Codex Desktop / CLI is signed in, then refresh.";
 
   return (
     <section
@@ -1115,7 +1139,7 @@ function renderQuotaProblem(
         className={`gap-2 ${USAGE_PAGE_COLORS.warningButton}`}
       >
         <RefreshCw className={`h-3.5 w-3.5 ${loading ? "animate-spin" : ""}`} />
-        重新刷新
+        Refresh again
       </Button>
     </section>
   );
@@ -1123,6 +1147,7 @@ function renderQuotaProblem(
 
 /** Codex 用量与 banked reset credits 的独立工具页。 */
 export const CodexUsagePage: React.FC = () => {
+  const { t } = useTranslation();
   const {
     data: quota,
     isFetching,
@@ -1165,30 +1190,30 @@ export const CodexUsagePage: React.FC = () => {
           <div className="min-w-0 space-y-2">
             <div className="flex items-center gap-2 text-base font-semibold">
               <Gauge className="h-4 w-4 text-sky-600 dark:text-blue-300" />
-              Codex 用量与重置额度
+              Codex usage and reset credits
             </div>
             <p className="max-w-4xl text-xs leading-5 text-muted-foreground dark:text-slate-400">
-              这里查看的是当前 Codex 登录账号的速率窗口和已存 reset
-              额度。页面只读：不会兑换 reset、不会修改账号，也不会写入 Codex
-              配置。
+              This page shows rate windows and stored reset credits for the
+              current Codex account. Read-only: it does not redeem resets,
+              modify the account, or write to Codex configuration.
             </p>
             <div className="flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
               <span
                 className={`inline-flex items-center gap-1 rounded-md border px-2 py-1 ${USAGE_PAGE_COLORS.chip}`}
               >
-                Codex 工具栏
+                Codex toolbar
                 <ArrowRight className="h-3 w-3" />
-                柱状图按钮
+                chart button
               </span>
               <span
                 className={`inline-flex items-center gap-1 rounded-md border px-2 py-1 ${USAGE_PAGE_COLORS.chip}`}
               >
-                只读查询
+                Read-only query
               </span>
               <span
                 className={`inline-flex items-center gap-1 rounded-md border px-2 py-1 ${USAGE_PAGE_COLORS.chip}`}
               >
-                自动 5 分钟刷新
+                Auto-refresh every 5 minutes
               </span>
             </div>
           </div>
@@ -1215,7 +1240,7 @@ export const CodexUsagePage: React.FC = () => {
               <RefreshCw
                 className={`h-4 w-4 ${isFetching ? "animate-spin" : ""}`}
               />
-              刷新
+              {t("common.refresh", { defaultValue: "Refresh" })}
             </Button>
           </div>
         </div>
@@ -1235,7 +1260,7 @@ export const CodexUsagePage: React.FC = () => {
               <section
                 className={`rounded-lg border p-5 text-sm text-muted-foreground lg:col-span-2 ${USAGE_PAGE_COLORS.card}`}
               >
-                Codex 没有返回 5 小时或每周用量窗口。
+                Codex returned no 5-hour or weekly usage windows.
               </section>
             )}
           </div>
@@ -1253,7 +1278,7 @@ export const CodexUsagePage: React.FC = () => {
             onSync={() => {
               void syncQuotaCollaboration.mutateAsync().catch((error) => {
                 toast.error(
-                  `同步设备报告失败：${error instanceof Error ? error.message : "请检查 WebDAV 或 S3 配置。"}`,
+                  `Failed to sync device reports: ${error instanceof Error ? error.message : "Check your WebDAV or S3 configuration."}`,
                 );
               });
             }}
@@ -1266,14 +1291,14 @@ export const CodexUsagePage: React.FC = () => {
               <div className="flex items-center gap-2">
                 <RotateCcw className="h-4 w-4 text-sky-600 dark:text-sky-400" />
                 <h3 className="text-base font-semibold text-foreground">
-                  已存 reset 额度
+                  Stored reset credits
                 </h3>
               </div>
               <div
                 className={`inline-flex items-center gap-2 rounded-lg px-3 py-2 text-sm font-semibold ${USAGE_PAGE_COLORS.resetSummary}`}
               >
                 <TimerReset className="h-4 w-4" />
-                {availableCount} 个可用
+                {availableCount} available
               </div>
             </div>
 
@@ -1290,8 +1315,8 @@ export const CodexUsagePage: React.FC = () => {
                   <div
                     className={`rounded-lg border border-dashed px-3 py-2 text-sm text-muted-foreground ${USAGE_PAGE_COLORS.inset}`}
                   >
-                    还有 {missingExpiryCount} 个可用 reset
-                    没有返回可展示的到期明细。
+                    {missingExpiryCount} available reset credits have no
+                    displayable expiry details.
                   </div>
                 )}
               </div>
@@ -1300,7 +1325,7 @@ export const CodexUsagePage: React.FC = () => {
                 className={`flex items-center gap-2 rounded-lg border px-3 py-3 text-sm text-muted-foreground ${USAGE_PAGE_COLORS.inset}`}
               >
                 <CheckCircle2 className="h-4 w-4 text-emerald-600 dark:text-emerald-400" />
-                当前没有已存 reset 额度。
+                There are no stored reset credits.
               </div>
             )}
 
@@ -1308,7 +1333,7 @@ export const CodexUsagePage: React.FC = () => {
               <div
                 className={`mt-3 rounded-lg border px-3 py-2 text-sm ${USAGE_PAGE_COLORS.warning}`}
               >
-                Reset credit 明细读取不完整：{quota.resetCreditsError}
+                Reset credit details are incomplete: {quota.resetCreditsError}
               </div>
             )}
           </section>

@@ -140,23 +140,23 @@ const closeSearch = () => {
 };
 
 const openViewModeMenu = async () => {
-  await userEvent.click(screen.getByRole("combobox", { name: /查看方式/i }));
+  await userEvent.click(screen.getByRole("combobox", { name: /View mode/i }));
 };
 
 const switchToGroupedView = async () => {
   await openViewModeMenu();
-  const groupedOption = await screen.findByRole("option", { name: /分类/i });
+  const groupedOption = await screen.findByRole("option", { name: /Grouped/i });
   await userEvent.click(groupedOption);
   await waitFor(() =>
     expect(
-      screen.queryByRole("option", { name: /分类/i }),
+      screen.queryByRole("option", { name: /Grouped/i }),
     ).not.toBeInTheDocument(),
   );
 };
 
 const switchProviderFilter = async (providerLabel: RegExp) => {
   const providerFilterTrigger = screen.getByRole("combobox", {
-    name: /供应商筛选/i,
+    name: /Provider filter/i,
   });
 
   await userEvent.click(providerFilterTrigger);
@@ -167,22 +167,22 @@ const switchProviderFilter = async (providerLabel: RegExp) => {
 
 const enterGroupedBatchMode = async () => {
   await switchToGroupedView();
-  fireEvent.click(screen.getByRole("button", { name: /批量管理/i }));
+  fireEvent.click(screen.getByRole("button", { name: /Bulk manage/i }));
 };
 
 const collapseAllGroups = () => {
-  fireEvent.click(screen.getByRole("button", { name: /全部收起/i }));
+  fireEvent.click(screen.getByRole("button", { name: /Collapse all/i }));
 };
 
 const expandDirectoryGroup = (provider: string, directory: string) => {
   fireEvent.click(
     screen.getByRole("button", {
-      name: new RegExp(`展开或折叠 ${provider} 供应商分组`),
+      name: new RegExp(`Expand or collapse the ${provider} provider group`),
     }),
   );
   fireEvent.click(
     screen.getByRole("button", {
-      name: new RegExp(`展开或折叠 ${directory} 目录分组`),
+      name: new RegExp(`Expand or collapse the ${directory} directory group`),
     }),
   );
 };
@@ -282,13 +282,15 @@ describe("SessionManagerPage", () => {
       ).toBeInTheDocument(),
     );
 
-    fireEvent.click(screen.getByRole("button", { name: /删除会话/i }));
+    fireEvent.click(screen.getByRole("button", { name: /Delete session/i }));
 
     const dialog = screen.getByTestId("confirm-dialog");
     expect(dialog).toBeInTheDocument();
     expect(within(dialog).getByText(/Alpha Session/)).toBeInTheDocument();
 
-    fireEvent.click(within(dialog).getByRole("button", { name: /删除会话/i }));
+    fireEvent.click(
+      within(dialog).getByRole("button", { name: /Delete session/i }),
+    );
 
     await waitFor(() =>
       expect(
@@ -322,10 +324,12 @@ describe("SessionManagerPage", () => {
       ).toBeInTheDocument(),
     );
 
-    fireEvent.click(screen.getByRole("button", { name: /删除会话/i }));
+    fireEvent.click(screen.getByRole("button", { name: /Delete session/i }));
 
     const dialog = screen.getByTestId("confirm-dialog");
-    fireEvent.click(within(dialog).getByRole("button", { name: /删除会话/i }));
+    fireEvent.click(
+      within(dialog).getByRole("button", { name: /Delete session/i }),
+    );
 
     await waitFor(() =>
       expect(screen.queryByText("Alpha Session")).not.toBeInTheDocument(),
@@ -354,13 +358,15 @@ describe("SessionManagerPage", () => {
       ).toBeInTheDocument(),
     );
 
-    fireEvent.click(screen.getByRole("button", { name: /批量管理/i }));
-    fireEvent.click(screen.getByRole("button", { name: /全选当前/i }));
-    fireEvent.click(screen.getByRole("button", { name: /批量删除/i }));
+    fireEvent.click(screen.getByRole("button", { name: /Bulk manage/i }));
+    fireEvent.click(
+      screen.getByRole("button", { name: /Select all visible/i }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: /Bulk delete/i }));
 
     const dialog = screen.getByTestId("confirm-dialog");
     fireEvent.click(
-      within(dialog).getByRole("button", { name: /删除所选会话/i }),
+      within(dialog).getByRole("button", { name: /Delete selected sessions/i }),
     );
 
     await waitFor(() =>
@@ -369,7 +375,7 @@ describe("SessionManagerPage", () => {
 
     await waitFor(() =>
       expect(
-        screen.getByRole("button", { name: /批量删除/i }),
+        screen.getByRole("button", { name: /Bulk delete/i }),
       ).not.toBeDisabled(),
     );
 
@@ -430,7 +436,7 @@ describe("SessionManagerPage", () => {
       ).toBeInTheDocument(),
     );
 
-    fireEvent.click(screen.getByRole("button", { name: /批量管理/i }));
+    fireEvent.click(screen.getByRole("button", { name: /Bulk manage/i }));
     openSearch();
     fireEvent.change(screen.getByRole("textbox"), {
       target: { value: "NoSuchSession" },
@@ -438,7 +444,9 @@ describe("SessionManagerPage", () => {
 
     await waitFor(() => expect(screen.queryByText("Alpha Session")).toBeNull());
 
-    expect(screen.getByRole("button", { name: /退出批量管理/i })).toBeVisible();
+    expect(
+      screen.getByRole("button", { name: /Exit bulk management/i }),
+    ).toBeVisible();
   });
 
   it("drops hidden selections when search narrows the result set", async () => {
@@ -450,10 +458,12 @@ describe("SessionManagerPage", () => {
       ).toBeInTheDocument(),
     );
 
-    fireEvent.click(screen.getByRole("button", { name: /批量管理/i }));
-    fireEvent.click(screen.getByRole("button", { name: /全选当前/i }));
+    fireEvent.click(screen.getByRole("button", { name: /Bulk manage/i }));
+    fireEvent.click(
+      screen.getByRole("button", { name: /Select all visible/i }),
+    );
 
-    expect(screen.getByText("已选 3 项")).toBeInTheDocument();
+    expect(screen.getByText("3 selected")).toBeInTheDocument();
 
     openSearch();
     fireEvent.change(screen.getByRole("textbox"), {
@@ -467,7 +477,7 @@ describe("SessionManagerPage", () => {
     closeSearch();
 
     await waitFor(() =>
-      expect(screen.getByText("已选 1 项")).toBeInTheDocument(),
+      expect(screen.getByText("1 selected")).toBeInTheDocument(),
     );
   });
 
@@ -489,13 +499,15 @@ describe("SessionManagerPage", () => {
       ).toBeInTheDocument(),
     );
 
-    fireEvent.click(screen.getByRole("button", { name: /批量管理/i }));
-    fireEvent.click(screen.getByRole("button", { name: /全选当前/i }));
-    fireEvent.click(screen.getByRole("button", { name: /批量删除/i }));
+    fireEvent.click(screen.getByRole("button", { name: /Bulk manage/i }));
+    fireEvent.click(
+      screen.getByRole("button", { name: /Select all visible/i }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: /Bulk delete/i }));
 
     const dialog = screen.getByTestId("confirm-dialog");
     fireEvent.click(
-      within(dialog).getByRole("button", { name: /删除所选会话/i }),
+      within(dialog).getByRole("button", { name: /Delete selected sessions/i }),
     );
 
     await waitFor(() => {
@@ -523,12 +535,12 @@ describe("SessionManagerPage", () => {
 
     // 等待 SessionManagerPage 的 useEffect 渲染 CodexHistoryRepairPanel
     await waitFor(() => {
-      expect(screen.getByText("Codex 历史修复")).toBeInTheDocument();
+      expect(screen.getByText("Codex history repair")).toBeInTheDocument();
     });
 
     expect(
       screen.getByText(
-        "MultiRouter 已配置成功，修复前先完全退出 Codex / ChatGPT App",
+        "MultiRouter is configured. Fully exit the Codex / ChatGPT app before repairing.",
       ),
     ).toBeInTheDocument();
 
@@ -556,7 +568,7 @@ describe("SessionManagerPage", () => {
       ).toBeInTheDocument();
     });
 
-    expect(screen.queryByText("Codex 历史修复")).not.toBeInTheDocument();
+    expect(screen.queryByText("Codex history repair")).not.toBeInTheDocument();
     expect(onConsumed).not.toHaveBeenCalled();
   });
 
@@ -572,20 +584,22 @@ describe("SessionManagerPage", () => {
     await switchToGroupedView();
 
     expect(
-      screen.getByRole("button", { name: /全部收起/i }),
+      screen.getByRole("button", { name: /Collapse all/i }),
     ).toBeInTheDocument();
     expect(
       screen.getByRole("button", {
-        name: /展开或折叠 codex 供应商分组/,
+        name: /Expand or collapse the codex provider group/,
       }),
     ).toBeInTheDocument();
     expect(
       screen.getByRole("button", {
-        name: /展开或折叠 claude 供应商分组/,
+        name: /Expand or collapse the claude provider group/,
       }),
     ).toBeInTheDocument();
     expect(
-      screen.queryByRole("button", { name: /展开或折叠 codex 目录分组/ }),
+      screen.queryByRole("button", {
+        name: /Expand or collapse the codex directory group/,
+      }),
     ).not.toBeInTheDocument();
     expect(
       screen.queryByRole("button", { name: /Alpha Session/ }),
@@ -605,7 +619,9 @@ describe("SessionManagerPage", () => {
     expandDirectoryGroup("codex", "codex");
 
     expect(
-      screen.getByRole("button", { name: /展开或折叠 codex 目录分组/ }),
+      screen.getByRole("button", {
+        name: /Expand or collapse the codex directory group/,
+      }),
     ).toBeInTheDocument();
     expect(
       screen.getByRole("button", { name: /Alpha Session/ }),
@@ -623,7 +639,9 @@ describe("SessionManagerPage", () => {
 
     await waitFor(() =>
       expect(
-        screen.queryByRole("button", { name: /展开或折叠 codex 目录分组/ }),
+        screen.queryByRole("button", {
+          name: /Expand or collapse the codex directory group/,
+        }),
       ).not.toBeInTheDocument(),
     );
     await waitFor(() =>
@@ -656,17 +674,21 @@ describe("SessionManagerPage", () => {
     ).toBeInTheDocument();
     expect(
       screen.getByRole("button", {
-        name: /展开或折叠 claude 供应商分组/,
+        name: /Expand or collapse the claude provider group/,
       }),
     ).toBeInTheDocument();
     expect(
-      screen.queryByRole("button", { name: /展开或折叠 claude 目录分组/ }),
+      screen.queryByRole("button", {
+        name: /Expand or collapse the claude directory group/,
+      }),
     ).not.toBeInTheDocument();
 
     expandDirectoryGroup("claude", "claude");
 
     expect(
-      screen.getByRole("button", { name: /展开或折叠 claude 目录分组/ }),
+      screen.getByRole("button", {
+        name: /Expand or collapse the claude directory group/,
+      }),
     ).toBeInTheDocument();
     expect(
       screen.getByRole("button", { name: /Claude Session/ }),
@@ -684,13 +706,15 @@ describe("SessionManagerPage", () => {
     );
 
     await switchToGroupedView();
-    fireEvent.click(screen.getByRole("button", { name: /批量管理/i }));
-    fireEvent.click(screen.getByRole("button", { name: /全选当前/i }));
-    fireEvent.click(screen.getByRole("button", { name: /批量删除/i }));
+    fireEvent.click(screen.getByRole("button", { name: /Bulk manage/i }));
+    fireEvent.click(
+      screen.getByRole("button", { name: /Select all visible/i }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: /Bulk delete/i }));
 
     const dialog = screen.getByTestId("confirm-dialog");
     fireEvent.click(
-      within(dialog).getByRole("button", { name: /删除所选会话/i }),
+      within(dialog).getByRole("button", { name: /Delete selected sessions/i }),
     );
 
     await waitFor(() => {
@@ -715,22 +739,22 @@ describe("SessionManagerPage", () => {
     await enterGroupedBatchMode();
 
     const codexProviderCheckbox = screen.getByRole("checkbox", {
-      name: /选择 codex 供应商分组内会话/,
+      name: /Select sessions in the codex provider group/,
     });
     const claudeProviderCheckbox = screen.getByRole("checkbox", {
-      name: /选择 claude 供应商分组内会话/,
+      name: /Select sessions in the claude provider group/,
     });
 
     fireEvent.click(codexProviderCheckbox);
 
     expect(codexProviderCheckbox).toBeChecked();
     expect(claudeProviderCheckbox).not.toBeChecked();
-    expect(screen.getByText("已选 3 项")).toBeInTheDocument();
+    expect(screen.getByText("3 selected")).toBeInTheDocument();
 
     fireEvent.click(codexProviderCheckbox);
 
     expect(codexProviderCheckbox).not.toBeChecked();
-    expect(screen.getByText("已选 0 项")).toBeInTheDocument();
+    expect(screen.getByText("0 selected")).toBeInTheDocument();
   });
 
   it("selects visible deletable sessions by directory group and marks the provider as mixed", async () => {
@@ -746,17 +770,17 @@ describe("SessionManagerPage", () => {
     expandDirectoryGroup("codex", "codex");
 
     const providerCheckbox = screen.getByRole("checkbox", {
-      name: /选择 codex 供应商分组内会话/,
+      name: /Select sessions in the codex provider group/,
     });
     const codexDirectoryCheckbox = screen.getByRole("checkbox", {
-      name: /选择 codex 目录分组内会话/,
+      name: /Select sessions in the codex directory group/,
     });
 
     fireEvent.click(codexDirectoryCheckbox);
 
     expect(codexDirectoryCheckbox).toBeChecked();
     expect(providerCheckbox).toHaveAttribute("aria-checked", "mixed");
-    expect(screen.getByText("已选 2 项")).toBeInTheDocument();
+    expect(screen.getByText("2 selected")).toBeInTheDocument();
   });
 
   it("marks grouped batch checkboxes as mixed when only one session is selected", async () => {
@@ -771,17 +795,21 @@ describe("SessionManagerPage", () => {
     await enterGroupedBatchMode();
     expandDirectoryGroup("codex", "codex");
 
-    fireEvent.click(screen.getAllByRole("checkbox", { name: "选择会话" })[0]);
+    fireEvent.click(
+      screen.getAllByRole("checkbox", { name: "Select session" })[0],
+    );
 
     expect(
       screen.getByRole("checkbox", {
-        name: /选择 codex 供应商分组内会话/,
+        name: /Select sessions in the codex provider group/,
       }),
     ).toHaveAttribute("aria-checked", "mixed");
     expect(
-      screen.getByRole("checkbox", { name: /选择 codex 目录分组内会话/ }),
+      screen.getByRole("checkbox", {
+        name: /Select sessions in the codex directory group/,
+      }),
     ).toHaveAttribute("aria-checked", "mixed");
-    expect(screen.getByText("已选 1 项")).toBeInTheDocument();
+    expect(screen.getByText("1 selected")).toBeInTheDocument();
   });
 
   it("batch deletes only sessions selected from a grouped directory", async () => {
@@ -797,14 +825,14 @@ describe("SessionManagerPage", () => {
     expandDirectoryGroup("codex", "codex");
     fireEvent.click(
       screen.getByRole("checkbox", {
-        name: /选择 codex 目录分组内会话/,
+        name: /Select sessions in the codex directory group/,
       }),
     );
-    fireEvent.click(screen.getByRole("button", { name: /批量删除/i }));
+    fireEvent.click(screen.getByRole("button", { name: /Bulk delete/i }));
 
     const dialog = screen.getByTestId("confirm-dialog");
     fireEvent.click(
-      within(dialog).getByRole("button", { name: /删除所选会话/i }),
+      within(dialog).getByRole("button", { name: /Delete selected sessions/i }),
     );
 
     await waitFor(() => {
@@ -813,17 +841,21 @@ describe("SessionManagerPage", () => {
     });
 
     expect(
-      screen.getByRole("button", { name: /展开或折叠 未知目录 目录分组/ }),
+      screen.getByRole("button", {
+        name: /Expand or collapse the Unknown directory directory group/,
+      }),
     ).toBeInTheDocument();
     expect(
-      screen.queryByRole("checkbox", { name: "选择会话" }),
+      screen.queryByRole("checkbox", { name: "Select session" }),
     ).not.toBeInTheDocument();
 
     fireEvent.click(
-      screen.getByRole("button", { name: /展开或折叠 未知目录 目录分组/ }),
+      screen.getByRole("button", {
+        name: /Expand or collapse the Unknown directory directory group/,
+      }),
     );
     expect(
-      screen.getByRole("checkbox", { name: "选择会话" }),
+      screen.getByRole("checkbox", { name: "Select session" }),
     ).toBeInTheDocument();
     expect(toastErrorMock).not.toHaveBeenCalled();
     expect(toastSuccessMock).toHaveBeenCalled();

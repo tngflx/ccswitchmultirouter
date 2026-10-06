@@ -353,7 +353,10 @@ export function EditProviderDialog({
           zIndexClassName={panelZIndexClassName}
         >
           <div className="rounded-lg border border-border-default bg-muted/30 p-4 text-sm text-muted-foreground">
-            正在读取模型源、协议证据和自动适配状态…
+            {t("codexProviderUi.loadingSnapshot", {
+              defaultValue:
+                "Loading the model source, protocol evidence, and automatic adaptation status…",
+            })}
           </div>
         </FullScreenPanel>
       );
@@ -366,7 +369,11 @@ export function EditProviderDialog({
         zIndexClassName={panelZIndexClassName}
       >
         <div className="rounded-lg border border-destructive/40 bg-destructive/5 p-4 text-sm text-destructive">
-          无法读取模型源的协议适配状态：{logicalProviderError}
+          {t("codexProviderUi.snapshotError", {
+            defaultValue:
+              "Failed to read the model source's protocol adaptation status: ",
+          })}
+          {logicalProviderError}
         </div>
       </FullScreenPanel>
     );

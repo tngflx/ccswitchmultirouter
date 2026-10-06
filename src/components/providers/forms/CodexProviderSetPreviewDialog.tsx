@@ -27,7 +27,7 @@ export function CodexProviderSetPreviewDialog(
   if (!preview || preview.plan.kind === "single") return null;
 
   const blocked = preview.plan.kind === "blocked";
-  const title = blocked ? "暂时无法保存" : "按协议自动拆分";
+  const title = blocked ? "Cannot save yet" : "Split by protocol";
 
   return (
     <Dialog
@@ -48,19 +48,19 @@ export function CodexProviderSetPreviewDialog(
           </DialogTitle>
           <DialogDescription>
             {blocked
-              ? "至少一个启用模型还没有可安全执行 Codex 工具事务的唯一协议。当前配置未写入，请重新探测或返回调整模型。"
-              : "同一模型源中的模型通过了不同的最佳 Codex 协议。保存后仍显示为一个模型源，CCSM 会在内部生成两个单协议 Provider 并自动路由。"}
+              ? "At least one enabled model has no single protocol that can safely execute Codex tool transactions. Nothing was written; probe again or go back and adjust the models."
+              : "Models in this source passed different best-fit Codex protocols. The source remains one entry after saving; CCSM creates two single-protocol providers internally and routes automatically."}
           </DialogDescription>
         </DialogHeader>
 
         {preview.plan.kind === "split" ? (
           <div className="grid gap-3 sm:grid-cols-2">
             <ModelGroup
-              title="Responses 模型"
+              title="Responses models"
               models={preview.responsesModels}
             />
             <ModelGroup
-              title="Chat Completions 模型"
+              title="Chat Completions models"
               models={preview.chatModels}
             />
           </div>
@@ -82,11 +82,11 @@ export function CodexProviderSetPreviewDialog(
                 </div>
                 {model.stage && (
                   <div className="mt-2 space-y-0.5 text-xs text-muted-foreground">
-                    <div>失败阶段：{blockedStageLabel(model.stage)}</div>
+                    <div>Failed stage: {blockedStageLabel(model.stage)}</div>
                     {model.failureKind && (
                       <div>
-                        失败类型：{blockedFailureLabel(model.failureKind)}
-                        {model.statusCode ? `（${model.statusCode}）` : ""}
+                        Failure type: {blockedFailureLabel(model.failureKind)}
+                        {model.statusCode ? ` (${model.statusCode})` : ""}
                       </div>
                     )}
                   </div>
@@ -98,15 +98,15 @@ export function CodexProviderSetPreviewDialog(
 
         <DialogFooter>
           <Button variant="outline" onClick={onBack} disabled={pending}>
-            返回调整模型
+            Back to adjust models
           </Button>
           {blocked ? (
             <Button onClick={onRetry} disabled={pending}>
-              重新探测
+              Probe again
             </Button>
           ) : (
             <Button onClick={onConfirmSplit} disabled={pending}>
-              确认按协议拆分
+              Confirm split
             </Button>
           )}
         </DialogFooter>
@@ -133,36 +133,36 @@ function ModelGroup({ title, models }: { title: string; models: string[] }) {
 function blockedReasonLabel(reason: string) {
   switch (reason) {
     case "probe_required":
-      return "尚未完成协议深度探测";
+      return "The deep protocol probe is not complete";
     case "probe_stale":
-      return "探测结果已失效，请重新探测";
+      return "Probe results are stale; run the probe again";
     case "probe_not_verified":
-      return "探测结果尚未通过完整验证";
+      return "Probe results have not passed full verification";
     case "probe_has_no_selection":
-      return "两个协议都没有形成唯一可用结论";
+      return "Neither protocol produced a unique usable conclusion";
     case "conflicting_probe_records":
-      return "探测结果互相冲突，请重新探测";
+      return "Probe results conflict; run the probe again";
     case "probe_target_mismatch":
-      return "探测结果与当前模型配置不匹配";
+      return "Probe results do not match the current model configuration";
     case "duplicate_model_identity":
-      return "模型目录中存在重复模型标识";
+      return "Duplicate model identifiers exist in the catalog";
     default:
-      return "当前探测结果不能用于自动保存";
+      return "The current probe results cannot be used for automatic saving";
   }
 }
 
 function blockedStageLabel(stage: string) {
   switch (stage) {
     case "baseline":
-      return "基础请求";
+      return "Baseline request";
     case "streaming":
-      return "流式响应";
+      return "Streaming response";
     case "reasoning":
-      return "推理内容";
+      return "Reasoning content";
     case "forced_tool":
-      return "强制工具调用";
+      return "Forced tool call";
     case "continuation":
-      return "工具续轮";
+      return "Tool continuation";
     default:
       return stage;
   }
@@ -171,17 +171,17 @@ function blockedStageLabel(stage: string) {
 function blockedFailureLabel(kind: string) {
   switch (kind) {
     case "http_status":
-      return "HTTP 状态";
+      return "HTTP status";
     case "timeout":
-      return "请求超时";
+      return "Request timed out";
     case "network":
-      return "网络错误";
+      return "Network error";
     case "response_too_large":
-      return "响应过大";
+      return "Response too large";
     case "invalid_response":
-      return "响应格式无效";
+      return "Invalid response format";
     case "invalid_request":
-      return "请求无效";
+      return "Invalid request";
     default:
       return kind;
   }

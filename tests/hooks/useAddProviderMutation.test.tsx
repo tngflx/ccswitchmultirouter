@@ -229,7 +229,7 @@ describe("useAddProviderMutation", () => {
       apiMocks.inspectActiveCodexMultiRouterProjection,
     ).toHaveBeenCalledTimes(1);
     expect(toastMocks.warning).toHaveBeenCalledWith(
-      "Provider 已保存，但当前 MultiRouter 尚未同步到 Codex。请到 MultiRouter 工作台查看并重试。",
+      "The provider was saved, but MultiRouter has not synced to Codex yet. Review and retry in the MultiRouter workspace.",
       { closeButton: true },
     );
   });

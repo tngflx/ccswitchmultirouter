@@ -51,7 +51,7 @@ describe("CodexProtocolProbeProgressDialog", () => {
     );
 
     expect(
-      screen.getByText("已完成 2 个模型：Verified 1，Partial 1，Failed 0。"),
+      screen.getByText("Completed 2 models: Verified 1, Partial 1, Failed 0."),
     ).toBeInTheDocument();
   });
 
@@ -124,7 +124,7 @@ describe("CodexProtocolProbeProgressDialog", () => {
     );
 
     expect(
-      screen.getByText("已完成 2 个模型：Verified 2，Partial 0，Failed 0。"),
+      screen.getByText("Completed 2 models: Verified 2, Partial 0, Failed 0."),
     ).toBeInTheDocument();
     expect(screen.getAllByRole("article")).toHaveLength(2);
     expect(screen.getByText("Kimi Responses")).toBeInTheDocument();
@@ -211,7 +211,7 @@ describe("CodexProtocolProbeProgressDialog", () => {
 
     fireEvent.click(
       screen.getByRole("button", {
-        name: "qwen3.8 选择 Chat Completions",
+        name: "qwen3.8 Select Chat Completions",
       }),
     );
 
@@ -292,14 +292,21 @@ describe("CodexProtocolProbeProgressDialog", () => {
       />,
     );
 
-    expect(screen.getByText(/工具续轮：不支持/)).toBeInTheDocument();
-    expect(screen.getByText(/思考内容：未返回/)).toBeInTheDocument();
-    expect(screen.queryByText("已选 Chat Completions")).not.toBeInTheDocument();
-    fireEvent.click(
-      screen.getByRole("button", {
-        name: "partial-model 仍然使用 Chat Completions",
-      }),
-    );
+    expect(
+      screen.getByText(/Tool continuation: Unsupported/),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText(/Reasoning content: Not returned/),
+    ).toBeInTheDocument();
+    const chatBranch = screen
+      .getByText("Chat Completions")
+      .closest("section") as HTMLElement;
+    const selectButton = within(chatBranch).getByRole("button", {
+      name: "partial-model Use anyway Chat Completions",
+    });
+    expect(selectButton).toHaveAttribute("aria-pressed", "false");
+    expect(onSelectTransport).not.toHaveBeenCalled();
+    fireEvent.click(selectButton);
     expect(onSelectTransport).toHaveBeenCalledWith({
       model: "partial-model",
       providerId: null,
@@ -417,46 +424,68 @@ describe("CodexProtocolProbeProgressDialog", () => {
     );
 
     expect(
-      screen.getByText("工具 Schema：Moonshot MFJS（模糊请求拒绝后完整验证）"),
-    ).toBeInTheDocument();
-    expect(
-      screen.getByText(/上游返回 400\/422，但未明确指出不兼容字段/),
+      screen.getByText(
+        "Tool schema:Moonshot MFJS (fully verified after ambiguous rejection)",
+      ),
     ).toBeInTheDocument();
     expect(
       screen.getByText(
-        /将动态 OpenAI 工具 Schema 编译为 MFJS object 兼容结构后重新请求/,
+        /Upstream returned 400\/422 without identifying an incompatible field/,
       ),
     ).toBeInTheDocument();
-    expect(screen.getByText(/完整复测通过/)).toBeInTheDocument();
     expect(
-      screen.getByText("工具 Schema：Moonshot MFJS（无来源，不自动生效）"),
+      screen.getByText(
+        /Re-request after compiling the dynamic OpenAI tool schema into the compatible MFJS object shape/,
+      ),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/Full re-test passed/)).toBeInTheDocument();
+    expect(
+      screen.getByText(
+        "Tool schema:Moonshot MFJS (no source; not applied automatically)",
+      ),
     ).toBeInTheDocument();
     expect(
-      screen.getByText("历史续轮：reasoning_text content"),
+      screen.getByText("History continuation:reasoning_text content"),
     ).toBeInTheDocument();
-    expect(screen.getByText("历史续轮：reasoning_content")).toBeInTheDocument();
-    expect(screen.getByText("上游原生摘要")).toBeInTheDocument();
-    expect(screen.getByText("原始推理正文")).toBeInTheDocument();
-    expect(screen.getAllByText("适配后通过")).toHaveLength(2);
-    expect(screen.getByText(/上游返回 reasoning_content/)).toBeInTheDocument();
     expect(
-      screen.getAllByText(/默认工具请求被拒绝或未返回有效工具调用/),
+      screen.getByText("History continuation:reasoning_content"),
+    ).toBeInTheDocument();
+    expect(screen.getByText("Native upstream summary")).toBeInTheDocument();
+    expect(screen.getByText("Raw reasoning text")).toBeInTheDocument();
+    expect(screen.getAllByText("Passed after adaptation")).toHaveLength(2);
+    expect(
+      screen.getByText(/The upstream returned reasoning_content/),
+    ).toBeInTheDocument();
+    expect(
+      screen.getAllByText(
+        /The default tool request was rejected or returned no valid tool call/,
+      ),
     ).toHaveLength(2);
-    expect(screen.getByText(/原生推理历史结构不被接受/)).toBeInTheDocument();
-    expect(screen.getByText(/本次上游已报告 1,500 tokens/)).toBeInTheDocument();
-    expect(screen.getByText(/估算费用约 US\$0\.0123/)).toBeInTheDocument();
     expect(
-      screen.getByText(/数字用量会随本次 Responses\/Chat 双协议脱敏证据保存/),
+      screen.getByText(/The native reasoning-history shape was rejected/),
     ).toBeInTheDocument();
-    expect(screen.getByText(/2 个成功响应未返回 usage/)).toBeInTheDocument();
+    expect(
+      screen.getByText(/The upstream reported 1,500 tokens/),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText(/Estimated cost is about US\$0\.0123/),
+    ).toBeInTheDocument();
     expect(
       screen.getByText(
-        "运行时适配：Responses 请求保持原协议；续轮推理按 reasoning_text content 重建。",
+        /Reported numeric usage is saved with this Responses\/Chat dual-protocol evidence/,
+      ),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText(/2 successful responses returned no usage/),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText(
+        "Runtime adaptation: keep Responses requests in the native protocol; rebuild continuation reasoning as reasoning_text content.",
       ),
     ).toBeInTheDocument();
     expect(
       screen.getByText(
-        "运行时适配：Codex Responses 转换为 Chat Completions；推理从 reasoning_content 读取并投影回 Codex。",
+        "Runtime adaptation: convert Codex Responses to Chat Completions; read reasoning from reasoning_content and project it back to Codex.",
       ),
     ).toBeInTheDocument();
 
@@ -465,7 +494,7 @@ describe("CodexProtocolProbeProgressDialog", () => {
       .closest("section") as HTMLElement;
     fireEvent.click(
       within(chatBranch).getByRole("button", {
-        name: "查看字段映射与生效方式",
+        name: "View field mappings and runtime behavior",
       }),
     );
     expect(
@@ -483,7 +512,7 @@ describe("CodexProtocolProbeProgressDialog", () => {
     ).toBeInTheDocument();
     expect(
       within(chatBranch).getByText(
-        "保存并启用 Provider 后，每次运行请求都会自动应用；仅运行探测不会改写当前配置。",
+        "After saving and enabling the provider, mappings are applied automatically to each request; running a probe alone does not rewrite the current configuration.",
       ),
     ).toBeInTheDocument();
 
@@ -492,17 +521,17 @@ describe("CodexProtocolProbeProgressDialog", () => {
       .closest("section") as HTMLElement;
     fireEvent.click(
       within(responsesBranch).getByRole("button", {
-        name: "查看字段映射与生效方式",
+        name: "View field mappings and runtime behavior",
       }),
     );
     expect(
       within(responsesBranch).getByText(
-        "reasoning.content / 可读 summary → content[type=reasoning_text]；summary=[]",
+        "reasoning.content / readable summary → content[type=reasoning_text]; summary=[]",
       ),
     ).toBeInTheDocument();
     expect(
       within(responsesBranch).getByText(
-        "工具调用与工具结果保持 Responses 原结构",
+        "Tool calls and outputs keep the native Responses structure",
       ),
     ).toBeInTheDocument();
     rerender(
@@ -517,7 +546,7 @@ describe("CodexProtocolProbeProgressDialog", () => {
         onOpenChange={vi.fn()}
       />,
     );
-    expect(screen.getAllByText("适配后通过")).toHaveLength(2);
+    expect(screen.getAllByText("Passed after adaptation")).toHaveLength(2);
     for (const running of [true, false]) {
       rerender(
         <CodexProtocolProbeProgressDialog
@@ -531,7 +560,7 @@ describe("CodexProtocolProbeProgressDialog", () => {
           onOpenChange={vi.fn()}
         />,
       );
-      expect(screen.queryAllByText("适配后通过")).toHaveLength(0);
+      expect(screen.queryAllByText("Passed after adaptation")).toHaveLength(0);
       expect(screen.queryAllByText("Verified", { exact: true })).toHaveLength(
         0,
       );
@@ -553,7 +582,7 @@ describe("CodexProtocolProbeProgressDialog", () => {
 
     expect(
       screen.getByText(
-        /深度探测会向每个模型的 Responses 和 Chat 端点发送多次真实请求，会消耗 Token 并可能产生费用/,
+        /The deep probe sends multiple real requests to each model’s Responses and Chat endpoints. This consumes tokens and may incur charges/,
       ),
     ).toBeInTheDocument();
   });
@@ -582,11 +611,17 @@ describe("CodexProtocolProbeProgressDialog", () => {
     const { rerender } = render(
       <CodexProtocolProbeProgressDialog {...props} />,
     );
-    expect(screen.getByText("正在自动适配并重试")).toBeInTheDocument();
     expect(
-      screen.getByText(/仅移除推理项，保留工具调用和工具结果/),
+      screen.getByText("Automatically adapting and retrying"),
     ).toBeInTheDocument();
-    expect(screen.queryByText("适配后通过")).not.toBeInTheDocument();
+    expect(
+      screen.getByText(
+        /removed only reasoning items while keeping tool calls and results/,
+      ),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByText("Passed after adaptation"),
+    ).not.toBeInTheDocument();
     rerender(
       <CodexProtocolProbeProgressDialog
         {...props}
@@ -602,8 +637,10 @@ describe("CodexProtocolProbeProgressDialog", () => {
         ]}
       />,
     );
-    expect(screen.getByText("适配仍未通过")).toBeInTheDocument();
-    expect(screen.queryByText("正在自动适配并重试")).not.toBeInTheDocument();
+    expect(screen.getByText("Adaptation did not pass")).toBeInTheDocument();
+    expect(
+      screen.queryByText("Automatically adapting and retrying"),
+    ).not.toBeInTheDocument();
   });
 
   it("aggregates reported token usage and mappings across provider outcomes", () => {
@@ -711,13 +748,17 @@ describe("CodexProtocolProbeProgressDialog", () => {
       />,
     );
 
-    expect(screen.getByText(/本次上游已报告 300 tokens/)).toBeInTheDocument();
-    expect(screen.getByText(/估算费用约 US\$0\.003/)).toBeInTheDocument();
+    expect(
+      screen.getByText(/The upstream reported 300 tokens/),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText(/Estimated cost is about US\$0\.003/),
+    ).toBeInTheDocument();
     expect(screen.getByText("qwen3.8")).toBeInTheDocument();
     expect(screen.getByText("glm-5.3")).toBeInTheDocument();
     expect(
       screen.getAllByText(
-        "运行时适配：Responses 请求保持原协议；上游原生推理项按原结构回放。",
+        "Runtime adaptation: keep Responses requests in the native protocol and replay native upstream reasoning items unchanged.",
       ),
     ).toHaveLength(2);
   });
@@ -796,16 +837,16 @@ describe("CodexProtocolProbeProgressDialog", () => {
     const responses = screen.getByText("Responses").closest("section");
     expect(responses).not.toBeNull();
     const reasoningRow = within(responses as HTMLElement)
-      .getByText("思考内容")
+      .getByText("Reasoning content")
       .closest("div");
     expect(reasoningRow).not.toBeNull();
     expect(
       within(reasoningRow as HTMLElement).getByText(
-        "加密/不透明（Codex 无法展示）",
+        "Encrypted/opaque (not displayable by Codex)",
       ),
     ).toBeInTheDocument();
     expect(
-      within(reasoningRow as HTMLElement).getByText("不支持"),
+      within(reasoningRow as HTMLElement).getByText("Unsupported"),
     ).toBeInTheDocument();
   });
 
@@ -845,10 +886,12 @@ describe("CodexProtocolProbeProgressDialog", () => {
       />,
     );
 
-    expect(screen.getByText(/正在验证模型 0\/1/)).toBeInTheDocument();
-    expect(screen.getByText("检测中")).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "探测进行中" })).toBeDisabled();
-    expect(screen.queryByRole("button", { name: "重新探测" })).toBeNull();
+    expect(screen.getByText(/Validating models 0\/1/)).toBeInTheDocument();
+    expect(screen.getByText("Checking")).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "Probe running" }),
+    ).toBeDisabled();
+    expect(screen.queryByRole("button", { name: "Probe again" })).toBeNull();
   });
 
   it("shows unavailable as not detected and offers an explicit retry", () => {
@@ -888,10 +931,12 @@ describe("CodexProtocolProbeProgressDialog", () => {
       />,
     );
 
-    expect(screen.getByText("HTTP 521 · 上游不可达")).toBeInTheDocument();
-    expect(screen.getByText("未检测")).toBeInTheDocument();
-    expect(screen.getByText("已跳过")).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: "重新探测" }));
+    expect(
+      screen.getByText("HTTP 521 · Upstream unreachable"),
+    ).toBeInTheDocument();
+    expect(screen.getByText("Not checked")).toBeInTheDocument();
+    expect(screen.getByText("Skipped")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Probe again" }));
     expect(onRetry).toHaveBeenCalledOnce();
   });
 
@@ -917,12 +962,14 @@ describe("CodexProtocolProbeProgressDialog", () => {
     );
 
     expect(
-      screen.queryByText("已完成 0 个模型：Verified 0，Partial 0，Failed 0。"),
+      screen.queryByText(
+        "Completed 0 models: Verified 0, Partial 0, Failed 0.",
+      ),
     ).not.toBeInTheDocument();
     expect(
-      screen.getByText("探测未完成：1 个模型没有结果。"),
+      screen.getByText("Probe incomplete: 1 models have no result."),
     ).toBeInTheDocument();
-    expect(screen.getAllByText("未返回探测结果")).toHaveLength(2);
+    expect(screen.getAllByText("No probe result returned")).toHaveLength(2);
   });
 
   it("describes a missing manual protocol as an unapplied configuration instead of a failed probe", () => {
@@ -940,22 +987,22 @@ describe("CodexProtocolProbeProgressDialog", () => {
     );
 
     expect(
-      screen.getByText("未执行新的探测；配置未应用。"),
+      screen.getByText("No new probe was run; configuration was not applied."),
     ).toBeInTheDocument();
     expect(
       screen.getByText(
-        "当前是手动协议模式，但尚未选择 Responses 或 Chat Completions。关闭可跳过本次应用，选择协议后可直接保存，无需重复探测。",
+        "Manual protocol mode is active, but neither Responses nor Chat Completions is selected. Close to skip this application, or choose a protocol and save without probing again.",
       ),
     ).toBeInTheDocument();
-    expect(screen.queryByText(/探测未完成/)).not.toBeInTheDocument();
-    expect(screen.queryByText(/探测中断/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/Probe incomplete/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/Probe interrupted/)).not.toBeInTheDocument();
   });
 
   it.each([
-    [401, "HTTP 401 · 认证失败"],
-    [403, "HTTP 403 · 当前凭据无权限"],
-    [429, "HTTP 429 · 限流或额度不足"],
-    [500, "HTTP 500 · 上游服务异常"],
+    [401, "HTTP 401 · Authentication failed"],
+    [403, "HTTP 403 · Current credentials are not authorized"],
+    [429, "HTTP 429 · Rate limited or insufficient quota"],
+    [500, "HTTP 500 · Upstream service error"],
   ])(
     "explains HTTP %s without treating it as protocol support",
     (status, label) => {

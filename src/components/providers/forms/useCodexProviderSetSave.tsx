@@ -1,6 +1,7 @@
 import { useCallback, useMemo } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
+import { useTranslation } from "react-i18next";
 
 import { providersApi } from "@/lib/api";
 import type {
@@ -34,6 +35,7 @@ export function isCodexProviderSetCancelled(error: unknown): boolean {
 }
 
 export function useCodexProviderSetSave() {
+  const { t } = useTranslation();
   const queryClient = useQueryClient();
   const adapter = useMemo(() => createSingleCodexProtocolLabAdapter(), []);
   const workflow = useProtocolLabWorkflow(adapter);
@@ -51,10 +53,13 @@ export function useCodexProviderSetSave() {
         error,
       );
       toast.warning(
-        "模型源已保存，但托盘菜单刷新失败；重新打开应用后会自动恢复。",
+        t("providerSet.trayRefreshFailed", {
+          defaultValue:
+            "The model source was saved, but the tray menu could not refresh. Reopen the app to restore it.",
+        }),
       );
     }
-  }, [queryClient]);
+  }, [queryClient, t]);
 
   const persistCodexProviderSet = useCallback(
     async (
@@ -93,15 +98,21 @@ export function useCodexProviderSetSave() {
         "committed_with_projection_error"
       ) {
         toast.warning(
-          "模型源已保存，但 Codex 当前配置尚未完成刷新；可稍后重新投影或重新激活该模型源。",
+          t("providerSet.projectionPending", {
+            defaultValue:
+              "The model source was saved, but the current Codex configuration has not refreshed. Reproject or reactivate the source later.",
+          }),
         );
       } else if (saveUnverified) {
         toast.warning(
-          "模型源已按当前协议保存，但未经深度验证；可稍后主动测试 Chat / Responses。",
+          t("providerSet.unverified", {
+            defaultValue:
+              "The model source was saved with its current protocol without deep verification. You can test Chat / Responses later.",
+          }),
         );
       }
     },
-    [adapter, refreshProviderViews, workflow],
+    [adapter, refreshProviderViews, workflow, t],
   );
 
   const handleBack = useCallback(() => {
@@ -134,27 +145,32 @@ export function useCodexProviderSetSave() {
       >
         <DialogContent className="max-w-lg" zIndex="top">
           <DialogHeader>
-            <DialogTitle>确认测试 Chat / Responses</DialogTitle>
+            <DialogTitle>
+              {t("providerSet.confirmTitle", {
+                defaultValue: "Confirm Chat / Responses test",
+              })}
+            </DialogTitle>
             <DialogDescription className="space-y-2 text-left">
               <span className="block">
-                保存前需要向上游发送少量真实请求，分别验证 Responses 和 Chat
-                Completions；会消耗模型 Token
-                并可能产生费用，也可能触发限流。完成后会显示上游已报告的 Token
-                和按当前模型定价估算的费用。
+                {t("providerSet.probeConsent", {
+                  defaultValue:
+                    "Before saving, a few real upstream requests will test Responses and Chat Completions. They consume model tokens, may incur charges, and may trigger rate limits. Reported token usage and estimated costs based on current model pricing will be shown afterward.",
+                })}
               </span>
               <span className="block">
-                每个启用模型会依次测试基础响应、SSE
-                流式、思考内容、强制工具调用和工具结果续轮。认证失败、限流、网络错误、HTTP
-                521 或其他 5xx 会显示为上游不可用，不会被误判为协议不支持。
+                {t("providerSet.probeStages", {
+                  defaultValue:
+                    "Each enabled model is tested for basic responses, SSE streaming, reasoning content, forced tool calls, and tool-result continuation. Authentication failures, rate limits, network errors, HTTP 521, and other 5xx errors are reported as upstream unavailability, not unsupported protocols.",
+                })}
               </span>
             </DialogDescription>
           </DialogHeader>
           <DialogFooter>
             <Button type="button" variant="outline" onClick={handleBack}>
-              取消
+              {t("providerSet.cancel", { defaultValue: "Cancel" })}
             </Button>
             <Button type="button" onClick={() => void workflow.confirmProbe()}>
-              确认测试
+              {t("providerSet.confirm", { defaultValue: "Confirm test" })}
             </Button>
           </DialogFooter>
         </DialogContent>

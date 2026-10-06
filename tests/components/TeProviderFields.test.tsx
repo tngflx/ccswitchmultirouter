@@ -1,5 +1,7 @@
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { useState } from "react";
+import { I18nextProvider } from "react-i18next";
+import { createLocalizedTestI18n } from "../utils/localizedTestI18n";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { TeProviderFields } from "@/components/providers/forms/TeProviderFields";
 import type { OpenClawTeProviderSettings } from "@/types";
@@ -60,6 +62,36 @@ describe("TeProviderFields", () => {
     expect(document.body.textContent).not.toContain("proxyKeyRef=");
   });
 
+  it.each(["en", "zh", "zh-TW", "ja"])(
+    "localizes runtime field notes in %s without changing binding ownership",
+    async (language) => {
+      const locale = await createLocalizedTestI18n(language);
+      render(
+        <I18nextProvider i18n={locale}>
+          <Harness initial={baseSettings()} />
+        </I18nextProvider>,
+      );
+      const runtimeFields = screen.getAllByTestId("te-runtime-field");
+      expect(runtimeFields).toHaveLength(9);
+      for (const field of runtimeFields) {
+        const identifier = field.querySelector(".font-mono")?.textContent;
+        expect(identifier).toBeTruthy();
+        expect(field).toHaveTextContent(
+          locale.t(`openclaw.teProvider.bindingNotes.${identifier}`),
+        );
+      }
+      expect(screen.queryByLabelText(/proxy key/i)).toBeNull();
+      expect(screen.getByTestId("te-sidecar-url")).toHaveValue(
+        "http://127.0.0.1:9814",
+      );
+      if (language === "en") {
+        expect(
+          runtimeFields.map((field) => field.textContent).join(" "),
+        ).not.toMatch(/\p{Script=Han}/u);
+      }
+    },
+  );
+
   it("collects model capability metadata that the injector projects into OpenClaw", () => {
     render(<Harness initial={baseSettings()} />);
 
@@ -105,9 +137,11 @@ describe("TeProviderFields", () => {
     );
 
     const errors = screen.getByTestId("te-provider-errors");
-    expect(errors.textContent).toContain("数值回环");
+    expect(errors.textContent).toContain("numeric loopback");
     expect(errors.textContent).toContain("Partner AIC");
-    expect(errors.textContent).toContain("至少需要一个模型条目");
+    expect(errors.textContent).toContain(
+      "At least one model entry is required",
+    );
   });
 
   it("reports duplicated model ids before they reach the Agent config", () => {
@@ -124,7 +158,7 @@ describe("TeProviderFields", () => {
     );
 
     expect(screen.getByTestId("te-provider-errors").textContent).toContain(
-      "模型 ID 不能重复",
+      "Model IDs must be unique",
     );
   });
 
@@ -155,10 +189,10 @@ describe("TeProviderFields", () => {
       "http://127.0.0.1:9814",
     );
     const summary = screen.getByTestId("te-runtime-summary").textContent ?? "";
-    expect(summary).toContain("存活");
+    expect(summary).toContain("Alive");
     // 未知不等于离线：未配置探针时必须显示“状态未知”。
-    expect(summary).toContain("上游状态未知");
-    expect(summary).toContain("不通过 HTTP 暴露");
+    expect(summary).toContain("Upstream status unknown");
+    expect(summary).toContain("Not exposed over HTTP");
     expect(summary).not.toContain("lease");
     expect(summary).not.toContain("sessionKey");
   });

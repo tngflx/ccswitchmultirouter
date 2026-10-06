@@ -79,13 +79,17 @@ describe("CodexOfficialAuthSection", () => {
         { mode: "managed_oauth", accountId: "missing" },
         accounts,
       ),
-    ).toBe("所选 CCSM OAuth 账号不存在或需要重新登录");
+    ).toBe(
+      "The selected CCSM OAuth account is missing or requires sign-in again",
+    );
     expect(
       validateCodexOfficialAuthSelection(
         { mode: "managed_oauth", accountId: "account-expired" },
         accounts,
       ),
-    ).toBe("所选 CCSM OAuth 账号不存在或需要重新登录");
+    ).toBe(
+      "The selected CCSM OAuth account is missing or requires sign-in again",
+    );
     expect(
       validateCodexOfficialAuthSelection(
         { mode: "managed_oauth", accountId: "account-ready" },

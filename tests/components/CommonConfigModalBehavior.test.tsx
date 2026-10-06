@@ -62,10 +62,9 @@ describe("Common config modals", () => {
       />,
     );
 
-    expect(screen.getByRole("button", { name: "专家配置" })).toHaveAttribute(
-      "aria-expanded",
-      "false",
-    );
+    expect(
+      screen.getByRole("button", { name: "Expert configuration" }),
+    ).toHaveAttribute("aria-expanded", "false");
     expect(screen.queryAllByLabelText("mock-editor")).toHaveLength(0);
     expect(
       screen.queryByRole("checkbox", { name: "codexConfig.enableGoalMode" }),
@@ -76,7 +75,9 @@ describe("Common config modals", () => {
       }),
     ).not.toBeInTheDocument();
 
-    fireEvent.click(screen.getByRole("button", { name: "专家配置" }));
+    fireEvent.click(
+      screen.getByRole("button", { name: "Expert configuration" }),
+    );
 
     expect(screen.getByText("codexConfig.authJson")).toBeInTheDocument();
     expect(screen.getByText("codexConfig.configToml")).toBeInTheDocument();

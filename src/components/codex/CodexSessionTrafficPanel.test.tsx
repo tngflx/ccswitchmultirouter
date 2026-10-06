@@ -27,9 +27,11 @@ describe("CodexSessionTrafficPanel", () => {
       />,
     );
 
-    expect(screen.getByText("后台采集空闲")).toBeInTheDocument();
-    expect(screen.getByText(/最近成功.*暂无新增/)).toBeInTheDocument();
-    expect(screen.queryByText("采集正常")).not.toBeInTheDocument();
+    expect(screen.getByText("Collector idle")).toBeInTheDocument();
+    expect(
+      screen.getByText(/Last success.*none added this run/),
+    ).toBeInTheDocument();
+    expect(screen.queryByText("Collection healthy")).not.toBeInTheDocument();
   });
 
   it("surfaces a degraded collector with its deferred work and error summary", () => {
@@ -56,10 +58,10 @@ describe("CodexSessionTrafficPanel", () => {
       />,
     );
 
-    expect(screen.getByText("后台采集降级")).toBeInTheDocument();
-    expect(screen.getByText(/待处理 3/)).toBeInTheDocument();
+    expect(screen.getByText("Collector degraded")).toBeInTheDocument();
+    expect(screen.getByText(/deferred 3/)).toBeInTheDocument();
     expect(
-      screen.getByText(/错误摘要：rollout 文件仍在写入/),
+      screen.getByText(/Error summary: rollout 文件仍在写入/),
     ).toBeInTheDocument();
   });
 
@@ -87,11 +89,11 @@ describe("CodexSessionTrafficPanel", () => {
       />,
     );
 
-    expect(screen.getByText("后台采集尚未启动")).toBeInTheDocument();
+    expect(screen.getByText("Collector not started")).toBeInTheDocument();
     expect(
-      screen.getByText(/尚无成功采集；可点击立即同步/),
+      screen.getByText(/No successful collection yet; sync now/),
     ).toBeInTheDocument();
-    expect(screen.queryByText(/本轮暂无新增/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/none added this run/)).not.toBeInTheDocument();
   });
 
   it("calls the existing manual sync path exactly once per click", () => {
@@ -106,7 +108,9 @@ describe("CodexSessionTrafficPanel", () => {
       />,
     );
 
-    fireEvent.click(screen.getByRole("button", { name: "立即同步会话用量" }));
+    fireEvent.click(
+      screen.getByRole("button", { name: "Sync session usage now" }),
+    );
     expect(onSync).toHaveBeenCalledTimes(1);
   });
 
@@ -201,37 +205,47 @@ describe("CodexSessionTrafficPanel", () => {
     );
 
     expect(
-      screen.getByText("今日（本地日历日）子 Agent 会话流量"),
+      screen.getByText("今日（本地日历日） sub-agent session traffic"),
     ).toBeInTheDocument();
-    expect(
-      screen.getByText(/请求统计与会话统计独立，不能相加。/),
-    ).toBeInTheDocument();
-    expect(screen.getByText("已观测请求")).toBeInTheDocument();
     expect(
       screen.getByText(
-        /会话范围无法确认，未计入所选范围；它们不属于未采集用量/,
+        /request and session totals are independent and must not be added together/,
       ),
     ).toBeInTheDocument();
-    expect(screen.getByText("非缓存输入")).toBeInTheDocument();
-    expect(screen.getByText("缓存读取")).toBeInTheDocument();
-    expect(screen.getByText("输出 Tokens")).toBeInTheDocument();
-    expect(screen.getAllByText("未采集")).toHaveLength(5);
-    fireEvent.mouseDown(screen.getByRole("tab", { name: "按任务" }), {
+    expect(screen.getByText("Observed requests")).toBeInTheDocument();
+    expect(
+      screen.getByText(
+        /sessions have an unknown range and are excluded; they are not uncollected usage/,
+      ),
+    ).toBeInTheDocument();
+    expect(screen.getByText("Uncached input")).toBeInTheDocument();
+    expect(screen.getByText("Cache reads")).toBeInTheDocument();
+    expect(screen.getByText("Output tokens")).toBeInTheDocument();
+    expect(screen.getAllByText("Uncollected")).toHaveLength(5);
+    fireEvent.mouseDown(screen.getByRole("tab", { name: "By task" }), {
       button: 0,
     });
     expect(
-      screen.getByText(/已记录父直接用量，但不与子用量相加/),
+      screen.getByText(
+        /Parent direct usage is recorded but is not added to child usage/,
+      ),
     ).toBeInTheDocument();
     expect(
-      screen.getByText(/父同步记录可能包含子用量，暂不计入/),
+      screen.getByText(
+        /Parent sync records may include child usage; it is not counted for now/,
+      ),
     ).toBeInTheDocument();
     expect(
-      screen.getByText(/请求耗时：会话记录未采集可信耗时，不显示为 0ms。/),
+      screen.getByText(
+        /Request latency is not collected reliably for sessions, so it is not shown as 0 ms/,
+      ),
     ).toBeInTheDocument();
     expect(
-      screen.getByText(/数据来源：CCSM 本地会话用量账/),
+      screen.getByText(/Source: CCSM local session usage ledger/),
     ).toBeInTheDocument();
-    expect(screen.queryByText(/状态库：|未定位/)).not.toBeInTheDocument();
+    expect(
+      screen.queryByText(/State database:|Not located/),
+    ).not.toBeInTheDocument();
     expect(
       screen.queryByText("C:/private/session-usage.sqlite"),
     ).not.toBeInTheDocument();
@@ -284,14 +298,20 @@ describe("CodexSessionTrafficPanel", () => {
     );
 
     expect(
-      screen.getByText("已观测子任务 Tokens").parentElement,
+      screen.getByText("Observed subtask tokens").parentElement,
     ).toHaveTextContent("270");
-    expect(screen.getByText("已观测请求").parentElement).toHaveTextContent("5");
-    expect(screen.getByText("已知价表估算").parentElement).toHaveTextContent(
-      "约 $0.0125",
-    );
-    expect(screen.getByText(/部分可计价.*未定价/)).toBeInTheDocument();
-    expect(screen.queryByText("总成本")).not.toBeInTheDocument();
+    expect(
+      screen.getByText("Observed requests").parentElement,
+    ).toHaveTextContent("5");
+    expect(
+      screen.getByText("Known price-table estimate").parentElement,
+    ).toHaveTextContent("~ $0.0125");
+    expect(
+      screen.getByText(
+        /Partially priced; some observed usage is still unpriced/,
+      ),
+    ).toBeInTheDocument();
+    expect(screen.queryByText("Total cost")).not.toBeInTheDocument();
   });
 
   it("does not turn loading, absent, or missing-only snapshots into observed zero traffic", () => {
@@ -305,12 +325,14 @@ describe("CodexSessionTrafficPanel", () => {
       />,
     );
     expect(
-      screen.getByText("已观测子任务 Tokens").parentElement,
-    ).toHaveTextContent("加载中");
-    fireEvent.mouseDown(screen.getByRole("tab", { name: "按任务" }), {
+      screen.getByText("Observed subtask tokens").parentElement,
+    ).toHaveTextContent("Loading");
+    fireEvent.mouseDown(screen.getByRole("tab", { name: "By task" }), {
       button: 0,
     });
-    expect(screen.getByText("正在读取本期任务关系...")).toBeInTheDocument();
+    expect(
+      screen.getByText("Reading task relationships for this period…"),
+    ).toBeInTheDocument();
 
     rerender(
       <CodexSessionTrafficPanel
@@ -322,9 +344,9 @@ describe("CodexSessionTrafficPanel", () => {
       />,
     );
     expect(
-      screen.getByText("已观测子任务 Tokens").parentElement,
+      screen.getByText("Observed subtask tokens").parentElement,
     ).toHaveTextContent("—");
-    expect(screen.getAllByText("暂无已采集快照")).toHaveLength(2);
+    expect(screen.getAllByText("No collected snapshot yet")).toHaveLength(2);
 
     rerender(
       <CodexSessionTrafficPanel
@@ -358,9 +380,9 @@ describe("CodexSessionTrafficPanel", () => {
       />,
     );
     expect(
-      screen.getByText("已观测子任务 Tokens").parentElement,
+      screen.getByText("Observed subtask tokens").parentElement,
     ).toHaveTextContent("—");
-    expect(screen.getAllByText(/仅有未采集会话/)).toHaveLength(2);
+    expect(screen.getAllByText(/Only uncollected sessions/)).toHaveLength(2);
   });
 
   it("sorts and filters the model view without treating missing usage as zero", () => {
@@ -407,19 +429,21 @@ describe("CodexSessionTrafficPanel", () => {
       />,
     );
 
-    fireEvent.mouseDown(screen.getByRole("tab", { name: "按模型" }), {
+    fireEvent.mouseDown(screen.getByRole("tab", { name: "By model" }), {
       button: 0,
     });
-    fireEvent.click(screen.getByRole("button", { name: "按模型名排序" }));
+    fireEvent.click(screen.getByRole("button", { name: "Sort by model name" }));
     expect(screen.getByTestId("model-rows").textContent).toMatch(
       /alpha-unpriced[\s\S]*zeta-priced/,
     );
 
-    fireEvent.click(screen.getByRole("combobox", { name: "筛选模型" }));
-    fireEvent.click(screen.getByRole("option", { name: "仅未定价" }));
+    fireEvent.click(screen.getByRole("combobox", { name: "Filter models" }));
+    fireEvent.click(screen.getByRole("option", { name: "Unpriced only" }));
     expect(screen.getByText("alpha-unpriced")).toBeInTheDocument();
     expect(screen.queryByText("zeta-priced")).not.toBeInTheDocument();
-    expect(screen.getByText(/未定价\/待核验/)).toBeInTheDocument();
+    expect(
+      screen.getByText(/Unpriced \/ needs verification/),
+    ).toBeInTheDocument();
   });
 
   it("groups only explicit parents and opens a detail sheet with source and unknown attribution", () => {
@@ -502,21 +526,21 @@ describe("CodexSessionTrafficPanel", () => {
       />,
     );
 
-    fireEvent.mouseDown(screen.getByRole("tab", { name: "按任务" }), {
+    fireEvent.mouseDown(screen.getByRole("tab", { name: "By task" }), {
       button: 0,
     });
-    expect(screen.getByText(/父 explicit-parent/)).toBeInTheDocument();
-    expect(screen.getByText(/未关联会话（1）/)).toBeInTheDocument();
-    expect(screen.queryByText(/^父模型：/)).not.toBeInTheDocument();
+    expect(screen.getByText(/Parent explicit-parent/)).toBeInTheDocument();
+    expect(screen.getByText(/Unlinked sessions \(1\)/)).toBeInTheDocument();
+    expect(screen.queryByText(/^Parent model:/)).not.toBeInTheDocument();
     fireEvent.click(
-      screen.getByRole("button", { name: "查看 explicit-parent 详情" }),
+      screen.getByRole("button", { name: "View explicit-parent Details" }),
     );
 
     expect(screen.getByRole("dialog")).toHaveTextContent(
-      "本地会话证据（来源混合）",
+      "Local session evidence (mixed sources)",
     );
     expect(screen.getByRole("dialog")).toHaveTextContent(
-      "父同步记录可能包含子用量，暂不计入",
+      "Parent sync records may include child usage; it is not counted for now",
     );
     expect(screen.getByRole("dialog")).toHaveTextContent("可追溯子任务");
   });
@@ -595,28 +619,40 @@ describe("CodexSessionTrafficPanel", () => {
     );
 
     fireEvent.click(screen.getByRole("button", { name: /missing-model/ }));
-    expect(screen.getByRole("dialog")).toHaveTextContent("尚无用量证据");
-    expect(screen.getByRole("dialog")).not.toHaveTextContent("Token 构成");
-    fireEvent.click(screen.getByRole("button", { name: "关闭" }));
+    expect(screen.getByRole("dialog")).toHaveTextContent(
+      "No usage evidence yet",
+    );
+    expect(screen.getByRole("dialog")).not.toHaveTextContent("Token breakdown");
+    fireEvent.click(screen.getByRole("button", { name: "Close" }));
 
-    fireEvent.mouseDown(screen.getByRole("tab", { name: "按任务" }), {
+    fireEvent.mouseDown(screen.getByRole("tab", { name: "By task" }), {
       button: 0,
     });
-    expect(screen.getByText(/子任务用量未采集/)).toBeInTheDocument();
     expect(
-      screen.getByText(/父同步记录可能包含子用量，暂不计入/),
+      screen.getByText(/Subtask usage is uncollected/),
     ).toBeInTheDocument();
-    expect(screen.queryByText(/已记录父直接用量/)).not.toBeInTheDocument();
+    expect(
+      screen.getByText(
+        /Parent sync records may include child usage; it is not counted for now/,
+      ),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByText(/Parent direct usage is recorded/),
+    ).not.toBeInTheDocument();
     fireEvent.click(
-      screen.getByRole("button", { name: "查看 legacy-parent 详情" }),
+      screen.getByRole("button", { name: "View legacy-parent Details" }),
     );
-    expect(screen.getByRole("dialog")).toHaveTextContent("尚无用量证据");
-    expect(screen.getByRole("dialog")).not.toHaveTextContent("Token 构成");
-    fireEvent.click(screen.getByRole("button", { name: "关闭" }));
+    expect(screen.getByRole("dialog")).toHaveTextContent(
+      "No usage evidence yet",
+    );
+    expect(screen.getByRole("dialog")).not.toHaveTextContent("Token breakdown");
+    fireEvent.click(screen.getByRole("button", { name: "Close" }));
     fireEvent.click(
-      screen.getByRole("button", { name: "查看 missing-child 详情" }),
+      screen.getByRole("button", { name: "View missing-child Details" }),
     );
-    expect(screen.getByRole("dialog")).toHaveTextContent("尚无用量证据");
-    expect(screen.getByRole("dialog")).not.toHaveTextContent("Token 构成");
+    expect(screen.getByRole("dialog")).toHaveTextContent(
+      "No usage evidence yet",
+    );
+    expect(screen.getByRole("dialog")).not.toHaveTextContent("Token breakdown");
   });
 });

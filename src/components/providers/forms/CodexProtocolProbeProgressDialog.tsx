@@ -1,4 +1,6 @@
 import { useMemo, useState } from "react";
+import { useTranslation } from "react-i18next";
+import type { TFunction } from "i18next";
 import {
   CheckCircle2,
   ChevronDown,
@@ -94,13 +96,40 @@ interface CodexProtocolProbeProgressDialogProps {
   }) => void;
 }
 
-const STAGES: Array<{ id: CodexProtocolProbeStage; label: string }> = [
-  { id: "baseline", label: "基础响应" },
-  { id: "streaming", label: "流式 SSE" },
-  { id: "reasoning", label: "思考内容" },
-  { id: "forced_tool", label: "工具调用" },
-  { id: "continuation", label: "工具续轮" },
-];
+function stages(
+  t: TFunction,
+): Array<{ id: CodexProtocolProbeStage; label: string }> {
+  return [
+    {
+      id: "baseline",
+      label: t("codexProtocolProbe.baseline", {
+        defaultValue: "Baseline response",
+      }),
+    },
+    {
+      id: "streaming",
+      label: t("codexProtocolProbe.streaming", {
+        defaultValue: "Streaming SSE",
+      }),
+    },
+    {
+      id: "reasoning",
+      label: t("codexProtocolProbe.reasoning", {
+        defaultValue: "Reasoning content",
+      }),
+    },
+    {
+      id: "forced_tool",
+      label: t("codexProtocolProbe.forcedTool", { defaultValue: "Tool call" }),
+    },
+    {
+      id: "continuation",
+      label: t("codexProtocolProbe.continuation", {
+        defaultValue: "Tool continuation",
+      }),
+    },
+  ];
+}
 
 const TRANSPORTS: CodexProtocolTransport[] = [
   "open_ai_responses",
@@ -356,72 +385,148 @@ function aggregateProbeUsage(
   };
 }
 
-function statusPresentation(status: VisibleStageStatus) {
+function statusPresentation(t: TFunction, status: VisibleStageStatus) {
   if (status === "running") {
     return {
-      label: "检测中",
+      label: t("codexProtocolProbe.checking", { defaultValue: "Checking" }),
       icon: Loader2,
       className: "text-sky-600 animate-spin",
     };
   }
   if (status === "passed") {
-    return { label: "通过", icon: CheckCircle2, className: "text-emerald-600" };
+    return {
+      label: t("codexProtocolProbe.passed", { defaultValue: "Passed" }),
+      icon: CheckCircle2,
+      className: "text-emerald-600",
+    };
   }
   if (status === "failed") {
-    return { label: "失败", icon: XCircle, className: "text-destructive" };
+    return {
+      label: t("codexProtocolProbe.failed", { defaultValue: "Failed" }),
+      icon: XCircle,
+      className: "text-destructive",
+    };
   }
   if (status === "unsupported") {
-    return { label: "不支持", icon: MinusCircle, className: "text-amber-600" };
+    return {
+      label: t("codexProtocolProbe.unsupported", {
+        defaultValue: "Unsupported",
+      }),
+      icon: MinusCircle,
+      className: "text-amber-600",
+    };
   }
   if (status === "skipped") {
     return {
-      label: "已跳过",
+      label: t("codexProtocolProbe.skipped", { defaultValue: "Skipped" }),
       icon: MinusCircle,
       className: "text-muted-foreground",
     };
   }
-  return { label: "等待", icon: Circle, className: "text-muted-foreground/60" };
+  return {
+    label: t("codexProtocolProbe.waiting", { defaultValue: "Waiting" }),
+    icon: Circle,
+    className: "text-muted-foreground/60",
+  };
 }
 
 function reasoningLabel(
+  t: TFunction,
   semantic: CodexReasoningSemantic | null,
   status: VisibleStageStatus,
 ) {
-  if (semantic === "readable") return "原始推理正文";
-  if (semantic === "summary") return "上游原生摘要";
-  if (semantic === "opaque") return "加密/不透明（Codex 无法展示）";
-  if (semantic === "none") return status === "skipped" ? "未检测" : "未返回";
-  return "待识别";
+  if (semantic === "readable")
+    return t("codexProtocolProbe.rawReasoning", {
+      defaultValue: "Raw reasoning text",
+    });
+  if (semantic === "summary")
+    return t("codexProtocolProbe.nativeSummary", {
+      defaultValue: "Native upstream summary",
+    });
+  if (semantic === "opaque")
+    return t("codexProtocolProbe.opaqueReasoning", {
+      defaultValue: "Encrypted/opaque (not displayable by Codex)",
+    });
+  if (semantic === "none")
+    return status === "skipped"
+      ? t("codexProtocolProbe.notChecked", { defaultValue: "Not checked" })
+      : t("codexProtocolProbe.notReturned", { defaultValue: "Not returned" });
+  return t("codexProtocolProbe.unidentified", { defaultValue: "Unidentified" });
 }
 
-function failureLabel(failure: CodexProtocolProbeFailure) {
+function failureLabel(t: TFunction, failure: CodexProtocolProbeFailure) {
   if (failure.kind === "http_status") {
-    if (failure.status_code === 521) return "HTTP 521 · 上游不可达";
-    if (failure.status_code === 401) return "HTTP 401 · 认证失败";
-    if (failure.status_code === 403) return "HTTP 403 · 当前凭据无权限";
-    if (failure.status_code === 429) return "HTTP 429 · 限流或额度不足";
+    if (failure.status_code === 521)
+      return t("codexProtocolProbe.http521", {
+        defaultValue: "HTTP 521 · Upstream unreachable",
+      });
+    if (failure.status_code === 401)
+      return t("codexProtocolProbe.http401", {
+        defaultValue: "HTTP 401 · Authentication failed",
+      });
+    if (failure.status_code === 403)
+      return t("codexProtocolProbe.http403", {
+        defaultValue: "HTTP 403 · Current credentials are not authorized",
+      });
+    if (failure.status_code === 429)
+      return t("codexProtocolProbe.http429", {
+        defaultValue: "HTTP 429 · Rate limited or insufficient quota",
+      });
     if ([404, 405, 415].includes(failure.status_code ?? 0)) {
-      return `HTTP ${failure.status_code} · 接口不支持`;
+      return t("codexProtocolProbe.httpEndpoint", {
+        defaultValue: "HTTP {{arg0}} · Endpoint unsupported",
+        arg0: failure.status_code,
+      });
     }
     if ((failure.status_code ?? 0) >= 500) {
-      return `HTTP ${failure.status_code} · 上游服务异常`;
+      return t("codexProtocolProbe.httpService", {
+        defaultValue: "HTTP {{arg0}} · Upstream service error",
+        arg0: failure.status_code,
+      });
     }
     return failure.status_code
-      ? `HTTP ${failure.status_code} · 上游请求失败`
-      : "上游请求失败";
+      ? t("codexProtocolProbe.httpRequest", {
+          defaultValue: "HTTP {{arg0}} · Upstream request failed",
+          arg0: failure.status_code,
+        })
+      : t("codexProtocolProbe.requestFailed", {
+          defaultValue: "Upstream request failed",
+        });
   }
-  if (failure.kind === "timeout") return "请求超时";
-  if (failure.kind === "network") return "网络连接失败";
-  if (failure.kind === "response_too_large") return "响应超过探测上限";
-  if (failure.kind === "invalid_request") return "探测地址无效";
-  return "响应格式无效";
+  if (failure.kind === "timeout")
+    return t("codexProtocolProbe.timeout", {
+      defaultValue: "Request timed out",
+    });
+  if (failure.kind === "network")
+    return t("codexProtocolProbe.network", {
+      defaultValue: "Network connection failed",
+    });
+  if (failure.kind === "response_too_large")
+    return t("codexProtocolProbe.responseLimit", {
+      defaultValue: "Response exceeds probe limit",
+    });
+  if (failure.kind === "invalid_request")
+    return t("codexProtocolProbe.invalidEndpoint", {
+      defaultValue: "Invalid probe endpoint",
+    });
+  return t("codexProtocolProbe.invalidResponse", {
+    defaultValue: "Invalid response format",
+  });
 }
 
-function readinessLabel(readiness: CodexProtocolProbeReadiness | null) {
-  if (readiness === "verified") return "Verified";
-  if (readiness === "partial") return "Partial";
-  if (readiness === "unverified") return "Failed";
-  return "待评估";
+function readinessLabel(
+  t: TFunction,
+  readiness: CodexProtocolProbeReadiness | null,
+) {
+  if (readiness === "verified")
+    return t("codexProtocolProbe.verified", { defaultValue: "Verified" });
+  if (readiness === "partial")
+    return t("codexProtocolProbe.partial", { defaultValue: "Partial" });
+  if (readiness === "unverified")
+    return t("codexProtocolProbe.failed", { defaultValue: "Failed" });
+  return t("codexProtocolProbe.pendingAssessment", {
+    defaultValue: "Pending assessment",
+  });
 }
 
 function transportLabel(transport: CodexProtocolTransport) {
@@ -429,38 +534,54 @@ function transportLabel(transport: CodexProtocolTransport) {
 }
 
 function toolSchemaLabel(
+  t: TFunction,
   dialect: CodexToolSchemaDialect | null,
   evidence: CodexToolSchemaEvidence | null,
   status: VisibleStageStatus,
 ) {
-  if (status !== "passed" || dialect === null) return "未确认";
+  if (status !== "passed" || dialect === null)
+    return t("codexProtocolProbe.unconfirmed", { defaultValue: "Unconfirmed" });
   if (dialect === "openai") return "OpenAI";
   if (evidence === "explicit_rejection") {
-    return "Moonshot MFJS（显式拒绝后协商）";
+    return t("codexProtocolProbe.schemaExplicit", {
+      defaultValue: "Moonshot MFJS (negotiated after explicit rejection)",
+    });
   }
   if (evidence === "ambiguous_rejection") {
-    return "Moonshot MFJS（模糊请求拒绝后完整验证）";
+    return t("codexProtocolProbe.schemaAmbiguous", {
+      defaultValue: "Moonshot MFJS (fully verified after ambiguous rejection)",
+    });
   }
   if (evidence === "negotiated_tool_call") {
-    return "Moonshot MFJS（行为协商后验证）";
+    return t("codexProtocolProbe.schemaBehavior", {
+      defaultValue: "Moonshot MFJS (verified after behavioral negotiation)",
+    });
   }
-  return "Moonshot MFJS（无来源，不自动生效）";
+  return t("codexProtocolProbe.schemaUnknown", {
+    defaultValue: "Moonshot MFJS (no source; not applied automatically)",
+  });
 }
 
 function historyReplayLabel(
+  t: TFunction,
   replay: CodexHistoryReplay | null,
   status: VisibleStageStatus,
 ) {
-  if (status !== "passed" || replay === null) return "未确认";
+  if (status !== "passed" || replay === null)
+    return t("codexProtocolProbe.unconfirmed", { defaultValue: "Unconfirmed" });
   if (replay === "chat_reasoning_content") return "reasoning_content";
   if (replay === "responses_reasoning_text_content") {
     return "reasoning_text content";
   }
-  if (replay === "omit") return "不回放推理项";
-  return "原生 Responses";
+  if (replay === "omit")
+    return t("codexProtocolProbe.omitReplay", {
+      defaultValue: "Do not replay reasoning items",
+    });
+  return "Native Responses";
 }
 
 function runtimeAdaptationLabel(
+  t: TFunction,
   transport: CodexProtocolTransport,
   reasoningSource: CodexReasoningSource | null,
   historyReplay: CodexHistoryReplay | null,
@@ -469,53 +590,100 @@ function runtimeAdaptationLabel(
     const source =
       reasoningSource && reasoningSource !== "none"
         ? reasoningSource
-        : "已识别的推理字段";
-    return `运行时适配：Codex Responses 转换为 Chat Completions；推理从 ${source} 读取并投影回 Codex。`;
+        : t("codexProtocolProbe.identifiedField", {
+            defaultValue: "identified reasoning field",
+          });
+    return t("codexProtocolProbe.runtimeChat", {
+      defaultValue:
+        "Runtime adaptation: convert Codex Responses to Chat Completions; read reasoning from {{arg0}} and project it back to Codex.",
+      arg0: source,
+    });
   }
   if (historyReplay === "responses_reasoning_text_content") {
-    return "运行时适配：Responses 请求保持原协议；续轮推理按 reasoning_text content 重建。";
+    return t("codexProtocolProbe.runtimeText", {
+      defaultValue:
+        "Runtime adaptation: keep Responses requests in the native protocol; rebuild continuation reasoning as reasoning_text content.",
+    });
   }
   if (historyReplay === "omit") {
-    return "运行时适配：Responses 请求保持原协议；续轮仅移除不兼容的推理项，工具调用和工具结果仍会保留。";
+    return t("codexProtocolProbe.runtimeOmit", {
+      defaultValue:
+        "Runtime adaptation: keep Responses requests in the native protocol; remove only incompatible reasoning items during continuation while preserving tool calls and outputs.",
+    });
   }
-  return "运行时适配：Responses 请求保持原协议；上游原生推理项按原结构回放。";
+  return t("codexProtocolProbe.runtimeNative", {
+    defaultValue:
+      "Runtime adaptation: keep Responses requests in the native protocol and replay native upstream reasoning items unchanged.",
+  });
 }
 
-function adaptationTriggerLabel(trigger: CodexAdaptationTrigger) {
+function adaptationTriggerLabel(t: TFunction, trigger: CodexAdaptationTrigger) {
   if (trigger === "explicit_tool_schema_rejection") {
-    return "上游明确拒绝了 OpenAI 工具 Schema";
+    return t("codexProtocolProbe.triggerSchema", {
+      defaultValue: "Upstream explicitly rejected the OpenAI tool schema",
+    });
   }
   if (trigger === "ambiguous_request_rejection") {
-    return "上游返回 400/422，但未明确指出不兼容字段";
+    return t("codexProtocolProbe.triggerAmbiguous", {
+      defaultValue:
+        "Upstream returned 400/422 without identifying an incompatible field",
+    });
   }
   if (trigger === "missing_valid_tool_call") {
-    return "响应已完整结束，但没有返回符合探测约束的工具调用";
+    return t("codexProtocolProbe.triggerMissing", {
+      defaultValue:
+        "The response completed but did not return a tool call matching the probe constraints",
+    });
   }
   if (trigger === "reasoning_replay_rejection") {
-    return "上游拒绝了原生 Responses 推理历史结构";
+    return t("codexProtocolProbe.triggerReplay", {
+      defaultValue: "Upstream rejected the native Responses reasoning history",
+    });
   }
-  return "调整后的推理历史结构仍被上游拒绝";
+  return t("codexProtocolProbe.triggerAdjusted", {
+    defaultValue: "The adjusted reasoning history was still rejected upstream",
+  });
 }
 
-function adaptationChangeLabel(change: CodexAdaptationChange) {
+function adaptationChangeLabel(t: TFunction, change: CodexAdaptationChange) {
   if (change === "tool_schema_moonshot_mfjs") {
-    return "将动态 OpenAI 工具 Schema 编译为 MFJS object 兼容结构后重新请求";
+    return t("codexProtocolProbe.changeSchema", {
+      defaultValue:
+        "Re-request after compiling the dynamic OpenAI tool schema into the compatible MFJS object shape",
+    });
   }
   if (change === "replay_reasoning_text_content") {
-    return "将推理历史改写为 content[type=reasoning_text] 后重新续轮";
+    return t("codexProtocolProbe.changeText", {
+      defaultValue:
+        "Rewrite reasoning history as content[type=reasoning_text] and retry the continuation",
+    });
   }
-  return "仅移除不兼容的推理历史项，保留工具调用与工具结果后重新续轮";
+  return t("codexProtocolProbe.changeOmit", {
+    defaultValue:
+      "Retry the continuation after removing only incompatible reasoning history while preserving tool calls and outputs",
+  });
 }
 
-function adaptationOutcomeLabel(outcome: CodexAdaptationOutcome | "trying") {
-  if (outcome === "trying") return "正在协商并重新验证";
-  if (outcome === "verified") return "完整复测通过";
-  return "复测未通过，不能自动应用";
+function adaptationOutcomeLabel(
+  t: TFunction,
+  outcome: CodexAdaptationOutcome | "trying",
+) {
+  if (outcome === "trying")
+    return t("codexProtocolProbe.negotiating", {
+      defaultValue: "Negotiating and re-validating",
+    });
+  if (outcome === "verified")
+    return t("codexProtocolProbe.retestPassed", {
+      defaultValue: "Full re-test passed",
+    });
+  return t("codexProtocolProbe.retestFailed", {
+    defaultValue: "Re-test failed; cannot apply automatically",
+  });
 }
 
-function compatibilityIssueLabels(branch: BranchProgress) {
+function compatibilityIssueLabels(t: TFunction, branch: BranchProgress) {
   const issues: string[] = [];
-  for (const stage of STAGES) {
+  for (const stage of stages(t)) {
     const status = branch.stages[stage.id];
     if (
       status === "failed" ||
@@ -524,21 +692,36 @@ function compatibilityIssueLabels(branch: BranchProgress) {
     ) {
       issues.push(
         stage.id === "reasoning" && branch.reasoningSemantic === "none"
-          ? "思考内容：未返回"
-          : `${stage.label}：${statusPresentation(status).label}`,
+          ? t("codexProtocolProbe.reasoningMissing", {
+              defaultValue: "Reasoning content: Not returned",
+            })
+          : t("codexProtocolProbe.stageIssue", {
+              defaultValue: "{{arg0}}: {{arg1}}",
+              arg0: stage.label,
+              arg1: statusPresentation(t, status).label,
+            }),
       );
     }
   }
   if (
     branch.reasoningSemantic === "none" &&
-    !issues.some((issue) => issue.startsWith("思考内容："))
+    !issues.includes(
+      t("codexProtocolProbe.reasoningMissing", {
+        defaultValue: "Reasoning content: Not returned",
+      }),
+    )
   ) {
-    issues.push("思考内容：未返回");
+    issues.push(
+      t("codexProtocolProbe.reasoningMissing", {
+        defaultValue: "Reasoning content: Not returned",
+      }),
+    );
   }
   return issues;
 }
 
 function runtimeMappingRows(
+  t: TFunction,
   transport: CodexProtocolTransport,
   reasoningSemantic: CodexReasoningSemantic | null,
   reasoningSource: CodexReasoningSource | null,
@@ -550,48 +733,81 @@ function runtimeMappingRows(
         return "choices[].delta.reasoning_content";
       }
       if (reasoningSource === "reasoning") {
-        return "choices[].delta.reasoning（字符串或 content/text/summary）";
+        return t("codexProtocolProbe.chatReasoningShape", {
+          defaultValue:
+            "choices[].delta.reasoning (string or content/text/summary)",
+        });
       }
       if (reasoningSource === "reasoning_details") {
         return "choices[].delta.reasoning_details[]";
       }
       if (reasoningSource === "think_tags") {
-        return "choices[].delta.content 中的 <think>...</think>";
+        return t("codexProtocolProbe.thinkTags", {
+          defaultValue: "<think>...</think> inside choices[].delta.content",
+        });
       }
-      return "探测到的 Chat 推理字段";
+      return t("codexProtocolProbe.chatField", {
+        defaultValue: "Detected Chat reasoning field",
+      });
     })();
     const projection =
       reasoningSemantic === "readable"
         ? "response.reasoning_text.delta"
         : reasoningSemantic === "summary"
           ? "response.reasoning_summary_text.delta"
-          : "不生成可见推理事件";
+          : t("codexProtocolProbe.noEvents", {
+              defaultValue: "No visible reasoning events generated",
+            });
     return [
       "Codex instructions → Chat messages[role=system]",
       "Codex input[] → Chat messages[]",
       "function_call / custom_tool_call → assistant.tool_calls[]",
       "function_call_output → role=tool + tool_call_id",
-      "tools[] → Chat tools[].function（按探测到的 Schema 方言编译）",
+      t("codexProtocolProbe.chatTools", {
+        defaultValue:
+          "tools[] → Chat tools[].function (compiled using the detected schema dialect)",
+      }),
       `${source} → ${projection}`,
       "choices[].delta.content → response.output_text.delta",
-      "Chat tool_calls[] → Responses function/custom/tool_search call items",
+      t("codexProtocolProbe.chatCalls", {
+        defaultValue:
+          "Chat tool_calls[] → Responses function/custom/tool_search call items",
+      }),
       "prompt/completion usage → input/output usage",
     ];
   }
 
   const replay =
     historyReplay === "responses_reasoning_text_content"
-      ? "reasoning.content / 可读 summary → content[type=reasoning_text]；summary=[]"
+      ? "reasoning.content / readable summary → content[type=reasoning_text]; summary=[]"
       : historyReplay === "omit"
-        ? "不兼容的 reasoning item → 删除（仅删除推理项）"
-        : "reasoning item → 按上游原生结构回放";
+        ? t("codexProtocolProbe.omitMapping", {
+            defaultValue:
+              "Incompatible reasoning item → remove (reasoning only)",
+          })
+        : t("codexProtocolProbe.nativeMapping", {
+            defaultValue:
+              "reasoning item → Replay using the native upstream structure",
+          });
   return [
-    "Codex Responses 请求 → Responses 上游（不改协议）",
-    "system / developer message → 顶层 instructions",
+    t("codexProtocolProbe.requestMapping", {
+      defaultValue:
+        "Codex Responses request → Responses upstream (protocol unchanged)",
+    }),
+    "system / developer message → top-level instructions",
     replay,
-    "tools[].parameters → 按探测到的 Schema 方言编译",
-    "工具调用与工具结果保持 Responses 原结构",
-    "SSE、推理事件与 usage → 规范化后返回 Codex",
+    t("codexProtocolProbe.toolMapping", {
+      defaultValue:
+        "tools[].parameters → compiled using the detected schema dialect",
+    }),
+    t("codexProtocolProbe.nativeTools", {
+      defaultValue:
+        "Tool calls and outputs keep the native Responses structure",
+    }),
+    t("codexProtocolProbe.normalizedEvents", {
+      defaultValue:
+        "SSE, reasoning events, and usage → normalized before returning to Codex",
+    }),
   ];
 }
 
@@ -611,6 +827,7 @@ export function CodexProtocolProbeProgressDialog({
   onRetry,
   onSelectTransport,
 }: CodexProtocolProbeProgressDialogProps) {
+  const { t } = useTranslation();
   const [expandedMappings, setExpandedMappings] = useState<Set<string>>(
     () => new Set(),
   );
@@ -700,19 +917,48 @@ export function CodexProtocolProbeProgressDialog({
         zIndex="top"
       >
         <DialogHeader>
-          <DialogTitle>Codex 兼容性深度探测</DialogTitle>
+          <DialogTitle>
+            {t("codexProtocolProbe.title", {
+              defaultValue: "Codex deep compatibility probe",
+            })}
+          </DialogTitle>
           <DialogDescription>
             {running
-              ? `正在验证模型 ${completed}/${models.length || "…"}。模型采用有限并发，Responses 与 Chat 同时检查；工具续轮按顺序验证。`
+              ? t("codexProtocolProbe.validating", {
+                  defaultValue:
+                    "Validating models {{arg0}}/{{arg1}}; Responses and Chat run with limited concurrency, and tool continuations are checked sequentially.",
+                  arg0: completed,
+                  arg1: models.length || "…",
+                })
               : actionRequired
                 ? completed > 0
-                  ? `探测已完成 ${completed} 个模型；配置未应用。`
-                  : "未执行新的探测；配置未应用。"
+                  ? t("codexProtocolProbe.notApplied", {
+                      defaultValue:
+                        "Probe completed for {{arg0}} models; configuration was not applied.",
+                      arg0: completed,
+                    })
+                  : t("codexProtocolProbe.notRun", {
+                      defaultValue:
+                        "No new probe was run; configuration was not applied.",
+                    })
                 : hasMissingResults
-                  ? `探测未完成：${missingResultCount} 个模型没有结果。`
+                  ? t("codexProtocolProbe.incomplete", {
+                      defaultValue:
+                        "Probe incomplete: {{arg0}} models have no result.",
+                      arg0: missingResultCount,
+                    })
                   : batchSummaries.length > 0 || completed > 0
-                    ? `已完成 ${completionSummary.total} 个模型：Verified ${completionSummary.verified}，Partial ${completionSummary.partial}，Failed ${completionSummary.failed}。`
-                    : "探测已结束。"}
+                    ? t("codexProtocolProbe.completed", {
+                        defaultValue:
+                          "Completed {{arg0}} models: Verified {{arg1}}, Partial {{arg2}}, Failed {{arg3}}.",
+                        arg0: completionSummary.total,
+                        arg1: completionSummary.verified,
+                        arg2: completionSummary.partial,
+                        arg3: completionSummary.failed,
+                      })
+                    : t("codexProtocolProbe.finished", {
+                        defaultValue: "Probe finished.",
+                      })}
           </DialogDescription>
         </DialogHeader>
 
@@ -722,46 +968,67 @@ export function CodexProtocolProbeProgressDialog({
           aria-live="polite"
         >
           <div className="rounded-md border border-amber-500/30 bg-amber-500/10 p-3 text-sm text-amber-800 dark:text-amber-200">
-            深度探测会向每个模型的 Responses 和 Chat
-            端点发送多次真实请求，会消耗 Token
-            并可能产生费用。探测成功后，所选协议的请求、推理、工具和续轮映射会由
-            CCSM 在运行时自动应用。
+            {t("codexProtocolProbe.chargeWarning", {
+              defaultValue:
+                "The deep probe sends multiple real requests to each model’s Responses and Chat endpoints. This consumes tokens and may incur charges. After a successful probe, CCSM applies the selected protocol’s request, reasoning, tool, and continuation mappings at runtime.",
+            })}
           </div>
           {!running && resolvedOutcomes.length > 0 && (
             <div className="rounded-md border border-border-default bg-muted/20 p-3 text-sm">
               {probeUsage && probeUsage.reportedResponses > 0 ? (
                 <div className="space-y-1">
                   <p className="font-medium text-foreground">
-                    本次上游已报告 {probeUsage.totalTokens.toLocaleString()}{" "}
-                    tokens （输入 {probeUsage.inputTokens.toLocaleString()}
-                    ，输出 {probeUsage.outputTokens.toLocaleString()}）
+                    {t("codexProtocolProbe.reportedUsage", {
+                      defaultValue:
+                        "The upstream reported {{total}} tokens (input {{input}}, output {{output}})",
+                      total: probeUsage.totalTokens.toLocaleString(),
+                      input: probeUsage.inputTokens.toLocaleString(),
+                      output: probeUsage.outputTokens.toLocaleString(),
+                    })}
                   </p>
                   <p className="text-xs text-muted-foreground">
                     {probeUsage.estimatedCostUsd
-                      ? `按当前模型定价和 Provider 倍率估算费用约 US$${probeUsage.estimatedCostUsd}。`
-                      : "当前模型没有可用定价，暂时无法估算费用。"}
+                      ? t("codexProtocolProbe.estimate", {
+                          defaultValue:
+                            "Estimated cost is about US${{arg0}} using current model pricing and the provider multiplier.",
+                          arg0: probeUsage.estimatedCostUsd,
+                        })
+                      : t("codexProtocolProbe.noPricing", {
+                          defaultValue:
+                            "No pricing is available for the current models, so cost cannot be estimated yet.",
+                        })}
                   </p>
                   <p className="text-xs text-muted-foreground">
-                    已报告的数字用量会随本次 Responses/Chat
-                    双协议脱敏证据保存，便于重开配置后复核；不会保存响应正文。
+                    {t("codexProtocolProbe.usageEvidence", {
+                      defaultValue:
+                        "Reported numeric usage is saved with this Responses/Chat dual-protocol evidence for later review; response bodies are not saved.",
+                    })}
                   </p>
                   {unreportedResponses > 0 && (
                     <p className="text-xs text-amber-700 dark:text-amber-300">
-                      {unreportedResponses} 个成功响应未返回 usage；上述 Token
-                      和费用只是已报告部分，实际消耗可能更高。
+                      {t("codexProtocolProbe.unreportedUsage", {
+                        defaultValue:
+                          "{{total}} successful responses returned no usage; the token and cost figures above cover only reported usage and actual consumption may be higher.",
+                        total: unreportedResponses,
+                      })}
                     </p>
                   )}
                   {probeUsage.unpricedModels.length > 0 && (
                     <p className="text-xs text-amber-700 dark:text-amber-300">
-                      未找到定价：{probeUsage.unpricedModels.join("、")}
-                      ；费用估算不包含这些模型。
+                      {t("codexProtocolProbe.unpricedModels", {
+                        defaultValue:
+                          "No pricing found: {{models}}; these models are excluded from the cost estimate.",
+                        models: probeUsage.unpricedModels.join(", "),
+                      })}
                     </p>
                   )}
                 </div>
               ) : (
                 <p className="text-xs text-amber-700 dark:text-amber-300">
-                  本次上游没有返回 usage，无法可靠统计 Token
-                  和费用；实际请求仍可能已经计费。
+                  {t("codexProtocolProbe.noUsage", {
+                    defaultValue:
+                      "The upstream returned no usage, so token and cost totals are unreliable; the real requests may still have been billed.",
+                  })}
                 </p>
               )}
             </div>
@@ -771,28 +1038,37 @@ export function CodexProtocolProbeProgressDialog({
               className="rounded-md border border-amber-500/40 bg-amber-500/10 p-3 text-sm text-amber-800 dark:text-amber-200"
               role="alert"
             >
-              当前是手动协议模式，但尚未选择 Responses 或 Chat
-              Completions。关闭可跳过本次应用，选择协议后可直接保存，无需重复探测。
+              {t("codexProtocolProbe.manualRequired", {
+                defaultValue:
+                  "Manual protocol mode is active, but neither Responses nor Chat Completions is selected. Close to skip this application, or choose a protocol and save without probing again.",
+              })}
             </div>
           ) : error ? (
             <div
               className="rounded-md border border-destructive/40 bg-destructive/10 p-3 text-sm text-destructive"
               role="alert"
             >
-              探测中断：{error}
+              {t("codexProtocolProbe.interrupted", {
+                defaultValue: "Probe interrupted: {{error}}",
+                error,
+              })}
             </div>
           ) : null}
           {models.length === 0 && !error && (
             <div className="rounded-md border border-dashed p-6 text-center text-sm text-muted-foreground">
-              正在准备模型和探测请求…
+              {t("codexProtocolProbe.preparing", {
+                defaultValue: "Preparing models and probe requests…",
+              })}
             </div>
           )}
           {models.map((model) => (
             <article
               key={model.key}
-              aria-label={`${
-                model.providerName ? `${model.providerName} · ` : ""
-              }${model.model} 探测进度`}
+              aria-label={t("codexProtocolProbe.modelProgress", {
+                defaultValue: "{{arg0}}{{arg1}} probe progress",
+                arg0: model.providerName ? `${model.providerName} · ` : "",
+                arg1: model.model,
+              })}
               className="space-y-3 rounded-lg border border-border-default bg-muted/10 p-4"
             >
               <div className="flex flex-wrap items-center justify-between gap-2">
@@ -807,14 +1083,16 @@ export function CodexProtocolProbeProgressDialog({
                 <div className="flex items-center gap-2 text-xs">
                   {selectedTransportFor(model, manualSelections) && (
                     <span className="rounded-full border border-sky-500/30 bg-sky-500/10 px-2 py-0.5 text-sky-700 dark:text-sky-300">
-                      已选{" "}
-                      {transportLabel(
-                        selectedTransportFor(model, manualSelections)!,
-                      )}
+                      {t("codexProtocolProbe.selectedTransport", {
+                        defaultValue: "Selected {{transport}}",
+                        transport: transportLabel(
+                          selectedTransportFor(model, manualSelections)!,
+                        ),
+                      })}
                     </span>
                   )}
                   <span className="rounded-full border px-2 py-0.5 text-muted-foreground">
-                    {readinessLabel(model.readiness)}
+                    {readinessLabel(t, model.readiness)}
                   </span>
                 </div>
               </div>
@@ -839,7 +1117,7 @@ export function CodexProtocolProbeProgressDialog({
                         </h4>
                         <div className="flex items-center gap-2">
                           <span className="text-xs text-muted-foreground">
-                            {readinessLabel(branch.readiness)}
+                            {readinessLabel(t, branch.readiness)}
                           </span>
                           {!running &&
                             branch.readiness !== null &&
@@ -854,11 +1132,22 @@ export function CodexProtocolProbeProgressDialog({
                                 size="sm"
                                 className="h-7 px-2 text-xs"
                                 aria-pressed={displaySelected === transport}
-                                aria-label={`${model.model} ${
-                                  branch.readiness === "verified"
-                                    ? "选择"
-                                    : "仍然使用"
-                                } ${transportLabel(transport)}`}
+                                aria-label={t(
+                                  "codexProtocolProbe.selectModelTransport",
+                                  {
+                                    defaultValue: "{{arg0}} {{arg1}} {{arg2}}",
+                                    arg0: model.model,
+                                    arg1:
+                                      branch.readiness === "verified"
+                                        ? t("codexProtocolProbe.select", {
+                                            defaultValue: "Select",
+                                          })
+                                        : t("codexProtocolProbe.useAnyway", {
+                                            defaultValue: "Use anyway",
+                                          }),
+                                    arg2: transportLabel(transport),
+                                  },
+                                )}
                                 onClick={() =>
                                   onSelectTransport({
                                     model: model.model,
@@ -869,10 +1158,18 @@ export function CodexProtocolProbeProgressDialog({
                                 }
                               >
                                 {displaySelected === transport
-                                  ? "已选"
+                                  ? t("codexProtocolProbe.selected", {
+                                      defaultValue: "Selected",
+                                    })
                                   : branch.readiness === "verified"
-                                    ? `选择 ${transportLabel(transport)}`
-                                    : `仍然使用 ${transportLabel(transport)}`}
+                                    ? t("codexProtocolProbe.selectTransport", {
+                                        defaultValue: "Select {{arg0}}",
+                                        arg0: transportLabel(transport),
+                                      })
+                                    : t("codexProtocolProbe.useTransport", {
+                                        defaultValue: "Use anyway {{arg0}}",
+                                        arg0: transportLabel(transport),
+                                      })}
                               </Button>
                             )}
                         </div>
@@ -880,8 +1177,12 @@ export function CodexProtocolProbeProgressDialog({
                       {!branch.touched ? (
                         <p className="text-xs text-muted-foreground">
                           {hasMissingResults && model.readiness === null
-                            ? "未返回探测结果"
-                            : "等待开始"}
+                            ? t("codexProtocolProbe.noResult", {
+                                defaultValue: "No probe result returned",
+                              })
+                            : t("codexProtocolProbe.waitingStart", {
+                                defaultValue: "Waiting to start",
+                              })}
                         </p>
                       ) : (
                         <div className="space-y-2">
@@ -892,8 +1193,9 @@ export function CodexProtocolProbeProgressDialog({
                             running={running}
                             selected={displaySelected === transport}
                           />
-                          {STAGES.map((stage) => {
+                          {stages(t).map((stage) => {
                             const status = statusPresentation(
+                              t,
                               branch.stages[stage.id],
                             );
                             const Icon = status.icon;
@@ -907,6 +1209,7 @@ export function CodexProtocolProbeProgressDialog({
                                   {stage.id === "reasoning" && (
                                     <span>
                                       {reasoningLabel(
+                                        t,
                                         branch.reasoningSemantic,
                                         branch.stages.reasoning,
                                       )}
@@ -923,20 +1226,40 @@ export function CodexProtocolProbeProgressDialog({
                           })}
                           <div className="space-y-1.5 rounded-md border border-border-default bg-muted/20 p-2 text-xs">
                             <p className="font-medium text-foreground">
-                              上游响应结构检查
+                              {t("codexProtocolProbe.structureTitle", {
+                                defaultValue: "Upstream response structure",
+                              })}
                             </p>
                             <p className="text-muted-foreground">
                               {branch.readiness === "verified"
-                                ? "普通响应、SSE 终态、工具调用和工具结果续轮均已由后端解析并实测通过。"
+                                ? t("codexProtocolProbe.structureVerified", {
+                                    defaultValue:
+                                      "Normal responses, terminal SSE events, tool calls, and tool-result continuations were parsed and verified by the backend.",
+                                  })
                                 : branch.readiness === "partial"
-                                  ? "响应可达，但仍有结构或续轮阶段未通过，不能作为完整 Codex 兼容结论。"
+                                  ? t("codexProtocolProbe.structurePartial", {
+                                      defaultValue:
+                                        "The response is reachable, but a structure or continuation stage failed; this is not a complete Codex compatibility result.",
+                                    })
                                   : branch.readiness === "unverified"
-                                    ? "基础响应结构未通过验证，不能用于 Codex 自动配置。"
-                                    : "正在检查响应字段、SSE 终态和工具调用结构。"}
+                                    ? t("codexProtocolProbe.structureFailed", {
+                                        defaultValue:
+                                          "The baseline response structure failed validation and cannot be used for automatic Codex configuration.",
+                                      })
+                                    : t(
+                                        "codexProtocolProbe.structureChecking",
+                                        {
+                                          defaultValue:
+                                            "Checking response fields, terminal SSE events, and tool-call structure.",
+                                        },
+                                      )}
                             </p>
                             <p className="text-muted-foreground">
-                              推理结构：
+                              {t("codexProtocolProbe.reasoningStructure", {
+                                defaultValue: "Reasoning structure:",
+                              })}
                               {reasoningLabel(
+                                t,
                                 branch.reasoningSemantic,
                                 branch.stages.reasoning,
                               )}
@@ -945,7 +1268,9 @@ export function CodexProtocolProbeProgressDialog({
                           {branch.adaptations.length > 0 && (
                             <div className="space-y-2 rounded-md border border-sky-500/30 bg-sky-500/5 p-2 text-xs">
                               <p className="font-medium text-foreground">
-                                CCSM 协议适配过程
+                                {t("codexProtocolProbe.adaptationTitle", {
+                                  defaultValue: "CCSM protocol adaptation",
+                                })}
                               </p>
                               {branch.adaptations.map((adaptation, index) => (
                                 <div
@@ -953,12 +1278,22 @@ export function CodexProtocolProbeProgressDialog({
                                   className="space-y-0.5 border-l-2 border-sky-500/30 pl-2"
                                 >
                                   <p className="text-muted-foreground">
-                                    检测：
-                                    {adaptationTriggerLabel(adaptation.trigger)}
+                                    {t("codexProtocolProbe.detection", {
+                                      defaultValue: "Detection:",
+                                    })}
+                                    {adaptationTriggerLabel(
+                                      t,
+                                      adaptation.trigger,
+                                    )}
                                   </p>
                                   <p className="text-foreground/80">
-                                    调整：
-                                    {adaptationChangeLabel(adaptation.change)}
+                                    {t("codexProtocolProbe.adjustment", {
+                                      defaultValue: "Adjustment:",
+                                    })}
+                                    {adaptationChangeLabel(
+                                      t,
+                                      adaptation.change,
+                                    )}
                                   </p>
                                   <p
                                     className={cn(
@@ -969,8 +1304,13 @@ export function CodexProtocolProbeProgressDialog({
                                           : "text-destructive",
                                     )}
                                   >
-                                    结果：
-                                    {adaptationOutcomeLabel(adaptation.outcome)}
+                                    {t("codexProtocolProbe.result", {
+                                      defaultValue: "Result:",
+                                    })}
+                                    {adaptationOutcomeLabel(
+                                      t,
+                                      adaptation.outcome,
+                                    )}
                                   </p>
                                 </div>
                               ))}
@@ -978,47 +1318,61 @@ export function CodexProtocolProbeProgressDialog({
                           )}
                           {branch.readiness === "verified" && (
                             <div className="rounded-md border border-emerald-500/30 bg-emerald-500/10 p-2 text-xs text-emerald-800 dark:text-emerald-200">
-                              后端完整验证通过：该协议分支可由 CCSM 应用到
-                              Codex；保存并启用 Provider 后生效。
+                              {t("codexProtocolProbe.backendPassed", {
+                                defaultValue:
+                                  "Backend verification passed: CCSM can apply this protocol branch to Codex; it takes effect after saving and enabling the provider.",
+                              })}
                             </div>
                           )}
                           {branch.readiness !== null &&
                             branch.readiness !== "verified" && (
                               <div className="space-y-1 rounded-md border border-amber-500/30 bg-amber-500/10 p-2 text-xs text-amber-900 dark:text-amber-200">
                                 <p className="font-medium">
-                                  自动适配未完整通过，但允许手动使用
+                                  {t("codexProtocolProbe.manualAllowed", {
+                                    defaultValue:
+                                      "Automatic adaptation did not fully pass, but manual use is allowed",
+                                  })}
                                 </p>
                                 <ul className="space-y-0.5">
-                                  {compatibilityIssueLabels(branch).map(
+                                  {compatibilityIssueLabels(t, branch).map(
                                     (issue) => (
                                       <li key={issue}>{issue}</li>
                                     ),
                                   )}
                                 </ul>
                                 <p>
-                                  手动选择只表示接受这些能力缺口，不会把本分支标记为
-                                  Verified。
+                                  {t("codexProtocolProbe.manualGaps", {
+                                    defaultValue:
+                                      "Manual selection accepts these capability gaps; this branch is not marked Verified.",
+                                  })}
                                 </p>
                               </div>
                             )}
                           <div className="space-y-1 border-t pt-2 text-xs text-muted-foreground">
                             <p>
-                              工具 Schema：
+                              {t("codexProtocolProbe.schemaLabel", {
+                                defaultValue: "Tool schema:",
+                              })}
                               {toolSchemaLabel(
+                                t,
                                 branch.toolSchemaDialect,
                                 branch.toolSchemaEvidence,
                                 branch.stages.forced_tool,
                               )}
                             </p>
                             <p>
-                              历史续轮：
+                              {t("codexProtocolProbe.historyLabel", {
+                                defaultValue: "History continuation:",
+                              })}
                               {historyReplayLabel(
+                                t,
                                 branch.historyReplay,
                                 branch.stages.continuation,
                               )}
                             </p>
                             <p className="pt-1 text-foreground/80">
                               {runtimeAdaptationLabel(
+                                t,
                                 transport,
                                 branch.reasoningSource,
                                 branch.historyReplay,
@@ -1042,7 +1396,10 @@ export function CodexProtocolProbeProgressDialog({
                                 })
                               }
                             >
-                              查看字段映射与生效方式
+                              {t("codexProtocolProbe.viewMappings", {
+                                defaultValue:
+                                  "View field mappings and runtime behavior",
+                              })}
                               <ChevronDown
                                 className={cn(
                                   "h-3.5 w-3.5 transition-transform",
@@ -1054,10 +1411,13 @@ export function CodexProtocolProbeProgressDialog({
                             {mappingExpanded && (
                               <div className="space-y-2 rounded-md border border-border-default bg-muted/20 p-2 text-[11px] leading-5">
                                 <p className="font-medium text-foreground">
-                                  实际运行字段映射
+                                  {t("codexProtocolProbe.mappingTitle", {
+                                    defaultValue: "Runtime field mappings",
+                                  })}
                                 </p>
                                 <ul className="space-y-0.5 font-mono text-muted-foreground">
                                   {runtimeMappingRows(
+                                    t,
                                     transport,
                                     branch.reasoningSemantic,
                                     branch.reasoningSource,
@@ -1067,8 +1427,10 @@ export function CodexProtocolProbeProgressDialog({
                                   ))}
                                 </ul>
                                 <p className="border-t pt-2 font-sans text-muted-foreground">
-                                  保存并启用 Provider
-                                  后，每次运行请求都会自动应用；仅运行探测不会改写当前配置。
+                                  {t("codexProtocolProbe.mappingSaved", {
+                                    defaultValue:
+                                      "After saving and enabling the provider, mappings are applied automatically to each request; running a probe alone does not rewrite the current configuration.",
+                                  })}
                                 </p>
                               </div>
                             )}
@@ -1079,7 +1441,7 @@ export function CodexProtocolProbeProgressDialog({
                                 <p
                                   key={`${failure.stage}:${failure.kind}:${failure.status_code ?? ""}`}
                                 >
-                                  {failureLabel(failure)}
+                                  {failureLabel(t, failure)}
                                 </p>
                               ))}
                             </div>
@@ -1097,7 +1459,7 @@ export function CodexProtocolProbeProgressDialog({
         <DialogFooter>
           {!running && onRetry && (
             <Button type="button" variant="outline" onClick={onRetry}>
-              重新探测
+              {t("codexProtocolProbe.retry", { defaultValue: "Probe again" })}
             </Button>
           )}
           <Button
@@ -1105,7 +1467,11 @@ export function CodexProtocolProbeProgressDialog({
             onClick={() => onOpenChange(false)}
             disabled={running}
           >
-            {running ? "探测进行中" : "关闭"}
+            {running
+              ? t("codexProtocolProbe.running", {
+                  defaultValue: "Probe running",
+                })
+              : t("codexProtocolProbe.close", { defaultValue: "Close" })}
           </Button>
         </DialogFooter>
       </DialogContent>

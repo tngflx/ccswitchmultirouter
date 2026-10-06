@@ -157,7 +157,7 @@ export function UsageDashboard({
         setClearConfirmOpen(false);
         toast.success(
           t("usage.clearLogsSuccess", {
-            defaultValue: "已清空使用日志",
+            defaultValue: "Usage logs cleared",
             count: deleted,
           }),
         );
@@ -165,7 +165,7 @@ export function UsageDashboard({
       onError: (error) => {
         toast.error(
           t("usage.clearLogsFailed", {
-            defaultValue: "清空使用日志失败",
+            defaultValue: "Failed to clear usage logs",
           }) + `: ${String(error)}`,
         );
       },
@@ -395,9 +395,9 @@ export function UsageDashboard({
               variant="outline"
               size="icon"
               className="h-9 w-9 text-muted-foreground hover:text-destructive"
-              title={t("usage.clearLogs", { defaultValue: "清空使用日志" })}
+              title={t("usage.clearLogs", { defaultValue: "Clear usage logs" })}
               aria-label={t("usage.clearLogs", {
-                defaultValue: "清空使用日志",
+                defaultValue: "Clear usage logs",
               })}
               disabled={clearUsageLogs.isPending}
               onClick={() => setClearConfirmOpen(true)}
@@ -487,14 +487,14 @@ export function UsageDashboard({
       <ConfirmDialog
         isOpen={clearConfirmOpen}
         title={t("usage.clearLogsConfirmTitle", {
-          defaultValue: "清空使用日志？",
+          defaultValue: "Clear usage logs?",
         })}
         message={t("usage.clearLogsConfirmMessage", {
           defaultValue:
-            "这会删除本地请求日志和历史日汇总。Provider、模型定价、登录态和配置不会被删除。",
+            "This deletes local request logs and historical daily summaries. Providers, model pricing, sign-ins, and configuration are preserved.",
         })}
         confirmText={t("usage.clearLogsConfirm", {
-          defaultValue: "清空",
+          defaultValue: "Clear",
         })}
         onConfirm={confirmClearUsageLogs}
         onCancel={() => setClearConfirmOpen(false)}

@@ -62,11 +62,11 @@ export function codexAccountPoolFacadeLabel(
     );
   return canUseDesktop
     ? (translate?.("codexOauth.facadeNativeMixed", {
-        defaultValue: "Desktop / 混合认证",
-      }) ?? "Desktop / 混合认证")
+        defaultValue: "Desktop / hybrid authentication",
+      }) ?? "Desktop / hybrid authentication")
     : (translate?.("codexOauth.facadeManaged", {
-        defaultValue: "CCSM 托管认证",
-      }) ?? "CCSM 托管认证");
+        defaultValue: "CCSM-managed authentication",
+      }) ?? "CCSM-managed authentication");
 }
 
 export function codexPoolFacadeRestartMessage(
@@ -77,18 +77,18 @@ export function codexPoolFacadeRestartMessage(
   const facade =
     outcome.facade === "native_mixed"
       ? (translate?.("codexOauth.facadeNativeMixed", {
-          defaultValue: "Desktop / 混合认证",
-        }) ?? "Desktop / 混合认证")
+          defaultValue: "Desktop / hybrid authentication",
+        }) ?? "Desktop / hybrid authentication")
       : (translate?.("codexOauth.facadeManaged", {
-          defaultValue: "CCSM 托管认证",
-        }) ?? "CCSM 托管认证");
+          defaultValue: "CCSM-managed authentication",
+        }) ?? "CCSM-managed authentication");
   return (
     translate?.("codexOauth.facadeRestartNotice", {
       facade,
       defaultValue:
-        "当前 Codex 认证门面已切换为{{facade}}。请完全退出并重启 Codex；已有任务不会热加载新的认证门面。",
+        "The Codex authentication facade is now {{facade}}. Fully quit and restart Codex; existing tasks will not hot-load the new facade.",
     }) ??
-    `当前 Codex 认证门面已切换为${facade}。请完全退出并重启 Codex；已有任务不会热加载新的认证门面。`
+    `The Codex authentication facade is now ${facade}. Fully quit and restart Codex; existing tasks will not hot-load the new facade.`
   );
 }
 
@@ -156,7 +156,7 @@ export const CodexOAuthSection: React.FC<CodexOAuthSectionProps> = ({
     error === "codex_oauth_duplicate_account"
       ? t(
           "codexOauth.duplicateAccount",
-          "该 ChatGPT 账号已经存在，无需重复添加。",
+          "This ChatGPT account already exists; it does not need to be added again.",
         )
       : error;
 
@@ -211,7 +211,7 @@ export const CodexOAuthSection: React.FC<CodexOAuthSectionProps> = ({
     ? accounts.find((account) => account.id === poolPolicy.desktopAccountId)
     : undefined;
   const displayAccount = (accountId: string | null | undefined) => {
-    if (!accountId) return t("codexOauth.notConfigured", "未配置");
+    if (!accountId) return t("codexOauth.notConfigured", "Not configured");
     return (
       accounts.find((account) => account.id === accountId)?.login ?? accountId
     );
@@ -222,17 +222,17 @@ export const CodexOAuthSection: React.FC<CodexOAuthSectionProps> = ({
   ) => {
     switch (source) {
       case "native_codex_auth":
-        return t("codexOauth.routeDesktop", "Desktop 当前登录");
+        return t("codexOauth.routeDesktop", "Desktop signed-in account");
       case "managed_codex_oauth":
       case "managed_account":
         return t("codexOauth.routeManaged", {
-          defaultValue: "CCSM 托管：{{account}}",
+          defaultValue: "CCSM-managed: {{account}}",
           account: displayAccount(accountId ?? defaultAccountId),
         });
       case "account_pool":
-        return t("codexOauth.routePool", "OAuth 账号池");
+        return t("codexOauth.routePool", "OAuth account pool");
       default:
-        return t("codexOauth.routeProvider", "供应商自身凭据");
+        return t("codexOauth.routeProvider", "Provider credentials");
     }
   };
   const activeRouteAuth = activeCodexContext?.activeProvider
@@ -296,9 +296,9 @@ export const CodexOAuthSection: React.FC<CodexOAuthSectionProps> = ({
 
   return (
     <div className={`space-y-4 ${className || ""}`}>
-      {/* 认证状态标题 */}
+      {/* Authentication status标题 */}
       <div className="flex items-center justify-between">
-        <Label>{t("codexOauth.authStatus", "认证状态")}</Label>
+        <Label>{t("codexOauth.authStatus", "Authentication status")}</Label>
         <Badge
           variant={hasAnyAccount ? "default" : "secondary"}
           className={hasAnyAccount ? "bg-green-500 hover:bg-green-600" : ""}
@@ -306,9 +306,9 @@ export const CodexOAuthSection: React.FC<CodexOAuthSectionProps> = ({
           {hasAnyAccount
             ? t("codexOauth.accountCount", {
                 count: accounts.length,
-                defaultValue: `${accounts.length} 个账号`,
+                defaultValue: `${accounts.length} account(s)`,
               })
-            : t("codexOauth.notAuthenticated", "未认证")}
+            : t("codexOauth.notAuthenticated", "Not authenticated")}
         </Badge>
       </div>
 
@@ -317,7 +317,7 @@ export const CodexOAuthSection: React.FC<CodexOAuthSectionProps> = ({
           {authError === "refresh_token_invalid"
             ? t(
                 "codexOauth.refreshTokenInvalid",
-                "ChatGPT 登录凭据已失效，但账号记录已保留。请重新登录以恢复认证。",
+                "The ChatGPT login credential expired, but the account record was kept. Sign in again to restore authentication.",
               )
             : authError}
         </div>
@@ -325,18 +325,23 @@ export const CodexOAuthSection: React.FC<CodexOAuthSectionProps> = ({
 
       <div className="space-y-3 rounded-md border bg-muted/20 p-3 text-sm">
         <div>
-          <Label>{t("codexOauth.identityRouting", "身份与路由")}</Label>
+          <Label>
+            {t("codexOauth.identityRouting", "Identity and routing")}
+          </Label>
           <p className="mt-1 text-xs text-muted-foreground">
             {t(
               "codexOauth.identityRoutingHint",
-              "Desktop 登录、CCSM 托管默认账号和路由认证来源相互独立；“设为默认”不会切换 Desktop 登录。",
+              "Desktop login, the CCSM-managed default account, and the route authentication source are independent; “Set as default” does not change the Desktop login.",
             )}
           </p>
         </div>
         <div className="grid gap-2 sm:grid-cols-2">
           <div className="rounded border bg-background/60 p-2">
             <div className="text-xs text-muted-foreground">
-              {t("codexOauth.desktopCurrentIdentity", "Codex Desktop 当前登录")}
+              {t(
+                "codexOauth.desktopCurrentIdentity",
+                "Codex Desktop signed-in account",
+              )}
             </div>
             <div className="mt-1 font-medium">
               {desktopAccount?.login ??
@@ -345,7 +350,10 @@ export const CodexOAuthSection: React.FC<CodexOAuthSectionProps> = ({
           </div>
           <div className="rounded border bg-background/60 p-2">
             <div className="text-xs text-muted-foreground">
-              {t("codexOauth.managedDefaultIdentity", "CCSM 托管默认账号")}
+              {t(
+                "codexOauth.managedDefaultIdentity",
+                "CCSM-managed default account",
+              )}
             </div>
             <div className="mt-1 font-medium">
               {displayAccount(defaultAccountId)}
@@ -354,7 +362,10 @@ export const CodexOAuthSection: React.FC<CodexOAuthSectionProps> = ({
         </div>
         <div className="rounded border bg-background/60 p-2">
           <div className="text-xs text-muted-foreground">
-            {t("codexOauth.activeRouteIdentity", "当前 Codex 路由认证来源")}
+            {t(
+              "codexOauth.activeRouteIdentity",
+              "Current Codex route authentication source",
+            )}
           </div>
           {activeCodexContext?.activeProvider ? (
             <div className="mt-1 space-y-1">
@@ -370,7 +381,10 @@ export const CodexOAuthSection: React.FC<CodexOAuthSectionProps> = ({
             </div>
           ) : (
             <div className="mt-1 text-xs text-muted-foreground">
-              {t("codexOauth.activeRouteUnavailable", "当前路由信息不可用")}
+              {t(
+                "codexOauth.activeRouteUnavailable",
+                "Current route information is unavailable",
+              )}
             </div>
           )}
         </div>
@@ -381,12 +395,15 @@ export const CodexOAuthSection: React.FC<CodexOAuthSectionProps> = ({
           <div className="flex items-center justify-between gap-4">
             <div>
               <Label>
-                {t("codexOauth.poolAutoSwitch", "ChatGPT 账号自动切换")}
+                {t(
+                  "codexOauth.poolAutoSwitch",
+                  "Automatic ChatGPT account switching",
+                )}
               </Label>
               <p className="mt-1 text-xs text-muted-foreground">
                 {t(
                   "codexOauth.poolDescription",
-                  "按列表顺序选择账号；达到保留额度后停止分配新任务。",
+                  "Accounts are selected in list order; new tasks stop being assigned when the reserve threshold is reached.",
                 )}
               </p>
             </div>
@@ -398,7 +415,7 @@ export const CodexOAuthSection: React.FC<CodexOAuthSectionProps> = ({
               }
               aria-label={t(
                 "codexOauth.poolAutoSwitch",
-                "ChatGPT 账号自动切换",
+                "Automatic ChatGPT account switching",
               )}
             />
           </div>
@@ -420,11 +437,12 @@ export const CodexOAuthSection: React.FC<CodexOAuthSectionProps> = ({
                 ? desktopAccount
                   ? t("codexOauth.desktopAccountWithLogin", {
                       login: desktopAccount.login,
-                      defaultValue: "{{login}}（Codex Desktop 当前登录）",
+                      defaultValue:
+                        "{{login}} (Codex Desktop signed-in account)",
                     })
                   : t(
                       "codexOauth.desktopCurrentAccount",
-                      "Codex Desktop 当前登录账号",
+                      "Codex Desktop signed-in account",
                     )
                 : (account?.login ?? entry.accountId);
               return (
@@ -449,7 +467,8 @@ export const CodexOAuthSection: React.FC<CodexOAuthSectionProps> = ({
                         <span className="mr-2">
                           {t("codexOauth.desktopAccountSameAsManaged", {
                             email: desktopAccount.login,
-                            defaultValue: "与已登录账号 {{email}} 相同，已合并",
+                            defaultValue:
+                              "Matches the signed-in account {{email}} and was merged",
                           })}
                         </span>
                       )}
@@ -458,11 +477,12 @@ export const CodexOAuthSection: React.FC<CodexOAuthSectionProps> = ({
                             remaining: quota.remainingPercent.toFixed(1),
                             reserve: entry.reservePercent,
                             defaultValue:
-                              "剩余 {{remaining}}%，低于 {{reserve}}% 时保留",
+                              "{{remaining}}% remaining; reserve this account below {{reserve}}%",
                           })
                         : t("codexOauth.poolRemainingUnknown", {
                             reserve: entry.reservePercent,
-                            defaultValue: "剩余低于 {{reserve}}% 时保留",
+                            defaultValue:
+                              "Reserve below {{reserve}}% remaining",
                           })}
                     </div>
                   </div>
@@ -490,7 +510,7 @@ export const CodexOAuthSection: React.FC<CodexOAuthSectionProps> = ({
                     className="h-8 w-16 rounded-md border bg-background px-2 text-right text-sm"
                     aria-label={t("codexOauth.poolReserveAria", {
                       account: accountLabel,
-                      defaultValue: "{{account}} 保留额度",
+                      defaultValue: "{{account}} reserve threshold",
                     })}
                   />
                   <span className="text-xs text-muted-foreground">%</span>
@@ -509,7 +529,7 @@ export const CodexOAuthSection: React.FC<CodexOAuthSectionProps> = ({
                     }
                     aria-label={t("codexOauth.poolEnableAria", {
                       account: accountLabel,
-                      defaultValue: "启用 {{account}}",
+                      defaultValue: "Enable {{account}}",
                     })}
                   />
                   <Button
@@ -519,7 +539,7 @@ export const CodexOAuthSection: React.FC<CodexOAuthSectionProps> = ({
                     className="h-7 w-7"
                     disabled={poolMutation.isPending || index === 0}
                     onClick={() => movePoolEntry(index, -1)}
-                    title={t("codexOauth.poolMoveUp", "上移")}
+                    title={t("codexOauth.poolMoveUp", "Move up")}
                   >
                     <ArrowUp className="h-4 w-4" />
                   </Button>
@@ -533,7 +553,7 @@ export const CodexOAuthSection: React.FC<CodexOAuthSectionProps> = ({
                       index === poolDraft.entries.length - 1
                     }
                     onClick={() => movePoolEntry(index, 1)}
-                    title={t("codexOauth.poolMoveDown", "下移")}
+                    title={t("codexOauth.poolMoveDown", "Move down")}
                   >
                     <ArrowDown className="h-4 w-4" />
                   </Button>
@@ -544,21 +564,21 @@ export const CodexOAuthSection: React.FC<CodexOAuthSectionProps> = ({
           {poolDraft.enabled && (
             <p className="text-xs text-muted-foreground">
               {isRefreshingPoolQuota
-                ? t("codexOauth.poolRefreshing", "正在刷新账号额度…")
+                ? t("codexOauth.poolRefreshing", "Refreshing account quotas…")
                 : t(
                     "codexOauth.poolRefreshHint",
-                    "额度每 5 分钟刷新；查询失败时保留上次可信状态。",
+                    "Quotas refresh every 5 minutes; the last trusted status is retained if a query fails.",
                   )}
             </p>
           )}
           <div className="rounded-md border bg-muted/30 px-3 py-2 text-xs leading-5 text-muted-foreground">
-            {t("codexOauth.poolFacadePreview", "账号池门面预览：")}
+            {t("codexOauth.poolFacadePreview", "Account-pool facade preview:")}
             <span className="font-medium text-foreground">
               {codexAccountPoolFacadeLabel(poolDraft, t)}
             </span>
             {t(
               "codexOauth.poolScope",
-              "。账号池由 OpenAI Official 使用，无需启用 MultiRouter；MultiRouter 中的官方模型会继承同一设置。",
+              ". The account pool is used by OpenAI Official and does not require MultiRouter; official models in MultiRouter inherit the same setting.",
             )}
           </div>
           {poolFacadeNotice && (
@@ -570,7 +590,8 @@ export const CodexOAuthSection: React.FC<CodexOAuthSectionProps> = ({
             <p className="text-xs text-red-500">
               {t("codexOauth.poolSaveFailed", {
                 error: String(poolMutation.error),
-                defaultValue: "账号切换策略保存失败：{{error}}",
+                defaultValue:
+                  "Failed to save account switching policy: {{error}}",
               })}
             </p>
           )}
@@ -588,7 +609,7 @@ export const CodexOAuthSection: React.FC<CodexOAuthSectionProps> = ({
                 }
               }}
             >
-              {t("codexOauth.poolDiscard", "放弃更改")}
+              {t("codexOauth.poolDiscard", "Discard changes")}
             </Button>
             <Button
               type="button"
@@ -598,7 +619,7 @@ export const CodexOAuthSection: React.FC<CodexOAuthSectionProps> = ({
               {poolMutation.isPending && (
                 <Loader2 className="mr-2 h-4 w-4 animate-spin" />
               )}
-              {t("codexOauth.poolSave", "保存账号池设置")}
+              {t("codexOauth.poolSave", "Save account-pool settings")}
             </Button>
           </div>
         </div>
@@ -608,7 +629,7 @@ export const CodexOAuthSection: React.FC<CodexOAuthSectionProps> = ({
       {accounts.length > 0 && onAccountSelect && (
         <div className="space-y-2">
           <Label className="text-sm text-muted-foreground">
-            {t("codexOauth.selectAccount", "选择账号")}
+            {t("codexOauth.selectAccount", "Select account")}
           </Label>
           <Select
             value={selectedAccountId || "none"}
@@ -618,14 +639,14 @@ export const CodexOAuthSection: React.FC<CodexOAuthSectionProps> = ({
               <SelectValue
                 placeholder={t(
                   "codexOauth.selectAccountPlaceholder",
-                  "选择一个 ChatGPT 账号",
+                  "Select a ChatGPT account",
                 )}
               />
             </SelectTrigger>
             <SelectContent>
               <SelectItem value="none">
                 <span className="text-muted-foreground">
-                  {t("codexOauth.useDefaultAccount", "使用默认账号")}
+                  {t("codexOauth.useDefaultAccount", "Use default account")}
                 </span>
               </SelectItem>
               {accounts.map((account) => (
@@ -666,11 +687,11 @@ export const CodexOAuthSection: React.FC<CodexOAuthSectionProps> = ({
         </div>
       )}
 
-      {/* 已登录账号列表 */}
+      {/* Signed-in accounts列表 */}
       {accounts.length > 0 && (
         <div className="space-y-2">
           <Label className="text-sm text-muted-foreground">
-            {t("codexOauth.loggedInAccounts", "已登录账号")}
+            {t("codexOauth.loggedInAccounts", "Signed-in accounts")}
           </Label>
           <div className="space-y-1">
             {accounts.map((account) => (
@@ -684,12 +705,12 @@ export const CodexOAuthSection: React.FC<CodexOAuthSectionProps> = ({
                     <span className="text-sm font-medium">{account.login}</span>
                     {defaultAccountId === account.id && (
                       <Badge variant="secondary" className="text-xs">
-                        {t("codexOauth.defaultAccount", "默认")}
+                        {t("codexOauth.defaultAccount", "Default")}
                       </Badge>
                     )}
                     {selectedAccountId === account.id && (
                       <Badge variant="outline" className="text-xs">
-                        {t("codexOauth.selected", "已选中")}
+                        {t("codexOauth.selected", "Selected")}
                       </Badge>
                     )}
                     {account.requires_reauth && (
@@ -697,7 +718,10 @@ export const CodexOAuthSection: React.FC<CodexOAuthSectionProps> = ({
                         variant="outline"
                         className="border-amber-500 text-xs text-amber-600"
                       >
-                        {t("codexOauth.reauthRequired", "需要重新认证")}
+                        {t(
+                          "codexOauth.reauthRequired",
+                          "Re-authentication required",
+                        )}
                       </Badge>
                     )}
                   </div>
@@ -711,7 +735,7 @@ export const CodexOAuthSection: React.FC<CodexOAuthSectionProps> = ({
                         onClick={() => reauthAccount(account.id)}
                         disabled={isAddingAccount}
                       >
-                        {t("codexOauth.reauth", "重新认证")}
+                        {t("codexOauth.reauth", "Re-authenticate")}
                       </Button>
                     ) : defaultAccountId !== account.id ? (
                       <Button
@@ -722,7 +746,7 @@ export const CodexOAuthSection: React.FC<CodexOAuthSectionProps> = ({
                         onClick={() => setDefaultAccount(account.id)}
                         disabled={isSettingDefaultAccount}
                       >
-                        {t("codexOauth.setAsDefault", "设为默认")}
+                        {t("codexOauth.setAsDefault", "Set as default")}
                       </Button>
                     ) : null}
                     <Button
@@ -732,7 +756,7 @@ export const CodexOAuthSection: React.FC<CodexOAuthSectionProps> = ({
                       className="h-7 w-7 text-muted-foreground hover:text-red-500"
                       onClick={(e) => handleRemoveAccount(account.id, e)}
                       disabled={isRemovingAccount}
-                      title={t("codexOauth.removeAccount", "移除账号")}
+                      title={t("codexOauth.removeAccount", "Remove account")}
                     >
                       <X className="h-4 w-4" />
                     </Button>
@@ -751,7 +775,7 @@ export const CodexOAuthSection: React.FC<CodexOAuthSectionProps> = ({
         </div>
       )}
 
-      {/* 未认证 - 登录按钮 */}
+      {/* Not authenticated - 登录按钮 */}
       {!hasAnyAccount && pollingState === "idle" && (
         <Button
           type="button"
@@ -760,7 +784,7 @@ export const CodexOAuthSection: React.FC<CodexOAuthSectionProps> = ({
           variant="outline"
         >
           <Sparkles className="mr-2 h-4 w-4" />
-          {t("codexOauth.loginWithChatGPT", "使用 ChatGPT 登录")}
+          {t("codexOauth.loginWithChatGPT", "Sign in with ChatGPT")}
         </Button>
       )}
 
@@ -774,7 +798,7 @@ export const CodexOAuthSection: React.FC<CodexOAuthSectionProps> = ({
           disabled={isAddingAccount}
         >
           <Plus className="mr-2 h-4 w-4" />
-          {t("codexOauth.addAnotherAccount", "添加其他账号")}
+          {t("codexOauth.addAnotherAccount", "Add another account")}
         </Button>
       )}
 
@@ -783,12 +807,15 @@ export const CodexOAuthSection: React.FC<CodexOAuthSectionProps> = ({
         <div className="space-y-3 p-4 rounded-lg border border-border bg-muted/50">
           <div className="flex items-center justify-center gap-2 text-sm text-muted-foreground">
             <Loader2 className="h-4 w-4 animate-spin" />
-            {t("codexOauth.waitingForAuth", "等待授权中...")}
+            {t("codexOauth.waitingForAuth", "Waiting for authorization…")}
           </div>
 
           <div className="text-center">
             <p className="text-xs text-muted-foreground mb-1">
-              {t("codexOauth.enterCode", "在浏览器中输入以下代码：")}
+              {t(
+                "codexOauth.enterCode",
+                "Enter the following code in your browser:",
+              )}
             </p>
             <div className="flex items-center justify-center gap-2">
               <code className="text-2xl font-mono font-bold tracking-wider bg-background px-4 py-2 rounded border">
@@ -799,7 +826,7 @@ export const CodexOAuthSection: React.FC<CodexOAuthSectionProps> = ({
                 size="icon"
                 variant="ghost"
                 onClick={copyUserCode}
-                title={t("codexOauth.copyCode", "复制代码")}
+                title={t("codexOauth.copyCode", "Copy code")}
               >
                 {copied ? (
                   <Check className="h-4 w-4 text-green-500" />
@@ -829,7 +856,7 @@ export const CodexOAuthSection: React.FC<CodexOAuthSectionProps> = ({
               size="sm"
               onClick={cancelAuth}
             >
-              {t("common.cancel", "取消")}
+              {t("common.cancel", "Cancel")}
             </Button>
           </div>
         </div>
@@ -846,7 +873,7 @@ export const CodexOAuthSection: React.FC<CodexOAuthSectionProps> = ({
               variant="outline"
               size="sm"
             >
-              {t("codexOauth.retry", "重试")}
+              {t("codexOauth.retry", "Retry")}
             </Button>
             <Button
               type="button"
@@ -854,13 +881,13 @@ export const CodexOAuthSection: React.FC<CodexOAuthSectionProps> = ({
               variant="ghost"
               size="sm"
             >
-              {t("common.cancel", "取消")}
+              {t("common.cancel", "Cancel")}
             </Button>
           </div>
         </div>
       )}
 
-      {/* 注销所有账号 */}
+      {/* Sign out all accounts */}
       {hasAnyAccount && accounts.length > 1 && (
         <Button
           type="button"
@@ -869,7 +896,7 @@ export const CodexOAuthSection: React.FC<CodexOAuthSectionProps> = ({
           className="w-full text-red-500 hover:text-red-600 hover:bg-red-50 dark:hover:bg-red-950"
         >
           <LogOut className="mr-2 h-4 w-4" />
-          {t("codexOauth.logoutAll", "注销所有账号")}
+          {t("codexOauth.logoutAll", "Sign out all accounts")}
         </Button>
       )}
       <OAuthDeleteConfirmDialog

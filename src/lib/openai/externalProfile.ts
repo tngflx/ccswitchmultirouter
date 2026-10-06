@@ -2,6 +2,8 @@ import type {
   ExternalOpenAIAPIBackendOption,
   ExternalOpenAIAPIProfileUpdate,
 } from "@/types/proxy";
+import type { TFunction } from "i18next";
+import i18n from "@/i18n";
 
 export type BackendGroup = {
   key: string;
@@ -33,14 +35,17 @@ export function appDisplayName(appType: string): string {
 }
 
 /// 将后端描述转换成中文；后端仍保留原始英文值用于判断和调试。
-export function displayBackendDescription(description: string): string {
+export function displayBackendDescription(
+  description: string,
+  t: TFunction = i18n.t,
+): string {
   const normalized = description.trim();
   const translations: Record<string, string> = {
-    "Managed OAuth provider": "OpenAI 官方登录 / 托管 OAuth",
-    "OpenAI-compatible provider": "OpenAI-compatible 模型源",
-    "Native provider": "原生协议模型源",
-    "Codex router provider": "Codex 多模型路由方案",
-    "Codex router route": "Codex 多模型路由规则",
+    "Managed OAuth provider": t("externalApi.source.managedOAuth"),
+    "OpenAI-compatible provider": t("externalApi.source.compatible"),
+    "Native provider": t("externalApi.source.native"),
+    "Codex router provider": t("externalApi.source.routerPlan"),
+    "Codex router route": t("externalApi.source.routerRule"),
   };
   return translations[normalized] ?? normalized;
 }
@@ -75,7 +80,7 @@ export function buildReachableBaseUrl(address?: string, port?: number): string {
     return `http://127.0.0.1:${resolvedPort}/v1`;
   }
   if (address === "0.0.0.0" || address === "::") {
-    return `http://<你的IP或域名>:${resolvedPort}/v1`;
+    return `http://<your-ip-or-domain>:${resolvedPort}/v1`;
   }
   return `http://${address}:${resolvedPort}/v1`;
 }
@@ -145,29 +150,30 @@ export function chooseDefaultBackendKey(
 /// 将 option 归类成 GUI 可扫描的服务来源分组；不可用来源保留展示，但不会参与默认选择。
 export function groupBackendOptions(
   options: ExternalOpenAIAPIBackendOption[],
+  t: TFunction = i18n.t,
 ): BackendGroup[] {
   const groups: BackendGroup[] = [
     {
       key: "official",
-      label: "OpenAI 官方登录",
+      label: t("externalApi.source.official"),
       tone: "emerald",
       options: [],
     },
     {
       key: "router",
-      label: "Codex 多模型路由",
+      label: t("externalApi.source.router"),
       tone: "blue",
       options: [],
     },
     {
       key: "compatible",
-      label: "OpenAI-compatible 模型源",
+      label: t("externalApi.source.compatible"),
       tone: "amber",
       options: [],
     },
     {
       key: "unavailable",
-      label: "暂不可接入",
+      label: t("externalApi.source.unavailable"),
       tone: "slate",
       options: [],
     },
@@ -199,14 +205,15 @@ export function groupBackendOptions(
 /// 生成服务来源的协议、认证和隔离摘要，供不同 GUI 场景复用。
 export function describeBackendTarget(
   option?: ExternalOpenAIAPIBackendOption | null,
+  t: TFunction = i18n.t,
 ): BackendTargetDescription {
   if (!option) {
     return {
-      kind: "未选择服务来源",
-      protocol: "尚未建立转发路径",
-      auth: "尚未配置本地访问 Key",
-      modelSource: "尚未选择模型",
-      compatibility: ["未配置"],
+      kind: t("externalApi.source.notSelected"),
+      protocol: t("externalApi.source.noForwarding"),
+      auth: t("externalApi.source.noLocalKey"),
+      modelSource: t("externalApi.source.noModel"),
+      compatibility: [t("externalApi.source.notConfigured")],
     };
   }
 
@@ -214,32 +221,34 @@ export function describeBackendTarget(
   const isRouterProvider = isCodexRouterProviderOption(option);
   return {
     kind: isRouterProvider
-      ? "多模型路由方案"
+      ? t("externalApi.source.routerPlan")
       : isRoute
-        ? "路由规则"
+        ? t("externalApi.source.routerRule")
         : option.isManagedOAuth
-          ? "OpenAI 官方登录"
-          : "直连模型源",
+          ? t("externalApi.source.official")
+          : t("externalApi.source.direct"),
     protocol: isRouterProvider
-      ? "按第三方请求里的 model 自动命中 Codex 路由"
+      ? t("externalApi.source.routerProtocol")
       : isRoute
-        ? "先按 Codex 路由解析，再转成 OpenAI v1 响应"
+        ? t("externalApi.source.routeProtocol")
         : option.isManagedOAuth
-          ? "转接 ChatGPT Codex Responses 后端"
-          : "按 OpenAI-compatible /chat/completions 转发",
+          ? t("externalApi.source.oauthProtocol")
+          : t("externalApi.source.compatibleProtocol"),
     auth: option.isManagedOAuth
-      ? "OAuth 留在 CC Switch 内部，不暴露给第三方 agent"
-      : "使用该模型源保存的凭据",
+      ? t("externalApi.source.oauthAuth")
+      : t("externalApi.source.savedAuth"),
     modelSource:
       option.models.length > 0
-        ? `${option.models.length} 个可选模型`
-        : "使用保存的默认模型",
+        ? t("externalApi.source.modelCount", { count: option.models.length })
+        : t("externalApi.source.savedModel"),
     compatibility: [
       "/v1/chat/completions",
       isRouterProvider || isRoute || option.isManagedOAuth
         ? "/v1/responses"
-        : "仅 Chat Completions",
-      option.available ? "可接入" : "需要补配置",
+        : t("externalApi.source.chatOnly"),
+      option.available
+        ? t("externalApi.source.available")
+        : t("externalApi.source.needsSetup"),
     ],
   };
 }

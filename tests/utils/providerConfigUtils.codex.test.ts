@@ -65,11 +65,9 @@ describe("Codex TOML utils", () => {
   });
 
   it("writes built-in OpenAI base URL through openai_base_url", () => {
-    const input = [
-      'model_provider = "openai"',
-      'model = "gpt-5.5"',
-      "",
-    ].join("\n");
+    const input = ['model_provider = "openai"', 'model = "gpt-5.5"', ""].join(
+      "\n",
+    );
 
     const output = setCodexBaseUrl(input, " http://127.0.0.1:15721/v1 ");
 
@@ -94,13 +92,11 @@ describe("Codex TOML utils", () => {
 
     const output = setCodexBaseUrl(input, "http://127.0.0.1:15721/v1");
 
-    expect(output).toContain(
-      'openai_base_url = "http://127.0.0.1:15721/v1"',
-    );
+    expect(output).toContain('openai_base_url = "http://127.0.0.1:15721/v1"');
     expect(output).not.toContain("stale-top-level");
     expect(output).not.toContain("stale-table");
     expect(output).not.toMatch(/^\s*base_url\s*=/m);
-    expect(output).toContain("[model_providers.openai]\nname = \"OpenAI\"");
+    expect(output).toContain('[model_providers.openai]\nname = "OpenAI"');
   });
 
   it("prefers openai_base_url over stale built-in OpenAI provider tables", () => {
@@ -151,9 +147,9 @@ describe("Codex TOML utils", () => {
       "",
       "[model_providers.custom]",
       'name = "custom"',
-      "base_url = \"https://su'us.codes/v1\"",
+      'base_url = "https://su\'us.codes/v1"',
       'wire_api = "responses"',
-      'requires_openai_auth = true',
+      "requires_openai_auth = true",
       "",
     ].join("\n");
 
@@ -174,7 +170,7 @@ describe("Codex TOML utils", () => {
       'base_url = "https://old.example/v1"',
       'base_url = "https://older.example/v1"',
       'wire_api = "responses"',
-      'requires_openai_auth = true',
+      "requires_openai_auth = true",
       "",
     ].join("\n");
 
@@ -318,6 +314,72 @@ describe("Codex TOML utils", () => {
       extractCodexTopLevelInt(removed, "model_context_window"),
     ).toBeUndefined();
     expect(removed).toContain("[model_providers.custom]");
+  });
+
+  it.each(['"high"', "'high'", "128000"])(
+    "removes a top-level scalar %s while preserving comments and nested fields",
+    (value) => {
+      const input =
+        '# Keep this comment\nmodel = "custom"\n' +
+        `model_reasoning_effort = ${value} # previous default\n\n` +
+        "[model_providers.custom] # Keep this header comment\n" +
+        'model_reasoning_effort = "low"\n';
+      expect(removeCodexTopLevelField(input, "model_reasoning_effort")).toBe(
+        '# Keep this comment\nmodel = "custom"\n\n' +
+          "[model_providers.custom] # Keep this header comment\n" +
+          'model_reasoning_effort = "low"\n',
+      );
+    },
+  );
+
+  it("does not confuse assignments inside multiline strings with top-level fields", () => {
+    const instructions =
+      'developer_instructions = """\n' +
+      'model_reasoning_effort = "do not remove this text"\n' +
+      '[model_providers.fake]\n"""\n';
+    const nested = '[model_providers.custom]\nmodel_reasoning_effort = "low"\n';
+    expect(
+      removeCodexTopLevelField(
+        instructions + 'model_reasoning_effort = "high"\n' + nested,
+        "model_reasoning_effort",
+      ),
+    ).toBe(instructions + nested);
+    expect(
+      removeCodexTopLevelField(instructions + nested, "model_reasoning_effort"),
+    ).toBe(instructions + nested);
+  });
+
+  it("removes quoted top-level keys but never nested array-table assignments", () => {
+    const nested =
+      '[[profiles]] # Keep this comment\nmodel_reasoning_effort = "low"\n';
+    expect(
+      removeCodexTopLevelField(
+        '"model_reasoning_effort" = "high"\n' + nested,
+        "model_reasoning_effort",
+      ),
+    ).toBe(nested);
+    expect(removeCodexTopLevelField(nested, "model_reasoning_effort")).toBe(
+      nested,
+    );
+  });
+
+  it.each([
+    'model_reasoning_effort = "high"\ninvalid = [\n',
+    'model_reasoning_effort = """high\ncontinued"""\n',
+  ])(
+    "preserves invalid drafts and multiline values without guessing",
+    (input) => {
+      expect(removeCodexTopLevelField(input, "model_reasoning_effort")).toBe(
+        input,
+      );
+    },
+  );
+
+  it("matches the literal field name rather than interpreting it as a regex", () => {
+    const input = '"custom.field" = "remove"\ncustomXfield = "keep"\n';
+    expect(removeCodexTopLevelField(input, "custom.field")).toBe(
+      'customXfield = "keep"\n',
+    );
   });
 
   it("adds Goal mode under the top-level features table", () => {

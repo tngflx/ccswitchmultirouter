@@ -39,7 +39,8 @@ vi.mock("@/hooks/useOpenClaw", () => ({
   },
 }));
 
-vi.mock("react-i18next", () => ({
+vi.mock("react-i18next", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("react-i18next")>()),
   useTranslation: () => ({
     t: (_key: string, options?: { defaultValue?: string }) =>
       options?.defaultValue ?? _key,
@@ -154,7 +155,7 @@ describe("useUpdateProviderMutation", () => {
       apiMocks.inspectActiveCodexMultiRouterProjection,
     ).toHaveBeenCalledTimes(1);
     expect(toastMocks.warning).toHaveBeenCalledWith(
-      "Provider 已保存，但当前 MultiRouter 尚未同步到 Codex。请到 MultiRouter 工作台查看并重试。",
+      "The provider was saved, but MultiRouter has not synced to Codex yet. Review and retry in the MultiRouter workspace.",
       { closeButton: true },
     );
   });

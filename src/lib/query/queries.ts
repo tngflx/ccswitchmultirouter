@@ -1,3 +1,4 @@
+import i18n from "@/i18n";
 import { useRef } from "react";
 import {
   useQuery,
@@ -95,8 +96,10 @@ export const useProvidersQuery = (
             await providersApi.getCodexEditorProviders(),
           );
         } catch {
-          codexEditorError =
-            "协议适配入口无法安全还原，请检查模型源配置后重试。";
+          codexEditorError = i18n.t("codexProviderUi.editorUnsafe", {
+            defaultValue:
+              "Protocol adaptation could not be safely restored. Check the model source configuration and retry.",
+          });
         }
       }
       return {

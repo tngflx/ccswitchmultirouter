@@ -18,7 +18,9 @@ describe("ProviderActions official authentication entry", () => {
       />,
     );
 
-    const action = screen.getByRole("button", { name: "认证设置" });
+    const action = screen.getByRole("button", {
+      name: "Authentication settings",
+    });
     expect(action).toHaveClass("opacity-100");
     fireEvent.click(action);
     expect(onOfficialAuthSettings).toHaveBeenCalledTimes(1);

@@ -1,5 +1,6 @@
 use super::compiler::{
-    compile_v2, compile_v2_strict, CompiledCodexModel, CompiledCodexRoutingPlan,
+    compile_v2, compile_v2_strict, supported_router_default_effort, CompiledCodexModel,
+    CompiledCodexRoutingPlan,
 };
 use super::schema::{CodexRouteAuthSource, CodexRoutingDocument};
 use crate::database::Database;
@@ -291,7 +292,7 @@ pub(crate) fn build_projection_artifact(
         .collect::<HashMap<_, _>>();
     let compiled = compile_v2(&plan, &providers)
         .map_err(|error| AppError::Message(format!("{}: {}", error.code, error.message)))?;
-    let projection_settings = projection_settings(&router, &compiled);
+    let projection_settings = projection_settings(&router, &compiled, &plan);
     let target_provider_names = providers
         .iter()
         .map(|(id, provider)| (id.clone(), provider.name.clone()))
@@ -344,19 +345,28 @@ pub(crate) fn effective_settings_for_candidate_with_providers(
         compile_v2(&plan, providers)
     }
     .map_err(|error| AppError::InvalidInput(format!("{}: {}", error.code, error.message)))?;
-    Ok(projection_settings(candidate, &compiled))
+    Ok(projection_settings(candidate, &compiled, &plan))
 }
 
-fn projection_settings(router: &Provider, compiled: &CompiledCodexRoutingPlan) -> Value {
+fn projection_settings(
+    router: &Provider,
+    compiled: &CompiledCodexRoutingPlan,
+    plan: &super::schema::CodexRoutingConfigV2,
+) -> Value {
     let mut settings = router.settings_config.clone();
     let models = projected_model_entries(compiled);
     settings["modelCatalog"] = json!({
         "models": models,
-        "spawnAgentModels": compiled.spawn_agent_models
+        "spawnAgentModels": compiled.spawn_agent_models,
+        "displayNameStyle": router.settings_config.pointer("/codexRouting/modelDisplayStyle")
+            .and_then(Value::as_str).unwrap_or("provider-model")
     });
     settings["codexRoutingProjection"] = json!({
         "dependencyFingerprint": compiled.dependency_fingerprint
     });
+    if let Some(effort) = supported_router_default_effort(plan, &compiled.model_catalog) {
+        settings["modelCatalog"]["defaultReasoningEffort"] = json!(effort);
+    }
     settings
 }
 
@@ -371,26 +381,10 @@ pub(crate) fn apply_projection_owned_settings(target: &mut Value, projection: &V
 }
 
 fn projected_model_entries(compiled: &CompiledCodexRoutingPlan) -> Vec<Value> {
-    let has_source_custom_order = compiled
+    compiled
         .model_catalog
         .iter()
-        .any(|model| model.sort_index.is_some());
-
-    let mut indexed = compiled
-        .model_catalog
-        .iter()
-        .enumerate()
-        .collect::<Vec<_>>();
-    if has_source_custom_order {
-        indexed.sort_by_key(|(index, model)| (model.sort_index.unwrap_or(usize::MAX), *index));
-    }
-
-    indexed
-        .into_iter()
-        .enumerate()
-        .map(|(sort_index, (_, model))| {
-            projected_model_entry(model, has_source_custom_order.then_some(sort_index))
-        })
+        .map(|model| projected_model_entry(model, model.sort_index))
         .collect()
 }
 
@@ -414,6 +408,14 @@ fn projected_model_entry(model: &CompiledCodexModel, sort_index: Option<usize>) 
     entry.insert(
         "apiFormat".to_string(),
         Value::String(model.api_format.clone()),
+    );
+    entry.insert(
+        "apiFormatSource".to_string(),
+        Value::String(model.api_format_source.clone()),
+    );
+    entry.insert(
+        "providerName".to_string(),
+        Value::String(model.target_provider_name.clone()),
     );
     if let Some(context_window) = model.capability_summary.context_window {
         entry.insert("contextWindow".to_string(), Value::from(context_window));
@@ -705,17 +707,11 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["qwen-a", "qwen-b"]
         );
-        assert_eq!(
-            models
-                .iter()
-                .map(|model| model["sortIndex"].as_u64().unwrap())
-                .collect::<Vec<_>>(),
-            vec![0, 1]
-        );
+        assert!(models.iter().all(|model| model.get("sortIndex").is_none()));
     }
 
     #[test]
-    fn projection_uses_source_sort_indexes_when_router_has_no_custom_order() {
+    fn projection_ignores_source_sort_indexes_when_router_has_no_custom_order() {
         let db = Database::memory().expect("memory db");
         let router = router();
         let target = Provider::with_id(
@@ -744,14 +740,41 @@ mod tests {
                 .iter()
                 .map(|model| model["model"].as_str().unwrap())
                 .collect::<Vec<_>>(),
-            vec!["qwen-b", "qwen-a"]
+            vec!["qwen-a", "qwen-b"]
         );
+        assert!(models.iter().all(|model| model.get("sortIndex").is_none()));
+    }
+
+    #[test]
+    fn projection_carries_router_order_raw_presentation_effort_and_protocol_provenance() {
+        let db = Database::memory().unwrap();
+        let mut router = router();
+        router.settings_config["codexRouting"]["modelOrder"] = json!(["b", "a"]);
+        router.settings_config["codexRouting"]["modelDisplayStyle"] = json!("model-provider");
+        router.settings_config["codexRouting"]["defaultReasoningEffort"] = json!("high");
+        let mut source = target("openai_responses");
+        source.settings_config["modelCatalog"]["models"] = json!([
+            {"model": "a", "sortIndex": 0},
+            {"model": "b", "displayName": "Friendly B", "apiFormat": "openai_chat",
+             "reasoning": {"supportedEfforts": ["low", "high"], "defaultEffort": "low"}}
+        ]);
+        db.save_provider("codex", &router).unwrap();
+        db.save_provider("codex", &source).unwrap();
+        let artifact = build_projection_artifact(&db, "router").unwrap();
+        let catalog = &artifact.projection_settings["modelCatalog"];
+        assert_eq!(catalog["models"][0]["model"], "b");
+        assert_eq!(catalog["models"][0]["sortIndex"], 0);
+        assert_eq!(catalog["models"][0]["displayName"], "Friendly B");
+        assert_eq!(catalog["models"][0]["providerName"], "Qwen");
+        assert_eq!(catalog["models"][0]["apiFormatSource"], "provider_model");
+        assert_eq!(catalog["displayNameStyle"], "model-provider");
+        assert_eq!(catalog["defaultReasoningEffort"], "high");
         assert_eq!(
-            models
-                .iter()
-                .map(|model| model["sortIndex"].as_u64().unwrap())
-                .collect::<Vec<_>>(),
-            vec![0, 1]
+            db.get_provider_by_id("qwen", "codex")
+                .unwrap()
+                .unwrap()
+                .settings_config,
+            source.settings_config
         );
     }
 

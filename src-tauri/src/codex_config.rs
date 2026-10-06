@@ -2072,7 +2072,16 @@ fn codex_catalog_model_specs(settings: &Value, config_text: &str) -> Vec<CodexCa
     }
 
     let spawn_agent_model_priority = codex_spawn_agent_model_priority(settings);
-    let mut specs = sort_codex_catalog_specs_for_picker(specs, &spawn_agent_model_priority);
+    // A compiled router already owns the complete picker order. Sub-agent
+    // priority and provider heuristics must not silently reorder that projection.
+    let mut specs = if settings
+        .pointer("/codexRoutingProjection/dependencyFingerprint")
+        .is_some()
+    {
+        specs
+    } else {
+        sort_codex_catalog_specs_for_picker(specs, &spawn_agent_model_priority)
+    };
 
     if default_model.is_none() {
         if let Some(first) = specs.first_mut() {
@@ -6438,7 +6447,21 @@ fn sync_codex_models_cache_with_cc_switch_catalog(catalog: &Value) -> Result<(),
         // 普通 catalog enrichment 仍以同 slug 官方 transport 元数据为权威；
         // 只有最终写入 CCSM-owned cache 时，才让当前用户选择的 V1/V2 投影
         // 覆盖接管前备份，避免第二次合并重新带回过期协议。
-        for field in ["multi_agent_version", "multiAgentVersion"] {
+        let mut projected_fields = vec!["multi_agent_version", "multiAgentVersion"];
+        if catalog
+            .get("ccSwitchRoutingDependencyFingerprint")
+            .is_some()
+        {
+            projected_fields.extend([
+                "display_name",
+                "displayName",
+                "description",
+                "default_reasoning_level",
+                "default_reasoning_effort",
+                "defaultReasoningEffort",
+            ]);
+        }
+        for field in projected_fields {
             if let Some(value) = routed_model.get(field).cloned() {
                 merged_object.insert(field.to_string(), value);
             }
@@ -6582,6 +6605,147 @@ pub(crate) fn prepare_codex_config_text_with_model_catalog_and_provider_context(
     )
 }
 
+/// Presentation is applied after official enrichment. Raw provider metadata
+/// remains untouched, and selecting a default never creates a supported tier.
+fn apply_codex_router_catalog_preferences(catalog: &mut Value, settings: &Value) -> Option<String> {
+    settings.pointer("/codexRoutingProjection/dependencyFingerprint")?;
+    let source_models = settings.pointer("/modelCatalog/models")?.as_array()?;
+    let style = settings
+        .pointer("/modelCatalog/displayNameStyle")
+        .and_then(Value::as_str)
+        .unwrap_or("provider-model");
+    let models = catalog.get_mut("models")?.as_array_mut()?;
+    for model in models.iter_mut() {
+        let Some(id) = codex_model_stable_id(model) else {
+            continue;
+        };
+        let Some(source) = source_models.iter().find(|source| {
+            source
+                .get("model")
+                .and_then(Value::as_str)
+                .is_some_and(|candidate| candidate.eq_ignore_ascii_case(&id))
+        }) else {
+            continue;
+        };
+        let provider = source
+            .get("providerName")
+            .or_else(|| source.get("provider_name"))
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim();
+        let raw = source
+            .get("displayName")
+            .or_else(|| source.get("display_name"))
+            .and_then(Value::as_str)
+            .filter(|label| !label.trim().is_empty())
+            .or_else(|| model.get("display_name").and_then(Value::as_str))
+            .unwrap_or(&id)
+            .trim();
+        let compact = compact_codex_router_provider_label(provider);
+        let mut display = raw.to_string();
+        for prefix in [provider, compact.as_str()] {
+            let bracket = format!("[{prefix}]");
+            if display
+                .get(..bracket.len())
+                .is_some_and(|start| start.eq_ignore_ascii_case(&bracket))
+            {
+                display = display[bracket.len()..].trim_start().to_string();
+            }
+        }
+        let display = match style {
+            "model" => display,
+            "model-provider" if !compact.is_empty() => format!("{display} · {compact}"),
+            _ if !compact.is_empty() => format!("[{compact}] {display}"),
+            _ => display,
+        };
+        if let Some(object) = model.as_object_mut() {
+            for field in ["display_name", "displayName", "description"] {
+                object.insert(field.to_string(), json!(display));
+            }
+        }
+    }
+    let requested = settings
+        .pointer("/modelCatalog/defaultReasoningEffort")?
+        .as_str()?;
+    if !matches!(
+        requested,
+        "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max"
+    ) {
+        return None;
+    }
+    let first = models.first_mut()?;
+    let supported = first
+        .get("supported_reasoning_levels")
+        .and_then(Value::as_array)
+        .is_some_and(|levels| {
+            levels
+                .iter()
+                .any(|level| level.get("effort").and_then(Value::as_str) == Some(requested))
+        });
+    if !supported {
+        return None;
+    }
+    let object = first.as_object_mut()?;
+    for field in [
+        "default_reasoning_level",
+        "default_reasoning_effort",
+        "defaultReasoningEffort",
+    ] {
+        object.insert(field.to_string(), json!(requested));
+    }
+    Some(requested.to_string())
+}
+
+fn compact_codex_router_provider_label(provider: &str) -> String {
+    let characters = provider
+        .chars()
+        .filter(|character| character.is_alphanumeric())
+        .collect::<String>();
+    match characters.to_lowercase().as_str() {
+        "openrouter" => return "ORter".to_string(),
+        "opencodezen" => return "OCzen".to_string(),
+        _ => {}
+    }
+    if characters.chars().count() <= 5 {
+        return characters;
+    }
+    let mut separated = String::new();
+    let mut previous_lowercase_or_digit = false;
+    for character in provider.chars() {
+        if previous_lowercase_or_digit && character.is_uppercase() {
+            separated.push(' ');
+        }
+        separated.push(character);
+        previous_lowercase_or_digit = character.is_lowercase() || character.is_numeric();
+    }
+    let words = separated
+        .split(|character: char| !character.is_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .collect::<Vec<_>>();
+    if words.len() < 2 {
+        return characters.chars().take(5).collect();
+    }
+    let prefix_count = if words.len() >= 5 { 5 } else { words.len() - 1 };
+    let prefix = words
+        .iter()
+        .take(prefix_count)
+        .filter_map(|word| word.chars().next())
+        .flat_map(char::to_uppercase)
+        .collect::<String>();
+    if words.len() >= 5 {
+        return prefix;
+    }
+    let suffix_chars = words.last().unwrap_or(&"").chars().collect::<Vec<_>>();
+    let budget = 5usize.saturating_sub(prefix.chars().count());
+    format!(
+        "{prefix}{}",
+        suffix_chars
+            .iter()
+            .skip(suffix_chars.len().saturating_sub(budget))
+            .collect::<String>()
+    )
+}
+
 fn prepare_codex_config_text_with_model_catalog_impl(
     settings: &Value,
     config_text: &str,
@@ -6607,6 +6771,7 @@ fn prepare_codex_config_text_with_model_catalog_impl(
         let generated_catalog = codex_model_catalog_from_settings(settings, config_text, profile)?
             .unwrap_or_else(|| json!({ "models": [] }));
         let mut catalog = enrich_codex_catalog_with_official_metadata(&generated_catalog)?;
+        let router_effort = apply_codex_router_catalog_preferences(&mut catalog, settings);
         if let Some(fingerprint) = settings
             .pointer("/codexRoutingProjection/dependencyFingerprint")
             .and_then(Value::as_str)
@@ -6627,6 +6792,11 @@ fn prepare_codex_config_text_with_model_catalog_impl(
         let mut doc = config_text
             .parse::<DocumentMut>()
             .map_err(|e| AppError::Message(format!("Invalid Codex config.toml: {e}")))?;
+        if let Some(effort) =
+            router_effort.filter(|_| specs.first().is_some_and(|model| model.is_default))
+        {
+            doc["model_reasoning_effort"] = toml_edit::value(effort);
+        }
         ensure_codex_multi_agent_reserved_schema_compatible(
             &mut doc,
             codex_subagent_version(settings),
@@ -14410,6 +14580,66 @@ openai_base_url = "http://127.0.0.1:15721/v1"
     }
 
     #[test]
+    fn compiled_router_catalog_array_is_the_picker_order_not_subagent_priority() {
+        let settings = json!({
+            "codexRoutingProjection": {"dependencyFingerprint": "router"},
+            "modelCatalog": {
+                "spawnAgentModels": ["qwen3.6", "deepseek-v4-pro"],
+                "models": [{"model": "z"}, {"model": "deepseek-v4-pro"}, {"model": "qwen3.6"}]
+            }
+        });
+        assert_eq!(
+            codex_catalog_model_specs(&settings, "model = \"qwen3.6\"")
+                .into_iter()
+                .map(|spec| spec.model)
+                .collect::<Vec<_>>(),
+            vec!["z", "deepseek-v4-pro", "qwen3.6"]
+        );
+    }
+
+    #[test]
+    fn router_presentation_applies_after_official_merge_without_double_prefixes() {
+        let settings = json!({
+            "codexRoutingProjection": {"dependencyFingerprint": "router"},
+            "modelCatalog": {
+                "displayNameStyle": "provider-model", "defaultReasoningEffort": "high",
+                "models": [{"model": "official", "providerName": "OpenRouter",
+                    "displayName": "[ORter] Friendly"}]
+            }
+        });
+        let official = json!({"slug": "official", "display_name": "Official",
+            "default_reasoning_level": "low",
+            "supported_reasoning_levels": [{"effort": "low"}, {"effort": "high"}]});
+        let mut catalog =
+            json!({"models": merge_codex_models(&[official], &[json!({"slug": "official"})])});
+        assert_eq!(
+            apply_codex_router_catalog_preferences(&mut catalog, &settings),
+            Some("high".into())
+        );
+        assert_eq!(catalog["models"][0]["display_name"], "[ORter] Friendly");
+        assert_eq!(catalog["models"][0]["default_reasoning_level"], "high");
+        let first = catalog.clone();
+        apply_codex_router_catalog_preferences(&mut catalog, &settings);
+        assert_eq!(catalog, first, "presentation must be idempotent");
+        let mut style = settings.clone();
+        style["modelCatalog"]["displayNameStyle"] = json!("model-provider");
+        apply_codex_router_catalog_preferences(&mut catalog, &style);
+        assert_eq!(catalog["models"][0]["display_name"], "Friendly · ORter");
+        style["modelCatalog"]["displayNameStyle"] = json!("model");
+        style["modelCatalog"]["defaultReasoningEffort"] = json!("xhigh");
+        assert_eq!(
+            apply_codex_router_catalog_preferences(&mut catalog, &style),
+            None
+        );
+        assert_eq!(catalog["models"][0]["display_name"], "Friendly");
+        assert_eq!(
+            catalog["models"][0]["supported_reasoning_levels"],
+            first["models"][0]["supported_reasoning_levels"]
+        );
+        assert_eq!(catalog["models"][0]["default_reasoning_level"], "high");
+    }
+
+    #[test]
     fn codex_model_catalog_without_explicit_default_uses_first_user_sorted_model() {
         let settings = json!({
             "modelCatalog": {
@@ -18145,6 +18375,78 @@ wire_api = "responses"
             catalog["ccSwitchRoutingDependencyFingerprint"],
             "fingerprint-v2"
         );
+    }
+
+    #[test]
+    #[serial]
+    fn router_presentation_and_declared_effort_survive_catalog_cache_republication() {
+        let _guard = TestHomeGuard::new();
+        write_codex_live_config_atomic(Some(
+            "model = \"parity-model\"\nmodel_provider = \"codex_model_router_v2\"\n\
+             model_reasoning_effort = \"low\"\n\n\
+             [model_providers.codex_model_router_v2]\n\
+             base_url = \"http://127.0.0.1:15721/v1\"\nwire_api = \"responses\"\n",
+        ))
+        .expect("seed router config");
+        seed_codex_models_cache(json!([{
+            "slug": "parity-model", "display_name": "Original official",
+            "default_reasoning_level": "low",
+            "supported_reasoning_levels": [{"effort": "low"}, {"effort": "high"}]
+        }]));
+        let settings = json!({
+            "modelCatalog": {
+                "displayNameStyle": "model-provider", "defaultReasoningEffort": "high",
+                "models": [{
+                    "model": "parity-model", "providerName": "OpenRouter",
+                    "displayName": "Friendly", "reasoning": {
+                        "schemaVersion": 2, "supportStatus": "confirmed_supported",
+                        "controlKind": "graded", "supportedEfforts": ["low", "high"],
+                        "defaultEffort": "low", "disableAllowed": false,
+                        "upstream": {"format": "string", "parameter": "reasoning_effort"}
+                    }
+                }]
+            },
+            "codexRouting": {"schemaVersion": 2, "enabled": true, "routes": []},
+            "codexRoutingProjection": {"dependencyFingerprint": "presentation"}
+        });
+        for _ in 0..2 {
+            let readback = publish_codex_multirouter_projection(&settings).expect("publish");
+            assert!(
+                readback.catalog_verified && readback.config_verified && readback.cache_verified
+            );
+            let catalog: Value = read_json_file(&get_codex_model_catalog_path()).expect("catalog");
+            let cache: Value = read_json_file(&get_codex_models_cache_path()).expect("cache");
+            for output in [catalog, cache] {
+                let model = output["models"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|model| codex_model_stable_id(model).as_deref() == Some("parity-model"))
+                    .expect("routed model");
+                assert_eq!(model["display_name"], "Friendly · ORter");
+                assert_eq!(model["default_reasoning_level"], "high");
+                assert_eq!(
+                    model["supported_reasoning_levels"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|level| level["effort"].as_str().unwrap())
+                        .collect::<Vec<_>>(),
+                    vec!["low", "high"],
+                    "preference must not fabricate supported tiers"
+                );
+            }
+            let config = read_codex_config_text()
+                .expect("config")
+                .parse::<DocumentMut>()
+                .unwrap();
+            assert_eq!(config["model"].as_str(), Some("parity-model"));
+            assert_eq!(config["model_reasoning_effort"].as_str(), Some("high"));
+        }
+        let original: Value =
+            read_json_file(&get_codex_models_cache_backup_path()).expect("official backup");
+        assert_eq!(original["models"][0]["display_name"], "Original official");
+        assert_eq!(original["models"][0]["default_reasoning_level"], "low");
     }
 
     #[test]

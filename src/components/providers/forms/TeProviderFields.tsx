@@ -49,39 +49,49 @@ const REASONING_EFFORTS = [
 
 /** 校验错误码 → 中文说明；未登记的错误码原样显示，便于排查而不是静默吞掉。 */
 const ERROR_LABELS: Record<string, string> = {
-  te_provider_settings_required: "缺少 TE Provider 设置对象",
-  te_provider_sidecar_url_required: "必须填写本机注入端点",
+  te_provider_settings_required: "TE Provider settings object is missing",
+  te_provider_sidecar_url_required: "The local injection endpoint is required",
   te_provider_sidecar_url_must_be_loopback:
-    "注入端点必须是数值回环 http://127.0.0.1 或 http://[::1]",
-  te_provider_expected_aic_required: "必须填写本 host 服务的 Partner AIC",
-  te_provider_expected_aic_invalid: "Partner AIC 含有非法字符或过长",
-  te_provider_protocol_version_invalid: "协议版本必须是 te-provider.v1",
+    "The injection endpoint must use a numeric loopback URL: http://127.0.0.1 or http://[::1]",
+  te_provider_expected_aic_required:
+    "The Partner AIC for this host service is required",
+  te_provider_expected_aic_invalid:
+    "Partner AIC contains invalid characters or is too long",
+  te_provider_protocol_version_invalid:
+    "Protocol version must be te-provider.v1",
   te_provider_binding_delivery_invalid:
-    "绑定投递方式必须是配置头或 Gateway 插件",
-  te_provider_probe_url_must_be_loopback: "保活探针地址必须是数值回环",
-  te_provider_timeout_invalid: "Provider 超时必须是不小于 30 的整数秒",
-  te_provider_keep_alive_invalid: "保活间隔必须是不小于 5 的整数秒",
-  te_provider_models_required: "至少需要一个模型条目",
-  te_provider_runtime_field_forbidden: "运行时绑定字段不能写入静态配置",
+    "Binding delivery must be a config header or Gateway plugin",
+  te_provider_probe_url_must_be_loopback:
+    "The keep-alive probe URL must use a numeric loopback address",
+  te_provider_timeout_invalid:
+    "Provider timeout must be an integer of at least 30 seconds",
+  te_provider_keep_alive_invalid:
+    "Keep-alive interval must be an integer of at least 5 seconds",
+  te_provider_models_required: "At least one model entry is required",
+  te_provider_runtime_field_forbidden:
+    "Runtime binding fields cannot be written to static configuration",
   te_provider_secret_field_forbidden:
-    "Proxy Key 或 Agent Credential 不能写入静态配置",
-  te_provider_unknown_field_forbidden: "配置包含未允许的字段",
+    "Proxy Key or Agent Credential cannot be written to static configuration",
+  te_provider_unknown_field_forbidden:
+    "Configuration contains a field that is not allowed",
 };
 
 function errorLabel(code: string): string {
   if (ERROR_LABELS[code]) return ERROR_LABELS[code];
-  if (code.includes("_id_required")) return "模型 ID 不能为空";
-  if (code.includes("_id_duplicated")) return "模型 ID 不能重复";
-  if (code.includes("_name_required")) return "模型显示名称不能为空";
+  if (code.includes("_id_required")) return "Model ID cannot be empty";
+  if (code.includes("_id_duplicated")) return "Model IDs must be unique";
+  if (code.includes("_name_required"))
+    return "Model display name cannot be empty";
   if (code.includes("_input_invalid"))
-    return "输入模态只能是 text/image/audio/video/file";
+    return "Input modality must be text/image/audio/video/file";
   if (code.includes("_output_invalid"))
-    return "输出模态只能是 text/embedding/audio/image";
-  if (code.includes("_reasoning_invalid")) return "推理档位取值非法";
+    return "Output modality must be text/embedding/audio/image";
+  if (code.includes("_reasoning_invalid"))
+    return "Invalid reasoning effort value";
   if (code.includes("_contextWindowTokens_invalid"))
-    return "上下文长度必须是正整数";
+    return "Context length must be a positive integer";
   if (code.includes("_maxOutputTokens_invalid"))
-    return "最大输出长度必须是正整数";
+    return "Maximum output length must be a positive integer";
   return code;
 }
 
@@ -114,7 +124,9 @@ export function TeProviderFields({ value, onChange }: TeProviderFieldsProps) {
     } catch (error) {
       setRuntimeStatus(null);
       setRuntimeError(
-        error instanceof Error ? error.message : "运行态读取失败",
+        error instanceof Error
+          ? error.message
+          : "Failed to read runtime status",
       );
     } finally {
       setRuntimeBusy(false);
@@ -122,10 +134,10 @@ export function TeProviderFields({ value, onChange }: TeProviderFieldsProps) {
   }, [value.sidecarUrl]);
 
   function providerStatusText(status: TeProviderRuntimeStatus): string {
-    if (!status.provider) return "上游探针未返回结果";
-    if (status.provider.online === true) return "上游在线";
-    if (status.provider.online === false) return "上游离线";
-    return `上游状态未知（${status.provider.reason ?? "provider_probe_not_configured"}）`;
+    if (!status.provider) return "The upstream probe returned no result";
+    if (status.provider.online === true) return "Upstream online";
+    if (status.provider.online === false) return "Upstream offline";
+    return `Upstream status unknown (${status.provider.reason ?? "provider_probe_not_configured"})`;
   }
 
   function update(patch: Partial<OpenClawTeProviderSettings>) {
@@ -240,13 +252,13 @@ export function TeProviderFields({ value, onChange }: TeProviderFieldsProps) {
         <div>
           <h3 className="text-sm font-medium">
             {t("openclaw.teProvider.bindings", {
-              defaultValue: "TE 绑定设置（静态、无秘密）",
+              defaultValue: "TE binding settings (static, no secrets)",
             })}
           </h3>
           <p className="text-xs text-muted-foreground">
             {t("openclaw.teProvider.bindingsHint", {
               defaultValue:
-                "这里只保存本机注入端点与能力元数据；Proxy Key 与 Agent Credential 永远由运行时注入，不进入配置。",
+                "Only the local injection endpoint and capability metadata are saved here; Proxy Key and Agent Credential are always injected at runtime and never enter configuration.",
             })}
           </p>
         </div>
@@ -255,7 +267,7 @@ export function TeProviderFields({ value, onChange }: TeProviderFieldsProps) {
           <div className="space-y-2">
             <Label htmlFor="te-sidecar-url">
               {t("openclaw.teProvider.sidecarUrl", {
-                defaultValue: "注入端点",
+                defaultValue: "Injection endpoint",
               })}
             </Label>
             <Input
@@ -269,7 +281,7 @@ export function TeProviderFields({ value, onChange }: TeProviderFieldsProps) {
           <div className="space-y-2">
             <Label htmlFor="te-partner-aic">
               {t("openclaw.teProvider.expectedPartnerAic", {
-                defaultValue: "本 host Partner AIC",
+                defaultValue: "Partner AIC for this host",
               })}
             </Label>
             <Input
@@ -285,7 +297,7 @@ export function TeProviderFields({ value, onChange }: TeProviderFieldsProps) {
           <div className="space-y-2">
             <Label htmlFor="te-binding-delivery">
               {t("openclaw.teProvider.bindingDelivery", {
-                defaultValue: "绑定投递方式",
+                defaultValue: "Binding delivery method",
               })}
             </Label>
             <Select
@@ -303,24 +315,25 @@ export function TeProviderFields({ value, onChange }: TeProviderFieldsProps) {
               <SelectContent>
                 <SelectItem value="config-headers" disabled>
                   {t("openclaw.teProvider.bindingDeliveryHeaders", {
-                    defaultValue: "写入 Agent 配置头",
+                    defaultValue: "Write to Agent config header",
                   })}
                 </SelectItem>
                 <SelectItem value="gateway-plugin">
                   {t("openclaw.teProvider.bindingDeliveryPlugin", {
-                    defaultValue: "OpenClaw Gateway 插件",
+                    defaultValue: "OpenClaw Gateway plugin",
                   })}
                 </SelectItem>
               </SelectContent>
             </Select>
             <p className="text-xs text-muted-foreground">
-              当前仅支持 Gateway 插件；配置头投递尚未接入私有运行配置。
+              Only the Gateway plugin is currently supported; config-header
+              delivery is not yet wired into the private runtime configuration.
             </p>
           </div>
           <div className="space-y-2">
             <Label htmlFor="te-provider-timeout">
               {t("openclaw.teProvider.providerTimeoutSeconds", {
-                defaultValue: "Provider 超时（秒）",
+                defaultValue: "Provider timeout (seconds)",
               })}
             </Label>
             <Input
@@ -339,7 +352,7 @@ export function TeProviderFields({ value, onChange }: TeProviderFieldsProps) {
           <div className="space-y-2">
             <Label htmlFor="te-keep-alive">
               {t("openclaw.teProvider.keepAliveIntervalSeconds", {
-                defaultValue: "保活间隔（秒）",
+                defaultValue: "Keep-alive interval (seconds)",
               })}
             </Label>
             <Input
@@ -358,7 +371,8 @@ export function TeProviderFields({ value, onChange }: TeProviderFieldsProps) {
             />
           </div>
           <p className="text-xs text-muted-foreground">
-            自定义超时和保活尚未持久化；仅默认 300 秒 / 30 秒可保存。
+            Custom timeout and keep-alive values are not yet persisted; only the
+            defaults of 300 seconds / 30 seconds can be saved.
           </p>
         </div>
       </div>
@@ -368,13 +382,13 @@ export function TeProviderFields({ value, onChange }: TeProviderFieldsProps) {
           <div>
             <h3 className="text-sm font-medium">
               {t("openclaw.teProvider.models", {
-                defaultValue: "模型能力元数据",
+                defaultValue: "Model capability metadata",
               })}
             </h3>
             <p className="text-xs text-muted-foreground">
               {t("openclaw.teProvider.modelsHint", {
                 defaultValue:
-                  "留空表示未知，不会据此推断模型能力；只有平台已验证的能力才能作为批准依据。",
+                  "Leave blank to mark unknown; capabilities are not inferred from blank values. Only platform-verified capabilities can be used as approval evidence.",
               })}
             </p>
           </div>
@@ -388,7 +402,7 @@ export function TeProviderFields({ value, onChange }: TeProviderFieldsProps) {
               })
             }
           >
-            {t("openclaw.teProvider.addModel", { defaultValue: "添加模型" })}
+            {t("openclaw.teProvider.addModel", { defaultValue: "Add model" })}
           </button>
         </div>
 
@@ -402,7 +416,7 @@ export function TeProviderFields({ value, onChange }: TeProviderFieldsProps) {
               <div className="space-y-2">
                 <Label>
                   {t("openclaw.teProvider.modelId", {
-                    defaultValue: "模型 ID",
+                    defaultValue: "Model ID",
                   })}
                 </Label>
                 <Input
@@ -416,7 +430,7 @@ export function TeProviderFields({ value, onChange }: TeProviderFieldsProps) {
               <div className="space-y-2">
                 <Label>
                   {t("openclaw.teProvider.modelName", {
-                    defaultValue: "显示名称",
+                    defaultValue: "Display name",
                   })}
                 </Label>
                 <Input
@@ -430,7 +444,7 @@ export function TeProviderFields({ value, onChange }: TeProviderFieldsProps) {
               <div className="space-y-2">
                 <Label>
                   {t("openclaw.teProvider.contextWindowTokens", {
-                    defaultValue: "上下文长度（Token）",
+                    defaultValue: "Context length (tokens)",
                   })}
                 </Label>
                 <Input
@@ -449,7 +463,7 @@ export function TeProviderFields({ value, onChange }: TeProviderFieldsProps) {
               <div className="space-y-2">
                 <Label>
                   {t("openclaw.teProvider.maxOutputTokens", {
-                    defaultValue: "最大输出（Token）",
+                    defaultValue: "Maximum output (tokens)",
                   })}
                 </Label>
                 <Input
@@ -468,7 +482,7 @@ export function TeProviderFields({ value, onChange }: TeProviderFieldsProps) {
             <div className="space-y-2">
               <Label>
                 {t("openclaw.teProvider.inputModalities", {
-                  defaultValue: "输入模态",
+                  defaultValue: "Input modality",
                 })}
               </Label>
               <div className="flex flex-wrap gap-3">
@@ -496,7 +510,7 @@ export function TeProviderFields({ value, onChange }: TeProviderFieldsProps) {
             <div className="space-y-2">
               <Label>
                 {t("openclaw.teProvider.outputModalities", {
-                  defaultValue: "输出模态",
+                  defaultValue: "Output modality",
                 })}
               </Label>
               <div className="flex flex-wrap gap-3">
@@ -524,7 +538,7 @@ export function TeProviderFields({ value, onChange }: TeProviderFieldsProps) {
             <div className="space-y-2">
               <Label>
                 {t("openclaw.teProvider.reasoningEfforts", {
-                  defaultValue: "推理档位",
+                  defaultValue: "Reasoning effort",
                 })}
               </Label>
               <div className="flex flex-wrap gap-3">
@@ -559,7 +573,7 @@ export function TeProviderFields({ value, onChange }: TeProviderFieldsProps) {
                   }
                 />
                 {t("openclaw.teProvider.supportsTools", {
-                  defaultValue: "支持工具调用",
+                  defaultValue: "Supports tool calling",
                 })}
               </label>
               <label className="flex items-center gap-2 text-xs">
@@ -571,7 +585,7 @@ export function TeProviderFields({ value, onChange }: TeProviderFieldsProps) {
                   }
                 />
                 {t("openclaw.teProvider.supportsReasoning", {
-                  defaultValue: "支持推理",
+                  defaultValue: "Supports reasoning",
                 })}
               </label>
             </div>
@@ -587,7 +601,8 @@ export function TeProviderFields({ value, onChange }: TeProviderFieldsProps) {
         >
           <p className="text-xs font-medium">
             {t("openclaw.teProvider.invalid", {
-              defaultValue: "当前设置还不能写入 Agent 配置",
+              defaultValue:
+                "Current settings cannot yet be written to Agent configuration",
             })}
           </p>
           <ul className="mt-1 list-disc pl-4 text-xs">
@@ -601,7 +616,7 @@ export function TeProviderFields({ value, onChange }: TeProviderFieldsProps) {
       <div className="rounded-lg border bg-muted/30 p-4 space-y-2">
         <h3 className="text-sm font-medium">
           {t("openclaw.teProvider.runtimeFields", {
-            defaultValue: "由运行时注入、不落盘的字段",
+            defaultValue: "Runtime-injected fields (not persisted)",
           })}
         </h3>
         <ul className="space-y-1 text-xs text-muted-foreground">
@@ -611,7 +626,7 @@ export function TeProviderFields({ value, onChange }: TeProviderFieldsProps) {
               {" · "}
               {field.filledBy}
               {" · "}
-              {field.note}
+              {t(`openclaw.teProvider.bindingNotes.${field.field}`)}
             </li>
           ))}
         </ul>
@@ -625,13 +640,13 @@ export function TeProviderFields({ value, onChange }: TeProviderFieldsProps) {
           <div>
             <h3 className="text-sm font-medium">
               {t("openclaw.teProvider.runtimeStatus", {
-                defaultValue: "运行态（只读探针）",
+                defaultValue: "Runtime status (read-only probe)",
               })}
             </h3>
             <p className="text-xs text-muted-foreground">
               {t("openclaw.teProvider.runtimeStatusHint", {
                 defaultValue:
-                  "只查询注入器存活与上游在线状态；不会读取、显示或落盘 Task、lease、session 与 binding。",
+                  "Checks only injector liveness and upstream availability; Task, lease, session, and binding are never read, displayed, or persisted.",
               })}
             </p>
           </div>
@@ -644,10 +659,10 @@ export function TeProviderFields({ value, onChange }: TeProviderFieldsProps) {
           >
             {runtimeBusy
               ? t("openclaw.teProvider.runtimeChecking", {
-                  defaultValue: "检查中…",
+                  defaultValue: "Checking…",
                 })
               : t("openclaw.teProvider.runtimeRefresh", {
-                  defaultValue: "刷新运行态",
+                  defaultValue: "Refresh runtime status",
                 })}
           </button>
         </div>
@@ -664,23 +679,23 @@ export function TeProviderFields({ value, onChange }: TeProviderFieldsProps) {
         {runtimeStatus ? (
           <ul className="space-y-1 text-xs" data-testid="te-runtime-summary">
             <li>
-              注入器：
+              Injector:
               {runtimeStatus.sidecarReachable
-                ? `存活（${runtimeStatus.sidecarStatus ?? "ok"}，${runtimeStatus.latencyMs}ms）`
-                : `不可达（${runtimeStatus.sidecarError ?? "connect_failed"}）`}
+                ? `Alive (${runtimeStatus.sidecarStatus ?? "ok"}, ${runtimeStatus.latencyMs}ms)`
+                : `Unreachable (${runtimeStatus.sidecarError ?? "connect_failed"})`}
             </li>
             <li>{providerStatusText(runtimeStatus)}</li>
             <li>
-              检查时间：{runtimeStatus.checkedAt}
+              Checked at:{runtimeStatus.checkedAt}
               {runtimeStatus.provider?.checkedAt
-                ? ` · 探针时间 ${runtimeStatus.provider.checkedAt}`
+                ? ` · Probe time ${runtimeStatus.provider.checkedAt}`
                 : ""}
             </li>
             <li data-testid="te-runtime-binding-note">
-              运行时绑定：
+              Runtime binding:
               {runtimeStatus.runtimeBindingExposed
-                ? "可读"
-                : "不通过 HTTP 暴露（按设计）"}
+                ? "Readable"
+                : "Not exposed over HTTP (by design)"}
             </li>
           </ul>
         ) : null}

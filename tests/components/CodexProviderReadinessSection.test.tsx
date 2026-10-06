@@ -21,14 +21,14 @@ describe("CodexProviderReadinessSection", () => {
     );
 
     expect(
-      screen.getByRole("heading", { name: "模型与兼容性" }),
+      screen.getByRole("heading", { name: "Models and compatibility" }),
     ).toBeInTheDocument();
-    expect(screen.getByText("就绪状态")).toBeInTheDocument();
-    expect(screen.getByText("需要同步模型")).toBeInTheDocument();
+    expect(screen.getByText("Readiness")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Sync models" })).toBeInTheDocument();
 
-    fireEvent.click(screen.getByRole("button", { name: "同步模型" }));
-    expect(screen.getByText("兼容性深度探测")).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: "验证连接" }));
+    fireEvent.click(screen.getByRole("button", { name: "Sync models" }));
+    expect(screen.getByText("Deep compatibility probe")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Validate connection" }));
 
     expect(onSyncModels).toHaveBeenCalledTimes(1);
     expect(onValidateConnection).toHaveBeenCalledTimes(1);
@@ -88,7 +88,9 @@ describe("CodexProviderReadinessSection", () => {
       />,
     );
 
-    fireEvent.click(screen.getByRole("button", { name: "查看已保存探测详情" }));
+    fireEvent.click(
+      screen.getByRole("button", { name: "View saved probe details" }),
+    );
     expect(onViewCompatibilityDetails).toHaveBeenCalledOnce();
   });
 
@@ -106,9 +108,9 @@ describe("CodexProviderReadinessSection", () => {
       />,
     );
 
-    expect(screen.getByText("由 CCSwitchMulti 维护")).toBeInTheDocument();
-    expect(screen.getByText("建议先验证连接")).toBeInTheDocument();
-    expect(screen.queryByText("可加入 MultiRouter")).not.toBeInTheDocument();
+    expect(screen.getByText("Maintained by CCSwitchMulti")).toBeInTheDocument();
+    expect(screen.getByText("Validate the connection first")).toBeInTheDocument();
+    expect(screen.queryByText("Ready for MultiRouter")).not.toBeInTheDocument();
     expect(screen.getByText("deepseek-v4-flash")).toBeInTheDocument();
     expect(screen.queryByText("请选择上游协议")).not.toBeInTheDocument();
 
@@ -120,14 +122,14 @@ describe("CodexProviderReadinessSection", () => {
         isMaintainedPreset
         isSyncingModels={false}
         isValidatingConnection={false}
-        validationSummary="当前凭据和端点验证通过"
+        validationSummary="Current credentials and endpoint validated"
         validationTone="success"
         onSyncModels={vi.fn()}
         onValidateConnection={vi.fn()}
       />,
     );
 
-    expect(screen.getByText("可加入 MultiRouter")).toBeInTheDocument();
+    expect(screen.getByText("Ready for MultiRouter")).toBeInTheDocument();
   });
 
   it("explains automatic protocol detection for custom providers", () => {
@@ -144,9 +146,11 @@ describe("CodexProviderReadinessSection", () => {
     );
 
     expect(
-      screen.getByText(/兼容性深度探测会自动检测 Chat 与 Responses/),
+      screen.getByText(
+        /The deep compatibility probe checks Chat and Responses automatically/,
+      ),
     ).toBeInTheDocument();
-    expect(screen.getByText("建议先验证连接")).toBeInTheDocument();
+    expect(screen.getByText("Validate the connection first")).toBeInTheDocument();
   });
 
   it("restores ready state from persisted protocol adaptation evidence", () => {
@@ -171,8 +175,10 @@ describe("CodexProviderReadinessSection", () => {
       />,
     );
 
-    expect(screen.getByText("可加入 MultiRouter")).toBeInTheDocument();
-    expect(screen.queryByText("建议先验证连接")).not.toBeInTheDocument();
+    expect(screen.getByText("Ready for MultiRouter")).toBeInTheDocument();
+    expect(
+      screen.queryByText("Validate the connection first"),
+    ).not.toBeInTheDocument();
   });
 
   it("does not let stale evidence hide a current validation failure", () => {
@@ -197,8 +203,8 @@ describe("CodexProviderReadinessSection", () => {
       />,
     );
 
-    expect(screen.getByText("建议先验证连接")).toBeInTheDocument();
-    expect(screen.queryByText("可加入 MultiRouter")).not.toBeInTheDocument();
+    expect(screen.getByText("Validate the connection first")).toBeInTheDocument();
+    expect(screen.queryByText("Ready for MultiRouter")).not.toBeInTheDocument();
 
     rerender(
       <CodexProviderReadinessSection
@@ -208,15 +214,15 @@ describe("CodexProviderReadinessSection", () => {
         isMaintainedPreset={false}
         isSyncingModels={false}
         isValidatingConnection={false}
-        validationSummary="当前端点不可用"
+        validationSummary="Current endpoint unavailable"
         validationTone="error"
         onSyncModels={vi.fn()}
         onValidateConnection={vi.fn()}
       />,
     );
 
-    expect(screen.getByText("连接验证失败")).toBeInTheDocument();
-    expect(screen.queryByText("可加入 MultiRouter")).not.toBeInTheDocument();
+    expect(screen.getByText("Connection validation failed")).toBeInTheDocument();
+    expect(screen.queryByText("Ready for MultiRouter")).not.toBeInTheDocument();
   });
 
   it("distinguishes an all-disabled catalog from usable probe models", () => {
@@ -234,9 +240,9 @@ describe("CodexProviderReadinessSection", () => {
       />,
     );
 
-    expect(screen.getByText("0 个已启用，1 个已停用")).toBeInTheDocument();
-    expect(screen.getByText("需要启用模型")).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: "验证连接" }));
+    expect(screen.getByText("0 enabled, 1 disabled")).toBeInTheDocument();
+    expect(screen.getByText("Enable a model")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Validate connection" }));
     expect(onValidateConnection).toHaveBeenCalledOnce();
   });
 
@@ -248,7 +254,7 @@ describe("CodexProviderReadinessSection", () => {
         isMaintainedPreset={false}
         isSyncingModels={false}
         isValidatingConnection={false}
-        validationSummary="Responses 和 Chat 均不可用"
+        validationSummary="Responses and Chat are both unavailable"
         validationTone="error"
         onSyncModels={vi.fn()}
         onValidateConnection={vi.fn()}
@@ -256,7 +262,7 @@ describe("CodexProviderReadinessSection", () => {
     );
 
     expect(screen.getByRole("alert")).toHaveTextContent(
-      "Responses 和 Chat 均不可用",
+      "Responses and Chat are both unavailable",
     );
 
     rerender(
@@ -266,13 +272,13 @@ describe("CodexProviderReadinessSection", () => {
         isMaintainedPreset={false}
         isSyncingModels={false}
         isValidatingConnection={false}
-        validationSummary="Chat 验证通过"
+        validationSummary="Chat validation passed"
         validationTone="success"
         onSyncModels={vi.fn()}
         onValidateConnection={vi.fn()}
       />,
     );
 
-    expect(screen.getByRole("status")).toHaveTextContent("Chat 验证通过");
+    expect(screen.getByRole("status")).toHaveTextContent("Chat validation passed");
   });
 });

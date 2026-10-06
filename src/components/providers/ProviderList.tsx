@@ -311,10 +311,20 @@ export function ProviderList({
       const { migratedJsonlFiles, migratedStateRows, skippedReason } =
         outcome.history;
       if (skippedReason) {
-        toast.success("已切回 OpenAI 官方；历史修复暂未执行。");
+        toast.success(
+          t("codexProviderUi.restoredSkipped", {
+            defaultValue:
+              "Switched back to OpenAI official; history repair has not run yet.",
+          }),
+        );
       } else {
         toast.success(
-          `已切回 OpenAI 官方，修复 ${migratedJsonlFiles} 个会话文件、${migratedStateRows} 条历史记录`,
+          t("codexProviderUi.restored", {
+            defaultValue:
+              "Switched back to OpenAI official; repaired {{files}} session files and {{rows}} history records",
+            files: migratedJsonlFiles,
+            rows: migratedStateRows,
+          }),
         );
       }
       outcome.switchWarnings.forEach((warning) => toast.warning(warning));
@@ -459,7 +469,9 @@ export function ProviderList({
             onClick={onStartCodexMultiRouterWizard}
           >
             <Wand2 className="mr-2 h-4 w-4" />
-            配置多路模型
+            {t("codexProviderUi.configureRouting", {
+              defaultValue: "Configure multi-model routing",
+            })}
           </Button>
           <Button
             type="button"
@@ -474,12 +486,16 @@ export function ProviderList({
             ) : (
               <RotateCcw className="mr-2 h-4 w-4" />
             )}
-            切回 OpenAI 官方
+            {t("codexProviderUi.restoreOfficial", {
+              defaultValue: "Switch back to OpenAI official",
+            })}
           </Button>
         </div>
         <p className="text-center text-xs text-muted-foreground">
-          会先退出本地代理并切回官方；历史修复需要 Codex/ChatGPT App
-          已完全退出。
+          {t("codexProviderUi.restoreNotice", {
+            defaultValue:
+              "First exit the local proxy and switch to official. History repair requires the Codex/ChatGPT app to be fully closed.",
+          })}
         </p>
       </div>
     );

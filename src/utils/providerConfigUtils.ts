@@ -3,6 +3,7 @@
 import type { TemplateValueConfig } from "../config/claudeProviderPresets";
 import type { CodexApiFormat } from "@/types";
 import { deepClone } from "@/utils/deepClone";
+import i18n from "@/i18n";
 import { normalizeTomlText } from "@/utils/textNormalization";
 import { parse as parseToml } from "smol-toml";
 
@@ -125,7 +126,9 @@ export interface UpdateCommonConfigResult {
 // 验证JSON配置格式
 export const validateJsonConfig = (
   value: string,
-  fieldName: string = "配置",
+  fieldName: string = i18n.t("configValidation.config", {
+    defaultValue: "Configuration",
+  }),
 ): string => {
   if (!value.trim()) {
     return "";
@@ -133,11 +136,17 @@ export const validateJsonConfig = (
   try {
     const parsed = JSON.parse(value);
     if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
-      return `${fieldName}必须是 JSON 对象`;
+      return i18n.t("configValidation.mustBeObject", {
+        field: fieldName,
+        defaultValue: "{{field}} must be a JSON object",
+      });
     }
     return "";
   } catch {
-    return `${fieldName}JSON格式错误，请检查语法`;
+    return i18n.t("configValidation.invalidJson", {
+      field: fieldName,
+      defaultValue: "{{field}} has invalid JSON syntax",
+    });
   }
 };
 
@@ -153,7 +162,10 @@ export const updateCommonConfigSnippet = (
   } catch (err) {
     return {
       updatedConfig: jsonString,
-      error: "配置 JSON 解析失败，无法应用通用配置",
+      error: i18n.t("configValidation.applyFailed", {
+        defaultValue:
+          "Configuration JSON could not be parsed; common configuration was not applied",
+      }),
     };
   }
 
@@ -164,7 +176,12 @@ export const updateCommonConfigSnippet = (
   }
 
   // 使用统一的验证函数
-  const snippetError = validateJsonConfig(snippetString, "通用配置片段");
+  const snippetError = validateJsonConfig(
+    snippetString,
+    i18n.t("configValidation.commonSnippet", {
+      defaultValue: "Common configuration snippet",
+    }),
+  );
   if (snippetError) {
     return {
       updatedConfig: JSON.stringify(config, null, 2),
@@ -1684,10 +1701,31 @@ export const removeCodexTopLevelField = (
   const normalizedText = normalizeTomlText(configText);
   if (!normalizedText) return normalizedText;
   const lines = normalizedText.split("\n");
-  const topLevelEndIndex = getTopLevelEndIndex(lines);
-  const existing = findTopLevelIntMatch(lines, fieldName, topLevelEndIndex);
-  if (existing) {
-    lines.splice(existing.index, 1);
+  const escapedField = fieldName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const assignment = new RegExp(
+    `^\\s*(?:${escapedField}|"${escapedField}"|'${escapedField}')\\s*=`,
+  );
+  // Parse only to verify ownership; never stringify and lose comments/key order.
+  // A matching line can be nested or merely text inside a multiline string.
+  try {
+    const parsed = parseToml(normalizedText);
+    if (!Object.prototype.hasOwnProperty.call(parsed, fieldName)) {
+      return normalizedText;
+    }
+    for (let index = 0; index < lines.length; index += 1) {
+      if (!assignment.test(lines[index])) continue;
+      const candidate = lines.filter((_, lineIndex) => lineIndex !== index);
+      try {
+        const remaining = parseToml(candidate.join("\n"));
+        if (!Object.prototype.hasOwnProperty.call(remaining, fieldName)) {
+          return candidate.join("\n");
+        }
+      } catch {
+        // Removing only the opening line of a multiline value is not safe.
+      }
+    }
+  } catch {
+    // Preserve invalid drafts rather than guessing which text owns the field.
   }
-  return finalizeTomlText(lines);
+  return normalizedText;
 };

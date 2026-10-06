@@ -32,19 +32,19 @@ describe("CodexProviderSetPreviewDialog", () => {
       />,
     );
 
-    const dialog = screen.getByRole("dialog", { name: "按协议自动拆分" });
+    const dialog = screen.getByRole("dialog", { name: "Split by protocol" });
     expect(within(dialog).getByText("qwen3.8")).toBeInTheDocument();
     expect(within(dialog).getByText("glm-5")).toBeInTheDocument();
     expect(within(dialog).getByText("deepseek-v4")).toBeInTheDocument();
-    expect(within(dialog).getByText("Responses 模型")).toBeInTheDocument();
+    expect(within(dialog).getByText("Responses models")).toBeInTheDocument();
     expect(
-      within(dialog).getByText("Chat Completions 模型"),
+      within(dialog).getByText("Chat Completions models"),
     ).toBeInTheDocument();
     expect(within(dialog).queryByRole("radio")).toBeNull();
     expect(within(dialog).queryByRole("combobox")).toBeNull();
 
     fireEvent.click(
-      within(dialog).getByRole("button", { name: "确认按协议拆分" }),
+      within(dialog).getByRole("button", { name: "Confirm split" }),
     );
     expect(onConfirmSplit).toHaveBeenCalledOnce();
     expect(onBack).not.toHaveBeenCalled();
@@ -83,21 +83,27 @@ describe("CodexProviderSetPreviewDialog", () => {
       />,
     );
 
-    const dialog = screen.getByRole("dialog", { name: "暂时无法保存" });
+    const dialog = screen.getByRole("dialog", { name: "Cannot save yet" });
     expect(within(dialog).getByText("qwen3.8")).toBeInTheDocument();
     expect(within(dialog).getByText("Qwen/Qwen3.8")).toBeInTheDocument();
     expect(
-      within(dialog).getByText("探测结果尚未通过完整验证"),
-    ).toBeInTheDocument();
-    expect(within(dialog).getByText("失败阶段：工具续轮")).toBeInTheDocument();
-    expect(
-      within(dialog).getByText("失败类型：HTTP 状态（422）"),
+      within(dialog).getByText(
+        "Probe results have not passed full verification",
+      ),
     ).toBeInTheDocument();
     expect(
-      within(dialog).queryByRole("button", { name: "确认按协议拆分" }),
+      within(dialog).getByText("Failed stage: Tool continuation"),
+    ).toBeInTheDocument();
+    expect(
+      within(dialog).getByText("Failure type: HTTP status (422)"),
+    ).toBeInTheDocument();
+    expect(
+      within(dialog).queryByRole("button", { name: "Confirm split" }),
     ).toBeNull();
 
-    fireEvent.click(within(dialog).getByRole("button", { name: "重新探测" }));
+    fireEvent.click(
+      within(dialog).getByRole("button", { name: "Probe again" }),
+    );
     expect(onRetry).toHaveBeenCalledOnce();
   });
 });

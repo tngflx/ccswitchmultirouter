@@ -503,36 +503,35 @@ describe("App integration with MSW", () => {
     renderApp(App);
 
     await waitFor(() => expect(toastWarningMock).toHaveBeenCalledTimes(1));
-    expect(screen.queryByText("codexConfigConsistency.title")).toBeNull();
-    expect(screen.queryByText("firstRunNotice.title")).toBeNull();
-    expect(screen.queryByText("Codex 本地路由已开启")).toBeNull();
+    expect(
+      screen.queryByText("Codex configuration differs from CCSM"),
+    ).toBeNull();
+    expect(screen.queryByText("Welcome to CC Switch")).toBeNull();
+    expect(screen.queryByText("Codex local routing is enabled")).toBeNull();
     expect(document.body.style.pointerEvents).not.toBe("none");
 
     const recoveryOptions = toastWarningMock.mock.calls[0]?.[1] as
-      | { onDismiss?: () => void }
-      | undefined;
+      { onDismiss?: () => void } | undefined;
     expect(recoveryOptions?.onDismiss).toEqual(expect.any(Function));
     act(() => recoveryOptions?.onDismiss?.());
 
     expect(
-      await screen.findByText("codexConfigConsistency.title"),
+      await screen.findByText("Codex configuration differs from CCSM"),
     ).toBeInTheDocument();
-    expect(screen.queryByText("firstRunNotice.title")).toBeNull();
-    expect(screen.queryByText("Codex 本地路由已开启")).toBeNull();
-    fireEvent.click(
-      screen.getByRole("button", { name: "codexConfigConsistency.later" }),
-    );
+    expect(screen.queryByText("Welcome to CC Switch")).toBeNull();
+    expect(screen.queryByText("Codex local routing is enabled")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Handle later" }));
 
-    expect(await screen.findByText("firstRunNotice.title")).toBeInTheDocument();
-    expect(screen.queryByText("Codex 本地路由已开启")).toBeNull();
-    fireEvent.click(
-      screen.getByRole("button", { name: "firstRunNotice.confirm" }),
-    );
+    expect(await screen.findByText("Welcome to CC Switch")).toBeInTheDocument();
+    expect(screen.queryByText("Codex local routing is enabled")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Got it" }));
 
-    expect(await screen.findByText("Codex 本地路由已开启")).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: "我知道了" }));
+    expect(
+      await screen.findByText("Codex local routing is enabled"),
+    ).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Got it" }));
     await waitFor(() =>
-      expect(screen.queryByText("Codex 本地路由已开启")).toBeNull(),
+      expect(screen.queryByText("Codex local routing is enabled")).toBeNull(),
     );
   }, 30_000);
 
@@ -578,17 +577,16 @@ describe("App integration with MSW", () => {
 
     await waitFor(() => expect(toastErrorMock).toHaveBeenCalled());
     const recoveryOptions = toastErrorMock.mock.calls[0]?.[1] as
-      | { action?: { label?: string; onClick?: () => void } }
-      | undefined;
+      { action?: { label?: string; onClick?: () => void } } | undefined;
     expect(recoveryOptions?.action?.label).toBe(
-      "notifications.recovery.forceRestoreTakeover",
+      "Release port and restore takeover",
     );
     act(() => recoveryOptions?.action?.onClick?.());
 
     await waitFor(() => expect(forcedAppType).toBe("codex"));
     await waitFor(() =>
       expect(toastSuccessMock).toHaveBeenCalledWith(
-        "notifications.recovery.forceRestoreSucceeded",
+        "The old CCSM listener was released and takeover was restored",
       ),
     );
   }, 30_000);
@@ -819,15 +817,19 @@ describe("App integration with MSW", () => {
 
     fireEvent.click(screen.getByText("open-multirouter-entry"));
 
-    expect(await screen.findByText("配置多路模型")).toBeInTheDocument();
-    expect(screen.getByText("创建新配置")).toBeInTheDocument();
-    expect(screen.getByText("编辑旧配置")).toBeInTheDocument();
     expect(
-      screen.getByText("暂无已有 MultiRouter，请先创建新配置。"),
+      await screen.findByText("Configure multi-model routing"),
     ).toBeInTheDocument();
-    expect(screen.getByText("直接打开工作台")).toBeInTheDocument();
+    expect(screen.getByText("Create new configuration")).toBeInTheDocument();
+    expect(screen.getByText("Edit existing configuration")).toBeInTheDocument();
+    expect(
+      screen.getByText(
+        "No MultiRouter exists yet. Create a new configuration first.",
+      ),
+    ).toBeInTheDocument();
+    expect(screen.getByText("Open workspace directly")).toBeInTheDocument();
 
-    fireEvent.click(screen.getByText("创建新配置"));
+    fireEvent.click(screen.getByText("Create new configuration"));
 
     const wizard = await screen.findByTestId("codex-multirouter-wizard");
     expect(wizard).toHaveAttribute("data-mode", "create");
@@ -871,7 +873,7 @@ describe("App integration with MSW", () => {
       fireEvent.click(screen.getByText("open-multirouter-entry"));
       // Startup notices may still be open while the picker refreshes providers.
       const dialog = await screen.findByRole("dialog", {
-        name: "配置多路模型",
+        name: "Configure multi-model routing",
       });
       expect(
         await within(dialog).findByText("My real router"),
@@ -905,10 +907,12 @@ describe("App integration with MSW", () => {
         ),
       );
       fireEvent.click(screen.getByText("open-multirouter-entry"));
-      fireEvent.click(await screen.findByText("创建新配置"));
+      fireEvent.click(await screen.findByText("Create new configuration"));
       expect(screen.queryByTestId("codex-multirouter-wizard")).toBeNull();
       expect(toastErrorMock).toHaveBeenCalledWith(
-        expect.stringContaining("无法安全还原"),
+        expect.stringContaining(
+          "Protocol adaptation could not be safely restored",
+        ),
       );
     } finally {
       projection.mockRestore();
@@ -926,7 +930,7 @@ describe("App integration with MSW", () => {
       ),
     );
     fireEvent.click(screen.getByText("open-multirouter-entry"));
-    fireEvent.click(await screen.findByText("创建新配置"));
+    fireEvent.click(await screen.findByText("Create new configuration"));
     fireEvent.click(await screen.findByText("add-provider"));
     expect(screen.getByTestId("add-provider-dialog")).toBeInTheDocument();
 
@@ -964,7 +968,7 @@ describe("App integration with MSW", () => {
       ),
     );
     fireEvent.click(screen.getByText("open-multirouter-entry"));
-    fireEvent.click(await screen.findByText("创建新配置"));
+    fireEvent.click(await screen.findByText("Create new configuration"));
 
     fireEvent.click(screen.getByText("edit-wizard-provider"));
     expect(screen.getByTestId("edit-provider-dialog")).toBeInTheDocument();
@@ -993,7 +997,7 @@ describe("App integration with MSW", () => {
       ),
     );
     fireEvent.click(screen.getByText("open-multirouter-entry"));
-    fireEvent.click(await screen.findByText("创建新配置"));
+    fireEvent.click(await screen.findByText("Create new configuration"));
     fireEvent.click(await screen.findByText("open-history-repair"));
 
     const sessionManager = await screen.findByTestId("session-manager-page");
@@ -1082,7 +1086,7 @@ describe("App integration with MSW", () => {
     );
 
     fireEvent.click(screen.getByText("open-multirouter-entry"));
-    fireEvent.click(await screen.findByText("直接打开工作台"));
+    fireEvent.click(await screen.findByText("Open workspace directly"));
 
     await waitFor(() =>
       expect(screen.getByTestId("codex-router-workspace")).toBeInTheDocument(),
@@ -1153,7 +1157,7 @@ describe("App integration with MSW", () => {
       ),
     );
 
-    fireEvent.click(screen.getByTitle("Codex 用量与重置额度"));
+    fireEvent.click(screen.getByTitle("Codex usage and reset credits"));
 
     await waitFor(() =>
       expect(screen.getByTestId("codex-usage-page")).toBeInTheDocument(),
@@ -1207,22 +1211,16 @@ describe("App integration with MSW", () => {
         "codex-1",
       ),
     );
-    fireEvent.click(screen.getByTitle("codexConfigConsistency.statusTitle"));
+    fireEvent.click(screen.getByTitle("Codex status and repair"));
 
     expect(
       await screen.findByRole("dialog", {
-        name: "codexConfigConsistency.statusTitle",
+        name: "Codex status and repair",
       }),
     ).toBeInTheDocument();
-    expect(
-      screen.getByText("codexConfigConsistency.configStatus"),
-    ).toBeInTheDocument();
-    expect(
-      screen.getByText("codexConfigConsistency.paginatedHistoryStatus"),
-    ).toBeInTheDocument();
-    expect(
-      screen.getByText("codexConfigConsistency.rendererCompatibilityStatus"),
-    ).toBeInTheDocument();
+    expect(screen.getByText("Configuration and runtime")).toBeInTheDocument();
+    expect(screen.getByText("Paginated history")).toBeInTheDocument();
+    expect(screen.getByText("History-query compatibility")).toBeInTheDocument();
   });
 
   it("shows toast when duplicate cannot load live provider ids", async () => {
@@ -1262,7 +1260,9 @@ describe("App integration with MSW", () => {
 
     await waitFor(() => {
       expect(toastErrorMock).toHaveBeenCalledWith(
-        expect.stringContaining("读取配置中的供应商标识失败"),
+        expect.stringContaining(
+          "Failed to read provider identifiers from config",
+        ),
       );
     });
 
@@ -1282,7 +1282,7 @@ describe("App integration with MSW", () => {
       await screen.findByTestId("unified-skills-panel"),
     ).toBeInTheDocument();
     const checkUpdatesButton = await screen.findByRole("button", {
-      name: "skills.checkUpdates",
+      name: "Check Updates",
     });
     await waitFor(() => expect(checkUpdatesButton).toBeEnabled());
 
@@ -1300,7 +1300,7 @@ describe("App integration with MSW", () => {
     ).toBeInTheDocument();
     fireEvent.click(
       await screen.findByRole("button", {
-        name: "skills.discover",
+        name: "Discover Skills",
       }),
     );
 

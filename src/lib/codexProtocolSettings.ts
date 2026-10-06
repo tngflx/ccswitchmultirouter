@@ -1,3 +1,4 @@
+import i18n from "@/i18n";
 import { normalizeCodexChatReasoningForSave } from "@/lib/codexChatReasoning";
 import { buildLocalProxyRequestOverrides } from "@/lib/requestOverrides";
 import { normalizeCodexPublicModelKey } from "@/lib/protocol-lab/codex-overrides";
@@ -136,14 +137,24 @@ export function buildCodexProtocolProbeProviderDraft(
   input: CodexProtocolProbeProviderDraftInput,
 ): Provider {
   if (!matchesProbeTransport(input.apiFormat)) {
-    throw new Error("深度探测仅支持 Responses 与 Chat Completions 上游");
+    throw new Error(
+      i18n.t("codexProviderUi.probeUnsupported", {
+        defaultValue:
+          "Deep probing only supports Responses and Chat Completions upstreams",
+      }),
+    );
   }
   const overrides = buildLocalProxyRequestOverrides(
     input.localProxyHeadersOverride,
     input.localProxyBodyOverride,
   );
   if (overrides.error) {
-    throw new Error(`本地代理请求覆盖格式错误：${overrides.error}`);
+    throw new Error(
+      i18n.t("codexProviderUi.overridesInvalid", {
+        defaultValue: "Invalid local proxy request overrides: {{error}}",
+        error: overrides.error,
+      }),
+    );
   }
 
   const apiFormat = input.apiFormat;

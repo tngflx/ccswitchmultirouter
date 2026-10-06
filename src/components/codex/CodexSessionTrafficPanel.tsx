@@ -1,4 +1,6 @@
 import { useMemo, useState } from "react";
+import { Trans, useTranslation } from "react-i18next";
+import type { TFunction } from "i18next";
 import { ChevronDown, RefreshCw } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -57,13 +59,17 @@ const costValue = (value: string) => {
   const n = Number.parseFloat(value);
   return Number.isFinite(n) && n > 0 ? n : null;
 };
-const cost = (value: string) => {
+const cost = (t: TFunction, value: string) => {
   const n = costValue(value);
-  return n === null ? "未定价/待核验" : `约 $${n.toFixed(n < 0.01 ? 6 : 4)}`;
+  return n === null
+    ? t("codexSessionTraffic.unpriced", {
+        defaultValue: "Unpriced / needs verification",
+      })
+    : `~ $${n.toFixed(n < 0.01 ? 6 : 4)}`;
 };
 const observed = (row: CodexSubagentUsageStats["modelStats"][number]) =>
   row.observedUsageAgents ?? row.agentCount;
-const collectorTime = (value: number | null | undefined) =>
+const collectorTime = (t: TFunction, value: number | null | undefined) =>
   typeof value === "number" && Number.isFinite(value)
     ? new Date(value * 1000).toLocaleString(undefined, {
         month: "numeric",
@@ -71,13 +77,24 @@ const collectorTime = (value: number | null | undefined) =>
         hour: "2-digit",
         minute: "2-digit",
       })
-    : "未记录";
-const collectorLabel = (phase: SessionCollectionStatus["phase"]) =>
+    : t("codexSessionTraffic.notRecorded", { defaultValue: "Not recorded" });
+const collectorLabel = (
+  t: TFunction,
+  phase: SessionCollectionStatus["phase"],
+) =>
   ({
-    idle: "后台采集空闲",
-    running: "后台采集中",
-    degraded: "后台采集降级",
-    not_started: "后台采集尚未启动",
+    idle: t("codexSessionTraffic.collectorIdle", {
+      defaultValue: "Collector idle",
+    }),
+    running: t("codexSessionTraffic.collectorRunning", {
+      defaultValue: "Collector running",
+    }),
+    degraded: t("codexSessionTraffic.collectorDegraded", {
+      defaultValue: "Collector degraded",
+    }),
+    not_started: t("codexSessionTraffic.collectorNotStarted", {
+      defaultValue: "Collector not started",
+    }),
   })[phase];
 
 /** Local bounded session evidence; never add it to proxy request traffic. */
@@ -92,6 +109,7 @@ export function CodexSessionTrafficPanel({
   collectionStatus,
   collectionStatusError,
 }: Props) {
+  const { t } = useTranslation();
   const [sort, setSort] = useState<SortKey>("tokens");
   const [filter, setFilter] = useState<Filter>("all");
   const [modelQuery, setModelQuery] = useState("");
@@ -160,11 +178,18 @@ export function CodexSessionTrafficPanel({
       <div className="flex flex-wrap items-start justify-between gap-3">
         <div>
           <h3 className="text-base font-semibold">
-            {rangeLabel}子 Agent 会话流量
+            {t("codexSessionTraffic.title", {
+              defaultValue: "{{range}} sub-agent session traffic",
+              range: rangeLabel,
+            })}
           </h3>
           <p className="mt-1 text-sm leading-6 text-muted-foreground">
-            只基于本地 Codex 会话索引与已同步的 <code>codex_session</code>{" "}
-            用量；请求统计与会话统计独立，不能相加。
+            <Trans
+              t={t}
+              i18nKey="codexSessionTraffic.description"
+              defaults="Based only on the local Codex session index and synchronized <code>codex_session</code> usage; request and session totals are independent and must not be added together."
+              components={{ code: <code /> }}
+            />
           </p>
         </div>
         <Button
@@ -175,7 +200,9 @@ export function CodexSessionTrafficPanel({
           className="gap-2"
         >
           <RefreshCw className={`h-4 w-4 ${isSyncing ? "animate-spin" : ""}`} />
-          立即同步会话用量
+          {t("codexSessionTraffic.sync", {
+            defaultValue: "Sync session usage now",
+          })}
         </Button>
       </div>
       {syncMessage ? (
@@ -189,135 +216,209 @@ export function CodexSessionTrafficPanel({
       />
       {error ? (
         <div className="mt-3 rounded-md border border-rose-200 bg-rose-50 px-3 py-2 text-xs text-rose-700">
-          子 Agent 用量读取失败：
-          {error instanceof Error ? error.message : String(error)}
+          {t("codexSessionTraffic.readFailed", {
+            defaultValue: "Failed to read sub-agent usage: {{error}}",
+            error: error instanceof Error ? error.message : String(error),
+          })}
         </div>
       ) : null}
       {stats?.skippedReason ? (
         <div className="mt-3 rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800">
-          会话用量索引读取跳过：{stats.skippedReason}
+          {t("codexSessionTraffic.indexSkipped", {
+            defaultValue: "Session usage index skipped: {{reason}}",
+            reason: stats.skippedReason,
+          })}
         </div>
       ) : null}
       <div className="mt-3 grid gap-2 sm:grid-cols-3">
         <Summary
-          label="已观测子任务 Tokens"
+          label={t("codexSessionTraffic.observedTokens", {
+            defaultValue: "Observed subtask tokens",
+          })}
           value={
             summaryState === "ready"
               ? tokens(overview.tokenCount)
               : summaryState === "loading"
-                ? "加载中"
+                ? t("codexSessionTraffic.loading", { defaultValue: "Loading" })
                 : "—"
           }
           detail={
             summaryState === "missing"
-              ? "仅有未采集会话，不按 0 Token 计"
+              ? t("codexSessionTraffic.missingTokens", {
+                  defaultValue:
+                    "Only uncollected sessions; not counted as 0 tokens",
+                })
               : summaryState === "absent"
-                ? "暂无已采集快照"
-                : "仅已同步的子任务用量；不是主/子任务总数"
+                ? t("codexSessionTraffic.noSnapshot", {
+                    defaultValue: "No collected snapshot yet",
+                  })
+                : t("codexSessionTraffic.tokensScope", {
+                    defaultValue:
+                      "Only synchronized subtask usage; not the parent/subtask count",
+                  })
           }
         />
         <Summary
-          label="已观测请求"
+          label={t("codexSessionTraffic.observedRequests", {
+            defaultValue: "Observed requests",
+          })}
           value={
             summaryState === "ready"
               ? tokens(overview.requestCount)
               : summaryState === "loading"
-                ? "加载中"
+                ? t("codexSessionTraffic.loading", { defaultValue: "Loading" })
                 : "—"
           }
-          detail={`${observedCount} 个有用量证据；${missingCount} 个未采集不按 0 计`}
+          detail={t("codexSessionTraffic.recordCounts", {
+            defaultValue:
+              "{{observed}} usage records; {{missing}} uncollected (not counted as 0)",
+            observed: observedCount,
+            missing: missingCount,
+          })}
         />
         <Summary
-          label="已知价表估算"
+          label={t("codexSessionTraffic.knownEstimate", {
+            defaultValue: "Known price-table estimate",
+          })}
           value={
             summaryState === "ready"
               ? overview.priced
-                ? cost(String(overview.priced))
-                : "未定价/待核验"
+                ? cost(t, String(overview.priced))
+                : t("codexSessionTraffic.unpriced", {
+                    defaultValue: "Unpriced / needs verification",
+                  })
               : summaryState === "loading"
-                ? "加载中"
+                ? t("codexSessionTraffic.loading", { defaultValue: "Loading" })
                 : "—"
           }
           detail={
             summaryState === "missing"
-              ? "仅有未采集会话，不构成 $0"
+              ? t("codexSessionTraffic.missingCost", {
+                  defaultValue:
+                    "Only uncollected sessions; this does not imply $0",
+                })
               : summaryState === "absent"
-                ? "暂无已采集快照"
+                ? t("codexSessionTraffic.noSnapshot", {
+                    defaultValue: "No collected snapshot yet",
+                  })
                 : overview.incompletePrice
-                  ? "部分可计价；仍有已观测用量未定价"
-                  : "本地价表估算，不等同上游账单"
+                  ? t("codexSessionTraffic.partialPrice", {
+                      defaultValue:
+                        "Partially priced; some observed usage is still unpriced",
+                    })
+                  : t("codexSessionTraffic.estimateScope", {
+                      defaultValue:
+                        "Local price-table estimate; not an upstream bill",
+                    })
           }
         />
       </div>
       {stats?.unknownRangeAgents ? (
         <p className="mt-2 text-xs text-amber-800 dark:text-amber-200">
-          有 {stats.unknownRangeAgents}{" "}
-          个会话范围无法确认，未计入所选范围；它们不属于未采集用量。
+          {t("codexSessionTraffic.unknownRange", {
+            defaultValue:
+              "{{total}} sessions have an unknown range and are excluded; they are not uncollected usage.",
+            total: stats.unknownRangeAgents,
+          })}
         </p>
       ) : null}
       {stats?.historyTruncated ? (
         <p className="mt-2 text-xs text-amber-800 dark:text-amber-200">
-          本地会话索引已截断；统计仅覆盖当前数据库快照中的会话。
+          {t("codexSessionTraffic.truncated", {
+            defaultValue:
+              "The local session index is truncated; statistics cover only the current database snapshot.",
+          })}
         </p>
       ) : null}
       <Tabs value={view} onValueChange={setView} className="mt-4">
         <TabsList className="w-full justify-start sm:w-auto">
           <TabsTrigger value="models" className="min-w-0">
-            按模型
+            {t("codexSessionTraffic.byModel", { defaultValue: "By model" })}
           </TabsTrigger>
           <TabsTrigger value="tasks" className="min-w-0">
-            按任务
+            {t("codexSessionTraffic.byTask", { defaultValue: "By task" })}
           </TabsTrigger>
         </TabsList>
         <TabsContent value="models" className="mt-3">
           <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
             <p className="text-xs text-muted-foreground">
-              模型统计仅汇总已观测子任务；概览不随此处筛选变化。
+              {t("codexSessionTraffic.filterScope", {
+                defaultValue:
+                  "Model statistics include only observed subtasks; the overview is not affected by these filters.",
+              })}
             </p>
             <div className="flex flex-wrap gap-2">
               <Input
-                aria-label="搜索模型"
+                aria-label={t("codexSessionTraffic.search", {
+                  defaultValue: "Search models",
+                })}
                 value={modelQuery}
                 onChange={(event) => setModelQuery(event.target.value)}
                 className="h-8 w-[132px] text-xs"
-                placeholder="搜索模型"
+                placeholder={t("codexSessionTraffic.search", {
+                  defaultValue: "Search models",
+                })}
               />
               <Select
                 value={filter}
                 onValueChange={(value) => setFilter(value as Filter)}
               >
                 <SelectTrigger
-                  aria-label="筛选模型"
+                  aria-label={t("codexSessionTraffic.filter", {
+                    defaultValue: "Filter models",
+                  })}
                   className="h-8 w-[132px] text-xs"
                 >
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent>
-                  <SelectItem value="all">全部模型</SelectItem>
-                  <SelectItem value="priced">有估算价格</SelectItem>
-                  <SelectItem value="unpriced">仅未定价</SelectItem>
-                  <SelectItem value="missing">含未采集会话</SelectItem>
+                  <SelectItem value="all">
+                    {t("codexSessionTraffic.allModels", {
+                      defaultValue: "All models",
+                    })}
+                  </SelectItem>
+                  <SelectItem value="priced">
+                    {t("codexSessionTraffic.pricedModels", {
+                      defaultValue: "Has an estimated price",
+                    })}
+                  </SelectItem>
+                  <SelectItem value="unpriced">
+                    {t("codexSessionTraffic.unpricedModels", {
+                      defaultValue: "Unpriced only",
+                    })}
+                  </SelectItem>
+                  <SelectItem value="missing">
+                    {t("codexSessionTraffic.missingModels", {
+                      defaultValue: "Includes uncollected sessions",
+                    })}
+                  </SelectItem>
                 </SelectContent>
               </Select>
               <Button
                 size="sm"
                 className="h-8 text-xs"
-                aria-label="按模型名排序"
+                aria-label={t("codexSessionTraffic.sortModel", {
+                  defaultValue: "Sort by model name",
+                })}
                 aria-pressed={sort === "model"}
                 variant={sort === "model" ? "secondary" : "outline"}
                 onClick={() => setSort("model")}
               >
-                模型名
+                {t("codexSessionTraffic.modelName", {
+                  defaultValue: "Model name",
+                })}
               </Button>
               <Button
                 size="sm"
                 className="h-8 text-xs"
-                aria-label="按 Tokens 排序"
+                aria-label={t("codexSessionTraffic.sortTokens", {
+                  defaultValue: "Sort by tokens",
+                })}
                 aria-pressed={sort === "tokens"}
                 variant={sort === "tokens" ? "secondary" : "outline"}
                 onClick={() => setSort("tokens")}
               >
-                Tokens
+                {t("codexSessionTraffic.tokens", { defaultValue: "Tokens" })}
               </Button>
             </div>
           </div>
@@ -342,9 +443,10 @@ export function CodexSessionTrafficPanel({
         </TabsContent>
       </Tabs>
       <div className="mt-3 rounded-lg border border-border bg-muted/20 px-3 py-2 text-xs leading-6 text-muted-foreground">
-        请求耗时：会话记录未采集可信耗时，不显示为
-        0ms。费用为本地价表估算，零值显示为待核验，不等同上游账单。数据来源：CCSM
-        本地会话用量账。
+        {t("codexSessionTraffic.accountingCaveat", {
+          defaultValue:
+            "Request latency is not collected reliably for sessions, so it is not shown as 0 ms. Costs use the local price table; zero values are marked for verification and are not upstream billing. Source: CCSM local session usage ledger.",
+        })}
       </div>
       <DetailSheet
         detail={detail}
@@ -361,11 +463,14 @@ function CollectorStatus({
   status?: SessionCollectionStatus;
   error: unknown;
 }) {
+  const { t } = useTranslation();
   if (error)
     return (
       <div className="mt-3 rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800">
-        后台采集状态暂不可用：
-        {error instanceof Error ? error.message : String(error)}
+        {t("codexSessionTraffic.collectorUnavailable", {
+          defaultValue: "Collector status unavailable: {{error}}",
+          error: error instanceof Error ? error.message : String(error),
+        })}
       </div>
     );
   if (!status) return null;
@@ -378,28 +483,63 @@ function CollectorStatus({
     >
       <div className="flex flex-wrap items-center justify-between gap-2">
         <span>
-          <strong>{collectorLabel(status.phase)}</strong>
+          <strong>{collectorLabel(t, status.phase)}</strong>
           {notStarted
-            ? " · 尚无成功采集；可点击立即同步或等待后台启动。"
-            : ` · 最近成功 ${collectorTime(status.lastSuccessAt)} · ${status.imported ? `本轮新增 ${status.imported}` : "本轮暂无新增"} · 待处理 ${status.deferred} · 错误 ${status.errorsCount}`}
+            ? t("codexSessionTraffic.collectorWaiting", {
+                defaultValue:
+                  " · No successful collection yet; sync now or wait for the background collector to start.",
+              })
+            : t("codexSessionTraffic.collectorSummary", {
+                defaultValue:
+                  " · Last success {{last}} · {{imported}} · deferred {{deferred}} · errors {{errors}}",
+                last: collectorTime(t, status.lastSuccessAt),
+                imported: status.imported
+                  ? t("codexSessionTraffic.collectorAdded", {
+                      defaultValue: "added this run {{total}}",
+                      total: status.imported,
+                    })
+                  : t("codexSessionTraffic.collectorNone", {
+                      defaultValue: "none added this run",
+                    }),
+                deferred: status.deferred,
+                errors: status.errorsCount,
+              })}
         </span>
         <CollapsibleTrigger asChild>
           <Button variant="ghost" size="sm" className="h-6 gap-1 px-1 text-xs">
-            采集诊断
+            {t("codexSessionTraffic.collectorDiagnostics", {
+              defaultValue: "Collection diagnostics",
+            })}
             <ChevronDown className="h-3 w-3" />
           </Button>
         </CollapsibleTrigger>
       </div>
       {status.lastErrorSummary ? (
-        <div className="mt-1">错误摘要：{status.lastErrorSummary}</div>
+        <div className="mt-1">
+          {t("codexSessionTraffic.errorSummary", {
+            defaultValue: "Error summary: {{error}}",
+            error: status.lastErrorSummary,
+          })}
+        </div>
       ) : null}
       <CollapsibleContent className="mt-2 border-t border-current/15 pt-2 leading-5">
-        最近开始 {collectorTime(status.lastStartedAt)}；最近完成{" "}
-        {collectorTime(status.lastCompletedAt)}。
+        {t("codexSessionTraffic.collectorTimes", {
+          defaultValue: "Started {{started}}; completed {{completed}}.",
+          started: collectorTime(t, status.lastStartedAt),
+          completed: collectorTime(t, status.lastCompletedAt),
+        })}
         {status.nextRunAt
-          ? `下次约 ${collectorTime(status.nextRunAt)}`
-          : "下次运行时间未记录"}
-        ；周期 {status.intervalSecs} 秒。
+          ? t("codexSessionTraffic.collectorNext", {
+              defaultValue: "Next around {{time}}",
+              time: collectorTime(t, status.nextRunAt),
+            })
+          : t("codexSessionTraffic.collectorNextUnknown", {
+              defaultValue: "Next run time not recorded",
+            })}
+        {t("codexSessionTraffic.collectorInterval", {
+          defaultValue: "; interval {{seconds}} seconds.",
+          seconds: status.intervalSecs,
+        })}
       </CollapsibleContent>
     </Collapsible>
   );
@@ -414,29 +554,47 @@ function ModelRows({
   isLoading: boolean;
   onDetail: (row: CodexSubagentUsageStats["modelStats"][number]) => void;
 }) {
+  const { t } = useTranslation();
   if (isLoading)
     return (
       <div className="rounded-lg border border-border p-4 text-sm text-muted-foreground">
-        正在读取本期会话统计...
+        {t("codexSessionTraffic.readingModels", {
+          defaultValue: "Reading session statistics for this period…",
+        })}
       </div>
     );
   if (!rows.length)
     return (
       <div className="rounded-lg border border-border p-4 text-sm text-muted-foreground">
-        本期暂无已采集的子 Agent 用量；未采集的会话不会显示为 $0。
+        {t("codexSessionTraffic.noModelUsage", {
+          defaultValue:
+            "No collected sub-agent usage for this period; uncollected sessions are not shown as $0.",
+        })}
       </div>
     );
   const max = Math.max(...rows.map((row) => row.totalTokens), 1);
   return (
     <div className="overflow-x-auto rounded-lg border border-border">
       <div className="min-w-[720px] grid grid-cols-[1.35fr_.55fr_.65fr_.8fr_.8fr_.8fr_.8fr] gap-2 bg-muted px-3 py-2 text-xs font-semibold text-muted-foreground">
-        <span>模型</span>
-        <span className="text-right">会话</span>
-        <span className="text-right">请求</span>
-        <span className="text-right">非缓存输入</span>
-        <span className="text-right">缓存读取</span>
-        <span className="text-right">输出 Tokens</span>
-        <span className="text-right">估算</span>
+        <span>{t("codexSessionTraffic.model", { defaultValue: "Model" })}</span>
+        <span className="text-right">
+          {t("codexSessionTraffic.sessions", { defaultValue: "Sessions" })}
+        </span>
+        <span className="text-right">
+          {t("codexSessionTraffic.requests", { defaultValue: "Requests" })}
+        </span>
+        <span className="text-right">
+          {t("codexSessionTraffic.input", { defaultValue: "Uncached input" })}
+        </span>
+        <span className="text-right">
+          {t("codexSessionTraffic.cache", { defaultValue: "Cache reads" })}
+        </span>
+        <span className="text-right">
+          {t("codexSessionTraffic.output", { defaultValue: "Output tokens" })}
+        </span>
+        <span className="text-right">
+          {t("codexSessionTraffic.estimate", { defaultValue: "Estimate" })}
+        </span>
       </div>
       <div data-testid="model-rows">
         {rows.map((row) => {
@@ -462,24 +620,47 @@ function ModelRows({
                 {seen + missing}
                 {missing ? (
                   <em className="ml-1 not-italic text-amber-700">
-                    ({missing} 未采集)
+                    {t("codexSessionTraffic.missingCount", {
+                      defaultValue: "({{total}} uncollected)",
+                      total: missing,
+                    })}
                   </em>
                 ) : null}
               </span>
               <span className="text-right tabular-nums">
-                {seen ? row.requestCount : "未采集"}
+                {seen
+                  ? row.requestCount
+                  : t("codexSessionTraffic.uncollected", {
+                      defaultValue: "Uncollected",
+                    })}
               </span>
               <span className="text-right tabular-nums">
-                {seen ? tokens(row.inputTokens) : "未采集"}
+                {seen
+                  ? tokens(row.inputTokens)
+                  : t("codexSessionTraffic.uncollected", {
+                      defaultValue: "Uncollected",
+                    })}
               </span>
               <span className="text-right tabular-nums">
-                {seen ? tokens(row.cacheReadTokens) : "未采集"}
+                {seen
+                  ? tokens(row.cacheReadTokens)
+                  : t("codexSessionTraffic.uncollected", {
+                      defaultValue: "Uncollected",
+                    })}
               </span>
               <span className="text-right tabular-nums">
-                {seen ? tokens(row.outputTokens) : "未采集"}
+                {seen
+                  ? tokens(row.outputTokens)
+                  : t("codexSessionTraffic.uncollected", {
+                      defaultValue: "Uncollected",
+                    })}
               </span>
               <span className="text-right tabular-nums">
-                {seen ? cost(row.totalCost) : "未采集"}
+                {seen
+                  ? cost(t, row.totalCost)
+                  : t("codexSessionTraffic.uncollected", {
+                      defaultValue: "Uncollected",
+                    })}
               </span>
             </button>
           );
@@ -509,23 +690,33 @@ function TaskRows({
   ) => void;
   onAgentDetail: (agent: CodexSubagentUsageAgent) => void;
 }) {
+  const { t } = useTranslation();
   if (isLoading)
     return (
       <div className="rounded-lg border border-border p-4 text-sm text-muted-foreground">
-        正在读取本期任务关系...
+        {t("codexSessionTraffic.readingTasks", {
+          defaultValue: "Reading task relationships for this period…",
+        })}
       </div>
     );
   if (!hasSnapshot)
     return (
       <div className="rounded-lg border border-border p-4 text-sm text-muted-foreground">
-        暂无已采集快照，无法判断任务关系。
+        {t("codexSessionTraffic.noTaskSnapshot", {
+          defaultValue:
+            "No collected snapshot yet; task relationships cannot be determined.",
+        })}
       </div>
     );
   return (
     <div className="space-y-2">
       <p className="text-xs leading-5 text-muted-foreground">
-        只按 <code>session_meta.parent_thread_id</code>{" "}
-        的显式关系分组；不推测父模型，也不把普通 fork 或嵌套关系拼成树。
+        <Trans
+          t={t}
+          i18nKey="codexSessionTraffic.taskScope"
+          defaults="Grouped only by the explicit <code>session_meta.parent_thread_id</code> relationship; parent models are not inferred, and ordinary forks or nested relationships are not merged into a tree."
+          components={{ code: <code /> }}
+        />
       </p>
       {groups.map((group) => {
         const children = agents.filter(
@@ -538,34 +729,62 @@ function TaskRows({
             open
           >
             <summary className="flex cursor-pointer list-none flex-wrap items-center justify-between gap-2 px-3 py-2 text-xs">
-              <span className="font-mono">父 {group.parentSessionId}</span>
+              <span className="font-mono">
+                {t("codexSessionTraffic.parent", {
+                  defaultValue: "Parent {{id}}",
+                  id: group.parentSessionId,
+                })}
+              </span>
               <span>
-                子会话 {group.childSessionCount}（已采集{" "}
-                {group.observedUsageChildren}，未采集{" "}
-                {group.missingUsageChildren}）
+                {t("codexSessionTraffic.childCounts", {
+                  defaultValue:
+                    "Child sessions {{total}} (collected {{observed}}; uncollected {{missing}})",
+                  total: group.childSessionCount,
+                  observed: group.observedUsageChildren,
+                  missing: group.missingUsageChildren,
+                })}
               </span>
               <Button
                 size="sm"
                 variant="ghost"
                 className="h-7 text-xs"
-                aria-label={`查看 ${group.parentSessionId} 详情`}
+                aria-label={t("codexSessionTraffic.viewDetails", {
+                  defaultValue: "View {{id}} Details",
+                  id: group.parentSessionId,
+                })}
                 onClick={(event) => {
                   event.preventDefault();
                   onDetail(group, children);
                 }}
               >
-                详情
+                {t("codexSessionTraffic.details", { defaultValue: "Details" })}
               </Button>
             </summary>
             <div className="border-t border-border px-3 py-2 text-xs text-muted-foreground">
               {group.observedUsageChildren > 0
-                ? `子任务仅计入子会话：请求 ${group.childRequestCount}；Tokens ${tokens(group.childTotalTokens)}。`
-                : "子任务用量未采集，不以 0 请求或 0 Tokens 表示。"}
+                ? t("codexSessionTraffic.childUsage", {
+                    defaultValue:
+                      "Subtask usage is counted only in child sessions: requests {{requests}}; tokens {{tokens}}.",
+                    requests: group.childRequestCount,
+                    tokens: tokens(group.childTotalTokens),
+                  })
+                : t("codexSessionTraffic.missingChildUsage", {
+                    defaultValue:
+                      "Subtask usage is uncollected; it is not represented as 0 requests or 0 tokens.",
+                  })}{" "}
               {group.parentUsageStatus === "unknown_may_overlap"
-                ? " 父同步记录可能包含子用量，暂不计入。"
+                ? t("codexSessionTraffic.parentOverlap", {
+                    defaultValue:
+                      "Parent sync records may include child usage; it is not counted for now.",
+                  })
                 : group.parentDirectUsage
-                  ? " 已记录父直接用量，但不与子用量相加。"
-                  : " 父直接用量未采集。"}
+                  ? t("codexSessionTraffic.parentDirect", {
+                      defaultValue:
+                        "Parent direct usage is recorded but is not added to child usage.",
+                    })
+                  : t("codexSessionTraffic.parentMissing", {
+                      defaultValue: "Parent direct usage is uncollected.",
+                    })}
             </div>
             {children.length ? (
               <div className="space-y-1 border-t border-border px-3 py-2">
@@ -575,29 +794,54 @@ function TaskRows({
                     className="flex flex-wrap items-center justify-between gap-2 rounded bg-background/60 px-2 py-1.5 text-xs"
                   >
                     <span className="min-w-0 break-all">
-                      <strong>{child.title || "未命名子任务"}</strong> ·{" "}
-                      {child.primaryModel || child.models[0] || "模型未知"} ·{" "}
+                      <strong>
+                        {child.title ||
+                          t("codexSessionTraffic.unnamedSubtask", {
+                            defaultValue: "Unnamed subtask",
+                          })}
+                      </strong>{" "}
+                      ·{" "}
+                      {child.primaryModel ||
+                        child.models[0] ||
+                        t("codexSessionTraffic.unknownModel", {
+                          defaultValue: "Unknown model",
+                        })}{" "}
+                      ·{" "}
                       <span className="tabular-nums">
                         {child.usageStatus === "observed"
-                          ? `${tokens(child.totalTokens)} Tokens · ${cost(child.totalCost)}`
-                          : "未采集"}
+                          ? t("codexSessionTraffic.agentUsage", {
+                              defaultValue: "{{tokens}} Tokens · {{cost}}",
+                              tokens: tokens(child.totalTokens),
+                              cost: cost(t, child.totalCost),
+                            })
+                          : t("codexSessionTraffic.uncollected", {
+                              defaultValue: "Uncollected",
+                            })}
                       </span>
                     </span>
                     <Button
                       size="sm"
                       variant="ghost"
                       className="h-6 text-xs"
-                      aria-label={`查看 ${child.sessionId} 详情`}
+                      aria-label={t("codexSessionTraffic.viewDetails", {
+                        defaultValue: "View {{id}} Details",
+                        id: child.sessionId,
+                      })}
                       onClick={() => onAgentDetail(child)}
                     >
-                      详情
+                      {t("codexSessionTraffic.details", {
+                        defaultValue: "Details",
+                      })}
                     </Button>
                   </div>
                 ))}
               </div>
             ) : (
               <div className="border-t border-border px-3 py-2 text-xs text-muted-foreground">
-                当前快照只保留该父组汇总，未提供子会话条目。
+                {t("codexSessionTraffic.summaryOnly", {
+                  defaultValue:
+                    "The current snapshot contains only the parent-group summary and no child-session entries.",
+                })}
               </div>
             )}
           </details>
@@ -606,7 +850,10 @@ function TaskRows({
       {ungrouped.length ? (
         <details className="rounded-lg border border-border bg-muted/10" open>
           <summary className="cursor-pointer px-3 py-2 text-xs font-medium">
-            未关联会话（{ungrouped.length}）
+            {t("codexSessionTraffic.unlinked", {
+              defaultValue: "Unlinked sessions ({{total}})",
+              total: ungrouped.length,
+            })}
           </summary>
           <div className="border-t border-border px-3 py-2 text-xs text-muted-foreground">
             {ungrouped.map((agent) => (
@@ -616,19 +863,34 @@ function TaskRows({
               >
                 <span>
                   <span className="font-mono">{agent.sessionId}</span> ·{" "}
-                  {agent.title || "未命名会话"} ·{" "}
+                  {agent.title ||
+                    t("codexSessionTraffic.unnamedSession", {
+                      defaultValue: "Unnamed session",
+                    })}{" "}
+                  ·{" "}
                   {agent.usageStatus === "observed"
-                    ? `${tokens(agent.totalTokens)} Tokens · ${cost(agent.totalCost)}`
-                    : "未采集"}
+                    ? t("codexSessionTraffic.agentUsage", {
+                        defaultValue: "{{tokens}} Tokens · {{cost}}",
+                        tokens: tokens(agent.totalTokens),
+                        cost: cost(t, agent.totalCost),
+                      })
+                    : t("codexSessionTraffic.uncollected", {
+                        defaultValue: "Uncollected",
+                      })}
                 </span>
                 <Button
                   size="sm"
                   variant="ghost"
                   className="h-6 text-xs"
-                  aria-label={`查看 ${agent.sessionId} 详情`}
+                  aria-label={t("codexSessionTraffic.viewDetails", {
+                    defaultValue: "View {{id}} Details",
+                    id: agent.sessionId,
+                  })}
                   onClick={() => onAgentDetail(agent)}
                 >
-                  详情
+                  {t("codexSessionTraffic.details", {
+                    defaultValue: "Details",
+                  })}
                 </Button>
               </div>
             ))}
@@ -637,7 +899,9 @@ function TaskRows({
       ) : null}
       {!groups.length && !ungrouped.length ? (
         <div className="rounded-lg border border-border p-4 text-sm text-muted-foreground">
-          暂无可展示的显式任务关系。
+          {t("codexSessionTraffic.noTasks", {
+            defaultValue: "No explicit task relationships to display.",
+          })}
         </div>
       ) : null}
     </div>
@@ -651,21 +915,40 @@ function DetailSheet({
   detail: Detail | null;
   onOpenChange: (open: boolean) => void;
 }) {
+  const { t } = useTranslation();
   return (
     <Dialog open={detail !== null} onOpenChange={onOpenChange}>
       <DialogContent className="fixed left-auto right-0 top-0 h-dvh max-h-none w-full max-w-xl translate-x-0 translate-y-0 rounded-none border-l p-0 sm:w-[36rem]">
         <DialogHeader>
           <DialogTitle>
             {detail?.kind === "model"
-              ? `${detail.row.model} 用量详情`
+              ? t("codexSessionTraffic.modelDetails", {
+                  defaultValue: "{{model}} usage details",
+                  model: detail.row.model,
+                })
               : detail?.kind === "agent"
-                ? `${detail.agent.title || "子任务"} 详情`
+                ? t("codexSessionTraffic.agentDetails", {
+                    defaultValue: "{{title}} details",
+                    title:
+                      detail.agent.title ||
+                      t("codexSessionTraffic.subtask", {
+                        defaultValue: "Subtask",
+                      }),
+                  })
                 : detail
-                  ? `父 ${detail.group.parentSessionId} 任务详情`
-                  : "用量详情"}
+                  ? t("codexSessionTraffic.taskDetails", {
+                      defaultValue: "Parent {{id}} task details",
+                      id: detail.group.parentSessionId,
+                    })
+                  : t("codexSessionTraffic.usageDetails", {
+                      defaultValue: "Usage details",
+                    })}
           </DialogTitle>
           <DialogDescription>
-            本页只展示当前本地会话证据；未知值不会转换为零值。
+            {t("codexSessionTraffic.detailScope", {
+              defaultValue:
+                "This page shows only current local session evidence; unknown values are never converted to zero.",
+            })}
           </DialogDescription>
         </DialogHeader>
         {detail?.kind === "model" ? (
@@ -679,18 +962,32 @@ function DetailSheet({
               />
             ) : (
               <p className="text-muted-foreground">
-                尚无用量证据；未采集不以 0 Tokens 或 $0 表示。
+                {t("codexSessionTraffic.noEvidence", {
+                  defaultValue:
+                    "No usage evidence yet; uncollected data is not shown as 0 tokens or $0.",
+                })}
               </p>
             )}
             <p>
-              来源：{observed(detail.row) ? "已观测本地会话证据" : "未采集"}
-              。费用：
-              {cost(detail.row.totalCost)}。
+              {t("codexSessionTraffic.sourceCost", {
+                defaultValue: "Source: {{source}}. Cost: {{cost}}.",
+                source: observed(detail.row)
+                  ? t("codexSessionTraffic.observedSource", {
+                      defaultValue: "Observed local session evidence",
+                    })
+                  : t("codexSessionTraffic.uncollected", {
+                      defaultValue: "Uncollected",
+                    }),
+                cost: cost(t, detail.row.totalCost),
+              })}
             </p>
             {(detail.row.missingUsageAgents ?? 0) > 0 ? (
               <p className="text-amber-700">
-                有 {detail.row.missingUsageAgents} 个会话未采集，不计入
-                Tokens、请求或费用。
+                {t("codexSessionTraffic.missingExcluded", {
+                  defaultValue:
+                    "{{total}} sessions are uncollected and excluded from tokens, requests, and cost.",
+                  total: detail.row.missingUsageAgents,
+                })}
               </p>
             ) : null}
           </div>
@@ -705,24 +1002,40 @@ function DetailSheet({
               />
             ) : (
               <p className="text-muted-foreground">
-                尚无用量证据；未采集不以 0 Tokens 或 $0 表示。
+                {t("codexSessionTraffic.noEvidence", {
+                  defaultValue:
+                    "No usage evidence yet; uncollected data is not shown as 0 tokens or $0.",
+                })}
               </p>
             )}
             <p>
-              来源：
-              {detail.agent.usageSource === "session_sync"
-                ? "本地会话同步账"
-                : detail.agent.usageSource === "rollout"
-                  ? "本地 rollout 用量证据"
-                  : "未采集"}
-              。费用：
-              {detail.agent.usageStatus === "observed"
-                ? cost(detail.agent.totalCost)
-                : "未定价/待核验"}
-              。
+              {t("codexSessionTraffic.sourceCost", {
+                defaultValue: "Source: {{source}}. Cost: {{cost}}.",
+                source:
+                  detail.agent.usageSource === "session_sync"
+                    ? t("codexSessionTraffic.syncSource", {
+                        defaultValue: "Local session sync ledger",
+                      })
+                    : detail.agent.usageSource === "rollout"
+                      ? t("codexSessionTraffic.rolloutSource", {
+                          defaultValue: "Local rollout usage evidence",
+                        })
+                      : t("codexSessionTraffic.uncollected", {
+                          defaultValue: "Uncollected",
+                        }),
+                cost:
+                  detail.agent.usageStatus === "observed"
+                    ? cost(t, detail.agent.totalCost)
+                    : t("codexSessionTraffic.unpriced", {
+                        defaultValue: "Unpriced / needs verification",
+                      }),
+              })}
             </p>
             <p className="break-all text-muted-foreground">
-              会话 {detail.agent.sessionId}
+              {t("codexSessionTraffic.sessionId", {
+                defaultValue: "Session {{id}}",
+                id: detail.agent.sessionId,
+              })}
             </p>
           </div>
         ) : detail ? (
@@ -736,35 +1049,60 @@ function DetailSheet({
               />
             ) : (
               <p className="text-muted-foreground">
-                尚无用量证据；未采集不以 0 Tokens 或 $0 表示。
+                {t("codexSessionTraffic.noEvidence", {
+                  defaultValue:
+                    "No usage evidence yet; uncollected data is not shown as 0 tokens or $0.",
+                })}
               </p>
             )}
             <p>
-              来源：
-              {detail.children.length === 0
-                ? "当前快照未提供逐条子会话，来源无法逐条确认"
-                : detail.children.every(
-                      (child) => child.usageSource === "session_sync",
-                    )
-                  ? "本地会话同步账"
-                  : detail.children.every(
-                        (child) => child.usageSource === "rollout",
-                      )
-                    ? "本地 rollout 用量证据"
-                    : detail.children.some(
-                          (child) => child.usageSource === "none",
+              {t("codexSessionTraffic.source", {
+                defaultValue: "Source: {{source}}.",
+                source:
+                  detail.children.length === 0
+                    ? t("codexSessionTraffic.sourceUnavailable", {
+                        defaultValue:
+                          "The current snapshot has no per-child entries, so the source cannot be confirmed individually",
+                      })
+                    : detail.children.every(
+                          (child) => child.usageSource === "session_sync",
                         )
-                      ? "本地会话证据（含未采集）"
-                      : "本地会话证据（来源混合）"}
-              。
+                      ? t("codexSessionTraffic.syncSource", {
+                          defaultValue: "Local session sync ledger",
+                        })
+                      : detail.children.every(
+                            (child) => child.usageSource === "rollout",
+                          )
+                        ? t("codexSessionTraffic.rolloutSource", {
+                            defaultValue: "Local rollout usage evidence",
+                          })
+                        : detail.children.some(
+                              (child) => child.usageSource === "none",
+                            )
+                          ? t("codexSessionTraffic.incompleteSource", {
+                              defaultValue:
+                                "Local session evidence (including uncollected)",
+                            })
+                          : t("codexSessionTraffic.mixedSource", {
+                              defaultValue:
+                                "Local session evidence (mixed sources)",
+                            }),
+              })}
             </p>
             {detail.group.parentUsageStatus === "unknown_may_overlap" ? (
               <p className="text-amber-700">
-                父同步记录可能包含子用量，暂不计入。
+                {t("codexSessionTraffic.parentOverlap", {
+                  defaultValue:
+                    "Parent sync records may include child usage; it is not counted for now.",
+                })}
               </p>
             ) : null}
             <div>
-              <h4 className="font-medium">显式子会话</h4>
+              <h4 className="font-medium">
+                {t("codexSessionTraffic.explicitChildren", {
+                  defaultValue: "Explicit child sessions",
+                })}
+              </h4>
               {detail.children.length ? (
                 detail.children.map((child) => (
                   <div
@@ -773,14 +1111,27 @@ function DetailSheet({
                   >
                     <div className="font-mono text-xs">{child.sessionId}</div>
                     <div>
-                      {child.title || "未命名会话"} ·{" "}
-                      {child.usageStatus === "observed" ? "已观测" : "未采集"}
+                      {child.title ||
+                        t("codexSessionTraffic.unnamedSession", {
+                          defaultValue: "Unnamed session",
+                        })}{" "}
+                      ·{" "}
+                      {child.usageStatus === "observed"
+                        ? t("codexSessionTraffic.observed", {
+                            defaultValue: "Observed",
+                          })
+                        : t("codexSessionTraffic.uncollected", {
+                            defaultValue: "Uncollected",
+                          })}
                     </div>
                   </div>
                 ))
               ) : (
                 <p className="mt-1 text-muted-foreground">
-                  当前 DTO 未提供可展开的子会话条目。
+                  {t("codexSessionTraffic.noChildEntries", {
+                    defaultValue:
+                      "The current DTO has no expandable child-session entries.",
+                  })}
                 </p>
               )}
             </div>
@@ -789,7 +1140,7 @@ function DetailSheet({
         <div className="border-t border-border p-3 text-right">
           <DialogClose asChild>
             <Button size="sm" variant="outline">
-              关闭
+              {t("codexSessionTraffic.close", { defaultValue: "Close" })}
             </Button>
           </DialogClose>
         </div>
@@ -809,16 +1160,33 @@ function Breakdown({
   creation: number;
   output: number;
 }) {
+  const { t } = useTranslation();
   const total = Math.max(input + cache + creation + output, 1);
   return (
     <div>
       <div className="mb-2 flex justify-between text-xs text-muted-foreground">
-        <span>Token 构成</span>
-        <span>总数 {tokens(input + cache + creation + output)}</span>
+        <span>
+          {t("codexSessionTraffic.breakdown", {
+            defaultValue: "Token breakdown",
+          })}
+        </span>
+        <span>
+          {t("codexSessionTraffic.totalTokens", {
+            defaultValue: "Total {{total}}",
+            total: tokens(input + cache + creation + output),
+          })}
+        </span>
       </div>
       <div
         className="flex h-3 overflow-hidden rounded bg-muted"
-        aria-label={`Token 构成：非缓存输入 ${input}，缓存读取 ${cache}，缓存写入 ${creation}，输出 ${output}`}
+        aria-label={t("codexSessionTraffic.breakdownLabel", {
+          defaultValue:
+            "Token breakdown: uncached input {{input}}, cache reads {{cache}}, cache writes {{creation}}, output {{output}}",
+          input,
+          cache,
+          creation,
+          output,
+        })}
       >
         <span
           className="bg-slate-500"
@@ -838,10 +1206,30 @@ function Breakdown({
         />
       </div>
       <div className="mt-2 grid grid-cols-2 gap-2 text-xs text-muted-foreground sm:grid-cols-4">
-        <span>非缓存输入 {tokens(input)}</span>
-        <span>缓存读取 {tokens(cache)}</span>
-        <span>缓存写入 {tokens(creation)}</span>
-        <span>输出 {tokens(output)}</span>
+        <span>
+          {t("codexSessionTraffic.inputValue", {
+            defaultValue: "Uncached input {{total}}",
+            total: tokens(input),
+          })}
+        </span>
+        <span>
+          {t("codexSessionTraffic.cacheValue", {
+            defaultValue: "Cache reads {{total}}",
+            total: tokens(cache),
+          })}
+        </span>
+        <span>
+          {t("codexSessionTraffic.creationValue", {
+            defaultValue: "Cache writes {{total}}",
+            total: tokens(creation),
+          })}
+        </span>
+        <span>
+          {t("codexSessionTraffic.outputValue", {
+            defaultValue: "Output {{total}}",
+            total: tokens(output),
+          })}
+        </span>
       </div>
     </div>
   );
