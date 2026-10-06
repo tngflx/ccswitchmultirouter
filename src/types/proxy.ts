@@ -220,6 +220,25 @@ export interface CodexRouterLogDiagnostics {
   recentEvents: CodexRouterLogEvent[];
 }
 
+export type StreamRetryActivityEvent =
+  | "retry_scheduled"
+  | "reconnected"
+  | "reconnect_failed"
+  | "retries_exhausted"
+  | string;
+
+export interface StreamRetryActivity {
+  timestamp: string;
+  stage: string;
+  event: StreamRetryActivityEvent;
+  attempt: number;
+  maxAttempts: number | null;
+  sessionId: string;
+  model: string;
+  providerId: string;
+  reasonClass: string | null;
+}
+
 export interface CodexGuardianStatus {
   active: boolean;
   codexRunning: boolean;

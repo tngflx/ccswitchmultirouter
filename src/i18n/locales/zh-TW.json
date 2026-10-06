@@ -3690,5 +3690,43 @@
       "deleteTemplateTitle": "刪除 /{{slug}}？",
       "deleteTemplateMessage": "此操作會永久刪除 prompts/{{slug}}.md。"
     }
+  },
+  "streamRetry": {
+    "compactLabel": "重試",
+    "title": "回合恢復",
+    "description": "選擇如何恢復中斷的 Codex 回合。",
+    "mode": {
+      "off": "關閉",
+      "safe": "安全",
+      "aggressive": "積極"
+    },
+    "maxAttempts": "繼續嘗試次數",
+    "help": {
+      "off": "不進行透明代理重新連線或桌面端繼續。",
+      "safe": "在語意輸出前最多重新連線 5 次；可見故障仍由 Codex 處理。",
+      "aggressive": "同樣先安全重新連線 5 次，然後 Codex 桌面端會為可恢復的中斷回合提交字面量「continue」，最多達到所選次數。"
+    },
+    "label": "持續重試",
+    "tooltip": {
+      "enabled": "已為符合條件的語意輸出前斷流啟用安全代理重新連線。",
+      "disabled": "代理重新連線和桌面端繼續均已關閉。"
+    },
+    "activity": {
+      "tab": "串流重試",
+      "tabDescription": "即時重連活動",
+      "title": "即時串流重試活動",
+      "description": "顯示執行中代理的脫敏重試狀態。日誌僅保留記憶體中的最近 50 筆事件。",
+      "empty": "目前沒有串流重試活動。符合條件的串流中斷後，這裡會即時更新。",
+      "open": "開啟串流重試活動",
+      "eventColumn": "事件",
+      "routeColumn": "路由",
+      "attemptColumn": "嘗試次數",
+      "events": {
+        "retry_scheduled": "已排程重試",
+        "reconnected": "已重連",
+        "reconnect_failed": "重連失敗",
+        "retries_exhausted": "重試耗盡"
+      }
+    }
   }
 }

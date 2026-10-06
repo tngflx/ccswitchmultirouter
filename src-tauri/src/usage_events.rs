@@ -14,12 +14,15 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
 use std::time::Duration;
 
+use serde::Serialize;
 use tauri::{AppHandle, Emitter};
 
 /// 前端监听的事件名
 pub const EVENT_USAGE_LOG_RECORDED: &str = "usage-log-recorded";
 /// A collection lifecycle update, including runs that import zero records.
 pub const EVENT_SESSION_COLLECTION_UPDATED: &str = "session-collection-updated";
+/// Live stream-retry transitions for the Codex workspace.
+pub const EVENT_STREAM_RETRY_ACTIVITY: &str = "stream-retry-activity";
 
 /// 防抖窗口：合并 200ms 内的多次通知。
 const DEBOUNCE_WINDOW: Duration = Duration::from_millis(200);
@@ -85,6 +88,31 @@ pub fn notify_session_collection_updated(
     }
 }
 
+/// Sanitized stream-retry activity. Request bodies, headers, tokens, and raw
+/// upstream messages must never cross this event boundary.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct StreamRetryActivity {
+    pub(crate) timestamp: String,
+    pub(crate) stage: String,
+    pub(crate) event: String,
+    pub(crate) attempt: u32,
+    pub(crate) max_attempts: Option<u32>,
+    pub(crate) session_id: String,
+    pub(crate) model: String,
+    pub(crate) provider_id: String,
+    pub(crate) reason_class: Option<String>,
+}
+
+pub(crate) fn notify_stream_retry_activity(activity: StreamRetryActivity) {
+    let Some(handle) = APP_HANDLE.get() else {
+        return;
+    };
+    if let Err(error) = handle.emit(EVENT_STREAM_RETRY_ACTIVITY, activity) {
+        log::warn!("emit {EVENT_STREAM_RETRY_ACTIVITY} failed: {error}");
+    }
+}
+
 #[cfg(test)]
 thread_local! {
     static TEST_NOTIFY_COUNT: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
@@ -93,4 +121,59 @@ thread_local! {
 #[cfg(test)]
 pub(crate) fn take_test_notify_count() -> u32 {
     TEST_NOTIFY_COUNT.with(|count| count.replace(0))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::StreamRetryActivity;
+    use serde_json::json;
+
+    #[test]
+    fn stream_retry_activity_serializes_the_frontend_contract() {
+        let activity = StreamRetryActivity {
+            timestamp: "2026-10-06T10:00:00Z".into(),
+            stage: "native_responses".into(),
+            event: "retry_scheduled".into(),
+            attempt: 1,
+            max_attempts: Some(5),
+            session_id: "session-1".into(),
+            model: "model-1".into(),
+            provider_id: "provider-1".into(),
+            reason_class: Some("stream_interrupted".into()),
+        };
+
+        assert_eq!(
+            serde_json::to_value(activity).expect("serialize retry activity"),
+            json!({
+                "timestamp": "2026-10-06T10:00:00Z",
+                "stage": "native_responses",
+                "event": "retry_scheduled",
+                "attempt": 1,
+                "maxAttempts": 5,
+                "sessionId": "session-1",
+                "model": "model-1",
+                "providerId": "provider-1",
+                "reasonClass": "stream_interrupted",
+            })
+        );
+    }
+
+    #[test]
+    fn stream_retry_activity_preserves_nullable_frontend_fields() {
+        let activity = StreamRetryActivity {
+            timestamp: "2026-10-06T10:00:00Z".into(),
+            stage: "native_responses".into(),
+            event: "reconnected".into(),
+            attempt: 1,
+            max_attempts: None,
+            session_id: "session-1".into(),
+            model: "model-1".into(),
+            provider_id: "provider-1".into(),
+            reason_class: None,
+        };
+        let payload = serde_json::to_value(activity).expect("serialize retry activity");
+
+        assert_eq!(payload.get("maxAttempts"), Some(&json!(null)));
+        assert_eq!(payload.get("reasonClass"), Some(&json!(null)));
+    }
 }

@@ -52,6 +52,7 @@ import { hermesApi } from "@/lib/api/hermes";
 import { useProxyStatus } from "@/hooks/useProxyStatus";
 import { useUsageCacheBridge } from "@/hooks/useUsageCacheBridge";
 import { useUsageEventBridge } from "@/hooks/useUsageEventBridge";
+import { useStreamRetryActivityBridge } from "@/hooks/useStreamRetryActivity";
 import { useTauriEvent } from "@/hooks/useTauriEvent";
 import { useLastValidValue } from "@/hooks/useLastValidValue";
 import { useCodexLocalRoutingNotice } from "@/hooks/useCodexLocalRoutingNotice";
@@ -90,6 +91,7 @@ import { ProxyToggle } from "@/components/proxy/ProxyToggle";
 import { RoutingActivationBrand } from "@/components/proxy/RoutingActivationBrand";
 import { ClaudeDesktopRouteToggle } from "@/components/proxy/ClaudeDesktopRouteToggle";
 import { FailoverToggle } from "@/components/proxy/FailoverToggle";
+import { StreamRetryHeaderToggle } from "@/components/proxy/StreamRetryHeaderToggle";
 import UsageScriptModal from "@/components/UsageScriptModal";
 import UnifiedMcpPanel from "@/components/mcp/UnifiedMcpPanel";
 import PromptPanel, {
@@ -478,6 +480,7 @@ function App() {
 
   useUsageCacheBridge();
   useUsageEventBridge();
+  useStreamRetryActivityBridge();
 
   const promptPanelRef = useRef<PromptPanelHandle>(null);
   const [promptPrimaryAction, setPromptPrimaryAction] =
@@ -1858,6 +1861,13 @@ function App() {
                       {settingsData?.enableFailoverToggle && (
                         <FailoverToggle activeApp={proxyAppId} />
                       )}
+                      <StreamRetryHeaderToggle
+                        onOpenActivity={
+                          activeApp === "codex"
+                            ? () => openCodexRouterWorkspace(null, "status")
+                            : undefined
+                        }
+                      />
                     </>
                   ) : null}
                 </div>

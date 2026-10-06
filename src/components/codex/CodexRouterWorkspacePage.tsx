@@ -23,6 +23,7 @@ import {
   verticalListSortingStrategy,
 } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
+import { useTranslation } from "react-i18next";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   Activity,
@@ -138,6 +139,8 @@ import { HostedToolsSwitchPanel } from "./HostedToolsSwitchPanel";
 import { CodexSubagentProfileEditor } from "./CodexSubagentProfileEditor";
 import { CodexEgressTimezoneStatusCard } from "./CodexEgressTimezoneStatusCard";
 import { CodexSessionTrafficPanel } from "./CodexSessionTrafficPanel";
+import { StreamRetryActivityPanel } from "./StreamRetryActivityPanel";
+import { StreamRetryHeaderToggle } from "@/components/proxy/StreamRetryHeaderToggle";
 import type {
   CodexOfficialAuthConfig,
   CodexRoutingAuth,
@@ -169,7 +172,8 @@ export type WorkspaceTab =
   | "status"
   | "test";
 
-type StatusView = "link" | "protocol" | "debug" | "providers" | "traffic";
+type StatusView =
+  "link" | "protocol" | "debug" | "providers" | "traffic" | "stream-retry";
 
 type SpawnAgentCandidateView = "selected" | "routed" | "priority" | "all";
 
@@ -3981,6 +3985,9 @@ function HeaderPanel({
             </Button>
           </div>
         </div>
+        <div className="flex shrink-0 items-center self-start">
+          <StreamRetryHeaderToggle onOpenActivity={() => onJump("status")} />
+        </div>
       </div>
     </div>
   );
@@ -7550,400 +7557,405 @@ function StatusTab({
       />
 
       {statusView === "link" && (
-        <section className="rounded-lg border border-border bg-card p-4 dark:border-slate-700 dark:bg-slate-950/40">
-          <SectionHeader
-            icon={Activity}
-            title="链路状态"
-            detail="默认先看这里：只有监听、Codex 接管、路由入口和至少一条匹配规则都通过，Codex 请求才会进入 MultiRouter。"
-            action={
-              <div className="flex flex-wrap gap-2">
-                <Button
-                  size="sm"
-                  variant="outline"
-                  onClick={refreshValidationState}
-                  disabled={isRefreshingValidation}
-                  className="gap-2 border-slate-300 bg-background/70 text-slate-700 hover:bg-slate-50 dark:border-slate-500/50 dark:bg-slate-500/10 dark:text-slate-100 dark:hover:bg-slate-500/20"
-                >
-                  <RefreshCw
-                    className={cn(
-                      "h-4 w-4",
-                      isRefreshingValidation ? "animate-spin" : "",
+        <>
+          <StreamRetryActivityPanel />
+          <section className="rounded-lg border border-border bg-card p-4 dark:border-slate-700 dark:bg-slate-950/40">
+            <SectionHeader
+              icon={Activity}
+              title="链路状态"
+              detail="默认先看这里：只有监听、Codex 接管、路由入口和至少一条匹配规则都通过，Codex 请求才会进入 MultiRouter。"
+              action={
+                <div className="flex flex-wrap gap-2">
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    onClick={refreshValidationState}
+                    disabled={isRefreshingValidation}
+                    className="gap-2 border-slate-300 bg-background/70 text-slate-700 hover:bg-slate-50 dark:border-slate-500/50 dark:bg-slate-500/10 dark:text-slate-100 dark:hover:bg-slate-500/20"
+                  >
+                    <RefreshCw
+                      className={cn(
+                        "h-4 w-4",
+                        isRefreshingValidation ? "animate-spin" : "",
+                      )}
+                    />
+                    {isRefreshingValidation ? "刷新中" : "刷新校验"}
+                  </Button>
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    onClick={() => runDiagnostics("debug")}
+                    disabled={isDiagnosing}
+                    className="gap-2 border-amber-300 bg-background/70 text-amber-700 hover:bg-amber-50 dark:border-amber-500/50 dark:bg-amber-500/10 dark:text-amber-100 dark:hover:bg-amber-500/20"
+                  >
+                    {isDiagnosing ? (
+                      <RefreshCw className="h-4 w-4 animate-spin" />
+                    ) : (
+                      <Bug className="h-4 w-4" />
                     )}
-                  />
-                  {isRefreshingValidation ? "刷新中" : "刷新校验"}
-                </Button>
-                <Button
-                  size="sm"
-                  variant="outline"
-                  onClick={() => runDiagnostics("debug")}
-                  disabled={isDiagnosing}
-                  className="gap-2 border-amber-300 bg-background/70 text-amber-700 hover:bg-amber-50 dark:border-amber-500/50 dark:bg-amber-500/10 dark:text-amber-100 dark:hover:bg-amber-500/20"
-                >
-                  {isDiagnosing ? (
-                    <RefreshCw className="h-4 w-4 animate-spin" />
-                  ) : (
-                    <Bug className="h-4 w-4" />
-                  )}
-                  Debug 检查
-                </Button>
-                <Button
-                  size="sm"
-                  variant="outline"
-                  onClick={() => runDiagnostics("protocol")}
-                  disabled={isDiagnosing}
-                  className="gap-2 border-cyan-300 bg-background/70 text-cyan-700 hover:bg-cyan-50 dark:border-cyan-500/50 dark:bg-cyan-500/10 dark:text-cyan-100 dark:hover:bg-cyan-500/20"
-                >
-                  {isDiagnosing ? (
-                    <RefreshCw className="h-4 w-4 animate-spin" />
-                  ) : (
-                    <GitBranch className="h-4 w-4" />
-                  )}
-                  协议探测
-                </Button>
-                <Button
-                  size="sm"
-                  variant="outline"
-                  onClick={refreshOfficialCatalog}
-                  disabled={isRefreshingOfficialCatalog}
-                  className="gap-2 border-sky-300 bg-background/70 text-sky-700 hover:bg-sky-50 dark:border-sky-500/50 dark:bg-sky-500/10 dark:text-sky-100"
-                >
-                  <RefreshCw
-                    className={cn(
-                      "h-4 w-4",
-                      isRefreshingOfficialCatalog && "animate-spin",
+                    Debug 检查
+                  </Button>
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    onClick={() => runDiagnostics("protocol")}
+                    disabled={isDiagnosing}
+                    className="gap-2 border-cyan-300 bg-background/70 text-cyan-700 hover:bg-cyan-50 dark:border-cyan-500/50 dark:bg-cyan-500/10 dark:text-cyan-100 dark:hover:bg-cyan-500/20"
+                  >
+                    {isDiagnosing ? (
+                      <RefreshCw className="h-4 w-4 animate-spin" />
+                    ) : (
+                      <GitBranch className="h-4 w-4" />
                     )}
-                  />
-                  {isRefreshingOfficialCatalog
-                    ? "正在刷新官方目录"
-                    : "强制刷新官方模型目录"}
-                </Button>
-                <TooltipProvider delayDuration={200}>
-                  <Tooltip>
-                    <TooltipTrigger asChild>
-                      <span
-                        className="inline-flex"
-                        title={MODEL_PICKER_UNLOCK_TOOLTIP}
-                      >
-                        <Button
-                          size="sm"
-                          variant="outline"
-                          onClick={unlockModelPicker}
-                          disabled={isUnlockingModelPicker}
-                          className="gap-2 border-indigo-300 bg-background/70 text-indigo-700 hover:bg-indigo-50 dark:border-indigo-500/50 dark:bg-indigo-500/10 dark:text-indigo-100 dark:hover:bg-indigo-500/20"
+                    协议探测
+                  </Button>
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    onClick={refreshOfficialCatalog}
+                    disabled={isRefreshingOfficialCatalog}
+                    className="gap-2 border-sky-300 bg-background/70 text-sky-700 hover:bg-sky-50 dark:border-sky-500/50 dark:bg-sky-500/10 dark:text-sky-100"
+                  >
+                    <RefreshCw
+                      className={cn(
+                        "h-4 w-4",
+                        isRefreshingOfficialCatalog && "animate-spin",
+                      )}
+                    />
+                    {isRefreshingOfficialCatalog
+                      ? "正在刷新官方目录"
+                      : "强制刷新官方模型目录"}
+                  </Button>
+                  <TooltipProvider delayDuration={200}>
+                    <Tooltip>
+                      <TooltipTrigger asChild>
+                        <span
+                          className="inline-flex"
+                          title={MODEL_PICKER_UNLOCK_TOOLTIP}
                         >
-                          {isUnlockingModelPicker ? (
-                            <RefreshCw className="h-4 w-4 animate-spin" />
-                          ) : (
-                            <Wand2 className="h-4 w-4" />
-                          )}
-                          解锁模型菜单
-                        </Button>
-                      </span>
-                    </TooltipTrigger>
-                    <TooltipContent
-                      side="bottom"
-                      align="end"
-                      className="max-w-80 whitespace-normal text-left leading-5"
-                    >
-                      {MODEL_PICKER_UNLOCK_TOOLTIP}
-                    </TooltipContent>
-                  </Tooltip>
-                </TooltipProvider>
-                {selectedPlan ? (
-                  <>
-                    <Button
-                      size="sm"
-                      onClick={() =>
-                        onEditPlan(selectedPlan, "打开多路路由配置")
-                      }
-                      className="gap-2 bg-blue-600 hover:bg-blue-500"
-                    >
-                      <Pencil className="h-4 w-4" />
-                      编辑配置
-                    </Button>
-                    <Button
-                      size="sm"
-                      variant="outline"
-                      onClick={() => onDeletePlan(selectedPlan)}
-                      className="gap-2 border-rose-300 bg-background/70 text-rose-700 hover:bg-rose-50 dark:border-rose-500/50 dark:bg-rose-500/10 dark:text-rose-100 dark:hover:bg-rose-500/20"
-                    >
-                      <Trash2 className="h-4 w-4" />
-                      删除
-                    </Button>
-                  </>
+                          <Button
+                            size="sm"
+                            variant="outline"
+                            onClick={unlockModelPicker}
+                            disabled={isUnlockingModelPicker}
+                            className="gap-2 border-indigo-300 bg-background/70 text-indigo-700 hover:bg-indigo-50 dark:border-indigo-500/50 dark:bg-indigo-500/10 dark:text-indigo-100 dark:hover:bg-indigo-500/20"
+                          >
+                            {isUnlockingModelPicker ? (
+                              <RefreshCw className="h-4 w-4 animate-spin" />
+                            ) : (
+                              <Wand2 className="h-4 w-4" />
+                            )}
+                            解锁模型菜单
+                          </Button>
+                        </span>
+                      </TooltipTrigger>
+                      <TooltipContent
+                        side="bottom"
+                        align="end"
+                        className="max-w-80 whitespace-normal text-left leading-5"
+                      >
+                        {MODEL_PICKER_UNLOCK_TOOLTIP}
+                      </TooltipContent>
+                    </Tooltip>
+                  </TooltipProvider>
+                  {selectedPlan ? (
+                    <>
+                      <Button
+                        size="sm"
+                        onClick={() =>
+                          onEditPlan(selectedPlan, "打开多路路由配置")
+                        }
+                        className="gap-2 bg-blue-600 hover:bg-blue-500"
+                      >
+                        <Pencil className="h-4 w-4" />
+                        编辑配置
+                      </Button>
+                      <Button
+                        size="sm"
+                        variant="outline"
+                        onClick={() => onDeletePlan(selectedPlan)}
+                        className="gap-2 border-rose-300 bg-background/70 text-rose-700 hover:bg-rose-50 dark:border-rose-500/50 dark:bg-rose-500/10 dark:text-rose-100 dark:hover:bg-rose-500/20"
+                      >
+                        <Trash2 className="h-4 w-4" />
+                        删除
+                      </Button>
+                    </>
+                  ) : null}
+                </div>
+              }
+            />
+            <div className="mt-4 grid gap-3 md:grid-cols-2 xl:grid-cols-5">
+              <StatusCard
+                ok={linkOnline}
+                label="当前链路"
+                value={
+                  linkOnline ? "在线" : configReady ? "待请求验证" : "未就绪"
+                }
+                detail={
+                  linkOnline
+                    ? "Codex 请求会进入本地代理并按 model 分流"
+                    : configReady
+                      ? "配置和监听已就绪，等待当前方案的路由转发成功"
+                      : readinessIssues.join("；") || "等待状态刷新"
+                }
+              />
+              <StatusCard
+                ok={isProxyRunning}
+                label="监听"
+                value={isProxyRunning ? "成功" : "未启动"}
+                detail={listenAddress}
+              />
+              <StatusCard
+                ok={isCodexTakeoverActive}
+                label="Codex 接管"
+                value={isCodexTakeoverActive ? "已接管" : "未接管"}
+                detail="Codex 请求需要指向本地代理才会进入路由"
+              />
+              <StatusCard
+                ok={Boolean(selectedPlan && routeEnabled)}
+                label="路由入口"
+                value={
+                  selectedPlan ? (routeEnabled ? "已启用" : "已关闭") : "未选择"
+                }
+                detail={selectedPlan?.name ?? "暂无 MultiRouter provider"}
+              />
+              <StatusCard
+                ok={currentRouteForwardOk}
+                label="最近转发"
+                value={
+                  currentRouteForwardOk
+                    ? "当前方案成功"
+                    : latestLog
+                      ? latestForwardOk
+                        ? `成功 ${latestLog.statusCode}`
+                        : `失败 ${latestLog.statusCode}`
+                      : "暂无请求"
+                }
+                detail={
+                  currentRouteForwardOk
+                    ? "已确认当前 MultiRouter route 命中并完成上游转发"
+                    : latestLog?.errorMessage ||
+                      latestLog?.requestModel ||
+                      latestLog?.model ||
+                      "等待 Codex 请求"
+                }
+              />
+            </div>
+            {linkOnline ? (
+              <div
+                role="status"
+                className="mt-3 rounded-lg border border-emerald-200 bg-emerald-50 p-3 text-sm leading-6 text-emerald-800 dark:border-emerald-700/50 dark:bg-emerald-950/25 dark:text-emerald-100"
+              >
+                <div className="font-semibold">
+                  MultiRouter 已通过真实请求验证
+                </div>
+                <div className="text-xs">
+                  当前 Provider、代理监听、Codex
+                  接管、路由入口和最近一次路由转发均正常。你可以继续留在状态页观察流量或调整路由。
+                </div>
+              </div>
+            ) : null}
+            {selectedPlan ? (
+              <CodexProjectionStatusPanel
+                status={projectionStatus}
+                queryError={projectionError}
+                retryError={projectionRetryError}
+                isRefreshing={isRefreshingProjection || isRetryingProjection}
+                onRetry={retryProjection}
+              />
+            ) : null}
+            {validationRefreshMessage ? (
+              <div className="mt-3 rounded-lg border border-slate-200 bg-slate-50 p-3 text-xs leading-5 text-slate-700 dark:border-slate-600/50 dark:bg-slate-900/60 dark:text-slate-200">
+                {validationRefreshMessage}
+              </div>
+            ) : null}
+            {guardianStatus?.active ? (
+              <div
+                className={cn(
+                  "mt-3 rounded-lg border p-3 text-xs leading-5",
+                  guardianStatus.injected
+                    ? "border-emerald-200 bg-emerald-50 text-emerald-800 dark:border-emerald-700/50 dark:bg-emerald-950/25 dark:text-emerald-100"
+                    : guardianStatus.cdpAvailable
+                      ? "border-amber-200 bg-amber-50 text-amber-800 dark:border-amber-700/50 dark:bg-amber-950/25 dark:text-amber-100"
+                      : "border-slate-200 bg-slate-50 text-slate-600 dark:border-slate-600/50 dark:bg-slate-900/60 dark:text-slate-300",
+                )}
+              >
+                <div className="font-semibold flex items-center gap-2">
+                  <span
+                    className={cn(
+                      "inline-block h-2 w-2 rounded-full",
+                      guardianStatus.injected
+                        ? "bg-emerald-500"
+                        : guardianStatus.cdpAvailable
+                          ? "bg-amber-400"
+                          : "bg-slate-400",
+                    )}
+                  />
+                  模型菜单守护
+                  {guardianStatus.injected
+                    ? " · 已注入"
+                    : guardianStatus.cdpAvailable
+                      ? " · 待注入"
+                      : " · 轮询中"}
+                </div>
+                <div className="mt-1">{guardianStatus.message}</div>
+                <div className="mt-1 font-mono text-[11px] opacity-80">
+                  codex={guardianStatus.codexRunning ? "运行中" : "未运行"} cdp=
+                  {guardianStatus.cdpAvailable ? "可用" : "不可用"} targets=
+                  {guardianStatus.injectedTargetCount}
+                </div>
+              </div>
+            ) : isCodexTakeoverActive ? (
+              <div className="mt-3 rounded-lg border border-slate-200 bg-slate-50 p-3 text-xs leading-5 text-slate-600 dark:border-slate-600/50 dark:bg-slate-900/60 dark:text-slate-300">
+                模型菜单守护未启动；重新开启 Codex 接管以激活。
+              </div>
+            ) : null}
+            {officialCatalogRefreshError ? (
+              <div
+                role="alert"
+                className="mt-3 rounded-lg border border-rose-200 bg-rose-50 p-3 text-xs text-rose-800 dark:border-rose-700/50 dark:bg-rose-950/25 dark:text-rose-100"
+              >
+                官方目录刷新未完成：{officialCatalogRefreshError}
+                。原有目录保持不变。
+              </div>
+            ) : null}
+            {officialCatalogRefreshResult ? (
+              <div
+                role="status"
+                className={cn(
+                  "mt-3 rounded-lg border p-3 text-xs leading-5",
+                  officialCatalogRefreshResult.projectionApplied
+                    ? "border-emerald-200 bg-emerald-50 text-emerald-800 dark:border-emerald-700/50 dark:bg-emerald-950/25 dark:text-emerald-100"
+                    : "border-amber-200 bg-amber-50 text-amber-800 dark:border-amber-700/50 dark:bg-amber-950/25 dark:text-amber-100",
+                )}
+              >
+                <div className="font-semibold">
+                  {officialCatalogRefreshResult.source === "unavailable" ||
+                  officialCatalogRefreshResult.usedStaleCache
+                    ? "官方目录未刷新成功"
+                    : officialCatalogRefreshResult.projectionApplied
+                      ? "官方目录刷新成功，Codex 接管目录已重生成"
+                      : "官方快照已刷新，但 Codex 接管目录未更新"}
+                </div>
+                <div>
+                  来源：
+                  {officialCatalogRefreshResult.source ===
+                  "openai_codex_models_json"
+                    ? "OpenAI Codex models.json"
+                    : officialCatalogRefreshResult.source === "stale_cache"
+                      ? "CCSM 旧官方快照"
+                      : officialCatalogRefreshResult.source === "unavailable"
+                        ? "无可用快照"
+                        : officialCatalogRefreshResult.source}
+                  ；{officialCatalogRefreshResult.modelCount} 个模型；刷新时间：
+                  {officialCatalogRefreshResult.fetchedAt ?? "无"}。
+                  {officialCatalogRefreshResult.usedStaleCache
+                    ? "本次沿用旧缓存。"
+                    : ""}
+                </div>
+                {officialCatalogRefreshResult.refreshError ? (
+                  <div>
+                    上游刷新失败：{officialCatalogRefreshResult.refreshError}
+                  </div>
+                ) : null}
+                {officialCatalogRefreshResult.projectionApplied ? (
+                  <div>
+                    请刷新 Codex 模型选择器；若 Desktop
+                    未热加载新目录，请新建任务后再检查。
+                  </div>
+                ) : officialCatalogRefreshResult.projectionReason ===
+                    "projection_failed" ||
+                  officialCatalogRefreshResult.projectionReason ===
+                    "projection_outputs_unconfirmed" ? (
+                  <div>
+                    目录重生成失败，未确认双目录同步；生成物可能部分变化，请检查诊断后再使用，不能视为运行态生效。
+                  </div>
+                ) : (
+                  <div>
+                    本次未修改 Codex 生成目录
+                    {officialCatalogRefreshResult.projectionReason
+                      ? `（${
+                          {
+                            takeover_not_active: "Codex 接管未启用",
+                            catalog_not_cc_switch_owned:
+                              "当前目录不归 CCSwitchMulti 管理",
+                            refresh_failed: "上游刷新失败",
+                            projection_failed: "目录重生成失败",
+                            projection_outputs_unconfirmed:
+                              "双目录更新状态未确认",
+                          }[officialCatalogRefreshResult.projectionReason] ??
+                          officialCatalogRefreshResult.projectionReason
+                        }）`
+                      : ""}
+                    ；不要将快照更新视为运行态生效。
+                  </div>
+                )}
+              </div>
+            ) : null}
+            {!modelPickerUnlockResult ? (
+              <div className="mt-3 rounded-lg border border-indigo-200 bg-indigo-50 p-3 text-xs leading-5 text-indigo-800 dark:border-indigo-700/50 dark:bg-indigo-950/25 dark:text-indigo-100">
+                {MODEL_PICKER_UNLOCK_HINT}
+              </div>
+            ) : null}
+            {modelPickerUnlockError ? (
+              <div className="mt-3 rounded-lg border border-rose-200 bg-rose-50 p-3 text-xs leading-5 text-rose-700 dark:border-rose-700/50 dark:bg-rose-950/30 dark:text-rose-100">
+                模型菜单解锁失败：{modelPickerUnlockError}
+              </div>
+            ) : null}
+            {modelPickerUnlockResult ? (
+              <div
+                className={cn(
+                  "mt-3 rounded-lg border p-3 text-xs leading-5",
+                  modelPickerUnlockResult.injected
+                    ? "border-emerald-200 bg-emerald-50 text-emerald-800 dark:border-emerald-700/50 dark:bg-emerald-950/25 dark:text-emerald-100"
+                    : "border-amber-200 bg-amber-50 text-amber-800 dark:border-amber-700/50 dark:bg-amber-950/25 dark:text-amber-100",
+                )}
+              >
+                <div className="font-semibold">
+                  {modelPickerUnlockResult.injected
+                    ? "模型菜单白名单已注入"
+                    : "模型菜单白名单尚未注入"}
+                </div>
+                <div className="mt-1">{modelPickerUnlockResult.message}</div>
+                <div className="mt-1 font-mono text-[11px] opacity-80">
+                  models={modelPickerUnlockResult.modelCount} port=
+                  {modelPickerUnlockResult.debugPort ?? "-"} launched=
+                  {String(modelPickerUnlockResult.launched)}
+                </div>
+                {modelPickerUnlockResult.codexExecutable ? (
+                  <div className="mt-2 rounded-md border border-current/20 bg-white/40 p-2 text-[11px] leading-5 dark:bg-black/10">
+                    Codex Desktop 主程序：
+                    <span className="font-mono break-all">
+                      {modelPickerUnlockResult.codexExecutable}
+                    </span>
+                    {!modelPickerUnlockResult.injected
+                      ? "。已捕获该 Desktop 路径；请完全退出 Codex Desktop 后再次点击“解锁模型菜单”，让 CCSwitchMulti 用 remote debugging 启动同一个 Desktop。成功注入后，切换第三方 API Key 不需要重复解锁；CLI/app-server 继续使用 live config、model_catalog_json 和本地 /v1/models 路径。"
+                      : ""}
+                  </div>
                 ) : null}
               </div>
-            }
-          />
-          <div className="mt-4 grid gap-3 md:grid-cols-2 xl:grid-cols-5">
-            <StatusCard
-              ok={linkOnline}
-              label="当前链路"
-              value={
-                linkOnline ? "在线" : configReady ? "待请求验证" : "未就绪"
-              }
-              detail={
-                linkOnline
-                  ? "Codex 请求会进入本地代理并按 model 分流"
-                  : configReady
-                    ? "配置和监听已就绪，等待当前方案的路由转发成功"
-                    : readinessIssues.join("；") || "等待状态刷新"
-              }
-            />
-            <StatusCard
-              ok={isProxyRunning}
-              label="监听"
-              value={isProxyRunning ? "成功" : "未启动"}
-              detail={listenAddress}
-            />
-            <StatusCard
-              ok={isCodexTakeoverActive}
-              label="Codex 接管"
-              value={isCodexTakeoverActive ? "已接管" : "未接管"}
-              detail="Codex 请求需要指向本地代理才会进入路由"
-            />
-            <StatusCard
-              ok={Boolean(selectedPlan && routeEnabled)}
-              label="路由入口"
-              value={
-                selectedPlan ? (routeEnabled ? "已启用" : "已关闭") : "未选择"
-              }
-              detail={selectedPlan?.name ?? "暂无 MultiRouter provider"}
-            />
-            <StatusCard
-              ok={currentRouteForwardOk}
-              label="最近转发"
-              value={
-                currentRouteForwardOk
-                  ? "当前方案成功"
-                  : latestLog
-                    ? latestForwardOk
-                      ? `成功 ${latestLog.statusCode}`
-                      : `失败 ${latestLog.statusCode}`
-                    : "暂无请求"
-              }
-              detail={
-                currentRouteForwardOk
-                  ? "已确认当前 MultiRouter route 命中并完成上游转发"
-                  : latestLog?.errorMessage ||
-                    latestLog?.requestModel ||
-                    latestLog?.model ||
-                    "等待 Codex 请求"
-              }
-            />
-          </div>
-          {linkOnline ? (
-            <div
-              role="status"
-              className="mt-3 rounded-lg border border-emerald-200 bg-emerald-50 p-3 text-sm leading-6 text-emerald-800 dark:border-emerald-700/50 dark:bg-emerald-950/25 dark:text-emerald-100"
-            >
-              <div className="font-semibold">
-                MultiRouter 已通过真实请求验证
-              </div>
-              <div className="text-xs">
-                当前 Provider、代理监听、Codex
-                接管、路由入口和最近一次路由转发均正常。你可以继续留在状态页观察流量或调整路由。
-              </div>
+            ) : null}
+            <div className="mt-4 grid gap-3 text-sm md:grid-cols-3">
+              <DetailRow label="当前代理目标" value={activeTargetLabel} />
+              <DetailRow
+                label="启用匹配规则"
+                value={`${selectedRoutes.filter(({ route }) => route.enabled !== false).length} / ${selectedRoutes.length}`}
+              />
+              <DetailRow
+                label="代理累计请求"
+                value={`${proxyStatus?.total_requests ?? 0} 次，成功率 ${proxyStatus?.success_rate ?? 0}%`}
+              />
             </div>
-          ) : null}
-          {selectedPlan ? (
-            <CodexProjectionStatusPanel
-              status={projectionStatus}
-              queryError={projectionError}
-              retryError={projectionRetryError}
-              isRefreshing={isRefreshingProjection || isRetryingProjection}
-              onRetry={retryProjection}
-            />
-          ) : null}
-          {validationRefreshMessage ? (
-            <div className="mt-3 rounded-lg border border-slate-200 bg-slate-50 p-3 text-xs leading-5 text-slate-700 dark:border-slate-600/50 dark:bg-slate-900/60 dark:text-slate-200">
-              {validationRefreshMessage}
+            <div className="mt-3">
+              <DetailRow
+                label="最近错误"
+                value={
+                  proxyStatus?.last_error || latestLog?.errorMessage || "无"
+                }
+              />
             </div>
-          ) : null}
-          {guardianStatus?.active ? (
-            <div
-              className={cn(
-                "mt-3 rounded-lg border p-3 text-xs leading-5",
-                guardianStatus.injected
-                  ? "border-emerald-200 bg-emerald-50 text-emerald-800 dark:border-emerald-700/50 dark:bg-emerald-950/25 dark:text-emerald-100"
-                  : guardianStatus.cdpAvailable
-                    ? "border-amber-200 bg-amber-50 text-amber-800 dark:border-amber-700/50 dark:bg-amber-950/25 dark:text-amber-100"
-                    : "border-slate-200 bg-slate-50 text-slate-600 dark:border-slate-600/50 dark:bg-slate-900/60 dark:text-slate-300",
-              )}
-            >
-              <div className="font-semibold flex items-center gap-2">
-                <span
-                  className={cn(
-                    "inline-block h-2 w-2 rounded-full",
-                    guardianStatus.injected
-                      ? "bg-emerald-500"
-                      : guardianStatus.cdpAvailable
-                        ? "bg-amber-400"
-                        : "bg-slate-400",
-                  )}
-                />
-                模型菜单守护
-                {guardianStatus.injected
-                  ? " · 已注入"
-                  : guardianStatus.cdpAvailable
-                    ? " · 待注入"
-                    : " · 轮询中"}
-              </div>
-              <div className="mt-1">{guardianStatus.message}</div>
-              <div className="mt-1 font-mono text-[11px] opacity-80">
-                codex={guardianStatus.codexRunning ? "运行中" : "未运行"} cdp=
-                {guardianStatus.cdpAvailable ? "可用" : "不可用"} targets=
-                {guardianStatus.injectedTargetCount}
-              </div>
-            </div>
-          ) : isCodexTakeoverActive ? (
-            <div className="mt-3 rounded-lg border border-slate-200 bg-slate-50 p-3 text-xs leading-5 text-slate-600 dark:border-slate-600/50 dark:bg-slate-900/60 dark:text-slate-300">
-              模型菜单守护未启动；重新开启 Codex 接管以激活。
-            </div>
-          ) : null}
-          {officialCatalogRefreshError ? (
-            <div
-              role="alert"
-              className="mt-3 rounded-lg border border-rose-200 bg-rose-50 p-3 text-xs text-rose-800 dark:border-rose-700/50 dark:bg-rose-950/25 dark:text-rose-100"
-            >
-              官方目录刷新未完成：{officialCatalogRefreshError}
-              。原有目录保持不变。
-            </div>
-          ) : null}
-          {officialCatalogRefreshResult ? (
-            <div
-              role="status"
-              className={cn(
-                "mt-3 rounded-lg border p-3 text-xs leading-5",
-                officialCatalogRefreshResult.projectionApplied
-                  ? "border-emerald-200 bg-emerald-50 text-emerald-800 dark:border-emerald-700/50 dark:bg-emerald-950/25 dark:text-emerald-100"
-                  : "border-amber-200 bg-amber-50 text-amber-800 dark:border-amber-700/50 dark:bg-amber-950/25 dark:text-amber-100",
-              )}
-            >
-              <div className="font-semibold">
-                {officialCatalogRefreshResult.source === "unavailable" ||
-                officialCatalogRefreshResult.usedStaleCache
-                  ? "官方目录未刷新成功"
-                  : officialCatalogRefreshResult.projectionApplied
-                    ? "官方目录刷新成功，Codex 接管目录已重生成"
-                    : "官方快照已刷新，但 Codex 接管目录未更新"}
-              </div>
-              <div>
-                来源：
-                {officialCatalogRefreshResult.source ===
-                "openai_codex_models_json"
-                  ? "OpenAI Codex models.json"
-                  : officialCatalogRefreshResult.source === "stale_cache"
-                    ? "CCSM 旧官方快照"
-                    : officialCatalogRefreshResult.source === "unavailable"
-                      ? "无可用快照"
-                      : officialCatalogRefreshResult.source}
-                ；{officialCatalogRefreshResult.modelCount} 个模型；刷新时间：
-                {officialCatalogRefreshResult.fetchedAt ?? "无"}。
-                {officialCatalogRefreshResult.usedStaleCache
-                  ? "本次沿用旧缓存。"
-                  : ""}
-              </div>
-              {officialCatalogRefreshResult.refreshError ? (
-                <div>
-                  上游刷新失败：{officialCatalogRefreshResult.refreshError}
-                </div>
-              ) : null}
-              {officialCatalogRefreshResult.projectionApplied ? (
-                <div>
-                  请刷新 Codex 模型选择器；若 Desktop
-                  未热加载新目录，请新建任务后再检查。
-                </div>
-              ) : officialCatalogRefreshResult.projectionReason ===
-                  "projection_failed" ||
-                officialCatalogRefreshResult.projectionReason ===
-                  "projection_outputs_unconfirmed" ? (
-                <div>
-                  目录重生成失败，未确认双目录同步；生成物可能部分变化，请检查诊断后再使用，不能视为运行态生效。
-                </div>
-              ) : (
-                <div>
-                  本次未修改 Codex 生成目录
-                  {officialCatalogRefreshResult.projectionReason
-                    ? `（${
-                        {
-                          takeover_not_active: "Codex 接管未启用",
-                          catalog_not_cc_switch_owned:
-                            "当前目录不归 CCSwitchMulti 管理",
-                          refresh_failed: "上游刷新失败",
-                          projection_failed: "目录重生成失败",
-                          projection_outputs_unconfirmed:
-                            "双目录更新状态未确认",
-                        }[officialCatalogRefreshResult.projectionReason] ??
-                        officialCatalogRefreshResult.projectionReason
-                      }）`
-                    : ""}
-                  ；不要将快照更新视为运行态生效。
-                </div>
-              )}
-            </div>
-          ) : null}
-          {!modelPickerUnlockResult ? (
-            <div className="mt-3 rounded-lg border border-indigo-200 bg-indigo-50 p-3 text-xs leading-5 text-indigo-800 dark:border-indigo-700/50 dark:bg-indigo-950/25 dark:text-indigo-100">
-              {MODEL_PICKER_UNLOCK_HINT}
-            </div>
-          ) : null}
-          {modelPickerUnlockError ? (
-            <div className="mt-3 rounded-lg border border-rose-200 bg-rose-50 p-3 text-xs leading-5 text-rose-700 dark:border-rose-700/50 dark:bg-rose-950/30 dark:text-rose-100">
-              模型菜单解锁失败：{modelPickerUnlockError}
-            </div>
-          ) : null}
-          {modelPickerUnlockResult ? (
-            <div
-              className={cn(
-                "mt-3 rounded-lg border p-3 text-xs leading-5",
-                modelPickerUnlockResult.injected
-                  ? "border-emerald-200 bg-emerald-50 text-emerald-800 dark:border-emerald-700/50 dark:bg-emerald-950/25 dark:text-emerald-100"
-                  : "border-amber-200 bg-amber-50 text-amber-800 dark:border-amber-700/50 dark:bg-amber-950/25 dark:text-amber-100",
-              )}
-            >
-              <div className="font-semibold">
-                {modelPickerUnlockResult.injected
-                  ? "模型菜单白名单已注入"
-                  : "模型菜单白名单尚未注入"}
-              </div>
-              <div className="mt-1">{modelPickerUnlockResult.message}</div>
-              <div className="mt-1 font-mono text-[11px] opacity-80">
-                models={modelPickerUnlockResult.modelCount} port=
-                {modelPickerUnlockResult.debugPort ?? "-"} launched=
-                {String(modelPickerUnlockResult.launched)}
-              </div>
-              {modelPickerUnlockResult.codexExecutable ? (
-                <div className="mt-2 rounded-md border border-current/20 bg-white/40 p-2 text-[11px] leading-5 dark:bg-black/10">
-                  Codex Desktop 主程序：
-                  <span className="font-mono break-all">
-                    {modelPickerUnlockResult.codexExecutable}
-                  </span>
-                  {!modelPickerUnlockResult.injected
-                    ? "。已捕获该 Desktop 路径；请完全退出 Codex Desktop 后再次点击“解锁模型菜单”，让 CCSwitchMulti 用 remote debugging 启动同一个 Desktop。成功注入后，切换第三方 API Key 不需要重复解锁；CLI/app-server 继续使用 live config、model_catalog_json 和本地 /v1/models 路径。"
-                    : ""}
-                </div>
-              ) : null}
-            </div>
-          ) : null}
-          <div className="mt-4 grid gap-3 text-sm md:grid-cols-3">
-            <DetailRow label="当前代理目标" value={activeTargetLabel} />
-            <DetailRow
-              label="启用匹配规则"
-              value={`${selectedRoutes.filter(({ route }) => route.enabled !== false).length} / ${selectedRoutes.length}`}
-            />
-            <DetailRow
-              label="代理累计请求"
-              value={`${proxyStatus?.total_requests ?? 0} 次，成功率 ${proxyStatus?.success_rate ?? 0}%`}
-            />
-          </div>
-          <div className="mt-3">
-            <DetailRow
-              label="最近错误"
-              value={proxyStatus?.last_error || latestLog?.errorMessage || "无"}
-            />
-          </div>
-        </section>
+          </section>
+        </>
       )}
 
       {statusView === "debug" && (
@@ -7954,6 +7966,8 @@ function StatusTab({
           onRun={() => runDiagnostics("debug")}
         />
       )}
+
+      {statusView === "stream-retry" && <StreamRetryActivityPanel />}
 
       {statusView === "protocol" && (
         <section className="rounded-lg border border-cyan-200 bg-cyan-50/70 p-4 dark:border-cyan-700/40 dark:bg-cyan-950/10">
@@ -8343,6 +8357,7 @@ function StatusViewSwitcher({
         : "已检查"
     : "未检查";
 
+  const { t } = useTranslation();
   const items: Array<{
     value: StatusView;
     icon: React.ComponentType<{ className?: string }>;
@@ -8379,11 +8394,19 @@ function StatusViewSwitcher({
       label: "流量",
       detail: `${trafficCount} 组统计`,
     },
+    {
+      value: "stream-retry",
+      icon: RefreshCw,
+      label: t("streamRetry.activity.tab", { defaultValue: "Stream retry" }),
+      detail: t("streamRetry.activity.tabDescription", {
+        defaultValue: "Live reconnect activity",
+      }),
+    },
   ];
 
   return (
     <div className="rounded-lg border border-border bg-card p-2 dark:border-slate-700 dark:bg-slate-950/40">
-      <div className="grid gap-2 md:grid-cols-5">
+      <div className="grid gap-2 md:grid-cols-3 xl:grid-cols-6">
         {items.map((item) => {
           const Icon = item.icon;
           const active = value === item.value;

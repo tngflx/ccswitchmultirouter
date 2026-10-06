@@ -42,11 +42,11 @@ use super::{
         },
         streaming_gemini::create_anthropic_sse_stream_from_gemini,
         streaming_retry::{
-            create_capacity_resilient_upstream_sse_stream,
-            create_resilient_anthropic_sse_stream_from_responses,
-            create_resilient_anthropic_sse_stream_from_responses_with_web_search_options,
-            create_resilient_responses_sse_stream_with_context, ByteStream,
-            CodexUpstreamSseProtocol, StreamLogContext, StreamReconnector,
+            create_resilient_anthropic_sse_stream_from_responses_with_web_search_options_and_context,
+            create_resilient_anthropic_upstream_sse_stream,
+            create_resilient_chat_sse_stream_with_context,
+            create_resilient_responses_sse_stream_with_context, ByteStream, StreamLogContext,
+            StreamReconnector,
         },
         transform, transform_codex_anthropic, transform_codex_chat,
         transform_codex_responses_namespace, transform_codex_responses_xai_sanitize,
@@ -1116,18 +1116,36 @@ async fn handle_claude_transform(
             // 尚未收到实质内容时自动重试（上限 5 次），其余场景行为不变。
             if hosted_web_search_name.is_none() && hosted_web_search_max_uses.is_none() {
                 Box::new(Box::pin(
-                    create_resilient_anthropic_sse_stream_from_responses(
+                    create_resilient_anthropic_sse_stream_from_responses_with_web_search_options_and_context(
                         Box::pin(stream),
                         stream_reconnect,
+                        None,
+                        None,
+                        Some(StreamLogContext {
+                            session_id: ctx.session_id.clone(),
+                            model: ctx
+                                .outbound_model
+                                .clone()
+                                .unwrap_or_else(|| ctx.request_model.clone()),
+                            provider_id: ctx.provider.id.clone(),
+                        }),
                     ),
                 ))
             } else {
                 Box::new(Box::pin(
-                    create_resilient_anthropic_sse_stream_from_responses_with_web_search_options(
+                    create_resilient_anthropic_sse_stream_from_responses_with_web_search_options_and_context(
                         Box::pin(stream),
                         stream_reconnect,
                         hosted_web_search_name.clone(),
                         hosted_web_search_max_uses,
+                        Some(StreamLogContext {
+                            session_id: ctx.session_id.clone(),
+                            model: ctx
+                                .outbound_model
+                                .clone()
+                                .unwrap_or_else(|| ctx.request_model.clone()),
+                            provider_id: ctx.provider.id.clone(),
+                        }),
                     ),
                 ))
             }
@@ -1542,13 +1560,17 @@ pub async fn handle_chat_completions(
     };
 
     let connection_guard = result.connection_guard.take();
+    let stream_reconnect = result.stream_reconnect.take();
     ctx.outbound_model = result.outbound_model.take();
     ctx.provider = result.provider;
     let response = result.response;
 
     if codex_chat_to_responses {
         return handle_codex_responses_to_chat_transform(
-            response,
+            CodexTransformUpstream {
+                response,
+                stream_reconnect,
+            },
             &ctx,
             &state,
             is_stream,
@@ -1556,6 +1578,30 @@ pub async fn handle_chat_completions(
         )
         .await;
     }
+
+    // Direct OpenAI-compatible Chat streams must be retried before the generic
+    // response processor consumes the body. The forwarder has already captured
+    // the finalized replay payload, so this wrapper only changes the stream
+    // lifecycle and leaves usage logging/connection ownership intact.
+    let response = if is_stream && response.status().is_success() && !response.is_json() {
+        let status = response.status();
+        let response_headers = response.headers().clone();
+        let stream = create_resilient_chat_sse_stream_with_context(
+            Box::pin(response.bytes_stream()),
+            stream_reconnect,
+            Some(StreamLogContext {
+                session_id: ctx.session_id.clone(),
+                model: ctx
+                    .outbound_model
+                    .clone()
+                    .unwrap_or_else(|| ctx.request_model.clone()),
+                provider_id: ctx.provider.id.clone(),
+            }),
+        );
+        super::hyper_client::ProxyResponse::streamed(status, response_headers, stream)
+    } else {
+        response
+    };
 
     process_response_with_stream_hint(
         response,
@@ -2863,18 +2909,34 @@ fn external_openai_api_unsupported_response(
 }
 
 async fn handle_codex_responses_to_chat_transform(
-    response: super::hyper_client::ProxyResponse,
+    upstream: CodexTransformUpstream,
     ctx: &RequestContext,
     state: &ProxyState,
     is_stream: bool,
     connection_guard: Option<ActiveConnectionGuard>,
 ) -> Result<axum::response::Response, ProxyError> {
+    let CodexTransformUpstream {
+        response,
+        stream_reconnect,
+    } = upstream;
     let status = response.status();
     if !status.is_success() {
         return handle_codex_responses_error_response(response, ctx, status).await;
     }
     if is_stream {
-        let stream = response.bytes_stream();
+        let stream = create_resilient_responses_sse_stream_with_context(
+            Box::pin(response.bytes_stream()),
+            stream_reconnect,
+            Some(StreamLogContext {
+                session_id: ctx.session_id.clone(),
+                model: ctx
+                    .outbound_model
+                    .clone()
+                    .unwrap_or_else(|| ctx.request_model.clone()),
+                provider_id: ctx.provider.id.clone(),
+            }),
+            ctx.app_config.capacity_retry_enabled,
+        );
         let sse_stream = openai_compat::create_chat_sse_stream_from_codex_responses(
             stream,
             ctx.request_model.clone(),
@@ -3227,8 +3289,21 @@ async fn handle_responses_for_app(
         let rebuilt = if is_stream || response.is_sse() {
             let status = response.status();
             let response_headers = response.headers().clone();
+            let stream = create_resilient_responses_sse_stream_with_context(
+                Box::pin(response.bytes_stream()),
+                stream_reconnect,
+                Some(StreamLogContext {
+                    session_id: ctx.session_id.clone(),
+                    model: ctx
+                        .outbound_model
+                        .clone()
+                        .unwrap_or_else(|| ctx.request_model.clone()),
+                    provider_id: ctx.provider.id.clone(),
+                }),
+                ctx.app_config.capacity_retry_enabled,
+            );
             let stream = record_responses_sse_stream_with_request(
-                response.bytes_stream(),
+                stream,
                 state.codex_chat_history.clone(),
                 request_body_for_history,
             );
@@ -3281,6 +3356,7 @@ async fn handle_responses_for_app(
     if super::providers::provider_needs_responses_namespace_flatten(&ctx.provider) {
         return handle_codex_xai_native_responses_rewrite(
             response,
+            stream_reconnect,
             &ctx,
             &state,
             connection_guard,
@@ -3534,8 +3610,21 @@ async fn handle_responses_compact_for_app(
         let rebuilt = if is_stream || response.is_sse() {
             let status = response.status();
             let response_headers = response.headers().clone();
+            let stream = create_resilient_responses_sse_stream_with_context(
+                Box::pin(response.bytes_stream()),
+                stream_reconnect,
+                Some(StreamLogContext {
+                    session_id: ctx.session_id.clone(),
+                    model: ctx
+                        .outbound_model
+                        .clone()
+                        .unwrap_or_else(|| ctx.request_model.clone()),
+                    provider_id: ctx.provider.id.clone(),
+                }),
+                ctx.app_config.capacity_retry_enabled,
+            );
             let stream = record_responses_sse_stream_with_request(
-                response.bytes_stream(),
+                stream,
                 state.codex_chat_history.clone(),
                 request_body_for_history,
             );
@@ -3583,6 +3672,7 @@ async fn handle_responses_compact_for_app(
     if super::providers::provider_needs_responses_namespace_flatten(&ctx.provider) {
         return handle_codex_xai_native_responses_rewrite(
             response,
+            stream_reconnect,
             &ctx,
             &state,
             connection_guard,
@@ -3616,6 +3706,7 @@ async fn handle_responses_compact_for_app(
 /// through unchanged. Usage is collected exactly as `process_response` would.
 async fn handle_codex_xai_native_responses_rewrite(
     response: super::hyper_client::ProxyResponse,
+    stream_reconnect: Option<StreamReconnector>,
     ctx: &RequestContext,
     state: &ProxyState,
     connection_guard: Option<ActiveConnectionGuard>,
@@ -3645,9 +3736,22 @@ async fn handle_codex_xai_native_responses_rewrite(
             builder = builder.header(key, value);
         }
 
+        let resilient_stream = create_resilient_responses_sse_stream_with_context(
+            Box::pin(response.bytes_stream()),
+            stream_reconnect,
+            Some(StreamLogContext {
+                session_id: ctx.session_id.clone(),
+                model: ctx
+                    .outbound_model
+                    .clone()
+                    .unwrap_or_else(|| ctx.request_model.clone()),
+                provider_id: ctx.provider.id.clone(),
+            }),
+            ctx.app_config.capacity_retry_enabled,
+        );
         let restore_stream =
             transform_codex_responses_xai_sanitize::create_xai_native_responses_sse_stream(
-                response.bytes_stream(),
+                resilient_stream,
                 tool_context,
                 namespace_map,
             );
@@ -4166,12 +4270,10 @@ async fn handle_codex_chat_to_responses_transform(
             model: upstream_model.to_string(),
             provider_id: ctx.provider.id.clone(),
         };
-        let stream = create_capacity_resilient_upstream_sse_stream(
+        let stream = create_resilient_chat_sse_stream_with_context(
             Box::pin(response.bytes_stream()),
             stream_reconnect,
-            ctx.app_config.capacity_retry_enabled,
-            CodexUpstreamSseProtocol::ChatCompletions,
-            Some(log_context.clone()),
+            Some(log_context),
         );
         let sse_stream = create_codex_chat_sse_stream_from_verified_profile_for_client(
             stream,
@@ -4184,12 +4286,6 @@ async fn handle_codex_chat_to_responses_transform(
             state.db.clone(),
             projection_now,
             ctx.codex_desktop_reasoning,
-        );
-        let sse_stream = create_resilient_responses_sse_stream_with_context(
-            Box::pin(sse_stream),
-            None,
-            Some(log_context),
-            false,
         );
         let sse_stream = record_responses_sse_stream(sse_stream, state.codex_chat_history.clone());
         let sse_stream = observe_aggressive_recovery(sse_stream, recovery_context);
@@ -4468,11 +4564,10 @@ async fn handle_codex_anthropic_to_responses_transform(
                 .unwrap_or_else(|| ctx.request_model.clone()),
             provider_id: ctx.provider.id.clone(),
         };
-        let stream = create_capacity_resilient_upstream_sse_stream(
+        let stream = create_resilient_anthropic_upstream_sse_stream(
             Box::pin(response.bytes_stream()),
             stream_reconnect,
             ctx.app_config.capacity_retry_enabled,
-            CodexUpstreamSseProtocol::AnthropicMessages,
             Some(log_context.clone()),
         );
         let sse_stream =

@@ -25,8 +25,13 @@ use super::{
     log_codes::fwd as log_fwd,
     provider_router::ProviderRouter,
     providers::{
-        codex_chat_history::CodexChatHistoryStore, gemini_shadow::GeminiShadowStore, get_adapter,
-        streaming_retry::StreamReconnector, AuthInfo, AuthStrategy, ProviderAdapter, ProviderType,
+        codex_chat_history::CodexChatHistoryStore,
+        gemini_shadow::GeminiShadowStore,
+        get_adapter,
+        streaming_retry::{
+            create_resilient_chat_sse_stream_with_context, StreamLogContext, StreamReconnector,
+        },
+        AuthInfo, AuthStrategy, ProviderAdapter, ProviderType,
     },
     thinking_budget_rectifier::{rectify_thinking_budget, should_rectify_thinking_budget},
     thinking_rectifier::{
@@ -4385,7 +4390,7 @@ impl RequestForwarder {
             "hyper"
         };
 
-        // 流式 Responses 请求提交给下游后，上游仍可能中途掐断 SSE。
+        // 流式 Chat/Responses 请求提交给下游后，上游仍可能中途掐断 SSE。
         // 在 headers/body 被移动之前捕获一份重放工厂，交给下游转换层做
         // 有界重连（见 providers::streaming_retry）。工厂只是重放同一
         // HTTP 请求；是否重试、重试多少次由转换层根据下游状态决定。
@@ -4394,7 +4399,7 @@ impl RequestForwarder {
         let build_stream_reconnect =
             |replay_headers: http::HeaderMap, replay_payload: FinalizedRequestPayload| {
                 if stream_retry_budget == 0
-                    || !should_create_responses_stream_reconnector(
+                    || !should_create_stream_reconnector(
                         app_type,
                         endpoint,
                         request_is_streaming,
@@ -4878,7 +4883,20 @@ impl RequestForwarder {
                     );
                     response_headers.remove(http::header::CONTENT_LENGTH);
                     response_headers.remove(http::header::CONTENT_ENCODING);
-                    let initial_stream: ChatSseStream = Box::pin(response.bytes_stream());
+                    let initial_stream: ChatSseStream =
+                        if let Some(reconnector) = stream_reconnect.take() {
+                            Box::pin(create_resilient_chat_sse_stream_with_context(
+                                Box::pin(response.bytes_stream()),
+                                Some(reconnector),
+                                Some(StreamLogContext {
+                                    session_id: self.session_id.clone(),
+                                    model: request_model_for_log.clone(),
+                                    provider_id: provider.id.clone(),
+                                }),
+                            ))
+                        } else {
+                            Box::pin(response.bytes_stream())
+                        };
                     let hosted_tool_diagnostic_context =
                         super::providers::streaming_codex_chat::HostedToolDiagnosticContext {
                             trace_id: codex_trace_id.clone(),
@@ -7466,9 +7484,10 @@ fn should_retry_without_codex_responses_lite_header(
             .unwrap_or(false)
 }
 
-/// 原生 Codex `/responses` 直通与 Claude 的 Responses 转换都能在未产生语义输出
-/// 前安全重连。其它端点即使是 streaming，也不能假定遵守 Responses SSE 语义。
-fn should_create_responses_stream_reconnector(
+/// Codex 的 `/responses` 直通、Chat Completions 直通，以及 Claude 的
+/// Responses 转换都能在未产生语义输出前安全重连。其它端点即使是
+/// streaming，也不能假定遵守这两种 SSE 语义。
+fn should_create_stream_reconnector(
     app_type: &AppType,
     endpoint: &str,
     request_is_streaming: bool,
@@ -7477,7 +7496,8 @@ fn should_create_responses_stream_reconnector(
     request_is_streaming
         && (resolved_claude_api_format == Some("openai_responses")
             || (matches!(app_type, AppType::Codex)
-                && super::providers::is_codex_responses_endpoint(endpoint)))
+                && (super::providers::is_codex_responses_endpoint(endpoint)
+                    || endpoint.contains("/chat/completions"))))
 }
 
 /// 生成 Codex Responses-Lite fallback 的能力缓存 key。
@@ -10410,29 +10430,45 @@ mod tests {
 
     #[test]
     fn native_codex_responses_streams_get_reconnect_factory() {
-        assert!(should_create_responses_stream_reconnector(
+        assert!(should_create_stream_reconnector(
             &AppType::Codex,
             "/v1/responses",
             true,
             None,
         ));
-        assert!(should_create_responses_stream_reconnector(
+        assert!(should_create_stream_reconnector(
             &AppType::Claude,
             "/v1/messages",
             true,
             Some("openai_responses"),
         ));
-        assert!(!should_create_responses_stream_reconnector(
+        assert!(!should_create_stream_reconnector(
             &AppType::Codex,
             "/v1/responses",
             false,
             None,
         ));
-        assert!(!should_create_responses_stream_reconnector(
+        assert!(!should_create_stream_reconnector(
             &AppType::Codex,
             "/v1/models",
             true,
             None,
+        ));
+    }
+
+    #[test]
+    fn codex_chat_streams_get_reconnect_factory() {
+        assert!(should_create_stream_reconnector(
+            &AppType::Codex,
+            "/v1/chat/completions",
+            true,
+            None,
+        ));
+        assert!(!should_create_stream_reconnector(
+            &AppType::Claude,
+            "/v1/chat/completions",
+            true,
+            Some("openai_chat"),
         ));
     }
 

@@ -1,3 +1,153 @@
+## 2026-10-06 - Retry consumer checks pass; shared fixture typecheck remains open
+
+What happened: finished the pending handler run and refreshed the retry's
+App/workspace consumer checks before its scoped commit.
+
+Root cause: the retry warnings came from obsolete production delegates; the
+remaining shared typecheck failure is a concurrent projection test fixture
+using null for a required timestamp string.
+
+What we did: retained the retry cleanup and main-page activity integration;
+selected only owned source, translations, and evidence for the index.
+
+Evidence: handlers passed 94/94; frontend retry/App/workspace tests passed
+5 files / 147 tests. Indexed syntax, locale parsing, and cached diff checks
+passed. `pnpm typecheck` failed at workspace test lines 910 and 911 on
+`generatedAt`; test-environment warnings remain. Full suites and runtime are
+not verified. No push, app restart, active-target cleaning, or release build.
+
+What NOT to do again: do not conflate scoped test passes with shared delivery
+readiness. Related:
+`docs/decisions/2026-10-06-stream-retry-warning-cleanup.md`.
+
+## 2026-10-06 - Retry continuation checks pass; shared delivery gates remain open
+
+What happened: completed the pending warning-cleanup test run and rechecked the
+retry source while another chat continued Model order changes in the checkout.
+
+Root cause: the three reported production warnings were stale retry helpers,
+not missing retry behavior. Concurrent unrelated edits change the shared
+typecheck and formatting gates between checks.
+
+What we did: preserved the warning cleanup, main-page controls, sanitized
+activity feed, and four-hour dev runner; isolated only retry-owned changes for
+the retry commit without overwriting shared source.
+
+Evidence: retry tests passed 50/50; the broader dependent streaming run passed
+172/172, including those 50 cases. Focused frontend retry tests passed 3 files /
+10 tests. Production `cargo check` passed without warnings; direct formatting
+checks on the four retry-owned Rust files passed. The latest typecheck failed
+on the concurrent Model order control's `ultra` type at workspace lines 4956
+and 4958; global Rust formatting failed in its config/compiler/projection
+files. Two untouched test-only Rust warnings remain. Full suites and live
+runtime were not verified; no push, release build, or process stop occurred.
+
+What NOT to do again: do not report a historical green gate as current in a
+moving shared tree, suppress stale-helper warnings, or use the old running
+binary to verify newer source. Related:
+`docs/decisions/2026-10-06-stream-retry-warning-cleanup.md`.
+
+## 2026-10-06 - Retry port dead-code warnings corrected
+
+What happened: the user reported three Rust dead-code warnings left by the
+refork retry port. Earlier records incorrectly described them as pre-existing.
+
+Root cause: production Chat handling had moved to its dedicated retry wrapper,
+and Responses-to-Anthropic handling to the context-aware wrapper, leaving an
+obsolete protocol variant and two unused production delegates.
+
+What we did: specialized the raw wrapper to Anthropic Messages, moved the
+two-argument convenience delegate into tests, removed the unused intermediate
+delegate, and routed Chat capacity/no-replay regressions through the production
+Chat wrapper and converter. Preserved retry budgets, semantic-output guards,
+reconnect-failure recovery, diagnostic labels and prior UI/dev-runner fixes.
+Appended the attribution correction without rewriting the earlier evidence.
+
+Evidence: targeted library tests passed 240/240 (50 retry, 67 Codex converter,
+29 Responses converter, 94 handler). `cargo check --manifest-path
+src-tauri/Cargo.toml` exited 0 without warnings; Rust formatting and diff checks
+passed. Initial formatting failures were corrected; an initial 49-pass/1-fail
+retry run was fixed with a valid Anthropic visible-text-delta fixture and
+rerun 50/50. Two warnings remain in untouched test code: an unused protocol
+fixture variant and an intentional invalid-UTF-8 literal. Frontend/full suites
+and live runtime were not tested in this cleanup; runtime freshness remains
+pending the user's refork `pnpm dev` restart.
+
+What NOT to do again: do not call port-introduced dead code pre-existing,
+suppress warnings to hide stale ownership, or treat unused helper warnings as
+a reason to remove retry. Related:
+`docs/decisions/2026-10-06-stream-retry-warning-cleanup.md` and
+`docs/decisions/2026-10-06-anthropic-upstream-stream-retry.md`.
+
+## 2026-10-06 — Anthropic raw-stream retry loop completed and verified
+
+What happened: the remaining refork stream-retry gap was in the raw
+Anthropic-to-Responses upstream wrapper. A transport drop before semantic
+content could be observed, but a failed reconnect incorrectly returned to the
+outer stream loop with no current stream, so the remaining retry budget was
+never used.
+
+Root cause: reconnect failure handling was structured as an outer-loop
+`continue` even though `current` was still `None`. The same wrapper also
+classified clean EOF after already-forwarded semantic content as a
+pre-semantic failure.
+
+What we did: added an inner reconnect loop that consumes bounded transport or
+capacity attempts, updates the diagnostic reason after each failed reconnect,
+emits retry activity for scheduled/failed/exhausted states, and only resumes
+the outer stream loop after a successful response. Preserved clean post-content
+EOF passthrough behavior. Added a regression covering Anthropic
+`message_start`, transport drop, failed reconnect, successful replay, one
+`response.created`, and recovered text.
+
+Evidence: `cargo test --manifest-path src-tauri/Cargo.toml --lib
+proxy::providers::streaming_retry -- --nocapture` passed 49/49; the initial
+non-library command was blocked by the live app holding
+`src-tauri\\target\\debug\\cc-switch.exe` open (`Access is denied`). Focused
+frontend retry tests passed 3 files/5 tests; `pnpm typecheck` passed; `cargo
+check --manifest-path src-tauri/Cargo.toml` passed with only existing
+warnings; `cargo fmt --manifest-path src-tauri/Cargo.toml --check` and
+`git diff --check` passed with only pre-existing CRLF normalization notices.
+Runtime freshness remains pending until the user stops and restarts the
+current `pnpm dev` process.
+
+What NOT to do again: do not jump out of the reconnect loop while `current` is
+empty, and do not claim desktop runtime behavior from the stale development
+binary. Related: `docs/decisions/2026-10-06-anthropic-upstream-stream-retry.md`.
+
+## 2026-10-06 — Completed refork stream-retry port and main-page observability
+
+What happened: continued the unfinished stream-retry port in the fresh refork
+after the first pass had left direct Codex Chat and the OAuth
+Chat-to-Responses-to-Chat path without the finalized replay factory, and had
+not yet recorded verification evidence.
+
+Root cause: the retry engine already owned bounded reconnect behavior, but the
+forwarder only created the replay handoff for the native Responses path.
+Separately, the main-page control and event feed had been implemented but
+runtime freshness was still blocked by the user's running Tauri process.
+
+What we did: completed forwarder wiring for direct Codex Chat streams and the
+OAuth conversion path, retained the safe pre-semantic-output boundary, kept
+capacity retry separate, and preserved the sanitized app-wide activity event.
+The header now exposes the retry switch, Off/Safe/Aggressive mode, and
+aggressive attempt slider beside the proxy controls; the Codex workspace
+status surface shows the latest 50 retry transitions and can be opened from
+that header control.
+
+Evidence: focused frontend retry tests passed (3 files, 5 tests); Rust
+streaming retry tests passed (48 passed, 0 failed); `pnpm typecheck` passed;
+`cargo check --manifest-path src-tauri/Cargo.toml` passed with only dead-code
+warnings; `cargo fmt --manifest-path src-tauri/Cargo.toml --check` passed.
+`git diff --check` passed with only CRLF-to-LF normalization notices for
+pre-existing files. Runtime freshness remains pending because the existing
+`pnpm dev`/Tauri process was not interrupted.
+
+What NOT to do again: do not hide the retry control only in Settings, do not
+create a second replay owner, and do not claim runtime behavior from a stale
+desktop binary. Related:
+`docs/decisions/2026-10-06-codex-stream-retry-observability.md`.
+
 ## 2026-10-06 — Committed dependency tree passes frontend gates; backend lock remains
 
 What happened: the approved dependency upgrades and formatter-compatible source

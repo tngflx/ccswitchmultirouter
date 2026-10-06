@@ -3698,5 +3698,43 @@
       "deleteTemplateTitle": "Delete /{{slug}}?",
       "deleteTemplateMessage": "This permanently deletes prompts/{{slug}}.md."
     }
+  },
+  "streamRetry": {
+    "compactLabel": "Retry",
+    "title": "Turn recovery",
+    "description": "Choose how interrupted Codex turns recover.",
+    "mode": {
+      "off": "Off",
+      "safe": "Safe",
+      "aggressive": "Aggressive"
+    },
+    "maxAttempts": "Continue attempts",
+    "help": {
+      "off": "No transparent proxy reconnect or Desktop continuation.",
+      "safe": "Reconnects up to 5 times before semantic output. Visible failures remain Codex-owned.",
+      "aggressive": "Same 5 safe reconnects, then Codex Desktop submits literal “continue” for recoverable interrupted turns up to this limit."
+    },
+    "label": "Stream Retry",
+    "tooltip": {
+      "enabled": "Safe proxy reconnect is enabled for eligible pre-semantic stream drops.",
+      "disabled": "Proxy reconnect and Desktop continuation are disabled."
+    },
+    "activity": {
+      "tab": "Stream retry",
+      "tabDescription": "Live reconnect activity",
+      "title": "Live stream retry activity",
+      "description": "Shows sanitized retry transitions from the running proxy. The feed is in-memory and keeps the latest 50 events.",
+      "empty": "No stream retry activity yet. This feed updates when an eligible stream is interrupted.",
+      "open": "Open stream retry activity",
+      "eventColumn": "Event",
+      "routeColumn": "Route",
+      "attemptColumn": "Attempt",
+      "events": {
+        "retry_scheduled": "Retry scheduled",
+        "reconnected": "Reconnected",
+        "reconnect_failed": "Reconnect failed",
+        "retries_exhausted": "Retries exhausted"
+      }
+    }
   }
 }
