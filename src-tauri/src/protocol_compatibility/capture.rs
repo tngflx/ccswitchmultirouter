@@ -27,6 +27,8 @@ pub enum ProbeCaptureError {
     ResponseTooLarge,
     #[error("protocol probe response payload was invalid")]
     InvalidPayload,
+    #[error("protocol probe final request failed the local Responses contract")]
+    InvalidRequest,
 }
 
 pub(super) struct CapturedPayload {

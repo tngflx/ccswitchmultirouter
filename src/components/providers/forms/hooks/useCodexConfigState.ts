@@ -8,6 +8,7 @@ import {
   updateCodexExperimentalBearerToken,
 } from "@/utils/providerConfigUtils";
 import { normalizeTomlText } from "@/utils/textNormalization";
+import { normalizeModelIdentityMetadata } from "@/lib/modelIdentities";
 import type {
   CodexApiFormat,
   CodexApiKeyGroup,
@@ -245,6 +246,7 @@ export function extractCodexCatalogModels(
 
       return {
         model: typeof item?.model === "string" ? item.model : "",
+        ...normalizeModelIdentityMetadata(item ?? {}),
         ...(enabled !== undefined ? { enabled } : {}),
         ...(upstreamModel ? { upstreamModel } : {}),
         ...(displayName ? { displayName } : {}),

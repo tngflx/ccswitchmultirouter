@@ -9,6 +9,41 @@ import { useCodexConfigState } from "@/components/providers/forms/hooks/useCodex
 // 注意：initialData 必须是稳定引用（hook 的 init effect 依赖 [initialData]）。
 // 写成内联字面量会每次 re-render 产生新引用 → effect 反复 setState → 死循环 OOM。
 describe("useCodexConfigState catalog load", () => {
+  it("preserves searchable identities and exclusions when reopening a provider", () => {
+    const initialData = {
+      settingsConfig: {
+        modelCatalog: {
+          models: [
+            {
+              model: "visible-model",
+              canonical_slug: " vendor/canonical ",
+              slug: " stable-slug ",
+              aliases: [" fast ", "backup"],
+              name: " Friendly Model ",
+              enabled: false,
+            },
+            {
+              model: "other-model",
+              aliases: { " quick ": " upstream-target " },
+            },
+          ],
+        },
+      },
+    };
+    const { result } = renderHook(() => useCodexConfigState({ initialData }));
+    expect(result.current.codexCatalogModels).toEqual([
+      {
+        model: "visible-model",
+        canonicalSlug: "vendor/canonical",
+        slug: "stable-slug",
+        aliases: ["fast", "backup"],
+        name: "Friendly Model",
+        enabled: false,
+      },
+      { model: "other-model", aliases: { quick: "upstream-target" } },
+    ]);
+  });
+
   it("preserves native-profile hidden fields (camelCase, DB SSOT)", () => {
     const initialData = {
       settingsConfig: {

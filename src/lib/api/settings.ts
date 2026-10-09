@@ -357,6 +357,17 @@ export const settingsApi = {
     return await invoke("get_tool_versions", { tools, wslShellByTool });
   },
 
+  async getToolAutoUpdateSettings(): Promise<Record<string, boolean>> {
+    return await invoke("get_tool_auto_update_settings");
+  },
+
+  async setToolAutoUpdate(
+    tool: string,
+    enabled: boolean,
+  ): Promise<Record<string, boolean>> {
+    return await invoke("set_tool_auto_update", { tool, enabled });
+  },
+
   async runToolLifecycleAction(
     tools: string[],
     action: "install" | "update",

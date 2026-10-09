@@ -69,6 +69,7 @@ impl RedactedProbeFailure {
             }
             ProbeCaptureError::ResponseTooLarge => (ProbeFailureKind::ResponseTooLarge, None),
             ProbeCaptureError::InvalidPayload => (ProbeFailureKind::InvalidResponse, None),
+            ProbeCaptureError::InvalidRequest => (ProbeFailureKind::InvalidRequest, None),
         };
         Self {
             stage,
@@ -1081,7 +1082,21 @@ fn prepare_case_request(
     };
     let mut prepared = candidate
         .prepare_request_with_options(transport, logical, options)
-        .map_err(|_| ProbeCaptureError::InvalidPayload)?;
+        .map_err(|_| ProbeCaptureError::InvalidRequest)?;
+    if transport == TransportKind::OpenAiResponses
+        && crate::proxy::providers::responses_contract::inspect(
+            &prepared.body,
+            prepared
+                .body
+                .get("model")
+                .and_then(Value::as_str)
+                .is_some_and(|model| model.starts_with("gpt-") || model.starts_with("codex-")),
+        )
+        .iter()
+        .any(|finding| finding.severity == "error")
+    {
+        return Err(ProbeCaptureError::InvalidRequest);
+    }
     // This direct probe bypasses the runtime forwarder. Reuse its Go identity policy
     // after provider overrides, with one stable identity per independent branch.
     // The nonce is allocated once per candidate run, not once per HTTP request.
@@ -1104,6 +1119,68 @@ fn prepare_case_request(
 #[cfg(test)]
 mod opencode_go_probe_tests {
     use super::*;
+
+    #[test]
+    fn outbound_contract_failure_is_not_mislabeled_as_invalid_response() {
+        let failure = RedactedProbeFailure::from_capture(
+            ProbeProgressStage::Baseline,
+            ProbeCaptureError::InvalidRequest,
+        );
+        assert_eq!(failure.kind, ProbeFailureKind::InvalidRequest);
+        assert_eq!(failure.status_code, None);
+    }
+
+    #[test]
+    fn final_provider_overrides_are_checked_before_probe_dispatch() {
+        use crate::provider::{LocalProxyRequestOverrides, Provider, ProviderMeta};
+        use crate::proxy::providers::codex_request::CodexThirdPartyRequestPolicy;
+
+        for (overrides, valid) in [
+            (json!({"model":false}), false),
+            (
+                json!({"conversation":"fixture","previous_response_id":"fixture"}),
+                false,
+            ),
+            (json!({"vendor_extension":true}), true),
+        ] {
+            let mut provider = Provider::with_id(
+                "fixture".to_string(),
+                "Fixture".to_string(),
+                json!({"base_url":"https://example.test/v1","auth":{"OPENAI_API_KEY":"fixture-secret"}}),
+                None,
+            );
+            provider.meta = Some(ProviderMeta {
+                local_proxy_request_overrides: Some(LocalProxyRequestOverrides {
+                    body: Some(overrides),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            });
+            let candidate = ProbeCandidate::from_request_policy(
+                None::<String>,
+                None::<String>,
+                "fixture-model",
+                "fixture-model",
+                TransportKind::OpenAiResponses,
+                CodexThirdPartyRequestPolicy::compile(&provider).unwrap(),
+            )
+            .unwrap();
+            let result = prepare_case_request(
+                &candidate,
+                &Client::new(),
+                TransportKind::OpenAiResponses,
+                ProbeCase::BaselineJson,
+                "fixture",
+                None,
+                CodexRequestOptions::default(),
+            );
+            if valid {
+                assert!(result.is_ok());
+            } else {
+                assert!(matches!(result, Err(ProbeCaptureError::InvalidRequest)));
+            }
+        }
+    }
 
     fn request(
         base_url: &str,

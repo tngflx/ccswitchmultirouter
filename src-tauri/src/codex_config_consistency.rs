@@ -14,6 +14,7 @@ use tauri::{Emitter, Manager, State};
 const LAST_ACTION_KEY: &str = "codex_config_consistency:last_action";
 const LAST_ACTUAL_FINGERPRINT_KEY: &str = "codex_config_consistency:last_actual_fingerprint";
 const LAST_PROVIDER_ID_KEY: &str = "codex_config_consistency:last_provider_id";
+const ACKNOWLEDGEMENT_KEY: &str = "codex_config_consistency:acknowledgement_v1";
 const MANAGED_ACTIVATION_RECEIPT_FILENAME: &str = "codex-managed-config-activation.json";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -69,6 +70,19 @@ pub enum CodexConfigConsistencyAction {
     ApplyCcsm,
     KeepCodex,
     Later,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CodexConfigConsistencyAcknowledgement {
+    provider_id: Option<String>,
+    expected_fingerprint: Option<String>,
+    actual_fingerprint: Option<String>,
+    app_server_started_at: Option<String>,
+    config_modified_at: Option<String>,
+    reason: Option<String>,
+    action: CodexConfigConsistencyAction,
+    acknowledged_at_ms: i64,
 }
 
 fn canonicalize_toml_value(value: &toml::Value) -> JsonValue {
@@ -387,6 +401,134 @@ fn report(
     }
 }
 
+fn report_needs_attention(report: &CodexConfigConsistencyReport) -> bool {
+    report.state == CodexConfigConsistencyState::ExternalDrift
+        || report.runtime_activation.state == CodexConfigRuntimeActivationState::RestartRequired
+}
+
+fn short_fingerprint(fingerprint: Option<&str>) -> &str {
+    fingerprint
+        .filter(|value| value.len() >= 8)
+        .map(|value| &value[..8])
+        .unwrap_or("none")
+}
+
+fn acknowledgement_for_report(
+    report: &CodexConfigConsistencyReport,
+    action: CodexConfigConsistencyAction,
+) -> Option<CodexConfigConsistencyAcknowledgement> {
+    if !report_needs_attention(report) || report.actual_fingerprint.is_none() {
+        return None;
+    }
+    Some(CodexConfigConsistencyAcknowledgement {
+        provider_id: report.provider_id.clone(),
+        expected_fingerprint: report.expected_fingerprint.clone(),
+        actual_fingerprint: report.actual_fingerprint.clone(),
+        app_server_started_at: report.runtime_activation.app_server_started_at.clone(),
+        config_modified_at: report.runtime_activation.config_modified_at.clone(),
+        reason: report.reason.clone(),
+        action,
+        acknowledged_at_ms: system_time_to_millis(SystemTime::now()).unwrap_or_default(),
+    })
+}
+
+fn read_acknowledgement(
+    state: &AppState,
+) -> Result<Option<CodexConfigConsistencyAcknowledgement>, AppError> {
+    let Some(value) = state.db.get_setting(ACKNOWLEDGEMENT_KEY)? else {
+        return Ok(None);
+    };
+    match serde_json::from_str(&value) {
+        Ok(acknowledgement) => Ok(Some(acknowledgement)),
+        Err(error) => {
+            log::warn!("[CCX-002] Codex config acknowledgement is invalid; ignoring it: {error}");
+            Ok(None)
+        }
+    }
+}
+
+fn write_acknowledgement(
+    state: &AppState,
+    report: &CodexConfigConsistencyReport,
+    action: CodexConfigConsistencyAction,
+) -> Result<(), AppError> {
+    let Some(acknowledgement) = acknowledgement_for_report(report, action) else {
+        return Ok(());
+    };
+    let value = serde_json::to_string(&acknowledgement)
+        .map_err(|error| AppError::JsonSerialize { source: error })?;
+    state.db.set_setting(ACKNOWLEDGEMENT_KEY, &value)?;
+    // Remove the pre-v1 split keys so a legacy partial acknowledgement cannot
+    // accidentally suppress a different runtime evidence tuple.
+    state.db.delete_setting(LAST_ACTION_KEY)?;
+    state.db.delete_setting(LAST_ACTUAL_FINGERPRINT_KEY)?;
+    state.db.delete_setting(LAST_PROVIDER_ID_KEY)?;
+    log::info!(
+        "[CCX-003] Codex config acknowledgement stored: action={action:?}, provider={:?}, actual={}..., reason={:?}",
+        report.provider_id,
+        short_fingerprint(report.actual_fingerprint.as_deref()),
+        report.reason
+    );
+    Ok(())
+}
+
+fn clear_acknowledgement(state: &AppState) -> Result<(), AppError> {
+    state.db.delete_setting(ACKNOWLEDGEMENT_KEY)?;
+    state.db.delete_setting(LAST_ACTION_KEY)?;
+    state.db.delete_setting(LAST_ACTUAL_FINGERPRINT_KEY)?;
+    state.db.delete_setting(LAST_PROVIDER_ID_KEY)?;
+    Ok(())
+}
+
+fn acknowledgement_matches(
+    acknowledgement: &CodexConfigConsistencyAcknowledgement,
+    report: &CodexConfigConsistencyReport,
+) -> bool {
+    acknowledgement.provider_id == report.provider_id
+        && acknowledgement.expected_fingerprint == report.expected_fingerprint
+        && acknowledgement.actual_fingerprint == report.actual_fingerprint
+        && acknowledgement.app_server_started_at == report.runtime_activation.app_server_started_at
+        && acknowledgement.config_modified_at == report.runtime_activation.config_modified_at
+        && acknowledgement.reason == report.reason
+}
+
+fn suppress_acknowledged_report(
+    state: &AppState,
+    report: CodexConfigConsistencyReport,
+    include_acknowledged: bool,
+) -> Result<CodexConfigConsistencyReport, AppError> {
+    if include_acknowledged || !report_needs_attention(&report) {
+        return Ok(report);
+    }
+    let Some(acknowledgement) = read_acknowledgement(state)? else {
+        return Ok(report);
+    };
+    if !acknowledgement_matches(&acknowledgement, &report) {
+        return Ok(report);
+    }
+    log::debug!(
+        "[CCX-004] Suppressing acknowledged Codex config evidence: action={:?}, provider={:?}, actual={}..., reason={:?}",
+        acknowledgement.action,
+        report.provider_id,
+        short_fingerprint(report.actual_fingerprint.as_deref()),
+        report.reason
+    );
+    Ok(CodexConfigConsistencyReport {
+        state: CodexConfigConsistencyState::Consistent,
+        provider_id: report.provider_id,
+        expected_fingerprint: report.expected_fingerprint,
+        actual_fingerprint: report.actual_fingerprint,
+        changed_keys: Vec::new(),
+        reason: Some("acknowledged".to_string()),
+        runtime_activation: CodexConfigRuntimeActivation {
+            state: CodexConfigRuntimeActivationState::Current,
+            app_server_started_at: report.runtime_activation.app_server_started_at,
+            config_modified_at: report.runtime_activation.config_modified_at,
+            reason: Some("acknowledged".to_string()),
+        },
+    })
+}
+
 fn runtime_activation_from_managed_receipt_evidence(
     app_server_started_at_ms: Option<i64>,
     managed_config_written_at_ms: Option<i64>,
@@ -555,7 +697,7 @@ pub(crate) async fn reconcile_after_startup(app: &tauri::AppHandle) -> Result<()
         );
     }
     state.finish_codex_startup_reconciliation();
-    let report = inspect(&state)?;
+    let report = suppress_acknowledged_report(&state, inspect(&state)?, false)?;
     if should_emit_report(&report) {
         app.emit("codex-config-consistency", &report)
             .map_err(|error| {
@@ -727,6 +869,7 @@ pub fn resolve(
 ) -> Result<CodexConfigConsistencyReport, AppError> {
     let current = inspect(state)?;
     if action == CodexConfigConsistencyAction::Later {
+        write_acknowledgement(state, &current, action)?;
         return Ok(current);
     }
 
@@ -741,14 +884,7 @@ pub fn resolve(
                     "cannot_keep_codex_changes_while_takeover_enabled".to_string(),
                 ));
             }
-            state.db.set_setting(LAST_ACTION_KEY, "keep_codex")?;
-            state
-                .db
-                .set_setting(LAST_ACTUAL_FINGERPRINT_KEY, &actual_fingerprint)?;
-            state.db.set_setting(
-                LAST_PROVIDER_ID_KEY,
-                current.provider_id.as_deref().unwrap_or_default(),
-            )?;
+            write_acknowledgement(state, &current, action)?;
             Ok(current)
         }
         CodexConfigConsistencyAction::ApplyCcsm => {
@@ -787,7 +923,9 @@ pub fn resolve(
                 }
                 merge_ccsm_owned_projection(before, &candidate)
             })?;
-            inspect(state)
+            let result = inspect(state)?;
+            clear_acknowledgement(state)?;
+            Ok(result)
         }
         CodexConfigConsistencyAction::Later => Ok(current),
     }
@@ -803,6 +941,7 @@ async fn resolve_for_command(
         return resolve(state, expected_fingerprint, action);
     }
     if action == CodexConfigConsistencyAction::Later {
+        write_acknowledgement(state, &current, action)?;
         return Ok(current);
     }
     if action == CodexConfigConsistencyAction::KeepCodex {
@@ -878,8 +1017,14 @@ pub(crate) async fn reproject_current_ccsm_config(
 #[tauri::command]
 pub fn inspect_codex_config_consistency(
     state: State<'_, AppState>,
+    include_acknowledged: Option<bool>,
 ) -> Result<CodexConfigConsistencyReport, String> {
-    inspect(&state).map_err(String::from)
+    suppress_acknowledged_report(
+        &state,
+        inspect(&state).map_err(String::from)?,
+        include_acknowledged.unwrap_or(false),
+    )
+    .map_err(String::from)
 }
 
 #[tauri::command]
@@ -1409,7 +1554,7 @@ wire_api = "responses"
 
     #[test]
     #[serial]
-    fn keep_codex_records_only_fingerprint_acknowledgement() {
+    fn keep_codex_records_the_full_evidence_acknowledgement() {
         let (_home, state, provider_id) = seed_drifted_state();
         let before = inspect(&state).expect("inspect drift");
         let actual = before
@@ -1425,31 +1570,26 @@ wire_api = "responses"
         .expect("keep Codex changes");
 
         assert_eq!(after.state, CodexConfigConsistencyState::ExternalDrift);
+        let acknowledgement = read_acknowledgement(&state)
+            .expect("read acknowledgement")
+            .expect("acknowledgement exists");
         assert_eq!(
-            state.db.get_setting(LAST_ACTION_KEY).unwrap().as_deref(),
-            Some("keep_codex")
+            acknowledgement.action,
+            CodexConfigConsistencyAction::KeepCodex
         );
         assert_eq!(
-            state
-                .db
-                .get_setting(LAST_ACTUAL_FINGERPRINT_KEY)
-                .unwrap()
-                .as_deref(),
+            acknowledgement.actual_fingerprint.as_deref(),
             Some(actual.as_str())
         );
         assert_eq!(
-            state
-                .db
-                .get_setting(LAST_PROVIDER_ID_KEY)
-                .unwrap()
-                .as_deref(),
+            acknowledgement.provider_id.as_deref(),
             Some(provider_id.as_str())
         );
     }
 
     #[test]
     #[serial]
-    fn later_does_not_persist_an_acknowledgement() {
+    fn later_persists_an_acknowledgement_for_the_same_evidence() {
         let (_home, state, _) = seed_drifted_state();
         let before = inspect(&state).expect("inspect drift");
         let actual = before
@@ -1459,17 +1599,55 @@ wire_api = "responses"
 
         resolve(&state, actual, CodexConfigConsistencyAction::Later).expect("defer Codex changes");
 
-        assert!(state.db.get_setting(LAST_ACTION_KEY).unwrap().is_none());
-        assert!(state
-            .db
-            .get_setting(LAST_ACTUAL_FINGERPRINT_KEY)
-            .unwrap()
-            .is_none());
-        assert!(state
-            .db
-            .get_setting(LAST_PROVIDER_ID_KEY)
-            .unwrap()
-            .is_none());
+        let acknowledgement = read_acknowledgement(&state)
+            .expect("read acknowledgement")
+            .expect("acknowledgement exists");
+        assert_eq!(acknowledgement.action, CodexConfigConsistencyAction::Later);
+        assert_eq!(
+            acknowledgement.actual_fingerprint,
+            before.actual_fingerprint
+        );
+        assert_eq!(acknowledgement.provider_id, before.provider_id);
+    }
+
+    #[test]
+    #[serial]
+    fn acknowledged_evidence_is_hidden_from_automatic_inspection_but_manual_check_can_show_it() {
+        let (_home, state, _) = seed_drifted_state();
+        let before = inspect(&state).expect("inspect drift");
+        resolve(
+            &state,
+            before
+                .actual_fingerprint
+                .clone()
+                .expect("actual fingerprint"),
+            CodexConfigConsistencyAction::Later,
+        )
+        .expect("defer Codex changes");
+
+        let hidden = suppress_acknowledged_report(&state, inspect(&state).expect("inspect"), false)
+            .expect("suppress acknowledged report");
+        assert_eq!(hidden.state, CodexConfigConsistencyState::Consistent);
+        assert_eq!(hidden.reason.as_deref(), Some("acknowledged"));
+
+        let manual = suppress_acknowledged_report(&state, inspect(&state).expect("inspect"), true)
+            .expect("manual report");
+        assert_eq!(manual.state, CodexConfigConsistencyState::ExternalDrift);
+
+        let live_path = codex_config::get_codex_config_path();
+        let mut live = fs::read_to_string(&live_path)
+            .expect("read drifted live config")
+            .parse::<toml_edit::DocumentMut>()
+            .expect("parse drifted config");
+        live["model_providers"]["ccsm-provider"]["wire_api"] = toml_edit::value("responses");
+        live["model"] = toml_edit::value("changed-model");
+        codex_config::write_codex_live_config_atomic(Some(&live.to_string()))
+            .expect("write changed evidence");
+        let changed =
+            suppress_acknowledged_report(&state, inspect(&state).expect("inspect"), false)
+                .expect("changed report");
+        assert_eq!(changed.state, CodexConfigConsistencyState::ExternalDrift);
+        assert_ne!(changed.reason.as_deref(), Some("acknowledged"));
     }
 
     #[test]

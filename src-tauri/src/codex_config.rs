@@ -80,7 +80,7 @@ static CODEX_BUNDLED_MODELS_CACHE: OnceCell<Option<Vec<Value>>> = OnceCell::new(
 
 /// Top-level `config.toml` key that controls Codex's built-in web-search tool.
 pub(crate) const CODEX_WEB_SEARCH_FIELD: &str = "web_search";
-/// CC Switch 写入的 web_search 禁用哨兵值，只移除自己写入的值。
+/// Managed value for providers that disable hosted search.
 pub(crate) const CODEX_WEB_SEARCH_DISABLED: &str = "disabled";
 /// 已确认原生 `/responses` 网关不接受 OpenAI hosted web_search 的主机片段。
 pub const CC_SWITCH_CODEX_OFFICIAL_PROXY_PROVIDER_ID: &str = "cc-switch-official";
@@ -1289,6 +1289,37 @@ fn codex_catalog_capabilities_for_model<'a>(settings: &'a Value, model: &str) ->
         .map(|entry| entry.get("capabilities").unwrap_or(entry))
 }
 
+/// Read one reasoning level from either the official string form or the
+/// object form used by newer Codex caches.
+fn codex_reasoning_effort_name(level: &Value) -> Option<&str> {
+    match level {
+        Value::String(value) => {
+            let value = value.trim();
+            (!value.is_empty()).then_some(value)
+        }
+        Value::Object(object) => ["effort", "reasoningEffort", "reasoning_effort"]
+            .into_iter()
+            .find_map(|field| {
+                object
+                    .get(field)
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+            }),
+        _ => None,
+    }
+}
+
+fn codex_reasoning_level_description<'a>(level: &'a Value, effort: &'a str) -> &'a str {
+    level
+        .as_object()
+        .and_then(|object| object.get("description"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|description| !description.is_empty())
+        .unwrap_or(effort)
+}
+
 /// 为 Codex Desktop renderer 生成 camelCase reasoning effort 数组。
 ///
 /// 官方 catalog 模板使用 `supported_reasoning_levels[].effort`，但 Desktop
@@ -1302,18 +1333,8 @@ fn codex_desktop_reasoning_efforts_from_levels(levels: Option<&Value>) -> Value 
             levels
                 .iter()
                 .filter_map(|level| {
-                    let effort = level
-                        .get("effort")
-                        .or_else(|| level.get("reasoningEffort"))
-                        .and_then(|value| value.as_str())
-                        .map(str::trim)
-                        .filter(|effort| !effort.is_empty())?;
-                    let description = level
-                        .get("description")
-                        .and_then(|value| value.as_str())
-                        .map(str::trim)
-                        .filter(|description| !description.is_empty())
-                        .unwrap_or(effort);
+                    let effort = codex_reasoning_effort_name(level)?;
+                    let description = codex_reasoning_level_description(level, effort);
                     Some(json!({
                         "reasoningEffort": effort,
                         "description": description,
@@ -1379,19 +1400,8 @@ fn codex_model_info_reasoning_levels_from_efforts(efforts: &Value) -> Value {
             efforts
                 .iter()
                 .filter_map(|effort| {
-                    let effort_name = effort
-                        .get("reasoningEffort")
-                        .or_else(|| effort.get("reasoning_effort"))
-                        .or_else(|| effort.get("effort"))
-                        .and_then(|value| value.as_str())
-                        .map(str::trim)
-                        .filter(|effort| !effort.is_empty())?;
-                    let description = effort
-                        .get("description")
-                        .and_then(|value| value.as_str())
-                        .map(str::trim)
-                        .filter(|description| !description.is_empty())
-                        .unwrap_or(effort_name);
+                    let effort_name = codex_reasoning_effort_name(effort)?;
+                    let description = codex_reasoning_level_description(effort, effort_name);
                     Some(json!({
                         "effort": effort_name,
                         "description": description,
@@ -2629,20 +2639,8 @@ fn codex_provider_reasoning_efforts_toml_array(
             levels
                 .iter()
                 .filter_map(|level| {
-                    let effort = level
-                        .get("effort")
-                        .or_else(|| level.get("reasoningEffort"))
-                        .and_then(Value::as_str)?
-                        .trim();
-                    if effort.is_empty() {
-                        return None;
-                    }
-                    let description = level
-                        .get("description")
-                        .and_then(Value::as_str)
-                        .map(str::trim)
-                        .filter(|description| !description.is_empty())
-                        .unwrap_or(effort);
+                    let effort = codex_reasoning_effort_name(level)?;
+                    let description = codex_reasoning_level_description(level, effort);
                     Some((effort.to_string(), description.to_string()))
                 })
                 .collect::<Vec<_>>()
@@ -2905,9 +2903,6 @@ fn set_active_codex_provider_models(
     specs: &[CodexCatalogModelSpec],
     catalog: Option<&Value>,
 ) {
-    if specs.is_empty() {
-        return;
-    }
     let Some(provider_id) = active_codex_model_provider_id(doc) else {
         return;
     };
@@ -3349,22 +3344,24 @@ fn codex_document_uses_multi_router(doc: &DocumentMut) -> bool {
         .is_some_and(|id| id.eq_ignore_ascii_case(CC_SWITCH_CODEX_ROUTER_MODEL_PROVIDER_ID))
 }
 
-/// 设置或清理由 CC Switch 管理的顶层 `web_search` 禁用项。
-fn set_codex_native_web_search_field(config_text: &str, disable: bool) -> Result<String, AppError> {
+/// Project the hosted-tool toggle into Codex's native search mode.
+fn set_codex_native_web_search_field(
+    config_text: &str,
+    settings: &Value,
+    unsupported: bool,
+) -> Result<String, AppError> {
     let mut doc = config_text
         .parse::<DocumentMut>()
         .map_err(|e| AppError::Message(format!("Invalid Codex config.toml: {e}")))?;
 
-    if disable {
+    let enabled = settings
+        .pointer("/hostedTools/webSearch/enabled")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+    if unsupported || !enabled {
         doc[CODEX_WEB_SEARCH_FIELD] = toml_edit::value(CODEX_WEB_SEARCH_DISABLED);
     } else {
-        let is_own_disabled = doc
-            .get(CODEX_WEB_SEARCH_FIELD)
-            .and_then(|item| item.as_str())
-            == Some(CODEX_WEB_SEARCH_DISABLED);
-        if is_own_disabled {
-            doc.as_table_mut().remove(CODEX_WEB_SEARCH_FIELD);
-        }
+        doc[CODEX_WEB_SEARCH_FIELD] = toml_edit::value("live");
     }
 
     Ok(doc.to_string())
@@ -6299,10 +6296,24 @@ fn project_official_picker_metadata_aliases(
     if let Some(value) = official.get("display_name").cloned() {
         merged.insert("displayName".to_string(), value);
     }
-    if let Some(value) = official.get("default_reasoning_level").cloned() {
+    if let Some(value) = [
+        "default_reasoning_level",
+        "default_reasoning_effort",
+        "defaultReasoningEffort",
+    ]
+    .into_iter()
+    .find_map(|field| official.get(field).cloned())
+    {
         merged.insert("defaultReasoningEffort".to_string(), value);
     }
-    if let Some(levels) = official.get("supported_reasoning_levels") {
+    if let Some(levels) = [
+        "supported_reasoning_levels",
+        "supported_reasoning_efforts",
+        "supportedReasoningEfforts",
+    ]
+    .into_iter()
+    .find_map(|field| official.get(field))
+    {
         merged.insert(
             "supportedReasoningEfforts".to_string(),
             codex_desktop_reasoning_efforts_from_levels(Some(levels)),
@@ -6378,9 +6389,6 @@ fn sync_codex_models_cache_with_cc_switch_catalog(catalog: &Value) -> Result<(),
     let Some(models) = catalog.get("models").and_then(|models| models.as_array()) else {
         return Ok(());
     };
-    if models.is_empty() {
-        return Ok(());
-    }
 
     let cache_path = get_codex_models_cache_path();
     let backup_path = get_codex_models_cache_backup_path();
@@ -6674,13 +6682,16 @@ fn apply_codex_router_catalog_preferences(catalog: &mut Value, settings: &Value)
         return None;
     }
     let first = models.first_mut()?;
-    let supported = first
+    let supported_levels = first
         .get("supported_reasoning_levels")
+        .or_else(|| first.get("supported_reasoning_efforts"))
+        .or_else(|| first.get("supportedReasoningEfforts"));
+    let supported = supported_levels
         .and_then(Value::as_array)
         .is_some_and(|levels| {
             levels
                 .iter()
-                .any(|level| level.get("effort").and_then(Value::as_str) == Some(requested))
+                .any(|level| codex_reasoning_effort_name(level) == Some(requested))
         });
     if !supported {
         return None;
@@ -6762,22 +6773,35 @@ fn prepare_codex_config_text_with_model_catalog_impl(
     schedule_codex_public_official_catalog_refresh();
     let catalog_path = get_codex_model_catalog_path();
     let specs = codex_catalog_model_specs(settings, config_text);
+    let projection_fingerprint = settings
+        .pointer("/codexRoutingProjection/dependencyFingerprint")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|fingerprint| !fingerprint.is_empty());
+    let has_catalog_inventory = settings
+        .pointer("/modelCatalog/models")
+        .and_then(Value::as_array)
+        .is_some_and(|models| {
+            models.iter().any(|model| {
+                model
+                    .get("model")
+                    .and_then(Value::as_str)
+                    .is_some_and(|model| !model.trim().is_empty())
+            })
+        });
 
     // 是否写入 provider 内联模型取决于已安装 Desktop 版本；严格诊断生效的
     // Desktop 只保留 catalog 指针。
     let write_inline_provider_models = projection_write_inline_provider_models();
 
-    if !specs.is_empty() {
+    // An explicitly empty included list must replace stale picker models, not
+    // restore official models. Only an absent/cleared inventory relinquishes ownership.
+    if !specs.is_empty() || has_catalog_inventory || projection_fingerprint.is_some() {
         let generated_catalog = codex_model_catalog_from_settings(settings, config_text, profile)?
             .unwrap_or_else(|| json!({ "models": [] }));
         let mut catalog = enrich_codex_catalog_with_official_metadata(&generated_catalog)?;
         let router_effort = apply_codex_router_catalog_preferences(&mut catalog, settings);
-        if let Some(fingerprint) = settings
-            .pointer("/codexRoutingProjection/dependencyFingerprint")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|fingerprint| !fingerprint.is_empty())
-        {
+        if let Some(fingerprint) = projection_fingerprint {
             catalog["ccSwitchRoutingDependencyFingerprint"] =
                 Value::String(fingerprint.to_string());
         }
@@ -6816,7 +6840,8 @@ fn prepare_codex_config_text_with_model_catalog_impl(
             }
             CodexCatalogToolProfile::ProxyChat => false,
         };
-        let config_text = set_codex_native_web_search_field(&config_text, disable_web_search)?;
+        let config_text =
+            set_codex_native_web_search_field(&config_text, settings, disable_web_search)?;
         let config_text = project_codex_subagent_v2_parent_instructions(
             settings,
             &config_text,
@@ -6850,7 +6875,10 @@ fn prepare_codex_config_text_with_model_catalog_impl(
         )?;
         let config_text = set_codex_native_web_search_field(
             &config_text,
-            profile == CodexCatalogToolProfile::Anthropic,
+            settings,
+            profile == CodexCatalogToolProfile::Anthropic
+                || (profile == CodexCatalogToolProfile::NativeResponses
+                    && codex_native_gateway_rejects_web_search(&config_text)),
         )?;
         project_codex_subagent_v2_parent_instructions(
             settings,
@@ -12189,6 +12217,74 @@ trust_level = "trusted"
     }
 
     #[test]
+    fn native_web_search_toggle_projects_live_disabled_and_default() {
+        let config = "model = \"gpt-6.1-sol\"\nweb_search = \"cached\"\n";
+        for (toggle, unsupported, expected) in [
+            (Some(true), false, "live"),
+            (Some(false), false, "disabled"),
+            (None, false, "live"),
+            (Some(true), true, "disabled"),
+        ] {
+            let settings = toggle.map_or_else(
+                || json!({}),
+                |enabled| json!({"hostedTools":{"webSearch":{"enabled":enabled}}}),
+            );
+            let projected =
+                set_codex_native_web_search_field(config, &settings, unsupported).unwrap();
+            let doc: toml::Value = toml::from_str(&projected).unwrap();
+            assert_eq!(doc["web_search"].as_str(), Some(expected));
+            assert_eq!(doc["model"].as_str(), Some("gpt-6.1-sol"));
+            assert_eq!(
+                set_codex_native_web_search_field(&projected, &settings, unsupported).unwrap(),
+                projected
+            );
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn native_web_search_toggle_is_applied_by_catalog_projection() {
+        let _home = TestHomeGuard::new();
+        let config = "model = \"gpt-6.1-sol\"\nmodel_provider = \"custom\"\nweb_search = \"cached\"\n\n[model_providers.custom]\nbase_url = \"https://example.org/v1\"\nwire_api = \"responses\"\n";
+        for with_catalog in [false, true] {
+            for enabled in [false, true] {
+                for profile in [
+                    CodexCatalogToolProfile::NativeResponses,
+                    CodexCatalogToolProfile::ProxyChat,
+                    CodexCatalogToolProfile::Anthropic,
+                ] {
+                    let mut settings = json!({"hostedTools":{"webSearch":{"enabled":enabled}}});
+                    if with_catalog {
+                        settings["modelCatalog"] = json!({"models":[{"model":"gpt-6.1-sol"}]});
+                    }
+                    let prepared =
+                        prepare_codex_config_text_with_model_catalog_without_provider_context(
+                            &settings, config, profile,
+                        )
+                        .unwrap();
+                    let doc: toml::Value = toml::from_str(&prepared).unwrap();
+                    let expected = if enabled && profile != CodexCatalogToolProfile::Anthropic {
+                        "live"
+                    } else {
+                        "disabled"
+                    };
+                    assert_eq!(doc["web_search"].as_str(), Some(expected));
+                    let unsupported_config = config.replace("example.org", "api.z.ai");
+                    let prepared =
+                        prepare_codex_config_text_with_model_catalog_without_provider_context(
+                            &settings,
+                            &unsupported_config,
+                            CodexCatalogToolProfile::NativeResponses,
+                        )
+                        .unwrap();
+                    let doc: toml::Value = toml::from_str(&prepared).unwrap();
+                    assert_eq!(doc["web_search"].as_str(), Some("disabled"));
+                }
+            }
+        }
+    }
+
+    #[test]
     fn unified_session_bucket_injects_for_empty_official_config() {
         let injected = inject_codex_unified_session_bucket("").expect("inject");
         let doc: toml::Table = toml::from_str(&injected).expect("parse injected config");
@@ -14637,6 +14733,44 @@ openai_base_url = "http://127.0.0.1:15721/v1"
             first["models"][0]["supported_reasoning_levels"]
         );
         assert_eq!(catalog["models"][0]["default_reasoning_level"], "high");
+    }
+
+    #[test]
+    fn router_default_effort_accepts_string_levels_from_official_cache() {
+        let settings = json!({
+            "codexRoutingProjection": {"dependencyFingerprint": "router"},
+            "modelCatalog": {
+                "displayNameStyle": "provider-model",
+                "defaultReasoningEffort": "high",
+                "models": [{
+                    "model": "official",
+                    "providerName": "OpenRouter",
+                    "displayName": "Friendly"
+                }]
+            }
+        });
+        let official = json!({
+            "slug": "official",
+            "display_name": "Official",
+            "default_reasoning_level": "low",
+            "supported_reasoning_levels": ["low", "high"]
+        });
+        let mut catalog =
+            json!({"models": merge_codex_models(&[official], &[json!({"slug": "official"})])});
+
+        assert_eq!(
+            apply_codex_router_catalog_preferences(&mut catalog, &settings),
+            Some("high".into())
+        );
+        assert_eq!(catalog["models"][0]["default_reasoning_level"], "high");
+        assert_eq!(catalog["models"][0]["defaultReasoningEffort"], "high");
+        assert_eq!(
+            catalog["models"][0]["supportedReasoningEfforts"],
+            json!([
+                {"reasoningEffort": "low", "description": "low"},
+                {"reasoningEffort": "high", "description": "high"}
+            ])
+        );
     }
 
     #[test]
@@ -17828,6 +17962,41 @@ model_catalog_json = "cc-switch-model-catalog.json"
 
     #[test]
     #[serial]
+    fn all_excluded_provider_catalog_publishes_empty_picker_models() {
+        let _home = TestHomeGuard::new();
+        seed_codex_models_cache(json!([{"slug": "official-only"}]));
+        let settings = json!({
+            "modelCatalog": {"models": [{"model": "hidden", "enabled": false}]}
+        });
+        let config = r#"model_provider = "custom"
+[model_providers.custom]
+base_url = "https://example.org/v1"
+models = [{ model = "stale-model" }]
+"#;
+
+        let prepared = prepare_codex_config_text_with_model_catalog_without_provider_context(
+            &settings,
+            config,
+            CodexCatalogToolProfile::ProxyChat,
+        )
+        .expect("publish explicitly empty included list");
+        let document: toml::Value = toml::from_str(&prepared).expect("prepared config");
+        assert!(document.get("model_catalog_json").is_some());
+        assert_eq!(
+            document["model_providers"]["custom"]["models"].as_array(),
+            Some(&Vec::new())
+        );
+        let catalog: Value = read_json_file(&get_codex_model_catalog_path()).unwrap();
+        let cache: Value = read_json_file(&get_codex_models_cache_path()).unwrap();
+        assert_eq!(catalog["models"], json!([]));
+        assert_eq!(cache["models"], json!([]));
+        assert!(codex_models_cache_is_cc_switch_owned(&cache));
+        let backup: Value = read_json_file(&get_codex_models_cache_backup_path()).unwrap();
+        assert_eq!(backup["models"], json!([{"slug": "official-only"}]));
+    }
+
+    #[test]
+    #[serial]
     /// custom MultiRouter 应同步 models_cache，让运行中的 Codex 菜单能看到 Qwen/DeepSeek。
     fn model_catalog_syncs_codex_models_cache_for_custom_provider_picker() {
         let _home = TestHomeGuard::new();
@@ -18375,6 +18544,213 @@ wire_api = "responses"
             catalog["ccSwitchRoutingDependencyFingerprint"],
             "fingerprint-v2"
         );
+    }
+
+    #[test]
+    #[serial]
+    fn multirouter_included_models_reach_every_picker_projection_without_inventory_loss() {
+        let _home = TestHomeGuard::new();
+        let db = crate::database::Database::memory().expect("memory database");
+        let mut source = Provider::with_id(
+            "curated-source".to_string(),
+            "Curated Source".to_string(),
+            json!({
+                "base_url": "https://example.org/v1",
+                "auth": {"OPENAI_API_KEY": "test-key"},
+                "modelCatalog": {"models": [
+                    {"model": "kept", "upstreamModel": "wire-kept", "enabled": true},
+                    {"model": "legacy"},
+                    {"model": "hidden", "enabled": false}
+                ]}
+            }),
+            None,
+        );
+        source.meta = Some(crate::provider::ProviderMeta {
+            api_format: Some("openai_responses".to_string()),
+            ..Default::default()
+        });
+        let router = Provider::with_id(
+            "curated-router".to_string(),
+            "Curated Router".to_string(),
+            json!({
+                "modelCatalog": {"models": [{"model": "stale-router-model"}]},
+                "codexRouting": {
+                    "schemaVersion": 2,
+                    "enabled": true,
+                    "defaultRouteId": "curated-route",
+                    "spawnAgentModels": ["hidden", "legacy", "kept", "official-only"],
+                    "routes": [{
+                        "id": "curated-route",
+                        "enabled": true,
+                        "targetProviderId": "curated-source",
+                        "modelSelection": {"mode": "all"},
+                        "authPolicy": {"source": "provider_config"}
+                    }]
+                }
+            }),
+            None,
+        );
+        db.save_provider("codex", &router).expect("save router");
+        write_codex_live_config_atomic(Some(
+            "model_provider = \"codex_model_router_v2\"\n\
+             [model_providers.codex_model_router_v2]\n\
+             base_url = \"http://127.0.0.1:15721/v1\"\nwire_api = \"responses\"\n",
+        ))
+        .expect("seed live config");
+        seed_codex_models_cache(json!([
+            {"slug": "official-only"},
+            {"slug": "hidden"},
+            {"slug": "kept"}
+        ]));
+        let mut previous_fingerprint = None;
+
+        for (inclusions, expected) in [
+            ([Some(true), None, Some(false)], vec!["kept", "legacy"]),
+            ([Some(false), Some(false), Some(false)], vec![]),
+            ([Some(false), Some(false), Some(true)], vec!["hidden"]),
+            ([Some(true), Some(false), Some(false)], vec!["kept"]),
+        ] {
+            let models = source.settings_config["modelCatalog"]["models"]
+                .as_array_mut()
+                .expect("provider inventory");
+            for (model, enabled) in models.iter_mut().zip(inclusions) {
+                if let Some(enabled) = enabled {
+                    model["enabled"] = json!(enabled);
+                } else {
+                    model.as_object_mut().unwrap().remove("enabled");
+                }
+            }
+            db.save_provider("codex", &source).expect("save inclusion");
+            let artifact =
+                crate::codex_multirouter::projection::build_projection_artifact(&db, &router.id)
+                    .expect("compile current provider inclusion");
+            assert_eq!(artifact.compiled.visible_models, expected);
+            assert!(artifact
+                .compiled
+                .spawn_agent_models
+                .iter()
+                .all(|model| expected.contains(&model.as_str())));
+            assert_ne!(
+                previous_fingerprint.as_ref(),
+                Some(&artifact.dependency_fingerprint)
+            );
+            previous_fingerprint = Some(artifact.dependency_fingerprint.clone());
+            let read_back = publish_codex_multirouter_projection_for_database(
+                &db,
+                &artifact.projection_settings,
+            )
+            .expect("publish included-only picker projection");
+            assert_eq!(
+                read_back.dependency_fingerprint,
+                artifact.dependency_fingerprint
+            );
+            assert!(read_back.catalog_verified);
+            assert!(read_back.config_verified);
+            assert!(read_back.cache_verified);
+            assert!(read_back.agent_files_verified);
+
+            for path in [
+                get_codex_model_catalog_path(),
+                get_codex_models_cache_path(),
+            ] {
+                let published: Value = read_json_file(&path).expect("published picker models");
+                let ids = published["models"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter_map(codex_model_stable_id)
+                    .collect::<Vec<_>>();
+                assert_eq!(ids, expected, "picker models in {}", path.display());
+            }
+            let live: toml::Value = toml::from_str(&read_codex_config_text().unwrap()).unwrap();
+            let inline_ids = live["model_providers"]["codex_model_router_v2"]["models"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|model| model.get("model").and_then(toml::Value::as_str))
+                .collect::<Vec<_>>();
+            assert_eq!(inline_ids, expected, "inline Desktop picker models");
+            let saved = db.get_provider_by_id(&source.id, "codex").unwrap().unwrap();
+            assert_eq!(saved.settings_config, source.settings_config);
+            assert_eq!(
+                saved.settings_config["modelCatalog"]["models"]
+                    .as_array()
+                    .unwrap()
+                    .len(),
+                3
+            );
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn active_router_saved_web_search_toggle_updates_live_codex_config() {
+        let _guard = TestHomeGuard::new();
+        let db = crate::database::Database::memory().expect("memory database");
+        let mut target = Provider::with_id(
+            "native-search".to_string(),
+            "Native Search".to_string(),
+            json!({
+                "base_url": "https://example.org/v1",
+                "api_key": "test-key",
+                "modelCatalog": {"models": [{"model": "gpt-6.1-sol"}]}
+            }),
+            None,
+        );
+        target.meta = Some(crate::provider::ProviderMeta {
+            api_format: Some("openai_responses".to_string()),
+            ..Default::default()
+        });
+        db.save_provider("codex", &target).expect("save target");
+        let mut router = Provider::with_id(
+            "search-router".to_string(),
+            "Search Router".to_string(),
+            json!({
+                "auth": {},
+                "codexRouting": {
+                    "schemaVersion": 2,
+                    "enabled": true,
+                    "routes": [{
+                        "id": "native-search-route",
+                        "enabled": true,
+                        "targetProviderId": "native-search",
+                        "modelSelection": {"mode": "all"},
+                        "authPolicy": {"source": "provider_config"}
+                    }]
+                }
+            }),
+            None,
+        );
+        db.save_provider("codex", &router).expect("save router");
+        db.set_current_provider("codex", &router.id)
+            .expect("activate router");
+        write_codex_live_config_atomic(Some(
+            "model = \"gpt-6.1-sol\"\nmodel_provider = \"codex_model_router_v2\"\n\
+             web_search = \"cached\"\n\n[model_providers.codex_model_router_v2]\n\
+             base_url = \"http://127.0.0.1:15721/v1\"\nwire_api = \"responses\"\n",
+        ))
+        .expect("seed live router config");
+        seed_codex_models_cache(json!([]));
+
+        for enabled in [false, true, false, true] {
+            router.settings_config["hostedTools"] = json!({"webSearch": {"enabled": enabled}});
+            crate::codex_multirouter::mutation::apply_codex_provider_mutation(&db, router.clone())
+                .expect("save and publish active router toggle");
+            let saved = db
+                .get_provider_by_id(&router.id, "codex")
+                .unwrap()
+                .expect("saved router");
+            assert_eq!(
+                saved.settings_config["hostedTools"]["webSearch"]["enabled"],
+                enabled
+            );
+            let config: toml::Value =
+                toml::from_str(&read_codex_config_text().expect("live config")).unwrap();
+            assert_eq!(
+                config["web_search"].as_str(),
+                Some(if enabled { "live" } else { "disabled" })
+            );
+        }
     }
 
     #[test]

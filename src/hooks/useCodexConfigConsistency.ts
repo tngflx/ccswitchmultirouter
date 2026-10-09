@@ -50,6 +50,7 @@ interface CodexConfigConsistencyState {
   error: string | null;
   refresh: CodexRuntimeRefreshWorkflow;
   close: () => void;
+  dismiss: () => void;
   resolve: (action: CodexConfigConsistencyAction) => Promise<void>;
   recheck: () => Promise<void>;
   openStatusPanel: () => Promise<void>;
@@ -75,6 +76,16 @@ function emptyRuntimeRefresh(): CodexRuntimeRefreshWorkflow {
   };
 }
 
+function attentionKeyForReport(
+  next: CodexConfigConsistencyReport,
+): string | null {
+  return next.state === "external_drift" && next.actualFingerprint
+    ? `drift:${next.actualFingerprint}`
+    : next.runtimeActivation?.state === "restart_required"
+      ? `runtime:${next.runtimeActivation.appServerStartedAt ?? "unknown"}:${next.runtimeActivation.configModifiedAt ?? "unknown"}`
+      : null;
+}
+
 export function useCodexConfigConsistency(): CodexConfigConsistencyState {
   const [report, setReport] = useState<CodexConfigConsistencyReport | null>(
     null,
@@ -85,6 +96,7 @@ export function useCodexConfigConsistency(): CodexConfigConsistencyState {
     useState<CodexRuntimeRefreshWorkflow>(emptyRuntimeRefresh);
   const seenFingerprintsRef = useRef(new Set<string>());
   const seenHistoryDamageRef = useRef(new Set<string>());
+  const dismissedAttentionRef = useRef<string | null>(null);
   const runtimeRefreshActiveRef = useRef(false);
   const refreshRunIdRef = useRef(0);
   const refreshStartedAtRef = useRef<number | null>(null);
@@ -92,16 +104,19 @@ export function useCodexConfigConsistency(): CodexConfigConsistencyState {
 
   const acceptReport = useCallback((next: CodexConfigConsistencyReport) => {
     if (runtimeRefreshActiveRef.current) return;
-    const attentionKey =
-      next.state === "external_drift" && next.actualFingerprint
-        ? `drift:${next.actualFingerprint}`
-        : next.runtimeActivation?.state === "restart_required"
-          ? `runtime:${next.runtimeActivation.appServerStartedAt ?? "unknown"}:${next.runtimeActivation.configModifiedAt ?? "unknown"}`
-          : null;
+    const attentionKey = attentionKeyForReport(next);
     if (!attentionKey) {
+      dismissedAttentionRef.current = null;
       setReport(null);
       setError(null);
       return;
+    }
+    if (dismissedAttentionRef.current === attentionKey) return;
+    if (
+      dismissedAttentionRef.current &&
+      dismissedAttentionRef.current !== attentionKey
+    ) {
+      dismissedAttentionRef.current = null;
     }
     if (seenFingerprintsRef.current.has(attentionKey)) return;
     seenFingerprintsRef.current.add(attentionKey);
@@ -253,18 +268,38 @@ export function useCodexConfigConsistency(): CodexConfigConsistencyState {
     setError(null);
   }, []);
 
+  const dismiss = useCallback(() => {
+    if (report) {
+      const attentionKey = attentionKeyForReport(report);
+      if (attentionKey) dismissedAttentionRef.current = attentionKey;
+    }
+    close();
+  }, [close, report]);
+
   const resolve = useCallback(
     async (action: CodexConfigConsistencyAction) => {
       if (!report) return;
       if (action === "later") {
-        if (report.actualFingerprint) {
-          void codexConfigConsistencyApi
-            .resolve(report.actualFingerprint, action)
-            .catch((cause) =>
-              console.debug("[CodexConsistency] defer failed", cause),
-            );
-        }
+        // Dismiss first. Persisting the acknowledgement is best effort: a
+        // missing runtime fingerprint or a transient backend failure must not
+        // trap the user in a modal that has no recovery path.
+        const currentReport = report;
+        const attentionKey = attentionKeyForReport(currentReport);
+        if (attentionKey) dismissedAttentionRef.current = attentionKey;
         close();
+        if (!currentReport.actualFingerprint) return;
+        setPending(true);
+        setError(null);
+        try {
+          await codexConfigConsistencyApi.resolve(
+            currentReport.actualFingerprint,
+            action,
+          );
+        } catch (cause) {
+          console.debug("[CodexConsistency] defer failed", cause);
+        } finally {
+          setPending(false);
+        }
         return;
       }
       if (!report.actualFingerprint) return;
@@ -301,7 +336,7 @@ export function useCodexConfigConsistency(): CodexConfigConsistencyState {
     setPending(true);
     setError(null);
     try {
-      const next = await codexConfigConsistencyApi.inspect();
+      const next = await codexConfigConsistencyApi.inspect(true);
       if (
         next.state === "external_drift" ||
         next.runtimeActivation?.state === "restart_required"
@@ -399,7 +434,7 @@ export function useCodexConfigConsistency(): CodexConfigConsistencyState {
     setError(null);
     try {
       const [nextReport, preflight] = await Promise.all([
-        codexConfigConsistencyApi.inspect(),
+        codexConfigConsistencyApi.inspect(true),
         codexConfigConsistencyApi.inspectRuntimeRefresh(),
       ]);
       setReport(nextReport);
@@ -536,6 +571,7 @@ export function useCodexConfigConsistency(): CodexConfigConsistencyState {
     error,
     refresh,
     close,
+    dismiss,
     resolve,
     recheck,
     openStatusPanel,

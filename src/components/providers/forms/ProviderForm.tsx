@@ -15,6 +15,7 @@ import {
 import { normalizeCodexChatReasoningForSave } from "@/lib/codexChatReasoning";
 export { normalizeCodexChatReasoningForSave } from "@/lib/codexChatReasoning";
 import { parseCodexSubagentCandidateError } from "@/lib/codexSubagentCandidateError";
+import { normalizeModelIdentityMetadata } from "@/lib/modelIdentities";
 import {
   buildCodexProtocolMeta,
   readCodexProtocolSettings,
@@ -332,6 +333,7 @@ export const normalizeCodexCatalogModelsForSave = (
 
     normalized.push({
       model,
+      ...normalizeModelIdentityMetadata(item),
       ...(item.enabled === false ? { enabled: false } : {}),
       ...(upstreamModel && upstreamModel !== model ? { upstreamModel } : {}),
       ...(displayName ? { displayName } : {}),

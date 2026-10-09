@@ -121,6 +121,7 @@ vi.mock("react-i18next", () => ({
         "codexConfigConsistency.newTaskHint": "请新建任务。",
         "codexConfigConsistency.historyRepairCompleted": "已恢复分页历史文件",
         "codexConfigConsistency.finish": "完成",
+        "common.close": "关闭",
         "common.unknown": "未知",
       })[key] ?? key,
   }),
@@ -266,6 +267,36 @@ describe("CodexConfigConsistencyDialog", () => {
     expect(screen.queryByText("应用 CCSM 配置")).toBeNull();
     fireEvent.click(screen.getByRole("button", { name: "重新检测" }));
     expect(onRetry).toHaveBeenCalledOnce();
+  });
+
+  it("exposes a real close action for runtime warnings", () => {
+    const onClose = vi.fn();
+    render(
+      <CodexConfigConsistencyDialog
+        report={{
+          ...report,
+          state: "consistent",
+          changedKeys: [],
+          reason: null,
+          runtimeActivation: {
+            state: "restart_required",
+            appServerStartedAt: "2026-08-31T21:48:34+08:00",
+            configModifiedAt: "2026-08-31T22:38:53+08:00",
+            reason: "app_server_started_before_managed_config",
+          },
+        }}
+        pending={false}
+        error="Codex configuration processing failed"
+        onApply={vi.fn()}
+        onKeep={vi.fn()}
+        onLater={vi.fn()}
+        onClose={onClose}
+        onRetry={vi.fn()}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "关闭" }));
+    expect(onClose).toHaveBeenCalledOnce();
   });
 
   it("checks the exact Codex runtime before offering the destructive refresh", () => {
@@ -560,6 +591,7 @@ describe("CodexConfigConsistencyDialog", () => {
   });
 
   it("keeps the exact failed stage visible for a retry", () => {
+    const onClose = vi.fn();
     render(
       <CodexConfigConsistencyDialog
         report={report}
@@ -574,6 +606,7 @@ describe("CodexConfigConsistencyDialog", () => {
         onApply={vi.fn()}
         onKeep={vi.fn()}
         onLater={vi.fn()}
+        onClose={onClose}
         onRetry={vi.fn()}
         onInspectRefresh={vi.fn()}
         onConfirmRefresh={vi.fn()}
@@ -583,6 +616,8 @@ describe("CodexConfigConsistencyDialog", () => {
 
     expect(screen.getByText("失败阶段： 重新打开 Codex")).toBeInTheDocument();
     expect(screen.getByText("AUMID 启动失败")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "关闭" }));
+    expect(onClose).toHaveBeenCalledOnce();
   });
 
   it("reports the exact paginated history repair outcome after completion", () => {

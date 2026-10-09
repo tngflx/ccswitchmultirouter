@@ -2566,6 +2566,7 @@ function App() {
         onApply={() => void codexConfigConsistency.resolve("apply_ccsm")}
         onKeep={() => void codexConfigConsistency.resolve("keep_codex")}
         onLater={() => void codexConfigConsistency.resolve("later")}
+        onClose={codexConfigConsistency.dismiss}
         onRetry={() => void codexConfigConsistency.recheck()}
         refresh={codexConfigConsistency.refresh}
         onInspectRefresh={() =>

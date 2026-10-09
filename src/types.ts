@@ -684,6 +684,9 @@ export interface Settings {
   watchdogEnabled?: boolean;
   // 是否在 CCSwitchMulti 启动后启动 Codex Desktop（独立于开机自启）
   launchCodexDesktopWithCcswitch?: boolean;
+  toolAutoUpdate?: Record<string, boolean>;
+  /** Legacy Codex-only preference; the per-tool policy takes precedence. */
+  autoUpdateCodexCli?: boolean;
   // Codex 子进程级出口时区；不会修改操作系统时区
   codexEgressTimezone?: CodexEgressTimezoneSettings;
   // 静默启动（程序启动时不显示主窗口）

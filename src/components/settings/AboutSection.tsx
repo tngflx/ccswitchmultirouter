@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Download,
   Copy,
@@ -26,6 +26,8 @@ import {
 import { useTranslation } from "react-i18next";
 import { toast } from "sonner";
 import { getVersion } from "@tauri-apps/api/app";
+import { listen } from "@tauri-apps/api/event";
+import { Switch } from "@/components/ui/switch";
 import { settingsApi } from "@/lib/api";
 import type {
   ToolInstallation,
@@ -247,6 +249,18 @@ export function AboutSection({ isPortable }: AboutSectionProps) {
     null,
   );
   const [showInstallCommands, setShowInstallCommands] = useState(false);
+  const [toolAutoUpdate, setToolAutoUpdate] = useState<Record<
+    string,
+    boolean
+  > | null>(null);
+  const [savingAutoUpdate, setSavingAutoUpdate] = useState(false);
+  const [loadingAutoUpdate, setLoadingAutoUpdate] = useState(true);
+  const [autoUpdateLoadAttempt, setAutoUpdateLoadAttempt] = useState(0);
+  const autoUpdateSaveInFlight = useRef(false);
+  const hadFreshVersionCache = useRef(
+    toolVersionsCache !== null &&
+      Date.now() - toolVersionsCache.at < TOOL_VERSIONS_CACHE_TTL_MS,
+  );
 
   const { hasUpdate, updateInfo, checkUpdate, resetDismiss, isChecking } =
     useUpdate();
@@ -399,6 +413,37 @@ export function AboutSection({ isPortable }: AboutSectionProps) {
 
   useEffect(() => {
     let active = true;
+    setLoadingAutoUpdate(true);
+    void settingsApi
+      .getToolAutoUpdateSettings()
+      .then((policies) => {
+        if (!active) return;
+        setToolAutoUpdate(policies);
+        // Startup updates may finish while About is unmounted. Revalidate only
+        // opted-in tools when the ordinary version lookup reused its cache.
+        if (hadFreshVersionCache.current && autoUpdateLoadAttempt === 0) {
+          void refreshToolVersions(TOOL_NAMES.filter((tool) => policies[tool]));
+        }
+      })
+      .catch((error) => {
+        if (active) {
+          toast.error(t("settings.toolAutoUpdateLoadFailed"), {
+            description: extractErrorMessage(error) || undefined,
+          });
+        }
+      })
+      .finally(() => {
+        if (active) setLoadingAutoUpdate(false);
+      });
+    return () => {
+      active = false;
+    };
+    // Reload on mount or explicit Refresh, not when the translation hook changes.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [autoUpdateLoadAttempt, refreshToolVersions]);
+
+  useEffect(() => {
+    let active = true;
 
     // 本软件自身版本走本地调用（getVersion，无网络，毫秒级），与工具版本探测彼此独立。
     // 之前两者被塞进同一个 Promise.all，导致 setVersion / setIsLoadingVersion 被压在
@@ -425,14 +470,55 @@ export function AboutSection({ isPortable }: AboutSectionProps) {
 
     void loadAppVersion();
     void loadAllToolVersions();
+    const unlisten = listen<ToolVersion>(
+      "tool-auto-update-completed",
+      ({ payload }) => {
+        toolVersionsCache = {
+          data: mergeToolVersions(toolVersionsCache?.data ?? [], [payload]),
+          at: toolVersionsCache?.at ?? 0,
+        };
+        if (active)
+          setToolVersions((prev) => mergeToolVersions(prev, [payload]));
+      },
+    );
+    void unlisten.catch((error) =>
+      console.error("[AboutSection] Failed to listen for CLI updates", error),
+    );
     return () => {
       active = false;
+      void unlisten.then((stop) => stop()).catch(() => {});
     };
     // Mount-only: loadAllToolVersions is intentionally excluded to avoid
     // re-fetching all tools whenever wslShellByTool changes. Single-tool
     // refreshes are handled by refreshToolVersions in the shell/flag handlers.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  const handleToolAutoUpdateChange = async (
+    toolName: ToolName,
+    enabled: boolean,
+  ) => {
+    if (
+      toolAutoUpdate === null ||
+      loadingAutoUpdate ||
+      autoUpdateSaveInFlight.current
+    )
+      return;
+    autoUpdateSaveInFlight.current = true;
+    setSavingAutoUpdate(true);
+    try {
+      const policies = await settingsApi.setToolAutoUpdate(toolName, enabled);
+      setToolAutoUpdate(policies);
+    } catch (error) {
+      toast.error(t("settings.toolAutoUpdateFailed"), {
+        description: extractErrorMessage(error) || undefined,
+        closeButton: true,
+      });
+    } finally {
+      autoUpdateSaveInFlight.current = false;
+      setSavingAutoUpdate(false);
+    }
+  };
 
   // ... (handlers like handleOpenReleaseNotes, handleCheckUpdate) ...
 
@@ -873,7 +959,7 @@ export function AboutSection({ isPortable }: AboutSectionProps) {
             </div>
           </div>
 
-          <div className="flex items-center gap-2">
+          <div className="flex flex-wrap items-center gap-2">
             <Button
               type="button"
               variant="outline"
@@ -986,8 +1072,16 @@ export function AboutSection({ isPortable }: AboutSectionProps) {
               size="sm"
               variant="outline"
               className="h-7 gap-1.5 text-xs"
-              onClick={() => loadAllToolVersions({ force: true })}
-              disabled={isLoadingTools || isAnyBusy}
+              onClick={() => {
+                void loadAllToolVersions({ force: true });
+                setAutoUpdateLoadAttempt((attempt) => attempt + 1);
+              }}
+              disabled={
+                isLoadingTools ||
+                isAnyBusy ||
+                savingAutoUpdate ||
+                loadingAutoUpdate
+              }
             >
               <RefreshCw
                 className={
@@ -1055,7 +1149,7 @@ export function AboutSection({ isPortable }: AboutSectionProps) {
                 initial={{ opacity: 0, y: 10 }}
                 animate={{ opacity: 1, y: 0 }}
                 transition={{ duration: 0.3, delay: 0.15 + index * 0.04 }}
-                className="flex min-h-[150px] flex-col gap-3 rounded-xl border border-border bg-gradient-to-br from-card/80 to-card/40 p-4 shadow-sm transition-colors hover:border-primary/30"
+                className="flex min-h-[150px] flex-col gap-3 rounded-lg border border-border bg-card p-4 shadow-sm transition-colors hover:border-primary/30"
               >
                 <div className="flex items-start justify-between gap-3">
                   <div className="flex min-w-0 items-center gap-2">
@@ -1186,42 +1280,68 @@ export function AboutSection({ isPortable }: AboutSectionProps) {
                   </div>
                 )}
 
-                <div className="mt-auto flex items-center justify-end">
-                  {isToolVersionLoading ? (
-                    <span className="text-xs text-muted-foreground">
-                      {t("common.loading")}
-                    </span>
-                  ) : installedButBroken ? (
-                    // 已安装但跑不起来：重装无济于事，不给按钮，给一句指向环境的提示。
-                    <span className="text-xs text-yellow-600 dark:text-yellow-400">
-                      {t("settings.toolCheckEnv")}
-                    </span>
-                  ) : action ? (
-                    <Button
-                      size="sm"
-                      variant={action === "install" ? "outline" : "default"}
-                      className="h-7 gap-1.5 text-xs"
-                      onClick={() => handleRunToolAction([toolName], action)}
-                      disabled={isToolVersionLoading || isAnyBusy}
+                <div className="mt-auto space-y-3">
+                  <div className="flex min-h-7 items-center justify-end">
+                    {isToolVersionLoading ? (
+                      <span className="text-xs text-muted-foreground">
+                        {t("common.loading")}
+                      </span>
+                    ) : installedButBroken ? (
+                      <span className="text-xs text-yellow-600 dark:text-yellow-400">
+                        {t("settings.toolCheckEnv")}
+                      </span>
+                    ) : action ? (
+                      <Button
+                        size="sm"
+                        variant={action === "install" ? "outline" : "default"}
+                        className="h-7 gap-1.5 text-xs"
+                        onClick={() => handleRunToolAction([toolName], action)}
+                        disabled={isToolVersionLoading || isAnyBusy}
+                      >
+                        {runningAction ? (
+                          <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                        ) : action === "install" ? (
+                          <Download className="h-3.5 w-3.5" />
+                        ) : (
+                          <ArrowUpCircle className="h-3.5 w-3.5" />
+                        )}
+                        {action === "install"
+                          ? t("settings.toolInstall")
+                          : t("settings.toolUpdate")}
+                      </Button>
+                    ) : (
+                      <span className="text-xs text-muted-foreground">
+                        {t("settings.toolReady")}
+                      </span>
+                    )}
+                  </div>
+                  <div className="flex items-center justify-between gap-3 border-t pt-3">
+                    <label
+                      htmlFor={`tool-auto-update-${toolName}`}
+                      className="min-w-0 cursor-pointer space-y-0.5"
+                      title={t("settings.toolAutoUpdateHint")}
                     >
-                      {runningAction ? (
-                        <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                      ) : action === "install" ? (
-                        <Download className="h-3.5 w-3.5" />
-                      ) : (
-                        <ArrowUpCircle className="h-3.5 w-3.5" />
-                      )}
-                      {/* loading 时文案保持不变、仅图标切换为 spinner，
-                          按钮宽度恒定，避免"升级"→"升级中…"导致的抖动。 */}
-                      {action === "install"
-                        ? t("settings.toolInstall")
-                        : t("settings.toolUpdate")}
-                    </Button>
-                  ) : (
-                    <span className="text-xs text-muted-foreground">
-                      {t("settings.toolReady")}
-                    </span>
-                  )}
+                      <span className="block text-xs font-medium">
+                        {t("settings.toolAutoUpdate")}
+                      </span>
+                      <span className="block text-[11px] text-muted-foreground">
+                        {t("settings.toolAutoUpdateOnStartup")}
+                      </span>
+                    </label>
+                    <Switch
+                      id={`tool-auto-update-${toolName}`}
+                      aria-label={`${displayName}: ${t("settings.toolAutoUpdate")}`}
+                      checked={toolAutoUpdate?.[toolName] ?? false}
+                      disabled={
+                        toolAutoUpdate === null ||
+                        loadingAutoUpdate ||
+                        savingAutoUpdate
+                      }
+                      onCheckedChange={(enabled) =>
+                        void handleToolAutoUpdateChange(toolName, enabled)
+                      }
+                    />
+                  </div>
                 </div>
               </motion.div>
             );

@@ -95,6 +95,17 @@ export function readCodexModelCatalog(
   };
 }
 
+// Preserve the full inventory for editors; model pickers only consume this view.
+export function readIncludedCodexModelCatalog(
+  provider: Pick<Provider, "settingsConfig"> | null,
+): CodexModelCatalog {
+  const catalog = readCodexModelCatalog(provider);
+  return {
+    ...catalog,
+    models: catalog.models.filter((model) => model.enabled !== false),
+  };
+}
+
 // 展示模型名称时优先使用 catalog 的 displayName，保留 slug 方便用户复制。
 export function catalogModelLabel(model: CodexCatalogModel): string {
   const id = model.model?.trim() ?? "";
@@ -149,11 +160,7 @@ export function validateSpawnAgentCandidates(
   priorityModels: string[] = [],
   limit = CODEX_SPAWN_AGENT_VISIBLE_MODEL_LIMIT,
 ): SpawnAgentCandidateValidation {
-  const catalogModels = new Set(
-    catalog.models
-      .map((model) => model.model?.trim())
-      .filter((model): model is string => Boolean(model)),
-  );
+  const catalogModels = new Set(catalogModelIds(catalog.models));
   const visible = visibleModels.slice(0, limit).filter(Boolean);
   const visibleSet = new Set(visible);
 

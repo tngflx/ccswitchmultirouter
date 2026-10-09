@@ -6,10 +6,43 @@ use crate::database::{Database, PRICING_SOURCE_REQUEST, PRICING_SOURCE_RESPONSE}
 use crate::error::AppError;
 use crate::services::sql_helpers::{INPUT_TOKEN_SEMANTICS_FRESH, INPUT_TOKEN_SEMANTICS_TOTAL};
 use crate::services::usage_stats::{find_model_pricing_row, is_placeholder_pricing_model};
+use once_cell::sync::Lazy;
 use rusqlite::OptionalExtension;
 use rust_decimal::Decimal;
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::str::FromStr;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
+
+const MISSING_PRICING_WARNING_WINDOW: Duration = Duration::from_secs(10 * 60);
+static MISSING_PRICING_WARNINGS: Lazy<Mutex<HashMap<String, Instant>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+
+fn should_warn_missing_pricing(model: &str) -> bool {
+    let now = Instant::now();
+    let Ok(mut warnings) = MISSING_PRICING_WARNINGS.lock() else {
+        return true;
+    };
+    warnings
+        .retain(|_, emitted_at| now.duration_since(*emitted_at) < MISSING_PRICING_WARNING_WINDOW);
+    if warnings.contains_key(model) {
+        return false;
+    }
+    // A malformed or provider-generated model name must not grow this process-wide
+    // guard without bound.
+    if warnings.len() >= 1024 {
+        if let Some(oldest) = warnings
+            .iter()
+            .min_by_key(|(_, emitted_at)| **emitted_at)
+            .map(|(model, _)| model.clone())
+        {
+            warnings.remove(&oldest);
+        }
+    }
+    warnings.insert(model.to_string(), now);
+    true
+}
 
 #[derive(Debug, PartialEq, Eq)]
 struct UsageSemantic {
@@ -468,7 +501,11 @@ impl<'a> UsageLogger<'a> {
             || usage.cache_read_tokens > 0
             || usage.cache_creation_tokens > 0;
 
-        if pricing.is_none() && has_usage && !is_placeholder_pricing_model(&pricing_model) {
+        if pricing.is_none()
+            && has_usage
+            && !is_placeholder_pricing_model(&pricing_model)
+            && should_warn_missing_pricing(&pricing_model)
+        {
             log::warn!("[USG-002] 模型定价未找到，成本将记录为 0: {pricing_model}");
         }
 

@@ -1,6 +1,6 @@
 # Archived root engineering notes
 
-> Consolidated on 2026-10-06. This file preserves the historical contents of internal Markdown notes that previously lived at repository root. New durable decisions belong in `docs/decisions/`; concise verification outcomes belong in `docs/memory/journal.md`.
+> Consolidated on 2026-10-06. This file preserves the historical contents of internal Markdown notes that previously lived at repository root. Keep this archive frozen. New durable architectural rationale belongs in existing topic guides; concise milestone evidence belongs in `docs/memory/journal.md`.
 
 ---
 

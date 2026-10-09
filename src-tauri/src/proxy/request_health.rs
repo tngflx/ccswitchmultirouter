@@ -32,6 +32,7 @@ pub(crate) struct RequestHealthContext<'a> {
     pub provider_name: &'a str,
     pub model: &'a str,
     pub endpoint: &'a str,
+    pub wire_responses: bool,
     pub client_request_bytes: usize,
     pub compaction_request: bool,
     pub session_client_provided: bool,
@@ -292,12 +293,31 @@ pub(crate) fn inspect_and_optimize(
     let blocked = false;
 
     let mut findings = Vec::new();
+    if context.wire_responses {
+        findings.extend(
+            super::providers::responses_contract::inspect(
+                body,
+                context.app_type == "codex"
+                    && (context.model.starts_with("gpt-") || context.model.starts_with("codex-")),
+            )
+            .into_iter()
+            .map(|finding| RequestHealthFinding {
+                code: finding.code.to_string(),
+                severity: finding.severity.to_string(),
+                count: finding.count,
+                detail: finding.detail,
+            }),
+        );
+    }
     let orphaned_outputs = analysis
         .outputs
         .iter()
         .filter(|call_id| !analysis.calls.contains(*call_id))
         .count();
-    if orphaned_outputs > 0 {
+    if orphaned_outputs > 0
+        && !(context.wire_responses
+            && super::providers::responses_contract::uses_server_history(body))
+    {
         findings.push(RequestHealthFinding {
             code: "orphaned_tool_output".to_string(),
             severity: "error".to_string(),
@@ -423,6 +443,14 @@ pub(crate) fn inspect_and_optimize(
     let mut store = diagnostics_store()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
+    // Fallbacks and provider retries share one client trace, not another turn.
+    if let Some(trace_id) = context.trace_id.filter(|trace| !trace.is_empty()) {
+        store.retain(|previous| {
+            !(previous.trace_id.as_deref() == Some(trace_id)
+                && previous.session_id == context.session_id
+                && previous.app_type == context.app_type)
+        });
+    }
     if store.len() == MAX_DIAGNOSTICS {
         store.pop_front();
     }
@@ -1338,6 +1366,7 @@ mod tests {
             provider_name: "Provider One",
             model: "model-1",
             endpoint: "/responses",
+            wire_responses: true,
             client_request_bytes: 0,
             compaction_request: false,
             session_client_provided: true,
@@ -1363,6 +1392,101 @@ mod tests {
             .any(|finding| finding.code == "orphaned_tool_output"));
         let serialized = serde_json::to_string(&diagnostic).expect("serialize diagnostic");
         assert!(!serialized.contains("secret tool output"));
+    }
+
+    #[test]
+    fn reports_search_history_mismatch_and_clears_after_standard_or_lite_repair() {
+        for lite in [false, true] {
+            let mut body = json!({
+                "model":"gpt-6.1-sol", "tools":[],
+                "input":[{"type":"web_search_call","id":"ws_1","action":{"query":"private query"}}]
+            });
+            let mut request_context = context();
+            request_context.model = "gpt-6.1-sol";
+            let diagnostic = inspect_and_optimize(
+                &mut body,
+                &RequestHealthConfig::default(),
+                request_context.clone(),
+            )
+            .unwrap();
+            assert!(diagnostic.findings.iter().any(|finding| {
+                finding.code == "undeclared_web_search_history" && finding.count == 1
+            }));
+            assert!(!serde_json::to_string(&diagnostic)
+                .unwrap()
+                .contains("private query"));
+            assert!(super::super::providers::codex_web_search_history::ensure_web_search_declared_for_history(
+                &mut body, lite
+            ));
+            let diagnostic =
+                inspect_and_optimize(&mut body, &RequestHealthConfig::default(), request_context)
+                    .unwrap();
+            assert!(!diagnostic
+                .findings
+                .iter()
+                .any(|finding| finding.code == "undeclared_web_search_history"));
+            assert_eq!(body["tool_choice"], "none");
+        }
+    }
+
+    #[test]
+    fn search_history_mismatch_check_excludes_other_transports_and_models() {
+        for (app, endpoint, model) in [
+            ("claude", "/v1/responses", "gpt-6.1-sol"),
+            ("codex", "/v1/chat/completions", "gpt-6.1-sol"),
+            ("codex", "/v1/responses/compact", "gpt-6.1-sol"),
+            ("codex", "/v1/responses", "qwen3"),
+        ] {
+            let mut request_context = context();
+            request_context.app_type = app;
+            request_context.endpoint = endpoint;
+            request_context.wire_responses = matches!(endpoint, "/responses" | "/v1/responses");
+            request_context.model = model;
+            let mut body = json!({"input":[{"type":"web_search_call"}]});
+            let diagnostic =
+                inspect_and_optimize(&mut body, &RequestHealthConfig::default(), request_context)
+                    .unwrap();
+            assert!(!diagnostic
+                .findings
+                .iter()
+                .any(|finding| finding.code == "undeclared_web_search_history"));
+        }
+    }
+
+    #[test]
+    fn contract_checks_use_final_wire_transport_and_accept_server_held_calls() {
+        for server_context in [
+            json!({"previous_response_id":"private"}),
+            json!({"conversation":{"id":"private"}}),
+        ] {
+            let mut body = json!({"input":[{"type":"function_call_output","call_id":"server-call","output":"private"}]});
+            body.as_object_mut()
+                .unwrap()
+                .extend(server_context.as_object().unwrap().clone());
+            let diagnostic =
+                inspect_and_optimize(&mut body, &RequestHealthConfig::default(), context())
+                    .unwrap();
+            assert!(!diagnostic
+                .findings
+                .iter()
+                .any(|finding| finding.code == "orphaned_tool_output"));
+        }
+        let mut body = json!({"model":false,"stream":"private"});
+        let mut converted = context();
+        converted.wire_responses = false;
+        let diagnostic =
+            inspect_and_optimize(&mut body, &RequestHealthConfig::default(), converted).unwrap();
+        assert!(!diagnostic
+            .findings
+            .iter()
+            .any(|finding| finding.code.starts_with("responses_")));
+        let diagnostic =
+            inspect_and_optimize(&mut body, &RequestHealthConfig::default(), context()).unwrap();
+        assert!(diagnostic
+            .findings
+            .iter()
+            .any(|finding| finding.code == "responses_field_type"));
+        assert!(!diagnostic.blocked);
     }
 
     #[test]
@@ -1549,6 +1673,7 @@ mod tests {
                 provider_name: "Provider One",
                 model: "model-1",
                 endpoint: "/responses",
+                wire_responses: true,
                 client_request_bytes: 70_000,
                 compaction_request: false,
                 session_client_provided: true,
@@ -1587,6 +1712,47 @@ mod tests {
             .cloned()
             .expect("preflight risk");
         assert_eq!(finding.code, "sustained_request_growth");
+    }
+
+    #[test]
+    fn fallback_replaces_the_same_trace_without_counting_as_another_turn() {
+        let config = RequestHealthConfig {
+            large_request_threshold_bytes: 64 * 1024,
+            ..RequestHealthConfig::default()
+        };
+        let session_id = "fallback-contract-session";
+        for (trace, payload_bytes, provider, expected_count) in [
+            ("fallback-contract-1", 70_000, "provider-1", 1),
+            ("fallback-contract-2", 75_000, "provider-1", 2),
+            ("fallback-contract-2", 80_000, "provider-2", 2),
+        ] {
+            let mut body = json!({"input":"x".repeat(payload_bytes)});
+            let mut request_context = context();
+            request_context.session_id = session_id;
+            request_context.trace_id = Some(trace);
+            request_context.provider_id = provider;
+            inspect_and_optimize(&mut body, &config, request_context).unwrap();
+            let diagnostics = snapshot(config.clone()).diagnostics;
+            let turns = diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.session_id == session_id)
+                .collect::<Vec<_>>();
+            assert_eq!(turns.len(), expected_count);
+            assert_eq!(turns[0].provider_id, provider);
+            assert!(turns[0].anomaly.is_none());
+        }
+        assert!(record_usage("fallback-contract-2", 100_000, 0).is_none());
+        let mut third = json!({"input":"x".repeat(90_000)});
+        let mut request_context = context();
+        request_context.session_id = session_id;
+        request_context.trace_id = Some("fallback-contract-3");
+        inspect_and_optimize(&mut third, &config, request_context).unwrap();
+        let store = diagnostics_store().lock().unwrap();
+        let latest = store.iter().rfind(|d| d.session_id == session_id).unwrap();
+        assert_eq!(
+            latest.anomaly.as_ref().unwrap().code,
+            "sustained_request_growth"
+        );
     }
 
     #[test]

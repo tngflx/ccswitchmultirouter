@@ -81,9 +81,45 @@ describe("RequestHealthPanel", () => {
       />,
     );
 
-    expect(screen.getAllByText("Codex MultiRouter · gpt-5.6-sol").length).toBeGreaterThan(0);
-    expect(screen.getByText("settings.requestHealth.reviewMode")).toBeInTheDocument();
-    expect(screen.getByText("settings.requestHealth.historyWarning")).toBeInTheDocument();
+    expect(
+      screen.getAllByText("Codex MultiRouter · gpt-5.6-sol").length,
+    ).toBeGreaterThan(0);
+    expect(
+      screen.getByText("settings.requestHealth.reviewMode"),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText("settings.requestHealth.historyWarning"),
+    ).toBeInTheDocument();
+  });
+
+  it("renders final-wire contract findings using the existing diagnostics surface", () => {
+    const withContractFinding: RequestHealthSnapshot = {
+      ...snapshot,
+      diagnostics: [
+        {
+          ...snapshot.diagnostics[0],
+          findings: [
+            {
+              code: "responses_field_type",
+              severity: "error",
+              count: 1,
+              detail:
+                "Contract v1: wrong field type at model; values are redacted",
+            },
+          ],
+        },
+      ],
+    };
+    render(
+      <RequestHealthPanel
+        snapshot={withContractFinding}
+        isRefreshing={false}
+        onRefresh={vi.fn()}
+        onSaved={vi.fn()}
+      />,
+    );
+    expect(screen.getByText("responses_field_type")).toBeInTheDocument();
+    expect(screen.getByText(/wrong field type at model/)).toBeInTheDocument();
   });
 
   it("persists an updated Windows notification setting", async () => {
@@ -105,13 +141,21 @@ describe("RequestHealthPanel", () => {
       />,
     );
 
-    await user.click(screen.getByRole("checkbox", { name: "settings.requestHealth.windowsNotificationsEnabled" }));
-    await user.click(screen.getByRole("button", { name: "settings.requestHealth.save" }));
+    await user.click(
+      screen.getByRole("checkbox", {
+        name: "settings.requestHealth.windowsNotificationsEnabled",
+      }),
+    );
+    await user.click(
+      screen.getByRole("button", { name: "settings.requestHealth.save" }),
+    );
 
     await waitFor(() =>
       expect(settingsApi.save).toHaveBeenCalledWith(
         expect.objectContaining({
-          requestHealth: expect.objectContaining({ windowsNotificationsEnabled: true }),
+          requestHealth: expect.objectContaining({
+            windowsNotificationsEnabled: true,
+          }),
         }),
       ),
     );

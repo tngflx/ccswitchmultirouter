@@ -615,7 +615,7 @@ fn format_bind_error(addr: &SocketAddr, error: std::io::Error) -> String {
 mod tests {
     use super::*;
     use crate::{
-        provider::Provider,
+        provider::{Provider, ProviderMeta},
         proxy::external_openai_api::{
             self, ExternalOpenAiApiBackendType, ExternalOpenAiApiProfileUpdate,
         },
@@ -1508,6 +1508,84 @@ base_url = "http://127.0.0.1:15721/v1"
         assert_eq!(response.status(), StatusCode::UPGRADE_REQUIRED);
         let body = response_json(response).await;
         assert_eq!(body["error"]["code"], "responses_websocket_not_supported");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn v1_responses_delivers_native_sse_error_without_synthetic_503() {
+        let _home = TestHomeGuard::new();
+        for event in ["error", "response.error", "response.failed"] {
+            let error = json!({
+                "type": "invalid_request_error",
+                "code": "invalid_prompt",
+                "param": "tools",
+                "message": "response protection is unavailable for this request"
+            });
+            let payload = if event == "response.failed" {
+                json!({"type": event, "response": {"status": "failed", "error": error}})
+            } else {
+                json!({"type": event, "error": error})
+            };
+            let failure = format!("event: {event}\ndata: {payload}\n\n");
+            let upstream = Router::new().route(
+                "/v1/responses",
+                post(move || {
+                    let failure = failure.clone();
+                    async move { ([(header::CONTENT_TYPE, "text/event-stream")], failure) }
+                }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind native error upstream");
+            let upstream_url = format!("http://{}/v1", listener.local_addr().unwrap());
+            let upstream_task = tokio::spawn(async move {
+                axum::serve(listener, upstream).await.unwrap();
+            });
+            let (server, db) = build_test_server();
+            let mut provider = Provider::with_id(
+                "native-error".to_string(),
+                "Native Error".to_string(),
+                json!({"base_url": upstream_url, "api_key": "test-key"}),
+                None,
+            );
+            provider.meta = Some(ProviderMeta {
+                api_format: Some("openai_responses".to_string()),
+                ..Default::default()
+            });
+            db.save_provider("codex", &provider)
+                .expect("save native provider");
+            db.set_current_provider("codex", &provider.id)
+                .expect("select native provider");
+            let response = server
+                .build_router()
+                .oneshot(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri("/v1/responses")
+                        .header(header::USER_AGENT, "Codex Desktop/test")
+                        .header(header::AUTHORIZATION, "Bearer PROXY_MANAGED")
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(
+                            json!({"model": "gpt-6.1-sol", "input": [], "stream": true})
+                                .to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .expect("Responses endpoint");
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = response.into_body().collect().await.unwrap().to_bytes();
+            let text = std::str::from_utf8(&bytes).unwrap();
+            let data = text
+                .lines()
+                .find_map(|line| line.strip_prefix("data: "))
+                .expect("terminal SSE event");
+            let failed: Value = serde_json::from_str(data).unwrap();
+            assert_eq!(failed["type"], "response.failed");
+            assert_eq!(failed["response"]["error"], error);
+            assert!(!text.contains("response.completed"));
+            upstream_task.abort();
+        }
     }
 
     #[tokio::test]

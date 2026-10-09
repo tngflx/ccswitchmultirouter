@@ -93,8 +93,10 @@ export interface CodexRuntimeRefreshResult {
 }
 
 export const codexConfigConsistencyApi = {
-  inspect(): Promise<CodexConfigConsistencyReport> {
-    return invoke("inspect_codex_config_consistency");
+  inspect(includeAcknowledged = false): Promise<CodexConfigConsistencyReport> {
+    return invoke("inspect_codex_config_consistency", {
+      includeAcknowledged,
+    });
   },
   resolve(
     expectedFingerprint: string,

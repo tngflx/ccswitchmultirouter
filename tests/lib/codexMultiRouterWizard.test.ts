@@ -3,6 +3,7 @@ import type { Provider } from "@/types";
 import {
   applyWizardConnectivityApiFormatOverrides,
   buildCodexMultiRouterWizardPlan,
+  buildWizardModelCatalog,
   buildWizardRoutesFromSources,
   canContinueAfterConnectivity,
   classifyWizardConnectivityResult,
@@ -10,7 +11,9 @@ import {
   collectWizardRouteAliasSelectionIssues,
   defaultWizardModelSources,
   getWizardConfigIssues,
+  getWizardConnectivityProbeModels,
   getWizardModelFetchConfig,
+  hasWizardModelCatalog,
   inferCodexOfficialAuth,
   inferWizardApiFormat,
   inferWizardCacheConfig,
@@ -19,6 +22,7 @@ import {
   isWizardCodexOAuthSource,
   mergeFetchedModelsIntoWizardProvider,
   readWizardModelCatalog,
+  readIncludedWizardModelCatalog,
   resolveWizardModelNameCollisions,
 } from "@/lib/codexMultiRouterWizard";
 
@@ -34,6 +38,168 @@ function provider(overrides: Partial<Provider>): Provider {
 }
 
 describe("codexMultiRouterWizard helpers", () => {
+  it("passes only included models to probes, collisions, restored selections and generated plans", () => {
+    const source = provider({
+      id: "curated",
+      name: "Curated",
+      settingsConfig: {
+        modelCatalog: {
+          models: [
+            { model: "kept", upstreamModel: "wire-kept" },
+            { model: "hidden", upstreamModel: "wire-hidden", enabled: false },
+          ],
+          spawnAgentModels: ["hidden", "kept"],
+        },
+      },
+    });
+    const hiddenDuplicate = provider({
+      id: "other",
+      settingsConfig: {
+        modelCatalog: {
+          models: [{ model: "wire-kept", enabled: false }],
+        },
+      },
+    });
+    const existingPlan = provider({
+      id: "router",
+      settingsConfig: {
+        codexRouting: {
+          schemaVersion: 2,
+          enabled: true,
+          routes: [
+            {
+              id: "curated-route",
+              targetProviderId: source.id,
+              modelSelection: {
+                mode: "include",
+                models: ["wire-kept", "wire-hidden"],
+              },
+            },
+          ],
+          spawnAgentModels: ["hidden", "kept"],
+        },
+      },
+    });
+    expect(readWizardModelCatalog(source)).toHaveLength(2);
+    expect(
+      readIncludedWizardModelCatalog(source).map((model) => model.model),
+    ).toEqual(["kept"]);
+    expect(getWizardConnectivityProbeModels(source)).toEqual(["kept"]);
+    expect(collectWizardModelNameCollisions([source, hiddenDuplicate])).toEqual(
+      [],
+    );
+    const resolved = resolveWizardModelNameCollisions([
+      source,
+      hiddenDuplicate,
+    ]);
+    expect(readWizardModelCatalog(resolved[0])).toEqual(
+      readWizardModelCatalog(source),
+    );
+    expect(readWizardModelCatalog(resolved[1])).toEqual(
+      readWizardModelCatalog(hiddenDuplicate),
+    );
+    expect(
+      initialWizardCatalogModelOrder(existingPlan, [source, hiddenDuplicate]),
+    ).toEqual(["kept"]);
+    const catalog = buildWizardModelCatalog([source, hiddenDuplicate], {
+      spawnAgentModels: ["hidden", "kept"],
+    });
+    expect(catalog.models.map((model) => model.model)).toEqual(["kept"]);
+    expect(catalog.spawnAgentModels).toEqual(["kept"]);
+    const result = buildCodexMultiRouterWizardPlan(
+      [source, hiddenDuplicate, existingPlan],
+      [source, hiddenDuplicate],
+      existingPlan,
+      {
+        catalogModelOrder: ["hidden", "kept"],
+        spawnAgentModels: ["hidden", "kept"],
+      },
+    );
+    expect(result.plan.settingsConfig.codexRouting.routes).toEqual([
+      expect.objectContaining({
+        targetProviderId: source.id,
+        aliases: { kept: "wire-kept" },
+      }),
+    ]);
+    expect(result.plan.settingsConfig.codexRouting.spawnAgentModels).toEqual([
+      "kept",
+    ]);
+    expect(result.sourceProviders.map((source) => source.id)).toEqual([
+      "curated",
+    ]);
+    expect(
+      result.sourceProviders[0].settingsConfig.modelCatalog.models,
+    ).toEqual([{ model: "kept", upstreamModel: "wire-kept" }]);
+    expect(readWizardModelCatalog(source)).toHaveLength(2);
+  });
+
+  it("does not resurrect all-excluded providers or sources deselected in model order", () => {
+    const excluded = provider({
+      id: "excluded",
+      settingsConfig: {
+        model: "hidden",
+        defaultModel: "hidden",
+        modelCatalog: { models: [{ model: "hidden", enabled: false }] },
+      },
+    });
+    const selected = provider({
+      id: "selected",
+      settingsConfig: { modelCatalog: { models: [{ model: "chosen" }] } },
+    });
+    const deselected = provider({
+      id: "deselected",
+      settingsConfig: { modelCatalog: { models: [{ model: "not-chosen" }] } },
+    });
+    expect(hasWizardModelCatalog(excluded)).toBe(false);
+    expect(getWizardConnectivityProbeModels(excluded)).toEqual([]);
+    expect(buildWizardRoutesFromSources([excluded])).toEqual([]);
+    expect(buildWizardModelCatalog([excluded]).models).toEqual([]);
+    const result = buildCodexMultiRouterWizardPlan(
+      [selected, deselected, excluded],
+      [selected, deselected, excluded],
+      null,
+      { catalogModelOrder: ["chosen"] },
+    );
+    expect(result.sourceProviders.map((source) => source.id)).toEqual([
+      "selected",
+    ]);
+    expect(
+      result.plan.settingsConfig.codexRouting.routes.map(
+        (route: { targetProviderId: string }) => route.targetProviderId,
+      ),
+    ).toEqual(["selected"]);
+  });
+
+  it("keeps exclusions and leaves newly discovered models excluded on a curated refresh", () => {
+    const source = provider({
+      id: "official",
+      category: "official",
+      settingsConfig: {
+        modelCatalog: {
+          models: [{ model: "kept" }, { model: "hidden", enabled: false }],
+          spawnAgentModels: ["hidden", "kept", "new"],
+        },
+      },
+    });
+    const refreshed = mergeFetchedModelsIntoWizardProvider(source, [
+      { id: "kept", ownedBy: null },
+      { id: "hidden", ownedBy: null, contextWindow: 128000 },
+      { id: "new", ownedBy: null },
+    ]);
+    expect(readWizardModelCatalog(refreshed)).toEqual([
+      expect.objectContaining({ model: "kept" }),
+      expect.objectContaining({
+        model: "hidden",
+        enabled: false,
+        contextWindow: 128000,
+      }),
+      expect.objectContaining({ model: "new", enabled: false }),
+    ]);
+    expect(getWizardConnectivityProbeModels(refreshed)).toEqual(["kept"]);
+    expect(refreshed.settingsConfig.modelCatalog.spawnAgentModels).toEqual([
+      "kept",
+    ]);
+  });
   it("keeps an existing all-model route in automatic-follow mode", () => {
     const source = provider({
       id: "deepseek",

@@ -1,0 +1,240 @@
+{
+  "version": 1,
+  "source": "https://developers.openai.com/api/reference/resources/responses/methods/create.md",
+  "verified_at": "2026-10-08",
+  "coverage": "Conservative Responses create field types and selected replay invariants; not a complete API or model capability schema.",
+  "declarations_sha256": "6e6bdcb5e6bdb6caa8df402fc6b935884135cecc1ee1b00d4a06702cac36364d",
+  "top_level_signatures": {
+    "access_programs": "optional object { cyber }",
+    "background": "optional boolean or null",
+    "context_management": "optional array of object { type, compact_threshold } or null",
+    "conversation": "optional string or ResponseConversationParam or null",
+    "include": "optional array of ResponseIncludable or null",
+    "input": "optional string or array of EasyInputMessage or Message { content, role, status, type } or ResponseOutputMessage or 30 more",
+    "instructions": "optional string or null",
+    "max_output_tokens": "optional number or null",
+    "max_tool_calls": "optional number or null",
+    "metadata": "optional Metadata or null",
+    "model": "optional ResponsesModel",
+    "moderation": "optional object { model, policy } or null",
+    "parallel_tool_calls": "optional boolean or null",
+    "previous_response_id": "optional string or null",
+    "prompt": "optional ResponsePrompt or null",
+    "prompt_cache_key": "optional string or null",
+    "prompt_cache_options": "optional object { comparison_response_id, mode, prewarm, ttl }",
+    "prompt_cache_retention": "optional \"in_memory\" or \"24h\" or null",
+    "reasoning": "optional Reasoning or null",
+    "safety_identifier": "optional string or null",
+    "service_tier": "optional ServiceTier or null",
+    "store": "optional boolean or null",
+    "stream": "optional boolean or null",
+    "stream_options": "optional object { include_obfuscation } or null",
+    "temperature": "optional number or null",
+    "text": "optional ResponseTextConfig",
+    "tool_choice": "optional ToolChoiceOptions or ToolChoiceAllowed or ToolChoiceTypes or 6 more",
+    "tools": "optional array of Function { name, parameters, strict, 6 more } or FileSearch { type, vector_store_ids, filters, 2 more } or Computer { type } or 13 more",
+    "top_logprobs": "optional number or null",
+    "top_p": "optional number or null",
+    "truncation": "optional \"auto\" or \"disabled\" or null",
+    "user": "optional string or null"
+  },
+  "input_types": [
+    "additional_tools",
+    "apply_patch_call",
+    "apply_patch_call_output",
+    "code_interpreter_call",
+    "compaction",
+    "compaction_trigger",
+    "computer_call",
+    "computer_call_output",
+    "configuration_update",
+    "custom_tool_call",
+    "custom_tool_call_output",
+    "file_search_call",
+    "function_call",
+    "function_call_output",
+    "image_generation_call",
+    "item_reference",
+    "local_shell_call",
+    "local_shell_call_output",
+    "mcp_approval_request",
+    "mcp_approval_response",
+    "mcp_call",
+    "mcp_list_tools",
+    "message",
+    "program",
+    "program_output",
+    "reasoning",
+    "shell_call",
+    "shell_call_output",
+    "tool_search_call",
+    "tool_search_output",
+    "web_search_call"
+  ],
+  "tool_types": [
+    "apply_patch",
+    "code_interpreter",
+    "computer",
+    "computer_use_preview",
+    "custom",
+    "file_search",
+    "function",
+    "image_generation",
+    "local_shell",
+    "mcp",
+    "namespace",
+    "programmatic_tool_calling",
+    "shell",
+    "tool_search",
+    "web_search",
+    "web_search_2025_08_26",
+    "web_search_preview",
+    "web_search_preview_2025_03_11"
+  ],
+  "field_types": {
+    "access_programs": [
+      "object"
+    ],
+    "background": [
+      "boolean",
+      "null"
+    ],
+    "context_management": [
+      "array",
+      "null"
+    ],
+    "conversation": [
+      "string",
+      "object",
+      "null"
+    ],
+    "include": [
+      "array",
+      "null"
+    ],
+    "input": [
+      "string",
+      "array"
+    ],
+    "instructions": [
+      "string",
+      "null"
+    ],
+    "max_output_tokens": [
+      "number",
+      "null"
+    ],
+    "max_tool_calls": [
+      "number",
+      "null"
+    ],
+    "metadata": [
+      "object",
+      "null"
+    ],
+    "model": [
+      "string"
+    ],
+    "moderation": [
+      "object",
+      "null"
+    ],
+    "parallel_tool_calls": [
+      "boolean",
+      "null"
+    ],
+    "previous_response_id": [
+      "string",
+      "null"
+    ],
+    "prompt": [
+      "object",
+      "null"
+    ],
+    "prompt_cache_key": [
+      "string",
+      "null"
+    ],
+    "prompt_cache_options": [
+      "object"
+    ],
+    "prompt_cache_retention": [
+      "string",
+      "null"
+    ],
+    "reasoning": [
+      "object",
+      "null"
+    ],
+    "safety_identifier": [
+      "string",
+      "null"
+    ],
+    "service_tier": [
+      "string",
+      "null"
+    ],
+    "store": [
+      "boolean",
+      "null"
+    ],
+    "stream": [
+      "boolean",
+      "null"
+    ],
+    "stream_options": [
+      "object",
+      "null"
+    ],
+    "temperature": [
+      "number",
+      "null"
+    ],
+    "text": [
+      "object"
+    ],
+    "tool_choice": [
+      "string",
+      "object",
+      "null"
+    ],
+    "tools": [
+      "array",
+      "null"
+    ],
+    "top_logprobs": [
+      "number",
+      "null"
+    ],
+    "top_p": [
+      "number",
+      "null"
+    ],
+    "truncation": [
+      "string",
+      "null"
+    ],
+    "user": [
+      "string",
+      "null"
+    ]
+  },
+  "compatibility_nulls": [
+    "tool_choice",
+    "tools"
+  ],
+  "invariants": [
+    {
+      "code": "conversation_previous_response_conflict",
+      "evidence": "Cannot be used in conjunction with `conversation`."
+    },
+    {
+      "code": "compaction_trigger_not_last",
+      "evidence": "Compacts the current context. Must be the final input item."
+    },
+    {
+      "code": "additional_tools_role",
+      "evidence": "Only `developer` is supported."
+    }
+  ]
+}

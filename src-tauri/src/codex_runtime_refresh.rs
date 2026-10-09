@@ -724,6 +724,9 @@ fn is_official_codex_desktop_shell(process: &RawCodexRuntimeProcess) -> bool {
             path.contains("\\windowsapps\\openai.codex_")
                 || path.contains("\\windowsapps\\openai.codex.preview_")
         }
+        // Lowercase `codex.exe` is the bundled CLI/app-server. The Desktop
+        // shell is the case-sensitive `Codex.exe`; both can share the same
+        // installation root on Windows.
         "Codex.exe" => {
             is_known_legacy_codex_desktop_path(&path) && !path.ends_with("\\resources\\codex.exe")
         }
@@ -755,11 +758,9 @@ fn classify_refresh_targets(processes: &[RawCodexRuntimeProcess]) -> CodexRuntim
     let mut app_servers = processes
         .iter()
         .filter(|process| is_codex_app_server(process))
-        .filter(|process| {
-            shell_pids.contains(&process.parent_pid)
-                || normalized_windows_path(&process.executable_path)
-                    .contains("\\appdata\\local\\openai\\codex\\bin\\")
-        })
+        // A CLI/app-server launched by a terminal, editor, or ChatGPT
+        // tooling must not be treated as the Desktop process being refreshed.
+        .filter(|process| shell_pids.contains(&process.parent_pid))
         .cloned()
         .collect::<Vec<_>>();
     app_servers.sort_by_key(|process| process.pid);
@@ -1493,6 +1494,13 @@ mod tests {
                 r"C:\Tools\Codex.exe",
                 r#""Codex.exe""#,
             ),
+            process(
+                203,
+                20,
+                "codex.exe",
+                r"C:\Users\sunda\AppData\Local\OpenAI\Codex\bin\hash\codex.exe",
+                r#""codex.exe" app-server"#,
+            ),
         ];
 
         let targets = classify_refresh_targets(&processes);
@@ -1501,6 +1509,20 @@ mod tests {
         assert_eq!(targets.desktop_shells[0].pid, 100);
         assert_eq!(targets.app_servers.len(), 1);
         assert_eq!(targets.app_servers[0].pid, 101);
+    }
+
+    #[test]
+    fn lowercase_app_server_without_desktop_parent_is_ignored() {
+        let targets = classify_refresh_targets(&[process(
+            203,
+            20,
+            "codex.exe",
+            r"C:\Users\sunda\AppData\Local\OpenAI\Codex\bin\hash\codex.exe",
+            r#""codex.exe" app-server"#,
+        )]);
+
+        assert!(targets.desktop_shells.is_empty());
+        assert!(targets.app_servers.is_empty());
     }
 
     #[test]

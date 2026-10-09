@@ -11,6 +11,36 @@ export interface ModelIdentityShape {
   name?: unknown;
 }
 
+/** Preserve searchable catalog identities through form load, editing, and save. */
+export function normalizeModelIdentityMetadata(item: ModelIdentityShape): {
+  canonicalSlug?: string;
+  slug?: string;
+  aliases?: string[] | Record<string, string>;
+  name?: string;
+} {
+  const trimmed = (value: unknown): string =>
+    typeof value === "string" ? value.trim() : "";
+  const canonicalSlug =
+    trimmed(item.canonicalSlug) || trimmed(item.canonical_slug);
+  const slug = trimmed(item.slug);
+  const name = trimmed(item.name);
+  const aliases = Array.isArray(item.aliases)
+    ? [...new Set(item.aliases.map(trimmed).filter(Boolean))]
+    : item.aliases && typeof item.aliases === "object"
+      ? Object.fromEntries(
+          Object.entries(item.aliases)
+            .map(([alias, target]) => [alias.trim(), trimmed(target)])
+            .filter(([alias, target]) => alias && target),
+        )
+      : undefined;
+  return {
+    ...(canonicalSlug ? { canonicalSlug } : {}),
+    ...(slug ? { slug } : {}),
+    ...(name ? { name } : {}),
+    ...(aliases && Object.keys(aliases).length > 0 ? { aliases } : {}),
+  };
+}
+
 function normalizedIdentity(value: unknown): string {
   return typeof value === "string" ? value.trim().toLowerCase() : "";
 }

@@ -6,6 +6,38 @@ import {
 import { extractCodexCatalogModels } from "@/components/providers/forms/hooks/useCodexConfigState";
 
 describe("ProviderForm Codex catalog helpers", () => {
+  it("round-trips searchable model identities and excluded inventory through load and save", () => {
+    const loaded = extractCodexCatalogModels({
+      models: [
+        {
+          model: " visible-model ",
+          canonical_slug: " vendor/canonical ",
+          slug: " stable-slug ",
+          aliases: [" fast ", "backup", "fast"],
+          name: " Friendly Model ",
+          enabled: false,
+        },
+        {
+          model: "included-model",
+          aliases: { " quick ": " upstream-target " },
+        },
+      ],
+    });
+    const saved = normalizeCodexCatalogModelsForSave(loaded);
+    expect(saved).toEqual([
+      {
+        model: "visible-model",
+        canonicalSlug: "vendor/canonical",
+        slug: "stable-slug",
+        aliases: ["fast", "backup"],
+        name: "Friendly Model",
+        enabled: false,
+      },
+      { model: "included-model", aliases: { quick: "upstream-target" } },
+    ]);
+    expect(extractCodexCatalogModels({ models: saved })).toEqual(saved);
+  });
+
   it("normalizes catalog rows and removes empty or duplicate models", () => {
     expect(
       normalizeCodexCatalogModelsForSave([

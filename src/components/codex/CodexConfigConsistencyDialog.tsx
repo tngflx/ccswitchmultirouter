@@ -6,6 +6,7 @@ import {
   Circle,
   Loader2,
   RotateCcw,
+  X,
   XCircle,
 } from "lucide-react";
 import { useTranslation } from "react-i18next";
@@ -52,6 +53,7 @@ interface CodexConfigConsistencyDialogProps {
   onApply: () => void;
   onKeep: () => void;
   onLater: () => void;
+  onClose?: () => void;
   onRetry: () => void;
   refresh?: CodexRuntimeRefreshView;
   onInspectRefresh?: () => void;
@@ -74,6 +76,31 @@ function formatProgressTime(emittedAtMs: number): string {
     minute: "2-digit",
     second: "2-digit",
   });
+}
+
+function DialogCloseButton({
+  onClick,
+  disabled = false,
+  label,
+}: {
+  onClick: () => void;
+  disabled?: boolean;
+  label: string;
+}) {
+  return (
+    <Button
+      type="button"
+      variant="ghost"
+      size="icon"
+      className="absolute right-4 top-4"
+      aria-label={label}
+      title={label}
+      onClick={onClick}
+      disabled={disabled}
+    >
+      <X className="h-4 w-4" />
+    </Button>
+  );
 }
 
 function RefreshProgressLog({
@@ -246,6 +273,7 @@ export function CodexConfigConsistencyDialog({
   onApply,
   onKeep,
   onLater,
+  onClose,
   onRetry,
   refresh = { phase: "idle", preflight: null, progress: null },
   onInspectRefresh,
@@ -272,6 +300,8 @@ export function CodexConfigConsistencyDialog({
     const failed = refreshPhase === "failed";
     const completedWithWarnings =
       completed && refresh.result?.outcome === "completed_with_warnings";
+    const canDismissRefresh = !refreshing;
+    const dismissRefresh = onClose ?? onCancelRefresh;
     const history = refresh.preflight?.paginatedHistory;
     const repairableHistoryCount = history?.affectedRolloutCount ?? 0;
     const skippedHistoryCount = history?.blockedRolloutCount ?? 0;
@@ -293,9 +323,20 @@ export function CodexConfigConsistencyDialog({
     ];
 
     return (
-      <Dialog open>
-        <DialogContent className="max-w-lg" zIndex="top">
-          <DialogHeader>
+      <Dialog
+        open
+        onOpenChange={(open) => {
+          if (!open && canDismissRefresh) dismissRefresh?.();
+        }}
+      >
+        <DialogContent className="relative max-w-lg" zIndex="top">
+          {canDismissRefresh && dismissRefresh ? (
+            <DialogCloseButton
+              onClick={dismissRefresh}
+              label={t("common.close")}
+            />
+          ) : null}
+          <DialogHeader className="pr-16">
             <DialogTitle className="flex items-center gap-2">
               {failed ? (
                 <XCircle className="h-5 w-5 text-destructive" />
@@ -770,11 +811,16 @@ export function CodexConfigConsistencyDialog({
       <Dialog
         open
         onOpenChange={(open) => {
-          if (!open && !pending) onLater();
+          if (!open && !pending) (onClose ?? onLater)();
         }}
       >
-        <DialogContent className="max-w-lg" zIndex="top">
-          <DialogHeader>
+        <DialogContent className="relative max-w-lg" zIndex="top">
+          <DialogCloseButton
+            onClick={onClose ?? onLater}
+            disabled={pending}
+            label={t("common.close")}
+          />
+          <DialogHeader className="pr-16">
             <DialogTitle className="flex items-center gap-2">
               <AlertTriangle className="h-5 w-5 text-amber-500" />
               {t("codexConfigConsistency.runtimeTitle")}
@@ -816,11 +862,16 @@ export function CodexConfigConsistencyDialog({
     <Dialog
       open
       onOpenChange={(open) => {
-        if (!open && !pending) onLater();
+        if (!open && !pending) (onClose ?? onLater)();
       }}
     >
-      <DialogContent className="max-w-lg" zIndex="top">
-        <DialogHeader>
+      <DialogContent className="relative max-w-lg" zIndex="top">
+        <DialogCloseButton
+          onClick={onClose ?? onLater}
+          disabled={pending}
+          label={t("common.close")}
+        />
+        <DialogHeader className="pr-16">
           <DialogTitle className="flex items-center gap-2">
             <AlertTriangle className="h-5 w-5 text-amber-500" />
             {t(

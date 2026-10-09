@@ -1185,10 +1185,85 @@ fn parse_rfc3339_to_local(text: &str) -> Option<chrono::DateTime<chrono::Local>>
 #[serde(rename_all = "PascalCase")]
 struct RawWindowsCodexProcess {
     process_id: Option<u32>,
+    parent_process_id: Option<u32>,
     name: Option<String>,
     executable_path: Option<String>,
     command_line: Option<String>,
     started_at: Option<String>,
+}
+
+fn normalized_windows_path(path: &str) -> String {
+    path.trim().replace('/', "\\").to_ascii_lowercase()
+}
+
+fn is_known_legacy_codex_desktop_path(path: &str) -> bool {
+    path.contains("\\windowsapps\\openai.codex_")
+        || path.contains("\\windowsapps\\openai.codex.preview_")
+        || path.contains("\\appdata\\local\\openai\\codex\\")
+        || path.contains("\\appdata\\local\\programs\\openai\\codex\\")
+        || path.contains("\\appdata\\local\\programs\\codex\\")
+        || path.contains("\\program files\\openai\\codex\\")
+        || path.contains("\\program files\\codex\\")
+        || path.contains("\\program files (x86)\\openai\\codex\\")
+        || path.contains("\\scoop\\apps\\codex\\")
+}
+
+fn is_official_codex_desktop_shell(process: &RawWindowsCodexProcess) -> bool {
+    let Some(name) = process.name.as_deref() else {
+        return false;
+    };
+    let Some(executable_path) = process.executable_path.as_deref() else {
+        return false;
+    };
+    if process
+        .command_line
+        .as_deref()
+        .is_some_and(|line| line.to_ascii_lowercase().contains(" --type="))
+    {
+        return false;
+    }
+    let path = normalized_windows_path(executable_path);
+    match name {
+        "ChatGPT.exe" => {
+            path.contains("\\windowsapps\\openai.codex_")
+                || path.contains("\\windowsapps\\openai.codex.preview_")
+        }
+        // The bundled CLI/app-server is deliberately named lowercase
+        // `codex.exe`; the Desktop shell uses the case-sensitive `Codex.exe`
+        // name on Windows. Keep that distinction here because both binaries
+        // can live below `%LOCALAPPDATA%\OpenAI\Codex`.
+        "Codex.exe" => {
+            is_known_legacy_codex_desktop_path(&path) && !path.ends_with("\\resources\\codex.exe")
+        }
+        _ => false,
+    }
+}
+
+fn is_codex_app_server(process: &RawWindowsCodexProcess, shell_pids: &HashSet<u32>) -> bool {
+    let Some(name) = process.name.as_deref() else {
+        return false;
+    };
+    if !name.eq_ignore_ascii_case("codex.exe") {
+        return false;
+    }
+    let is_app_server = process
+        .command_line
+        .as_deref()
+        .unwrap_or_default()
+        .split_whitespace()
+        .any(|argument| {
+            argument
+                .trim_matches('"')
+                .eq_ignore_ascii_case("app-server")
+        });
+    if !is_app_server {
+        return false;
+    }
+    // A standalone CLI/app-server can be launched by editors, ChatGPT
+    // tooling, or a terminal and is not evidence that Codex Desktop is
+    // running. Only accept an app-server whose direct parent was already
+    // verified as the Desktop shell above.
+    shell_pids.contains(&process.parent_process_id.unwrap_or_default())
 }
 
 /// 通过 Windows CIM 读取 Codex 进程；非 Windows 构建返回空快照。
@@ -1199,23 +1274,9 @@ pub(crate) fn query_codex_processes() -> (Vec<CodexAppServerProcessDiagnostics>,
         const CREATE_NO_WINDOW: u32 = 0x08000000;
         let script = r#"
 [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false)
-$all = @(Get-CimInstance Win32_Process -Filter "Name = 'Codex.exe' OR Name = 'codex.exe' OR Name = 'ChatGPT.exe'")
-$desktopShellPids = @($all |
-  Where-Object {
-    ($_.Name -ceq 'ChatGPT.exe' -and $_.ExecutablePath -match '\\WindowsApps\\OpenAI\.Codex(?:\.Preview)?_' -and $_.CommandLine -notmatch ' --type=') -or
-    ($_.Name -ceq 'Codex.exe' -and $_.CommandLine -notmatch ' --type=')
-  } | Select-Object -ExpandProperty ProcessId)
-$all | Where-Object {
-    if ($_.Name -ceq 'ChatGPT.exe') {
-      return $_.ExecutablePath -and $_.ExecutablePath -match '\\WindowsApps\\OpenAI\.Codex(?:\.Preview)?_'
-    }
-    if ($_.Name -ceq 'Codex.exe') { return $true }
-    return $_.Name -ceq 'codex.exe' -and
-      $_.CommandLine -match '(?i)(^|\s)app-server(\s|$)' -and
-      (($_.ExecutablePath -and $_.ExecutablePath -match '\\AppData\\Local\\OpenAI\\Codex\\bin\\') -or
-       ($desktopShellPids -contains $_.ParentProcessId))
-  } |
-  Select-Object ProcessId,Name,ExecutablePath,CommandLine,@{Name='StartedAt';Expression={$_.CreationDate.ToLocalTime().ToString('o')}} |
+$all = @(Get-CimInstance Win32_Process -Filter "Name = 'Codex.exe' OR Name = 'codex.exe' OR Name = 'ChatGPT.exe'") |
+  Select-Object ProcessId,ParentProcessId,Name,ExecutablePath,CommandLine,@{Name='StartedAt';Expression={$_.CreationDate.ToLocalTime().ToString('o')}}
+$all |
   ConvertTo-Json -Compress
 "#;
         let output = match Command::new("powershell")
@@ -1269,26 +1330,37 @@ $all | Where-Object {
             serde_json::from_value::<RawWindowsCodexProcess>(raw_value).map(|item| vec![item])
         };
         match raw_processes {
-            Ok(processes) => (
-                processes
+            Ok(processes) => {
+                let shell_pids = processes
+                    .iter()
+                    .filter(|process| is_official_codex_desktop_shell(process))
+                    .filter_map(|process| process.process_id)
+                    .collect::<HashSet<_>>();
+                let selected: Vec<CodexAppServerProcessDiagnostics> = processes
                     .into_iter()
-                    .map(|process| {
-                        let command_line = process.command_line;
-                        let is_app_server = command_line
-                            .as_deref()
-                            .is_some_and(|line| line.contains("app-server"));
-                        CodexAppServerProcessDiagnostics {
+                    .filter_map(|process| {
+                        let is_app_server = is_codex_app_server(&process, &shell_pids);
+                        let is_shell = is_official_codex_desktop_shell(&process);
+                        if !is_shell && !is_app_server {
+                            return None;
+                        }
+                        Some(CodexAppServerProcessDiagnostics {
                             pid: process.process_id.unwrap_or_default(),
                             name: process.name,
                             executable_path: process.executable_path,
-                            command_line,
+                            command_line: process.command_line,
                             started_at: process.started_at,
                             is_app_server,
-                        }
+                        })
                     })
-                    .collect(),
-                None,
-            ),
+                    .collect();
+                log::debug!(
+                    "[CCX-005] Codex process scan selected {} shell/app-server processes ({} app-server)",
+                    selected.len(),
+                    selected.iter().filter(|process| process.is_app_server).count()
+                );
+                (selected, None)
+            }
             Err(err) => (
                 Vec::new(),
                 Some(format!(
@@ -1847,6 +1919,7 @@ fn codex_router_log_protocol_from_path(value: &str) -> Option<&'static str> {
 #[cfg(test)]
 mod codex_router_log_diagnostics_tests {
     use super::*;
+    use std::collections::HashSet;
     use std::sync::{Mutex, OnceLock};
 
     #[test]
@@ -1865,6 +1938,73 @@ mod codex_router_log_diagnostics_tests {
 
         assert_eq!(status, CodexDiagnosticStatus::Fail);
         assert!(detail.contains("probe failed"));
+    }
+
+    fn raw_process(
+        pid: u32,
+        parent_process_id: u32,
+        name: &str,
+        executable_path: &str,
+        command_line: &str,
+    ) -> RawWindowsCodexProcess {
+        RawWindowsCodexProcess {
+            process_id: Some(pid),
+            parent_process_id: Some(parent_process_id),
+            name: Some(name.to_string()),
+            executable_path: Some(executable_path.to_string()),
+            command_line: Some(command_line.to_string()),
+            started_at: Some("2026-10-07T16:00:00+08:00".to_string()),
+        }
+    }
+
+    #[test]
+    fn standalone_lowercase_app_server_is_not_a_desktop_shell_or_runtime() {
+        let process = raw_process(
+            200,
+            20,
+            "codex.exe",
+            r"C:\Users\Felix\AppData\Local\OpenAI\Codex\bin\hash\codex.exe",
+            r#""codex.exe" app-server --stdio"#,
+        );
+        let shell_pids = HashSet::new();
+
+        assert!(!is_official_codex_desktop_shell(&process));
+        assert!(!is_codex_app_server(&process, &shell_pids));
+    }
+
+    #[test]
+    fn app_server_is_runtime_only_when_parent_is_verified_desktop_shell() {
+        let shell = raw_process(
+            100,
+            10,
+            "Codex.exe",
+            r"C:\Users\Felix\AppData\Local\Programs\Codex\app-1.0.0\Codex.exe",
+            r#""Codex.exe""#,
+        );
+        let app_server = raw_process(
+            101,
+            100,
+            "codex.exe",
+            r"C:\Users\Felix\AppData\Local\OpenAI\Codex\bin\hash\codex.exe",
+            r#""codex.exe" app-server --stdio"#,
+        );
+        let shell_pids = [100].into_iter().collect::<HashSet<_>>();
+
+        assert!(is_official_codex_desktop_shell(&shell));
+        assert!(is_codex_app_server(&app_server, &shell_pids));
+    }
+
+    #[test]
+    fn renderer_process_is_not_a_desktop_shell() {
+        let renderer = raw_process(
+            102,
+            100,
+            "Codex.exe",
+            r"C:\Users\Felix\AppData\Local\Programs\Codex\app-1.0.0\Codex.exe",
+            r#""Codex.exe" --type=renderer"#,
+        );
+
+        assert!(!is_official_codex_desktop_shell(&renderer));
     }
 
     /// 返回测试专用的环境变量锁，避免并行测试互相污染代理变量。

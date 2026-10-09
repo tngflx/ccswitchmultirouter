@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   modelBindingIdentityValues,
   modelIdentityValues,
+  normalizeModelIdentityMetadata,
 } from "./modelIdentities";
 
 describe("model identity contract", () => {
@@ -23,5 +24,33 @@ describe("model identity contract", () => {
         upstreamModel: "gpt-6.1-sol",
       }),
     ).toEqual(["gpt-6.1-sol"]);
+  });
+
+  it("normalizes searchable metadata without changing identity case", () => {
+    expect(
+      normalizeModelIdentityMetadata({
+        canonical_slug: " Vendor/Canonical ",
+        slug: " stable-slug ",
+        name: " Friendly Model ",
+        aliases: [" quick ", "", null, "quick", "Other"],
+      }),
+    ).toEqual({
+      canonicalSlug: "Vendor/Canonical",
+      slug: "stable-slug",
+      name: "Friendly Model",
+      aliases: ["quick", "Other"],
+    });
+  });
+
+  it("preserves alias maps and ignores invalid metadata", () => {
+    expect(
+      normalizeModelIdentityMetadata({
+        canonicalSlug: "",
+        canonical_slug: "canonical",
+        name: 42,
+        aliases: { " quick ": " Target ", blank: " ", invalid: null },
+      }),
+    ).toEqual({ canonicalSlug: "canonical", aliases: { quick: "Target" } });
+    expect(normalizeModelIdentityMetadata({ aliases: [] })).toEqual({});
   });
 });

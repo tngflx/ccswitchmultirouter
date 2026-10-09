@@ -48,8 +48,11 @@ pub async fn get_watchdog_status(
         .map(|config| config.listen_port)
         .unwrap_or(0);
     let app_pid = std::process::id();
-    let supervisor_pid = crate::watchdog::last_supervisor_pid(&config_dir, app_pid);
-    let supervisor_identity = supervisor_pid.and_then(crate::process_identity::process_identity);
+    let supervisor_identity = crate::watchdog::live_supervisor_identity(&config_dir, app_pid);
+    let verified_supervisor_pid = supervisor_identity.as_ref().map(|identity| identity.pid);
+    let verified_supervisor_path = supervisor_identity
+        .as_ref()
+        .map(|identity| identity.executable_path.clone());
     let listener_pid = if port > 0 {
         crate::process_identity::tcp_listener_owner_pid(port)
     } else {
@@ -63,9 +66,9 @@ pub async fn get_watchdog_status(
     Ok(WatchdogStatus {
         enabled: crate::settings::get_settings().watchdog_enabled,
         app_pid,
-        supervisor_pid,
+        supervisor_pid: verified_supervisor_pid,
         supervisor_alive: supervisor_identity.is_some(),
-        supervisor_path: supervisor_identity.map(|identity| identity.executable_path),
+        supervisor_path: verified_supervisor_path,
         restarts_in_window: crate::watchdog::recent_restart_count(&config_dir),
         port,
         listener_pid,

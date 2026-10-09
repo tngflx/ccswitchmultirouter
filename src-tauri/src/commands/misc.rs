@@ -8,7 +8,9 @@ use regex::Regex;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::sync::Arc;
 use tauri::AppHandle;
+use tauri::Emitter;
 use tauri::State;
 use tauri_plugin_opener::OpenerExt;
 
@@ -96,7 +98,7 @@ pub async fn get_skills_migration_result() -> Result<Option<SkillsMigrationPaylo
     Ok(crate::init_status::take_skills_migration_result())
 }
 
-#[derive(serde::Serialize)]
+#[derive(Clone, serde::Serialize)]
 pub struct ToolVersion {
     name: String,
     version: Option<String>,
@@ -111,7 +113,7 @@ pub struct ToolVersion {
     wsl_distro: Option<String>,
 }
 
-const VALID_TOOLS: [&str; 8] = [
+pub(crate) const VALID_TOOLS: [&str; 8] = [
     "claude", "codex", "gemini", "grok", "opencode", "openclaw", "hermes", "pi",
 ];
 
@@ -177,6 +179,62 @@ pub async fn get_tool_versions(
     Ok(results)
 }
 
+// Package managers can share a global manifest even across different CLIs.
+// Reserve tools before queueing and keep both locks until the installer exits.
+struct ToolLifecycleCoordinator {
+    tools: HashMap<&'static str, Arc<tokio::sync::Mutex<()>>>,
+    execution: Arc<tokio::sync::Mutex<()>>,
+}
+
+impl Default for ToolLifecycleCoordinator {
+    fn default() -> Self {
+        Self {
+            tools: VALID_TOOLS
+                .iter()
+                .map(|&tool| (tool, Arc::new(tokio::sync::Mutex::new(()))))
+                .collect(),
+            execution: Arc::new(tokio::sync::Mutex::new(())),
+        }
+    }
+}
+
+impl ToolLifecycleCoordinator {
+    async fn run<F, R>(&self, tools: Vec<&'static str>, operation: F) -> Result<R, String>
+    where
+        F: FnOnce(&[&str]) -> Result<R, String> + Send + 'static,
+        R: Send + 'static,
+    {
+        let tool_guards = tools
+            .iter()
+            .map(|tool| {
+                self.tools
+                    .get(tool)
+                    .ok_or_else(|| format!("Unsupported tool action target: {tool}"))?
+                    .clone()
+                    .try_lock_owned()
+                    .map_err(|_| {
+                        format!(
+                            "{} already has an installation or update in progress",
+                            tool_display_name(tool)
+                        )
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let execution_guard = self.execution.clone().lock_owned().await;
+        // A cancelled IPC future must not unlock a still-running child process.
+        tokio::task::spawn_blocking(move || {
+            let _tool_guards = tool_guards;
+            let _execution_guard = execution_guard;
+            operation(&tools)
+        })
+        .await
+        .map_err(|error| format!("tool lifecycle task join error: {error}"))?
+    }
+}
+
+static TOOL_LIFECYCLE: Lazy<ToolLifecycleCoordinator> =
+    Lazy::new(ToolLifecycleCoordinator::default);
+
 #[tauri::command]
 pub async fn run_tool_lifecycle_action(
     tools: Vec<String>,
@@ -194,15 +252,208 @@ pub async fn run_tool_lifecycle_action(
         ToolLifecycleAction::Update => "tool_update",
     };
 
-    // build 阶段含锚定探测（对每个工具跑 `--version` 定位命令行实际命中那处），
-    // 与执行一并放进 blocking 线程，避免阻塞 async runtime。
-    tokio::task::spawn_blocking(move || {
-        let command_line =
-            build_tool_lifecycle_command(&requested, action, wsl_shell_by_tool.as_ref())?;
-        run_tool_lifecycle_silently(&command_line, label)
-    })
-    .await
-    .map_err(|e| format!("tool lifecycle task join error: {e}"))?
+    TOOL_LIFECYCLE
+        .run(requested, move |tools| {
+            let command_line =
+                build_tool_lifecycle_command(tools, action, wsl_shell_by_tool.as_ref())?;
+            run_tool_lifecycle_silently(&command_line, label)
+        })
+        .await
+}
+
+fn automatic_update_available(current: &ToolVersion) -> bool {
+    if current.installed_but_broken || current.error.is_some() || current.env_type == "wsl" {
+        return false;
+    }
+    let (Some(version), Some(latest)) = (
+        current.version.as_deref(),
+        current.latest_version.as_deref(),
+    ) else {
+        return false;
+    };
+    // Automatic actions never move a stable install onto a prerelease channel.
+    parse_semver(latest).is_some_and(|(_, prerelease)| prerelease.is_empty())
+        && compare_semver(version, latest) == Some(std::cmp::Ordering::Less)
+}
+
+fn tool_process_matches(tool: &str, executable: &str, command_line: &str) -> bool {
+    let executable = executable.replace('\\', "/").to_ascii_lowercase();
+    let name = executable
+        .rsplit('/')
+        .next()
+        .unwrap_or("")
+        .trim_end_matches(".exe");
+    if name == tool || (tool == "codex" && matches!(name, "chatgpt" | "codex.appimage")) {
+        return true;
+    }
+    if !matches!(
+        name,
+        "node" | "nodejs" | "bun" | "deno" | "python" | "python3" | "pythonw"
+    ) && !name.starts_with("python3.")
+    {
+        return false;
+    }
+    if command_line.trim().is_empty() {
+        // A runtime with an unreadable command may be hosting this CLI.
+        return true;
+    }
+    let command = command_line.replace('\\', "/").to_ascii_lowercase();
+    let package_marker = match tool {
+        "claude" => "@anthropic-ai/claude-code",
+        "codex" => "@openai/codex",
+        "gemini" => "@google/gemini-cli",
+        "grok" => "@xai-official/grok",
+        "opencode" => "opencode-ai",
+        "openclaw" => "node_modules/openclaw",
+        "hermes" => "hermes_cli",
+        "pi" => "pi-coding-agent",
+        _ => return false,
+    };
+    command.contains(package_marker)
+        || command.split_whitespace().any(|arg| {
+            let arg = arg.trim_matches(['"', '\'']);
+            let entry = arg.rsplit('/').next().unwrap_or("");
+            entry == tool || entry == format!("{tool}.js") || entry == format!("{tool}.mjs")
+        })
+}
+
+fn tool_process_is_running(tool: &str) -> Result<bool, String> {
+    use std::process::{Command, Stdio};
+    #[cfg(target_os = "windows")]
+    let mut command = {
+        let mut command = Command::new("powershell");
+        command.args([
+            "-NoProfile", "-NonInteractive", "-Command",
+            "$ErrorActionPreference='Stop'; ConvertTo-Json -Compress -InputObject @(Get-CimInstance Win32_Process | Select-Object Name,CommandLine)",
+        ]);
+        command.creation_flags(CREATE_NO_WINDOW);
+        command
+    };
+    #[cfg(not(target_os = "windows"))]
+    let mut command = {
+        let mut command = Command::new("ps");
+        command.args(["-A", "-o", "comm=", "-o", "args="]);
+        isolate_child_process_group(&mut command);
+        command
+    };
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let child = command
+        .spawn()
+        .map_err(|error| format!("Cannot inspect running CLIs: {error}"))?;
+    let output = wait_child_output(
+        child,
+        CommandDeadline::from_timeout(Some(std::time::Duration::from_secs(15))),
+    )?;
+    if !output.status.success() {
+        return Err("Cannot inspect running CLIs; automatic update skipped".to_string());
+    }
+    let text = decode_command_output(&output.stdout);
+    #[cfg(target_os = "windows")]
+    {
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "PascalCase")]
+        struct Process {
+            name: String,
+            command_line: Option<String>,
+        }
+        let processes: Vec<Process> = serde_json::from_str(text.trim())
+            .map_err(|error| format!("Cannot read running CLIs: {error}"))?;
+        Ok(processes.iter().any(|process| {
+            tool_process_matches(
+                tool,
+                &process.name,
+                process.command_line.as_deref().unwrap_or(""),
+            )
+        }))
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        Ok(text.lines().any(|line| {
+            let line = line.trim();
+            let (name, args) = line.split_once(char::is_whitespace).unwrap_or((line, ""));
+            tool_process_matches(tool, name, args)
+        }))
+    }
+}
+
+pub(crate) async fn auto_update_tool_if_needed(
+    app: &AppHandle,
+    tool: &'static str,
+) -> Result<bool, String> {
+    if !crate::settings::get_settings().tool_auto_update_enabled(tool) {
+        return Ok(false);
+    }
+    let current = get_single_tool_version_impl(tool, None, None).await;
+    if !automatic_update_available(&current) {
+        return Ok(false);
+    }
+    let latest = current.latest_version.unwrap();
+    let expected_latest = latest.clone();
+    let updated = TOOL_LIFECYCLE
+        .run(vec![tool], move |_| {
+            // Re-check policy, version, and installation after waiting for manual
+            // updates. Never fall back to installing a missing or ambiguous target.
+            if !crate::settings::get_settings().tool_auto_update_enabled(tool) {
+                return Ok(false);
+            }
+            let installs = enumerate_tool_installations(tool);
+            let (command, needs_confirmation, anchored) = plan_command_for(tool, &installs);
+            if !automatic_update_target_is_safe(&installs, needs_confirmation, anchored, &latest) {
+                log::info!("Skipping automatic {tool} update: installation needs manual review");
+                return Ok(false);
+            }
+            if tool_process_is_running(tool)? {
+                log::info!("Skipping automatic {tool} update: CLI is running");
+                return Ok(false);
+            }
+            #[cfg(target_os = "windows")]
+            let script =
+                format!("@echo off\r\ncall {command}\r\nif errorlevel 1 exit /b %errorlevel%\r\n");
+            #[cfg(not(target_os = "windows"))]
+            let script = format!("set -e\nset -o pipefail\n{command}\n");
+            run_tool_lifecycle_silently(&script, "tool_auto_update")?;
+            Ok(true)
+        })
+        .await?;
+    if updated {
+        let refreshed = get_single_tool_version_impl(tool, None, None).await;
+        if !refreshed.version.as_deref().is_some_and(|version| {
+            matches!(
+                compare_semver(version, &expected_latest),
+                Some(std::cmp::Ordering::Equal | std::cmp::Ordering::Greater)
+            )
+        }) {
+            return Err(format!(
+                "{tool} updater finished but the latest version was not detected"
+            ));
+        }
+        let _ = app.emit("tool-auto-update-completed", refreshed);
+        log::info!("Automatic {tool} CLI update completed");
+    }
+    Ok(updated)
+}
+
+fn automatic_update_target_is_safe(
+    installs: &[ToolInstallation],
+    needs_confirmation: bool,
+    anchored: bool,
+    latest: &str,
+) -> bool {
+    installs.len() == 1
+        && !needs_confirmation
+        && anchored
+        && installs[0].runnable
+        && installs[0].version.as_deref().is_some_and(|version| {
+            compare_semver(version, latest) == Some(std::cmp::Ordering::Less)
+        })
+}
+
+pub(crate) async fn auto_update_other_clis_on_startup(app: AppHandle) {
+    for tool in VALID_TOOLS.into_iter().filter(|tool| *tool != "codex") {
+        if let Err(error) = auto_update_tool_if_needed(&app, tool).await {
+            log::warn!("Automatic {tool} CLI update skipped or failed: {error}");
+        }
+    }
 }
 
 /// 静默执行工具安装/更新脚本：直接捕获子进程输出并阻塞到命令真正结束，
@@ -234,8 +485,11 @@ fn run_tool_lifecycle_silently(command_line: &str, label: &str) -> Result<(), St
     use std::os::windows::process::CommandExt;
     use std::process::Command;
 
-    let bat_file =
-        std::env::temp_dir().join(format!("cc_switch_{}_{}.bat", label, std::process::id()));
+    let script_dir = tempfile::Builder::new()
+        .prefix("cc_switch_lifecycle_")
+        .tempdir()
+        .map_err(|e| format!("Cannot create tool lifecycle script directory: {e}"))?;
+    let bat_file = script_dir.path().join(format!("{label}.bat"));
     std::fs::write(&bat_file, command_line).map_err(|e| format!("写入批处理文件失败: {e}"))?;
 
     let output = Command::new("cmd")
@@ -243,7 +497,6 @@ fn run_tool_lifecycle_silently(command_line: &str, label: &str) -> Result<(), St
         .arg(&bat_file)
         .creation_flags(CREATE_NO_WINDOW)
         .output();
-    let _ = std::fs::remove_file(&bat_file);
 
     finish_lifecycle_output(&output.map_err(|e| format!("启动安装进程失败: {e}"))?)
 }
@@ -1820,15 +2073,42 @@ fn windows_runnable_sibling_for_extensionless_tool(path: &Path) -> Option<std::p
 }
 
 #[cfg(target_os = "windows")]
-fn run_windows_tool_command(
-    tool_path: &Path,
-    args: &[&str],
-    new_path: &str,
-) -> std::io::Result<std::process::Output> {
+fn windows_command_script_path(path: &Path) -> PathBuf {
+    use std::path::{Component, Prefix};
+
+    // canonicalize returns verbatim paths. CreateProcess can run native EXEs
+    // with those paths, but cmd's CALL and npm's %~dp0 sibling resolution cannot.
+    // Keep canonical paths for identity/deduplication; adapt only shell input.
+    let mut components = path.components();
+    let Some(Component::Prefix(prefix)) = components.next() else {
+        return path.to_path_buf();
+    };
+    let mut shell_path = match prefix.kind() {
+        Prefix::VerbatimDisk(drive) => PathBuf::from(format!("{}:\\", char::from(drive))),
+        Prefix::VerbatimUNC(server, share) => {
+            let mut unc = std::ffi::OsString::from(r"\\");
+            unc.push(server);
+            unc.push(r"\");
+            unc.push(share);
+            PathBuf::from(unc)
+        }
+        _ => return path.to_path_buf(),
+    };
+    for component in components {
+        if !matches!(component, Component::RootDir) {
+            shell_path.push(component.as_os_str());
+        }
+    }
+    shell_path
+}
+
+#[cfg(target_os = "windows")]
+fn windows_tool_command(tool_path: &Path, args: &[&str], new_path: &str) -> std::process::Command {
     use std::process::Command;
 
-    if is_windows_command_script(tool_path) {
-        let path = tool_path.to_string_lossy();
+    let mut cmd = if is_windows_command_script(tool_path) {
+        let shell_path = windows_command_script_path(tool_path);
+        let path = shell_path.to_string_lossy();
         let args = args
             .iter()
             .map(|arg| windows_cmd_double_quote_arg(arg))
@@ -1844,19 +2124,24 @@ fn run_windows_tool_command(
             }
         );
         let mut cmd = Command::new("cmd");
-        return cmd
-            .args(["/D", "/S", "/C"])
-            .raw_arg(&command)
-            .env("PATH", new_path)
-            .creation_flags(CREATE_NO_WINDOW)
-            .output();
-    }
+        cmd.args(["/D", "/S", "/C"]).raw_arg(&command);
+        cmd
+    } else {
+        let mut cmd = Command::new(tool_path);
+        cmd.args(args);
+        cmd
+    };
+    cmd.env("PATH", new_path).creation_flags(CREATE_NO_WINDOW);
+    cmd
+}
 
-    Command::new(tool_path)
-        .args(args)
-        .env("PATH", new_path)
-        .creation_flags(CREATE_NO_WINDOW)
-        .output()
+#[cfg(target_os = "windows")]
+fn run_windows_tool_command(
+    tool_path: &Path,
+    args: &[&str],
+    new_path: &str,
+) -> std::io::Result<std::process::Output> {
+    windows_tool_command(tool_path, args, new_path).output()
 }
 
 #[cfg(target_os = "windows")]
@@ -3121,38 +3406,9 @@ fn run_windows_tool_command_capture(
     extra_env: &[(&str, String)],
     working_dir: &Path,
 ) -> Result<std::process::Output, String> {
-    use std::process::{Command, Stdio};
+    use std::process::Stdio;
 
-    let mut cmd = if is_windows_command_script(tool_path) {
-        let path = tool_path.to_string_lossy();
-        let args = args
-            .iter()
-            .map(|arg| windows_cmd_double_quote_arg(arg))
-            .collect::<Vec<_>>()
-            .join(" ");
-        let command = format!(
-            "call {}{}",
-            win_quote_path_for_batch(&path),
-            if args.is_empty() {
-                String::new()
-            } else {
-                format!(" {args}")
-            }
-        );
-        let mut cmd = Command::new("cmd");
-        cmd.args(["/D", "/S", "/C"])
-            .raw_arg(&command)
-            .env("PATH", new_path)
-            .creation_flags(CREATE_NO_WINDOW);
-        cmd
-    } else {
-        let mut cmd = Command::new(tool_path);
-        cmd.args(args)
-            .env("PATH", new_path)
-            .creation_flags(CREATE_NO_WINDOW);
-        cmd
-    };
-
+    let mut cmd = windows_tool_command(tool_path, args, new_path);
     apply_extra_env(&mut cmd, extra_env);
     cmd.current_dir(working_dir)
         .stdout(Stdio::piped())
@@ -4488,6 +4744,251 @@ pub async fn set_window_theme(window: tauri::Window, theme: String) -> Result<()
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn automatic_updates_require_a_runnable_outdated_stable_release() {
+        let mut current = ToolVersion {
+            name: "codex".to_string(),
+            version: Some("0.160.0".to_string()),
+            latest_version: Some("0.161.0".to_string()),
+            error: None,
+            installed_but_broken: false,
+            env_type: "windows".to_string(),
+            wsl_distro: None,
+        };
+        assert!(automatic_update_available(&current));
+        current.version = None;
+        assert!(!automatic_update_available(&current));
+        current.version = Some("0.161.0".to_string());
+        assert!(!automatic_update_available(&current));
+        current.version = Some("0.162.0".to_string());
+        assert!(!automatic_update_available(&current));
+        current.version = Some("0.160.0".to_string());
+        current.installed_but_broken = true;
+        assert!(!automatic_update_available(&current));
+        current.installed_but_broken = false;
+        current.latest_version = None;
+        assert!(!automatic_update_available(&current));
+        current.latest_version = Some("0.161.0-beta.1".to_string());
+        assert!(!automatic_update_available(&current));
+        current.latest_version = Some("false".to_string());
+        assert!(!automatic_update_available(&current));
+        current.latest_version = Some("0.161.0".to_string());
+        current.env_type = "wsl".to_string();
+        assert!(!automatic_update_available(&current));
+    }
+
+    #[test]
+    fn automatic_updates_require_one_unambiguous_anchored_installation() {
+        let install = || ToolInstallation {
+            path: "/tools/codex".to_string(),
+            version: Some("0.160.0".to_string()),
+            runnable: true,
+            error: None,
+            source: "npm".to_string(),
+            is_path_default: true,
+            real: PathBuf::from("/tools/codex"),
+        };
+        assert!(automatic_update_target_is_safe(
+            &[install()],
+            false,
+            true,
+            "0.161.0"
+        ));
+        assert!(!automatic_update_target_is_safe(
+            &[],
+            false,
+            true,
+            "0.161.0"
+        ));
+        assert!(!automatic_update_target_is_safe(
+            &[install(), install()],
+            false,
+            true,
+            "0.161.0"
+        ));
+        assert!(!automatic_update_target_is_safe(
+            &[install()],
+            true,
+            true,
+            "0.161.0"
+        ));
+        assert!(!automatic_update_target_is_safe(
+            &[install()],
+            false,
+            false,
+            "0.161.0"
+        ));
+        assert!(!automatic_update_target_is_safe(
+            &[install()],
+            false,
+            true,
+            "0.160.0"
+        ));
+        let mut broken = install();
+        broken.runnable = false;
+        assert!(!automatic_update_target_is_safe(
+            &[broken],
+            false,
+            true,
+            "0.161.0"
+        ));
+    }
+
+    #[test]
+    fn automatic_updates_recognize_native_and_runtime_cli_processes() {
+        for tool in VALID_TOOLS {
+            assert!(tool_process_matches(tool, &format!("{tool}.exe"), ""));
+            assert!(tool_process_matches(
+                tool,
+                "/usr/bin/node",
+                &format!("node /bin/{tool}")
+            ));
+            assert!(!tool_process_matches(
+                tool,
+                "notepad.exe",
+                &format!("notes about {tool}")
+            ));
+            assert!(!tool_process_matches(
+                tool,
+                "node",
+                "node /projects/unrelated/index.js"
+            ));
+        }
+        assert!(tool_process_matches("codex", "ChatGPT.exe", ""));
+        assert!(tool_process_matches(
+            "gemini",
+            "node.exe",
+            r#"node "C:\npm\node_modules\@google\gemini-cli\dist\index.js""#
+        ));
+        assert!(tool_process_matches(
+            "pi",
+            "bun",
+            "bun /global/@earendil-works/pi-coding-agent/dist/cli.js"
+        ));
+        assert!(tool_process_matches(
+            "hermes",
+            "python3.12",
+            "python -m hermes_cli.main"
+        ));
+        for runtime in ["nodejs.exe", "deno.exe", "pythonw.exe", "python3.12"] {
+            assert!(tool_process_matches("codex", runtime, ""));
+        }
+        assert!(!tool_process_matches("codex", "notepad.exe", ""));
+    }
+
+    #[tokio::test]
+    async fn lifecycle_coordinator_serializes_writes_and_rejects_duplicates() {
+        let coordinator = Arc::new(ToolLifecycleCoordinator::default());
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (finish_tx, finish_rx) = std::sync::mpsc::channel();
+        let first = {
+            let coordinator = coordinator.clone();
+            tokio::spawn(async move {
+                coordinator
+                    .run(vec!["codex"], move |_| {
+                        started_tx.send(()).unwrap();
+                        finish_rx.recv().unwrap();
+                        Ok(())
+                    })
+                    .await
+            })
+        };
+        started_rx.await.unwrap();
+        assert!(coordinator
+            .run(vec!["codex"], |_| Ok(()))
+            .await
+            .unwrap_err()
+            .contains("in progress"));
+        assert!(coordinator
+            .run(vec!["claude", "codex"], |_| Ok(()))
+            .await
+            .is_err());
+        let second = coordinator.run(vec!["claude"], |_| Ok(()));
+        tokio::pin!(second);
+        assert!(futures::poll!(second.as_mut()).is_pending());
+        assert!(coordinator.run(vec!["claude"], |_| Ok(())).await.is_err());
+        finish_tx.send(()).unwrap();
+        first.await.unwrap().unwrap();
+        second.await.unwrap();
+        coordinator.run(vec!["codex"], |_| Ok(())).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn lifecycle_coordinator_keeps_locks_after_caller_cancellation() {
+        let coordinator = Arc::new(ToolLifecycleCoordinator::default());
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (finish_tx, finish_rx) = std::sync::mpsc::channel();
+        let first = {
+            let coordinator = coordinator.clone();
+            tokio::spawn(async move {
+                coordinator
+                    .run(vec!["codex"], move |_| {
+                        started_tx.send(()).unwrap();
+                        finish_rx.recv().unwrap();
+                        Ok(())
+                    })
+                    .await
+            })
+        };
+        started_rx.await.unwrap();
+        first.abort();
+        assert!(first.await.unwrap_err().is_cancelled());
+        assert!(coordinator.run(vec!["codex"], |_| Ok(())).await.is_err());
+        let next = coordinator.run(vec!["claude"], |_| Ok(()));
+        tokio::pin!(next);
+        assert!(futures::poll!(next.as_mut()).is_pending());
+        finish_tx.send(()).unwrap();
+        next.await.unwrap();
+        coordinator.run(vec!["codex"], |_| Ok(())).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn lifecycle_coordinator_releases_locks_after_failure() {
+        let coordinator = ToolLifecycleCoordinator::default();
+        assert_eq!(
+            coordinator
+                .run(vec!["pi"], |_| Err::<(), _>("failed".to_string()))
+                .await,
+            Err("failed".to_string())
+        );
+        coordinator.run(vec!["pi"], |_| Ok(())).await.unwrap();
+        assert!(coordinator
+            .run(vec!["pi"], |_| -> Result<(), String> {
+                panic!("installer panicked")
+            })
+            .await
+            .is_err());
+        coordinator.run(vec!["pi"], |_| Ok(())).await.unwrap();
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn concurrent_lifecycle_runs_use_independent_scripts() {
+        let output_dir = tempfile::tempdir().unwrap();
+        let outputs = [
+            output_dir.path().join("first.txt"),
+            output_dir.path().join("second.txt"),
+        ];
+        let barrier = std::sync::Barrier::new(2);
+        std::thread::scope(|scope| {
+            for output in &outputs {
+                let barrier = &barrier;
+                scope.spawn(move || {
+                    let command = format!("@echo off\r\n>\"{}\" echo %~f0\r\n", output.display());
+                    barrier.wait();
+                    run_tool_lifecycle_silently(&command, "tool_update").unwrap();
+                });
+            }
+        });
+        let paths =
+            outputs.map(|output| PathBuf::from(std::fs::read_to_string(output).unwrap().trim()));
+        assert_ne!(paths[0], paths[1]);
+        for path in paths {
+            assert!(!path.exists());
+            assert!(!path.parent().unwrap().exists());
+        }
+    }
+
     use std::path::{Path, PathBuf};
 
     #[cfg(target_os = "windows")]
@@ -6587,6 +7088,102 @@ mod tests {
         assert_eq!(preferred.as_deref(), Some(cmd.as_path()));
     }
 
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_canonical_script_paths_adapt_only_filesystem_verbatim_prefixes() {
+        for (source, expected) in [
+            (
+                r"\\?\C:\Users\name\npm\codex.cmd",
+                r"C:\Users\name\npm\codex.cmd",
+            ),
+            (
+                r"\\?\UNC\server\share\npm install\codex.cmd",
+                r"\\server\share\npm install\codex.cmd",
+            ),
+            (
+                r"C:\Users\name\npm\codex.cmd",
+                r"C:\Users\name\npm\codex.cmd",
+            ),
+            (r"\\server\share\codex.cmd", r"\\server\share\codex.cmd"),
+            (r"\\.\pipe\codex", r"\\.\pipe\codex"),
+        ] {
+            assert_eq!(
+                windows_command_script_path(Path::new(source)),
+                PathBuf::from(expected)
+            );
+        }
+        let native = Path::new(r"\\?\C:\tools\codex.exe");
+        assert_eq!(
+            windows_tool_command(native, &["--version"], "").get_program(),
+            native.as_os_str()
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_canonical_script_version_probe_runs_npm_style_sibling_launcher() {
+        let dir = tempfile::tempdir().expect("launcher fixture");
+        let bin = dir.path().join("npm install (with spaces)");
+        std::fs::create_dir_all(&bin).unwrap();
+        let launcher = bin.join("codex.cmd");
+        std::fs::write(&launcher, "@echo off\r\ncall \"%~dp0runtime.cmd\" %*\r\n").unwrap();
+        std::fs::write(
+            bin.join("runtime.cmd"),
+            "@echo off\r\necho codex-cli 0.160.0\r\nexit /b 0\r\n",
+        )
+        .unwrap();
+        let canonical = std::fs::canonicalize(&launcher).unwrap();
+        assert!(canonical.to_string_lossy().starts_with(r"\\?\"));
+        let output = run_windows_tool_version_command(&canonical, &effective_path_string())
+            .expect("run canonical npm launcher");
+        assert!(
+            output.status.success(),
+            "canonical script failed: {}",
+            decode_command_output(&output.stderr)
+        );
+        assert_eq!(
+            extract_version(decode_command_output(&output.stdout).trim()),
+            "0.160.0"
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_canonical_script_capture_keeps_cwd_env_and_nonzero_exit() {
+        let dir = tempfile::tempdir().expect("capture fixture");
+        let bin = dir.path().join("npm install (with spaces)");
+        let cwd = dir.path().join("working directory");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::create_dir_all(&cwd).unwrap();
+        let launcher = bin.join("codex.cmd");
+        std::fs::write(&launcher, "@echo off\r\ncall \"%~dp0runtime.cmd\" %*\r\n").unwrap();
+        std::fs::write(
+            bin.join("runtime.cmd"),
+            "@echo off\r\necho probe-env=%CCSM_CANONICAL_SCRIPT_TEST%\r\necho probe-cwd=%CD%\r\nexit /b 23\r\n",
+        )
+        .unwrap();
+        let canonical = std::fs::canonicalize(&launcher).unwrap();
+        let output = run_windows_tool_command_capture(
+            &canonical,
+            &["--version"],
+            &effective_path_string(),
+            CommandDeadline::from_timeout(Some(std::time::Duration::from_secs(5))),
+            &[("CCSM_CANONICAL_SCRIPT_TEST", "kept".to_string())],
+            &cwd,
+        )
+        .expect("bounded canonical launcher execution");
+        assert_eq!(output.status.code(), Some(23));
+        let stdout = decode_command_output(&output.stdout);
+        assert!(
+            stdout.contains("probe-env=kept"),
+            "environment lost: {stdout}"
+        );
+        assert!(
+            stdout.contains(&format!("probe-cwd={}", cwd.display())),
+            "cwd lost: {stdout}"
+        );
+    }
+
     #[test]
     fn resolve_launch_cwd_accepts_existing_directory() {
         let resolved =
@@ -6595,6 +7192,35 @@ mod tests {
                 .expect("temp dir should be present");
 
         assert!(resolved.is_dir());
+    }
+
+    #[cfg(target_os = "windows")]
+    #[tokio::test]
+    #[ignore = "requires a locally installed Codex CLI and optional registry network access"]
+    async fn windows_installed_codex_about_version_smoke() {
+        let tools = get_tool_versions(Some(vec!["codex".to_string()]), None)
+            .await
+            .expect("About version command");
+        assert_eq!(tools.len(), 1);
+        let tool = &tools[0];
+        println!(
+            "About Codex result: {}",
+            serde_json::to_string(tool).unwrap()
+        );
+        assert!(tool.version.is_some(), "Codex CLI version was not detected");
+        assert!(!tool.installed_but_broken, "false broken-install result");
+        assert!(tool.error.is_none(), "unexpected error: {:?}", tool.error);
+        let reports = probe_tool_installations(vec!["codex".to_string()])
+            .await
+            .expect("Codex install diagnostics");
+        assert_eq!(reports.len(), 1);
+        assert!(
+            reports[0]
+                .installs
+                .iter()
+                .any(|install| install.is_path_default && install.runnable),
+            "PATH default must be reported as runnable"
+        );
     }
 
     #[test]

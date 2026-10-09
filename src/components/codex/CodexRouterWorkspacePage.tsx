@@ -60,6 +60,11 @@ import { useTranslation } from "react-i18next";
 import i18n from "@/i18n";
 import { Input } from "@/components/ui/input";
 import { applyCodexCatalogModelOrder } from "@/lib/codexModelCatalogOrder";
+import {
+  codexCatalogModelUsage,
+  defaultCodexCatalogModelOrder,
+  type CodexCatalogUsageHistory,
+} from "@/lib/codexModelCatalogRecommendations";
 
 function tr(key: string, options?: Record<string, unknown>): string {
   return String(i18n.t(key, options));
@@ -128,6 +133,7 @@ import {
   normalizeCodexSpawnAgentModels,
   normalizeSpawnAgentCandidateSelection,
   readCodexModelCatalog,
+  readIncludedCodexModelCatalog,
   reorderSpawnAgentCandidates,
   validateSpawnAgentCandidates,
   type CodexCatalogModel,
@@ -401,10 +407,8 @@ function providerHasModelIdentity(
 ): boolean {
   const normalized = normalizedModelIdentity(modelIdentity);
   if (!normalized) return false;
-  const catalogModels = readCodexModelCatalog(provider).models.filter(
-    (model) => model.enabled !== false,
-  );
-  if (catalogModels.length > 0) {
+  const catalogModels = readIncludedCodexModelCatalog(provider).models;
+  if (readCodexModelCatalog(provider).models.length > 0) {
     return catalogModels.some((model) =>
       modelIdentityValues(model).includes(normalized),
     );
@@ -475,7 +479,9 @@ function normalizedRouteIdentityText(value?: string | null): string {
 function providerRouteModelIdentitySet(provider: Provider): Set<string> {
   return new Set(
     [
-      ...readCodexModelCatalog(provider).models.map((model) => model.model),
+      ...readIncludedCodexModelCatalog(provider).models.map(
+        (model) => model.model,
+      ),
       ...collectProviderModelIds(provider),
       ...inferProviderPrefixes(provider, collectProviderModelIds(provider)),
     ]
@@ -1058,6 +1064,7 @@ export function providerWithFetchedModelCatalog(
     if (!shouldAppendFetchedModels) continue;
     const nextModel: CodexCatalogModelDraft = {
       model: id,
+      ...(currentCatalog.models.length > 0 ? { enabled: false } : {}),
       upstreamModel: id,
       displayName: id,
       ...(contextWindow ? { contextWindow } : {}),
@@ -1466,9 +1473,12 @@ function uniqueRouteId(preferredId: string, usedIds: Set<string>): string {
 
 /// 从真实模型目录里推断精确模型名；没有目录时只读取显式单模型字段，不能伪造 OAuth 模型权限。
 function collectProviderModelIds(provider: Provider): string[] {
-  const catalogModels = readCodexModelCatalog(provider)
+  const catalogModels = readIncludedCodexModelCatalog(provider)
     .models.map((model) => model.model?.trim())
     .filter((model): model is string => Boolean(model));
+  if (readCodexModelCatalog(provider).models.length > 0) {
+    return Array.from(new Set(catalogModels));
+  }
   const singleModelFields = [
     provider.settingsConfig?.model,
     provider.settingsConfig?.defaultModel,
@@ -1484,7 +1494,7 @@ function collectProviderModelIds(provider: Provider): string[] {
 function buildRouteModelMapFromProvider(
   provider: Provider,
 ): Record<string, string> | undefined {
-  const entries = readCodexModelCatalog(provider)
+  const entries = readIncludedCodexModelCatalog(provider)
     .models.map((model) => {
       const visibleModel = model.model?.trim();
       const upstreamModel = (
@@ -1568,7 +1578,7 @@ function inferRouteCapabilitiesFromProvider(
   provider: Provider,
   modelIds: string[],
 ): CodexRouteCapabilities | undefined {
-  const catalogModels = readCodexModelCatalog(provider).models;
+  const catalogModels = readIncludedCodexModelCatalog(provider).models;
   const modelSet = new Set(
     modelIds.map((model) => model.trim()).filter(Boolean),
   );
@@ -1736,7 +1746,7 @@ function buildModelCatalogDraftFromSources(
   const byModel = new Map<string, CodexCatalogModelDraft>();
 
   for (const provider of modelSources) {
-    const sourceCatalogModels = readCodexModelCatalog(provider).models;
+    const sourceCatalogModels = readIncludedCodexModelCatalog(provider).models;
     for (const catalogModel of sourceCatalogModels) {
       const id = catalogModel.model?.trim();
       if (!id || byModel.has(id)) continue;
@@ -2111,7 +2121,7 @@ export function normalizeCodexRoutesForVisibleModelAliases(
   return routes.map((route) => {
     const targetProvider = routeTargetProvider(route, providersById);
     const targetCatalogModels = targetProvider
-      ? readCodexModelCatalog(targetProvider).models
+      ? readIncludedCodexModelCatalog(targetProvider).models
       : [];
     if (!targetProvider || targetCatalogModels.length === 0) return route;
 
@@ -2267,7 +2277,7 @@ export function buildModelCatalogForRoutes(
       ? providersById.get(routeTargetProviderId(route)!)
       : undefined;
     const targetCatalogModels = targetProvider
-      ? readCodexModelCatalog(targetProvider).models
+      ? readIncludedCodexModelCatalog(targetProvider).models
       : [];
     // Saved routes use their persisted names, not the wizard's temporary
     // collision aliases. Resolve only aliases explicitly saved on this route.
@@ -2311,6 +2321,14 @@ export function buildModelCatalogForRoutes(
     for (const model of route.match?.models ?? []) {
       const id = model.trim();
       if (!id || byModel.has(id)) continue;
+      // A persisted route is policy, not evidence that an excluded model exists.
+      if (
+        targetProvider &&
+        readCodexModelCatalog(targetProvider).models.length > 0
+      ) {
+        continue;
+      }
+      if (legacyModelById.get(id)?.enabled === false) continue;
       byModel.set(
         id,
         applyRouteCapabilitiesToCatalogModel(
@@ -2586,15 +2604,6 @@ function routeProviderModelSyncSummary(
   return parts.join("; ");
 }
 
-/// 收集所有可被 Codex 请求命中的模型名，测试页会优先使用这些真实规则生成候选项。
-function collectRouteModels(routes: RouteEntry[]): string[] {
-  const modelNames = routes.flatMap(({ route }) => [
-    ...(route.match?.models ?? []),
-    ...(route.match?.prefixes ?? []).map((prefix) => `${prefix}*`),
-  ]);
-  return Array.from(new Set(modelNames.filter(Boolean)));
-}
-
 /// 根据当前 MultiRouter 规则反查 catalog 中真实存在的模型，用于子 Agent 候选页的“路由命中”选项卡。
 export function collectRoutedCatalogModels(
   routes: RouteEntry[],
@@ -2604,8 +2613,9 @@ export function collectRoutedCatalogModels(
   const prefixes: string[] = [];
 
   for (const { route, provider } of routes) {
+    if (route.enabled === false) continue;
     if (route.modelSelection?.mode === "all") {
-      for (const model of readCodexModelCatalog(provider).models) {
+      for (const model of readIncludedCodexModelCatalog(provider).models) {
         const normalized = model.model?.trim();
         if (normalized) exactModels.add(normalized);
       }
@@ -2621,6 +2631,7 @@ export function collectRoutedCatalogModels(
   }
 
   const routed = catalogModels
+    .filter((model) => model.enabled !== false)
     .map((model) => model.model?.trim())
     .filter((model): model is string => Boolean(model))
     .filter(
@@ -3333,7 +3344,6 @@ export function CodexRouterWorkspacePage({
       index,
     })),
   );
-  const routeModels = collectRouteModels(routeEntries);
   const selectedPlan =
     routingPlans.find((provider) => provider.id === selectedPlanId) ??
     routingPlans.find((provider) => provider.id === activeProviderId) ??
@@ -3343,6 +3353,9 @@ export function CodexRouterWorkspacePage({
   const selectedProjectedCatalog = useMemo(
     () => projectCodexModelCatalog(selectedPlan, providersById),
     [selectedPlan, providersById],
+  );
+  const routeModels = selectedProjectedCatalog.models.map(
+    (model) => model.model,
   );
   const selectedPlanRouteEntries = selectedPlan
     ? routeEntries.filter(({ provider }) => provider.id === selectedPlan.id)
@@ -3713,6 +3726,19 @@ export function CodexRouterWorkspacePage({
 
     const matched = selectedPlanRouteEntries.find(({ route }) => {
       if (route.enabled === false) return false;
+      const target = routeTargetProvider(route, providersById);
+      const upstream =
+        Object.entries(route.aliases ?? route.upstream?.modelMap ?? {}).find(
+          ([alias]) =>
+            normalizedModelIdentity(alias) === normalizedModelIdentity(model),
+        )?.[1] ?? model;
+      if (
+        target &&
+        readCodexModelCatalog(target).models.length > 0 &&
+        !providerHasModelIdentity(target, upstream)
+      ) {
+        return false;
+      }
       if (routeCanMatchVisibleCatalogModel(route, model)) return true;
       if (route.modelSelection?.mode !== "all") return false;
 
@@ -3724,8 +3750,7 @@ export function CodexRouterWorkspacePage({
       ) {
         return true;
       }
-      const target = routeTargetProvider(route, providersById);
-      return readCodexModelCatalog(target ?? null).models.some(
+      return readIncludedCodexModelCatalog(target ?? null).models.some(
         (catalogModel) => {
           const candidate = catalogModel.model?.trim();
           const upstream = (
@@ -4577,14 +4602,11 @@ export function sortCodexCatalogModels(
   });
 }
 
-function codexModelRecommendationScore(
-  model: CodexCatalogModel,
-  providerIndex: number,
-): number {
+function codexModelRecommendationScore(model: CodexCatalogModel): number {
   const id = (model.model ?? "").trim().toLocaleLowerCase();
   const label =
     `${id} ${model.displayName ?? model.display_name ?? ""}`.toLocaleLowerCase();
-  let score = Math.max(0, 30 - providerIndex);
+  let score = 0;
   if (/(codex|coder|coding|code-|sonnet|opus)/.test(label)) score += 60;
   if (model.reasoning?.supportStatus === "confirmed_supported") score += 24;
   if ((model.reasoning?.supportedEfforts?.length ?? 0) >= 3) score += 12;
@@ -4618,7 +4640,16 @@ export function recommendCodexCatalogModels(
   models: CodexCatalogModel[],
   limit = RANKED_MODEL_LIMIT,
   preferredProviders: string[] = [],
+  history?: CodexCatalogUsageHistory,
 ): CodexCatalogModel[] {
+  if (limit <= 0) return [];
+  const usage = codexCatalogModelUsage(models, history);
+  const defaultRank = new Map(
+    defaultCodexCatalogModelOrder(models).map((model, index) => [
+      model.model,
+      index,
+    ]),
+  );
   const providerRank = new Map(
     preferredProviders.map((provider, index) => [
       provider.trim().toLocaleLowerCase(),
@@ -4630,30 +4661,121 @@ export function recommendCodexCatalogModels(
       model,
       index,
       provider: codexCatalogProviderName(model) || "unknown",
-      score: codexModelRecommendationScore(model, index),
+      score: codexModelRecommendationScore(model),
+      usage: usage.get(model.model.trim().toLowerCase()),
     }))
     .sort(
       (left, right) =>
+        (right.usage?.codexRequests ?? 0) - (left.usage?.codexRequests ?? 0) ||
+        (right.usage?.codexTokens ?? 0) - (left.usage?.codexTokens ?? 0) ||
+        (right.usage?.providerRequests ?? 0) -
+          (left.usage?.providerRequests ?? 0) ||
+        (right.usage?.providerTokens ?? 0) -
+          (left.usage?.providerTokens ?? 0) ||
         (providerRank.get(left.provider.toLocaleLowerCase()) ?? 999) -
           (providerRank.get(right.provider.toLocaleLowerCase()) ?? 999) ||
         right.score - left.score ||
+        (defaultRank.get(left.model.model) ?? 0) -
+          (defaultRank.get(right.model.model) ?? 0) ||
         left.index - right.index,
     );
-  const selected: typeof ranked = [];
-  const firstProvider = preferredProviders[0]?.trim().toLocaleLowerCase();
-  if (firstProvider) {
-    for (const candidate of ranked) {
-      if (candidate.provider.toLocaleLowerCase() !== firstProvider) continue;
-      selected.push(candidate);
-      if (selected.length >= Math.min(2, limit)) break;
+  return ranked.slice(0, limit).map(({ model }) => model);
+}
+
+type ModelOrderReasoning = {
+  efforts: CodexReasoningEffort[];
+  defaultEffort?: CodexReasoningEffort | null;
+};
+
+const UNKNOWN_MODEL_ORDER_REASONING: ModelOrderReasoning = { efforts: [] };
+
+function declaredModelOrderReasoning(
+  model?: CodexCatalogModel,
+): ModelOrderReasoning | undefined {
+  const reasoning = model?.reasoning;
+  if (!reasoning) return undefined;
+  if (
+    reasoning.supportStatus === "confirmed_unsupported" ||
+    reasoning.supported === false ||
+    reasoning.controlKind === "boolean" ||
+    reasoning.controlKind === "none"
+  ) {
+    return UNKNOWN_MODEL_ORDER_REASONING;
+  }
+  return {
+    efforts: reasoning.supportedEfforts.filter((effort) => effort !== "ultra"),
+    defaultEffort: reasoning.defaultEffort,
+  };
+}
+
+function modelOrderReasoningQueryOptions(
+  model: CodexCatalogModel | undefined,
+  selectedRoutes: RouteEntry[],
+  providersById: Map<string, Provider>,
+) {
+  let source: Provider | undefined;
+  let upstream = model ? catalogDraftUpstreamModel(model) : "";
+  if (model) {
+    const identities = modelIdentityValues(model);
+    for (const { route } of selectedRoutes) {
+      if (route.enabled === false) continue;
+      const provider = providersById.get(routeTargetProviderId(route) ?? "");
+      if (!provider) continue;
+      const sourceModel = readIncludedCodexModelCatalog(provider).models.find(
+        (entry) =>
+          modelIdentityValues(entry).some((identity) =>
+            identities.includes(identity),
+          ),
+      );
+      if (
+        !routeCanMatchVisibleCatalogModel(route, model) &&
+        !(route.modelSelection?.mode === "all" && sourceModel)
+      ) {
+        continue;
+      }
+      source = provider;
+      upstream =
+        (route.aliases ?? route.upstream?.modelMap)?.[model.model] ??
+        (sourceModel ? catalogDraftUpstreamModel(sourceModel) : upstream);
+      break;
     }
   }
-  for (const candidate of ranked) {
-    if (selected.includes(candidate)) continue;
-    selected.push(candidate);
-    if (selected.length >= limit) break;
-  }
-  return selected.map(({ model }) => model);
+  return {
+    queryKey: [
+      "codexModelOrderReasoning",
+      model?.model,
+      upstream,
+      source?.id,
+      source?.settingsConfig,
+    ],
+    retry: false,
+    staleTime: 60_000,
+    queryFn: async (): Promise<ModelOrderReasoning> => {
+      if (!source || !model) return UNKNOWN_MODEL_ORDER_REASONING;
+      let resolution = await codexSubagentV2Api.resolveModelReasoningCapability(
+        source.settingsConfig,
+        source.id,
+        model.model,
+      );
+      // Preserve visible-model overrides before falling back to the wire identity.
+      if (resolution.source === "unknown" && upstream !== model.model) {
+        resolution = await codexSubagentV2Api.resolveModelReasoningCapability(
+          source.settingsConfig,
+          source.id,
+          upstream,
+        );
+      }
+      return {
+        efforts:
+          resolution.resolved.supportKind === "effort_levels"
+            ? resolution.resolved.codexSelectableEfforts.filter(
+                (effort) => effort !== "ultra",
+              )
+            : [],
+        defaultEffort: resolution.resolved.providerDefaultEffort,
+      };
+    },
+  };
 }
 
 export function ModelOrderTab({
@@ -4675,6 +4797,10 @@ export function ModelOrderTab({
   const [error, setError] = useState<string | null>(null);
   const [draftModels, setDraftModels] = useState<CodexCatalogModel[]>([]);
   const [isSaving, setIsSaving] = useState(false);
+  const [isRecommending, setIsRecommending] = useState(false);
+  const [recommendationUsage, setRecommendationUsage] =
+    useState<CodexCatalogUsageHistory>();
+  const recommendationRequest = useRef(0);
   const [displayStyle, setDisplayStyle] = useState<CodexModelDisplayStyle>(
     DEFAULT_CODEX_MODEL_DISPLAY_STYLE,
   );
@@ -4682,10 +4808,9 @@ export function ModelOrderTab({
   const [modelSearch, setModelSearch] = useState("");
   const configuredDefaultReasoningEffort =
     selectedPlan?.settingsConfig?.codexRouting?.defaultReasoningEffort;
-  const [defaultReasoningEffort, setDefaultReasoningEffort] =
-    useState<CodexReasoningEffort>(
-      configuredDefaultReasoningEffort ?? "medium",
-    );
+  const [defaultReasoningEffort, setDefaultReasoningEffort] = useState<
+    CodexReasoningEffort | undefined
+  >(configuredDefaultReasoningEffort);
   const sensors = useSensors(
     useSensor(PointerSensor),
     useSensor(KeyboardSensor, {
@@ -4705,14 +4830,27 @@ export function ModelOrderTab({
         )
       : [];
   }, [selectedPlan?.settingsConfig?.codexRouting?.modelOrder]);
-  const hasCustomOrder = persistedModelOrder.length > 0;
+  const defaultModels = useMemo(
+    () =>
+      selectedPlan
+        ? defaultCodexCatalogModelOrder(
+            buildModelCatalogForRoutes(
+              selectedPlan,
+              selectedRoutes.map(({ route }) => route),
+              providersById,
+              { ignorePersistedModelOrder: true },
+            ).models,
+          )
+        : [],
+    [selectedPlan, selectedRoutes, providersById],
+  );
   const providerNamesByModel = useMemo(() => {
     const names = new Map<string, string>();
     for (const { route } of selectedRoutes) {
       if (route.enabled === false) continue;
       const provider = providersById.get(routeTargetProviderId(route) ?? "");
       if (!provider) continue;
-      for (const source of readCodexModelCatalog(provider).models) {
+      for (const source of readIncludedCodexModelCatalog(provider).models) {
         for (const value of [
           source.model,
           source.upstreamModel,
@@ -4752,6 +4890,14 @@ export function ModelOrderTab({
       ].some((value) => value?.toLocaleLowerCase().includes(query)),
     );
   }, [modelSearch, orderedDraftModels]);
+  const latestDraftModels = useRef(orderedDraftModels);
+  latestDraftModels.current = orderedDraftModels;
+  const defaultOrderKey = defaultModels.map((model) => model.model).join("\n");
+  const canRestoreDefault =
+    orderedDraftModels.map((model) => model.model).join("\n") !==
+      defaultOrderKey ||
+    (persistedModelOrder.length > 0 &&
+      persistedModelOrder.join("\n") !== defaultOrderKey);
   const globalRankByModel = useMemo(
     () =>
       new Map(
@@ -4779,25 +4925,37 @@ export function ModelOrderTab({
             )
             .filter((provider): provider is Provider => Boolean(provider))
             .map((provider) => provider.name),
+          recommendationUsage,
         ).map((model) => model.model?.trim()),
       ),
-    [orderedDraftModels, providersById, selectedRoutes],
+    [orderedDraftModels, providersById, selectedRoutes, recommendationUsage],
   );
   const topModel = orderedDraftModels[0];
-  const topReasoningEfforts = useMemo<CodexReasoningEffort[]>(() => {
-    const declared = topModel?.reasoning?.supportedEfforts?.filter(
-      (effort): effort is CodexReasoningEffort => effort !== "ultra",
-    );
-    return declared ?? [];
-  }, [topModel]);
+  const declaredTopReasoning = declaredModelOrderReasoning(topModel);
+  const topReasoningQuery = useQuery({
+    ...modelOrderReasoningQueryOptions(topModel, selectedRoutes, providersById),
+    enabled: Boolean(topModel) && !declaredTopReasoning,
+  });
+  const topReasoning =
+    declaredTopReasoning ??
+    topReasoningQuery.data ??
+    UNKNOWN_MODEL_ORDER_REASONING;
+  const topReasoningEfforts = topReasoning.efforts;
+  const topDefaultReasoningEffort =
+    topReasoning.defaultEffort &&
+    topReasoningEfforts.includes(topReasoning.defaultEffort)
+      ? topReasoning.defaultEffort
+      : topReasoningEfforts[0];
+  const selectedDefaultReasoningEffort =
+    defaultReasoningEffort &&
+    topReasoningEfforts.includes(defaultReasoningEffort)
+      ? defaultReasoningEffort
+      : topDefaultReasoningEffort;
   const effectiveConfiguredDefaultReasoningEffort =
     configuredDefaultReasoningEffort &&
     topReasoningEfforts.includes(configuredDefaultReasoningEffort)
       ? configuredDefaultReasoningEffort
-      : topModel?.reasoning?.defaultEffort &&
-          topReasoningEfforts.includes(topModel.reasoning.defaultEffort)
-        ? topModel.reasoning.defaultEffort
-        : topReasoningEfforts[0];
+      : topDefaultReasoningEffort;
   const fallbackProtocolCount = visibleDraftModels.filter(
     isCodexProtocolFallback,
   ).length;
@@ -4806,7 +4964,8 @@ export function ModelOrderTab({
     (catalog.displayNameStyle ?? DEFAULT_CODEX_MODEL_DISPLAY_STYLE);
   const effortDirty =
     topReasoningEfforts.length > 0 &&
-    defaultReasoningEffort !== effectiveConfiguredDefaultReasoningEffort;
+    selectedDefaultReasoningEffort !==
+      effectiveConfiguredDefaultReasoningEffort;
   const hasChanges =
     styleDirty ||
     effortDirty ||
@@ -4814,6 +4973,9 @@ export function ModelOrderTab({
       catalog.models.map((model) => model.model).join("\n");
 
   useEffect(() => {
+    recommendationRequest.current += 1;
+    setIsRecommending(false);
+    setRecommendationUsage(undefined);
     setSortMode("custom");
     setMessage(null);
     setError(null);
@@ -4829,32 +4991,15 @@ export function ModelOrderTab({
             (right.sortIndex ?? Number.MAX_SAFE_INTEGER),
         ),
     );
-    setDefaultReasoningEffort(
-      configuredDefaultReasoningEffort ??
-        catalog.models
-          .slice()
-          .sort(
-            (left, right) =>
-              (left.sortIndex ?? Number.MAX_SAFE_INTEGER) -
-              (right.sortIndex ?? Number.MAX_SAFE_INTEGER),
-          )[0]?.reasoning?.defaultEffort ??
-        catalog.models[0]?.reasoning?.supportedEfforts?.find(
-          (effort) => effort !== "ultra",
-        ) ??
-        "medium",
-    );
+    setDefaultReasoningEffort(configuredDefaultReasoningEffort);
   }, [selectedPlan?.id, catalogKey, configuredDefaultReasoningEffort]);
 
-  useEffect(() => {
-    if (topReasoningEfforts.length === 0) return;
-    if (topReasoningEfforts.includes(defaultReasoningEffort)) return;
-    const declaredDefault = topModel?.reasoning?.defaultEffort;
-    setDefaultReasoningEffort(
-      declaredDefault && topReasoningEfforts.includes(declaredDefault)
-        ? declaredDefault
-        : topReasoningEfforts[0],
-    );
-  }, [defaultReasoningEffort, topModel, topReasoningEfforts]);
+  useEffect(
+    () => () => {
+      recommendationRequest.current += 1;
+    },
+    [],
+  );
 
   const hiddenCatalogModels = useMemo(() => {
     const hidden: Array<{
@@ -4907,26 +5052,91 @@ export function ModelOrderTab({
     });
   }
 
-  function applyRecommendations() {
-    const preferredProviders = selectedRoutes
-      .map(({ route }) => providersById.get(routeTargetProviderId(route) ?? ""))
-      .filter((provider): provider is Provider => Boolean(provider))
-      .map((provider) => provider.name);
-    const recommended = recommendCodexCatalogModels(
-      orderedDraftModels,
-      RANKED_MODEL_LIMIT,
-      preferredProviders,
-    );
-    const recommendedIds = new Set(
-      recommended.map((model) => model.model?.trim()),
-    );
-    setSortMode("custom");
-    setDraftModels([
-      ...recommended,
-      ...orderedDraftModels.filter(
-        (model) => !recommendedIds.has(model.model?.trim()),
-      ),
-    ]);
+  async function applyRecommendations() {
+    if (isRecommending || isSaving) return;
+    const request = ++recommendationRequest.current;
+    setIsRecommending(true);
+    setMessage(null);
+    setError(null);
+    try {
+      let syncIncomplete = false;
+      try {
+        const sync = await usageApi.syncSessionUsage();
+        syncIncomplete = sync.errors.length > 0 || sync.deferredFiles > 0;
+      } catch {
+        syncIncomplete = true;
+      }
+      if (request !== recommendationRequest.current) return;
+      const results = await Promise.allSettled([
+        usageApi.getModelStats(undefined, undefined, "codex"),
+        usageApi.getModelStats(),
+      ]);
+      if (request !== recommendationRequest.current) return;
+      if (results.every((result) => result.status === "rejected")) {
+        throw new Error(
+          results
+            .filter((result) => result.status === "rejected")
+            .map((result) => workspaceErrorMessage(result.reason))
+            .join("; "),
+        );
+      }
+      const history: CodexCatalogUsageHistory = {
+        codex: results[0].status === "fulfilled" ? results[0].value : [],
+        providers: results[1].status === "fulfilled" ? results[1].value : [],
+      };
+      const models = latestDraftModels.current;
+      const matchedUsage = codexCatalogModelUsage(models, history);
+      const preferredProviders = selectedRoutes
+        .filter(({ route }) => route.enabled !== false)
+        .map(({ route }) =>
+          providersById.get(routeTargetProviderId(route) ?? ""),
+        )
+        .filter((provider): provider is Provider => Boolean(provider))
+        .map((provider) => provider.name);
+      setRecommendationUsage(history);
+      setSortMode("custom");
+      setDraftModels(
+        recommendCodexCatalogModels(
+          models,
+          models.length,
+          preferredProviders,
+          history,
+        ),
+      );
+      const partial =
+        syncIncomplete ||
+        results.some((result) => result.status === "rejected");
+      setMessage(
+        (matchedUsage.size
+          ? tr("codexRouterWorkspace.recommendationsFromUsage", {
+              defaultValue:
+                "Recommendations applied from usage history for {{count}} models.",
+              count: matchedUsage.size,
+            })
+          : tr("codexRouterWorkspace.recommendationsNoUsage", {
+              defaultValue:
+                "No matching usage history; applied coding-capability recommendations.",
+            })) +
+          (partial
+            ? ` ${tr("codexRouterWorkspace.recommendationsPartialUsage", {
+                defaultValue:
+                  "Some usage could not be refreshed; available history was used.",
+              })}`
+            : ""),
+      );
+      void queryClient.invalidateQueries({ queryKey: usageKeys.all });
+    } catch (recommendationError) {
+      if (request !== recommendationRequest.current) return;
+      setError(
+        tr("codexRouterWorkspace.recommendationsUsageFailed", {
+          defaultValue:
+            "Could not read usage history. Model order was not changed: {{error}}",
+          error: workspaceErrorMessage(recommendationError),
+        }),
+      );
+    } finally {
+      if (request === recommendationRequest.current) setIsRecommending(false);
+    }
   }
 
   function moveModelToPosition(modelId: string, position: number) {
@@ -4959,28 +5169,39 @@ export function ModelOrderTab({
     setMessage(null);
     setError(null);
     try {
-      const models = reset
-        ? buildModelCatalogForRoutes(
-            selectedPlan,
-            selectedRoutes.map(({ route }) => route),
-            providersById,
-            { ignorePersistedModelOrder: true },
-          ).models
-        : orderedDraftModels;
+      const models = reset ? defaultModels : orderedDraftModels;
       const orderChanged =
         models.map((model) => model.model).join("\n") !==
         catalog.models.map((model) => model.model).join("\n");
       const persistOrder = reset || orderChanged;
       const currentRouting = selectedPlan.settingsConfig?.codexRouting;
       const currentConfig = selectedPlan.settingsConfig?.config;
-      const declaredEfforts: CodexReasoningEffort[] =
-        models[0]?.reasoning?.supportedEfforts?.filter(
-          (effort) => effort !== "ultra",
-        ) ?? [];
-      const declaredDefault = models[0]?.reasoning?.defaultEffort;
+      const reasoning =
+        declaredModelOrderReasoning(models[0]) ??
+        (await queryClient.fetchQuery<ModelOrderReasoning>(
+          modelOrderReasoningQueryOptions(
+            models[0],
+            selectedRoutes,
+            providersById,
+          ),
+        ));
+      const declaredEfforts = reasoning.efforts;
+      const declaredDefault = reasoning.defaultEffort;
+      const sameTopModel =
+        models[0] &&
+        topModel &&
+        (models[0].model === topModel.model ||
+          (Boolean(codexCatalogProviderName(topModel)) &&
+            codexCatalogProviderName(models[0]).toLowerCase() ===
+              codexCatalogProviderName(topModel).toLowerCase() &&
+            modelBindingIdentityValues(models[0]).some((identity) =>
+              modelBindingIdentityValues(topModel).includes(identity),
+            )));
       const nextEffort =
-        !reset && declaredEfforts.includes(defaultReasoningEffort)
-          ? defaultReasoningEffort
+        (!reset || sameTopModel) &&
+        selectedDefaultReasoningEffort &&
+        declaredEfforts.includes(selectedDefaultReasoningEffort)
+          ? selectedDefaultReasoningEffort
           : declaredDefault && declaredEfforts.includes(declaredDefault)
             ? declaredDefault
             : declaredEfforts[0];
@@ -5012,7 +5233,9 @@ export function ModelOrderTab({
               ...routingBase,
               ...(persistOrder
                 ? {
-                    modelOrder: reset ? [] : models.map((model) => model.model),
+                    // Persist the calculated default too: the live compiler
+                    // otherwise reuses the upstream catalog's unsorted order.
+                    modelOrder: models.map((model) => model.model),
                   }
                 : {}),
               modelDisplayStyle: displayStyle,
@@ -5025,6 +5248,7 @@ export function ModelOrderTab({
         "codex",
       );
       await queryClient.invalidateQueries({ queryKey: ["providers", "codex"] });
+      if (reset) setSortMode("custom");
       setDraftModels(models);
       try {
         let projection = await providersApi.inspectCodexMultiRouterProjection(
@@ -5068,9 +5292,9 @@ export function ModelOrderTab({
       }
       setMessage(
         reset
-          ? tr("codexRouterWorkspace.s127", {
+          ? tr("codexRouterWorkspace.modelOrderDefaultsRestored", {
               defaultValue:
-                "Removed the custom router order; the default catalog order is restored.",
+                "Restored newest-first model order within each provider.",
             })
           : tr("codexRouterWorkspace.s128", {
               defaultValue:
@@ -5284,20 +5508,30 @@ export function ModelOrderTab({
               type="button"
               size="sm"
               variant="outline"
-              disabled={isSaving || orderedDraftModels.length < 2}
-              onClick={applyRecommendations}
+              disabled={
+                isSaving || isRecommending || orderedDraftModels.length < 2
+              }
+              onClick={() => void applyRecommendations()}
               className="gap-2"
             >
-              <Wand2 className="h-4 w-4" />
-              {tr("codexRouterWorkspace.applyRecommendations", {
-                defaultValue: "Apply recommendations",
-              })}
+              {isRecommending ? (
+                <RefreshCw className="h-4 w-4 animate-spin" />
+              ) : (
+                <Wand2 className="h-4 w-4" />
+              )}
+              {isRecommending
+                ? tr("codexRouterWorkspace.queryingRecommendationUsage", {
+                    defaultValue: "Querying usage...",
+                  })
+                : tr("codexRouterWorkspace.applyRecommendations", {
+                    defaultValue: "Apply recommendations",
+                  })}
             </Button>
             <Button
               type="button"
               size="sm"
               variant="outline"
-              disabled={isSaving || !hasCustomOrder}
+              disabled={isSaving || isRecommending || !canRestoreDefault}
               onClick={() => void saveOrder(true)}
             >
               {tr("codexRouterWorkspace.s137", {
@@ -5307,7 +5541,7 @@ export function ModelOrderTab({
             <Button
               type="button"
               size="sm"
-              disabled={isSaving || !hasChanges}
+              disabled={isSaving || isRecommending || !hasChanges}
               onClick={() => void saveOrder()}
               className="gap-2 bg-blue-600 hover:bg-blue-500"
             >
@@ -5318,8 +5552,8 @@ export function ModelOrderTab({
         }
       />
 
-      <div className="mt-4 flex flex-wrap items-end gap-3 rounded-md border border-blue-200/70 bg-background/60 p-3 dark:border-blue-800/50 dark:bg-slate-950/30">
-        <label className="grid gap-1 text-xs font-medium text-muted-foreground">
+      <div className="mt-4 flex flex-wrap items-start gap-3 rounded-md border border-blue-200/70 bg-background/60 p-3 dark:border-blue-800/50 dark:bg-slate-950/30">
+        <label className="grid min-w-0 max-w-full gap-1 text-xs font-medium text-muted-foreground">
           <span>
             {tr("codexRouterWorkspace.modelDisplayStyle", {
               defaultValue: "Model display",
@@ -5327,11 +5561,11 @@ export function ModelOrderTab({
           </span>
           <select
             value={displayStyle}
-            disabled={isSaving}
+            disabled={isSaving || isRecommending}
             onChange={(event) =>
               setDisplayStyle(event.target.value as CodexModelDisplayStyle)
             }
-            className="h-8 rounded border border-input bg-background px-2 text-sm text-foreground"
+            className="h-8 min-w-0 rounded border border-input bg-background px-2 text-sm text-foreground"
           >
             <option value="model">
               {tr("codexRouterWorkspace.modelOnly", {
@@ -5350,7 +5584,7 @@ export function ModelOrderTab({
             </option>
           </select>
         </label>
-        <label className="grid gap-1 text-xs font-medium text-muted-foreground">
+        <label className="grid min-w-0 max-w-full gap-1 text-xs font-medium text-muted-foreground">
           <span>
             {tr("codexRouterWorkspace.modelSort", {
               defaultValue: "Sort models",
@@ -5358,11 +5592,11 @@ export function ModelOrderTab({
           </span>
           <select
             value={sortMode}
-            disabled={isSaving}
+            disabled={isSaving || isRecommending}
             onChange={(event) =>
               setSortMode(event.target.value as CodexModelSortMode)
             }
-            className="h-8 rounded border border-input bg-background px-2 text-sm text-foreground"
+            className="h-8 min-w-0 rounded border border-input bg-background px-2 text-sm text-foreground"
           >
             <option value="custom">
               {tr("codexRouterWorkspace.currentOrder", {
@@ -5386,15 +5620,17 @@ export function ModelOrderTab({
             </option>
           </select>
         </label>
-        <label className="grid gap-1 text-xs font-medium text-muted-foreground">
+        <label className="grid w-64 min-w-0 max-w-full gap-1 text-xs font-medium text-muted-foreground">
           <span>
             {tr("codexRouterWorkspace.topModelDefaultEffort", {
               defaultValue: "Top model default effort",
             })}
           </span>
           <select
-            value={defaultReasoningEffort}
-            disabled={isSaving || topReasoningEfforts.length === 0}
+            value={selectedDefaultReasoningEffort ?? ""}
+            disabled={
+              isSaving || isRecommending || topReasoningEfforts.length === 0
+            }
             onChange={(event) =>
               setDefaultReasoningEffort(
                 event.target.value as CodexReasoningEffort,
@@ -5403,23 +5639,30 @@ export function ModelOrderTab({
             aria-label={tr("codexRouterWorkspace.topModelDefaultEffort", {
               defaultValue: "Top model default effort",
             })}
-            className="h-8 rounded border border-input bg-background px-2 text-sm text-foreground"
+            className="h-8 min-w-0 rounded border border-input bg-background px-2 text-sm text-foreground"
           >
             {topReasoningEfforts.length > 0 ? (
               topReasoningEfforts.map((effort) => (
                 <option key={effort} value={effort}>
-                  {effort}
+                  {effort === "xhigh"
+                    ? tr("codexRouterWorkspace.extraHighEffort", {
+                        defaultValue: "Extra high (xhigh)",
+                      })
+                    : effort}
                 </option>
               ))
             ) : (
               <option value="" disabled>
-                {tr("codexRouterWorkspace.reasoningUnknown", {
-                  defaultValue: "Unknown until provider metadata is available",
-                })}
+                {!declaredTopReasoning && topReasoningQuery.isFetching
+                  ? tr("common.loading", { defaultValue: "Loading..." })
+                  : tr("codexRouterWorkspace.reasoningUnknown", {
+                      defaultValue:
+                        "Unknown until provider metadata is available",
+                    })}
               </option>
             )}
           </select>
-          <span className="max-w-64 font-normal text-muted-foreground">
+          <span className="break-words font-normal text-muted-foreground">
             {tr("codexRouterWorkspace.topModelDefaultEffortHint", {
               defaultValue: "Used by new threads when {{model}} is first.",
               model: topModel?.model ?? "—",
@@ -5514,7 +5757,7 @@ export function ModelOrderTab({
                     onDelete={(modelId) => void hideModel(modelId)}
                     onMoveToTop={moveModelToTop}
                     onMoveToPosition={moveModelToPosition}
-                    dragDisabled={isSaving}
+                    dragDisabled={isSaving || isRecommending}
                     modelCount={orderedDraftModels.length}
                     isTop={index === 0}
                     recommended={recommendedModelIds.has(model.model?.trim())}
@@ -5554,7 +5797,7 @@ export function ModelOrderTab({
                       onDelete={(modelId) => void hideModel(modelId)}
                       onMoveToTop={moveModelToTop}
                       onMoveToPosition={moveModelToPosition}
-                      dragDisabled={isSaving}
+                      dragDisabled={isSaving || isRecommending}
                       modelCount={orderedDraftModels.length}
                       isTop={false}
                       recommended={recommendedModelIds.has(model.model?.trim())}
@@ -5604,7 +5847,7 @@ export function ModelOrderTab({
                   type="button"
                   size="sm"
                   variant="outline"
-                  disabled={isSaving}
+                  disabled={isSaving || isRecommending}
                   onClick={() => void restoreHiddenModel(hidden)}
                   className="shrink-0"
                 >

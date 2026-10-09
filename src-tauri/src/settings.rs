@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::{OnceLock, RwLock};
@@ -603,6 +604,12 @@ pub struct AppSettings {
     /// 绝不会拉起 Codex Desktop。
     #[serde(default)]
     pub launch_codex_desktop_with_ccswitch: bool,
+    /// Device-local, opt-in updates of installed CLIs at application startup.
+    #[serde(default)]
+    pub tool_auto_update: HashMap<String, bool>,
+    /// Preserve the preference written by the original Codex-only feature.
+    #[serde(default)]
+    pub auto_update_codex_cli: bool,
     /// Optional, process-local timezone injection for Codex Desktop.
     #[serde(default)]
     pub codex_egress_timezone: CodexEgressTimezoneSettings,
@@ -798,6 +805,8 @@ impl Default for AppSettings {
             launch_on_startup: false,
             watchdog_enabled: default_watchdog_enabled(),
             launch_codex_desktop_with_ccswitch: false,
+            tool_auto_update: HashMap::new(),
+            auto_update_codex_cli: false,
             codex_egress_timezone: CodexEgressTimezoneSettings::default(),
             silent_startup: false,
             enable_local_proxy: false,
@@ -851,6 +860,20 @@ impl Default for AppSettings {
 }
 
 impl AppSettings {
+    pub fn tool_auto_update_enabled(&self, tool: &str) -> bool {
+        self.tool_auto_update
+            .get(tool)
+            .copied()
+            .unwrap_or(tool == "codex" && self.auto_update_codex_cli)
+    }
+
+    fn set_tool_auto_update(&mut self, tool: &str, enabled: bool) {
+        self.tool_auto_update.insert(tool.to_string(), enabled);
+        if tool == "codex" {
+            self.auto_update_codex_cli = enabled;
+        }
+    }
+
     /// Effective policy after accounting for settings written by pre-tier versions.
     pub fn stream_retry_mode_effective(&self) -> StreamRetryMode {
         if !self.enable_stream_retry && self.stream_retry_mode == StreamRetryMode::Safe {
@@ -879,7 +902,7 @@ impl AppSettings {
         }
     }
 
-    fn settings_path() -> Option<PathBuf> {
+    pub(crate) fn settings_path() -> Option<PathBuf> {
         // settings.json 保留用于旧版本迁移和无数据库场景
         Some(
             crate::config::get_home_dir()
@@ -1099,6 +1122,25 @@ pub fn update_settings(mut new_settings: AppSettings) -> Result<(), AppError> {
     save_settings_file(&new_settings)?;
     *guard = new_settings;
     Ok(())
+}
+
+pub fn update_settings_preserving_tool_auto_update(
+    mut new_settings: AppSettings,
+) -> Result<(), AppError> {
+    new_settings.env_injection.validate()?;
+    crate::codex_egress_timezone::validate_timezone_settings(&new_settings.codex_egress_timezone)
+        .map_err(AppError::InvalidInput)?;
+    mutate_settings(|existing| {
+        // Read under the same write lock as the dedicated card setter, not from
+        // the settings page's potentially stale snapshot.
+        new_settings.tool_auto_update = existing.tool_auto_update.clone();
+        new_settings.auto_update_codex_cli = existing.auto_update_codex_cli;
+        *existing = new_settings;
+    })
+}
+
+pub fn set_tool_auto_update(tool: &str, enabled: bool) -> Result<(), AppError> {
+    mutate_settings(|settings| settings.set_tool_auto_update(tool, enabled))
 }
 
 pub fn snooze_request_health_windows_notifications() -> Result<(), AppError> {
@@ -1613,6 +1655,41 @@ where
 mod tests {
     use super::*;
     use crate::app_config::AppType;
+
+    #[test]
+    fn tool_auto_update_is_opt_in_and_preserves_legacy_codex_preference() {
+        let defaults = AppSettings::default();
+        for tool in crate::commands::VALID_TOOLS {
+            assert!(!defaults.tool_auto_update_enabled(tool));
+        }
+        let mut settings: AppSettings = serde_json::from_value(serde_json::json!({
+            "autoUpdateCodexCli": true
+        }))
+        .unwrap();
+        assert!(settings.tool_auto_update_enabled("codex"));
+        assert!(!settings.tool_auto_update_enabled("claude"));
+        settings.set_tool_auto_update("gemini", true);
+        assert!(settings.tool_auto_update_enabled("codex"));
+        assert!(settings.tool_auto_update_enabled("gemini"));
+        settings.set_tool_auto_update("codex", false);
+        assert!(!settings.auto_update_codex_cli);
+        assert!(!settings.tool_auto_update_enabled("codex"));
+        let round_trip: AppSettings =
+            serde_json::from_value(serde_json::to_value(settings).unwrap()).unwrap();
+        assert!(round_trip.tool_auto_update_enabled("gemini"));
+        assert!(!round_trip.tool_auto_update_enabled("codex"));
+    }
+
+    #[test]
+    fn explicit_codex_policy_overrides_legacy_auto_update() {
+        let settings: AppSettings = serde_json::from_value(serde_json::json!({
+            "autoUpdateCodexCli": true,
+            "toolAutoUpdate": { "codex": false, "pi": true }
+        }))
+        .unwrap();
+        assert!(!settings.tool_auto_update_enabled("codex"));
+        assert!(settings.tool_auto_update_enabled("pi"));
+    }
 
     #[test]
     fn visible_apps_old_settings_default_claude_desktop_visible() {

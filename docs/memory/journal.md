@@ -79,7 +79,7 @@ freshness still requires the user to restart `pnpm dev`; full suites were not ru
 What NOT to do again: do not mount stream-retry controls in both the global
 header and the MultiRouter workspace, or treat the Link status view as the live
 retry event feed. Related:
-`docs/decisions/2026-10-06-status-observability-placement.md`.
+[retained journal record](#2026-10-06---status-observability-placement-corrected).
 
 ## 2026-10-06 - Timezone localization verified; refork cutover still gated
 
@@ -107,7 +107,7 @@ the user has not restarted `pnpm dev`. `origin/main` was not changed.
 What NOT to do again: do not stage or reformat the protected reasoning/form files,
 claim the refork cutover is published before the final green gate, or treat a
 targeted locale run as proof of full-suite readiness. Related:
-`docs/decisions/2026-10-06-localization-and-docs-consolidation.md`.
+[retained journal record](#2026-10-06---timezone-localization-verified-refork-cutover-still-gated).
 
 ## 2026-10-06 - Four-hour dev runner checks pass; runtime awaits restart
 
@@ -131,7 +131,7 @@ active-target cleanup, competing dev launch, or release build.
 
 What NOT to do again: do not leave Tauri's own watcher active alongside a delayed
 scheduler, treat 5 GB as a hard size cap, or verify new source with an old binary.
-Related: `docs/decisions/2026-10-06-delayed-dev-runner-port.md`.
+Related: [retained journal record](#2026-10-06---four-hour-dev-runner-checks-pass-runtime-awaits-restart).
 
 ## 2026-10-06 - Retry consumer checks pass; shared fixture typecheck remains open
 
@@ -153,7 +153,7 @@ not verified. No push, app restart, active-target cleaning, or release build.
 
 What NOT to do again: do not conflate scoped test passes with shared delivery
 readiness. Related:
-`docs/decisions/2026-10-06-stream-retry-warning-cleanup.md`.
+[retained journal record](#2026-10-06---retry-consumer-checks-pass-shared-fixture-typecheck-remains-open).
 
 ## 2026-10-06 - Retry continuation checks pass; shared delivery gates remain open
 
@@ -180,7 +180,7 @@ runtime were not verified; no push, release build, or process stop occurred.
 What NOT to do again: do not report a historical green gate as current in a
 moving shared tree, suppress stale-helper warnings, or use the old running
 binary to verify newer source. Related:
-`docs/decisions/2026-10-06-stream-retry-warning-cleanup.md`.
+[retained journal record](#2026-10-06---retry-continuation-checks-pass-shared-delivery-gates-remain-open).
 
 ## 2026-10-06 - Retry port dead-code warnings corrected
 
@@ -211,8 +211,8 @@ pending the user's refork `pnpm dev` restart.
 What NOT to do again: do not call port-introduced dead code pre-existing,
 suppress warnings to hide stale ownership, or treat unused helper warnings as
 a reason to remove retry. Related:
-`docs/decisions/2026-10-06-stream-retry-warning-cleanup.md` and
-`docs/decisions/2026-10-06-anthropic-upstream-stream-retry.md`.
+[retained journal record](#2026-10-06---retry-port-dead-code-warnings-corrected) and
+[retained journal record](#2026-10-06---retry-port-dead-code-warnings-corrected).
 
 ## 2026-10-06 — Existing Model order drag owner verified with real sensor tests
 
@@ -239,7 +239,7 @@ push or cutover occurred.
 What NOT to do again: do not assume visible drag handles prove working sensors,
 copy the old workspace wholesale, or call mocked Save/remount evidence a real
 database or desktop-runtime test. Related:
-`docs/decisions/2026-10-06-model-order-drag-audit.md`.
+[retained journal record](#2026-10-06--existing-model-order-drag-owner-verified-with-real-sensor-tests).
 
 ## 2026-10-06 — English-UI/docs cleanup source batch completed
 
@@ -266,7 +266,7 @@ delivery gate, reset form drafts on locale changes, or claim 100% migration from
 component tests. Continue only a test-only audit of the already-present Model
 order sensors while the concurrent formatting gate remains red; production drag
 changes remain deferred. Related:
-`docs/decisions/2026-10-06-localization-and-docs-consolidation.md`.
+[retained journal record](#2026-10-06--english-uidocs-cleanup-source-batch-completed).
 
 ## 2026-10-06 — Anthropic raw-stream retry loop completed and verified
 
@@ -302,7 +302,7 @@ current `pnpm dev` process.
 
 What NOT to do again: do not jump out of the reconnect loop while `current` is
 empty, and do not claim desktop runtime behavior from the stale development
-binary. Related: `docs/decisions/2026-10-06-anthropic-upstream-stream-retry.md`.
+binary. Related: [retained journal record](#2026-10-06--anthropic-raw-stream-retry-loop-completed-and-verified).
 
 ## 2026-10-06 — Completed refork stream-retry port and main-page observability
 
@@ -335,7 +335,7 @@ pre-existing files. Runtime freshness remains pending because the existing
 What NOT to do again: do not hide the retry control only in Settings, do not
 create a second replay owner, and do not claim runtime behavior from a stale
 desktop binary. Related:
-`docs/decisions/2026-10-06-codex-stream-retry-observability.md`.
+[retained journal record](#2026-10-06--completed-refork-stream-retry-port-and-main-page-observability).
 
 ## 2026-10-06 — Localization/docs batch verification completed with formatting follow-up
 
@@ -364,7 +364,7 @@ while the repository-wide formatting gate is red. The remaining four formatting
 failures are in the concurrent reasoning-effort task and must be resolved by that
 task owner before final delivery; do not reformat those files here or begin the
 drag-and-drop port until the shared gate is green. Related:
-`docs/decisions/2026-10-06-localization-and-docs-consolidation.md`.
+[retained journal record](#2026-10-06--localizationdocs-batch-verification-completed-with-formatting-follow-up).
 
 ## 2026-10-06 — Refork dev target bloat traced to missing Cargo profile bounds
 
@@ -393,9 +393,172 @@ What NOT to do again: do not treat a size-threshold cleaner as the size-control
 itself; restore the Cargo profile bounds before repeated local Tauri builds, and
 do not run the refork until the JS and Rust Tauri plugin minor versions align.
 
-Related decision: `docs/decisions/2026-10-06-delayed-dev-runner-port.md`.
+Related decision: [retained journal record](#2026-10-06--refork-dev-target-bloat-traced-to-missing-cargo-profile-bounds).
 
 ## 2026-10-06 — Committed dependency tree passes frontend gates; backend lock remains
+
+## 2026-10-08 — Search-history replay repaired without disabling web search
+
+What happened: Sublyx native GPT Responses requests repeatedly failed during
+automatic context compaction with `response protection is unavailable`.
+The original HTTP status was 200 with a `response.failed` SSE event; early-stream
+priming mapped that failure to the misleading logged upstream HTTP 503.
+The affected local rollout contained completed hosted `web_search_call` items.
+
+Root cause: tool-free compaction replays search history without declaring its
+hosted search tool. Sub2API PR #7939 documents upstream reproduction and a
+transport-specific declaration repair. A small synthetic request through the
+running local Sublyx route reproduced the exact protection error before reload.
+
+What we did: added one gated final-wire repair for Codex native GPT/Codex
+Responses after model mapping, provider overrides, and cached Lite fallback.
+It preserves all search history and existing search options, adds only a missing
+replay declaration, and keeps originally tool-free requests at tool_choice=none.
+Lite declares the tool in additional_tools before a trailing compaction_trigger;
+standard fallback restores that declaration to tools. Other apps, converted
+Chat/Anthropic requests, unrelated native models, and standalone compact are
+unchanged. A sanitized web_search_history_declared event records repair use.
+
+Evidence: the forwarder wire regression failed before production wiring and
+passed afterwards; 12 focused search-history tests passed. Broader suites passed:
+OpenAI compatibility 38, third-party request policy 36, streaming retry 50, and
+forwarder 187. Rustfmt and git diff --check passed. Rebuilt and restarted only
+the verified repo-owned development tree; Codex was not restarted. The same
+synthetic live request then completed with OK. Two further real Sublyx canaries
+completed: live web search emitted web_search_call and a cited answer; compaction
+with search history emitted a compaction item. A third Responses Lite compaction
+canary also completed with a compaction item. None returned protection errors.
+Previous binary and a consistent database/config snapshot are retained outside
+the checkout under the user's LocalAppData CCSwitchMulti/local-hotfix-backups/
+web-search-history-hotfix-20261008-225427. No release or commit was made.
+
+What NOT to do again: do not disable web search, delete session history, or add
+unbounded retries to repair a deterministic missing tool declaration. Do not
+claim the original user thread has completed merely from synthetic canaries;
+the user should retry that conversation against the now-patched runtime.
+
+## 2026-10-09 - Live-search toggle and native error delivery verified
+
+What happened: continued the search-history repair with save-to-live-config
+coverage and truthful native Responses errors. The user also asked whether
+request-schema checks could catch similar failures before transmission.
+
+Root cause: the router projection cache did not include the effective hosted
+search toggle, so saving the toggle could leave a stale projected search mode.
+Native Codex stream priming also replaced an HTTP 200 terminal SSE failure with
+a synthetic 503 before the existing Responses handler could preserve its cause.
+
+What we did: reused the existing toggle, config projection, short-value hash,
+Request Health inspector, Responses retry/error handler, and wire-test helpers.
+Enabled supported native search projects live; disabled or unsupported search
+projects disabled. The projection fingerprint includes the effective toggle.
+Final-body diagnostics share the replay repair's missing-search invariant and
+run after overrides and repair. Native Codex early SSE failures retain the real
+status and error fields; converted transports retain their existing behavior.
+No recurring documentation scraper or blanket public-schema validator was added.
+
+Evidence: full Rust library suite passed sequentially (4,420 passed, 10 ignored).
+The first parallel run had one Universal-provider projection failure; that test
+passed alone and the full sequential rerun passed. Shared settings/home-state
+interference is suspected, not established. The workspace frontend suite passed
+(139 tests). The final pending pnpm typecheck exited 0. Rustfmt, locale formatting,
+and diff checks passed. New regressions cover toggle persistence/projection,
+cache invalidation, standard/Lite/cached-fallback wire bodies, unchanged live
+search options, split SSE failures, and the full Responses endpoint. The existing
+hosted-search canary against gpt-6.1-sol-sublyx returned HTTP 200, completed its
+response, and emitted actual web_search_call searching/completed events.
+
+Runtime read-back: config.toml contains web_search=live and model
+gpt-6.1-sol-sublyx. The verified repo binary was built at 00:41:23 and its app
+started at 00:41:24 local time, after the relevant source edits. A newer dev tree
+appeared during lifecycle work; its launch provenance was not established.
+Codex was not restarted. No commit or release was made.
+
+Read-only reference check: GitHub's latest published BigStrongSun release is
+v3.20.4-2 (September 30, 2026, Singapore time); current main is b4741adeac9b5da84bffe2b75c18c9bb234c5e72.
+That revision's forwarder still maps an early non-capacity SSE error to HTTP 503.
+Sub2API PR #7939 was opened October 8, 2026 and remains open at this check.
+This does not establish when the third-party backend's replay behavior changed
+or verify the latest upstream release end to end.
+Sources: [latest upstream release](https://api.github.com/repos/BigStrongSun/ccswitchmulti/releases/latest),
+[upstream main](https://api.github.com/repos/BigStrongSun/ccswitchmulti/commits/main),
+[upstream forwarder](https://raw.githubusercontent.com/BigStrongSun/ccswitchmulti/b4741adeac9b5da84bffe2b75c18c9bb234c5e72/src-tauri/src/proxy/forwarder.rs),
+and [replay repair PR](https://github.com/Wei-Shaw/sub2api/pull/7939).
+Official [Codex configuration](https://developers.openai.com/codex/config-reference/)
+and [Responses request reference](https://developers.openai.com/api/reference/resources/responses/methods/create)
+were fetched directly after web search returned no usable results. They establish
+the public search settings and request shapes, not the selected third-party
+route's complete behavioral contract.
+
+What NOT to do again: do not call this exhaustive replay coverage or verified
+Codex UI rendering. The original user conversation was not retried. Public
+Responses schemas do not establish private Codex/Lite or third-party gateway
+semantics; any broader checker should extend existing Request Health/probe
+owners, use versioned contract fixtures, and avoid sending private history to
+validation probes or scraping documentation on each production request.
+
+## 2026-10-08 — Third-party replay canary kept provider-agnostic
+
+What happened: the rebuilt three-stage replay canary initially stopped at its
+first hosted-search request with HTTP 400. The redacted upstream diagnostic
+identified `Unsupported parameter: max_tool_calls` from the selected Sublyx
+route. Request Health had approved the body because `max_tool_calls` is a valid
+public Responses field; this was a provider capability mismatch, not a checker
+false positive or a replay-repair failure.
+
+What we did: added the versioned official Responses declaration fixture and
+shared final-wire checker to Request Health, including selected field/item/tool
+types, replay invariants, redacted findings, and informational pass-through for
+unknown extensions. The offline/live drift script and weekly read-only workflow
+check the public reference without fetching documentation on production
+requests. Protocol probes classify known local contract failures as invalid
+requests. Separately, removed the optional `max_tool_calls` limit from the
+synthetic canary because it does not exercise the hosted-search replay
+invariant, and added a regression test. Provider-specific unsupported fields
+remain informational/diagnostic rather than being silently stripped from
+ordinary traffic.
+
+Evidence: the redacted error was observed without printing request or response
+content; offline contract, canary, and Rust checks remained green before the
+live rerun. The corrected live search passed with HTTP 200, completed terminal
+status, an actual completed `web_search_call`, and the fixed marker. The full
+three-stage replay suite then passed: search, standard compaction replay, and
+Lite compaction replay each returned HTTP 200 with a completed compaction item.
+No protection error occurred.
+
+## 2026-10-08 — Windows CLI probe no longer mislabels working Codex as broken
+
+What happened: About displayed Codex as installed but unable to run, with
+"The system cannot find the path specified." The npm launcher actually ran
+and reported 0.160.0; the Desktop app's separate bundled runtime reported
+0.162.0-alpha.2. Neither installation required reinstalling.
+
+Root cause: PATH resolution canonicalized codex.cmd to a verbatim Windows
+path with the \\?\ prefix. Passing that path to cmd CALL broke script dispatch
+and npm-style sibling resolution. The probe truthfully reported its failed
+child process, but the failure was in CC Switch's launcher, not Codex.
+
+What we did: adapt filesystem verbatim drive/UNC paths only at the command-script
+execution boundary. Native EXE paths and canonical identity/deduplication remain
+unchanged. Version checks and bounded captured commands now use the same command
+builder; PATH, cwd, extra environment, deadline, no-window flags, and exit status
+are retained. Added Windows regression fixtures for npm-style sibling launchers,
+spaces/parentheses, drive/UNC paths, and real nonzero exit propagation.
+
+Evidence: both script-execution tests failed before the fix with the reported
+path error, then all three regression tests passed. Misc command tests passed
+83/83; the opt-in installed-Codex smoke test invoked the actual About backend
+command and diagnostics, returning version=0.160.0, error=null, and
+installed_but_broken=false. TypeScript, rustfmt, and diff checks passed.
+The optional frontend About test run encountered an existing React invalid-hook
+call failure in both tests; no frontend or dependency changes were made here.
+Rebuilt and restarted only the verified repo dev tree, without reinstalling
+Codex or restarting its app-server. Private rollback artifacts are in LocalAppData
+CCSwitchMulti/local-hotfix-backups/codex-cli-probe-20261008-231744.
+
+What NOT to do again: do not strip canonical prefixes globally or replace a
+working npm installation because a GUI command wrapper rejected its path.
+Keep the npm CLI version separate from the Desktop-bundled runtime version.
 
 What happened: the approved dependency upgrades and formatter-compatible source
 tree were committed on the fresh-refork `main`; the first final frontend run
@@ -421,8 +584,8 @@ What NOT to do again: do not infer a clean publication gate from library-only
 Cargo results, and do not bypass the running app with a process kill or
 alternate target directory.
 
-Related decisions: `docs/decisions/2026-10-06-refork-dependency-publication.md`
-and `docs/decisions/2026-10-06-github-main-refork-cutover.md`.
+Related decisions: [retained journal record](#2026-10-06--committed-dependency-tree-passes-frontend-gates-backend-lock-remains)
+and [retained journal record](#2026-10-06--committed-dependency-tree-passes-frontend-gates-backend-lock-remains).
 
 ## 2026-10-06 — Final frontend regressions fixed; GitHub cutover still gated
 
@@ -453,8 +616,8 @@ and `docs/decisions/2026-10-06-github-main-refork-cutover.md`.
   coverage from green tests.
 
 Related decisions:
-`docs/decisions/2026-10-06-refork-final-frontend-regressions.md`,
-`docs/decisions/2026-10-06-github-main-refork-cutover.md`.
+[retained journal record](#2026-10-06--final-frontend-regressions-fixed-github-cutover-still-gated),
+[retained journal record](#2026-10-06--final-frontend-regressions-fixed-github-cutover-still-gated).
 
 ## 2026-10-05 — Final source verification for refork foundation and public identity
 
@@ -520,7 +683,7 @@ What NOT to do again: do not interpret paging-file exhaustion as a source test
 failure, do not bypass the full suite with a second build target, and do not
 claim runtime freshness or replacement cutover from source-only evidence.
 
-Related decision: `docs/decisions/2026-10-03-bigstrongsun-refork-foundation.md`.
+Related decision: [retained journal record](#2026-10-05-completed-source-verification-for-the-fresh-refork-migration).
 
 ## 2026-10-05 Classified remaining legacy-only candidates
 
@@ -536,7 +699,7 @@ common-config plumbing.
 What we did: rejected the generic common-config hook and compatibility
 template as duplicate owners; deferred global loading/deferred rendering
 because the fresh tree has no consumers or upstream equivalent; and recorded
-the rationale in `docs/decisions/2026-10-05-legacy-only-audit.md`.
+the rationale in [retained journal record](#2026-10-05-classified-remaining-legacy-only-candidates).
 
 Evidence: fresh-tree searches confirmed none of the four legacy source modules
 are referenced; `git show upstream/main:src/components/providers/forms/hooks/useLoadCommonConfigSnippet.ts`
@@ -567,7 +730,7 @@ tests/components/CodexCatalogViewport.test.tsx` passed (42/42);
 `pnpm typecheck` passed; targeted Prettier checks passed; and `git diff --check`
 passed. Runtime freshness was not checked because the refork desktop process
 has not been rebuilt and restarted. Related decision:
-`docs/decisions/2026-10-05-codex-catalog-viewport-port.md`.
+[retained journal record](#2026-10-05-added-visible-only-codex-catalog-rendering).
 
 What NOT to do again: do not reintroduce direct full-catalog maps or move
 catalog persistence and reasoning policy into the viewport renderer.
@@ -588,7 +751,7 @@ tests/components/RoutingActivationBrand.test.tsx` passed (2/2);
 `pnpm typecheck` passed; targeted Prettier checks passed; and `git diff
 --check` passed. Runtime freshness was not checked because the refork desktop
 process has not been rebuilt and restarted. Related decision:
-`docs/decisions/2026-10-05-routing-activation-brand-port.md`.
+[retained journal record](#2026-10-05-restored-takeover-activation-feedback-in-the-refork-header).
 
 What NOT to do again: do not move proxy status ownership into a visual header
 component or animate the initial resolved state as though it were a new
@@ -613,8 +776,8 @@ Evidence: `cargo test --manifest-path src-tauri/Cargo.toml --lib auto_sync` pass
 passed (1/1); `cargo check --manifest-path src-tauri/Cargo.toml` passed; and
 `git diff --check` passed. Runtime freshness was not checked because the refork
 desktop process has not been rebuilt and restarted. Related decisions:
-`docs/decisions/2026-10-05-auto-sync-coordination-port.md` and
-`docs/decisions/2026-10-05-windows-taskbar-icon-port.md`.
+[retained journal record](#2026-10-05-consolidated-auto-sync-coordination-and-restored-windows-taskbar-icon) and
+[retained journal record](#2026-10-05-consolidated-auto-sync-coordination-and-restored-windows-taskbar-icon).
 
 What NOT to do again: do not duplicate coordination mechanics inside each sync
 transport, merge transport suppression state globally, or add a second Codex
@@ -647,7 +810,7 @@ restarted.
 What NOT to do again: do not normalize only in React, copy the legacy DAO into
 every caller, or create a second owner for reconciliation, route projection,
 or pruning. Related:
-`docs/decisions/2026-10-05-codex-catalog-normalization-port.md`.
+[retained journal record](#2026-10-05-ported-codex-catalog-normalization-into-the-refork).
 
 ## 2026-10-05 Ported Codex catalog version pruning
 
@@ -674,7 +837,7 @@ has not been rebuilt and restarted.
 
 What NOT to do again: do not prune every catalog projection, copy pruning into
 the provider form, or introduce a second reconciliation owner. Related:
-`docs/decisions/2026-10-05-codex-catalog-version-pruning-port.md`.
+[retained journal record](#2026-10-05-ported-codex-catalog-version-pruning).
 
 ## 2026-10-04 Ported Codex plugin/browser health diagnostics
 
@@ -701,7 +864,7 @@ this feature. No rebuilt runtime was inspected.
 What NOT to do again: do not copy the legacy plugin registry into the refork,
 automatically install browser extensions/native hosts, or claim live health
 without rebuilding and restarting the refork app. Related:
-`docs/decisions/2026-10-04-codex-plugin-health-port.md`.
+[retained journal record](#2026-10-04-ported-codex-pluginbrowser-health-diagnostics).
 
 ## 2026-10-04 Ported Codex session deletion coordination
 
@@ -722,7 +885,7 @@ still reports known upstream/toolchain formatting drift outside this port. No
 rebuilt runtime was inspected. What NOT to do again: do not treat rollout-file
 deletion as sufficient catalog cleanup, mutate Codex state databases directly,
 or replace the fresh Session Manager with the legacy component. Related:
-`docs/decisions/2026-10-04-codex-session-deletion-coordination.md`.
+[retained journal record](#2026-10-04-ported-codex-session-deletion-coordination).
 
 ## 2026-10-04 Finalized four-point request-body accounting
 
@@ -747,7 +910,7 @@ runtime was rebuilt or inspected. What NOT to do again: do not reserialize or
 restore request history inside a retry, hash semantic JSON while sending a
 different compressed entity, or let fallback reconnect retain the rejected
 primary variant. Related:
-`docs/decisions/2026-10-04-request-health-port.md`.
+[retained journal record](#2026-10-04-finalized-four-point-request-body-accounting).
 
 ## 2026-10-04 Ported bounded Codex Desktop turn recovery
 
@@ -769,7 +932,7 @@ passed. The full suites and live Desktop runtime remain untested at this stage.
 What NOT to do again: do not merge semantic continuation into transparent
 stream replay, accept External API identity spoofing, or give a settings widget
 its own full-object save path. Related:
-`docs/decisions/2026-10-04-codex-desktop-turn-recovery-port.md`.
+[retained journal record](#2026-10-04-ported-bounded-codex-desktop-turn-recovery).
 
 ## 2026-10-04 Ported reasoning and catalog compatibility into fresh refork
 
@@ -791,8 +954,8 @@ three reasoning-mode Rust tests and one strict-schema adapter Rust test passed;
 `pnpm vitest run src/lib/codexCatalogReconciliation.test.ts` passed (6 tests);
 `pnpm typecheck` passed; and `git diff --check` passed. Runtime freshness was
 not checked because no rebuilt desktop process was requested. Related decisions:
-`docs/decisions/2026-10-04-reasoning-compatibility-adapters.md` and
-`docs/decisions/2026-10-04-catalog-reconciliation-port.md`.
+[retained journal record](#2026-10-04-ported-reasoning-and-catalog-compatibility-into-fresh-refork) and
+[retained journal record](#2026-10-04-ported-reasoning-and-catalog-compatibility-into-fresh-refork).
 
 What NOT to do again: do not copy legacy request branches or form helpers into
 the fresh refork when the new architecture already has a canonical owner.
@@ -815,7 +978,7 @@ passed. Runtime freshness was not checked because no rebuilt desktop process
 was requested.
 What NOT to do again: do not copy the legacy Codex form wholesale when the
 fresh form already owns catalog state and reconciliation. Related:
-`docs/decisions/2026-10-04-key-group-model-editor-port.md`.
+[retained journal record](#2026-10-04-ported-model-specific-key-group-editor).
 
 ## 2026-10-04 Centralized packaged Codex launcher identity
 
@@ -835,7 +998,7 @@ and `services/provider/mod.rs`;
 no runtime freshness check was performed. What NOT to do again: do not select
 the first Start-menu AUMID when the executable identity is available, and do
 not add a second COM launcher owner. Related:
-`docs/decisions/2026-10-04-packaged-codex-launcher-port.md`.
+[retained journal record](#2026-10-04-centralized-packaged-codex-launcher-identity).
 
 ## 2026-10-04 Ported shared auto model refresh primitive
 
@@ -853,7 +1016,7 @@ checked because no rebuilt desktop process was requested. What NOT to do again:
 do not copy legacy form integrations wholesale before confirming the fresh
 form's state owner, and do not treat an empty model response as proof that all
 saved models were removed. Related:
-`docs/decisions/2026-10-04-auto-model-refresh-port.md`.
+[retained journal record](#2026-10-04-ported-shared-auto-model-refresh-primitive).
 
 ## 2026-10-04 Restored atomic Codex provider switch Desktop lifecycle
 
@@ -879,7 +1042,7 @@ desktop process was requested. What NOT to do again: do not call the normal
 lock-taking switch method from inside a lifecycle lock, do not terminate by
 process name without verified Desktop identity, and do not duplicate catalog
 identity or row-seed contracts. Related:
-`docs/decisions/2026-10-04-codex-provider-switch-desktop-lifecycle-port.md`.
+[retained journal record](#2026-10-04-restored-atomic-codex-provider-switch-desktop-lifecycle).
 
 ## 2026-10-05 Consolidated usage relative-time formatting
 
@@ -893,7 +1056,7 @@ and `git diff --check` passed. Runtime freshness was not checked because no
 rebuilt desktop process was requested. What NOT to do again: do not duplicate
 the `usage.*` threshold logic in another footer; keep session-specific labels
 in the session formatter. Related:
-`docs/decisions/2026-10-05-usage-relative-time-consolidation.md`.
+[retained journal record](#2026-10-05-consolidated-usage-relative-time-formatting).
 
 ## 2026-10-05 Extracted Codex Sub-Agent validation diagnostics
 
@@ -907,7 +1070,7 @@ tests), `pnpm typecheck`, Prettier, and `git diff --check` passed. Runtime
 freshness was not checked because no rebuilt desktop process was requested.
 What NOT to do again: do not move validation into UI parsing or hardcode a
 second error-code check in another form. Related:
-`docs/decisions/2026-10-05-codex-subagent-error-parser-port.md`.
+[retained journal record](#2026-10-05-extracted-codex-sub-agent-validation-diagnostics).
 
 ## 2026-10-05 Consolidated models.dev catalog ownership
 
@@ -923,7 +1086,7 @@ tests/hooks/useModelsDevCatalog.test.tsx` (24 tests), `pnpm typecheck`,
 Prettier checks, and `git diff --check` passed. Runtime freshness was not
 checked because no rebuilt desktop process was requested. What NOT to do again:
 do not copy either dialog wholesale or add another models.dev query/filter
-owner. Related: `docs/decisions/2026-10-05-models-dev-catalog-hook-port.md`.
+owner. Related: [retained journal record](#2026-10-05-consolidated-modelsdev-catalog-ownership).
 
 ## 2026-10-03 Centralized Codex catalog reconciliation
 
@@ -941,7 +1104,7 @@ decision. Evidence: `pnpm typecheck`,
 desktop process was requested. What NOT to do again: do not copy the legacy
 Codex form or add a second persistence path when the fresh form already owns
 state and save behavior. Related:
-`docs/decisions/2026-10-03-codex-catalog-reconciliation-port.md`.
+[retained journal record](#2026-10-03-centralized-codex-catalog-reconciliation).
 
 ## 2026-10-03 Kept official Codex proxy sessions in stable history buckets
 
@@ -962,7 +1125,7 @@ provider-form files outside this change. Runtime freshness was not checked
 because no rebuilt desktop process was requested. What NOT to do again: do not
 restore a second legacy route builder or classify a missing
 `[model_providers.openai]` table as managed without checking the top-level route
-marker. Related: `docs/decisions/2026-10-03-codex-official-history-bucket-port.md`.
+marker. Related: [retained journal record](#2026-10-03-kept-official-codex-proxy-sessions-in-stable-history-buckets).
 
 ## 2026-10-03 Restored the refork language quick switcher
 
@@ -979,15 +1142,15 @@ passed (38), `pnpm typecheck`, Prettier checks, and `git diff --check` passed.
 Runtime freshness was not checked because no rebuilt desktop process was
 requested. What NOT to do again: do not add another language normalization or
 independent persistence API beside the shared contract. Related:
-`docs/decisions/2026-10-03-language-switcher-port.md`.
+[retained journal record](#2026-10-03-restored-the-refork-language-quick-switcher).
 
 ## 2026-10-03 Ported the stream retry setting into the refork
 
-What happened: the fresh refork already had bounded Responses stream reconnection, but users could not disable that replay behavior. Root cause: the retry owner existed without the fork's persisted `enable_stream_retry` control. What we did: added the default-on compatibility setting, typed frontend state and all four locale strings, a proxy settings toggle, and a gate around only the existing Responses reconnect factory. Capacity replay and transport retry remain separate. Deliberately did not port legacy aggressive continuation because the fresh architecture has no matching client-session owner. Evidence: focused Rust settings test passed (1), `cargo check`, `cargo fmt --check`, `pnpm typecheck`, frontend Prettier, and `git diff --check` passed. Runtime freshness was not checked because no rebuilt desktop process was requested. What NOT to do again: do not gate unrelated retry policies with this setting or add a second continuation owner. Related: `docs/decisions/2026-10-03-stream-retry-setting-port.md`.
+What happened: the fresh refork already had bounded Responses stream reconnection, but users could not disable that replay behavior. Root cause: the retry owner existed without the fork's persisted `enable_stream_retry` control. What we did: added the default-on compatibility setting, typed frontend state and all four locale strings, a proxy settings toggle, and a gate around only the existing Responses reconnect factory. Capacity replay and transport retry remain separate. Deliberately did not port legacy aggressive continuation because the fresh architecture has no matching client-session owner. Evidence: focused Rust settings test passed (1), `cargo check`, `cargo fmt --check`, `pnpm typecheck`, frontend Prettier, and `git diff --check` passed. Runtime freshness was not checked because no rebuilt desktop process was requested. What NOT to do again: do not gate unrelated retry policies with this setting or add a second continuation owner. Related: [retained journal record](#2026-10-03-ported-the-stream-retry-setting-into-the-refork).
 
 ## 2026-10-03 Adapted shared MultiRouter model identities in the refork
 
-What happened: the fresh refork could retain a visible alias in a Provider catalog while refresh, route projection, or picker selection compared only the visible string and treated the upstream model as missing. Root cause: model identity was reconstructed independently at each boundary; canonical slugs and aliases were not part of the matching contract. What we did: added a shared normalized identity helper and adapted refresh deduplication, route catalog projection, fixed-route summaries, alias validation, picker state, and wizard selection matching. Kept fresh ownership, fixed include semantics, and disabled inventory rows. Evidence: `pnpm typecheck`; focused Vitest suites with 104 tests passed; Prettier check; `git diff --check`; `cargo check --manifest-path src-tauri/Cargo.toml`. Runtime freshness was not checked because no rebuilt desktop process was requested. What NOT to do again: do not copy the legacy workspace wholesale or hide identity mismatches by converting explicit include routes to all-model routes. Related: `docs/decisions/2026-10-03-model-identity-port.md`.
+What happened: the fresh refork could retain a visible alias in a Provider catalog while refresh, route projection, or picker selection compared only the visible string and treated the upstream model as missing. Root cause: model identity was reconstructed independently at each boundary; canonical slugs and aliases were not part of the matching contract. What we did: added a shared normalized identity helper and adapted refresh deduplication, route catalog projection, fixed-route summaries, alias validation, picker state, and wizard selection matching. Kept fresh ownership, fixed include semantics, and disabled inventory rows. Evidence: `pnpm typecheck`; focused Vitest suites with 104 tests passed; Prettier check; `git diff --check`; `cargo check --manifest-path src-tauri/Cargo.toml`. Runtime freshness was not checked because no rebuilt desktop process was requested. What NOT to do again: do not copy the legacy workspace wholesale or hide identity mismatches by converting explicit include routes to all-model routes. Related: [retained journal record](#2026-10-03-adapted-shared-multirouter-model-identities-in-the-refork).
 
 ## 2026-10-03 Ported Codex traffic admission policy
 
@@ -1003,7 +1166,7 @@ What happened: legacy providers used `reasoningContentMode` to choose DeepSeek-s
 
 ## 2026-10-03 BigStrongSun replacement foundation started
 
-What happened: the user approved replacing the legacy fork foundation with a fresh BigStrongSun refork and adapting distinctive behavior incrementally. Root cause: the legacy branch had diverged across hundreds of files and retained older save/probe ownership, while BigStrongSun now provides provider-set and protocol-lab boundaries. What we did: cloned `BigStrongSun/ccswitchmulti` at `b4741ade`, retained the dirty legacy checkout at `641d53c8` as read-only migration evidence, and recorded a single-owner, deletion-gated port strategy in `docs/decisions/2026-10-03-bigstrongsun-refork-foundation.md`. Evidence: clean-foundation `cargo check` passed, `pnpm install --frozen-lockfile` passed, and `pnpm typecheck` passed. What NOT to do again: do not bulk replay legacy commits or create parallel save/probe orchestration in the fresh foundation.
+What happened: the user approved replacing the legacy fork foundation with a fresh BigStrongSun refork and adapting distinctive behavior incrementally. Root cause: the legacy branch had diverged across hundreds of files and retained older save/probe ownership, while BigStrongSun now provides provider-set and protocol-lab boundaries. What we did: cloned `BigStrongSun/ccswitchmulti` at `b4741ade`, retained the dirty legacy checkout at `641d53c8` as read-only migration evidence, and recorded a single-owner, deletion-gated port strategy in [retained journal record](#2026-10-03-bigstrongsun-replacement-foundation-started). Evidence: clean-foundation `cargo check` passed, `pnpm install --frozen-lockfile` passed, and `pnpm typecheck` passed. What NOT to do again: do not bulk replay legacy commits or create parallel save/probe orchestration in the fresh foundation.
 
 # 2026-10-06 — English-first bootstrap and root-note consolidation
 

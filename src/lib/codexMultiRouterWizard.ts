@@ -182,8 +182,12 @@ export function readWizardModelCatalog(
   );
 }
 
-function isWizardModelEnabled(model: CodexCatalogModel): boolean {
-  return model.enabled !== false;
+export function readIncludedWizardModelCatalog(
+  provider: Provider,
+): CodexCatalogModel[] {
+  return readWizardModelCatalog(provider).filter(
+    (model) => model.enabled !== false,
+  );
 }
 
 // 判断 provider 是否是 MultiRouter 方案；向导只把普通 provider 当作上游模型源。
@@ -304,7 +308,7 @@ export function getWizardModelFetchConfig(
 
 // 判断 provider 是否已有可用于路由的真实模型目录。
 export function hasWizardModelCatalog(provider: Provider): boolean {
-  return readWizardModelCatalog(provider).length > 0;
+  return readIncludedWizardModelCatalog(provider).length > 0;
 }
 
 // 从 Codex provider 配置中读取 Base URL，兼容已扁平化字段和原始 config.toml 字符串。
@@ -402,6 +406,7 @@ export function mergeFetchedModelsIntoWizardProvider(
     byModel.set(visibleModelId, {
       ...(existing ?? {}),
       model: visibleModelId,
+      ...(!existing && existingModels.length > 0 ? { enabled: false } : {}),
       upstreamModel:
         existing?.upstreamModel ?? existing?.upstream_model ?? modelId,
       displayName: existing?.displayName ?? visibleModelId,
@@ -433,7 +438,11 @@ export function mergeFetchedModelsIntoWizardProvider(
     }
   }
   const models = Array.from(byModel.values());
-  const allowedModels = new Set(models.map((model) => model.model));
+  const allowedModels = new Set(
+    models
+      .filter((model) => model.enabled !== false)
+      .map((model) => model.model),
+  );
   const rawSpawnAgentModels =
     provider.settingsConfig?.modelCatalog?.spawnAgentModels;
   const spawnAgentModels = Array.isArray(rawSpawnAgentModels)
@@ -468,9 +477,7 @@ export function collectWizardModelNameCollisions(
 ): WizardModelNameCollision[] {
   const ownersByUpstream = new Map<string, Provider[]>();
   for (const provider of providers) {
-    for (const model of readWizardModelCatalog(provider).filter(
-      isWizardModelEnabled,
-    )) {
+    for (const model of readIncludedWizardModelCatalog(provider)) {
       const identities = modelBindingIdentityValues(model);
       const upstream = identities[0];
       if (!upstream) continue;
@@ -517,7 +524,7 @@ function aliasModelName(provider: Provider, modelName: string): string {
 function buildWizardRouteModelMap(
   provider: Provider,
 ): Record<string, string> | undefined {
-  const entries = readWizardModelCatalog(provider)
+  const entries = readIncludedWizardModelCatalog(provider)
     .map((model) => {
       const visibleModel = model.model?.trim();
       const upstreamModel = (
@@ -536,7 +543,7 @@ function buildWizardRouteModelMap(
 // 判断模型目录是否主要是 OpenAI 官方 GPT/O 系列；这些模型应优先保持 Responses 原生链路。
 function hasOpenAiResponsesNativeModels(provider: Provider): boolean {
   if (!isOfficialCodexSource(provider)) return false;
-  return readWizardModelCatalog(provider).some((model) => {
+  return readIncludedWizardModelCatalog(provider).some((model) => {
     const upstream = (
       model.upstreamModel ??
       model.upstream_model ??
@@ -555,7 +562,7 @@ export function resolveWizardModelNameCollisions(
 ): Provider[] {
   const ownersByUpstream = new Map<string, Provider[]>();
   for (const provider of providers) {
-    for (const model of readWizardModelCatalog(provider)) {
+    for (const model of readIncludedWizardModelCatalog(provider)) {
       const upstream = modelBindingIdentityValues(model)[0];
       if (!upstream) continue;
       const owners = ownersByUpstream.get(upstream) ?? [];
@@ -566,6 +573,7 @@ export function resolveWizardModelNameCollisions(
 
   return providers.map((provider) => {
     const nextModels = readWizardModelCatalog(provider).map((model) => {
+      if (model.enabled === false) return model;
       const upstream =
         model.upstreamModel ?? model.upstream_model ?? model.model;
       const owners = ownersByUpstream.get(upstream) ?? [];
@@ -597,9 +605,9 @@ export function inferWizardRoutePrefixes(provider: Provider): string[] {
   const text = `${provider.id} ${provider.name} ${provider.category ?? ""} ${
     provider.meta?.providerType ?? ""
   }`.toLowerCase();
-  const models = readWizardModelCatalog(provider)
-    .filter(isWizardModelEnabled)
-    .map((model) => model.model.toLowerCase());
+  const models = readIncludedWizardModelCatalog(provider).map((model) =>
+    model.model.toLowerCase(),
+  );
   const has = (value: string) =>
     text.includes(value) || models.some((model) => model.startsWith(value));
   const prefixes = new Set<string>();
@@ -632,7 +640,7 @@ export function inferWizardCacheConfig(provider: Provider): CodexCacheConfig {
   const text = `${provider.id} ${provider.name} ${provider.category ?? ""} ${
     provider.meta?.providerType ?? ""
   }`.toLowerCase();
-  const models = readWizardModelCatalog(provider).map((model) =>
+  const models = readIncludedWizardModelCatalog(provider).map((model) =>
     String(model.upstreamModel ?? model.upstream_model ?? model.model)
       .trim()
       .toLowerCase(),
@@ -692,7 +700,7 @@ export function inferWizardCacheConfig(provider: Provider): CodexCacheConfig {
 export function getWizardConnectivityProbeModels(provider: Provider): string[] {
   return Array.from(
     new Set(
-      readWizardModelCatalog(provider)
+      readIncludedWizardModelCatalog(provider)
         .map((model) => model.model?.trim())
         .filter((model): model is string => Boolean(model)),
     ),
@@ -898,15 +906,16 @@ export function filterWizardProvidersByModelOrder(
   providers: Provider[],
   modelOrder?: string[],
 ): Provider[] {
-  if (!modelOrder) return providers;
   const enabledModels = new Set(
-    modelOrder.map((model) => model.trim()).filter(Boolean),
+    (modelOrder ?? []).map((model) => model.trim()).filter(Boolean),
   );
-  const orderIndex = new Map(modelOrder.map((model, index) => [model, index]));
+  const orderIndex = new Map(
+    (modelOrder ?? []).map((model, index) => [model, index]),
+  );
   return providers
     .map((provider) => {
-      const models = readWizardModelCatalog(provider)
-        .filter((model) => enabledModels.has(model.model))
+      const models = readIncludedWizardModelCatalog(provider)
+        .filter((model) => !modelOrder || enabledModels.has(model.model))
         .sort(
           (left, right) =>
             (orderIndex.get(left.model) ?? Number.MAX_SAFE_INTEGER) -
@@ -929,8 +938,7 @@ export function filterWizardProvidersByModelOrder(
 function canonicalWizardModelIds(provider: Provider): string[] {
   return Array.from(
     new Set(
-      readWizardModelCatalog(provider)
-        .filter(isWizardModelEnabled)
+      readIncludedWizardModelCatalog(provider)
         .map((model) =>
           (model.upstreamModel ?? model.upstream_model ?? model.model).trim(),
         )
@@ -1028,7 +1036,7 @@ export function buildWizardRoutesFromSources(
   providers: Provider[],
   existingRoutes: CodexRoutingRouteV2[] = [],
 ): CodexRoutingRouteV2[] {
-  return providers.map((provider) => {
+  return providers.filter(hasWizardModelCatalog).map((provider) => {
     const modelMap = buildWizardRouteModelMap(provider);
     const existingRoute = existingRoutes.find(
       (route) => route.targetProviderId === provider.id,
@@ -1080,9 +1088,7 @@ export function buildWizardModelCatalog(
 ): CodexModelCatalogConfig {
   const byModel = new Map<string, CodexCatalogModel>();
   for (const provider of providers) {
-    for (const model of readWizardModelCatalog(provider).filter(
-      isWizardModelEnabled,
-    )) {
+    for (const model of readIncludedWizardModelCatalog(provider)) {
       if (!byModel.has(model.model)) {
         byModel.set(model.model, model);
       }
@@ -1190,7 +1196,7 @@ export function initialWizardCatalogModelOrder(
     CodexRoutingConfigV2 | undefined;
   if (routing?.schemaVersion !== 2) {
     return existingPlan?.settingsConfig?.modelCatalog
-      ? readWizardModelCatalog(existingPlan).map((model) => model.model)
+      ? readIncludedWizardModelCatalog(existingPlan).map((model) => model.model)
       : null;
   }
 
@@ -1228,7 +1234,7 @@ export function initialWizardCatalogModelOrder(
             ),
           )
         : null;
-    for (const model of readWizardModelCatalog(source)) {
+    for (const model of readIncludedWizardModelCatalog(source)) {
       const identities = modelIdentityValues(model);
       if (selected && !identities.some((identity) => selected.has(identity))) {
         continue;
@@ -1261,7 +1267,7 @@ function buildSubagentNameRedirector(
 
   const identityToNewVisible = new Map<string, string>();
   for (const source of resolvedSources) {
-    for (const model of readWizardModelCatalog(source)) {
+    for (const model of readIncludedWizardModelCatalog(source)) {
       const upstream = (
         model.upstreamModel ??
         model.upstream_model ??
@@ -1364,10 +1370,10 @@ export function buildCodexMultiRouterWizardPlan(
     ]),
   );
   const canonicalSourceProviders = sourceProviders
+    .filter((provider) => selectedCanonicalByProvider.has(provider.id))
     .map((provider) => {
-      const selected = selectedCanonicalByProvider.get(provider.id);
-      if (!selected) return provider;
-      const models = readWizardModelCatalog(provider).filter((model) =>
+      const selected = selectedCanonicalByProvider.get(provider.id)!;
+      const models = readIncludedWizardModelCatalog(provider).filter((model) =>
         selected.has(
           (model.upstreamModel ?? model.upstream_model ?? model.model).trim(),
         ),
@@ -1383,7 +1389,7 @@ export function buildCodexMultiRouterWizardPlan(
         },
       };
     })
-    .filter((provider) => readWizardModelCatalog(provider).length > 0);
+    .filter(hasWizardModelCatalog);
   const existingRouting = existingPlan?.settingsConfig?.codexRouting as
     CodexRoutingConfig | undefined;
   const existingRoutingV2 =
@@ -1421,7 +1427,7 @@ export function buildCodexMultiRouterWizardPlan(
   });
   const selectedVisibleModels = new Set(
     resolvedSources.flatMap((provider) =>
-      readWizardModelCatalog(provider).map((model) => model.model),
+      readIncludedWizardModelCatalog(provider).map((model) => model.model),
     ),
   );
   const requestedSpawnAgentModels: string[] =

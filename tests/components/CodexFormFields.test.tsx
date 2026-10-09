@@ -4,8 +4,10 @@ import {
   render,
   screen,
   waitFor,
+  within,
 } from "@testing-library/react";
 import { useState, type ReactNode } from "react";
+import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { CodexFormFields } from "@/components/providers/forms/CodexFormFields";
 import { fetchModelsForConfig } from "@/lib/api/model-fetch";
@@ -46,21 +48,28 @@ vi.mock("@/lib/api/codexSubagentV2", () => ({
   },
 }));
 
-vi.mock("react-i18next", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("react-i18next")>()),
-  useTranslation: () => ({
-    t: (
-      _key: string,
-      options?: Record<string, unknown> & { defaultValue?: string },
-    ) => {
-      const template = options?.defaultValue ?? _key;
-      if (typeof template !== "string") return template;
-      return template.replace(/\{\{(\w+)\}\}/g, (_match, name: string) =>
-        String(options?.[name] ?? `{{${name}}}`),
-      );
-    },
-  }),
-}));
+vi.mock("react-i18next", async (importOriginal) => {
+  const { default: en } = await import("@/i18n/locales/en.json");
+  const catalogueTranslations: Record<string, string> = en.catalogBrowser;
+  return {
+    ...(await importOriginal<typeof import("react-i18next")>()),
+    useTranslation: () => ({
+      t: (
+        _key: string,
+        options?: Record<string, unknown> & { defaultValue?: string },
+      ) => {
+        const translation = _key.startsWith("catalogBrowser.")
+          ? catalogueTranslations[_key.slice("catalogBrowser.".length)]
+          : undefined;
+        const template = options?.defaultValue ?? translation ?? _key;
+        if (typeof template !== "string") return template;
+        return template.replace(/\{\{(\w+)\}\}/g, (_match, name: string) =>
+          String(options?.[name] ?? `{{${name}}}`),
+        );
+      },
+    }),
+  };
+});
 
 vi.mock("@/lib/api/model-fetch", () => ({
   fetchModelsForConfig: vi.fn(),
@@ -355,17 +364,25 @@ function renderCatalogHarness(
     historyReplay?: CodexHistoryReplay;
     codexProviderEditorSnapshot?: CodexProviderEditorSnapshot;
     protocolOverrides?: Record<string, CodexProtocolOverride>;
+    defaultModel?: string;
   } = {},
 ) {
   const onCatalogChange = vi.fn();
   const onApiFormatChange = vi.fn();
   const onProtocolProbeReceiptIdsChange = vi.fn();
   let latestCatalog = initialCatalog;
+  let updateCatalog: (next: CodexCatalogModel[]) => void;
   let latestProtocolOverrides = options.protocolOverrides ?? {};
+  let latestDefaultModel = options.defaultModel ?? "";
 
   function Harness() {
     const [catalog, setCatalog] = useState<CodexCatalogModel[]>(initialCatalog);
+    updateCatalog = (next) => {
+      latestCatalog = next;
+      setCatalog(next);
+    };
     const [apiFormat, setApiFormat] = useState<CodexApiFormat>("openai_chat");
+    const [defaultModel, setDefaultModel] = useState(latestDefaultModel);
     const [protocolOverrides, setProtocolOverrides] = useState<
       Record<string, CodexProtocolOverride>
     >(latestProtocolOverrides);
@@ -384,6 +401,15 @@ function renderCatalogHarness(
         codexProviderEditorSnapshot={options.codexProviderEditorSnapshot}
         codexApiKey={options.apiKey ?? "sk-test"}
         onApiKeyChange={vi.fn()}
+        codexModel={defaultModel}
+        onModelChange={
+          options.defaultModel === undefined
+            ? undefined
+            : (model) => {
+                latestDefaultModel = model;
+                setDefaultModel(model);
+              }
+        }
         category="custom"
         shouldShowApiKeyLink={false}
         websiteUrl=""
@@ -450,6 +476,9 @@ function renderCatalogHarness(
     onProtocolProbeReceiptIdsChange,
     latestCatalog: () => latestCatalog,
     latestProtocolOverrides: () => latestProtocolOverrides,
+    latestDefaultModel: () => latestDefaultModel,
+    updateCatalog: (next: CodexCatalogModel[]) =>
+      act(() => updateCatalog(next)),
   };
 }
 
@@ -645,6 +674,356 @@ function renderAutoSplitHarness() {
 }
 
 describe("CodexFormFields local model routing", () => {
+  it("uses only staged models across filters while preserving the editable inventory and included-only pickers", async () => {
+    const { latestCatalog } = renderCatalogHarness(
+      [
+        {
+          model: "first",
+          upstreamModel: "wire-first",
+          aliases: ["first-alias"],
+          enabled: false,
+        },
+        { model: "second", upstreamModel: "wire-second" },
+        { model: "unselected", upstreamModel: "wire-unselected" },
+      ],
+      { defaultModel: "" },
+    );
+    await waitForReasoningResolution();
+    const search = screen.getByRole("searchbox", { name: "Search models" });
+    fireEvent.change(search, { target: { value: "first-alias" } });
+    fireEvent.click(screen.getByRole("checkbox", { name: "Select first" }));
+    expect(latestCatalog()[0].enabled).toBe(false);
+    fireEvent.change(search, { target: { value: "wire-second" } });
+    fireEvent.click(screen.getByRole("checkbox", { name: "Select second" }));
+    expect(screen.getByText("2 selected")).toBeVisible();
+    fireEvent.click(screen.getByRole("button", { name: "Use only selected" }));
+    await waitFor(() =>
+      expect(latestCatalog().map((row) => row.enabled)).toEqual([
+        true,
+        true,
+        false,
+      ]),
+    );
+    expect(latestCatalog()).toHaveLength(3);
+    expect(latestCatalog()[0].aliases).toEqual(["first-alias"]);
+    expect(screen.getByText("0 selected")).toBeVisible();
+    expect(screen.getByRole("tab", { name: "Included 2" })).toBeVisible();
+    expect(
+      screen.queryByRole("button", {
+        name: "Configure reasoning capabilities for unselected",
+      }),
+    ).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Select model" }));
+    expect(screen.getByRole("option", { name: "first" })).toBeVisible();
+    expect(screen.getByRole("option", { name: "second" })).toBeVisible();
+    expect(
+      screen.queryByRole("option", { name: "unselected" }),
+    ).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("option", { name: "first" }));
+    await waitForReasoningResolution();
+  });
+
+  it("reveals newly added models even when capability, inclusion, and search filters hide the inventory", async () => {
+    renderCatalogHarness(
+      Array.from({ length: 21 }, (_, index) => ({
+        model: `model-${index}`,
+        enabled: false,
+        inputModalities: ["text"],
+      })),
+    );
+    fireEvent.change(screen.getByRole("searchbox"), {
+      target: { value: "no-match" },
+    });
+    fireEvent.change(screen.getByRole("combobox", { name: "Input" }), {
+      target: { value: "text_only" },
+    });
+    fireEvent.change(screen.getByRole("combobox", { name: "Sort" }), {
+      target: { value: "name" },
+    });
+    fireEvent.click(screen.getByRole("tab", { name: "Included 0" }));
+    fireEvent.click(screen.getByRole("button", { name: "Add model" }));
+    expect(screen.getByRole("searchbox")).toHaveValue("");
+    expect(screen.getByRole("combobox", { name: "Input" })).toHaveValue("all");
+    expect(screen.getByRole("combobox", { name: "Sort" })).toHaveValue("order");
+    expect(screen.getByRole("tab", { name: "All 22" })).toHaveAttribute(
+      "aria-selected",
+      "true",
+    );
+    expect(screen.getByLabelText("Candidate model name")).toBeVisible();
+    expect(screen.getByRole("button", { name: "Next models" })).toBeDisabled();
+    await waitForReasoningResolution();
+  });
+
+  it("searches preserved identity metadata and reacts to incoming alias changes", async () => {
+    const metadata: CodexCatalogModel = {
+      model: "visible-model",
+      canonical_slug: "vendor/canonical",
+      slug: "stable-slug",
+      aliases: { quick: "upstream-target" },
+      name: "Friendly Model",
+      enabled: false,
+    };
+    const { latestCatalog, updateCatalog } = renderCatalogHarness([
+      metadata,
+      { model: "other-model" },
+    ]);
+    const search = screen.getByRole("searchbox", { name: "Search models" });
+    for (const query of [
+      "VENDOR/CANONICAL",
+      "stable-slug",
+      "quick",
+      "upstream-target",
+      "friendly",
+    ]) {
+      fireEvent.change(search, { target: { value: query } });
+      expect(
+        screen.getByLabelText("Include visible-model"),
+      ).toBeInTheDocument();
+      expect(
+        screen.queryByLabelText("Include other-model"),
+      ).not.toBeInTheDocument();
+    }
+    fireEvent.click(screen.getByRole("button", { name: "Include matching" }));
+    await waitFor(() =>
+      expect(latestCatalog()[0]).toMatchObject({
+        canonicalSlug: "vendor/canonical",
+        slug: "stable-slug",
+        aliases: { quick: "upstream-target" },
+        name: "Friendly Model",
+        enabled: true,
+      }),
+    );
+    await act(async () => {
+      updateCatalog([
+        { ...latestCatalog()[0], aliases: ["new-alias"] },
+        latestCatalog()[1],
+      ]);
+    });
+    expect(latestCatalog()[0].aliases).toEqual(["new-alias"]);
+    fireEvent.change(search, { target: { value: "quick" } });
+    expect(screen.getByText("No matching models")).toBeInTheDocument();
+    fireEvent.change(search, { target: { value: "new-alias" } });
+    expect(screen.getByLabelText("Include visible-model")).toBeInTheDocument();
+    await waitForReasoningResolution();
+  });
+
+  it("keeps external catalogue loads editable after capability hydration", async () => {
+    const { latestCatalog, updateCatalog } = renderCatalogHarness(
+      [{ model: "old-model" }],
+      {
+        presetCatalogModels: [
+          { model: "new-model", inputModalities: ["text", "image"] },
+        ],
+      },
+    );
+    await waitForReasoningResolution();
+    updateCatalog([
+      { model: "new-model", aliases: ["new-alias"], enabled: false },
+    ]);
+    expect(screen.getByLabelText("Candidate model name")).toHaveValue(
+      "new-model",
+    );
+    fireEvent.click(screen.getByLabelText("Include new-model"));
+    fireEvent.change(screen.getByLabelText("Menu display name"), {
+      target: { value: "New Display Name" },
+    });
+    await waitFor(() =>
+      expect(latestCatalog()[0]).toMatchObject({
+        model: "new-model",
+        aliases: ["new-alias"],
+        enabled: true,
+        displayName: "New Display Name",
+        inputModalities: ["text", "image"],
+        supportsImage: true,
+        textOnly: false,
+      }),
+    );
+    await waitForReasoningResolution();
+  });
+
+  it("removes staged models hidden by filters and clears stale selection after external loads", async () => {
+    const user = userEvent.setup();
+    const { latestCatalog, updateCatalog } = renderCatalogHarness([
+      { model: "first", enabled: false },
+      { model: "second" },
+      { model: "retained", aliases: ["keep-alias"] },
+    ]);
+    await waitForReasoningResolution();
+    const search = screen.getByRole("searchbox");
+    fireEvent.click(screen.getByRole("checkbox", { name: "Select first" }));
+    fireEvent.click(screen.getByRole("checkbox", { name: "Select second" }));
+    fireEvent.change(search, { target: { value: "keep-alias" } });
+    await user.click(screen.getByRole("button", { name: "Catalogue actions" }));
+    await user.click(
+      screen.getByRole("menuitem", { name: "Remove selected models" }),
+    );
+    expect(latestCatalog().map((row) => row.model)).toEqual(["retained"]);
+    expect(latestCatalog()[0].aliases).toEqual(["keep-alias"]);
+    expect(screen.getByText("0 selected")).toBeVisible();
+    fireEvent.click(screen.getByRole("checkbox", { name: "Select retained" }));
+    expect(screen.getByText("1 selected")).toBeVisible();
+    await act(async () => {
+      updateCatalog([{ model: "replacement" }]);
+    });
+    expect(screen.getByText("0 selected")).toBeVisible();
+    expect(
+      screen.getByRole("button", { name: "Use only selected" }),
+    ).toBeDisabled();
+    fireEvent.click(screen.getByRole("button", { name: "Clear search" }));
+    expect(
+      screen.getByRole("checkbox", { name: "Select replacement" }),
+    ).not.toBeChecked();
+    await waitForReasoningResolution();
+  });
+
+  it("prunes outdated versions across filters without changing retained membership or metadata", async () => {
+    const user = userEvent.setup();
+    const { latestCatalog } = renderCatalogHarness([
+      { model: "vendor/gpt-6-sol", upstreamModel: "vendor/gpt-6-sol" },
+      {
+        model: "vendor/gpt-6.1-sol",
+        enabled: false,
+        aliases: ["newest"],
+        inputModalities: ["text", "image"],
+      },
+      { model: "vendor/gpt-6-astra", enabled: true },
+      { model: "custom-alias", enabled: false },
+    ]);
+    await waitForReasoningResolution();
+    fireEvent.click(
+      screen.getByRole("checkbox", {
+        name: "Select vendor/gpt-6-sol",
+      }),
+    );
+    fireEvent.change(screen.getByRole("searchbox"), {
+      target: { value: "custom-alias" },
+    });
+    await user.click(screen.getByRole("button", { name: "Catalogue actions" }));
+    await user.click(
+      screen.getByRole("menuitem", { name: "Keep latest versions" }),
+    );
+    expect(latestCatalog().map((row) => row.model)).toEqual([
+      "vendor/gpt-6.1-sol",
+      "vendor/gpt-6-astra",
+      "custom-alias",
+    ]);
+    expect(latestCatalog()[0]).toMatchObject({
+      enabled: false,
+      aliases: ["newest"],
+      inputModalities: ["text", "image"],
+    });
+    expect(screen.getByText("0 selected")).toBeVisible();
+    expect(screen.getByRole("tab", { name: "Included 1" })).toBeVisible();
+    expect(screen.getByRole("tab", { name: "Excluded 2" })).toBeVisible();
+    await user.click(screen.getByRole("button", { name: "Catalogue actions" }));
+    await user.click(
+      screen.getByRole("menuitem", { name: "Keep latest versions" }),
+    );
+    expect(latestCatalog()).toHaveLength(3);
+    await waitForReasoningResolution();
+  });
+
+  it("persists searched inclusion changes and exposes only included rows to default and reasoning pickers", async () => {
+    const { latestCatalog, latestDefaultModel } = renderCatalogHarness(
+      [
+        { model: "hidden", upstreamModel: "wire-hidden", enabled: false },
+        { model: "kept", upstreamModel: "wire-kept" },
+      ],
+      { defaultModel: "" },
+    );
+    await waitForReasoningResolution();
+    expect(
+      screen.queryByRole("button", {
+        name: "Configure reasoning capabilities for hidden",
+      }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.getByRole("button", {
+        name: "Configure reasoning capabilities for kept",
+      }),
+    ).toBeVisible();
+    expect(
+      reasoningApiMocks.resolve.mock.calls.every(
+        ([settings, , model]) =>
+          model === "wire-kept" &&
+          settings.modelCatalog.models.every(
+            (row: CodexCatalogModel) => row.enabled !== false,
+          ),
+      ),
+    ).toBe(true);
+    fireEvent.click(screen.getByRole("button", { name: "Select model" }));
+    expect(screen.getByRole("option", { name: "kept" })).toBeVisible();
+    expect(
+      screen.queryByRole("option", { name: "hidden" }),
+    ).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("option", { name: "kept" }));
+    expect(latestDefaultModel()).toBe("kept");
+
+    fireEvent.change(screen.getByRole("searchbox", { name: "Search models" }), {
+      target: { value: "WIRE-HIDDEN" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Include matching" }));
+    await waitFor(() => expect(latestCatalog()[0].enabled).toBe(true));
+    expect(latestCatalog()[1].model).toBe("kept");
+    expect(
+      screen.getByRole("button", {
+        name: "Configure reasoning capabilities for hidden",
+      }),
+    ).toBeVisible();
+    fireEvent.click(screen.getByRole("button", { name: "Select model" }));
+    expect(screen.getByRole("option", { name: "hidden" })).toBeVisible();
+    fireEvent.click(screen.getByRole("option", { name: "hidden" }));
+    expect(latestDefaultModel()).toBe("hidden");
+    fireEvent.click(screen.getByRole("button", { name: "Exclude matching" }));
+    await waitFor(() => expect(latestCatalog()[0].enabled).toBe(false));
+    expect(
+      screen.queryByRole("button", {
+        name: "Configure reasoning capabilities for hidden",
+      }),
+    ).not.toBeInTheDocument();
+    expect(screen.getByRole("tab", { name: "Included 1" })).toBeVisible();
+    await waitForReasoningResolution();
+  });
+
+  it("does not fall back to fetched models when every catalogue row is excluded", async () => {
+    vi.mocked(fetchModelsForConfig).mockResolvedValueOnce([
+      { id: "hidden", ownedBy: null, contextWindow: 128000 },
+      { id: "new-model", ownedBy: null },
+    ]);
+    const { latestCatalog, container } = renderCatalogHarness(
+      [{ model: "hidden", enabled: false }],
+      { defaultModel: "", shouldShowSpeedTest: true },
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Sync models" }));
+    await waitFor(() => expect(latestCatalog()).toHaveLength(2));
+    expect(latestCatalog().every((model) => model.enabled === false)).toBe(
+      true,
+    );
+    expect(screen.getByText("No included models")).toBeVisible();
+    const defaultModelField =
+      container.querySelector("#codexDefaultModel")!.parentElement!;
+    expect(
+      within(defaultModelField).queryByRole("button", {
+        name: "Select model",
+      }),
+    ).not.toBeInTheDocument();
+    expect(reasoningApiMocks.resolve).not.toHaveBeenCalled();
+    fireEvent.change(screen.getByRole("searchbox", { name: "Search models" }), {
+      target: { value: "hidden" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Include matching" }));
+    await waitFor(() => expect(latestCatalog()[0].enabled).toBe(true));
+    expect(latestCatalog()[1].enabled).toBe(false);
+    fireEvent.click(
+      within(defaultModelField).getByRole("button", { name: "Select model" }),
+    );
+    expect(screen.getByRole("option", { name: "hidden" })).toBeVisible();
+    expect(
+      screen.queryByRole("option", { name: "new-model" }),
+    ).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("option", { name: "hidden" }));
+    await waitForReasoningResolution();
+  });
   it("restores split persistence and per-model transports from the editor snapshot", async () => {
     const responsesRecord = createDeepProbeRecord(
       "gpt-5.5",
@@ -2054,14 +2433,14 @@ describe("CodexFormFields local model routing", () => {
     });
   });
 
-  it("uses model mapping checkboxes and arrows for catalog retention and order", async () => {
+  it("uses explicit removal and arrows for catalog retention and order", async () => {
     const { latestCatalog } = renderCatalogHarness([
       { model: "model-a", upstreamModel: "model-a" },
       { model: "model-b", upstreamModel: "model-b" },
       { model: "model-c", upstreamModel: "model-c" },
     ]);
 
-    fireEvent.click(screen.getByLabelText("Keep model-b"));
+    fireEvent.click(screen.getByRole("button", { name: "Remove model-b" }));
 
     await waitFor(() => {
       expect(latestCatalog().map((model) => model.model)).toEqual([

@@ -20,13 +20,15 @@ import {
 } from "@/lib/api/model-fetch";
 import type { CodexRoutingProjectionStatus } from "@/lib/api/providers";
 import { proxyApi } from "@/lib/api/proxy";
+import { usageApi } from "@/lib/api/usage";
 import type {
   CodexCatalogModel,
   CodexRoutingAuthPolicy,
   Provider,
 } from "@/types";
-import type { PaginatedLogs, RequestLog } from "@/types/usage";
+import type { ModelStats, PaginatedLogs, RequestLog } from "@/types/usage";
 import type { RequestHealthSnapshot } from "@/types/proxy";
+import type { CodexModelReasoningResolution } from "@/types/codexSubagentV2";
 import {
   applyMultiRouterSettingsDraft,
   buildMultiRouterRuntimeStatus,
@@ -106,6 +108,13 @@ vi.mock("@/lib/query/usage", () => ({
   useRequestLogs: () => requestLogsFixture.value,
 }));
 
+vi.mock("@/lib/api/usage", () => ({
+  usageApi: {
+    syncSessionUsage: vi.fn(),
+    getModelStats: vi.fn(),
+  },
+}));
+
 vi.mock("@/lib/api", () => ({
   providersApi: {
     add: vi.fn(),
@@ -154,6 +163,7 @@ vi.mock("@/lib/api/codexEgressTimezone", () => ({
 
 vi.mock("@/lib/api/codexSubagentV2", () => ({
   codexSubagentV2Api: {
+    resolveModelReasoningCapability: vi.fn(),
     getReasoningCapabilities: vi.fn().mockResolvedValue({
       "deepseek-v4-flash": {
         supportKind: "effort_levels",
@@ -260,6 +270,30 @@ function createDeferred<T>(): Deferred<T> {
   return { promise, resolve, reject };
 }
 
+function modelReasoningResolution(
+  model: string,
+  efforts: Array<"none" | "low" | "medium" | "high" | "xhigh"> = [],
+  defaultEffort: "low" | "medium" | "high" | "xhigh" = "medium",
+): CodexModelReasoningResolution {
+  return {
+    model,
+    source: efforts.length ? "official" : "unknown",
+    fingerprint: efforts.length ? `official-${model}` : "",
+    capability: null,
+    resolved: {
+      supportKind: efforts.length ? "effort_levels" : "unknown",
+      confidence: efforts.length ? "confirmed" : "unverified",
+      codexSelectableEfforts: efforts,
+      providerAcceptedEfforts: efforts,
+      providerDefaultEffort: efforts.length ? defaultEffort : null,
+      disableAllowed: efforts.includes("none"),
+      effortMap: {},
+    },
+    hasDetectionCandidate: false,
+    detection: null,
+  };
+}
+
 /// 为刷新类测试补齐真实的启用 route，避免把 provider 存在误当成已在当前方案中勾选。
 function withEnabledProviderRoute(
   plan: Provider,
@@ -337,6 +371,21 @@ function createCodexProxyLog(overrides: Partial<RequestLog> = {}): RequestLog {
 
 beforeEach(() => {
   requestLogsFixture.value = { data: [], isLoading: false };
+  vi.mocked(usageApi.getModelStats).mockReset().mockResolvedValue([]);
+  vi.mocked(usageApi.syncSessionUsage).mockReset().mockResolvedValue({
+    imported: 0,
+    skipped: 0,
+    filesScanned: 0,
+    suspectedDuplicates: 0,
+    deferredFiles: 0,
+    errors: [],
+  });
+  vi.mocked(codexSubagentV2Api.resolveModelReasoningCapability).mockReset();
+  vi.mocked(
+    codexSubagentV2Api.resolveModelReasoningCapability,
+  ).mockImplementation(async (_settings, _provider, model) =>
+    modelReasoningResolution(model),
+  );
   vi.mocked(fetchCodexOauthModels).mockReset();
   vi.mocked(fetchModelsForConfig).mockReset();
   vi.mocked(proxyApi.unlockCodexModelPicker).mockReset();
@@ -459,7 +508,7 @@ describe("Model order real drag sensors", () => {
 
   function modelOrder() {
     return screen
-      .getAllByRole("button", { name: /^Drag order-/ })
+      .getAllByRole("button", { name: /^Drag / })
       .map((handle) => handle.getAttribute("aria-label")?.slice(5));
   }
 
@@ -536,6 +585,39 @@ describe("Model order real drag sensors", () => {
       rendered: renderWorkspace(elementFor([source, plan])),
     };
   }
+
+  it("top-aligns all model-order controls independently of the wrapped effort hint", () => {
+    renderModelOrder({
+      models: [
+        {
+          model: "gpt-6.1-sol-sublyx-with-a-long-provider-alias",
+          reasoning: {
+            ...reasoning(["low", "high"], "low"),
+            supportedEfforts: ["medium", "high", "xhigh"],
+            defaultEffort: "medium",
+          },
+        },
+      ],
+      routing: { defaultReasoningEffort: "xhigh" },
+    });
+    const display = screen.getByRole("combobox", { name: "Model display" });
+    const sort = screen.getByRole("combobox", { name: "Sort models" });
+    const effort = screen.getByRole("combobox", {
+      name: "Top model default effort",
+    });
+    const controls = display.closest("label")!.parentElement;
+    expect(controls).toHaveClass("items-start", "flex-wrap");
+    expect(controls).not.toHaveClass("items-end");
+    for (const select of [display, sort, effort]) {
+      expect(select.closest("label")?.parentElement).toBe(controls);
+      expect(select).toHaveClass("h-8", "min-w-0");
+    }
+    expect(effort.closest("label")).toHaveClass("w-64", "max-w-full");
+    expect(screen.getByText(/Used by new threads when/)).toHaveClass(
+      "break-words",
+    );
+    expect(effort).toHaveValue("xhigh");
+  });
 
   async function pointerMoveFirstToSecond() {
     const handle = await screen.findByRole("button", {
@@ -944,6 +1026,313 @@ describe("Model order real drag sensors", () => {
     },
   });
 
+  const modelUsage = (
+    model: string,
+    requestCount: number,
+    providerName = "Drag Source",
+  ): ModelStats => ({
+    model,
+    providerName,
+    requestCount,
+    totalTokens: requestCount * 100,
+    totalCost: "0",
+    avgCostPerRequest: "0",
+  });
+
+  it("syncs Codex history before querying usage and ranks all models by request count", async () => {
+    const sync =
+      createDeferred<Awaited<ReturnType<typeof usageApi.syncSessionUsage>>>();
+    vi.mocked(usageApi.syncSessionUsage).mockReturnValueOnce(sync.promise);
+    const stats = tenModels().map((model, index) =>
+      modelUsage(model.model, index + 1),
+    );
+    vi.mocked(usageApi.getModelStats).mockResolvedValue(stats);
+    const { source, plan, snapshot, elementFor, rendered } = renderModelOrder({
+      models: tenModels(),
+    });
+    const user = userEvent.setup();
+    expect(usageApi.getModelStats).not.toHaveBeenCalled();
+    await user.click(
+      screen.getByRole("button", { name: "Apply recommendations" }),
+    );
+    expect(
+      screen.getByRole("button", { name: "Querying usage..." }),
+    ).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Save order" })).toBeDisabled();
+    expect(usageApi.getModelStats).not.toHaveBeenCalled();
+    await act(async () =>
+      sync.resolve({
+        imported: 10,
+        skipped: 0,
+        filesScanned: 1,
+        suspectedDuplicates: 0,
+        deferredFiles: 0,
+        errors: [],
+      }),
+    );
+    await screen.findByText(/usage history for 10 models/);
+    expect(usageApi.getModelStats).toHaveBeenCalledWith(
+      undefined,
+      undefined,
+      "codex",
+    );
+    expect(usageApi.getModelStats).toHaveBeenCalledWith();
+    expect(usageApi.getModelStats).toHaveBeenCalledTimes(2);
+    const expectedOrder = "jihgfedcba"
+      .split("")
+      .map((suffix) => `order-${suffix}`);
+    expect(modelOrder()).toEqual(expectedOrder);
+    expect(providersApi.update).not.toHaveBeenCalled();
+    await user.click(screen.getByRole("button", { name: "Save order" }));
+    await screen.findByText(/Saved the display order for 10 models/);
+    const saved = vi.mocked(providersApi.update).mock.calls[0][0];
+    expect(saved.settingsConfig.codexRouting.modelOrder).toEqual(expectedOrder);
+    expect(JSON.stringify({ source, plan })).toBe(snapshot);
+    rendered.unmount();
+    renderWorkspace(elementFor([source, saved]));
+    expect(modelOrder()).toEqual(expectedOrder);
+  });
+
+  it("uses provider model history when Codex has no matching usage and re-queries on every click", async () => {
+    vi.mocked(usageApi.getModelStats).mockImplementation(
+      async (_start, _end, app) =>
+        app === "codex"
+          ? []
+          : [
+              modelUsage("order-c", 30),
+              { ...modelUsage("order-b", 5), totalCost: "100" },
+            ],
+    );
+    renderModelOrder();
+    const user = userEvent.setup();
+    await user.click(
+      screen.getByRole("button", { name: "Apply recommendations" }),
+    );
+    await screen.findByText(/usage history for 2 models/);
+    expect(modelOrder()).toEqual(["order-c", "order-b", "order-a"]);
+    vi.mocked(usageApi.getModelStats).mockImplementation(
+      async (_start, _end, app) =>
+        app === "codex" ? [] : [modelUsage("wire-a", 100)],
+    );
+    await user.click(
+      screen.getByRole("button", { name: "Apply recommendations" }),
+    );
+    await screen.findByText(/usage history for 1 models/);
+    expect(modelOrder()[0]).toBe("order-a");
+    expect(usageApi.syncSessionUsage).toHaveBeenCalledTimes(2);
+    expect(usageApi.getModelStats).toHaveBeenCalledTimes(4);
+    expect(providersApi.update).not.toHaveBeenCalled();
+  });
+
+  it("does not change the order or save when both usage queries fail", async () => {
+    vi.mocked(usageApi.getModelStats).mockRejectedValue(
+      new Error("usage database unavailable"),
+    );
+    renderModelOrder();
+    await userEvent.click(
+      screen.getByRole("button", { name: "Apply recommendations" }),
+    );
+    await screen.findByText(
+      /Could not read usage history\. Model order was not changed:/,
+    );
+    expect(modelOrder()).toEqual(["order-a", "order-b", "order-c"]);
+    expect(providersApi.update).not.toHaveBeenCalled();
+    expect(
+      screen.getByRole("button", { name: "Apply recommendations" }),
+    ).toBeEnabled();
+  });
+
+  it("uses available provider records and reports incomplete sync or Codex queries", async () => {
+    vi.mocked(usageApi.syncSessionUsage).mockRejectedValue(
+      new Error("sync unavailable"),
+    );
+    vi.mocked(usageApi.getModelStats).mockImplementation(
+      async (_start, _end, app) => {
+        if (app === "codex") throw new Error("Codex usage unavailable");
+        return [modelUsage("order-c", 40)];
+      },
+    );
+    renderModelOrder();
+    await userEvent.click(
+      screen.getByRole("button", { name: "Apply recommendations" }),
+    );
+    await screen.findByText(/Some usage could not be refreshed/);
+    expect(modelOrder()[0]).toBe("order-c");
+    expect(screen.getByRole("button", { name: "Save order" })).toBeEnabled();
+    expect(providersApi.update).not.toHaveBeenCalled();
+  });
+
+  it("ignores a recommendation response after leaving the ordering page", async () => {
+    const history = createDeferred<ModelStats[]>();
+    vi.mocked(usageApi.getModelStats).mockReturnValue(history.promise);
+    const { rendered } = renderModelOrder();
+    await userEvent.click(
+      screen.getByRole("button", { name: "Apply recommendations" }),
+    );
+    await waitFor(() =>
+      expect(usageApi.getModelStats).toHaveBeenCalledTimes(2),
+    );
+    rendered.unmount();
+    renderModelOrder({
+      models: [{ model: "order-new" }, { model: "order-other" }],
+    });
+    await act(async () => history.resolve([modelUsage("order-c", 100)]));
+    expect(modelOrder()).toEqual(["order-new", "order-other"]);
+    expect(
+      screen.queryByText(/Recommendations applied from usage/),
+    ).not.toBeInTheDocument();
+    expect(providersApi.update).not.toHaveBeenCalled();
+  });
+
+  it("restores latest-first defaults without a saved custom order and projects the saved ranks", async () => {
+    const models = [
+      { model: "gpt-5.6-luna-sublyx", upstreamModel: "gpt-5.6-luna" },
+      { model: "gpt-6-astra-sublyx", upstreamModel: "gpt-6-astra" },
+      { model: "gpt-6.1-sol-sublyx", upstreamModel: "gpt-6.1-sol" },
+    ];
+    const { source, plan, snapshot, elementFor, rendered } = renderModelOrder({
+      models,
+      config: 'model = "gpt-5.6-luna-sublyx"\n',
+    });
+    expect(
+      screen.getByRole("button", { name: "Restore default" }),
+    ).toBeEnabled();
+    await userEvent.click(
+      screen.getByRole("button", { name: "Restore default" }),
+    );
+    await screen.findByText(/Restored newest-first model order/);
+    const saved = vi.mocked(providersApi.update).mock.calls[0][0];
+    const expected = [
+      "gpt-6.1-sol-sublyx",
+      "gpt-6-astra-sublyx",
+      "gpt-5.6-luna-sublyx",
+    ];
+    expect(saved.settingsConfig.codexRouting.modelOrder).toEqual(expected);
+    expect(saved.settingsConfig.config).toBe('model = "gpt-6.1-sol-sublyx"\n');
+    expect(saved.settingsConfig.codexRouting.routes).toEqual(
+      plan.settingsConfig.codexRouting.routes,
+    );
+    expect(providersApi.inspectCodexMultiRouterProjection).toHaveBeenCalledWith(
+      plan.id,
+    );
+    expect(JSON.stringify({ source, plan })).toBe(snapshot);
+    rendered.unmount();
+    renderWorkspace(elementFor([source, saved]));
+    expect(
+      screen
+        .getAllByRole("button", { name: /^Drag / })
+        .map((button) => button.getAttribute("aria-label")?.slice(5)),
+    ).toEqual(expected);
+    expect(
+      screen.getByRole("button", { name: "Restore default" }),
+    ).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Save order" })).toBeDisabled();
+  });
+
+  it("keeps Extra high when resetting the remaining order leaves Sol first", async () => {
+    vi.mocked(
+      codexSubagentV2Api.resolveModelReasoningCapability,
+    ).mockImplementation(async (_settings, _provider, model) =>
+      modelReasoningResolution(model, ["medium", "high", "xhigh"]),
+    );
+    renderModelOrder({
+      models: [
+        { model: "gpt-5.6-luna-sublyx", upstreamModel: "gpt-5.6-luna" },
+        { model: "gpt-6-astra-sublyx", upstreamModel: "gpt-6-astra" },
+        { model: "gpt-6.1-sol-sublyx", upstreamModel: "gpt-6.1-sol" },
+      ],
+      routing: {
+        modelOrder: [
+          "gpt-6.1-sol-sublyx",
+          "gpt-5.6-luna-sublyx",
+          "gpt-6-astra-sublyx",
+        ],
+        defaultReasoningEffort: "xhigh",
+      },
+    });
+    await waitFor(() =>
+      expect(
+        screen.getByRole("combobox", {
+          name: "Top model default effort",
+        }),
+      ).toHaveValue("xhigh"),
+    );
+    await userEvent.click(
+      screen.getByRole("button", { name: "Restore default" }),
+    );
+    await screen.findByText(/Restored newest-first model order/);
+    const saved = vi.mocked(providersApi.update).mock.calls[0][0];
+    expect(saved.settingsConfig.codexRouting.defaultReasoningEffort).toBe(
+      "xhigh",
+    );
+    expect(saved.settingsConfig.codexRouting.modelOrder).toEqual([
+      "gpt-6.1-sol-sublyx",
+      "gpt-6-astra-sublyx",
+      "gpt-5.6-luna-sublyx",
+    ]);
+  });
+
+  it("leaves alphabetical view mode when restoring newest-first defaults", async () => {
+    renderModelOrder({
+      models: [
+        { model: "gpt-5.6-luna-sublyx", upstreamModel: "gpt-5.6-luna" },
+        { model: "gpt-6.1-sol-sublyx", upstreamModel: "gpt-6.1-sol" },
+      ],
+    });
+    const user = userEvent.setup();
+    await user.selectOptions(
+      screen.getByRole("combobox", { name: "Sort models" }),
+      "model",
+    );
+    await user.click(screen.getByRole("button", { name: "Restore default" }));
+    await screen.findByText(/Restored newest-first model order/);
+    expect(screen.getByRole("combobox", { name: "Sort models" })).toHaveValue(
+      "custom",
+    );
+    expect(modelOrder()).toEqual(["gpt-6.1-sol-sublyx", "gpt-5.6-luna-sublyx"]);
+  });
+
+  it("retains Extra high when reset replaces a Sol alias with the same provider's canonical model", async () => {
+    vi.mocked(
+      codexSubagentV2Api.resolveModelReasoningCapability,
+    ).mockImplementation(async (_settings, _provider, model) =>
+      modelReasoningResolution(model, ["medium", "high", "xhigh"]),
+    );
+    const { source, elementFor, rendered } = renderModelOrder({
+      models: [
+        { model: "gpt-5.6-luna", upstreamModel: "gpt-5.6-luna" },
+        { model: "gpt-6.1-sol", upstreamModel: "gpt-6.1-sol" },
+        { model: "gpt-6.1-sol-sublyx", upstreamModel: "gpt-6.1-sol" },
+      ],
+      routing: {
+        modelOrder: ["gpt-6.1-sol-sublyx", "gpt-5.6-luna", "gpt-6.1-sol"],
+        defaultReasoningEffort: "xhigh",
+      },
+    });
+    await waitFor(() =>
+      expect(
+        screen.getByRole("combobox", { name: "Top model default effort" }),
+      ).toHaveValue("xhigh"),
+    );
+    await userEvent.click(
+      screen.getByRole("button", { name: "Restore default" }),
+    );
+    await screen.findByText(/Restored newest-first model order/);
+    const saved = vi.mocked(providersApi.update).mock.calls[0][0];
+    expect(saved.settingsConfig.codexRouting).toMatchObject({
+      modelOrder: ["gpt-6.1-sol", "gpt-6.1-sol-sublyx", "gpt-5.6-luna"],
+      defaultReasoningEffort: "xhigh",
+    });
+    rendered.unmount();
+    renderWorkspace(elementFor([source, saved]));
+    await waitFor(() =>
+      expect(
+        screen.getByRole("combobox", { name: "Top model default effort" }),
+      ).toHaveValue("xhigh"),
+    );
+    expect(screen.getByRole("button", { name: "Save order" })).toBeDisabled();
+  });
+
   it("applies recommendations across both columns, saves once to the router and remounts the adapted preferences", async () => {
     const models = tenModels().map((model) => ({
       ...model,
@@ -965,6 +1354,7 @@ describe("Model order real drag sensors", () => {
     await user.click(
       screen.getByRole("button", { name: "Apply recommendations" }),
     );
+    await screen.findByText(/No matching usage history/);
     const expectedOrder = [
       "order-j",
       "order-i",
@@ -1031,11 +1421,11 @@ describe("Model order real drag sensors", () => {
     await userEvent.click(
       screen.getByRole("button", { name: "Restore default" }),
     );
-    await screen.findByText(/Removed the custom router order/);
+    await screen.findByText(/Restored newest-first model order/);
     const saved = vi.mocked(providersApi.update).mock.calls[0][0];
     expect(saved.id).toBe(plan.id);
     expect(saved.settingsConfig.codexRouting).toMatchObject({
-      modelOrder: [],
+      modelOrder: ["order-a", "order-b"],
       defaultReasoningEffort: "low",
     });
     expect(saved.settingsConfig.config).toMatch(/^model = "order-a"/m);
@@ -1071,6 +1461,175 @@ describe("Model order real drag sensors", () => {
     );
     expect(saved.settingsConfig.codexRouting.modelOrder).toBeUndefined();
   });
+
+  it("shows a selected placeholder instead of a blank value for unknown reasoning", async () => {
+    renderModelOrder({ models: [{ model: "order-a" }] });
+    const effort = screen.getByRole("combobox", {
+      name: "Top model default effort",
+    });
+    await waitFor(() =>
+      expect(
+        within(effort).getByRole("option", { selected: true }),
+      ).toHaveTextContent("Unknown until provider metadata is available"),
+    );
+    expect(effort).toHaveValue("");
+    expect(effort).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Save order" })).toBeDisabled();
+  });
+
+  it("resolves the Sol wire model, saves Extra high, and restores it on remount", async () => {
+    vi.mocked(
+      codexSubagentV2Api.resolveModelReasoningCapability,
+    ).mockImplementation(async (_settings, _provider, model) =>
+      model === "gpt-6.1-sol"
+        ? modelReasoningResolution(model, [
+            "none",
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+          ])
+        : modelReasoningResolution(model),
+    );
+    const { source, plan, snapshot, elementFor, rendered } = renderModelOrder({
+      models: [
+        {
+          model: "gpt-6.1-sol-sublyx",
+          upstreamModel: "gpt-6.1-sol",
+          displayName: "[Subly] gpt-6.1-sol",
+        },
+      ],
+      config: 'model = "gpt-6.1-sol-sublyx"\n',
+    });
+    const effort = screen.getByRole("combobox", {
+      name: "Top model default effort",
+    });
+    await waitFor(() => expect(effort).toBeEnabled());
+    expect(effort).toHaveValue("medium");
+    expect(
+      within(effort).getByRole("option", { name: "Extra high (xhigh)" }),
+    ).toHaveValue("xhigh");
+    expect(
+      codexSubagentV2Api.resolveModelReasoningCapability,
+    ).toHaveBeenCalledWith(source.settingsConfig, source.id, "gpt-6.1-sol");
+    expect(screen.getByRole("button", { name: "Save order" })).toBeDisabled();
+    const user = userEvent.setup();
+    await user.selectOptions(effort, "xhigh");
+    await user.click(screen.getByRole("button", { name: "Save order" }));
+    await screen.findByText(/Saved the display order for 1 models/);
+    const saved = vi.mocked(providersApi.update).mock.calls[0][0];
+    expect(saved.id).toBe(plan.id);
+    expect(saved.settingsConfig.codexRouting.defaultReasoningEffort).toBe(
+      "xhigh",
+    );
+    expect(saved.settingsConfig.config).toBe(plan.settingsConfig.config);
+    expect(saved.settingsConfig.modelCatalog).toBeUndefined();
+    expect(JSON.stringify({ source, plan })).toBe(snapshot);
+    rendered.unmount();
+    renderWorkspace(elementFor([source, saved]));
+    await waitFor(() =>
+      expect(
+        screen.getByRole("combobox", { name: "Top model default effort" }),
+      ).toHaveValue("xhigh"),
+    );
+    expect(screen.getByRole("button", { name: "Save order" })).toBeDisabled();
+  });
+
+  it("saves Sol as the favorite with Extra high after moving it above Luna", async () => {
+    vi.mocked(
+      codexSubagentV2Api.resolveModelReasoningCapability,
+    ).mockImplementation(async (_settings, _provider, model) =>
+      ["gpt-5.6-luna", "gpt-6.1-sol"].includes(model)
+        ? modelReasoningResolution(model, ["low", "medium", "high", "xhigh"])
+        : modelReasoningResolution(model),
+    );
+    renderModelOrder({
+      models: [
+        { model: "gpt-5.6-luna-sublyx", upstreamModel: "gpt-5.6-luna" },
+        { model: "gpt-6.1-sol-sublyx", upstreamModel: "gpt-6.1-sol" },
+      ],
+      config:
+        'model = "gpt-5.6-luna-sublyx"\nmodel_reasoning_effort = "high"\n',
+    });
+    const user = userEvent.setup();
+    await user.click(
+      screen.getByRole("button", {
+        name: "Make gpt-6.1-sol-sublyx the favorite model",
+      }),
+    );
+    const effort = screen.getByRole("combobox", {
+      name: "Top model default effort",
+    });
+    await waitFor(() => expect(effort).toBeEnabled());
+    await user.selectOptions(effort, "xhigh");
+    await user.click(screen.getByRole("button", { name: "Save order" }));
+    await screen.findByText(/Saved the display order for 2 models/);
+    const saved = vi.mocked(providersApi.update).mock.calls[0][0];
+    expect(saved.settingsConfig.codexRouting).toMatchObject({
+      modelOrder: ["gpt-6.1-sol-sublyx", "gpt-5.6-luna-sublyx"],
+      defaultReasoningEffort: "xhigh",
+    });
+    expect(saved.settingsConfig.config).toBe('model = "gpt-6.1-sol-sublyx"\n');
+  });
+
+  it("ignores a stale Sol capability response after a different model becomes first", async () => {
+    const sol = createDeferred<CodexModelReasoningResolution>();
+    vi.mocked(
+      codexSubagentV2Api.resolveModelReasoningCapability,
+    ).mockImplementation(async (_settings, _provider, model) =>
+      model === "gpt-6.1-sol" ? sol.promise : modelReasoningResolution(model),
+    );
+    renderModelOrder({
+      models: [{ model: "gpt-6.1-sol" }, { model: "order-b" }],
+      routing: { defaultReasoningEffort: "xhigh" },
+    });
+    await waitFor(() =>
+      expect(
+        codexSubagentV2Api.resolveModelReasoningCapability,
+      ).toHaveBeenCalled(),
+    );
+    await userEvent.click(
+      screen.getByRole("button", {
+        name: "Make order-b the favorite model",
+      }),
+    );
+    await act(async () =>
+      sol.resolve(modelReasoningResolution("gpt-6.1-sol", ["medium", "xhigh"])),
+    );
+    const effort = screen.getByRole("combobox", {
+      name: "Top model default effort",
+    });
+    await waitFor(() => expect(effort).toHaveValue(""));
+    expect(effort).toBeDisabled();
+    expect(
+      within(effort).queryByRole("option", { name: "Extra high (xhigh)" }),
+    ).not.toBeInTheDocument();
+  });
+
+  it.each(["confirmed_unsupported", "boolean", "empty"] as const)(
+    "does not override an explicit %s declaration with inferred tiers",
+    async (kind) => {
+      const declared = {
+        ...reasoning(["low", "high"], "low"),
+        ...(kind === "confirmed_unsupported"
+          ? { supportStatus: "confirmed_unsupported" as const }
+          : kind === "boolean"
+            ? { controlKind: "boolean" as const }
+            : { supportedEfforts: [] }),
+      };
+      renderModelOrder({
+        models: [{ model: "gpt-6.1-sol", reasoning: declared }],
+      });
+      const effort = screen.getByRole("combobox", {
+        name: "Top model default effort",
+      });
+      expect(effort).toBeDisabled();
+      expect(effort).toHaveValue("");
+      expect(
+        codexSubagentV2Api.resolveModelReasoningCapability,
+      ).not.toHaveBeenCalled();
+    },
+  );
 
   it("clears an old preference when reordering to a model with unknown reasoning instead of inventing tiers", async () => {
     renderModelOrder({
@@ -1206,6 +1765,37 @@ describe("Model order presentation helpers", () => {
       recommendCodexCatalogModels(candidates, 2).map((model) => model.model),
     ).toEqual(["coding-6", "generic"]);
     expect(JSON.stringify(candidates)).toBe(snapshot);
+  });
+
+  it("prioritizes observed Codex requests over provider preference, cost and fallback suitability", () => {
+    const candidates = [
+      { model: "coding-6", providerName: "Preferred" },
+      {
+        model: "favorite-alias",
+        upstreamModel: "gpt-5.6",
+        providerName: "Other",
+      },
+      { model: "provider-popular", providerName: "Preferred" },
+    ];
+    const stat = (
+      model: string,
+      providerName: string,
+      requestCount: number,
+    ): ModelStats => ({
+      model,
+      providerName,
+      requestCount,
+      totalTokens: requestCount * 100,
+      totalCost: "0",
+      avgCostPerRequest: "0",
+    });
+    expect(
+      recommendCodexCatalogModels(candidates, 3, ["Preferred"], {
+        codex: [stat("gpt-5.6", "Other", 8)],
+        providers: [stat("provider-popular", "Preferred", 1000)],
+      }).map((model) => model.model),
+    ).toEqual(["favorite-alias", "provider-popular", "coding-6"]);
+    expect(recommendCodexCatalogModels(candidates, 0)).toEqual([]);
   });
 });
 
@@ -1551,6 +2141,163 @@ describe("Codex MultiRouter workspace route persistence helpers", () => {
       screen.getByText(/shared-model.*cannot be routed/i),
     ).toBeInTheDocument();
     expect(screen.queryByText(/Other Route/)).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "shared-model" }),
+    ).not.toBeInTheDocument();
+  });
+
+  it.each(["exact", "prefix", "alias"] as const)(
+    "rejects excluded models in %s previews and suggests only included models",
+    async (matchKind) => {
+      const source: Provider = {
+        id: "curated-preview-source",
+        name: "Curated Preview Source",
+        settingsConfig: {
+          model: "hidden-model",
+          modelCatalog: {
+            models: [
+              { model: "kept-model" },
+              { model: "hidden-model", enabled: false },
+            ],
+          },
+        },
+      };
+      const requestedModel =
+        matchKind === "alias" ? "hidden-alias" : "hidden-model";
+      const plan: Provider = {
+        id: "curated-preview-router",
+        name: "Curated Preview Router",
+        settingsConfig: {
+          codexRouting: {
+            schemaVersion: 2,
+            enabled: true,
+            routes: [
+              {
+                id: "curated-route",
+                enabled: true,
+                targetProviderId: source.id,
+                modelSelection: { mode: "all" },
+                match: {
+                  models:
+                    matchKind === "prefix"
+                      ? []
+                      : ["kept-model", requestedModel],
+                  prefixes: matchKind === "prefix" ? ["hidden-", "kept-"] : [],
+                },
+                ...(matchKind === "alias"
+                  ? { aliases: { "hidden-alias": "hidden-model" } }
+                  : {}),
+              },
+            ],
+          },
+        },
+      };
+      renderWorkspace(
+        React.createElement(CodexRouterWorkspacePage, {
+          providers: [source, plan],
+          activeProviderId: plan.id,
+          initialProviderId: plan.id,
+          initialTab: "test",
+          isProxyRunning: true,
+          isCodexTakeoverActive: true,
+          onEditProvider: vi.fn(),
+          onDeletePlan: vi.fn(),
+          onCreateProvider: vi.fn(),
+        }),
+      );
+      expect(screen.getByRole("button", { name: "kept-model" })).toBeVisible();
+      expect(
+        screen.queryByRole("button", { name: requestedModel }),
+      ).not.toBeInTheDocument();
+      const user = userEvent.setup();
+      await user.type(
+        screen.getByPlaceholderText(/gpt-5\.4-mini/),
+        requestedModel,
+      );
+      await user.click(screen.getByRole("button", { name: "Preview match" }));
+      expect(
+        screen.getByText(
+          `${requestedModel} cannot be routed: it did not match any enabled model rule in the current plan.`,
+        ),
+      ).toBeVisible();
+      expect(providersApi.update).not.toHaveBeenCalled();
+    },
+  );
+
+  it("does not revive excluded models through saved defaults, exact routes or aliases", () => {
+    const source: Provider = {
+      id: "curated-projection-source",
+      name: "Curated Projection Source",
+      settingsConfig: {
+        model: "hidden-model",
+        config: 'model = "hidden-model"',
+        modelCatalog: {
+          models: [
+            { model: "kept-model" },
+            { model: "hidden-model", enabled: false },
+          ],
+        },
+      },
+    };
+    const plan: Provider = {
+      id: "curated-projection-router",
+      name: "Curated Projection Router",
+      settingsConfig: {
+        codexRouting: {
+          schemaVersion: 2,
+          enabled: true,
+          spawnAgentModels: ["hidden-model", "hidden-alias", "kept-model"],
+          routes: [
+            {
+              id: "curated-route",
+              enabled: true,
+              targetProviderId: source.id,
+              modelSelection: { mode: "all" },
+              match: {
+                models: ["kept-model", "hidden-model", "hidden-alias"],
+                prefixes: ["hidden-"],
+              },
+              aliases: { "hidden-alias": "hidden-model" },
+            },
+          ],
+        },
+        modelCatalog: {
+          models: [{ model: "hidden-model" }, { model: "hidden-alias" }],
+        },
+      },
+    };
+    const projection = projectCodexModelCatalog(
+      plan,
+      new Map([[source.id, source]]),
+    );
+    expect(projection.models.map((model) => model.model)).toEqual([
+      "kept-model",
+    ]);
+    expect(projection.spawnAgentModels).toEqual(["kept-model"]);
+    expect(plan.settingsConfig.codexRouting.routes[0].match.models).toContain(
+      "hidden-model",
+    );
+
+    const allExcluded: Provider = {
+      ...source,
+      settingsConfig: {
+        ...source.settingsConfig,
+        modelCatalog: {
+          models: source.settingsConfig.modelCatalog.models.map(
+            (model: CodexCatalogModel) => ({
+              ...model,
+              enabled: false,
+            }),
+          ),
+        },
+      },
+    };
+    const emptyProjection = projectCodexModelCatalog(
+      plan,
+      new Map([[source.id, allExcluded]]),
+    );
+    expect(emptyProjection.models).toEqual([]);
+    expect(emptyProjection.spawnAgentModels).toEqual([]);
   });
 
   it("shows a readable warning instead of an active default-route control for legacy plans", async () => {
@@ -5099,11 +5846,14 @@ describe("Codex MultiRouter workspace route persistence helpers", () => {
       .setup()
       .click(screen.getByRole("button", { name: "Restore default" }));
 
-    await screen.findByText(/Removed the custom router order/);
+    await screen.findByText(/Restored newest-first model order/);
     expect(providersApi.update).toHaveBeenCalledTimes(1);
     const saved = vi.mocked(providersApi.update).mock.calls[0][0];
     expect(saved.id).toBe(routedPlan.id);
-    expect(saved.settingsConfig.codexRouting.modelOrder).toEqual([]);
+    expect(saved.settingsConfig.codexRouting.modelOrder).toEqual([
+      "model-a",
+      "model-b",
+    ]);
     expect(saved.settingsConfig.codexRouting.routes).toEqual(
       routedPlan.settingsConfig.codexRouting.routes,
     );
@@ -5188,6 +5938,48 @@ describe("Codex MultiRouter workspace route persistence helpers", () => {
         supportsImage: true,
       }),
     );
+  });
+
+  it("keeps newly discovered official models excluded when a curated inventory already exists", () => {
+    const source: Provider = {
+      id: "curated-official-refresh",
+      name: "Curated Official",
+      category: "official",
+      settingsConfig: {
+        auth: {},
+        config: "",
+        modelCatalog: {
+          models: [
+            { model: "kept-model" },
+            { model: "hidden-model", enabled: false },
+          ],
+          spawnAgentModels: ["hidden-model", "kept-model"],
+        },
+      },
+    };
+    const refreshed = providerWithFetchedModelCatalog(source, [
+      { id: "kept-model", ownedBy: null },
+      { id: "hidden-model", ownedBy: null },
+      { id: "new-model", ownedBy: null },
+    ]);
+    expect(refreshed.settingsConfig.modelCatalog.models).toEqual([
+      expect.objectContaining({ model: "kept-model" }),
+      expect.objectContaining({ model: "hidden-model", enabled: false }),
+      expect.objectContaining({ model: "new-model", enabled: false }),
+    ]);
+    expect(refreshed.settingsConfig.modelCatalog.spawnAgentModels).toEqual([
+      "kept-model",
+    ]);
+    const plan = withEnabledProviderRoute(
+      createDraftRoutingPlan([refreshed], [refreshed]),
+      refreshed,
+    );
+    expect(
+      projectCodexModelCatalog(
+        plan,
+        new Map([[refreshed.id, refreshed]]),
+      ).models.map((model) => model.model),
+    ).toEqual(["kept-model"]);
   });
 
   it("refreshes an aliased catalog row by its upstream identity", () => {

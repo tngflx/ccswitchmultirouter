@@ -1402,8 +1402,20 @@ pub fn run() {
                     .await
                     .map(|config| config.listen_port)
                     .unwrap_or(0);
-                crate::watchdog::spawn_supervisor(&crate::config::get_app_config_dir(), watchdog_port);
+                crate::watchdog::ensure_supervisor(
+                    &crate::config::get_app_config_dir(),
+                    watchdog_port,
+                );
 
+                if startup_recovery_classification.allows_proxy_startup() {
+                    // Codex must finish before the optional Desktop launch. Other
+                    // CLIs run in the background once that launch is reconciled.
+                    if let Err(error) =
+                        crate::commands::auto_update_tool_if_needed(&app_handle, "codex").await
+                    {
+                        log::warn!("Automatic Codex CLI update skipped or failed: {error}");
+                    }
+                }
                 crate::codex_egress_timezone::refresh_automatic_timezone_before_codex_launch()
                     .await;
                 match crate::codex_startup::launch_after_startup_reconciliation(
@@ -1422,6 +1434,13 @@ pub fn run() {
                     Err(error) => log::error!(
                         "Codex 启动门禁未通过，已阻止随 CCSwitchMulti 启动 Codex Desktop: {error}"
                     ),
+                }
+
+                if startup_recovery_classification.allows_proxy_startup() {
+                    let update_handle = app_handle.clone();
+                    tauri::async_runtime::spawn(async move {
+                        crate::commands::auto_update_other_clis_on_startup(update_handle).await;
+                    });
                 }
 
                 if let Err(error) = crate::codex_config_consistency::reconcile_after_startup(
@@ -1857,6 +1876,8 @@ pub fn run() {
             commands::purge_archived_sessions,
             commands::launch_session_terminal,
             commands::get_tool_versions,
+            commands::get_tool_auto_update_settings,
+            commands::set_tool_auto_update,
             commands::run_tool_lifecycle_action,
             commands::probe_tool_installations,
             // Provider terminal

@@ -70,6 +70,8 @@ import {
 } from "@/lib/protocol-lab/codex-overrides";
 import { resolveFetchedCodexModelContextWindow } from "@/utils/codexModelContext";
 import { reconcileFetchedCodexCatalogRows } from "@/lib/codexCatalogReconciliation";
+import { pruneOutdatedCodexCatalogModels } from "@/lib/codexCatalogVersionPruning";
+import { normalizeModelIdentityMetadata } from "@/lib/modelIdentities";
 import {
   buildCodexInputCapabilityReferenceMap,
   codexInputCapabilityPatch,
@@ -441,6 +443,7 @@ function createCatalogRow(seed?: Partial<CodexCatalogModel>): CodexCatalogRow {
   return {
     rowId: crypto.randomUUID(),
     model: seed?.model ?? "",
+    ...normalizeModelIdentityMetadata(seed ?? {}),
     upstreamModel: seed?.upstreamModel ?? seed?.upstream_model ?? "",
     displayName: seed?.displayName ?? "",
     contextWindow: seed?.contextWindow ?? "",
@@ -492,6 +495,11 @@ function catalogRowsMatchModels(
       | "model"
       | "upstreamModel"
       | "upstream_model"
+      | "canonicalSlug"
+      | "canonical_slug"
+      | "slug"
+      | "aliases"
+      | "name"
       | "displayName"
       | "contextWindow"
       | "supportsParallelToolCalls"
@@ -514,6 +522,8 @@ function catalogRowsMatchModels(
     const incoming = models[i];
     return (
       row.model === (incoming.model ?? "") &&
+      JSON.stringify(normalizeModelIdentityMetadata(row)) ===
+        JSON.stringify(normalizeModelIdentityMetadata(incoming)) &&
       catalogRowUpstreamModel(row) === catalogRowUpstreamModel(incoming) &&
       (row.displayName ?? "") === (incoming.displayName ?? "") &&
       String(row.contextWindow ?? "") ===
@@ -881,6 +891,10 @@ export function CodexFormFields({
       inputCapabilityReferences,
     ),
   );
+  const [selectedCatalogRowIds, setSelectedCatalogRowIds] = useState<
+    Set<string>
+  >(() => new Set());
+  const [revealedCatalogRowId, setRevealedCatalogRowId] = useState<string>();
   const apiKeyGroupsRef = useRef(apiKeyGroups);
   apiKeyGroupsRef.current = apiKeyGroups;
   const hasLegacyMixedProtocolCatalog = useMemo(() => {
@@ -905,9 +919,26 @@ export function CodexFormFields({
     () => catalogRows.map((row, index) => ({ row, index })),
     [catalogRows],
   );
+  const includedCatalogViewportItems = useMemo(
+    () => catalogViewportItems.filter(({ row }) => row.enabled !== false),
+    [catalogViewportItems],
+  );
+  const includedModelOptions = useMemo(
+    () =>
+      catalogRows.length > 0
+        ? catalogRows
+            .filter((row) => row.enabled !== false && row.model.trim())
+            .map((row) => ({ id: row.model, ownedBy: null }))
+        : fetchedModels,
+    [catalogRows, fetchedModels],
+  );
 
   const reasoningSettingsConfig = useMemo(
-    () => ({ modelCatalog: { models: catalogRows } }),
+    () => ({
+      modelCatalog: {
+        models: catalogRows.filter((row) => row.enabled !== false),
+      },
+    }),
     [catalogRows],
   );
   const reasoningDetectionProvider = useMemo<Provider>(
@@ -925,6 +956,7 @@ export function CodexFormFields({
   useEffect(() => {
     const visibleModelSet = new Set(visibleReasoningModels);
     const models = catalogRows
+      .filter((row) => row.enabled !== false)
       .map((row) => catalogRowUpstreamModel(row) || row.model.trim())
       .filter((model) => model && visibleModelSet.has(model));
     if (models.length === 0) {
@@ -996,11 +1028,19 @@ export function CodexFormFields({
   // 记录上次发送给父组件的数据，避免重复触发
   const lastSentModelsRef = useRef<CodexCatalogModel[]>(catalogModels);
   const catalogPropKeyRef = useRef(JSON.stringify(catalogModels));
-  const skipCatalogEchoRef = useRef(false);
+  const pendingCatalogSyncRef = useRef<CodexCatalogModel[] | null>(null);
 
   // 保留最新的模型映射行给异步刷新回调用，避免点击“获取模型列表”时合并到旧闭包里的 catalogRows。
   useEffect(() => {
     catalogRowsRef.current = catalogRows;
+  }, [catalogRows]);
+
+  useEffect(() => {
+    const validIds = new Set(catalogRows.map((row) => row.rowId));
+    setSelectedCatalogRowIds((current) => {
+      const next = new Set([...current].filter((id) => validIds.has(id)));
+      return next.size === current.size ? current : next;
+    });
   }, [catalogRows]);
 
   const buildReadinessIdentityFor = useCallback(
@@ -1158,20 +1198,18 @@ export function CodexFormFields({
     const isExternalCatalogChange =
       incomingCatalogKey !== catalogPropKeyRef.current;
     catalogPropKeyRef.current = incomingCatalogKey;
-
-    setCatalogRows((current) => {
-      // A local row edit intentionally diverges from the previous prop until
-      // the child -> parent effect emits it. Rebuilding here would erase that
-      // edit before it can cross the controlled boundary. Only a changed prop
-      // (preset switch / parent load) owns row reconstruction.
-      if (!isExternalCatalogChange) return current;
-      if (catalogRowsMatchModels(current, catalogModels)) return current;
-      skipCatalogEchoRef.current = true;
-      return hydrateCodexInputCapabilities(
+    if (isExternalCatalogChange) {
+      const syncedRows = hydrateCodexInputCapabilities(
         catalogModels.map((model) => createCatalogRow(model)),
         inputCapabilityReferences,
       );
-    });
+      // Gate stale echoes before React can defer the state updater. Compare
+      // against hydrated rows so normalization cannot permanently block edits.
+      pendingCatalogSyncRef.current = syncedRows;
+      setCatalogRows((current) =>
+        catalogRowsMatchModels(current, syncedRows) ? current : syncedRows,
+      );
+    }
     // 同步更新 ref，避免父组件传入新数据时子→父 effect 误判为本地修改
     lastSentModelsRef.current = catalogModels;
   }, [catalogModels, inputCapabilityReferences]);
@@ -1181,9 +1219,10 @@ export function CodexFormFields({
   useEffect(() => {
     if (!onCatalogModelsChange) return;
     // 外部 catalog 同步进来时先等本地 rowId 重建完成，再允许子组件回写。
-    if (skipCatalogEchoRef.current) {
-      if (!catalogRowsMatchModels(catalogRows, catalogModels)) return;
-      skipCatalogEchoRef.current = false;
+    if (pendingCatalogSyncRef.current) {
+      if (!catalogRowsMatchModels(catalogRows, pendingCatalogSyncRef.current))
+        return;
+      pendingCatalogSyncRef.current = null;
     }
     const next: CodexCatalogModel[] = catalogRows.map(
       ({ rowId: _rowId, ...rest }) => rest,
@@ -1589,8 +1628,23 @@ export function CodexFormFields({
 
   const handleAddCatalogRow = useCallback(() => {
     if (!onCatalogModelsChange) return;
-    setCatalogRows((current) => [...current, createCatalogRow()]);
+    const row = createCatalogRow();
+    setCatalogRows((current) => [...current, row]);
+    setRevealedCatalogRowId(row.rowId);
   }, [onCatalogModelsChange]);
+
+  const handlePruneOutdatedCatalogRows = useCallback(() => {
+    const result = pruneOutdatedCodexCatalogModels(catalogRows);
+    if (!result.pruned.length) {
+      toast.info(t("catalogBrowser.noOutdated"));
+      return;
+    }
+    const prunedIds = new Set(result.pruned.map((row) => row.rowId));
+    setCatalogRows((current) =>
+      current.filter((row) => !prunedIds.has(row.rowId)),
+    );
+    toast.success(t("catalogBrowser.pruned", { count: result.pruned.length }));
+  }, [catalogRows, t]);
 
   const handleUpdateCatalogRow = useCallback(
     (index: number, patch: Partial<CodexCatalogModel>) => {
@@ -1936,9 +1990,9 @@ export function CodexFormFields({
                 defaultValue: "Example: gpt-5.6",
               })}
             />
-            {fetchedModels.length > 0 && (
+            {includedModelOptions.length > 0 && (
               <ModelDropdown
-                models={fetchedModels}
+                models={includedModelOptions}
                 onSelect={(id) => onModelChange(id)}
               />
             )}
@@ -2032,16 +2086,17 @@ export function CodexFormFields({
             </p>
           </div>
 
-          {catalogRows.length === 0 ? (
+          {includedCatalogViewportItems.length === 0 ? (
             <p className="rounded-md border border-dashed p-3 text-xs text-muted-foreground">
-              No models yet. Sync models above or add one in the model catalog
-              details under Advanced settings.
+              {t("catalogBrowser.noIncludedModels", {
+                defaultValue: "No included models",
+              })}
             </p>
           ) : (
             <div className="space-y-3">
               <CodexCatalogViewport
-                items={catalogViewportItems}
-                compact={catalogRows.length > 20}
+                items={includedCatalogViewportItems}
+                compact={includedCatalogViewportItems.length > 20}
                 selected={new Set()}
                 onSelect={() => undefined}
                 showSelection={false}
@@ -2662,47 +2717,20 @@ export function CodexFormFields({
 
                 {catalogRows.length > 0 && (
                   <div className="space-y-2">
-                    {/* 列头：md+ 显示 */}
-                    <div className="hidden grid-cols-[88px_1fr_1fr_1fr_132px_150px_76px_36px] gap-2 px-1 text-xs font-medium text-muted-foreground md:grid">
-                      <span>
-                        {t("codexConfig.keepCatalogModelColumn", {
-                          defaultValue: "Keep",
-                        })}
-                      </span>
-                      <span>
-                        {t("codexConfig.catalogColumnDisplay", {
-                          defaultValue: "Menu display name",
-                        })}
-                      </span>
-                      <span>
-                        {t("codexConfig.catalogColumnModel", {
-                          defaultValue: "Candidate model name",
-                        })}
-                      </span>
-                      <span>
-                        {t("codexConfig.catalogColumnUpstreamModel", {
-                          defaultValue: "Upstream model name",
-                        })}
-                      </span>
-                      <span>
-                        {t("codexConfig.catalogColumnContext", {
-                          defaultValue: "Context window",
-                        })}
-                      </span>
-                      <span>Protocol override</span>
-                      <span>
-                        {t("codexConfig.catalogOrderColumn", {
-                          defaultValue: "Order",
-                        })}
-                      </span>
-                      <span />
-                    </div>
-
                     <CodexCatalogViewport
                       items={catalogViewportItems}
                       compact={catalogRows.length > 20}
-                      selected={new Set()}
-                      onSelect={() => undefined}
+                      revealRowId={revealedCatalogRowId}
+                      selected={selectedCatalogRowIds}
+                      onSelectionChange={setSelectedCatalogRowIds}
+                      onSelect={(rowId, checked) =>
+                        setSelectedCatalogRowIds((current) => {
+                          const next = new Set(current);
+                          if (checked) next.add(rowId);
+                          else next.delete(rowId);
+                          return next;
+                        })
+                      }
                       onToggleEnabled={(rowId, enabled) => {
                         const index = catalogRows.findIndex(
                           (row) => row.rowId === rowId,
@@ -2711,6 +2739,30 @@ export function CodexFormFields({
                           handleUpdateCatalogRow(index, { enabled });
                         }
                       }}
+                      onSetIncluded={(ids, enabled) => {
+                        const matched = new Set(ids);
+                        setCatalogRows((current) =>
+                          current.map((row) =>
+                            matched.has(row.rowId) ? { ...row, enabled } : row,
+                          ),
+                        );
+                      }}
+                      onUseOnlySelected={(ids) => {
+                        const selected = new Set(ids);
+                        setCatalogRows((current) =>
+                          current.map((row) => ({
+                            ...row,
+                            enabled: selected.has(row.rowId),
+                          })),
+                        );
+                      }}
+                      onRemoveSelected={(ids) => {
+                        const selected = new Set(ids);
+                        setCatalogRows((current) =>
+                          current.filter((row) => !selected.has(row.rowId)),
+                        );
+                      }}
+                      onPruneOutdated={handlePruneOutdatedCatalogRows}
                     >
                       {({ row, index }) => {
                         const model = row.model.trim();
@@ -2734,69 +2786,74 @@ export function CodexFormFields({
                         return (
                           <div
                             key={row.rowId}
-                            className="grid grid-cols-1 gap-2 rounded-md border border-transparent p-1 md:grid-cols-[88px_1fr_1fr_1fr_132px_150px_76px_36px]"
+                            className="grid min-w-0 grid-cols-1 gap-3 sm:grid-cols-2 xl:grid-cols-3"
                           >
-                            <label className="flex h-9 items-center gap-2 text-xs text-muted-foreground">
-                              <input
-                                type="checkbox"
-                                className="h-4 w-4 rounded border-border-default"
-                                checked
-                                onChange={(event) => {
-                                  if (!event.target.checked) {
-                                    handleRemoveCatalogRow(index);
-                                  }
-                                }}
-                                aria-label={t("codexConfig.keepCatalogModel", {
-                                  model: row.model || row.displayName || "",
-                                  defaultValue: `Keep ${row.model || row.displayName || "this model"}`,
-                                })}
-                              />
-                              <span className="md:hidden">
-                                {t("codexConfig.keepCatalogModelColumn", {
-                                  defaultValue: "Keep",
+                            <label className="min-w-0 space-y-1 text-xs">
+                              <span className="text-muted-foreground">
+                                {t("codexConfig.catalogColumnDisplay", {
+                                  defaultValue: "Menu display name",
                                 })}
                               </span>
+                              <Input
+                                value={row.displayName ?? ""}
+                                onChange={(event) =>
+                                  handleUpdateCatalogRow(index, {
+                                    displayName: event.target.value,
+                                  })
+                                }
+                                placeholder={t(
+                                  "codexConfig.catalogDisplayNamePlaceholder",
+                                  {
+                                    defaultValue: "Example: DeepSeek V4 Flash",
+                                  },
+                                )}
+                                aria-label={t(
+                                  "codexConfig.catalogColumnDisplay",
+                                  {
+                                    defaultValue: "Menu display name",
+                                  },
+                                )}
+                              />
                             </label>
-                            <Input
-                              value={row.displayName ?? ""}
-                              onChange={(event) =>
-                                handleUpdateCatalogRow(index, {
-                                  displayName: event.target.value,
-                                })
-                              }
-                              placeholder={t(
-                                "codexConfig.catalogDisplayNamePlaceholder",
-                                {
-                                  defaultValue: "Example: DeepSeek V4 Flash",
-                                },
-                              )}
-                              aria-label={t(
-                                "codexConfig.catalogColumnDisplay",
-                                {
-                                  defaultValue: "Menu display name",
-                                },
-                              )}
-                            />
-                            <Input
-                              value={row.model}
-                              onChange={(event) =>
-                                handleUpdateCatalogRow(index, {
-                                  model: event.target.value,
-                                })
-                              }
-                              placeholder={t(
-                                "codexConfig.catalogModelPlaceholder",
-                                {
-                                  defaultValue: "Example: gpt-5.5-thirdparty",
-                                },
-                              )}
-                              aria-label={t("codexConfig.catalogColumnModel", {
-                                defaultValue: "Candidate model name",
-                              })}
-                            />
-                            <div className="space-y-1">
+                            <label className="min-w-0 space-y-1 text-xs">
+                              <span className="text-muted-foreground">
+                                {t("codexConfig.catalogColumnModel", {
+                                  defaultValue: "Candidate model name",
+                                })}
+                              </span>
+                              <Input
+                                value={row.model}
+                                onChange={(event) =>
+                                  handleUpdateCatalogRow(index, {
+                                    model: event.target.value,
+                                  })
+                                }
+                                placeholder={t(
+                                  "codexConfig.catalogModelPlaceholder",
+                                  {
+                                    defaultValue: "Example: gpt-5.5-thirdparty",
+                                  },
+                                )}
+                                aria-label={t(
+                                  "codexConfig.catalogColumnModel",
+                                  {
+                                    defaultValue: "Candidate model name",
+                                  },
+                                )}
+                              />
+                            </label>
+                            <div className="min-w-0 space-y-1">
+                              <label
+                                className="text-xs text-muted-foreground"
+                                htmlFor={`catalog-upstream-${row.rowId}`}
+                              >
+                                {t("codexConfig.catalogColumnUpstreamModel", {
+                                  defaultValue: "Upstream model name",
+                                })}
+                              </label>
                               <div className="flex gap-1">
                                 <Input
+                                  id={`catalog-upstream-${row.rowId}`}
                                   value={
                                     row.upstreamModel ??
                                     row.upstream_model ??
@@ -2820,7 +2877,7 @@ export function CodexFormFields({
                                       defaultValue: "Upstream model name",
                                     },
                                   )}
-                                  className="flex-1"
+                                  className="min-w-0 flex-1"
                                 />
                                 {fetchedModels.length > 0 && (
                                   <ModelDropdown
@@ -2837,99 +2894,129 @@ export function CodexFormFields({
                                 )}
                               </div>
                             </div>
-                            <Input
-                              type="number"
-                              min={1}
-                              inputMode="numeric"
-                              value={row.contextWindow ?? ""}
-                              onChange={(event) =>
-                                handleUpdateCatalogRow(index, {
-                                  contextWindow: event.target.value.replace(
-                                    /[^\d]/g,
-                                    "",
-                                  ),
-                                })
-                              }
-                              placeholder={t(
-                                "codexConfig.contextWindowPlaceholder",
-                                {
-                                  defaultValue: "Example: 128000",
-                                },
-                              )}
-                              aria-label={t(
-                                "codexConfig.catalogColumnContext",
-                                {
+                            <label className="min-w-0 space-y-1 text-xs">
+                              <span className="text-muted-foreground">
+                                {t("codexConfig.catalogColumnContext", {
                                   defaultValue: "Context window",
-                                },
-                              )}
-                            />
-                            <select
-                              className="h-9 rounded-md border border-border-default bg-background px-2 text-xs text-foreground"
-                              aria-label={`${model || "Model"} protocol selection`}
-                              value={
-                                protocolOverrides[
-                                  normalizeCodexPublicModelKey(model)
-                                ] ?? "follow_auto"
-                              }
-                              onChange={(event) =>
-                                onProtocolOverridesChange(
-                                  setCodexProtocolOverride(
-                                    protocolOverrides,
-                                    model,
-                                    event.target
-                                      .value as CodexProtocolChoiceInput,
-                                  ),
-                                )
-                              }
-                            >
-                              <option value="follow_auto">
-                                Follow automatic selection
-                              </option>
-                              <option value="openai_responses">
-                                Responses
-                              </option>
-                              <option value="openai_chat">Chat</option>
-                            </select>
-                            <div className="flex h-9 items-center gap-1">
-                              <Button
-                                type="button"
-                                variant="ghost"
-                                size="icon"
-                                className="h-8 w-8 text-muted-foreground"
-                                disabled={index <= 0}
-                                onClick={() => handleMoveCatalogRow(index, -1)}
-                                title={t("common.moveUp", {
-                                  defaultValue: "Move up",
                                 })}
+                              </span>
+                              <Input
+                                type="number"
+                                min={1}
+                                inputMode="numeric"
+                                value={row.contextWindow ?? ""}
+                                onChange={(event) =>
+                                  handleUpdateCatalogRow(index, {
+                                    contextWindow: event.target.value.replace(
+                                      /[^\d]/g,
+                                      "",
+                                    ),
+                                  })
+                                }
+                                placeholder={t(
+                                  "codexConfig.contextWindowPlaceholder",
+                                  {
+                                    defaultValue: "Example: 128000",
+                                  },
+                                )}
+                                aria-label={t(
+                                  "codexConfig.catalogColumnContext",
+                                  {
+                                    defaultValue: "Context window",
+                                  },
+                                )}
+                              />
+                            </label>
+                            <label className="min-w-0 space-y-1 text-xs">
+                              <span className="text-muted-foreground">
+                                {t("catalogBrowser.protocolOverride")}
+                              </span>
+                              <select
+                                className="h-9 w-full min-w-0 rounded-md border border-border-default bg-background px-2 text-xs text-foreground"
+                                aria-label={`${model || "Model"} protocol selection`}
+                                value={
+                                  protocolOverrides[
+                                    normalizeCodexPublicModelKey(model)
+                                  ] ?? "follow_auto"
+                                }
+                                onChange={(event) =>
+                                  onProtocolOverridesChange(
+                                    setCodexProtocolOverride(
+                                      protocolOverrides,
+                                      model,
+                                      event.target
+                                        .value as CodexProtocolChoiceInput,
+                                    ),
+                                  )
+                                }
                               >
-                                <ArrowUp className="h-4 w-4" />
-                              </Button>
-                              <Button
-                                type="button"
-                                variant="ghost"
-                                size="icon"
-                                className="h-8 w-8 text-muted-foreground"
-                                disabled={index >= catalogRows.length - 1}
-                                onClick={() => handleMoveCatalogRow(index, 1)}
-                                title={t("common.moveDown", {
-                                  defaultValue: "Move down",
+                                <option value="follow_auto">
+                                  Follow automatic selection
+                                </option>
+                                <option value="openai_responses">
+                                  Responses
+                                </option>
+                                <option value="openai_chat">Chat</option>
+                              </select>
+                            </label>
+                            <div className="flex flex-col justify-end gap-1">
+                              <span className="text-xs text-muted-foreground">
+                                {t("codexConfig.catalogOrderColumn", {
+                                  defaultValue: "Order",
                                 })}
-                              >
-                                <ArrowDown className="h-4 w-4" />
-                              </Button>
+                              </span>
+                              <div className="flex h-9 items-center gap-1">
+                                <Button
+                                  type="button"
+                                  variant="ghost"
+                                  size="icon"
+                                  className="h-8 w-8 text-muted-foreground"
+                                  disabled={index <= 0}
+                                  onClick={() =>
+                                    handleMoveCatalogRow(index, -1)
+                                  }
+                                  title={t("common.moveUp", {
+                                    defaultValue: "Move up",
+                                  })}
+                                  aria-label={t("catalogBrowser.moveUp", {
+                                    model: row.model,
+                                  })}
+                                >
+                                  <ArrowUp className="h-4 w-4" />
+                                </Button>
+                                <Button
+                                  type="button"
+                                  variant="ghost"
+                                  size="icon"
+                                  className="h-8 w-8 text-muted-foreground"
+                                  disabled={index >= catalogRows.length - 1}
+                                  onClick={() => handleMoveCatalogRow(index, 1)}
+                                  title={t("common.moveDown", {
+                                    defaultValue: "Move down",
+                                  })}
+                                  aria-label={t("catalogBrowser.moveDown", {
+                                    model: row.model,
+                                  })}
+                                >
+                                  <ArrowDown className="h-4 w-4" />
+                                </Button>
+                                <Button
+                                  type="button"
+                                  variant="ghost"
+                                  size="icon"
+                                  className="h-9 w-9 text-muted-foreground hover:text-destructive"
+                                  onClick={() => handleRemoveCatalogRow(index)}
+                                  title={t("common.delete", {
+                                    defaultValue: "Delete",
+                                  })}
+                                  aria-label={t("catalogBrowser.removeModel", {
+                                    model: row.model,
+                                  })}
+                                >
+                                  <Trash2 className="h-4 w-4" />
+                                </Button>
+                              </div>
                             </div>
-                            <Button
-                              type="button"
-                              variant="ghost"
-                              size="icon"
-                              className="h-9 w-9 text-muted-foreground hover:text-destructive"
-                              onClick={() => handleRemoveCatalogRow(index)}
-                              title={t("common.delete", {
-                                defaultValue: "Delete",
-                              })}
-                            >
-                              <Trash2 className="h-4 w-4" />
-                            </Button>
                             <fieldset
                               className="col-span-full flex flex-wrap items-center gap-2 border-t border-border-default pt-2 text-xs"
                               aria-label={`${model || "Model"} Input capability`}

@@ -6,6 +6,7 @@ use super::schema::{CodexRouteAuthSource, CodexRoutingDocument};
 use crate::database::Database;
 use crate::error::AppError;
 use crate::provider::Provider;
+use crate::proxy::json_canonical::short_value_hash;
 use chrono::{SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
@@ -297,9 +298,10 @@ pub(crate) fn build_projection_artifact(
         .iter()
         .map(|(id, provider)| (id.clone(), provider.name.clone()))
         .collect();
+    let dependency_fingerprint = projection_dependency_fingerprint(&router, &compiled);
     Ok(CodexRoutingProjectionArtifact {
         router_provider_id: router.id,
-        dependency_fingerprint: compiled.dependency_fingerprint.clone(),
+        dependency_fingerprint,
         projection_settings,
         compiled,
         target_provider_names,
@@ -348,6 +350,17 @@ pub(crate) fn effective_settings_for_candidate_with_providers(
     Ok(projection_settings(candidate, &compiled, &plan))
 }
 
+fn projection_dependency_fingerprint(
+    router: &Provider,
+    compiled: &CompiledCodexRoutingPlan,
+) -> String {
+    short_value_hash(Some(&json!({
+        "routing": compiled.dependency_fingerprint,
+        "webSearchEnabled": router.settings_config.pointer("/hostedTools/webSearch/enabled")
+            .and_then(Value::as_bool).unwrap_or(true)
+    })))
+}
+
 fn projection_settings(
     router: &Provider,
     compiled: &CompiledCodexRoutingPlan,
@@ -362,7 +375,7 @@ fn projection_settings(
             .and_then(Value::as_str).unwrap_or("provider-model")
     });
     settings["codexRoutingProjection"] = json!({
-        "dependencyFingerprint": compiled.dependency_fingerprint
+        "dependencyFingerprint": projection_dependency_fingerprint(router, compiled)
     });
     if let Some(effort) = supported_router_default_effort(plan, &compiled.model_catalog) {
         settings["modelCatalog"]["defaultReasoningEffort"] = json!(effort);
@@ -654,6 +667,35 @@ mod tests {
         assert_eq!(changed.state, ProjectionState::Ready);
         assert_ne!(changed.dependency_fingerprint, first.dependency_fingerprint);
         assert_eq!(calls.get(), 2);
+    }
+
+    #[test]
+    fn saved_search_toggle_invalidates_projection_cache_only_when_mode_changes() {
+        let db = Database::memory().expect("memory db");
+        save_fixture(&db, "openai_responses");
+        let calls = Cell::new(0);
+        for (enabled, expected_calls) in [
+            (None, 1),
+            (Some(true), 1),
+            (Some(false), 2),
+            (Some(false), 2),
+            (Some(true), 3),
+        ] {
+            let mut router = router();
+            if let Some(enabled) = enabled {
+                router.settings_config["hostedTools"] = json!({"webSearch": {"enabled": enabled}});
+            }
+            db.save_provider("codex", &router).expect("save toggle");
+            let status = ensure_projection_with_publisher(&db, &router.id, false, |artifact| {
+                calls.set(calls.get() + 1);
+                Ok(ProjectionReadBack::verified(
+                    artifact.dependency_fingerprint.clone(),
+                ))
+            })
+            .expect("project search mode");
+            assert_eq!(status.state, ProjectionState::Ready);
+            assert_eq!(calls.get(), expected_calls);
+        }
     }
 
     #[test]

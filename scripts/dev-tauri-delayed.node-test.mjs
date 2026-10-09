@@ -354,6 +354,16 @@ test("undefined watcher filenames are ignored instead of becoming fake edits", (
     resolveRepoRootBackendInput("rust-toolchain.toml"),
     path.join("..", "rust-toolchain.toml"),
   );
+  assert.equal(
+    resolveRepoRootBackendInput(
+      path.join("contracts", "openai-responses.v1.json"),
+    ),
+    path.join("..", "contracts", "openai-responses.v1.json"),
+  );
+  assert.equal(
+    resolveRepoRootBackendInput(path.join("contracts", "README.md")),
+    null,
+  );
 });
 
 test("backend build baseline includes the repository Rust toolchain file", () => {
@@ -361,6 +371,10 @@ test("backend build baseline includes the repository Rust toolchain file", () =>
     snapshotBackendFileFingerprints().map(([trackedPath]) => trackedPath),
   );
   assert.equal(trackedPaths.has(path.join("..", "rust-toolchain.toml")), true);
+  assert.equal(
+    trackedPaths.has(path.join("..", "contracts", "openai-responses.v1.json")),
+    true,
+  );
 });
 
 test("backend rebuild gate recovers from a failed build and later edits", async () => {

@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   normalizeSpawnAgentCandidateSelection,
   readCodexModelCatalog,
+  readIncludedCodexModelCatalog,
   reorderSpawnAgentCandidates,
   validateSpawnAgentCandidates,
   type CodexCatalogModel,
@@ -27,6 +28,28 @@ function providerWithModelCatalog(modelCatalog: unknown): Provider {
 }
 
 describe("codexSpawnAgentCandidates", () => {
+  it("retains excluded inventory for editors but never offers it to model or agent pickers", () => {
+    const provider = providerWithModelCatalog({
+      models: [{ model: "kept" }, { model: "hidden", enabled: false }],
+      spawnAgentModels: ["hidden", "kept"],
+    });
+    const raw = readCodexModelCatalog(provider);
+    expect(raw.models).toHaveLength(2);
+    expect(raw.spawnAgentModels).toEqual(["kept"]);
+    expect(readIncludedCodexModelCatalog(provider).models).toEqual([
+      { model: "kept" },
+    ]);
+    expect(
+      normalizeSpawnAgentCandidateSelection(["hidden", "kept"], raw.models),
+    ).toEqual(["kept"]);
+    expect(
+      validateSpawnAgentCandidates(
+        { ...raw, spawnAgentModels: ["hidden", "kept"] },
+        ["kept"],
+        ["hidden"],
+      ),
+    ).toMatchObject({ missingSelectedModels: [], missingPriorityModels: [] });
+  });
   it("读取 camelCase 子 Agent 候选并限制为前五个", () => {
     const provider = providerWithModelCatalog({
       models: catalogModels,

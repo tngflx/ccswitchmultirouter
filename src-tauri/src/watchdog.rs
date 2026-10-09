@@ -16,6 +16,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 pub const SUPERVISE_FLAG: &str = "--ccsm-supervise";
 pub const SUPERVISE_CONFIG_FLAG: &str = "--ccsm-supervise-config";
 pub const SUPERVISE_PORT_FLAG: &str = "--ccsm-supervise-port";
+pub const SUPERVISE_SETTINGS_FLAG: &str = "--ccsm-supervise-settings";
 
 const POLL_INTERVAL: Duration = Duration::from_secs(5);
 const READY_TIMEOUT: Duration = Duration::from_secs(90);
@@ -30,6 +31,7 @@ const WATCHDOG_STATE_FILE: &str = "watchdog-state.json";
 pub struct SuperviseArgs {
     pub parent_pid: u32,
     pub config_dir: Option<String>,
+    pub settings_path: Option<String>,
     pub port: u16,
 }
 
@@ -50,12 +52,14 @@ pub fn parse_supervise_args(args: &[String]) -> Option<SuperviseArgs> {
         .get(position + 1)
         .and_then(|value| value.parse::<u32>().ok())?;
     let config_dir = flag_value(args, SUPERVISE_CONFIG_FLAG);
+    let settings_path = flag_value(args, SUPERVISE_SETTINGS_FLAG);
     let port = flag_value(args, SUPERVISE_PORT_FLAG)
         .and_then(|value| value.parse::<u16>().ok())
         .unwrap_or(0);
     Some(SuperviseArgs {
         parent_pid,
         config_dir,
+        settings_path,
         port,
     })
 }
@@ -170,8 +174,78 @@ pub fn current_executable() -> Option<PathBuf> {
     std::env::current_exe().ok()
 }
 
-/// 由主进程调用：按设置决定是否拉起守护进程。
-pub fn spawn_supervisor(config_dir: &Path, port: u16) {
+/// Read the persisted watchdog setting without using the supervisor process's
+/// cached settings store. The settings writer uses camelCase JSON, but accepting
+/// the legacy snake_case spelling keeps older files safe to interpret.
+fn read_watchdog_enabled(settings_path: Option<&Path>) -> Result<bool, String> {
+    let Some(settings_path) = settings_path else {
+        return Ok(true);
+    };
+    let content = match std::fs::read_to_string(settings_path) {
+        Ok(content) => content,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(true),
+        Err(error) => return Err(format!("读取看门狗设置失败: {error}")),
+    };
+    let value = serde_json::from_str::<serde_json::Value>(&content)
+        .map_err(|error| format!("解析看门狗设置失败: {error}"))?;
+    value
+        .get("watchdogEnabled")
+        .or_else(|| value.get("watchdog_enabled"))
+        .and_then(serde_json::Value::as_bool)
+        .map(Ok)
+        .unwrap_or(Ok(true))
+}
+
+fn settings_path() -> Option<PathBuf> {
+    crate::settings::AppSettings::settings_path()
+}
+
+fn supervisor_identity_from_event(
+    config_dir: &Path,
+    parent_pid: u32,
+) -> Option<crate::process_identity::ProcessIdentity> {
+    let record = recent_events(config_dir, 64).into_iter().find(|record| {
+        if record.event != "supervisor-spawned" {
+            return false;
+        }
+        record
+            .detail
+            .get("parentPid")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|value| u32::try_from(value).ok())
+            == Some(parent_pid)
+    })?;
+    let detail = record.detail;
+    let supervisor_pid = detail
+        .get("supervisorPid")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|value| u32::try_from(value).ok())?;
+    let observed = crate::process_identity::process_identity(supervisor_pid)?;
+    if !crate::process_identity::executable_matches_current(&observed.executable_path) {
+        return None;
+    }
+    if let Some(started_at_ticks) = detail
+        .get("startedAtTicks")
+        .and_then(serde_json::Value::as_u64)
+    {
+        if started_at_ticks != observed.started_at_ticks {
+            return None;
+        }
+    }
+    Some(observed)
+}
+
+/// Return the currently live supervisor only when its PID still refers to the
+/// same executable identity recorded at spawn time.
+pub(crate) fn live_supervisor_identity(
+    config_dir: &Path,
+    parent_pid: u32,
+) -> Option<crate::process_identity::ProcessIdentity> {
+    supervisor_identity_from_event(config_dir, parent_pid)
+}
+
+/// Idempotently ensure one supervisor exists for the current app process.
+pub fn ensure_supervisor(config_dir: &Path, port: u16) {
     if crate::lightweight::is_lightweight_mode() {
         return;
     }
@@ -180,17 +254,26 @@ pub fn spawn_supervisor(config_dir: &Path, port: u16) {
         log::debug!("内置看门狗已关闭，跳过 supervisor 启动");
         return;
     }
+    let parent_pid = std::process::id();
+    if let Some(identity) = live_supervisor_identity(config_dir, parent_pid) {
+        log::debug!(
+            "内置看门狗已在运行: supervisorPid={} parentPid={parent_pid}",
+            identity.pid
+        );
+        return;
+    }
     let Some(executable) = current_executable() else {
         log::warn!("无法解析当前可执行文件路径，跳过 supervisor 启动");
         return;
     };
-    let parent_pid = std::process::id();
     let mut command = std::process::Command::new(&executable);
     command
         .arg(SUPERVISE_FLAG)
         .arg(parent_pid.to_string())
         .arg(SUPERVISE_CONFIG_FLAG)
         .arg(config_dir)
+        .arg(SUPERVISE_SETTINGS_FLAG)
+        .arg(settings_path().unwrap_or_else(|| config_dir.join("settings.json")))
         .arg(SUPERVISE_PORT_FLAG)
         .arg(port.to_string())
         .stdin(std::process::Stdio::null())
@@ -209,6 +292,8 @@ pub fn spawn_supervisor(config_dir: &Path, port: u16) {
     }
     match command.spawn() {
         Ok(child) => {
+            let started_at_ticks = crate::process_identity::process_identity(child.id())
+                .map(|identity| identity.started_at_ticks);
             append_event(
                 config_dir,
                 "info",
@@ -218,6 +303,7 @@ pub fn spawn_supervisor(config_dir: &Path, port: u16) {
                     "parentPid": parent_pid,
                     "port": port,
                     "executable": executable.to_string_lossy(),
+                    "startedAtTicks": started_at_ticks,
                 }),
             );
             log::info!(
@@ -237,6 +323,12 @@ pub fn spawn_supervisor(config_dir: &Path, port: u16) {
     }
 }
 
+/// Backwards-compatible startup entry point for callers outside the settings
+/// command. New callers should use `ensure_supervisor`.
+pub fn spawn_supervisor(config_dir: &Path, port: u16) {
+    ensure_supervisor(config_dir, port);
+}
+
 /// 守护进程入口：盯住主进程，必要时把它拉起来，然后退出。
 pub fn run_supervisor(args: SuperviseArgs) -> ! {
     let config_dir = args
@@ -244,11 +336,17 @@ pub fn run_supervisor(args: SuperviseArgs) -> ! {
         .clone()
         .map(PathBuf::from)
         .unwrap_or_else(crate::config::get_app_config_dir);
+    let settings_path = args.settings_path.map(PathBuf::from).or_else(settings_path);
+    let settings_path = settings_path.as_deref();
     append_event(
         &config_dir,
         "info",
         "supervisor-started",
-        serde_json::json!({ "parentPid": args.parent_pid, "port": args.port }),
+        serde_json::json!({
+            "parentPid": args.parent_pid,
+            "port": args.port,
+            "settingsPath": settings_path.map(|path| path.to_string_lossy().to_string()),
+        }),
     );
 
     let expected = crate::process_identity::process_identity(args.parent_pid);
@@ -266,7 +364,33 @@ pub fn run_supervisor(args: SuperviseArgs) -> ! {
     }
 
     let mut unhealthy_logged = false;
+    let mut setting_read_error_logged = false;
     loop {
+        match read_watchdog_enabled(settings_path) {
+            Ok(true) => {
+                setting_read_error_logged = false;
+            }
+            Ok(false) => {
+                append_event(
+                    &config_dir,
+                    "info",
+                    "supervisor-disabled",
+                    serde_json::json!({ "parentPid": args.parent_pid }),
+                );
+                std::process::exit(0);
+            }
+            Err(error) => {
+                if !setting_read_error_logged {
+                    setting_read_error_logged = true;
+                    append_event(
+                        &config_dir,
+                        "warning",
+                        "supervisor-settings-unreadable",
+                        serde_json::json!({ "parentPid": args.parent_pid, "error": error }),
+                    );
+                }
+            }
+        }
         let current = crate::process_identity::process_identity(args.parent_pid);
         let still_running = match (expected.as_ref(), current.as_ref()) {
             (Some(expected), Some(current)) => expected.matches(current),
@@ -292,6 +416,32 @@ pub fn run_supervisor(args: SuperviseArgs) -> ! {
             continue;
         }
         break;
+    }
+
+    match read_watchdog_enabled(settings_path) {
+        Ok(true) => {}
+        Ok(false) => {
+            append_event(
+                &config_dir,
+                "info",
+                "supervisor-disabled",
+                serde_json::json!({ "parentPid": args.parent_pid }),
+            );
+            std::process::exit(0);
+        }
+        Err(error) => {
+            append_event(
+                &config_dir,
+                "error",
+                "supervisor-restart-skipped",
+                serde_json::json!({
+                    "parentPid": args.parent_pid,
+                    "error": error,
+                    "reason": "watchdog setting could not be verified",
+                }),
+            );
+            std::process::exit(0);
+        }
     }
 
     let marker = read_run_marker(&config_dir);
@@ -490,12 +640,18 @@ mod tests {
             "4242",
             SUPERVISE_CONFIG_FLAG,
             "C:/cfg",
+            SUPERVISE_SETTINGS_FLAG,
+            "C:/cfg/settings.json",
             SUPERVISE_PORT_FLAG,
             "15721",
         ]))
         .expect("parsed");
         assert_eq!(parsed.parent_pid, 4242);
         assert_eq!(parsed.config_dir.as_deref(), Some("C:/cfg"));
+        assert_eq!(
+            parsed.settings_path.as_deref(),
+            Some("C:/cfg/settings.json")
+        );
         assert_eq!(parsed.port, 15721);
     }
 
@@ -514,6 +670,59 @@ mod tests {
             classify_parent_outcome(Some(r#"{"pid": 42, "version": "1.0"}"#), 42),
             ParentOutcome::Crashed
         );
+    }
+
+    #[test]
+    fn watchdog_setting_is_read_from_persisted_json_each_time() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("settings.json");
+
+        assert!(read_watchdog_enabled(Some(&path)).expect("missing settings"));
+
+        std::fs::write(&path, r#"{"watchdogEnabled":false}"#).expect("write camel case");
+        assert!(!read_watchdog_enabled(Some(&path)).expect("camel case settings"));
+
+        std::fs::write(&path, r#"{"watchdog_enabled":false}"#).expect("write snake case");
+        assert!(!read_watchdog_enabled(Some(&path)).expect("snake case settings"));
+
+        std::fs::write(&path, r#"{"watchdogEnabled":true}"#).expect("write enabled");
+        assert!(read_watchdog_enabled(Some(&path)).expect("enabled settings"));
+    }
+
+    #[test]
+    fn unreadable_watchdog_setting_fails_closed_before_recovery() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("settings.json");
+        std::fs::write(&path, "{").expect("write malformed settings");
+
+        let error = read_watchdog_enabled(Some(&path)).expect_err("malformed settings");
+        assert!(error.contains("解析看门狗设置失败"));
+    }
+
+    #[test]
+    fn stale_or_reused_supervisor_pid_is_not_reported_as_live() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let logs = dir.path().join("logs");
+        std::fs::create_dir_all(&logs).expect("logs dir");
+        let current =
+            crate::process_identity::current_process_identity().expect("current process identity");
+        let line = serde_json::json!({
+            "timestamp": "t1",
+            "level": "info",
+            "event": "supervisor-spawned",
+            "detail": {
+                "supervisorPid": current.pid,
+                "parentPid": 4242,
+                "startedAtTicks": current.started_at_ticks.saturating_add(1),
+            }
+        });
+        std::fs::write(
+            logs.join(WATCHDOG_LOG_FILE),
+            serde_json::to_string(&line).expect("serialize event"),
+        )
+        .expect("write log");
+
+        assert!(live_supervisor_identity(dir.path(), 4242).is_none());
     }
 
     #[test]

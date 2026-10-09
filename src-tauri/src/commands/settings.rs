@@ -120,6 +120,8 @@ fn merge_settings_for_save(
     // 开关）后、前端 query 缓存刷新前的一次全量保存会把旧 marker 重放回来，
     // 重新开启时被"复活"的标记挡住而漏迁。
     incoming.local_migrations = existing.local_migrations.clone();
+    incoming.tool_auto_update = existing.tool_auto_update.clone();
+    incoming.auto_update_codex_cli = existing.auto_update_codex_cli;
     incoming
 }
 
@@ -127,6 +129,28 @@ fn merge_settings_for_save(
 #[tauri::command]
 pub async fn get_settings() -> Result<crate::settings::AppSettings, String> {
     Ok(crate::settings::get_settings_for_frontend())
+}
+
+#[tauri::command]
+pub async fn get_tool_auto_update_settings(
+) -> Result<std::collections::HashMap<String, bool>, String> {
+    let settings = crate::settings::get_settings();
+    Ok(super::misc::VALID_TOOLS
+        .iter()
+        .map(|&tool| (tool.to_string(), settings.tool_auto_update_enabled(tool)))
+        .collect())
+}
+
+#[tauri::command]
+pub async fn set_tool_auto_update(
+    tool: String,
+    enabled: bool,
+) -> Result<std::collections::HashMap<String, bool>, String> {
+    if !super::misc::VALID_TOOLS.contains(&tool.as_str()) {
+        return Err(format!("Unsupported tool: {tool}"));
+    }
+    crate::settings::set_tool_auto_update(&tool, enabled).map_err(|error| error.to_string())?;
+    get_tool_auto_update_settings().await
 }
 
 /// 保存设置
@@ -145,10 +169,12 @@ pub async fn save_settings(
     let existing = crate::settings::get_settings();
     let merged = merge_settings_for_save(settings, &existing);
     let env_injection = merged.env_injection.clone();
+    let watchdog_enabled = merged.watchdog_enabled;
     let unify_codex_changed =
         merged.unify_codex_session_history != existing.unify_codex_session_history;
     let unify_codex_enabled = merged.unify_codex_session_history;
-    crate::settings::update_settings(merged).map_err(|e| e.to_string())?;
+    crate::settings::update_settings_preserving_tool_auto_update(merged)
+        .map_err(|e| e.to_string())?;
 
     // 统一会话开关变更时立即重写当前官方 Codex 供应商的 live 配置，
     // 不必等下一次切换才生效。
@@ -162,7 +188,9 @@ pub async fn save_settings(
             crate::services::provider::reapply_current_codex_official_live(state.inner())
         {
             log::warn!("统一 Codex 会话历史开关变更后重写 live 配置失败，回滚设置: {err}");
-            if let Err(rollback_err) = crate::settings::update_settings(existing) {
+            if let Err(rollback_err) =
+                crate::settings::update_settings_preserving_tool_auto_update(existing)
+            {
                 log::error!("回滚统一会话开关设置失败: {rollback_err}");
             }
             return Err(format!(
@@ -202,6 +230,15 @@ pub async fn save_settings(
                 log::warn!("清除统一会话迁移意愿失败: {err}");
             }
         }
+    }
+    if watchdog_enabled {
+        let watchdog_port = state
+            .db
+            .get_proxy_config()
+            .await
+            .map(|config| config.listen_port)
+            .unwrap_or(0);
+        crate::watchdog::ensure_supervisor(&crate::config::get_app_config_dir(), watchdog_port);
     }
     let env_injection = crate::env_injection::sync_to_live_configs(&env_injection);
     Ok(SettingsSaveResult {
@@ -439,6 +476,41 @@ pub async fn set_auto_launch(enabled: bool) -> Result<bool, String> {
 mod tests {
     use super::{build_app_update_info, merge_settings_for_save};
     use crate::settings::{CodexEgressTimezoneMode, CodexEgressTimezoneSettings};
+
+    #[test]
+    fn stale_frontend_save_preserves_tool_auto_update_preferences() {
+        let mut existing = crate::settings::AppSettings::default();
+        existing.tool_auto_update.insert("gemini".to_string(), true);
+        existing.auto_update_codex_cli = true;
+        let mut incoming = crate::settings::AppSettings::default();
+        incoming.tool_auto_update.insert("codex".to_string(), false);
+        incoming.language = Some("ja".to_string());
+        let merged = merge_settings_for_save(incoming, &existing);
+        assert_eq!(merged.tool_auto_update, existing.tool_auto_update);
+        assert!(merged.auto_update_codex_cli);
+        assert_eq!(merged.language.as_deref(), Some("ja"));
+    }
+
+    #[test]
+    fn save_settings_keeps_the_watchdog_toggle_value_from_the_incoming_form() {
+        let existing = AppSettings {
+            watchdog_enabled: true,
+            ..AppSettings::default()
+        };
+        let incoming = AppSettings {
+            watchdog_enabled: false,
+            ..AppSettings::default()
+        };
+
+        assert!(!merge_settings_for_save(incoming, &existing).watchdog_enabled);
+    }
+
+    #[tokio::test]
+    async fn tool_auto_update_rejects_unsupported_targets() {
+        assert!(super::set_tool_auto_update("npm".to_string(), true)
+            .await
+            .is_err());
+    }
 
     #[test]
     fn stale_frontend_save_preserves_newer_automatic_egress_detection() {

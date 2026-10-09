@@ -81,6 +81,86 @@ describe("useCodexConfigConsistency", () => {
     await waitFor(() => expect(result.current.report).toEqual(runtimeStale));
   });
 
+  it("dismisses immediately when deferring fails to persist acknowledgement", async () => {
+    vi.mocked(codexConfigConsistencyApi.inspect).mockResolvedValue(drift);
+    vi.mocked(codexConfigConsistencyApi.resolve).mockRejectedValueOnce(
+      new Error("database unavailable"),
+    );
+
+    const { result } = renderHook(() => useCodexConfigConsistency());
+    await waitFor(() => expect(result.current.report).toEqual(drift));
+
+    await act(async () => result.current.resolve("later"));
+
+    expect(codexConfigConsistencyApi.resolve).toHaveBeenCalledWith(
+      "actual",
+      "later",
+    );
+    expect(result.current.report).toBeNull();
+    expect(result.current.error).toBeNull();
+    expect(result.current.pending).toBe(false);
+  });
+
+  it("does not fall through into a second resolve when defer returns stale evidence", async () => {
+    vi.mocked(codexConfigConsistencyApi.inspect).mockResolvedValue(drift);
+    vi.mocked(codexConfigConsistencyApi.resolve).mockResolvedValueOnce(drift);
+
+    const { result } = renderHook(() => useCodexConfigConsistency());
+    await waitFor(() => expect(result.current.report).toEqual(drift));
+
+    await act(async () => result.current.resolve("later"));
+
+    expect(codexConfigConsistencyApi.resolve).toHaveBeenCalledTimes(1);
+    expect(result.current.report).toBeNull();
+    expect(result.current.error).toBeNull();
+    expect(result.current.pending).toBe(false);
+  });
+
+  it("dismisses runtime attention even when no fingerprint is available", async () => {
+    const runtimeWithoutFingerprint: CodexConfigConsistencyReport = {
+      ...drift,
+      state: "consistent",
+      actualFingerprint: null,
+      changedKeys: [],
+      reason: null,
+      runtimeActivation: {
+        ...drift.runtimeActivation,
+        state: "restart_required",
+      },
+    };
+    vi.mocked(codexConfigConsistencyApi.inspect).mockResolvedValue(
+      runtimeWithoutFingerprint,
+    );
+
+    const { result } = renderHook(() => useCodexConfigConsistency());
+    await waitFor(() =>
+      expect(result.current.report).toEqual(runtimeWithoutFingerprint),
+    );
+
+    await act(async () => result.current.resolve("later"));
+
+    expect(codexConfigConsistencyApi.resolve).not.toHaveBeenCalled();
+    expect(result.current.report).toBeNull();
+    expect(result.current.error).toBeNull();
+  });
+
+  it("does not reopen dismissed runtime attention when the same event is replayed", async () => {
+    vi.mocked(codexConfigConsistencyApi.inspect).mockResolvedValue(drift);
+    let onEvent: ((payload: CodexConfigConsistencyReport) => void) | undefined;
+    vi.mocked(useTauriEvent).mockImplementation((name, handler) => {
+      if (name === "codex-config-consistency") {
+        onEvent = handler as (payload: CodexConfigConsistencyReport) => void;
+      }
+    });
+
+    const { result } = renderHook(() => useCodexConfigConsistency());
+    await waitFor(() => expect(result.current.report).toEqual(drift));
+    await act(async () => result.current.resolve("later"));
+
+    onEvent?.(drift);
+    expect(result.current.report).toBeNull();
+  });
+
   it("proactively opens the repair status when Codex history projection damage is detected", async () => {
     const consistent: CodexConfigConsistencyReport = {
       ...drift,

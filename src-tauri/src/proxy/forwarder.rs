@@ -3337,83 +3337,6 @@ impl RequestForwarder {
         {
             outbound_model = Some(m.to_string());
         }
-        let request_health_config = crate::settings::get_settings().request_health;
-        let request_health_app_type = format!("{app_type:?}").to_ascii_lowercase();
-        let request_health_diagnostic = super::request_health::inspect_and_optimize(
-            &mut filtered_body,
-            &request_health_config,
-            super::request_health::RequestHealthContext {
-                trace_id: codex_trace_id.as_deref(),
-                session_id: &self.session_id,
-                app_type: &request_health_app_type,
-                provider_id: &provider.id,
-                provider_name: &provider.name,
-                model: outbound_model
-                    .as_deref()
-                    .unwrap_or(request_model_for_log.as_str()),
-                endpoint: &effective_endpoint,
-                client_request_bytes,
-                compaction_request: codex_request_metadata.request_kind == "compaction",
-                session_client_provided: self.session_client_provided,
-            },
-        );
-        if let (Some(trace_id), Some(diagnostic)) = (
-            codex_trace_id.as_deref(),
-            request_health_diagnostic.as_ref(),
-        ) {
-            super::codex_router_log::append_event(
-                "request_health",
-                &[
-                    ("trace", trace_id.to_string()),
-                    ("session", self.session_id.clone()),
-                    ("model", diagnostic.model.clone()),
-                    ("provider", provider.id.clone()),
-                    ("endpoint", effective_endpoint.clone()),
-                    (
-                        "client_request_bytes",
-                        diagnostic.client_request_bytes.to_string(),
-                    ),
-                    ("request_bytes", diagnostic.optimized_bytes.to_string()),
-                    (
-                        "proxy_size_delta_bytes",
-                        (diagnostic.optimized_bytes as i128
-                            - diagnostic.client_request_bytes as i128)
-                            .to_string(),
-                    ),
-                    ("original_bytes", diagnostic.original_bytes.to_string()),
-                    ("bytes_removed", diagnostic.bytes_removed.to_string()),
-                    (
-                        "transformed_request_bytes",
-                        diagnostic.optimized_bytes.to_string(),
-                    ),
-                    ("item_count", diagnostic.item_count.to_string()),
-                    ("media_bytes", diagnostic.media_bytes.to_string()),
-                    ("media_items", diagnostic.media_items.to_string()),
-                    ("media_dominated", diagnostic.media_dominated.to_string()),
-                    (
-                        "largest_item_bytes",
-                        diagnostic.largest_item_bytes.to_string(),
-                    ),
-                    (
-                        "threshold_exceeded",
-                        diagnostic.threshold_exceeded.to_string(),
-                    ),
-                    (
-                        "orphaned_tool_outputs",
-                        diagnostic
-                            .findings
-                            .iter()
-                            .find(|finding| finding.code == "orphaned_tool_output")
-                            .map_or(0, |finding| finding.count)
-                            .to_string(),
-                    ),
-                    (
-                        "compaction_recommended",
-                        diagnostic.compaction_recommended.to_string(),
-                    ),
-                ],
-            );
-        }
         log_prompt_cache_trace(
             app_type,
             provider,
@@ -4122,6 +4045,137 @@ impl RequestForwarder {
                 );
         }
 
+        // Compaction replays hosted search history with tools omitted. Repair
+        // the final wire body (including provider overrides and Lite fallback),
+        // not the saved session or the user's web-search setting.
+        if super::providers::codex_web_search_history::repair_codex_web_search_history(
+            app_type,
+            &effective_endpoint,
+            &mut filtered_body,
+            codex_responses_lite_requested && !responses_lite_fallback_cached,
+            !needs_transform
+                && !codex_responses_to_chat
+                && !codex_responses_to_messages
+                && !codex_responses_to_anthropic,
+            normalize_codex_oauth_responses || is_codex_oauth || codex_official_auth_passthrough,
+        ) {
+            if let Some(trace_id) = codex_trace_id.as_deref() {
+                super::codex_router_log::append_event(
+                    "web_search_history_declared",
+                    &[
+                        ("trace", trace_id.to_string()),
+                        ("session", self.session_id.clone()),
+                        ("provider", provider.id.clone()),
+                        (
+                            "responses_lite",
+                            (codex_responses_lite_requested && !responses_lite_fallback_cached)
+                                .to_string(),
+                        ),
+                    ],
+                );
+            }
+        }
+
+        let request_health_config = crate::settings::get_settings().request_health;
+        let request_health_app_type = format!("{app_type:?}").to_ascii_lowercase();
+        let request_health_diagnostic = super::request_health::inspect_and_optimize(
+            &mut filtered_body,
+            &request_health_config,
+            super::request_health::RequestHealthContext {
+                trace_id: codex_trace_id.as_deref(),
+                session_id: &self.session_id,
+                app_type: &request_health_app_type,
+                provider_id: &provider.id,
+                provider_name: &provider.name,
+                model: outbound_model
+                    .as_deref()
+                    .unwrap_or(request_model_for_log.as_str()),
+                endpoint: &effective_endpoint,
+                wire_responses: url::Url::parse(&url)
+                    .is_ok_and(|url| url.path().ends_with("/responses")),
+                client_request_bytes,
+                compaction_request: codex_request_metadata.request_kind == "compaction",
+                session_client_provided: self.session_client_provided,
+            },
+        );
+        if let (Some(trace_id), Some(diagnostic)) = (
+            codex_trace_id.as_deref(),
+            request_health_diagnostic.as_ref(),
+        ) {
+            super::codex_router_log::append_event(
+                "request_health",
+                &[
+                    ("trace", trace_id.to_string()),
+                    ("session", self.session_id.clone()),
+                    ("model", diagnostic.model.clone()),
+                    ("provider", provider.id.clone()),
+                    ("endpoint", effective_endpoint.clone()),
+                    (
+                        "client_request_bytes",
+                        diagnostic.client_request_bytes.to_string(),
+                    ),
+                    ("request_bytes", diagnostic.optimized_bytes.to_string()),
+                    (
+                        "proxy_size_delta_bytes",
+                        (diagnostic.optimized_bytes as i128
+                            - diagnostic.client_request_bytes as i128)
+                            .to_string(),
+                    ),
+                    ("original_bytes", diagnostic.original_bytes.to_string()),
+                    ("bytes_removed", diagnostic.bytes_removed.to_string()),
+                    (
+                        "transformed_request_bytes",
+                        diagnostic.optimized_bytes.to_string(),
+                    ),
+                    ("item_count", diagnostic.item_count.to_string()),
+                    ("media_bytes", diagnostic.media_bytes.to_string()),
+                    ("media_items", diagnostic.media_items.to_string()),
+                    ("media_dominated", diagnostic.media_dominated.to_string()),
+                    (
+                        "largest_item_bytes",
+                        diagnostic.largest_item_bytes.to_string(),
+                    ),
+                    (
+                        "threshold_exceeded",
+                        diagnostic.threshold_exceeded.to_string(),
+                    ),
+                    (
+                        "orphaned_tool_outputs",
+                        diagnostic
+                            .findings
+                            .iter()
+                            .find(|finding| finding.code == "orphaned_tool_output")
+                            .map_or(0, |finding| finding.count)
+                            .to_string(),
+                    ),
+                    (
+                        "undeclared_web_search_history",
+                        diagnostic
+                            .findings
+                            .iter()
+                            .find(|finding| finding.code == "undeclared_web_search_history")
+                            .map_or(0, |finding| finding.count)
+                            .to_string(),
+                    ),
+                    (
+                        "structural_findings",
+                        diagnostic
+                            .findings
+                            .iter()
+                            .map(|finding| {
+                                format!("{}:{}:{}", finding.code, finding.severity, finding.count)
+                            })
+                            .collect::<Vec<_>>()
+                            .join(","),
+                    ),
+                    (
+                        "compaction_recommended",
+                        diagnostic.compaction_recommended.to_string(),
+                    ),
+                ],
+            );
+        }
+
         // GET/HEAD are idempotent/safe methods and must not carry the JSON body
         // used for routing. For every other method, serialize exactly once after
         // the final provider/request-health mutation.
@@ -4638,10 +4692,28 @@ impl RequestForwarder {
                         ],
                     );
                 }
-                let retry_body =
+                let mut retry_body =
                     super::providers::openai_compat::normalize_codex_responses_lite_fallback_request(
                         filtered_body.clone(),
                     );
+                super::request_health::inspect_and_optimize(
+                    &mut retry_body,
+                    &request_health_config,
+                    super::request_health::RequestHealthContext {
+                        trace_id: codex_trace_id.as_deref(),
+                        session_id: &self.session_id,
+                        app_type: &request_health_app_type,
+                        provider_id: &provider.id,
+                        provider_name: &provider.name,
+                        model: &responses_lite_request_model,
+                        endpoint: &effective_endpoint,
+                        wire_responses: url::Url::parse(&url)
+                            .is_ok_and(|url| url.path().ends_with("/responses")),
+                        client_request_bytes,
+                        compaction_request: codex_request_metadata.request_kind == "compaction",
+                        session_client_provided: self.session_client_provided,
+                    },
+                );
                 let retry_body_bytes = serde_json::to_vec(&retry_body).map_err(|error| {
                     ProxyError::Internal(format!(
                         "Failed to serialize Responses-Lite fallback body: {error}"
@@ -4730,7 +4802,15 @@ impl RequestForwarder {
         if status.is_success() {
             let response_prepare_started_at = std::time::Instant::now();
             let mut response = self
-                .prepare_success_response_for_failover(response, request_is_streaming)
+                .prepare_success_response_for_failover(
+                    response,
+                    request_is_streaming,
+                    matches!(app_type, AppType::Codex)
+                        && !needs_transform
+                        && !codex_responses_to_chat
+                        && !codex_responses_to_messages
+                        && !codex_responses_to_anthropic,
+                )
                 .await?;
             if codex_responses_to_anthropic && (!request_is_streaming || response.is_json()) {
                 response = self
@@ -5501,7 +5581,11 @@ impl RequestForwarder {
         }
 
         let response = self
-            .prepare_success_response_for_failover(response, request_is_streaming)
+            .prepare_success_response_for_failover(
+                response,
+                request_is_streaming,
+                matches!(app_type, AppType::Codex),
+            )
             .await?;
         if let Some(trace_id) = codex_trace_id.as_deref() {
             super::codex_router_log::append_event(
@@ -5822,9 +5906,12 @@ impl RequestForwarder {
         &self,
         response: ProxyResponse,
         request_is_streaming: bool,
+        preserve_sse_errors: bool,
     ) -> Result<ProxyResponse, ProxyError> {
         if request_is_streaming {
-            return self.prime_streaming_response(response).await;
+            return self
+                .prime_streaming_response(response, preserve_sse_errors)
+                .await;
         }
 
         if self.non_streaming_timeout.is_zero() {
@@ -6001,6 +6088,7 @@ impl RequestForwarder {
     async fn prime_streaming_response(
         &self,
         response: ProxyResponse,
+        preserve_sse_errors: bool,
     ) -> Result<ProxyResponse, ProxyError> {
         if self.streaming_first_byte_timeout.is_zero() {
             return Ok(response);
@@ -6042,12 +6130,17 @@ impl RequestForwarder {
             ));
         };
 
-        if let Some(error) = retryable_error_from_primed_sse_chunk(&first) {
-            if !(self.capacity_retry_enabled && error.is_capacity) {
-                return Err(ProxyError::UpstreamError {
-                    status: 503,
-                    body: Some(error.message),
-                });
+        // Native Codex errors belong to the existing Responses SSE handler:
+        // it preserves error fields and applies capacity-only retries. Turning
+        // HTTP 200 + response.failed into HTTP 503 loses the cause and status.
+        if !preserve_sse_errors {
+            if let Some(error) = retryable_error_from_primed_sse_chunk(&first) {
+                if !(self.capacity_retry_enabled && error.is_capacity) {
+                    return Err(ProxyError::UpstreamError {
+                        status: 503,
+                        body: Some(error.message),
+                    });
+                }
             }
         }
 
@@ -7900,6 +7993,8 @@ fn is_terminal_codex_quota_429(body: Option<&str>) -> bool {
         "insufficient_quota",
         "billing_hard_limit_reached",
         "the usage limit has been reached",
+        "daily_limit_exceeded",
+        "daily usage limit exceeded",
     ]
     .iter()
     .any(|marker| normalized.contains(marker))
@@ -10307,6 +10402,16 @@ mod tests {
     }
 
     async fn capture_single_http_request(listener: tokio::net::TcpListener) -> (String, Vec<u8>) {
+        capture_single_http_request_with_response(
+            listener,
+            Bytes::from_static(b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{}"),
+        ).await
+    }
+
+    async fn capture_single_http_request_with_response(
+        listener: tokio::net::TcpListener,
+        response: Bytes,
+    ) -> (String, Vec<u8>) {
         let (mut stream, _) = listener.accept().await.expect("accept HTTP request");
         let mut received = Vec::new();
         loop {
@@ -10334,13 +10439,174 @@ mod tests {
             if received.len() >= header_end + 4 + content_length {
                 let body = received[header_end + 4..header_end + 4 + content_length].to_vec();
                 stream
-                    .write_all(b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{}")
+                    .write_all(&response)
                     .await
                     .expect("write HTTP response");
                 return (header_text.into_owned(), body);
             }
         }
         panic!("HTTP request ended before the complete body arrived");
+    }
+
+    #[tokio::test]
+    async fn search_history_forwarder_repairs_native_gpt_compaction_on_standard_and_lite() {
+        for (lite, cached_fallback) in [(false, false), (true, false), (true, true)] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind search history upstream");
+            let upstream = format!("http://{}", listener.local_addr().unwrap());
+            let capture = tokio::spawn(capture_single_http_request(listener));
+            let mut provider = test_provider_with_type(None);
+            provider.settings_config = json!({
+                "base_url": upstream,
+                "api_key": "search-history-test-key",
+                "modelCatalog": {"models": [{"model": "gpt-6.1-sol"}]}
+            });
+            provider.meta = Some(ProviderMeta {
+                api_format: Some("openai_responses".to_string()),
+                ..Default::default()
+            });
+            let search = json!({
+                "type": "web_search_call", "id": "ws_saved", "status": "completed",
+                "action": {"type": "search", "query": "reference", "sources": [{"url": "https://example.org"}]}
+            });
+            let body = json!({
+                "model": "gpt-6.1-sol", "input": [search.clone(), {"type": "compaction_trigger"}],
+                "tools": [], "tool_choice": "auto", "stream": false
+            });
+            let mut headers = HeaderMap::new();
+            if lite {
+                headers.insert(
+                    "x-openai-internal-codex-responses-lite",
+                    HeaderValue::from_static("true"),
+                );
+            }
+            let mut forwarder = test_forwarder(Duration::from_secs(5), Duration::ZERO);
+            forwarder.session_id = uuid::Uuid::new_v4().to_string();
+            forwarder.request_health_trace = uuid::Uuid::new_v4().to_string();
+            if cached_fallback {
+                forwarder
+                    .codex_responses_lite_fallbacks
+                    .write()
+                    .await
+                    .insert(
+                        codex_responses_lite_fallback_key(
+                            &provider.id,
+                            &format!("{upstream}/v1/responses"),
+                            "gpt-6.1-sol",
+                        ),
+                        Instant::now() + CODEX_RESPONSES_LITE_FALLBACK_TTL,
+                    );
+            }
+            let adapter = get_adapter(&AppType::Codex);
+            forwarder
+                .forward(
+                    &AppType::Codex,
+                    &http::Method::POST,
+                    &provider,
+                    "/v1/responses",
+                    &body,
+                    &headers,
+                    &Extensions::new(),
+                    adapter.as_ref(),
+                )
+                .await
+                .expect("forward native search history");
+            let (captured_headers, bytes) = capture.await.expect("captured request");
+            let sent: Value = serde_json::from_slice(&bytes).expect("outgoing JSON");
+            let diagnostic = super::super::request_health::snapshot(
+                crate::settings::RequestHealthConfig::default(),
+            )
+            .diagnostics
+            .into_iter()
+            .find(|diagnostic| diagnostic.session_id == forwarder.session_id)
+            .expect("final outgoing request diagnostic");
+            assert_eq!(diagnostic.optimized_bytes, bytes.len());
+            assert!(!diagnostic
+                .findings
+                .iter()
+                .any(|finding| finding.code == "undeclared_web_search_history"));
+            assert_eq!(sent["input"][0], search);
+            assert_eq!(
+                sent["input"].as_array().unwrap().last().unwrap()["type"],
+                "compaction_trigger"
+            );
+            assert_eq!(sent["tool_choice"], "none");
+            assert_eq!(
+                captured_headers
+                    .to_ascii_lowercase()
+                    .contains("x-openai-internal-codex-responses-lite:"),
+                lite && !cached_fallback
+            );
+            if lite && !cached_fallback {
+                assert_eq!(sent["input"][1]["type"], "additional_tools");
+                assert_eq!(sent["input"][1]["tools"][0]["type"], "web_search");
+                assert!(sent["tools"].as_array().is_none_or(Vec::is_empty));
+            } else {
+                assert_eq!(
+                    sent["tools"],
+                    json!([{"type": "web_search", "external_web_access": false}])
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn search_history_forwarder_preserves_real_search_on_regular_turns() {
+        for lite in [false, true] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let upstream = format!("http://{}", listener.local_addr().unwrap());
+            let capture = tokio::spawn(capture_single_http_request(listener));
+            let mut provider = test_provider_with_type(None);
+            provider.settings_config =
+                json!({"base_url": upstream, "api_key": "search-history-test-key"});
+            provider.meta = Some(ProviderMeta {
+                api_format: Some("openai_responses".to_string()),
+                ..Default::default()
+            });
+            let search_tool = json!({"type": "web_search", "external_web_access": true, "search_context_size": "high"});
+            let function = json!({"type": "function", "name": "shell", "parameters": {"type": "object", "properties": {}}});
+            let search = json!({"type": "web_search_call", "id": "ws_saved", "status": "completed", "action": {"type": "search", "query": "reference"}});
+            let mut body = json!({"model": "gpt-6.1-sol", "input": [search.clone()], "tool_choice": "auto", "stream": false});
+            if lite {
+                body["input"].as_array_mut().unwrap().push(json!({"type": "additional_tools", "role": "developer", "tools": [function, search_tool.clone()]}));
+            } else {
+                body["tools"] = json!([function, search_tool.clone()]);
+            }
+            let mut headers = HeaderMap::new();
+            if lite {
+                headers.insert(
+                    "x-openai-internal-codex-responses-lite",
+                    HeaderValue::from_static("true"),
+                );
+            }
+            let forwarder = test_forwarder(Duration::from_secs(5), Duration::ZERO);
+            let adapter = get_adapter(&AppType::Codex);
+            forwarder
+                .forward(
+                    &AppType::Codex,
+                    &http::Method::POST,
+                    &provider,
+                    "/v1/responses",
+                    &body,
+                    &headers,
+                    &Extensions::new(),
+                    adapter.as_ref(),
+                )
+                .await
+                .expect("forward regular web-search turn");
+            let (_, bytes) = capture.await.expect("captured search turn");
+            let sent: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(sent["input"][0], search);
+            assert_eq!(sent["tool_choice"], "auto");
+            let tools = if lite {
+                &sent["input"][1]["tools"]
+            } else {
+                &sent["tools"]
+            };
+            assert_eq!(tools.as_array().unwrap().len(), 2);
+            assert_eq!(tools[1], search_tool);
+        }
     }
 
     // 验证只有上游明确返回 Responses-Lite 不支持时，才触发剥头重试。
@@ -11964,7 +12230,7 @@ mod tests {
         );
 
         let prepared = forwarder
-            .prepare_success_response_for_failover(response, false)
+            .prepare_success_response_for_failover(response, false, false)
             .await
             .expect("response should be buffered");
 
@@ -11989,7 +12255,7 @@ mod tests {
         );
 
         let err = match forwarder
-            .prepare_success_response_for_failover(response, false)
+            .prepare_success_response_for_failover(response, false, false)
             .await
         {
             Ok(_) => panic!("body read errors should fail the attempt"),
@@ -12012,7 +12278,7 @@ mod tests {
         );
 
         let prepared = forwarder
-            .prepare_success_response_for_failover(response, true)
+            .prepare_success_response_for_failover(response, true, false)
             .await
             .expect("stream should be primed");
 
@@ -12037,7 +12303,7 @@ mod tests {
         );
 
         let err = match forwarder
-            .prepare_success_response_for_failover(response, true)
+            .prepare_success_response_for_failover(response, true, false)
             .await
         {
             Ok(_) => panic!("first chunk errors should fail the attempt"),
@@ -12062,7 +12328,7 @@ mod tests {
         );
 
         let err = match forwarder
-            .prepare_success_response_for_failover(response, true)
+            .prepare_success_response_for_failover(response, true, false)
             .await
         {
             Ok(_) => panic!("first SSE error event should fail the attempt before streaming"),
@@ -12094,7 +12360,7 @@ mod tests {
         );
 
         let prepared = forwarder
-            .prepare_success_response_for_failover(response, true)
+            .prepare_success_response_for_failover(response, true, false)
             .await
             .expect("capacity retry must receive the original SSE terminal event");
 
@@ -12124,7 +12390,7 @@ mod tests {
         );
 
         let prepared = forwarder
-            .prepare_success_response_for_failover(response, true)
+            .prepare_success_response_for_failover(response, true, false)
             .await
             .expect("normal first SSE event should be replayed");
 
@@ -12134,6 +12400,114 @@ mod tests {
             .unwrap();
         assert!(String::from_utf8_lossy(&body).contains("response.created"));
         assert!(String::from_utf8_lossy(&body).contains("response.completed"));
+    }
+
+    #[tokio::test]
+    async fn codex_native_sse_failure_reaches_client_with_real_status_and_cause() {
+        for capacity_retry in [false, true] {
+            for event in ["error", "response.error", "response.failed"] {
+                for split in [false, true] {
+                    let mut forwarder =
+                        test_forwarder(Duration::from_secs(1), Duration::from_secs(1));
+                    forwarder.capacity_retry_enabled = capacity_retry;
+                    let error = json!({
+                        "type":"invalid_request_error", "code":"invalid_prompt", "param":"tools",
+                        "message":"response protection is unavailable for this request"
+                    });
+                    let payload = if event == "response.failed" {
+                        json!({"type":event,"response":{"status":"failed","error":error}})
+                    } else {
+                        json!({"type":event,"error":error})
+                    };
+                    let bytes = Bytes::from(format!("event: {event}\r\ndata: {payload}\r\n\r\n"));
+                    let chunks = if split {
+                        vec![bytes.slice(..11), bytes.slice(11..)]
+                    } else {
+                        vec![bytes]
+                    };
+                    let mut headers = HeaderMap::new();
+                    headers.insert(
+                        http::header::CONTENT_TYPE,
+                        HeaderValue::from_static("text/event-stream"),
+                    );
+                    let response = ProxyResponse::streamed(
+                        StatusCode::OK,
+                        headers,
+                        futures::stream::iter(chunks.into_iter().map(Ok::<_, std::io::Error>)),
+                    );
+                    let prepared = forwarder
+                        .prepare_success_response_for_failover(response, true, true)
+                        .await
+                        .expect("preserve native stream failure instead of synthesizing 503");
+                    assert_eq!(prepared.status(), StatusCode::OK);
+                    let stream = super::super::providers::streaming_retry::create_resilient_responses_sse_stream_with_context(
+                        Box::pin(prepared.bytes_stream()), None, None, capacity_retry
+                    );
+                    let chunks: Vec<_> = stream.collect().await;
+                    let output = chunks.into_iter().map(Result::unwrap).fold(
+                        Vec::new(),
+                        |mut output, chunk| {
+                            output.extend_from_slice(&chunk);
+                            output
+                        },
+                    );
+                    let text = String::from_utf8(output).unwrap();
+                    assert!(text.contains("response.failed"));
+                    let data = text
+                        .lines()
+                        .find_map(|line| line.strip_prefix("data: "))
+                        .unwrap();
+                    let failed: Value = serde_json::from_str(data).unwrap();
+                    assert_eq!(failed["response"]["error"], error);
+                    assert!(!text.contains("response.completed"));
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn codex_forwarder_preserves_early_native_sse_failure_on_wire() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream = format!("http://{}", listener.local_addr().unwrap());
+        let failure = "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"status\":\"failed\",\"error\":{\"code\":\"invalid_prompt\",\"message\":\"response protection is unavailable for this request\",\"param\":\"tools\"}}}\n\n";
+        let response = Bytes::from(format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{failure}", failure.len()
+        ));
+        let capture = tokio::spawn(capture_single_http_request_with_response(
+            listener, response,
+        ));
+        let mut provider = test_provider_with_type(None);
+        provider.settings_config = json!({"base_url":upstream,"api_key":"test-key"});
+        provider.meta = Some(ProviderMeta {
+            api_format: Some("openai_responses".to_string()),
+            ..Default::default()
+        });
+        let mut forwarder = test_forwarder(Duration::from_secs(1), Duration::from_secs(1));
+        forwarder.capacity_retry_enabled = false;
+        let adapter = get_adapter(&AppType::Codex);
+        let result = forwarder
+            .forward(
+                &AppType::Codex,
+                &http::Method::POST,
+                &provider,
+                "/v1/responses",
+                &json!({"model":"gpt-6.1-sol","input":[],"stream":true}),
+                &HeaderMap::new(),
+                &Extensions::new(),
+                adapter.as_ref(),
+            )
+            .await
+            .expect("native failure must retain the actual upstream HTTP 200");
+        assert_eq!(result.0.status(), StatusCode::OK);
+        assert_eq!(
+            result
+                .0
+                .bytes_with_limit(MAX_RESPONSE_BODY_BYTES)
+                .await
+                .unwrap(),
+            Bytes::from(failure)
+        );
+        capture.await.unwrap();
     }
 
     #[test]
@@ -14728,6 +15102,38 @@ mod tests {
                 ))
             }
         })
+        .await;
+
+        assert_eq!(
+            result.unwrap().status(),
+            http::StatusCode::TOO_MANY_REQUESTS
+        );
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn codex_rate_limit_retry_does_not_spin_on_daily_limit_exceeded() {
+        let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let attempts_for_send = attempts.clone();
+
+        let result = send_codex_request_with_rate_limit_retry(
+            "test",
+            true,
+            safe_test_codex_traffic_policy(),
+            || {
+                let attempts = attempts_for_send.clone();
+                async move {
+                    attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Ok(ProxyResponse::buffered(
+                        http::StatusCode::TOO_MANY_REQUESTS,
+                        http::HeaderMap::new(),
+                        Bytes::from_static(
+                            br#"error: code=429 reason="DAILY_LIMIT_EXCEEDED" message="daily usage limit exceeded" metadata=map[]"#,
+                        ),
+                    ))
+                }
+            },
+        )
         .await;
 
         assert_eq!(

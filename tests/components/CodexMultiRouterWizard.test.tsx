@@ -172,6 +172,62 @@ async function completeWizardDeepProbe() {
 }
 
 describe("CodexMultiRouterWizard", () => {
+  it("routes only included models while preserving excluded inventory in the batch save", async () => {
+    const inventory = [
+      { model: "kept", upstreamModel: "wire-kept" },
+      { model: "hidden", upstreamModel: "wire-hidden", enabled: false },
+    ];
+    const source = provider({
+      settingsConfig: {
+        base_url: "https://api.deepseek.com/v1",
+        auth: { OPENAI_API_KEY: "sk-test" },
+        modelCatalog: { models: inventory },
+      },
+    });
+    renderWithQueryClient(
+      <CodexMultiRouterWizard
+        open
+        providers={[source]}
+        onOpenChange={vi.fn()}
+        onCreateProvider={vi.fn()}
+        onOpenWorkspace={vi.fn()}
+        onEnablePlan={vi.fn()}
+      />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Choose models" }));
+    expect(screen.getByLabelText("Keep kept")).toBeInTheDocument();
+    expect(screen.queryByLabelText("Keep hidden")).not.toBeInTheDocument();
+
+    await completeWizardDeepProbe();
+    fireEvent.click(screen.getByRole("button", { name: "Save and enable" }));
+    fireEvent.click(
+      screen.getAllByRole("button", { name: "Save and publish" }).at(-1)!,
+    );
+    await waitFor(() =>
+      expect(commitCodexProviderSetBatch).toHaveBeenCalledTimes(1),
+    );
+    const [savedSources, savedRouter] = vi.mocked(commitCodexProviderSetBatch)
+      .mock.calls[0];
+    expect(savedSources[0].provider.settingsConfig.modelCatalog.models).toEqual(
+      inventory,
+    );
+    expect(savedRouter.settingsConfig.codexRouting).toMatchObject({
+      schemaVersion: 2,
+      spawnAgentModels: [],
+      routes: [
+        {
+          targetProviderId: source.id,
+          modelSelection: { mode: "all" },
+        },
+      ],
+    });
+    expect(
+      savedRouter.settingsConfig.codexRouting.spawnAgentModels,
+    ).not.toContain("hidden");
+    expect(savedRouter.settingsConfig).not.toHaveProperty("modelCatalog");
+    expect(source.settingsConfig.modelCatalog.models).toEqual(inventory);
+  });
+
   it("deep-probes ordinary sources and saves the sources plus router through one batch commit", async () => {
     const source = provider();
     renderWithQueryClient(
@@ -874,7 +930,7 @@ describe("CodexMultiRouterWizard", () => {
     expect(providersApi.update).not.toHaveBeenCalled();
   });
 
-  it("refreshes an official OAuth catalog with its bound account and appends new models", async () => {
+  it("refreshes an official OAuth catalog with its bound account without including new models", async () => {
     vi.mocked(fetchCodexOauthModels).mockResolvedValueOnce([
       { id: "gpt-5.5", ownedBy: "openai", contextWindow: 272000 },
       { id: "gpt-5.6-sol", ownedBy: "openai", contextWindow: 372000 },
@@ -921,7 +977,8 @@ describe("CodexMultiRouterWizard", () => {
     ).toBeInTheDocument();
     expect(providersApi.update).not.toHaveBeenCalled();
     fireEvent.click(screen.getByRole("button", { name: "Choose models" }));
-    expect(screen.getByLabelText("Keep gpt-5.6-sol")).toBeInTheDocument();
+    expect(screen.getByLabelText("Keep gpt-5.5")).toBeInTheDocument();
+    expect(screen.queryByLabelText("Keep gpt-5.6-sol")).not.toBeInTheDocument();
     expect(fetchModelsForConfig).not.toHaveBeenCalled();
   });
 

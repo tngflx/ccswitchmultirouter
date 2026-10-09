@@ -44,7 +44,10 @@ const BACKEND_ROOT_FILES = new Set([
   "common-controls.manifest",
   "Info.plist",
 ]);
-const BACKEND_REPO_ROOT_FILES = new Set(["rust-toolchain.toml"]);
+const BACKEND_REPO_ROOT_FILES = new Set([
+  "rust-toolchain.toml",
+  path.join("contracts", "openai-responses.v1.json"),
+]);
 
 export function normalizeCliArgs(args) {
   return args[0] === "--" ? args.slice(1) : args;
@@ -1219,6 +1222,16 @@ Use "pnpm dev:immediate" for the same verified lifecycle with no quiet delay.`);
 
     addWatcher(TAURI_DIR, { recursive: false }, resolveTauriRootBackendInput);
     addWatcher(REPO_ROOT, { recursive: false }, resolveRepoRootBackendInput);
+    addWatcher(
+      path.join(REPO_ROOT, "contracts"),
+      { recursive: false },
+      (filename) =>
+        filename
+          ? resolveRepoRootBackendInput(
+              path.join("contracts", filename.toString()),
+            )
+          : null,
+    );
     console.log("[dev] Backend watcher armed.");
   };
 

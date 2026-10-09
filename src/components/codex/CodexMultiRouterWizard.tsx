@@ -79,6 +79,7 @@ import {
   mergeFetchedModelsIntoWizardProvider,
   readWizardCodexOAuthAccountId,
   readWizardModelCatalog,
+  readIncludedWizardModelCatalog,
   readWizardProviderBaseUrl,
   resolveWizardModelNameCollisions,
   wizardRouteDisplayLabel,
@@ -403,13 +404,13 @@ function wizardFlowReducer(
 
 // 将模型源的模型目录数量转成人可扫读的摘要，避免向导卡片暴露底层 JSON。
 function modelSourceSummary(provider: Provider): string {
-  const models = readWizardModelCatalog(provider);
+  const models = readIncludedWizardModelCatalog(provider);
   if (models.length === 0) return "No models fetched";
   return `${models.length} models`;
 }
 
 function modelSourceStatusDetails(provider: Provider): string[] {
-  const models = readWizardModelCatalog(provider);
+  const models = readIncludedWizardModelCatalog(provider);
   const fetchConfig = getWizardModelFetchConfig(provider);
   const auth = isWizardCodexOAuthSource(provider)
     ? "OAuth linked"
@@ -516,7 +517,7 @@ function defaultModelFetchCardState(provider: Provider): ModelFetchCardState {
   return {
     status: "idle",
     message: "Waiting to read model list",
-    modelCount: readWizardModelCatalog(provider).length,
+    modelCount: readIncludedWizardModelCatalog(provider).length,
   };
 }
 
@@ -2844,7 +2845,8 @@ export function CodexMultiRouterWizard({
                           <div className="font-medium">{provider.name}</div>
                           <div className="mt-1 text-xs text-muted-foreground">
                             {inferWizardApiFormat(provider)} ·{" "}
-                            {readWizardModelCatalog(provider).length} models
+                            {readIncludedWizardModelCatalog(provider).length}{" "}
+                            models
                           </div>
                         </div>
                         <Button
@@ -2857,38 +2859,41 @@ export function CodexMultiRouterWizard({
                         </Button>
                       </div>
                       <div className="grid gap-2 md:grid-cols-2">
-                        {readWizardModelCatalog(provider).map((model) => {
-                          const reasoning = model.reasoning;
-                          const support =
-                            reasoning?.supportStatus === "confirmed_supported"
-                              ? "Reasoning support confirmed"
-                              : reasoning?.supportStatus ===
-                                  "confirmed_unsupported"
-                                ? "Reasoning support not confirmed"
-                                : "Capability unknown; use server default";
-                          return (
-                            <div
-                              key={model.model}
-                              className="rounded-md border bg-muted/20 p-3 text-xs"
-                            >
-                              <div className="font-medium text-foreground">
-                                {model.displayName ?? model.model}
-                              </div>
-                              <div className="mt-2 space-y-1 text-muted-foreground">
-                                <div>{support}</div>
-                                <div>
-                                  Available efforts:
-                                  {reasoning?.supportedEfforts?.join(" / ") ||
-                                    "Not declared"}
+                        {readIncludedWizardModelCatalog(provider).map(
+                          (model) => {
+                            const reasoning = model.reasoning;
+                            const support =
+                              reasoning?.supportStatus === "confirmed_supported"
+                                ? "Reasoning support confirmed"
+                                : reasoning?.supportStatus ===
+                                    "confirmed_unsupported"
+                                  ? "Reasoning support not confirmed"
+                                  : "Capability unknown; use server default";
+                            return (
+                              <div
+                                key={model.model}
+                                className="rounded-md border bg-muted/20 p-3 text-xs"
+                              >
+                                <div className="font-medium text-foreground">
+                                  {model.displayName ?? model.model}
                                 </div>
-                                <div>
-                                  Default effort:
-                                  {reasoning?.defaultEffort ?? "Model default"}
+                                <div className="mt-2 space-y-1 text-muted-foreground">
+                                  <div>{support}</div>
+                                  <div>
+                                    Available efforts:
+                                    {reasoning?.supportedEfforts?.join(" / ") ||
+                                      "Not declared"}
+                                  </div>
+                                  <div>
+                                    Default effort:
+                                    {reasoning?.defaultEffort ??
+                                      "Model default"}
+                                  </div>
                                 </div>
                               </div>
-                            </div>
-                          );
-                        })}
+                            );
+                          },
+                        )}
                       </div>
                     </div>
                   ))}
