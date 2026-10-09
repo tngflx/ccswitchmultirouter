@@ -58,7 +58,9 @@ describe("localized child owners with production locale resources", () => {
     );
     expect(container.textContent).not.toMatch(/\p{Script=Han}/u);
     fireEvent.click(
-      screen.getByRole("checkbox", { name: "Web Search hosted tool bridge" }),
+      screen.getByRole("checkbox", {
+        name: locale.t("codexHostedTools.webSearchLabel"),
+      }),
     );
     expect(onChange).toHaveBeenLastCalledWith({
       webSearchEnabled: true,
