@@ -11,6 +11,7 @@ export interface WatchdogEventRecord {
 /** 设置页“看门狗与端口自检”面板的数据。 */
 export interface WatchdogStatus {
   enabled: boolean;
+  supervisorMode?: "rust" | "pnpm-dev";
   appPid: number;
   supervisorPid?: number | null;
   supervisorAlive: boolean;

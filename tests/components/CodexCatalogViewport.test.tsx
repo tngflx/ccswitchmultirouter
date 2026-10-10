@@ -56,6 +56,18 @@ describe("large catalog viewport", () => {
       expect(
         within(toolbar).getByRole("checkbox", { name: "Select matching" }),
       ).toBeEnabled();
+      expect(
+        within(toolbar).getByRole("button", { name: "Include matching" }),
+      ).toBeEnabled();
+      expect(
+        within(toolbar).getByRole("button", { name: "Exclude matching" }),
+      ).toBeEnabled();
+      expect(
+        screen.getAllByRole("button", { name: "Include matching" }),
+      ).toHaveLength(1);
+      expect(
+        screen.getAllByRole("button", { name: "Exclude matching" }),
+      ).toHaveLength(1);
       fireEvent.click(
         within(toolbar).getByRole("button", { name: "Use only selected" }),
       );
@@ -230,11 +242,26 @@ describe("large catalog viewport", () => {
       target: { value: "absent" },
     });
     expect(screen.getByText("No matching models")).toBeVisible();
+    const toolbar = screen.getByRole("group", {
+      name: "Model selection actions",
+    });
     expect(
-      screen.getByRole("button", { name: "Include matching" }),
+      within(toolbar).getByRole("button", { name: "Include matching" }),
     ).toBeDisabled();
     expect(
-      screen.getByRole("button", { name: "Exclude matching" }),
+      within(toolbar).getByRole("button", { name: "Exclude matching" }),
+    ).toBeDisabled();
+    expect(
+      screen.getAllByRole("button", { name: "Include matching" }),
+    ).toHaveLength(1);
+    expect(
+      screen.getAllByRole("button", { name: "Exclude matching" }),
+    ).toHaveLength(1);
+    expect(
+      screen.getByRole("button", { name: "Include selected" }),
+    ).toBeDisabled();
+    expect(
+      screen.getByRole("button", { name: "Exclude selected" }),
     ).toBeDisabled();
     fireEvent.click(screen.getByRole("button", { name: "Clear search" }));
     expect(screen.getByText("editor-unused-0")).toBeVisible();
@@ -250,12 +277,21 @@ describe("large catalog viewport", () => {
     const onToggleEnabled = vi.fn();
     function Harness() {
       const [rows, setRows] = useState(initialRows);
+      const [selected, setSelected] = useState(new Set<string>());
       return (
         <CodexCatalogViewport
           items={rows.map((row, index) => ({ row, index }))}
           compact
-          selected={new Set()}
-          onSelect={vi.fn()}
+          selected={selected}
+          onSelect={(id, checked) =>
+            setSelected((current) => {
+              const next = new Set(current);
+              if (checked) next.add(id);
+              else next.delete(id);
+              return next;
+            })
+          }
+          onSelectionChange={setSelected}
           onToggleEnabled={onToggleEnabled}
           onSetIncluded={(ids, enabled) => {
             onSetIncluded(ids, enabled);
@@ -285,7 +321,12 @@ describe("large catalog viewport", () => {
     expect(screen.getByText("coder-0")).toBeVisible();
     expect(screen.getByText("25 matching models")).toBeVisible();
     expect(screen.getAllByRole("switch")).toHaveLength(10);
-    fireEvent.click(screen.getByRole("button", { name: "Include matching" }));
+    const toolbar = screen.getByRole("group", {
+      name: "Model selection actions",
+    });
+    fireEvent.click(
+      within(toolbar).getByRole("button", { name: "Include matching" }),
+    );
     expect(onSetIncluded).toHaveBeenLastCalledWith(
       initialRows.slice(0, 25).map((row) => row.rowId),
       true,
@@ -301,7 +342,12 @@ describe("large catalog viewport", () => {
     fireEvent.change(screen.getByRole("searchbox"), {
       target: { value: "coder" },
     });
-    fireEvent.click(screen.getByRole("button", { name: "Exclude matching" }));
+    fireEvent.click(
+      within(screen.getByRole("group", { name: "Model selection actions" })).getByRole(
+        "button",
+        { name: "Exclude matching" },
+      ),
+    );
     expect(onSetIncluded).toHaveBeenLastCalledWith(
       initialRows.slice(0, 25).map((row) => row.rowId),
       false,
@@ -358,22 +404,36 @@ describe("large catalog viewport", () => {
       { rowId: "legacy", model: "legacy" },
       { rowId: "excluded", model: "excluded", enabled: false },
     ];
-    render(
-      <CodexCatalogViewport
-        items={rows.map((row, index) => ({ row, index }))}
-        compact
-        selected={new Set()}
-        onSelect={vi.fn()}
-        onToggleEnabled={onToggleEnabled}
-      >
-        {({ row }) => <span>{row.model}</span>}
-      </CodexCatalogViewport>,
-    );
-    fireEvent.click(screen.getByRole("button", { name: "Include matching" }));
+    function Harness() {
+      const [selected, setSelected] = useState(new Set<string>());
+      return (
+        <CodexCatalogViewport
+          items={rows.map((row, index) => ({ row, index }))}
+          compact
+          selected={selected}
+          onSelect={(id, checked) =>
+            setSelected((current) => {
+              const next = new Set(current);
+              if (checked) next.add(id);
+              else next.delete(id);
+              return next;
+            })
+          }
+          onSelectionChange={setSelected}
+          onToggleEnabled={onToggleEnabled}
+        >
+          {({ row }) => <span>{row.model}</span>}
+        </CodexCatalogViewport>
+      );
+    }
+    render(<Harness />);
+    fireEvent.click(screen.getByRole("checkbox", { name: "Select excluded" }));
+    fireEvent.click(screen.getByRole("button", { name: "Include selected" }));
     expect(onToggleEnabled).toHaveBeenCalledTimes(1);
     expect(onToggleEnabled).toHaveBeenCalledWith("excluded", true);
     onToggleEnabled.mockClear();
-    fireEvent.click(screen.getByRole("button", { name: "Exclude matching" }));
+    fireEvent.click(screen.getByRole("checkbox", { name: "Select legacy" }));
+    fireEvent.click(screen.getByRole("button", { name: "Exclude selected" }));
     expect(onToggleEnabled).toHaveBeenCalledTimes(1);
     expect(onToggleEnabled).toHaveBeenCalledWith("legacy", false);
   });

@@ -320,30 +320,6 @@ export function CodexCatalogViewport<
             defaultValue: "{{count}} matching models",
           })}
         </span>
-        <Button
-          type="button"
-          variant="outline"
-          size="sm"
-          disabled={!filteredItems.some(({ row }) => row.enabled === false)}
-          onClick={() => setMatchedIncluded(true)}
-        >
-          <ListChecks className="mr-1.5 h-4 w-4" />
-          {t("catalogBrowser.includeMatching", {
-            defaultValue: "Include matching",
-          })}
-        </Button>
-        <Button
-          type="button"
-          variant="outline"
-          size="sm"
-          disabled={!filteredItems.some(({ row }) => row.enabled !== false)}
-          onClick={() => setMatchedIncluded(false)}
-        >
-          <ListX className="mr-1.5 h-4 w-4" />
-          {t("catalogBrowser.excludeMatching", {
-            defaultValue: "Exclude matching",
-          })}
-        </Button>
       </div>
     </div>
   );
@@ -461,6 +437,32 @@ export function CodexCatalogViewport<
           <ListX className="mr-1.5 h-4 w-4 shrink-0" />
           {t("catalogBrowser.excludeSelected")}
         </Button>
+        <Button
+          type="button"
+          variant="outline"
+          size="sm"
+          className="h-auto min-h-8 whitespace-normal"
+          disabled={!filteredItems.some(({ row }) => row.enabled === false)}
+          onClick={() => setMatchedIncluded(true)}
+        >
+          <ListChecks className="mr-1.5 h-4 w-4 shrink-0" />
+          {t("catalogBrowser.includeMatching", {
+            defaultValue: "Include matching",
+          })}
+        </Button>
+        <Button
+          type="button"
+          variant="outline"
+          size="sm"
+          className="h-auto min-h-8 whitespace-normal"
+          disabled={!filteredItems.some(({ row }) => row.enabled !== false)}
+          onClick={() => setMatchedIncluded(false)}
+        >
+          <ListX className="mr-1.5 h-4 w-4 shrink-0" />
+          {t("catalogBrowser.excludeMatching", {
+            defaultValue: "Exclude matching",
+          })}
+        </Button>
         {onUseOnlySelected && (
           <Button
             type="button"
@@ -492,60 +494,65 @@ export function CodexCatalogViewport<
     return (
       <div className="min-w-0 border-y">
         {browserControls}
-        {emptyState}
-        {visibleItems.map((entry) => {
-          const { row } = entry;
-          return (
-            <div
-              key={row.rowId}
-              className={cn(
-                "min-w-0 space-y-3 border-b px-2 py-3 last:border-b-0",
-                selected.has(row.rowId) && "bg-primary/5",
-              )}
-            >
-              <div className="flex items-center justify-between gap-3">
-                {showSelection && (
-                  <label className="flex min-w-0 items-center gap-2 text-sm">
-                    <Checkbox
-                      checked={selected.has(row.rowId)}
-                      onCheckedChange={(checked) =>
-                        onSelect(row.rowId, checked === true)
-                      }
-                      aria-label={t("codexConfig.catalogSelectModel", {
-                        model: row.model,
-                        defaultValue: "Select {{model}}",
-                      })}
-                    />
-                    <span className="min-w-0 break-words font-medium">
-                      {row.displayName || row.model}
-                    </span>
-                  </label>
+        <div
+          data-catalog-scroll-viewport
+          className="max-h-[min(60vh,720px)] overflow-y-auto overscroll-contain"
+        >
+          {emptyState}
+          {visibleItems.map((entry) => {
+            const { row } = entry;
+            return (
+              <div
+                key={row.rowId}
+                className={cn(
+                  "min-w-0 space-y-3 border-b px-2 py-3 last:border-b-0",
+                  selected.has(row.rowId) && "bg-primary/5",
                 )}
-                {onToggleEnabled && (
-                  <label className="ml-auto flex shrink-0 items-center gap-2 text-xs">
-                    {t(
-                      row.enabled !== false
-                        ? "catalogBrowser.included"
-                        : "catalogBrowser.excluded",
-                    )}
-                    <Switch
-                      checked={row.enabled !== false}
-                      onCheckedChange={(enabled) =>
-                        onToggleEnabled(row.rowId, enabled)
-                      }
-                      aria-label={t("codexConfig.catalogIncludeModel", {
-                        model: row.model,
-                        defaultValue: "Include {{model}}",
-                      })}
-                    />
-                  </label>
-                )}
+              >
+                <div className="flex items-center justify-between gap-3">
+                  {showSelection && (
+                    <label className="flex min-w-0 items-center gap-2 text-sm">
+                      <Checkbox
+                        checked={selected.has(row.rowId)}
+                        onCheckedChange={(checked) =>
+                          onSelect(row.rowId, checked === true)
+                        }
+                        aria-label={t("codexConfig.catalogSelectModel", {
+                          model: row.model,
+                          defaultValue: "Select {{model}}",
+                        })}
+                      />
+                      <span className="min-w-0 break-words font-medium">
+                        {row.displayName || row.model}
+                      </span>
+                    </label>
+                  )}
+                  {onToggleEnabled && (
+                    <label className="ml-auto flex shrink-0 items-center gap-2 text-xs">
+                      {t(
+                        row.enabled !== false
+                          ? "catalogBrowser.included"
+                          : "catalogBrowser.excluded",
+                      )}
+                      <Switch
+                        checked={row.enabled !== false}
+                        onCheckedChange={(enabled) =>
+                          onToggleEnabled(row.rowId, enabled)
+                        }
+                        aria-label={t("codexConfig.catalogIncludeModel", {
+                          model: row.model,
+                          defaultValue: "Include {{model}}",
+                        })}
+                      />
+                    </label>
+                  )}
+                </div>
+                {children(entry)}
               </div>
-              {children(entry)}
-            </div>
-          );
-        })}
-        {selectionToolbar}
+            );
+          })}
+          {selectionToolbar}
+        </div>
       </div>
     );
   }

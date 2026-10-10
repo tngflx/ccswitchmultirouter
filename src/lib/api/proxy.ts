@@ -21,6 +21,7 @@ import type {
   CodexHistoryVisibilityRepairOutcome,
   CodexGuardianStatus,
   RequestHealthSnapshot,
+  OpenAIResponsesContractStatus,
 } from "@/types/proxy";
 
 export const proxyApi = {
@@ -48,6 +49,10 @@ export const proxyApi = {
 
   async getRequestHealthDiagnostics(): Promise<RequestHealthSnapshot> {
     return invoke("get_request_health_diagnostics");
+  },
+
+  async checkOpenAIResponsesContract(): Promise<OpenAIResponsesContractStatus> {
+    return invoke("check_openai_responses_contract");
   },
 
   async diagnoseCodexMultiRouter(

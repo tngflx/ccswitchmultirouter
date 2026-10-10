@@ -414,6 +414,7 @@
     "tabAuth": "驗證",
     "tabAdvanced": "進階",
     "tabProxy": "路由",
+    "tabRequestHealth": "請求健康",
     "authCenter": {
       "title": "OAuth 驗證中心",
       "description": "在 Claude Code 中使用您的其他訂閱，請注意合規風險。",
@@ -451,7 +452,20 @@
       "mediaBytes": "影像載荷位元組數",
       "timeline": "請求時間線",
       "actionNone": "未審核",
-      "empty": "尚無請求健康樣本。請透過本機代理程式傳送一次請求後重新整理。"
+      "empty": "尚無請求健康樣本。請透過本機代理程式傳送一次請求後重新整理。",
+      "contractTitle": "OpenAI Responses 契約",
+      "contractDescription": "將本機審核過的請求規則與最新公開的 OpenAI Responses create 參考進行比較。執行時檢查保持保守且離線。",
+      "contractCheck": "檢查官方契約",
+      "contractStatusNotChecked": "尚未檢查",
+      "contractStatusCurrent": "已是最新",
+      "contractStatusDrift": "偵測到差異",
+      "contractStatusFailed": "檢查失敗",
+      "contractSnapshot": "內嵌快照",
+      "contractLastChecked": "上次檢查",
+      "contractNeverChecked": "從未檢查",
+      "contractCoverage": "涵蓋範圍",
+      "contractChanged": "官方宣告已變更",
+      "contractLoading": "正在載入契約中繼資料..."
     },
     "codexPluginHealth": {
       "loading": "正在檢查 Codex 外掛...",
@@ -848,6 +862,8 @@
     "watchdogSupervisor": "守護程序",
     "watchdogStateRunning": "執行中",
     "watchdogStateStopped": "未執行",
+    "watchdogStateDevManaged": "開發守護中",
+    "watchdogDevSupervisor": "由 pnpm dev 負責復原",
     "watchdogStateDisabled": "已關閉",
     "watchdogRestartsWindow": "最近 30 分鐘自動拉起",
     "watchdogPortLabel": "本機代理連接埠",

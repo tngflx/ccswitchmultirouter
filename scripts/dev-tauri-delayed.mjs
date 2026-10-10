@@ -28,6 +28,10 @@ const WATCH_EVENT_BATCH_MS = 100;
 const CHILD_EXIT_TIMEOUT_MS = 10_000;
 const WINDOWS_PROCESS_EXIT_TIMEOUT_MS = 2_000;
 const WINDOWS_LISTENER_RELEASE_TIMEOUT_MS = 60_000;
+const DEV_AUTO_RESTART_WINDOW_MS = 30 * 60 * 1_000;
+const DEV_MAX_AUTO_RESTARTS = 5;
+const DEV_AUTO_RESTART_DELAY_MS = 1_000;
+const DEV_SUPERVISOR_ENV = "CC_SWITCH_DEV_SUPERVISOR";
 const BACKEND_WATCH_DIRECTORIES = [
   "src",
   "capabilities",
@@ -148,6 +152,86 @@ export function parsePort(environment = process.env) {
     throw new Error(`Invalid development port "${rawPort}".`);
   }
   return port;
+}
+
+/**
+ * Development uses the same persisted watchdog toggle as the packaged app.
+ * A missing settings file is treated as enabled for backwards compatibility;
+ * malformed JSON disables recovery so a broken preference cannot cause a
+ * restart loop.
+ */
+export function resolveDevSettingsPath(environment = process.env) {
+  const home =
+    environment.CC_SWITCH_TEST_HOME ||
+    (process.platform === "win32"
+      ? environment.USERPROFILE
+      : environment.HOME || environment.USERPROFILE);
+  return home ? path.join(home, ".cc-switch", "settings.json") : null;
+}
+
+export function readDevWatchdogEnabled(
+  environment = process.env,
+  read = readFileSync,
+) {
+  const override = environment.CC_SWITCH_DEV_WATCHDOG_ENABLED;
+  if (override !== undefined) {
+    const normalized = String(override).trim().toLowerCase();
+    if (["1", "true", "yes", "on"].includes(normalized)) {
+      return true;
+    }
+    if (["0", "false", "no", "off"].includes(normalized)) {
+      return false;
+    }
+    return false;
+  }
+
+  const settingsPath = resolveDevSettingsPath(environment);
+  if (!settingsPath) {
+    return true;
+  }
+  let content;
+  try {
+    content = read(settingsPath, "utf8");
+  } catch (error) {
+    if (error.code === "ENOENT") {
+      return true;
+    }
+    return false;
+  }
+  let settings;
+  try {
+    settings = JSON.parse(content);
+  } catch {
+    return false;
+  }
+  const value = settings?.watchdogEnabled ?? settings?.watchdog_enabled;
+  return typeof value === "boolean" ? value : true;
+}
+
+export function devAutoRestartDecision({
+  appStarted,
+  exitCode,
+  signal,
+  watchdogEnabled,
+  nowMs = Date.now(),
+  restartTimesMs = [],
+}) {
+  if (!watchdogEnabled) {
+    return { restart: false, reason: "disabled" };
+  }
+  if (!appStarted) {
+    return { restart: false, reason: "app-not-started" };
+  }
+  if (exitCode === 0 && signal === null) {
+    return { restart: false, reason: "clean-exit" };
+  }
+  const recent = restartTimesMs.filter(
+    (timestamp) => timestamp >= nowMs - DEV_AUTO_RESTART_WINDOW_MS,
+  );
+  if (recent.length >= DEV_MAX_AUTO_RESTARTS) {
+    return { restart: false, reason: "rate-limited" };
+  }
+  return { restart: true, reason: "unexpected-exit" };
 }
 
 export function assertNormalCargoTargetDirectory(
@@ -1093,6 +1177,8 @@ Use "pnpm dev:immediate" for the same verified lifecycle with no quiet delay.`);
   let backendWatchers = [];
   let shuttingDown = false;
   let shutdownPromise;
+  let devRestartTimer;
+  const devRestartTimesMs = [];
   const expectedTauriExits = createExpectedExitRegistry();
   const backendContentTracker = createBackendContentTracker();
   let lastBackendEditAt;
@@ -1257,6 +1343,10 @@ Use "pnpm dev:immediate" for the same verified lifecycle with no quiet delay.`);
         env: {
           ...process.env,
           CARGO_INCREMENTAL: "0",
+          // In a `pnpm dev` session this Node process owns the Tauri child.
+          // The Rust supervisor stays disabled here so both layers cannot
+          // relaunch the same app after one crash.
+          [DEV_SUPERVISOR_ENV]: "1",
         },
       },
     );
@@ -1294,7 +1384,41 @@ Use "pnpm dev:immediate" for the same verified lifecycle with no quiet delay.`);
         return;
       }
       if (!shuttingDown && tauri === child) {
-        if (code === 0) {
+        const watchdogEnabled = readDevWatchdogEnabled();
+        const decision = devAutoRestartDecision({
+          appStarted,
+          exitCode: code,
+          signal,
+          watchdogEnabled,
+          restartTimesMs: devRestartTimesMs,
+        });
+        if (decision.restart) {
+          const now = Date.now();
+          devRestartTimesMs.push(now);
+          while (
+            devRestartTimesMs.length > 0 &&
+            devRestartTimesMs[0] < now - DEV_AUTO_RESTART_WINDOW_MS
+          ) {
+            devRestartTimesMs.shift();
+          }
+          tauri = undefined;
+          console.log(
+            `[dev] Tauri backend exited unexpectedly (${signal ?? `code ${code}`}); restarting the existing pnpm dev session (${devRestartTimesMs.length}/${DEV_MAX_AUTO_RESTARTS}).`,
+          );
+          devRestartTimer = setTimeout(() => {
+            devRestartTimer = undefined;
+            if (!shuttingDown && !tauri) {
+              startTauri();
+            }
+          }, DEV_AUTO_RESTART_DELAY_MS);
+          return;
+        }
+        if (decision.reason === "rate-limited") {
+          console.error(
+            `[dev] Tauri backend restart limit reached (${DEV_MAX_AUTO_RESTARTS} in ${DEV_AUTO_RESTART_WINDOW_MS / 60_000} minutes); leaving the backend stopped until the next edit.`,
+          );
+        }
+        if (code === 0 && signal === null) {
           void shutdown(0);
           return;
         }
@@ -1357,6 +1481,10 @@ Use "pnpm dev:immediate" for the same verified lifecycle with no quiet delay.`);
     shuttingDown = true;
     rebuildGate.cancel();
     closeBackendWatchers();
+    if (devRestartTimer) {
+      clearTimeout(devRestartTimer);
+      devRestartTimer = undefined;
+    }
     process.exitCode = exitCode;
     shutdownPromise = Promise.allSettled([
       stopProcessTree(tauri, windowsDevDescendants),

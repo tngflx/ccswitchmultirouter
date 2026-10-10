@@ -17,6 +17,7 @@ pub const SUPERVISE_FLAG: &str = "--ccsm-supervise";
 pub const SUPERVISE_CONFIG_FLAG: &str = "--ccsm-supervise-config";
 pub const SUPERVISE_PORT_FLAG: &str = "--ccsm-supervise-port";
 pub const SUPERVISE_SETTINGS_FLAG: &str = "--ccsm-supervise-settings";
+pub const DEV_SUPERVISOR_ENV: &str = "CC_SWITCH_DEV_SUPERVISOR";
 
 const POLL_INTERVAL: Duration = Duration::from_secs(5);
 const READY_TIMEOUT: Duration = Duration::from_secs(90);
@@ -43,6 +44,14 @@ pub enum ParentOutcome {
     Crashed,
     /// 主进程正常退出（运行标记已被应用自己删除或不属于它），不应打扰。
     CleanExit,
+}
+
+/// Whether the running development wrapper, rather than this binary, owns
+/// recovery for the Tauri child.
+pub fn dev_supervisor_owned() -> bool {
+    std::env::var(DEV_SUPERVISOR_ENV)
+        .ok()
+        .is_some_and(|value| matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true"))
 }
 
 /// 解析守护模式参数；不是守护模式时返回 None。
@@ -75,6 +84,17 @@ fn flag_value(args: &[String], flag: &str) -> Option<String> {
 /// 并且该进程已经不存在 ⇒ 崩溃。标记缺失、pid 不匹配或内容不可解析时一律按正常退出处理
 /// （宁可少重启，也不制造崩溃循环）。
 pub fn classify_parent_outcome(marker_json: Option<&str>, parent_pid: u32) -> ParentOutcome {
+    classify_parent_outcome_with_identity(marker_json, parent_pid, None)
+}
+
+/// Classify the parent while optionally binding the marker to the exact process
+/// instance observed when the supervisor started. PID values can be reused after
+/// a process exits, so a matching PID alone is not sufficient for recovery.
+fn classify_parent_outcome_with_identity(
+    marker_json: Option<&str>,
+    parent_pid: u32,
+    expected_identity: Option<&crate::process_identity::ProcessIdentity>,
+) -> ParentOutcome {
     let Some(marker_json) = marker_json else {
         return ParentOutcome::CleanExit;
     };
@@ -88,6 +108,35 @@ pub fn classify_parent_outcome(marker_json: Option<&str>, parent_pid: u32) -> Pa
     if marker_pid != Some(parent_pid) {
         return ParentOutcome::CleanExit;
     }
+
+    if let Some(expected_identity) = expected_identity {
+        let marker_executable = marker
+            .get("executablePath")
+            .or_else(|| marker.get("executable_path"))
+            .and_then(serde_json::Value::as_str);
+        let marker_started_at = marker
+            .get("processStartedAtTicks")
+            .or_else(|| marker.get("process_started_at_ticks"))
+            .and_then(serde_json::Value::as_u64);
+
+        match (marker_executable, marker_started_at) {
+            (Some(executable_path), Some(started_at_ticks)) => {
+                let marker_identity = crate::process_identity::ProcessIdentity {
+                    pid: parent_pid,
+                    executable_path: executable_path.to_string(),
+                    started_at_ticks,
+                };
+                if !expected_identity.matches(&marker_identity) {
+                    return ParentOutcome::CleanExit;
+                }
+            }
+            // Older markers only recorded the PID. Keep those markers
+            // recoverable, but reject partially written identity metadata.
+            (None, None) => {}
+            _ => return ParentOutcome::CleanExit,
+        }
+    }
+
     ParentOutcome::Crashed
 }
 
@@ -134,6 +183,36 @@ fn append_event(config_dir: &Path, level: &str, event: &str, detail: serde_json:
 
 fn read_run_marker(config_dir: &Path) -> Option<String> {
     std::fs::read_to_string(log_dir(config_dir).join(RUN_MARKER_FILE)).ok()
+}
+
+fn process_identity_from_marker(
+    marker_json: Option<&str>,
+    parent_pid: u32,
+) -> Option<crate::process_identity::ProcessIdentity> {
+    let marker = serde_json::from_str::<serde_json::Value>(marker_json?).ok()?;
+    let marker_pid = marker
+        .get("pid")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|value| u32::try_from(value).ok())?;
+    if marker_pid != parent_pid {
+        return None;
+    }
+    let executable_path = marker
+        .get("executablePath")
+        .or_else(|| marker.get("executable_path"))
+        .and_then(serde_json::Value::as_str)?;
+    let started_at_ticks = marker
+        .get("processStartedAtTicks")
+        .or_else(|| marker.get("process_started_at_ticks"))
+        .and_then(serde_json::Value::as_u64)?;
+    if !crate::process_identity::executable_matches_current(executable_path) {
+        return None;
+    }
+    Some(crate::process_identity::ProcessIdentity {
+        pid: parent_pid,
+        executable_path: executable_path.to_string(),
+        started_at_ticks,
+    })
 }
 
 fn read_recent_restarts(config_dir: &Path) -> Vec<u64> {
@@ -249,6 +328,13 @@ pub fn ensure_supervisor(config_dir: &Path, port: u16) {
     if crate::lightweight::is_lightweight_mode() {
         return;
     }
+    // `pnpm dev` has its own parent-level recovery loop. Running both
+    // supervisors would let the Rust child and the Node wrapper relaunch the
+    // same Tauri app concurrently after one crash.
+    if dev_supervisor_owned() {
+        log::debug!("开发会话由 pnpm dev supervisor 接管，跳过 Rust supervisor");
+        return;
+    }
     let settings = crate::settings::get_settings();
     if !settings.watchdog_enabled {
         log::debug!("内置看门狗已关闭，跳过 supervisor 启动");
@@ -349,19 +435,31 @@ pub fn run_supervisor(args: SuperviseArgs) -> ! {
         }),
     );
 
-    let expected = crate::process_identity::process_identity(args.parent_pid);
-    if let Some(identity) = expected.as_ref() {
+    let initial_marker = read_run_marker(&config_dir);
+    let Some(expected) = crate::process_identity::process_identity(args.parent_pid)
+        .or_else(|| process_identity_from_marker(initial_marker.as_deref(), args.parent_pid))
+    else {
         append_event(
             &config_dir,
-            "info",
-            "supervisor-watching",
+            "error",
+            "supervisor-watch-skipped",
             serde_json::json!({
-                "parentPid": identity.pid,
-                "startedAtTicks": identity.started_at_ticks,
-                "executable": identity.executable_path,
+                "parentPid": args.parent_pid,
+                "reason": "parent process identity could not be verified at supervisor startup",
             }),
         );
-    }
+        std::process::exit(0);
+    };
+    append_event(
+        &config_dir,
+        "info",
+        "supervisor-watching",
+        serde_json::json!({
+            "parentPid": expected.pid,
+            "startedAtTicks": expected.started_at_ticks,
+            "executable": expected.executable_path,
+        }),
+    );
 
     let mut unhealthy_logged = false;
     let mut setting_read_error_logged = false;
@@ -392,10 +490,9 @@ pub fn run_supervisor(args: SuperviseArgs) -> ! {
             }
         }
         let current = crate::process_identity::process_identity(args.parent_pid);
-        let still_running = match (expected.as_ref(), current.as_ref()) {
-            (Some(expected), Some(current)) => expected.matches(current),
-            _ => false,
-        };
+        let still_running = current
+            .as_ref()
+            .is_some_and(|current| expected.matches(current));
         if still_running {
             let port_ready = args.port == 0
                 || crate::process_identity::tcp_listener_owner_pid(args.port).is_some();
@@ -444,8 +541,12 @@ pub fn run_supervisor(args: SuperviseArgs) -> ! {
         }
     }
 
+    // Read the marker after the parent has stopped. A clean exit removes it;
+    // retaining the startup snapshot here would turn an intentional quit into
+    // a false crash and relaunch.
     let marker = read_run_marker(&config_dir);
-    match classify_parent_outcome(marker.as_deref(), args.parent_pid) {
+    match classify_parent_outcome_with_identity(marker.as_deref(), args.parent_pid, Some(&expected))
+    {
         ParentOutcome::StillRunning => std::process::exit(0),
         ParentOutcome::CleanExit => {
             append_event(
@@ -670,6 +771,92 @@ mod tests {
             classify_parent_outcome(Some(r#"{"pid": 42, "version": "1.0"}"#), 42),
             ParentOutcome::Crashed
         );
+    }
+
+    #[test]
+    fn crash_marker_is_bound_to_the_observed_process_identity_when_available() {
+        let expected =
+            crate::process_identity::current_process_identity().expect("current process identity");
+        let matching = serde_json::json!({
+            "pid": expected.pid,
+            "executablePath": expected.executable_path,
+            "processStartedAtTicks": expected.started_at_ticks,
+        });
+        assert_eq!(
+            classify_parent_outcome_with_identity(
+                Some(&matching.to_string()),
+                expected.pid,
+                Some(&expected),
+            ),
+            ParentOutcome::Crashed
+        );
+
+        let reused_pid = serde_json::json!({
+            "pid": expected.pid,
+            "executablePath": expected.executable_path,
+            "processStartedAtTicks": expected.started_at_ticks.saturating_add(1),
+        });
+        assert_eq!(
+            classify_parent_outcome_with_identity(
+                Some(&reused_pid.to_string()),
+                expected.pid,
+                Some(&expected),
+            ),
+            ParentOutcome::CleanExit
+        );
+    }
+
+    #[test]
+    fn legacy_pid_only_marker_remains_eligible_for_recovery() {
+        let expected =
+            crate::process_identity::current_process_identity().expect("current process identity");
+        let marker = serde_json::json!({ "pid": expected.pid });
+        assert_eq!(
+            classify_parent_outcome_with_identity(
+                Some(&marker.to_string()),
+                expected.pid,
+                Some(&expected),
+            ),
+            ParentOutcome::Crashed
+        );
+    }
+
+    #[test]
+    fn missing_marker_after_parent_exit_is_a_clean_exit_even_with_identity_binding() {
+        let expected =
+            crate::process_identity::current_process_identity().expect("current process identity");
+        assert_eq!(
+            classify_parent_outcome_with_identity(None, expected.pid, Some(&expected)),
+            ParentOutcome::CleanExit
+        );
+    }
+
+    #[test]
+    fn marker_identity_can_bootstrap_a_supervisor_after_parent_exit() {
+        let expected =
+            crate::process_identity::current_process_identity().expect("current process identity");
+        let marker = serde_json::json!({
+            "pid": expected.pid,
+            "executablePath": expected.executable_path,
+            "processStartedAtTicks": expected.started_at_ticks,
+        });
+
+        let recovered = process_identity_from_marker(Some(&marker.to_string()), expected.pid)
+            .expect("identity");
+        assert!(expected.matches(&recovered));
+    }
+
+    #[test]
+    fn marker_identity_cannot_bootstrap_from_another_executable() {
+        let expected =
+            crate::process_identity::current_process_identity().expect("current process identity");
+        let marker = serde_json::json!({
+            "pid": expected.pid,
+            "executablePath": "C:/not-ccswitch.exe",
+            "processStartedAtTicks": expected.started_at_ticks,
+        });
+
+        assert!(process_identity_from_marker(Some(&marker.to_string()), expected.pid).is_none());
     }
 
     #[test]

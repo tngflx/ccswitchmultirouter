@@ -1112,6 +1112,8 @@ pub fn update_settings(mut new_settings: AppSettings) -> Result<(), AppError> {
     new_settings.env_injection.validate()?;
     crate::codex_egress_timezone::validate_timezone_settings(&new_settings.codex_egress_timezone)
         .map_err(AppError::InvalidInput)?;
+    let request_health_windows_notifications_active =
+        request_health_windows_notifications_active(&new_settings.request_health);
     let mut guard = settings_store().write().unwrap_or_else(|e| {
         log::warn!("设置锁已毒化，使用恢复值: {e}");
         e.into_inner()
@@ -1121,6 +1123,11 @@ pub fn update_settings(mut new_settings: AppSettings) -> Result<(), AppError> {
     // 两个不同版本，并在下一次启动时丢失其中一方的结果。
     save_settings_file(&new_settings)?;
     *guard = new_settings;
+    drop(guard);
+    if !request_health_windows_notifications_active {
+        crate::proxy::request_health::cancel_pending_reviews();
+        crate::codex_desktop::clear_codex_request_health_warnings();
+    }
     Ok(())
 }
 
@@ -1149,7 +1156,6 @@ pub fn snooze_request_health_windows_notifications() -> Result<(), AppError> {
             .request_health
             .windows_notification_snooze_hours
             .clamp(1, 24);
-        settings.request_health.windows_notifications_enabled = true;
         settings
             .request_health
             .windows_notifications_snoozed_until_ms = Some(
@@ -1161,10 +1167,15 @@ pub fn snooze_request_health_windows_notifications() -> Result<(), AppError> {
 }
 
 pub fn request_health_windows_notifications_active(config: &RequestHealthConfig) -> bool {
-    config.windows_notifications_enabled
+    request_health_diagnostics_active(config)
+        && config.windows_notifications_enabled
         && config
             .windows_notifications_snoozed_until_ms
             .is_none_or(|until| chrono::Utc::now().timestamp_millis() >= until)
+}
+
+pub fn request_health_diagnostics_active(config: &RequestHealthConfig) -> bool {
+    config.enabled && config.review_mode != RequestHealthReviewMode::Off
 }
 
 fn mutate_settings<F, R>(mutator: F) -> Result<R, AppError>
@@ -1178,8 +1189,15 @@ where
     let mut next = guard.clone();
     let result = mutator(&mut next);
     next.normalize_paths();
+    let request_health_windows_notifications_active =
+        request_health_windows_notifications_active(&next.request_health);
     save_settings_file(&next)?;
     *guard = next;
+    drop(guard);
+    if !request_health_windows_notifications_active {
+        crate::proxy::request_health::cancel_pending_reviews();
+        crate::codex_desktop::clear_codex_request_health_warnings();
+    }
     Ok(result)
 }
 
@@ -1689,6 +1707,28 @@ mod tests {
         .unwrap();
         assert!(!settings.tool_auto_update_enabled("codex"));
         assert!(settings.tool_auto_update_enabled("pi"));
+    }
+
+    #[test]
+    fn request_health_advisories_follow_all_user_visible_disable_paths() {
+        let defaults = RequestHealthConfig::default();
+        assert!(request_health_diagnostics_active(&defaults));
+        assert!(request_health_windows_notifications_active(&defaults));
+
+        let mut disabled = defaults.clone();
+        disabled.enabled = false;
+        assert!(!request_health_diagnostics_active(&disabled));
+
+        let mut review_off = defaults.clone();
+        review_off.review_mode = RequestHealthReviewMode::Off;
+        assert!(!request_health_diagnostics_active(&review_off));
+
+        let mut notifications_off = defaults;
+        assert!(request_health_diagnostics_active(&notifications_off));
+        notifications_off.windows_notifications_enabled = false;
+        assert!(!request_health_windows_notifications_active(
+            &notifications_off
+        ));
     }
 
     #[test]

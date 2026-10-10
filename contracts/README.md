@@ -6,6 +6,16 @@ after provider transformations and overrides, including Lite fallback.
 Enable Request Health in CC Switch to see redacted findings in its existing
 panel and router logs. Retry attempts replace the same trace's diagnostic.
 
+The same panel includes an **OpenAI Responses contract** section. It displays
+the embedded snapshot, coverage, verification date, and last comparison result.
+Use **Check official contract** there to fetch the current public reference and
+show whether typed declarations or reviewed invariant evidence have drifted.
+This action is user-triggered; normal proxy traffic never fetches documentation.
+The panel is available directly in CC Switch under **Settings → Request Health**;
+the Codex router status view also keeps a shortcut to the same diagnostics.
+No terminal command is required for normal use. The pnpm commands below are
+optional maintainer/CI gates only.
+
 This is a conservative checker, not the entire OpenAI schema. It covers known
 top-level types, selected nested types, conversation/previous-response conflicts,
 compaction-trigger placement, additional-tool roles, tool choices, and selected

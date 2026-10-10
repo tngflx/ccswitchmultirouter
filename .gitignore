@@ -37,3 +37,4 @@ mainWindow.js
 /scripts/codex-history-tool/*.spec
 /scripts/logs/
 /.tmp/local-release-cargo/
+/target/

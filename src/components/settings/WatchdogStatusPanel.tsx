@@ -50,10 +50,15 @@ export function WatchdogStatusPanel() {
             label: t("settings.watchdogStateRunning"),
             variant: "default" as const,
           }
-        : {
-            label: t("settings.watchdogStateStopped"),
-            variant: "destructive" as const,
-          };
+        : status.supervisorMode === "pnpm-dev"
+          ? {
+              label: t("settings.watchdogStateDevManaged"),
+              variant: "default" as const,
+            }
+          : {
+              label: t("settings.watchdogStateStopped"),
+              variant: "destructive" as const,
+            };
 
   return (
     <section className="space-y-4">
@@ -93,6 +98,11 @@ export function WatchdogStatusPanel() {
               <Badge variant={supervisorBadge.variant}>
                 {supervisorBadge.label}
               </Badge>
+            ) : null}
+            {status.supervisorMode === "pnpm-dev" ? (
+              <span className="text-muted-foreground">
+                {t("settings.watchdogDevSupervisor")}
+              </span>
             ) : null}
             {status.supervisorPid ? (
               <span className="font-mono text-muted-foreground">

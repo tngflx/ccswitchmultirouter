@@ -783,7 +783,10 @@ describe("CodexFormFields local model routing", () => {
         screen.queryByLabelText("Include other-model"),
       ).not.toBeInTheDocument();
     }
-    fireEvent.click(screen.getByRole("button", { name: "Include matching" }));
+    fireEvent.click(
+      screen.getByRole("checkbox", { name: "Select matching" }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Include selected" }));
     await waitFor(() =>
       expect(latestCatalog()[0]).toMatchObject({
         canonicalSlug: "vendor/canonical",
@@ -962,7 +965,10 @@ describe("CodexFormFields local model routing", () => {
     fireEvent.change(screen.getByRole("searchbox", { name: "Search models" }), {
       target: { value: "WIRE-HIDDEN" },
     });
-    fireEvent.click(screen.getByRole("button", { name: "Include matching" }));
+    fireEvent.click(
+      screen.getByRole("checkbox", { name: "Select matching" }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Include selected" }));
     await waitFor(() => expect(latestCatalog()[0].enabled).toBe(true));
     expect(latestCatalog()[1].model).toBe("kept");
     expect(
@@ -974,7 +980,10 @@ describe("CodexFormFields local model routing", () => {
     expect(screen.getByRole("option", { name: "hidden" })).toBeVisible();
     fireEvent.click(screen.getByRole("option", { name: "hidden" }));
     expect(latestDefaultModel()).toBe("hidden");
-    fireEvent.click(screen.getByRole("button", { name: "Exclude matching" }));
+    fireEvent.click(
+      screen.getByRole("checkbox", { name: "Select matching" }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Exclude selected" }));
     await waitFor(() => expect(latestCatalog()[0].enabled).toBe(false));
     expect(
       screen.queryByRole("button", {
@@ -1011,7 +1020,10 @@ describe("CodexFormFields local model routing", () => {
     fireEvent.change(screen.getByRole("searchbox", { name: "Search models" }), {
       target: { value: "hidden" },
     });
-    fireEvent.click(screen.getByRole("button", { name: "Include matching" }));
+    fireEvent.click(
+      screen.getByRole("checkbox", { name: "Select matching" }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Include selected" }));
     await waitFor(() => expect(latestCatalog()[0].enabled).toBe(true));
     expect(latestCatalog()[1].enabled).toBe(false);
     fireEvent.click(

@@ -1796,6 +1796,7 @@ pub fn run() {
             commands::restore_configured_proxy_listener,
             commands::get_proxy_status,
             commands::get_request_health_diagnostics,
+            commands::check_openai_responses_contract,
             commands::diagnose_codex_multirouter,
             commands::unlock_codex_model_picker,
             commands::get_codex_guardian_status,

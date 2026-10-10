@@ -2,6 +2,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Output};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 use std::time::Instant;
@@ -25,6 +26,7 @@ const REMEMBERED_CODEX_DESKTOP_EXECUTABLE_FILENAME: &str = "codex-desktop-execut
 static CODEX_REQUEST_HEALTH_WARNINGS: OnceLock<Mutex<HashMap<String, CodexRequestHealthWarning>>> =
     OnceLock::new();
 static CODEX_REQUEST_HEALTH_WARNING_SYNC: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+static CODEX_REQUEST_HEALTH_WARNINGS_SUPPRESSED: AtomicBool = AtomicBool::new(false);
 #[cfg(any(target_os = "macos", test))]
 const CODEX_DESKTOP_BUNDLE_IDENTIFIER: &str = "com.openai.codex";
 
@@ -47,10 +49,25 @@ fn codex_request_health_warning_sync_lock() -> &'static tokio::sync::Mutex<()> {
 }
 
 pub(crate) fn show_codex_request_health_warning(warning: CodexRequestHealthWarning) {
+    let settings = crate::settings::get_settings();
+    if !crate::settings::request_health_windows_notifications_active(&settings.request_health) {
+        clear_codex_request_health_warnings();
+        return;
+    }
+    CODEX_REQUEST_HEALTH_WARNINGS_SUPPRESSED.store(false, Ordering::Release);
     codex_request_health_warnings()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .insert(warning.token.clone(), warning);
+    spawn_codex_request_health_warning_sync();
+}
+
+pub(crate) fn clear_codex_request_health_warnings() {
+    CODEX_REQUEST_HEALTH_WARNINGS_SUPPRESSED.store(true, Ordering::Release);
+    codex_request_health_warnings()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clear();
     spawn_codex_request_health_warning_sync();
 }
 
@@ -430,6 +447,9 @@ fn codex_model_entries_from_catalog_value(catalog: &Value) -> (Vec<String>, Vec<
     let mut projected = Vec::new();
 
     for entry in entries {
+        if entry.get("enabled").and_then(Value::as_bool) == Some(false) {
+            continue;
+        }
         let Some(model_name) = codex_model_name(entry) else {
             continue;
         };
@@ -1163,8 +1183,10 @@ fn app_server_module_client_discovery_core_script() -> &'static str {
 "#
 }
 
-fn request_health_warning_core_script() -> &'static str {
-    r###"
+fn request_health_warning_core_script(suppressed: bool) -> String {
+    let suppressed = if suppressed { "true" } else { "false" };
+    (r###"
+  const requestHealthWarningsSuppressed = {suppressed};
   const requestHealthWarningStorageKey = "ccswitch-request-health-warnings-v1";
   const requestHealthWarningContainerId = "ccswitch-request-health-warning-container";
   const readStoredRequestHealthWarnings = () => {
@@ -1174,6 +1196,13 @@ fn request_health_warning_core_script() -> &'static str {
     } catch { return []; }
   };
   const renderRequestHealthWarnings = (warnings) => {
+    if (requestHealthWarningsSuppressed) {
+      try { localStorage.removeItem(requestHealthWarningStorageKey); } catch {}
+      document.getElementById(requestHealthWarningContainerId)?.remove();
+      if (state.requestHealthWarningExpiryTimer) clearTimeout(state.requestHealthWarningExpiryTimer);
+      state.requestHealthWarningExpiryTimer = null;
+      return { active: 0 };
+    }
     const now = Date.now();
     const active = (Array.isArray(warnings) ? warnings : [])
       .filter((warning) => warning && String(warning.token || "").trim() && Number(warning.expiresAtMs) > now)
@@ -1222,12 +1251,24 @@ fn request_health_warning_core_script() -> &'static str {
     }
     if (state.requestHealthWarningExpiryTimer) clearTimeout(state.requestHealthWarningExpiryTimer);
     const nextExpiry = Math.min(...active.map((warning) => Number(warning.expiresAtMs)));
-    state.requestHealthWarningExpiryTimer = setTimeout(() => renderRequestHealthWarnings(readStoredRequestHealthWarnings()), Math.max(50, nextExpiry - now + 25));
+    state.requestHealthWarningExpiryTimer = setTimeout(() => {
+      if (!requestHealthWarningsSuppressed) {
+        renderRequestHealthWarnings(readStoredRequestHealthWarnings());
+      }
+    }, Math.max(50, nextExpiry - now + 25));
     return { active: active.length };
   };
-  state.syncRequestHealthWarnings = (warnings) => renderRequestHealthWarnings(warnings);
-  renderRequestHealthWarnings(readStoredRequestHealthWarnings());
-"###
+  state.syncRequestHealthWarnings = (warnings) => {
+    if (!requestHealthWarningsSuppressed) renderRequestHealthWarnings(warnings);
+  };
+  if (requestHealthWarningsSuppressed) {
+    try { localStorage.removeItem(requestHealthWarningStorageKey); } catch {}
+    renderRequestHealthWarnings([]);
+  } else {
+    renderRequestHealthWarnings(readStoredRequestHealthWarnings());
+  }
+"###)
+        .replace("{suppressed}", suppressed)
 }
 
 ///
@@ -1823,7 +1864,12 @@ fn build_model_picker_unlock_script(catalog: &CodexModelCatalogProjection) -> St
     let request_normalization_core = app_server_request_normalization_core_script();
     let history_lineage_hydration_core = history_lineage_hydration_core_script();
     let module_client_discovery_core = app_server_module_client_discovery_core_script();
-    let request_health_warning_core = request_health_warning_core_script();
+    let settings = crate::settings::get_settings();
+    let request_health_warning_suppressed = CODEX_REQUEST_HEALTH_WARNINGS_SUPPRESSED
+        .load(Ordering::Acquire)
+        || !crate::settings::request_health_windows_notifications_active(&settings.request_health);
+    let request_health_warning_core =
+        request_health_warning_core_script(request_health_warning_suppressed);
     let summary_handoff_core = summary_handoff_core_script();
     format!(
         r#"
@@ -3726,6 +3772,39 @@ mod tests {
     }
 
     #[test]
+    fn catalog_projection_excludes_disabled_models() {
+        let value = json!({
+            "models": [
+                { "model": "included-model", "enabled": true },
+                { "model": "excluded-model", "enabled": false },
+                { "model": "legacy-model" }
+            ]
+        });
+
+        let (names, models) = codex_model_entries_from_catalog_value(&value);
+
+        assert_eq!(names, vec!["included-model", "legacy-model"]);
+        assert_eq!(
+            models
+                .iter()
+                .filter_map(|model| model.get("model").and_then(Value::as_str))
+                .collect::<Vec<_>>(),
+            vec!["included-model", "legacy-model"]
+        );
+        assert!(
+            codex_model_catalog_projection_from_value(
+                &json!({
+                    "models": [{ "model": "excluded-model", "enabled": false }]
+                }),
+                None,
+                None
+            )
+            .is_none(),
+            "a catalog containing only excluded models must remain empty for fallback resolution"
+        );
+    }
+
+    #[test]
     fn catalog_projection_does_not_invent_unknown_reasoning_defaults() {
         let value = json!({
             "models": [{ "model": "unknown-third-party", "display_name": "Unknown" }]
@@ -4617,6 +4696,9 @@ JSON.stringify({
         assert!(script.contains("isGuardianV2FeatureTomlError(error)"));
         assert!(script.contains("guardianV2FallbackRequestParams"));
         assert!(script.contains("auth.setAuthMethod(\"chatgpt\")"));
+        assert!(script.contains("requestHealthWarningsSuppressed"));
+        assert!(script.contains("if (!requestHealthWarningsSuppressed) renderRequestHealthWarnings(warnings)"));
+        assert!(script.contains("if (!requestHealthWarningsSuppressed) {"));
     }
 
     /// 验证新版历史兼容层同时恢复官方目录同步，并把 Desktop 的全量历史查询

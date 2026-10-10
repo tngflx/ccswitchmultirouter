@@ -2373,11 +2373,20 @@ export function projectCodexModelCatalog(
   providersById: Map<string, Provider>,
 ): CodexModelCatalogDraft {
   if (!plan) return { models: [], spawnAgentModels: [] };
-  return buildModelCatalogForRoutes(
+  const projected = buildModelCatalogForRoutes(
     plan,
     readCodexRouting(plan)?.routes ?? [],
     providersById,
   );
+  const models = projected.models.filter((model) => model.enabled !== false);
+  const modelIds = new Set(models.map((model) => model.model));
+  return {
+    ...projected,
+    models,
+    spawnAgentModels: (projected.spawnAgentModels ?? []).filter((model) =>
+      modelIds.has(model),
+    ),
+  };
 }
 
 /// 生成工作台专用的新 MultiRouter provider；它只承载路由配置，不再让用户填写无关的上游密钥表单。

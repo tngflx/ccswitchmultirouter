@@ -414,6 +414,7 @@
     "tabAuth": "认证",
     "tabAdvanced": "高级",
     "tabProxy": "路由",
+    "tabRequestHealth": "请求健康",
     "authCenter": {
       "title": "OAuth 认证中心",
       "description": "在 Claude Code 中使用您的其他订阅，请注意合规风险。",
@@ -451,7 +452,20 @@
       "mediaBytes": "图像载荷字节数",
       "timeline": "请求时间线",
       "actionNone": "未审核",
-      "empty": "还没有请求健康样本。请通过本地代理发送一次请求后刷新。"
+      "empty": "还没有请求健康样本。请通过本地代理发送一次请求后刷新。",
+      "contractTitle": "OpenAI Responses 契约",
+      "contractDescription": "将本地审核过的请求规则与最新公开的 OpenAI Responses create 参考进行比较。运行时检查保持保守且离线。",
+      "contractCheck": "检查官方契约",
+      "contractStatusNotChecked": "尚未检查",
+      "contractStatusCurrent": "已是最新",
+      "contractStatusDrift": "检测到差异",
+      "contractStatusFailed": "检查失败",
+      "contractSnapshot": "内置快照",
+      "contractLastChecked": "上次检查",
+      "contractNeverChecked": "从未检查",
+      "contractCoverage": "覆盖范围",
+      "contractChanged": "官方声明已变更",
+      "contractLoading": "正在加载契约元数据..."
     },
     "codexPluginHealth": {
       "loading": "正在检查 Codex 插件...",
@@ -848,6 +862,8 @@
     "watchdogSupervisor": "守护进程",
     "watchdogStateRunning": "运行中",
     "watchdogStateStopped": "未运行",
+    "watchdogStateDevManaged": "开发守护中",
+    "watchdogDevSupervisor": "由 pnpm dev 负责恢复",
     "watchdogStateDisabled": "已关闭",
     "watchdogRestartsWindow": "最近 30 分钟自动拉起",
     "watchdogPortLabel": "本地代理端口",

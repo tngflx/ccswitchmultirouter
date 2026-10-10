@@ -287,6 +287,14 @@ pub async fn get_request_health_diagnostics(
     ))
 }
 
+/// Compare the embedded Responses contract with the current official OpenAI
+/// reference. This is an explicit UI action; normal requests stay offline.
+#[tauri::command]
+pub async fn check_openai_responses_contract(
+) -> Result<crate::proxy::openai_contract::OpenAIResponsesContractStatus, String> {
+    Ok(crate::proxy::openai_contract::check().await)
+}
+
 /// 运行 Codex MultiRouter 一键诊断。
 ///
 /// 该命令只读取本机配置、探测本地代理端口和读取本地 router 日志；不会向真实上游发送

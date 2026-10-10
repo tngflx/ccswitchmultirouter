@@ -110,6 +110,7 @@ pub struct RequestHealthDiagnostic {
 pub struct RequestHealthSnapshot {
     pub config: RequestHealthConfig,
     pub diagnostics: Vec<RequestHealthDiagnostic>,
+    pub contract: crate::proxy::openai_contract::OpenAIResponsesContractStatus,
 }
 
 #[derive(Default)]
@@ -251,16 +252,21 @@ fn summary_handoff_active(session_id: &str) -> bool {
 }
 
 pub fn snapshot(config: RequestHealthConfig) -> RequestHealthSnapshot {
-    let diagnostics = diagnostics_store()
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .iter()
-        .rev()
-        .cloned()
-        .collect();
+    let diagnostics = if crate::settings::request_health_diagnostics_active(&config) {
+        diagnostics_store()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .rev()
+            .cloned()
+            .collect()
+    } else {
+        Vec::new()
+    };
     RequestHealthSnapshot {
         config,
         diagnostics,
+        contract: crate::proxy::openai_contract::status(),
     }
 }
 
@@ -269,7 +275,7 @@ pub(crate) fn inspect_and_optimize(
     config: &RequestHealthConfig,
     context: RequestHealthContext<'_>,
 ) -> Option<RequestHealthDiagnostic> {
-    if !config.enabled {
+    if !crate::settings::request_health_diagnostics_active(config) {
         return None;
     }
 
@@ -684,6 +690,27 @@ fn resolve_pending_review(token: &str, body_hash: &str, decision: ReviewDecision
         );
     }
     pending.sender.send(decision).is_ok()
+}
+
+/// Release any in-flight approval waits when the user disables Request Health
+/// or its Windows notification channel. The request should continue once the
+/// user has explicitly turned the gate off; stale injected warnings are hidden
+/// by the caller that changes the setting.
+pub(crate) fn cancel_pending_reviews() -> usize {
+    let pending = {
+        let mut reviews = pending_reviews()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        reviews
+            .drain()
+            .map(|(_, review)| review)
+            .collect::<Vec<_>>()
+    };
+    let count = pending.len();
+    for review in pending {
+        let _ = review.sender.send(ReviewDecision::ContinueOnce);
+    }
+    count
 }
 
 fn review_finding(
@@ -1392,6 +1419,60 @@ mod tests {
             .any(|finding| finding.code == "orphaned_tool_output"));
         let serialized = serde_json::to_string(&diagnostic).expect("serialize diagnostic");
         assert!(!serialized.contains("secret tool output"));
+    }
+
+    #[test]
+    fn snapshot_hides_historical_diagnostics_when_advisories_are_disabled() {
+        let mut body = json!({
+            "input": [{
+                "type": "function_call_output",
+                "call_id": "missing-call",
+                "output": "secret tool output"
+            }]
+        });
+        inspect_and_optimize(&mut body, &RequestHealthConfig::default(), context())
+            .expect("diagnostic");
+
+        let mut disabled = RequestHealthConfig::default();
+        disabled.enabled = false;
+        assert!(snapshot(disabled).diagnostics.is_empty());
+    }
+
+    #[test]
+    fn snapshot_keeps_diagnostics_when_only_windows_notifications_are_disabled() {
+        let mut body = json!({
+            "input": [{
+                "type": "function_call_output",
+                "call_id": "missing-call",
+                "output": "secret tool output"
+            }]
+        });
+        inspect_and_optimize(&mut body, &RequestHealthConfig::default(), context())
+            .expect("diagnostic");
+
+        let disabled_notifications = RequestHealthConfig {
+            windows_notifications_enabled: false,
+            ..RequestHealthConfig::default()
+        };
+        assert!(!snapshot(disabled_notifications).diagnostics.is_empty());
+    }
+
+    #[test]
+    fn review_mode_off_skips_diagnostics_and_does_not_retain_findings() {
+        let mut body = json!({
+            "input": [{
+                "type": "function_call_output",
+                "call_id": "missing-call",
+                "output": "secret tool output"
+            }]
+        });
+        let config = RequestHealthConfig {
+            review_mode: RequestHealthReviewMode::Off,
+            ..RequestHealthConfig::default()
+        };
+
+        assert!(inspect_and_optimize(&mut body, &config, context()).is_none());
+        assert!(snapshot(config).diagnostics.is_empty());
     }
 
     #[test]

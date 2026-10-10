@@ -2,6 +2,7 @@ import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { RequestHealthPanel } from "@/components/settings/RequestHealthPanel";
+import { proxyApi } from "@/lib/api/proxy";
 import { settingsApi } from "@/lib/api/settings";
 import type { RequestHealthSnapshot } from "@/types/proxy";
 
@@ -11,6 +12,10 @@ vi.mock("react-i18next", () => ({
 
 vi.mock("@/lib/api/settings", () => ({
   settingsApi: { get: vi.fn(), save: vi.fn() },
+}));
+
+vi.mock("@/lib/api/proxy", () => ({
+  proxyApi: { checkOpenAIResponsesContract: vi.fn() },
 }));
 
 const snapshot: RequestHealthSnapshot = {
@@ -25,6 +30,19 @@ const snapshot: RequestHealthSnapshot = {
     windowsNotificationsEnabled: true,
     windowsNotificationSnoozeHours: 4,
     windowsNotificationsSnoozedUntilMs: null,
+  },
+  contract: {
+    version: 1,
+    source:
+      "https://developers.openai.com/api/reference/resources/responses/methods/create.md",
+    verifiedAt: "2026-10-08",
+    coverage:
+      "Conservative Responses create field types and selected replay invariants",
+    declarationsSha256: "a".repeat(64),
+    status: "not_checked",
+    checkedAt: null,
+    changedSections: [],
+    error: null,
   },
   diagnostics: [
     {
@@ -69,6 +87,7 @@ describe("RequestHealthPanel", () => {
   beforeEach(() => {
     vi.mocked(settingsApi.get).mockReset();
     vi.mocked(settingsApi.save).mockReset();
+    vi.mocked(proxyApi.checkOpenAIResponsesContract).mockReset();
   });
 
   it("renders the latest diagnostic and controls", () => {
@@ -122,6 +141,64 @@ describe("RequestHealthPanel", () => {
     expect(screen.getByText(/wrong field type at model/)).toBeInTheDocument();
   });
 
+  it("hides stale diagnostics while request health advisories are disabled", () => {
+    const disabledSnapshot: RequestHealthSnapshot = {
+      ...snapshot,
+      config: {
+        ...snapshot.config,
+        enabled: false,
+      },
+    };
+
+    render(
+      <RequestHealthPanel
+        snapshot={disabledSnapshot}
+        isRefreshing={false}
+        onRefresh={vi.fn()}
+        onSaved={vi.fn()}
+      />,
+    );
+
+    expect(
+      screen.queryByText("settings.requestHealth.historyWarning"),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByText("Codex MultiRouter · gpt-5.6-sol"),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByText("settings.requestHealth.timeline"),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.getByText("settings.requestHealth.empty"),
+    ).toBeInTheDocument();
+  });
+
+  it("keeps diagnostics visible when only Windows notifications are disabled", () => {
+    const notificationsOffSnapshot: RequestHealthSnapshot = {
+      ...snapshot,
+      config: {
+        ...snapshot.config,
+        windowsNotificationsEnabled: false,
+      },
+    };
+
+    render(
+      <RequestHealthPanel
+        snapshot={notificationsOffSnapshot}
+        isRefreshing={false}
+        onRefresh={vi.fn()}
+        onSaved={vi.fn()}
+      />,
+    );
+
+    expect(
+      screen.getAllByText("Codex MultiRouter · gpt-5.6-sol").length,
+    ).toBeGreaterThan(0);
+    expect(
+      screen.getByText("settings.requestHealth.historyWarning"),
+    ).toBeInTheDocument();
+  });
+
   it("persists an updated Windows notification setting", async () => {
     const user = userEvent.setup();
     const settings = { requestHealth: snapshot.config };
@@ -159,5 +236,74 @@ describe("RequestHealthPanel", () => {
         }),
       ),
     );
+  });
+
+  it("checks the official contract from the in-app panel and renders drift", async () => {
+    const user = userEvent.setup();
+    vi.mocked(proxyApi.checkOpenAIResponsesContract).mockResolvedValue({
+      ...snapshot.contract!,
+      status: "drift_detected",
+      checkedAt: "2026-10-09T00:00:00Z",
+      changedSections: ["top-level fields", "tool types"],
+    });
+
+    render(
+      <RequestHealthPanel
+        snapshot={snapshot}
+        isRefreshing={false}
+        onRefresh={vi.fn()}
+        onSaved={vi.fn()}
+      />,
+    );
+
+    await user.click(
+      screen.getByRole("button", {
+        name: "settings.requestHealth.contractCheck",
+      }),
+    );
+
+    await waitFor(() =>
+      expect(
+        screen.getByText("settings.requestHealth.contractStatusDrift"),
+      ).toBeInTheDocument(),
+    );
+    expect(
+      screen.getByText("top-level fields, tool types"),
+    ).toBeInTheDocument();
+    expect(proxyApi.checkOpenAIResponsesContract).toHaveBeenCalledOnce();
+  });
+
+  it("uses the shared settings save pipeline when hosted by Settings", async () => {
+    const user = userEvent.setup();
+    const onSaveConfig = vi.fn().mockResolvedValue(true);
+    const onSaved = vi.fn();
+
+    render(
+      <RequestHealthPanel
+        snapshot={snapshot}
+        isRefreshing={false}
+        onRefresh={vi.fn()}
+        onSaveConfig={onSaveConfig}
+        onSaved={onSaved}
+      />,
+    );
+
+    await user.click(
+      screen.getByRole("checkbox", {
+        name: "settings.requestHealth.windowsNotificationsEnabled",
+      }),
+    );
+    await user.click(
+      screen.getByRole("button", { name: "settings.requestHealth.save" }),
+    );
+
+    await waitFor(() => expect(onSaveConfig).toHaveBeenCalledOnce());
+    expect(onSaveConfig).toHaveBeenCalledWith(
+      expect.objectContaining({ windowsNotificationsEnabled: false }),
+    );
+    expect(onSaved).toHaveBeenCalledWith(
+      expect.objectContaining({ windowsNotificationsEnabled: false }),
+    );
+    expect(settingsApi.save).not.toHaveBeenCalled();
   });
 });

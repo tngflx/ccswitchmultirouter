@@ -414,6 +414,7 @@
     "tabAuth": "Auth",
     "tabAdvanced": "Advanced",
     "tabProxy": "Routing",
+    "tabRequestHealth": "Request Health",
     "authCenter": {
       "title": "OAuth Authentication Center",
       "description": "Use your other subscriptions in Claude Code — please be mindful of compliance risks.",
@@ -451,7 +452,20 @@
       "mediaBytes": "Image payload bytes",
       "timeline": "Request timeline",
       "actionNone": "No review",
-      "empty": "No request-health sample yet. Send a request through the local proxy, then refresh."
+      "empty": "No request-health sample yet. Send a request through the local proxy, then refresh.",
+      "contractTitle": "OpenAI Responses contract",
+      "contractDescription": "Compare the reviewed local request rules with the latest public OpenAI Responses create reference. Runtime checks remain conservative and offline.",
+      "contractCheck": "Check official contract",
+      "contractStatusNotChecked": "Not checked",
+      "contractStatusCurrent": "Up to date",
+      "contractStatusDrift": "Drift detected",
+      "contractStatusFailed": "Check failed",
+      "contractSnapshot": "Embedded snapshot",
+      "contractLastChecked": "Last checked",
+      "contractNeverChecked": "Never",
+      "contractCoverage": "Coverage",
+      "contractChanged": "Official declarations changed",
+      "contractLoading": "Loading contract metadata..."
     },
     "codexPluginHealth": {
       "loading": "Checking Codex plugins...",
@@ -848,6 +862,8 @@
     "watchdogSupervisor": "Supervisor",
     "watchdogStateRunning": "Running",
     "watchdogStateStopped": "Not running",
+    "watchdogStateDevManaged": "Dev supervisor",
+    "watchdogDevSupervisor": "Recovery is owned by pnpm dev",
     "watchdogStateDisabled": "Disabled",
     "watchdogRestartsWindow": "Auto restarts (last 30 min)",
     "watchdogPortLabel": "Local proxy port",

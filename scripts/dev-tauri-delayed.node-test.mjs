@@ -10,12 +10,15 @@ import {
   createChangeEventBatcher,
   createExpectedExitRegistry,
   createQuietPeriodScheduler,
+  devAutoRestartDecision,
   isPathInside,
   isTauriAppStartedOutput,
   normalizeCliArgs,
   parseDelayMs,
   parseNoRebuild,
   parsePort,
+  readDevWatchdogEnabled,
+  resolveDevSettingsPath,
   parseWindowsListeners,
   resolveRepoRootBackendInput,
   resolveTauriRootBackendInput,
@@ -104,6 +107,95 @@ test("parsePort supports isolated development sessions", () => {
   assert.throws(
     () => parsePort({ TAURI_DEV_PORT: "0" }),
     /Invalid development port/,
+  );
+});
+
+test("development recovery reads the shared watchdog toggle safely", () => {
+  assert.equal(
+    resolveDevSettingsPath({
+      CC_SWITCH_TEST_HOME: path.join("tmp", "cc-switch"),
+    }),
+    path.join("tmp", "cc-switch", ".cc-switch", "settings.json"),
+  );
+  assert.equal(
+    readDevWatchdogEnabled(
+      { CC_SWITCH_TEST_HOME: "tmp", CC_SWITCH_DEV_WATCHDOG_ENABLED: "off" },
+      () => {
+        throw new Error("settings should not be read when overridden");
+      },
+    ),
+    false,
+  );
+  assert.equal(
+    readDevWatchdogEnabled(
+      { CC_SWITCH_TEST_HOME: "tmp" },
+      () => '{"watchdogEnabled":false}',
+    ),
+    false,
+  );
+  assert.equal(
+    readDevWatchdogEnabled({ CC_SWITCH_TEST_HOME: "tmp" }, () => "{"),
+    false,
+  );
+  assert.equal(
+    readDevWatchdogEnabled({ CC_SWITCH_TEST_HOME: "tmp" }, (filePath) => {
+      const error = new Error(`missing ${filePath}`);
+      error.code = "ENOENT";
+      throw error;
+    }),
+    true,
+  );
+});
+
+test("development recovery restarts only a started app after an unexpected exit", () => {
+  assert.deepEqual(
+    devAutoRestartDecision({
+      appStarted: false,
+      exitCode: 1,
+      signal: null,
+      watchdogEnabled: true,
+    }),
+    { restart: false, reason: "app-not-started" },
+  );
+  assert.deepEqual(
+    devAutoRestartDecision({
+      appStarted: true,
+      exitCode: 0,
+      signal: null,
+      watchdogEnabled: true,
+    }),
+    { restart: false, reason: "clean-exit" },
+  );
+  assert.deepEqual(
+    devAutoRestartDecision({
+      appStarted: true,
+      exitCode: 1,
+      signal: null,
+      watchdogEnabled: false,
+    }),
+    { restart: false, reason: "disabled" },
+  );
+  assert.deepEqual(
+    devAutoRestartDecision({
+      appStarted: true,
+      exitCode: 1,
+      signal: null,
+      watchdogEnabled: true,
+      nowMs: 1_000,
+      restartTimesMs: [],
+    }),
+    { restart: true, reason: "unexpected-exit" },
+  );
+  assert.deepEqual(
+    devAutoRestartDecision({
+      appStarted: true,
+      exitCode: 1,
+      signal: null,
+      watchdogEnabled: true,
+      nowMs: 1_000,
+      restartTimesMs: [1, 2, 3, 4, 5],
+    }),
+    { restart: false, reason: "rate-limited" },
   );
 });
 

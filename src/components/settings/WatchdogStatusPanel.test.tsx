@@ -16,6 +16,7 @@ vi.mock("@/lib/api/watchdog", () => ({
 
 const healthy: WatchdogStatus = {
   enabled: true,
+  supervisorMode: "rust",
   appPid: 4242,
   supervisorPid: 5151,
   supervisorAlive: true,
@@ -65,5 +66,20 @@ describe("WatchdogStatusPanel", () => {
     expect(screen.getByText("settings.watchdogStateStopped")).toBeTruthy();
     expect(screen.getByText("settings.watchdogNoEvents")).toBeTruthy();
     expect(screen.getByText(/LISTEN ipv4/)).toBeTruthy();
+  });
+
+  it("labels development recovery as owned by pnpm dev", async () => {
+    vi.mocked(watchdogApi.getStatus).mockResolvedValue({
+      ...healthy,
+      supervisorMode: "pnpm-dev",
+      supervisorAlive: false,
+      supervisorPid: null,
+    });
+    render(<WatchdogStatusPanel />);
+
+    await waitFor(() =>
+      expect(screen.getByText("settings.watchdogStateDevManaged")).toBeTruthy(),
+    );
+    expect(screen.getByText("settings.watchdogDevSupervisor")).toBeTruthy();
   });
 });

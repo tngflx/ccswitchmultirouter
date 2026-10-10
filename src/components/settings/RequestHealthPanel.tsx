@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import {
   AlertTriangle,
   CheckCircle2,
+  Clock3,
   DatabaseZap,
   RefreshCw,
   Save,
@@ -10,9 +11,14 @@ import {
 import { useTranslation } from "react-i18next";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { proxyApi } from "@/lib/api/proxy";
 import { settingsApi } from "@/lib/api/settings";
 import { cn } from "@/lib/utils";
-import type { RequestHealthConfig, RequestHealthSnapshot } from "@/types/proxy";
+import type {
+  OpenAIResponsesContractStatus,
+  RequestHealthConfig,
+  RequestHealthSnapshot,
+} from "@/types/proxy";
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
@@ -28,11 +34,13 @@ export function RequestHealthPanel({
   isRefreshing,
   onRefresh,
   onSaved,
+  onSaveConfig,
 }: {
   snapshot?: RequestHealthSnapshot;
   isRefreshing: boolean;
   onRefresh: () => void;
-  onSaved: () => void;
+  onSaved: (config: RequestHealthConfig) => void;
+  onSaveConfig?: (config: RequestHealthConfig) => Promise<boolean>;
 }) {
   const { t } = useTranslation();
   const [draft, setDraft] = useState<RequestHealthConfig | null>(null);
@@ -41,6 +49,13 @@ export function RequestHealthPanel({
   const [timeoutSeconds, setTimeoutSeconds] = useState("");
   const [isSaving, setIsSaving] = useState(false);
   const [saveMessage, setSaveMessage] = useState<string | null>(null);
+  const [contract, setContract] = useState<
+    OpenAIResponsesContractStatus | undefined
+  >(snapshot?.contract);
+  const [isCheckingContract, setIsCheckingContract] = useState(false);
+  const [contractActionError, setContractActionError] = useState<string | null>(
+    null,
+  );
 
   useEffect(() => {
     if (!snapshot?.config) return;
@@ -51,6 +66,10 @@ export function RequestHealthPanel({
     setMaxTokens(String(snapshot.config.maxCodexInputTokens));
     setTimeoutSeconds(String(snapshot.config.reviewTimeoutSeconds));
   }, [snapshot?.config]);
+
+  useEffect(() => {
+    if (snapshot?.contract) setContract(snapshot.contract);
+  }, [snapshot?.contract]);
 
   const update = <K extends keyof RequestHealthConfig>(
     key: K,
@@ -63,10 +82,15 @@ export function RequestHealthPanel({
     setIsSaving(true);
     setSaveMessage(null);
     try {
-      const settings = await settingsApi.get();
-      await settingsApi.save({ ...settings, requestHealth: draft });
+      if (onSaveConfig) {
+        const saved = await onSaveConfig(draft);
+        if (!saved) return;
+      } else {
+        const settings = await settingsApi.get();
+        await settingsApi.save({ ...settings, requestHealth: draft });
+      }
       setSaveMessage(t("settings.requestHealth.saved"));
-      onSaved();
+      onSaved(draft);
     } catch (error) {
       setSaveMessage(errorMessage(error));
     } finally {
@@ -74,8 +98,22 @@ export function RequestHealthPanel({
     }
   }
 
-  const latest = snapshot?.diagnostics[0];
-  const diagnostics = snapshot?.diagnostics ?? [];
+  async function checkContract() {
+    setIsCheckingContract(true);
+    setContractActionError(null);
+    try {
+      setContract(await proxyApi.checkOpenAIResponsesContract());
+    } catch (error) {
+      setContractActionError(errorMessage(error));
+    } finally {
+      setIsCheckingContract(false);
+    }
+  }
+
+  const advisoriesActive =
+    draft?.enabled === true && draft.reviewMode !== "off";
+  const diagnostics = advisoriesActive ? (snapshot?.diagnostics ?? []) : [];
+  const latest = diagnostics[0];
   const hasWarnings = diagnostics.some(
     (item) =>
       item.thresholdExceeded ||
@@ -86,6 +124,21 @@ export function RequestHealthPanel({
   const ratio = latest
     ? Math.min(1, latest.optimizedBytes / Math.max(1, latest.thresholdBytes))
     : 0;
+  const contractStatus = contract?.status ?? "not_checked";
+  const contractStatusLabel =
+    contractStatus === "up_to_date"
+      ? t("settings.requestHealth.contractStatusCurrent")
+      : contractStatus === "drift_detected"
+        ? t("settings.requestHealth.contractStatusDrift")
+        : contractStatus === "check_failed"
+          ? t("settings.requestHealth.contractStatusFailed")
+          : t("settings.requestHealth.contractStatusNotChecked");
+  const contractStatusClass =
+    contractStatus === "up_to_date"
+      ? "border-emerald-300/70 bg-emerald-50/70 text-emerald-800 dark:border-emerald-700/50 dark:bg-emerald-950/20 dark:text-emerald-200"
+      : contractStatus === "drift_detected" || contractStatus === "check_failed"
+        ? "border-amber-300/70 bg-amber-50/70 text-amber-900 dark:border-amber-700/50 dark:bg-amber-950/20 dark:text-amber-100"
+        : "border-border bg-background/50 text-muted-foreground";
 
   return (
     <div className="space-y-4">
@@ -289,6 +342,96 @@ export function RequestHealthPanel({
       {saveMessage ? (
         <div className="text-xs text-muted-foreground">{saveMessage}</div>
       ) : null}
+
+      <section className="rounded-md border border-border bg-background/50 p-4">
+        <div className="flex flex-wrap items-start justify-between gap-3">
+          <div className="flex min-w-0 items-start gap-3">
+            <ShieldCheck className="mt-0.5 h-5 w-5 shrink-0 text-cyan-600 dark:text-cyan-300" />
+            <div className="min-w-0">
+              <div className="flex flex-wrap items-center gap-2">
+                <h4 className="text-sm font-semibold">
+                  {t("settings.requestHealth.contractTitle")}
+                </h4>
+                <Badge
+                  variant="outline"
+                  className={cn("border", contractStatusClass)}
+                >
+                  {contractStatusLabel}
+                </Badge>
+              </div>
+              <p className="mt-1 max-w-3xl text-xs leading-relaxed text-muted-foreground">
+                {t("settings.requestHealth.contractDescription")}
+              </p>
+            </div>
+          </div>
+          <Button
+            size="sm"
+            variant="outline"
+            onClick={() => void checkContract()}
+            disabled={isCheckingContract}
+          >
+            <RefreshCw
+              className={cn("h-4 w-4", isCheckingContract && "animate-spin")}
+            />
+            {t("settings.requestHealth.contractCheck")}
+          </Button>
+        </div>
+        {contract ? (
+          <div className="mt-3 grid gap-2 text-xs sm:grid-cols-2">
+            <div className="rounded-md border border-border/70 px-3 py-2">
+              <div className="text-muted-foreground">
+                {t("settings.requestHealth.contractSnapshot")}
+              </div>
+              <div className="mt-1 font-medium">
+                v{contract.version} · {contract.verifiedAt}
+              </div>
+            </div>
+            <div className="rounded-md border border-border/70 px-3 py-2">
+              <div className="text-muted-foreground">
+                {t("settings.requestHealth.contractLastChecked")}
+              </div>
+              <div className="mt-1 flex items-center gap-1 font-medium">
+                <Clock3 className="h-3.5 w-3.5 text-muted-foreground" />
+                {contract.checkedAt ??
+                  t("settings.requestHealth.contractNeverChecked")}
+              </div>
+            </div>
+            <div className="rounded-md border border-border/70 px-3 py-2 sm:col-span-2">
+              <div className="text-muted-foreground">
+                {t("settings.requestHealth.contractCoverage")}
+              </div>
+              <div className="mt-1">{contract.coverage}</div>
+              <div className="mt-2 break-all font-mono text-[11px] text-muted-foreground">
+                {contract.source}
+              </div>
+            </div>
+          </div>
+        ) : (
+          <div className="mt-3 text-xs text-muted-foreground">
+            {t("settings.requestHealth.contractLoading")}
+          </div>
+        )}
+        {contract?.changedSections.length ? (
+          <div
+            role="alert"
+            className="mt-3 rounded-md border border-amber-300/70 bg-amber-50 px-3 py-2 text-xs text-amber-900 dark:border-amber-700/50 dark:bg-amber-950/20 dark:text-amber-100"
+          >
+            <div className="font-semibold">
+              {t("settings.requestHealth.contractChanged")}
+            </div>
+            <div className="mt-1">{contract.changedSections.join(", ")}</div>
+          </div>
+        ) : null}
+        {contract?.error || contractActionError ? (
+          <div
+            role="alert"
+            className="mt-3 rounded-md border border-red-300/70 bg-red-50 px-3 py-2 text-xs text-red-800 dark:border-red-700/50 dark:bg-red-950/20 dark:text-red-200"
+          >
+            {contract?.error ?? contractActionError}
+          </div>
+        ) : null}
+      </section>
+
       {hasWarnings ? (
         <div
           role="status"

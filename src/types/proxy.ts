@@ -129,6 +129,25 @@ export interface RequestHealthDiagnostic {
 export interface RequestHealthSnapshot {
   config: RequestHealthConfig;
   diagnostics: RequestHealthDiagnostic[];
+  contract?: OpenAIResponsesContractStatus;
+}
+
+export type OpenAIResponsesContractStatusKind =
+  | "not_checked"
+  | "up_to_date"
+  | "drift_detected"
+  | "check_failed";
+
+export interface OpenAIResponsesContractStatus {
+  version: number;
+  source: string;
+  verifiedAt: string;
+  coverage: string;
+  declarationsSha256: string;
+  status: OpenAIResponsesContractStatusKind;
+  checkedAt: string | null;
+  changedSections: string[];
+  error: string | null;
 }
 
 export type CodexDiagnosticStatus = "pass" | "warn" | "fail" | "info";

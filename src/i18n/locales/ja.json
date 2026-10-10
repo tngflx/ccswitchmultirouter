@@ -414,6 +414,7 @@
     "tabAuth": "認証",
     "tabAdvanced": "詳細",
     "tabProxy": "ルーティング",
+    "tabRequestHealth": "リクエスト健全性",
     "authCenter": {
       "title": "OAuth 認証センター",
       "description": "Claude Code で他のサブスクリプションをご利用いただけます。コンプライアンスリスクにご注意ください。",
@@ -451,7 +452,20 @@
       "mediaBytes": "画像ペイロードのバイト数",
       "timeline": "リクエストタイムライン",
       "actionNone": "レビューなし",
-      "empty": "リクエスト健全性のサンプルはまだありません。ローカルプロキシ経由でリクエストを送信してから更新してください。"
+      "empty": "リクエスト健全性のサンプルはまだありません。ローカルプロキシ経由でリクエストを送信してから更新してください。",
+      "contractTitle": "OpenAI Responses 契約",
+      "contractDescription": "レビュー済みのローカルリクエストルールを、最新の公開 OpenAI Responses create リファレンスと比較します。実行時チェックは保守的かつオフラインです。",
+      "contractCheck": "公式契約を確認",
+      "contractStatusNotChecked": "未確認",
+      "contractStatusCurrent": "最新",
+      "contractStatusDrift": "差分を検出",
+      "contractStatusFailed": "確認失敗",
+      "contractSnapshot": "埋め込みスナップショット",
+      "contractLastChecked": "最終確認",
+      "contractNeverChecked": "未確認",
+      "contractCoverage": "対象範囲",
+      "contractChanged": "公式宣言に変更があります",
+      "contractLoading": "契約メタデータを読み込んでいます..."
     },
     "codexPluginHealth": {
       "loading": "Codex プラグインを確認しています...",
@@ -848,6 +862,8 @@
     "watchdogSupervisor": "監視プロセス",
     "watchdogStateRunning": "稼働中",
     "watchdogStateStopped": "停止",
+    "watchdogStateDevManaged": "開発監視中",
+    "watchdogDevSupervisor": "pnpm dev が復旧を担当",
     "watchdogStateDisabled": "無効",
     "watchdogRestartsWindow": "直近 30 分の自動再起動",
     "watchdogPortLabel": "ローカルプロキシポート",

@@ -59,12 +59,15 @@ import { AuthCenterPanel } from "@/components/settings/AuthCenterPanel";
 import { CodexAuthSettings } from "@/components/settings/CodexAuthSettings";
 import { CodexGlobalConfigSettings } from "@/components/settings/CodexGlobalConfigSettings";
 import { CodexPluginHealthPanel } from "@/components/settings/CodexPluginHealthPanel";
+import { RequestHealthPanel } from "@/components/settings/RequestHealthPanel";
 import { useInstalledSkills } from "@/hooks/useSkills";
 import { useSettings } from "@/hooks/useSettings";
 import { useImportExport } from "@/hooks/useImportExport";
 import { useTranslation } from "react-i18next";
 import type { SettingsFormState } from "@/hooks/useSettings";
 import type { EnvInjectionSettings as EnvInjectionSettingsValue } from "@/types";
+import type { RequestHealthSnapshot } from "@/types/proxy";
+import { proxyApi } from "@/lib/api/proxy";
 
 interface SettingsDialogProps {
   open: boolean;
@@ -117,6 +120,9 @@ export function SettingsPage({
 
   const [activeTab, setActiveTab] = useState<string>("general");
   const [showRestartPrompt, setShowRestartPrompt] = useState(false);
+  const [requestHealthSnapshot, setRequestHealthSnapshot] =
+    useState<RequestHealthSnapshot>();
+  const [requestHealthLoading, setRequestHealthLoading] = useState(false);
   const tabScrollContainerRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -137,6 +143,26 @@ export function SettingsPage({
       tabScrollContainerRef.current.scrollTop = 0;
     }
   }, [activeTab]);
+
+  const refreshRequestHealth = useCallback(async () => {
+    setRequestHealthLoading(true);
+    try {
+      setRequestHealthSnapshot(await proxyApi.getRequestHealthDiagnostics());
+    } catch (error) {
+      console.error(
+        "[SettingsPage] Failed to load request-health diagnostics",
+        error,
+      );
+    } finally {
+      setRequestHealthLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (open && activeTab === "request-health") {
+      void refreshRequestHealth();
+    }
+  }, [activeTab, open, refreshRequestHealth]);
 
   const closeAfterSave = useCallback(() => {
     // 保存成功后关闭：不再重置语言，避免需要“保存两次”才生效
@@ -251,7 +277,7 @@ export function SettingsPage({
           onValueChange={setActiveTab}
           className="flex flex-col h-full"
         >
-          <TabsList className="grid w-full grid-cols-6 mb-6 glass rounded-lg">
+          <TabsList className="grid w-full grid-cols-7 mb-6 glass rounded-lg">
             <TabsTrigger value="general">
               {t("settings.tabGeneral")}
             </TabsTrigger>
@@ -261,6 +287,9 @@ export function SettingsPage({
             </TabsTrigger>
             <TabsTrigger value="advanced">
               {t("settings.tabAdvanced")}
+            </TabsTrigger>
+            <TabsTrigger value="request-health">
+              {t("settings.tabRequestHealth")}
             </TabsTrigger>
             <TabsTrigger value="usage">{t("usage.title")}</TabsTrigger>
             <TabsTrigger value="about">{t("common.about")}</TabsTrigger>
@@ -588,6 +617,27 @@ export function SettingsPage({
                     </Accordion>
                   </motion.div>
                 ) : null}
+              </TabsContent>
+
+              <TabsContent value="request-health" className="mt-0 pb-4">
+                <RequestHealthPanel
+                  snapshot={requestHealthSnapshot}
+                  isRefreshing={requestHealthLoading}
+                  onRefresh={() => void refreshRequestHealth()}
+                  onSaveConfig={async (config) => {
+                    const result = await handleAutoSave({
+                      requestHealth: config,
+                    });
+                    return result;
+                  }}
+                  onSaved={(config) => {
+                    // Keep the shared settings form in sync with the panel's
+                    // dedicated save so a later autosave cannot restore an
+                    // older Request Health configuration.
+                    updateSettings({ requestHealth: config });
+                    void refreshRequestHealth();
+                  }}
+                />
               </TabsContent>
 
               <TabsContent value="about" className="mt-0">

@@ -111,6 +111,38 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+function includedModelCatalog(value: unknown): Record<string, unknown> | null {
+  if (!isRecord(value)) return null;
+  const rawModels = Array.isArray(value.models) ? value.models : [];
+  const models = rawModels.filter(
+    (model) => !isRecord(model) || model.enabled !== false,
+  );
+  const includedIds = new Set(
+    models
+      .filter(
+        (model): model is Record<string, unknown> =>
+          isRecord(model) && typeof model.model === "string",
+      )
+      .map((model) =>
+        typeof model.model === "string" ? model.model.trim() : "",
+      )
+      .filter(Boolean),
+  );
+  const rawSpawnAgentModels = Array.isArray(value.spawnAgentModels)
+    ? value.spawnAgentModels
+    : Array.isArray(value.spawn_agent_models)
+      ? value.spawn_agent_models
+      : [];
+  return {
+    ...value,
+    models,
+    spawnAgentModels: rawSpawnAgentModels.filter(
+      (model): model is string =>
+        typeof model === "string" && includedIds.has(model.trim()),
+    ),
+  };
+}
+
 function evaluateMutationResult(
   result: CodexSubagentV2MutationProvider,
 ): string {
@@ -323,11 +355,9 @@ function inferredInputModalities(
   projectedModelCatalog?: unknown,
 ): CodexSubagentV2Profile["inputModalities"] {
   if (profile.inputModalities) return profile.inputModalities;
-  const catalog = isRecord(projectedModelCatalog)
-    ? projectedModelCatalog
-    : isRecord(provider.settingsConfig?.modelCatalog)
-      ? provider.settingsConfig.modelCatalog
-      : null;
+  const catalog =
+    includedModelCatalog(projectedModelCatalog) ??
+    includedModelCatalog(provider.settingsConfig?.modelCatalog);
   const models = catalog && Array.isArray(catalog.models) ? catalog.models : [];
   const entry = models.find(
     (candidate) =>
@@ -424,9 +454,10 @@ function settingsForDiagnostics(
     invalidOrdinal += 1;
   }
   const settings = settingsWithConfig(provider, { ...config, profiles });
-  return isRecord(projectedModelCatalog)
-    ? { ...settings, modelCatalog: projectedModelCatalog }
-    : settings;
+  const catalog =
+    includedModelCatalog(projectedModelCatalog) ??
+    includedModelCatalog(provider.settingsConfig?.modelCatalog);
+  return catalog ? { ...settings, modelCatalog: catalog } : settings;
 }
 
 function parseNicknames(value: string): string[] {
@@ -565,8 +596,11 @@ export function CodexSubagentProfileEditor({
 
   const diagnosticSettings = draft
     ? settingsForDiagnostics(provider, draft, modelCatalog)
-    : isRecord(modelCatalog)
-      ? { ...provider.settingsConfig, modelCatalog }
+    : includedModelCatalog(modelCatalog)
+      ? {
+          ...provider.settingsConfig,
+          modelCatalog: includedModelCatalog(modelCatalog),
+        }
       : provider.settingsConfig;
   const diagnosticSettingsKey = JSON.stringify(diagnosticSettings);
 

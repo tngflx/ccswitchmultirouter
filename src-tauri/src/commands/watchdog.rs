@@ -12,6 +12,8 @@ use serde::Serialize;
 pub struct WatchdogStatus {
     /// 设置里是否启用内置看门狗。
     pub enabled: bool,
+    /// 当前恢复责任方：Rust supervisor 或 pnpm dev 的开发包装器。
+    pub supervisor_mode: String,
     /// 当前应用主进程 PID。
     pub app_pid: u32,
     /// 当前应用对应的守护进程 PID（来自守护日志）。
@@ -41,6 +43,11 @@ pub async fn get_watchdog_status(
     state: tauri::State<'_, AppState>,
 ) -> Result<WatchdogStatus, String> {
     let config_dir = crate::config::get_app_config_dir();
+    let supervisor_mode = if crate::watchdog::dev_supervisor_owned() {
+        "pnpm-dev"
+    } else {
+        "rust"
+    };
     let port = state
         .db
         .get_proxy_config()
@@ -65,6 +72,7 @@ pub async fn get_watchdog_status(
 
     Ok(WatchdogStatus {
         enabled: crate::settings::get_settings().watchdog_enabled,
+        supervisor_mode: supervisor_mode.to_string(),
         app_pid,
         supervisor_pid: verified_supervisor_pid,
         supervisor_alive: supervisor_identity.is_some(),

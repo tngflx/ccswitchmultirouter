@@ -4449,7 +4449,7 @@ impl RequestForwarder {
         // 有界重连（见 providers::streaming_retry）。工厂只是重放同一
         // HTTP 请求；是否重试、重试多少次由转换层根据下游状态决定。
         let stream_retry_budget = crate::settings::get_settings()
-            .stream_retry_budget(super::providers::streaming_retry::RESPONSES_STREAM_MAX_RETRIES);
+            .stream_retry_budget(super::providers::streaming_retry::STREAM_MAX_RETRIES);
         let build_stream_reconnect =
             |replay_headers: http::HeaderMap, replay_payload: FinalizedRequestPayload| {
                 if stream_retry_budget == 0
@@ -7819,8 +7819,7 @@ where
 {
     let mut retry_count = 0usize;
     let mut total_delay = Duration::ZERO;
-    let mut capacity_retry_count = 0usize;
-    let mut capacity_total_delay = Duration::ZERO;
+    let mut capacity_long_wait_mode = false;
     let mut admission_retry_count = 0usize;
 
     loop {
@@ -7873,10 +7872,13 @@ where
         );
 
         if capacity {
+            capacity_long_wait_mode |=
+                super::providers::streaming_retry::capacity_error_body_requires_long_wait(
+                    body_text.as_deref(),
+                );
             if !capacity_retry_enabled
                 || terminal_quota
-                || capacity_retry_count
-                    >= super::providers::streaming_retry::CAPACITY_STREAM_MAX_RETRIES as usize
+                || retry_count >= super::providers::streaming_retry::STREAM_MAX_RETRIES as usize
             {
                 return Ok(rebuild_consumed_error_response(
                     status,
@@ -7884,10 +7886,19 @@ where
                     body_text,
                 ));
             }
-            let requested_delay =
-                retry_after.unwrap_or_else(|| codex_rate_limit_backoff(capacity_retry_count));
-            let remaining_budget =
-                CODEX_RATE_LIMIT_TOTAL_DELAY_BUDGET.saturating_sub(capacity_total_delay);
+            let requested_delay = retry_after.unwrap_or_else(|| {
+                if capacity_long_wait_mode {
+                    super::providers::streaming_retry::CAPACITY_RETRY_LONG_DELAY
+                } else {
+                    codex_rate_limit_backoff(retry_count)
+                }
+            });
+            let total_delay_budget = if capacity_long_wait_mode {
+                super::providers::streaming_retry::CAPACITY_RETRY_LONG_TOTAL_DELAY_BUDGET
+            } else {
+                CODEX_RATE_LIMIT_TOTAL_DELAY_BUDGET
+            };
+            let remaining_budget = total_delay_budget.saturating_sub(total_delay);
             if remaining_budget.is_zero() {
                 return Ok(rebuild_consumed_error_response(
                     status,
@@ -7896,18 +7907,23 @@ where
                 ));
             }
             let delay = requested_delay
-                .min(CODEX_RATE_LIMIT_MAX_SINGLE_DELAY)
+                .min(if capacity_long_wait_mode {
+                    super::providers::streaming_retry::CAPACITY_RETRY_LONG_DELAY
+                } else {
+                    CODEX_RATE_LIMIT_MAX_SINGLE_DELAY
+                })
                 .min(remaining_budget);
-            capacity_retry_count += 1;
+            retry_count += 1;
             log::warn!(
-                "[{app_tag}] Codex upstream capacity pressure (HTTP {}); replaying same request {}/{} after {}ms",
+                "[{app_tag}] Codex upstream capacity pressure (HTTP {}); replaying same request {}/{} after {}ms (long_wait={})",
                 status.as_u16(),
-                capacity_retry_count,
-                super::providers::streaming_retry::CAPACITY_STREAM_MAX_RETRIES,
+                retry_count,
+                super::providers::streaming_retry::STREAM_MAX_RETRIES,
                 delay.as_millis(),
+                capacity_long_wait_mode,
             );
             tokio::time::sleep(delay).await;
-            capacity_total_delay += delay;
+            total_delay += delay;
             continue;
         }
 
@@ -9271,6 +9287,8 @@ fn codex_realtime_multipart_field_name(headers: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[path = "../../retry_policy_tests.rs"]
+    mod retry_policy_tests;
     use crate::provider::{LocalProxyRequestOverrides, ProviderMeta};
     use crate::proxy::providers::codex_oauth_auth::CodexAccountPoolEntry;
     use crate::{
@@ -15170,6 +15188,88 @@ mod tests {
 
         assert!(result.is_ok());
         assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn codex_capacity_retry_uses_ten_minute_fallback_for_explicit_high_demand() {
+        let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let attempts_for_send = attempts.clone();
+        let started_at = tokio::time::Instant::now();
+
+        let result = send_codex_request_with_rate_limit_retry(
+            "test",
+            true,
+            safe_test_codex_traffic_policy(),
+            || {
+                let attempts = attempts_for_send.clone();
+                async move {
+                    if attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                        Ok(ProxyResponse::buffered(
+                            http::StatusCode::SERVICE_UNAVAILABLE,
+                            http::HeaderMap::new(),
+                            Bytes::from_static(
+                                br#"{"error":{"type":"server_error","message":"We're currently experiencing high demand"}}"#,
+                            ),
+                        ))
+                    } else {
+                        Ok(ProxyResponse::buffered(
+                            http::StatusCode::OK,
+                            http::HeaderMap::new(),
+                            Bytes::new(),
+                        ))
+                    }
+                }
+            },
+        )
+        .await;
+
+        assert!(result.is_ok());
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert_eq!(
+            tokio::time::Instant::now() - started_at,
+            crate::proxy::providers::streaming_retry::CAPACITY_RETRY_LONG_DELAY
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn codex_capacity_retry_uses_ten_minute_fallback_for_concurrent_limit() {
+        let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let attempts_for_send = attempts.clone();
+        let started_at = tokio::time::Instant::now();
+
+        let result = send_codex_request_with_rate_limit_retry(
+            "test",
+            true,
+            safe_test_codex_traffic_policy(),
+            || {
+                let attempts = attempts_for_send.clone();
+                async move {
+                    if attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                        Ok(ProxyResponse::buffered(
+                            http::StatusCode::TOO_MANY_REQUESTS,
+                            http::HeaderMap::new(),
+                            Bytes::from_static(
+                                br#"{"error":{"type":"rate_limit_exceeded","message":"concurrent limit reached"}}"#,
+                            ),
+                        ))
+                    } else {
+                        Ok(ProxyResponse::buffered(
+                            http::StatusCode::OK,
+                            http::HeaderMap::new(),
+                            Bytes::new(),
+                        ))
+                    }
+                }
+            },
+        )
+        .await;
+
+        assert!(result.is_ok());
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert_eq!(
+            tokio::time::Instant::now() - started_at,
+            crate::proxy::providers::streaming_retry::CAPACITY_RETRY_LONG_DELAY
+        );
     }
 
     #[tokio::test(start_paused = true)]
