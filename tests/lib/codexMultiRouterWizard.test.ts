@@ -23,6 +23,7 @@ import {
   mergeFetchedModelsIntoWizardProvider,
   readWizardModelCatalog,
   readIncludedWizardModelCatalog,
+  readWizardProviderBaseUrl,
   resolveWizardModelNameCollisions,
 } from "@/lib/codexMultiRouterWizard";
 
@@ -38,6 +39,106 @@ function provider(overrides: Partial<Provider>): Provider {
 }
 
 describe("codexMultiRouterWizard helpers", () => {
+  describe("persisted provider format compatibility", () => {
+    const endpoint = "https://router.example/v1";
+    const secret = "sk-format-matrix";
+
+    it.each([
+      ["base_url", { base_url: endpoint }],
+      ["baseURL", { baseURL: endpoint }],
+      ["baseUrl", { baseUrl: endpoint }],
+      [
+        "embedded config.toml",
+        {
+          config: `model_provider = "router"
+
+[model_providers.router]
+name = "Router"
+base_url = "${endpoint}"
+wire_api = "responses"
+`,
+        },
+      ],
+    ])("reads the %s URL representation", (_label, settingsConfig) => {
+      const source = provider({ settingsConfig });
+
+      expect(readWizardProviderBaseUrl(source)).toBe(endpoint);
+    });
+
+    it.each([
+      ["auth.OPENAI_API_KEY", { auth: { OPENAI_API_KEY: secret } }],
+      ["apiKey", { apiKey: secret }],
+      ["api_key", { api_key: secret }],
+      ["experimental_bearer_token", { experimental_bearer_token: secret }],
+    ])("builds fetch config from %s", (_label, credentialConfig) => {
+      const source = provider({
+        settingsConfig: { base_url: endpoint, ...credentialConfig },
+      });
+
+      expect(getWizardModelFetchConfig(source)).toMatchObject({
+        baseUrl: endpoint,
+        apiKey: secret,
+      });
+      expect(getWizardConfigIssues([source])).toEqual([]);
+    });
+
+    it.each([
+      ["missing", undefined, []],
+      ["empty", [], []],
+      ["wrong container type", { model: "not-an-array" }, []],
+      ["all malformed", [null, "model", {}, { model: "   " }], []],
+      [
+        "mixed",
+        [
+          null,
+          "model",
+          { model: "first" },
+          { model: "hidden", enabled: false },
+          { model: "   " },
+        ],
+        ["first", "hidden"],
+      ],
+    ])(
+      "reads a %s model catalog without inventing entries",
+      (_label, models, expected) => {
+        const source = provider({
+          settingsConfig: {
+            modelCatalog:
+              models === undefined
+                ? undefined
+                : Array.isArray(models)
+                  ? { models }
+                  : models,
+          },
+        });
+
+        expect(
+          readWizardModelCatalog(source).map((model) => model.model),
+        ).toEqual(expected);
+      },
+    );
+
+    it("prefers explicit URL and credential fields when legacy aliases coexist", () => {
+      const source = provider({
+        settingsConfig: {
+          base_url: `${endpoint}/preferred`,
+          baseURL: `${endpoint}/secondary`,
+          baseUrl: `${endpoint}/tertiary`,
+          config: `base_url = "${endpoint}/toml"`,
+          auth: { OPENAI_API_KEY: `${secret}-preferred` },
+          apiKey: `${secret}-secondary`,
+          api_key: `${secret}-tertiary`,
+          experimental_bearer_token: `${secret}-legacy`,
+        },
+      });
+
+      expect(readWizardProviderBaseUrl(source)).toBe(`${endpoint}/preferred`);
+      expect(getWizardModelFetchConfig(source)).toMatchObject({
+        apiKey: `${secret}-preferred`,
+      });
+    });
+  });
+
   it("passes only included models to probes, collisions, restored selections and generated plans", () => {
     const source = provider({
       id: "curated",
@@ -168,6 +269,30 @@ describe("codexMultiRouterWizard helpers", () => {
         (route: { targetProviderId: string }) => route.targetProviderId,
       ),
     ).toEqual(["selected"]);
+  });
+
+  it("can expose disabled catalog rows for wizard recovery without routing them", () => {
+    const disabled = provider({
+      id: "disabled-source",
+      settingsConfig: {
+        modelCatalog: {
+          models: [{ model: "kept-for-recovery", enabled: false }],
+        },
+      },
+    });
+
+    expect(buildWizardModelCatalog([disabled]).models).toEqual([]);
+    expect(
+      buildWizardModelCatalog([disabled], { includeDisabled: true }).models,
+    ).toEqual([{ model: "kept-for-recovery", enabled: false }]);
+    expect(
+      buildCodexMultiRouterWizardPlan(
+        [disabled],
+        [disabled],
+        null,
+        { catalogModelOrder: ["kept-for-recovery"] },
+      ).sourceProviders,
+    ).toEqual([]);
   });
 
   it("keeps exclusions and leaves newly discovered models excluded on a curated refresh", () => {

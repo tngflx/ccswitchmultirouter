@@ -63,9 +63,9 @@ pub(crate) fn codex_provider_base_url(provider: &Provider) -> Option<String> {
 
 pub(crate) fn resolve_codex_traffic_policy(provider: &Provider) -> ResolvedCodexTrafficPolicy {
     let base_url = codex_provider_base_url(provider);
-    let is_zen = base_url
-        .as_deref()
-        .is_some_and(|value| value.contains("opencode.ai/zen/go"));
+    let is_zen = base_url.as_deref().is_some_and(|value| {
+        value.contains("opencode.ai/zen/") || value.ends_with("opencode.ai/zen")
+    });
     let explicit = provider
         .meta
         .as_ref()
@@ -186,6 +186,18 @@ mod tests {
         );
         assert!(resolved.admission_enabled);
         assert_eq!(resolved.max_in_flight, 4);
+        assert_eq!(resolved.rejection_max_retries, 2);
+    }
+
+    #[test]
+    fn paid_zen_gets_maintained_recommendation() {
+        let resolved =
+            resolve_codex_traffic_policy(&provider("zen", "https://opencode.ai/zen/v1", None));
+        assert_eq!(
+            resolved.source,
+            CodexTrafficPolicySource::MaintainedRecommendation
+        );
+        assert!(resolved.admission_enabled);
         assert_eq!(resolved.rejection_max_retries, 2);
     }
 

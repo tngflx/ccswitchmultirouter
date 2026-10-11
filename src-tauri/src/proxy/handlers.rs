@@ -10,7 +10,9 @@
 use super::{
     codex_turn_recovery::{begin_turn, observe_responses_turn_stream, TurnRecoveryContext},
     content_encoding::{decompress_body, get_content_encoding, is_supported_content_encoding},
-    error_mapper::{get_error_message, map_proxy_error_to_status},
+    error_mapper::{
+        actionable_upstream_error_message, get_error_message, map_proxy_error_to_status,
+    },
     external_openai_api::{
         self, ExternalOpenAiApiAuthError, ExternalOpenAiApiBackendType, ExternalOpenAiApiProfile,
     },
@@ -5315,6 +5317,13 @@ fn codex_proxy_error_json(
         return body;
     };
 
+    let actionable_upstream_message = match error {
+        ProxyError::UpstreamError { status, body } => {
+            actionable_upstream_error_message(*status, body.as_deref())
+        }
+        _ => None,
+    };
+
     let message = if upstream_status == Some(413) {
         // 413 来自上游渠道商的网关（典型是 nginx 的 client_max_body_size），不是 CC
         // Switch 本地代理的限制（本地 DefaultBodyLimit 已放到 200MB）。上游响应体往往是
@@ -5333,6 +5342,10 @@ fn codex_proxy_error_json(
             provider = provider_name,
             model = request_model,
             endpoint = endpoint,
+        )
+    } else if let Some(guidance) = actionable_upstream_message {
+        format!(
+            "{guidance} Provider: {provider_name}; model: {request_model}; endpoint: {endpoint}."
         )
     } else {
         let cause = error_obj
@@ -8227,6 +8240,26 @@ data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_deepseek\",\"
         assert_eq!(body["error"]["provider"], "HCAI");
         assert_eq!(body["error"]["model"], "gpt-5.5");
         assert_eq!(body["error"]["endpoint"], "/responses");
+    }
+
+    #[test]
+    fn codex_proxy_explains_opencode_zen_free_tier_rejection() {
+        let error = ProxyError::UpstreamError {
+            status: 403,
+            body: Some(
+                r#"{"type":"FreeTierError","message":"OpenCode's free tier can only be used from within OpenCode"}"#
+                    .to_string(),
+            ),
+        };
+        let body = codex_proxy_error_json("OpenCode Zen", "space-bunny-free", "/responses", &error);
+
+        let message = body["error"]["message"].as_str().unwrap();
+        assert!(message.contains("official OpenCode client"));
+        assert!(message.contains("User-Agent or session headers cannot grant access"));
+        assert!(message.contains("https://opencode.ai/zen/v1"));
+        assert!(message.contains("Provider: OpenCode Zen"));
+        assert!(!message.contains("CC Switch local proxy failed"));
+        assert_eq!(body["error"]["upstream_status"], 403);
     }
 
     #[test]

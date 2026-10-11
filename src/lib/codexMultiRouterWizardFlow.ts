@@ -69,6 +69,15 @@ export function canEnterWizardPage(
     case "protocol":
       return context.selectedSourceCount > 0 && context.catalogPrepared;
     case "models":
+      // The model-selection page must remain editable when the user has
+      // deselected every model. Its recovery controls ("Follow all models
+      // automatically" and the individual checkboxes) live on this page.
+      return (
+        context.selectedSourceCount > 0 &&
+        context.allSelectedSourcesReady &&
+        context.protocolProbeComplete &&
+        context.catalogPrepared
+      );
     case "model-order":
     case "reasoning":
     case "subagents-tools":
@@ -102,6 +111,11 @@ export function requiredWizardPrerequisite(
     case "protocol":
       return context.selectedSourceCount > 0 ? "catalog" : "sources";
     case "models":
+      if (context.selectedSourceCount === 0) return "sources";
+      if (!context.allSelectedSourcesReady) return "sources";
+      if (!context.catalogPrepared) return "catalog";
+      if (!context.protocolProbeComplete) return "protocol";
+      return null;
     case "model-order":
     case "reasoning":
     case "subagents-tools":

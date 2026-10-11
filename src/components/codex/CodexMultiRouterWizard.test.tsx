@@ -478,6 +478,33 @@ describe("CodexMultiRouterWizard", () => {
       expect(
         screen.getByRole("button", { name: "Choose models" }),
       ).not.toHaveAttribute("data-read-only", "true");
+
+      fireEvent.click(screen.getByRole("button", { name: "Choose models" }));
+      const followAll = screen.getByRole("button", {
+        name: "Follow all models automatically",
+      });
+      fireEvent.click(screen.getByRole("button", { name: "Deselect all" }));
+      await waitFor(() => expect(followAll).toBeEnabled());
+      fireEvent.click(screen.getByRole("button", { name: "Next" }));
+      expect(
+        screen.getByRole("heading", { name: "Choose models" }),
+      ).toBeVisible();
+      expect(
+        screen.getByRole("button", { name: "Choose models" }),
+      ).not.toHaveAttribute("data-read-only", "true");
+
+      // Reproduce the native workflow: leave the empty selection, revisit the
+      // model page, then recover it through the automatic-follow action.
+      fireEvent.click(
+        screen.getByRole("button", { name: "Protocol deep probe" }),
+      );
+      fireEvent.click(screen.getByRole("button", { name: "Choose models" }));
+      const reopenedFollowAll = screen.getByRole("button", {
+        name: "Follow all models automatically",
+      });
+      expect(reopenedFollowAll).toBeEnabled();
+      fireEvent.click(reopenedFollowAll);
+      expect(screen.getByText("Follow provider automatically")).toBeVisible();
     } finally {
       fetchSpy.mockRestore();
       restoreCodexProviderProtocolEvidence.mockReset();

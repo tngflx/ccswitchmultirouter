@@ -196,7 +196,7 @@ describe("CodexMultiRouterWizard", () => {
     );
     fireEvent.click(screen.getByRole("button", { name: "Choose models" }));
     expect(screen.getByLabelText("Keep kept")).toBeInTheDocument();
-    expect(screen.queryByLabelText("Keep hidden")).not.toBeInTheDocument();
+    expect(screen.getByLabelText("Keep hidden")).not.toBeChecked();
 
     await completeWizardDeepProbe();
     fireEvent.click(screen.getByRole("button", { name: "Save and enable" }));
@@ -978,7 +978,7 @@ describe("CodexMultiRouterWizard", () => {
     expect(providersApi.update).not.toHaveBeenCalled();
     fireEvent.click(screen.getByRole("button", { name: "Choose models" }));
     expect(screen.getByLabelText("Keep gpt-5.5")).toBeInTheDocument();
-    expect(screen.queryByLabelText("Keep gpt-5.6-sol")).not.toBeInTheDocument();
+    expect(screen.getByLabelText("Keep gpt-5.6-sol")).not.toBeChecked();
     expect(fetchModelsForConfig).not.toHaveBeenCalled();
   });
 

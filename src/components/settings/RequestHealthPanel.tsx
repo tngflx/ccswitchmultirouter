@@ -9,6 +9,7 @@ import {
   ShieldCheck,
 } from "lucide-react";
 import { useTranslation } from "react-i18next";
+import { toast } from "sonner";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { proxyApi } from "@/lib/api/proxy";
@@ -78,21 +79,52 @@ export function RequestHealthPanel({
     setDraft((current) => (current ? { ...current, [key]: value } : current));
 
   async function save() {
-    if (!draft) return;
+    if (!draft) {
+      const message = t("settings.saveFailedGeneric", {
+        defaultValue: "Save failed, please try again",
+      });
+      setSaveMessage(message);
+      toast.error(message, { closeButton: true });
+      return;
+    }
     setIsSaving(true);
     setSaveMessage(null);
     try {
       if (onSaveConfig) {
         const saved = await onSaveConfig(draft);
-        if (!saved) return;
+        if (!saved) {
+          const message = t("settings.saveFailedGeneric", {
+            defaultValue: "Save failed, please try again",
+          });
+          setSaveMessage(message);
+          toast.error(message, { closeButton: true });
+          return;
+        }
       } else {
         const settings = await settingsApi.get();
-        await settingsApi.save({ ...settings, requestHealth: draft });
+        const result = await settingsApi.save({
+          ...settings,
+          requestHealth: draft,
+        });
+        if (
+          result !== true &&
+          !(typeof result === "object" && result?.settingsSaved === true)
+        ) {
+          throw new Error(
+            t("settings.saveFailedGeneric", {
+              defaultValue: "Save failed, please try again",
+            }),
+          );
+        }
       }
-      setSaveMessage(t("settings.requestHealth.saved"));
+      const message = t("settings.requestHealth.saved");
+      setSaveMessage(message);
+      toast.success(message, { closeButton: true });
       onSaved(draft);
     } catch (error) {
-      setSaveMessage(errorMessage(error));
+      const message = errorMessage(error);
+      setSaveMessage(message);
+      toast.error(message, { closeButton: true });
     } finally {
       setIsSaving(false);
     }
@@ -340,7 +372,9 @@ export function RequestHealthPanel({
       ) : null}
 
       {saveMessage ? (
-        <div className="text-xs text-muted-foreground">{saveMessage}</div>
+        <div role="status" className="text-xs text-muted-foreground">
+          {saveMessage}
+        </div>
       ) : null}
 
       <section className="rounded-md border border-border bg-background/50 p-4">

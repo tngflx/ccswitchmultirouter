@@ -658,7 +658,9 @@ function resolveActiveCatalogModelOrder(
   availableModels: CodexCatalogModel[],
   draftOrder: string[] | null,
 ) {
-  const availableNames = availableModels.map((model) => model.model);
+  const availableNames = availableModels
+    .filter((model) => model.enabled !== false)
+    .map((model) => model.model);
   if (draftOrder === null) return availableNames;
   const availableSet = new Set(availableNames);
   return draftOrder.filter((model) => availableSet.has(model));
@@ -978,7 +980,7 @@ export function CodexMultiRouterWizard({
   const retainedConnectivityResults = connectivityResults.filter(
     (result) => !isProbeModelExcluded(result.providerId, result.model),
   );
-  const routeReadySources = draftSources
+  const probeAdjustedSources = draftSources
     .map((provider) => {
       const entry = protocolLabOutcomeById.get(provider.id);
       return entry &&
@@ -1005,16 +1007,26 @@ export function CodexMultiRouterWizard({
           ),
         },
       },
-    }))
-    .filter((provider) =>
-      readWizardModelCatalog(provider).some((model) => model.enabled !== false),
-    );
+    }));
+  const routeReadySources = probeAdjustedSources.filter((provider) =>
+    readWizardModelCatalog(provider).some((model) => model.enabled !== false),
+  );
   const availableCatalogModels = buildWizardModelCatalog(
-    resolveWizardModelNameCollisions(routeReadySources),
+    resolveWizardModelNameCollisions(probeAdjustedSources),
+    { includeDisabled: true },
   ).models;
   const activeCatalogModelOrder = resolveActiveCatalogModelOrder(
     availableCatalogModels,
     catalogModelOrder,
+  );
+  // Disabled rows stay visible on the Models page so a user can understand
+  // and recover a previously filtered catalog. They are not routeable,
+  // however, and must not satisfy navigation or save gates.
+  const routeableCatalogModelOrder = activeCatalogModelOrder.filter((model) =>
+    availableCatalogModels.some(
+      (catalogModel) =>
+        catalogModel.model === model && catalogModel.enabled !== false,
+    ),
   );
   const activeSpawnAgentModels = resolveActiveSpawnAgentModels(
     draftSpawnAgentModels,
@@ -1032,7 +1044,7 @@ export function CodexMultiRouterWizard({
     protocolProbeComplete:
       retainedConnectivityResults.length > 0 &&
       canContinueAfterConnectivity(retainedConnectivityResults),
-    hasVisibleModels: activeCatalogModelOrder.length > 0,
+    hasVisibleModels: routeableCatalogModelOrder.length > 0,
     planSaved: Boolean(savedPlan),
     planEnabled:
       flowState.status === "enabled" ||
@@ -1679,7 +1691,7 @@ export function CodexMultiRouterWizard({
         });
         return;
       case "models":
-        if (activeCatalogModelOrder.length === 0) {
+        if (routeableCatalogModelOrder.length === 0) {
           toast.error("Keep at least one model.", { closeButton: true });
           return;
         }
@@ -1699,7 +1711,7 @@ export function CodexMultiRouterWizard({
           toast.error("Enter a MultiRouter name first.", { closeButton: true });
           return;
         }
-        if (activeCatalogModelOrder.length === 0) {
+        if (routeableCatalogModelOrder.length === 0) {
           toast.error("Keep at least one model.", { closeButton: true });
           return;
         }
@@ -2010,6 +2022,7 @@ export function CodexMultiRouterWizard({
       setDraftSources(refreshedSources);
       const nextAvailableModels = buildWizardModelCatalog(
         resolveWizardModelNameCollisions(refreshedSources),
+        { includeDisabled: true },
       ).models.map((model) => model.model);
       setCatalogModelOrder((current) =>
         reconcileCatalogModelOrderAfterFetch(

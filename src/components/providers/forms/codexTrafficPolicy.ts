@@ -82,7 +82,7 @@ export function normalizeCodexTrafficPolicy(
 }
 
 export function isOpenCodeZenBaseUrl(baseUrl: string): boolean {
-  return baseUrl.trim().toLowerCase().includes("opencode.ai/zen/go");
+  return /opencode\.ai\/zen(?:\/|$)/i.test(baseUrl.trim());
 }
 
 export function resolveCodexTrafficPolicy(

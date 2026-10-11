@@ -10,6 +10,13 @@ vi.mock("react-i18next", () => ({
   useTranslation: () => ({ t: (key: string) => key }),
 }));
 
+const toastMock = vi.hoisted(() => ({
+  success: vi.fn(),
+  error: vi.fn(),
+}));
+
+vi.mock("sonner", () => ({ toast: toastMock }));
+
 vi.mock("@/lib/api/settings", () => ({
   settingsApi: { get: vi.fn(), save: vi.fn() },
 }));
@@ -88,6 +95,8 @@ describe("RequestHealthPanel", () => {
     vi.mocked(settingsApi.get).mockReset();
     vi.mocked(settingsApi.save).mockReset();
     vi.mocked(proxyApi.checkOpenAIResponsesContract).mockReset();
+    toastMock.success.mockReset();
+    toastMock.error.mockReset();
   });
 
   it("renders the latest diagnostic and controls", () => {
@@ -236,6 +245,197 @@ describe("RequestHealthPanel", () => {
         }),
       ),
     );
+    expect(toastMock.success).toHaveBeenCalledWith(
+      "settings.requestHealth.saved",
+      { closeButton: true },
+    );
+  });
+
+  it("reports a failed direct save instead of silently treating it as success", async () => {
+    const user = userEvent.setup();
+    const onSaved = vi.fn();
+    vi.mocked(settingsApi.get).mockResolvedValue({
+      requestHealth: snapshot.config,
+    } as never);
+    vi.mocked(settingsApi.save).mockRejectedValue(new Error("disk full"));
+
+    render(
+      <RequestHealthPanel
+        snapshot={snapshot}
+        isRefreshing={false}
+        onRefresh={vi.fn()}
+        onSaved={onSaved}
+      />,
+    );
+
+    await user.click(
+      screen.getByRole("button", { name: "settings.requestHealth.save" }),
+    );
+
+    await waitFor(() =>
+      expect(toastMock.error).toHaveBeenCalledWith("disk full", {
+        closeButton: true,
+      }),
+    );
+    expect(screen.getByText("disk full")).toBeInTheDocument();
+    expect(onSaved).not.toHaveBeenCalled();
+    expect(toastMock.success).not.toHaveBeenCalled();
+    expect(
+      screen.getByRole("button", { name: "settings.requestHealth.save" }),
+    ).toBeEnabled();
+  });
+
+  it.each([false, { settingsSaved: false }, null, undefined, {}])(
+    "rejects an unsuccessful or malformed save result: %j",
+    async (result) => {
+      const user = userEvent.setup();
+      const onSaved = vi.fn();
+      vi.mocked(settingsApi.get).mockResolvedValue({
+        requestHealth: snapshot.config,
+      } as never);
+      vi.mocked(settingsApi.save).mockResolvedValue(result as never);
+
+      render(
+        <RequestHealthPanel
+          snapshot={snapshot}
+          isRefreshing={false}
+          onRefresh={vi.fn()}
+          onSaved={onSaved}
+        />,
+      );
+
+      await user.click(
+        screen.getByRole("button", { name: "settings.requestHealth.save" }),
+      );
+
+      await waitFor(() =>
+        expect(toastMock.error).toHaveBeenCalledWith(
+          "settings.saveFailedGeneric",
+          { closeButton: true },
+        ),
+      );
+      expect(
+        screen.getByText("settings.saveFailedGeneric"),
+      ).toBeInTheDocument();
+      expect(onSaved).not.toHaveBeenCalled();
+      expect(toastMock.success).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each([true, { settingsSaved: true }])(
+    "saves edited fields and preserves other settings with acknowledgement %j",
+    async (result) => {
+      const user = userEvent.setup();
+      const onSaved = vi.fn();
+      const settings = { language: "en", requestHealth: snapshot.config };
+      vi.mocked(settingsApi.get).mockResolvedValue(settings as never);
+      vi.mocked(settingsApi.save).mockResolvedValue(result as never);
+      const { unmount } = render(
+        <RequestHealthPanel
+          snapshot={snapshot}
+          isRefreshing={false}
+          onRefresh={vi.fn()}
+          onSaved={onSaved}
+        />,
+      );
+      await user.selectOptions(
+        screen.getByRole("combobox", { name: "settings.requestHealth.mode" }),
+        "diagnose",
+      );
+      await user.selectOptions(
+        screen.getByRole("combobox", {
+          name: "settings.requestHealth.reviewMode",
+        }),
+        "sustained_growth",
+      );
+      const threshold = screen.getByRole("spinbutton", {
+        name: "settings.requestHealth.threshold",
+      });
+      await user.clear(threshold);
+      await user.type(threshold, "512");
+      const tokens = screen.getByRole("spinbutton", {
+        name: "settings.requestHealth.maxInputTokens",
+      });
+      await user.clear(tokens);
+      await user.type(tokens, "100000");
+      const timeout = screen.getByRole("spinbutton", {
+        name: "settings.requestHealth.reviewTimeout",
+      });
+      await user.clear(timeout);
+      await user.type(timeout, "90");
+      await user.click(
+        screen.getByRole("checkbox", {
+          name: "settings.requestHealth.summarizeAndRestartEnabled",
+        }),
+      );
+      await user.click(
+        screen.getByRole("button", { name: "settings.requestHealth.save" }),
+      );
+      const config = {
+        ...snapshot.config,
+        optimizationMode: "diagnose",
+        reviewMode: "sustained_growth",
+        largeRequestThresholdBytes: 512 * 1024,
+        maxCodexInputTokens: 100000,
+        reviewTimeoutSeconds: 90,
+        summarizeAndRestartEnabled: false,
+      };
+      await waitFor(() => expect(onSaved).toHaveBeenCalledWith(config));
+      expect(settingsApi.save).toHaveBeenCalledTimes(1);
+      expect(settingsApi.save).toHaveBeenCalledWith({
+        ...settings,
+        requestHealth: config,
+      });
+      expect(toastMock.success).toHaveBeenCalledOnce();
+      expect(toastMock.error).not.toHaveBeenCalled();
+      unmount();
+      render(
+        <RequestHealthPanel
+          snapshot={{ ...snapshot, config: onSaved.mock.calls[0][0] }}
+          isRefreshing={false}
+          onRefresh={vi.fn()}
+          onSaved={vi.fn()}
+        />,
+      );
+      expect(
+        screen.getByRole("spinbutton", {
+          name: "settings.requestHealth.threshold",
+        }),
+      ).toHaveValue(512);
+      expect(
+        screen.getByRole("combobox", { name: "settings.requestHealth.mode" }),
+      ).toHaveValue("diagnose");
+    },
+  );
+
+  it("reports a failed shared save and permits a successful retry", async () => {
+    const user = userEvent.setup();
+    const onSaved = vi.fn();
+    const onSaveConfig = vi
+      .fn()
+      .mockResolvedValueOnce(false)
+      .mockResolvedValueOnce(true);
+    render(
+      <RequestHealthPanel
+        snapshot={snapshot}
+        isRefreshing={false}
+        onRefresh={vi.fn()}
+        onSaved={onSaved}
+        onSaveConfig={onSaveConfig}
+      />,
+    );
+    const save = screen.getByRole("button", {
+      name: "settings.requestHealth.save",
+    });
+    await user.click(save);
+    await waitFor(() => expect(toastMock.error).toHaveBeenCalledOnce());
+    expect(onSaved).not.toHaveBeenCalled();
+    expect(toastMock.success).not.toHaveBeenCalled();
+    expect(save).toBeEnabled();
+    await user.click(save);
+    await waitFor(() => expect(onSaved).toHaveBeenCalledWith(snapshot.config));
+    expect(toastMock.success).toHaveBeenCalledOnce();
+    expect(settingsApi.save).not.toHaveBeenCalled();
   });
 
   it("checks the official contract from the in-app panel and renders drift", async () => {

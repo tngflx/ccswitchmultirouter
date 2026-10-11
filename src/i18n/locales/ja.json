@@ -14,8 +14,6 @@
     "included": "含める",
     "excluded": "除外",
     "matching": "{{count}} 件の一致するモデル",
-    "includeMatching": "一致するモデルを含める",
-    "excludeMatching": "一致するモデルを除外",
     "noMatches": "一致するモデルがありません",
     "noIncludedModels": "含めるモデルがありません",
     "editModel": "{{model}} を編集",
@@ -958,6 +956,7 @@
           "alacritty": "Alacritty",
           "kitty": "Kitty",
           "ghostty": "Ghostty",
+          "otty": "Otty",
           "wezterm": "WezTerm",
           "kaku": "Kaku",
           "warp": "Warp"
@@ -1784,7 +1783,9 @@
     "modelOptionValuePlaceholder": "{\"order\": [\"baseten\"]}",
     "modelRange": "モデル {{from}}-{{to}} / 全 {{total}} 件",
     "previousModels": "前のモデル",
-    "nextModels": "次のモデル"
+    "nextModels": "次のモデル",
+    "zenFreeTierTitle": "OpenCode Zen の無料モデルは OpenCode 専用です",
+    "zenFreeTierDescription": "-free で終わるモデルは、OpenCode Zen により公式 OpenCode クライアント専用に制限されています。User-Agent やセッションヘッダーを変更してもアクセス権は得られません。CC Switch/Codex プロキシでは有料の Zen モデルを使用するか、公式 OpenCode クライアントでこの無料モデルを実行してください。"
   },
   "providerPreset": {
     "label": "プロバイダータイプ",

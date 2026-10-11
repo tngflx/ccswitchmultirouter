@@ -15,8 +15,16 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
+import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { toast } from "sonner";
-import { Download, Plus, Trash2, ChevronRight, Loader2 } from "lucide-react";
+import {
+  Download,
+  Plus,
+  Trash2,
+  ChevronRight,
+  Loader2,
+  TriangleAlert,
+} from "lucide-react";
 import { ApiKeySection, ModelDropdown } from "./shared";
 import {
   fetchModelsForConfig,
@@ -27,6 +35,7 @@ import { opencodeNpmPackages } from "@/config/opencodeProviderPresets";
 import { cn } from "@/lib/utils";
 import {
   getModelExtraFields,
+  hasOpenCodeZenFreeModel,
   isKnownModelKey,
   OPENCODE_EXTRA_OPTION_DRAFT_PREFIX,
   OPENCODE_HEADER_DRAFT_PREFIX,
@@ -213,6 +222,7 @@ export function OpenCodeFormFields({
   const [extraOptionsOpen, setExtraOptionsOpen] = useState(
     () => Object.keys(extraOptions).length > 0,
   );
+  const hasZenFreeModel = hasOpenCodeZenFreeModel(baseUrl, models);
 
   useEffect(() => {
     if (Object.keys(extraOptions).length > 0) {
@@ -545,6 +555,23 @@ export function OpenCodeFormFields({
 
   return (
     <>
+      {hasZenFreeModel && (
+        <Alert className="border-amber-500/50 bg-amber-50/50 text-amber-950 dark:bg-amber-950/20 dark:text-amber-100">
+          <TriangleAlert className="h-4 w-4" />
+          <AlertTitle>
+            {t("opencode.zenFreeTierTitle", {
+              defaultValue: "OpenCode Zen free models are OpenCode-only",
+            })}
+          </AlertTitle>
+          <AlertDescription>
+            {t("opencode.zenFreeTierDescription", {
+              defaultValue:
+                "Models ending in -free are restricted by OpenCode Zen to the official OpenCode client. Changing User-Agent or session headers cannot grant access. Use a paid Zen model for the CC Switch/Codex proxy, or run the official OpenCode client.",
+            })}
+          </AlertDescription>
+        </Alert>
+      )}
+
       {/* NPM Package Selector */}
       <div className="space-y-2">
         <FormLabel htmlFor="opencode-npm">

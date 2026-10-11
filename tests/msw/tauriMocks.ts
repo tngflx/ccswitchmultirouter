@@ -63,3 +63,19 @@ vi.mock("@tauri-apps/api/path", () => ({
   homeDir: async () => "/home/mock",
   join: async (...segments: string[]) => segments.join("/"),
 }));
+
+// App startup and window controls are native-only in the desktop build. Keep
+// the shared integration harness usable while allowing individual tests to
+// override this module when they need specific window behavior.
+const currentWindow = {
+  isMaximized: vi.fn(async () => false),
+  onResized: vi.fn(async () => () => undefined),
+  setDecorations: vi.fn(async () => undefined),
+  minimize: vi.fn(async () => undefined),
+  toggleMaximize: vi.fn(async () => undefined),
+  close: vi.fn(async () => undefined),
+};
+
+vi.mock("@tauri-apps/api/window", () => ({
+  getCurrentWindow: () => currentWindow,
+}));

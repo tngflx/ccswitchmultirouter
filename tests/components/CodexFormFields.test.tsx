@@ -675,6 +675,7 @@ function renderAutoSplitHarness() {
 
 describe("CodexFormFields local model routing", () => {
   it("uses only staged models across filters while preserving the editable inventory and included-only pickers", async () => {
+    const user = userEvent.setup();
     const { latestCatalog } = renderCatalogHarness(
       [
         {
@@ -696,7 +697,10 @@ describe("CodexFormFields local model routing", () => {
     fireEvent.change(search, { target: { value: "wire-second" } });
     fireEvent.click(screen.getByRole("checkbox", { name: "Select second" }));
     expect(screen.getByText("2 selected")).toBeVisible();
-    fireEvent.click(screen.getByRole("button", { name: "Use only selected" }));
+    await user.click(screen.getByRole("button", { name: "Catalogue actions" }));
+    await user.click(
+      screen.getByRole("menuitem", { name: "Use only selected" }),
+    );
     await waitFor(() =>
       expect(latestCatalog().map((row) => row.enabled)).toEqual([
         true,
@@ -783,9 +787,7 @@ describe("CodexFormFields local model routing", () => {
         screen.queryByLabelText("Include other-model"),
       ).not.toBeInTheDocument();
     }
-    fireEvent.click(
-      screen.getByRole("checkbox", { name: "Select matching" }),
-    );
+    fireEvent.click(screen.getByRole("checkbox", { name: "Select matching" }));
     fireEvent.click(screen.getByRole("button", { name: "Include selected" }));
     await waitFor(() =>
       expect(latestCatalog()[0]).toMatchObject({
@@ -869,9 +871,11 @@ describe("CodexFormFields local model routing", () => {
       updateCatalog([{ model: "replacement" }]);
     });
     expect(screen.getByText("0 selected")).toBeVisible();
+    await user.click(screen.getByRole("button", { name: "Catalogue actions" }));
     expect(
-      screen.getByRole("button", { name: "Use only selected" }),
-    ).toBeDisabled();
+      screen.getByRole("menuitem", { name: "Use only selected" }),
+    ).toHaveAttribute("data-disabled");
+    await user.keyboard("{Escape}");
     fireEvent.click(screen.getByRole("button", { name: "Clear search" }));
     expect(
       screen.getByRole("checkbox", { name: "Select replacement" }),
@@ -901,9 +905,8 @@ describe("CodexFormFields local model routing", () => {
     fireEvent.change(screen.getByRole("searchbox"), {
       target: { value: "custom-alias" },
     });
-    await user.click(screen.getByRole("button", { name: "Catalogue actions" }));
     await user.click(
-      screen.getByRole("menuitem", { name: "Keep latest versions" }),
+      screen.getByRole("button", { name: "Keep latest versions" }),
     );
     expect(latestCatalog().map((row) => row.model)).toEqual([
       "vendor/gpt-6.1-sol",
@@ -918,9 +921,8 @@ describe("CodexFormFields local model routing", () => {
     expect(screen.getByText("0 selected")).toBeVisible();
     expect(screen.getByRole("tab", { name: "Included 1" })).toBeVisible();
     expect(screen.getByRole("tab", { name: "Excluded 2" })).toBeVisible();
-    await user.click(screen.getByRole("button", { name: "Catalogue actions" }));
     await user.click(
-      screen.getByRole("menuitem", { name: "Keep latest versions" }),
+      screen.getByRole("button", { name: "Keep latest versions" }),
     );
     expect(latestCatalog()).toHaveLength(3);
     await waitForReasoningResolution();
@@ -965,9 +967,7 @@ describe("CodexFormFields local model routing", () => {
     fireEvent.change(screen.getByRole("searchbox", { name: "Search models" }), {
       target: { value: "WIRE-HIDDEN" },
     });
-    fireEvent.click(
-      screen.getByRole("checkbox", { name: "Select matching" }),
-    );
+    fireEvent.click(screen.getByRole("checkbox", { name: "Select matching" }));
     fireEvent.click(screen.getByRole("button", { name: "Include selected" }));
     await waitFor(() => expect(latestCatalog()[0].enabled).toBe(true));
     expect(latestCatalog()[1].model).toBe("kept");
@@ -980,9 +980,7 @@ describe("CodexFormFields local model routing", () => {
     expect(screen.getByRole("option", { name: "hidden" })).toBeVisible();
     fireEvent.click(screen.getByRole("option", { name: "hidden" }));
     expect(latestDefaultModel()).toBe("hidden");
-    fireEvent.click(
-      screen.getByRole("checkbox", { name: "Select matching" }),
-    );
+    fireEvent.click(screen.getByRole("checkbox", { name: "Select matching" }));
     fireEvent.click(screen.getByRole("button", { name: "Exclude selected" }));
     await waitFor(() => expect(latestCatalog()[0].enabled).toBe(false));
     expect(
@@ -1020,9 +1018,7 @@ describe("CodexFormFields local model routing", () => {
     fireEvent.change(screen.getByRole("searchbox", { name: "Search models" }), {
       target: { value: "hidden" },
     });
-    fireEvent.click(
-      screen.getByRole("checkbox", { name: "Select matching" }),
-    );
+    fireEvent.click(screen.getByRole("checkbox", { name: "Select matching" }));
     fireEvent.click(screen.getByRole("button", { name: "Include selected" }));
     await waitFor(() => expect(latestCatalog()[0].enabled).toBe(true));
     expect(latestCatalog()[1].enabled).toBe(false);

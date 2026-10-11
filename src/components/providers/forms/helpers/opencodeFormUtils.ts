@@ -127,6 +127,29 @@ export function parseOpencodeConfigStrict(
 
 export const OPENCODE_KNOWN_MODEL_KEYS = ["name", "limit", "options"] as const;
 
+/**
+ * OpenCode Zen marks its intentionally OpenCode-only free-tier catalog with
+ * a `-free` suffix. Keep this classifier narrow so arbitrary providers that
+ * happen to use the word "free" in a model name are not mislabelled.
+ */
+export function isOpenCodeZenFreeModel(modelId: string): boolean {
+  return /(?:^|-)free$/i.test(modelId.trim());
+}
+
+export function isOpenCodeZenBaseUrl(baseUrl: string): boolean {
+  return /opencode\.ai\/zen(?:\/|$)/i.test(baseUrl.trim());
+}
+
+export function hasOpenCodeZenFreeModel(
+  baseUrl: string,
+  models: Record<string, OpenCodeModel>,
+): boolean {
+  return (
+    isOpenCodeZenBaseUrl(baseUrl) &&
+    Object.keys(models).some(isOpenCodeZenFreeModel)
+  );
+}
+
 export function isKnownModelKey(key: string): boolean {
   return OPENCODE_KNOWN_MODEL_KEYS.includes(
     key as (typeof OPENCODE_KNOWN_MODEL_KEYS)[number],

@@ -148,6 +148,107 @@ export const handlers = [
   http.post(`${TAURI_ENDPOINT}/get_skills_migration_result`, () =>
     success(null),
   ),
+  http.post(`${TAURI_ENDPOINT}/inspect_codex_config_consistency`, () =>
+    success({
+      state: "consistent",
+      providerId: null,
+      expectedFingerprint: null,
+      actualFingerprint: null,
+      changedKeys: [],
+      reason: null,
+      runtimeActivation: {
+        state: "not_running",
+        appServerStartedAt: null,
+        configModifiedAt: null,
+        reason: null,
+      },
+    }),
+  ),
+  http.post(`${TAURI_ENDPOINT}/inspect_codex_runtime_refresh`, () =>
+    success({
+      supported: false,
+      canRefresh: false,
+      snapshotToken: "test-snapshot",
+      desktopProcessCount: 0,
+      appServerProcessCount: 0,
+      processCount: 0,
+      launchTarget: null,
+      warning: null,
+      paginatedHistory: {
+        affectedRolloutCount: 0,
+        duplicateOrdinalCount: 0,
+        affectedBytes: 0,
+        blockedRolloutCount: 0,
+        blockedReason: null,
+        blockedReasonGroups: [],
+      },
+    }),
+  ),
+  http.post(`${TAURI_ENDPOINT}/get_pending_recovery_outcomes`, () =>
+    success([]),
+  ),
+  http.post(`${TAURI_ENDPOINT}/preset_catalog_get`, () => success(null)),
+  http.post(`${TAURI_ENDPOINT}/detect_codex_plugin_registration`, () =>
+    success([]),
+  ),
+  http.post(`${TAURI_ENDPOINT}/get_installed_skills`, () => success([])),
+  http.post(`${TAURI_ENDPOINT}/get_watchdog_status`, () =>
+    success({
+      enabled: false,
+      supervisorMode: "pnpm-dev",
+      appPid: 0,
+      supervisorPid: null,
+      supervisorAlive: false,
+      supervisorPath: null,
+      restartsInWindow: 0,
+      port: 3000,
+      listenerPid: null,
+      listenerPath: null,
+      portReady: true,
+      portDiagnosis: "test harness",
+      recentEvents: [],
+    }),
+  ),
+  http.post(`${TAURI_ENDPOINT}/inspect_env_injection_status`, () =>
+    success({
+      state: "disabled",
+      claude: {
+        state: "disabled",
+        managedKeys: [],
+        addedKeys: [],
+        updatedKeys: [],
+        removedKeys: [],
+        relinquishedKeys: [],
+        conflictedKeys: [],
+      },
+      codex: {
+        state: "disabled",
+        managedKeys: [],
+        addedKeys: [],
+        updatedKeys: [],
+        removedKeys: [],
+        relinquishedKeys: [],
+        conflictedKeys: [],
+      },
+      codexIncludeAllowlist: false,
+    }),
+  ),
+  http.post(`${TAURI_ENDPOINT}/auth_get_status`, () =>
+    success({
+      provider: "codex_oauth",
+      authenticated: false,
+      default_account_id: null,
+      migration_error: null,
+      auth_error: null,
+      accounts: [],
+    }),
+  ),
+  http.post(`${TAURI_ENDPOINT}/get_codex_account_pool_policy`, () =>
+    success({ enabled: false, entries: [], desktopAccountId: null }),
+  ),
+  http.post(`${TAURI_ENDPOINT}/restore_codex_provider_protocol_evidence`, () =>
+    success(null),
+  ),
   http.post(`${TAURI_ENDPOINT}/list_profiles`, () => success([])),
   http.post(`${TAURI_ENDPOINT}/get_providers`, async ({ request }) => {
     const { app } = await withJson<{ app: AppId }>(request);

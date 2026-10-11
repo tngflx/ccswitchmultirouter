@@ -28,6 +28,7 @@ import {
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
+  DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import type { CodexCatalogModel } from "@/types";
@@ -192,12 +193,6 @@ export function CodexCatalogViewport<
     if (onSetIncluded) onSetIncluded(ids, enabled);
     else ids.forEach((rowId) => onToggleEnabled?.(rowId, enabled));
   };
-  const setMatchedIncluded = (enabled: boolean) => {
-    const ids = filteredItems
-      .filter(({ row }) => (row.enabled !== false) !== enabled)
-      .map(({ row }) => row.rowId);
-    setIncluded(ids, enabled);
-  };
   const applySelected = (enabled: boolean) => {
     setIncluded(selectedIds, enabled);
     updateSelection("clear");
@@ -346,18 +341,6 @@ export function CodexCatalogViewport<
           />
           {t("catalogBrowser.selectMatching")}
         </label>
-        <Button
-          type="button"
-          variant="ghost"
-          size="icon"
-          className="h-8 w-8"
-          disabled={filteredItems.length === 0}
-          title={t("catalogBrowser.invertSelection")}
-          aria-label={t("catalogBrowser.invertSelection")}
-          onClick={() => updateSelection("invert")}
-        >
-          <ArrowLeftRight className="h-4 w-4" />
-        </Button>
         <span className="text-xs font-medium tabular-nums" aria-live="polite">
           {t("catalogBrowser.selected", { count: selectedIds.length })}
         </span>
@@ -373,48 +356,8 @@ export function CodexCatalogViewport<
         >
           <X className="h-4 w-4" />
         </Button>
-        {(onRemoveSelected || onPruneOutdated) && (
-          <DropdownMenu>
-            <DropdownMenuTrigger asChild>
-              <Button
-                type="button"
-                variant="ghost"
-                size="icon"
-                className="h-8 w-8"
-                title={t("catalogBrowser.moreActions")}
-                aria-label={t("catalogBrowser.moreActions")}
-              >
-                <MoreHorizontal className="h-4 w-4" />
-              </Button>
-            </DropdownMenuTrigger>
-            <DropdownMenuContent align="end">
-              {onPruneOutdated && (
-                <DropdownMenuItem
-                  disabled={items.length < 2}
-                  onSelect={onPruneOutdated}
-                >
-                  <Sparkles className="h-4 w-4" />
-                  {t("catalogBrowser.keepRecent")}
-                </DropdownMenuItem>
-              )}
-              {onRemoveSelected && (
-                <DropdownMenuItem
-                  className="text-destructive focus:text-destructive"
-                  disabled={selectedIds.length === 0}
-                  onSelect={() => {
-                    onRemoveSelected(selectedIds);
-                    updateSelection("clear");
-                  }}
-                >
-                  <Trash2 className="h-4 w-4" />
-                  {t("catalogBrowser.removeSelected")}
-                </DropdownMenuItem>
-              )}
-            </DropdownMenuContent>
-          </DropdownMenu>
-        )}
       </div>
-      <div className="grid w-full min-w-0 grid-cols-2 items-center gap-2 sm:flex sm:w-auto sm:flex-wrap">
+      <div className="flex min-w-0 flex-wrap items-center justify-end gap-2">
         <Button
           type="button"
           variant="outline"
@@ -437,47 +380,68 @@ export function CodexCatalogViewport<
           <ListX className="mr-1.5 h-4 w-4 shrink-0" />
           {t("catalogBrowser.excludeSelected")}
         </Button>
-        <Button
-          type="button"
-          variant="outline"
-          size="sm"
-          className="h-auto min-h-8 whitespace-normal"
-          disabled={!filteredItems.some(({ row }) => row.enabled === false)}
-          onClick={() => setMatchedIncluded(true)}
-        >
-          <ListChecks className="mr-1.5 h-4 w-4 shrink-0" />
-          {t("catalogBrowser.includeMatching", {
-            defaultValue: "Include matching",
-          })}
-        </Button>
-        <Button
-          type="button"
-          variant="outline"
-          size="sm"
-          className="h-auto min-h-8 whitespace-normal"
-          disabled={!filteredItems.some(({ row }) => row.enabled !== false)}
-          onClick={() => setMatchedIncluded(false)}
-        >
-          <ListX className="mr-1.5 h-4 w-4 shrink-0" />
-          {t("catalogBrowser.excludeMatching", {
-            defaultValue: "Exclude matching",
-          })}
-        </Button>
-        {onUseOnlySelected && (
+        {onPruneOutdated && (
           <Button
             type="button"
+            variant="outline"
             size="sm"
-            className="col-span-2 h-auto min-h-8 whitespace-normal"
-            disabled={selectedIds.length === 0}
-            onClick={() => {
-              onUseOnlySelected(selectedIds);
-              updateSelection("clear");
-            }}
+            className="h-auto min-h-8 whitespace-normal"
+            disabled={items.length < 2}
+            onClick={onPruneOutdated}
           >
-            <ListChecks className="mr-1.5 h-4 w-4 shrink-0" />
-            {t("catalogBrowser.useOnlySelected")}
+            <Sparkles className="mr-1.5 h-4 w-4 shrink-0" />
+            {t("catalogBrowser.keepRecent")}
           </Button>
         )}
+        <DropdownMenu>
+          <DropdownMenuTrigger asChild>
+            <Button
+              type="button"
+              variant="ghost"
+              size="icon"
+              className="h-8 w-8 shrink-0"
+              title={t("catalogBrowser.moreActions")}
+              aria-label={t("catalogBrowser.moreActions")}
+            >
+              <MoreHorizontal className="h-4 w-4" />
+            </Button>
+          </DropdownMenuTrigger>
+          <DropdownMenuContent align="end">
+            <DropdownMenuItem
+              disabled={filteredItems.length === 0}
+              onSelect={() => updateSelection("invert")}
+            >
+              <ArrowLeftRight className="h-4 w-4" />
+              {t("catalogBrowser.invertSelection")}
+            </DropdownMenuItem>
+            {onUseOnlySelected && (
+              <DropdownMenuItem
+                disabled={selectedIds.length === 0}
+                onSelect={() => {
+                  onUseOnlySelected(selectedIds);
+                  updateSelection("clear");
+                }}
+              >
+                <ListChecks className="h-4 w-4" />
+                {t("catalogBrowser.useOnlySelected")}
+              </DropdownMenuItem>
+            )}
+            {onRemoveSelected && <DropdownMenuSeparator />}
+            {onRemoveSelected && (
+              <DropdownMenuItem
+                className="text-destructive focus:text-destructive"
+                disabled={selectedIds.length === 0}
+                onSelect={() => {
+                  onRemoveSelected(selectedIds);
+                  updateSelection("clear");
+                }}
+              >
+                <Trash2 className="h-4 w-4" />
+                {t("catalogBrowser.removeSelected")}
+              </DropdownMenuItem>
+            )}
+          </DropdownMenuContent>
+        </DropdownMenu>
       </div>
     </div>
   );

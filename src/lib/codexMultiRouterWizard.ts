@@ -1084,11 +1084,14 @@ export function buildWizardModelCatalog(
   options: Pick<
     WizardPlanBuildOptions,
     "catalogModelOrder" | "spawnAgentModels"
-  > = {},
+  > & { includeDisabled?: boolean } = {},
 ): CodexModelCatalogConfig {
   const byModel = new Map<string, CodexCatalogModel>();
   for (const provider of providers) {
-    for (const model of readIncludedWizardModelCatalog(provider)) {
+    const sourceModels = options.includeDisabled
+      ? readWizardModelCatalog(provider)
+      : readIncludedWizardModelCatalog(provider);
+    for (const model of sourceModels) {
       if (!byModel.has(model.model)) {
         byModel.set(model.model, model);
       }

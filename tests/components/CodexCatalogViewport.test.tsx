@@ -6,6 +6,7 @@ import {
 } from "@testing-library/react";
 import { useState, type ReactNode } from "react";
 import { I18nextProvider } from "react-i18next";
+import userEvent from "@testing-library/user-event";
 import type { CodexCatalogModel } from "@/types";
 import { beforeAll, describe, expect, it, vi } from "vitest";
 import { CodexCatalogViewport } from "@/components/providers/forms/CodexCatalogViewport";
@@ -26,7 +27,8 @@ function render(node: ReactNode) {
 describe("large catalog viewport", () => {
   it.each([true, false])(
     "keeps selection actions after the model rows when compact=%s",
-    (compact) => {
+    async (compact) => {
+      const user = userEvent.setup();
       const onUseOnlySelected = vi.fn();
       const rows = [
         { rowId: "first", model: "first" },
@@ -57,19 +59,22 @@ describe("large catalog viewport", () => {
         within(toolbar).getByRole("checkbox", { name: "Select matching" }),
       ).toBeEnabled();
       expect(
-        within(toolbar).getByRole("button", { name: "Include matching" }),
+        within(toolbar).getByRole("button", { name: "Include selected" }),
       ).toBeEnabled();
       expect(
-        within(toolbar).getByRole("button", { name: "Exclude matching" }),
+        within(toolbar).getByRole("button", { name: "Exclude selected" }),
       ).toBeEnabled();
       expect(
-        screen.getAllByRole("button", { name: "Include matching" }),
-      ).toHaveLength(1);
+        within(toolbar).queryByRole("button", { name: "Include matching" }),
+      ).not.toBeInTheDocument();
       expect(
-        screen.getAllByRole("button", { name: "Exclude matching" }),
-      ).toHaveLength(1);
-      fireEvent.click(
-        within(toolbar).getByRole("button", { name: "Use only selected" }),
+        within(toolbar).queryByRole("button", { name: "Exclude matching" }),
+      ).not.toBeInTheDocument();
+      await user.click(
+        within(toolbar).getByRole("button", { name: "Catalogue actions" }),
+      );
+      await user.click(
+        screen.getByRole("menuitem", { name: "Use only selected" }),
       );
       expect(onUseOnlySelected).toHaveBeenCalledWith(["last"]);
     },
@@ -94,6 +99,47 @@ describe("large catalog viewport", () => {
     );
     expect(screen.queryByRole("group")).not.toBeInTheDocument();
     expect(screen.getByRole("searchbox")).toBeVisible();
+  });
+
+  it("keeps latest versions visible and leaves removal in catalogue actions", async () => {
+    const user = userEvent.setup();
+    const onPruneOutdated = vi.fn();
+    const onRemoveSelected = vi.fn();
+    render(
+      <CodexCatalogViewport
+        items={[
+          { row: { rowId: "old", model: "glm-4" }, index: 0 },
+          { row: { rowId: "new", model: "glm-5" }, index: 1 },
+        ]}
+        compact
+        selected={new Set(["old"])}
+        onSelect={vi.fn()}
+        onToggleEnabled={vi.fn()}
+        onPruneOutdated={onPruneOutdated}
+        onRemoveSelected={onRemoveSelected}
+      >
+        {({ row }) => <span>{row.model}</span>}
+      </CodexCatalogViewport>,
+    );
+
+    const toolbar = screen.getByRole("group", {
+      name: "Model selection actions",
+    });
+    await user.click(
+      within(toolbar).getByRole("button", { name: "Keep latest versions" }),
+    );
+    expect(onPruneOutdated).toHaveBeenCalledOnce();
+    expect(
+      screen.queryByRole("menuitem", { name: "Keep latest versions" }),
+    ).not.toBeInTheDocument();
+
+    await user.click(
+      within(toolbar).getByRole("button", { name: "Catalogue actions" }),
+    );
+    await user.click(
+      screen.getByRole("menuitem", { name: "Remove selected models" }),
+    );
+    expect(onRemoveSelected).toHaveBeenCalledWith(["old"]);
   });
 
   it("opens only on explicit activation and keeps Include clickable", () => {
@@ -242,21 +288,6 @@ describe("large catalog viewport", () => {
       target: { value: "absent" },
     });
     expect(screen.getByText("No matching models")).toBeVisible();
-    const toolbar = screen.getByRole("group", {
-      name: "Model selection actions",
-    });
-    expect(
-      within(toolbar).getByRole("button", { name: "Include matching" }),
-    ).toBeDisabled();
-    expect(
-      within(toolbar).getByRole("button", { name: "Exclude matching" }),
-    ).toBeDisabled();
-    expect(
-      screen.getAllByRole("button", { name: "Include matching" }),
-    ).toHaveLength(1);
-    expect(
-      screen.getAllByRole("button", { name: "Exclude matching" }),
-    ).toHaveLength(1);
     expect(
       screen.getByRole("button", { name: "Include selected" }),
     ).toBeDisabled();
@@ -267,7 +298,7 @@ describe("large catalog viewport", () => {
     expect(screen.getByText("editor-unused-0")).toBeVisible();
   });
 
-  it("filters inclusion, resets paging and applies matching actions across all pages", () => {
+  it("filters inclusion, resets paging and applies selected matches across all pages", () => {
     const initialRows = Array.from({ length: 31 }, (_, index) => ({
       rowId: `row-${index}`,
       model: `${index < 25 ? "coder" : "other"}-${index}`,
@@ -325,7 +356,10 @@ describe("large catalog viewport", () => {
       name: "Model selection actions",
     });
     fireEvent.click(
-      within(toolbar).getByRole("button", { name: "Include matching" }),
+      within(toolbar).getByRole("checkbox", { name: "Select matching" }),
+    );
+    fireEvent.click(
+      within(toolbar).getByRole("button", { name: "Include selected" }),
     );
     expect(onSetIncluded).toHaveBeenLastCalledWith(
       initialRows.slice(0, 25).map((row) => row.rowId),
@@ -343,10 +377,10 @@ describe("large catalog viewport", () => {
       target: { value: "coder" },
     });
     fireEvent.click(
-      within(screen.getByRole("group", { name: "Model selection actions" })).getByRole(
-        "button",
-        { name: "Exclude matching" },
-      ),
+      within(toolbar).getByRole("checkbox", { name: "Select matching" }),
+    );
+    fireEvent.click(
+      within(toolbar).getByRole("button", { name: "Exclude selected" }),
     );
     expect(onSetIncluded).toHaveBeenLastCalledWith(
       initialRows.slice(0, 25).map((row) => row.rowId),
@@ -438,7 +472,8 @@ describe("large catalog viewport", () => {
     expect(onToggleEnabled).toHaveBeenCalledWith("legacy", false);
   });
 
-  it("stages matching selections across pages and filters without changing inclusion", () => {
+  it("stages matching selections across pages and filters without changing inclusion", async () => {
+    const user = userEvent.setup();
     const rows = Array.from({ length: 31 }, (_, index) => ({
       rowId: `row-${index}`,
       model: `${index < 25 ? "coder" : "other"}-${index}`,
@@ -488,8 +523,9 @@ describe("large catalog viewport", () => {
     fireEvent.click(screen.getByRole("button", { name: "Next models" }));
     fireEvent.click(screen.getByRole("checkbox", { name: "Select coder-10" }));
     expect(screen.getByText("8 selected")).toBeVisible();
-    fireEvent.click(
-      screen.getByRole("button", { name: "Invert matching selection" }),
+    await user.click(screen.getByRole("button", { name: "Catalogue actions" }));
+    await user.click(
+      screen.getByRole("menuitem", { name: "Invert matching selection" }),
     );
     expect(screen.getByText("29 selected")).toBeVisible();
     expect(onSetIncluded).not.toHaveBeenCalled();

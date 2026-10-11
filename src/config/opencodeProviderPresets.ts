@@ -1,4 +1,8 @@
-import type { ProviderCategory, OpenCodeProviderConfig } from "../types";
+import type {
+  ProviderCategory,
+  OpenCodeModel,
+  OpenCodeProviderConfig,
+} from "../types";
 import type { PresetTheme, TemplateValueConfig } from "./claudeProviderPresets";
 import { OPEN_CODE_GO_MODELS } from "./openCodeGoCatalog";
 
@@ -69,6 +73,26 @@ const openCodeGoModels = Object.fromEntries(
     ];
   }),
 );
+
+// Zen's paid Responses endpoint is available to third-party clients. Keep
+// this separate from the Go catalog: Go and free Zen models have different
+// access rules and must not be presented as interchangeable routes.
+const openCodeZenPaidModels: Record<string, OpenCodeModel> = {
+  "gpt-5.6-sol": {
+    name: "GPT-5.6 Sol",
+    provider: { npm: "@ai-sdk/openai" },
+    limit: { context: 400000, output: 128000 },
+    modalities: { input: ["text", "image"], output: ["text"] },
+    reasoning: true,
+  },
+  "gpt-6.1-sol": {
+    name: "GPT-6.1 Sol",
+    provider: { npm: "@ai-sdk/openai" },
+    limit: { context: 400000, output: 128000 },
+    modalities: { input: ["text", "image"], output: ["text"] },
+    reasoning: true,
+  },
+};
 
 export interface PresetModelVariant {
   id: string;
@@ -1936,6 +1960,31 @@ export const opencodeProviderPresets: OpenCodeProviderPreset[] = [
     },
   },
 
+  {
+    name: "OpenCode Zen",
+    websiteUrl: "https://opencode.ai/zen",
+    apiKeyUrl: "https://opencode.ai/zen",
+    settingsConfig: {
+      npm: "@ai-sdk/openai",
+      name: "OpenCode Zen",
+      options: {
+        baseURL: "https://opencode.ai/zen/v1",
+        apiKey: "",
+        setCacheKey: true,
+      },
+      models: openCodeZenPaidModels,
+    },
+    category: "third_party",
+    icon: "opencode",
+    iconColor: "#211E1E",
+    templateValues: {
+      apiKey: {
+        label: "Zen API Key",
+        placeholder: "sk-...",
+        editorValue: "",
+      },
+    },
+  },
   {
     name: "OpenCode Go",
     websiteUrl: "https://opencode.ai/go",

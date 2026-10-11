@@ -316,6 +316,37 @@ function openCodeGoCodexCatalog(protocol: OpenCodeGoProtocol) {
   );
 }
 
+const openCodeZenReasoning: CodexModelReasoningCapability = {
+  schemaVersion: 2,
+  supportStatus: "confirmed_supported",
+  controlKind: "graded",
+  supportedEfforts: ["low", "medium", "high", "xhigh"],
+  defaultEffort: "high",
+  disableAllowed: false,
+  upstream: { format: "reasoning_object", parameter: "reasoning.effort" },
+  outputFormat: "reasoning",
+  source: "builtin",
+};
+
+function openCodeZenCodexCatalog() {
+  return modelCatalog([
+    {
+      model: "gpt-5.6-sol",
+      displayName: "GPT-5.6 Sol",
+      contextWindow: 400_000,
+      inputModalities: ["text", "image"],
+      reasoning: openCodeZenReasoning,
+    },
+    {
+      model: "gpt-6.1-sol",
+      displayName: "GPT-6.1 Sol",
+      contextWindow: 400_000,
+      inputModalities: ["text", "image"],
+      reasoning: openCodeZenReasoning,
+    },
+  ]);
+}
+
 const deepSeekV4Reasoning: CodexModelReasoningCapability = {
   schemaVersion: 2,
   supportStatus: "confirmed_supported",
@@ -2045,6 +2076,24 @@ wire_api = "responses"`,
     category: "aggregator",
     icon: "nvidia",
     iconColor: "#000000",
+  },
+  {
+    name: "OpenCode Zen (Paid Responses)",
+    presetKey: "opencode-zen-paid-responses",
+    websiteUrl: "https://opencode.ai/zen",
+    apiKeyUrl: "https://opencode.ai/zen",
+    auth: generateThirdPartyAuth(""),
+    config: generateThirdPartyConfig(
+      "opencode_zen_paid",
+      "https://opencode.ai/zen/v1",
+      "gpt-6.1-sol",
+    ),
+    endpointCandidates: ["https://opencode.ai/zen/v1"],
+    apiFormat: "openai_responses",
+    modelCatalog: openCodeZenCodexCatalog(),
+    category: "third_party",
+    icon: "opencode",
+    iconColor: "#211E1E",
   },
   {
     name: "OpenCode Go (Responses)",

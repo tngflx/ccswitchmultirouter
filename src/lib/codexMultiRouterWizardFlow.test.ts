@@ -115,4 +115,46 @@ describe("Codex MultiRouter guided flow", () => {
     ).toBe("sources");
     expect(requiredWizardPrerequisite("reasoning", readyContext)).toBeNull();
   });
+
+  it("keeps the model selection page editable when every model is deselected", () => {
+    const noModelsKept: WizardFlowContext = {
+      ...readyContext,
+      hasVisibleModels: false,
+    };
+
+    expect(canEnterWizardPage("models", noModelsKept)).toBe(true);
+    expect(requiredWizardPrerequisite("models", noModelsKept)).toBeNull();
+    expect(
+      canEnterWizardPage("models", {
+        ...noModelsKept,
+        selectedSourceCount: 0,
+        allSelectedSourcesReady: false,
+      }),
+    ).toBe(false);
+    expect(
+      requiredWizardPrerequisite("models", {
+        ...noModelsKept,
+        selectedSourceCount: 0,
+        allSelectedSourcesReady: false,
+      }),
+    ).toBe("sources");
+    expect(canEnterWizardPage("model-order", noModelsKept)).toBe(false);
+    expect(requiredWizardPrerequisite("model-order", noModelsKept)).toBe(
+      "catalog",
+    );
+  });
+
+  it("blocks route pages when the catalog only contains disabled recovery rows", () => {
+    const disabledOnly: WizardFlowContext = {
+      ...readyContext,
+      hasVisibleModels: false,
+    };
+
+    expect(canEnterWizardPage("models", disabledOnly)).toBe(true);
+    expect(canEnterWizardPage("model-order", disabledOnly)).toBe(false);
+    expect(canEnterWizardPage("routing-review", disabledOnly)).toBe(false);
+    expect(requiredWizardPrerequisite("routing-review", disabledOnly)).toBe(
+      "catalog",
+    );
+  });
 });

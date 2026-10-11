@@ -6,6 +6,24 @@ import {
 } from "@/config/opencodeProviderPresets";
 
 describe("AWS Bedrock OpenCode Provider Presets", () => {
+  it("includes a paid OpenCode Zen Responses preset", () => {
+    const preset = opencodeProviderPresets.find(
+      (candidate) => candidate.name === "OpenCode Zen",
+    );
+
+    expect(preset).toBeDefined();
+    expect(preset?.settingsConfig.npm).toBe("@ai-sdk/openai");
+    expect(preset?.settingsConfig.options?.baseURL).toBe(
+      "https://opencode.ai/zen/v1",
+    );
+    expect(Object.keys(preset?.settingsConfig.models ?? {})).toEqual(
+      expect.arrayContaining(["gpt-5.6-sol", "gpt-6.1-sol"]),
+    );
+    expect(Object.keys(preset?.settingsConfig.models ?? {})).not.toContain(
+      "space-bunny-free",
+    );
+  });
+
   it("should include @ai-sdk/amazon-bedrock in npm packages", () => {
     const bedrockPkg = opencodeNpmPackages.find(
       (p) => p.value === "@ai-sdk/amazon-bedrock",

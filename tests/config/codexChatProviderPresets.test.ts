@@ -104,6 +104,23 @@ const expectedChatPresets = new Map<
 ]);
 
 describe("Codex Chat provider presets", () => {
+  it("includes a paid OpenCode Zen Responses preset", () => {
+    const preset = codexProviderPresets.find(
+      (candidate) => candidate.presetKey === "opencode-zen-paid-responses",
+    );
+
+    expect(preset?.name).toBe("OpenCode Zen (Paid Responses)");
+    expect(preset?.apiFormat).toBe("openai_responses");
+    expect(extractCodexBaseUrl(preset?.config)).toBe(
+      "https://opencode.ai/zen/v1",
+    );
+    expect(extractCodexModelName(preset?.config)).toBe("gpt-6.1-sol");
+    expect(preset?.modelCatalog?.map((model) => model.model)).toEqual([
+      "gpt-5.6-sol",
+      "gpt-6.1-sol",
+    ]);
+  });
+
   it("keeps generated third-party bearer configs independent from OpenAI OAuth", () => {
     const config = generateThirdPartyConfig(
       "Remote CCSwitch",

@@ -14,8 +14,6 @@
     "included": "已包含",
     "excluded": "已排除",
     "matching": "{{count}} 个匹配模型",
-    "includeMatching": "包含匹配模型",
-    "excludeMatching": "排除匹配模型",
     "noMatches": "没有匹配的模型",
     "noIncludedModels": "没有已包含的模型",
     "editModel": "编辑 {{model}}",
@@ -958,6 +956,7 @@
           "alacritty": "Alacritty",
           "kitty": "Kitty",
           "ghostty": "Ghostty",
+          "otty": "Otty",
           "wezterm": "WezTerm",
           "kaku": "Kaku",
           "warp": "Warp"
@@ -1784,7 +1783,9 @@
     "modelOptionValuePlaceholder": "{\"order\": [\"baseten\"]}",
     "modelRange": "模型 {{from}}-{{to}}，共 {{total}} 个",
     "previousModels": "上一页模型",
-    "nextModels": "下一页模型"
+    "nextModels": "下一页模型",
+    "zenFreeTierTitle": "OpenCode Zen 免费模型仅限 OpenCode 使用",
+    "zenFreeTierDescription": "OpenCode Zen 将以 -free 结尾的模型限制为官方 OpenCode 客户端使用。修改 User-Agent 或会话请求头无法获得访问权限。请为 CC Switch/Codex 代理使用付费 Zen 模型，或在官方 OpenCode 客户端中运行此免费模型。"
   },
   "providerPreset": {
     "label": "预设供应商",

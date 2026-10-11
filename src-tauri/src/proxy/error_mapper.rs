@@ -4,6 +4,29 @@
 
 use super::ProxyError;
 
+const OPENCODE_ZEN_FREE_TIER_GUIDANCE: &str = concat!(
+    "OpenCode Zen rejected this free-tier model because Zen free models are restricted ",
+    "to the official OpenCode client. Changing User-Agent or session headers cannot ",
+    "grant access. Use a paid Zen model through https://opencode.ai/zen/v1 with a Zen ",
+    "API key, or run this free model in the official OpenCode client."
+);
+
+/// Return actionable guidance for upstream errors whose raw text otherwise
+/// encourages users to keep retrying an unsupported client configuration.
+pub fn actionable_upstream_error_message(status: u16, body: Option<&str>) -> Option<String> {
+    if status != 403 {
+        return None;
+    }
+
+    let normalized = body?.to_ascii_lowercase();
+    let is_zen_free_tier_rejection = normalized.contains("opencode")
+        && normalized.contains("free tier")
+        && normalized.contains("only be used")
+        && (normalized.contains("within opencode") || normalized.contains("in opencode"));
+
+    is_zen_free_tier_rejection.then(|| OPENCODE_ZEN_FREE_TIER_GUIDANCE.to_string())
+}
+
 /// 将 ProxyError 映射到 HTTP 状态码
 ///
 /// 映射规则：
@@ -73,6 +96,9 @@ pub fn map_proxy_error_to_status(error: &ProxyError) -> u16 {
 pub fn get_error_message(error: &ProxyError) -> String {
     match error {
         ProxyError::UpstreamError { status, body } => {
+            if let Some(message) = actionable_upstream_error_message(*status, body.as_deref()) {
+                return message;
+            }
             if let Some(body) = body
                 .as_deref()
                 .map(str::trim)
@@ -195,5 +221,32 @@ mod tests {
                 "上游错误 (502)"
             );
         }
+    }
+
+    #[test]
+    fn opencode_zen_free_tier_rejection_has_actionable_guidance() {
+        let body = r#"{"type":"FreeTierError","message":"OpenCode's free tier can only be used from within OpenCode"}"#;
+        let error = ProxyError::UpstreamError {
+            status: 403,
+            body: Some(body.to_string()),
+        };
+
+        let message = get_error_message(&error);
+        assert!(message.contains("official OpenCode client"));
+        assert!(message.contains("Changing User-Agent or session headers cannot grant access"));
+        assert!(message.contains("https://opencode.ai/zen/v1"));
+        assert!(!message.contains("FreeTierError"));
+    }
+
+    #[test]
+    fn similar_non_403_error_keeps_the_upstream_body() {
+        let body = "OpenCode's free tier can only be used from within OpenCode";
+        let message = get_error_message(&ProxyError::UpstreamError {
+            status: 429,
+            body: Some(body.to_string()),
+        });
+
+        assert!(message.contains("上游错误 (429)"));
+        assert!(message.contains(body));
     }
 }

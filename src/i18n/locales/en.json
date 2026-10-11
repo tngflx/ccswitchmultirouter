@@ -14,8 +14,6 @@
     "included": "Included",
     "excluded": "Excluded",
     "matching": "{{count}} matching models",
-    "includeMatching": "Include matching",
-    "excludeMatching": "Exclude matching",
     "noMatches": "No matching models",
     "noIncludedModels": "No included models",
     "editModel": "Edit {{model}}",
@@ -958,6 +956,7 @@
           "alacritty": "Alacritty",
           "kitty": "Kitty",
           "ghostty": "Ghostty",
+          "otty": "Otty",
           "wezterm": "WezTerm",
           "kaku": "Kaku",
           "warp": "Warp"
@@ -1784,7 +1783,9 @@
     "modelOptionValuePlaceholder": "{\"order\": [\"baseten\"]}",
     "modelRange": "Models {{from}}-{{to}} of {{total}}",
     "previousModels": "Previous models",
-    "nextModels": "Next models"
+    "nextModels": "Next models",
+    "zenFreeTierTitle": "OpenCode Zen free models are OpenCode-only",
+    "zenFreeTierDescription": "Models ending in -free are restricted by OpenCode Zen to the official OpenCode client. Changing User-Agent or session headers cannot grant access. Use a paid Zen model for the CC Switch/Codex proxy, or run the official OpenCode client."
   },
   "providerPreset": {
     "label": "Provider Preset",

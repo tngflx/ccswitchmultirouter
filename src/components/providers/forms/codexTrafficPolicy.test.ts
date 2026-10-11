@@ -12,6 +12,12 @@ describe("codex traffic policy", () => {
     expect(policy.maxInFlight).toBe(4);
   });
 
+  it("also recognizes paid Zen outside the Go endpoint", () => {
+    const policy = resolveCodexTrafficPolicy("https://opencode.ai/zen/v1");
+    expect(policy.source).toBe("recommended");
+    expect(policy.admissionEnabled).toBe(true);
+  });
+
   it("clamps custom values and disables dependent retries", () => {
     const policy = normalizeCodexTrafficPolicy({
       maxInFlight: 999,

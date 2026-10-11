@@ -55,6 +55,36 @@ const expandFirstModel = () => {
 };
 
 describe("OpenCodeFormFields", () => {
+  it("warns when an OpenCode Zen provider contains a free-tier model", () => {
+    renderOpenCodeForm({
+      baseUrl: "https://opencode.ai/zen/v1",
+      models: {
+        "space-bunny-free": { name: "Space Bunny" },
+        "gpt-6.1-sol": { name: "GPT-6.1 Sol" },
+      },
+    });
+
+    expect(
+      screen.getByText("OpenCode Zen free models are OpenCode-only"),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText(
+        /Changing User-Agent or session headers cannot grant access/,
+      ),
+    ).toBeInTheDocument();
+  });
+
+  it("does not show the Zen free-tier warning for ordinary providers", () => {
+    renderOpenCodeForm({
+      baseUrl: "https://api.example.com/v1",
+      models: { "example-free": { name: "Example Free" } },
+    });
+
+    expect(
+      screen.queryByText("OpenCode Zen free models are OpenCode-only"),
+    ).not.toBeInTheDocument();
+  });
+
   it("surfaces existing provider headers", () => {
     renderOpenCodeForm({
       headers: {
