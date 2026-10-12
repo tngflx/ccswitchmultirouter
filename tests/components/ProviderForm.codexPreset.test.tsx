@@ -3,6 +3,7 @@ import type { ComponentProps } from "react";
 import { describe, expect, it, vi } from "vitest";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { ProviderForm } from "@/components/providers/forms/ProviderForm";
+import { CodexProviderSetCancelled } from "@/components/providers/forms/useCodexProviderSetSave";
 
 const codexCandidateApiMocks = vi.hoisted(() => ({
   validateProviderCandidate: vi.fn(),
@@ -817,6 +818,24 @@ describe("ProviderForm Codex preset selection", () => {
     expect(
       screen.getByTestId("codex-preset-reasoning-models"),
     ).toBeEmptyDOMElement();
+  });
+
+  it("treats closing the paid probe confirmation as a silent cancellation", async () => {
+    const onSubmit = vi.fn().mockRejectedValue(new CodexProviderSetCancelled());
+    renderProviderForm({ showButtons: true, submitLabel: "保存", onSubmit });
+
+    fireEvent.click(screen.getByRole("button", { name: /Zhipu GLM$/ }));
+    await waitFor(() => {
+      expect(screen.getByTestId("codex-catalog")).toHaveTextContent(
+        "glm-5.3,glm-5-turbo",
+      );
+    });
+    fireEvent.click(screen.getByRole("button", { name: "mock-set-api-key" }));
+    fireEvent.click(screen.getByRole("button", { name: "保存" }));
+
+    await waitFor(() => expect(onSubmit).toHaveBeenCalledTimes(1));
+    expect(screen.queryByText(/Operation canceled/)).toBeNull();
+    expect(screen.queryByText(/Save result was not confirmed/)).toBeNull();
   });
 });
 

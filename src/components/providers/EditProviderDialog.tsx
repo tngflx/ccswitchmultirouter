@@ -315,6 +315,7 @@ export function EditProviderDialog({
         await persistCodexProviderSet(
           updatedProvider,
           values.protocolProbeReceiptIds ?? [],
+          { allowUnverifiedSave: true },
         );
         onOpenChange(false);
         return;

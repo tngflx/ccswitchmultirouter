@@ -11,6 +11,7 @@ const apiMocks = vi.hoisted(() => ({
   prepareCodexProviderSet: vi.fn(),
   commitCodexProviderSet: vi.fn(),
   preflightCodexProviderProtocolCompatibility: vi.fn(),
+  restoreCodexProviderProtocolEvidence: vi.fn(),
   getCodexProviderEditorSnapshot: vi.fn(),
   invalidateQueries: vi.fn(),
 }));
@@ -50,6 +51,8 @@ vi.mock("@/lib/api/protocol-compatibility", async (importOriginal) => {
     commitCodexProviderSet: apiMocks.commitCodexProviderSet,
     preflightCodexProviderProtocolCompatibility:
       apiMocks.preflightCodexProviderProtocolCompatibility,
+    restoreCodexProviderProtocolEvidence:
+      apiMocks.restoreCodexProviderProtocolEvidence,
     getCodexProviderEditorSnapshot: apiMocks.getCodexProviderEditorSnapshot,
   };
 });
@@ -175,6 +178,9 @@ describe("EditProviderDialog", () => {
       status: "committed",
     });
     apiMocks.preflightCodexProviderProtocolCompatibility.mockReset();
+    apiMocks.restoreCodexProviderProtocolEvidence
+      .mockReset()
+      .mockResolvedValue(null);
     apiMocks.getCodexProviderEditorSnapshot.mockReset();
     apiMocks.invalidateQueries.mockReset().mockResolvedValue(undefined);
     formSubmission.receiptIds = [];
@@ -540,6 +546,58 @@ describe("EditProviderDialog", () => {
       apiMocks.preflightCodexProviderProtocolCompatibility,
     ).not.toHaveBeenCalled();
     expect(handleSubmit).not.toHaveBeenCalled();
+    expect(handleOpenChange).toHaveBeenCalledWith(false);
+  });
+
+  it("saves a newly added non-GPT model without forcing a paid protocol probe", async () => {
+    const provider: Provider = {
+      id: "deepseek",
+      name: "DeepSeek",
+      category: "custom",
+      settingsConfig: {
+        auth: { OPENAI_API_KEY: "db-key" },
+        config:
+          'model_provider = "deepseek"\nmodel = "deepseek-v4.1-flash"\n[model_providers.deepseek]\nbase_url = "https://api.deepseek.com/v1"\nwire_api = "responses"\n',
+        modelCatalog: { models: [{ model: "deepseek-v4.1-flash" }] },
+      },
+      meta: { apiFormat: "openai_responses" },
+    };
+    const handleOpenChange = vi.fn();
+    apiMocks.getCodexProviderEditorSnapshot.mockResolvedValue(
+      editorSnapshotFor(provider),
+    );
+
+    render(
+      <EditProviderDialog
+        open
+        provider={provider}
+        onOpenChange={handleOpenChange}
+        onSubmit={vi.fn()}
+        appId="codex"
+        isProxyTakeover
+      />,
+    );
+
+    fireEvent.click(await screen.findByRole("button", { name: "common.save" }));
+
+    await waitFor(() =>
+      expect(apiMocks.commitCodexProviderSet).toHaveBeenCalledWith(
+        expect.objectContaining({
+          id: "deepseek",
+          meta: expect.objectContaining({
+            apiFormat: "openai_responses",
+            codexProtocolMode: "manual",
+          }),
+        }),
+        [],
+        "edit-digest",
+        "confirm_manual",
+      ),
+    );
+    expect(
+      apiMocks.preflightCodexProviderProtocolCompatibility,
+    ).not.toHaveBeenCalled();
+    expect(screen.queryByRole("button", { name: "Confirm test" })).toBeNull();
     expect(handleOpenChange).toHaveBeenCalledWith(false);
   });
 

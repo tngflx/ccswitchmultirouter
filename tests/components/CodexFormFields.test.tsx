@@ -20,6 +20,7 @@ import type {
   CodexProviderProtocolPreflightOutcome,
 } from "@/lib/api/protocol-compatibility";
 import type {
+  CodexApiKeyGroup,
   CodexApiFormat,
   CodexCatalogModel,
   CodexChatReasoning,
@@ -365,6 +366,7 @@ function renderCatalogHarness(
     codexProviderEditorSnapshot?: CodexProviderEditorSnapshot;
     protocolOverrides?: Record<string, CodexProtocolOverride>;
     defaultModel?: string;
+    apiKeyGroups?: CodexApiKeyGroup[];
   } = {},
 ) {
   const onCatalogChange = vi.fn();
@@ -401,6 +403,14 @@ function renderCatalogHarness(
         codexProviderEditorSnapshot={options.codexProviderEditorSnapshot}
         codexApiKey={options.apiKey ?? "sk-test"}
         onApiKeyChange={vi.fn()}
+        apiKeyGroups={options.apiKeyGroups}
+        onApiKeyGroupsChange={
+          options.apiKeyGroups === undefined ? undefined : vi.fn()
+        }
+        apiKeyGroupMode="isolated"
+        onApiKeyGroupModeChange={
+          options.apiKeyGroups === undefined ? undefined : vi.fn()
+        }
         codexModel={defaultModel}
         onModelChange={
           options.defaultModel === undefined
@@ -674,6 +684,34 @@ function renderAutoSplitHarness() {
 }
 
 describe("CodexFormFields local model routing", () => {
+  it("keeps API key groups visible without opening Advanced settings", () => {
+    renderCatalogHarness([], {
+      openAdvancedOptions: false,
+      apiKeyGroups: [
+        {
+          id: "deepseek-primary",
+          apiKeys: ["sk-one", "sk-two"],
+          models: ["deepseek-v4.1-flash"],
+          strategy: "fixed",
+        },
+      ],
+    });
+
+    expect(screen.getByText("codexConfig.apiKeyGroupsTitle")).toBeVisible();
+    expect(screen.getByLabelText("codexConfig.apiKeyGroupId")).toHaveValue(
+      "deepseek-primary",
+    );
+    expect(screen.getByLabelText("codexConfig.apiKeyGroupKey")).toHaveValue(
+      "sk-one, sk-two",
+    );
+    fireEvent.change(screen.getByLabelText("codexConfig.apiKeyGroupKey"), {
+      target: { value: "sk-one, " },
+    });
+    expect(screen.getByLabelText("codexConfig.apiKeyGroupKey")).toHaveValue(
+      "sk-one, ",
+    );
+  });
+
   it("uses only staged models across filters while preserving the editable inventory and included-only pickers", async () => {
     const user = userEvent.setup();
     const { latestCatalog } = renderCatalogHarness(

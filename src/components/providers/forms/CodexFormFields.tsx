@@ -55,7 +55,10 @@ import { CodexProtocolAdvancedSettings } from "./CodexProtocolAdvancedSettings";
 import { CustomUserAgentField } from "./CustomUserAgentField";
 import { LocalProxyRequestOverridesField } from "./LocalProxyRequestOverridesField";
 import { CodexProviderReadinessSection } from "./CodexProviderReadinessSection";
-import { CodexKeyGroupModels } from "./CodexKeyGroupModels";
+import {
+  CodexKeyGroupModels,
+  CommaSeparatedListInput,
+} from "./CodexKeyGroupModels";
 import { CodexCatalogViewport } from "./CodexCatalogViewport";
 import { CodexModelReasoningCard } from "./CodexModelReasoningCard";
 import { CodexModelReasoningEditor } from "./CodexModelReasoningEditor";
@@ -1958,6 +1961,140 @@ export function CodexFormFields({
         />
       )}
 
+      {category !== "official" && onApiKeyGroupsChange ? (
+        <section className="space-y-3 rounded-lg border border-border-default p-4">
+          <div className="flex items-center justify-between gap-3">
+            <div>
+              <FormLabel>{t("codexConfig.apiKeyGroupsTitle")}</FormLabel>
+              <p className="text-xs text-muted-foreground">
+                {t("codexConfig.apiKeyGroupsHint")}
+              </p>
+            </div>
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              onClick={() =>
+                onApiKeyGroupsChange([
+                  ...apiKeyGroups,
+                  {
+                    id: `group-${apiKeyGroups.length + 1}`,
+                    apiKeys: [],
+                    strategy: "fixed",
+                  },
+                ])
+              }
+            >
+              <Plus className="mr-1 h-3.5 w-3.5" />
+              {t("codexConfig.apiKeyGroupsAdd")}
+            </Button>
+          </div>
+          {apiKeyGroups.map((group, index) => (
+            <div
+              key={`${group.id}-${index}`}
+              className="space-y-2 rounded-md border p-3"
+            >
+              <div className="grid gap-2 md:grid-cols-[1fr_1fr_auto]">
+                <Input
+                  value={group.id}
+                  aria-label={t("codexConfig.apiKeyGroupId")}
+                  placeholder={t("codexConfig.apiKeyGroupId")}
+                  onChange={(event) => {
+                    const next = [...apiKeyGroups];
+                    next[index] = { ...group, id: event.target.value };
+                    onApiKeyGroupsChange(next);
+                  }}
+                />
+                <CommaSeparatedListInput
+                  type="password"
+                  values={group.apiKeys}
+                  label={t("codexConfig.apiKeyGroupKey")}
+                  onChange={(apiKeys) => {
+                    const next = [...apiKeyGroups];
+                    next[index] = { ...group, apiKeys };
+                    onApiKeyGroupsChange(next);
+                  }}
+                />
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="icon"
+                  aria-label={t("codexConfig.apiKeyGroupRemove")}
+                  onClick={() =>
+                    onApiKeyGroupsChange(
+                      apiKeyGroups.filter((_, item) => item !== index),
+                    )
+                  }
+                >
+                  <Trash2 className="h-4 w-4" />
+                </Button>
+              </div>
+              <CodexKeyGroupModels
+                group={group}
+                baseUrl={codexBaseUrl}
+                isFullUrl={isFullUrl}
+                customUserAgent={customUserAgent}
+                onChange={(nextGroup) => {
+                  const next = apiKeyGroupsRef.current.map((item) =>
+                    item.id === group.id ? nextGroup : item,
+                  );
+                  apiKeyGroupsRef.current = next;
+                  onApiKeyGroupsChange(next);
+                }}
+                onModelsFetched={(models) => {
+                  const mergedRows = mergeFetchedModelsIntoCatalogRows(
+                    catalogRowsRef.current,
+                    models,
+                    {
+                      providerId,
+                      providerName,
+                      baseUrl: codexBaseUrl,
+                      websiteUrl,
+                    },
+                  );
+                  catalogRowsRef.current = mergedRows;
+                  setCatalogRows(mergedRows);
+                }}
+              />
+              <div className="flex items-center gap-2">
+                <Switch
+                  checked={group.enabled !== false}
+                  aria-label={t("codexConfig.apiKeyGroupEnabled")}
+                  onCheckedChange={(enabled) => {
+                    const next = [...apiKeyGroups];
+                    next[index] = { ...group, enabled };
+                    onApiKeyGroupsChange(next);
+                  }}
+                />
+                <span className="text-xs text-muted-foreground">
+                  {t("codexConfig.apiKeyGroupEnabled")}
+                </span>
+              </div>
+            </div>
+          ))}
+          {apiKeyGroups.length > 0 && onApiKeyGroupModeChange ? (
+            <Select
+              value={apiKeyGroupMode}
+              onValueChange={(value) =>
+                onApiKeyGroupModeChange(value as CodexApiKeyGroupMode)
+              }
+            >
+              <SelectTrigger aria-label={t("codexConfig.apiKeyGroupMode")}>
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="isolated">
+                  {t("codexConfig.apiKeyGroupModeIsolated")}
+                </SelectItem>
+                <SelectItem value="round_robin">
+                  {t("codexConfig.apiKeyGroupModeRoundRobin")}
+                </SelectItem>
+              </SelectContent>
+            </Select>
+          ) : null}
+        </section>
+      ) : null}
+
       {/* Codex Base URL 输入框（托管 OAuth 端点由 adapter 硬定向，不展示） */}
       {shouldShowSpeedTest && !isXaiOauthPreset && (
         <EndpointField
@@ -3115,147 +3252,6 @@ export function CodexFormFields({
                   "border-t border-border-default pt-3",
               )}
             >
-              {onApiKeyGroupsChange ? (
-                <div className="space-y-3 border-t border-border-default pt-3">
-                  <div className="flex items-center justify-between gap-3">
-                    <div>
-                      <FormLabel>
-                        {t("codexConfig.apiKeyGroupsTitle")}
-                      </FormLabel>
-                      <p className="text-xs text-muted-foreground">
-                        {t("codexConfig.apiKeyGroupsHint")}
-                      </p>
-                    </div>
-                    <Button
-                      type="button"
-                      variant="outline"
-                      size="sm"
-                      onClick={() =>
-                        onApiKeyGroupsChange([
-                          ...apiKeyGroups,
-                          {
-                            id: `group-${apiKeyGroups.length + 1}`,
-                            apiKeys: [],
-                            strategy: "fixed",
-                          },
-                        ])
-                      }
-                    >
-                      <Plus className="mr-1 h-3.5 w-3.5" />
-                      {t("codexConfig.apiKeyGroupsAdd")}
-                    </Button>
-                  </div>
-                  {apiKeyGroups.map((group, index) => (
-                    <div
-                      key={`${group.id}-${index}`}
-                      className="space-y-2 rounded-md border p-3"
-                    >
-                      <div className="grid gap-2 md:grid-cols-[1fr_1fr_auto]">
-                        <Input
-                          value={group.id}
-                          aria-label={t("codexConfig.apiKeyGroupId")}
-                          placeholder={t("codexConfig.apiKeyGroupId")}
-                          onChange={(event) => {
-                            const next = [...apiKeyGroups];
-                            next[index] = { ...group, id: event.target.value };
-                            onApiKeyGroupsChange(next);
-                          }}
-                        />
-                        <Input
-                          value={group.apiKeys.join(", ")}
-                          aria-label={t("codexConfig.apiKeyGroupKey")}
-                          placeholder={t("codexConfig.apiKeyGroupKey")}
-                          onChange={(event) => {
-                            const apiKeys = event.target.value
-                              .split(",")
-                              .map((key) => key.trim())
-                              .filter(Boolean);
-                            const next = [...apiKeyGroups];
-                            next[index] = { ...group, apiKeys };
-                            onApiKeyGroupsChange(next);
-                          }}
-                        />
-                        <Button
-                          type="button"
-                          variant="ghost"
-                          size="icon"
-                          aria-label={t("codexConfig.apiKeyGroupRemove")}
-                          onClick={() =>
-                            onApiKeyGroupsChange(
-                              apiKeyGroups.filter((_, item) => item !== index),
-                            )
-                          }
-                        >
-                          <Trash2 className="h-4 w-4" />
-                        </Button>
-                      </div>
-                      <CodexKeyGroupModels
-                        group={group}
-                        baseUrl={codexBaseUrl}
-                        isFullUrl={isFullUrl}
-                        customUserAgent={customUserAgent}
-                        onChange={(nextGroup) => {
-                          const next = apiKeyGroupsRef.current.map((item) =>
-                            item.id === group.id ? nextGroup : item,
-                          );
-                          apiKeyGroupsRef.current = next;
-                          onApiKeyGroupsChange(next);
-                        }}
-                        onModelsFetched={(models) => {
-                          const mergedRows = mergeFetchedModelsIntoCatalogRows(
-                            catalogRowsRef.current,
-                            models,
-                            {
-                              providerId,
-                              providerName,
-                              baseUrl: codexBaseUrl,
-                              websiteUrl,
-                            },
-                          );
-                          catalogRowsRef.current = mergedRows;
-                          setCatalogRows(mergedRows);
-                        }}
-                      />
-                      <div className="flex items-center gap-2">
-                        <Switch
-                          checked={group.enabled !== false}
-                          aria-label={t("codexConfig.apiKeyGroupEnabled")}
-                          onCheckedChange={(enabled) => {
-                            const next = [...apiKeyGroups];
-                            next[index] = { ...group, enabled };
-                            onApiKeyGroupsChange(next);
-                          }}
-                        />
-                        <span className="text-xs text-muted-foreground">
-                          {t("codexConfig.apiKeyGroupEnabled")}
-                        </span>
-                      </div>
-                    </div>
-                  ))}
-                  {apiKeyGroups.length > 0 && onApiKeyGroupModeChange ? (
-                    <Select
-                      value={apiKeyGroupMode}
-                      onValueChange={(value) =>
-                        onApiKeyGroupModeChange(value as CodexApiKeyGroupMode)
-                      }
-                    >
-                      <SelectTrigger
-                        aria-label={t("codexConfig.apiKeyGroupMode")}
-                      >
-                        <SelectValue />
-                      </SelectTrigger>
-                      <SelectContent>
-                        <SelectItem value="isolated">
-                          {t("codexConfig.apiKeyGroupModeIsolated")}
-                        </SelectItem>
-                        <SelectItem value="round_robin">
-                          {t("codexConfig.apiKeyGroupModeRoundRobin")}
-                        </SelectItem>
-                      </SelectContent>
-                    </Select>
-                  ) : null}
-                </div>
-              ) : null}
               <CustomUserAgentField
                 id="codex-custom-user-agent"
                 value={customUserAgent}

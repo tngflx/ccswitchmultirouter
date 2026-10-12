@@ -50,17 +50,4 @@ describe("CodexFormSaveFeedback", () => {
       "avoid changing the API Key again",
     );
   });
-
-  it("shows canceled Codex saves as definitely not saved", () => {
-    render(
-      <CodexFormSaveFeedback saveError="Operation canceled; nothing was saved. The current draft is preserved so you can edit and retry." />,
-    );
-
-    expect(screen.getByRole("alert")).toHaveTextContent(
-      "Operation canceled; nothing was saved",
-    );
-    expect(screen.getByRole("alert")).toHaveTextContent(
-      "The current draft is preserved",
-    );
-  });
 });

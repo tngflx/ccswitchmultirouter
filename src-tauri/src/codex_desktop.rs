@@ -4697,7 +4697,9 @@ JSON.stringify({
         assert!(script.contains("guardianV2FallbackRequestParams"));
         assert!(script.contains("auth.setAuthMethod(\"chatgpt\")"));
         assert!(script.contains("requestHealthWarningsSuppressed"));
-        assert!(script.contains("if (!requestHealthWarningsSuppressed) renderRequestHealthWarnings(warnings)"));
+        assert!(script.contains(
+            "if (!requestHealthWarningsSuppressed) renderRequestHealthWarnings(warnings)"
+        ));
         assert!(script.contains("if (!requestHealthWarningsSuppressed) {"));
     }
 

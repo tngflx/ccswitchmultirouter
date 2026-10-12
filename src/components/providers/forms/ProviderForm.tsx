@@ -2275,10 +2275,13 @@ function ProviderFormFull({
       await onSubmit(payload);
     } catch (error) {
       if (appId === "codex") {
+        if (isCodexProviderSetCancelled(error)) {
+          setCodexSaveError(null);
+          return;
+        }
         const message = t("providerForm.codexConfigInvalidNotSaved", {
-          defaultValue: isCodexProviderSetCancelled(error)
-            ? "Operation canceled; nothing was saved. The current draft is preserved so you can edit and retry."
-            : "Save result was not confirmed. The backend may have written the data, but follow-up synchronization failed. Refresh to verify the state and avoid changing the API Key again until then. The current draft is preserved.",
+          defaultValue:
+            "Save result was not confirmed. The backend may have written the data, but follow-up synchronization failed. Refresh to verify the state and avoid changing the API Key again until then. The current draft is preserved.",
         });
         setCodexSaveError(message);
         toast.error(message);

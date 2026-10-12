@@ -200,4 +200,95 @@ describe("useCodexProviderSetSave", () => {
       act(() => result.current.workflow.cancel());
     }
   });
+
+  it("saves a new automatic model with the declared protocol when unverified save is allowed", async () => {
+    protocolCompatibilityMocks.restore.mockResolvedValue(null);
+    const deepseekProvider: Provider = {
+      ...provider,
+      settingsConfig: {
+        ...provider.settingsConfig,
+        modelCatalog: { models: [{ model: "deepseek-v4.1-flash" }] },
+      },
+    };
+    const { result } = renderHook(() => useCodexProviderSetSave(), {
+      wrapper: createWrapper(),
+    });
+
+    await act(async () => {
+      await result.current.persistCodexProviderSet(deepseekProvider, [], {
+        allowUnverifiedSave: true,
+      });
+    });
+
+    const expectedDraft = expect.objectContaining({
+      id: deepseekProvider.id,
+      meta: expect.objectContaining({
+        apiFormat: "openai_responses",
+        codexProtocolMode: "manual",
+      }),
+    });
+    expect(protocolCompatibilityMocks.restore).toHaveBeenCalledWith(
+      deepseekProvider,
+    );
+    expect(protocolCompatibilityMocks.preflight).not.toHaveBeenCalled();
+    expect(protocolCompatibilityMocks.prepare).toHaveBeenCalledWith(
+      expectedDraft,
+      [],
+    );
+    expect(protocolCompatibilityMocks.commit).toHaveBeenCalledWith(
+      expectedDraft,
+      [],
+      "prepared-digest",
+      "confirm_manual",
+    );
+    expect(result.current.workflow.state.phase).toBe("committed");
+  });
+
+  it("saves an OpenRouter DeepSeek Flash model without forcing a paid probe", async () => {
+    protocolCompatibilityMocks.restore.mockResolvedValue(null);
+    const openRouterProvider: Provider = {
+      ...provider,
+      id: "openrouter",
+      name: "OpenRouter",
+      settingsConfig: {
+        auth: { OPENAI_API_KEY: "sk-or-test" },
+        config:
+          'model_provider = "openrouter"\nmodel = "deepseek/deepseek-v4.1-flash"\n[model_providers.openrouter]\nname = "OpenRouter"\nbase_url = "https://openrouter.ai/api/v1"\nwire_api = "responses"\n',
+        modelCatalog: {
+          models: [{ model: "deepseek/deepseek-v4.1-flash" }],
+        },
+      },
+    };
+    const { result } = renderHook(() => useCodexProviderSetSave(), {
+      wrapper: createWrapper(),
+    });
+
+    await act(async () => {
+      await result.current.persistCodexProviderSet(openRouterProvider, [], {
+        allowUnverifiedSave: true,
+      });
+    });
+
+    expect(protocolCompatibilityMocks.preflight).not.toHaveBeenCalled();
+    expect(protocolCompatibilityMocks.prepare).toHaveBeenCalledWith(
+      expect.objectContaining({
+        id: "openrouter",
+        settingsConfig: expect.objectContaining({
+          config: expect.stringContaining("https://openrouter.ai/api/v1"),
+        }),
+        meta: expect.objectContaining({
+          apiFormat: "openai_responses",
+          codexProtocolMode: "manual",
+        }),
+      }),
+      [],
+    );
+    expect(protocolCompatibilityMocks.commit).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "openrouter" }),
+      [],
+      "prepared-digest",
+      "confirm_manual",
+    );
+    expect(result.current.workflow.state.phase).toBe("committed");
+  });
 });

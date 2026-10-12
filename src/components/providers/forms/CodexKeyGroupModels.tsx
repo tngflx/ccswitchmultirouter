@@ -13,14 +13,16 @@ import {
 
 // Keep separators while typing; parsing directly into the controlled input
 // otherwise removes the comma before the next model can be entered.
-function ModelListInput({
+export function CommaSeparatedListInput({
   values,
   label,
   onChange,
+  type = "text",
 }: {
   values: string[];
   label: string;
   onChange: (values: string[]) => void;
+  type?: "text" | "password";
 }) {
   const [draft, setDraft] = useState(values.join(", "));
   const lastEmitted = useRef(JSON.stringify(values));
@@ -35,6 +37,8 @@ function ModelListInput({
 
   return (
     <Input
+      type={type}
+      autoComplete={type === "password" ? "off" : undefined}
       aria-label={label}
       placeholder={label}
       value={draft}
@@ -129,14 +133,14 @@ export function CodexKeyGroupModels({
   return (
     <div className="space-y-2">
       <div className="grid gap-2 md:grid-cols-2">
-        <ModelListInput
+        <CommaSeparatedListInput
           values={group.models ?? []}
           label={t("codexConfig.apiKeyGroupModels", {
             defaultValue: "Exact models, comma separated",
           })}
           onChange={(models) => onChange({ ...group, models })}
         />
-        <ModelListInput
+        <CommaSeparatedListInput
           values={group.prefixes ?? []}
           label={t("codexConfig.apiKeyGroupPrefixes", {
             defaultValue: "Model prefixes, comma separated",

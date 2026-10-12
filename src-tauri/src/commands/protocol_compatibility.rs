@@ -3321,6 +3321,77 @@ mod tests {
     }
 
     #[test]
+    fn unverified_manual_provider_set_persists_grouped_credentials_atomically() {
+        let db = Arc::new(Database::memory().expect("memory database"));
+        let state = AppState::new(db.clone());
+        let mut provider = ordinary_provider();
+        provider.settings_config["codexApiKeyGroupMode"] = json!("isolated");
+        provider.settings_config["codexApiKeyGroups"] = json!([{
+            "id": "deepseek-flash",
+            "strategy": "fixed",
+            "apiKeys": ["group-secret"],
+            "models": ["deepseek-v4.1-flash"]
+        }]);
+        provider.settings_config["modelCatalog"] = json!({"models": [
+            {
+                "model": "deepseek-v4.1-flash",
+                "upstreamModel": "deepseek-v4.1-flash"
+            },
+            {
+                "model": "deepseek-v4.1-flash--ccg-deepseek-flash",
+                "upstreamModel": "deepseek-v4.1-flash",
+                "apiKeyGroupId": "deepseek-flash",
+                "apiKeyGroupGenerated": true
+            }
+        ]});
+        provider
+            .meta
+            .get_or_insert_with(ProviderMeta::default)
+            .codex_protocol_mode = Some(crate::provider::CodexProtocolMode::Manual);
+        let now = chrono::Utc::now().timestamp();
+
+        let preview = prepare_codex_provider_set_internal(
+            &state,
+            PrepareCodexProviderSetRequest {
+                provider: provider.clone(),
+                receipt_ids: Vec::new(),
+            },
+            now,
+        )
+        .expect("prepare grouped manual Provider Set without probe evidence");
+        commit_codex_provider_set_internal_with_publisher(
+            &state,
+            CommitCodexProviderSetRequest {
+                provider,
+                receipt_ids: Vec::new(),
+                digest: preview.digest,
+                intent: CodexProviderSetCommitIntent::ConfirmManual,
+            },
+            now,
+            |_| panic!("a Single manual Provider has no Router projection"),
+        )
+        .expect("commit grouped manual Provider Set");
+
+        let saved = db
+            .get_provider_by_id("provider-a", "codex")
+            .expect("read committed Provider")
+            .expect("committed Provider exists");
+        assert_eq!(saved.settings_config["codexApiKeyGroupMode"], "isolated");
+        assert_eq!(
+            saved.settings_config["codexApiKeyGroups"][0]["id"],
+            "deepseek-flash"
+        );
+        assert_eq!(
+            saved.settings_config["modelCatalog"]["models"][1]["apiKeyGroupId"],
+            "deepseek-flash"
+        );
+        assert!(db
+            .list_protocol_probe_observations("provider-a")
+            .expect("read observations")
+            .is_empty());
+    }
+
+    #[test]
     fn manual_provider_set_requires_explicit_whole_provider_intent() {
         let db = Arc::new(Database::memory().expect("memory database"));
         let state = AppState::new(db.clone());
