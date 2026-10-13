@@ -1032,7 +1032,7 @@ fn guardian_v2_compatibility_patch_core_script() -> &'static str {
 /// 覆盖历史线程保存的旧入口标签，使跨 Provider 历史在冷恢复后重新经过 CCSM Router。
 fn app_server_request_normalization_core_script() -> &'static str {
     r#"
-  const appServerRequestPatchVersion = "9";
+  const appServerRequestPatchVersion = "10";
   const appServerRequestClientNeedsPatch = (client) => client?.__ccSwitchModelRequestPatch !== appServerRequestPatchVersion;
   const appServerMethod = (method, params) => method === "send-cli-request-for-host" && params?.method ? String(params.method) : String(method || "");
   const currentModelProvider = () => {
@@ -1164,23 +1164,11 @@ fn history_lineage_hydration_core_script() -> &'static str {
 "#
 }
 
-/// Locate the current app-server request client from Codex's cached signal
-/// module. The signal getter can replace its client without replacing the
-/// module object, so this function must run on every lightweight heartbeat.
-/// Kept as an executable core so the replacement behavior is regression-tested.
+/// Locate real request clients from legacy signals or the current app-shared
+/// scoped registry. Declared descriptors exclude RPC proxies, and retained app
+/// scopes let each heartbeat observe a replaced client without scanning React.
 fn app_server_module_client_discovery_core_script() -> &'static str {
-    r#"
-  const patchAppServerModuleClients = (module) => {
-    let patched = 0;
-    for (const candidate of Object.values(module || {}).filter((item) => item && typeof item === "object")) {
-      if (patchRequestClient(candidate)) patched += 1;
-      if (typeof candidate.sendRequest !== "function" && typeof candidate.get === "function") {
-        try { if (patchRequestClient(candidate.get())) patched += 1; } catch {}
-      }
-    }
-    return patched;
-  };
-"#
+    include_str!("resources/codex_client_discovery_core.js")
 }
 
 fn request_health_warning_core_script(suppressed: bool) -> String {
@@ -1692,71 +1680,48 @@ pub(crate) async fn summarize_and_restart_codex_session(
 #[derive(Debug, Clone)]
 pub(crate) struct CodexContinuationResult {
     pub submitted: bool,
+    pub mutation_attempted: bool,
     pub debug_port: Option<u16>,
     pub target_id: Option<String>,
     pub message: String,
 }
 
-/// Find a Codex Desktop renderer and submit a literal `continue` message.
-///
-/// The script deliberately uses user-visible DOM affordances rather than React
-/// internals. It refuses to submit while another turn is generating and returns
-/// an explicit diagnostic when the composer cannot be identified.
-pub(crate) async fn submit_codex_continuation() -> Result<CodexContinuationResult, String> {
-    let attempted_ports = candidate_debug_ports(DEFAULT_CODEX_DEBUG_PORT);
-    let script = r#"(async () => {
-      const visible = (el) => {
-        if (!el) return false;
-        const s = getComputedStyle(el);
-        const r = el.getBoundingClientRect();
-        return s.visibility !== 'hidden' && s.display !== 'none' && r.width > 0 && r.height > 0;
-      };
-      const busy = () => [...document.querySelectorAll('button,[role="button"]')].some((el) => {
-        const label = `${el.getAttribute('aria-label') || ''} ${el.getAttribute('title') || ''}`.trim();
-        const text = `${el.textContent || ''}`.trim();
-        return visible(el) && (/^(stop|cancel|interrupt)( generating| response)?$/i.test(label)
-          || /^(stop|cancel|interrupt)$/i.test(text));
-      });
-      if (busy()) return { submitted:false, reason:'Codex is still generating' };
-      const composer = [...document.querySelectorAll('textarea,[contenteditable="true"],[role="textbox"]')]
-        .filter(visible)
-        .find((el) => !el.matches('[disabled],[readonly]'));
-      if (!composer) return { submitted:false, reason:'Codex composer was not found' };
-      composer.focus();
-      if (composer instanceof HTMLTextAreaElement || composer instanceof HTMLInputElement) {
-        const prototype = composer instanceof HTMLTextAreaElement
-          ? HTMLTextAreaElement.prototype
-          : HTMLInputElement.prototype;
-        const setter = Object.getOwnPropertyDescriptor(prototype, 'value')?.set;
-        if (setter) setter.call(composer, 'continue'); else composer.value = 'continue';
-        composer.dispatchEvent(new InputEvent('input', {bubbles:true, inputType:'insertText', data:'continue'}));
-        composer.dispatchEvent(new Event('change', {bubbles:true}));
-      } else {
-        composer.textContent = 'continue';
-        composer.dispatchEvent(new InputEvent('input', {bubbles:true, inputType:'insertText', data:'continue'}));
-      }
-      const form = composer.closest('form');
-      const submit = form?.querySelector('button[type="submit"],button[aria-label*="send" i],button[aria-label*="submit" i]')
-        || [...document.querySelectorAll('button')].find((el) => visible(el) && /(send|submit)/i.test(`${el.getAttribute('aria-label') || ''} ${el.textContent || ''}`));
-      let method = 'enter';
-      if (submit && !submit.disabled) {
-        submit.click();
-        method = 'button';
-      } else {
-        composer.dispatchEvent(new KeyboardEvent('keydown', {key:'Enter', code:'Enter', bubbles:true, cancelable:true}));
-        composer.dispatchEvent(new KeyboardEvent('keyup', {key:'Enter', code:'Enter', bubbles:true, cancelable:true}));
-      }
-      await new Promise((resolve) => setTimeout(resolve, 750));
-      const value = composer instanceof HTMLTextAreaElement || composer instanceof HTMLInputElement
-        ? composer.value
-        : composer.textContent;
-      const accepted = `${value || ''}`.trim().toLowerCase() !== 'continue' || busy();
-      return accepted
-        ? {submitted:true, method}
-        : {submitted:false, reason:'Codex did not accept the continuation'};
-    })()"#;
+fn codex_continuation_core_script() -> &'static str {
+    include_str!("resources/codex_continuation_core.js")
+}
+
+/// Submit a literal `continue` to the exact failed Codex thread through the
+/// renderer-owned app-server client. Recovery never changes a visible draft or
+/// uses the currently selected model/provider. A renderer job and a persisted
+/// failed-turn marker prevent retries after an ambiguous mutation response.
+pub(crate) async fn submit_codex_continuation(
+    thread_id: &str,
+    recovery_id: &str,
+    expected_model: &str,
+    observed_at_ms: i64,
+) -> Result<CodexContinuationResult, String> {
+    if thread_id.trim().is_empty() || recovery_id.trim().is_empty() {
+        return Err("An exact Codex thread and recovery id are required".to_string());
+    }
+    if observed_at_ms <= 0 {
+        return Err("The interrupted turn observation time is required".to_string());
+    }
+    let thread_id_json =
+        serde_json::to_string(thread_id.trim()).map_err(|error| error.to_string())?;
+    let recovery_id_json =
+        serde_json::to_string(recovery_id.trim()).map_err(|error| error.to_string())?;
+    let expected_model_json =
+        serde_json::to_string(expected_model.trim()).map_err(|error| error.to_string())?;
+    let start_script = format!(
+        r#"(() => {{
+          const state = window[{patch_key:?}];
+          if (!state || typeof state.startCodexContinuation !== 'function') return {{started:false, reason:'Codex compatibility layer is not ready'}};
+          return state.startCodexContinuation({thread_id_json}, {recovery_id_json}, {expected_model_json}, {observed_at_ms});
+        }})()"#,
+        patch_key = MODEL_PICKER_PATCH_KEY,
+    );
     let mut diagnostics = Vec::new();
-    for port in attempted_ports.iter().copied() {
+    for port in candidate_debug_ports(DEFAULT_CODEX_DEBUG_PORT) {
         let targets = match list_cdp_targets(port).await {
             Ok(value) => value,
             Err(error) => {
@@ -1772,81 +1737,78 @@ pub(crate) async fn submit_codex_continuation() -> Result<CodexContinuationResul
             }
         };
         for target in targets {
-            let Some(ws) = target.web_socket_debugger_url.as_deref() else {
+            let Some(websocket_url) = target.web_socket_debugger_url.as_deref() else {
                 continue;
             };
-            let (socket, _) =
-                match tokio::time::timeout(CDP_CONNECT_TIMEOUT, connect_async(ws)).await {
-                    Ok(Ok(value)) => value,
-                    Ok(Err(error)) => {
-                        diagnostics.push(format!(
-                            "target {}: failed to connect Codex Desktop CDP: {error}",
-                            target.id
-                        ));
-                        continue;
-                    }
-                    Err(_) => {
-                        diagnostics.push(format!(
-                            "target {}: timed out connecting Codex Desktop CDP",
-                            target.id
-                        ));
-                        continue;
-                    }
-                };
-            let mut session = CdpSession::new(socket);
-            let evaluation = match session
-                .send_command(
-                    1,
-                    "Runtime.evaluate",
-                    json!({
-                        "expression": script, "awaitPromise": true, "returnByValue": true,
-                        "allowUnsafeEvalBlockedByCSP": true
-                    }),
-                )
-                .await
-            {
+            // This synchronous expression only registers a job. If its reply
+            // is lost, do not try another renderer: the job may be submitting.
+            let evaluation = match evaluate_cdp_expression(websocket_url, &start_script).await {
                 Ok(value) => value,
-                Err(error) => {
-                    diagnostics.push(format!("target {}: {error}", target.id));
-                    continue;
-                }
+                Err(error) => return Err(format!("target {}: {error}", target.id)),
             };
-            if let Some(exception) = evaluation
-                .get("result")
-                .and_then(|result| result.get("exceptionDetails"))
-            {
-                diagnostics.push(format!(
+            if let Some(exception) = evaluation.pointer("/result/exceptionDetails") {
+                return Err(format!(
                     "target {}: CDP evaluation failed: {exception}",
                     target.id
                 ));
-                continue;
             }
-            let value = evaluation
+            let started = evaluation
                 .pointer("/result/result/value")
                 .cloned()
                 .unwrap_or(Value::Null);
-            let submitted = value
-                .get("submitted")
+            if !started
+                .get("started")
                 .and_then(Value::as_bool)
-                .unwrap_or(false);
-            let message = value
-                .get("reason")
-                .and_then(Value::as_str)
-                .unwrap_or(if submitted {
-                    "Continuation submitted"
-                } else {
-                    "Continuation was not submitted"
-                })
-                .to_string();
-            if submitted {
-                return Ok(CodexContinuationResult {
-                    submitted,
-                    debug_port: Some(port),
-                    target_id: Some(target.id),
-                    message,
-                });
+                .unwrap_or(false)
+            {
+                diagnostics.push(format!(
+                    "target {}: {}",
+                    target.id,
+                    started
+                        .get("reason")
+                        .and_then(Value::as_str)
+                        .unwrap_or("Continuation was not started")
+                ));
+                continue;
             }
-            diagnostics.push(format!("target {}: {message}", target.id));
+            let poll_script = format!(
+                r#"(() => {{
+                  const state = window[{patch_key:?}];
+                  return state && typeof state.readCodexContinuationJob === 'function' ? state.readCodexContinuationJob({recovery_id_json}) : null;
+                }})()"#,
+                patch_key = MODEL_PICKER_PATCH_KEY,
+            );
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+            loop {
+                let evaluation = evaluate_cdp_expression(websocket_url, &poll_script).await?;
+                let value = evaluation
+                    .pointer("/result/result/value")
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                if value.get("status").and_then(Value::as_str) == Some("completed") {
+                    return Ok(CodexContinuationResult {
+                        submitted: value
+                            .get("submitted")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false),
+                        mutation_attempted: value
+                            .get("mutationAttempted")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false),
+                        debug_port: Some(port),
+                        target_id: Some(target.id),
+                        message: value
+                            .get("reason")
+                            .and_then(Value::as_str)
+                            .unwrap_or("Codex did not confirm the targeted continuation")
+                            .to_string(),
+                    });
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(format!("target {}: continuation is still pending; no second submission was attempted", target.id));
+                }
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
         }
     }
     Err(if diagnostics.is_empty() {
@@ -1871,6 +1833,7 @@ fn build_model_picker_unlock_script(catalog: &CodexModelCatalogProjection) -> St
     let request_health_warning_core =
         request_health_warning_core_script(request_health_warning_suppressed);
     let summary_handoff_core = summary_handoff_core_script();
+    let codex_continuation_core = codex_continuation_core_script();
     format!(
         r#"
 (async () => {{
@@ -1881,7 +1844,10 @@ fn build_model_picker_unlock_script(catalog: &CodexModelCatalogProjection) -> St
   state.requestIds = state.requestIds || new Set();
   state.modulePromises = state.modulePromises || new Map();
   state.failures = state.failures || [];
-  const rendererSchedulerVersion = "2";
+  // Bump this whenever the injected app-server/request patch changes. The
+  // scheduler closure captures those functions; leaving an older interval
+  // alive would reapply stale recovery hooks over the new patch.
+  const rendererSchedulerVersion = "4";
   if (state.rendererSchedulerVersion !== rendererSchedulerVersion) {{
     if (state.interval) clearInterval(state.interval);
     try {{ state.reactRootObserver?.disconnect(); }} catch {{}}
@@ -1889,6 +1855,11 @@ fn build_model_picker_unlock_script(catalog: &CodexModelCatalogProjection) -> St
     state.runPromise = null;
     state.reactRootObserver = null;
     state.reactDiscoveryPromise = null;
+    // Older discovery admitted dynamic RPC stubs before patching failed. Drop
+    // that registry so continuation can use only declared request clients.
+    state.appServerClients = [];
+    state.appServerModuleRetryAt = 0;
+    state.scopedAppServerScopes = new Set();
     state.pendingReactNodes = new Set();
     state.lastReactFullScanAt = 0;
     state.lastReactIncrementalScanAt = 0;
@@ -1909,6 +1880,7 @@ fn build_model_picker_unlock_script(catalog: &CodexModelCatalogProjection) -> St
 {module_client_discovery_core}
 {request_health_warning_core}
 {summary_handoff_core}
+{codex_continuation_core}
   const patchStatsigConfig = (name, config, repairLegacyPollution = false) => {{
     const prepared = prepareStatsigDynamicConfig(name, config, repairLegacyPollution);
     config = prepared.config;
@@ -2110,6 +2082,7 @@ fn build_model_picker_unlock_script(catalog: &CodexModelCatalogProjection) -> St
       const original = client.__ccSwitchOriginalSendRequest || client.sendRequest.bind(client);
       client.__ccSwitchOriginalSendRequest = original;
       client.sendRequest = async function ccSwitchPatchedSendRequest(method, params, options) {{
+        rememberCodexUserTurnAction(method, params);
         const normalizedParams = normalizeAppServerRequestParams(method, params);
         const actualMethod = appServerMethod(method, params);
         try {{
@@ -2130,16 +2103,6 @@ fn build_model_picker_unlock_script(catalog: &CodexModelCatalogProjection) -> St
       // rpc-BaVz... also exposes immutable RpcStub objects whose method shape
       // resembles AppServerRequestClient. Skip them and keep scanning React.
       recordFailure(error);
-      return false;
-    }}
-  }};
-  const looksLikeAppServerRequestClient = (value) => {{
-    try {{
-      return value
-        && typeof value.sendRequest === "function"
-        && typeof value.getCompatibleThreadSortKey === "function"
-        && typeof value.supportsPaginatedThreadHistory === "function";
-    }} catch {{
       return false;
     }}
   }};
@@ -2312,10 +2275,18 @@ fn build_model_picker_unlock_script(catalog: &CodexModelCatalogProjection) -> St
     const wallNow = Date.now();
     if (!state.appServerModuleRetryAt || wallNow >= state.appServerModuleRetryAt) {{
       try {{
-        const module = await loadAppModule("app-server-manager-signals-");
-        modulePatched = patchAppServerModuleClients(module);
+        // 26.1007+ merges the signal module into app-shared. Discover the
+        // initialized local manager from its declared registry and app scope.
+        try {{
+          const shared = await loadAppModule("app-shared-");
+          modulePatched = await patchCodexScopedAppServerClients(shared);
+        }} catch {{}}
+        if (modulePatched === 0) {{
+          const module = await loadAppModule("app-server-manager-signals-");
+          modulePatched = patchAppServerModuleClients(module);
+        }}
         patched += modulePatched;
-        state.appServerModuleRetryAt = 0;
+        state.appServerModuleRetryAt = modulePatched > 0 ? 0 : wallNow + 30000;
       }} catch (error) {{
         recordFailure(error);
         state.appServerModuleRetryAt = wallNow + 30000;
@@ -3948,6 +3919,290 @@ mod tests {
         })
     }
 
+    fn run_codex_continuation_probe(probe: &str) -> serde_json::Value {
+        let runtime = rquickjs::Runtime::new().expect("create JavaScript runtime");
+        let context = rquickjs::Context::full(&runtime).expect("create JavaScript context");
+        let script = format!(
+            r#"
+const state = {{}};
+Object.defineProperty(state, "appServerClients", {{
+  set(clients) {{ this.clients = clients.map((client) => ({{ hostId: "local", getCompatibleThreadSortKey() {{}}, supportsPaginatedThreadHistory() {{}}, ...client }})); }},
+  get() {{ return this.clients; }},
+}});
+state.appServerClients = [];
+const storage = {{}};
+const localStorage = {{
+  getItem: (key) => storage[key] || null,
+  setItem: (key, value) => {{ storage[key] = value; }},
+}};
+const installAppServerPatch = async () => {{}};
+const recordFailure = () => {{}};
+const setTimeout = (callback) => globalThis.__continuationTimer ? globalThis.__continuationTimer(callback) : 1;
+const clearTimeout = () => {{}};
+{}
+{}
+{}
+"#,
+            app_server_module_client_discovery_core_script(),
+            codex_continuation_core_script(),
+            probe,
+        );
+        context.with(|ctx| {
+            ctx.eval::<(), _>(script)
+                .expect("start Codex continuation probe");
+        });
+        while runtime
+            .execute_pending_job()
+            .expect("execute Codex continuation job")
+        {}
+        context.with(|ctx| {
+            let json_text: String = ctx
+                .eval("globalThis.__codexContinuationResult")
+                .expect("read Codex continuation probe result");
+            serde_json::from_str(&json_text).expect("parse Codex continuation probe result")
+        })
+    }
+
+    #[test]
+    fn codex_continuation_targets_only_the_exact_failed_thread_without_picker_overrides() {
+        let result = run_codex_continuation_probe(
+            r#"
+const calls = [];
+const failed = { id: "exact-thread", model: "request-model", turns: [{ id: "failed-turn", status: "failed", error: { message: "server overloaded" } }] };
+state.appServerClients = [
+  { sendRequest: async () => ({ thread: { ...failed, id: "wrong-thread" } }) },
+  {
+    sendRequest: async () => { throw new Error("the picker wrapper must not be called"); },
+    __ccSwitchOriginalSendRequest: async (method, params) => {
+      calls.push({ method, params });
+      return method === "thread/read" ? { thread: failed } : { turn: { id: "continue-turn" } };
+    },
+  },
+];
+void runCodexContinuation("exact-thread", "recovery-1", "request-model", Date.now()).then((result) => {
+  globalThis.__codexContinuationResult = JSON.stringify({ result, calls });
+});
+"#,
+        );
+        assert_eq!(result["result"]["submitted"], true);
+        assert_eq!(
+            result["calls"],
+            json!([
+                { "method": "thread/read", "params": { "threadId": "exact-thread", "includeTurns": true } },
+                { "method": "thread/read", "params": { "threadId": "exact-thread", "includeTurns": true } },
+                { "method": "turn/start", "params": { "threadId": "exact-thread", "input": [{ "type": "text", "text": "continue" }] } },
+            ])
+        );
+    }
+
+    #[test]
+    fn codex_continuation_ignores_retained_rpc_stubs_before_the_real_client() {
+        let result = run_codex_continuation_probe(
+            r#"
+let proxyPropertyReads = 0;
+let starts = 0;
+const proxy = new Proxy({}, { get() { proxyPropertyReads += 1; return () => { throw new Error("stale RPC stub must not be called"); }; } });
+state.clients = [proxy, {
+  hostId: "local",
+  getCompatibleThreadSortKey() {},
+  supportsPaginatedThreadHistory() {},
+  sendRequest: async (method) => {
+    if (method === "turn/start") { starts += 1; return { turn: { id: "continue-turn" } }; }
+    return { thread: { id: "exact-thread", turns: [{ id: "failed-turn", status: "failed" }] } };
+  },
+}];
+void runCodexContinuation("exact-thread", "recovery-1", "request-model", Date.now()).then((result) => {
+  globalThis.__codexContinuationResult = JSON.stringify({ result, starts, proxyPropertyReads });
+});
+"#,
+        );
+        assert_eq!(result["result"]["submitted"], true);
+        assert_eq!(result["starts"], 1);
+        assert_eq!(result["proxyPropertyReads"], 0);
+    }
+
+    #[test]
+    fn codex_continuation_skips_remote_clients_and_times_out_stale_local_reads() {
+        let result = run_codex_continuation_probe(
+            r#"
+let remoteCalls = 0;
+let starts = 0;
+let firstTimer = null;
+globalThis.__continuationTimer = (callback) => { if (!firstTimer) firstTimer = callback; return 1; };
+state.appServerClients = [
+  { hostId: "remote", sendRequest: async () => { remoteCalls += 1; throw new Error("remote thread must not be used"); } },
+  { sendRequest: () => new Promise(() => {}) },
+  { sendRequest: async (method) => {
+    if (method === "turn/start") { starts += 1; return { turn: { id: "continue-turn" } }; }
+    return { thread: { id: "exact-thread", turns: [{ id: "failed-turn", status: "failed" }] } };
+  } },
+];
+void runCodexContinuation("exact-thread", "recovery-1", "request-model", Date.now()).then((result) => {
+  globalThis.__codexContinuationResult = JSON.stringify({ result, starts, remoteCalls });
+});
+void Promise.resolve().then(() => Promise.resolve()).then(() => { firstTimer(); });
+"#,
+        );
+        assert_eq!(result["result"]["submitted"], true);
+        assert_eq!(result["starts"], 1);
+        assert_eq!(result["remoteCalls"], 0);
+    }
+
+    #[test]
+    fn codex_continuation_refuses_user_cancellation_completed_turns_and_changed_models() {
+        let result = run_codex_continuation_probe(
+            r#"
+const thread = (turn, extra = {}) => ({ id: "exact-thread", turns: [{ id: "older-failure", status: "failed" }, { id: "latest-turn", ...turn }], ...extra });
+const cases = [
+  thread({ status: "completed" }),
+  thread({ status: "inProgress" }),
+  thread({ status: "interrupted" }),
+  thread({ status: "failed", error: { codexErrorInfo: "turnAborted" } }),
+  thread({ status: "failed", error: { message: "User cancelled the turn" } }),
+  thread({ status: "failed" }, { model: "new-user-model" }),
+  thread({ status: "failed", error: { message: "Authentication failed" } }),
+  thread({ status: "failed", error: { message: "server overloaded" } }),
+  thread({ status: "interrupted", error: { message: "unexpected transport EOF" } }),
+];
+globalThis.__codexContinuationResult = JSON.stringify(cases.map((value) => classifyCodexContinuationThread(value, "exact-thread", "request-model").ready));
+"#,
+        );
+        assert_eq!(
+            result,
+            json!([false, false, false, false, false, false, false, true, true])
+        );
+    }
+
+    #[test]
+    fn codex_continuation_rechecks_for_a_newer_turn_before_submitting() {
+        let result = run_codex_continuation_probe(
+            r#"
+let reads = 0;
+let starts = 0;
+state.appServerClients = [{ sendRequest: async (method) => {
+  if (method === "turn/start") { starts += 1; return { turn: { id: "continued" } }; }
+  reads += 1;
+  return { thread: { id: "exact-thread", turns: [{ id: reads === 1 ? "failed-turn" : "new-user-turn", status: reads === 1 ? "failed" : "inProgress" }] } };
+} }];
+void runCodexContinuation("exact-thread", "recovery-1", "request-model", Date.now()).then((result) => {
+  globalThis.__codexContinuationResult = JSON.stringify({ result, reads, starts });
+});
+"#,
+        );
+        assert_eq!(result["result"]["submitted"], false);
+        assert_eq!(result["reads"], 2);
+        assert_eq!(result["starts"], 0);
+    }
+
+    #[test]
+    fn codex_continuation_does_not_replay_an_ambiguous_submission_on_another_client_or_retry() {
+        let result = run_codex_continuation_probe(
+            r#"
+let starts = 0;
+let secondClientCalls = 0;
+const failed = { id: "exact-thread", turns: [{ id: "failed-turn", status: "failed" }] };
+state.appServerClients = [
+  { sendRequest: async (method) => {
+    if (method === "thread/read") return { thread: failed };
+    starts += 1;
+    throw new Error("connection closed after request was sent");
+  } },
+  { sendRequest: async () => { secondClientCalls += 1; return { thread: failed }; } },
+];
+void (async () => {
+  const first = await runCodexContinuation("exact-thread", "recovery-1", "request-model", Date.now());
+  const retry = await runCodexContinuation("exact-thread", "recovery-2", "request-model", Date.now());
+  globalThis.__codexContinuationResult = JSON.stringify({ first, retry, starts, secondClientCalls, markers: readCodexContinuationMarkers() });
+})();
+"#,
+        );
+        assert_eq!(result["first"]["submitted"], false);
+        assert_eq!(result["first"]["mutationAttempted"], true);
+        assert_eq!(result["retry"]["submitted"], false);
+        assert_eq!(result["retry"]["mutationAttempted"], true);
+        assert_eq!(result["starts"], 1);
+        assert_eq!(result["secondClientCalls"], 0);
+        assert_eq!(
+            result["markers"]["exact-thread:failed-turn"]["status"],
+            "attempted"
+        );
+    }
+
+    #[test]
+    fn codex_continuation_recovery_id_cannot_be_rebound_to_another_thread() {
+        let result = run_codex_continuation_probe(
+            r#"
+state.codexContinuationJobs["recovery-1"] = { status: "pending", threadId: "exact-thread" };
+globalThis.__codexContinuationResult = JSON.stringify(state.startCodexContinuation("other-thread", "recovery-1", "request-model", Date.now()));
+"#,
+        );
+        assert_eq!(result["started"], false);
+        assert_eq!(
+            result["reason"],
+            "The recovery id belongs to a different Codex thread"
+        );
+    }
+
+    #[test]
+    fn codex_continuation_recovery_id_cannot_be_rebound_to_another_request() {
+        let result = run_codex_continuation_probe(
+            r#"
+state.codexContinuationJobs["recovery-1"] = { status: "pending", threadId: "exact-thread", expectedModel: "old-model", observedAtMs: 1000 };
+globalThis.__codexContinuationResult = JSON.stringify(state.startCodexContinuation("exact-thread", "recovery-1", "new-model", 2000));
+"#,
+        );
+        assert_eq!(result["started"], false);
+        assert_eq!(
+            result["reason"],
+            "The recovery id belongs to a different interrupted request"
+        );
+    }
+
+    #[test]
+    fn codex_continuation_refuses_a_newer_user_turn_even_when_it_has_already_failed() {
+        let result = run_codex_continuation_probe(
+            r#"
+const observedAtMs = Date.now() - 1000;
+let calls = 0;
+state.appServerClients = [{ sendRequest: async () => {
+  calls += 1;
+  return { thread: { id: "exact-thread", turns: [{ id: "newer-failed-turn", status: "failed" }] } };
+} }];
+rememberCodexUserTurnAction("send-cli-request-for-host", { method: "turn/start", params: { threadId: "exact-thread" } });
+// The persisted action still protects recovery after compatibility reinjection.
+state.codexUserTurnActions = {};
+void runCodexContinuation("exact-thread", "recovery-1", "request-model", observedAtMs).then((result) => {
+  globalThis.__codexContinuationResult = JSON.stringify({ result, calls });
+});
+"#,
+        );
+        assert_eq!(result["result"]["submitted"], false);
+        assert_eq!(result["calls"], 0);
+    }
+
+    #[test]
+    fn codex_continuation_refuses_a_user_stop_while_its_thread_read_is_pending() {
+        let result = run_codex_continuation_probe(
+            r#"
+const observedAtMs = Date.now() - 1000;
+let reads = 0;
+let starts = 0;
+state.appServerClients = [{ sendRequest: async (method) => {
+  if (method === "turn/start") { starts += 1; return { turn: { id: "continued" } }; }
+  reads += 1;
+  if (reads === 2) rememberCodexUserTurnAction("turn/interrupt", { threadId: "exact-thread", turnId: "failed-turn" });
+  return { thread: { id: "exact-thread", turns: [{ id: "failed-turn", status: "failed" }] } };
+} }];
+void runCodexContinuation("exact-thread", "recovery-1", "request-model", observedAtMs).then((result) => {
+  globalThis.__codexContinuationResult = JSON.stringify({ result, reads, starts });
+});
+"#,
+        );
+        assert_eq!(result["result"]["submitted"], false);
+        assert_eq!(result["reads"], 2);
+        assert_eq!(result["starts"], 0);
+    }
+
     #[test]
     fn history_lineage_hydration_repairs_only_idle_conversations_with_a_changed_rollout_path() {
         let result = run_history_lineage_hydration_probe(
@@ -4284,7 +4539,7 @@ JSON.stringify({
   v6NeedsPatch: appServerRequestClientNeedsPatch({ __ccSwitchModelRequestPatch: "6" }),
   v7NeedsPatch: appServerRequestClientNeedsPatch({ __ccSwitchModelRequestPatch: "7" }),
   v8NeedsPatch: appServerRequestClientNeedsPatch({ __ccSwitchModelRequestPatch: "8" }),
-  currentNeedsPatch: appServerRequestClientNeedsPatch({ __ccSwitchModelRequestPatch: "9" }),
+  currentNeedsPatch: appServerRequestClientNeedsPatch({ __ccSwitchModelRequestPatch: "10" }),
   missingNeedsPatch: appServerRequestClientNeedsPatch({}),
   patchVersion: appServerRequestPatchVersion,
 });
@@ -4297,7 +4552,7 @@ JSON.stringify({
         assert_eq!(result["v8NeedsPatch"], true);
         assert_eq!(result["currentNeedsPatch"], false);
         assert_eq!(result["missingNeedsPatch"], true);
-        assert_eq!(result["patchVersion"], "9");
+        assert_eq!(result["patchVersion"], "10");
     }
 
     #[test]
@@ -4679,7 +4934,7 @@ JSON.stringify({
         assert!(script.contains("await installAppServerPatch()"));
         assert!(script.contains("!state.requestIds.has(requestId)"));
         assert!(script.contains("__ccSwitchCodexAppCompatibilityV9"));
-        assert!(script.contains("appServerRequestPatchVersion = \"9\""));
+        assert!(script.contains("appServerRequestPatchVersion = \"10\""));
         assert!(script.contains("rehydrateStaleHistoryLineages(manager)"));
         assert!(
             script.contains("state.reactRequestClientPatchVersion = appServerRequestPatchVersion")
@@ -4733,7 +4988,7 @@ JSON.stringify({
     fn codex_app_compatibility_heartbeat_does_not_repeat_full_react_scan() {
         let script = build_model_picker_unlock_script(&CodexModelCatalogProjection::empty());
 
-        assert!(script.contains("const rendererSchedulerVersion = \"2\""));
+        assert!(script.contains("const rendererSchedulerVersion = \"4\""));
         assert!(script.contains("clearInterval(state.interval)"));
         assert!(script.contains("const patchAppServerModuleClients"));
         assert!(script.contains("state.reactDiscoveryPromise"));
@@ -4767,10 +5022,10 @@ const patchRequestClient = (client) => {{
   return true;
 }};
 {}
-let current = {{ id: "first", sendRequest() {{}} }};
+let current = {{ id: "first", sendRequest() {{}}, getCompatibleThreadSortKey() {{}}, supportsPaginatedThreadHistory() {{}} }};
 const module = {{ signal: {{ get: () => current }} }};
 const firstCount = patchAppServerModuleClients(module);
-current = {{ id: "second", sendRequest() {{}} }};
+current = {{ id: "second", sendRequest() {{}}, getCompatibleThreadSortKey() {{}}, supportsPaginatedThreadHistory() {{}} }};
 const secondCount = patchAppServerModuleClients(module);
 JSON.stringify({{ firstCount, secondCount, patched }});
 "#,
@@ -4784,6 +5039,103 @@ JSON.stringify({{ firstCount, secondCount, patched }});
             assert_eq!(result["firstCount"], 1);
             assert_eq!(result["secondCount"], 1);
             assert_eq!(result["patched"], json!(["first", "second"]));
+        });
+    }
+
+    #[test]
+    fn app_server_module_discovery_does_not_invoke_rpc_proxy_properties() {
+        let runtime = rquickjs::Runtime::new().expect("create JavaScript runtime");
+        let context = rquickjs::Context::full(&runtime).expect("create JavaScript context");
+        let script = format!(
+            r#"
+let propertyReads = 0;
+let patched = 0;
+const patchRequestClient = () => {{ patched += 1; return true; }};
+{}
+const rpc = new Proxy({{}}, {{ get() {{ propertyReads += 1; return () => {{ throw new Error("an arbitrary RPC must not be called"); }}; }} }});
+const count = patchAppServerModuleClients({{ rpc, map: new Map() }});
+JSON.stringify({{ count, patched, propertyReads, client: looksLikeAppServerRequestClient(rpc) }});
+"#,
+            app_server_module_client_discovery_core_script()
+        );
+        context.with(|ctx| {
+            let result: String = ctx.eval(script).expect("execute RPC exclusion probe");
+            let result: Value = serde_json::from_str(&result).expect("parse RPC exclusion result");
+            assert_eq!(
+                result,
+                json!({ "count": 0, "patched": 0, "propertyReads": 0, "client": false })
+            );
+        });
+    }
+
+    #[test]
+    fn app_server_module_discovery_finds_deep_scoped_local_clients_and_observes_replacement() {
+        let runtime = rquickjs::Runtime::new().expect("create JavaScript runtime");
+        let context = rquickjs::Context::full(&runtime).expect("create JavaScript context");
+        let script = format!(
+            r#"
+const state = {{}};
+const patched = [];
+let registryMutations = 0;
+let queryClientReads = 0;
+let scopeScans = 0;
+const patchRequestClient = (client) => {{ patched.push(client.id); return true; }};
+const monotonicNow = () => 1;
+const yieldReactDiscovery = async () => {{}};
+const recordFailure = (error) => {{ throw error; }};
+const document = {{ getElementById() {{ scopeScans += 1; return null; }} }};
+class Client {{
+  constructor(id) {{ this.id = id; this.hostId = "local"; }}
+  sendRequest() {{}}
+  getCompatibleThreadSortKey() {{}}
+  supportsPaginatedThreadHistory() {{}}
+}}
+let manager = {{ requestClient: new Client("first") }};
+const scope = {{ chain: {{}}, node: {{}}, get queryClient() {{ queryClientReads += 1; return {{}}; }}, get: () => manager, set() {{}}, watch() {{}} }};
+const current = {{}};
+let leaf = current;
+for (let index = 0; index < 40; index += 1) {{ leaf.child = {{}}; leaf = leaf.child; }}
+leaf.memoizedState = {{ memoizedState: {{ current: scope }} }};
+const window = {{ __codexRoot: {{ _internalRoot: {{ current }} }} }};
+class Registry {{
+  constructor(scope) {{ this.scope = scope; }}
+  getForHostId(host) {{ return this.scope.get(host); }}
+  getAll() {{}}
+  getDefault() {{}}
+  getImplForHostId() {{}}
+}}
+class UntrustedRegistry {{
+  constructor(scope) {{ registryMutations += 1; this.scope = scope; }}
+  getForHostId(host) {{ return this.scope.get(host); }}
+  getAll() {{}}
+  getDefault() {{}}
+  getImplForHostId() {{}}
+}}
+{}
+void (async () => {{
+  const module = {{ minifiedExport: Registry, unrelatedFactory: UntrustedRegistry }};
+  const firstCount = await patchCodexScopedAppServerClients(module);
+  manager = {{ requestClient: new Client("second") }};
+  const secondCount = await patchCodexScopedAppServerClients(module);
+  manager = {{ requestClient: {{ ...new Client("remote"), hostId: "remote" }} }};
+  const remoteCount = await patchCodexScopedAppServerClients(module);
+  globalThis.__scopedClientDiscoveryResult = JSON.stringify({{ firstCount, secondCount, remoteCount, patched, registryMutations, scopeScans, queryClientReads }});
+}})();
+"#,
+            app_server_module_client_discovery_core_script()
+        );
+        context.with(|ctx| {
+            ctx.eval::<(), _>(script)
+                .expect("start scoped discovery probe")
+        });
+        while runtime
+            .execute_pending_job()
+            .expect("execute scoped discovery job")
+        {}
+        context.with(|ctx| {
+            let result: String = ctx.eval("globalThis.__scopedClientDiscoveryResult").expect("read scoped discovery result");
+            let result: Value = serde_json::from_str(&result).expect("parse scoped discovery result");
+            assert_eq!(result, json!({ "firstCount": 1, "secondCount": 1, "remoteCount": 0, "patched": ["first", "second"], "registryMutations": 0, "scopeScans": 1, "queryClientReads": 0 }));
         });
     }
 

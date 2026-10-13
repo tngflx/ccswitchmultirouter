@@ -812,6 +812,7 @@ pub fn create_logged_passthrough_stream_with_options(
             .filter(|_| emit_sse_keepalive)
             .map(|duration| std::cmp::max(Duration::from_secs(1), duration / 3));
         let mut last_activity = tokio::time::Instant::now();
+        let mut last_keepalive = last_activity;
 
         tokio::pin!(stream);
 
@@ -826,10 +827,11 @@ pub fn create_logged_passthrough_stream_with_options(
             let chunk_result = match (timeout_duration, is_first_chunk, emit_sse_keepalive) {
                 (Some(_), false, true) => {
                     let idle_deadline = last_activity + idle_timeout.unwrap();
-                    let keepalive_deadline = last_activity + keepalive_interval.unwrap();
+                    let keepalive_deadline = last_keepalive + keepalive_interval.unwrap();
                     tokio::select! {
                         chunk = stream.next() => chunk,
                         _ = tokio::time::sleep_until(keepalive_deadline) => {
+                            last_keepalive = tokio::time::Instant::now();
                             yield Ok(Bytes::from_static(b": keep-alive\n\n"));
                             continue;
                         }
@@ -866,6 +868,7 @@ pub fn create_logged_passthrough_stream_with_options(
                     }
                     is_first_chunk = false;
                     last_activity = tokio::time::Instant::now();
+                    last_keepalive = last_activity;
                     if inspect_sse_events {
                         crate::proxy::sse::append_utf8_safe(&mut buffer, &mut utf8_remainder, &bytes);
 

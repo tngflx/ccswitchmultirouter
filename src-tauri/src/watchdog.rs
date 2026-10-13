@@ -49,6 +49,15 @@ pub enum ParentOutcome {
 /// Whether the running development wrapper, rather than this binary, owns
 /// recovery for the Tauri child.
 pub fn dev_supervisor_owned() -> bool {
+    // The Node supervisor is a development-only lifecycle owner. Release
+    // builds must always use the installed app's Rust supervisor, even if a
+    // stale development environment variable is inherited by the process.
+    #[cfg(not(debug_assertions))]
+    {
+        return false;
+    }
+
+    #[cfg(debug_assertions)]
     std::env::var(DEV_SUPERVISOR_ENV)
         .ok()
         .is_some_and(|value| matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true"))

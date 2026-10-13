@@ -556,6 +556,9 @@ pub fn run() {
             }
 
             let startup_recovery = app_exit_monitor::record_startup_report();
+            crate::proxy::codex_turn_recovery::capture_startup_recovery(
+                startup_recovery.classification,
+            );
             if let Some(previous) = startup_recovery.previous.as_ref() {
                 log::warn!(
                     "检测到上次运行 marker: classification={:?}, started_at={}, pid={}, crash_log_modified_at={:?}",
@@ -1449,6 +1452,17 @@ pub fn run() {
                 .await
                 {
                     log::warn!("启动时 Codex 配置一致性对账失败: {error}");
+                }
+
+                // An app crash also severs active client streams. Restore only
+                // known Desktop turns after their proxy route is ready again.
+                if codex_takeover_restore_ready
+                    && startup_recovery_classification.allows_proxy_startup()
+                {
+                    crate::proxy::codex_turn_recovery::restore_after_startup(
+                        startup_recovery_classification,
+                        &state.db,
+                    );
                 }
 
                 // Periodic backup check (on startup)

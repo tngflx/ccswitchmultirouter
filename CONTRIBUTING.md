@@ -42,17 +42,63 @@ pnpm install
 pnpm dev
 ```
 
+`pnpm dev` starts Vite with immediate frontend HMR and builds the Tauri backend
+on startup. Backend edits rebuild after a four-hour quiet period; use
+`pnpm dev:immediate` for immediate backend rebuilds.
+
+When the watchdog setting is enabled, an unexpected app, worker, or launcher
+exit restarts the full dev session and runs Cargo/Tauri again. Recovery cleans
+the previous session's processes and listeners first, preserves dev arguments
+and supported environment overrides, and is limited to five restarts per
+30 minutes. A normal app quit or Ctrl+C stops recovery. `--no-rebuild` suppresses
+rebuilds from edits; crash recovery remains enabled. Launcher recovery events
+are recorded in `<config-dir>/logs/dev-watchdog.jsonl`.
+
+The Node restart/rebuild supervisor runs only through the development commands.
+Release builds ignore `CC_SWITCH_DEV_SUPERVISOR` and use the app's Rust watchdog
+to relaunch the installed executable after a crash. The installed PowerShell
+guardian also monitors the installed executable; development session recovery
+requires explicitly running `watch-ccswitchmulti.ps1 -DevelopmentMode`.
+
+Stream retry is available in both development and production. Safe mode
+reconnects before output is delivered. Aggressive mode also resumes a failed
+Codex Desktop turn by submitting `continue` to that exact chat, within the
+configured attempt limit. Known active turns are saved for recovery after an
+app crash, and resumed after the proxy is restored. Normal completion, user
+cancellation, and a clean app quit clear that recovery state.
+
+### Local Production Build (Windows)
+
+```powershell
+pnpm install --frozen-lockfile
+pnpm build
+```
+
+This builds the frontend, compiles the Rust app in release mode, and creates an
+NSIS installer locally. No CI is needed. The executable is exported to
+`output/production/cc-switch.exe`, with resources alongside it and installers
+under `output/production/bundle/nsis/`, before the temporary Cargo target is
+cleaned up. To choose another directory, use `pnpm build -OutputDir D:\builds\ccswitch`.
+Local builds do not require an updater signing key or install or publish the artifacts.
+
+For a complete release export with frozen dependencies, type checking, build
+validation, metadata, and checksums, use `pnpm release:local` from a clean tracked
+worktree. `pnpm release:local:skip-build` re-exports compiled release artifacts
+from `CARGO_TARGET_DIR/release` or `src-tauri/target/release`; it does not consume
+the `pnpm build` export directory.
+The release pipeline writes to the configured release root and reports its path.
+
 ### Useful Commands
 
-| Command | Description |
-|---------|-------------|
-| `pnpm dev` | Start dev server (hot reload) |
-| `pnpm build` | Production build |
-| `pnpm typecheck` | TypeScript type checking |
-| `pnpm test:unit` | Run unit tests |
-| `pnpm lint` | ESLint check |
-| `pnpm format` | Format code (Prettier) |
-| `pnpm format:check` | Check code formatting |
+| Command             | Description                   |
+| ------------------- | ----------------------------- |
+| `pnpm dev`          | Start dev server (hot reload) |
+| `pnpm build`        | Production build              |
+| `pnpm typecheck`    | TypeScript type checking      |
+| `pnpm test:unit`    | Run unit tests                |
+| `pnpm lint`         | ESLint check                  |
+| `pnpm format`       | Format code (Prettier)        |
+| `pnpm format:check` | Check code formatting         |
 
 For Rust backend:
 
@@ -176,17 +222,57 @@ pnpm install
 pnpm dev
 ```
 
+`pnpm dev` 启动 Vite（前端立即 HMR），并在启动时构建 Tauri 后端。
+后端文件连续四小时没有变更后才重新构建；需要立即构建时使用
+`pnpm dev:immediate`。
+
+启用看门狗时，应用、开发工作进程或启动器异常退出都会重新启动完整开发会话，
+再次运行 Cargo/Tauri。恢复前会清理上一会话的进程和监听端口，并保留开发参数与
+支持的环境变量覆盖；每 30 分钟最多重启五次。正常退出应用或按 Ctrl+C 会停止恢复。
+`--no-rebuild` 只抑制文件编辑触发的构建，崩溃恢复仍然有效。
+启动器恢复事件保存在 `<配置目录>/logs/dev-watchdog.jsonl`。
+
+Node 重启与重新构建守护只由开发命令启动。发布版忽略
+`CC_SWITCH_DEV_SUPERVISOR`，崩溃后由 Rust 看门狗重新启动安装态程序。
+安装态 PowerShell 守护同样只监控安装态程序；要恢复开发会话，必须显式运行
+`watch-ccswitchmulti.ps1 -DevelopmentMode`。
+
+开发版与生产版都支持流重试。Safe 模式只在尚未交付输出时重新连接；Aggressive
+模式还会在配置的次数限制内向发生失败的 Codex Desktop 对话发送 `continue`。
+已知的活动轮次会保存到本地，应用崩溃后在代理恢复就绪时继续运行。
+正常完成、用户取消或正常退出应用都会清理恢复状态。
+
+### Windows 本地生产构建
+
+```powershell
+pnpm install --frozen-lockfile
+pnpm build
+```
+
+无需 CI：该命令构建前端、编译 release 模式的 Rust 程序，并生成 NSIS 安装包。
+清理临时 Cargo target 前，可执行文件会导出到
+`output/production/cc-switch.exe`，资源保存在旁边，安装包位于
+`output/production/bundle/nsis/`。可通过
+`pnpm build -OutputDir D:\builds\ccswitch` 指定输出目录。
+本地构建不签署更新包，也不会自动安装或发布。
+
+需要包含依赖校验、类型检查、构建校验、元数据和校验和的完整发布导出时，
+在已提交所有跟踪文件修改的工作区运行 `pnpm release:local`。
+`pnpm release:local:skip-build` 从 `CARGO_TARGET_DIR/release` 或
+`src-tauri/target/release` 重新导出现有编译产物，不读取 `pnpm build` 的导出目录。
+脚本会报告配置的发布目录。
+
 ### 常用命令
 
-| 命令 | 说明 |
-|------|------|
-| `pnpm dev` | 启动开发服务器（热重载） |
-| `pnpm build` | 构建生产版本 |
-| `pnpm typecheck` | TypeScript 类型检查 |
-| `pnpm test:unit` | 运行单元测试 |
-| `pnpm lint` | ESLint 检查 |
-| `pnpm format` | 格式化代码（Prettier） |
-| `pnpm format:check` | 检查代码格式 |
+| 命令                | 说明                     |
+| ------------------- | ------------------------ |
+| `pnpm dev`          | 启动开发服务器（热重载） |
+| `pnpm build`        | 构建生产版本             |
+| `pnpm typecheck`    | TypeScript 类型检查      |
+| `pnpm test:unit`    | 运行单元测试             |
+| `pnpm lint`         | ESLint 检查              |
+| `pnpm format`       | 格式化代码（Prettier）   |
+| `pnpm format:check` | 检查代码格式             |
 
 Rust 后端命令：
 

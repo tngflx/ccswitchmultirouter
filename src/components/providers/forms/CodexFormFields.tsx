@@ -1497,7 +1497,6 @@ export function CodexFormFields({
         );
       }
       setProtocolProbeOutcome(outcome);
-      onProtocolProbeReceiptIdsChange(outcome.receiptIds);
       const verifiedRecords = outcome.records.filter(
         (record) =>
           record.result.readiness === "verified" &&
@@ -1506,6 +1505,13 @@ export function CodexFormFields({
       const allVerified =
         outcome.records.length > 0 &&
         verifiedRecords.length === outcome.records.length;
+      // A receipt is an automatic-save lease, not a record of an attempted
+      // probe. Partial/failed batches cannot produce an executable Provider
+      // Set, so passing their receipts to the save coordinator traps the form
+      // in the blocked preview and prevents the explicit unverified-save path
+      // from being used. Keep receipts only when every enabled model has a
+      // verified transport selection.
+      onProtocolProbeReceiptIdsChange(allVerified ? outcome.receiptIds : []);
       const allResponses =
         allVerified &&
         verifiedRecords.every(
@@ -1568,7 +1574,7 @@ export function CodexFormFields({
       const summary =
         allVerified && hasMixedVerifiedTransports
           ? `Deep probe complete: different models selected different protocols; ${resultCounts}. Saving will split them into two same-protocol providers while keeping them as one model source.`
-          : `Deep probe complete: some models are Partial/Failed, so automatic saving is unavailable; ${resultCounts}. Review the failed stages and retry.`;
+          : `Deep probe complete: some models are Partial/Failed, so automatic protocol selection is unavailable; ${resultCounts}. Saving will use the declared protocol without deep verification. Review the failed stages and retry when you want automatic selection.`;
       const resultIdentity = buildReadinessIdentityFor(catalogRowsRef.current);
       bindProtocolProbeIdentity(resultIdentity);
       const tone = allVerified

@@ -38,3 +38,4 @@ mainWindow.js
 /scripts/logs/
 /.tmp/local-release-cargo/
 /target/
+/output/production/

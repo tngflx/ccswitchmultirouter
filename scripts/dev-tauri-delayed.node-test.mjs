@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
 import path from "node:path";
 import test from "node:test";
+import { fileURLToPath } from "node:url";
 
 import {
   assertNormalCargoTargetDirectory,
@@ -11,6 +12,10 @@ import {
   createExpectedExitRegistry,
   createQuietPeriodScheduler,
   devAutoRestartDecision,
+  devSessionEnvironment,
+  devWorkerCommand,
+  devWorkerRestartDecision,
+  isDevCrashMarker,
   isPathInside,
   isTauriAppStartedOutput,
   normalizeCliArgs,
@@ -26,11 +31,15 @@ import {
   sameWindowsProcess,
   snapshotBackendFileFingerprints,
   stopVerifiedWindowsApp,
+  stopWindowsProcess,
+  superviseDevSessions,
   waitForChildExit,
   waitForWindowsListenersReleased,
   waitForWindowsProcessExit,
   windowsDevDescendants,
+  windowsDevWorkerDescendants,
   windowsFrontendDescendants,
+  windowsProcessStartedAtUtc,
 } from "./dev-tauri-delayed.mjs";
 
 test("CLI normalization removes pnpm's leading argument separator", () => {
@@ -147,7 +156,7 @@ test("development recovery reads the shared watchdog toggle safely", () => {
   );
 });
 
-test("development recovery restarts only a started app after an unexpected exit", () => {
+test("development recovery rebuilds after startup and runtime crashes", () => {
   assert.deepEqual(
     devAutoRestartDecision({
       appStarted: false,
@@ -155,7 +164,7 @@ test("development recovery restarts only a started app after an unexpected exit"
       signal: null,
       watchdogEnabled: true,
     }),
-    { restart: false, reason: "app-not-started" },
+    { restart: true, reason: "unexpected-exit" },
   );
   assert.deepEqual(
     devAutoRestartDecision({
@@ -197,6 +206,401 @@ test("development recovery restarts only a started app after an unexpected exit"
     }),
     { restart: false, reason: "rate-limited" },
   );
+});
+
+test("development recovery uses a crash marker when Tauri reports code zero", () => {
+  assert.deepEqual(
+    devAutoRestartDecision({
+      exitCode: 0,
+      signal: null,
+      uncleanExit: true,
+      watchdogEnabled: true,
+    }),
+    { restart: true, reason: "unexpected-exit" },
+  );
+});
+
+test("development recovery retries code-zero quits before Tauri is ready", () => {
+  assert.deepEqual(
+    devAutoRestartDecision({
+      appStarted: false,
+      exitCode: 0,
+      signal: null,
+      watchdogEnabled: true,
+    }),
+    { restart: true, reason: "unexpected-exit" },
+  );
+});
+
+test("development crash markers require the current dev launch and target", () => {
+  const repoRoot = path.resolve("workspace", "ccswitchmulti");
+  const sessionStartedAt = Date.parse("2026-10-13T04:00:00Z");
+  const appName = process.platform === "win32" ? "cc-switch.exe" : "cc-switch";
+  const marker = {
+    pid: 42,
+    executablePath: path.join(
+      repoRoot,
+      "src-tauri",
+      "target",
+      "debug",
+      appName,
+    ),
+    startedAt: "2026-10-13T04:00:01Z",
+  };
+
+  assert.equal(isDevCrashMarker(marker, sessionStartedAt, repoRoot), true);
+  assert.equal(
+    isDevCrashMarker(
+      {
+        pid: 42,
+        executable_path: marker.executablePath,
+        started_at: marker.startedAt,
+      },
+      sessionStartedAt,
+      repoRoot,
+    ),
+    true,
+  );
+  for (const invalid of [
+    null,
+    { ...marker, pid: 0 },
+    { ...marker, pid: -1 },
+    { ...marker, pid: 1.5 },
+    { ...marker, pid: undefined },
+    { ...marker, startedAt: "2026-10-13T03:59:59Z" },
+    { ...marker, startedAt: "invalid" },
+    { ...marker, executablePath: path.join(repoRoot, "installed", appName) },
+    {
+      ...marker,
+      executablePath: path.join(
+        repoRoot,
+        "src-tauri",
+        "target-imposter",
+        "debug",
+        appName,
+      ),
+    },
+    {
+      ...marker,
+      executablePath: path.join(
+        repoRoot,
+        "src-tauri",
+        "target",
+        "debug",
+        "foreign-app.exe",
+      ),
+    },
+  ]) {
+    assert.equal(isDevCrashMarker(invalid, sessionStartedAt, repoRoot), false);
+  }
+});
+
+test("development worker launch preserves options and enters worker mode", () => {
+  const args = ["--delay", "25000", "--no-rebuild"];
+  const environment = {
+    TAURI_DEV_PORT: "3410",
+    CC_SWITCH_TEST_HOME: "isolated-home",
+    CC_SWITCH_DEV_SUPERVISOR: "0",
+  };
+  const command = devWorkerCommand(args, environment);
+  const scriptPath = fileURLToPath(
+    new URL("./dev-tauri-delayed.mjs", import.meta.url),
+  );
+
+  assert.equal(command.executable, process.execPath);
+  assert.deepEqual(command.args, [scriptPath, "--ccsm-dev-worker", ...args]);
+  assert.equal(
+    command.options.cwd,
+    path.resolve(path.dirname(scriptPath), ".."),
+  );
+  assert.deepEqual(command.options.env, {
+    ...environment,
+    CC_SWITCH_DEV_SUPERVISOR: "1",
+  });
+  assert.deepEqual(command.options.stdio, [
+    "inherit",
+    "inherit",
+    "inherit",
+    "ipc",
+  ]);
+  assert.equal(command.options.windowsHide, true);
+  assert.deepEqual(args, ["--delay", "25000", "--no-rebuild"]);
+  assert.equal(environment.CC_SWITCH_DEV_SUPERVISOR, "0");
+});
+
+test("development recovery metadata saves options without arbitrary environment secrets", () => {
+  const options = {
+    TAURI_DEV_PORT: "3410",
+    TAURI_DEV_REBUILD_DELAY_MS: "25000",
+    TAURI_DEV_NO_REBUILD: "true",
+    CC_SWITCH_TEST_HOME: "isolated-home",
+    CC_SWITCH_DEV_WATCHDOG_ENABLED: "off",
+  };
+  const environment = {
+    ...options,
+    OPENAI_API_KEY: "dummy-secret-for-test",
+    PRIVATE_SERVICE_TOKEN: "dummy-token-for-test",
+    CC_SWITCH_DEV_SUPERVISOR: "1",
+    PATH: "not-persisted",
+  };
+
+  assert.deepEqual(devSessionEnvironment(environment), options);
+  assert.deepEqual(devSessionEnvironment(), {});
+  assert.deepEqual(
+    devSessionEnvironment({
+      TAURI_DEV_PORT: 3410,
+      TAURI_DEV_REBUILD_DELAY_MS: undefined,
+      TAURI_DEV_NO_REBUILD: false,
+    }),
+    {},
+  );
+  assert.equal(environment.OPENAI_API_KEY, "dummy-secret-for-test");
+});
+
+test("development worker recovery respects intentional exits and restart budget", () => {
+  const defaults = {
+    exitCode: 1,
+    signal: null,
+    watchdogEnabled: true,
+    nowMs: 2_000_000,
+  };
+  assert.deepEqual(devWorkerRestartDecision(defaults), {
+    restart: true,
+    reason: "unexpected-exit",
+  });
+  assert.deepEqual(
+    devWorkerRestartDecision({
+      ...defaults,
+      exitCode: null,
+      signal: "SIGKILL",
+    }),
+    { restart: true, reason: "unexpected-exit" },
+  );
+  assert.deepEqual(
+    devWorkerRestartDecision({ ...defaults, expectedExit: true }),
+    { restart: false, reason: "expected-exit" },
+  );
+  assert.deepEqual(
+    devWorkerRestartDecision({ ...defaults, watchdogEnabled: false }),
+    { restart: false, reason: "disabled" },
+  );
+  assert.deepEqual(devWorkerRestartDecision({ ...defaults, exitCode: 0 }), {
+    restart: false,
+    reason: "clean-exit",
+  });
+  assert.deepEqual(
+    devWorkerRestartDecision({
+      ...defaults,
+      restartTimesMs: Array(5).fill(2_000_000),
+    }),
+    { restart: false, reason: "rate-limited" },
+  );
+  assert.deepEqual(
+    devWorkerRestartDecision({
+      ...defaults,
+      restartTimesMs: Array(5).fill(199_999),
+    }),
+    { restart: true, reason: "unexpected-exit" },
+  );
+});
+
+function fakeDevWorker(pid) {
+  const child = new EventEmitter();
+  child.pid = pid;
+  child.exitCode = null;
+  child.signalCode = null;
+  child.finish = (code, signal = null) => {
+    child.exitCode = code;
+    child.signalCode = signal;
+    child.emit("exit", code, signal);
+  };
+  return child;
+}
+
+const nextEventLoopTurn = () => new Promise((resolve) => setImmediate(resolve));
+
+test("development supervisor waits for cleanup before relaunching a full worker", async () => {
+  const workers = [];
+  const actions = [];
+  let finishCleanup;
+  const cleanupBarrier = new Promise((resolve) => {
+    finishCleanup = resolve;
+  });
+  const supervising = superviseDevSessions({
+    spawnSession: () => {
+      const child = fakeDevWorker(workers.length + 1);
+      workers.push(child);
+      actions.push(`launch-worker:${child.pid}`);
+      return child;
+    },
+    cleanSession: async (child) => {
+      actions.push(`cleanup-start:${child.pid}`);
+      if (child.pid === 1) await cleanupBarrier;
+      actions.push(`cleanup-done:${child.pid}`);
+    },
+    readEnabled: () => true,
+    waitToRestart: async () => {
+      actions.push("restart-delay");
+    },
+  });
+
+  workers[0].finish(1);
+  await nextEventLoopTurn();
+  assert.equal(workers.length, 1);
+  assert.deepEqual(actions, ["launch-worker:1", "cleanup-start:1"]);
+  finishCleanup();
+  await nextEventLoopTurn();
+  assert.equal(workers.length, 2);
+  assert.deepEqual(actions, [
+    "launch-worker:1",
+    "cleanup-start:1",
+    "cleanup-done:1",
+    "restart-delay",
+    "launch-worker:2",
+  ]);
+  workers[1].finish(0);
+  assert.equal(await supervising, 0);
+});
+
+test("development supervisor rebuilds a new worker after a startup error", async () => {
+  const actions = [];
+  const outcomes = [];
+  let launches = 0;
+  const code = await superviseDevSessions({
+    spawnSession: () => {
+      const child = fakeDevWorker(++launches);
+      actions.push(`launch-worker:${child.pid}`);
+      queueMicrotask(() => {
+        if (child.pid === 1)
+          child.emit("error", new Error("injected startup failure"));
+        else child.finish(0);
+      });
+      return child;
+    },
+    cleanSession: async (child) => {
+      actions.push(`cleanup:${child.pid}`);
+    },
+    readEnabled: () => true,
+    waitToRestart: async () => {
+      actions.push("restart-delay");
+    },
+    onEvent: (decision, outcome) => {
+      outcomes.push({ decision, outcome });
+    },
+  });
+
+  assert.equal(code, 0);
+  assert.deepEqual(actions, [
+    "launch-worker:1",
+    "cleanup:1",
+    "restart-delay",
+    "launch-worker:2",
+    "cleanup:2",
+  ]);
+  assert.equal(outcomes[0].decision.reason, "unexpected-exit");
+  assert.match(outcomes[0].outcome.error.message, /startup failure/);
+  assert.equal(outcomes[1].decision.reason, "clean-exit");
+});
+
+test("development supervisor leaves clean and disabled sessions stopped", async () => {
+  for (const { exitCode, enabled, reason } of [
+    { exitCode: 0, enabled: true, reason: "clean-exit" },
+    { exitCode: 1, enabled: false, reason: "disabled" },
+  ]) {
+    let launches = 0;
+    let cleanups = 0;
+    const decisions = [];
+    const code = await superviseDevSessions({
+      spawnSession: () => {
+        const child = fakeDevWorker(++launches);
+        queueMicrotask(() => child.finish(exitCode));
+        return child;
+      },
+      cleanSession: async () => {
+        cleanups += 1;
+      },
+      readEnabled: () => enabled,
+      waitToRestart: async () => {
+        assert.fail("stopped sessions must not schedule a restart");
+      },
+      onEvent: (decision) => {
+        decisions.push(decision.reason);
+      },
+    });
+    assert.equal(code, exitCode);
+    assert.equal(launches, 1);
+    assert.equal(cleanups, 1);
+    assert.deepEqual(decisions, [reason]);
+  }
+});
+
+test("development supervisor stops a repeated startup crash loop at five restarts", async () => {
+  let launches = 0;
+  let cleanups = 0;
+  let delays = 0;
+  const decisions = [];
+  const code = await superviseDevSessions({
+    spawnSession: () => {
+      const child = fakeDevWorker(++launches);
+      queueMicrotask(() => child.finish(1));
+      return child;
+    },
+    cleanSession: async () => {
+      cleanups += 1;
+    },
+    readEnabled: () => true,
+    now: () => 2_000_000,
+    waitToRestart: async () => {
+      delays += 1;
+    },
+    onEvent: (decision) => {
+      decisions.push(decision.reason);
+    },
+  });
+  assert.equal(code, 1);
+  assert.equal(launches, 6);
+  assert.equal(cleanups, 6);
+  assert.equal(delays, 5);
+  assert.equal(decisions.at(-1), "rate-limited");
+});
+
+test("development supervisor cancels a delayed restart when shutting down", async () => {
+  let stopping = false;
+  let launches = 0;
+  const code = await superviseDevSessions({
+    spawnSession: () => {
+      const child = fakeDevWorker(++launches);
+      queueMicrotask(() => child.finish(1));
+      return child;
+    },
+    cleanSession: async () => {},
+    readEnabled: () => true,
+    isStopping: () => stopping,
+    waitToRestart: async () => {
+      stopping = true;
+    },
+  });
+  assert.equal(code, 0);
+  assert.equal(launches, 1);
+});
+
+test("development supervisor rereads the watchdog toggle after the restart delay", async () => {
+  let enabled = true;
+  let launches = 0;
+  const code = await superviseDevSessions({
+    spawnSession: () => {
+      const child = fakeDevWorker(++launches);
+      queueMicrotask(() => child.finish(1));
+      return child;
+    },
+    cleanSession: async () => {},
+    readEnabled: () => enabled,
+    waitToRestart: async () => {
+      enabled = false;
+    },
+  });
+  assert.equal(code, 1);
+  assert.equal(launches, 1);
 });
 
 test("development requires the repository Cargo target directory", () => {
@@ -600,6 +1004,352 @@ test("Windows shutdown selects only the owned Tauri development chain", () => {
   );
 });
 
+test("Windows worker cleanup follows only its Vite and Tauri roots", () => {
+  const repoRoot = path.resolve("workspace", "ccswitchmulti");
+  const processes = [
+    {
+      ProcessId: 20,
+      ParentProcessId: 10,
+      Name: "node.exe",
+      CommandLine: 'node "./node_modules/vite/bin/vite.js" --port 3410',
+    },
+    {
+      ProcessId: 21,
+      ParentProcessId: 20,
+      Name: "esbuild.exe",
+      ExecutablePath: path.join(
+        repoRoot,
+        "node_modules",
+        "esbuild",
+        "esbuild.exe",
+      ),
+    },
+    {
+      ProcessId: 30,
+      ParentProcessId: 10,
+      Name: "node.exe",
+      CommandLine:
+        'node ".\\node_modules\\@tauri-apps\\cli\\tauri.js" dev --no-watch',
+    },
+    {
+      ProcessId: 31,
+      ParentProcessId: 30,
+      Name: "cargo.exe",
+      ExecutablePath: "C:\\Users\\dev\\.cargo\\bin\\cargo.exe",
+    },
+    {
+      ProcessId: 32,
+      ParentProcessId: 31,
+      Name: "cc-switch.exe",
+      ExecutablePath: path.join(
+        repoRoot,
+        "src-tauri",
+        "target",
+        "debug",
+        "cc-switch.exe",
+      ),
+    },
+    {
+      ProcessId: 40,
+      ParentProcessId: 32,
+      Name: "node.exe",
+      CommandLine: "codex app-server",
+    },
+    {
+      ProcessId: 41,
+      ParentProcessId: 40,
+      Name: "cargo.exe",
+      CommandLine: "cargo test",
+    },
+    {
+      ProcessId: 50,
+      ParentProcessId: 10,
+      Name: "node.exe",
+      CommandLine: "node unrelated-helper.js",
+    },
+    {
+      ProcessId: 51,
+      ParentProcessId: 50,
+      Name: "esbuild.exe",
+      ExecutablePath: path.join(
+        repoRoot,
+        "node_modules",
+        "esbuild",
+        "esbuild.exe",
+      ),
+    },
+    {
+      ProcessId: 60,
+      ParentProcessId: 99,
+      Name: "node.exe",
+      CommandLine: 'node "./node_modules/vite/bin/vite.js"',
+    },
+    {
+      ProcessId: 70,
+      ParentProcessId: 10,
+      Name: "foreign.exe",
+      CommandLine: 'node "./node_modules/vite/bin/vite.js"',
+    },
+  ];
+
+  assert.deepEqual(
+    windowsDevWorkerDescendants(processes, 10, repoRoot).map(
+      ({ ProcessId, kind }) => ({ ProcessId, kind }),
+    ),
+    [
+      { ProcessId: 32, kind: "app" },
+      { ProcessId: 21, kind: "frontend-helper" },
+      { ProcessId: 31, kind: "cargo" },
+      { ProcessId: 20, kind: "frontend" },
+      { ProcessId: 30, kind: "tauri" },
+    ],
+  );
+});
+
+test("Windows worker cleanup refuses a foreign cc-switch descendant", async () => {
+  const repoRoot = path.resolve("workspace", "ccswitchmulti");
+  const processes = [
+    {
+      ProcessId: 20,
+      ParentProcessId: 10,
+      Name: "node.exe",
+      CommandLine: 'node "./node_modules/@tauri-apps/cli/tauri.js" dev',
+    },
+    { ProcessId: 30, ParentProcessId: 20, Name: "cargo.exe" },
+    {
+      ProcessId: 40,
+      ParentProcessId: 30,
+      Name: "cc-switch.exe",
+      ExecutablePath: path.resolve(
+        "foreign",
+        "src-tauri",
+        "target",
+        "debug",
+        "cc-switch.exe",
+      ),
+    },
+  ];
+  const child = fakeDevWorker(10);
+  child.exitCode = 1;
+  const terminations = [];
+  const select = (snapshot, pid) =>
+    windowsDevWorkerDescendants(snapshot, pid, repoRoot);
+
+  assert.equal(select(processes, child.pid)[0].kind, "unverified-app");
+  await assert.rejects(
+    stopWindowsProcess(child, select, {
+      queryProcesses: () => processes,
+      terminate: (pid) => {
+        terminations.push(pid);
+        return { status: 0 };
+      },
+      log: () => {},
+    }),
+    /outside the verified Cargo target directory/,
+  );
+  assert.deepEqual(terminations, []);
+});
+
+test("Windows worker relaunch waits for old app and Vite listeners to release", async () => {
+  const repoRoot = path.resolve("workspace", "ccswitchmulti");
+  const creationDate = "2026-10-13T04:00:00Z";
+  const processes = [
+    {
+      ProcessId: 20,
+      ParentProcessId: 10,
+      Name: "node.exe",
+      ExecutablePath: "C:\\node\\node.exe",
+      CreationDate: creationDate,
+      CommandLine: 'node "./node_modules/vite/bin/vite.js"',
+    },
+    {
+      ProcessId: 30,
+      ParentProcessId: 10,
+      Name: "node.exe",
+      ExecutablePath: "C:\\node\\node.exe",
+      CreationDate: creationDate,
+      CommandLine: 'node "./node_modules/@tauri-apps/cli/tauri.js" dev',
+    },
+    {
+      ProcessId: 31,
+      ParentProcessId: 30,
+      Name: "cargo.exe",
+      ExecutablePath: "C:\\cargo\\cargo.exe",
+      CreationDate: creationDate,
+    },
+    {
+      ProcessId: 32,
+      ParentProcessId: 31,
+      Name: "cc-switch.exe",
+      ExecutablePath: path.join(
+        repoRoot,
+        "src-tauri",
+        "target",
+        "debug",
+        "cc-switch.exe",
+      ),
+      CreationDate: creationDate,
+    },
+  ];
+  const workers = [];
+  const actions = [];
+  let releaseFrontend;
+  const frontendRelease = new Promise((resolve) => {
+    releaseFrontend = resolve;
+  });
+  const supervising = superviseDevSessions({
+    spawnSession: () => {
+      const child = fakeDevWorker(workers.length === 0 ? 10 : 11);
+      workers.push(child);
+      actions.push(`launch-worker:${child.pid}`);
+      return child;
+    },
+    cleanSession: (child) =>
+      stopWindowsProcess(
+        child,
+        (snapshot, pid) => windowsDevWorkerDescendants(snapshot, pid, repoRoot),
+        {
+          queryProcesses: () => processes,
+          queryListeners: (info) =>
+            info.ProcessId === 32
+              ? [{ address: "127.0.0.1", port: 15721 }]
+              : info.ProcessId === 20
+                ? [{ address: "127.0.0.1", port: 3410 }]
+                : [],
+          terminate: (pid, force, tree = false) => {
+            actions.push(`terminate:${pid}:${force}:${tree}`);
+            return { status: 0 };
+          },
+          waitForProcessExit: async (info) => {
+            actions.push(`exited:${info.ProcessId}`);
+          },
+          waitForListenersReleased: async (listeners) => {
+            const port = listeners[0].port;
+            actions.push(`release-start:${port}`);
+            if (port === 3410) await frontendRelease;
+            actions.push(`release-done:${port}`);
+          },
+          log: () => {},
+        },
+      ),
+    readEnabled: () => true,
+    waitToRestart: async () => {},
+  });
+
+  workers[0].finish(1);
+  await nextEventLoopTurn();
+  assert.equal(workers.length, 1);
+  assert.equal(actions.includes("release-done:15721"), true);
+  assert.equal(actions.includes("release-start:3410"), true);
+  assert.equal(actions.includes("release-done:3410"), false);
+  releaseFrontend();
+  await nextEventLoopTurn();
+  assert.equal(workers.length, 2);
+  assert.equal(
+    actions.indexOf("release-done:3410") < actions.indexOf("launch-worker:11"),
+    true,
+  );
+  assert.equal(actions.includes("terminate:32:true:true"), true);
+  assert.equal(actions.includes("terminate:20:true:true"), true);
+  workers[1].finish(0);
+  assert.equal(await supervising, 0);
+});
+
+test("Windows root cleanup checks identity again after listener release", async () => {
+  for (const reuseRootPid of [false, true]) {
+    const root = {
+      ProcessId: 10,
+      Name: "node.exe",
+      ExecutablePath: "C:\\node\\node.exe",
+      CreationDate: "2026-10-13T04:00:00Z",
+    };
+    const frontend = {
+      ...root,
+      ProcessId: 20,
+      ParentProcessId: 10,
+      kind: "frontend",
+    };
+    const replacement = {
+      ...root,
+      Name: "unrelated.exe",
+      ExecutablePath: "C:\\other\\unrelated.exe",
+      CreationDate: "2026-10-13T04:01:00Z",
+    };
+    let processes = [root, frontend];
+    const terminations = [];
+    let releaseListener;
+    const listenerRelease = new Promise((resolve) => {
+      releaseListener = resolve;
+    });
+    let waitingForListener = false;
+    const child = fakeDevWorker(10);
+    child.exitCode = 0;
+    const cleanup = stopWindowsProcess(child, () => [frontend], {
+      expectedRootIdentity: root,
+      terminateRoot: true,
+      queryProcesses: () => processes,
+      queryListeners: () => [{ address: "127.0.0.1", port: 3410 }],
+      terminate: (pid, force, tree) => {
+        terminations.push({ pid, force, tree });
+        processes = processes.filter(({ ProcessId }) => ProcessId !== pid);
+        return { status: 0 };
+      },
+      waitForProcessExit: async () => {},
+      waitForListenersReleased: async () => {
+        waitingForListener = true;
+        await listenerRelease;
+      },
+      log: () => {},
+    });
+    await nextEventLoopTurn();
+    assert.equal(waitingForListener, true);
+    assert.deepEqual(terminations, [{ pid: 20, force: true, tree: true }]);
+    if (reuseRootPid) processes = [replacement];
+    releaseListener();
+    await cleanup;
+    assert.deepEqual(terminations, [
+      { pid: 20, force: true, tree: true },
+      ...(!reuseRootPid ? [{ pid: 10, force: true, tree: true }] : []),
+    ]);
+  }
+});
+
+test("Windows recorded root cleanup skips an already reused PID and its tree", async () => {
+  const original = {
+    ProcessId: 10,
+    Name: "node.exe",
+    ExecutablePath: "C:\\node\\node.exe",
+    CreationDate: "2026-10-13T04:00:00Z",
+  };
+  const replacement = {
+    ...original,
+    CreationDate: "2026-10-13T04:01:00Z",
+  };
+  const child = fakeDevWorker(10);
+  child.exitCode = 0;
+  let selectedTree = false;
+  const terminations = [];
+  await stopWindowsProcess(
+    child,
+    () => {
+      selectedTree = true;
+      return [];
+    },
+    {
+      expectedRootIdentity: original,
+      terminateRoot: true,
+      queryProcesses: () => [replacement],
+      terminate: (pid) => {
+        terminations.push(pid);
+        return { status: 0 };
+      },
+      log: () => {},
+    },
+  );
+  assert.equal(selectedTree, false);
+  assert.deepEqual(terminations, []);
+});
+
 test("Windows shutdown roots the tree kill at the verified app", () => {
   const repoRoot = "H:\\repos\\ccswitchmulti-fork";
   const processes = [
@@ -913,6 +1663,22 @@ test("Windows shutdown identity rejects PID reuse", () => {
   assert.equal(
     sameWindowsProcess(original, { ...original, CreationDate: "" }),
     false,
+  );
+});
+
+test("Windows process creation dates normalize PowerShell JSON and UTC forms", () => {
+  const iso = "2026-10-13T04:00:00.000Z";
+  const milliseconds = Date.parse(iso);
+  assert.equal(windowsProcessStartedAtUtc({ CreationDate: iso }), iso);
+  assert.equal(
+    windowsProcessStartedAtUtc({ CreationDate: `/Date(${milliseconds})/` }),
+    iso,
+  );
+  assert.equal(
+    windowsProcessStartedAtUtc({
+      CreationDate: `/Date(${milliseconds}+0800)/`,
+    }),
+    iso,
   );
 });
 

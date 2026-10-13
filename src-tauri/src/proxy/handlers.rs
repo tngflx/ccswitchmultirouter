@@ -8,7 +8,11 @@
 //! - Claude 的格式转换逻辑保留在此文件（用于 OpenRouter 旧接口回退）
 
 use super::{
-    codex_turn_recovery::{begin_turn, observe_responses_turn_stream, TurnRecoveryContext},
+    codex_turn_recovery::{
+        begin_turn, forward_error_is_recoverable, mark_observed_turn_completed,
+        observe_responses_turn_stream, provider_fingerprint, schedule_turn_recovery, track_turn,
+        TurnRecoveryContext,
+    },
     content_encoding::{decompress_body, get_content_encoding, is_supported_content_encoding},
     error_mapper::{
         actionable_upstream_error_message, get_error_message, map_proxy_error_to_status,
@@ -681,6 +685,36 @@ fn is_verified_codex_desktop_request(headers: &HeaderMap) -> bool {
     should_handle_as_codex_client(headers) && is_codex_desktop_request(headers)
 }
 
+/// A request correlation ID is not a Desktop thread ID. Prefer explicit thread
+/// identity over the router's broader session extraction fallbacks.
+fn desktop_recovery_thread_id(headers: &HeaderMap) -> Option<String> {
+    let nonempty = |value: &axum::http::HeaderValue| {
+        value
+            .to_str()
+            .ok()
+            .map(str::trim)
+            .filter(|value| value.len() > 10)
+            .map(str::to_string)
+    };
+    headers
+        .get("thread-id")
+        .and_then(nonempty)
+        .or_else(|| {
+            headers
+                .get("x-codex-window-id")
+                .and_then(nonempty)
+                .map(|value| {
+                    value
+                        .rsplit_once(':')
+                        .map(|(thread_id, _)| thread_id.to_string())
+                        .unwrap_or(value)
+                })
+                .filter(|value| value.len() > 10)
+        })
+        .or_else(|| headers.get("session-id").and_then(nonempty))
+        .or_else(|| headers.get("session_id").and_then(nonempty))
+}
+
 /// Observe the exact Responses SSE form returned to Codex Desktop. The stream
 /// may have passed through a provider adapter first, so recovery belongs here
 /// at the final client-facing boundary rather than in an upstream converter.
@@ -696,20 +730,73 @@ fn observe_aggressive_recovery(
     }
 }
 
+/// Observe after response conversion, logging, and timeout handling. Otherwise
+/// an outer idle timeout drops the provider observer as a cancelled request
+/// before that observer can see the error returned to Desktop.
+fn finalize_aggressive_recovery(
+    result: Result<axum::response::Response, ProxyError>,
+    recovery_context: Option<TurnRecoveryContext>,
+) -> Result<axum::response::Response, ProxyError> {
+    let Some(context) = recovery_context else {
+        return result;
+    };
+
+    match result {
+        Ok(response)
+            if response.status().is_success()
+                && response
+                    .headers()
+                    .get(axum::http::header::CONTENT_TYPE)
+                    .and_then(|value| value.to_str().ok())
+                    .and_then(|value| value.split(';').next())
+                    .is_some_and(|value| {
+                        value.trim().eq_ignore_ascii_case("text/event-stream")
+                    }) =>
+        {
+            let (parts, body) = response.into_parts();
+            let stream = body
+                .into_data_stream()
+                .map(|item| item.map_err(std::io::Error::other));
+            let stream = observe_aggressive_recovery(stream, Some(context));
+            Ok(axum::response::Response::from_parts(
+                parts,
+                axum::body::Body::from_stream(stream),
+            ))
+        }
+        Ok(response) => {
+            mark_observed_turn_completed(&context);
+            Ok(response)
+        }
+        Err(error) => {
+            if forward_error_is_recoverable(&error) {
+                schedule_turn_recovery(context, "response_processing_failed");
+            } else {
+                mark_observed_turn_completed(&context);
+            }
+            Err(error)
+        }
+    }
+}
+
 /// Match only the literal recovery turn CCSM injects. Prompts that merely
 /// contain the word "continue", tool results, and mixed-media messages do not
 /// preserve the existing recovery budget.
 fn request_is_literal_continue(body: &Value) -> bool {
+    // Tool results and assistant items can follow CCSM's injected user turn.
+    // They are transport bookkeeping, so find the most recent actual user
+    // message instead of requiring it to be the final array element.
     let Some(item) = body
         .get("input")
         .and_then(Value::as_array)
-        .and_then(|items| items.last())
+        .and_then(|items| {
+            items
+                .iter()
+                .rev()
+                .find(|item| item.get("role").and_then(Value::as_str) == Some("user"))
+        })
     else {
         return false;
     };
-    if item.get("role").and_then(Value::as_str) != Some("user") {
-        return false;
-    }
 
     match item.get("content") {
         Some(Value::String(text)) => text == "continue",
@@ -3171,6 +3258,9 @@ async fn handle_responses_for_app(
     let request_body_for_history = body.clone();
     let desktop_recovery_eligible =
         app_type == AppType::Codex && is_verified_codex_desktop_request(&headers);
+    let desktop_thread_id = desktop_recovery_eligible
+        .then(|| desktop_recovery_thread_id(&headers))
+        .flatten();
     let is_recovery_continuation = request_is_literal_continue(&body);
     let desktop_reasoning = app_type == AppType::Codex
         && super::providers::is_codex_desktop_reasoning_client(
@@ -3179,7 +3269,43 @@ async fn handle_responses_for_app(
         );
 
     let endpoint = endpoint_with_query(&uri, "/responses");
-    let mut ctx = if app_type == AppType::Codex && !should_handle_as_codex_client(&headers) {
+    // Capture enough identity before provider selection: circuit-open errors
+    // can happen in RequestContext::new, before a context exists to carry the
+    // Desktop continuation ledger.
+    let is_stream = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
+    let is_codex_v2_compaction =
+        super::forwarder::codex_request_is_v2_compaction(&app_type, &endpoint, &body, &headers);
+    let recovery_thread_id = (is_stream && !is_codex_v2_compaction)
+        .then(|| desktop_thread_id.clone())
+        .flatten();
+    if let Some(thread_id) = recovery_thread_id.as_ref() {
+        begin_turn(thread_id, is_recovery_continuation);
+    }
+    let mut recovery_context = recovery_thread_id.and_then(|desktop_thread_id| {
+        let durable_provider_id = crate::settings::get_current_provider(&AppType::Codex)?;
+        let durable_provider = state
+            .db
+            .get_provider_by_id(&durable_provider_id, "codex")
+            .ok()
+            .flatten()?;
+        let request_model = request_model_from_body(&body);
+        Some(TurnRecoveryContext {
+            session_id: crate::proxy::extract_session_id(&headers, &body, "codex").session_id,
+            desktop_thread_id,
+            recovery_id: uuid::Uuid::new_v4().to_string(),
+            observed_at_ms: chrono::Utc::now().timestamp_millis(),
+            model: request_model.clone(),
+            desktop_model: request_model,
+            provider_id: durable_provider_id.clone(),
+            durable_provider_id,
+            provider_fingerprint: provider_fingerprint(&durable_provider),
+            desktop_eligible: true,
+            max_recoveries: crate::settings::get_settings().stream_recovery_budget(),
+        })
+    });
+    let recovery_tracking = recovery_context.as_ref().map(track_turn);
+
+    let ctx_result = if app_type == AppType::Codex && !should_handle_as_codex_client(&headers) {
         let external_api_profile = match external_openai_api::validate_request(&state.db, &headers)
         {
             Ok(profile) => profile,
@@ -3206,25 +3332,33 @@ async fn handle_responses_for_app(
             "codex",
             provider,
         )
-        .await?
+        .await
     } else {
-        RequestContext::new(&state, &body, &headers, app_type.clone(), tag, app_type_str).await?
+        RequestContext::new(&state, &body, &headers, app_type.clone(), tag, app_type_str).await
     };
-    if desktop_recovery_eligible {
-        begin_turn(&ctx.session_id, is_recovery_continuation);
-    }
-
-    let is_stream = body
-        .get("stream")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
+    let mut ctx = match ctx_result {
+        Ok(ctx) => ctx,
+        Err(error) => {
+            if let Some(context) = recovery_context {
+                if forward_error_is_recoverable(&error) {
+                    schedule_turn_recovery(context, "provider_selection_failed");
+                } else {
+                    mark_observed_turn_completed(&context);
+                }
+            }
+            return Err(error);
+        }
+    };
     let codex_tool_context = transform_codex_chat::build_codex_tool_context_from_request(&body);
     // Captured before `body` is moved into the forwarder: the flat-name →
     // {namespace, name} map used to restore the native Responses upstream's
     // function-call names (see the namespace-restore dispatch below).
     let namespace_restore_map = transform_codex_responses_namespace::namespace_restore_map(&body);
-    let is_codex_v2_compaction =
-        super::forwarder::codex_request_is_v2_compaction(&app_type, &endpoint, &body, &headers);
+    if let Some(context) = recovery_context.as_mut() {
+        context.session_id = ctx.session_id.clone();
+        context.model = ctx.request_model.clone();
+        context.provider_id = ctx.provider.id.clone();
+    }
 
     let forwarder = ctx.create_forwarder(&state);
     let mut result = match forwarder
@@ -3243,6 +3377,14 @@ async fn handle_responses_for_app(
         Err(mut err) => {
             update_context_provider_for_forward_error(&state, &mut ctx, err.provider.take());
             log_forward_error(&state, &ctx, is_stream, &err.error);
+            if let Some(mut context) = recovery_context {
+                context.provider_id = ctx.provider.id.clone();
+                if forward_error_is_recoverable(&err.error) {
+                    schedule_turn_recovery(context, "upstream_request_failed");
+                } else {
+                    mark_observed_turn_completed(&context);
+                }
+            }
             return build_codex_proxy_error_response(&ctx, &endpoint, &err.error);
         }
     };
@@ -3252,43 +3394,135 @@ async fn handle_responses_for_app(
     ctx.outbound_model = result.outbound_model.take();
     ctx.provider = result.provider;
     let response = result.response;
-    let recovery_context = (desktop_recovery_eligible && is_stream).then(|| TurnRecoveryContext {
-        session_id: ctx.session_id.clone(),
-        model: ctx
+    if let Some(context) = recovery_context.as_mut() {
+        context.model = ctx
             .outbound_model
             .clone()
-            .unwrap_or_else(|| ctx.request_model.clone()),
-        provider_id: ctx.provider.id.clone(),
-        desktop_eligible: true,
-        max_recoveries: crate::settings::get_settings().stream_recovery_budget(),
-    });
-    let desktop_reasoning_mapping = desktop_reasoning
-        && super::providers::resolve_codex_native_responses_reasoning_projection(
-            &ctx.provider,
-            &ctx.request_model,
-            ctx.outbound_model.as_deref().unwrap_or(&ctx.request_model),
-            &state.db,
-            chrono::Utc::now().timestamp(),
-        ) == crate::protocol_compatibility::ReasoningProjection::RawReasoningText;
+            .unwrap_or_else(|| ctx.request_model.clone());
+        context.provider_id = ctx.provider.id.clone();
+    }
+    let response_result = async {
+        let desktop_reasoning_mapping = desktop_reasoning
+            && super::providers::resolve_codex_native_responses_reasoning_projection(
+                &ctx.provider,
+                &ctx.request_model,
+                ctx.outbound_model.as_deref().unwrap_or(&ctx.request_model),
+                &state.db,
+                chrono::Utc::now().timestamp(),
+            ) == crate::protocol_compatibility::ReasoningProjection::RawReasoningText;
 
-    if super::providers::should_convert_codex_responses_to_anthropic(&ctx.provider, &endpoint) {
-        return handle_codex_anthropic_to_responses_transform(
-            CodexTransformUpstream {
+        if super::providers::should_convert_codex_responses_to_anthropic(&ctx.provider, &endpoint) {
+            return handle_codex_anthropic_to_responses_transform(
+                CodexTransformUpstream {
+                    response,
+                    stream_reconnect,
+                },
+                &ctx,
+                &state,
+                is_stream,
+                connection_guard,
+                codex_tool_context,
+                None,
+            )
+            .await;
+        }
+
+        if super::providers::should_convert_codex_responses_to_messages(&ctx.provider, &endpoint) {
+            let rebuilt = if is_stream || response.is_sse() {
+                let status = response.status();
+                let response_headers = response.headers().clone();
+                let stream = create_resilient_responses_sse_stream_with_context(
+                    Box::pin(response.bytes_stream()),
+                    stream_reconnect,
+                    Some(StreamLogContext {
+                        session_id: ctx.session_id.clone(),
+                        model: ctx
+                            .outbound_model
+                            .clone()
+                            .unwrap_or_else(|| ctx.request_model.clone()),
+                        provider_id: ctx.provider.id.clone(),
+                    }),
+                    ctx.app_config.capacity_retry_enabled,
+                );
+                let stream = record_responses_sse_stream_with_request(
+                    stream,
+                    state.codex_chat_history.clone(),
+                    request_body_for_history,
+                );
+                super::hyper_client::ProxyResponse::streamed(status, response_headers, stream)
+            } else {
+                let (response_headers, status, body_bytes) =
+                    read_decoded_body(response, ctx.tag, std::time::Duration::ZERO).await?;
+                if let Ok(resp_json) = serde_json::from_slice::<Value>(&body_bytes) {
+                    state
+                        .codex_chat_history
+                        .record_exchange(&request_body_for_history, &resp_json)
+                        .await;
+                }
+                super::hyper_client::ProxyResponse::buffered(status, response_headers, body_bytes)
+            };
+            return process_response(
+                rebuilt,
+                &ctx,
+                &state,
+                &CODEX_PARSER_CONFIG,
+                connection_guard,
+            )
+            .await;
+        }
+
+        if super::providers::should_convert_codex_responses_to_chat(&ctx.provider, &endpoint) {
+            return handle_codex_chat_to_responses_transform(
+                CodexTransformUpstream {
+                    response,
+                    stream_reconnect,
+                },
+                CodexChatToResponsesTransformContext {
+                    ctx: &ctx,
+                    state: &state,
+                    is_stream,
+                    is_compaction: is_codex_v2_compaction,
+                    connection_guard,
+                    tool_context: codex_tool_context,
+                    recovery_context: None,
+                },
+            )
+            .await;
+        }
+
+        // xAI native Responses accepts namespace/custom tools only after they are
+        // projected to ordinary functions. Always run the inverse on this provider,
+        // even when the request had no namespace: custom tool calls still need their
+        // event and item semantics restored for Codex.
+        if super::providers::provider_needs_responses_namespace_flatten(&ctx.provider) {
+            return handle_codex_xai_native_responses_rewrite(
                 response,
                 stream_reconnect,
-            },
-            &ctx,
-            &state,
-            is_stream,
-            connection_guard,
-            codex_tool_context,
-            recovery_context,
-        )
-        .await;
-    }
+                &ctx,
+                &state,
+                connection_guard,
+                codex_tool_context,
+                namespace_restore_map,
+                None,
+            )
+            .await;
+        }
 
-    if super::providers::should_convert_codex_responses_to_messages(&ctx.provider, &endpoint) {
-        let rebuilt = if is_stream || response.is_sse() {
+        if is_codex_v2_compaction
+            && !super::providers::codex_route_supports_responses_compaction(&ctx.provider)
+        {
+            return handle_codex_native_compaction_fallback(
+                response,
+                &ctx,
+                &state,
+                connection_guard,
+            )
+            .await;
+        }
+
+        let response = if should_wrap_native_codex_responses_stream(is_stream, &response)
+            || (desktop_reasoning_mapping && response.status().is_success() && response.is_sse())
+        {
             let status = response.status();
             let response_headers = response.headers().clone();
             let stream = create_resilient_responses_sse_stream_with_context(
@@ -3304,141 +3538,58 @@ async fn handle_responses_for_app(
                 }),
                 ctx.app_config.capacity_retry_enabled,
             );
-            let stream = record_responses_sse_stream_with_request(
-                stream,
-                state.codex_chat_history.clone(),
-                request_body_for_history,
-            );
-            let stream = observe_aggressive_recovery(stream, recovery_context);
+            let stream = if desktop_reasoning_mapping {
+                Box::pin(create_desktop_reasoning_mapping_stream(stream))
+                    as std::pin::Pin<
+                        Box<dyn futures::Stream<Item = Result<Bytes, std::io::Error>> + Send>,
+                    >
+            } else {
+                Box::pin(stream)
+                    as std::pin::Pin<
+                        Box<dyn futures::Stream<Item = Result<Bytes, std::io::Error>> + Send>,
+                    >
+            };
             super::hyper_client::ProxyResponse::streamed(status, response_headers, stream)
-        } else {
-            let (response_headers, status, body_bytes) =
+        } else if desktop_reasoning_mapping && response.status().is_success() && response.is_json()
+        {
+            let (mut response_headers, status, body_bytes) =
                 read_decoded_body(response, ctx.tag, std::time::Duration::ZERO).await?;
-            if let Ok(resp_json) = serde_json::from_slice::<Value>(&body_bytes) {
-                state
-                    .codex_chat_history
-                    .record_exchange(&request_body_for_history, &resp_json)
-                    .await;
+            if let Ok(mut value) = serde_json::from_slice::<Value>(&body_bytes) {
+                map_completed_response_for_desktop(&mut value);
+                let rebuilt = serde_json::to_vec(&value).map_err(|error| {
+                    ProxyError::TransformError(format!(
+                        "Failed to serialize mapped Responses response: {error}"
+                    ))
+                })?;
+                strip_entity_headers_for_rebuilt_body(&mut response_headers);
+                super::hyper_client::ProxyResponse::buffered(
+                    status,
+                    response_headers,
+                    Bytes::from(rebuilt),
+                )
+            } else {
+                super::hyper_client::ProxyResponse::buffered(status, response_headers, body_bytes)
             }
-            super::hyper_client::ProxyResponse::buffered(status, response_headers, body_bytes)
+        } else {
+            response
         };
-        return process_response(
-            rebuilt,
+
+        process_response_with_stream_hint(
+            response,
             &ctx,
             &state,
             &CODEX_PARSER_CONFIG,
             connection_guard,
+            is_stream,
         )
-        .await;
+        .await
     }
-
-    if super::providers::should_convert_codex_responses_to_chat(&ctx.provider, &endpoint) {
-        return handle_codex_chat_to_responses_transform(
-            CodexTransformUpstream {
-                response,
-                stream_reconnect,
-            },
-            CodexChatToResponsesTransformContext {
-                ctx: &ctx,
-                state: &state,
-                is_stream,
-                is_compaction: is_codex_v2_compaction,
-                connection_guard,
-                tool_context: codex_tool_context,
-                recovery_context,
-            },
-        )
-        .await;
+    .await;
+    let final_result = finalize_aggressive_recovery(response_result, recovery_context);
+    if let Some(tracking) = recovery_tracking {
+        tracking.hand_off_to_stream();
     }
-
-    // xAI native Responses accepts namespace/custom tools only after they are
-    // projected to ordinary functions. Always run the inverse on this provider,
-    // even when the request had no namespace: custom tool calls still need their
-    // event and item semantics restored for Codex.
-    if super::providers::provider_needs_responses_namespace_flatten(&ctx.provider) {
-        return handle_codex_xai_native_responses_rewrite(
-            response,
-            stream_reconnect,
-            &ctx,
-            &state,
-            connection_guard,
-            codex_tool_context,
-            namespace_restore_map,
-            recovery_context,
-        )
-        .await;
-    }
-
-    if is_codex_v2_compaction
-        && !super::providers::codex_route_supports_responses_compaction(&ctx.provider)
-    {
-        return handle_codex_native_compaction_fallback(response, &ctx, &state, connection_guard)
-            .await;
-    }
-
-    let response = if should_wrap_native_codex_responses_stream(is_stream, &response)
-        || (desktop_reasoning_mapping && response.status().is_success() && response.is_sse())
-    {
-        let status = response.status();
-        let response_headers = response.headers().clone();
-        let stream = create_resilient_responses_sse_stream_with_context(
-            Box::pin(response.bytes_stream()),
-            stream_reconnect,
-            Some(StreamLogContext {
-                session_id: ctx.session_id.clone(),
-                model: ctx
-                    .outbound_model
-                    .clone()
-                    .unwrap_or_else(|| ctx.request_model.clone()),
-                provider_id: ctx.provider.id.clone(),
-            }),
-            ctx.app_config.capacity_retry_enabled,
-        );
-        let stream = if desktop_reasoning_mapping {
-            Box::pin(create_desktop_reasoning_mapping_stream(stream))
-                as std::pin::Pin<
-                    Box<dyn futures::Stream<Item = Result<Bytes, std::io::Error>> + Send>,
-                >
-        } else {
-            Box::pin(stream)
-                as std::pin::Pin<
-                    Box<dyn futures::Stream<Item = Result<Bytes, std::io::Error>> + Send>,
-                >
-        };
-        let stream = observe_aggressive_recovery(stream, recovery_context);
-        super::hyper_client::ProxyResponse::streamed(status, response_headers, stream)
-    } else if desktop_reasoning_mapping && response.status().is_success() && response.is_json() {
-        let (mut response_headers, status, body_bytes) =
-            read_decoded_body(response, ctx.tag, std::time::Duration::ZERO).await?;
-        if let Ok(mut value) = serde_json::from_slice::<Value>(&body_bytes) {
-            map_completed_response_for_desktop(&mut value);
-            let rebuilt = serde_json::to_vec(&value).map_err(|error| {
-                ProxyError::TransformError(format!(
-                    "Failed to serialize mapped Responses response: {error}"
-                ))
-            })?;
-            strip_entity_headers_for_rebuilt_body(&mut response_headers);
-            super::hyper_client::ProxyResponse::buffered(
-                status,
-                response_headers,
-                Bytes::from(rebuilt),
-            )
-        } else {
-            super::hyper_client::ProxyResponse::buffered(status, response_headers, body_bytes)
-        }
-    } else {
-        response
-    };
-
-    process_response_with_stream_hint(
-        response,
-        &ctx,
-        &state,
-        &CODEX_PARSER_CONFIG,
-        connection_guard,
-        is_stream,
-    )
-    .await
+    final_result
 }
 
 /// 处理 /v1/responses/compact 请求（OpenAI Responses Compact API - Codex CLI 透传）
@@ -7522,7 +7673,7 @@ data: [DONE]\n\n";
     }
 
     #[test]
-    fn recovery_continuation_match_is_exact_and_final_user_only() {
+    fn recovery_continuation_match_is_exact_and_latest_user_only() {
         assert!(request_is_literal_continue(&json!({
             "input": [{"role": "user", "content": "continue"}]
         })));
@@ -7534,6 +7685,14 @@ data: [DONE]\n\n";
                 {"role": "user", "content": "old prompt"},
                 {"role": "assistant", "content": "partial answer"},
                 {"role": "user", "content": "continue"}
+            ]
+        })));
+        assert!(request_is_literal_continue(&json!({
+            "input": [
+                {"role": "user", "content": "continue"},
+                {"role": "assistant", "content": "working"},
+                {"type": "function_call", "call_id": "call_1", "name": "exec_command", "arguments": "{}"},
+                {"type": "function_call_output", "call_id": "call_1", "output": "done"}
             ]
         })));
 
@@ -7550,6 +7709,7 @@ data: [DONE]\n\n";
             json!({"input": [{"type": "function_call_output", "call_id": "call_1", "output": "continue"}]}),
             json!({"input": [
                 {"role": "user", "content": "continue"},
+                {"role": "user", "content": "new request"},
                 {"type": "function_call_output", "call_id": "call_1", "output": "done"}
             ]}),
         ] {
@@ -7558,6 +7718,132 @@ data: [DONE]\n\n";
                 "unexpected match: {body}"
             );
         }
+    }
+
+    fn final_recovery_context(label: &str) -> super::TurnRecoveryContext {
+        let thread_id = format!("{label}-{}", uuid::Uuid::new_v4());
+        super::TurnRecoveryContext {
+            session_id: thread_id.clone(),
+            desktop_thread_id: thread_id,
+            recovery_id: uuid::Uuid::new_v4().to_string(),
+            observed_at_ms: chrono::Utc::now().timestamp_millis(),
+            model: "test-model".to_string(),
+            desktop_model: "test-model".to_string(),
+            provider_id: "test-provider".to_string(),
+            durable_provider_id: "test-provider".to_string(),
+            provider_fingerprint: "test-fingerprint".to_string(),
+            desktop_eligible: true,
+            max_recoveries: 2,
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn final_response_observer_recovers_logged_idle_timeout_without_keepalive_flood() {
+        use crate::proxy::codex_turn_recovery::{mark_turn_completed, recovery_reserved_for_test};
+        let context = final_recovery_context("final-idle-timeout");
+        let created = Bytes::from_static(
+            b"event: response.created\ndata: {\"type\":\"response.created\"}\n\n",
+        );
+        let first_chunk = created.clone();
+        let upstream = async_stream::stream! {
+            yield Ok(first_chunk);
+            futures::future::pending::<()>().await;
+        };
+        let logged_stream = super::create_logged_passthrough_stream(
+            upstream,
+            "test-final-boundary",
+            None,
+            crate::proxy::handler_context::StreamingTimeoutConfig {
+                first_byte_timeout: 1,
+                idle_timeout: 3,
+            },
+            None,
+        );
+        let mut response = axum::response::Response::builder()
+            .status(StatusCode::OK)
+            .header("content-type", "text/event-stream; charset=utf-8")
+            .header("x-upstream-request-id", "unchanged")
+            .body(axum::body::Body::from_stream(logged_stream))
+            .unwrap();
+        response.extensions_mut().insert(41_u32);
+        let response =
+            super::finalize_aggressive_recovery(Ok(response), Some(context.clone())).unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()["x-upstream-request-id"], "unchanged");
+        assert_eq!(response.extensions().get::<u32>(), Some(&41));
+
+        let started = tokio::time::Instant::now();
+        let mut stream = Box::pin(response.into_body().into_data_stream());
+        assert_eq!(stream.next().await.unwrap().unwrap(), created);
+        let mut keepalives = 0;
+        let mut timed_out = false;
+        // A bounded poll count also catches an expired keepalive deadline that
+        // repeatedly yields pings without ever advancing the idle deadline.
+        for _ in 0..8 {
+            match stream.next().await {
+                Some(Ok(bytes)) => {
+                    assert_eq!(bytes, Bytes::from_static(b": keep-alive\n\n"));
+                    keepalives += 1;
+                }
+                Some(Err(error)) => {
+                    assert!(error.to_string().contains("静默期超时"));
+                    timed_out = true;
+                    break;
+                }
+                None => break,
+            }
+        }
+        assert!(timed_out, "keepalives must not suppress the idle timeout");
+        assert!((2..=3).contains(&keepalives));
+        assert_eq!(started.elapsed(), std::time::Duration::from_secs(3));
+        assert!(stream.next().await.is_none());
+        assert!(recovery_reserved_for_test(&context.desktop_thread_id));
+        drop(stream);
+        // The reservation must survive the stream's normal cleanup.
+        assert!(recovery_reserved_for_test(&context.desktop_thread_id));
+        mark_turn_completed(&context.desktop_thread_id);
+    }
+
+    #[tokio::test]
+    async fn final_completed_json_preserves_response_and_clears_pending_recovery() {
+        use crate::proxy::codex_turn_recovery::recovery_reserved_for_test;
+        let context = final_recovery_context("final-json-completed");
+        super::schedule_turn_recovery(context.clone(), "test_interruption");
+        assert!(recovery_reserved_for_test(&context.desktop_thread_id));
+        let response = axum::response::Response::builder()
+            .status(StatusCode::OK)
+            .header("content-type", "application/json")
+            .header("x-upstream-request-id", "unchanged")
+            .body(axum::body::Body::from("{\"status\":\"completed\"}"))
+            .unwrap();
+        let response =
+            super::finalize_aggressive_recovery(Ok(response), Some(context.clone())).unwrap();
+        assert!(!recovery_reserved_for_test(&context.desktop_thread_id));
+        assert_eq!(response.headers()["x-upstream-request-id"], "unchanged");
+        assert_eq!(
+            response.into_body().collect().await.unwrap().to_bytes(),
+            Bytes::from_static(b"{\"status\":\"completed\"}")
+        );
+    }
+
+    #[test]
+    fn final_response_processing_errors_recover_transient_failures_only() {
+        use crate::proxy::codex_turn_recovery::{mark_turn_completed, recovery_reserved_for_test};
+        let context = final_recovery_context("final-processing-error");
+        let result = super::finalize_aggressive_recovery(
+            Err(ProxyError::Timeout("upstream read".to_string())),
+            Some(context.clone()),
+        );
+        assert!(matches!(result, Err(ProxyError::Timeout(_))));
+        assert!(recovery_reserved_for_test(&context.desktop_thread_id));
+
+        let result = super::finalize_aggressive_recovery(
+            Err(ProxyError::AuthError("expired".to_string())),
+            Some(context.clone()),
+        );
+        assert!(matches!(result, Err(ProxyError::AuthError(_))));
+        assert!(!recovery_reserved_for_test(&context.desktop_thread_id));
+        mark_turn_completed(&context.desktop_thread_id);
     }
 
     #[test]

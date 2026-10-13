@@ -291,4 +291,153 @@ describe("useCodexProviderSetSave", () => {
     );
     expect(result.current.workflow.state.phase).toBe("committed");
   });
+
+  it("saves an OpenRouter MiMo model without forcing a paid probe", async () => {
+    protocolCompatibilityMocks.restore.mockResolvedValue(null);
+    const openRouterProvider: Provider = {
+      ...provider,
+      id: "openrouter-mimo",
+      name: "OpenRouter MiMo",
+      settingsConfig: {
+        auth: { OPENAI_API_KEY: "sk-or-test" },
+        config:
+          'model_provider = "openrouter"\nmodel = "xiaomi/mimo-v2.5-pro"\n[model_providers.openrouter]\nname = "OpenRouter"\nbase_url = "https://openrouter.ai/api/v1"\nwire_api = "responses"\n',
+        modelCatalog: {
+          models: [{ model: "xiaomi/mimo-v2.5-pro" }],
+        },
+      },
+    };
+    const { result } = renderHook(() => useCodexProviderSetSave(), {
+      wrapper: createWrapper(),
+    });
+
+    await act(async () => {
+      await result.current.persistCodexProviderSet(openRouterProvider, [], {
+        allowUnverifiedSave: true,
+      });
+    });
+
+    expect(protocolCompatibilityMocks.preflight).not.toHaveBeenCalled();
+    expect(protocolCompatibilityMocks.prepare).toHaveBeenCalledWith(
+      expect.objectContaining({
+        id: "openrouter-mimo",
+        meta: expect.objectContaining({
+          apiFormat: "openai_responses",
+          codexProtocolMode: "manual",
+          codexProtocolOverrides: {
+            "xiaomi/mimo-v2.5-pro": "openai_responses",
+          },
+        }),
+      }),
+      [],
+    );
+    expect(result.current.workflow.state.phase).toBe("committed");
+  });
+
+  it("falls back to an unverified save when evidence restoration cannot compile the draft", async () => {
+    protocolCompatibilityMocks.restore.mockRejectedValue(
+      new Error("provider-specific catalog entry is invalid"),
+    );
+    const { result } = renderHook(() => useCodexProviderSetSave(), {
+      wrapper: createWrapper(),
+    });
+
+    await act(async () => {
+      await result.current.persistCodexProviderSet(provider, [], {
+        allowUnverifiedSave: true,
+      });
+    });
+
+    expect(protocolCompatibilityMocks.preflight).not.toHaveBeenCalled();
+    expect(protocolCompatibilityMocks.prepare).toHaveBeenCalledWith(
+      expect.objectContaining({
+        meta: expect.objectContaining({
+          apiFormat: "openai_responses",
+          codexProtocolMode: "manual",
+        }),
+      }),
+      [],
+    );
+    expect(protocolCompatibilityMocks.commit).toHaveBeenCalledWith(
+      expect.objectContaining({ id: provider.id }),
+      [],
+      "prepared-digest",
+      "confirm_manual",
+    );
+  });
+
+  it.each(["modelCatalog", "model_catalog"])(
+    "saves a partial %s protocol selection without testing",
+    async (catalogKey) => {
+      protocolCompatibilityMocks.restore.mockResolvedValue(null);
+      const mixedProvider: Provider = {
+        ...provider,
+        settingsConfig: {
+          auth: provider.settingsConfig.auth,
+          [catalogKey]: {
+            models: [
+              { model: "model-a" },
+              { model: " MODEL-B " },
+              { model: "model-c", api_format: "openai_chat" },
+              { id: "model-d", wireApi: "chat" },
+              { slug: "model-e", wire_api: "open_ai_chat" },
+              { model: "disabled-model", enabled: false },
+            ],
+          },
+        },
+        meta: {
+          apiFormat: "openai_responses",
+          codexProtocolOverrides: { " MODEL-A ": "openai_chat" },
+        },
+      };
+      const { result } = renderHook(() => useCodexProviderSetSave(), {
+        wrapper: createWrapper(),
+      });
+      let savePromise!: Promise<void>;
+
+      try {
+        act(() => {
+          savePromise = result.current.persistCodexProviderSet(
+            mixedProvider,
+            [],
+            { allowUnverifiedSave: true },
+          );
+          savePromise.catch(() => undefined);
+        });
+
+        await waitFor(() =>
+          expect(result.current.workflow.state.phase).toBe("committed"),
+        );
+        await act(async () => {
+          await savePromise;
+        });
+
+        expect(protocolCompatibilityMocks.preflight).not.toHaveBeenCalled();
+        expect(protocolCompatibilityMocks.commit).toHaveBeenCalledWith(
+          expect.objectContaining({
+            meta: expect.objectContaining({
+              apiFormat: "openai_responses",
+              codexProtocolMode: "manual",
+              codexProtocolOverrides: {
+                "model-a": "openai_chat",
+                "model-b": "openai_responses",
+                "model-c": "openai_chat",
+                "model-d": "openai_chat",
+                "model-e": "openai_chat",
+              },
+            }),
+          }),
+          [],
+          "prepared-digest",
+          "confirm_manual",
+        );
+        expect(mixedProvider.meta).toEqual({
+          apiFormat: "openai_responses",
+          codexProtocolOverrides: { " MODEL-A ": "openai_chat" },
+        });
+      } finally {
+        act(() => result.current.workflow.cancel());
+      }
+    },
+  );
 });

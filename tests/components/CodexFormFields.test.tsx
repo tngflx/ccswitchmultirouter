@@ -2011,7 +2011,7 @@ describe("CodexFormFields local model routing", () => {
     });
   });
 
-  it("keeps per-model selections out of the catalog and exposes receipts to the save coordinator", async () => {
+  it("keeps per-model selections out of the catalog and drops incomplete receipts", async () => {
     const records = [
       createDeepProbeRecord("gpt-5.5", "open_ai_responses"),
       createDeepProbeRecord("qwen3.6", "open_ai_chat"),
@@ -2045,11 +2045,7 @@ describe("CodexFormFields local model routing", () => {
     fireEvent.click(screen.getByRole("button", { name: "Confirm probe" }));
 
     await waitFor(() =>
-      expect(onProtocolProbeReceiptIdsChange).toHaveBeenLastCalledWith([
-        "receipt-gpt-5.5",
-        "receipt-qwen3.6",
-        "receipt-glm-4.5",
-      ]),
+      expect(onProtocolProbeReceiptIdsChange).toHaveBeenLastCalledWith([]),
     );
     expect(latestCatalog()).toEqual([
       expect.objectContaining({ model: "gpt-5.5" }),
@@ -2064,7 +2060,7 @@ describe("CodexFormFields local model routing", () => {
     ).not.toBeInTheDocument();
     expect(
       screen.getByText(
-        /some models are Partial\/Failed, so automatic saving is unavailable/,
+        /some models are Partial\/Failed, so automatic protocol selection is unavailable/,
       ),
     ).toBeInTheDocument();
     expect(onApiFormatChange).not.toHaveBeenCalled();

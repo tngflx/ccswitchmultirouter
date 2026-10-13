@@ -2,10 +2,17 @@ import { spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
   existsSync,
+  appendFileSync,
+  closeSync,
+  mkdirSync,
+  openSync,
   readFileSync,
   readdirSync,
+  renameSync,
+  rmSync,
   statSync,
   watch,
+  writeFileSync,
 } from "node:fs";
 import net from "node:net";
 import path from "node:path";
@@ -32,6 +39,15 @@ const DEV_AUTO_RESTART_WINDOW_MS = 30 * 60 * 1_000;
 const DEV_MAX_AUTO_RESTARTS = 5;
 const DEV_AUTO_RESTART_DELAY_MS = 1_000;
 const DEV_SUPERVISOR_ENV = "CC_SWITCH_DEV_SUPERVISOR";
+const DEV_WORKER_FLAG = "--ccsm-dev-worker";
+const DEV_WATCHDOG_FLAG = "--ccsm-dev-watchdog";
+const DEV_SESSION_ENV_KEYS = [
+  "TAURI_DEV_REBUILD_DELAY_MS",
+  "TAURI_DEV_NO_REBUILD",
+  "TAURI_DEV_PORT",
+  "CC_SWITCH_TEST_HOME",
+  "CC_SWITCH_DEV_WATCHDOG_ENABLED",
+];
 const BACKEND_WATCH_DIRECTORIES = [
   "src",
   "capabilities",
@@ -212,6 +228,7 @@ export function devAutoRestartDecision({
   appStarted,
   exitCode,
   signal,
+  uncleanExit = false,
   watchdogEnabled,
   nowMs = Date.now(),
   restartTimesMs = [],
@@ -219,8 +236,79 @@ export function devAutoRestartDecision({
   if (!watchdogEnabled) {
     return { restart: false, reason: "disabled" };
   }
-  if (!appStarted) {
-    return { restart: false, reason: "app-not-started" };
+  if (
+    exitCode === 0 &&
+    signal === null &&
+    !uncleanExit &&
+    appStarted !== false
+  ) {
+    return { restart: false, reason: "clean-exit" };
+  }
+  const recent = restartTimesMs.filter(
+    (timestamp) => timestamp >= nowMs - DEV_AUTO_RESTART_WINDOW_MS,
+  );
+  if (recent.length >= DEV_MAX_AUTO_RESTARTS) {
+    return { restart: false, reason: "rate-limited" };
+  }
+  return { restart: true, reason: "unexpected-exit" };
+}
+
+export function readDevRunMarker(
+  environment = process.env,
+  read = readFileSync,
+) {
+  const settingsPath = resolveDevSettingsPath(environment);
+  if (!settingsPath) return null;
+  try {
+    return JSON.parse(
+      read(
+        path.join(path.dirname(settingsPath), "logs", "app-run-marker.json"),
+        "utf8",
+      ),
+    );
+  } catch {
+    return null;
+  }
+}
+
+export function isDevCrashMarker(
+  marker,
+  sessionStartedAt,
+  repoRoot = REPO_ROOT,
+) {
+  const executable = marker?.executablePath ?? marker?.executable_path;
+  const startedAt = Date.parse(marker?.startedAt ?? marker?.started_at ?? "");
+  return (
+    Number.isInteger(marker?.pid) &&
+    marker.pid > 0 &&
+    typeof executable === "string" &&
+    isPathInside(path.join(repoRoot, "src-tauri", "target"), executable) &&
+    path.basename(executable).toLowerCase() ===
+      (process.platform === "win32" ? "cc-switch.exe" : "cc-switch") &&
+    Number.isFinite(startedAt) &&
+    startedAt >= sessionStartedAt
+  );
+}
+
+/**
+ * The process started by `pnpm dev` is the long-lived supervisor. The actual
+ * Vite/Tauri session runs in a child so a crash can restart the complete dev
+ * lifecycle (including the initial Cargo build), instead of only relaunching
+ * the already-built cc-switch executable.
+ */
+export function devWorkerRestartDecision({
+  exitCode,
+  signal,
+  expectedExit = false,
+  watchdogEnabled,
+  nowMs = Date.now(),
+  restartTimesMs = [],
+}) {
+  if (expectedExit) {
+    return { restart: false, reason: "expected-exit" };
+  }
+  if (!watchdogEnabled) {
+    return { restart: false, reason: "disabled" };
   }
   if (exitCode === 0 && signal === null) {
     return { restart: false, reason: "clean-exit" };
@@ -688,6 +776,41 @@ export function windowsFrontendDescendants(
   return descendants.sort((left, right) => right.depth - left.depth);
 }
 
+export function windowsDevWorkerDescendants(
+  processes,
+  rootPid,
+  repoRoot = REPO_ROOT,
+) {
+  const children = processes.filter(
+    (candidate) => Number(candidate.ParentProcessId) === Number(rootPid),
+  );
+  const descendants = [];
+  for (const child of children) {
+    if (String(child.Name).toLowerCase() !== "node.exe") continue;
+    const command = String(child.CommandLine ?? "")
+      .replaceAll("\\", "/")
+      .toLowerCase();
+    // The runner launches scripts relative to cwd. Match the exact script
+    // suffix, while descendants remain bound to this worker's PID.
+    if (command.includes("node_modules/@tauri-apps/cli/tauri.js")) {
+      descendants.push(
+        ...windowsDevDescendants(processes, child.ProcessId, repoRoot).map(
+          (entry) => ({ ...entry, depth: entry.depth + 1 }),
+        ),
+        { ...child, kind: "tauri", depth: 1 },
+      );
+    } else if (command.includes("node_modules/vite/bin/vite.js")) {
+      descendants.push(
+        ...windowsFrontendDescendants(processes, child.ProcessId, repoRoot).map(
+          (entry) => ({ ...entry, depth: entry.depth + 1 }),
+        ),
+        { ...child, kind: "frontend", depth: 1 },
+      );
+    }
+  }
+  return descendants.sort((left, right) => right.depth - left.depth);
+}
+
 function queryWindowsProcesses() {
   const script = [
     "Get-CimInstance Win32_Process |",
@@ -782,6 +905,12 @@ export function sameWindowsProcess(left, right) {
       path.resolve(rightExecutable).toLowerCase() &&
     leftCreationDate === rightCreationDate
   );
+}
+
+export function windowsProcessStartedAtUtc(processInfo) {
+  const value = String(processInfo?.CreationDate ?? "");
+  const epoch = /^\/Date\((\d+)(?:[+-]\d+)?\)\/$/.exec(value);
+  return new Date(epoch ? Number(epoch[1]) : value).toISOString();
 }
 
 export async function waitForWindowsProcessExit(
@@ -941,7 +1070,7 @@ export async function stopVerifiedWindowsApp(
   }
 }
 
-async function stopWindowsProcess(
+export async function stopWindowsProcess(
   child,
   selectDescendants,
   {
@@ -950,10 +1079,26 @@ async function stopWindowsProcess(
     terminate = runTaskkill,
     waitForProcessExit = waitForWindowsProcessExit,
     waitForListenersReleased = waitForWindowsListenersReleased,
+    terminateRoot = false,
+    expectedRootIdentity,
     log = console.log,
   } = {},
 ) {
-  const descendants = selectDescendants(queryProcesses(), child.pid);
+  const processes = queryProcesses();
+  const initialRoot = processes.find(
+    (candidate) => Number(candidate.ProcessId) === Number(child.pid),
+  );
+  // Recorded roots may already be gone, leaving owned descendants behind.
+  // A reused root PID belongs to a different tree and must never be selected.
+  if (
+    expectedRootIdentity &&
+    initialRoot &&
+    !sameWindowsProcess(expectedRootIdentity, initialRoot)
+  ) {
+    return;
+  }
+  const rootIdentity = expectedRootIdentity ?? initialRoot;
+  const descendants = selectDescendants(processes, child.pid);
 
   for (const descendant of descendants) {
     if (descendant.kind === "unverified-app") {
@@ -975,7 +1120,7 @@ async function stopWindowsProcess(
     if (!sameWindowsProcess(descendant, current)) {
       continue;
     }
-    if (descendant.kind === "app") {
+    if (descendant.kind === "app" || descendant.kind === "frontend") {
       await stopVerifiedWindowsApp(descendant, {
         queryProcesses,
         queryListeners,
@@ -999,7 +1144,18 @@ async function stopWindowsProcess(
     }
   }
 
-  if (child.exitCode === null && child.signalCode === null) {
+  if (terminateRoot) {
+    const currentRoot = queryProcesses().find(
+      (candidate) => Number(candidate.ProcessId) === Number(child.pid),
+    );
+    // Descendant/listener cleanup can await for a minute. Recheck the original
+    // identity immediately before taskkill so a recycled PID cannot be killed.
+    if (sameWindowsProcess(rootIdentity, currentRoot)) {
+      const rootResult = terminate(child.pid, true, true);
+      if (rootResult?.error) throw rootResult.error;
+      await waitForProcessExit(currentRoot, queryProcesses);
+    }
+  } else if (child.exitCode === null && child.signalCode === null) {
     try {
       child.kill();
     } catch (error) {
@@ -1131,8 +1287,507 @@ export function runCargoTargetMaintenance({
   }
 }
 
-async function run() {
-  const args = normalizeCliArgs(process.argv.slice(2));
+export async function superviseDevSessions({
+  spawnSession,
+  cleanSession,
+  readEnabled = readDevWatchdogEnabled,
+  isStopping = () => false,
+  waitToRestart = () =>
+    new Promise((resolve) => setTimeout(resolve, DEV_AUTO_RESTART_DELAY_MS)),
+  now = Date.now,
+  onEvent = () => {},
+}) {
+  const restartTimesMs = [];
+  while (!isStopping()) {
+    const child = spawnSession();
+    const outcome = await new Promise((resolve) => {
+      const onExit = (exitCode, signal) => {
+        child.off("error", onError);
+        resolve({ exitCode, signal });
+      };
+      const onError = (error) => {
+        child.off("exit", onExit);
+        resolve({ exitCode: 1, signal: null, error });
+      };
+      child.once("exit", onExit);
+      child.once("error", onError);
+    });
+    // Cleanup finishes before a new worker starts; orphaned Cargo, cc-switch
+    // and Vite processes must not retain listeners or the debug executable.
+    await cleanSession(child);
+    const decision = devWorkerRestartDecision({
+      ...outcome,
+      expectedExit: isStopping(),
+      watchdogEnabled: readEnabled(),
+      nowMs: now(),
+      restartTimesMs,
+    });
+    onEvent(decision, outcome);
+    if (!decision.restart) return outcome.exitCode ?? 1;
+    restartTimesMs.push(now());
+    await waitToRestart();
+    if (!readEnabled()) return outcome.exitCode ?? 1;
+  }
+  return 0;
+}
+
+export function devWorkerCommand(args, environment = process.env) {
+  return {
+    executable: process.execPath,
+    args: [fileURLToPath(import.meta.url), DEV_WORKER_FLAG, ...args],
+    options: {
+      cwd: REPO_ROOT,
+      env: { ...environment, [DEV_SUPERVISOR_ENV]: "1" },
+      stdio: ["inherit", "inherit", "inherit", "ipc"],
+      detached: process.platform !== "win32",
+      windowsHide: true,
+    },
+  };
+}
+
+function devSessionPath() {
+  const settingsPath = resolveDevSettingsPath();
+  return settingsPath
+    ? path.join(path.dirname(settingsPath), "logs", "dev-session.json")
+    : null;
+}
+
+export function devSessionEnvironment(environment) {
+  return Object.fromEntries(
+    DEV_SESSION_ENV_KEYS.filter(
+      (key) => typeof environment?.[key] === "string",
+    ).map((key) => [key, environment[key]]),
+  );
+}
+
+function writeDevWatchdogEvent(event, detail) {
+  const markerPath = devSessionPath();
+  if (!markerPath) return;
+  try {
+    appendFileSync(
+      path.join(path.dirname(markerPath), "dev-watchdog.jsonl"),
+      `${JSON.stringify({ timestamp: new Date().toISOString(), event, detail })}\n`,
+    );
+  } catch {}
+}
+
+function devSupervisorIsAlive(session, processes) {
+  if (!Number.isInteger(session?.supervisorPid) || session.supervisorPid < 1)
+    return false;
+  if (process.platform === "win32") {
+    const identity = processes.find(
+      (candidate) => Number(candidate.ProcessId) === session.supervisorPid,
+    );
+    return Boolean(
+      identity &&
+      path.resolve(identity.ExecutablePath).toLowerCase() ===
+        path.resolve(session.supervisorExecutablePath).toLowerCase() &&
+      windowsProcessStartedAtUtc(identity) === session.supervisorStartedAtUtc,
+    );
+  }
+  try {
+    process.kill(session.supervisorPid, 0);
+    return true;
+  } catch (error) {
+    if (error.code !== "ESRCH") throw error;
+    return false;
+  }
+}
+
+async function runDetachedDevWatchdog(supervisorPid) {
+  const markerPath = devSessionPath();
+  if (!markerPath) return;
+  while (true) {
+    await new Promise((resolve) => setTimeout(resolve, 2_000));
+    try {
+      let session;
+      try {
+        session = JSON.parse(readFileSync(markerPath, "utf8"));
+      } catch (error) {
+        if (error.code === "ENOENT") return;
+        throw error;
+      }
+      if (
+        session.supervisorPid !== supervisorPid ||
+        session.state !== "running" ||
+        session.repoRoot !== REPO_ROOT ||
+        session.scriptPath !== fileURLToPath(import.meta.url)
+      )
+        return;
+      const alive = devSupervisorIsAlive(
+        session,
+        process.platform === "win32" ? queryWindowsProcesses() : [],
+      );
+      if (alive) continue;
+      const nowMs = Date.now();
+      const decision = devWorkerRestartDecision({
+        exitCode: 1,
+        signal: null,
+        watchdogEnabled: readDevWatchdogEnabled(),
+        nowMs,
+        restartTimesMs: session.supervisorRestartTimesMs ?? [],
+      });
+      if (!decision.restart) return;
+      session.supervisorRestartTimesMs = [
+        ...(session.supervisorRestartTimesMs ?? []),
+        nowMs,
+      ].filter((timestamp) => timestamp >= nowMs - DEV_AUTO_RESTART_WINDOW_MS);
+      const temporary = `${markerPath}.${process.pid}.tmp`;
+      writeFileSync(temporary, JSON.stringify(session));
+      renameSync(temporary, markerPath);
+      // Relaunch the entry point of pnpm dev, not the compiled application.
+      const replacement = spawn(
+        process.execPath,
+        [fileURLToPath(import.meta.url), ...session.args],
+        {
+          cwd: REPO_ROOT,
+          env: {
+            ...process.env,
+            ...devSessionEnvironment(session.environment),
+          },
+          stdio: "ignore",
+          detached: true,
+          windowsHide: true,
+        },
+      );
+      await new Promise((resolve, reject) => {
+        replacement.once("spawn", resolve);
+        replacement.once("error", reject);
+      });
+      writeDevWatchdogEvent("dev-supervisor-restarted", {
+        oldPid: supervisorPid,
+        newPid: replacement.pid,
+      });
+      replacement.unref();
+      return;
+    } catch (error) {
+      writeDevWatchdogEvent("dev-watchdog-iteration-failed", {
+        error: error.message,
+      });
+    }
+  }
+}
+
+function sendDevRoot(role, child) {
+  if (process.connected)
+    process.send({ type: "dev-root", role, pid: child.pid });
+}
+
+async function cleanRecordedDevRoots(roots) {
+  for (const root of roots) {
+    const select =
+      root.role === "tauri"
+        ? windowsDevDescendants
+        : windowsFrontendDescendants;
+    if (process.platform === "win32") {
+      const current = queryWindowsProcesses().find(
+        (candidate) => Number(candidate.ProcessId) === root.pid,
+      );
+      if (current && !sameWindowsProcess(root.identity, current)) continue;
+      const child = { pid: root.pid, exitCode: 0, signalCode: null };
+      await stopWindowsProcess(
+        child,
+        (processes, pid) => [
+          ...select(processes, pid),
+          ...(current
+            ? [
+                {
+                  ...current,
+                  depth: 0,
+                  kind: root.role === "vite" ? "frontend" : "tauri",
+                },
+              ]
+            : []),
+        ],
+        { terminateRoot: true, expectedRootIdentity: root.identity },
+      );
+    } else {
+      try {
+        process.kill(-root.pid, "SIGTERM");
+      } catch (error) {
+        if (error.code !== "ESRCH") throw error;
+      }
+    }
+  }
+}
+
+async function cleanRecordedDevWorker(session) {
+  if (!Number.isInteger(session?.workerPid)) return;
+  if (process.platform !== "win32") {
+    try {
+      process.kill(-session.workerPid, "SIGTERM");
+    } catch (error) {
+      if (error.code !== "ESRCH") throw error;
+    }
+    return;
+  }
+  const current = queryWindowsProcesses().find(
+    (candidate) => Number(candidate.ProcessId) === session.workerPid,
+  );
+  if (!current) return;
+  const command = String(current.CommandLine ?? "");
+  const matchesIdentity = session.workerIdentity
+    ? sameWindowsProcess(session.workerIdentity, current)
+    : String(current.Name).toLowerCase() === "node.exe" &&
+      command.includes(fileURLToPath(import.meta.url)) &&
+      command.includes(DEV_WORKER_FLAG) &&
+      Date.parse(windowsProcessStartedAtUtc(current)) >=
+        Date.parse(session.startedAtUtc);
+  if (!matchesIdentity) return;
+  await stopWindowsProcess(
+    { pid: session.workerPid, exitCode: 0, signalCode: null },
+    windowsDevWorkerDescendants,
+    { terminateRoot: true, expectedRootIdentity: current },
+  );
+}
+
+async function runDevSupervisor(args) {
+  // Reject bad options once, before the recovery loop can retry them.
+  parseDelayMs(args);
+  parseNoRebuild(args);
+  parsePort();
+  const markerPath = devSessionPath();
+  let previous;
+  if (markerPath) {
+    try {
+      previous = JSON.parse(readFileSync(markerPath, "utf8"));
+    } catch {}
+  }
+  let supervisorIdentity;
+  const processes = process.platform === "win32" ? queryWindowsProcesses() : [];
+  if (devSupervisorIsAlive(previous, processes)) {
+    throw new Error(
+      `An existing pnpm dev supervisor (PID ${previous.supervisorPid}) owns this configuration.`,
+    );
+  }
+  if (process.platform === "win32") {
+    supervisorIdentity = processes.find(
+      (candidate) => Number(candidate.ProcessId) === process.pid,
+    );
+  }
+  const ownsPrevious =
+    previous?.repoRoot === REPO_ROOT &&
+    previous?.scriptPath === fileURLToPath(import.meta.url);
+  let worker;
+  let workerIdentity;
+  let stopping = false;
+  let roots = new Map(
+    (ownsPrevious ? (previous.roots ?? []) : []).map((root) => [
+      root.role,
+      root,
+    ]),
+  );
+  let restartTimer;
+  let finishRestartWait;
+  const session = {
+    schemaVersion: 1,
+    supervisorPid: process.pid,
+    supervisorExecutablePath: process.execPath,
+    supervisorStartedAtUtc: supervisorIdentity
+      ? windowsProcessStartedAtUtc(supervisorIdentity)
+      : new Date(Date.now() - process.uptime() * 1000).toISOString(),
+    repoRoot: REPO_ROOT,
+    scriptPath: fileURLToPath(import.meta.url),
+    args,
+    environment: devSessionEnvironment(process.env),
+    startedAtUtc: new Date().toISOString(),
+    supervisorRestartTimesMs: previous?.supervisorRestartTimesMs ?? [],
+    state: "running",
+  };
+  const lockPath = markerPath ? `${markerPath}.lock` : null;
+  if (lockPath) {
+    mkdirSync(path.dirname(lockPath), { recursive: true });
+    let lock;
+    try {
+      lock = openSync(lockPath, "wx");
+    } catch (error) {
+      if (error.code !== "EEXIST") throw error;
+      let owner;
+      try {
+        owner = JSON.parse(readFileSync(lockPath, "utf8"));
+      } catch {}
+      if (
+        devSupervisorIsAlive(
+          owner,
+          process.platform === "win32" ? queryWindowsProcesses() : [],
+        ) ||
+        (!owner && Date.now() - statSync(lockPath).mtimeMs < 5_000)
+      )
+        throw new Error("Another pnpm dev supervisor is starting or running.");
+      rmSync(lockPath);
+      lock = openSync(lockPath, "wx");
+    }
+    try {
+      writeFileSync(lock, JSON.stringify(session));
+    } finally {
+      closeSync(lock);
+    }
+  }
+  const saveSession = () => {
+    if (!markerPath) return;
+    mkdirSync(path.dirname(markerPath), { recursive: true });
+    const temporary = `${markerPath}.${process.pid}.tmp`;
+    writeFileSync(
+      temporary,
+      JSON.stringify({
+        ...session,
+        workerPid: worker?.pid,
+        workerIdentity,
+        roots: [...roots.values()],
+      }),
+    );
+    renameSync(temporary, markerPath);
+  };
+  const stop = (exitCode) => {
+    if (stopping) return;
+    stopping = true;
+    process.exitCode = exitCode;
+    session.state = "stopping";
+    saveSession();
+    clearTimeout(restartTimer);
+    finishRestartWait?.();
+    if (worker?.connected) worker.send({ type: "dev-shutdown", exitCode });
+  };
+  const onInterrupt = () => stop(130);
+  const onTerminate = () => stop(143);
+  process.once("SIGINT", onInterrupt);
+  process.once("SIGTERM", onTerminate);
+  saveSession();
+  const detachedWatchdog = spawn(
+    process.execPath,
+    [fileURLToPath(import.meta.url), DEV_WATCHDOG_FLAG, String(process.pid)],
+    {
+      cwd: REPO_ROOT,
+      env: process.env,
+      stdio: "ignore",
+      detached: true,
+      windowsHide: true,
+    },
+  );
+  detachedWatchdog.unref();
+  detachedWatchdog.once("error", (error) =>
+    writeDevWatchdogEvent("dev-watchdog-spawn-failed", {
+      error: error.message,
+    }),
+  );
+  let completed = false;
+  try {
+    // Claim recovery before cleanup, which can wait up to a minute for a
+    // listener to release. The product guardian must see the live owner.
+    if (ownsPrevious) {
+      await cleanRecordedDevWorker(previous);
+      await cleanRecordedDevRoots(previous.roots ?? []);
+    }
+    const code = await superviseDevSessions({
+      spawnSession() {
+        roots = new Map();
+        const command = devWorkerCommand(args);
+        worker = spawn(command.executable, command.args, command.options);
+        workerIdentity = null;
+        saveSession();
+        if (process.platform === "win32" && worker.pid) {
+          workerIdentity = queryWindowsProcesses().find(
+            (candidate) => Number(candidate.ProcessId) === worker.pid,
+          );
+          saveSession();
+        }
+        worker.on("message", (message) => {
+          if (
+            message?.type !== "dev-root" ||
+            !["tauri", "vite"].includes(message.role) ||
+            !Number.isInteger(message.pid)
+          )
+            return;
+          const identity =
+            process.platform === "win32"
+              ? queryWindowsProcesses().find(
+                  (candidate) => Number(candidate.ProcessId) === message.pid,
+                )
+              : null;
+          if (process.platform === "win32" && !identity) return;
+          roots.set(message.role, {
+            pid: message.pid,
+            role: message.role,
+            identity,
+          });
+          saveSession();
+        });
+        return worker;
+      },
+      async cleanSession(child) {
+        if (!child.pid) return;
+        if (process.platform === "win32") {
+          await stopProcessTree(child, windowsDevWorkerDescendants, {
+            expectedRootIdentity: workerIdentity,
+          });
+        } else {
+          try {
+            process.kill(-child.pid, "SIGTERM");
+          } catch (error) {
+            if (error.code !== "ESRCH") throw error;
+          }
+        }
+        await cleanRecordedDevRoots([...roots.values()]);
+      },
+      isStopping: () => stopping,
+      waitToRestart: () =>
+        new Promise((resolve) => {
+          finishRestartWait = resolve;
+          restartTimer = setTimeout(resolve, DEV_AUTO_RESTART_DELAY_MS);
+        }),
+      onEvent(decision, outcome) {
+        if (decision.restart)
+          console.log(
+            `[dev watchdog] pnpm dev session exited (${outcome.signal ?? `code ${outcome.exitCode}`}); restarting the complete Vite + Cargo/Tauri dev build.`,
+          );
+        else if (decision.reason === "rate-limited")
+          console.error(
+            `[dev watchdog] Restart limit reached (${DEV_MAX_AUTO_RESTARTS} in 30 minutes).`,
+          );
+      },
+    });
+    if (!stopping) process.exitCode = code;
+    completed = true;
+  } finally {
+    process.off("SIGINT", onInterrupt);
+    process.off("SIGTERM", onTerminate);
+    clearTimeout(restartTimer);
+    if (markerPath && completed) {
+      let recorded;
+      try {
+        recorded = JSON.parse(readFileSync(markerPath, "utf8"));
+      } catch {}
+      if (
+        recorded?.supervisorPid === process.pid &&
+        recorded?.supervisorStartedAtUtc === session.supervisorStartedAtUtc
+      )
+        rmSync(markerPath, { force: true });
+      let owner;
+      try {
+        owner = JSON.parse(readFileSync(lockPath, "utf8"));
+      } catch {}
+      if (
+        owner?.supervisorPid === process.pid &&
+        owner?.supervisorStartedAtUtc === session.supervisorStartedAtUtc
+      )
+        rmSync(lockPath, { force: true });
+    }
+  }
+}
+
+async function runDevWorker(args) {
+  const hadParent = typeof process.send === "function";
+  let parentLost = hadParent && !process.connected;
+  let requestedExitCode;
+  if (hadParent) {
+    process.once("disconnect", () => {
+      parentLost = true;
+    });
+    process.on("message", (message) => {
+      if (message?.type === "dev-shutdown")
+        requestedExitCode = message.exitCode ?? 0;
+    });
+  }
   if (args.includes("--help") || args.includes("-h")) {
     console.log(`Usage: pnpm dev:delayed -- [--delay milliseconds] [--no-rebuild]
 
@@ -1141,7 +1796,7 @@ backend files have remained unchanged for the configured quiet period.
 
 Options:
   -d, --delay <ms>  Quiet period before a backend rebuild (default: 14400000 / 4 hours)
-  --no-rebuild      Detect and log backend edits, but never rebuild/restart Tauri
+  --no-rebuild      Detect backend edits without rebuilding; crash recovery remains enabled
 
 Environment:
   TAURI_DEV_REBUILD_DELAY_MS  Same setting as --delay; CLI option takes priority
@@ -1162,6 +1817,17 @@ Use "pnpm dev:immediate" for the same verified lifecycle with no quiet delay.`);
     );
   }
   runCargoTargetMaintenance();
+  // Drain parent-disconnect/shutdown events after synchronous Cargo preflight.
+  await new Promise((resolve) => setImmediate(resolve));
+  if (
+    parentLost ||
+    (hadParent && !process.connected) ||
+    requestedExitCode !== undefined
+  ) {
+    process.exitCode = requestedExitCode ?? 1;
+    if (process.connected) process.disconnect();
+    return;
+  }
 
   console.log(
     `[dev] Frontend HMR is immediate; backend ${noRebuild ? "rebuilds are disabled (--no-rebuild)" : `rebuilds after ${delayMs}ms without changes`}.`,
@@ -1173,12 +1839,11 @@ Use "pnpm dev:immediate" for the same verified lifecycle with no quiet delay.`);
     String(frontendPort),
     "--strictPort",
   ]);
+  sendDevRoot("vite", vite);
   let tauri;
   let backendWatchers = [];
   let shuttingDown = false;
   let shutdownPromise;
-  let devRestartTimer;
-  const devRestartTimesMs = [];
   const expectedTauriExits = createExpectedExitRegistry();
   const backendContentTracker = createBackendContentTracker();
   let lastBackendEditAt;
@@ -1324,6 +1989,7 @@ Use "pnpm dev:immediate" for the same verified lifecycle with no quiet delay.`);
   const startTauri = () => {
     let outputTail = "";
     let appStarted = false;
+    const sessionStartedAt = Date.now();
     const child = startProcess(
       process.execPath,
       [
@@ -1351,6 +2017,7 @@ Use "pnpm dev:immediate" for the same verified lifecycle with no quiet delay.`);
       },
     );
     tauri = child;
+    sendDevRoot("tauri", child);
     child.once("error", (error) => {
       if (!shuttingDown && tauri === child) {
         void shutdownWithError(
@@ -1384,51 +2051,27 @@ Use "pnpm dev:immediate" for the same verified lifecycle with no quiet delay.`);
         return;
       }
       if (!shuttingDown && tauri === child) {
-        const watchdogEnabled = readDevWatchdogEnabled();
-        const decision = devAutoRestartDecision({
+        const uncleanExit = isDevCrashMarker(
+          readDevRunMarker(),
+          sessionStartedAt,
+        );
+        const outcome = devAutoRestartDecision({
           appStarted,
           exitCode: code,
           signal,
-          watchdogEnabled,
-          restartTimesMs: devRestartTimesMs,
+          uncleanExit,
+          // The outer supervisor reads the persisted toggle at the restart
+          // boundary. Here we only classify the worker's exit as clean/crashed.
+          watchdogEnabled: true,
         });
-        if (decision.restart) {
-          const now = Date.now();
-          devRestartTimesMs.push(now);
-          while (
-            devRestartTimesMs.length > 0 &&
-            devRestartTimesMs[0] < now - DEV_AUTO_RESTART_WINDOW_MS
-          ) {
-            devRestartTimesMs.shift();
-          }
-          tauri = undefined;
-          console.log(
-            `[dev] Tauri backend exited unexpectedly (${signal ?? `code ${code}`}); restarting the existing pnpm dev session (${devRestartTimesMs.length}/${DEV_MAX_AUTO_RESTARTS}).`,
-          );
-          devRestartTimer = setTimeout(() => {
-            devRestartTimer = undefined;
-            if (!shuttingDown && !tauri) {
-              startTauri();
-            }
-          }, DEV_AUTO_RESTART_DELAY_MS);
-          return;
-        }
-        if (decision.reason === "rate-limited") {
-          console.error(
-            `[dev] Tauri backend restart limit reached (${DEV_MAX_AUTO_RESTARTS} in ${DEV_AUTO_RESTART_WINDOW_MS / 60_000} minutes); leaving the backend stopped until the next edit.`,
-          );
-        }
-        if (code === 0 && signal === null) {
+        if (outcome.reason === "clean-exit") {
           void shutdown(0);
           return;
         }
-        if (rebuildGate.markFailed()) {
-          console.log(
-            "[dev] Build failed after an edit arrived; one follow-up rebuild remains queued.",
-          );
-        }
-        console.log(
-          `[dev] Tauri backend exited (${signal ?? `code ${code}`}); waiting for the next backend edit.`,
+        void shutdownWithError(
+          new Error(
+            `Tauri backend exited unexpectedly (${signal ?? `code ${code}`}${uncleanExit ? "; crash marker remains" : ""}); handing recovery to the pnpm dev watchdog.`,
+          ),
         );
       }
     });
@@ -1481,10 +2124,6 @@ Use "pnpm dev:immediate" for the same verified lifecycle with no quiet delay.`);
     shuttingDown = true;
     rebuildGate.cancel();
     closeBackendWatchers();
-    if (devRestartTimer) {
-      clearTimeout(devRestartTimer);
-      devRestartTimer = undefined;
-    }
     process.exitCode = exitCode;
     shutdownPromise = Promise.allSettled([
       stopProcessTree(tauri, windowsDevDescendants),
@@ -1497,6 +2136,7 @@ Use "pnpm dev:immediate" for the same verified lifecycle with no quiet delay.`);
         process.exitCode = 1;
         console.error(`[dev] Shutdown failed: ${failures.join("; ")}`);
       }
+      if (process.connected) process.disconnect();
     });
     return shutdownPromise;
   };
@@ -1508,6 +2148,13 @@ Use "pnpm dev:immediate" for the same verified lifecycle with no quiet delay.`);
 
   process.once("SIGINT", () => void shutdown(130));
   process.once("SIGTERM", () => void shutdown(143));
+  if (process.connected) {
+    process.on("message", (message) => {
+      if (message?.type === "dev-shutdown")
+        void shutdown(message.exitCode ?? 0);
+    });
+    process.once("disconnect", () => void shutdown(1));
+  }
   vite.once("error", (error) => {
     if (!shuttingDown) {
       void shutdownWithError(
@@ -1538,7 +2185,17 @@ const isMainModule =
   process.argv[1] &&
   pathToFileURL(path.resolve(process.argv[1])).href === import.meta.url;
 if (isMainModule) {
-  run().catch((error) => {
+  const cliArgs = normalizeCliArgs(process.argv.slice(2));
+  const isWorker = cliArgs[0] === DEV_WORKER_FLAG;
+  const isDetachedWatchdog = cliArgs[0] === DEV_WATCHDOG_FLAG;
+  const task = isDetachedWatchdog
+    ? runDetachedDevWatchdog(Number(cliArgs[1]))
+    : isWorker
+      ? runDevWorker(cliArgs.slice(1))
+      : cliArgs.includes("--help") || cliArgs.includes("-h")
+        ? runDevWorker(cliArgs)
+        : runDevSupervisor(cliArgs);
+  task.catch((error) => {
     console.error(`[dev] ${error.message}`);
     process.exitCode = 1;
   });

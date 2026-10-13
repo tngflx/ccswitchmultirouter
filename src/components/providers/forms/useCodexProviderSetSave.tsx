@@ -79,9 +79,21 @@ export function useCodexProviderSetSave() {
         reusableReceiptIds.length === 0 &&
         adapter.requiresProbe(provider, reusableReceiptIds)
       ) {
-        const restored = await restoreCodexProviderProtocolEvidence(provider);
-        if (restored?.receiptIds.length) {
-          reusableReceiptIds = restored.receiptIds;
+        try {
+          const restored = await restoreCodexProviderProtocolEvidence(provider);
+          if (restored?.receiptIds.length) {
+            reusableReceiptIds = restored.receiptIds;
+          }
+        } catch (error) {
+          // Evidence restoration is an optimization for automatic saves. A
+          // malformed or provider-specific catalog entry must not prevent an
+          // explicitly allowed unverified save from using the declared wire
+          // protocol. The backend still validates the manual transaction.
+          if (options.allowUnverifiedSave !== true) throw error;
+          console.warn(
+            "Failed to restore Codex protocol evidence; continuing with unverified save",
+            error,
+          );
         }
       }
       const saveUnverified =

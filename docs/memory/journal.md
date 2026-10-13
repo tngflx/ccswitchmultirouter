@@ -1,3 +1,76 @@
+## 2026-10-13 - Development and production recovery have separate owners
+
+What happened: the user required development crashes to restart the complete
+`pnpm dev` build, production crashes to relaunch the installed executable, and
+interrupted Codex Desktop work to resume through the existing `continue` policy.
+
+Root cause: the installed guardian could interpret development markers; release
+Rust code trusted the dev supervisor environment variable. Stream continuation
+was disabled by the user's Safe mode and missed provider-selection errors,
+pre-stream failures, outer idle timeouts, and app crashes. The Desktop bridge
+also submitted to whichever composer was visible, and current Desktop builds
+had moved the real request client into the app-shared scoped registry.
+
+What we did: gated Node recovery behind explicit PowerShell DevelopmentMode
+and Rust debug builds, kept installed app monitoring in production, preserved
+local production artifacts under `output/production`, and documented manual
+build/release commands. Added exact-thread continuation, a bounded crash ledger,
+provider identity validation, latest-user continuation budget preservation,
+final response observation, and cancellation/newer-request ownership checks.
+Added descriptor-based local client discovery, scheduler replacement, stale
+client read timeouts, and a total 60-second recovery readiness deadline.
+Fixed a keepalive deadline that could repeatedly emit pings instead of waiting
+for the idle timeout. Current user settings now select Aggressive with three
+continuation attempts; other installations retain the Safe default.
+
+Evidence: Node runner/cache tests 70/70, Windows PowerShell guardian/build/release
+tests 92/92, initial recovery/handler tests 104/104, latest Desktop/recovery tests
+88/88, transparent stream retry tests 51/51, and non-test Cargo checking passed.
+TypeScript, Rust formatting, scoped Prettier, and diff checks passed.
+The actual watchdog function was also
+compiled with debug assertions enabled and disabled to verify the release gate.
+A final rebuilt development app (PID 49108, compiled 21:38:01 +08:00) returned
+health HTTP 200. Live read-only Desktop validation confirmed scheduler 4,
+one real local client patched at version 10, and exact native thread/read with
+turn metadata available. Continuation submission was tested with simulated
+clients; no real continue was sent for validation.
+No production installer build or publication was run.
+
+What NOT to do again: infer development mode from a stale file in an installed
+guardian, erase a newer request's recovery state from an older stream, reset the
+continuation budget on a tool result, submit into an unrelated chat, or claim
+Desktop recovery works based solely on mocked client discovery.
+
+## 2026-10-13 - Dev watchdog recovers the complete pnpm dev session
+
+What happened: improved the existing root dev runner so application, worker,
+and launcher crashes recover through the full Vite and Cargo/Tauri lifecycle.
+
+Root cause: the previous Node wrapper only restarted its Tauri child, while
+`CC_SWITCH_DEV_SUPERVISOR=1` disabled Rust recovery. Wrapper death therefore
+had no survivor. The PowerShell guardian also selected the installed executable
+without a dev-session ownership contract.
+
+What we did: retained the four-hour edit gate and guarded target maintenance;
+added a supervised dev worker, a detached launcher watchdog, process identity
+and listener cleanup, atomic session ownership, persisted restart options, and
+dev-aware guardian recovery. Clean exits and the watchdog toggle remain honored.
+Crash recovery runs the normal Cargo/Tauri build immediately; it does not wait
+for the edit quiet period. Launcher events live in `logs/dev-watchdog.jsonl`.
+
+Evidence: runner tests 61/61 and Cargo maintenance tests 7/7 passed. Windows
+PowerShell watchdog tests 20/20 and adjacent guardian tests 19/19 passed.
+Syntax, scoped Prettier, and diff checks passed. Real Windows app-process death
+changed worker 32176 to 21148, reran Cargo/Tauri, and restored health HTTP 200.
+Launcher death changed supervisor 35848 to 42816; the final-source recovery
+changed 42816 to 64060 with worker 54048 and dev app 65440, again HTTP 200.
+The new runner is active. Unrelated provider-form work was preserved; no commit
+or publication was made. Other operating systems were not exercised live.
+
+What NOT to do again: treat Tauri-child relaunch as supervision of the complete
+dev command, recover a dev-owned session with the installed binary, or start a
+new worker before the previous session's processes and listeners are released.
+
 ## 2026-10-06 - Refork parity and English-first UI continuation committed
 
 What happened: committed the remaining non-protected refork adaptation batch as

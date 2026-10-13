@@ -129,6 +129,7 @@ pub fn record_startup() -> Option<PreviousRunReport> {
 ///
 /// 退出原因由调用方传入，便于区分托盘退出、窗口关闭、设置重启和更新安装等不同路径。
 pub fn record_clean_exit(reason: &str, exit_code: i32) {
+    crate::proxy::codex_turn_recovery::clear_persisted_recovery();
     append_event("clean_exit", reason, Some(exit_code), None);
     if let Err(err) = remove_run_marker_if_owned() {
         log::warn!("清理应用运行 marker 失败: {err}");

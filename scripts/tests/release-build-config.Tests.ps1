@@ -684,7 +684,8 @@ Remove-LocalReleaseCargoTargetDir -RepoRoot '$($fixtureRoot.Replace("'", "''"))'
             -RepoRoot $repoRoot `
             -GitCommonDir $gitCommonDir
 
-        $releaseRoot | Should Be 'C:\workspace\最新版ccswitchmulti'
+        $expectedReleaseRoot = 'C:\workspace\' + (@([char]0x6700, [char]0x65B0, [char]0x7248, 'ccswitchmulti') -join '')
+        $releaseRoot | Should Be $expectedReleaseRoot
     }
 
     It "keeps the default export beside a normal main checkout" {
@@ -694,7 +695,8 @@ Remove-LocalReleaseCargoTargetDir -RepoRoot '$($fixtureRoot.Replace("'", "''"))'
             -RepoRoot 'C:\workspace\cc-switch' `
             -GitCommonDir 'C:\workspace\cc-switch\.git'
 
-        $releaseRoot | Should Be 'C:\workspace\最新版ccswitchmulti'
+        $expectedReleaseRoot = 'C:\workspace\' + (@([char]0x6700, [char]0x65B0, [char]0x7248, 'ccswitchmulti') -join '')
+        $releaseRoot | Should Be $expectedReleaseRoot
     }
 
     It "honors an explicit release root without consulting Git metadata" {

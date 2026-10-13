@@ -15,6 +15,7 @@ param(
     [switch]$RestartOnCleanExit,
     [int]$MaxCycles = 0,
     [switch]$NoRestart,
+    [switch]$DevelopmentMode,
     [switch]$PlanOnly
 )
 
@@ -88,7 +89,15 @@ function Test-CcsmUpgradeProcessActive {
 function Test-CcsmGuardianMaintenance {
     $leaseActive = Test-CcsmMaintenanceLease -MarkerPath $MaintenanceMarker -NowUtc ([datetime]::UtcNow) `
         -GetProcessIdentity { param($ProcessId) Get-CcsmGuardianProcessIdentity -ProcessId $ProcessId }
-    return $leaseActive -or (Test-CcsmUpgradeProcessActive)
+    if ($DevelopmentMode) {
+        $devSession = Get-CcsmDevSessionRecoveryPlan -ConfigPath $ConfigPath `
+            -GetProcessIdentity { param($ProcessId) Get-CcsmGuardianProcessIdentity -ProcessId $ProcessId }
+        return $leaseActive -or (Test-CcsmUpgradeProcessActive) -or
+            -not (Test-CcsmGuardianWatchdogEnabled -ConfigPath $ConfigPath) -or
+            $devSession.Active -or $devSession.State -eq "stopping"
+    }
+    return $leaseActive -or (Test-CcsmUpgradeProcessActive) -or
+        -not (Test-CcsmGuardianWatchdogEnabled -ConfigPath $ConfigPath)
 }
 
 function Stop-CcsmGuardianVerifiedProcess {
@@ -128,6 +137,90 @@ function Wait-CcsmGuardianReady {
     return $false
 }
 
+function Invoke-CcsmGuardianRecoveryPolicy {
+    param(
+        [Parameter(Mandatory = $true)][scriptblock]$IsMaintenance,
+        [Parameter(Mandatory = $true)][scriptblock]$WriteEvent,
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][System.Collections.Generic.List[datetime]]$RestartTimesUtc
+    )
+
+    if (-not (Test-CcsmGuardianWatchdogEnabled -ConfigPath $ConfigPath)) {
+        Write-CcsmGuardianEvent -Level "info" -Event "restart-skipped-watchdog-disabled" -Detail @{ Port = $Port }
+        return
+    }
+    if ($NoRestart) {
+        Write-CcsmGuardianEvent -Level "warning" -Event "restart-suppressed" -Detail @{ Port = $Port }
+        return
+    }
+    $devSession = $null
+    if ($DevelopmentMode) {
+        $devSession = Get-CcsmDevSessionRecoveryPlan -ConfigPath $ConfigPath `
+            -GetProcessIdentity { param($ProcessId) Get-CcsmGuardianProcessIdentity -ProcessId $ProcessId }
+        if ($devSession.PreventInstalledFallback -and -not $devSession.Recoverable) {
+            Invoke-CcsmDevSessionRecovery -Plan $devSession -IsMaintenance $IsMaintenance `
+                -GetListenerOwner { Get-CcsmGuardianListenerOwner } `
+                -GetProcessIdentity { param($ProcessId) Get-CcsmGuardianProcessIdentity -ProcessId $ProcessId } `
+                -StartDevSession { throw "an inactive dev recovery plan must not start a process" } `
+                -WriteEvent $WriteEvent
+            return
+        }
+    }
+    # 只重启“异常死亡”的实例：应用正常退出（含托盘退出）时会自己移除运行标记，
+    # 此时不重启，避免用户主动退出后被守护反复拉起。
+    if ((-not $DevelopmentMode -or -not $devSession.Recoverable) -and -not $RestartOnCleanExit) {
+        $uncleanExit = Test-CcsmGuardianUncleanExit -ConfigPath $ConfigPath -GetProcessIdentity {
+            param($ProcessId) Get-CcsmGuardianProcessIdentity -ProcessId $ProcessId
+        }
+        if (-not $uncleanExit) {
+            Write-CcsmGuardianEvent -Level "info" -Event "restart-skipped-clean-exit" -Detail @{ Port = $Port }
+            return
+        }
+    }
+    $budgetOk = Test-CcsmGuardianRestartBudget -RestartTimesUtc $RestartTimesUtc.ToArray() `
+        -NowUtc ([datetime]::UtcNow) -WindowMinutes $RestartWindowMinutes -MaxRestarts $MaxRestartsPerWindow
+    if (-not $budgetOk) {
+        Write-CcsmGuardianEvent -Level "warning" -Event "restart-rate-limited" -Detail @{
+            Port = $Port
+            WindowMinutes = $RestartWindowMinutes
+            MaxRestarts = $MaxRestartsPerWindow
+            RestartsInWindow = $RestartTimesUtc.Count
+        }
+        return
+    }
+    $RestartTimesUtc.Add([datetime]::UtcNow)
+    if ($DevelopmentMode -and $devSession.Recoverable) {
+        Invoke-CcsmDevSessionRecovery -Plan $devSession -IsMaintenance $IsMaintenance `
+            -GetListenerOwner { Get-CcsmGuardianListenerOwner } `
+            -GetProcessIdentity { param($ProcessId) Get-CcsmGuardianProcessIdentity -ProcessId $ProcessId } `
+            -StartDevSession {
+                param($DevPlan)
+                return Start-CcsmDevSessionLauncher -Plan $DevPlan
+            } -WriteEvent $WriteEvent
+        return
+    }
+    Invoke-CcsmGuardianRecovery -InstalledExecutable $InstalledExecutable `
+        -IsMaintenance $IsMaintenance `
+        -InstalledExecutableExists { Test-Path -LiteralPath $InstalledExecutable -PathType Leaf } `
+        -GetListenerOwner { Get-CcsmGuardianListenerOwner } `
+        -GetProcessIdentity { param($ProcessId) Get-CcsmGuardianProcessIdentity -ProcessId $ProcessId } `
+        -IsExpectedProductIdentity { param($Identity) Test-CcsmExpectedProductIdentity -Identity $Identity } `
+        -GetExpectedProductProcesses {
+            $identities = @()
+            foreach ($process in @(Get-CimInstance Win32_Process -Filter "Name='cc-switch.exe'" -ErrorAction SilentlyContinue)) {
+                try {
+                    $identity = Get-CcsmGuardianProcessIdentity -ProcessId ([int]$process.ProcessId)
+                    if (Test-CcsmExpectedProductIdentity -Identity $identity) { $identities += $identity }
+                } catch { }
+            }
+            return $identities
+        } `
+        -StopVerifiedProductProcess { param($Identity) Stop-CcsmGuardianVerifiedProcess -ExpectedIdentity $Identity } `
+        -WaitPortFree { Wait-CcsmGuardianPortFree } `
+        -StartProduct { (Start-Process -FilePath $InstalledExecutable -WindowStyle Hidden -PassThru).Id } `
+        -WaitReady { param($ProcessId) Wait-CcsmGuardianReady -ExpectedPid $ProcessId } `
+        -WriteEvent $WriteEvent
+}
+
 $plan = [ordered]@{
     InstalledExecutable = $InstalledExecutable
     Port = $Port
@@ -143,6 +236,7 @@ $plan = [ordered]@{
     RestartWindowMinutes = $RestartWindowMinutes
     RestartOnCleanExit = [bool]$RestartOnCleanExit
     NoRestart = [bool]$NoRestart
+    DevelopmentMode = [bool]$DevelopmentMode
 }
 if ($PlanOnly) {
     $plan | ConvertTo-Json -Depth 4
@@ -179,54 +273,8 @@ try {
             }
         }
         $recover = {
-            if ($NoRestart) {
-                Write-CcsmGuardianEvent -Level "warning" -Event "restart-suppressed" -Detail @{ Port = $Port }
-                return
-            }
-            # 只重启“异常死亡”的实例：应用正常退出（含托盘退出）时会自己移除运行标记，
-            # 此时不重启，避免用户主动退出后被守护反复拉起。
-            if (-not $RestartOnCleanExit) {
-                $uncleanExit = Test-CcsmGuardianUncleanExit -ConfigPath $ConfigPath -GetProcessIdentity {
-                    param($ProcessId) Get-CcsmGuardianProcessIdentity -ProcessId $ProcessId
-                }
-                if (-not $uncleanExit) {
-                    Write-CcsmGuardianEvent -Level "info" -Event "restart-skipped-clean-exit" -Detail @{ Port = $Port }
-                    return
-                }
-            }
-            $budgetOk = Test-CcsmGuardianRestartBudget -RestartTimesUtc $restartTimesUtc.ToArray() `
-                -NowUtc ([datetime]::UtcNow) -WindowMinutes $RestartWindowMinutes -MaxRestarts $MaxRestartsPerWindow
-            if (-not $budgetOk) {
-                Write-CcsmGuardianEvent -Level "warning" -Event "restart-rate-limited" -Detail @{
-                    Port = $Port
-                    WindowMinutes = $RestartWindowMinutes
-                    MaxRestarts = $MaxRestartsPerWindow
-                    RestartsInWindow = $restartTimesUtc.Count
-                }
-                return
-            }
-            $restartTimesUtc.Add([datetime]::UtcNow)
-            Invoke-CcsmGuardianRecovery -InstalledExecutable $InstalledExecutable `
-                -IsMaintenance $isMaintenance `
-                -InstalledExecutableExists { Test-Path -LiteralPath $InstalledExecutable -PathType Leaf } `
-                -GetListenerOwner { Get-CcsmGuardianListenerOwner } `
-                -GetProcessIdentity { param($ProcessId) Get-CcsmGuardianProcessIdentity -ProcessId $ProcessId } `
-                -IsExpectedProductIdentity { param($Identity) Test-CcsmExpectedProductIdentity -Identity $Identity } `
-                -GetExpectedProductProcesses {
-                    $identities = @()
-                    foreach ($process in @(Get-CimInstance Win32_Process -Filter "Name='cc-switch.exe'" -ErrorAction SilentlyContinue)) {
-                        try {
-                            $identity = Get-CcsmGuardianProcessIdentity -ProcessId ([int]$process.ProcessId)
-                            if (Test-CcsmExpectedProductIdentity -Identity $identity) { $identities += $identity }
-                        } catch { }
-                    }
-                    return $identities
-                } `
-                -StopVerifiedProductProcess { param($Identity) Stop-CcsmGuardianVerifiedProcess -ExpectedIdentity $Identity } `
-                -WaitPortFree { Wait-CcsmGuardianPortFree } `
-                -StartProduct { (Start-Process -FilePath $InstalledExecutable -WindowStyle Hidden -PassThru).Id } `
-                -WaitReady { param($ProcessId) Wait-CcsmGuardianReady -ExpectedPid $ProcessId } `
-                -WriteEvent $writeEvent
+            Invoke-CcsmGuardianRecoveryPolicy -IsMaintenance $isMaintenance -WriteEvent $writeEvent `
+                -RestartTimesUtc $restartTimesUtc
         }
         Invoke-CcsmGuardianSafeIteration -WriteEvent $writeEvent -Action {
             Invoke-CcsmGuardianIteration -State $state -NowUtc ([datetime]::UtcNow) `
