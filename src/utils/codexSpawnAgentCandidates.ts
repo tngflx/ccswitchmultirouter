@@ -1,4 +1,5 @@
 import type { CodexCatalogModel, Provider } from "@/types";
+import { readCodexCatalogSettings } from "@/lib/codexCatalogSchema";
 
 export type { CodexCatalogModel } from "@/types";
 
@@ -62,7 +63,7 @@ export function normalizeCodexSpawnAgentModels(
 export function readCodexModelCatalog(
   provider: Pick<Provider, "settingsConfig"> | null,
 ): CodexModelCatalog {
-  const catalog = provider?.settingsConfig?.modelCatalog;
+  const catalog = readCodexCatalogSettings(provider?.settingsConfig);
   if (!catalog || typeof catalog !== "object") {
     return { models: [], spawnAgentModels: [] };
   }

@@ -29,6 +29,7 @@ pub mod log_codes;
 pub mod media_sanitizer;
 pub mod model_mapper;
 pub(crate) mod openai_contract;
+pub(crate) mod orchestration_runtime;
 pub mod provider_router;
 pub mod providers;
 pub(crate) mod request_health;

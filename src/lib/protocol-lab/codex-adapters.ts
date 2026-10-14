@@ -24,6 +24,7 @@ import {
 import type { Provider, UniversalProvider } from "@/types";
 
 import { normalizeCodexPublicModelKey } from "./codex-overrides";
+import { readCodexCatalogSettings } from "@/lib/codexCatalogSchema";
 import type { ProtocolLabAdapter } from "./useProtocolLabWorkflow";
 
 interface SingleCodexProtocolLabApi {
@@ -401,7 +402,7 @@ function isRetryableCodexEvidenceChange(error: unknown): boolean {
 }
 
 function enabledPublicModels(provider: Provider): string[] {
-  const catalog = provider.settingsConfig.modelCatalog as
+  const catalog = readCodexCatalogSettings(provider.settingsConfig) as
     { models?: Array<{ model?: unknown; enabled?: unknown }> } | undefined;
   return (catalog?.models ?? [])
     .filter((model) => model.enabled !== false)

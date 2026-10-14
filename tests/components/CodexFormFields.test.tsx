@@ -1030,6 +1030,91 @@ describe("CodexFormFields local model routing", () => {
     await waitForReasoningResolution();
   });
 
+  it("disables omitted models on a complete catalog sync without reviving hidden choices", async () => {
+    vi.mocked(fetchModelsForConfig).mockResolvedValueOnce([
+      { id: "wire-kept", ownedBy: null },
+      { id: "hidden", ownedBy: null },
+      { id: "new", ownedBy: null },
+    ]);
+    const { latestCatalog } = renderCatalogHarness([
+      { model: "kept", upstreamModel: "wire-kept", displayName: "My Model" },
+      { model: "removed" },
+      { model: "hidden", enabled: false },
+    ]);
+    await waitForReasoningResolution();
+
+    fireEvent.click(screen.getByRole("button", { name: "Sync models" }));
+    await waitFor(() => {
+      expect(latestCatalog()).toEqual([
+        expect.objectContaining({
+          model: "kept",
+          upstreamModel: "wire-kept",
+          displayName: "My Model",
+        }),
+        expect.objectContaining({ model: "removed", enabled: false }),
+        expect.objectContaining({ model: "hidden", enabled: false }),
+        expect.objectContaining({ model: "new", enabled: false }),
+      ]);
+    });
+    expect(latestCatalog()[0].enabled).not.toBe(false);
+    expect(
+      screen.queryByRole("button", {
+        name: "Configure reasoning capabilities for removed",
+      }),
+    ).not.toBeInTheDocument();
+    await waitForReasoningResolution();
+  });
+
+  it("makes a successful empty catalog sync non-routable", async () => {
+    vi.mocked(fetchModelsForConfig).mockResolvedValueOnce([]);
+    const { latestCatalog } = renderCatalogHarness([{ model: "removed" }]);
+    await waitForReasoningResolution();
+
+    fireEvent.click(screen.getByRole("button", { name: "Sync models" }));
+    await waitFor(() => expect(latestCatalog()[0].enabled).toBe(false));
+    expect(screen.getByText("No included models")).toBeVisible();
+    await waitForReasoningResolution();
+  });
+
+  it("preserves catalog inclusion after a failed sync", async () => {
+    vi.mocked(fetchModelsForConfig).mockRejectedValueOnce(new Error("offline"));
+    const { latestCatalog } = renderCatalogHarness([{ model: "kept" }]);
+    await waitForReasoningResolution();
+
+    fireEvent.click(screen.getByRole("button", { name: "Sync models" }));
+    await waitFor(() => expect(fetchModelsForConfig).toHaveBeenCalledOnce());
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: "Sync models" })).toBeEnabled(),
+    );
+    expect(latestCatalog()).toEqual([{ model: "kept" }]);
+    await waitForReasoningResolution();
+  });
+
+  it("preserves independent key-group inventory on a primary-key sync", async () => {
+    vi.mocked(fetchModelsForConfig).mockResolvedValueOnce([
+      { id: "primary", ownedBy: null },
+    ]);
+    const { latestCatalog } = renderCatalogHarness(
+      [{ model: "primary" }, { model: "other-key-model" }],
+      {
+        apiKeyGroups: [
+          { id: "other", apiKeys: ["other-key"], models: ["other-key-model"] },
+        ],
+      },
+    );
+    await waitForReasoningResolution();
+
+    fireEvent.click(screen.getByRole("button", { name: "Sync models" }));
+    await waitFor(() => expect(fetchModelsForConfig).toHaveBeenCalledOnce());
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: "Sync models" })).toBeEnabled(),
+    );
+    expect(latestCatalog().every((model) => model.enabled !== false)).toBe(
+      true,
+    );
+    await waitForReasoningResolution();
+  });
+
   it("does not fall back to fetched models when every catalogue row is excluded", async () => {
     vi.mocked(fetchModelsForConfig).mockResolvedValueOnce([
       { id: "hidden", ownedBy: null, contextWindow: 128000 },

@@ -4,6 +4,7 @@
 
 pub mod failover;
 pub mod mcp;
+pub mod orchestration;
 pub mod profiles;
 pub mod prompts;
 pub mod protocol_compatibility;

@@ -37,6 +37,7 @@ mod mcp;
 mod model_capabilities;
 mod openclaw_config;
 mod opencode_config;
+mod orchestration;
 mod panic_hook;
 mod pi_config;
 mod process_identity;
@@ -1566,6 +1567,10 @@ pub fn run() {
             commands::get_codex_multirouter_revision,
             commands::preview_codex_multirouter_migration,
             commands::apply_codex_multirouter_migration,
+            commands::get_orchestration_settings,
+            commands::save_orchestration_settings,
+            commands::list_orchestration_runs,
+            commands::cancel_orchestration_run,
             commands::delete_provider,
             commands::remove_provider_from_live_config,
             commands::switch_provider,

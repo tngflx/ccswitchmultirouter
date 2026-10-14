@@ -1,4 +1,4 @@
-import { renderHook } from "@testing-library/react";
+import { act, renderHook } from "@testing-library/react";
 import { describe, it, expect } from "vitest";
 import { useCodexConfigState } from "@/components/providers/forms/hooks/useCodexConfigState";
 
@@ -9,6 +9,36 @@ import { useCodexConfigState } from "@/components/providers/forms/hooks/useCodex
 // 注意：initialData 必须是稳定引用（hook 的 init effect 依赖 [initialData]）。
 // 写成内联字面量会每次 re-render 产生新引用 → effect 反复 setState → 死循环 OOM。
 describe("useCodexConfigState catalog load", () => {
+  it.each(["modelCatalog", "model_catalog"])(
+    "distinguishes an explicitly empty %s from a missing catalog",
+    (key) => {
+      const initialData = { settingsConfig: { [key]: { models: [] } } };
+      const { result } = renderHook(() => useCodexConfigState({ initialData }));
+      expect(result.current.codexCatalogModels).toEqual([]);
+      expect(result.current.codexCatalogConfigured).toBe(true);
+    },
+  );
+
+  it("marks catalog edits as authoritative even when they leave no rows", () => {
+    const initialData = {
+      settingsConfig: { config: 'model = "legacy-model"' },
+    };
+    const { result } = renderHook(() => useCodexConfigState({ initialData }));
+    expect(result.current.codexCatalogConfigured).toBe(false);
+
+    act(() => result.current.setCodexCatalogModels([]));
+    expect(result.current.codexCatalogConfigured).toBe(true);
+  });
+
+  it("resets catalog presence when switching between catalog and legacy presets", () => {
+    const { result } = renderHook(() => useCodexConfigState({}));
+    act(() => result.current.resetCodexConfig({}, "", []));
+    expect(result.current.codexCatalogConfigured).toBe(true);
+
+    act(() => result.current.resetCodexConfig({}, 'model = "legacy-model"'));
+    expect(result.current.codexCatalogConfigured).toBe(false);
+  });
+
   it("preserves searchable identities and exclusions when reopening a provider", () => {
     const initialData = {
       settingsConfig: {

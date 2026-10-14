@@ -28,7 +28,9 @@
     "apiKeyGroupId": ["api_key_group_id"],
     "apiKeyGroupGenerated": ["api_key_group_generated"],
     "sortIndex": ["sort_index"],
-    "codexUltra": ["codex_ultra"]
+    "codexUltra": ["codex_ultra"],
+    "role": ["role"],
+    "orchestrationProfileId": ["orchestration_profile_id"]
   },
   "reasoning": {
     "schemaVersion": ["schema_version"],

@@ -72,7 +72,10 @@ import {
   type CodexProtocolChoiceInput,
 } from "@/lib/protocol-lab/codex-overrides";
 import { resolveFetchedCodexModelContextWindow } from "@/utils/codexModelContext";
-import { reconcileFetchedCodexCatalogRows } from "@/lib/codexCatalogReconciliation";
+import {
+  isCompleteCodexCatalogFetch,
+  reconcileFetchedCodexCatalogRows,
+} from "@/lib/codexCatalogReconciliation";
 import { pruneOutdatedCodexCatalogModels } from "@/lib/codexCatalogVersionPruning";
 import { normalizeModelIdentityMetadata } from "@/lib/modelIdentities";
 import {
@@ -673,11 +676,15 @@ function mergeFetchedModelsIntoCatalogRows(
     baseUrl?: string;
     websiteUrl?: string;
   } = {},
+  authoritative = false,
 ): CodexCatalogRow[] {
   const result = reconcileFetchedCodexCatalogRows(rows, fetchedModels, source, {
     appendNew: true,
     createRow: (seed) => createCatalogRow(seed),
     existingMetadataMode: "fill-missing",
+    removeMissingRemote: authoritative,
+    includeUnboundRemoteRows: true,
+    markMissingRemoteDisabled: true,
   });
   return result.rows;
 }
@@ -1351,7 +1358,7 @@ export function CodexFormFields({
       .then((models) => {
         if (seq !== fetchModelsSeqRef.current) return;
         setFetchedModels(models);
-        if (onCatalogModelsChange && models.length > 0) {
+        if (onCatalogModelsChange) {
           const mergedRows = mergeFetchedModelsIntoCatalogRows(
             catalogRowsRef.current,
             models,
@@ -1361,6 +1368,7 @@ export function CodexFormFields({
               baseUrl: codexBaseUrl,
               websiteUrl,
             },
+            isCompleteCodexCatalogFetch(apiKeyGroupsRef.current),
           );
           catalogRowsRef.current = mergedRows;
           setCatalogRows(mergedRows);

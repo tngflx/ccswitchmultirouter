@@ -49,6 +49,9 @@ jobs:
       - name: TypeScript type check
         run: pnpm typecheck
 
+      - name: Catalog authority and regression checks
+        run: pnpm catalog:verify
+
       - name: Check formatting
         run: pnpm format:check
 

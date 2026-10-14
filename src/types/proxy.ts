@@ -133,10 +133,7 @@ export interface RequestHealthSnapshot {
 }
 
 export type OpenAIResponsesContractStatusKind =
-  | "not_checked"
-  | "up_to_date"
-  | "drift_detected"
-  | "check_failed";
+  "not_checked" | "up_to_date" | "drift_detected" | "check_failed";
 
 export interface OpenAIResponsesContractStatus {
   version: number;

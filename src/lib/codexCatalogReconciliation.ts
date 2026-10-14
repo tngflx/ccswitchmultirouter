@@ -46,6 +46,20 @@ export function catalogModelIdentity(value: unknown): string {
   return typeof value === "string" ? value.trim().toLowerCase() : "";
 }
 
+/** A single key's model list cannot describe a provider with independent key groups. */
+export function isCompleteCodexCatalogFetch(apiKeyGroups: unknown): boolean {
+  return (
+    !Array.isArray(apiKeyGroups) ||
+    !apiKeyGroups.some(
+      (group) =>
+        Array.isArray(group?.apiKeys) &&
+        group.apiKeys.some(
+          (key: unknown) => typeof key === "string" && key.trim(),
+        ),
+    )
+  );
+}
+
 function nonEmptyString(value: unknown): string {
   return typeof value === "string" ? value.trim() : "";
 }
@@ -87,6 +101,9 @@ function refreshedCapabilityPatch(
   fetched: FetchedCodexCatalogModel,
 ): Partial<CodexCatalogRowLike> {
   const patch = missingCapabilityPatch(row, fetched);
+  if (patch.inputModalities) patch.input_modalities = patch.inputModalities;
+  if (typeof patch.supportsImage === "boolean")
+    patch.supports_image = patch.supportsImage;
   if (fetched.reasoning && row.reasoning?.source !== "user") {
     patch.reasoning = fetched.reasoning;
   }
@@ -126,7 +143,13 @@ export function pruneMissingRemoteCodexCatalogRows<
 >(
   rows: T[],
   fetchedModels: Fetched[],
-  options?: { maxRemovalRatio?: number },
+  options?: {
+    maxRemovalRatio?: number;
+    /** Treat rows without an explicit upstream binding as remote inventory too. */
+    includeUnboundRows?: boolean;
+    /** Keep the row for editing, but make an absent remote model non-routable. */
+    markMissingDisabled?: boolean;
+  },
 ): Pick<
   CatalogSyncResult<T>,
   "rows" | "removed" | "removedModels" | "removalSuppressed"
@@ -134,28 +157,49 @@ export function pruneMissingRemoteCodexCatalogRows<
   const fetchedIdentities = new Set(
     fetchedModels.flatMap((model) => modelIdentityValues(model)),
   );
-  const boundRows = rows.filter((row) => rowExplicitUpstreamModel(row));
-  const removedModels: string[] = [];
-  const candidates = rows.filter((row) => {
-    const upstream = catalogModelIdentity(rowExplicitUpstreamModel(row));
-    if (!upstream || fetchedIdentities.has(upstream)) return true;
-    removedModels.push(row.model);
-    return false;
-  });
+  const consideredRows = rows.filter(
+    (row) =>
+      options?.includeUnboundRows === true || rowExplicitUpstreamModel(row),
+  );
+  const missingRows = new Set(
+    consideredRows.filter(
+      (row) =>
+        !rowIdentities(row).some((identity) => fetchedIdentities.has(identity)),
+    ),
+  );
+  const removedModels = [...missingRows]
+    .filter((row) => !options?.markMissingDisabled || row.enabled !== false)
+    .map((row) => row.model);
+  const consideredCount = options?.markMissingDisabled
+    ? consideredRows.filter((row) => row.enabled !== false).length
+    : consideredRows.length;
   const maxRemovalRatio = options?.maxRemovalRatio ?? 0;
   const removalSuppressed =
     maxRemovalRatio > 0 &&
-    boundRows.length > 0 &&
+    consideredCount > 0 &&
     removedModels.length > 0 &&
-    removedModels.length / boundRows.length > maxRemovalRatio;
-  return removalSuppressed
-    ? { rows, removed: 0, removedModels, removalSuppressed: true }
-    : {
-        rows: candidates,
-        removed: removedModels.length,
-        removedModels,
-        removalSuppressed: false,
-      };
+    removedModels.length / consideredCount > maxRemovalRatio;
+  if (removalSuppressed) {
+    return { rows, removed: 0, removedModels, removalSuppressed: true };
+  }
+  if (options?.markMissingDisabled) {
+    return {
+      rows: rows.map((row) =>
+        missingRows.has(row) && row.enabled !== false
+          ? ({ ...row, enabled: false } as T)
+          : row,
+      ),
+      removed: 0,
+      removedModels,
+      removalSuppressed: false,
+    };
+  }
+  return {
+    rows: rows.filter((row) => !missingRows.has(row)),
+    removed: removedModels.length,
+    removedModels,
+    removalSuppressed: false,
+  };
 }
 
 /** Reconcile remote /models results without destroying user intent. */
@@ -168,6 +212,11 @@ export function reconcileFetchedCodexCatalogRows<T extends CodexCatalogRowLike>(
     createRow: (seed: CodexCatalogRowSeed) => T;
     existingMetadataMode?: ExistingCatalogMetadataMode;
     removeMissingRemote?: boolean;
+    includeUnboundRemoteRows?: boolean;
+    markMissingRemoteDisabled?: boolean;
+    newRowEnabled?: boolean;
+    contextWindowFormat?: "number" | "string";
+    inferContextWindow?: boolean;
     maxRemovalRatio?: number;
   },
 ): CatalogSyncResult<T> {
@@ -184,6 +233,13 @@ export function reconcileFetchedCodexCatalogRows<T extends CodexCatalogRowLike>(
   let added = 0;
   const updated: string[] = [];
   const refresh = options.existingMetadataMode === "refresh";
+  const resolveContextWindow = (fetched: FetchedCodexCatalogModel) =>
+    options.inferContextWindow === false
+      ? (fetched.contextWindow ?? undefined)
+      : resolveFetchedCodexModelContextWindow(fetched, {
+          ...source,
+          existingModels: rows,
+        });
 
   for (const fetched of fetchedModels) {
     const model =
@@ -199,10 +255,7 @@ export function reconcileFetchedCodexCatalogRows<T extends CodexCatalogRowLike>(
       .find((index): index is number => index !== undefined);
     if (existingIndex !== undefined) {
       const row = next[existingIndex];
-      const contextWindow = resolveFetchedCodexModelContextWindow(fetched, {
-        ...source,
-        existingModels: rows,
-      });
+      const contextWindow = resolveContextWindow(fetched);
       const patch: Partial<CodexCatalogRowLike> = {};
       if (
         !hasValue(rowExplicitUpstreamModel(row)) &&
@@ -216,7 +269,10 @@ export function reconcileFetchedCodexCatalogRows<T extends CodexCatalogRowLike>(
         String(row.contextWindow ?? row.context_window ?? "") !==
           String(contextWindow)
       ) {
-        patch.contextWindow = String(contextWindow);
+        patch.contextWindow =
+          options.contextWindowFormat === "number"
+            ? contextWindow
+            : String(contextWindow);
       }
       Object.assign(
         patch,
@@ -242,16 +298,22 @@ export function reconcileFetchedCodexCatalogRows<T extends CodexCatalogRowLike>(
       continue;
     }
     if (!options.appendNew) continue;
-    const contextWindow = resolveFetchedCodexModelContextWindow(fetched, {
-      ...source,
-      existingModels: rows,
-    });
+    const contextWindow = resolveContextWindow(fetched);
     const seed: CodexCatalogRowSeed = {
       model,
       upstreamModel: model,
       displayName: model,
-      enabled: false,
-      ...(contextWindow ? { contextWindow: String(contextWindow) } : {}),
+      ...(options.newRowEnabled !== undefined
+        ? { enabled: options.newRowEnabled }
+        : { enabled: false }),
+      ...(contextWindow
+        ? {
+            contextWindow:
+              options.contextWindowFormat === "number"
+                ? contextWindow
+                : String(contextWindow),
+          }
+        : {}),
       ...fetchedIdentityPatch({}, fetched, true),
       ...(fetched.inputModalities?.length
         ? { inputModalities: [...fetched.inputModalities] }
@@ -263,7 +325,9 @@ export function reconcileFetchedCodexCatalogRows<T extends CodexCatalogRowLike>(
     };
     const created = options.createRow({
       ...seed,
-      ...missingCapabilityPatch(seed as CodexCatalogRowLike, fetched),
+      ...(refresh
+        ? refreshedCapabilityPatch(seed as CodexCatalogRowLike, fetched)
+        : missingCapabilityPatch(seed as CodexCatalogRowLike, fetched)),
     });
     next.push(created);
     for (const identity of rowIdentities(created)) {
@@ -275,6 +339,8 @@ export function reconcileFetchedCodexCatalogRows<T extends CodexCatalogRowLike>(
 
   const authoritativeResult = options.removeMissingRemote
     ? pruneMissingRemoteCodexCatalogRows(next, fetchedModels, {
+        includeUnboundRows: options.includeUnboundRemoteRows,
+        markMissingDisabled: options.markMissingRemoteDisabled,
         maxRemovalRatio: options.maxRemovalRatio,
       })
     : { rows: next, removed: 0, removedModels: [], removalSuppressed: false };

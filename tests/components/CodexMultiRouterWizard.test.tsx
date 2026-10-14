@@ -172,6 +172,55 @@ async function completeWizardDeepProbe() {
 }
 
 describe("CodexMultiRouterWizard", () => {
+  it("opens a v2 plan with malformed historical candidates without restoring catalog selections", async () => {
+    const source = provider();
+    const plan = provider({
+      id: "existing-plan",
+      name: "Existing Plan",
+      settingsConfig: {
+        codexRouting: {
+          schemaVersion: 2,
+          enabled: true,
+          spawnAgentModels: { stale: "deepseek-chat" },
+          routes: [
+            {
+              id: "route",
+              targetProviderId: source.id,
+              modelSelection: { mode: "all" },
+            },
+          ],
+        },
+        modelCatalog: {
+          models: [{ model: "deepseek-chat" }],
+          spawnAgentModels: ["deepseek-chat"],
+        },
+        model_catalog: {
+          models: [{ model: "removed" }],
+          spawnAgentModels: ["removed"],
+        },
+      },
+    });
+    renderWithQueryClient(
+      <CodexMultiRouterWizard
+        open
+        providers={[source, plan]}
+        onOpenChange={vi.fn()}
+        onCreateProvider={vi.fn()}
+        onOpenWorkspace={vi.fn()}
+        onEnablePlan={vi.fn()}
+      />,
+    );
+    fireEvent.click(
+      screen.getByRole("button", { name: "Sub-Agent and tools" }),
+    );
+    expect(
+      screen.getByLabelText("Use deepseek-chat as a Sub-Agent candidate"),
+    ).not.toBeChecked();
+    expect(
+      screen.queryByLabelText("Use removed as a Sub-Agent candidate"),
+    ).not.toBeInTheDocument();
+  });
+
   it("routes only included models while preserving excluded inventory in the batch save", async () => {
     const inventory = [
       { model: "kept", upstreamModel: "wire-kept" },
@@ -1316,11 +1365,10 @@ describe("CodexMultiRouterWizard", () => {
       );
       expect(providersApi.update).not.toHaveBeenCalled();
     });
-    expect(
-      await screen.findByText(
-        "Read succeeded with no model-list changes; still 1 models.",
-      ),
-    ).toBeInTheDocument();
+    expect(await screen.findByText("Model list updated")).toBeInTheDocument();
+    expect(screen.getByText("Changed 1: ark-code-latest")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Choose models" }));
+    expect(screen.getByLabelText("Keep ark-code-latest")).not.toBeChecked();
   });
 
   it("keeps previous model selections without re-adding newly fetched provider models", async () => {

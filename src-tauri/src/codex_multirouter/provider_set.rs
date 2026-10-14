@@ -1,3 +1,4 @@
+use super::catalog::{catalog_models, read_catalog, read_catalog_mut};
 use super::schema::{
     CodexModelSelection, CodexRoutingConfigV2, CodexRoutingDocument, CodexRoutingRouteV2,
 };
@@ -565,12 +566,7 @@ pub fn migrate_legacy_codex_protocol_overrides_for_save(
     }
 
     let settings = settings_object_mut(provider)?;
-    let catalog_key = if settings.contains_key("modelCatalog") {
-        "modelCatalog"
-    } else {
-        "model_catalog"
-    };
-    let catalog = settings.get_mut(catalog_key);
+    let catalog = read_catalog_mut(settings);
     let mut enabled_models = Vec::new();
     let mut found_legacy_model_protocol = false;
     if let Some(models) = catalog
@@ -1324,18 +1320,12 @@ fn ensure_unique_route_ids(plan: &CodexRoutingConfigV2) -> Result<(), CodexProvi
 }
 
 fn source_catalog(source: &Provider) -> Result<Vec<CatalogModel>, CodexProviderSetError> {
-    let models = source
-        .settings_config
-        .get("modelCatalog")
-        .or_else(|| source.settings_config.get("model_catalog"))
-        .and_then(|catalog| catalog.get("models"))
-        .and_then(Value::as_array)
-        .ok_or_else(|| {
-            error(
-                "codex_provider_set_model_catalog_required",
-                "Codex Provider must synchronize a model catalog before protocol planning",
-            )
-        })?;
+    let models = catalog_models(&source.settings_config).ok_or_else(|| {
+        error(
+            "codex_provider_set_model_catalog_required",
+            "Codex Provider must synchronize a model catalog before protocol planning",
+        )
+    })?;
     let mut parsed = Vec::with_capacity(models.len());
     for value in models {
         let Some(public_model) = string_field(value, &["model", "id", "slug"]) else {
@@ -1476,10 +1466,7 @@ fn build_leaf(
         }
     );
     remove_provider_set_fields(&mut leaf);
-    let catalog = source
-        .settings_config
-        .get("modelCatalog")
-        .or_else(|| source.settings_config.get("model_catalog"))
+    let catalog = read_catalog(&source.settings_config)
         .cloned()
         .unwrap_or_else(|| json!({}));
     let mut filtered_catalog = catalog;
@@ -1510,10 +1497,7 @@ fn build_facade(
     let mut facade = source.clone();
     remove_provider_set_fields(&mut facade);
     normalize_provider_transport(&mut facade, TransportKind::OpenAiResponses)?;
-    let mut source_catalog = source
-        .settings_config
-        .get("modelCatalog")
-        .or_else(|| source.settings_config.get("model_catalog"))
+    let mut source_catalog = read_catalog(&source.settings_config)
         .cloned()
         .ok_or_else(|| {
             error(
@@ -1631,12 +1615,7 @@ fn normalize_provider_transport(
             .map_err(|message| error("codex_provider_set_invalid_toml", message))?;
         settings.insert("config".to_string(), Value::String(updated));
     }
-    let catalog_key = if settings.contains_key("modelCatalog") {
-        "modelCatalog"
-    } else {
-        "model_catalog"
-    };
-    if let Some(catalog) = settings.get_mut(catalog_key) {
+    if let Some(catalog) = read_catalog_mut(settings) {
         remove_model_protocols_from_catalog(catalog);
     }
     Ok(())

@@ -150,18 +150,74 @@ fn normalize_capability_fields(model: &mut Value) {
     }
 }
 
+fn is_catalog_container(value: &Value) -> bool {
+    value
+        .as_object()
+        .and_then(|object| object.get("models"))
+        .is_some_and(Value::is_array)
+}
+
+/// Read the one authoritative Codex catalog representation.
+///
+/// `modelCatalog` wins when it is structurally valid, including an explicit
+/// empty `models` array. The legacy key is only a recovery path for absent or
+/// malformed canonical data.
+pub(crate) fn read_catalog(settings: &Value) -> Option<&Value> {
+    settings
+        .get("modelCatalog")
+        .filter(|catalog| is_catalog_container(catalog))
+        .or_else(|| {
+            settings
+                .get("model_catalog")
+                .filter(|catalog| is_catalog_container(catalog))
+        })
+}
+
+pub(crate) fn read_catalog_mut(
+    settings: &mut serde_json::Map<String, Value>,
+) -> Option<&mut Value> {
+    let key = if settings
+        .get("modelCatalog")
+        .is_some_and(is_catalog_container)
+    {
+        "modelCatalog"
+    } else if settings
+        .get("model_catalog")
+        .is_some_and(is_catalog_container)
+    {
+        "model_catalog"
+    } else {
+        return None;
+    };
+    settings.get_mut(key)
+}
+
+pub(crate) fn catalog_models(settings: &Value) -> Option<&[Value]> {
+    read_catalog(settings)?
+        .get("models")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+}
+
 pub(crate) fn normalize_settings(settings: &mut Value) {
+    let selected_catalog = read_catalog(settings).cloned();
     normalize_aliases(settings, "settings");
     normalize_capability_fields(settings);
-    let Some(catalog) = settings.get_mut("modelCatalog") else {
+    let Some(mut catalog) = selected_catalog.or_else(|| settings.get("modelCatalog").cloned())
+    else {
         return;
     };
-    normalize_aliases(catalog, "catalog");
+    normalize_aliases(&mut catalog, "catalog");
     if let Some(models) = catalog.get_mut("models").and_then(Value::as_array_mut) {
         for model in models {
             normalize_model(model);
         }
     }
+    settings["modelCatalog"] = catalog;
+    settings
+        .as_object_mut()
+        .expect("settings is an object after normalization")
+        .remove("model_catalog");
 }
 
 pub(crate) fn parse_context_window(value: &Value) -> Option<u64> {
@@ -188,6 +244,58 @@ pub(crate) fn parse_context_window(value: &Value) -> Option<u64> {
 mod tests {
     use super::*;
     use crate::{database::Database, provider::Provider};
+    use serde_json::json;
+
+    #[test]
+    fn canonical_empty_catalog_wins_over_stale_legacy_catalog() {
+        let settings = json!({
+            "modelCatalog": {"models": []},
+            "model_catalog": {"models": [{"model": "removed-model"}]}
+        });
+
+        let catalog = read_catalog(&settings).expect("canonical catalog");
+        assert_eq!(catalog["models"], json!([]));
+        assert!(catalog_models(&settings).expect("models").is_empty());
+    }
+
+    #[test]
+    fn malformed_canonical_catalog_falls_back_to_legacy_catalog() {
+        let settings = json!({
+            "modelCatalog": {"models": "invalid"},
+            "model_catalog": {"models": [{"model": "legacy-model"}]}
+        });
+
+        let models = catalog_models(&settings).expect("legacy models");
+        assert_eq!(models[0]["model"], "legacy-model");
+    }
+
+    #[test]
+    fn mutable_reader_preserves_canonical_authority() {
+        for canonical in [
+            json!({"models": []}),
+            json!({"models": [{"model": "kept"}]}),
+        ] {
+            let mut settings = json!({
+                "modelCatalog": canonical,
+                "model_catalog": {"models": [{"model": "removed-model"}]}
+            });
+            read_catalog_mut(settings.as_object_mut().unwrap()).unwrap()["enabled"] = json!(true);
+            assert_eq!(settings["modelCatalog"]["enabled"], json!(true));
+            assert!(settings["model_catalog"].get("enabled").is_none());
+        }
+    }
+
+    #[test]
+    fn mutable_reader_uses_only_a_structurally_valid_fallback() {
+        let mut settings = json!({
+            "modelCatalog": {"models": null},
+            "model_catalog": {"models": []}
+        });
+        read_catalog_mut(settings.as_object_mut().unwrap()).unwrap()["enabled"] = json!(true);
+        assert_eq!(settings["model_catalog"]["enabled"], json!(true));
+        settings["model_catalog"]["models"] = json!(null);
+        assert!(read_catalog_mut(settings.as_object_mut().unwrap()).is_none());
+    }
 
     #[test]
     fn shared_catalogue_contract_is_idempotent_and_round_trips_sqlite() {

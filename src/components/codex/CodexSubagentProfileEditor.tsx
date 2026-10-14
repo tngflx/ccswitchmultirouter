@@ -17,6 +17,7 @@ import {
 import { Input } from "@/components/ui/input";
 import { Switch } from "@/components/ui/switch";
 import { cn } from "@/lib/utils";
+import { readCodexCatalogSettings } from "@/lib/codexCatalogSchema";
 import {
   codexSubagentV2Api,
   type CodexSubagentV2MutationProvider,
@@ -355,9 +356,12 @@ function inferredInputModalities(
   projectedModelCatalog?: unknown,
 ): CodexSubagentV2Profile["inputModalities"] {
   if (profile.inputModalities) return profile.inputModalities;
+  const providerModelCatalog = readCodexCatalogSettings(
+    provider.settingsConfig,
+  );
   const catalog =
     includedModelCatalog(projectedModelCatalog) ??
-    includedModelCatalog(provider.settingsConfig?.modelCatalog);
+    includedModelCatalog(providerModelCatalog);
   const models = catalog && Array.isArray(catalog.models) ? catalog.models : [];
   const entry = models.find(
     (candidate) =>
@@ -454,9 +458,12 @@ function settingsForDiagnostics(
     invalidOrdinal += 1;
   }
   const settings = settingsWithConfig(provider, { ...config, profiles });
+  const providerModelCatalog = readCodexCatalogSettings(
+    provider.settingsConfig,
+  );
   const catalog =
     includedModelCatalog(projectedModelCatalog) ??
-    includedModelCatalog(provider.settingsConfig?.modelCatalog);
+    includedModelCatalog(providerModelCatalog);
   return catalog ? { ...settings, modelCatalog: catalog } : settings;
 }
 

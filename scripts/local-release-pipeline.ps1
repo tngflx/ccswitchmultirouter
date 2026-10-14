@@ -179,6 +179,9 @@ try {
                 Invoke-CheckedCommand -FilePath "pnpm" -Arguments @("typecheck")
             }
 
+            # Required even for SkipBuild and NoTypecheck releases.
+            Invoke-CheckedCommand -FilePath "pnpm" -Arguments @("catalog:verify")
+
             $exportArgs = @(
                 "-NoProfile",
                 "-ExecutionPolicy",

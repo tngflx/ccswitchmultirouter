@@ -122,7 +122,6 @@ import {
   useSessionCollectionStatus,
 } from "@/lib/query/usage";
 import { cn } from "@/lib/utils";
-import { resolveFetchedCodexModelContextWindow } from "@/utils/codexModelContext";
 import {
   catalogHasRoleModel,
   deepSeekRoleForModel,
@@ -139,6 +138,7 @@ import {
   type CodexCatalogModel,
 } from "@/utils/codexSpawnAgentCandidates";
 import {
+  extractCodexModelName,
   extractCodexExperimentalBearerToken,
   getCodexBaseUrl,
   removeCodexTopLevelField,
@@ -154,6 +154,22 @@ import {
   modelBindingIdentityValues,
   modelIdentityValues,
 } from "@/lib/modelIdentities";
+import {
+  isCompleteCodexCatalogFetch,
+  reconcileFetchedCodexCatalogRows,
+} from "@/lib/codexCatalogReconciliation";
+import {
+  hasCodexCatalog,
+  readCodexCatalogSettings,
+} from "@/lib/codexCatalogSchema";
+import {
+  buildCodexModelReferenceIndex,
+  canonicalizeCodexModelReferences,
+  resolveCodexRouteModelReference,
+  sanitizeCodexApiKeyGroups,
+  sanitizeCodexProtocolOverrides,
+  sanitizeCodexRoutingConfig,
+} from "@/lib/codexConfigSanitizer";
 import { pruneOutdatedCodexCatalogModels } from "@/lib/codexCatalogVersionPruning";
 import { HostedToolsSwitchPanel } from "./HostedToolsSwitchPanel";
 import { CodexSubagentProfileEditor } from "./CodexSubagentProfileEditor";
@@ -408,7 +424,7 @@ function providerHasModelIdentity(
   const normalized = normalizedModelIdentity(modelIdentity);
   if (!normalized) return false;
   const catalogModels = readIncludedCodexModelCatalog(provider).models;
-  if (readCodexModelCatalog(provider).models.length > 0) {
+  if (providerHasCodexModelCatalog(provider)) {
     return catalogModels.some((model) =>
       modelIdentityValues(model).includes(normalized),
     );
@@ -966,139 +982,100 @@ export function providerWithFetchedModelCatalog(
 ): Provider {
   const currentCatalog = readCodexModelCatalog(provider);
   const fetchConfig = getProviderModelFetchConfig(provider);
-  const models = currentCatalog.models.map((model) => {
-    const id = model.model?.trim();
-    return {
-      model: id ?? "",
-      ...(model.upstreamModel ? { upstreamModel: model.upstreamModel } : {}),
-      ...(model.upstream_model ? { upstream_model: model.upstream_model } : {}),
-      ...(model.canonicalSlug ? { canonicalSlug: model.canonicalSlug } : {}),
-      ...(model.canonical_slug ? { canonical_slug: model.canonical_slug } : {}),
-      ...(model.slug ? { slug: model.slug } : {}),
-      ...(model.aliases ? { aliases: model.aliases } : {}),
-      ...(model.displayName ? { displayName: model.displayName } : {}),
-      ...(model.display_name ? { display_name: model.display_name } : {}),
-      ...(model.contextWindow ? { contextWindow: model.contextWindow } : {}),
-      ...(model.context_window ? { context_window: model.context_window } : {}),
-      ...(model.inputModalities
-        ? { inputModalities: model.inputModalities }
-        : {}),
-      ...(model.input_modalities
-        ? { input_modalities: model.input_modalities }
-        : {}),
-      ...(model.textOnly !== undefined ? { textOnly: model.textOnly } : {}),
-      ...(model.text_only !== undefined ? { text_only: model.text_only } : {}),
-      ...(model.supportsImage !== undefined
-        ? { supportsImage: model.supportsImage }
-        : {}),
-      ...(model.supports_image !== undefined
-        ? { supports_image: model.supports_image }
-        : {}),
-      ...(model.vision !== undefined ? { vision: model.vision } : {}),
-      ...(model.sortIndex !== undefined ? { sortIndex: model.sortIndex } : {}),
-      // 远端目录刷新不能把用户隐藏的模型静默复活。
-      ...(model.enabled !== undefined ? { enabled: model.enabled } : {}),
-      // 模型目录刷新必须保留已有 reasoning 声明（用户手动声明的档位/能力）。
-      // 否则 /models 拉取重建会把声明清空，导致档位消失（K3/Qwen 均受影响）。
-      ...(model.reasoning ? { reasoning: model.reasoning } : {}),
-      ...(model.codexUltra ? { codexUltra: model.codexUltra } : {}),
-    } satisfies CodexCatalogModelDraft;
-  });
-  const byFetchedModel = new Map<string, number>();
-  const byVisibleModel = new Map<string, number>();
-  for (const model of currentCatalog.models) {
-    const id = model.model?.trim();
-    if (!id) continue;
-    const index = models.findIndex((item) => item.model === id);
-    if (index < 0) continue;
-    byVisibleModel.set(id.toLowerCase(), index);
-    for (const identity of modelBindingIdentityValues(models[index])) {
-      byFetchedModel.set(identity, index);
-    }
-  }
   const shouldAppendFetchedModels =
     currentCatalog.models.length === 0 || isWizardCodexOAuthSource(provider);
-
-  for (const fetched of fetchedModels) {
-    const id = fetched.id.trim();
-    if (!id) continue;
-    const existingIndex =
-      modelIdentityValues(fetched)
-        .map((identity) => byFetchedModel.get(identity))
-        .find((index): index is number => index !== undefined) ??
-      byVisibleModel.get(id.toLowerCase());
-    const contextWindow = resolveFetchedCodexModelContextWindow(fetched, {
+  const result = reconcileFetchedCodexCatalogRows(
+    currentCatalog.models,
+    fetchedModels,
+    {
       providerId: provider.id,
       providerName: provider.name,
       baseUrl: fetchConfig.baseUrl,
-      existingModels: currentCatalog.models,
-    });
-    if (existingIndex !== undefined) {
-      models[existingIndex] = {
-        ...models[existingIndex],
-        ...(contextWindow ? { contextWindow } : {}),
-        ...(fetched.inputModalities && fetched.inputModalities.length > 0
-          ? {
-              inputModalities: fetched.inputModalities,
-              input_modalities: fetched.inputModalities,
-            }
-          : {}),
-        ...(fetched.supportsImage !== undefined &&
-        fetched.supportsImage !== null
-          ? {
-              supportsImage: fetched.supportsImage,
-              supports_image: fetched.supportsImage,
-            }
-          : {}),
-        ...(fetched.reasoning ? { reasoning: fetched.reasoning } : {}),
-      };
-      for (const identity of modelIdentityValues({
-        ...fetched,
-        model: models[existingIndex].model,
-        upstreamModel: catalogDraftUpstreamModel(models[existingIndex]),
-      })) {
-        byFetchedModel.set(identity, existingIndex);
-      }
-      continue;
-    }
-    if (!shouldAppendFetchedModels) continue;
-    const nextModel: CodexCatalogModelDraft = {
-      model: id,
-      ...(currentCatalog.models.length > 0 ? { enabled: false } : {}),
-      upstreamModel: id,
-      displayName: id,
-      ...(contextWindow ? { contextWindow } : {}),
-      ...(fetched.inputModalities && fetched.inputModalities.length > 0
-        ? {
-            inputModalities: fetched.inputModalities,
-            input_modalities: fetched.inputModalities,
-          }
-        : {}),
-      ...(fetched.supportsImage !== undefined && fetched.supportsImage !== null
-        ? {
-            supportsImage: fetched.supportsImage,
-            supports_image: fetched.supportsImage,
-          }
-        : {}),
-      ...(fetched.reasoning ? { reasoning: fetched.reasoning } : {}),
-    };
-    byFetchedModel.set(id, models.length);
-    byVisibleModel.set(id.toLowerCase(), models.length);
-    models.push(nextModel);
-  }
+    },
+    {
+      appendNew: shouldAppendFetchedModels,
+      createRow: (seed) => seed as CodexCatalogModel,
+      existingMetadataMode: "refresh",
+      // A successful fetch is the source of truth for routing. Rows omitted
+      // by it remain editable but are disabled so "follow all" cannot revive
+      // removed upstream IDs.
+      removeMissingRemote: isCompleteCodexCatalogFetch(
+        provider.settingsConfig?.codexApiKeyGroups,
+      ),
+      includeUnboundRemoteRows: true,
+      markMissingRemoteDisabled: true,
+      newRowEnabled: currentCatalog.models.length === 0,
+      contextWindowFormat: "number",
+    },
+  );
+  return providerWithReconciledModelCatalog(provider, result.rows);
+}
 
+/** Catalog mutations must update source-owned references in the same save. */
+function providerWithReconciledModelCatalog(
+  provider: Provider,
+  models: CodexCatalogModel[],
+  providersById?: Map<string, Provider>,
+): Provider {
+  const settings = provider.settingsConfig;
+  const catalog = (readCodexCatalogSettings(settings) ?? {}) as Record<
+    string,
+    any
+  >;
+  const index = buildCodexModelReferenceIndex(models);
+  const nextCatalog: Record<string, any> = {
+    ...catalog,
+    models,
+    spawnAgentModels: normalizeCodexSpawnAgentModels(
+      canonicalizeCodexModelReferences(
+        catalog.spawnAgentModels ?? catalog.spawn_agent_models,
+        index,
+        5,
+      ),
+      models,
+    ),
+  };
+  delete nextCatalog.spawn_agent_models;
+  const nextSettings: Record<string, any> = {
+    ...settings,
+    modelCatalog: nextCatalog,
+  };
+  delete nextSettings.model_catalog;
+  if (settings.codexRouting) {
+    nextSettings.codexRouting = sanitizeCodexRoutingConfig(
+      settings.codexRouting,
+      index,
+      (targetProviderId) => {
+        if (targetProviderId === provider.id) return index;
+        const target = providersById?.get(targetProviderId);
+        return target && providerHasCodexModelCatalog(target)
+          ? buildCodexModelReferenceIndex(
+              readIncludedCodexModelCatalog(target).models,
+            )
+          : undefined;
+      },
+    );
+  }
+  if (Array.isArray(settings.codexApiKeyGroups)) {
+    nextSettings.codexApiKeyGroups = sanitizeCodexApiKeyGroups(
+      settings.codexApiKeyGroups,
+      index,
+    );
+  }
   return {
     ...provider,
-    settingsConfig: {
-      ...provider.settingsConfig,
-      modelCatalog: {
-        models,
-        spawnAgentModels: normalizeCodexSpawnAgentModels(
-          currentCatalog.spawnAgentModels,
-          models,
-        ),
-      },
-    },
+    settingsConfig: withReconciledCodexDefaultModel(nextSettings, models),
+    ...(provider.meta?.codexProtocolOverrides
+      ? {
+          meta: {
+            ...provider.meta,
+            codexProtocolOverrides: sanitizeCodexProtocolOverrides(
+              provider.meta.codexProtocolOverrides,
+              index,
+            ),
+          },
+        }
+      : {}),
   };
 }
 
@@ -1402,6 +1379,13 @@ function routeTargetProvider(
   return targetProviderId ? providersById.get(targetProviderId) : undefined;
 }
 
+/// Distinguish an explicitly empty catalog from a provider that predates the
+/// catalog contract. An empty catalog is authoritative and must not revive
+/// legacy route match fields.
+function providerHasCodexModelCatalog(provider: Provider | undefined): boolean {
+  return hasCodexCatalog(provider?.settingsConfig);
+}
+
 /// 规则名称优先使用用户可读 label；历史 route 缺少 label 时跟随目标 Provider 名称，最后才暴露稳定 ID。
 function routeDisplayName(
   route: CodexRoute,
@@ -1476,7 +1460,7 @@ function collectProviderModelIds(provider: Provider): string[] {
   const catalogModels = readIncludedCodexModelCatalog(provider)
     .models.map((model) => model.model?.trim())
     .filter((model): model is string => Boolean(model));
-  if (readCodexModelCatalog(provider).models.length > 0) {
+  if (providerHasCodexModelCatalog(provider)) {
     return Array.from(new Set(catalogModels));
   }
   const singleModelFields = [
@@ -2077,10 +2061,8 @@ function serializeCodexRoutingV2(routing: CodexRouting): CodexRoutingConfigV2 {
 function buildExistingCatalogByModel(
   plan: Provider,
 ): Map<string, CodexCatalogModelDraft> {
-  const existingCatalog = plan.settingsConfig?.modelCatalog;
-  const existingModels = Array.isArray(existingCatalog?.models)
-    ? (existingCatalog.models as CodexCatalogModelDraft[])
-    : [];
+  const existingModels = readCodexModelCatalog(plan)
+    .models as CodexCatalogModelDraft[];
   const existingModelById = new Map<string, CodexCatalogModelDraft>();
   for (const model of existingModels) {
     const id = model.model?.trim();
@@ -2219,6 +2201,14 @@ function routeCanMatchVisibleCatalogModel(
     typeof catalogModel === "string"
       ? [model.toLowerCase()]
       : modelIdentityValues(catalogModel);
+  if (route.modelSelection?.mode === "include") {
+    // Schema-v2 modelSelection is authoritative. Legacy match.models can
+    // survive in older drafts, but must not widen an explicit allowlist.
+    return modelSelectionMatchesCatalogModel(
+      route.modelSelection.models,
+      typeof catalogModel === "string" ? { model } : catalogModel,
+    );
+  }
   const exactModels = route.match?.models ?? [];
   if (
     exactModels.some((matchedModel) =>
@@ -2235,7 +2225,7 @@ function routeCanMatchVisibleCatalogModel(
     );
   });
   if (!prefixMatched) return false;
-  return route.modelSelection?.mode !== "include";
+  return true;
 }
 
 /// route 能力比 provider catalog 更接近最终路由结果；写入聚合 catalog，确保 Codex 看到的模型能力与规则一致。
@@ -2265,7 +2255,7 @@ export function buildModelCatalogForRoutes(
 ): CodexModelCatalogDraft {
   const routing = readCodexRouting(plan);
   const isSchemaV2 = routing?.schemaVersion === 2;
-  const existingCatalog = plan.settingsConfig?.modelCatalog;
+  const existingCatalog = readCodexCatalogSettings(plan.settingsConfig);
   const legacyModelById = isSchemaV2
     ? new Map<string, CodexCatalogModelDraft>()
     : buildExistingCatalogByModel(plan);
@@ -2276,28 +2266,50 @@ export function buildModelCatalogForRoutes(
     const targetProvider = routeTargetProviderId(route)
       ? providersById.get(routeTargetProviderId(route)!)
       : undefined;
+    const targetProviderId = routeTargetProviderId(route);
+    const hasTargetCatalog = providerHasCodexModelCatalog(targetProvider);
     const targetCatalogModels = targetProvider
       ? readIncludedCodexModelCatalog(targetProvider).models
       : [];
-    // Saved routes use their persisted names, not the wizard's temporary
-    // collision aliases. Resolve only aliases explicitly saved on this route.
-    for (const [visible, upstream] of Object.entries(
+    const aliases = Object.entries(
       route.aliases ?? route.upstream?.modelMap ?? {},
-    )) {
-      if (targetCatalogModels.some((entry) => entry.model === visible))
-        continue;
-      const source = targetCatalogModels.find(
-        (entry) => entry.model === upstream,
-      );
-      if (source) {
-        targetCatalogModels.push({
-          ...source,
-          model: visible,
-          upstreamModel: upstream,
-        });
+    );
+    const sourceIndex = buildCodexModelReferenceIndex(targetCatalogModels);
+    const selectedSourceModels =
+      isSchemaV2 && route.modelSelection?.mode === "include"
+        ? new Set(
+            route.modelSelection.models
+              .map((model) =>
+                resolveCodexRouteModelReference(
+                  model,
+                  sourceIndex,
+                  route.aliases,
+                ),
+              )
+              .filter((model): model is string => Boolean(model)),
+          )
+        : undefined;
+    if (!isSchemaV2) {
+      for (const [visible, upstream] of aliases) {
+        if (targetCatalogModels.some((entry) => entry.model === visible))
+          continue;
+        const source = targetCatalogModels.find(
+          (entry) =>
+            normalizedModelIdentity(entry.model) ===
+              normalizedModelIdentity(upstream) ||
+            normalizedModelIdentity(catalogDraftUpstreamModel(entry)) ===
+              normalizedModelIdentity(upstream),
+        );
+        if (source) {
+          targetCatalogModels.push({
+            ...source,
+            model: visible.trim(),
+            upstreamModel: catalogDraftUpstreamModel(source),
+          });
+        }
       }
     }
-    const routableCatalogModels =
+    const selectedCatalogModels =
       route.modelSelection?.mode === "all"
         ? targetCatalogModels.filter(
             (catalogModel) => catalogModel.enabled !== false,
@@ -2305,8 +2317,32 @@ export function buildModelCatalogForRoutes(
         : targetCatalogModels.filter(
             (catalogModel) =>
               catalogModel.enabled !== false &&
-              routeCanMatchVisibleCatalogModel(route, catalogModel),
+              (selectedSourceModels
+                ? selectedSourceModels.has(catalogModel.model)
+                : routeCanMatchVisibleCatalogModel(route, catalogModel)),
           );
+    // The v2 compiler replaces a selected row's visible name with its explicit
+    // aliases. Alias targets may use either its picker ID or its upstream ID.
+    const routableCatalogModels = isSchemaV2
+      ? selectedCatalogModels.flatMap((model) => {
+          const upstream = catalogDraftUpstreamModel(model);
+          const visibleAliases = aliases.filter(
+            ([visible, target]) =>
+              visible.trim() &&
+              (normalizedModelIdentity(target) ===
+                normalizedModelIdentity(model.model) ||
+                normalizedModelIdentity(target) ===
+                  normalizedModelIdentity(upstream)),
+          );
+          return visibleAliases.length > 0
+            ? visibleAliases.map(([visible]) => ({
+                ...model,
+                model: visible.trim(),
+                upstreamModel: upstream,
+              }))
+            : [model];
+        })
+      : selectedCatalogModels;
     for (const catalogModel of routableCatalogModels) {
       const id = catalogModel.model?.trim();
       if (!id || byModel.has(id)) continue;
@@ -2318,16 +2354,16 @@ export function buildModelCatalogForRoutes(
         ),
       );
     }
-    for (const model of route.match?.models ?? []) {
+    const fallbackModels =
+      hasTargetCatalog || (isSchemaV2 && Boolean(targetProviderId))
+        ? []
+        : route.modelSelection?.mode === "include"
+          ? route.modelSelection.models
+          : (route.match?.models ?? []);
+    for (const model of fallbackModels) {
       const id = model.trim();
       if (!id || byModel.has(id)) continue;
       // A persisted route is policy, not evidence that an excluded model exists.
-      if (
-        targetProvider &&
-        readCodexModelCatalog(targetProvider).models.length > 0
-      ) {
-        continue;
-      }
       if (legacyModelById.get(id)?.enabled === false) continue;
       byModel.set(
         id,
@@ -2387,6 +2423,80 @@ export function projectCodexModelCatalog(
       modelIds.has(model),
     ),
   };
+}
+
+/** Reconcile persisted policy against source catalogs before strict router saves. */
+export function reconcileCodexRoutingPlanForSave(
+  plan: Provider,
+  providersById: Map<string, Provider>,
+): Provider {
+  const routing = plan.settingsConfig?.codexRouting;
+  if (routing?.schemaVersion !== 2) return plan;
+  const resolveRouteIndex = (providerId: string) => {
+    const provider = providersById.get(providerId);
+    return providerHasCodexModelCatalog(provider) && provider
+      ? buildCodexModelReferenceIndex(
+          readIncludedCodexModelCatalog(provider).models,
+        )
+      : undefined;
+  };
+  const options = { preserveUpstreamReferences: true };
+  const routeReconciledRouting = sanitizeCodexRoutingConfig(
+    routing,
+    buildCodexModelReferenceIndex(
+      projectCodexModelCatalog(plan, providersById).models,
+    ),
+    resolveRouteIndex,
+    options,
+  );
+  const reconciledPlan: Provider = {
+    ...plan,
+    settingsConfig: {
+      ...withoutDerivedRouterCatalog(plan.settingsConfig),
+      codexRouting: {
+        ...routing,
+        routes: routeReconciledRouting?.routes,
+      },
+    },
+  };
+  // Pruned aliases or emptied selections can shrink the router's own catalog.
+  const catalog = projectCodexModelCatalog(reconciledPlan, providersById);
+  const index = buildCodexModelReferenceIndex(catalog.models);
+  reconciledPlan.settingsConfig.codexRouting = sanitizeCodexRoutingConfig(
+    reconciledPlan.settingsConfig.codexRouting,
+    index,
+    resolveRouteIndex,
+    options,
+  );
+  reconciledPlan.settingsConfig = withReconciledCodexDefaultModel(
+    reconciledPlan.settingsConfig,
+    catalog.models,
+  );
+  return reconciledPlan;
+}
+
+function withReconciledCodexDefaultModel(
+  settingsConfig: Record<string, any>,
+  models: CodexCatalogModel[],
+): Record<string, any> {
+  const config = settingsConfig.config;
+  if (typeof config === "string") {
+    const defaultModel = extractCodexModelName(config);
+    const resolvedDefault =
+      buildCodexModelReferenceIndex(models).resolve(defaultModel);
+    if (defaultModel && resolvedDefault !== defaultModel) {
+      const nextDefault =
+        resolvedDefault ??
+        models.find((model) => model.enabled !== false)?.model;
+      return {
+        ...settingsConfig,
+        config: nextDefault
+          ? setCodexModelName(config, nextDefault)
+          : removeCodexTopLevelField(config, "model"),
+      };
+    }
+  }
+  return settingsConfig;
 }
 
 /// 生成工作台专用的新 MultiRouter provider；它只承载路由配置，不再让用户填写无关的上游密钥表单。
@@ -2617,25 +2727,75 @@ function routeProviderModelSyncSummary(
 export function collectRoutedCatalogModels(
   routes: RouteEntry[],
   catalogModels: CodexCatalogModel[],
+  providersById: Map<string, Provider>,
 ): string[] {
   const exactModels = new Set<string>();
   const prefixes: string[] = [];
 
-  for (const { route, provider } of routes) {
+  for (const { route } of routes) {
     if (route.enabled === false) continue;
-    if (route.modelSelection?.mode === "all") {
-      for (const model of readIncludedCodexModelCatalog(provider).models) {
-        const normalized = model.model?.trim();
-        if (normalized) exactModels.add(normalized);
+    const targetProviderId = routeTargetProviderId(route);
+    const targetProvider = routeTargetProvider(route, providersById);
+    const hasTargetCatalog = providerHasCodexModelCatalog(targetProvider);
+    const targetCatalogModels = targetProvider
+      ? readIncludedCodexModelCatalog(targetProvider).models
+      : [];
+
+    if (hasTargetCatalog) {
+      for (const model of targetCatalogModels) {
+        if (
+          route.modelSelection?.mode === "all" ||
+          routeCanMatchVisibleCatalogModel(route, model)
+        ) {
+          const normalized = model.model?.trim();
+          if (normalized) exactModels.add(normalized);
+        }
       }
+      for (const [visible, upstream] of Object.entries(
+        route.aliases ?? route.upstream?.modelMap ?? {},
+      )) {
+        const hasSelectedTarget = targetCatalogModels.some(
+          (model) =>
+            modelIdentityValues(model).includes(
+              normalizedModelIdentity(upstream),
+            ) &&
+            (route.modelSelection?.mode === "all" ||
+              (route.modelSelection?.mode === "include"
+                ? modelSelectionMatchesCatalogModel(
+                    route.modelSelection.models,
+                    model,
+                  )
+                : routeCanMatchVisibleCatalogModel(route, visible))),
+        );
+        if (hasSelectedTarget) {
+          const normalized = visible.trim();
+          if (normalized) exactModels.add(normalized);
+        }
+      }
+      continue;
     }
-    for (const model of route.match?.models ?? []) {
+
+    // Schema-v2 routes are catalog-bound even when the target provider has
+    // not produced a catalog yet. Do not resurrect stale match fields while
+    // the source is empty or unavailable.
+    if (route.modelSelection && targetProviderId) continue;
+
+    // A missing catalog is the only case where legacy route text is still the
+    // available evidence. Once a catalog exists, stale match fields cannot
+    // resurrect models removed from that catalog.
+    const fallbackModels =
+      route.modelSelection?.mode === "include"
+        ? route.modelSelection.models
+        : (route.match?.models ?? []);
+    for (const model of fallbackModels) {
       const normalized = model.trim();
       if (normalized) exactModels.add(normalized);
     }
-    for (const prefix of route.match?.prefixes ?? []) {
-      const normalized = prefix.trim();
-      if (normalized) prefixes.push(normalized);
+    if (route.modelSelection?.mode !== "include") {
+      for (const prefix of route.match?.prefixes ?? []) {
+        const normalized = prefix.trim();
+        if (normalized) prefixes.push(normalized);
+      }
     }
   }
 
@@ -3233,12 +3393,10 @@ export function CodexRouterWorkspacePage({
         if (!isCurrentAttempt()) {
           return { status: "stale" };
         }
-        if (models.length === 0) {
+        if (models.length === 0 && onlineErrorMessage) {
           return {
             status: "empty",
-            message: onlineErrorMessage
-              ? `OAuth online model-list fetch failed: ${onlineErrorMessage}; the fallback official catalog also has no models.`
-              : "Model-list fetch failed: the remote returned an empty list; check the current provider configuration.",
+            message: `OAuth online model-list fetch failed: ${onlineErrorMessage}; the fallback official catalog also has no models.`,
           };
         }
 
@@ -3280,7 +3438,7 @@ export function CodexRouterWorkspacePage({
                 status: "error",
                 message:
                   result.message ??
-                  "Model-list fetch failed: the remote returned an empty list; check the current provider configuration.",
+                  "OAuth online model-list fetch failed and the fallback official catalog also has no models.",
                 modelCount: 0,
               },
             }));
@@ -3305,13 +3463,15 @@ export function CodexRouterWorkspacePage({
               status: "success",
               message: result.usedCodexFallback
                 ? `OAuth online read failed; updated ${
-                    readCodexModelCatalog(result.nextProvider).models.length
+                    readIncludedCodexModelCatalog(result.nextProvider).models
+                      .length
                   }  models. Online error:${result.onlineErrorMessage}`
                 : `Read and updated ${
-                    readCodexModelCatalog(result.nextProvider).models.length
+                    readIncludedCodexModelCatalog(result.nextProvider).models
+                      .length
                   }  models.`,
-              modelCount: readCodexModelCatalog(result.nextProvider).models
-                .length,
+              modelCount: readIncludedCodexModelCatalog(result.nextProvider)
+                .models.length,
             },
           }));
           await queryClient.invalidateQueries({
@@ -3402,8 +3562,10 @@ export function CodexRouterWorkspacePage({
       persistedPlan &&
       JSON.stringify(persistedPlan.settingsConfig?.codexRouting) ===
         JSON.stringify(optimisticRoutingPlan?.settingsConfig?.codexRouting) &&
-      JSON.stringify(persistedPlan.settingsConfig?.modelCatalog) ===
-        JSON.stringify(optimisticRoutingPlan?.settingsConfig?.modelCatalog)
+      JSON.stringify(readCodexCatalogSettings(persistedPlan.settingsConfig)) ===
+        JSON.stringify(
+          readCodexCatalogSettings(optimisticRoutingPlan?.settingsConfig),
+        )
     ) {
       setOptimisticRoutingPlan(null);
     }
@@ -3434,8 +3596,12 @@ export function CodexRouterWorkspacePage({
           getProviderModelFetchConfig(optimisticProvider),
         );
         const catalogPersisted =
-          JSON.stringify(persistedProvider.settingsConfig?.modelCatalog) ===
-          JSON.stringify(optimisticProvider.settingsConfig?.modelCatalog);
+          JSON.stringify(
+            readCodexCatalogSettings(persistedProvider.settingsConfig),
+          ) ===
+          JSON.stringify(
+            readCodexCatalogSettings(optimisticProvider.settingsConfig),
+          );
         if (persistedAttemptKey !== optimisticAttemptKey || catalogPersisted) {
           delete next[providerId];
           changed = true;
@@ -3500,12 +3666,15 @@ export function CodexRouterWorkspacePage({
     onEditProvider(provider);
   }
 
-  /// 保存 MultiRouter 方案元信息时不触碰 routes/modelCatalog，避免普通 Provider 表单误清空路由私有字段。
+  /// 保存方案设置时保留有效 policy，仅清理已从模型源目录移除的引用。
   async function handleSavePlanSettings(
     plan: Provider,
     draft: MultiRouterSettingsDraft,
   ) {
-    const nextProvider = applyMultiRouterSettingsDraft(plan, draft);
+    const nextProvider = reconcileCodexRoutingPlanForSave(
+      applyMultiRouterSettingsDraft(plan, draft),
+      providersById,
+    );
     setIsSavingPlanSettings(true);
     setRoutePickerError(null);
     setRoutePickerMessage(null);
@@ -3562,15 +3731,18 @@ export function CodexRouterWorkspacePage({
       routes: normalizedRoutes,
     };
     delete nextRouting.defaultRouteId;
-    const nextProvider: Provider = {
-      ...plan,
-      settingsConfig: {
-        ...withoutDerivedRouterCatalog(plan.settingsConfig),
-        codexRouting: serializeCodexRoutingV2(nextRouting),
+    const nextProvider = reconcileCodexRoutingPlanForSave(
+      {
+        ...plan,
+        settingsConfig: {
+          ...withoutDerivedRouterCatalog(plan.settingsConfig),
+          codexRouting: serializeCodexRoutingV2(nextRouting),
+        },
       },
-    };
+      providersById,
+    );
     const nextEnabledProviderIds = new Set<string>();
-    for (const route of normalizedRoutes) {
+    for (const route of readCodexRouting(nextProvider)?.routes ?? []) {
       if (route.enabled === false) continue;
       const providerId = routeSemanticProviderId(route, modelSources);
       if (providerId) nextEnabledProviderIds.add(providerId);
@@ -3743,7 +3915,7 @@ export function CodexRouterWorkspacePage({
         )?.[1] ?? model;
       if (
         target &&
-        readCodexModelCatalog(target).models.length > 0 &&
+        providerHasCodexModelCatalog(target) &&
         !providerHasModelIdentity(target, upstream)
       ) {
         return false;
@@ -3917,6 +4089,7 @@ export function CodexRouterWorkspacePage({
               selectedPlan={selectedPlan}
               selectedRoutes={selectedPlanRouteEntries}
               catalog={selectedProjectedCatalog}
+              providersById={providersById}
               onCreatePlan={handleCreatePlan}
             />
           </TabsContent>
@@ -4449,11 +4622,13 @@ function SubagentsTab({
   selectedPlan,
   selectedRoutes,
   catalog,
+  providersById,
   onCreatePlan,
 }: {
   selectedPlan: Provider | null;
   selectedRoutes: RouteEntry[];
   catalog: CodexModelCatalogDraft;
+  providersById: Map<string, Provider>;
   onCreatePlan: () => void;
 }) {
   if (!selectedPlan) {
@@ -4492,6 +4667,7 @@ function SubagentsTab({
         selectedPlan={selectedPlan}
         selectedRoutes={selectedRoutes}
         catalog={catalog}
+        providersById={providersById}
       />
     </div>
   );
@@ -4736,6 +4912,12 @@ function modelOrderReasoningQueryOptions(
             identities.includes(identity),
           ),
       );
+      // An explicit catalog is authoritative, including an empty catalog.
+      // Do not resolve stale router models against legacy route fields when
+      // the target provider no longer exposes that model.
+      if (providerHasCodexModelCatalog(provider) && !sourceModel) {
+        continue;
+      }
       if (
         !routeCanMatchVisibleCatalogModel(route, model) &&
         !(route.modelSelection?.mode === "all" && sourceModel)
@@ -5223,37 +5405,40 @@ export function ModelOrderTab({
       if (persistOrder || effortDirty)
         delete routingBase.defaultReasoningEffort;
       await providersApi.update(
-        {
-          ...selectedPlan,
-          settingsConfig: {
-            ...withoutDerivedRouterCatalog(selectedPlan.settingsConfig),
-            ...(persistOrder && models[0]?.model
-              ? {
-                  config: setCodexModelName(
-                    removeCodexTopLevelField(
-                      typeof currentConfig === "string" ? currentConfig : "",
-                      "model_reasoning_effort",
-                    ),
-                    models[0].model,
-                  ),
-                }
-              : {}),
-            codexRouting: {
-              ...routingBase,
-              ...(persistOrder
+        reconcileCodexRoutingPlanForSave(
+          {
+            ...selectedPlan,
+            settingsConfig: {
+              ...withoutDerivedRouterCatalog(selectedPlan.settingsConfig),
+              ...(persistOrder && models[0]?.model
                 ? {
-                    // Persist the calculated default too: the live compiler
-                    // otherwise reuses the upstream catalog's unsorted order.
-                    modelOrder: models.map((model) => model.model),
+                    config: setCodexModelName(
+                      removeCodexTopLevelField(
+                        typeof currentConfig === "string" ? currentConfig : "",
+                        "model_reasoning_effort",
+                      ),
+                      models[0].model,
+                    ),
                   }
                 : {}),
-              modelDisplayStyle: displayStyle,
-              ...(nextEffort && (persistOrder || effortDirty)
-                ? { defaultReasoningEffort: nextEffort }
-                : {}),
+              codexRouting: {
+                ...routingBase,
+                ...(persistOrder
+                  ? {
+                      // Persist the calculated default too: the live compiler
+                      // otherwise reuses the upstream catalog's unsorted order.
+                      modelOrder: models.map((model) => model.model),
+                    }
+                  : {}),
+                modelDisplayStyle: displayStyle,
+                ...(nextEffort && (persistOrder || effortDirty)
+                  ? { defaultReasoningEffort: nextEffort }
+                  : {}),
+              },
             },
           },
-        },
+          providersById,
+        ),
         "codex",
       );
       await queryClient.invalidateQueries({ queryKey: ["providers", "codex"] });
@@ -5345,34 +5530,32 @@ export function ModelOrderTab({
         if (!targetProviderId) continue;
         const aliases = route.aliases ?? route.upstream?.modelMap ?? {};
         const canonicalModel = aliases[trimmed] ?? trimmed;
-        if (
-          route.modelSelection?.mode === "include" &&
-          !route.modelSelection.models.includes(canonicalModel)
-        ) {
-          continue;
-        }
         const source = providersById.get(targetProviderId);
         if (!source) continue;
         const sourceModels = readCodexModelCatalog(source).models;
         const sourceIndex = sourceModels.findIndex(
           (model) =>
-            model.model?.trim() === canonicalModel ||
-            model.upstreamModel?.trim() === canonicalModel ||
-            model.upstream_model?.trim() === canonicalModel,
+            normalizedModelIdentity(model.model) ===
+              normalizedModelIdentity(canonicalModel) ||
+            normalizedModelIdentity(catalogDraftUpstreamModel(model)) ===
+              normalizedModelIdentity(canonicalModel),
         );
         if (sourceIndex < 0) continue;
-        nextProvider = {
-          ...source,
-          settingsConfig: {
-            ...source.settingsConfig,
-            modelCatalog: {
-              ...(source.settingsConfig?.modelCatalog ?? {}),
-              models: sourceModels.map((model, index) =>
-                index === sourceIndex ? { ...model, enabled: false } : model,
-              ),
-            },
-          },
-        };
+        if (
+          route.modelSelection?.mode === "include" &&
+          !modelSelectionMatchesCatalogModel(
+            route.modelSelection.models,
+            sourceModels[sourceIndex],
+          )
+        )
+          continue;
+        nextProvider = providerWithReconciledModelCatalog(
+          source,
+          sourceModels.map((model, index) =>
+            index === sourceIndex ? { ...model, enabled: false } : model,
+          ),
+          providersById,
+        );
         break;
       }
       if (!nextProvider) {
@@ -5431,16 +5614,7 @@ export function ModelOrderTab({
         return restored;
       });
       await providersApi.update(
-        {
-          ...source,
-          settingsConfig: {
-            ...source.settingsConfig,
-            modelCatalog: {
-              ...(source.settingsConfig?.modelCatalog ?? {}),
-              models,
-            },
-          },
-        },
+        providerWithReconciledModelCatalog(source, models, providersById),
         "codex",
       );
       setMessage(
@@ -6872,9 +7046,18 @@ function RouteCandidatePicker({
         setRoutePolicyError(aliasesResult.error);
         return;
       }
-      for (const upstreamModel of Object.values(aliasesResult.aliases)) {
+      for (const [alias, upstreamModel] of Object.entries(
+        aliasesResult.aliases,
+      )) {
+        const persistedAliases =
+          candidate.route.aliases ?? candidate.route.upstream?.modelMap ?? {};
+        const isStalePersistedAlias =
+          candidate.isExisting &&
+          providerHasCodexModelCatalog(candidate.canonicalProvider) &&
+          persistedAliases[alias] === upstreamModel;
         if (
           enabled &&
+          !isStalePersistedAlias &&
           (!candidate.canonicalProvider ||
             !providerHasModelIdentity(
               candidate.canonicalProvider,
@@ -7412,10 +7595,12 @@ function SpawnAgentCandidatesPanel({
   selectedPlan,
   selectedRoutes,
   catalog,
+  providersById,
 }: {
   selectedPlan: Provider | null;
   selectedRoutes: RouteEntry[];
   catalog: CodexModelCatalogDraft;
+  providersById: Map<string, Provider>;
 }) {
   const [diagnostics, setDiagnostics] =
     useState<CodexMultiRouterDiagnostics | null>(null);
@@ -7485,8 +7670,13 @@ function SpawnAgentCandidatesPanel({
         ? configuredSpawnAgentModels
         : selectedCatalog.models.slice(0, spawnAgentVisibleLimit);
   const routedCatalogModelIds = useMemo(
-    () => collectRoutedCatalogModels(selectedRoutes, selectedCatalog.models),
-    [selectedRoutes, selectedCatalog.models],
+    () =>
+      collectRoutedCatalogModels(
+        selectedRoutes,
+        selectedCatalog.models,
+        providersById,
+      ),
+    [providersById, selectedRoutes, selectedCatalog.models],
   );
   const draftVisibleModels = draftSpawnAgentModels.map(
     (model) => selectedCatalogByModel.get(model) ?? { model },
@@ -7612,16 +7802,19 @@ function SpawnAgentCandidatesPanel({
       if (currentRouting?.schemaVersion !== 2) {
         throw new Error("legacy_route_requires_migration");
       }
-      const nextProvider: Provider = {
-        ...selectedPlan,
-        settingsConfig: {
-          ...withoutDerivedRouterCatalog(selectedPlan.settingsConfig),
-          codexRouting: serializeCodexRoutingV2({
-            ...currentRouting,
-            spawnAgentModels: normalized,
-          }),
+      const nextProvider = reconcileCodexRoutingPlanForSave(
+        {
+          ...selectedPlan,
+          settingsConfig: {
+            ...withoutDerivedRouterCatalog(selectedPlan.settingsConfig),
+            codexRouting: serializeCodexRoutingV2({
+              ...currentRouting,
+              spawnAgentModels: normalized,
+            }),
+          },
         },
-      };
+        providersById,
+      );
       await providersApi.update(nextProvider, "codex");
       setDraftSpawnAgentModels(normalized);
       setCandidateSaveMessage(
@@ -7647,16 +7840,19 @@ function SpawnAgentCandidatesPanel({
       if (currentRouting?.schemaVersion !== 2) {
         throw new Error("legacy_route_requires_migration");
       }
-      const nextProvider: Provider = {
-        ...selectedPlan,
-        settingsConfig: {
-          ...withoutDerivedRouterCatalog(selectedPlan.settingsConfig),
-          codexRouting: serializeCodexRoutingV2({
-            ...currentRouting,
-            subagentVersion: version,
-          }),
+      const nextProvider = reconcileCodexRoutingPlanForSave(
+        {
+          ...selectedPlan,
+          settingsConfig: {
+            ...withoutDerivedRouterCatalog(selectedPlan.settingsConfig),
+            codexRouting: serializeCodexRoutingV2({
+              ...currentRouting,
+              subagentVersion: version,
+            }),
+          },
         },
-      };
+        providersById,
+      );
       await providersApi.update(nextProvider, "codex");
       setActiveSubagentVersion(version);
       setSubagentVersionMessage(

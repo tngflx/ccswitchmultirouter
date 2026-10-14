@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use crate::app_config::AppType;
+use crate::codex_multirouter::catalog::catalog_models;
 use crate::codex_subagent_profiles::{
     compile_subagent_v2_profiles, deepseek_role_identity_for_model, deepseek_role_models_match,
     initialize_legacy_subagent_v2, normalize_profile_key, parse_persisted_subagent_v2,
@@ -3845,12 +3846,7 @@ impl ProviderClassificationContext {
                     SubagentProviderKind::ThirdParty
                 },
             );
-            let models = provider
-                .settings_config
-                .get("modelCatalog")
-                .or_else(|| provider.settings_config.get("model_catalog"))
-                .and_then(|catalog| catalog.get("models"))
-                .and_then(Value::as_array)
+            let models = catalog_models(&provider.settings_config)
                 .into_iter()
                 .flatten()
                 .filter_map(|entry| entry.get("model").and_then(Value::as_str))

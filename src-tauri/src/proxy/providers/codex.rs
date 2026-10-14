@@ -6,6 +6,7 @@
 //! 支持检测官方 Codex 客户端 (codex_vscode, codex_cli_rs)
 
 use super::{AuthInfo, AuthStrategy, ProviderAdapter};
+use crate::codex_multirouter::catalog::catalog_models;
 use crate::codex_multirouter::compiler::{
     compile_provider_v2, CodexRoutingCompileError, CompiledCodexModel, CompiledCodexRoute,
     CompiledCodexRoutingPlan,
@@ -2085,13 +2086,7 @@ pub(crate) fn codex_provider_has_legacy_mixed_model_transports(provider: &Provid
     {
         return false;
     }
-    let Some(models) = provider
-        .settings_config
-        .get("modelCatalog")
-        .or_else(|| provider.settings_config.get("model_catalog"))
-        .and_then(|catalog| catalog.get("models"))
-        .and_then(JsonValue::as_array)
-    else {
+    let Some(models) = catalog_models(&provider.settings_config) else {
         return false;
     };
     let mut has_responses = false;

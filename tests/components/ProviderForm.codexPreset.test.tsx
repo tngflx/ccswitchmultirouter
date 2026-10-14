@@ -2,8 +2,11 @@ import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import type { ComponentProps } from "react";
 import { describe, expect, it, vi } from "vitest";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { toast } from "sonner";
 import { ProviderForm } from "@/components/providers/forms/ProviderForm";
 import { CodexProviderSetCancelled } from "@/components/providers/forms/useCodexProviderSetSave";
+import type { Provider } from "@/types";
+import * as providerConfigUtils from "@/utils/providerConfigUtils";
 
 const codexCandidateApiMocks = vi.hoisted(() => ({
   validateProviderCandidate: vi.fn(),
@@ -101,6 +104,9 @@ vi.mock("@/components/JsonEditor", () => ({
 }));
 
 vi.mock("@/components/providers/forms/CodexFormFields", () => ({
+  CodexFormSaveFeedback: ({ saveError }: { saveError?: string }) => (
+    <div role="alert">{saveError}</div>
+  ),
   CodexFormFields: ({
     codexApiKey,
     codexBaseUrl,
@@ -162,6 +168,9 @@ vi.mock("@/components/providers/forms/CodexFormFields", () => ({
       >
         mock-set-catalog
       </button>
+      <button type="button" onClick={() => onCatalogModelsChange?.([])}>
+        mock-clear-catalog
+      </button>
       <button type="button" onClick={() => onApiKeyChange?.("sk-test")}>
         mock-set-api-key
       </button>
@@ -204,6 +213,7 @@ vi.mock("@/components/providers/forms/CodexFormFields", () => ({
 
 function renderProviderForm(
   props: Partial<ComponentProps<typeof ProviderForm>> = {},
+  providers?: Record<string, Provider>,
 ) {
   const queryClient = new QueryClient({
     defaultOptions: {
@@ -211,6 +221,15 @@ function renderProviderForm(
       mutations: { retry: false },
     },
   });
+  if (providers) {
+    queryClient.setQueryDefaults(["providers", "codex"], {
+      staleTime: Infinity,
+    });
+    queryClient.setQueryData(["providers", "codex"], {
+      providers,
+      currentProviderId: "",
+    });
+  }
 
   return render(
     <QueryClientProvider client={queryClient}>
@@ -542,6 +561,276 @@ describe("ProviderForm Codex preset selection", () => {
     expect(savedSettings.modelCatalog.models).toEqual([
       { model: "gpt-5.5", contextWindow: 272000 },
     ]);
+  });
+
+  it("cleans removed defaults and dependent model references when saving a changed catalog", async () => {
+    const onSubmit = vi.fn();
+    renderProviderForm({
+      providerId: "relay",
+      showButtons: true,
+      submitLabel: "Save",
+      onSubmit,
+      initialData: {
+        name: "Relay",
+        category: "custom",
+        settingsConfig: {
+          auth: { OPENAI_API_KEY: "sk-test" },
+          config:
+            'model_provider = "relay"\nmodel = "model-a"\n[model_providers.relay]\nbase_url = "https://relay.example/v1"\nwire_api = "responses"\n',
+          modelCatalog: {
+            models: [{ model: "model-a" }],
+            spawnAgentModels: ["model-a"],
+          },
+          codexApiKeyGroups: [
+            { id: "group", apiKeys: ["sk-group"], models: ["model-a"] },
+          ],
+          codexRouting: {
+            schemaVersion: 2,
+            enabled: true,
+            modelOrder: ["model-a"],
+            spawnAgentModels: ["model-a"],
+            routes: [
+              {
+                id: "self",
+                targetProviderId: "relay",
+                modelSelection: { mode: "include", models: ["model-a"] },
+                aliases: { fast: "model-a" },
+              },
+            ],
+          },
+        },
+        meta: {
+          apiFormat: "openai_responses",
+          codexProtocolOverrides: { "model-a": "openai_chat" },
+        },
+      },
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "mock-set-catalog" }));
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(onSubmit).toHaveBeenCalledOnce());
+    const payload = onSubmit.mock.calls[0][0];
+    const settings = JSON.parse(payload.settingsConfig);
+    expect(settings.config).toContain('model = "gpt-5.5"');
+    expect(
+      settings.modelCatalog.models.map((model: any) => model.model),
+    ).toEqual(["gpt-5.5"]);
+    expect(settings.modelCatalog.spawnAgentModels).toEqual(["gpt-5.5"]);
+    expect(settings.codexRouting.modelOrder).toEqual([]);
+    expect(settings.codexRouting.spawnAgentModels).toEqual([]);
+    expect(settings.codexRouting.routes[0].modelSelection.models).toEqual([]);
+    expect(settings.codexRouting.routes[0].enabled).toBe(false);
+    expect(settings.codexRouting.routes[0].aliases).toEqual({});
+    expect(settings.codexApiKeyGroups[0].models).toEqual([]);
+    expect(payload.meta.codexProtocolOverrides).toBeUndefined();
+  });
+
+  it("persists an explicitly empty catalog without reviving the previous default model", async () => {
+    const onSubmit = vi.fn();
+    renderProviderForm({
+      showButtons: true,
+      submitLabel: "Save",
+      onSubmit,
+      initialData: {
+        name: "Empty relay",
+        category: "custom",
+        settingsConfig: {
+          auth: { OPENAI_API_KEY: "sk-test" },
+          config:
+            'model_provider = "relay"\nmodel = "model-a"\n[model_providers.relay]\nbase_url = "https://relay.example/v1"\nwire_api = "responses"\n',
+          modelCatalog: { models: [{ model: "model-a" }] },
+        },
+        meta: { apiFormat: "openai_responses" },
+      },
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "mock-clear-catalog" }));
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(onSubmit).toHaveBeenCalledOnce());
+    const settings = JSON.parse(onSubmit.mock.calls[0][0].settingsConfig);
+    expect(settings.modelCatalog).toEqual({ models: [] });
+    expect(
+      providerConfigUtils.extractCodexModelName(settings.config),
+    ).toBeFalsy();
+  });
+
+  it("preserves legacy defaults and references when no catalog was configured", async () => {
+    const onSubmit = vi.fn();
+    renderProviderForm({
+      showButtons: true,
+      submitLabel: "Save",
+      onSubmit,
+      initialData: {
+        name: "Legacy Relay",
+        category: "custom",
+        settingsConfig: {
+          auth: { OPENAI_API_KEY: "sk-test" },
+          config:
+            'model_provider = "relay"\nmodel = "legacy-model"\n[model_providers.relay]\nbase_url = "https://relay.example/v1"\nwire_api = "responses"\n',
+          codexApiKeyGroups: [
+            { id: "group", apiKeys: ["sk-group"], models: ["legacy-model"] },
+          ],
+          codexRouting: {
+            enabled: true,
+            routes: [{ id: "legacy", match: { models: ["legacy-model"] } }],
+          },
+        },
+        meta: {
+          apiFormat: "openai_responses",
+          codexProtocolOverrides: { "legacy-model": "openai_chat" },
+        },
+      },
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(onSubmit).toHaveBeenCalledOnce());
+    const payload = onSubmit.mock.calls[0][0];
+    const settings = JSON.parse(payload.settingsConfig);
+    expect(settings.modelCatalog).toBeUndefined();
+    expect(providerConfigUtils.extractCodexModelName(settings.config)).toBe(
+      "legacy-model",
+    );
+    expect(settings.codexApiKeyGroups[0].models).toEqual(["legacy-model"]);
+    expect(settings.codexRouting.routes[0].match.models).toEqual([
+      "legacy-model",
+    ]);
+    expect(payload.meta.codexProtocolOverrides).toEqual({
+      "legacy-model": "openai_chat",
+    });
+  });
+
+  it("persists a deliberately emptied catalog even when the original provider had none", async () => {
+    const onSubmit = vi.fn();
+    renderProviderForm({
+      showButtons: true,
+      submitLabel: "Save",
+      onSubmit,
+      initialData: {
+        name: "Legacy Relay",
+        category: "custom",
+        settingsConfig: {
+          auth: { OPENAI_API_KEY: "sk-test" },
+          config:
+            'model_provider = "relay"\nmodel = "legacy-model"\n[model_providers.relay]\nbase_url = "https://relay.example/v1"\nwire_api = "responses"\n',
+        },
+        meta: { apiFormat: "openai_responses" },
+      },
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "mock-clear-catalog" }));
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(onSubmit).toHaveBeenCalledOnce());
+    const settings = JSON.parse(onSubmit.mock.calls[0][0].settingsConfig);
+    expect(settings.modelCatalog).toEqual({ models: [] });
+    expect(
+      providerConfigUtils.extractCodexModelName(settings.config),
+    ).toBeFalsy();
+  });
+
+  it("preserves route targets from other providers and removes their unavailable references", async () => {
+    const onSubmit = vi.fn();
+    renderProviderForm(
+      {
+        providerId: "router",
+        showButtons: true,
+        submitLabel: "Save",
+        onSubmit,
+        initialData: {
+          name: "MultiRouter",
+          category: "custom",
+          settingsConfig: {
+            auth: { OPENAI_API_KEY: "sk-test" },
+            config:
+              'model_provider = "router"\nmodel = "relay-visible"\n[model_providers.router]\nbase_url = "http://127.0.0.1:15721/v1"\nwire_api = "responses"\n',
+            modelCatalog: {
+              models: [{ model: "relay-visible", upstreamModel: "wire-model" }],
+            },
+            codexRouting: {
+              schemaVersion: 2,
+              enabled: true,
+              routes: [
+                {
+                  id: "target",
+                  targetProviderId: "relay",
+                  modelSelection: {
+                    mode: "include",
+                    models: ["wire-model", "removed"],
+                  },
+                  aliases: {
+                    "relay-visible": "wire-model",
+                    stale: "removed",
+                  },
+                },
+              ],
+            },
+          },
+          meta: { apiFormat: "openai_responses" },
+        },
+      },
+      {
+        relay: {
+          id: "relay",
+          name: "Relay",
+          settingsConfig: {
+            model_catalog: {
+              models: [
+                { model: "target-visible", upstreamModel: "wire-model" },
+              ],
+            },
+          },
+        },
+      },
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(onSubmit).toHaveBeenCalledOnce());
+    const settings = JSON.parse(onSubmit.mock.calls[0][0].settingsConfig);
+    expect(settings.codexRouting.routes[0].modelSelection.models).toEqual([
+      "target-visible",
+    ]);
+    expect(settings.codexRouting.routes[0].aliases).toEqual({
+      "relay-visible": "target-visible",
+    });
+  });
+
+  it("shows the underlying pre-submit diagnostic and leaves the draft unsubmitted", async () => {
+    const onSubmit = vi.fn();
+    const errorToast = vi.spyOn(toast, "error");
+    const wireApi = vi
+      .spyOn(providerConfigUtils, "setCodexWireApi")
+      .mockImplementationOnce(() => {
+        throw new Error("Specific model-catalog diagnostic");
+      });
+    try {
+      renderProviderForm({
+        showButtons: true,
+        submitLabel: "Save",
+        onSubmit,
+        initialData: {
+          name: "Relay",
+          category: "custom",
+          settingsConfig: {
+            auth: { OPENAI_API_KEY: "sk-test" },
+            config:
+              'model_provider = "relay"\n[model_providers.relay]\nbase_url = "https://relay.example/v1"\nwire_api = "responses"\n',
+            modelCatalog: { models: [{ model: "model-a" }] },
+          },
+          meta: { apiFormat: "openai_responses" },
+        },
+      });
+      fireEvent.click(screen.getByRole("button", { name: "Save" }));
+      await waitFor(() =>
+        expect(errorToast).toHaveBeenCalledWith(
+          expect.stringContaining("Specific model-catalog diagnostic"),
+          expect.any(Object),
+        ),
+      );
+      expect(onSubmit).not.toHaveBeenCalled();
+      expect(screen.getByTestId("codex-catalog")).toHaveTextContent("model-a");
+    } finally {
+      wireApi.mockRestore();
+      errorToast.mockRestore();
+    }
   });
 
   it("preserves the complete Sub-Agent V2 document during an ordinary provider save", async () => {

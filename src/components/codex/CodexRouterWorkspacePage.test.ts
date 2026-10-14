@@ -13,6 +13,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { providersApi } from "@/lib/api";
 import { codexSubagentV2Api } from "@/lib/api/codexSubagentV2";
 import {
+  fetchCodexOfficialFallbackModels,
   fetchCodexOauthModels,
   fetchModelsForConfig,
   refreshCodexOfficialModelCatalog,
@@ -35,6 +36,7 @@ import {
   buildCodexProxyBaseUrl,
   buildModelCatalogForRoutes,
   buildRouteTrafficRows,
+  collectRoutedCatalogModels,
   CodexRouterWorkspacePage,
   formatCodexCatalogModelLabel,
   recommendCodexCatalogModels,
@@ -48,6 +50,7 @@ import {
   normalizeCodexRoutesForVisibleModelAliases,
   providerWithFetchedModelCatalog,
   projectCodexModelCatalog,
+  reconcileCodexRoutingPlanForSave,
   readCodexRouting,
   resolveCodexRouterAuthFacadeLabel,
   routeSummaryDisplayName,
@@ -386,6 +389,7 @@ beforeEach(() => {
   ).mockImplementation(async (_settings, _provider, model) =>
     modelReasoningResolution(model),
   );
+  vi.mocked(fetchCodexOfficialFallbackModels).mockReset();
   vi.mocked(fetchCodexOauthModels).mockReset();
   vi.mocked(fetchModelsForConfig).mockReset();
   vi.mocked(proxyApi.unlockCodexModelPicker).mockReset();
@@ -557,7 +561,11 @@ describe("Model order real drag sensors", () => {
           routes: enabledPlan.settingsConfig.codexRouting.routes.map(
             (route: Record<string, unknown>) => ({
               ...route,
-              aliases: { "order-a": "wire-a" },
+              aliases: source.settingsConfig.modelCatalog.models.some(
+                (model: CodexCatalogModel) => model.upstreamModel === "wire-a",
+              )
+                ? { "order-a": "wire-a" }
+                : {},
             }),
           ),
           ...options.routing,
@@ -716,6 +724,56 @@ describe("Model order real drag sensors", () => {
     );
     expect(providersApi.update).not.toHaveBeenCalled();
     expect(screen.getByRole("button", { name: "Save order" })).toBeEnabled();
+  });
+
+  it("reconciles stale route references when saving model order after catalog changes", async () => {
+    const { source, plan } = renderModelOrder({
+      models: [{ model: "order-a" }, { model: "order-b" }],
+      routing: {
+        routes: [
+          {
+            id: "stale-selection",
+            targetProviderId: "drag-source",
+            enabled: true,
+            modelSelection: {
+              mode: "include",
+              models: ["order-a", "removed", "hidden"],
+            },
+            aliases: { fast: "order-a", stale: "removed" },
+            authPolicy: { source: "provider_config" },
+          },
+        ],
+        spawnAgentModels: ["order-a", "removed"],
+      },
+    });
+    const sourceSnapshot = JSON.stringify(source);
+    const user = userEvent.setup();
+    await user.selectOptions(
+      screen.getByRole("combobox", { name: "Model display" }),
+      "model",
+    );
+    await user.click(screen.getByRole("button", { name: "Save order" }));
+
+    await waitFor(() => expect(providersApi.update).toHaveBeenCalledOnce());
+    const saved = vi.mocked(providersApi.update).mock.calls[0][0];
+    expect(saved.id).toBe(plan.id);
+    expect(saved.settingsConfig.codexRouting.routes[0].modelSelection).toEqual({
+      mode: "include",
+      models: ["order-a"],
+    });
+    expect(saved.settingsConfig.codexRouting.routes[0].aliases).toEqual({
+      fast: "order-a",
+    });
+    expect(saved.settingsConfig.codexRouting.spawnAgentModels).toEqual([
+      "fast",
+    ]);
+    expect(
+      projectCodexModelCatalog(
+        saved,
+        new Map([[source.id, source]]),
+      ).models.map((model) => model.model),
+    ).toEqual(["fast"]);
+    expect(JSON.stringify(source)).toBe(sourceSnapshot);
   });
 
   it.each(["pointer", "keyboard"] as const)(
@@ -3493,7 +3551,7 @@ describe("Codex MultiRouter workspace route persistence helpers", () => {
       ).toBe(true),
     );
     await waitFor(() =>
-      expect(screen.getAllByText("Read and updated 1 models.")).toHaveLength(2),
+      expect(screen.getAllByText("Read and updated 0 models.")).toHaveLength(2),
     );
   });
 
@@ -3892,6 +3950,142 @@ describe("Codex MultiRouter workspace route persistence helpers", () => {
         /No model catalog found\. Save first, then add a catalog in the model source\./,
       ),
     ).not.toBeInTheDocument();
+  });
+
+  it("persists a successful empty remote catalog instead of retaining routable stale models", async () => {
+    vi.mocked(fetchModelsForConfig).mockResolvedValueOnce([]);
+    const source: Provider = {
+      id: "empty-remote-source",
+      name: "Empty Remote Source",
+      category: "custom",
+      settingsConfig: {
+        baseUrl: "https://empty.example/v1",
+        auth: { OPENAI_API_KEY: "test-only-key" },
+        config: 'model = "removed-model"\n',
+        modelCatalog: {
+          models: [{ model: "removed-model" }],
+          spawnAgentModels: ["removed-model"],
+        },
+      },
+    };
+    const plan = withEnabledProviderRoute(
+      createDraftRoutingPlan([source], [source]),
+      source,
+    );
+    renderWorkspace(
+      React.createElement(CodexRouterWorkspacePage, {
+        providers: [source, plan],
+        isProxyRunning: true,
+        isCodexTakeoverActive: true,
+        activeProviderId: plan.id,
+        initialProviderId: plan.id,
+        initialTab: "routes",
+        onEditProvider: vi.fn(),
+        onDeletePlan: vi.fn(),
+        onCreateProvider: vi.fn(),
+      }),
+    );
+
+    await waitFor(() => expect(providersApi.update).toHaveBeenCalledOnce());
+    const saved = vi.mocked(providersApi.update).mock.calls[0][0];
+    expect(saved.id).toBe(source.id);
+    expect(saved.settingsConfig.modelCatalog.models).toEqual([
+      { model: "removed-model", enabled: false },
+    ]);
+    expect(saved.settingsConfig.modelCatalog.spawnAgentModels).toEqual([]);
+    expect(saved.settingsConfig.config).not.toMatch(/^model\s*=/m);
+    await screen.findByText("Read and updated 0 models.");
+    await waitFor(() =>
+      expect(
+        screen.queryByText(/remote returned an empty list/),
+      ).not.toBeInTheDocument(),
+    );
+  });
+
+  it("preserves the saved catalog when OAuth fails and its fallback is empty", async () => {
+    vi.mocked(fetchCodexOauthModels).mockRejectedValueOnce(
+      new Error("offline"),
+    );
+    vi.mocked(fetchCodexOfficialFallbackModels).mockResolvedValueOnce([]);
+    const source: Provider = {
+      id: "failed-oauth-source",
+      name: "Failed OAuth Source",
+      category: "official",
+      meta: {
+        providerType: "codex_oauth",
+        authBinding: {
+          source: "managed_codex_oauth",
+          accountId: "test-account",
+        },
+      },
+      settingsConfig: {
+        config: 'model = "saved-model"\n',
+        modelCatalog: {
+          models: [
+            { model: "saved-model" },
+            { model: "hidden-model", enabled: false },
+          ],
+          spawnAgentModels: ["saved-model"],
+        },
+      },
+    };
+    const plan = withEnabledProviderRoute(
+      createDraftRoutingPlan([source], [source]),
+      source,
+    );
+    const snapshot = JSON.stringify(source);
+    renderWorkspace(
+      React.createElement(CodexRouterWorkspacePage, {
+        providers: [source, plan],
+        isProxyRunning: true,
+        isCodexTakeoverActive: true,
+        activeProviderId: plan.id,
+        initialProviderId: plan.id,
+        initialTab: "routes",
+        onEditProvider: vi.fn(),
+        onDeletePlan: vi.fn(),
+        onCreateProvider: vi.fn(),
+      }),
+    );
+
+    await screen.findByText(/the fallback official catalog also has no models/);
+    expect(fetchCodexOauthModels).toHaveBeenCalledWith("test-account");
+    expect(fetchCodexOfficialFallbackModels).toHaveBeenCalledOnce();
+    expect(providersApi.update).not.toHaveBeenCalled();
+    expect(JSON.stringify(source)).toBe(snapshot);
+  });
+
+  it("repairs a removed source default during successful refresh without selecting an excluded model", () => {
+    const source: Provider = {
+      id: "source-default",
+      name: "Source Default",
+      settingsConfig: {
+        config: 'model = "removed-model"\nmodel_reasoning_effort = "medium"\n',
+        model_catalog: {
+          models: [
+            { model: "removed-model" },
+            { model: "hidden-model", enabled: false },
+            { model: "included-model" },
+          ],
+        },
+      },
+    };
+    const saved = providerWithFetchedModelCatalog(source, [
+      { id: "hidden-model", ownedBy: null },
+      { id: "included-model", ownedBy: null },
+    ]);
+    expect(saved.settingsConfig.config).toBe(
+      'model = "included-model"\nmodel_reasoning_effort = "medium"\n',
+    );
+    expect(saved.settingsConfig.modelCatalog.models[0]).toMatchObject({
+      model: "removed-model",
+      enabled: false,
+    });
+    expect(saved.settingsConfig.modelCatalog.models[1]).toMatchObject({
+      model: "hidden-model",
+      enabled: false,
+    });
+    expect(source.settingsConfig.config).toContain('model = "removed-model"');
   });
 
   it("updates the Provider catalog without mutating a stale MultiRouter projection", async () => {
@@ -4395,6 +4589,158 @@ describe("Codex MultiRouter workspace route persistence helpers", () => {
       }),
     );
   }
+
+  it.each([
+    "settings",
+    "rules",
+    "follow-all",
+    "candidates",
+    "protocol",
+  ] as const)(
+    "reconciles stale catalog references through the %s save path",
+    async (action) => {
+      const fixture = createSubagentWorkspaceFixture();
+      const source: Provider = {
+        ...fixture.source,
+        settingsConfig: {
+          ...fixture.source.settingsConfig,
+          modelCatalog: {
+            models: [
+              { model: "deepseek-v4-pro" },
+              { model: "deepseek-v4-flash", enabled: false },
+              { model: "qwen3.8" },
+            ],
+          },
+        },
+      };
+      const plan: Provider = {
+        ...fixture.plan,
+        settingsConfig: {
+          ...fixture.plan.settingsConfig,
+          config: 'model = "removed-model"\n',
+          codexRouting: {
+            ...fixture.plan.settingsConfig.codexRouting,
+            modelOrder: ["removed-model", "deepseek-v4-pro"],
+            routes: fixture.plan.settingsConfig.codexRouting.routes.map(
+              (route: Record<string, unknown>) => ({
+                ...route,
+                modelSelection: {
+                  mode: "include",
+                  models: [
+                    "deepseek-v4-pro",
+                    "deepseek-v4-flash",
+                    "removed-model",
+                  ],
+                },
+                aliases: { stale: "removed-model" },
+              }),
+            ),
+          },
+        },
+      };
+      const snapshot = JSON.stringify({ source, plan });
+      renderSubagentWorkspace(source, plan);
+      const user = userEvent.setup();
+      if (action === "settings") {
+        await user.click(screen.getByRole("button", { name: "Rename" }));
+        await user.click(screen.getByRole("button", { name: "Save settings" }));
+      } else if (action === "rules") {
+        await user.click(
+          screen.getByRole("button", { name: "Edit matching rules" }),
+        );
+        await user.click(screen.getByRole("button", { name: "Save rules" }));
+      } else if (action === "follow-all") {
+        await user.click(
+          screen.getByRole("button", {
+            name: "Follow all models automatically",
+          }),
+        );
+      } else {
+        await user.click(screen.getByRole("tab", { name: "Sub-Agent" }));
+        if (action === "candidates") {
+          await user.click(
+            screen.getByRole("button", {
+              name: /deepseek-v4-pro Top five #1/i,
+            }),
+          );
+        }
+        await user.click(
+          screen.getByRole("button", {
+            name: action === "protocol" ? "Enable V1" : "Save ordering",
+          }),
+        );
+      }
+
+      await waitFor(() => expect(providersApi.update).toHaveBeenCalledOnce());
+      const saved = vi.mocked(providersApi.update).mock.calls[0][0];
+      const routing = saved.settingsConfig.codexRouting;
+      expect(saved.id).toBe(plan.id);
+      expect(routing.routes[0].modelSelection).toEqual(
+        action === "follow-all"
+          ? { mode: "all" }
+          : { mode: "include", models: ["deepseek-v4-pro"] },
+      );
+      expect(routing.routes[0].aliases).toEqual({});
+      expect(routing.modelOrder).toEqual(["deepseek-v4-pro"]);
+      expect(routing.spawnAgentModels).not.toContain("deepseek-v4-flash");
+      expect(routing.subagentV2.profiles).not.toHaveProperty(
+        "deepseek-v4-flash",
+      );
+      expect(saved.settingsConfig.config).toBe('model = "deepseek-v4-pro"\n');
+      expect(saved.settingsConfig.modelCatalog).toBeUndefined();
+      expect(JSON.stringify({ source, plan })).toBe(snapshot);
+    },
+  );
+
+  it("disables an emptied include route and removes its default rather than broadening it to all", () => {
+    const { source, plan } = createSubagentWorkspaceFixture();
+    const hiddenSource: Provider = {
+      ...source,
+      settingsConfig: {
+        ...source.settingsConfig,
+        modelCatalog: {
+          models: [{ model: "deepseek-v4-flash", enabled: false }],
+        },
+      },
+    };
+    const stalePlan: Provider = {
+      ...plan,
+      settingsConfig: {
+        ...plan.settingsConfig,
+        config:
+          'model = "deepseek-v4-flash"\nmodel_reasoning_effort = "high"\n',
+        codexRouting: {
+          ...plan.settingsConfig.codexRouting,
+          modelOrder: ["deepseek-v4-flash"],
+          routes: plan.settingsConfig.codexRouting.routes.map(
+            (route: Record<string, unknown>) => ({
+              ...route,
+              modelSelection: {
+                mode: "include",
+                models: ["deepseek-v4-flash"],
+              },
+            }),
+          ),
+        },
+      },
+    };
+    const snapshot = JSON.stringify(stalePlan);
+    const saved = reconcileCodexRoutingPlanForSave(
+      stalePlan,
+      new Map([[hiddenSource.id, hiddenSource]]),
+    );
+    expect(saved.settingsConfig.codexRouting.routes[0]).toMatchObject({
+      enabled: false,
+      modelSelection: { mode: "include", models: [] },
+    });
+    expect(saved.settingsConfig.codexRouting.modelOrder).toEqual([]);
+    expect(saved.settingsConfig.codexRouting.spawnAgentModels).toEqual([]);
+    expect(saved.settingsConfig.codexRouting.subagentV2.profiles).toEqual({});
+    expect(saved.settingsConfig.config).toBe(
+      'model_reasoning_effort = "high"\n',
+    );
+    expect(JSON.stringify(stalePlan)).toBe(snapshot);
+  });
 
   it("moves Step 1: Configure V2 sub-agent models and capabilities into a dedicated top-level workspace tab", async () => {
     const { source, plan } = createSubagentWorkspaceFixture();
@@ -5115,6 +5461,39 @@ describe("Codex MultiRouter workspace route persistence helpers", () => {
     expect(normalized[0].upstream?.modelMap).toBeUndefined();
   });
 
+  it("treats an explicitly empty target catalog as authoritative", () => {
+    const source: Provider = {
+      id: "empty-catalog-source",
+      name: "Empty Catalog Source",
+      category: "custom",
+      settingsConfig: {
+        model: "stale-top-level-model",
+        modelCatalog: { models: [] },
+      },
+    };
+    const plan = createDraftRoutingPlan([source], [source]);
+    const routes = [
+      {
+        id: "empty-source-route",
+        enabled: true,
+        targetProviderId: source.id,
+        modelSelection: { mode: "all" },
+        match: {
+          models: ["stale-top-level-model"],
+          prefixes: ["stale-"],
+        },
+      },
+    ] satisfies Parameters<typeof buildModelCatalogForRoutes>[1];
+
+    const rebuilt = buildModelCatalogForRoutes(
+      plan,
+      routes,
+      new Map([[source.id, source]]),
+    );
+
+    expect(rebuilt.models).toEqual([]);
+  });
+
   it("projects every Provider model capability with model overrides taking precedence", () => {
     const official: Provider = {
       id: "codex-official",
@@ -5606,6 +5985,305 @@ describe("Codex MultiRouter workspace route persistence helpers", () => {
     expect(rebuilt.spawnAgentModels).toEqual(["qwen3.6"]);
   });
 
+  it("treats an explicit model selection as authoritative over stale match models", () => {
+    const source: Provider = {
+      id: "selection-source",
+      name: "Selection Source",
+      category: "custom",
+      settingsConfig: {
+        modelCatalog: {
+          models: [{ model: "alpha" }, { model: "beta" }],
+        },
+      },
+    };
+    const plan = createDraftRoutingPlan([], []);
+    const route = {
+      id: "selection-route",
+      enabled: true,
+      targetProviderId: source.id,
+      modelSelection: { mode: "include" as const, models: ["alpha"] },
+      match: { models: ["alpha", "beta"], prefixes: [""] },
+    };
+
+    expect(
+      buildModelCatalogForRoutes(
+        plan,
+        [route],
+        new Map([[source.id, source]]),
+      ).models.map((model) => model.model),
+    ).toEqual(["alpha"]);
+  });
+
+  it("projects only the current enabled provider catalog for automatic routes", () => {
+    const source: Provider = {
+      id: "automatic-source",
+      name: "Automatic Source",
+      category: "custom",
+      settingsConfig: {
+        modelCatalog: {
+          models: [{ model: "alpha" }, { model: "beta", enabled: false }],
+        },
+      },
+    };
+    const plan = createDraftRoutingPlan([], []);
+    const route = {
+      id: "automatic-route",
+      enabled: true,
+      targetProviderId: source.id,
+      modelSelection: { mode: "all" as const },
+      match: { models: ["alpha", "beta", "removed"], prefixes: [""] },
+    };
+
+    expect(
+      buildModelCatalogForRoutes(
+        plan,
+        [route],
+        new Map([[source.id, source]]),
+      ).models.map((model) => model.model),
+    ).toEqual(["alpha"]);
+  });
+
+  it.each(["all", "include", "historical-alias"] as const)(
+    "projects only selected, available aliases targeting upstream IDs (%s)",
+    (mode) => {
+      const source: Provider = {
+        id: "upstream-alias-source",
+        name: "Upstream Alias Source",
+        settingsConfig: {
+          modelCatalog: {
+            models: [
+              { model: "picker-model", upstreamModel: "wire-model" },
+              {
+                model: "hidden-model",
+                upstreamModel: "wire-hidden",
+                enabled: false,
+              },
+            ],
+          },
+        },
+      };
+      const plan: Provider = {
+        ...createDraftRoutingPlan([source], [source]),
+        settingsConfig: {
+          config: 'model = "fast"\n',
+          codexRouting: {
+            schemaVersion: 2,
+            enabled: true,
+            modelOrder: ["fast"],
+            spawnAgentModels: ["fast"],
+            routes: [
+              {
+                id: "alias-route",
+                targetProviderId: source.id,
+                modelSelection:
+                  mode === "all"
+                    ? { mode }
+                    : {
+                        mode: "include",
+                        models:
+                          mode === "historical-alias"
+                            ? ["FAST", "hidden", "removed"]
+                            : ["picker-model"],
+                      },
+                aliases: {
+                  fast: "WIRE-MODEL",
+                  hidden: "wire-hidden",
+                  removed: "wire-removed",
+                },
+              },
+            ],
+          },
+        },
+      };
+      const providers = new Map([[source.id, source]]);
+      const snapshot = JSON.stringify(plan);
+      expect(projectCodexModelCatalog(plan, providers).models).toEqual([
+        expect.objectContaining({ model: "fast", upstreamModel: "wire-model" }),
+      ]);
+      const saved = reconcileCodexRoutingPlanForSave(plan, providers);
+      expect(saved.settingsConfig.codexRouting).toMatchObject({
+        modelOrder: ["fast"],
+        spawnAgentModels: ["fast"],
+        routes: [{ aliases: { fast: "WIRE-MODEL" } }],
+      });
+      expect(
+        saved.settingsConfig.codexRouting.routes[0].modelSelection,
+      ).toEqual(
+        mode === "all"
+          ? { mode: "all" }
+          : { mode: "include", models: ["picker-model"] },
+      );
+      expect(saved.settingsConfig.config).toBe('model = "fast"\n');
+      expect(reconcileCodexRoutingPlanForSave(saved, providers)).toEqual(saved);
+      expect(JSON.stringify(plan)).toBe(snapshot);
+    },
+  );
+
+  it("uses target provider catalogs when building routed sub-agent candidates", () => {
+    const source: Provider = {
+      id: "candidate-source",
+      name: "Candidate Source",
+      category: "custom",
+      settingsConfig: {
+        modelCatalog: {
+          models: [{ model: "alpha" }, { model: "beta" }],
+        },
+      },
+    };
+    const router: Provider = {
+      id: "candidate-router",
+      name: "Candidate Router",
+      category: "custom",
+      settingsConfig: {},
+    };
+    const routes = [
+      {
+        provider: router,
+        index: 0,
+        route: {
+          id: "candidate-route",
+          enabled: true,
+          targetProviderId: source.id,
+          modelSelection: { mode: "include" as const, models: ["alpha"] },
+          match: { models: ["alpha", "beta"], prefixes: [""] },
+        },
+      },
+    ];
+
+    expect(
+      collectRoutedCatalogModels(
+        routes,
+        [{ model: "alpha" }, { model: "beta" }],
+        new Map([
+          [router.id, router],
+          [source.id, source],
+        ]),
+      ),
+    ).toEqual(["alpha"]);
+  });
+
+  it("excludes stale aliases and legacy matches from routed sub-agent candidates", () => {
+    const source: Provider = {
+      id: "candidate-source",
+      name: "Candidate Source",
+      settingsConfig: {
+        modelCatalog: {
+          models: [
+            { model: "alpha", upstreamModel: "wire-alpha" },
+            { model: "hidden", enabled: false },
+          ],
+        },
+      },
+    };
+    const router = createDraftRoutingPlan([], []);
+    const providers = new Map([[source.id, source]]);
+    const catalog = [
+      { model: "alpha" },
+      { model: "fast" },
+      { model: "removed-alias" },
+      { model: "hidden" },
+      { model: "removed" },
+    ];
+    const includeRoute = {
+      id: "include",
+      targetProviderId: source.id,
+      modelSelection: {
+        mode: "include" as const,
+        models: ["alpha", "removed", "hidden"],
+      },
+      aliases: { fast: "wire-alpha", "removed-alias": "removed" },
+    };
+    const legacyRoute = {
+      id: "legacy",
+      upstream: {
+        providerId: source.id,
+        modelMap: { fast: "wire-alpha", "removed-alias": "removed" },
+      },
+      match: {
+        models: ["fast", "removed-alias", "hidden", "removed"],
+        prefixes: ["removed"],
+      },
+    };
+
+    expect(
+      collectRoutedCatalogModels(
+        [{ provider: router, index: 0, route: includeRoute }],
+        catalog,
+        providers,
+      ),
+    ).toEqual(["alpha", "fast"]);
+    expect(
+      collectRoutedCatalogModels(
+        [{ provider: router, index: 0, route: legacyRoute }],
+        catalog,
+        providers,
+      ),
+    ).toEqual(["fast"]);
+  });
+
+  it("does not resurrect stale v2 match models when a target catalog is empty", () => {
+    const source: Provider = {
+      id: "empty-target",
+      name: "Empty Target",
+      category: "custom",
+      settingsConfig: {
+        modelCatalog: { models: [] },
+      },
+    };
+    const plan = createDraftRoutingPlan([], []);
+    const route = {
+      id: "empty-target-route",
+      enabled: true,
+      targetProviderId: source.id,
+      modelSelection: { mode: "all" as const },
+      match: { models: ["removed-model"], prefixes: ["removed-"] },
+    };
+
+    expect(
+      buildModelCatalogForRoutes(plan, [route], new Map([[source.id, source]]))
+        .models,
+    ).toEqual([]);
+    expect(
+      collectRoutedCatalogModels(
+        [{ provider: plan, index: 0, route }],
+        [{ model: "removed-model" }],
+        new Map([[source.id, source]]),
+      ),
+    ).toEqual([]);
+  });
+
+  it("does not resurrect stale v2 match models when the target catalog is missing", () => {
+    const source: Provider = {
+      id: "missing-target",
+      name: "Missing Target",
+      category: "custom",
+      settingsConfig: {},
+    };
+    const plan: Provider = {
+      ...createDraftRoutingPlan([], []),
+      settingsConfig: {
+        ...createDraftRoutingPlan([], []).settingsConfig,
+        codexRouting: {
+          schemaVersion: 2,
+          enabled: true,
+          routes: [],
+        },
+      },
+    };
+    const route = {
+      id: "missing-target-route",
+      enabled: true,
+      targetProviderId: source.id,
+      modelSelection: { mode: "all" as const },
+      match: { models: ["removed-model"], prefixes: ["removed-"] },
+    };
+
+    expect(
+      buildModelCatalogForRoutes(plan, [route], new Map([[source.id, source]]))
+        .models,
+    ).toEqual([]);
+  });
+
   it("keeps OpenAI/Codex providers empty until their OAuth catalog is fetched", () => {
     const officialBackup: Provider = {
       id: "codex-official-backup",
@@ -5774,7 +6452,7 @@ describe("Codex MultiRouter workspace route persistence helpers", () => {
     expect(rebuilt.spawnAgentModels).toEqual(["model-b", "model-a"]);
   });
 
-  it("resets only router ordering even when an unrelated alias is stale", async () => {
+  it("repairs stale aliases while resetting router ordering without changing the source", async () => {
     const source: Provider = {
       id: "order-source",
       name: "Order Source",
@@ -5855,28 +6533,214 @@ describe("Codex MultiRouter workspace route persistence helpers", () => {
       "model-b",
     ]);
     expect(saved.settingsConfig.codexRouting.routes).toEqual(
-      routedPlan.settingsConfig.codexRouting.routes,
+      routedPlan.settingsConfig.codexRouting.routes.map(
+        (route: Record<string, unknown>) => ({ ...route, aliases: {} }),
+      ),
     );
     expect(source.settingsConfig.modelCatalog.models[0].sortIndex).toBe(0);
   });
 
-  it("hides a model from the target Provider catalog through the model-order page", async () => {
+  it.each([
+    ["modelCatalog", true],
+    ["model_catalog", true],
+    ["modelCatalog", false],
+    ["model_catalog", false],
+  ] as const)(
+    "reconciles source references when hiding a model (%s, remaining=%s)",
+    async (catalogKey, hasRemainingModel) => {
+      const source: Provider = {
+        id: "visibility-source",
+        name: "Visibility Source",
+        category: "custom",
+        settingsConfig: {
+          config: 'model = "model-a"\nmodel_reasoning_effort = "high"\n',
+          [catalogKey]: {
+            models: [
+              { model: "model-a" },
+              ...(hasRemainingModel ? [{ model: "model-b" }] : []),
+            ],
+            spawn_agent_models: ["model-a", "model-b"],
+            displayNameStyle: "model-provider",
+            customMetadata: { preserved: true },
+          },
+          codexApiKeyGroups: [
+            {
+              id: "shared",
+              apiKeys: ["test-key"],
+              models: ["model-a", "model-b"],
+            },
+          ],
+        },
+        meta: {
+          codexProtocolOverrides: {
+            "model-a": "openai_chat",
+            "model-b": "openai_responses",
+          },
+        },
+      };
+      const plan = withEnabledProviderRoute(
+        createDraftRoutingPlan([source], [source]),
+        source,
+      );
+      const snapshot = JSON.stringify(source);
+      vi.spyOn(window, "confirm").mockReturnValue(true);
+
+      renderWorkspace(
+        React.createElement(CodexRouterWorkspacePage, {
+          providers: [source, plan],
+          isProxyRunning: true,
+          isCodexTakeoverActive: true,
+          activeProviderId: plan.id,
+          initialProviderId: plan.id,
+          initialTab: "model-order",
+          onEditProvider: vi.fn(),
+          onDeletePlan: vi.fn(),
+          onCreateProvider: vi.fn(),
+        }),
+      );
+
+      await userEvent
+        .setup()
+        .click(screen.getByRole("button", { name: "Remove model-a" }));
+
+      await waitFor(() => expect(providersApi.update).toHaveBeenCalledOnce());
+      const [saved, appType] = vi.mocked(providersApi.update).mock.calls[0];
+      expect(appType).toBe("codex");
+      expect(saved.id).toBe(source.id);
+      expect(saved.settingsConfig.modelCatalog).toMatchObject({
+        models: [
+          { model: "model-a", enabled: false },
+          ...(hasRemainingModel ? [{ model: "model-b" }] : []),
+        ],
+        spawnAgentModels: hasRemainingModel ? ["model-b"] : [],
+        displayNameStyle: "model-provider",
+        customMetadata: { preserved: true },
+      });
+      expect(saved.settingsConfig.modelCatalog).not.toHaveProperty(
+        "spawn_agent_models",
+      );
+      expect(saved.settingsConfig).not.toHaveProperty("model_catalog");
+      expect(saved.settingsConfig.config).toBe(
+        hasRemainingModel
+          ? 'model = "model-b"\nmodel_reasoning_effort = "high"\n'
+          : 'model_reasoning_effort = "high"\n',
+      );
+      expect(saved.settingsConfig.codexApiKeyGroups[0].models).toEqual(
+        hasRemainingModel ? ["model-b"] : [],
+      );
+      expect(saved.meta?.codexProtocolOverrides).toEqual(
+        hasRemainingModel ? { "model-b": "openai_responses" } : {},
+      );
+      expect(JSON.stringify(source)).toBe(snapshot);
+      expect(screen.getByText(/Hidden model-a;/)).toBeInTheDocument();
+    },
+  );
+
+  it("reconciles source-owned policies and preserves metadata during catalog refresh", () => {
     const source: Provider = {
-      id: "visibility-source",
-      name: "Visibility Source",
-      category: "custom",
+      id: "refresh-policy-source",
+      name: "Refresh Policy Source",
       settingsConfig: {
-        modelCatalog: {
-          models: [{ model: "model-a" }, { model: "model-b" }],
+        config: 'model = "removed"\n',
+        model_catalog: {
+          models: [
+            { model: "kept", upstream_model: "wire-kept" },
+            { model: "removed" },
+          ],
+          spawn_agent_models: ["removed", "wire-kept"],
+          displayNameStyle: "provider-model",
+          customMetadata: { preserved: true },
+        },
+        codexRouting: {
+          schemaVersion: 2,
+          enabled: true,
+          routes: [
+            {
+              id: "local",
+              targetProviderId: "refresh-policy-source",
+              modelSelection: {
+                mode: "include",
+                models: ["removed", "wire-kept"],
+              },
+              aliases: { fast: "wire-kept", stale: "removed" },
+            },
+            {
+              id: "unloaded",
+              targetProviderId: "unloaded-source",
+              modelSelection: { mode: "include", models: ["external-model"] },
+            },
+          ],
+          modelOrder: ["removed", "wire-kept"],
+          spawnAgentModels: ["removed", "wire-kept"],
+          subagentV2: {
+            profiles: {
+              removed: { model: "removed" },
+              kept: { model: "wire-kept" },
+            },
+          },
         },
       },
     };
-    const plan = withEnabledProviderRoute(
-      createDraftRoutingPlan([source], [source]),
-      source,
-    );
-    vi.spyOn(window, "confirm").mockReturnValue(true);
+    const snapshot = JSON.stringify(source);
+    const saved = providerWithFetchedModelCatalog(source, [
+      { id: "wire-kept", ownedBy: null },
+    ]);
 
+    expect(saved.settingsConfig.modelCatalog).toMatchObject({
+      spawnAgentModels: ["kept"],
+      displayNameStyle: "provider-model",
+      customMetadata: { preserved: true },
+    });
+    expect(saved.settingsConfig).not.toHaveProperty("model_catalog");
+    expect(saved.settingsConfig.codexRouting).toMatchObject({
+      routes: [
+        {
+          id: "local",
+          modelSelection: { mode: "include", models: ["kept"] },
+          aliases: { fast: "kept" },
+        },
+        source.settingsConfig.codexRouting.routes[1],
+      ],
+      modelOrder: ["kept"],
+      spawnAgentModels: ["kept"],
+      subagentV2: { profiles: { kept: { model: "kept" } } },
+    });
+    expect(saved.settingsConfig.config).toBe('model = "kept"\n');
+    expect(JSON.stringify(source)).toBe(snapshot);
+  });
+
+  it("hides an included picker model through its upstream route alias", async () => {
+    const source: Provider = {
+      id: "hide-alias-source",
+      name: "Hide Alias Source",
+      settingsConfig: {
+        config: 'model = "picker-model"\n',
+        modelCatalog: {
+          models: [
+            { model: "picker-model", upstreamModel: "wire-model" },
+            { model: "not-selected" },
+          ],
+        },
+      },
+    };
+    const plan: Provider = {
+      ...createDraftRoutingPlan([source], [source]),
+      settingsConfig: {
+        codexRouting: {
+          schemaVersion: 2,
+          enabled: true,
+          routes: [
+            {
+              id: "alias-route",
+              targetProviderId: source.id,
+              modelSelection: { mode: "include", models: ["picker-model"] },
+              aliases: { fast: "WIRE-MODEL" },
+            },
+          ],
+        },
+      },
+    };
+    vi.spyOn(window, "confirm").mockReturnValue(true);
     renderWorkspace(
       React.createElement(CodexRouterWorkspacePage, {
         providers: [source, plan],
@@ -5890,28 +6754,17 @@ describe("Codex MultiRouter workspace route persistence helpers", () => {
         onCreateProvider: vi.fn(),
       }),
     );
-
     await userEvent
       .setup()
-      .click(screen.getByRole("button", { name: "Remove model-a" }));
-
-    await waitFor(() => {
-      expect(providersApi.update).toHaveBeenCalledWith(
-        expect.objectContaining({
-          id: source.id,
-          settingsConfig: expect.objectContaining({
-            modelCatalog: expect.objectContaining({
-              models: [
-                expect.objectContaining({ model: "model-a", enabled: false }),
-                expect.objectContaining({ model: "model-b" }),
-              ],
-            }),
-          }),
-        }),
-        "codex",
-      );
-    });
-    expect(screen.getByText(/Hidden model-a;/)).toBeInTheDocument();
+      .click(screen.getByRole("button", { name: "Remove fast" }));
+    await waitFor(() => expect(providersApi.update).toHaveBeenCalledOnce());
+    const saved = vi.mocked(providersApi.update).mock.calls[0][0];
+    expect(saved.id).toBe(source.id);
+    expect(saved.settingsConfig.modelCatalog.models).toEqual([
+      { model: "picker-model", upstreamModel: "wire-model", enabled: false },
+      { model: "not-selected" },
+    ]);
+    expect(saved.settingsConfig.config).toBe('model = "not-selected"\n');
   });
 
   it("does not resurrect a hidden model when refreshing the upstream catalog", () => {
@@ -5938,6 +6791,55 @@ describe("Codex MultiRouter workspace route persistence helpers", () => {
         supportsImage: true,
       }),
     );
+  });
+
+  it("disables a previously enabled model omitted by the refreshed upstream catalog", () => {
+    const source: Provider = {
+      id: "refresh-removed-source",
+      name: "Refresh Removed Source",
+      category: "custom",
+      settingsConfig: {
+        modelCatalog: {
+          models: [{ model: "kept-model" }, { model: "removed-model" }],
+          spawnAgentModels: ["removed-model", "kept-model"],
+        },
+      },
+    };
+
+    const refreshed = providerWithFetchedModelCatalog(source, [
+      { id: "kept-model", ownedBy: null },
+    ]);
+
+    expect(refreshed.settingsConfig?.modelCatalog?.models).toEqual([
+      expect.objectContaining({ model: "kept-model" }),
+      expect.objectContaining({ model: "removed-model", enabled: false }),
+    ]);
+    expect(refreshed.settingsConfig?.modelCatalog?.spawnAgentModels).toEqual([
+      "kept-model",
+    ]);
+  });
+
+  it("keeps independent key-group inventory during a single-key catalog refresh", () => {
+    const source: Provider = {
+      id: "grouped-source",
+      name: "Grouped Source",
+      settingsConfig: {
+        codexApiKeyGroups: [
+          { id: "other", apiKeys: ["other-key"], models: ["other-model"] },
+        ],
+        modelCatalog: {
+          models: [{ model: "primary-model" }, { model: "other-model" }],
+        },
+      },
+    };
+
+    const refreshed = providerWithFetchedModelCatalog(source, [
+      { id: "primary-model", ownedBy: null },
+    ]);
+    expect(refreshed.settingsConfig.modelCatalog.models).toEqual([
+      { model: "primary-model" },
+      { model: "other-model" },
+    ]);
   });
 
   it("keeps newly discovered official models excluded when a curated inventory already exists", () => {
@@ -6055,49 +6957,73 @@ describe("Codex MultiRouter workspace route persistence helpers", () => {
     ).toEqual(reasoning);
   });
 
-  it("restores the only hidden model even when the projected catalog is empty", async () => {
-    const source: Provider = {
-      id: "hidden-only-source",
-      name: "Hidden Only Source",
-      category: "custom",
-      settingsConfig: {
-        modelCatalog: {
-          models: [{ model: "hidden-model", enabled: false }],
+  it.each(["modelCatalog", "model_catalog"])(
+    "restores the only hidden model without losing %s metadata",
+    async (catalogKey) => {
+      const source: Provider = {
+        id: "hidden-only-source",
+        name: "Hidden Only Source",
+        category: "custom",
+        settingsConfig: {
+          config: 'model = "wire-hidden"\n',
+          [catalogKey]: {
+            models: [
+              {
+                model: "hidden-model",
+                upstream_model: "wire-hidden",
+                enabled: false,
+              },
+            ],
+            spawn_agent_models: ["wire-hidden"],
+            displayNameStyle: "provider-model",
+            customMetadata: { preserved: true },
+          },
         },
-      },
-    };
-    const plan = withEnabledProviderRoute(
-      createDraftRoutingPlan([source], [source]),
-      source,
-    );
+      };
+      const plan = withEnabledProviderRoute(
+        createDraftRoutingPlan([source], [source]),
+        source,
+      );
 
-    renderWorkspace(
-      React.createElement(CodexRouterWorkspacePage, {
-        providers: [source, plan],
-        isProxyRunning: true,
-        isCodexTakeoverActive: true,
-        activeProviderId: plan.id,
-        initialProviderId: plan.id,
-        initialTab: "model-order",
-        onEditProvider: vi.fn(),
-        onDeletePlan: vi.fn(),
-        onCreateProvider: vi.fn(),
-      }),
-    );
+      renderWorkspace(
+        React.createElement(CodexRouterWorkspacePage, {
+          providers: [source, plan],
+          isProxyRunning: true,
+          isCodexTakeoverActive: true,
+          activeProviderId: plan.id,
+          initialProviderId: plan.id,
+          initialTab: "model-order",
+          onEditProvider: vi.fn(),
+          onDeletePlan: vi.fn(),
+          onCreateProvider: vi.fn(),
+        }),
+      );
 
-    expect(await screen.findByText(/Hidden models \(1\)/)).toBeInTheDocument();
-    await userEvent
-      .setup()
-      .click(screen.getByRole("button", { name: "Restore" }));
+      expect(
+        await screen.findByText(/Hidden models \(1\)/),
+      ).toBeInTheDocument();
+      await userEvent
+        .setup()
+        .click(screen.getByRole("button", { name: "Restore" }));
 
-    await waitFor(() => {
-      const updated = vi.mocked(providersApi.update).mock.calls.at(-1)?.[0];
-      expect(updated?.id).toBe(source.id);
-      expect(updated?.settingsConfig?.modelCatalog?.models).toEqual([
-        { model: "hidden-model" },
-      ]);
-    });
-  });
+      await waitFor(() => {
+        const updated = vi.mocked(providersApi.update).mock.calls.at(-1)?.[0];
+        expect(updated?.id).toBe(source.id);
+        expect(updated?.settingsConfig?.modelCatalog?.models).toEqual([
+          { model: "hidden-model", upstream_model: "wire-hidden" },
+        ]);
+        expect(updated?.settingsConfig?.modelCatalog).toMatchObject({
+          spawnAgentModels: ["hidden-model"],
+          displayNameStyle: "provider-model",
+          customMetadata: { preserved: true },
+        });
+        expect(updated?.settingsConfig).not.toHaveProperty("model_catalog");
+        expect(updated?.settingsConfig?.config).toBe(
+          'model = "hidden-model"\n',
+        );
+      });
+    },
+  );
 
   it("keeps unsaved route picker enabled draft state across candidate refreshes", () => {
     const currentEnabledIds = new Set(["openai-route"]);

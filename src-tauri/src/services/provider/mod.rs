@@ -14,6 +14,7 @@ use serde_json::Value;
 use std::future::Future;
 
 use crate::app_config::AppType;
+use crate::codex_multirouter::catalog::catalog_models;
 use crate::database::{
     validate_cost_multiplier, validate_pricing_source, ProviderSetDatabaseMutation,
     ProviderSetDatabaseTransaction,
@@ -90,12 +91,7 @@ fn validate_codex_manual_protocol_settings(provider: &Provider) -> Result<(), Ap
     if !has_model_overrides && !matches!(api_format, "openai_chat" | "openai_responses") {
         return Err(invalid("上游协议必须是 Responses 或 Chat Completions"));
     }
-    let has_model_level_protocol = provider
-        .settings_config
-        .get("modelCatalog")
-        .or_else(|| provider.settings_config.get("model_catalog"))
-        .and_then(|catalog| catalog.get("models"))
-        .and_then(Value::as_array)
+    let has_model_level_protocol = catalog_models(&provider.settings_config)
         .is_some_and(|models| {
             models
                 .iter()

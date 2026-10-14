@@ -1,3 +1,4 @@
+use crate::codex_multirouter::catalog::catalog_models;
 use crate::codex_multirouter::schema::{
     validate_v2, CodexModelSelection, CodexRouteAuthPolicy, CodexRoutingConfigV2,
     CodexRoutingRouteV2,
@@ -441,12 +442,7 @@ fn provider_display(provider: &Provider) -> String {
 }
 
 fn provider_model_entries(provider: &Provider) -> Vec<&Value> {
-    provider
-        .settings_config
-        .get("modelCatalog")
-        .or_else(|| provider.settings_config.get("model_catalog"))
-        .and_then(|catalog| catalog.get("models"))
-        .and_then(Value::as_array)
+    catalog_models(&provider.settings_config)
         .map(|models| {
             models
                 .iter()
@@ -1204,6 +1200,34 @@ mod tests {
         assert_eq!(compiled.visible_models, vec!["qwen-enabled"]);
         assert_eq!(compiled.routes[0].visible_models, vec!["qwen-enabled"]);
         assert_eq!(compiled.spawn_agent_models, vec!["qwen-enabled"]);
+    }
+
+    #[test]
+    fn follow_all_uses_current_canonical_catalog_after_removal_or_emptying() {
+        for models in [
+            json!([{"model": "kept"}, {"model": "excluded", "enabled": false}]),
+            json!([]),
+        ] {
+            let mut source = provider("qwen", "Qwen", "openai_responses", models.clone());
+            source.settings_config["model_catalog"] = json!({
+                "models": [{"model": "removed"}, {"model": "excluded"}]
+            });
+            let mut plan = plan(vec![route("all", "qwen", CodexModelSelection::All)]);
+            plan.spawn_agent_models = vec![
+                "removed".to_string(),
+                "excluded".to_string(),
+                "kept".to_string(),
+            ];
+            let compiled = compile(&plan, [source]);
+            let expected = if models.as_array().unwrap().is_empty() {
+                Vec::<String>::new()
+            } else {
+                vec!["kept".to_string()]
+            };
+            assert_eq!(compiled.visible_models, expected);
+            assert_eq!(compiled.routes[0].visible_models, expected);
+            assert_eq!(compiled.spawn_agent_models, expected);
+        }
     }
 
     #[test]

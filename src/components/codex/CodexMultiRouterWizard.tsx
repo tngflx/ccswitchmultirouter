@@ -64,6 +64,7 @@ import {
   buildCodexMultiRouterWizardPlan,
   initialWizardCatalogModelOrder,
   initialWizardSelectedSourceIds,
+  initialWizardSpawnAgentModels,
   buildWizardModelCatalog,
   canContinueAfterConnectivity,
   collectWizardModelNameCollisions,
@@ -86,6 +87,7 @@ import {
   type WizardConnectivityResult,
   type WizardModelFetchConfig,
 } from "@/lib/codexMultiRouterWizard";
+import { readCodexCatalogSettings } from "@/lib/codexCatalogSchema";
 import {
   DEFAULT_HOSTED_TOOLS_CONFIG,
   readHostedToolsConfig,
@@ -445,6 +447,7 @@ function modelSourceStatusDetails(provider: Provider): string[] {
 function modelCatalogSignature(model: CodexCatalogModel): string {
   const displayName = model.displayName?.trim() || model.model;
   return JSON.stringify({
+    enabled: model.enabled !== false,
     upstreamModel: model.upstreamModel ?? model.upstream_model ?? model.model,
     displayName,
     contextWindow:
@@ -999,7 +1002,7 @@ export function CodexMultiRouterWizard({
       settingsConfig: {
         ...provider.settingsConfig,
         modelCatalog: {
-          ...provider.settingsConfig.modelCatalog,
+          ...(readCodexCatalogSettings(provider.settingsConfig) ?? {}),
           models: readWizardModelCatalog(provider).map((model) =>
             isProbeModelExcluded(provider.id, model.model)
               ? { ...model, enabled: false }
@@ -1191,15 +1194,7 @@ export function CodexMultiRouterWizard({
       initialWizardCatalogModelOrder(existingPlan, providerModelSources),
     );
     setDraftSpawnAgentModels(
-      existingPlan?.settingsConfig?.codexRouting?.schemaVersion === 2
-        ? (existingPlan.settingsConfig.codexRouting.spawnAgentModels?.slice(
-            0,
-            5,
-          ) ?? [])
-        : (existingPlan?.settingsConfig?.modelCatalog?.spawnAgentModels?.slice(
-            0,
-            5,
-          ) ?? []),
+      initialWizardSpawnAgentModels(existingPlan).slice(0, 5),
     );
     setConnectivityResults([]);
     setRestoredEvidence(null);
@@ -2109,7 +2104,11 @@ export function CodexMultiRouterWizard({
       {
         planId: activePlan?.id ?? createPlanIdRef.current ?? undefined,
         planName: draftPlanName,
-        catalogModelOrder: activeCatalogModelOrder,
+        // `null` is the distinct "follow the provider catalog" mode. Do not
+        // materialize it into an explicit allowlist or a later catalog refresh
+        // can be frozen to stale model IDs.
+        catalogModelOrder:
+          catalogModelOrder === null ? undefined : activeCatalogModelOrder,
         spawnAgentModels: activeSpawnAgentModels,
         hostedTools: {
           webSearch: { enabled: webSearchEnabled },
@@ -2391,7 +2390,10 @@ export function CodexMultiRouterWizard({
     {
       planId: activePlan?.id ?? createPlanIdRef.current ?? undefined,
       planName: draftPlanName,
-      catalogModelOrder: activeCatalogModelOrder,
+      // Keep automatic-follow semantics intact in the preview as well as the
+      // save path; the concrete active list is only a UI projection.
+      catalogModelOrder:
+        catalogModelOrder === null ? undefined : activeCatalogModelOrder,
       spawnAgentModels: activeSpawnAgentModels,
     },
   );

@@ -1,3 +1,4 @@
+use super::catalog::catalog_models;
 use super::compiler::compile_v2_strict;
 use super::schema::{
     CodexModelSelection, CodexRouteAuthPolicy, CodexRouteAuthSource, CodexRoutingConfigV2,
@@ -508,9 +509,7 @@ fn build_migration(
         }
     }
 
-    let spawn_agent_models = router
-        .settings_config
-        .get("modelCatalog")
+    let spawn_agent_models = super::catalog::read_catalog(&router.settings_config)
         .and_then(|catalog| catalog.get("spawnAgentModels"))
         .and_then(Value::as_array)
         .map(|models| {
@@ -572,12 +571,7 @@ fn provider_catalog_models(provider: &Provider) -> BTreeSet<String> {
 }
 
 fn provider_catalog_entries(provider: &Provider) -> Vec<(String, String)> {
-    provider
-        .settings_config
-        .get("modelCatalog")
-        .or_else(|| provider.settings_config.get("model_catalog"))
-        .and_then(|catalog| catalog.get("models"))
-        .and_then(Value::as_array)
+    catalog_models(&provider.settings_config)
         .into_iter()
         .flatten()
         .filter_map(|model| {

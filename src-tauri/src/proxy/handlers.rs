@@ -26,6 +26,7 @@ use super::{
         CODEX_PARSER_CONFIG, GEMINI_PARSER_CONFIG, OPENAI_PARSER_CONFIG,
     },
     handler_context::RequestContext,
+    orchestration_runtime,
     providers::{
         codex_chat_common::extract_reasoning_field_text,
         codex_chat_history::{
@@ -72,6 +73,7 @@ use super::{
 };
 use crate::app_config::AppType;
 use crate::database::PRICING_SOURCE_REQUEST;
+use crate::orchestration::{ModelApp, Route};
 use crate::protocol_compatibility::{
     capture_chat_json_shape, capture_chat_sse_stream,
     runtime_observer::observe_and_expire_protocol_profile, ProtocolCompatibilityRecord,
@@ -957,12 +959,8 @@ async fn handle_messages_for_app(
         .map_err(|e| ProxyError::Internal(format!("Failed to read request body: {e}")))?
         .to_bytes();
     extensions.insert(super::forwarder::ClientRequestBodyBytes(body_bytes.len()));
-    let body: Value = serde_json::from_slice(&body_bytes)
+    let mut body: Value = serde_json::from_slice(&body_bytes)
         .map_err(|e| ProxyError::Internal(format!("Failed to parse request body: {e}")))?;
-
-    let mut ctx =
-        RequestContext::new(&state, &body, &headers, app_type.clone(), tag, app_type_str).await?;
-
     let raw_endpoint = uri
         .path_and_query()
         .map(|path_and_query| path_and_query.as_str())
@@ -970,6 +968,59 @@ async fn handle_messages_for_app(
     let endpoint = strip_prefix
         .and_then(|prefix| raw_endpoint.strip_prefix(prefix))
         .unwrap_or(raw_endpoint);
+
+    let mut role_provider = None;
+    if let Some(route) = orchestration_runtime::resolve_route(
+        &state
+            .db
+            .get_orchestration_settings()
+            .map_err(|e| ProxyError::DatabaseError(e.to_string()))?,
+        app_type_str,
+        body.get("model").and_then(Value::as_str).unwrap_or(""),
+    )? {
+        match route {
+            Route::Profile(profile) => {
+                return orchestration_runtime::run_profile(
+                    &state,
+                    profile,
+                    orchestration_runtime::ClientRequest {
+                        body: &body,
+                        headers: &headers,
+                        app: &app_type,
+                        app_type: app_type_str,
+                        endpoint,
+                        is_stream: body.get("stream").and_then(Value::as_bool).unwrap_or(false),
+                    },
+                )
+                .await;
+            }
+            Route::Role(profile, role) => {
+                if role.app_type != ModelApp::Claude {
+                    return Err(ProxyError::ConfigError(
+                        "This orchestration role belongs to a different protocol".into(),
+                    ));
+                }
+                role_provider = Some(orchestration_runtime::provider_for_role(&state, &role)?);
+                body["model"] = Value::String(role.model);
+                let _ = profile;
+            }
+        }
+    }
+
+    let mut ctx = if let Some(provider) = role_provider {
+        RequestContext::new_with_provider(
+            &state,
+            &body,
+            &headers,
+            app_type.clone(),
+            tag,
+            app_type_str,
+            provider,
+        )
+        .await?
+    } else {
+        RequestContext::new(&state, &body, &headers, app_type.clone(), tag, app_type_str).await?
+    };
 
     let is_stream = body
         .get("stream")
@@ -1569,28 +1620,96 @@ pub async fn handle_chat_completions(
         .to_bytes();
     let body_bytes = decode_codex_request_body(&mut headers, body_bytes)?;
     extensions.insert(super::forwarder::ClientRequestBodyBytes(body_bytes.len()));
-    let body: Value = serde_json::from_slice(&body_bytes)
+    let mut body: Value = serde_json::from_slice(&body_bytes)
         .map_err(|e| ProxyError::Internal(format!("Failed to parse request body: {e}")))?;
 
     let is_external_openai_client = !should_handle_as_codex_client(&headers);
-    let mut ctx = if is_external_openai_client {
-        let external_api_profile = match external_openai_api::validate_request(&state.db, &headers)
-        {
-            Ok(profile) => profile,
-            Err(err) => return Ok(external_openai_api_auth_error_response(err)),
-        };
-        let provider = match resolve_external_openai_compatible_provider(
-            &state,
-            &body,
-            &external_api_profile,
-        )? {
-            Some(provider) => provider,
-            None => {
-                return Ok(external_openai_api_route_error_response(
-                    &request_model_from_body(&body),
-                ))
+    let mut role_provider = None;
+    if let Some(route) = orchestration_runtime::resolve_route(
+        &state
+            .db
+            .get_orchestration_settings()
+            .map_err(|e| ProxyError::DatabaseError(e.to_string()))?,
+        "codex",
+        body.get("model").and_then(Value::as_str).unwrap_or(""),
+    )? {
+        if is_external_openai_client {
+            if let Err(err) = external_openai_api::validate_request(&state.db, &headers) {
+                return Ok(external_openai_api_auth_error_response(err));
             }
-        };
+        }
+        match route {
+            Route::Profile(profile) => {
+                let endpoint = endpoint_with_query(&uri, "/chat/completions");
+                return orchestration_runtime::run_profile(
+                    &state,
+                    profile,
+                    orchestration_runtime::ClientRequest {
+                        body: &body,
+                        headers: &headers,
+                        app: &AppType::Codex,
+                        app_type: "codex",
+                        endpoint: &endpoint,
+                        is_stream: body.get("stream").and_then(Value::as_bool).unwrap_or(false),
+                    },
+                )
+                .await;
+            }
+            Route::Role(profile, role) => {
+                if role.app_type != ModelApp::Codex {
+                    return Err(ProxyError::ConfigError(
+                        "This orchestration role belongs to a different protocol".into(),
+                    ));
+                }
+                role_provider = Some(orchestration_runtime::provider_for_role(&state, &role)?);
+                body["model"] = Value::String(role.model);
+                let _ = profile;
+            }
+        }
+    }
+
+    let mut ctx = if is_external_openai_client {
+        if let Some(provider) = role_provider {
+            RequestContext::new_with_provider(
+                &state,
+                &body,
+                &headers,
+                AppType::Codex,
+                "Codex",
+                "codex",
+                provider,
+            )
+            .await?
+        } else {
+            let external_api_profile =
+                match external_openai_api::validate_request(&state.db, &headers) {
+                    Ok(profile) => profile,
+                    Err(err) => return Ok(external_openai_api_auth_error_response(err)),
+                };
+            let provider = match resolve_external_openai_compatible_provider(
+                &state,
+                &body,
+                &external_api_profile,
+            )? {
+                Some(provider) => provider,
+                None => {
+                    return Ok(external_openai_api_route_error_response(
+                        &request_model_from_body(&body),
+                    ))
+                }
+            };
+            RequestContext::new_with_provider(
+                &state,
+                &body,
+                &headers,
+                AppType::Codex,
+                "Codex",
+                "codex",
+                provider,
+            )
+            .await?
+        }
+    } else if let Some(provider) = role_provider {
         RequestContext::new_with_provider(
             &state,
             &body,
@@ -3253,7 +3372,7 @@ async fn handle_responses_for_app(
         .to_bytes();
     let body_bytes = decode_codex_request_body(&mut headers, body_bytes)?;
     extensions.insert(super::forwarder::ClientRequestBodyBytes(body_bytes.len()));
-    let body: Value = serde_json::from_slice(&body_bytes)
+    let mut body: Value = serde_json::from_slice(&body_bytes)
         .map_err(|e| ProxyError::Internal(format!("Failed to parse request body: {e}")))?;
     let request_body_for_history = body.clone();
     let desktop_recovery_eligible =
@@ -3305,31 +3424,105 @@ async fn handle_responses_for_app(
     });
     let recovery_tracking = recovery_context.as_ref().map(track_turn);
 
-    let ctx_result = if app_type == AppType::Codex && !should_handle_as_codex_client(&headers) {
-        let external_api_profile = match external_openai_api::validate_request(&state.db, &headers)
-        {
-            Ok(profile) => profile,
-            Err(err) => return Ok(external_openai_api_auth_error_response(err)),
-        };
-        let provider = match resolve_external_openai_compatible_provider(
-            &state,
-            &body,
-            &external_api_profile,
-        )? {
-            Some(provider) => provider,
-            None => {
-                return Ok(external_openai_api_route_error_response(
-                    &request_model_from_body(&body),
-                ))
+    let is_external_openai_client =
+        app_type == AppType::Codex && !should_handle_as_codex_client(&headers);
+    let mut role_provider = None;
+    if let Some(route) = orchestration_runtime::resolve_route(
+        &state
+            .db
+            .get_orchestration_settings()
+            .map_err(|e| ProxyError::DatabaseError(e.to_string()))?,
+        app_type_str,
+        body.get("model").and_then(Value::as_str).unwrap_or(""),
+    )? {
+        if is_external_openai_client {
+            if let Err(err) = external_openai_api::validate_request(&state.db, &headers) {
+                return Ok(external_openai_api_auth_error_response(err));
             }
-        };
+        }
+        match route {
+            Route::Profile(profile) => {
+                let response_result = orchestration_runtime::run_profile(
+                    &state,
+                    profile,
+                    orchestration_runtime::ClientRequest {
+                        body: &body,
+                        headers: &headers,
+                        app: &app_type,
+                        app_type: app_type_str,
+                        endpoint: &endpoint,
+                        is_stream,
+                    },
+                )
+                .await;
+                let final_result = finalize_aggressive_recovery(response_result, recovery_context);
+                if let Some(tracking) = recovery_tracking {
+                    tracking.hand_off_to_stream();
+                }
+                return final_result;
+            }
+            Route::Role(profile, role) => {
+                if role.app_type != ModelApp::Codex || app_type != AppType::Codex {
+                    return Err(ProxyError::ConfigError(
+                        "This orchestration role belongs to a different protocol".into(),
+                    ));
+                }
+                role_provider = Some(orchestration_runtime::provider_for_role(&state, &role)?);
+                body["model"] = Value::String(role.model);
+                let _ = profile;
+            }
+        }
+    }
+
+    let ctx_result = if is_external_openai_client {
+        if let Some(provider) = role_provider {
+            RequestContext::new_with_provider(
+                &state,
+                &body,
+                &headers,
+                AppType::Codex,
+                "Codex",
+                "codex",
+                provider,
+            )
+            .await
+        } else {
+            let external_api_profile =
+                match external_openai_api::validate_request(&state.db, &headers) {
+                    Ok(profile) => profile,
+                    Err(err) => return Ok(external_openai_api_auth_error_response(err)),
+                };
+            let provider = match resolve_external_openai_compatible_provider(
+                &state,
+                &body,
+                &external_api_profile,
+            )? {
+                Some(provider) => provider,
+                None => {
+                    return Ok(external_openai_api_route_error_response(
+                        &request_model_from_body(&body),
+                    ))
+                }
+            };
+            RequestContext::new_with_provider(
+                &state,
+                &body,
+                &headers,
+                AppType::Codex,
+                "Codex",
+                "codex",
+                provider,
+            )
+            .await
+        }
+    } else if let Some(provider) = role_provider {
         RequestContext::new_with_provider(
             &state,
             &body,
             &headers,
-            AppType::Codex,
-            "Codex",
-            "codex",
+            app_type.clone(),
+            tag,
+            app_type_str,
             provider,
         )
         .await
@@ -3501,8 +3694,10 @@ async fn handle_responses_for_app(
                 &ctx,
                 &state,
                 connection_guard,
-                codex_tool_context,
-                namespace_restore_map,
+                NativeResponsesTools {
+                    tool_context: codex_tool_context,
+                    namespace_map: namespace_restore_map,
+                },
                 None,
             )
             .await;
@@ -3829,8 +4024,10 @@ async fn handle_responses_compact_for_app(
             &ctx,
             &state,
             connection_guard,
-            codex_tool_context,
-            namespace_restore_map,
+            NativeResponsesTools {
+                tool_context: codex_tool_context,
+                namespace_map: namespace_restore_map,
+            },
             None,
         )
         .await;
@@ -3854,6 +4051,12 @@ async fn handle_responses_compact_for_app(
     .await
 }
 
+struct NativeResponsesTools {
+    tool_context: transform_codex_chat::CodexToolContext,
+    namespace_map:
+        std::collections::HashMap<String, transform_codex_responses_namespace::NamespacedName>,
+}
+
 /// Response handler for xAI native Responses, restoring namespace identities
 /// and custom-tool semantics projected on the request side. Error bodies pass
 /// through unchanged. Usage is collected exactly as `process_response` would.
@@ -3863,13 +4066,13 @@ async fn handle_codex_xai_native_responses_rewrite(
     ctx: &RequestContext,
     state: &ProxyState,
     connection_guard: Option<ActiveConnectionGuard>,
-    tool_context: transform_codex_chat::CodexToolContext,
-    namespace_map: std::collections::HashMap<
-        String,
-        transform_codex_responses_namespace::NamespacedName,
-    >,
+    tools: NativeResponsesTools,
     recovery_context: Option<TurnRecoveryContext>,
 ) -> Result<axum::response::Response, ProxyError> {
+    let NativeResponsesTools {
+        tool_context,
+        namespace_map,
+    } = tools;
     let status = response.status();
 
     // Error bodies (and any non-SSE, non-success response) never contain
@@ -7670,6 +7873,60 @@ data: [DONE]\n\n";
         headers.remove(axum::http::header::AUTHORIZATION);
         mark_external_openai_headers(&mut headers);
         assert!(!is_verified_codex_desktop_request(&headers));
+    }
+
+    #[tokio::test]
+    async fn external_orchestration_aliases_require_auth_before_execution_or_recovery() {
+        let db = Arc::new(Database::memory().expect("memory db"));
+        db.save_orchestration_settings(&crate::orchestration::fixture())
+            .expect("save orchestration settings");
+        external_openai_api::update_profile(
+            &db,
+            ExternalOpenAiApiProfileUpdate {
+                enabled: true,
+                backend_type: ExternalOpenAiApiBackendType::Provider,
+                app_type: Some("codex".to_string()),
+                provider_id: Some("same".to_string()),
+                route_id: None,
+                default_model: Some("worker".to_string()),
+                listen_address: None,
+                listen_port: None,
+            },
+        )
+        .expect("enable external API");
+        let state = build_state(db.clone());
+
+        for model in ["ccsm-orch/test", "ccsm-role/test/worker"] {
+            let thread_id = format!("external-orchestration-{}", uuid::Uuid::new_v4());
+            let mut request = axum::http::Request::builder()
+                .method("POST")
+                .uri("/v1/responses")
+                .header("content-type", "application/json")
+                .header("originator", "codex_chatgpt_desktop")
+                .header("thread-id", &thread_id)
+                .body(axum::body::Body::from(
+                    serde_json::to_vec(&json!({
+                        "model": model,
+                        "stream": true,
+                        "input": [{"role": "user", "content": "test task"}]
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap();
+            mark_external_openai_headers(request.headers_mut());
+
+            let response = super::handle_responses(axum::extract::State(state.clone()), request)
+                .await
+                .expect("authentication response");
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+            let payload: Value =
+                serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                    .unwrap();
+            assert_eq!(payload["error"]["code"], "external_openai_api_key_missing");
+            assert!(!crate::proxy::codex_turn_recovery::recovery_reserved_for_test(&thread_id));
+        }
+
+        assert!(db.list_orchestration_runs().unwrap().is_empty());
     }
 
     #[test]

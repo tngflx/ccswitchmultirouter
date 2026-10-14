@@ -16,6 +16,7 @@ import {
 } from "@/lib/protocol-lab/useProtocolLabWorkflow";
 import type { Provider } from "@/types";
 import { prepareUnverifiedCodexProvider } from "@/lib/protocol-lab/unverified-save";
+import { readCodexCatalogSettings } from "@/lib/codexCatalogSchema";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -220,7 +221,7 @@ export function useCodexProviderSetSave() {
 }
 
 function providerModels(provider: Provider | undefined): string[] {
-  const catalog = provider?.settingsConfig.modelCatalog as
+  const catalog = readCodexCatalogSettings(provider?.settingsConfig) as
     { models?: Array<{ model?: unknown; enabled?: unknown }> } | undefined;
   return (catalog?.models ?? [])
     .filter((model) => model.enabled !== false)

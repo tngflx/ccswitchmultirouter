@@ -47,6 +47,7 @@ impl Database {
 
         // TE 静态注册表不依附于 Agent 通用配置；只接受无秘密的严格描述符。
         Self::create_te_provider_descriptor_table(conn)?;
+        Self::create_orchestration_tables(conn)?;
 
         // 2. Provider Endpoints 表
         conn.execute(
@@ -616,6 +617,10 @@ impl Database {
                     24 => {
                         Self::migrate_v24_to_v25(conn)?;
                         Self::set_user_version(conn, 25)?;
+                    }
+                    25 => {
+                        Self::create_orchestration_tables(conn)?;
+                        Self::set_user_version(conn, 26)?;
                     }
                     _ => {
                         return Err(AppError::Database(format!(

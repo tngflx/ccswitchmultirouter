@@ -9,6 +9,8 @@ release/
 .npmrc
 CLAUDE.md
 AGENTS.md
+# Keep shared repository guardrails; nested agent instructions stay local.
+!/AGENTS.md
 GEMINI.md
 /.claude
 /.codex

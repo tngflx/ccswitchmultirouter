@@ -4,7 +4,9 @@ import {
   buildCodexMultiRouterWizardPlan,
   initialWizardCatalogModelOrder,
   initialWizardSelectedSourceIds,
+  initialWizardSpawnAgentModels,
   isCodexMultiRouterPlan,
+  mergeFetchedModelsIntoWizardProvider,
 } from "./codexMultiRouterWizard";
 import { isRoutingPlan } from "@/components/codex/CodexRouterWorkspacePage";
 
@@ -20,6 +22,76 @@ const deepseekSource: Provider = {
     },
   },
 };
+
+describe("wizard Sub-Agent selection authority", () => {
+  it.each([{ models: [] }, { models: [{ model: "deepseek-v4-pro" }] }])(
+    "does not resurrect legacy candidates when the canonical catalog has models %j",
+    ({ models }) => {
+      const plan: Provider = {
+        id: "plan",
+        name: "Plan",
+        settingsConfig: {
+          modelCatalog: { models },
+          model_catalog: {
+            models: [{ model: "deepseek-v4-pro" }],
+            spawnAgentModels: ["deepseek-v4-pro"],
+          },
+        },
+      };
+      expect(initialWizardSpawnAgentModels(plan)).toEqual([]);
+      expect(
+        buildCodexMultiRouterWizardPlan(
+          [deepseekSource, plan],
+          [deepseekSource],
+          plan,
+        ).plan.settingsConfig.codexRouting.spawnAgentModels,
+      ).toEqual([]);
+    },
+  );
+
+  it("restores legacy candidates only when the canonical catalog is malformed", () => {
+    expect(
+      initialWizardSpawnAgentModels({
+        id: "plan",
+        name: "Plan",
+        settingsConfig: {
+          modelCatalog: { models: null },
+          model_catalog: {
+            models: [{ model: "deepseek-v4-pro" }],
+            spawn_agent_models: ["deepseek-v4-pro"],
+          },
+        },
+      }),
+    ).toEqual(["deepseek-v4-pro"]);
+  });
+
+  it.each([
+    { spawnAgentModels: undefined, expected: [] },
+    { spawnAgentModels: [], expected: [] },
+    { spawnAgentModels: "not-an-array", expected: [] },
+    {
+      spawnAgentModels: [null, 1, "deepseek-v4-pro"],
+      expected: ["deepseek-v4-pro"],
+    },
+  ])(
+    "takes v2 candidates from routing, not catalog snapshots: %j",
+    ({ spawnAgentModels, expected }) => {
+      expect(
+        initialWizardSpawnAgentModels({
+          id: "plan",
+          name: "Plan",
+          settingsConfig: {
+            codexRouting: { schemaVersion: 2, spawnAgentModels },
+            modelCatalog: {
+              models: [{ model: "snapshot-model" }],
+              spawnAgentModels: ["snapshot-model"],
+            },
+          },
+        }),
+      ).toEqual(expected);
+    },
+  );
+});
 
 describe("buildCodexMultiRouterWizardPlan subagent version", () => {
   it("keeps canonical official auth entirely out of the Router route", () => {
@@ -258,6 +330,208 @@ describe("buildCodexMultiRouterWizardPlan subagent version", () => {
     ]);
     expect(plan.settingsConfig).not.toHaveProperty("modelCatalog");
     expect(plan.settingsConfig).not.toHaveProperty("model_catalog");
+  });
+
+  it("follows the current provider catalog after a model is removed", () => {
+    const currentSource: Provider = {
+      ...deepseekSource,
+      settingsConfig: {
+        ...deepseekSource.settingsConfig,
+        modelCatalog: {
+          models: [{ model: "deepseek-v4-flash" }],
+        },
+      },
+    };
+    const existingPlan: Provider = {
+      id: "router-v2",
+      name: "Router V2",
+      category: "custom",
+      settingsConfig: {
+        modelCatalog: {
+          models: [
+            { model: "deepseek-v4-flash" },
+            { model: "removed-from-source" },
+          ],
+        },
+        codexRouting: {
+          schemaVersion: 2,
+          enabled: true,
+          routes: [
+            {
+              id: "deepseek",
+              targetProviderId: currentSource.id,
+              modelSelection: {
+                mode: "include",
+                models: ["deepseek-v4-flash", "removed-from-source"],
+              },
+              aliases: { removed: "removed-from-source" },
+              authPolicy: { source: "provider_config" },
+            },
+          ],
+        },
+      },
+    };
+
+    const { plan, sourceProviders } = buildCodexMultiRouterWizardPlan(
+      [currentSource, existingPlan],
+      [currentSource],
+      existingPlan,
+      // `undefined` is the automatic-follow mode used by the wizard when its
+      // state is `null`; it must not become a stale explicit allowlist.
+      { catalogModelOrder: undefined },
+    );
+
+    expect(sourceProviders[0].settingsConfig.modelCatalog.models).toEqual([
+      { model: "deepseek-v4-flash" },
+    ]);
+    expect(plan.settingsConfig.codexRouting.routes).toMatchObject([
+      {
+        targetProviderId: currentSource.id,
+        modelSelection: { mode: "all" },
+        aliases: {},
+      },
+    ]);
+  });
+
+  it("keeps a fixed catalog selection as an explicit route allowlist", () => {
+    const source: Provider = {
+      ...deepseekSource,
+      settingsConfig: {
+        ...deepseekSource.settingsConfig,
+        modelCatalog: {
+          models: [
+            { model: "deepseek-v4-flash" },
+            { model: "deepseek-v4-pro" },
+          ],
+        },
+      },
+    };
+
+    const { plan, sourceProviders } = buildCodexMultiRouterWizardPlan(
+      [source],
+      [source],
+      null,
+      { catalogModelOrder: ["deepseek-v4-flash"] },
+    );
+
+    expect(sourceProviders[0].settingsConfig.modelCatalog.models).toEqual([
+      { model: "deepseek-v4-flash" },
+    ]);
+    expect(plan.settingsConfig.codexRouting.routes[0].modelSelection).toEqual({
+      mode: "include",
+      models: ["deepseek-v4-flash"],
+    });
+  });
+
+  it("disables models omitted by a successful refresh and drops them from spawn candidates", () => {
+    const source: Provider = {
+      ...deepseekSource,
+      settingsConfig: {
+        ...deepseekSource.settingsConfig,
+        modelCatalog: {
+          models: [
+            { model: "deepseek-v4-flash" },
+            { model: "deepseek-v4-pro" },
+          ],
+          spawnAgentModels: ["deepseek-v4-pro", "deepseek-v4-flash"],
+        },
+      },
+    };
+
+    const refreshed = mergeFetchedModelsIntoWizardProvider(
+      source,
+      [{ id: "deepseek-v4-flash", ownedBy: null }],
+      { preserveExistingSelection: true },
+    );
+    expect(refreshed.settingsConfig?.modelCatalog?.models).toEqual([
+      expect.objectContaining({ model: "deepseek-v4-flash" }),
+      expect.objectContaining({ model: "deepseek-v4-pro", enabled: false }),
+    ]);
+    expect(refreshed.settingsConfig?.modelCatalog?.spawnAgentModels).toEqual([
+      "deepseek-v4-flash",
+    ]);
+  });
+
+  it("keeps models from independent key groups during a single-key refresh", () => {
+    const source: Provider = {
+      ...deepseekSource,
+      settingsConfig: {
+        ...deepseekSource.settingsConfig,
+        codexApiKeyGroups: [
+          {
+            id: "pro-key",
+            apiKeys: ["other-key"],
+            models: ["deepseek-v4-pro"],
+          },
+        ],
+      },
+    };
+    const refreshed = mergeFetchedModelsIntoWizardProvider(source, [
+      { id: "deepseek-v4-flash", ownedBy: null },
+    ]);
+
+    expect(refreshed.settingsConfig.modelCatalog.models).toEqual([
+      { model: "deepseek-v4-flash" },
+      { model: "deepseek-v4-pro" },
+    ]);
+  });
+
+  it("restores mixed route selections only from current included source catalogs", () => {
+    const source = {
+      ...deepseekSource,
+      settingsConfig: {
+        modelCatalog: {
+          models: [
+            { model: "deepseek-v4-flash" },
+            { model: "deepseek-v4-pro", enabled: false },
+          ],
+        },
+      },
+    };
+    const otherSource: Provider = {
+      id: "other-source",
+      name: "Other",
+      settingsConfig: {
+        modelCatalog: {
+          models: [{ model: "kept" }, { model: "not-selected" }],
+        },
+      },
+    };
+    const plan: Provider = {
+      id: "plan",
+      name: "Plan",
+      settingsConfig: {
+        modelCatalog: {
+          models: [{ model: "removed-model" }, { model: "deepseek-v4-pro" }],
+        },
+        codexRouting: {
+          schemaVersion: 2,
+          enabled: true,
+          modelOrder: ["removed-model", "deepseek-v4-pro"],
+          routes: [
+            {
+              id: "follow",
+              targetProviderId: source.id,
+              modelSelection: { mode: "all" },
+              match: { models: ["removed-model", "deepseek-v4-pro"] },
+            },
+            {
+              id: "selected",
+              targetProviderId: otherSource.id,
+              modelSelection: {
+                mode: "include",
+                models: ["kept", "removed-model"],
+              },
+              match: { models: ["not-selected"] },
+            },
+          ],
+        },
+      },
+    };
+
+    expect(initialWizardCatalogModelOrder(plan, [source, otherSource])).toEqual(
+      ["deepseek-v4-flash", "kept"],
+    );
   });
 });
 

@@ -444,6 +444,16 @@ export interface CodexCatalogModel {
   /** Marks rows projected from a credential group rather than user-authored. */
   apiKeyGroupGenerated?: boolean;
   api_key_group_generated?: boolean;
+  /**
+   * Optional product role for models surfaced by an orchestration profile.
+   *
+   * Ordinary provider models omit this field and remain direct routes. Profile
+   * projections use it to make the Codex picker explain whether a model is the
+   * planner, executor, verifier, or a complete orchestration entry.
+   */
+  role?: "direct" | "orchestrator" | "worker" | "verifier" | "profile";
+  orchestrationProfileId?: string;
+  orchestration_profile_id?: string;
 }
 
 export interface CodexApiKeyGroup {
@@ -481,6 +491,75 @@ export interface CodexModelCatalogConfig {
   models: CodexCatalogModel[];
   spawnAgentModels?: string[];
   displayNameStyle?: CodexModelDisplayStyle;
+}
+
+export type OrchestrationAppScope = "claude" | "codex" | "all";
+export type OrchestrationFailureFallback = "direct" | "fail_closed";
+export type OrchestrationApprovalPolicy = "client";
+
+export interface OrchestrationModelRef {
+  appType: "claude" | "codex";
+  providerId: string;
+  model: string;
+}
+
+export interface OrchestrationBudget {
+  maxRounds: number;
+  maxWorkerCalls: number;
+  maxParallelWorkers: number;
+  timeoutSeconds: number;
+  maxOutputTokens: number;
+  /** Reserved. Saving a monetary budget is rejected until pricing is reliable. */
+  budgetUsd?: number;
+}
+
+/**
+ * A named multimodel routing policy. This is intentionally separate from the
+ * Codex model catalog: the catalog answers "what can the picker show?", while a
+ * profile answers "how should this request be executed and verified?"
+ */
+export interface OrchestrationProfile {
+  id: string;
+  displayName: string;
+  enabled: boolean;
+  scope: OrchestrationAppScope;
+  orchestrator: OrchestrationModelRef;
+  worker: OrchestrationModelRef;
+  verifier?: OrchestrationModelRef;
+  budget: OrchestrationBudget;
+  approvalPolicy: OrchestrationApprovalPolicy;
+  failureFallback: OrchestrationFailureFallback;
+  workerGuidance: string;
+  /** Stable model id projected into the Codex picker for this profile. */
+  pickerModel?: string;
+}
+
+export interface OrchestrationSettings {
+  enabled: boolean;
+  activeProfileId?: string;
+  profiles: OrchestrationProfile[];
+  defaultModeByApp?: Partial<
+    Record<"claude" | "codex", "direct" | "orchestrated">
+  >;
+}
+
+export interface OrchestrationRun {
+  id: string;
+  profileId: string;
+  appType: string;
+  sessionId: string;
+  status: string;
+  startedAt: number;
+  finishedAt?: number;
+  events: OrchestrationEvent[];
+}
+
+export interface OrchestrationEvent {
+  stage: string;
+  at: number;
+  role?: string;
+  inputTokens?: number;
+  outputTokens?: number;
 }
 
 export type CodexModelDisplayStyle =

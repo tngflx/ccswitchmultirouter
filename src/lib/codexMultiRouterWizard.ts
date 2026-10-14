@@ -31,6 +31,11 @@ import {
   modelBindingIdentityValues,
   modelIdentityValues,
 } from "@/lib/modelIdentities";
+import {
+  isCompleteCodexCatalogFetch,
+  reconcileFetchedCodexCatalogRows,
+} from "@/lib/codexCatalogReconciliation";
+import { readCodexCatalogSettings } from "@/lib/codexCatalogSchema";
 
 export const CODEX_MULTI_ROUTER_WIZARD_DISMISSED_KEY =
   "ccswitchmulti.codexMultiRouterWizard.dismissed";
@@ -166,10 +171,17 @@ function isOfficialCodexSource(provider: Provider): boolean {
 }
 
 // 读取 Codex provider 的真实持久化模型目录；缺失或结构异常时返回空目录，不能伪造 OAuth 模型权限。
+function readWizardModelCatalogConfig(
+  provider: Provider | null | undefined,
+): Record<string, any> | undefined {
+  return readCodexCatalogSettings(provider?.settingsConfig) as
+    Record<string, any> | undefined;
+}
+
 export function readWizardModelCatalog(
   provider: Provider,
 ): CodexCatalogModel[] {
-  const models = provider.settingsConfig?.modelCatalog?.models;
+  const models = readWizardModelCatalogConfig(provider)?.models;
   if (!Array.isArray(models)) {
     return [];
   }
@@ -383,68 +395,46 @@ export function mergeFetchedModelsIntoWizardProvider(
   options: MergeFetchedWizardModelsOptions = {},
 ): Provider {
   const existingModels = readWizardModelCatalog(provider);
-  const byModel = new Map<string, CodexCatalogModel>();
-  const byFetchedModel = new Map<string, string>();
-  for (const model of existingModels) {
-    byModel.set(model.model, model);
-    const visibleModel = model.model.trim();
-    for (const identity of modelBindingIdentityValues(model)) {
-      byFetchedModel.set(identity, visibleModel);
-    }
-  }
   const shouldAppendFetchedModels =
     !options.preserveExistingSelection || existingModels.length === 0;
-  for (const fetched of fetchedModels) {
-    const modelId = fetched.id.trim();
-    if (!modelId) continue;
-    const visibleModelId =
-      modelIdentityValues(fetched)
-        .map((identity) => byFetchedModel.get(identity))
-        .find((value): value is string => Boolean(value)) ?? modelId;
-    const existing = byModel.get(visibleModelId);
-    if (!existing && !shouldAppendFetchedModels) continue;
-    byModel.set(visibleModelId, {
-      ...(existing ?? {}),
-      model: visibleModelId,
-      ...(!existing && existingModels.length > 0 ? { enabled: false } : {}),
-      upstreamModel:
-        existing?.upstreamModel ?? existing?.upstream_model ?? modelId,
-      displayName: existing?.displayName ?? visibleModelId,
-      ...(fetched.contextWindow
-        ? { contextWindow: fetched.contextWindow }
-        : {}),
-      ...(fetched.inputModalities && fetched.inputModalities.length > 0
-        ? {
-            inputModalities: fetched.inputModalities as Array<"text" | "image">,
-            input_modalities: fetched.inputModalities as Array<
-              "text" | "image"
-            >,
-          }
-        : {}),
-      ...(fetched.supportsImage !== undefined && fetched.supportsImage !== null
-        ? {
-            supportsImage: fetched.supportsImage,
-            supports_image: fetched.supportsImage,
-          }
-        : {}),
-    });
-    for (const identity of modelIdentityValues({
-      ...fetched,
-      model: visibleModelId,
-      upstreamModel:
-        existing?.upstreamModel ?? existing?.upstream_model ?? modelId,
-    })) {
-      byFetchedModel.set(identity, visibleModelId);
-    }
-  }
-  const models = Array.from(byModel.values());
+  const result = reconcileFetchedCodexCatalogRows(
+    existingModels,
+    fetchedModels,
+    {
+      providerId: provider.id,
+      providerName: provider.name,
+      baseUrl: readWizardProviderBaseUrl(provider),
+    },
+    {
+      appendNew: shouldAppendFetchedModels,
+      createRow: (seed) => {
+        const { enabled, ...model } = seed;
+        return (
+          enabled === false ? { ...model, enabled: false } : model
+        ) as CodexCatalogModel;
+      },
+      existingMetadataMode: "refresh",
+      // A successful remote refresh is authoritative for routing. Keep stale
+      // rows visible for editing, but never leave them enabled.
+      removeMissingRemote: isCompleteCodexCatalogFetch(
+        provider.settingsConfig?.codexApiKeyGroups,
+      ),
+      includeUnboundRemoteRows: true,
+      markMissingRemoteDisabled: true,
+      newRowEnabled: existingModels.length === 0,
+      contextWindowFormat: "number",
+      inferContextWindow: false,
+    },
+  );
+  const models = result.rows;
   const allowedModels = new Set(
     models
       .filter((model) => model.enabled !== false)
       .map((model) => model.model),
   );
+  const catalog = readWizardModelCatalogConfig(provider);
   const rawSpawnAgentModels =
-    provider.settingsConfig?.modelCatalog?.spawnAgentModels;
+    catalog?.spawnAgentModels ?? catalog?.spawn_agent_models;
   const spawnAgentModels = Array.isArray(rawSpawnAgentModels)
     ? rawSpawnAgentModels
         .filter(
@@ -458,7 +448,7 @@ export function mergeFetchedModelsIntoWizardProvider(
     settingsConfig: {
       ...provider.settingsConfig,
       modelCatalog: {
-        ...(provider.settingsConfig?.modelCatalog ?? {}),
+        ...(readWizardModelCatalogConfig(provider) ?? {}),
         models,
         ...(spawnAgentModels ? { spawnAgentModels } : {}),
       },
@@ -592,7 +582,7 @@ export function resolveWizardModelNameCollisions(
       settingsConfig: {
         ...provider.settingsConfig,
         modelCatalog: {
-          ...(provider.settingsConfig?.modelCatalog ?? {}),
+          ...(readWizardModelCatalogConfig(provider) ?? {}),
           models: nextModels,
         },
       },
@@ -893,7 +883,7 @@ export function applyWizardConnectivityApiFormatOverrides(
       settingsConfig: {
         ...(provider.settingsConfig ?? {}),
         modelCatalog: {
-          ...(provider.settingsConfig?.modelCatalog ?? {}),
+          ...(readWizardModelCatalogConfig(provider) ?? {}),
           models,
         },
       },
@@ -926,7 +916,7 @@ export function filterWizardProvidersByModelOrder(
         settingsConfig: {
           ...provider.settingsConfig,
           modelCatalog: {
-            ...(provider.settingsConfig?.modelCatalog ?? {}),
+            ...(readWizardModelCatalogConfig(provider) ?? {}),
             models,
           },
         },
@@ -1191,6 +1181,20 @@ export function initialWizardSelectedSourceIds(
   return availableIds.filter((providerId) => routedProviderIds.has(providerId));
 }
 
+export function initialWizardSpawnAgentModels(
+  existingPlan: Provider | null | undefined,
+): string[] {
+  const routing = existingPlan?.settingsConfig?.codexRouting;
+  const catalog = readWizardModelCatalogConfig(existingPlan);
+  const requested =
+    routing?.schemaVersion === 2
+      ? routing.spawnAgentModels
+      : (catalog?.spawnAgentModels ?? catalog?.spawn_agent_models);
+  return Array.isArray(requested)
+    ? requested.filter((model): model is string => typeof model === "string")
+    : [];
+}
+
 export function initialWizardCatalogModelOrder(
   existingPlan: Provider | null | undefined,
   sourceProviders: Provider[],
@@ -1198,8 +1202,12 @@ export function initialWizardCatalogModelOrder(
   const routing = existingPlan?.settingsConfig?.codexRouting as
     CodexRoutingConfigV2 | undefined;
   if (routing?.schemaVersion !== 2) {
-    return existingPlan?.settingsConfig?.modelCatalog
-      ? readIncludedWizardModelCatalog(existingPlan).map((model) => model.model)
+    return readWizardModelCatalogConfig(existingPlan)
+      ? existingPlan
+        ? readIncludedWizardModelCatalog(existingPlan).map(
+            (model) => model.model,
+          )
+        : []
       : null;
   }
 
@@ -1386,7 +1394,7 @@ export function buildCodexMultiRouterWizardPlan(
         settingsConfig: {
           ...provider.settingsConfig,
           modelCatalog: {
-            ...(provider.settingsConfig?.modelCatalog ?? {}),
+            ...(readWizardModelCatalogConfig(provider) ?? {}),
             models,
           },
         },
@@ -1434,12 +1442,7 @@ export function buildCodexMultiRouterWizardPlan(
     ),
   );
   const requestedSpawnAgentModels: string[] =
-    options.spawnAgentModels ??
-    existingRoutingV2?.spawnAgentModels ??
-    (existingRoutingV2
-      ? []
-      : existingPlan?.settingsConfig?.modelCatalog?.spawnAgentModels) ??
-    [];
+    options.spawnAgentModels ?? initialWizardSpawnAgentModels(existingPlan);
   const subagentVersion = normalizeCodexSubagentVersion(
     options.subagentVersion ?? existingRouting?.subagentVersion,
   );

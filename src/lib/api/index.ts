@@ -24,6 +24,7 @@ export { proxyApi } from "./proxy";
 export { openclawApi } from "./openclaw";
 export { sessionsApi } from "./sessions";
 export { workspaceApi } from "./workspace";
+export { orchestrationApi } from "./orchestration";
 export { codexSubagentV2Api } from "./codexSubagentV2";
 export {
   codexConfigConsistencyApi,

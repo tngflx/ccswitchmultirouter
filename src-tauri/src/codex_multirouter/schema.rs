@@ -1,3 +1,4 @@
+use crate::codex_multirouter::catalog::catalog_models;
 use crate::Provider;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -304,13 +305,7 @@ fn provider_models_equivalent(provider: &Provider, left: &str, right: &str) -> b
     if left == right {
         return true;
     }
-    let Some(models) = provider
-        .settings_config
-        .get("modelCatalog")
-        .or_else(|| provider.settings_config.get("model_catalog"))
-        .and_then(|catalog| catalog.get("models"))
-        .and_then(Value::as_array)
-    else {
+    let Some(models) = catalog_models(&provider.settings_config) else {
         return false;
     };
     models.iter().any(|model| {

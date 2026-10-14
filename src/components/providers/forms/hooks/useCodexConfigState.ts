@@ -1,4 +1,10 @@
-import { useState, useCallback, useEffect, useRef } from "react";
+import {
+  useState,
+  useCallback,
+  useEffect,
+  useRef,
+  type SetStateAction,
+} from "react";
 import {
   extractCodexBaseUrl,
   extractCodexExperimentalBearerToken,
@@ -9,6 +15,7 @@ import {
 } from "@/utils/providerConfigUtils";
 import { normalizeTomlText } from "@/utils/textNormalization";
 import { normalizeModelIdentityMetadata } from "@/lib/modelIdentities";
+import { readCodexCatalogSettings } from "@/lib/codexCatalogSchema";
 import type {
   CodexApiFormat,
   CodexApiKeyGroup,
@@ -143,6 +150,7 @@ interface CodexConfigInitialState {
   apiKey: string;
   baseUrl: string;
   catalogModels: CodexCatalogModel[];
+  catalogConfigured: boolean;
   apiKeyGroups: CodexApiKeyGroup[];
   spawnAgentModels: string[];
   routing: CodexRoutingConfig;
@@ -294,6 +302,7 @@ function readInitialCodexState(
     apiKey: "",
     baseUrl: "",
     catalogModels: [],
+    catalogConfigured: false,
     apiKeyGroups: [],
     spawnAgentModels: [],
     routing: emptyRouting,
@@ -312,7 +321,7 @@ function readInitialCodexState(
       : {};
   const configString =
     typeof settingsConfig.config === "string" ? settingsConfig.config : "";
-  const modelCatalog = settingsConfig.modelCatalog;
+  const modelCatalog = readCodexCatalogSettings(settingsConfig);
   const apiKeyGroups = Array.isArray(settingsConfig.codexApiKeyGroups)
     ? settingsConfig.codexApiKeyGroups.filter(
         (group): group is CodexApiKeyGroup =>
@@ -330,6 +339,11 @@ function readInitialCodexState(
     apiKey: pickCodexApiKey(auth, configString),
     baseUrl: extractCodexBaseUrl(configString) || "",
     catalogModels: extractCodexCatalogModels(modelCatalog),
+    catalogConfigured: Boolean(
+      modelCatalog &&
+      typeof modelCatalog === "object" &&
+      Array.isArray((modelCatalog as { models?: unknown }).models),
+    ),
     apiKeyGroups,
     spawnAgentModels: extractCodexSpawnAgentModels(modelCatalog),
     routing: extractCodexRoutingConfig(settingsConfig as Record<string, any>),
@@ -353,9 +367,19 @@ export function useCodexConfigState({ initialData }: UseCodexConfigStateProps) {
   const [codexModel, setCodexModel] = useState(
     () => extractCodexModelName(initialState.configString) || "",
   );
-  const [codexCatalogModels, setCodexCatalogModels] = useState<
+  const [codexCatalogModels, setCodexCatalogModelsState] = useState<
     CodexCatalogModel[]
   >(() => initialState.catalogModels);
+  const [codexCatalogConfigured, setCodexCatalogConfigured] = useState(
+    () => initialState.catalogConfigured,
+  );
+  const setCodexCatalogModels = useCallback(
+    (models: SetStateAction<CodexCatalogModel[]>) => {
+      setCodexCatalogConfigured(true);
+      setCodexCatalogModelsState(models);
+    },
+    [],
+  );
   const [codexApiKeyGroups, setCodexApiKeyGroups] = useState<
     CodexApiKeyGroup[]
   >(() => initialState.apiKeyGroups);
@@ -377,7 +401,8 @@ export function useCodexConfigState({ initialData }: UseCodexConfigStateProps) {
     const nextState = readInitialCodexState(initialData);
     setCodexAuthState(nextState.authString);
     setCodexConfigState(nextState.configString);
-    setCodexCatalogModels(nextState.catalogModels);
+    setCodexCatalogModelsState(nextState.catalogModels);
+    setCodexCatalogConfigured(nextState.catalogConfigured);
     setCodexApiKeyGroups(nextState.apiKeyGroups);
     setCodexSpawnAgentModels(nextState.spawnAgentModels);
     setCodexRouting(nextState.routing);
@@ -534,7 +559,7 @@ export function useCodexConfigState({ initialData }: UseCodexConfigStateProps) {
     (
       auth: Record<string, unknown>,
       config: string,
-      modelCatalogModels: CodexCatalogModel[] = [],
+      modelCatalogModels?: CodexCatalogModel[],
       spawnAgentModels: string[] = [],
       routingConfig: CodexRoutingConfig = {
         enabled: false,
@@ -545,7 +570,8 @@ export function useCodexConfigState({ initialData }: UseCodexConfigStateProps) {
       const authString = JSON.stringify(auth, null, 2);
       setCodexAuth(authString);
       setCodexConfig(config);
-      setCodexCatalogModels(modelCatalogModels);
+      setCodexCatalogModelsState(modelCatalogModels ?? []);
+      setCodexCatalogConfigured(modelCatalogModels !== undefined);
       setCodexApiKeyGroups([]);
       setCodexSpawnAgentModels(spawnAgentModels.slice(0, 5));
       setCodexRouting(routingConfig);
@@ -555,7 +581,7 @@ export function useCodexConfigState({ initialData }: UseCodexConfigStateProps) {
 
       setCodexApiKey(pickCodexApiKey(auth, config));
     },
-    [setCodexAuth, setCodexConfig, setCodexCatalogModels, setCodexApiKeyGroups],
+    [setCodexAuth, setCodexConfig, setCodexApiKeyGroups],
   );
 
   return {
@@ -565,6 +591,7 @@ export function useCodexConfigState({ initialData }: UseCodexConfigStateProps) {
     codexBaseUrl,
     codexModel,
     codexCatalogModels,
+    codexCatalogConfigured,
     codexApiKeyGroups,
     codexSpawnAgentModels,
     codexRouting,

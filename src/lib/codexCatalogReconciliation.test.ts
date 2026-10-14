@@ -1,5 +1,9 @@
 import { describe, expect, it } from "vitest";
-import { reconcileFetchedCodexCatalogRows } from "./codexCatalogReconciliation";
+import {
+  isCompleteCodexCatalogFetch,
+  pruneMissingRemoteCodexCatalogRows,
+  reconcileFetchedCodexCatalogRows,
+} from "./codexCatalogReconciliation";
 import type { CodexCatalogRowLike } from "./codexCatalogReconciliation";
 
 const createRow = (seed: Record<string, unknown>): CodexCatalogRowLike =>
@@ -131,6 +135,33 @@ describe("reconcileFetchedCodexCatalogRows", () => {
     expect(suppressed.removedModels).toEqual(["remote-one"]);
   });
 
+  it("can demote omitted unbound rows without touching explicitly hidden rows", () => {
+    const result = reconcileFetchedCodexCatalogRows(
+      [
+        createRow({ model: "kept-model" }),
+        createRow({ model: "removed-model" }),
+        createRow({ model: "hidden-model", enabled: false }),
+      ],
+      [{ id: "kept-model" }],
+      {},
+      {
+        appendNew: false,
+        createRow,
+        removeMissingRemote: true,
+        includeUnboundRemoteRows: true,
+        markMissingRemoteDisabled: true,
+      },
+    );
+
+    expect(result.rows).toEqual([
+      expect.objectContaining({ model: "kept-model", enabled: true }),
+      expect.objectContaining({ model: "removed-model", enabled: false }),
+      expect.objectContaining({ model: "hidden-model", enabled: false }),
+    ]);
+    expect(result.removed).toBe(0);
+    expect(result.removedModels).toEqual(["removed-model"]);
+  });
+
   it("does not append a duplicate when a fetched alias matches an existing binding", () => {
     const result = reconcileFetchedCodexCatalogRows(
       [createRow({ model: "visible-name", upstreamModel: "upstream-name" })],
@@ -140,5 +171,65 @@ describe("reconcileFetchedCodexCatalogRows", () => {
     );
     expect(result.added).toBe(0);
     expect(result.rows).toHaveLength(1);
+  });
+
+  it("uses stable binding identities for unbound rows during authoritative pruning", () => {
+    const kept = createRow({
+      model: "visible-model",
+      canonicalSlug: "wire-model",
+    });
+    const removed = createRow({
+      model: "wire-model",
+      upstreamModel: "removed-wire-model",
+    });
+    const result = pruneMissingRemoteCodexCatalogRows(
+      [kept, removed],
+      [{ id: "wire-model" }],
+      { includeUnboundRows: true, markMissingDisabled: true },
+    );
+
+    expect(result.rows[0]).toBe(kept);
+    expect(result.rows[1]).toMatchObject({
+      model: "wire-model",
+      upstreamModel: "removed-wire-model",
+      enabled: false,
+    });
+  });
+
+  it("still deletes absent hidden remote rows when physical removal is requested", () => {
+    const result = pruneMissingRemoteCodexCatalogRows(
+      [createRow({ model: "hidden", upstreamModel: "wire", enabled: false })],
+      [],
+    );
+
+    expect(result.rows).toEqual([]);
+    expect(result.removed).toBe(1);
+    expect(result.removedModels).toEqual(["hidden"]);
+  });
+
+  it("applies mass-removal protection to unbound enabled inventory too", () => {
+    const rows = [
+      createRow({ model: "kept" }),
+      createRow({ model: "removed" }),
+      createRow({ model: "hidden", enabled: false }),
+    ];
+    const result = pruneMissingRemoteCodexCatalogRows(rows, [{ id: "kept" }], {
+      includeUnboundRows: true,
+      markMissingDisabled: true,
+      maxRemovalRatio: 0.25,
+    });
+
+    expect(result.removalSuppressed).toBe(true);
+    expect(result.rows).toBe(rows);
+    expect(result.removedModels).toEqual(["removed"]);
+  });
+
+  it("does not treat a single-key fetch as complete when independent key groups exist", () => {
+    expect(isCompleteCodexCatalogFetch(undefined)).toBe(true);
+    expect(isCompleteCodexCatalogFetch([])).toBe(true);
+    expect(isCompleteCodexCatalogFetch([{ apiKeys: [" "] }])).toBe(true);
+    expect(isCompleteCodexCatalogFetch([{ apiKeys: ["group-key"] }])).toBe(
+      false,
+    );
   });
 });

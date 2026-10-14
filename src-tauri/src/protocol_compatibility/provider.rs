@@ -2,6 +2,7 @@ use serde_json::Value;
 use std::collections::HashMap;
 
 use crate::{
+    codex_multirouter::catalog::catalog_models,
     codex_multirouter::{compiler::compile_v2, schema::CodexRoutingDocument},
     provider::Provider,
     proxy::providers::{
@@ -26,14 +27,7 @@ pub fn compile_provider_probe_candidate(provider: &Provider) -> Result<ProbeCand
 pub fn compile_provider_probe_candidates(
     provider: &Provider,
 ) -> Result<Vec<ProbeCandidate>, String> {
-    let catalog_models = provider
-        .settings_config
-        .get("modelCatalog")
-        .or_else(|| provider.settings_config.get("model_catalog"))
-        .and_then(|catalog| catalog.get("models"))
-        .and_then(Value::as_array);
-
-    let Some(catalog_models) = catalog_models else {
+    let Some(catalog_models) = catalog_models(&provider.settings_config) else {
         return compile_provider_probe_candidate(provider).map(|candidate| vec![candidate]);
     };
 
@@ -138,12 +132,7 @@ pub fn compile_codex_router_probe_candidates(
 }
 
 fn resolve_primary_model(provider: &Provider, configured_model: &str) -> (String, String) {
-    let models = provider
-        .settings_config
-        .get("modelCatalog")
-        .or_else(|| provider.settings_config.get("model_catalog"))
-        .and_then(|catalog| catalog.get("models"))
-        .and_then(Value::as_array);
+    let models = catalog_models(&provider.settings_config);
     if let Some(models) = models {
         for model in models {
             let Some(public_model) = string_field(model, &["model", "id", "slug"]) else {

@@ -16,6 +16,7 @@ import { normalizeCodexChatReasoningForSave } from "@/lib/codexChatReasoning";
 export { normalizeCodexChatReasoningForSave } from "@/lib/codexChatReasoning";
 import { parseCodexSubagentCandidateError } from "@/lib/codexSubagentCandidateError";
 import { normalizeModelIdentityMetadata } from "@/lib/modelIdentities";
+import { readCodexCatalogSettings } from "@/lib/codexCatalogSchema";
 import {
   buildCodexProtocolMeta,
   readCodexProtocolSettings,
@@ -175,6 +176,13 @@ import {
   buildCodexApiKeyGroupCatalog,
   normalizeCodexApiKeyGroupMode,
 } from "./codexApiKeyGroupRouting";
+import {
+  buildCodexModelReferenceIndex,
+  canonicalizeCodexModelReferences,
+  sanitizeCodexApiKeyGroups,
+  sanitizeCodexProtocolOverrides,
+  sanitizeCodexRoutingConfig,
+} from "@/lib/codexConfigSanitizer";
 
 type PresetEntry = {
   id: string;
@@ -201,12 +209,8 @@ const normalizeClaudeApiFormat = (
 
 // 从已保存的 settingsConfig 推断 Codex 模型目录条目数；旧版没有独立映射开关时用它做兼容推断。
 const codexCatalogCountFromSettings = (settingsConfig: unknown): number => {
-  if (settingsConfig && typeof settingsConfig === "object") {
-    const models = (settingsConfig as { modelCatalog?: { models?: unknown } })
-      .modelCatalog?.models;
-    return Array.isArray(models) ? models.length : 0;
-  }
-  return 0;
+  const models = readCodexCatalogSettings(settingsConfig)?.models;
+  return Array.isArray(models) ? models.length : 0;
 };
 
 // 读取 Codex 菜单映射开关。新配置优先读取 meta；旧配置没有 meta 时继续按 modelCatalog 存在与否启用。
@@ -390,29 +394,19 @@ const normalizeCodexSpawnAgentModelsForSave = (
   selectedModels: string[],
   catalogModels: CodexCatalogModel[],
 ): string[] => {
-  const catalogModelIds = catalogModels
-    .filter((item) => item.enabled !== false)
-    .map((item) => item.model.trim())
-    .filter(Boolean);
-  const availableModels = new Set(catalogModelIds);
-  const seen = new Set<string>();
-  const normalized: string[] = [];
+  const enabledModels = catalogModels.filter((item) => item.enabled !== false);
+  const index = buildCodexModelReferenceIndex(enabledModels);
+  const normalized = canonicalizeCodexModelReferences(selectedModels, index, 5);
+  if (normalized.length >= 5) return normalized;
 
-  for (const item of selectedModels) {
-    const model = item.trim();
-    if (!model || seen.has(model) || !availableModels.has(model)) continue;
-    seen.add(model);
-    normalized.push(model);
-    if (normalized.length >= 5) return normalized;
-  }
-
-  for (const model of catalogModelIds) {
-    if (seen.has(model)) continue;
-    seen.add(model);
+  const seen = new Set(normalized.map((model) => model.toLowerCase()));
+  for (const item of enabledModels) {
+    const model = index.resolve(item.model);
+    if (!model || seen.has(model.toLowerCase())) continue;
+    seen.add(model.toLowerCase());
     normalized.push(model);
     if (normalized.length >= 5) break;
   }
-
   return normalized;
 };
 
@@ -822,6 +816,7 @@ function ProviderFormFull({
     codexBaseUrl,
     codexModel,
     codexCatalogModels,
+    codexCatalogConfigured,
     codexApiKeyGroups,
     codexSpawnAgentModels,
     codexRouting,
@@ -1097,11 +1092,9 @@ function ProviderFormFull({
     );
     const savedModels = Object.values(codexCapabilityProviders).flatMap(
       (provider) => {
-        const settings = provider.settingsConfig as
-          Record<string, unknown> | undefined;
-        const catalog = settings?.modelCatalog;
-        if (!catalog || typeof catalog !== "object") return [];
-        const models = (catalog as { models?: unknown }).models;
+        const models = readCodexCatalogSettings(
+          provider.settingsConfig,
+        )?.models;
         return Array.isArray(models) ? (models as CodexCatalogModel[]) : [];
       },
     );
@@ -1795,6 +1788,7 @@ function ProviderFormFull({
       initialData?.meta?.providerType === "xai_oauth";
 
     let settingsConfig: string;
+    let codexProtocolOverridesForSave = codexProtocolOverrides;
 
     if (isTokenExchangeProvider) {
       // 新格式只有公开投影；未从私有注册表读回身份时禁止把默认草稿当成原值。
@@ -1846,11 +1840,12 @@ function ProviderFormFull({
           shouldPersistCodexLocalConfig && (codexConfig ?? "").trim()
             ? setCodexWireApi(codexConfig ?? "", "responses")
             : (codexConfig ?? "");
-        const shouldPersistCodexCatalog = shouldPersistCodexLocalConfig;
+        const shouldPersistCodexCatalog =
+          shouldPersistCodexLocalConfig && codexCatalogConfigured;
         const normalizedCatalogModels = shouldPersistCodexCatalog
           ? normalizeCodexCatalogModelsForSave(codexCatalogModels)
           : [];
-        const normalizedApiKeyGroups: CodexApiKeyGroup[] = codexApiKeyGroups
+        const cleanedApiKeyGroups: CodexApiKeyGroup[] = codexApiKeyGroups
           .map((group) => ({
             ...group,
             id: group.id.trim(),
@@ -1862,39 +1857,82 @@ function ProviderFormFull({
               .filter(Boolean),
           }))
           .filter((group) => group.id && group.apiKeys.length > 0);
+        const enabledCatalogModels = normalizedCatalogModels.filter(
+          (item) => item.enabled !== false,
+        );
+        const baseCatalogIndex =
+          buildCodexModelReferenceIndex(enabledCatalogModels);
+        const normalizedApiKeyGroups = shouldPersistCodexCatalog
+          ? sanitizeCodexApiKeyGroups(cleanedApiKeyGroups, baseCatalogIndex)
+          : cleanedApiKeyGroups;
         const projectedCatalogModels = buildCodexApiKeyGroupCatalog(
           normalizedCatalogModels,
           normalizedApiKeyGroups,
           codexApiKeyGroupMode,
         );
-        const enabledCatalogModels = normalizedCatalogModels.filter(
+        const enabledProjectedCatalogModels = projectedCatalogModels.filter(
           (item) => item.enabled !== false,
         );
+        const catalogIndex = buildCodexModelReferenceIndex(
+          enabledProjectedCatalogModels,
+        );
+        if (shouldPersistCodexCatalog) {
+          codexProtocolOverridesForSave = sanitizeCodexProtocolOverrides(
+            codexProtocolOverrides,
+            catalogIndex,
+          );
+        }
         const normalizedSpawnAgentModels =
-          normalizedCatalogModels.length > 0
+          projectedCatalogModels.length > 0
             ? normalizeCodexSpawnAgentModelsForSave(
                 codexSpawnAgentModels,
-                enabledCatalogModels,
+                enabledProjectedCatalogModels,
               )
             : [];
+        const sanitizedCodexRouting = shouldPersistCodexCatalog
+          ? sanitizeCodexRoutingConfig(
+              codexRouting,
+              catalogIndex,
+              (targetProviderId) => {
+                if (targetProviderId === providerId) return catalogIndex;
+                const catalog = readCodexCatalogSettings(
+                  codexCapabilityProviders[targetProviderId]?.settingsConfig,
+                );
+                if (!catalog || !Array.isArray(catalog.models))
+                  return undefined;
+                return buildCodexModelReferenceIndex(
+                  catalog.models.filter(
+                    (model: unknown): model is CodexCatalogModel =>
+                      Boolean(model) &&
+                      typeof model === "object" &&
+                      typeof (model as CodexCatalogModel).model === "string",
+                  ),
+                );
+              },
+            )
+          : codexRouting;
         // The default-model field writes the top-level `model` into the TOML
-        // as the user types; only when it was left empty fall back to the
-        // first catalog row so "fill mapping only" keeps its old behavior.
-        const currentDefaultModel = extractCodexModelName(
-          normalizedCodexConfig,
-        )?.trim();
-        const defaultModelDisabled = normalizedCatalogModels.some(
-          (item) =>
-            item.enabled === false && item.model === currentDefaultModel,
-        );
-        if (
-          enabledCatalogModels.length > 0 &&
-          (!currentDefaultModel || defaultModelDisabled)
-        ) {
-          normalizedCodexConfig = setCodexModelNameInConfig(
+        // as the user types. Migrate aliases/renames and remove it when the
+        // catalog has no enabled model left.
+        if (shouldPersistCodexCatalog) {
+          const currentDefaultModel = extractCodexModelName(
             normalizedCodexConfig,
-            enabledCatalogModels[0].model,
-          );
+          )?.trim();
+          const resolvedDefaultModel =
+            catalogIndex.resolve(currentDefaultModel);
+          if (enabledProjectedCatalogModels.length > 0) {
+            const nextDefaultModel =
+              resolvedDefaultModel ?? enabledProjectedCatalogModels[0].model;
+            normalizedCodexConfig = setCodexModelNameInConfig(
+              normalizedCodexConfig,
+              nextDefaultModel,
+            );
+          } else if (currentDefaultModel) {
+            normalizedCodexConfig = setCodexModelNameInConfig(
+              normalizedCodexConfig,
+              "",
+            );
+          }
         }
         const configObj = {
           auth: authJson,
@@ -1907,7 +1945,10 @@ function ProviderFormFull({
           codexApiKeyGroups?: CodexApiKeyGroup[];
           codexApiKeyGroupMode?: CodexApiKeyGroupMode;
         };
-        if (projectedCatalogModels.length > 0) {
+        // Preserve an explicitly empty local catalog. Omitting the key makes
+        // downstream routing code treat this as a legacy provider and revive
+        // stale top-level/route model fields that the user just removed.
+        if (shouldPersistCodexCatalog) {
           configObj.modelCatalog = {
             models: projectedCatalogModels,
             ...(normalizedSpawnAgentModels.length > 0
@@ -1916,7 +1957,7 @@ function ProviderFormFull({
           };
         }
         if (shouldPersistCodexLocalConfig && hasCodexRouting) {
-          configObj.codexRouting = codexRouting;
+          configObj.codexRouting = sanitizedCodexRouting;
         }
         if (normalizedApiKeyGroups.length > 0) {
           configObj.codexApiKeyGroups = normalizedApiKeyGroups;
@@ -1928,12 +1969,14 @@ function ProviderFormFull({
           setCodexCatalogValidationError(err);
           toast.error(err.message, { duration: 6000 });
         } else {
-          const message = t("providerForm.codexConfigInvalidNotSaved", {
+          const baseMessage = t("providerForm.codexConfigInvalidNotSaved", {
             defaultValue:
               "Codex 设置校验或解析失败；本次尚未提交，草稿仍保留。请检查配置后重试。",
           });
+          const detail = extractErrorMessage(err).trim();
+          const message = detail ? `${baseMessage}\n\n${detail}` : baseMessage;
           setCodexSaveError(message);
-          toast.error(message);
+          toast.error(message, { duration: 8000 });
         }
         return;
       }
@@ -2251,7 +2294,7 @@ function ProviderFormFull({
       nextMeta = buildCodexProtocolMeta(nextMeta, {
         protocolMode: category === "official" ? "auto" : codexProtocolMode,
         protocolOverrides:
-          category === "official" ? {} : codexProtocolOverrides,
+          category === "official" ? {} : codexProtocolOverridesForSave,
         apiFormat: localCodexApiFormat,
         reasoningProjection: codexReasoningProjection,
         toolSchemaDialect: codexToolSchemaDialect,
@@ -2279,12 +2322,17 @@ function ProviderFormFull({
           setCodexSaveError(null);
           return;
         }
-        const message = t("providerForm.codexConfigInvalidNotSaved", {
+        const baseMessage = t("providerForm.codexConfigInvalidNotSaved", {
           defaultValue:
             "Save result was not confirmed. The backend may have written the data, but follow-up synchronization failed. Refresh to verify the state and avoid changing the API Key again until then. The current draft is preserved.",
         });
+        const detail = extractErrorMessage(error).trim();
+        const message =
+          detail && !isCodexProviderSetCancelled(error)
+            ? `${baseMessage}\n\n${detail}`
+            : baseMessage;
         setCodexSaveError(message);
-        toast.error(message);
+        toast.error(message, { duration: 8000 });
         return;
       }
       throw error;
@@ -2479,7 +2527,7 @@ function ProviderFormFull({
       const auth = preset.auth ?? {};
       const config = preset.config ?? "";
 
-      resetCodexConfig(auth, config, preset.modelCatalog ?? []);
+      resetCodexConfig(auth, config, preset.modelCatalog);
       setCodexChatReasoning(preset.codexChatReasoning ?? {});
       setCodexTrafficPolicy(undefined);
       setCodexRouting({ enabled: false, defaultRouteId: "", routes: [] });

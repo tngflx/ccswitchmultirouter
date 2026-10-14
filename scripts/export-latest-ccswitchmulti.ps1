@@ -321,6 +321,17 @@ function Write-LatestJson {
 }
 
 $repoRoot = Get-RepoRoot
+if ($SkipBuild) {
+    Push-Location $repoRoot
+    try {
+        & pnpm catalog:verify
+        if ($LASTEXITCODE -ne 0) {
+            throw "catalog verification failed with exit code $LASTEXITCODE"
+        }
+    } finally {
+        Pop-Location
+    }
+}
 $exportRoot = Resolve-CcswitchmultiReleaseRoot -RepoRoot $repoRoot -RequestedRoot $ReleaseRoot
 $tauriDir = Join-Path $repoRoot "src-tauri"
 $cargoTargetDir = Resolve-CargoTargetDir -TauriDir $tauriDir -RequestedTargetDir $env:CARGO_TARGET_DIR

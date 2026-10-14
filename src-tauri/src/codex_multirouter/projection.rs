@@ -293,12 +293,16 @@ pub(crate) fn build_projection_artifact(
         .collect::<HashMap<_, _>>();
     let compiled = compile_v2(&plan, &providers)
         .map_err(|error| AppError::Message(format!("{}: {}", error.code, error.message)))?;
-    let projection_settings = projection_settings(&router, &compiled, &plan);
+    let orchestration = db.get_orchestration_settings()?;
+    let dependency_fingerprint =
+        projection_dependency_fingerprint(&router, &compiled, &orchestration);
+    let mut projection_settings =
+        projection_settings(&router, &compiled, &plan, &dependency_fingerprint);
+    orchestration.project_settings(&mut projection_settings);
     let target_provider_names = providers
         .iter()
         .map(|(id, provider)| (id.clone(), provider.name.clone()))
         .collect();
-    let dependency_fingerprint = projection_dependency_fingerprint(&router, &compiled);
     Ok(CodexRoutingProjectionArtifact {
         router_provider_id: router.id,
         dependency_fingerprint,
@@ -347,17 +351,29 @@ pub(crate) fn effective_settings_for_candidate_with_providers(
         compile_v2(&plan, providers)
     }
     .map_err(|error| AppError::InvalidInput(format!("{}: {}", error.code, error.message)))?;
-    Ok(projection_settings(candidate, &compiled, &plan))
+    let dependency_fingerprint = projection_dependency_fingerprint(
+        candidate,
+        &compiled,
+        &crate::orchestration::Settings::default(),
+    );
+    Ok(projection_settings(
+        candidate,
+        &compiled,
+        &plan,
+        &dependency_fingerprint,
+    ))
 }
 
 fn projection_dependency_fingerprint(
     router: &Provider,
     compiled: &CompiledCodexRoutingPlan,
+    orchestration: &crate::orchestration::Settings,
 ) -> String {
     short_value_hash(Some(&json!({
         "routing": compiled.dependency_fingerprint,
         "webSearchEnabled": router.settings_config.pointer("/hostedTools/webSearch/enabled")
-            .and_then(Value::as_bool).unwrap_or(true)
+            .and_then(Value::as_bool).unwrap_or(true),
+        "orchestration": orchestration
     })))
 }
 
@@ -365,6 +381,7 @@ fn projection_settings(
     router: &Provider,
     compiled: &CompiledCodexRoutingPlan,
     plan: &super::schema::CodexRoutingConfigV2,
+    dependency_fingerprint: &str,
 ) -> Value {
     let mut settings = router.settings_config.clone();
     let models = projected_model_entries(compiled);
@@ -375,7 +392,7 @@ fn projection_settings(
             .and_then(Value::as_str).unwrap_or("provider-model")
     });
     settings["codexRoutingProjection"] = json!({
-        "dependencyFingerprint": projection_dependency_fingerprint(router, compiled)
+        "dependencyFingerprint": dependency_fingerprint
     });
     if let Some(effort) = supported_router_default_effort(plan, &compiled.model_catalog) {
         settings["modelCatalog"]["defaultReasoningEffort"] = json!(effort);

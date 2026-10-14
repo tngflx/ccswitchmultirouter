@@ -90,6 +90,21 @@ describe("codexSpawnAgentCandidates", () => {
     ]);
   });
 
+  it("never revives models from a stale legacy catalog", () => {
+    const provider = providerWithModelCatalog({
+      models: [],
+      model_catalog: {
+        models: [{ model: "removed-model" }],
+        spawnAgentModels: ["removed-model"],
+      },
+    });
+
+    expect(readCodexModelCatalog(provider)).toEqual({
+      models: [],
+      spawnAgentModels: [],
+    });
+  });
+
   it("规整选择时去掉未知模型和重复模型", () => {
     expect(
       normalizeSpawnAgentCandidateSelection(
