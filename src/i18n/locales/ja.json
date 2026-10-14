@@ -1,4 +1,18 @@
 {
+  "orchestration": {
+    "title": "マルチモデルオーケストレーション",
+    "profileEditor": "プロファイル編集",
+    "saved": "オーケストレーション設定を保存しました。",
+    "publicationPending": "設定は保存済みですが、Codex カタログの公開は保留中です。",
+    "publicationReady": "Codex カタログを公開しました。選択リストが古い場合は Codex を開き直してください。",
+    "routerRequired": "プロファイルの公開には schema-v2 Codex MultiRouter を有効にしてください。",
+    "retryPublication": "公開を再試行",
+    "unsaved": "未保存のプロファイル変更があります。",
+    "disabled": "オーケストレーションは無効です。プロファイルモデルをカタログから削除しました。",
+    "nameRequired": "プロファイル名が必要です。",
+    "noIncludedModels": "含まれるモデルがありません",
+    "modelUnavailable": "{{name}}: {{role}} モデルは利用不可または除外されています。"
+  },
   "app": {
     "title": "CCSwitchMulti",
     "description": "Claude Code・Codex・Gemini CLI のためのオールインワンアシスタント"
@@ -413,6 +427,7 @@
     "tabAdvanced": "詳細",
     "tabProxy": "ルーティング",
     "tabRequestHealth": "リクエスト健全性",
+    "tabRequestHealthSettings": "リクエスト健全性設定",
     "authCenter": {
       "title": "OAuth 認証センター",
       "description": "Claude Code で他のサブスクリプションをご利用いただけます。コンプライアンスリスクにご注意ください。",

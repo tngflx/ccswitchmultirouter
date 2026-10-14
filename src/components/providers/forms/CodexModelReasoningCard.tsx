@@ -174,6 +174,13 @@ export function CodexModelReasoningCard({
   const controlKind = reasoningControlKind(resolution);
   const { resolved, detection } = resolution;
   const isUnknown = status === "unknown";
+  const hasUsableDetection =
+    resolution.hasDetectionCandidate &&
+    Boolean(
+      detection?.reasoning?.supportedEfforts?.some(
+        (effort) => effort && effort !== "none",
+      ),
+    );
 
   return (
     <div className="space-y-3 rounded-md border bg-muted/30 p-3">
@@ -280,7 +287,7 @@ export function CodexModelReasoningCard({
             >
               {redetecting ? "Detecting…" : "Detect again"}
             </Button>
-            {resolution.hasDetectionCandidate ? (
+            {hasUsableDetection ? (
               <Button
                 type="button"
                 variant="outline"

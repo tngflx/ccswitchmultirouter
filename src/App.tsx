@@ -17,6 +17,7 @@ import {
   Wrench,
   History,
   BarChart2,
+  Bot,
   Download,
   FolderArchive,
   Search,
@@ -31,6 +32,7 @@ import {
   RefreshCw,
 } from "lucide-react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { confirmDialog } from "@/lib/dialog";
 import type { Provider, VisibleApps } from "@/types";
 import type { EnvConflict } from "@/types/env";
 import { proxyKeys, useProvidersQuery, useSettingsQuery } from "@/lib/query";
@@ -374,6 +376,8 @@ function App() {
     isCodexMultiRouterEntryChoiceOpen,
     setIsCodexMultiRouterEntryChoiceOpen,
   ] = useState(false);
+  const [isOrchestrationProfilesOpen, setIsOrchestrationProfilesOpen] =
+    useState(false);
   const [isCodexMultiRouterWizardOpen, setIsCodexMultiRouterWizardOpen] =
     useState(false);
   const [newlyCreatedCodexProviderIds, setNewlyCreatedCodexProviderIds] =
@@ -1325,6 +1329,12 @@ function App() {
     openCodexRouterWorkspace(existingPlan ?? null, "status");
   };
 
+  const handleOpenOrchestrationProfiles = () => {
+    setIsCodexMultiRouterEntryChoiceOpen(false);
+    setActiveApp("codex");
+    setIsOrchestrationProfilesOpen(true);
+  };
+
   // 目标 Provider 的 switch 路径会在同一个后端切换锁内启动代理并完成接管；
   // 这里不能先接管当前 Provider，否则会短暂写入错误的模型目录与 managed roles。
   const handleEnableCodexMultiRouterPlan = async (provider: Provider) => {
@@ -1375,13 +1385,14 @@ function App() {
         duration: 10000,
       },
     );
-    const shouldOpenHome = window.confirm(
+    const shouldOpenHome = await confirmDialog(
       [
         "History repair completed. Fully restart Codex so the sidebar and model state reload.",
         "",
         "If this CCSwitchMulti MultiRouter configuration helped, please star the GitHub repository.",
         "Click “Confirm” to open the CCSwitchMulti GitHub repository in your default browser.",
       ].join("\n"),
+      { title: "History repair completed", kind: "info" },
     );
     if (shouldOpenHome) {
       await settingsApi.openExternal(
@@ -2179,6 +2190,15 @@ function App() {
                                   <Button
                                     variant="ghost"
                                     size="sm"
+                                    onClick={handleOpenOrchestrationProfiles}
+                                    className="text-muted-foreground hover:text-foreground hover:bg-black/5 dark:hover:bg-white/5 w-8 px-2"
+                                    title="Orchestration profiles"
+                                  >
+                                    <Bot className="w-4 h-4" />
+                                  </Button>
+                                  <Button
+                                    variant="ghost"
+                                    size="sm"
                                     onClick={() => setCurrentView("codexUsage")}
                                     className="text-muted-foreground hover:text-foreground hover:bg-black/5 dark:hover:bg-white/5 w-8 px-2"
                                     title="Codex usage and reset credits"
@@ -2331,7 +2351,7 @@ function App() {
         open={isCodexMultiRouterEntryChoiceOpen}
         onOpenChange={setIsCodexMultiRouterEntryChoiceOpen}
       >
-        <DialogContent className="max-w-lg" zIndex="alert">
+        <DialogContent className="max-w-lg overflow-hidden" zIndex="alert">
           <DialogHeader>
             <DialogTitle className="flex items-center gap-2">
               <RouteIcon className="h-5 w-5 text-primary" />
@@ -2344,7 +2364,7 @@ function App() {
             </DialogDescription>
           </DialogHeader>
 
-          <div className="grid gap-3 px-6 py-4">
+          <div className="grid min-h-0 gap-3 overflow-y-auto px-6 py-4">
             <button
               type="button"
               onClick={handleCreateCodexMultiRouter}
@@ -2398,6 +2418,21 @@ function App() {
                 )}
               </div>
             </div>
+
+            <button
+              type="button"
+              onClick={handleOpenOrchestrationProfiles}
+              className="rounded-xl border border-emerald-500/25 bg-gradient-to-r from-emerald-500/10 via-background to-cyan-500/10 p-4 text-left shadow-sm transition-colors hover:border-emerald-500/45 hover:from-emerald-500/15"
+            >
+              <div className="flex items-center gap-2 font-medium">
+                <Bot className="h-4 w-4 text-emerald-500" />
+                Create orchestration profile
+              </div>
+              <p className="mt-2 text-sm leading-6 text-muted-foreground">
+                Choose the Claude mastermind, Codex/Sublyx worker, verifier,
+                budgets, and default routing mode.
+              </p>
+            </button>
           </div>
 
           <DialogFooter>
@@ -2415,6 +2450,41 @@ function App() {
               Open workspace directly
             </Button>
           </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog
+        open={isOrchestrationProfilesOpen}
+        onOpenChange={setIsOrchestrationProfilesOpen}
+      >
+        <DialogContent
+          className="h-[min(94vh,900px)] max-h-[94vh] max-w-7xl overflow-hidden p-0"
+          zIndex="alert"
+        >
+          <DialogTitle className="sr-only">
+            {t("orchestration.title", {
+              defaultValue: "Multimodel orchestration",
+            })}
+          </DialogTitle>
+          <DialogDescription className="sr-only">
+            {t("orchestration.profileEditor", {
+              defaultValue: "Profile editor",
+            })}
+          </DialogDescription>
+          <div className="relative flex h-full min-h-0 flex-col">
+            <button
+              type="button"
+              onClick={() => setIsOrchestrationProfilesOpen(false)}
+              className="absolute right-4 top-4 z-10 inline-flex h-8 w-8 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
+              aria-label="Close orchestration profiles"
+              title="Close orchestration profiles"
+            >
+              <X className="h-4 w-4" />
+            </button>
+            <AgentsPanel
+              onOpenChange={() => setIsOrchestrationProfilesOpen(false)}
+            />
+          </div>
         </DialogContent>
       </Dialog>
 

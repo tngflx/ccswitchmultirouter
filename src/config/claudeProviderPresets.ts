@@ -1258,6 +1258,27 @@ export const providerPresets: ProviderPreset[] = [
     iconColor: "#6566F1",
   },
   {
+    name: "Kilo",
+    websiteUrl: "https://kilo.ai",
+    apiKeyUrl: "https://app.kilo.ai/profile",
+    settingsConfig: {
+      env: {
+        ANTHROPIC_BASE_URL: "https://api.kilo.ai/api/gateway",
+        ANTHROPIC_AUTH_TOKEN: "",
+        ANTHROPIC_MODEL: "kilo-auto/free",
+        ANTHROPIC_DEFAULT_HAIKU_MODEL: "kilo-auto/free",
+        ANTHROPIC_DEFAULT_SONNET_MODEL: "kilo-auto/free",
+        ANTHROPIC_DEFAULT_OPUS_MODEL: "kilo-auto/free",
+      },
+    },
+    category: "aggregator",
+    apiFormat: "openai_chat",
+    modelsUrl: "https://api.kilo.ai/api/gateway/models",
+    endpointCandidates: ["https://api.kilo.ai/api/gateway"],
+    icon: "kilo",
+    iconColor: "#6E56CF",
+  },
+  {
     name: "TheRouter",
     websiteUrl: "https://therouter.ai",
     apiKeyUrl: "https://dashboard.therouter.ai",

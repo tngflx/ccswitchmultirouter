@@ -113,12 +113,136 @@ function Get-CcsmDevSessionEnvironment {
         $value = $null
         if ($Environment -is [System.Collections.IDictionary]) {
             if ($Environment.Keys -ccontains $name) { $value = $Environment[$name] }
-        } elseif ($null -ne $Environment -and $Environment.PSObject.Properties.Name -ccontains $name) {
-            $value = $Environment.$name
+        } elseif ($null -ne $Environment) {
+            $property = $Environment.PSObject.Properties[$name]
+            if ($null -ne $property -and $property.Name -ceq $name) { $value = $property.Value }
         }
         if ($value -is [string] -and $value.IndexOf([char]0) -lt 0) { $result[$name] = $value }
     }
     return $result
+}
+
+function Get-CcsmDevSessionRestartTimesMs {
+    param(
+        [Parameter(Mandatory = $true)]$Session,
+        [long]$NowMs = [datetimeoffset]::UtcNow.ToUnixTimeMilliseconds()
+    )
+
+    $fields = @($Session.PSObject.Properties.Name)
+    if ($Session -is [System.Collections.IDictionary]) { $fields = @($Session.Keys) }
+    $history = $null
+    if ($fields -contains "restartTimesMs" -and $Session.restartTimesMs -is [array]) {
+        $history = $Session.restartTimesMs
+    } elseif ($fields -contains "supervisorRestartTimesMs" -and $Session.supervisorRestartTimesMs -is [array]) {
+        $history = $Session.supervisorRestartTimesMs
+    }
+    foreach ($timestamp in @($history)) {
+        if ($timestamp -isnot [int] -and $timestamp -isnot [long] -and
+            $timestamp -isnot [double] -and $timestamp -isnot [decimal]) { continue }
+        $number = [double]$timestamp
+        if ([double]::IsNaN($number) -or [double]::IsInfinity($number) -or
+            [math]::Abs($number) -gt 9007199254740991 -or
+            $number -ne [math]::Truncate($number) -or $number -lt $NowMs - 1800000) { continue }
+        [long]$number
+    }
+}
+
+function ConvertTo-CcsmDevSessionBudgetJson {
+    param(
+        [Parameter(Mandatory = $true)][string]$SessionJson,
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][long[]]$RestartTimesMs
+    )
+
+    # PowerShell JSON date coercion must not change Node's exact CIM identity strings.
+    Add-Type -AssemblyName System.Runtime.Serialization
+    $reader = [System.Runtime.Serialization.Json.JsonReaderWriterFactory]::CreateJsonReader(
+        [System.Text.Encoding]::UTF8.GetBytes($SessionJson),
+        [System.Xml.XmlDictionaryReaderQuotas]::Max
+    )
+    $stream = New-Object System.IO.MemoryStream
+    $writer = $null
+    try {
+        $document = New-Object System.Xml.XmlDocument
+        $document.Load($reader)
+        $root = $document.DocumentElement
+        foreach ($field in @($root.SelectNodes("restartTimesMs|supervisorRestartTimesMs"))) {
+            [void]$root.RemoveChild($field)
+        }
+        $history = $document.CreateElement("restartTimesMs")
+        $history.SetAttribute("type", "array")
+        foreach ($timestamp in $RestartTimesMs) {
+            $item = $document.CreateElement("item")
+            $item.SetAttribute("type", "number")
+            $item.InnerText = $timestamp.ToString([System.Globalization.CultureInfo]::InvariantCulture)
+            [void]$history.AppendChild($item)
+        }
+        [void]$root.AppendChild($history)
+        $writer = [System.Runtime.Serialization.Json.JsonReaderWriterFactory]::CreateJsonWriter(
+            $stream, [System.Text.UTF8Encoding]::new($false), $false
+        )
+        $document.WriteTo($writer)
+        $writer.Flush()
+        return [System.Text.Encoding]::UTF8.GetString($stream.ToArray())
+    } finally {
+        if ($null -ne $writer) { $writer.Close() }
+        $reader.Close()
+        $stream.Dispose()
+    }
+}
+
+function Get-CcsmDevSessionWatchdogOwnership {
+    param([Parameter(Mandatory = $true)]$Plan)
+
+    $ownership = [pscustomobject]@{ Active = $false; Unknown = $false }
+    try {
+        $processes = @(Get-CimInstance Win32_Process -Filter "Name='node.exe'" -ErrorAction Stop)
+    } catch {
+        $ownership.Unknown = $true
+        return $ownership
+    }
+    $executable = [regex]::Escape($Plan.Executable.Replace('/', '\'))
+    $scriptPath = [regex]::Escape($Plan.ScriptPath.Replace('/', '\'))
+    $supervisorPid = [string]$Plan.SupervisorPid
+    $commandPattern = '^\s*(?:"' + $executable + '"|' + $executable + ')\s+(?:"' +
+        $scriptPath + '"|' + $scriptPath + ')\s+--ccsm-dev-watchdog\s+(?:"' +
+        $supervisorPid + '"|' + $supervisorPid + ')\s*$'
+    $supervisorStart = ConvertTo-CcsmGuardianUtc $Plan.Session.supervisorStartedAtUtc
+    foreach ($process in $processes) {
+        $fields = @($process.PSObject.Properties.Name)
+        $hasPath = $fields -contains "ExecutablePath" -and $process.ExecutablePath -is [string] -and
+            -not [string]::IsNullOrWhiteSpace($process.ExecutablePath)
+        $hasCommand = $fields -contains "CommandLine" -and $process.CommandLine -is [string] -and
+            -not [string]::IsNullOrWhiteSpace($process.CommandLine)
+        $parentPid = 0
+        $hasParent = $fields -contains "ParentProcessId" -and
+            [int]::TryParse([string]$process.ParentProcessId, [ref]$parentPid) -and $parentPid -gt 0
+        if ($hasPath -and -not (Test-CcsmGuardianSamePath $process.ExecutablePath $Plan.Executable)) { continue }
+        if ($hasCommand -and -not [regex]::IsMatch(
+                $process.CommandLine.Replace('/', '\'), $commandPattern,
+                [System.Text.RegularExpressions.RegexOptions]::IgnoreCase
+            )) { continue }
+        if ($hasParent -and $parentPid -ne $Plan.SupervisorPid) { continue }
+        if (-not $hasPath -or -not $hasCommand -or -not $hasParent) {
+            $ownership.Unknown = $true
+            continue
+        }
+        try {
+            $watchdogPid = 0
+            if ($fields -notcontains "ProcessId" -or $fields -notcontains "CreationDate" -or
+                -not [int]::TryParse([string]$process.ProcessId, [ref]$watchdogPid) -or
+                $watchdogPid -lt 1) {
+                $ownership.Unknown = $true
+                continue
+            }
+            $created = ConvertTo-CcsmGuardianUtc $process.CreationDate
+            if ($created.ToUnixTimeMilliseconds() -lt $supervisorStart.ToUnixTimeMilliseconds()) { continue }
+            $ownership.Active = $true
+            return $ownership
+        } catch {
+            $ownership.Unknown = $true
+        }
+    }
+    return $ownership
 }
 
 function Get-CcsmDevSessionRecoveryPlan {
@@ -130,15 +254,19 @@ function Get-CcsmDevSessionRecoveryPlan {
     $plan = [pscustomobject]@{
         Exists = $false; Active = $false; Recoverable = $false; PreventInstalledFallback = $false
         State = ""; Executable = ""; ScriptPath = ""; RepoRoot = ""; Args = @(); Roots = @(); Environment = @{}
-        SupervisorPid = 0; Marker = $null
+        SupervisorPid = 0; Marker = $null; ConfigPath = [System.IO.Path]::GetFullPath($ConfigPath)
+        SessionPath = ""; Session = $null; SessionJson = ""
+        WatchdogActive = $false; WatchdogOwnershipUnknown = $false
     }
     $sessionPath = Join-Path $ConfigPath "logs\dev-session.json"
+    $plan.SessionPath = $sessionPath
     if (-not (Test-Path -LiteralPath $sessionPath -PathType Leaf)) { return $plan }
     $plan.Exists = $true
     # Even an unreadable dev marker must not select the installed binary instead.
     $plan.PreventInstalledFallback = $true
     try {
-        $session = [System.IO.File]::ReadAllText($sessionPath, [System.Text.Encoding]::UTF8) | ConvertFrom-Json
+        $sessionJson = [System.IO.File]::ReadAllText($sessionPath, [System.Text.Encoding]::UTF8)
+        $session = $sessionJson | ConvertFrom-Json
         if ([int]$session.schemaVersion -ne 1 -or $session.state -notin @("running", "stopping") -or
             -not (Test-CcsmGuardianAbsolutePath ([string]$session.repoRoot)) -or
             -not (Test-CcsmGuardianAbsolutePath ([string]$session.scriptPath))) { return $plan }
@@ -179,6 +307,8 @@ function Get-CcsmDevSessionRecoveryPlan {
         $plan.SupervisorPid = [int]$session.supervisorPid
         $plan.Args = @($session.args)
         $plan.Roots = @($session.roots)
+        $plan.Session = $session
+        $plan.SessionJson = $sessionJson
         if ($session.PSObject.Properties.Name -contains "environment") {
             $plan.Environment = Get-CcsmDevSessionEnvironment $session.environment
         }
@@ -199,7 +329,13 @@ function Get-CcsmDevSessionRecoveryPlan {
             $plan.Active = $sameStart -and [regex]::IsMatch($commandLine, $scriptToken,
                 [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
         }
-        $plan.Recoverable = -not $plan.Active -and $plan.State -eq "running"
+        if (-not $plan.Active -and $plan.State -eq "running") {
+            $watchdog = Get-CcsmDevSessionWatchdogOwnership -Plan $plan
+            $plan.WatchdogActive = $watchdog.Active
+            $plan.WatchdogOwnershipUnknown = $watchdog.Unknown
+        }
+        $plan.Recoverable = -not $plan.Active -and -not $plan.WatchdogActive -and
+            -not $plan.WatchdogOwnershipUnknown -and $plan.State -eq "running"
     } catch {
         $plan.Active = $false
         $plan.Recoverable = $false
@@ -261,12 +397,17 @@ function Invoke-CcsmDevSessionRecovery {
         [Parameter(Mandatory = $true)][scriptblock]$WriteEvent
     )
 
-    if ($Plan.Active -or $Plan.State -eq "stopping" -or (& $IsMaintenance)) {
+    if ($Plan.Active -or $Plan.WatchdogActive -or $Plan.WatchdogOwnershipUnknown -or
+        $Plan.State -eq "stopping" -or (& $IsMaintenance)) {
         & $WriteEvent "info" "dev-session-recovery-deferred" @{ State = $Plan.State; Active = $Plan.Active }
         return
     }
     if (-not $Plan.Recoverable) {
         & $WriteEvent "warning" "dev-session-recovery-required" @{ RepoRoot = $Plan.RepoRoot }
+        return
+    }
+    if (-not (Test-CcsmGuardianWatchdogEnabled -ConfigPath $Plan.ConfigPath)) {
+        & $WriteEvent "info" "dev-session-restart-skipped-watchdog-disabled" $null
         return
     }
     $ownerPid = & $GetListenerOwner
@@ -277,6 +418,39 @@ function Invoke-CcsmDevSessionRecovery {
             & $WriteEvent "error" "foreign-listener-blocked-dev-recovery" @{ ProcessId = $ownerPid }
             return
         }
+    }
+    if ((& $IsMaintenance) -or -not (Test-CcsmGuardianWatchdogEnabled -ConfigPath $Plan.ConfigPath)) {
+        & $WriteEvent "info" "dev-session-recovery-deferred" @{ State = $Plan.State; Active = $Plan.Active }
+        return
+    }
+    $currentPlan = Get-CcsmDevSessionRecoveryPlan -ConfigPath $Plan.ConfigPath -GetProcessIdentity $GetProcessIdentity
+    if (-not $currentPlan.Recoverable -or $currentPlan.SupervisorPid -ne $Plan.SupervisorPid -or
+        -not (Test-CcsmGuardianSamePath $currentPlan.ScriptPath $Plan.ScriptPath) -or
+        -not (Test-CcsmGuardianSamePath $currentPlan.Executable $Plan.Executable)) {
+        & $WriteEvent "info" "dev-session-recovery-deferred" @{ State = $currentPlan.State; Active = $currentPlan.Active }
+        return
+    }
+    $Plan = $currentPlan
+    $nowMs = [datetimeoffset]::UtcNow.ToUnixTimeMilliseconds()
+    $restartTimesMs = @(Get-CcsmDevSessionRestartTimesMs -Session $Plan.Session -NowMs $nowMs)
+    if ($restartTimesMs.Count -ge 5) {
+        & $WriteEvent "warning" "dev-session-restart-rate-limited" @{ RestartsInWindow = $restartTimesMs.Count }
+        return
+    }
+    $temporary = $Plan.SessionPath + "." + [guid]::NewGuid().ToString("N") + ".tmp"
+    try {
+        $updatedJson = ConvertTo-CcsmDevSessionBudgetJson -SessionJson $Plan.SessionJson -RestartTimesMs @($restartTimesMs + $nowMs)
+        [System.IO.File]::WriteAllText(
+            $temporary,
+            $updatedJson,
+            [System.Text.UTF8Encoding]::new($false)
+        )
+        [System.IO.File]::Replace($temporary, $Plan.SessionPath, [NullString]::Value)
+    } catch {
+        & $WriteEvent "error" "dev-session-restart-budget-persist-failed" @{ Error = $_.Exception.Message }
+        return
+    } finally {
+        if (Test-Path -LiteralPath $temporary -PathType Leaf) { Remove-Item -LiteralPath $temporary -Force }
     }
     $startedPid = [int](& $StartDevSession $Plan)
     & $WriteEvent "warning" "dev-session-started" @{
@@ -551,7 +725,8 @@ function Test-CcsmGuardianUncleanExit {
     #>
     param(
         [Parameter(Mandatory = $true)][string]$ConfigPath,
-        [Parameter(Mandatory = $true)][scriptblock]$GetProcessIdentity
+        [Parameter(Mandatory = $true)][scriptblock]$GetProcessIdentity,
+        [string]$ExpectedExecutable
     )
 
     $configRoot = [System.IO.Path]::GetFullPath($ConfigPath)
@@ -562,15 +737,62 @@ function Test-CcsmGuardianUncleanExit {
     } catch {
         return $false
     }
+    if ($null -eq $marker) { return $false }
+    $fields = @($marker.PSObject.Properties.Name)
+    $hasPath = $fields -contains "executablePath"
+    $hasStart = $fields -contains "processStartedAtTicks"
+    $hasRecordedIdentity = $hasPath -or $hasStart
     $markerPid = 0
-    if ($marker.PSObject.Properties.Name -contains "pid") { $markerPid = [int]$marker.pid }
-    if ($markerPid -lt 1) { return $true }
+    $expectedTicks = 0L
+    try {
+        if ($fields -contains "pid" -and -not [int]::TryParse([string]$marker.pid, [ref]$markerPid)) {
+            return $false
+        }
+        if ($hasRecordedIdentity) {
+            # Partial modern identities must not silently fall back to PID-only matching.
+            if ($markerPid -lt 1 -or -not $hasPath -or -not $hasStart -or
+                $marker.executablePath -isnot [string] -or
+                -not (Test-CcsmGuardianAbsolutePath $marker.executablePath) -or
+                ([System.IO.Path]::GetPathRoot($marker.executablePath)).Length -lt 3 -or
+                -not [long]::TryParse([string]$marker.processStartedAtTicks, [ref]$expectedTicks) -or
+                $expectedTicks -lt 1) { return $false }
+            $expectedStart = [datetime]::FromFileTimeUtc($expectedTicks)
+            if ($PSBoundParameters.ContainsKey("ExpectedExecutable") -and
+                (-not (Test-CcsmGuardianAbsolutePath $ExpectedExecutable) -or
+                    ([System.IO.Path]::GetPathRoot($ExpectedExecutable)).Length -lt 3 -or
+                    -not (Test-CcsmGuardianSamePath $marker.executablePath $ExpectedExecutable))) {
+                return $false
+            }
+        } elseif ($markerPid -lt 1) {
+            return $true
+        }
+    } catch {
+        return $false
+    }
     try {
         $identity = & $GetProcessIdentity $markerPid
     } catch {
         return $true
     }
-    return $null -eq $identity
+    if ($null -eq $identity) { return $true }
+    if (-not $hasRecordedIdentity) { return $false }
+    try {
+        $identityFields = @($identity.PSObject.Properties.Name)
+        $observedPid = 0
+        if ($identityFields -notcontains "ProcessId" -or
+            $identityFields -notcontains "Path" -or
+            $identityFields -notcontains "StartTimeUtc" -or
+            -not [int]::TryParse([string]$identity.ProcessId, [ref]$observedPid) -or
+            $observedPid -lt 1 -or $identity.Path -isnot [string] -or
+            -not (Test-CcsmGuardianAbsolutePath $identity.Path) -or
+            ([System.IO.Path]::GetPathRoot($identity.Path)).Length -lt 3) { return $false }
+        $observedStart = ConvertTo-CcsmGuardianUtc $identity.StartTimeUtc
+        return $observedPid -ne $markerPid -or
+            -not (Test-CcsmGuardianSamePath $marker.executablePath $identity.Path) -or
+            $expectedStart.Ticks -ne $observedStart.UtcTicks
+    } catch {
+        return $false
+    }
 }
 
 function Test-CcsmGuardianRestartBudget {

@@ -4717,6 +4717,51 @@ JSON.stringify({
     }
 
     #[test]
+    fn model_picker_clears_stale_effort_defaults_when_provider_advertises_no_levels() {
+        let result = run_model_picker_patch_core_probe_with_payload(
+            json!({
+                "defaultModel": "xiaomi/mimo-v2.6-flash",
+                "modelNames": [
+                    "xiaomi/mimo-v2.6-flash",
+                    "xiaomi/mimo-v2.6-pro"
+                ],
+                "models": [
+                    {
+                        "model": "xiaomi/mimo-v2.6-flash",
+                        "defaultReasoningEffort": "medium"
+                    },
+                    {"model": "xiaomi/mimo-v2.6-pro"}
+                ]
+            }),
+            r#"
+const models = [];
+patchModelArray(models, true);
+JSON.stringify(models.map((model) => ({
+  model: model.model,
+  hasDefault: Object.prototype.hasOwnProperty.call(model, "defaultReasoningEffort"),
+  hasEfforts: Object.prototype.hasOwnProperty.call(model, "supportedReasoningEfforts"),
+})));
+"#,
+        );
+
+        assert_eq!(
+            result,
+            json!([
+                {
+                    "model": "xiaomi/mimo-v2.6-flash",
+                    "hasDefault": false,
+                    "hasEfforts": false
+                },
+                {
+                    "model": "xiaomi/mimo-v2.6-pro",
+                    "hasDefault": false,
+                    "hasEfforts": false
+                }
+            ])
+        );
+    }
+
+    #[test]
     fn model_picker_matches_renderer_rows_by_canonical_slug_and_alias() {
         let result = run_model_picker_patch_core_probe_with_payload(
             json!({

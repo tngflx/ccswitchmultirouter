@@ -1509,6 +1509,36 @@ const piProviderPresetDefinitions: PiProviderPreset[] = [
     iconColor: "#6566F1",
   },
   {
+    name: "Kilo",
+    providerKey: "cc-switch-kilo",
+    websiteUrl: "https://kilo.ai",
+    apiKeyUrl: "https://app.kilo.ai/profile",
+    settingsConfig: {
+      name: "Kilo",
+      baseUrl: "https://api.kilo.ai/api/gateway",
+      api: "openai-completions",
+      apiKey: "",
+      models: [
+        piModel("kilo/kilo-auto-free", { id: "kilo-auto/free" }),
+        piModel("kilo/kilo-auto-free", {
+          id: "minimax/minimax-m2.1:free",
+          name: "MiniMax M2.1 (Free)",
+        }),
+        piModel("kilo/kilo-auto-free", {
+          id: "z-ai/glm-5:free",
+          name: "GLM-5 (Free)",
+        }),
+        piModel("kilo/kilo-auto-free", {
+          id: "google/gemma-4-26b-a4b-it:free",
+          name: "Gemma 4 26B (Free)",
+        }),
+      ],
+    },
+    category: "aggregator",
+    icon: "kilo",
+    iconColor: "#6E56CF",
+  },
+  {
     name: "TheRouter",
     providerKey: "cc-switch-the-router",
     websiteUrl: "https://therouter.ai",

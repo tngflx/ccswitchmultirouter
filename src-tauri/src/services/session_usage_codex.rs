@@ -493,6 +493,10 @@ struct CodexReplayCaches {
 
 static CODEX_REPLAY_CACHES: OnceLock<Mutex<CodexReplayCaches>> = OnceLock::new();
 
+fn should_warn_for_pending(previous: Option<&PendingEntry>, next: &PendingEntry) -> bool {
+    previous.is_none_or(|previous| previous.reason != next.reason)
+}
+
 fn replay_caches() -> &'static Mutex<CodexReplayCaches> {
     CODEX_REPLAY_CACHES.get_or_init(|| Mutex::new(CodexReplayCaches::default()))
 }
@@ -1793,13 +1797,13 @@ fn mark_deferred(
     let should_warn = replay_caches()
         .lock()
         .ok()
-        .and_then(|mut caches| {
-            caches
+        .map(|mut caches| {
+            let previous = caches
                 .pending
-                .insert(file_path.to_path_buf(), entry.clone())
+                .insert(file_path.to_path_buf(), entry.clone());
+            should_warn_for_pending(previous.as_ref(), &entry)
         })
-        .as_ref()
-        != Some(&entry);
+        .unwrap_or(true);
     if should_warn {
         let reason = match &entry.reason {
             PendingReason::MissingParent(parent) => format!("找不到父 rollout {parent}"),
@@ -2453,6 +2457,30 @@ mod tests {
     const PARENT_ID: &str = "00000000-0000-4000-8000-000000000001";
     const CHILD_A_ID: &str = "00000000-0000-4000-8000-000000000002";
     const CHILD_B_ID: &str = "00000000-0000-4000-8000-000000000003";
+
+    #[test]
+    fn repeated_retryable_defer_with_new_file_stamp_does_not_spam_warning() {
+        let previous = PendingEntry {
+            modified: 1,
+            size: 10,
+            reason: PendingReason::Retryable("父 rollout 尚未写到 child fork 时刻".to_string()),
+        };
+        let next = PendingEntry {
+            modified: 2,
+            size: 20,
+            reason: previous.reason.clone(),
+        };
+
+        assert!(!should_warn_for_pending(Some(&previous), &next));
+        assert!(should_warn_for_pending(
+            Some(&previous),
+            &PendingEntry {
+                modified: 2,
+                size: 20,
+                reason: PendingReason::Retryable("父 rollout 已更新但仍无法验证".to_string()),
+            }
+        ));
+    }
 
     fn write_jsonl(path: &Path, values: &[serde_json::Value]) {
         let contents = values

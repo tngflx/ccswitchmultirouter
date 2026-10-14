@@ -1,6 +1,7 @@
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { useTranslation } from "react-i18next";
 import { toast } from "sonner";
+import { confirmDialog } from "@/lib/dialog";
 import { providersApi, sessionsApi, settingsApi, type AppId } from "@/lib/api";
 import type { DeleteSessionOptions } from "@/lib/api/sessions";
 import type {
@@ -513,11 +514,15 @@ export const useSwitchProviderMutation = (appId: AppId) => {
         },
         forceRepair: async (failedProviderId) => {
           if (codexForceRepairInFlight.has(failedProviderId)) return;
-          const confirmed = window.confirm(
+          const confirmed = await confirmDialog(
             t("notifications.forceRepairConfirm", {
               defaultValue:
                 "Back up the current Codex configuration, repair legacy fields, and rebuild CCSM-managed configuration with this provider? MCP, projects, and user customizations will be preserved.",
             }),
+            {
+              title: t("notifications.forceRepair", "Force repair"),
+              kind: "warning",
+            },
           );
           if (!confirmed) return;
 

@@ -18,6 +18,10 @@ import net from "node:net";
 import path from "node:path";
 import process from "node:process";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import {
+  createDevReconnectTracker,
+  createDevWatchdogOutputReader,
+} from "./dev-watchdog-policy.mjs";
 
 // A four-hour quiet period keeps the running Tauri binary stable during normal
 // development while still rebuilding automatically after sustained backend
@@ -33,11 +37,13 @@ const CARGO_TARGET_MAINTENANCE_SCRIPT = path.join(
 );
 const WATCH_EVENT_BATCH_MS = 100;
 const CHILD_EXIT_TIMEOUT_MS = 10_000;
+const DEV_CHILD_STDIO_DRAIN_TIMEOUT_MS = 250;
 const WINDOWS_PROCESS_EXIT_TIMEOUT_MS = 2_000;
 const WINDOWS_LISTENER_RELEASE_TIMEOUT_MS = 60_000;
 const DEV_AUTO_RESTART_WINDOW_MS = 30 * 60 * 1_000;
 const DEV_MAX_AUTO_RESTARTS = 5;
 const DEV_AUTO_RESTART_DELAY_MS = 1_000;
+const DEV_SUPERVISOR_PUBLICATION_TIMEOUT_MS = 30_000;
 const DEV_SUPERVISOR_ENV = "CC_SWITCH_DEV_SUPERVISOR";
 const DEV_WORKER_FLAG = "--ccsm-dev-worker";
 const DEV_WATCHDOG_FLAG = "--ccsm-dev-watchdog";
@@ -185,6 +191,39 @@ export function resolveDevSettingsPath(environment = process.env) {
   return home ? path.join(home, ".cc-switch", "settings.json") : null;
 }
 
+export function resolveDevRunMarkerPath(environment = process.env) {
+  const settingsPath = resolveDevSettingsPath(environment);
+  return settingsPath
+    ? path.join(path.dirname(settingsPath), "logs", "app-run-marker.json")
+    : null;
+}
+
+export function readDevRunMarkerPresent(
+  environment = process.env,
+  read = readFileSync,
+  expected,
+) {
+  if (!expected) {
+    return false;
+  }
+  const markerPath =
+    expected.markerPath ?? resolveDevRunMarkerPath(environment);
+  if (!markerPath) {
+    return false;
+  }
+  try {
+    const marker = JSON.parse(read(markerPath, "utf8"));
+    return (
+      marker.pid === expected.pid &&
+      marker.processStartedAtTicks === expected.processStartedAtTicks &&
+      path.resolve(marker.executablePath).toLowerCase() ===
+        path.resolve(expected.executablePath).toLowerCase()
+    );
+  } catch {
+    return false;
+  }
+}
+
 export function readDevWatchdogEnabled(
   environment = process.env,
   read = readFileSync,
@@ -226,21 +265,28 @@ export function readDevWatchdogEnabled(
 
 export function devAutoRestartDecision({
   appStarted,
+  appRunning = false,
   exitCode,
   signal,
   uncleanExit = false,
+  runMarkerPresent = false,
   watchdogEnabled,
   nowMs = Date.now(),
   restartTimesMs = [],
 }) {
+  if (signal === "SIGINT" || signal === "SIGTERM") {
+    return { restart: false, reason: "signal" };
+  }
   if (!watchdogEnabled) {
     return { restart: false, reason: "disabled" };
   }
+  // The exact app marker distinguishes a crash from an intentional live quit.
+  // Before startup, code zero still means the dev session failed to launch.
   if (
-    exitCode === 0 &&
-    signal === null &&
+    (appRunning ||
+      (exitCode === 0 && signal === null && appStarted !== false)) &&
     !uncleanExit &&
-    appStarted !== false
+    !runMarkerPresent
   ) {
     return { restart: false, reason: "clean-exit" };
   }
@@ -320,6 +366,75 @@ export function devWorkerRestartDecision({
     return { restart: false, reason: "rate-limited" };
   }
   return { restart: true, reason: "unexpected-exit" };
+}
+
+export function readDevRestartTimesMs(session, nowMs = Date.now()) {
+  const history = Array.isArray(session?.restartTimesMs)
+    ? session.restartTimesMs
+    : session?.supervisorRestartTimesMs;
+  if (!Array.isArray(history)) return [];
+  return history.filter(
+    (timestamp) =>
+      Number.isSafeInteger(timestamp) &&
+      timestamp >= nowMs - DEV_AUTO_RESTART_WINDOW_MS,
+  );
+}
+
+export function createDevWorkerRecovery({
+  isCurrent,
+  readEnabled = readDevWatchdogEnabled,
+  readMarkerPresent,
+  isRecoveryNeeded = () => true,
+  recover,
+  schedule = setTimeout,
+  cancelScheduled = clearTimeout,
+}) {
+  let timer;
+  let queued = false;
+  let generation = 0;
+  return {
+    request(reason) {
+      if (queued || !isCurrent() || !readEnabled() || !readMarkerPresent()) {
+        return false;
+      }
+      queued = true;
+      const requestedGeneration = ++generation;
+      timer = schedule(() => {
+        if (requestedGeneration !== generation) return;
+        timer = undefined;
+        if (!isCurrent()) return;
+        if (!readEnabled() || !readMarkerPresent()) {
+          queued = false;
+          return;
+        }
+        let recoveryNeeded = false;
+        try {
+          recoveryNeeded = isRecoveryNeeded(reason) === true;
+        } catch {
+          // An unavailable identity probe is not proof of a current crash.
+        }
+        // Identity probes can block while the app clears its quit marker.
+        if (
+          !recoveryNeeded ||
+          !isCurrent() ||
+          !readEnabled() ||
+          !readMarkerPresent()
+        ) {
+          queued = false;
+          return;
+        }
+        // Only the outer supervisor owns restarts and their shared budget.
+        recover(reason);
+      }, DEV_AUTO_RESTART_DELAY_MS);
+      return true;
+    },
+    cancel() {
+      generation += 1;
+      if (timer !== undefined) cancelScheduled(timer);
+      timer = undefined;
+      queued = false;
+    },
+  };
 }
 
 export function assertNormalCargoTargetDirectory(
@@ -811,12 +926,33 @@ export function windowsDevWorkerDescendants(
   return descendants.sort((left, right) => right.depth - left.depth);
 }
 
-function queryWindowsProcesses() {
-  const script = [
-    "Get-CimInstance Win32_Process |",
-    "Select-Object ProcessId,ParentProcessId,Name,ExecutablePath,CommandLine,CreationDate |",
-    "ConvertTo-Json -Compress",
-  ].join(" ");
+export function windowsJsonQueryCommand(script) {
+  return [
+    "[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)",
+    "$OutputEncoding = [Console]::OutputEncoding",
+    script,
+  ].join("\n");
+}
+
+export function parseWindowsJsonQueryOutput(stdout, queryName) {
+  try {
+    return JSON.parse(stdout);
+  } catch {
+    throw new Error(`PowerShell ${queryName} query returned malformed JSON.`);
+  }
+}
+
+function queryWindowsProcesses(processId) {
+  if (processId !== undefined && !Number.isInteger(processId)) {
+    throw new Error("A process query requires an integer PID.");
+  }
+  const script = windowsJsonQueryCommand(
+    [
+      `Get-CimInstance Win32_Process${processId === undefined ? "" : ` -Filter 'ProcessId = ${processId}'`} |`,
+      "Select-Object ProcessId,ParentProcessId,Name,ExecutablePath,CommandLine,CreationDate |",
+      "ConvertTo-Json -Compress",
+    ].join(" "),
+  );
   const result = spawnSync(
     "powershell.exe",
     ["-NoProfile", "-NonInteractive", "-Command", script],
@@ -834,7 +970,7 @@ function queryWindowsProcesses() {
   if (!result.stdout.trim()) {
     return [];
   }
-  const parsed = JSON.parse(result.stdout);
+  const parsed = parseWindowsJsonQueryOutput(result.stdout, "process");
   return (Array.isArray(parsed) ? parsed : [parsed]).filter(Boolean);
 }
 
@@ -842,7 +978,7 @@ export function parseWindowsListeners(stdout) {
   if (!String(stdout ?? "").trim()) {
     return [];
   }
-  const parsed = JSON.parse(stdout);
+  const parsed = parseWindowsJsonQueryOutput(stdout, "listener");
   return (Array.isArray(parsed) ? parsed : [parsed])
     .filter(Boolean)
     .map((listener) => ({
@@ -860,12 +996,14 @@ export function parseWindowsListeners(stdout) {
 
 function queryWindowsListeners(processInfo) {
   const processId = Number(processInfo.ProcessId);
-  const script = [
-    `Get-NetTCPConnection -State Listen -OwningProcess ${processId} -ErrorAction SilentlyContinue |`,
-    "Select-Object LocalAddress,LocalPort |",
-    "Sort-Object LocalAddress,LocalPort -Unique |",
-    "ConvertTo-Json -Compress",
-  ].join(" ");
+  const script = windowsJsonQueryCommand(
+    [
+      `Get-NetTCPConnection -State Listen -OwningProcess ${processId} -ErrorAction SilentlyContinue |`,
+      "Select-Object LocalAddress,LocalPort |",
+      "Sort-Object LocalAddress,LocalPort -Unique |",
+      "ConvertTo-Json -Compress",
+    ].join(" "),
+  );
   const result = spawnSync(
     "powershell.exe",
     ["-NoProfile", "-NonInteractive", "-Command", script],
@@ -905,6 +1043,20 @@ export function sameWindowsProcess(left, right) {
       path.resolve(rightExecutable).toLowerCase() &&
     leftCreationDate === rightCreationDate
   );
+}
+
+export function windowsProcessObservationCrashed(observed, current) {
+  const completeIdentity = (identity) =>
+    Number.isInteger(identity?.ProcessId) &&
+    identity.ProcessId > 0 &&
+    [identity.Name, identity.ExecutablePath, identity.CreationDate].every(
+      (value) => typeof value === "string" && value.trim().length > 0,
+    ) &&
+    sameWindowsProcess(identity, identity);
+  if (!completeIdentity(observed) || (current && !completeIdentity(current))) {
+    return false;
+  }
+  return !sameWindowsProcess(observed, current);
 }
 
 export function windowsProcessStartedAtUtc(processInfo) {
@@ -959,6 +1111,34 @@ export function waitForChildExit(child, timeoutMs = CHILD_EXIT_TIMEOUT_MS) {
       onExit();
     }
   });
+}
+
+export function observeDevChildTermination(
+  child,
+  classifyExit,
+  {
+    drainTimeoutMs = DEV_CHILD_STDIO_DRAIN_TIMEOUT_MS,
+    schedule = setTimeout,
+    cancelScheduled = clearTimeout,
+  } = {},
+) {
+  let timer;
+  let classified = false;
+  const classifyOnce = (code, signal) => {
+    if (classified) return;
+    classified = true;
+    if (timer !== undefined) cancelScheduled(timer);
+    child.off("exit", onExit);
+    child.off("close", onClose);
+    classifyExit(code, signal);
+  };
+  const onExit = (code, signal) => {
+    // Orphaned Cargo/app children can hold inherited pipes open after CLI exit.
+    timer = schedule(() => classifyOnce(code, signal), drainTimeoutMs);
+  };
+  const onClose = (code, signal) => classifyOnce(code, signal);
+  child.once("exit", onExit);
+  child.once("close", onClose);
 }
 
 export function isListenerBindable(listener) {
@@ -1295,9 +1475,10 @@ export async function superviseDevSessions({
   waitToRestart = () =>
     new Promise((resolve) => setTimeout(resolve, DEV_AUTO_RESTART_DELAY_MS)),
   now = Date.now,
+  restartTimesMs = [],
+  onRestart = () => {},
   onEvent = () => {},
 }) {
-  const restartTimesMs = [];
   while (!isStopping()) {
     const child = spawnSession();
     const outcome = await new Promise((resolve) => {
@@ -1315,16 +1496,38 @@ export async function superviseDevSessions({
     // Cleanup finishes before a new worker starts; orphaned Cargo, cc-switch
     // and Vite processes must not retain listeners or the debug executable.
     await cleanSession(child);
+    const decisionAtMs = now();
     const decision = devWorkerRestartDecision({
       ...outcome,
       expectedExit: isStopping(),
       watchdogEnabled: readEnabled(),
-      nowMs: now(),
+      nowMs: decisionAtMs,
       restartTimesMs,
     });
-    onEvent(decision, outcome);
+    const watchdogEvent =
+      decision.reason === "rate-limited"
+        ? {
+            event: "dev-session-restart-limited",
+            detail: {
+              supervisorPid: process.pid,
+              restartCount: readDevRestartTimesMs(
+                { restartTimesMs },
+                decisionAtMs,
+              ).length,
+            },
+          }
+        : null;
+    onEvent(decision, outcome, watchdogEvent);
     if (!decision.restart) return outcome.exitCode ?? 1;
-    restartTimesMs.push(now());
+    const restartAtMs = now();
+    restartTimesMs.splice(
+      0,
+      restartTimesMs.length,
+      ...readDevRestartTimesMs({ restartTimesMs }, restartAtMs),
+      restartAtMs,
+    );
+    // Persist before waiting so launcher recovery cannot reset this budget.
+    onRestart();
     await waitToRestart();
     if (!readEnabled()) return outcome.exitCode ?? 1;
   }
@@ -1394,6 +1597,68 @@ function devSupervisorIsAlive(session, processes) {
   }
 }
 
+export async function waitForDevSupervisorPublication({
+  expected,
+  readSession,
+  isRunning,
+  verifyOwnership = () => expected.supervisorStartedAtUtc !== undefined,
+  timeoutMs = DEV_SUPERVISOR_PUBLICATION_TIMEOUT_MS,
+  onTimeout = () => {},
+  now = Date.now,
+  wait = (milliseconds) =>
+    new Promise((resolve) => setTimeout(resolve, milliseconds)),
+}) {
+  const deadline = now() + timeoutMs;
+  let timeoutReported = false;
+  const normalizeExecutable = (value) => {
+    const resolved = path.resolve(value);
+    return process.platform === "win32" ? resolved.toLowerCase() : resolved;
+  };
+  while (true) {
+    if (!isRunning()) {
+      throw new Error(
+        `Replacement dev supervisor PID ${expected.supervisorPid} exited before publishing its session.`,
+      );
+    }
+    let session;
+    try {
+      session = readSession();
+    } catch {
+      // An in-progress or unreadable marker is not a confirmed handoff.
+    }
+    const matchesReplacement =
+      session?.schemaVersion === 1 &&
+      session.state === "running" &&
+      session.supervisorPid === expected.supervisorPid &&
+      typeof session.supervisorExecutablePath === "string" &&
+      normalizeExecutable(session.supervisorExecutablePath) ===
+        normalizeExecutable(expected.supervisorExecutablePath) &&
+      session.repoRoot === expected.repoRoot &&
+      session.scriptPath === expected.scriptPath &&
+      Number.isFinite(Date.parse(session.supervisorStartedAtUtc)) &&
+      (expected.supervisorStartedAtUtc === undefined ||
+        session.supervisorStartedAtUtc === expected.supervisorStartedAtUtc) &&
+      Date.parse(session.startedAtUtc) >= expected.launchedAtMs;
+    if (matchesReplacement) {
+      try {
+        if (verifyOwnership(session)) return session;
+      } catch {
+        // Transient identity-query failures cannot release recovery ownership.
+      }
+    }
+    if (!timeoutReported && now() >= deadline) {
+      timeoutReported = true;
+      // A live unpublished child still owns this attempt; never race fallback.
+      onTimeout(
+        new Error(
+          `Replacement dev supervisor PID ${expected.supervisorPid} did not publish its owned session within ${timeoutMs}ms.`,
+        ),
+      );
+    }
+    await wait(100);
+  }
+}
+
 async function runDetachedDevWatchdog(supervisorPid) {
   const markerPath = devSessionPath();
   if (!markerPath) return;
@@ -1420,22 +1685,22 @@ async function runDetachedDevWatchdog(supervisorPid) {
       );
       if (alive) continue;
       const nowMs = Date.now();
+      const restartTimesMs = readDevRestartTimesMs(session, nowMs);
       const decision = devWorkerRestartDecision({
         exitCode: 1,
         signal: null,
         watchdogEnabled: readDevWatchdogEnabled(),
         nowMs,
-        restartTimesMs: session.supervisorRestartTimesMs ?? [],
+        restartTimesMs,
       });
       if (!decision.restart) return;
-      session.supervisorRestartTimesMs = [
-        ...(session.supervisorRestartTimesMs ?? []),
-        nowMs,
-      ].filter((timestamp) => timestamp >= nowMs - DEV_AUTO_RESTART_WINDOW_MS);
+      session.restartTimesMs = [...restartTimesMs, nowMs];
+      delete session.supervisorRestartTimesMs;
       const temporary = `${markerPath}.${process.pid}.tmp`;
       writeFileSync(temporary, JSON.stringify(session));
       renameSync(temporary, markerPath);
       // Relaunch the entry point of pnpm dev, not the compiled application.
+      const launchedAtMs = Date.now();
       const replacement = spawn(
         process.execPath,
         [fileURLToPath(import.meta.url), ...session.args],
@@ -1454,11 +1719,44 @@ async function runDetachedDevWatchdog(supervisorPid) {
         replacement.once("spawn", resolve);
         replacement.once("error", reject);
       });
-      writeDevWatchdogEvent("dev-supervisor-restarted", {
-        oldPid: supervisorPid,
-        newPid: replacement.pid,
-      });
-      replacement.unref();
+      try {
+        await waitForDevSupervisorPublication({
+          expected: {
+            supervisorPid: replacement.pid,
+            supervisorExecutablePath: process.execPath,
+            repoRoot: REPO_ROOT,
+            scriptPath: fileURLToPath(import.meta.url),
+            launchedAtMs,
+          },
+          readSession: () => JSON.parse(readFileSync(markerPath, "utf8")),
+          isRunning: () =>
+            replacement.exitCode === null && replacement.signalCode === null,
+          verifyOwnership: (recorded) =>
+            process.platform !== "win32" ||
+            devSupervisorIsAlive(
+              recorded,
+              queryWindowsProcesses(replacement.pid),
+            ),
+          onTimeout: (error) =>
+            writeDevWatchdogEvent("dev-supervisor-publication-timeout", {
+              oldPid: supervisorPid,
+              newPid: replacement.pid,
+              error: error.message,
+            }),
+        });
+        writeDevWatchdogEvent("dev-supervisor-restarted", {
+          oldPid: supervisorPid,
+          newPid: replacement.pid,
+        });
+      } catch (error) {
+        writeDevWatchdogEvent("dev-supervisor-publication-failed", {
+          oldPid: supervisorPid,
+          newPid: replacement.pid,
+          error: error.message,
+        });
+      } finally {
+        replacement.unref();
+      }
       return;
     } catch (error) {
       writeDevWatchdogEvent("dev-watchdog-iteration-failed", {
@@ -1591,7 +1889,7 @@ async function runDevSupervisor(args) {
     args,
     environment: devSessionEnvironment(process.env),
     startedAtUtc: new Date().toISOString(),
-    supervisorRestartTimesMs: previous?.supervisorRestartTimesMs ?? [],
+    restartTimesMs: readDevRestartTimesMs(previous),
     state: "running",
   };
   const lockPath = markerPath ? `${markerPath}.lock` : null;
@@ -1730,12 +2028,17 @@ async function runDevSupervisor(args) {
         await cleanRecordedDevRoots([...roots.values()]);
       },
       isStopping: () => stopping,
+      restartTimesMs: session.restartTimesMs,
+      onRestart: saveSession,
       waitToRestart: () =>
         new Promise((resolve) => {
           finishRestartWait = resolve;
           restartTimer = setTimeout(resolve, DEV_AUTO_RESTART_DELAY_MS);
         }),
-      onEvent(decision, outcome) {
+      onEvent(decision, outcome, watchdogEvent) {
+        if (watchdogEvent) {
+          writeDevWatchdogEvent(watchdogEvent.event, watchdogEvent.detail);
+        }
         if (decision.restart)
           console.log(
             `[dev watchdog] pnpm dev session exited (${outcome.signal ?? `code ${outcome.exitCode}`}); restarting the complete Vite + Cargo/Tauri dev build.`,
@@ -1796,7 +2099,11 @@ backend files have remained unchanged for the configured quiet period.
 
 Options:
   -d, --delay <ms>  Quiet period before a backend rebuild (default: 14400000 / 4 hours)
-  --no-rebuild      Detect backend edits without rebuilding; crash recovery remains enabled
+  --no-rebuild      Disable source-edit rebuilds (watchdog crash recovery still applies)
+
+Watchdog:
+  watchdogEnabled recovers crashes and sustained reconnect loops immediately,
+  without the source-edit delay (maximum 5 automatic restarts / 30 minutes).
 
 Environment:
   TAURI_DEV_REBUILD_DELAY_MS  Same setting as --delay; CLI option takes priority
@@ -1843,7 +2150,9 @@ Use "pnpm dev:immediate" for the same verified lifecycle with no quiet delay.`);
   let tauri;
   let backendWatchers = [];
   let shuttingDown = false;
+  let restartInProgress = false;
   let shutdownPromise;
+  let tauriRecovery;
   const expectedTauriExits = createExpectedExitRegistry();
   const backendContentTracker = createBackendContentTracker();
   let lastBackendEditAt;
@@ -1990,6 +2299,10 @@ Use "pnpm dev:immediate" for the same verified lifecycle with no quiet delay.`);
     let outputTail = "";
     let appStarted = false;
     const sessionStartedAt = Date.now();
+    let appIdentity;
+    let observedAppProcess;
+    let processQueryFailed = false;
+    const reconnectTracker = createDevReconnectTracker();
     const child = startProcess(
       process.execPath,
       [
@@ -2026,8 +2339,95 @@ Use "pnpm dev:immediate" for the same verified lifecycle with no quiet delay.`);
       }
     });
 
+    const packetReader = createDevWatchdogOutputReader((packet) => {
+      if (tauri !== child || shuttingDown) {
+        return;
+      }
+      if (
+        packet.event === "ready" &&
+        Number.isInteger(packet.pid) &&
+        packet.pid > 0 &&
+        typeof packet.executablePath === "string" &&
+        isPathInside(path.join(TAURI_DIR, "target"), packet.executablePath) &&
+        Number.isFinite(packet.processStartedAtTicks) &&
+        typeof packet.markerPath === "string"
+      ) {
+        appIdentity = packet;
+        if (process.platform === "win32") {
+          try {
+            observedAppProcess = queryWindowsProcesses(packet.pid).find(
+              (candidate) => Number(candidate.ProcessId) === packet.pid,
+            );
+          } catch {
+            // A failed OS query is not proof that the app crashed.
+          }
+        }
+      }
+      reconnectTracker.observe(packet);
+    });
+
+    const backendProcessCrashed = () => {
+      if (process.platform !== "win32" || !observedAppProcess || !appIdentity) {
+        return false;
+      }
+      const current = queryWindowsProcesses(appIdentity.pid).find(
+        (candidate) => Number(candidate.ProcessId) === appIdentity.pid,
+      );
+      return windowsProcessObservationCrashed(observedAppProcess, current);
+    };
+    const recovery = createDevWorkerRecovery({
+      isCurrent: () => !shuttingDown && !restartInProgress && tauri === child,
+      readMarkerPresent: () =>
+        readDevRunMarkerPresent(process.env, readFileSync, appIdentity),
+      isRecoveryNeeded: (reason) =>
+        reason === "reconnect-loop"
+          ? reconnectTracker.recoveryReason() === reason
+          : reason === "backend-process-crashed" && backendProcessCrashed(),
+      recover: (reason) => {
+        void shutdownWithError(
+          new Error(
+            `${reason}; handing recovery to the complete pnpm dev session watchdog.`,
+          ),
+        );
+      },
+    });
+    tauriRecovery = recovery;
+    const reconnectTimer = setInterval(() => {
+      if (!shuttingDown && process.platform === "win32" && observedAppProcess) {
+        try {
+          const crashed = backendProcessCrashed();
+          processQueryFailed = false;
+          if (
+            crashed &&
+            readDevRunMarkerPresent(process.env, readFileSync, appIdentity)
+          ) {
+            recovery.request("backend-process-crashed");
+          }
+        } catch {
+          if (!processQueryFailed) {
+            console.warn(
+              "[dev-watchdog] Process observation unavailable; recovery remains fail-closed.",
+            );
+            processQueryFailed = true;
+          }
+        }
+      }
+      const reason = reconnectTracker.recoveryReason();
+      if (reason) {
+        recovery.request(reason);
+      }
+    }, 5_000);
+    reconnectTimer.unref();
+    child.once("exit", () => {
+      clearInterval(reconnectTimer);
+      recovery.cancel();
+    });
+
     const observeOutput = (chunk, destination) => {
       destination.write(chunk);
+      if (destination === process.stdout) {
+        packetReader.push(chunk);
+      }
       if (appStarted || tauri !== child) {
         return;
       }
@@ -2046,15 +2446,14 @@ Use "pnpm dev:immediate" for the same verified lifecycle with no quiet delay.`);
     child.stdout.on("data", (chunk) => observeOutput(chunk, process.stdout));
     child.stderr.on("data", (chunk) => observeOutput(chunk, process.stderr));
 
-    child.once("exit", (code, signal) => {
+    observeDevChildTermination(child, (code, signal) => {
       if (expectedTauriExits.consume(child)) {
         return;
       }
       if (!shuttingDown && tauri === child) {
-        const uncleanExit = isDevCrashMarker(
-          readDevRunMarker(),
-          sessionStartedAt,
-        );
+        const uncleanExit = appIdentity
+          ? readDevRunMarkerPresent(process.env, readFileSync, appIdentity)
+          : isDevCrashMarker(readDevRunMarker(), sessionStartedAt);
         const outcome = devAutoRestartDecision({
           appStarted,
           exitCode: code,
@@ -2064,7 +2463,7 @@ Use "pnpm dev:immediate" for the same verified lifecycle with no quiet delay.`);
           // boundary. Here we only classify the worker's exit as clean/crashed.
           watchdogEnabled: true,
         });
-        if (outcome.reason === "clean-exit") {
+        if (outcome.reason === "clean-exit" || outcome.reason === "signal") {
           void shutdown(0);
           return;
         }
@@ -2077,18 +2476,23 @@ Use "pnpm dev:immediate" for the same verified lifecycle with no quiet delay.`);
     });
   };
 
-  const restartTauri = async () => {
+  const restartTauri = async (reason = "backend-edit") => {
+    if (restartInProgress || shuttingDown) {
+      return;
+    }
+    restartInProgress = true;
+    tauriRecovery?.cancel();
     const rebuildStartedAt = new Date().toISOString();
     const triggeringPaths = lastBackendEditPaths;
     const triggeringSummary = triggeringPaths.slice(0, 8).join(", ");
     const extraCount = triggeringPaths.length - 8;
-    rebuildGate.markBuilding();
-    backendContentTracker.beginBuild(snapshotBackendFileFingerprints());
-    logBackendEvent(
-      `Backend rebuild triggered at ${rebuildStartedAt}; last edit detected at ${lastBackendEditAt ?? "unknown"}; paths: ${triggeringSummary || "unknown"}${extraCount > 0 ? ` (+${extraCount} more)` : ""}.`,
-    );
     const previousTauri = tauri;
     try {
+      rebuildGate.markBuilding();
+      backendContentTracker.beginBuild(snapshotBackendFileFingerprints());
+      logBackendEvent(
+        `Backend rebuild triggered at ${rebuildStartedAt}; reason=${reason}; last edit detected at ${lastBackendEditAt ?? "unknown"}; paths: ${triggeringSummary || "unknown"}${extraCount > 0 ? ` (+${extraCount} more)` : ""}.`,
+      );
       if (previousTauri) {
         expectedTauriExits.mark(previousTauri);
       }
@@ -2110,6 +2514,8 @@ Use "pnpm dev:immediate" for the same verified lifecycle with no quiet delay.`);
           `Could not safely restart the Tauri backend: ${error.message}`,
         ),
       );
+    } finally {
+      restartInProgress = false;
     }
   };
 
@@ -2122,6 +2528,7 @@ Use "pnpm dev:immediate" for the same verified lifecycle with no quiet delay.`);
       return shutdownPromise;
     }
     shuttingDown = true;
+    tauriRecovery?.cancel();
     rebuildGate.cancel();
     closeBackendWatchers();
     process.exitCode = exitCode;

@@ -24,14 +24,69 @@ const ERROR_BODY_MAX_CHARS: usize = 512;
 /// 仅以平台标识判定，绝不掺入 model 名——model 名属于模型厂商，会把托管
 /// 平台误判成模型官方接口。
 pub fn detect_platform(provider: &Provider) -> Option<&'static str> {
-    let base_url = provider
-        .settings_config
+    detect_platform_from_settings_parts(&provider.settings_config, Some(&provider.name))
+}
+
+/// Detect a known provider platform from the transient settings shape used by
+/// unsaved provider forms and catalog projections.
+///
+/// The persisted `Provider` record keeps the display name outside
+/// `settings_config`, while a draft resolver only receives the settings object.
+/// Keep this helper aligned with [`detect_platform`] so both paths select the
+/// same capability-library entries.
+pub fn detect_platform_from_settings(settings: &Value) -> Option<&'static str> {
+    detect_platform_from_settings_parts(settings, None)
+}
+
+fn detect_platform_from_settings_parts(
+    settings: &Value,
+    provider_name: Option<&str>,
+) -> Option<&'static str> {
+    let name = settings
+        .get("providerName")
+        .or_else(|| settings.get("provider_name"))
+        .or_else(|| settings.get("name"))
+        .and_then(Value::as_str)
+        .or(provider_name)
+        .unwrap_or("");
+    let base_url = settings
         .get("base_url")
-        .or_else(|| provider.settings_config.get("baseURL"))
-        .or_else(|| provider.settings_config.get("baseUrl"))
+        .or_else(|| settings.get("baseURL"))
+        .or_else(|| settings.get("baseUrl"))
         .and_then(Value::as_str)
         .unwrap_or("");
-    let platform = format!("{} {}", provider.name, base_url).to_ascii_lowercase();
+    if let Some(platform) = detect_platform_from_identity(name, base_url) {
+        return Some(platform);
+    }
+
+    // Persisted Codex providers commonly keep the endpoint only in their TOML
+    // `config` string. Inspect model_providers metadata as the same logical
+    // provider identity, without reading credentials or logging the config.
+    let config = settings.get("config").and_then(Value::as_str)?;
+    let config = toml::from_str::<toml::Value>(config).ok()?;
+    let providers = config.get("model_providers")?.as_table()?;
+    for provider in providers.values() {
+        let config_name = provider
+            .get("name")
+            .or_else(|| provider.get("providerName"))
+            .or_else(|| provider.get("provider_name"))
+            .and_then(toml::Value::as_str)
+            .unwrap_or("");
+        let config_base_url = provider
+            .get("base_url")
+            .or_else(|| provider.get("baseURL"))
+            .or_else(|| provider.get("baseUrl"))
+            .and_then(toml::Value::as_str)
+            .unwrap_or("");
+        if let Some(platform) = detect_platform_from_identity(config_name, config_base_url) {
+            return Some(platform);
+        }
+    }
+    None
+}
+
+fn detect_platform_from_identity(name: &str, base_url: &str) -> Option<&'static str> {
+    let platform = format!("{name} {base_url}").to_ascii_lowercase();
     if platform.contains("openrouter") {
         Some("openrouter")
     } else if platform.contains("vllm") {
@@ -136,49 +191,95 @@ pub async fn discover_openrouter(provider: &Provider, model: &str) -> DiscoveryO
         return DiscoveryOutcome::NotAdvertised;
     };
 
-    let Some(reasoning) = entry.get("reasoning") else {
+    let Some(reasoning) = openrouter_reasoning_snapshot(entry) else {
         return DiscoveryOutcome::NotAdvertised;
     };
-    if reasoning.is_null() {
-        return DiscoveryOutcome::NotAdvertised;
-    }
 
     let snapshot = ProviderCapabilitySnapshot {
         provider_key: provider_key(provider),
         model: model.to_string(),
         fetched_at: now_millis(),
         source: "openrouter_api".to_string(),
-        reasoning: Some(ReasoningCapabilitySnapshot {
-            supported_efforts: reasoning
-                .get("supported_efforts")
-                .and_then(Value::as_array)
-                .map(|items| {
-                    items
-                        .iter()
-                        .filter_map(Value::as_str)
-                        .map(ToString::to_string)
-                        .collect()
-                })
-                .unwrap_or_default(),
-            default_effort: reasoning
-                .get("default_effort")
-                .and_then(Value::as_str)
-                .map(ToString::to_string),
-            mandatory: reasoning
-                .get("mandatory")
-                .and_then(Value::as_bool)
-                .unwrap_or(false),
-            default_enabled: reasoning.get("default_enabled").and_then(Value::as_bool),
-            supports_max_tokens: reasoning
-                .get("supports_max_tokens")
-                .and_then(Value::as_bool)
-                .unwrap_or(false),
-            upstream_format: Some("object".to_string()),
-            upstream_parameter: Some("reasoning.effort".to_string()),
-            output_format: Some("auto".to_string()),
-        }),
+        reasoning: Some(reasoning),
     };
     DiscoveryOutcome::Found(snapshot)
+}
+
+/// Convert the allowlisted OpenRouter model metadata into a reasoning snapshot.
+///
+/// OpenRouter currently advertises MiMo-V2.6's `reasoning` capability without
+/// advertising effort levels. Preserve that distinction: an empty effort list
+/// is evidence that no selectable effort was advertised, not permission to
+/// synthesize Codex's generic levels.
+fn openrouter_reasoning_snapshot(entry: &Value) -> Option<ReasoningCapabilitySnapshot> {
+    let reasoning = entry.get("reasoning")?;
+    if reasoning.is_null() {
+        return None;
+    }
+    let supported_efforts = reasoning
+        .get("supported_efforts")
+        .or_else(|| reasoning.get("supportedEfforts"))
+        .or_else(|| reasoning.get("efforts"))
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::trim)
+                .filter(|effort| !effort.is_empty())
+                .map(ToString::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    let default_effort = reasoning
+        .get("default_effort")
+        .or_else(|| reasoning.get("defaultEffort"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|effort| !effort.is_empty())
+        .map(ToString::to_string);
+    let mandatory = reasoning
+        .get("mandatory")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let default_enabled = reasoning
+        .get("default_enabled")
+        .or_else(|| reasoning.get("defaultEnabled"))
+        .and_then(Value::as_bool);
+    let supports_max_tokens = reasoning
+        .get("supports_max_tokens")
+        .or_else(|| reasoning.get("supportsMaxTokens"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let upstream_format = reasoning
+        .get("upstream_format")
+        .or_else(|| reasoning.get("upstreamFormat"))
+        .and_then(Value::as_str)
+        .map(ToString::to_string)
+        .or_else(|| Some("object".to_string()));
+    let upstream_parameter = reasoning
+        .get("upstream_parameter")
+        .or_else(|| reasoning.get("upstreamParameter"))
+        .and_then(Value::as_str)
+        .map(ToString::to_string)
+        .or_else(|| Some("reasoning.effort".to_string()));
+    let output_format = reasoning
+        .get("output_format")
+        .or_else(|| reasoning.get("outputFormat"))
+        .and_then(Value::as_str)
+        .map(ToString::to_string)
+        .or_else(|| Some("auto".to_string()));
+
+    Some(ReasoningCapabilitySnapshot {
+        supported_efforts,
+        default_effort,
+        mandatory,
+        default_enabled,
+        supports_max_tokens,
+        upstream_format,
+        upstream_parameter,
+        output_format,
+    })
 }
 
 /// 归一化 OpenRouter models 端点：base 已含 `/api/v1` 时直接拼 `/models`。
@@ -346,6 +447,59 @@ mod tests {
     }
 
     #[test]
+    fn detect_platform_from_settings_matches_persisted_provider_detection() {
+        assert_eq!(
+            detect_platform_from_settings(&json!({
+                "providerName": "OpenRouter",
+                "base_url": "https://openrouter.ai/api/v1"
+            })),
+            Some("openrouter")
+        );
+        assert_eq!(
+            detect_platform_from_settings(&json!({
+                "base_url": "http://vllm.local:8000/v1"
+            })),
+            Some("vllm")
+        );
+        assert_eq!(
+            detect_platform_from_settings(&json!({
+                "base_url": "https://example.test/v1"
+            })),
+            None
+        );
+        assert_eq!(
+            detect_platform_from_settings(&json!({
+                "config": r#"
+                    model_provider = "custom"
+                    [model_providers.custom]
+                    name = "openrouter"
+                    base_url = "https://openrouter.ai/api/v1"
+                "#
+            })),
+            Some("openrouter")
+        );
+        assert_eq!(
+            detect_platform(&provider(
+                "Saved custom provider",
+                "https://gateway.example/v1"
+            )),
+            None
+        );
+        let persisted = Provider {
+            settings_config: json!({
+                "config": r#"
+                    model_provider = "custom"
+                    [model_providers.custom]
+                    name = "openrouter"
+                    base_url = "https://openrouter.ai/api/v1"
+                "#
+            }),
+            ..provider("Saved custom provider", "https://gateway.example/v1")
+        };
+        assert_eq!(detect_platform(&persisted), Some("openrouter"));
+    }
+
+    #[test]
     fn openrouter_models_url_normalization() {
         assert_eq!(
             openrouter_models_url("https://openrouter.ai/api/v1"),
@@ -359,5 +513,43 @@ mod tests {
             openrouter_models_url("https://openrouter.ai/api/v1/"),
             "https://openrouter.ai/api/v1/models"
         );
+    }
+
+    #[test]
+    fn openrouter_reasoning_metadata_preserves_missing_effort_levels() {
+        let snapshot = openrouter_reasoning_snapshot(&json!({
+            "reasoning": {"mandatory": false},
+            "supported_parameters": ["reasoning", "include_reasoning"]
+        }))
+        .expect("reasoning metadata");
+        assert!(snapshot.supported_efforts.is_empty());
+        assert_eq!(snapshot.default_effort, None);
+        assert_eq!(snapshot.upstream_format.as_deref(), Some("object"));
+        assert_eq!(
+            snapshot.upstream_parameter.as_deref(),
+            Some("reasoning.effort")
+        );
+    }
+
+    #[test]
+    fn openrouter_reasoning_metadata_accepts_effort_aliases() {
+        let snapshot = openrouter_reasoning_snapshot(&json!({
+            "reasoning": {
+                "supportedEfforts": ["low", "high"],
+                "defaultEffort": "high",
+                "mandatory": true,
+                "supportsMaxTokens": true,
+                "upstreamFormat": "object",
+                "upstreamParameter": "reasoning.effort"
+            }
+        }))
+        .expect("reasoning metadata");
+        assert_eq!(
+            snapshot.supported_efforts,
+            vec!["low".to_string(), "high".to_string()]
+        );
+        assert_eq!(snapshot.default_effort.as_deref(), Some("high"));
+        assert!(snapshot.mandatory);
+        assert!(snapshot.supports_max_tokens);
     }
 }

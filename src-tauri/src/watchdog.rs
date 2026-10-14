@@ -63,6 +63,71 @@ pub fn dev_supervisor_owned() -> bool {
         .is_some_and(|value| matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true"))
 }
 
+pub(crate) fn dev_retry_packet(
+    event: &str,
+    session_id: &str,
+    provider_id: &str,
+    attempt: u32,
+    reason_class: Option<&str>,
+) -> Option<serde_json::Value> {
+    let scheduled_transport_retry = event == "retry_scheduled"
+        && matches!(
+            reason_class,
+            Some(
+                "stream_interrupted"
+                    | "premature_eof"
+                    | "transport_error"
+                    | "reconnect_transport_failure"
+                    | "reconnect_http_failure"
+            )
+        );
+    if !matches!(
+        event,
+        "reconnect_failed" | "stream_finished" | "stream_cancelled"
+    ) && !scheduled_transport_retry
+    {
+        return None;
+    }
+    use sha2::{Digest, Sha256};
+    let key = hex::encode(Sha256::digest(
+        serde_json::to_vec(&(session_id, provider_id)).ok()?,
+    ));
+    Some(serde_json::json!({ "event": event, "key": &key[..16], "attempt": attempt }))
+}
+
+fn write_dev_packet(packet: &serde_json::Value) {
+    let _ = writeln!(std::io::stdout().lock(), "[ccsm-dev-watchdog] {packet}");
+}
+
+/// Notify the parent-owned dev watchdog without exporting request data or IDs.
+pub(crate) fn report_dev_retry_activity(
+    event: &str,
+    session_id: &str,
+    provider_id: &str,
+    attempt: u32,
+    reason_class: Option<&str>,
+) {
+    if !dev_supervisor_owned() {
+        return;
+    }
+    if let Some(packet) = dev_retry_packet(event, session_id, provider_id, attempt, reason_class) {
+        write_dev_packet(&packet);
+    }
+}
+
+fn report_dev_identity(config_dir: &Path) {
+    let Some(identity) = crate::process_identity::current_process_identity() else {
+        return;
+    };
+    write_dev_packet(&serde_json::json!({
+        "event": "ready",
+        "pid": identity.pid,
+        "executablePath": identity.executable_path,
+        "processStartedAtTicks": identity.started_at_ticks,
+        "markerPath": log_dir(config_dir).join(RUN_MARKER_FILE),
+    }));
+}
+
 /// 解析守护模式参数；不是守护模式时返回 None。
 pub fn parse_supervise_args(args: &[String]) -> Option<SuperviseArgs> {
     let position = args.iter().position(|arg| arg == SUPERVISE_FLAG)?;
@@ -288,6 +353,28 @@ fn settings_path() -> Option<PathBuf> {
     crate::settings::AppSettings::settings_path()
 }
 
+fn watched_parent_is_running(expected: &crate::process_identity::ProcessIdentity) -> bool {
+    crate::process_identity::process_identity(expected.pid)
+        .is_some_and(|observed| expected.matches(&observed))
+}
+
+fn listener_is_ready(
+    port: u16,
+    expected: Option<&crate::process_identity::ProcessIdentity>,
+) -> bool {
+    if port == 0 {
+        return true;
+    }
+    let Some(expected) = expected else {
+        return false;
+    };
+    if crate::process_identity::tcp_listener_owner_pid(port) != Some(expected.pid) {
+        return false;
+    }
+    crate::process_identity::process_identity(expected.pid)
+        .is_some_and(|observed| expected.matches(&observed))
+}
+
 fn supervisor_identity_from_event(
     config_dir: &Path,
     parent_pid: u32,
@@ -341,6 +428,7 @@ pub fn ensure_supervisor(config_dir: &Path, port: u16) {
     // supervisors would let the Rust child and the Node wrapper relaunch the
     // same Tauri app concurrently after one crash.
     if dev_supervisor_owned() {
+        report_dev_identity(config_dir);
         log::debug!("开发会话由 pnpm dev supervisor 接管，跳过 Rust supervisor");
         return;
     }
@@ -498,13 +586,8 @@ pub fn run_supervisor(args: SuperviseArgs) -> ! {
                 }
             }
         }
-        let current = crate::process_identity::process_identity(args.parent_pid);
-        let still_running = current
-            .as_ref()
-            .is_some_and(|current| expected.matches(current));
-        if still_running {
-            let port_ready = args.port == 0
-                || crate::process_identity::tcp_listener_owner_pid(args.port).is_some();
+        if watched_parent_is_running(&expected) {
+            let port_ready = listener_is_ready(args.port, Some(&expected));
             if !port_ready {
                 if !unhealthy_logged {
                     unhealthy_logged = true;
@@ -604,7 +687,7 @@ pub fn run_supervisor(args: SuperviseArgs) -> ! {
         command.creation_flags(CREATE_NO_WINDOW);
     }
     let spawned = command.spawn();
-    let Ok(child) = spawned else {
+    let Ok(mut child) = spawned else {
         let error = spawned
             .err()
             .map(|value| value.to_string())
@@ -629,9 +712,16 @@ pub fn run_supervisor(args: SuperviseArgs) -> ! {
         }),
     );
 
+    let restarted_identity =
+        crate::process_identity::process_identity(child.id()).filter(|identity| {
+            crate::process_identity::executable_matches_current(&identity.executable_path)
+        });
     let deadline = SystemTime::now() + READY_TIMEOUT;
     while SystemTime::now() < deadline {
-        if args.port == 0 || crate::process_identity::tcp_listener_owner_pid(args.port).is_some() {
+        if !matches!(child.try_wait(), Ok(None)) {
+            break;
+        }
+        if listener_is_ready(args.port, restarted_identity.as_ref()) {
             append_event(
                 &config_dir,
                 "info",
@@ -737,6 +827,235 @@ mod tests {
 
     fn args(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| value.to_string()).collect()
+    }
+
+    #[test]
+    fn watched_parent_liveness_requires_the_exact_process_identity() {
+        let current =
+            crate::process_identity::current_process_identity().expect("current process identity");
+        assert!(watched_parent_is_running(&current));
+        let reused = crate::process_identity::ProcessIdentity {
+            started_at_ticks: current.started_at_ticks + 1,
+            ..current
+        };
+        assert!(!watched_parent_is_running(&reused));
+    }
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn watched_parent_liveness_rejects_exited_process_with_retained_child_handle() {
+        use std::os::windows::process::CommandExt;
+
+        let mut child = std::process::Command::new("cmd.exe")
+            .args(["/D", "/C", "set /p ccsm_watchdog_test_exit= & exit /b 0"])
+            .creation_flags(0x0800_0000)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("owned test child");
+        let expected = crate::process_identity::process_identity(child.id())
+            .expect("owned child process identity");
+        assert!(watched_parent_is_running(&expected));
+        child
+            .stdin
+            .take()
+            .expect("owned child input")
+            .write_all(b"\r\n")
+            .expect("release owned child");
+        assert!(child.wait().expect("owned child exit").success());
+        assert!(!crate::process_identity::process_exists(child.id()));
+        assert!(!watched_parent_is_running(&expected));
+    }
+
+    #[cfg(target_os = "windows")]
+    fn test_listener() -> (
+        std::net::TcpListener,
+        u16,
+        crate::process_identity::ProcessIdentity,
+    ) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("test listener");
+        let port = listener.local_addr().expect("listener address").port();
+        let current =
+            crate::process_identity::current_process_identity().expect("current process identity");
+        assert_eq!(
+            crate::process_identity::tcp_listener_owner_pid(port),
+            Some(current.pid)
+        );
+        (listener, port, current)
+    }
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn listener_readiness_rejects_foreign_process() {
+        let (_listener, port, current) = test_listener();
+        let expected = crate::process_identity::ProcessIdentity {
+            pid: current.pid + 1,
+            ..current
+        };
+        assert!(!listener_is_ready(port, Some(&expected)));
+    }
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn listener_readiness_rejects_reused_pid() {
+        let (_listener, port, current) = test_listener();
+        let expected = crate::process_identity::ProcessIdentity {
+            started_at_ticks: current.started_at_ticks + 1,
+            ..current
+        };
+        assert!(!listener_is_ready(port, Some(&expected)));
+    }
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn listener_readiness_rejects_different_executable() {
+        let (_listener, port, current) = test_listener();
+        let expected = crate::process_identity::ProcessIdentity {
+            executable_path: "C:/not-ccswitch.exe".to_string(),
+            ..current
+        };
+        assert!(!listener_is_ready(port, Some(&expected)));
+    }
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn listener_readiness_rejects_unverified_process() {
+        let (_listener, port, _current) = test_listener();
+        assert!(!listener_is_ready(port, None));
+    }
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn listener_readiness_accepts_exact_process() {
+        let (_listener, port, current) = test_listener();
+        assert!(listener_is_ready(port, Some(&current)));
+    }
+
+    #[test]
+    fn listener_readiness_without_port_does_not_require_identity() {
+        assert!(listener_is_ready(0, None));
+    }
+
+    #[test]
+    fn dev_retry_packets_include_chat_transport_failures_only() {
+        for reason_class in ["premature_eof", "transport_error"] {
+            assert!(
+                dev_retry_packet(
+                    "retry_scheduled",
+                    "session-redacted",
+                    "provider-redacted",
+                    1,
+                    Some(reason_class),
+                )
+                .is_some(),
+                "missing Chat transport retry: {reason_class}"
+            );
+        }
+        for reason_class in [
+            "capacity_pressure",
+            "capacity_error",
+            "capacity_error_long_wait",
+            "upstream_error",
+            "upstream_http_error",
+            "terminal_error",
+            "transport_error_after_semantic_output",
+        ] {
+            assert!(
+                dev_retry_packet(
+                    "retry_scheduled",
+                    "session-redacted",
+                    "provider-redacted",
+                    1,
+                    Some(reason_class),
+                )
+                .is_none(),
+                "non-transport retry reported: {reason_class}"
+            );
+        }
+    }
+
+    #[test]
+    fn dev_terminal_packets_use_the_same_private_request_key_as_retry_packets() {
+        let retry = dev_retry_packet(
+            "retry_scheduled",
+            "request-redacted",
+            "provider-redacted",
+            1,
+            Some("transport_error"),
+        )
+        .expect("retry packet");
+        for event in ["stream_finished", "stream_cancelled"] {
+            let terminal =
+                dev_retry_packet(event, "request-redacted", "provider-redacted", 0, None)
+                    .expect("terminal packet");
+            assert_eq!(terminal["event"], event);
+            assert_eq!(terminal["key"], retry["key"]);
+            let serialized = terminal.to_string();
+            assert!(!serialized.contains("request-redacted"));
+            assert!(!serialized.contains("provider-redacted"));
+        }
+        let other_request = dev_retry_packet(
+            "stream_finished",
+            "other-request-redacted",
+            "provider-redacted",
+            0,
+            None,
+        )
+        .expect("other request terminal packet");
+        assert_ne!(other_request["key"], retry["key"]);
+    }
+
+    #[test]
+    fn dev_retry_packets_only_report_failures_and_hash_stream_identifiers() {
+        assert!(dev_retry_packet(
+            "reconnected",
+            "session-redacted",
+            "provider-redacted",
+            1,
+            None
+        )
+        .is_none());
+        assert!(dev_retry_packet(
+            "retry_scheduled",
+            "session-redacted",
+            "provider-redacted",
+            1,
+            Some("capacity_pressure")
+        )
+        .is_none());
+        assert!(dev_retry_packet(
+            "retry_scheduled",
+            "session-redacted",
+            "provider-redacted",
+            1,
+            Some("stream_interrupted")
+        )
+        .is_some());
+        let packet = dev_retry_packet(
+            "reconnect_failed",
+            "session-redacted",
+            "provider-redacted",
+            1,
+            None,
+        )
+        .expect("retry packet");
+        assert_eq!(packet["event"], "reconnect_failed");
+        assert_eq!(packet["key"].as_str().expect("hash").len(), 16);
+        let serialized = packet.to_string();
+        assert!(!serialized.contains("session-redacted"));
+        assert!(!serialized.contains("provider-redacted"));
+        assert_ne!(
+            packet,
+            dev_retry_packet(
+                "reconnect_failed",
+                "other-session",
+                "provider-redacted",
+                1,
+                None
+            )
+            .expect("other retry packet")
+        );
     }
 
     #[test]

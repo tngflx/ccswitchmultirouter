@@ -293,7 +293,7 @@ pub(crate) fn build_projection_artifact(
         .collect::<HashMap<_, _>>();
     let compiled = compile_v2(&plan, &providers)
         .map_err(|error| AppError::Message(format!("{}: {}", error.code, error.message)))?;
-    let orchestration = db.get_orchestration_settings()?;
+    let orchestration = db.get_orchestration_settings()?.routable_settings(db)?;
     let dependency_fingerprint =
         projection_dependency_fingerprint(&router, &compiled, &orchestration);
     let mut projection_settings =
@@ -646,6 +646,43 @@ mod tests {
         db.save_provider("codex", &router()).expect("save router");
         db.save_provider("codex", &target(api_format))
             .expect("save target");
+    }
+
+    #[test]
+    fn projection_publishes_enabled_orchestration_aliases_into_codex_catalog() {
+        let db = Database::memory().expect("memory db");
+        save_fixture(&db, "openai_responses");
+        for (app, model) in [("claude", "planner"), ("codex", "worker")] {
+            db.save_provider(
+                app,
+                &Provider::with_id(
+                    "same".into(),
+                    "Role".into(),
+                    json!({"modelCatalog": {"models": [{"model": model}]}}),
+                    None,
+                ),
+            )
+            .unwrap();
+        }
+        db.save_orchestration_settings(&crate::orchestration::fixture())
+            .expect("save orchestration settings");
+
+        let artifact = build_projection_artifact(&db, "router")
+            .expect("build projection with orchestration aliases");
+        let models = artifact.projection_settings["modelCatalog"]["models"]
+            .as_array()
+            .expect("projected catalog models");
+
+        assert!(models.iter().any(|model| {
+            model["model"] == "ccsm-orch/test"
+                && model["role"] == "profile"
+                && model["orchestrationProfileId"] == "test"
+        }));
+        assert!(models.iter().any(|model| {
+            model["model"] == "ccsm-role/test/worker"
+                && model["role"] == "worker"
+                && model["orchestrationProfileId"] == "test"
+        }));
     }
 
     #[test]

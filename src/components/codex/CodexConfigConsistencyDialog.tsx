@@ -329,7 +329,7 @@ export function CodexConfigConsistencyDialog({
           if (!open && canDismissRefresh) dismissRefresh?.();
         }}
       >
-        <DialogContent className="relative max-w-lg" zIndex="top">
+        <DialogContent className="max-w-lg overflow-y-auto" zIndex="top">
           {canDismissRefresh && dismissRefresh ? (
             <DialogCloseButton
               onClick={dismissRefresh}
@@ -814,7 +814,7 @@ export function CodexConfigConsistencyDialog({
           if (!open && !pending) (onClose ?? onLater)();
         }}
       >
-        <DialogContent className="relative max-w-lg" zIndex="top">
+        <DialogContent className="max-w-lg overflow-y-auto" zIndex="top">
           <DialogCloseButton
             onClick={onClose ?? onLater}
             disabled={pending}
@@ -865,7 +865,7 @@ export function CodexConfigConsistencyDialog({
         if (!open && !pending) (onClose ?? onLater)();
       }}
     >
-      <DialogContent className="relative max-w-lg" zIndex="top">
+      <DialogContent className="max-w-lg overflow-y-auto" zIndex="top">
         <DialogCloseButton
           onClick={onClose ?? onLater}
           disabled={pending}

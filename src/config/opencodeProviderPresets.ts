@@ -2095,6 +2095,44 @@ export const opencodeProviderPresets: OpenCodeProviderPreset[] = [
     },
   },
   {
+    name: "Kilo",
+    websiteUrl: "https://kilo.ai",
+    apiKeyUrl: "https://app.kilo.ai/profile",
+    settingsConfig: {
+      npm: "@ai-sdk/openai-compatible",
+      name: "Kilo",
+      options: {
+        baseURL: "https://api.kilo.ai/api/gateway",
+        apiKey: "",
+        setCacheKey: true,
+      },
+      models: {
+        "kilo-auto/free": { name: "Kilo Auto (Free)" },
+        "minimax/minimax-m2.1:free": { name: "MiniMax M2.1 (Free)" },
+        "z-ai/glm-5:free": { name: "GLM-5 (Free)" },
+        "google/gemma-4-26b-a4b-it:free": {
+          name: "Gemma 4 26B (Free)",
+        },
+      },
+    },
+    category: "aggregator",
+    icon: "kilo",
+    iconColor: "#6E56CF",
+    templateValues: {
+      baseURL: {
+        label: "Base URL",
+        placeholder: "https://api.kilo.ai/api/gateway",
+        defaultValue: "https://api.kilo.ai/api/gateway",
+        editorValue: "",
+      },
+      apiKey: {
+        label: "API Key",
+        placeholder: "kilo-...",
+        editorValue: "",
+      },
+    },
+  },
+  {
     name: "TheRouter",
     websiteUrl: "https://therouter.ai",
     apiKeyUrl: "https://dashboard.therouter.ai",

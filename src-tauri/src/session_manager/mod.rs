@@ -248,9 +248,15 @@ fn purge_codex_archived_files_with<F>(
 where
     F: FnMut(&[String]) -> Vec<Result<(), String>>,
 {
-    let thread_ids = files
+    // Read each ID once before any app-server or filesystem mutation. The
+    // app-server may remove/index a rollout while this batch is in flight.
+    let identities = files
         .iter()
-        .filter_map(|path| codex::session_id_for_delete(path))
+        .map(|path| (path.clone(), codex::session_id_for_delete(path)))
+        .collect::<Vec<_>>();
+    let thread_ids = identities
+        .iter()
+        .filter_map(|(_, thread_id)| thread_id.clone())
         .collect::<Vec<_>>();
     let mut rpc_results = delete_threads(&thread_ids).into_iter();
     let mut deleted = 0;
@@ -258,8 +264,7 @@ where
     let mut index_cleanup_warnings = 0;
     let mut errors = Vec::new();
 
-    for path in files {
-        let thread_id = codex::session_id_for_delete(path);
+    for (path, thread_id) in &identities {
         let rpc_result = thread_id.as_ref().map(|thread_id| {
             (
                 thread_id,
@@ -529,5 +534,28 @@ mod tests {
         assert_eq!(outcome.deleted, 1);
         assert_eq!(outcome.index_cleanup_warnings, 1);
         assert!(!malformed.exists());
+    }
+
+    #[test]
+    fn archived_purge_keeps_captured_thread_id_when_app_server_removes_file_first() {
+        let root = tempdir().expect("archive root");
+        let rollout = root
+            .path()
+            .join("rollout-2026-08-31T00-00-00-00000000-0000-0000-0000-000000000003.jsonl");
+        write_codex_session(&rollout, "00000000-0000-0000-0000-000000000003");
+
+        let rollout_for_rpc = rollout.clone();
+        let outcome = purge_codex_archived_files_with(&[rollout.clone()], |thread_ids| {
+            assert_eq!(
+                thread_ids,
+                &["00000000-0000-0000-0000-000000000003".to_string()]
+            );
+            std::fs::remove_file(&rollout_for_rpc).expect("simulate app-server removal");
+            vec![Ok(())]
+        });
+
+        assert_eq!(outcome.deleted, 1);
+        assert_eq!(outcome.index_cleanup_warnings, 0);
+        assert!(!rollout.exists());
     }
 }

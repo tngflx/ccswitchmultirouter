@@ -10,7 +10,8 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { normalizeLanguage, type SupportedLanguage } from "@/i18n/language";
-import { useSaveSettingsMutation, useSettingsQuery } from "@/lib/query";
+import { useSettingsQuery } from "@/lib/query";
+import { settingsApi } from "@/lib/api";
 import { cn } from "@/lib/utils";
 import { extractErrorMessage } from "@/utils/errorUtils";
 
@@ -58,7 +59,7 @@ function writeStoredLanguage(value: string | null): void {
 export function LanguageSwitcher() {
   const { t, i18n } = useTranslation();
   const { data: settings } = useSettingsQuery();
-  const saveMutation = useSaveSettingsMutation();
+  const [isSaving, setIsSaving] = useState(false);
   const [selectedLanguage, setSelectedLanguage] =
     useState<SupportedLanguage | null>(null);
   const currentLanguage =
@@ -75,7 +76,7 @@ export function LanguageSwitcher() {
   );
 
   const changeLanguage = (language: SupportedLanguage) => {
-    if (saveMutation.isPending || language === currentLanguage) return;
+    if (isSaving || language === currentLanguage) return;
 
     const previousLanguage = currentLanguage;
     const previousStoredLanguage = readStoredLanguage();
@@ -86,24 +87,18 @@ export function LanguageSwitcher() {
 
     if (!settings) return;
 
-    saveMutation.mutate(
-      {
-        ...settings,
-        showInTray: settings.showInTray ?? true,
-        minimizeToTrayOnClose: settings.minimizeToTrayOnClose ?? true,
-        language,
-      },
-      {
-        onError: (error) => {
-          setSelectedLanguage(previousLanguage);
-          void i18n.changeLanguage(previousLanguage);
-          writeStoredLanguage(previousStoredLanguage);
-          toast.error(t("settings.saveFailedGeneric"), {
-            description: extractErrorMessage(error),
-          });
-        },
-      },
-    );
+    setIsSaving(true);
+    void settingsApi
+      .patch({ language })
+      .catch((error) => {
+        setSelectedLanguage(previousLanguage);
+        void i18n.changeLanguage(previousLanguage);
+        writeStoredLanguage(previousStoredLanguage);
+        toast.error(t("settings.saveFailedGeneric"), {
+          description: extractErrorMessage(error),
+        });
+      })
+      .finally(() => setIsSaving(false));
   };
 
   return (
@@ -112,7 +107,7 @@ export function LanguageSwitcher() {
         <Button
           variant="ghost"
           size="sm"
-          disabled={saveMutation.isPending}
+          disabled={isSaving}
           title={t("settings.language")}
           aria-label={t("settings.language")}
           className="gap-1.5 px-2 hover:bg-black/5 dark:hover:bg-white/5"

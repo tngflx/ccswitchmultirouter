@@ -1496,6 +1496,46 @@ describe("CodexFormFields local model routing", () => {
     });
   });
 
+  it("does not adopt a provider reasoning snapshot that advertises no effort levels", async () => {
+    const detected: CodexReasoningDiscoveryOutcome = {
+      found: {
+        providerKey: "codex-thirdparty",
+        model: "xiaomi/mimo-v2.6-pro",
+        fetchedAt: 1_700_000_000_000,
+        source: "openrouter_api",
+        reasoning: {
+          supportedEfforts: [],
+          defaultEffort: null,
+          mandatory: false,
+          defaultEnabled: null,
+        },
+      },
+    };
+    reasoningApiMocks.resolve.mockImplementation(
+      async (_settings, _provider, model) => ({
+        ...createUnknownReasoningResolution(model),
+        hasDetectionCandidate: true,
+        detection: detected.found,
+      }),
+    );
+    const { latestCatalog } = renderCatalogHarness([
+      { model: "xiaomi/mimo-v2.6-pro" },
+    ]);
+    fireEvent.click(
+      screen.getByRole("button", {
+        name: "Configure reasoning capabilities for xiaomi/mimo-v2.6-pro",
+      }),
+    );
+
+    expect(
+      await screen.findByText("Unknown (using server default)"),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "Use detected result" }),
+    ).not.toBeInTheDocument();
+    expect(latestCatalog()[0].reasoning).toBeUndefined();
+  });
+
   it("re-detects a model through the read-only capability command", async () => {
     const detected = createDetectedReasoningOutcome("qwen3.8");
     let redetected = false;

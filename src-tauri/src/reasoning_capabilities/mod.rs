@@ -472,12 +472,12 @@ pub fn snapshot_to_capability(
         ReasoningControlKind::Graded
     } else if reasoning.supports_max_tokens {
         ReasoningControlKind::Budget
-    } else if reasoning.mandatory {
-        // 强制开启且无控制：模型产生 reasoning，但上游未声明开关或档位。
-        ReasoningControlKind::None
     } else {
-        // 无分档、无预算、非强制：无法确认支持，返回 None 落到库/内置。
-        return None;
+        // The provider explicitly returned a reasoning capability object, but
+        // did not advertise a switch, budget, or effort levels. Preserve that
+        // positive evidence as "no provider-side control"; the UI can show
+        // reasoning is present while still using the server default.
+        ReasoningControlKind::None
     };
 
     let mut supported_efforts = graded_efforts.clone();
@@ -777,8 +777,9 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_to_capability_none_when_no_evidence() {
-        // 无分档、无预算、非强制：无法确认支持 → None。
+    fn snapshot_to_capability_no_control_when_reasoning_is_advertised_without_levels() {
+        // A positive reasoning object with no controls is still confirmed
+        // reasoning support; it simply cannot expose an effort selector.
         let snapshot = ProviderCapabilitySnapshot {
             provider_key: "p".into(),
             model: "m".into(),
@@ -786,7 +787,13 @@ mod tests {
             source: "openrouter_api".into(),
             reasoning: Some(ReasoningCapabilitySnapshot::default()),
         };
-        assert!(snapshot_to_capability(&snapshot).is_none());
+        let capability = snapshot_to_capability(&snapshot).expect("reasoning capability");
+        assert_eq!(capability.control_kind, Some(ReasoningControlKind::None));
+        assert_eq!(
+            capability.support_status,
+            Some(ReasoningSupportStatus::ConfirmedSupported)
+        );
+        assert!(capability.supported_efforts.is_empty());
     }
 
     #[test]

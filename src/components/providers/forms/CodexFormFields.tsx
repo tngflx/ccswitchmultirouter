@@ -400,6 +400,10 @@ function capabilityFromReasoningDetection(
     (effort): effort is CodexReasoningEffort =>
       ["none", ...PROVIDER_REASONING_EFFORT_CHOICES].includes(effort),
   );
+  // A provider can advertise reasoning output without advertising any
+  // selectable effort. That is not enough evidence to persist a Codex
+  // effort-capability declaration or to guess a boolean wire parameter.
+  if (!supportedEfforts.some((effort) => effort !== "none")) return undefined;
   return {
     schemaVersion: 2,
     supportStatus: "confirmed_supported",
@@ -945,11 +949,16 @@ export function CodexFormFields({
 
   const reasoningSettingsConfig = useMemo(
     () => ({
+      // The backend resolver needs the draft endpoint/name to select a
+      // platform-specific maintained capability entry before the provider is
+      // saved.
+      providerName: providerName?.trim() || "",
+      base_url: codexBaseUrl.trim(),
       modelCatalog: {
         models: catalogRows.filter((row) => row.enabled !== false),
       },
     }),
-    [catalogRows],
+    [catalogRows, codexBaseUrl, providerName],
   );
   const reasoningDetectionProvider = useMemo<Provider>(
     () => ({

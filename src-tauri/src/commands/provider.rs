@@ -682,19 +682,18 @@ fn codex_adaptation_catalog_models(provider: &Provider) -> Vec<(String, String)>
 }
 
 fn catalog_contains_legacy_codex_protocols(provider: &Provider) -> bool {
-    catalog_models(&provider.settings_config)
-        .is_some_and(|models| {
-            models.iter().any(|model| {
-                ["apiFormat", "api_format", "wireApi", "wire_api"]
-                    .into_iter()
-                    .any(|field| {
-                        model
-                            .get(field)
-                            .and_then(serde_json::Value::as_str)
-                            .is_some()
-                    })
-            })
+    catalog_models(&provider.settings_config).is_some_and(|models| {
+        models.iter().any(|model| {
+            ["apiFormat", "api_format", "wireApi", "wire_api"]
+                .into_iter()
+                .any(|field| {
+                    model
+                        .get(field)
+                        .and_then(serde_json::Value::as_str)
+                        .is_some()
+                })
         })
+    })
 }
 
 fn persisted_protocols_by_model(

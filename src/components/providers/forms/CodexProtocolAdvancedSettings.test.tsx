@@ -1,9 +1,37 @@
-import { fireEvent, render, screen } from "@testing-library/react";
-import { describe, expect, it, vi } from "vitest";
+import { act, fireEvent, render, screen } from "@testing-library/react";
+import type { ComponentProps } from "react";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { CodexProtocolAdvancedSettings } from "./CodexProtocolAdvancedSettings";
 
+const selectChangeHandlers = vi.hoisted(
+  () => new Map<string, (value: string) => void>(),
+);
+
+vi.mock("@/components/ui/select", async () => {
+  const actual = await vi.importActual<typeof import("@/components/ui/select")>(
+    "@/components/ui/select",
+  );
+  return {
+    ...actual,
+    Select: (props: ComponentProps<typeof actual.Select>) => {
+      if (props.value && props.onValueChange) {
+        selectChangeHandlers.set(props.value, props.onValueChange);
+      }
+      return <actual.Select {...props} />;
+    },
+  };
+});
+
+type ProtocolSettingsProps = ComponentProps<
+  typeof CodexProtocolAdvancedSettings
+>;
+
 describe("CodexProtocolAdvancedSettings", () => {
+  beforeEach(() => {
+    selectChangeHandlers.clear();
+  });
+
   it("keeps ordinary users on automatic probing without exposing manual knobs", () => {
     render(
       <CodexProtocolAdvancedSettings
@@ -87,4 +115,84 @@ describe("CodexProtocolAdvancedSettings", () => {
       screen.queryByText("Chat reasoning display"),
     ).not.toBeInTheDocument();
   });
+
+  it.each([
+    {
+      control: "protocol mode",
+      callback: "onModeChange",
+      selected: "manual",
+      values: ["auto", "manual"],
+      rejected: ["unknown", ""],
+      apiFormat: "openai_chat",
+    },
+    {
+      control: "runtime API format",
+      callback: "onApiFormatChange",
+      selected: "openai_chat",
+      values: ["openai_chat", "openai_responses"],
+      rejected: ["unknown", "anthropic", "openai_messages"],
+      apiFormat: "openai_chat",
+    },
+    {
+      control: "tool schema",
+      callback: "onToolSchemaDialectChange",
+      selected: "openai",
+      values: ["openai", "moonshot_mfjs"],
+      rejected: ["unknown", ""],
+      apiFormat: "openai_chat",
+    },
+    {
+      control: "Chat reasoning display",
+      callback: "onReasoningProjectionChange",
+      selected: "none",
+      values: ["none", "raw_reasoning_text"],
+      rejected: ["unknown", "reasoning_summary"],
+      apiFormat: "openai_chat",
+    },
+    {
+      control: "Responses history continuation",
+      callback: "onHistoryReplayChange",
+      selected: "native_only",
+      values: [
+        "native_only",
+        "responses_reasoning_text_content",
+        "responses_reasoning_summary_only",
+        "omit",
+      ],
+      rejected: ["unknown", "chat_reasoning_content"],
+      apiFormat: "openai_responses",
+    },
+  ] as const)(
+    "accepts only listed $control values from the select callback",
+    ({ callback, selected, values, rejected, apiFormat }) => {
+      const onChange = vi.fn();
+      const props: ProtocolSettingsProps = {
+        mode: "manual",
+        apiFormat,
+        reasoningProjection: "none",
+        toolSchemaDialect: "openai",
+        historyReplay: "native_only",
+        onModeChange: vi.fn(),
+        onApiFormatChange: vi.fn(),
+        onReasoningProjectionChange: vi.fn(),
+        onToolSchemaDialectChange: vi.fn(),
+        onHistoryReplayChange: vi.fn(),
+        [callback]: onChange,
+      };
+      render(<CodexProtocolAdvancedSettings {...props} />);
+      const onValueChange = selectChangeHandlers.get(selected);
+      expect(onValueChange).toBeDefined();
+
+      act(() => {
+        for (const value of rejected) onValueChange?.(value);
+      });
+      expect(onChange).not.toHaveBeenCalled();
+
+      for (const value of values) {
+        act(() => onValueChange?.(value));
+        expect(onChange).toHaveBeenLastCalledWith(value);
+      }
+      expect(onChange).toHaveBeenCalledTimes(values.length);
+    },
+  );
 });

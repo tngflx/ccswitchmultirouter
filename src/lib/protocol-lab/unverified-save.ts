@@ -1,4 +1,5 @@
 import type { Provider, UniversalProvider } from "@/types";
+import { readCodexCatalogSettings } from "@/lib/codexCatalogSchema";
 import { normalizeCodexPublicModelKey } from "./codex-overrides";
 
 type ManualCodexApiFormat = "openai_chat" | "openai_responses";
@@ -11,21 +12,28 @@ function declaredCodexApiFormat(provider: Provider): ManualCodexApiFormat {
 
 export function prepareUnverifiedCodexProvider(provider: Provider): Provider {
   const apiFormat = declaredCodexApiFormat(provider);
-  const protocolOverrides = new Map(
+  const savedOverrides = new Map(
     Object.entries(provider.meta?.codexProtocolOverrides ?? {})
       .filter(
-        ([, transport]) =>
-          transport === "openai_chat" || transport === "openai_responses",
+        ([model, transport]) =>
+          normalizeCodexPublicModelKey(model) &&
+          (transport === "openai_chat" || transport === "openai_responses"),
       )
       .map(([model, transport]) => [
         normalizeCodexPublicModelKey(model),
         transport,
       ]),
   );
-  const catalog = (provider.settingsConfig.modelCatalog ??
-    provider.settingsConfig.model_catalog) as
-    { models?: Array<Record<string, unknown>> } | undefined;
-  for (const row of catalog?.models ?? []) {
+  const catalog = readCodexCatalogSettings(provider.settingsConfig);
+  // Only a loaded catalog can establish which existing overrides are stale.
+  const protocolOverrides = catalog
+    ? new Map<string, ManualCodexApiFormat>()
+    : new Map(savedOverrides);
+  const rows: unknown[] = Array.isArray(catalog?.models) ? catalog.models : [];
+  for (const value of rows) {
+    if (value === null || typeof value !== "object" || Array.isArray(value))
+      continue;
+    const row = value as Record<string, unknown>;
     const publicModel = [row.model, row.id, row.slug].find(
       (value) => typeof value === "string",
     );
@@ -43,27 +51,29 @@ export function prepareUnverifiedCodexProvider(provider: Provider): Provider {
       .toLowerCase();
     protocolOverrides.set(
       model,
-      configuredFormat === "openai_chat" ||
+      savedOverrides.get(model) ??
+        (configuredFormat === "openai_chat" ||
         configuredFormat === "open_ai_chat" ||
         configuredFormat === "chat"
-        ? "openai_chat"
-        : configuredFormat === "openai_responses" ||
-            configuredFormat === "open_ai_responses" ||
-            configuredFormat === "responses"
-          ? "openai_responses"
-          : apiFormat,
+          ? "openai_chat"
+          : configuredFormat === "openai_responses" ||
+              configuredFormat === "open_ai_responses" ||
+              configuredFormat === "responses"
+            ? "openai_responses"
+            : apiFormat),
     );
   }
+  const meta = {
+    ...provider.meta,
+    apiFormat,
+    codexProtocolMode: "manual" as const,
+  };
+  delete meta.codexProtocolOverrides;
+  if (protocolOverrides.size > 0)
+    meta.codexProtocolOverrides = Object.fromEntries(protocolOverrides);
   return {
     ...provider,
-    meta: {
-      ...provider.meta,
-      apiFormat,
-      codexProtocolMode: "manual",
-      ...(protocolOverrides.size > 0
-        ? { codexProtocolOverrides: Object.fromEntries(protocolOverrides) }
-        : {}),
-    },
+    meta,
   };
 }
 

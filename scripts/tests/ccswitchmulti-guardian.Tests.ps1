@@ -2,6 +2,8 @@ $corePath = Join-Path (Split-Path -Parent $PSScriptRoot) "ccswitchmulti-guardian
 if (Test-Path -LiteralPath $corePath -PathType Leaf) {
     . $corePath
 }
+$watchdogPath = Join-Path (Split-Path -Parent $PSScriptRoot) "watch-ccswitchmulti.ps1"
+. $watchdogPath -PlanOnly | Out-Null
 
 function Write-TestLease {
     param([string]$Path, [hashtable]$Lease)
@@ -31,6 +33,614 @@ function New-TestLease {
         ownerStartTimeUtc = $OwnerStartTimeUtc
         createdAtUtc = "2026-08-24T05:00:10.0000000Z"
         expiresAtUtc = $ExpiresAtUtc.ToUniversalTime().ToString("o")
+    }
+}
+
+Describe "CCSwitchMulti production run marker ownership" {
+    BeforeEach {
+        $script:runRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("ccsm-run-marker-" + [guid]::NewGuid().ToString("N"))
+        $script:runMarkerPath = Join-Path $script:runRoot "logs\app-run-marker.json"
+        $script:runMarker = @{
+            pid = 4242
+            executablePath = "C:\Apps\CCSwitchMulti\cc-switch.exe"
+            processStartedAtTicks = 134000000000000001L
+        }
+        $script:runIdentity = [pscustomobject]@{
+            ProcessId = 4242
+            Path = $script:runMarker.executablePath
+            StartTimeUtc = ([datetime]::FromFileTimeUtc($script:runMarker.processStartedAtTicks)).ToString("o")
+        }
+        New-Item -ItemType Directory -Path (Split-Path -Parent $script:runMarkerPath) -Force | Out-Null
+    }
+
+    AfterEach {
+        if (Test-Path -LiteralPath $script:runRoot) {
+            Remove-Item -LiteralPath $script:runRoot -Recurse -Force
+        }
+    }
+
+    function Write-RunMarker {
+        [System.IO.File]::WriteAllText(
+            $script:runMarkerPath,
+            ($script:runMarker | ConvertTo-Json -Depth 4),
+            [System.Text.UTF8Encoding]::new($false)
+        )
+    }
+
+    It "keeps the exact original process alive with a <TimestampType> timestamp" -TestCases @(
+        @{ TimestampType = "string" }
+        @{ TimestampType = "date" }
+    ) {
+        param($TimestampType)
+        if ($TimestampType -eq "date") {
+            $script:runIdentity.StartTimeUtc = [datetime]::FromFileTimeUtc($script:runMarker.processStartedAtTicks)
+        }
+        Write-RunMarker
+
+        Test-CcsmGuardianUncleanExit -ConfigPath $script:runRoot `
+            -GetProcessIdentity { param($ProcessId) $script:runIdentity } | Should Be $false
+    }
+
+    It "does not confuse a matching Codex AppContainer path projection with PID reuse" {
+        $script:runMarker.executablePath = Join-Path $env:LOCALAPPDATA "CCSwitchMulti\cc-switch.exe"
+        $script:runIdentity.Path = Join-Path $env:LOCALAPPDATA "Packages\OpenAI.Codex_test\LocalCache\Local\CCSwitchMulti\cc-switch.exe"
+        Write-RunMarker
+
+        Test-CcsmGuardianUncleanExit -ConfigPath $script:runRoot `
+            -GetProcessIdentity { param($ProcessId) $script:runIdentity } | Should Be $false
+    }
+
+    It "allows recovery when the recorded PID belongs to a different executable" {
+        $script:runIdentity.Path = "C:\Windows\notepad.exe"
+        Write-RunMarker
+
+        Test-CcsmGuardianUncleanExit -ConfigPath $script:runRoot `
+            -GetProcessIdentity { param($ProcessId) $script:runIdentity } | Should Be $true
+    }
+
+    It "allows recovery when the same executable reused the PID one FILETIME tick later" {
+        $script:runIdentity.StartTimeUtc = ([datetime]::FromFileTimeUtc($script:runMarker.processStartedAtTicks + 1)).ToString("o")
+        Write-RunMarker
+
+        Test-CcsmGuardianUncleanExit -ConfigPath $script:runRoot `
+            -GetProcessIdentity { param($ProcessId) $script:runIdentity } | Should Be $true
+    }
+
+    It "allows recovery when the returned identity belongs to another PID" {
+        $script:runIdentity.ProcessId = 5151
+        Write-RunMarker
+
+        Test-CcsmGuardianUncleanExit -ConfigPath $script:runRoot `
+            -GetProcessIdentity { param($ProcessId) $script:runIdentity } | Should Be $true
+    }
+
+    It "allows recovery after the recorded process disappears" {
+        Write-RunMarker
+
+        Test-CcsmGuardianUncleanExit -ConfigPath $script:runRoot `
+            -GetProcessIdentity { param($ProcessId) $null } | Should Be $true
+    }
+
+    It "does not authorize installed recovery from a modern development crash marker" {
+        $expectedInstalled = $script:runMarker.executablePath
+        $script:runMarker.executablePath = Join-Path $script:runRoot "repo\src-tauri\target\debug\cc-switch.exe"
+        Write-RunMarker
+
+        Test-CcsmGuardianUncleanExit -ConfigPath $script:runRoot -ExpectedExecutable $expectedInstalled `
+            -GetProcessIdentity { param($ProcessId) $null } | Should Be $false
+    }
+
+    It "authorizes recovery when the modern marker belongs to the expected installed executable" {
+        Write-RunMarker
+
+        Test-CcsmGuardianUncleanExit -ConfigPath $script:runRoot -ExpectedExecutable $script:runMarker.executablePath `
+            -GetProcessIdentity { param($ProcessId) $null } | Should Be $true
+    }
+
+    It "accepts the installed AppContainer projection when binding a modern crash marker" {
+        $expectedInstalled = Join-Path $env:LOCALAPPDATA "CCSwitchMulti\cc-switch.exe"
+        $script:runMarker.executablePath = Join-Path $env:LOCALAPPDATA "Packages\OpenAI.Codex_test\LocalCache\Local\CCSwitchMulti\cc-switch.exe"
+        Write-RunMarker
+
+        Test-CcsmGuardianUncleanExit -ConfigPath $script:runRoot -ExpectedExecutable $expectedInstalled `
+            -GetProcessIdentity { param($ProcessId) $null } | Should Be $true
+    }
+
+    It "preserves <ProcessState> PID-only marker compatibility with an expected executable" -TestCases @(
+        @{ ProcessState = "live"; Expected = $false }
+        @{ ProcessState = "dead"; Expected = $true }
+    ) {
+        param($ProcessState, $Expected)
+        $expectedInstalled = $script:runMarker.executablePath
+        $script:runMarker = @{ pid = 4242 }
+        if ($ProcessState -eq "dead") { $script:runIdentity = $null }
+        Write-RunMarker
+
+        Test-CcsmGuardianUncleanExit -ConfigPath $script:runRoot -ExpectedExecutable $expectedInstalled `
+            -GetProcessIdentity { param($ProcessId) $script:runIdentity } | Should Be $Expected
+    }
+
+    It "preserves conservative PID-only compatibility for a <ProcessState> legacy marker" -TestCases @(
+        @{ ProcessState = "live"; Expected = $false }
+        @{ ProcessState = "dead"; Expected = $true }
+    ) {
+        param($ProcessState, $Expected)
+        $script:runMarker = @{ pid = 4242 }
+        if ($ProcessState -eq "dead") { $script:runIdentity = $null }
+        Write-RunMarker
+
+        Test-CcsmGuardianUncleanExit -ConfigPath $script:runRoot `
+            -GetProcessIdentity { param($ProcessId) $script:runIdentity } | Should Be $Expected
+    }
+
+    It "does not restart from a modern marker with <InvalidField>" -TestCases @(
+        @{ InvalidField = "missing path" }
+        @{ InvalidField = "missing start time" }
+        @{ InvalidField = "relative path" }
+        @{ InvalidField = "drive-relative path" }
+        @{ InvalidField = "empty path" }
+        @{ InvalidField = "null path" }
+        @{ InvalidField = "null identity" }
+        @{ InvalidField = "null ticks" }
+        @{ InvalidField = "zero ticks" }
+        @{ InvalidField = "fractional ticks" }
+        @{ InvalidField = "non-numeric ticks" }
+        @{ InvalidField = "out-of-range ticks" }
+    ) {
+        param($InvalidField)
+        switch ($InvalidField) {
+            "missing path" { $script:runMarker.Remove("executablePath") }
+            "missing start time" { $script:runMarker.Remove("processStartedAtTicks") }
+            "relative path" { $script:runMarker.executablePath = "cc-switch.exe" }
+            "drive-relative path" { $script:runMarker.executablePath = "C:cc-switch.exe" }
+            "empty path" { $script:runMarker.executablePath = "" }
+            "null path" { $script:runMarker.executablePath = $null }
+            "null identity" { $script:runMarker.executablePath = $null; $script:runMarker.processStartedAtTicks = $null }
+            "null ticks" { $script:runMarker.processStartedAtTicks = $null }
+            "zero ticks" { $script:runMarker.processStartedAtTicks = 0 }
+            "fractional ticks" { $script:runMarker.processStartedAtTicks = 1.5 }
+            "non-numeric ticks" { $script:runMarker.processStartedAtTicks = "not-ticks" }
+            "out-of-range ticks" { $script:runMarker.processStartedAtTicks = [long]::MaxValue }
+        }
+        Write-RunMarker
+
+        Test-CcsmGuardianUncleanExit -ConfigPath $script:runRoot `
+            -GetProcessIdentity { param($ProcessId) $null } | Should Be $false
+    }
+
+    It "does not restart from a live identity with <InvalidField>" -TestCases @(
+        @{ InvalidField = "missing PID" }
+        @{ InvalidField = "missing path" }
+        @{ InvalidField = "relative path" }
+        @{ InvalidField = "drive-relative path" }
+        @{ InvalidField = "missing start time" }
+        @{ InvalidField = "invalid start time" }
+    ) {
+        param($InvalidField)
+        switch ($InvalidField) {
+            "missing PID" { $script:runIdentity.PSObject.Properties.Remove("ProcessId") }
+            "missing path" { $script:runIdentity.PSObject.Properties.Remove("Path") }
+            "relative path" { $script:runIdentity.Path = "cc-switch.exe" }
+            "drive-relative path" { $script:runIdentity.Path = "C:cc-switch.exe" }
+            "missing start time" { $script:runIdentity.PSObject.Properties.Remove("StartTimeUtc") }
+            "invalid start time" { $script:runIdentity.StartTimeUtc = "not-a-date" }
+        }
+        Write-RunMarker
+
+        Test-CcsmGuardianUncleanExit -ConfigPath $script:runRoot `
+            -GetProcessIdentity { param($ProcessId) $script:runIdentity } | Should Be $false
+    }
+}
+
+Describe "CCSwitchMulti shared development restart budget" {
+    BeforeEach {
+        $script:budgetRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("ccsm-dev-budget-" + [guid]::NewGuid().ToString("N"))
+        $script:budgetConfig = Join-Path $script:budgetRoot "config"
+        $script:budgetRepo = Join-Path $script:budgetRoot "repo"
+        $script:budgetNode = Join-Path $script:budgetRoot "node.exe"
+        $script:budgetSessionPath = Join-Path $script:budgetConfig "logs\dev-session.json"
+        $script:budgetNowMs = [datetimeoffset]::UtcNow.ToUnixTimeMilliseconds()
+        $script:budgetLaunches = 0
+        $script:budgetHistoryAtLaunch = @()
+        $script:budgetEvents = New-Object System.Collections.Generic.List[string]
+        $script:budgetWatchdogs = @()
+        $script:budgetSession = @{
+            schemaVersion = 1; state = "running"; supervisorPid = 4242
+            supervisorExecutablePath = $script:budgetNode; supervisorStartedAtUtc = "2026-10-13T00:00:00.000Z"
+            startedAtUtc = "2026-10-13T00:00:01.000Z"; repoRoot = $script:budgetRepo
+            scriptPath = (Join-Path $script:budgetRepo "scripts\dev-tauri-delayed.mjs")
+            args = @("--no-rebuild"); roots = @(); restartTimesMs = @()
+            environment = @{ TAURI_DEV_PORT = "4321" }; preservedExtra = "keep"
+        }
+        New-Item -ItemType Directory -Force -Path (Split-Path -Parent $script:budgetSessionPath), (Join-Path $script:budgetRepo "scripts") | Out-Null
+        [System.IO.File]::WriteAllText($script:budgetNode, "")
+        [System.IO.File]::WriteAllText((Join-Path $script:budgetRepo "package.json"), "{}")
+        [System.IO.File]::WriteAllText($script:budgetSession.scriptPath, "")
+        Mock Get-CimInstance { $script:budgetWatchdogs } -ParameterFilter {
+            $ClassName -eq "Win32_Process" -and $Filter -eq "Name='node.exe'"
+        }
+    }
+
+    AfterEach {
+        if (Test-Path -LiteralPath $script:budgetRoot) {
+            Remove-Item -LiteralPath $script:budgetRoot -Recurse -Force
+        }
+    }
+
+    function Write-BudgetSession {
+        [System.IO.File]::WriteAllText(
+            $script:budgetSessionPath,
+            ($script:budgetSession | ConvertTo-Json -Depth 8),
+            [System.Text.UTF8Encoding]::new($false)
+        )
+    }
+
+    function Invoke-BudgetRecovery {
+        param([switch]$Maintenance)
+        $plan = Get-CcsmDevSessionRecoveryPlan -ConfigPath $script:budgetConfig -GetProcessIdentity { param($ProcessId) $null }
+        Invoke-CcsmDevSessionRecovery -Plan $plan -IsMaintenance { [bool]$Maintenance } -GetListenerOwner { $null } `
+            -GetProcessIdentity { param($ProcessId) $null } -StartDevSession {
+                param($DevPlan)
+                $script:budgetLaunches++
+                $saved = [System.IO.File]::ReadAllText($script:budgetSessionPath) | ConvertFrom-Json
+                $script:budgetHistoryAtLaunch = @()
+                if ($saved.PSObject.Properties.Name -contains "restartTimesMs") {
+                    $script:budgetHistoryAtLaunch = @($saved.restartTimesMs)
+                }
+                return 9876
+            } -WriteEvent { param($Level, $Event, $Detail) $script:budgetEvents.Add($Event) | Out-Null }
+    }
+
+    function New-BudgetWatchdog {
+        return [pscustomobject]@{
+            ProcessId = 5151; ParentProcessId = 4242
+            ExecutablePath = $script:budgetNode
+            CommandLine = "`"$script:budgetNode`" `"$($script:budgetSession.scriptPath)`" --ccsm-dev-watchdog 4242"
+            CreationDate = [datetime]"2026-10-13T00:00:01.000Z"
+        }
+    }
+
+    It "recognizes a live supervisor with an <EnvironmentState> environment" -TestCases @(
+        @{ EnvironmentState = "absent" }
+        @{ EnvironmentState = "null" }
+        @{ EnvironmentState = "empty object" }
+    ) {
+        param($EnvironmentState)
+        switch ($EnvironmentState) {
+            "absent" { $script:budgetSession.Remove("environment") }
+            "null" { $script:budgetSession.environment = $null }
+            "empty object" { $script:budgetSession.environment = [pscustomobject]@{} }
+        }
+        Write-BudgetSession
+        $plan = Get-CcsmDevSessionRecoveryPlan -ConfigPath $script:budgetConfig -GetProcessIdentity {
+            param($ProcessId)
+            [pscustomobject]@{
+                ProcessId = $ProcessId; Path = $script:budgetNode
+                StartTimeUtc = "2026-10-13T00:00:00.0001234Z"; CimStartTimeUtc = "2026-10-13T00:00:00.0001230Z"
+                CommandLine = "node scripts/dev-tauri-delayed.mjs --no-rebuild"
+            }
+        }
+
+        $plan.Active | Should Be $true
+        $plan.Recoverable | Should Be $false
+        $plan.Environment.Count | Should Be 0
+    }
+
+    It "permits canonical-budget fallback for a stale session with an empty environment object" {
+        $script:budgetSession.environment = [pscustomobject]@{}
+        Write-BudgetSession
+
+        Invoke-BudgetRecovery
+
+        $script:budgetLaunches | Should Be 1
+        $script:budgetHistoryAtLaunch.Count | Should Be 1
+    }
+
+    It "does not charge or launch while the exact detached watchdog owns <Phase>" -TestCases @(
+        @{ Phase = "crash monitoring"; PriorCharges = 0 }
+        @{ Phase = "replacement publication"; PriorCharges = 1 }
+    ) {
+        param($Phase, $PriorCharges)
+        $script:budgetSession.restartTimesMs = @($script:budgetNowMs) * $PriorCharges
+        $script:budgetWatchdogs = @(New-BudgetWatchdog)
+        Write-BudgetSession
+        $before = [System.IO.File]::ReadAllText($script:budgetSessionPath)
+
+        Invoke-BudgetRecovery
+
+        $script:budgetLaunches | Should Be 0
+        [System.IO.File]::ReadAllText($script:budgetSessionPath) | Should Be $before
+        ($script:budgetEvents -contains "dev-session-recovery-deferred") | Should Be $true
+        $plan = Get-CcsmDevSessionRecoveryPlan -ConfigPath $script:budgetConfig -GetProcessIdentity { param($ProcessId) $null }
+        $plan.Active | Should Be $false
+        $plan.WatchdogActive | Should Be $true
+        $plan.Recoverable | Should Be $false
+    }
+
+    It "does not let an unrelated <Mismatch> process claim development recovery" -TestCases @(
+        @{ Mismatch = "executable" }
+        @{ Mismatch = "similarly named script" }
+        @{ Mismatch = "repository" }
+        @{ Mismatch = "supervisor PID" }
+        @{ Mismatch = "worker flag" }
+        @{ Mismatch = "parent PID" }
+        @{ Mismatch = "older creation time" }
+        @{ Mismatch = "extra arguments" }
+    ) {
+        param($Mismatch)
+        $candidate = New-BudgetWatchdog
+        switch ($Mismatch) {
+            "executable" { $candidate.ExecutablePath = "C:\Windows\node.exe" }
+            "similarly named script" { $candidate.CommandLine = $candidate.CommandLine.Replace("dev-tauri-delayed.mjs", "dev-tauri-delayed.mjs.other") }
+            "repository" { $candidate.CommandLine = $candidate.CommandLine.Replace($script:budgetRepo, (Join-Path $script:budgetRoot "foreign")) }
+            "supervisor PID" { $candidate.CommandLine = $candidate.CommandLine.Replace("4242", "4243") }
+            "worker flag" { $candidate.CommandLine = $candidate.CommandLine.Replace("--ccsm-dev-watchdog 4242", "--ccsm-dev-worker") }
+            "parent PID" { $candidate.ParentProcessId = 9001 }
+            "older creation time" { $candidate.CreationDate = [datetime]"2026-10-12T23:59:59.999Z" }
+            "extra arguments" { $candidate.CommandLine += " --foreign" }
+        }
+        $script:budgetWatchdogs = @($candidate)
+        Write-BudgetSession
+
+        Invoke-BudgetRecovery
+
+        $script:budgetLaunches | Should Be 1
+        $script:budgetHistoryAtLaunch.Count | Should Be 1
+    }
+
+    It "defers an otherwise plausible watchdog with <MissingIdentity> identity data" -TestCases @(
+        @{ MissingIdentity = "missing executable" }
+        @{ MissingIdentity = "missing command line" }
+        @{ MissingIdentity = "missing parent" }
+        @{ MissingIdentity = "missing creation time" }
+        @{ MissingIdentity = "invalid creation time" }
+        @{ MissingIdentity = "missing PID" }
+    ) {
+        param($MissingIdentity)
+        $candidate = New-BudgetWatchdog
+        switch ($MissingIdentity) {
+            "missing executable" { $candidate.PSObject.Properties.Remove("ExecutablePath") }
+            "missing command line" { $candidate.PSObject.Properties.Remove("CommandLine") }
+            "missing parent" { $candidate.PSObject.Properties.Remove("ParentProcessId") }
+            "missing creation time" { $candidate.PSObject.Properties.Remove("CreationDate") }
+            "invalid creation time" { $candidate.CreationDate = "not-a-date" }
+            "missing PID" { $candidate.PSObject.Properties.Remove("ProcessId") }
+        }
+        $script:budgetWatchdogs = @($candidate)
+        Write-BudgetSession
+        $before = [System.IO.File]::ReadAllText($script:budgetSessionPath)
+
+        Invoke-BudgetRecovery
+
+        $script:budgetLaunches | Should Be 0
+        [System.IO.File]::ReadAllText($script:budgetSessionPath) | Should Be $before
+        $plan = Get-CcsmDevSessionRecoveryPlan -ConfigPath $script:budgetConfig -GetProcessIdentity { param($ProcessId) $null }
+        $plan.WatchdogOwnershipUnknown | Should Be $true
+        $plan.Recoverable | Should Be $false
+    }
+
+    It "does not charge or launch when live watchdog ownership cannot be inspected" {
+        Write-BudgetSession
+        $before = [System.IO.File]::ReadAllText($script:budgetSessionPath)
+        Mock Get-CimInstance { throw "injected watchdog census failure" } -ParameterFilter {
+            $ClassName -eq "Win32_Process" -and $Filter -eq "Name='node.exe'"
+        }
+
+        Invoke-BudgetRecovery
+
+        $script:budgetLaunches | Should Be 0
+        [System.IO.File]::ReadAllText($script:budgetSessionPath) | Should Be $before
+    }
+
+    It "permits fallback after the detached watchdog has disappeared" {
+        $script:budgetWatchdogs = @(New-BudgetWatchdog)
+        Write-BudgetSession
+        Invoke-BudgetRecovery
+        $script:budgetWatchdogs = @()
+
+        Invoke-BudgetRecovery
+
+        $script:budgetLaunches | Should Be 1
+        $script:budgetHistoryAtLaunch.Count | Should Be 1
+    }
+
+    It "does not start Node when five canonical restart charges remain in the shared window" {
+        $script:budgetSession.restartTimesMs = @($script:budgetNowMs) * 5
+        Write-BudgetSession
+
+        Invoke-BudgetRecovery
+
+        $script:budgetLaunches | Should Be 0
+        ($script:budgetEvents -contains "dev-session-restart-rate-limited") | Should Be $true
+    }
+
+    It "persists the fifth canonical charge before launch and blocks the next guardian attempt" {
+        $script:budgetSession.restartTimesMs = @($script:budgetNowMs) * 4
+        Write-BudgetSession
+
+        Invoke-BudgetRecovery
+        Invoke-BudgetRecovery
+
+        $script:budgetLaunches | Should Be 1
+        $script:budgetHistoryAtLaunch.Count | Should Be 5
+        $saved = [System.IO.File]::ReadAllText($script:budgetSessionPath) | ConvertFrom-Json
+        @($saved.restartTimesMs).Count | Should Be 5
+        $saved.preservedExtra | Should Be "keep"
+        $saved.environment.TAURI_DEV_PORT | Should Be "4321"
+    }
+
+    It "blocks exhausted legacy history when the canonical field is <CanonicalState>" -TestCases @(
+        @{ CanonicalState = "absent" }
+        @{ CanonicalState = "malformed" }
+    ) {
+        param($CanonicalState)
+        if ($CanonicalState -eq "absent") {
+            $script:budgetSession.Remove("restartTimesMs")
+        } else {
+            $script:budgetSession.restartTimesMs = $null
+        }
+        $script:budgetSession.supervisorRestartTimesMs = @($script:budgetNowMs) * 5
+        Write-BudgetSession
+
+        Invoke-BudgetRecovery
+
+        $script:budgetLaunches | Should Be 0
+    }
+
+    It "migrates legacy history and removes the competing field when charging a restart" {
+        $script:budgetSession.Remove("restartTimesMs")
+        $script:budgetSession.supervisorRestartTimesMs = @($script:budgetNowMs) * 4
+        Write-BudgetSession
+
+        Invoke-BudgetRecovery
+
+        $script:budgetLaunches | Should Be 1
+        $script:budgetHistoryAtLaunch.Count | Should Be 5
+        $saved = [System.IO.File]::ReadAllText($script:budgetSessionPath) | ConvertFrom-Json
+        ($saved.PSObject.Properties.Name -contains "supervisorRestartTimesMs") | Should Be $false
+    }
+
+    It "keeps an empty canonical history authoritative over stale legacy charges" {
+        $script:budgetSession.supervisorRestartTimesMs = @($script:budgetNowMs) * 5
+        Write-BudgetSession
+
+        Invoke-BudgetRecovery
+
+        $script:budgetLaunches | Should Be 1
+        $script:budgetHistoryAtLaunch.Count | Should Be 1
+        $saved = [System.IO.File]::ReadAllText($script:budgetSessionPath) | ConvertFrom-Json
+        ($saved.PSObject.Properties.Name -contains "supervisorRestartTimesMs") | Should Be $false
+    }
+
+    It "expires old charges before persisting the next launch" {
+        $script:budgetSession.restartTimesMs = @($script:budgetNowMs - 1800001) * 5
+        Write-BudgetSession
+
+        Invoke-BudgetRecovery
+
+        $script:budgetLaunches | Should Be 1
+        $script:budgetHistoryAtLaunch.Count | Should Be 1
+    }
+
+    It "preserves raw worker and root identity date strings for Node's exact cleanup checks" {
+        $creationDate = "/Date(1791914373703)/"
+        $script:budgetSession.workerIdentity = @{
+            ProcessId = 5000; ExecutablePath = $script:budgetNode; CreationDate = $creationDate
+        }
+        $script:budgetSession.roots = @(@{
+            pid = 6000; role = "vite"
+            identity = @{ ProcessId = 6000; ExecutablePath = $script:budgetNode; CreationDate = $creationDate }
+        })
+        Write-BudgetSession
+
+        Invoke-BudgetRecovery
+
+        $script:budgetLaunches | Should Be 1
+        $savedJson = [System.IO.File]::ReadAllText($script:budgetSessionPath).Replace('\/', '/')
+        [regex]::Matches($savedJson, [regex]::Escape($creationDate)).Count | Should Be 2
+        $savedJson | Should Match ([regex]::Escape('"supervisorStartedAtUtc":"2026-10-13T00:00:00.000Z"'))
+    }
+
+    It "does not charge or launch during <Suppression>" -TestCases @(
+        @{ Suppression = "maintenance" }
+        @{ Suppression = "planned stopping" }
+        @{ Suppression = "disabled watchdog" }
+    ) {
+        param($Suppression)
+        if ($Suppression -eq "planned stopping") { $script:budgetSession.state = "stopping" }
+        if ($Suppression -eq "disabled watchdog") {
+            [System.IO.File]::WriteAllText((Join-Path $script:budgetConfig "settings.json"), '{"watchdogEnabled":false}')
+        }
+        Write-BudgetSession
+        $before = [System.IO.File]::ReadAllText($script:budgetSessionPath)
+
+        Invoke-BudgetRecovery -Maintenance:($Suppression -eq "maintenance")
+
+        $script:budgetLaunches | Should Be 0
+        [System.IO.File]::ReadAllText($script:budgetSessionPath) | Should Be $before
+    }
+
+    It "does not launch or overwrite a newer stopping marker from a stale recovery plan" {
+        Write-BudgetSession
+        $plan = Get-CcsmDevSessionRecoveryPlan -ConfigPath $script:budgetConfig -GetProcessIdentity { param($ProcessId) $null }
+        $script:budgetSession.state = "stopping"
+        Write-BudgetSession
+        $before = [System.IO.File]::ReadAllText($script:budgetSessionPath)
+
+        Invoke-CcsmDevSessionRecovery -Plan $plan -IsMaintenance { $false } -GetListenerOwner { $null } `
+            -GetProcessIdentity { param($ProcessId) $null } -StartDevSession { $script:budgetLaunches++; 9876 } `
+            -WriteEvent { param($Level, $Event, $Detail) $script:budgetEvents.Add($Event) | Out-Null }
+
+        $script:budgetLaunches | Should Be 0
+        [System.IO.File]::ReadAllText($script:budgetSessionPath) | Should Be $before
+    }
+
+    It "matches Node's inclusive window and numeric safe-integer filtering" {
+        $history = [pscustomobject]@{
+            restartTimesMs = @(199999L, 200000L, 200000L, 2000000L, 9007199254740991L,
+                "2000000", $null, $true, 1.5, [double]::NaN, [double]::PositiveInfinity, 9007199254740992L)
+            supervisorRestartTimesMs = @(2000000L) * 5
+        }
+
+        $actual = @(Get-CcsmDevSessionRestartTimesMs -Session $history -NowMs 2000000L)
+
+        $actual.Count | Should Be 4
+        ($actual -join ",") | Should Be "200000,200000,2000000,9007199254740991"
+    }
+
+    It "retains the persisted charge when spawning the replacement fails" {
+        Write-BudgetSession
+        $plan = Get-CcsmDevSessionRecoveryPlan -ConfigPath $script:budgetConfig -GetProcessIdentity { param($ProcessId) $null }
+
+        {
+            Invoke-CcsmDevSessionRecovery -Plan $plan -IsMaintenance { $false } -GetListenerOwner { $null } `
+                -GetProcessIdentity { param($ProcessId) $null } -StartDevSession { throw "injected dev start failure" } `
+                -WriteEvent { param($Level, $Event, $Detail) $script:budgetEvents.Add($Event) | Out-Null }
+        } | Should Throw "injected dev start failure"
+
+        $saved = [System.IO.File]::ReadAllText($script:budgetSessionPath) | ConvertFrom-Json
+        @($saved.restartTimesMs).Count | Should Be 1
+    }
+
+    It "does not launch or damage the marker when persisting the charge fails" {
+        Write-BudgetSession
+        $before = [System.IO.File]::ReadAllText($script:budgetSessionPath)
+        $lock = [System.IO.File]::Open(
+            $script:budgetSessionPath,
+            [System.IO.FileMode]::Open,
+            [System.IO.FileAccess]::Read,
+            [System.IO.FileShare]::Read
+        )
+        try {
+            Invoke-BudgetRecovery
+        } finally {
+            $lock.Dispose()
+        }
+
+        $script:budgetLaunches | Should Be 0
+        [System.IO.File]::ReadAllText($script:budgetSessionPath) | Should Be $before
+        ($script:budgetEvents -contains "dev-session-restart-budget-persist-failed") | Should Be $true
+        @(Get-ChildItem -LiteralPath (Split-Path -Parent $script:budgetSessionPath) -Filter "*.tmp").Count | Should Be 0
+    }
+
+    It "uses the shared development budget without consulting the production restart allowance" {
+        $script:DevelopmentMode = $true
+        $script:ConfigPath = $script:budgetConfig
+        $restartTimesUtc = New-Object "System.Collections.Generic.List[datetime]"
+        foreach ($index in 1..6) { $restartTimesUtc.Add([datetime]::UtcNow) }
+        Write-BudgetSession
+        Mock Get-CcsmGuardianProcessIdentity { $null }
+        Mock Get-CcsmGuardianListenerOwner { $null }
+        Mock Start-CcsmDevSessionLauncher { $script:budgetLaunches++; 9876 }
+        Mock Test-CcsmGuardianRestartBudget { throw "development must not use the production restart allowance" }
+
+        Invoke-CcsmGuardianRecoveryPolicy -IsMaintenance { $false } `
+            -WriteEvent { param($Level, $Event, $Detail) $script:budgetEvents.Add($Event) | Out-Null } `
+            -RestartTimesUtc $restartTimesUtc
+
+        $script:budgetLaunches | Should Be 1
+        $restartTimesUtc.Count | Should Be 6
+        Assert-MockCalled Test-CcsmGuardianRestartBudget -Times 0 -Exactly -Scope It
     }
 }
 

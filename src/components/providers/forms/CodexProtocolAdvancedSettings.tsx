@@ -54,7 +54,12 @@ export function CodexProtocolAdvancedSettings({
       </p>
       <div className="space-y-1.5">
         <Label>Protocol configuration</Label>
-        <Select value={mode} onValueChange={onModeChange}>
+        <Select
+          value={mode}
+          onValueChange={(value) => {
+            if (value === "auto" || value === "manual") onModeChange(value);
+          }}
+        >
           <SelectTrigger aria-label="Protocol configuration">
             <SelectValue />
           </SelectTrigger>
@@ -78,9 +83,11 @@ export function CodexProtocolAdvancedSettings({
             <Label>Protocol used at runtime</Label>
             <Select
               value={apiFormat}
-              onValueChange={(value) =>
-                onApiFormatChange(value as CodexApiFormat)
-              }
+              onValueChange={(value) => {
+                if (value === "openai_chat" || value === "openai_responses") {
+                  onApiFormatChange(value);
+                }
+              }}
             >
               <SelectTrigger aria-label="Protocol used at runtime">
                 <SelectValue />
@@ -101,7 +108,11 @@ export function CodexProtocolAdvancedSettings({
             <Label>Tool schema</Label>
             <Select
               value={toolSchemaDialect}
-              onValueChange={onToolSchemaDialectChange}
+              onValueChange={(value) => {
+                if (value === "openai" || value === "moonshot_mfjs") {
+                  onToolSchemaDialectChange(value);
+                }
+              }}
             >
               <SelectTrigger aria-label="Tool schema">
                 <SelectValue />
@@ -121,7 +132,11 @@ export function CodexProtocolAdvancedSettings({
                 <Label>Chat reasoning display</Label>
                 <Select
                   value={reasoningProjection}
-                  onValueChange={onReasoningProjectionChange}
+                  onValueChange={(value) => {
+                    if (value === "raw_reasoning_text" || value === "none") {
+                      onReasoningProjectionChange(value);
+                    }
+                  }}
                 >
                   <SelectTrigger aria-label="Chat reasoning display">
                     <SelectValue />
@@ -144,7 +159,16 @@ export function CodexProtocolAdvancedSettings({
               <Label>Responses history continuation</Label>
               <Select
                 value={historyReplay}
-                onValueChange={onHistoryReplayChange}
+                onValueChange={(value) => {
+                  if (
+                    value === "native_only" ||
+                    value === "responses_reasoning_text_content" ||
+                    value === "responses_reasoning_summary_only" ||
+                    value === "omit"
+                  ) {
+                    onHistoryReplayChange(value);
+                  }
+                }}
               >
                 <SelectTrigger aria-label="Responses history continuation">
                   <SelectValue />

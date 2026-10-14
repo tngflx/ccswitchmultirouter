@@ -161,6 +161,83 @@ pub struct SettingsSaveResult {
     pub env_injection: crate::env_injection::EnvInjectionSyncReport,
 }
 
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SettingsPatch {
+    #[serde(default)]
+    pub first_run_notice_confirmed: Option<bool>,
+    #[serde(default)]
+    pub usage_confirmed: Option<bool>,
+    #[serde(default)]
+    pub common_config_confirmed: Option<bool>,
+    #[serde(default)]
+    pub language: Option<String>,
+    #[serde(default)]
+    pub enable_stream_retry: Option<bool>,
+    #[serde(default)]
+    pub stream_retry_mode: Option<crate::settings::StreamRetryMode>,
+    #[serde(default)]
+    pub stream_retry_max_attempts: Option<u32>,
+    #[serde(default)]
+    pub quota_collaboration: Option<QuotaCollaborationPatch>,
+}
+
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QuotaCollaborationPatch {
+    #[serde(default)]
+    pub device_name: Option<String>,
+    #[serde(default)]
+    pub mode: Option<String>,
+    #[serde(default)]
+    pub enforce_remaining_percent: Option<f64>,
+}
+
+fn apply_settings_patch(
+    settings: &mut crate::settings::AppSettings,
+    patch: SettingsPatch,
+) {
+    if let Some(value) = patch.first_run_notice_confirmed {
+        settings.first_run_notice_confirmed = Some(value);
+    }
+    if let Some(value) = patch.usage_confirmed {
+        settings.usage_confirmed = Some(value);
+    }
+    if let Some(value) = patch.common_config_confirmed {
+        settings.common_config_confirmed = Some(value);
+    }
+    if let Some(value) = patch.language {
+        settings.language = Some(value);
+    }
+    if let Some(value) = patch.enable_stream_retry {
+        settings.enable_stream_retry = value;
+    }
+    if let Some(value) = patch.stream_retry_mode {
+        settings.stream_retry_mode = value;
+    }
+    if let Some(value) = patch.stream_retry_max_attempts {
+        settings.stream_retry_max_attempts = value.clamp(1, 3);
+    }
+    if let Some(patch) = patch.quota_collaboration {
+        if let Some(value) = patch.device_name {
+            settings.quota_collaboration.device_name = value;
+        }
+        if let Some(value) = patch.mode {
+            settings.quota_collaboration.mode = value;
+        }
+        if let Some(value) = patch.enforce_remaining_percent {
+            settings.quota_collaboration.enforce_remaining_percent = value;
+        }
+    }
+}
+
+/// Persist small UI changes without replaying a stale full settings snapshot.
+#[tauri::command]
+pub async fn patch_settings(patch: SettingsPatch) -> Result<(), String> {
+    crate::settings::mutate_settings(|settings| apply_settings_patch(settings, patch))
+        .map_err(|error| error.to_string())
+}
+
 #[tauri::command]
 pub async fn save_settings(
     state: tauri::State<'_, crate::store::AppState>,
@@ -245,6 +322,15 @@ pub async fn save_settings(
         settings_saved: true,
         env_injection,
     })
+}
+
+/// Persist Request Health independently from the full settings form. This
+/// avoids letting a stale renderer snapshot overwrite unrelated settings.
+#[tauri::command]
+pub async fn save_request_health_settings(
+    config: crate::settings::RequestHealthConfig,
+) -> Result<crate::settings::RequestHealthConfig, String> {
+    crate::settings::update_request_health_config(config).map_err(|e| e.to_string())
 }
 
 #[tauri::command]

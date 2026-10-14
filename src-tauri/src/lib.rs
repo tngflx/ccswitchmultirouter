@@ -1420,6 +1420,16 @@ pub fn run() {
                         log::warn!("Automatic Codex CLI update skipped or failed: {error}");
                     }
                 }
+                if let Err(error) = crate::codex_config_consistency::reconcile_after_startup(
+                    &app_handle,
+                )
+                .await
+                {
+                    log::warn!("启动时 Codex 配置一致性对账失败: {error}");
+                }
+
+                // Reconciliation must publish a settled live-config state before
+                // the optional Desktop launch performs its readiness inspection.
                 crate::codex_egress_timezone::refresh_automatic_timezone_before_codex_launch()
                     .await;
                 match crate::codex_startup::launch_after_startup_reconciliation(
@@ -1445,14 +1455,6 @@ pub fn run() {
                     tauri::async_runtime::spawn(async move {
                         crate::commands::auto_update_other_clis_on_startup(update_handle).await;
                     });
-                }
-
-                if let Err(error) = crate::codex_config_consistency::reconcile_after_startup(
-                    &app_handle,
-                )
-                .await
-                {
-                    log::warn!("启动时 Codex 配置一致性对账失败: {error}");
                 }
 
                 // An app crash also severs active client streams. Restore only
@@ -1626,6 +1628,8 @@ pub fn run() {
             codex_config::get_codex_subagent_profile_statuses,
             codex_config::preview_codex_subagent_profile,
             commands::save_settings,
+            commands::patch_settings,
+            commands::save_request_health_settings,
             commands::inspect_env_injection_status,
             commands::retry_env_injection_sync,
             commands::has_codex_unify_history_backup,

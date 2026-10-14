@@ -73,7 +73,7 @@ use super::{
 };
 use crate::app_config::AppType;
 use crate::database::PRICING_SOURCE_REQUEST;
-use crate::orchestration::{ModelApp, Route};
+use crate::orchestration::{ModelApp, Route, PROFILE_PREFIX, ROLE_PREFIX};
 use crate::protocol_compatibility::{
     capture_chat_json_shape, capture_chat_sse_stream,
     runtime_observer::observe_and_expire_protocol_profile, ProtocolCompatibilityRecord,
@@ -1624,46 +1624,56 @@ pub async fn handle_chat_completions(
         .map_err(|e| ProxyError::Internal(format!("Failed to parse request body: {e}")))?;
 
     let is_external_openai_client = !should_handle_as_codex_client(&headers);
-    let mut role_provider = None;
-    if let Some(route) = orchestration_runtime::resolve_route(
-        &state
-            .db
-            .get_orchestration_settings()
-            .map_err(|e| ProxyError::DatabaseError(e.to_string()))?,
-        "codex",
-        body.get("model").and_then(Value::as_str).unwrap_or(""),
-    )? {
-        if is_external_openai_client {
-            if let Err(err) = external_openai_api::validate_request(&state.db, &headers) {
-                return Ok(external_openai_api_auth_error_response(err));
-            }
+    let external_api_profile = if is_external_openai_client {
+        let profile = match external_openai_api::validate_request(&state.db, &headers) {
+            Ok(profile) => profile,
+            Err(err) => return Ok(external_openai_api_auth_error_response(err)),
+        };
+        let requested_model = request_model_from_body(&body);
+        if requested_model.starts_with(PROFILE_PREFIX) || requested_model.starts_with(ROLE_PREFIX) {
+            return Ok(external_openai_api_route_error_response(&requested_model));
         }
-        match route {
-            Route::Profile(profile) => {
-                let endpoint = endpoint_with_query(&uri, "/chat/completions");
-                return orchestration_runtime::run_profile(
-                    &state,
-                    profile,
-                    orchestration_runtime::ClientRequest {
-                        body: &body,
-                        headers: &headers,
-                        app: &AppType::Codex,
-                        app_type: "codex",
-                        endpoint: &endpoint,
-                        is_stream: body.get("stream").and_then(Value::as_bool).unwrap_or(false),
-                    },
-                )
-                .await;
-            }
-            Route::Role(profile, role) => {
-                if role.app_type != ModelApp::Codex {
-                    return Err(ProxyError::ConfigError(
-                        "This orchestration role belongs to a different protocol".into(),
-                    ));
+        Some(profile)
+    } else {
+        None
+    };
+    let mut role_provider = None;
+    if !is_external_openai_client {
+        if let Some(route) = orchestration_runtime::resolve_route(
+            &state
+                .db
+                .get_orchestration_settings()
+                .map_err(|e| ProxyError::DatabaseError(e.to_string()))?,
+            "codex",
+            body.get("model").and_then(Value::as_str).unwrap_or(""),
+        )? {
+            match route {
+                Route::Profile(profile) => {
+                    let endpoint = endpoint_with_query(&uri, "/chat/completions");
+                    return orchestration_runtime::run_profile(
+                        &state,
+                        profile,
+                        orchestration_runtime::ClientRequest {
+                            body: &body,
+                            headers: &headers,
+                            app: &AppType::Codex,
+                            app_type: "codex",
+                            endpoint: &endpoint,
+                            is_stream: body.get("stream").and_then(Value::as_bool).unwrap_or(false),
+                        },
+                    )
+                    .await;
                 }
-                role_provider = Some(orchestration_runtime::provider_for_role(&state, &role)?);
-                body["model"] = Value::String(role.model);
-                let _ = profile;
+                Route::Role(profile, role) => {
+                    if role.app_type != ModelApp::Codex {
+                        return Err(ProxyError::ConfigError(
+                            "This orchestration role belongs to a different protocol".into(),
+                        ));
+                    }
+                    role_provider = Some(orchestration_runtime::provider_for_role(&state, &role)?);
+                    body["model"] = Value::String(role.model);
+                    let _ = profile;
+                }
             }
         }
     }
@@ -1681,15 +1691,13 @@ pub async fn handle_chat_completions(
             )
             .await?
         } else {
-            let external_api_profile =
-                match external_openai_api::validate_request(&state.db, &headers) {
-                    Ok(profile) => profile,
-                    Err(err) => return Ok(external_openai_api_auth_error_response(err)),
-                };
+            let external_api_profile = external_api_profile
+                .as_ref()
+                .expect("external API profile validated before routing");
             let provider = match resolve_external_openai_compatible_provider(
                 &state,
                 &body,
-                &external_api_profile,
+                external_api_profile,
             )? {
                 Some(provider) => provider,
                 None => {
@@ -3426,50 +3434,61 @@ async fn handle_responses_for_app(
 
     let is_external_openai_client =
         app_type == AppType::Codex && !should_handle_as_codex_client(&headers);
-    let mut role_provider = None;
-    if let Some(route) = orchestration_runtime::resolve_route(
-        &state
-            .db
-            .get_orchestration_settings()
-            .map_err(|e| ProxyError::DatabaseError(e.to_string()))?,
-        app_type_str,
-        body.get("model").and_then(Value::as_str).unwrap_or(""),
-    )? {
-        if is_external_openai_client {
-            if let Err(err) = external_openai_api::validate_request(&state.db, &headers) {
-                return Ok(external_openai_api_auth_error_response(err));
-            }
+    let external_api_profile = if is_external_openai_client {
+        let profile = match external_openai_api::validate_request(&state.db, &headers) {
+            Ok(profile) => profile,
+            Err(err) => return Ok(external_openai_api_auth_error_response(err)),
+        };
+        let requested_model = request_model_from_body(&body);
+        if requested_model.starts_with(PROFILE_PREFIX) || requested_model.starts_with(ROLE_PREFIX) {
+            return Ok(external_openai_api_route_error_response(&requested_model));
         }
-        match route {
-            Route::Profile(profile) => {
-                let response_result = orchestration_runtime::run_profile(
-                    &state,
-                    profile,
-                    orchestration_runtime::ClientRequest {
-                        body: &body,
-                        headers: &headers,
-                        app: &app_type,
-                        app_type: app_type_str,
-                        endpoint: &endpoint,
-                        is_stream,
-                    },
-                )
-                .await;
-                let final_result = finalize_aggressive_recovery(response_result, recovery_context);
-                if let Some(tracking) = recovery_tracking {
-                    tracking.hand_off_to_stream();
+        Some(profile)
+    } else {
+        None
+    };
+    let mut role_provider = None;
+    if !is_external_openai_client {
+        if let Some(route) = orchestration_runtime::resolve_route(
+            &state
+                .db
+                .get_orchestration_settings()
+                .map_err(|e| ProxyError::DatabaseError(e.to_string()))?,
+            app_type_str,
+            body.get("model").and_then(Value::as_str).unwrap_or(""),
+        )? {
+            match route {
+                Route::Profile(profile) => {
+                    let response_result = orchestration_runtime::run_profile(
+                        &state,
+                        profile,
+                        orchestration_runtime::ClientRequest {
+                            body: &body,
+                            headers: &headers,
+                            app: &app_type,
+                            app_type: app_type_str,
+                            endpoint: &endpoint,
+                            is_stream,
+                        },
+                    )
+                    .await;
+                    let final_result =
+                        finalize_aggressive_recovery(response_result, recovery_context);
+                    if let Some(tracking) = recovery_tracking {
+                        tracking.hand_off_to_stream();
+                    }
+                    return final_result;
                 }
-                return final_result;
-            }
-            Route::Role(profile, role) => {
-                if role.app_type != ModelApp::Codex || app_type != AppType::Codex {
-                    return Err(ProxyError::ConfigError(
-                        "This orchestration role belongs to a different protocol".into(),
-                    ));
+                Route::Role(profile, role) => {
+                    if role.app_type != ModelApp::Codex || app_type != AppType::Codex {
+                        return Err(ProxyError::ConfigError(
+                            "This orchestration role belongs to a different protocol".into(),
+                        ));
+                    }
+                    role_provider = Some(orchestration_runtime::provider_for_role(&state, &role)?);
+                    body["model"] = Value::String(role.model);
+                    let _ = profile;
                 }
-                role_provider = Some(orchestration_runtime::provider_for_role(&state, &role)?);
-                body["model"] = Value::String(role.model);
-                let _ = profile;
             }
         }
     }
@@ -3487,15 +3506,13 @@ async fn handle_responses_for_app(
             )
             .await
         } else {
-            let external_api_profile =
-                match external_openai_api::validate_request(&state.db, &headers) {
-                    Ok(profile) => profile,
-                    Err(err) => return Ok(external_openai_api_auth_error_response(err)),
-                };
+            let external_api_profile = external_api_profile
+                .as_ref()
+                .expect("external API profile validated before routing");
             let provider = match resolve_external_openai_compatible_provider(
                 &state,
                 &body,
-                &external_api_profile,
+                external_api_profile,
             )? {
                 Some(provider) => provider,
                 None => {
@@ -7878,7 +7895,11 @@ data: [DONE]\n\n";
     #[tokio::test]
     async fn external_orchestration_aliases_require_auth_before_execution_or_recovery() {
         let db = Arc::new(Database::memory().expect("memory db"));
-        db.save_orchestration_settings(&crate::orchestration::fixture())
+        let mut orchestration = crate::orchestration::fixture();
+        orchestration
+            .default_mode_by_app
+            .insert("codex".to_string(), "orchestrated".to_string());
+        db.save_orchestration_settings(&orchestration)
             .expect("save orchestration settings");
         external_openai_api::update_profile(
             &db,
@@ -7926,6 +7947,66 @@ data: [DONE]\n\n";
             assert!(!crate::proxy::codex_turn_recovery::recovery_reserved_for_test(&thread_id));
         }
 
+        assert!(db.list_orchestration_runs().unwrap().is_empty());
+
+        let generated = external_openai_api::regenerate_api_key(&db).expect("generate key");
+        for (uri, body, handler) in [
+            (
+                "/v1/responses",
+                json!({
+                    "model": "ccsm-role/test/worker",
+                    "stream": true,
+                    "input": [{"role": "user", "content": "test task"}]
+                }),
+                "responses",
+            ),
+            (
+                "/v1/chat/completions",
+                json!({
+                    "model": "ccsm-orch/test",
+                    "stream": true,
+                    "messages": [{"role": "user", "content": "test task"}]
+                }),
+                "chat",
+            ),
+            (
+                "/v1/responses",
+                json!({
+                    "model": "worker",
+                    "stream": true,
+                    "input": [{"role": "user", "content": "ordinary request"}]
+                }),
+                "responses",
+            ),
+        ] {
+            let request = axum::http::Request::builder()
+                .method("POST")
+                .uri(uri)
+                .header("content-type", "application/json")
+                .header(
+                    axum::http::header::AUTHORIZATION,
+                    format!("Bearer {}", generated.api_key),
+                )
+                .body(axum::body::Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap();
+            let response = if handler == "chat" {
+                super::handle_chat_completions(axum::extract::State(state.clone()), request)
+                    .await
+                    .expect("chat route response")
+            } else {
+                super::handle_responses(axum::extract::State(state.clone()), request)
+                    .await
+                    .expect("responses route response")
+            };
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            let payload: Value =
+                serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                    .unwrap();
+            assert_eq!(
+                payload["error"]["code"],
+                "external_openai_api_route_not_found"
+            );
+        }
         assert!(db.list_orchestration_runs().unwrap().is_empty());
     }
 

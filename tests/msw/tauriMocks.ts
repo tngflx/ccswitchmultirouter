@@ -29,6 +29,11 @@ vi.mock("@tauri-apps/api/core", () => ({
   },
 }));
 
+vi.mock("@tauri-apps/plugin-dialog", () => ({
+  confirm: vi.fn(async () => true),
+  message: vi.fn(async () => "Ok"),
+}));
+
 const listeners = new Map<string, Set<(event: { payload: unknown }) => void>>();
 
 const ensureListenerSet = (event: string) => {

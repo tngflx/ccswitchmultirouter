@@ -409,6 +409,81 @@ Describe "CCSwitchMulti production and development guardian boundary" {
         Assert-MockCalled Start-CcsmDevSessionLauncher -Times 0 -Exactly -Scope It
     }
 
+    It "does not launch the installed app from a modern dev crash while the supervisor is <SupervisorState>" -TestCases @(
+        @{ SupervisorState = "rebuilding"; Alive = $true }
+        @{ SupervisorState = "stale"; Alive = $false }
+    ) {
+        param($SupervisorState, $Alive)
+        $script:boundarySupervisorAlive = $Alive
+        Write-BoundaryDevSession
+        [ordered]@{
+            pid = 7777
+            executablePath = (Join-Path $script:boundaryRepo "src-tauri\target\debug\cc-switch.exe")
+            processStartedAtTicks = 134000000000000001L
+        } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $script:ConfigPath "logs\app-run-marker.json") -Encoding utf8
+        Mock Get-CcsmDevSessionRecoveryPlan { throw "production must not inspect the development session" }
+
+        Invoke-BoundaryRecovery
+
+        $script:boundaryInstalledTarget | Should Be ""
+        $script:boundaryStartedDevPlan | Should Be $null
+        $script:boundaryRestarts.Count | Should Be 0
+        Assert-MockCalled Invoke-CcsmGuardianRecovery -Times 0 -Exactly -Scope It
+        Assert-MockCalled Start-CcsmDevSessionLauncher -Times 0 -Exactly -Scope It
+        Assert-MockCalled Get-CcsmDevSessionRecoveryPlan -Times 0 -Exactly -Scope It
+    }
+
+    It "does not authorize production launch from a modern foreign executable marker" {
+        [ordered]@{
+            pid = 7777; executablePath = "C:\OtherApp\cc-switch.exe"
+            processStartedAtTicks = 134000000000000001L
+        } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $script:ConfigPath "logs\app-run-marker.json") -Encoding utf8
+
+        Invoke-BoundaryRecovery
+
+        $script:boundaryInstalledTarget | Should Be ""
+        $script:boundaryRestarts.Count | Should Be 0
+        Assert-MockCalled Invoke-CcsmGuardianRecovery -Times 0 -Exactly -Scope It
+    }
+
+    It "recovers the expected modern installed executable independently of a live dev session" {
+        $script:boundarySupervisorAlive = $true
+        Write-BoundaryDevSession
+        [ordered]@{
+            pid = 7777; executablePath = $script:InstalledExecutable
+            processStartedAtTicks = 134000000000000001L
+        } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $script:ConfigPath "logs\app-run-marker.json") -Encoding utf8
+        Mock Get-CcsmDevSessionRecoveryPlan { throw "production must not inspect the development session" }
+
+        Invoke-BoundaryRecovery
+
+        $script:boundaryInstalledTarget | Should Be $script:InstalledExecutable
+        $script:boundaryStartedDevPlan | Should Be $null
+        $script:boundaryRestarts.Count | Should Be 1
+        Assert-MockCalled Invoke-CcsmGuardianRecovery -Times 1 -Exactly -Scope It
+        Assert-MockCalled Start-CcsmDevSessionLauncher -Times 0 -Exactly -Scope It
+        Assert-MockCalled Get-CcsmDevSessionRecoveryPlan -Times 0 -Exactly -Scope It
+    }
+
+    It "keeps explicit production clean-exit restart opt-in bound to the installed app" {
+        $script:RestartOnCleanExit = $true
+        Write-BoundaryDevSession
+        [ordered]@{
+            pid = 7777
+            executablePath = (Join-Path $script:boundaryRepo "src-tauri\target\debug\cc-switch.exe")
+            processStartedAtTicks = 134000000000000001L
+        } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $script:ConfigPath "logs\app-run-marker.json") -Encoding utf8
+        Mock Get-CcsmDevSessionRecoveryPlan { throw "production opt-in must not select development recovery" }
+
+        Invoke-BoundaryRecovery
+
+        $script:boundaryInstalledTarget | Should Be $script:InstalledExecutable
+        $script:boundaryStartedDevPlan | Should Be $null
+        Assert-MockCalled Invoke-CcsmGuardianRecovery -Times 1 -Exactly -Scope It
+        Assert-MockCalled Start-CcsmDevSessionLauncher -Times 0 -Exactly -Scope It
+        Assert-MockCalled Get-CcsmDevSessionRecoveryPlan -Times 0 -Exactly -Scope It
+    }
+
     It "restarts the recorded dev launcher only after opting into development mode" {
         $script:DevelopmentMode = $true
         Write-BoundaryDevSession

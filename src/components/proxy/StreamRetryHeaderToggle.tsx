@@ -1,3 +1,4 @@
+import { useState } from "react";
 import { Loader2, RadioTower, RefreshCw, Settings2 } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import {
@@ -6,7 +7,8 @@ import {
   PopoverTrigger,
 } from "@/components/ui/popover";
 import { Switch } from "@/components/ui/switch";
-import { useSaveSettingsMutation, useSettingsQuery } from "@/lib/query";
+import { useSettingsQuery } from "@/lib/query";
+import { settingsApi } from "@/lib/api";
 import { cn } from "@/lib/utils";
 import type { Settings } from "@/types";
 
@@ -34,7 +36,6 @@ export function StreamRetryHeaderToggle({
 }: StreamRetryHeaderToggleProps) {
   const { t } = useTranslation();
   const { data: settings, isLoading } = useSettingsQuery();
-  const saveSettings = useSaveSettingsMutation();
   const mode = resolveMode(
     settings?.streamRetryMode,
     settings?.enableStreamRetry,
@@ -45,14 +46,20 @@ export function StreamRetryHeaderToggle({
   );
   const label = t("streamRetry.label", { defaultValue: "Stream Retry" });
   const modeLabel = t(`streamRetry.mode.${mode}`, { defaultValue: mode });
-  const busy = !settings || isLoading || saveSettings.isPending;
+  const [isSaving, setIsSaving] = useState(false);
+  const busy = !settings || isLoading || isSaving;
 
-  const update = (patch: Partial<Settings>) => {
+  const update = async (patch: Partial<Settings>) => {
     if (!settings) return;
-    saveSettings.mutate({ ...settings, ...patch });
+    setIsSaving(true);
+    try {
+      await settingsApi.patch(patch);
+    } finally {
+      setIsSaving(false);
+    }
   };
   const setMode = (next: Mode) =>
-    update({
+    void update({
       streamRetryMode: next,
       enableStreamRetry: next !== "off",
     });

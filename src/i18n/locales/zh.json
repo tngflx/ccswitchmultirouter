@@ -1,4 +1,18 @@
 {
+  "orchestration": {
+    "title": "多模型编排",
+    "profileEditor": "配置编辑器",
+    "saved": "编排设置已保存。",
+    "publicationPending": "设置已保存；Codex 模型目录尚未发布。",
+    "publicationReady": "Codex 模型目录已发布。如选择器仍显示旧列表，请重新打开 Codex。",
+    "routerRequired": "请启用 schema-v2 Codex MultiRouter 以发布这些配置。",
+    "retryPublication": "重试发布",
+    "unsaved": "配置更改尚未保存。",
+    "disabled": "编排已停用；配置模型已从目录中移除。",
+    "nameRequired": "请填写配置名称。",
+    "noIncludedModels": "没有已包含的模型",
+    "modelUnavailable": "{{name}}：{{role}} 模型不可用或已排除。"
+  },
   "app": {
     "title": "CCSwitchMulti",
     "description": "Claude Code / Codex / Gemini CLI 全方位辅助工具"
@@ -413,6 +427,7 @@
     "tabAdvanced": "高级",
     "tabProxy": "路由",
     "tabRequestHealth": "请求健康",
+    "tabRequestHealthSettings": "请求健康设置",
     "authCenter": {
       "title": "OAuth 认证中心",
       "description": "在 Claude Code 中使用您的其他订阅，请注意合规风险。",

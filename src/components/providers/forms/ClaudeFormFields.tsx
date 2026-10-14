@@ -825,7 +825,19 @@ export function ClaudeFormFields({
                 <FormLabel htmlFor="apiFormat">
                   {t("providerForm.apiFormat", { defaultValue: "API 格式" })}
                 </FormLabel>
-                <Select value={apiFormat} onValueChange={onApiFormatChange}>
+                <Select
+                  value={apiFormat}
+                  onValueChange={(value) => {
+                    if (
+                      value === "anthropic" ||
+                      value === "openai_chat" ||
+                      value === "openai_responses" ||
+                      value === "gemini_native"
+                    ) {
+                      onApiFormatChange(value);
+                    }
+                  }}
+                >
                   <SelectTrigger id="apiFormat" className="w-full">
                     <SelectValue />
                   </SelectTrigger>

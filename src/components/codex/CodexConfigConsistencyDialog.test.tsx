@@ -162,6 +162,8 @@ describe("CodexConfigConsistencyDialog", () => {
     const dialog = screen.getByRole("dialog", {
       name: "Codex 配置与 CCSM 不一致",
     });
+    expect(dialog).toHaveClass("fixed", "overflow-y-auto");
+    expect(dialog).not.toHaveClass("relative");
     expect(
       within(dialog).getByText("model_reasoning_effort"),
     ).toBeInTheDocument();

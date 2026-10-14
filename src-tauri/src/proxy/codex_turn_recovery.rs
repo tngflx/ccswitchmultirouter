@@ -203,10 +203,10 @@ fn finish_reserved_recovery(context: &TurnRecoveryContext, submitted: bool) -> u
         return 0;
     };
     if !state.in_flight
-        || !state
+        || state
             .tracked
             .as_ref()
-            .is_some_and(|tracked| tracked.recovery_id == context.recovery_id)
+            .is_none_or(|tracked| tracked.recovery_id != context.recovery_id)
     {
         return state.submitted;
     }

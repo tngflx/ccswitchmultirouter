@@ -3,6 +3,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { CodexHistoryRepairPanel } from "@/components/sessions/CodexHistoryRepairPanel";
 import { proxyApi } from "@/lib/api/proxy";
 import { toast } from "sonner";
+import { confirm } from "@tauri-apps/plugin-dialog";
 
 vi.mock("@/lib/api/proxy", () => ({
   proxyApi: {
@@ -19,6 +20,10 @@ vi.mock("sonner", () => ({
     info: vi.fn(),
     error: vi.fn(),
   },
+}));
+
+vi.mock("@tauri-apps/plugin-dialog", () => ({
+  confirm: vi.fn(),
 }));
 
 // 构造最小历史列表返回值，用于验证前端参数而不依赖真实 SQLite。
@@ -105,6 +110,7 @@ function repairOutcomeFixture(dryRun: boolean) {
 
 beforeEach(() => {
   vi.clearAllMocks();
+  vi.mocked(confirm).mockResolvedValue(true);
   Object.defineProperty(window, "__TAURI_INTERNALS__", {
     value: {},
     configurable: true,
@@ -139,7 +145,6 @@ describe("CodexHistoryRepairPanel", () => {
   ])(
     "does not turn a non-process repair failure into a quit-and-retry instruction: %s",
     async (error, immutable) => {
-      const confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(true);
       vi.mocked(proxyApi.repairCodexHistoryVisibility)
         .mockReset()
         .mockRejectedValue(error);
@@ -155,12 +160,11 @@ describe("CodexHistoryRepairPanel", () => {
       } else {
         expect(message).toBe(error);
       }
-      expect(confirmSpy).not.toHaveBeenCalled();
+      expect(confirm).not.toHaveBeenCalled();
       expect(proxyApi.repairCodexHistoryVisibility).toHaveBeenCalledTimes(1);
       expect(proxyApi.repairCodexHistoryVisibility).toHaveBeenCalledWith(
         expect.objectContaining({ dryRun: true }),
       );
-      confirmSpy.mockRestore();
     },
   );
 
@@ -226,10 +230,14 @@ describe("CodexHistoryRepairPanel", () => {
       }),
     );
     expect(
-      screen.getByPlaceholderText("Enter a project path when enabled; otherwise repair all projects"),
+      screen.getByPlaceholderText(
+        "Enter a project path when enabled; otherwise repair all projects",
+      ),
     ).toHaveValue("");
     expect(
-      screen.getByText(/No project limit; matching records across projects will be read and repaired/),
+      screen.getByText(
+        /No project limit; matching records across projects will be read and repaired/,
+      ),
     ).toBeInTheDocument();
   });
 
@@ -243,9 +251,13 @@ describe("CodexHistoryRepairPanel", () => {
     });
     vi.mocked(proxyApi.listCodexHistorySessions).mockClear();
 
-    fireEvent.click(screen.getByRole("checkbox", { name: "Repair one project only" }));
+    fireEvent.click(
+      screen.getByRole("checkbox", { name: "Repair one project only" }),
+    );
     fireEvent.change(
-      screen.getByPlaceholderText("Enter a project path when enabled; otherwise repair all projects"),
+      screen.getByPlaceholderText(
+        "Enter a project path when enabled; otherwise repair all projects",
+      ),
       { target: { value: "C:\\Users\\sunda\\Documents\\Project A" } },
     );
     fireEvent.click(screen.getByRole("button", { name: "Refresh records" }));
@@ -260,8 +272,6 @@ describe("CodexHistoryRepairPanel", () => {
   });
 
   it("confirms with the close-Codex warning before applying the repair", async () => {
-    const confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(true);
-
     render(<CodexHistoryRepairPanel />);
 
     await waitFor(() => {
@@ -281,11 +291,15 @@ describe("CodexHistoryRepairPanel", () => {
         sourceFilter: "all",
       }),
     );
-    expect(confirmSpy).toHaveBeenCalledWith(
-      expect.stringContaining("Before confirming repair, fully exit the Codex / ChatGPT app."),
+    expect(confirm).toHaveBeenCalledWith(
+      expect.stringContaining(
+        "Before confirming repair, fully exit the Codex / ChatGPT app.",
+      ),
+      expect.objectContaining({ kind: "warning" }),
     );
-    expect(confirmSpy).toHaveBeenCalledWith(
+    expect(confirm).toHaveBeenCalledWith(
       expect.stringContaining("thread_settings_applied"),
+      expect.objectContaining({ kind: "warning" }),
     );
     expect(proxyApi.repairCodexHistoryVisibility).toHaveBeenNthCalledWith(
       2,
@@ -295,7 +309,5 @@ describe("CodexHistoryRepairPanel", () => {
         targetProvider: null,
       }),
     );
-
-    confirmSpy.mockRestore();
   });
 });

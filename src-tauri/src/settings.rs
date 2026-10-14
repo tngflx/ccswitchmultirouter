@@ -1146,6 +1146,21 @@ pub fn update_settings_preserving_tool_auto_update(
     })
 }
 
+/// Persist only the Request Health configuration without replaying a stale
+/// full settings snapshot from the renderer.
+fn replace_request_health_config(settings: &mut AppSettings, request_health: RequestHealthConfig) {
+    settings.request_health = request_health;
+}
+
+pub fn update_request_health_config(
+    request_health: RequestHealthConfig,
+) -> Result<RequestHealthConfig, AppError> {
+    mutate_settings(|settings| {
+        replace_request_health_config(settings, request_health);
+    })?;
+    Ok(get_settings().request_health)
+}
+
 pub fn set_tool_auto_update(tool: &str, enabled: bool) -> Result<(), AppError> {
     mutate_settings(|settings| settings.set_tool_auto_update(tool, enabled))
 }
@@ -1178,7 +1193,7 @@ pub fn request_health_diagnostics_active(config: &RequestHealthConfig) -> bool {
     config.enabled && config.review_mode != RequestHealthReviewMode::Off
 }
 
-fn mutate_settings<F, R>(mutator: F) -> Result<R, AppError>
+pub(crate) fn mutate_settings<F, R>(mutator: F) -> Result<R, AppError>
 where
     F: FnOnce(&mut AppSettings) -> R,
 {
@@ -1729,6 +1744,25 @@ mod tests {
         assert!(!request_health_windows_notifications_active(
             &notifications_off
         ));
+    }
+
+    #[test]
+    fn request_health_update_changes_only_the_canonical_request_health_field() {
+        let mut settings = AppSettings {
+            language: Some("en".to_string()),
+            ..AppSettings::default()
+        };
+        settings.tool_auto_update.insert("codex".to_string(), true);
+
+        let mut request_health = RequestHealthConfig::default();
+        request_health.enabled = false;
+        request_health.large_request_threshold_bytes = 512 * 1024;
+
+        replace_request_health_config(&mut settings, request_health.clone());
+
+        assert_eq!(settings.request_health, request_health);
+        assert_eq!(settings.language.as_deref(), Some("en"));
+        assert_eq!(settings.tool_auto_update.get("codex"), Some(&true));
     }
 
     #[test]

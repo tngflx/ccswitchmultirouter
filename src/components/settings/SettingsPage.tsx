@@ -6,6 +6,7 @@ import {
   useRef,
   useState,
 } from "react";
+import { useQueryClient } from "@tanstack/react-query";
 import { motion } from "framer-motion";
 import {
   Loader2,
@@ -83,6 +84,7 @@ export function SettingsPage({
   defaultTab = "general",
 }: SettingsDialogProps) {
   const { t } = useTranslation();
+  const queryClient = useQueryClient();
   const {
     settings,
     isLoading,
@@ -289,7 +291,7 @@ export function SettingsPage({
               {t("settings.tabAdvanced")}
             </TabsTrigger>
             <TabsTrigger value="request-health">
-              {t("settings.tabRequestHealth")}
+              {t("settings.tabRequestHealthSettings")}
             </TabsTrigger>
             <TabsTrigger value="usage">{t("usage.title")}</TabsTrigger>
             <TabsTrigger value="about">{t("common.about")}</TabsTrigger>
@@ -621,20 +623,26 @@ export function SettingsPage({
 
               <TabsContent value="request-health" className="mt-0 pb-4">
                 <RequestHealthPanel
+                  mode="settings"
                   snapshot={requestHealthSnapshot}
                   isRefreshing={requestHealthLoading}
                   onRefresh={() => void refreshRequestHealth()}
                   onSaveConfig={async (config) => {
-                    const result = await handleAutoSave({
-                      requestHealth: config,
-                    });
-                    return result;
+                    await settingsApi.saveRequestHealthConfig(config);
+                    return true;
                   }}
                   onSaved={(config) => {
                     // Keep the shared settings form in sync with the panel's
                     // dedicated save so a later autosave cannot restore an
                     // older Request Health configuration.
                     updateSettings({ requestHealth: config });
+                    queryClient.setQueryData<SettingsFormState>(
+                      ["settings"],
+                      (current) =>
+                        current
+                          ? { ...current, requestHealth: config }
+                          : current,
+                    );
                     void refreshRequestHealth();
                   }}
                 />

@@ -748,15 +748,11 @@ const QuotaCollaborationPanel: React.FC<{
     setIsSaving(true);
     try {
       const current = settings.quotaCollaboration;
-      await settingsApi.save({
-        ...settings,
+      await settingsApi.patch({
         quotaCollaboration: {
-          deviceId: current?.deviceId ?? overview?.deviceId ?? "",
           deviceName: deviceName.trim(),
           mode: nextMode,
           enforceRemainingPercent: Math.min(90, Math.max(1, threshold)),
-          latestWindowUtilization: current?.latestWindowUtilization ?? {},
-          latestWindowCapturedAt: current?.latestWindowCapturedAt ?? null,
         },
       });
       setMode(nextMode);

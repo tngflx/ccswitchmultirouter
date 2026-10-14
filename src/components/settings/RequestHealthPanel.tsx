@@ -36,14 +36,18 @@ export function RequestHealthPanel({
   onRefresh,
   onSaved,
   onSaveConfig,
+  mode = "full",
 }: {
   snapshot?: RequestHealthSnapshot;
   isRefreshing: boolean;
   onRefresh: () => void;
-  onSaved: (config: RequestHealthConfig) => void;
+  onSaved?: (config: RequestHealthConfig) => void;
   onSaveConfig?: (config: RequestHealthConfig) => Promise<boolean>;
+  mode?: "full" | "settings" | "status";
 }) {
   const { t } = useTranslation();
+  const showSettings = mode !== "status";
+  const showStatus = mode !== "settings";
   const [draft, setDraft] = useState<RequestHealthConfig | null>(null);
   const [thresholdKb, setThresholdKb] = useState("");
   const [maxTokens, setMaxTokens] = useState("");
@@ -120,7 +124,7 @@ export function RequestHealthPanel({
       const message = t("settings.requestHealth.saved");
       setSaveMessage(message);
       toast.success(message, { closeButton: true });
-      onSaved(draft);
+      onSaved?.(draft);
     } catch (error) {
       const message = errorMessage(error);
       setSaveMessage(message);
@@ -187,29 +191,33 @@ export function RequestHealthPanel({
           </div>
         </div>
         <div className="flex gap-2">
-          <Button
-            size="sm"
-            variant="outline"
-            onClick={onRefresh}
-            disabled={isRefreshing}
-          >
-            <RefreshCw
-              className={cn("mr-2 h-4 w-4", isRefreshing && "animate-spin")}
-            />
-            {t("settings.requestHealth.refresh")}
-          </Button>
-          <Button
-            size="sm"
-            onClick={() => void save()}
-            disabled={!draft || isSaving}
-          >
-            <Save className="mr-2 h-4 w-4" />
-            {t("settings.requestHealth.save")}
-          </Button>
+          {showStatus ? (
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={onRefresh}
+              disabled={isRefreshing}
+            >
+              <RefreshCw
+                className={cn("mr-2 h-4 w-4", isRefreshing && "animate-spin")}
+              />
+              {t("settings.requestHealth.refresh")}
+            </Button>
+          ) : null}
+          {showSettings ? (
+            <Button
+              size="sm"
+              onClick={() => void save()}
+              disabled={!draft || isSaving}
+            >
+              <Save className="mr-2 h-4 w-4" />
+              {t("settings.requestHealth.save")}
+            </Button>
+          ) : null}
         </div>
       </div>
 
-      {draft ? (
+      {showSettings && draft ? (
         <div className="rounded-md border border-border bg-background/50 p-3">
           <div className="mb-3 flex items-center gap-2 text-xs font-semibold uppercase tracking-wide text-muted-foreground">
             <DatabaseZap className="h-4 w-4 text-cyan-500" />
@@ -371,102 +379,104 @@ export function RequestHealthPanel({
         </div>
       ) : null}
 
-      {saveMessage ? (
+      {showSettings && saveMessage ? (
         <div role="status" className="text-xs text-muted-foreground">
           {saveMessage}
         </div>
       ) : null}
 
-      <section className="rounded-md border border-border bg-background/50 p-4">
-        <div className="flex flex-wrap items-start justify-between gap-3">
-          <div className="flex min-w-0 items-start gap-3">
-            <ShieldCheck className="mt-0.5 h-5 w-5 shrink-0 text-cyan-600 dark:text-cyan-300" />
-            <div className="min-w-0">
-              <div className="flex flex-wrap items-center gap-2">
-                <h4 className="text-sm font-semibold">
-                  {t("settings.requestHealth.contractTitle")}
-                </h4>
-                <Badge
-                  variant="outline"
-                  className={cn("border", contractStatusClass)}
-                >
-                  {contractStatusLabel}
-                </Badge>
-              </div>
-              <p className="mt-1 max-w-3xl text-xs leading-relaxed text-muted-foreground">
-                {t("settings.requestHealth.contractDescription")}
-              </p>
-            </div>
-          </div>
-          <Button
-            size="sm"
-            variant="outline"
-            onClick={() => void checkContract()}
-            disabled={isCheckingContract}
-          >
-            <RefreshCw
-              className={cn("h-4 w-4", isCheckingContract && "animate-spin")}
-            />
-            {t("settings.requestHealth.contractCheck")}
-          </Button>
-        </div>
-        {contract ? (
-          <div className="mt-3 grid gap-2 text-xs sm:grid-cols-2">
-            <div className="rounded-md border border-border/70 px-3 py-2">
-              <div className="text-muted-foreground">
-                {t("settings.requestHealth.contractSnapshot")}
-              </div>
-              <div className="mt-1 font-medium">
-                v{contract.version} · {contract.verifiedAt}
+      {showStatus ? (
+        <section className="rounded-md border border-border bg-background/50 p-4">
+          <div className="flex flex-wrap items-start justify-between gap-3">
+            <div className="flex min-w-0 items-start gap-3">
+              <ShieldCheck className="mt-0.5 h-5 w-5 shrink-0 text-cyan-600 dark:text-cyan-300" />
+              <div className="min-w-0">
+                <div className="flex flex-wrap items-center gap-2">
+                  <h4 className="text-sm font-semibold">
+                    {t("settings.requestHealth.contractTitle")}
+                  </h4>
+                  <Badge
+                    variant="outline"
+                    className={cn("border", contractStatusClass)}
+                  >
+                    {contractStatusLabel}
+                  </Badge>
+                </div>
+                <p className="mt-1 max-w-3xl text-xs leading-relaxed text-muted-foreground">
+                  {t("settings.requestHealth.contractDescription")}
+                </p>
               </div>
             </div>
-            <div className="rounded-md border border-border/70 px-3 py-2">
-              <div className="text-muted-foreground">
-                {t("settings.requestHealth.contractLastChecked")}
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={() => void checkContract()}
+              disabled={isCheckingContract}
+            >
+              <RefreshCw
+                className={cn("h-4 w-4", isCheckingContract && "animate-spin")}
+              />
+              {t("settings.requestHealth.contractCheck")}
+            </Button>
+          </div>
+          {contract ? (
+            <div className="mt-3 grid gap-2 text-xs sm:grid-cols-2">
+              <div className="rounded-md border border-border/70 px-3 py-2">
+                <div className="text-muted-foreground">
+                  {t("settings.requestHealth.contractSnapshot")}
+                </div>
+                <div className="mt-1 font-medium">
+                  v{contract.version} · {contract.verifiedAt}
+                </div>
               </div>
-              <div className="mt-1 flex items-center gap-1 font-medium">
-                <Clock3 className="h-3.5 w-3.5 text-muted-foreground" />
-                {contract.checkedAt ??
-                  t("settings.requestHealth.contractNeverChecked")}
+              <div className="rounded-md border border-border/70 px-3 py-2">
+                <div className="text-muted-foreground">
+                  {t("settings.requestHealth.contractLastChecked")}
+                </div>
+                <div className="mt-1 flex items-center gap-1 font-medium">
+                  <Clock3 className="h-3.5 w-3.5 text-muted-foreground" />
+                  {contract.checkedAt ??
+                    t("settings.requestHealth.contractNeverChecked")}
+                </div>
+              </div>
+              <div className="rounded-md border border-border/70 px-3 py-2 sm:col-span-2">
+                <div className="text-muted-foreground">
+                  {t("settings.requestHealth.contractCoverage")}
+                </div>
+                <div className="mt-1">{contract.coverage}</div>
+                <div className="mt-2 break-all font-mono text-[11px] text-muted-foreground">
+                  {contract.source}
+                </div>
               </div>
             </div>
-            <div className="rounded-md border border-border/70 px-3 py-2 sm:col-span-2">
-              <div className="text-muted-foreground">
-                {t("settings.requestHealth.contractCoverage")}
-              </div>
-              <div className="mt-1">{contract.coverage}</div>
-              <div className="mt-2 break-all font-mono text-[11px] text-muted-foreground">
-                {contract.source}
-              </div>
+          ) : (
+            <div className="mt-3 text-xs text-muted-foreground">
+              {t("settings.requestHealth.contractLoading")}
             </div>
-          </div>
-        ) : (
-          <div className="mt-3 text-xs text-muted-foreground">
-            {t("settings.requestHealth.contractLoading")}
-          </div>
-        )}
-        {contract?.changedSections.length ? (
-          <div
-            role="alert"
-            className="mt-3 rounded-md border border-amber-300/70 bg-amber-50 px-3 py-2 text-xs text-amber-900 dark:border-amber-700/50 dark:bg-amber-950/20 dark:text-amber-100"
-          >
-            <div className="font-semibold">
-              {t("settings.requestHealth.contractChanged")}
+          )}
+          {contract?.changedSections.length ? (
+            <div
+              role="alert"
+              className="mt-3 rounded-md border border-amber-300/70 bg-amber-50 px-3 py-2 text-xs text-amber-900 dark:border-amber-700/50 dark:bg-amber-950/20 dark:text-amber-100"
+            >
+              <div className="font-semibold">
+                {t("settings.requestHealth.contractChanged")}
+              </div>
+              <div className="mt-1">{contract.changedSections.join(", ")}</div>
             </div>
-            <div className="mt-1">{contract.changedSections.join(", ")}</div>
-          </div>
-        ) : null}
-        {contract?.error || contractActionError ? (
-          <div
-            role="alert"
-            className="mt-3 rounded-md border border-red-300/70 bg-red-50 px-3 py-2 text-xs text-red-800 dark:border-red-700/50 dark:bg-red-950/20 dark:text-red-200"
-          >
-            {contract?.error ?? contractActionError}
-          </div>
-        ) : null}
-      </section>
+          ) : null}
+          {contract?.error || contractActionError ? (
+            <div
+              role="alert"
+              className="mt-3 rounded-md border border-red-300/70 bg-red-50 px-3 py-2 text-xs text-red-800 dark:border-red-700/50 dark:bg-red-950/20 dark:text-red-200"
+            >
+              {contract?.error ?? contractActionError}
+            </div>
+          ) : null}
+        </section>
+      ) : null}
 
-      {hasWarnings ? (
+      {showStatus && hasWarnings ? (
         <div
           role="status"
           className="flex items-start gap-2 rounded-md border border-amber-300/60 bg-amber-50 px-3 py-3 text-sm text-amber-900 dark:border-amber-700/50 dark:bg-amber-950/20 dark:text-amber-100"
@@ -476,7 +486,7 @@ export function RequestHealthPanel({
         </div>
       ) : null}
 
-      {latest ? (
+      {showStatus && latest ? (
         <div className="space-y-3 rounded-md border border-border bg-background/50 p-3">
           <div className="flex flex-wrap items-center justify-between gap-2">
             <div className="flex items-center gap-2 text-sm font-semibold">
@@ -546,13 +556,13 @@ export function RequestHealthPanel({
             </div>
           ) : null}
         </div>
-      ) : (
+      ) : showStatus ? (
         <div className="rounded-md border border-dashed border-border p-4 text-sm text-muted-foreground">
           {t("settings.requestHealth.empty")}
         </div>
-      )}
+      ) : null}
 
-      {diagnostics.length > 0 ? (
+      {showStatus && diagnostics.length > 0 ? (
         <div className="rounded-md border border-border bg-background/50 p-3">
           <div className="mb-2 text-xs font-semibold uppercase tracking-wide text-muted-foreground">
             {t("settings.requestHealth.timeline")}

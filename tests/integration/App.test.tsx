@@ -127,6 +127,17 @@ vi.mock("@/components/providers/EditProviderDialog", () => ({
     ) : null,
 }));
 
+vi.mock("@/components/agents/AgentsPanel", () => ({
+  AgentsPanel: ({ onOpenChange }: any) => (
+    <div data-testid="orchestration-profiles-panel">
+      <span>Multimodel orchestration</span>
+      <button onClick={() => onOpenChange?.(false)}>
+        close-orchestration-profiles
+      </button>
+    </div>
+  ),
+}));
+
 vi.mock("@/components/codex/CodexRouterWorkspacePage", async () => {
   const actual = await vi.importActual<any>(
     "@/components/codex/CodexRouterWorkspacePage",
@@ -829,6 +840,27 @@ describe("App integration with MSW", () => {
     ).toBeInTheDocument();
     expect(screen.getByText("Open workspace directly")).toBeInTheDocument();
 
+    const createOrchestration = screen.getByText("Create orchestration profile");
+    expect(createOrchestration.closest("button")?.parentElement).toHaveClass(
+      "min-h-0",
+      "overflow-y-auto",
+    );
+    fireEvent.click(createOrchestration);
+
+    expect(
+      await screen.findByTestId("orchestration-profiles-panel"),
+    ).toBeInTheDocument();
+    expect(screen.queryByText("Configure multi-model routing")).toBeNull();
+
+    fireEvent.click(screen.getByText("close-orchestration-profiles"));
+    await waitFor(() =>
+      expect(
+        screen.queryByTestId("orchestration-profiles-panel"),
+      ).toBeNull(),
+    );
+
+    fireEvent.click(screen.getByText("open-multirouter-entry"));
+    await screen.findByText("Configure multi-model routing");
     fireEvent.click(screen.getByText("Create new configuration"));
 
     const wizard = await screen.findByTestId("codex-multirouter-wizard");

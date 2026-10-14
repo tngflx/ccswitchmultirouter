@@ -1132,6 +1132,23 @@ export const claudeDesktopProviderPresets: ClaudeDesktopProviderPreset[] = [
     iconColor: "#6566F1",
   },
   {
+    name: "Kilo",
+    websiteUrl: "https://kilo.ai",
+    apiKeyUrl: "https://app.kilo.ai/profile",
+    category: "aggregator",
+    baseUrl: "https://api.kilo.ai/api/gateway",
+    mode: "proxy",
+    apiFormat: "openai_chat",
+    modelRoutes: mappedRoutes(
+      "kilo-auto/free",
+      "kilo-auto/free",
+      "kilo-auto/free",
+    ),
+    endpointCandidates: ["https://api.kilo.ai/api/gateway"],
+    icon: "kilo",
+    iconColor: "#6E56CF",
+  },
+  {
     name: "TheRouter",
     websiteUrl: "https://therouter.ai",
     apiKeyUrl: "https://dashboard.therouter.ai",

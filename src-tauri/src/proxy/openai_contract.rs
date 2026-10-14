@@ -210,7 +210,8 @@ fn changed_sections(snapshot: &Value, current: &Value) -> Vec<String> {
         ("tool_types", "tool types"),
     ]
     .into_iter()
-    .filter_map(|(key, label)| (snapshot.get(key) != current.get(key)).then(|| label.to_string()))
+    .filter(|(key, _)| snapshot.get(key) != current.get(key))
+    .map(|(_, label)| label.to_string())
     .collect()
 }
 

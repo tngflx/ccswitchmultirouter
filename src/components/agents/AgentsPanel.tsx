@@ -15,6 +15,12 @@ import { toast } from "sonner";
 
 import { orchestrationApi, providersApi } from "@/lib/api";
 import { readCodexCatalogSettings } from "@/lib/codexCatalogSchema";
+import {
+  isUserCodexRoutingPlan,
+  isCodexProtocolSetMember,
+} from "@/lib/codexProviderKind";
+import type { CodexRoutingProjectionStatus } from "@/lib/api/providers";
+import { useTranslation } from "react-i18next";
 import type {
   OrchestrationModelRef,
   OrchestrationProfile,
@@ -53,6 +59,7 @@ interface ProviderChoice {
   id: string;
   name: string;
   models: string[];
+  hasCatalog: boolean;
 }
 
 const EMPTY_SETTINGS: OrchestrationSettings = {
@@ -82,7 +89,13 @@ function asRecord(value: unknown): Record<string, unknown> | undefined {
 }
 
 function uniqueModels(values: string[]): string[] {
-  return [...new Set(values.map((value) => value.trim()).filter(Boolean))];
+  return [
+    ...new Set(
+      values
+        .map((value) => value.trim())
+        .filter((value) => value && !value.startsWith("ccsm-")),
+    ),
+  ];
 }
 
 function getProviderModels(provider: Provider): string[] {
@@ -98,6 +111,7 @@ function getProviderModels(provider: Provider): string[] {
         continue;
       }
       const entry = asRecord(item);
+      if (entry?.enabled === false) continue;
       for (const key of ["model", "slug", "id", "name"]) {
         if (typeof entry?.[key] === "string") {
           models.push(entry[key] as string);
@@ -116,6 +130,15 @@ function getProviderModels(provider: Provider): string[] {
   if (typeof nestedConfig?.model === "string") {
     models.push(nestedConfig.model);
   }
+  const env = asRecord(settings?.env);
+  for (const key of [
+    "ANTHROPIC_MODEL",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL",
+  ]) {
+    if (typeof env?.[key] === "string") models.push(env[key] as string);
+  }
   return uniqueModels(models);
 }
 
@@ -123,10 +146,17 @@ function toProviderChoices(
   providers: Record<string, Provider>,
 ): ProviderChoice[] {
   return Object.values(providers)
+    .filter(
+      (provider) =>
+        !isUserCodexRoutingPlan(provider) &&
+        !isCodexProtocolSetMember(provider),
+    )
     .map((provider) => ({
       id: provider.id,
       name: provider.name,
       models: getProviderModels(provider),
+      hasCatalog:
+        readCodexCatalogSettings(provider.settingsConfig) !== undefined,
     }))
     .sort((a, b) => a.name.localeCompare(b.name));
 }
@@ -177,6 +207,7 @@ function formatRunTime(timestamp: number): string {
 }
 
 export function AgentsPanel({ onOpenChange }: AgentsPanelProps) {
+  const { t } = useTranslation();
   const [draft, setDraft] = useState<OrchestrationSettings>(EMPTY_SETTINGS);
   const [runs, setRuns] = useState<OrchestrationRun[]>([]);
   const [providers, setProviders] = useState<
@@ -186,6 +217,11 @@ export function AgentsPanel({ onOpenChange }: AgentsPanelProps) {
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string>();
+  const [projection, setProjection] =
+    useState<CodexRoutingProjectionStatus | null>(null);
+  const [publicationError, setPublicationError] = useState<string | null>(null);
+  const [savedSnapshot, setSavedSnapshot] = useState("");
+  const dirty = JSON.stringify(draft) !== savedSnapshot;
 
   const providerChoices = useMemo<Record<AppType, ProviderChoice[]>>(
     () => ({
@@ -199,16 +235,20 @@ export function AgentsPanel({ onOpenChange }: AgentsPanelProps) {
     setLoading(true);
     setError(undefined);
     try {
-      const [settings, recentRuns, claudeProviders, codexProviders] =
+      const [settings, recentRuns, claudeProviders, codexProviders, status] =
         await Promise.all([
           orchestrationApi.getSettings(),
           orchestrationApi.listRuns(),
           providersApi.getAll("claude"),
           providersApi.getAll("codex"),
+          providersApi.inspectActiveCodexMultiRouterProjection(),
         ]);
       setDraft(settings);
+      setSavedSnapshot(JSON.stringify(settings));
       setRuns(recentRuns);
       setProviders({ claude: claudeProviders, codex: codexProviders });
+      setProjection(status);
+      setPublicationError(null);
       setSelectedProfileId(
         settings.activeProfileId ?? settings.profiles[0]?.id ?? "",
       );
@@ -272,6 +312,7 @@ export function AgentsPanel({ onOpenChange }: AgentsPanelProps) {
     const profile = createProfile(draft.profiles.length, providerChoices);
     setDraft((current) => ({
       ...current,
+      enabled: true,
       activeProfileId: profile.id,
       profiles: [...current.profiles, profile],
     }));
@@ -295,15 +336,26 @@ export function AgentsPanel({ onOpenChange }: AgentsPanelProps) {
   const save = async () => {
     setSaving(true);
     try {
-      const saved = await orchestrationApi.saveSettings({
+      const result = await orchestrationApi.saveSettings({
         ...draft,
         activeProfileId: selectedProfileId || undefined,
       });
+      const saved = result.settings;
       setDraft(saved);
+      setSavedSnapshot(JSON.stringify(saved));
+      setProjection(result.codexProjection);
+      setPublicationError(result.publicationError);
       setSelectedProfileId(
         saved.activeProfileId ?? saved.profiles[0]?.id ?? "",
       );
-      toast.success("Orchestration settings saved.");
+      if (
+        result.publicationError ||
+        result.codexProjection?.state === "pending"
+      ) {
+        toast.warning(t("orchestration.publicationPending"));
+      } else {
+        toast.success(t("orchestration.saved"));
+      }
     } catch (cause) {
       toast.error(cause instanceof Error ? cause.message : String(cause));
     } finally {
@@ -328,6 +380,25 @@ export function AgentsPanel({ onOpenChange }: AgentsPanelProps) {
           return `${profile.displayName}: choose a provider and model for the ${role}.`;
         }
       }
+      if (!profile.displayName.trim()) return t("orchestration.nameRequired");
+      for (const role of ["orchestrator", "worker", "verifier"] as const) {
+        const ref = profile[role];
+        if (!ref) continue;
+        const provider = providerChoices[ref.appType].find(
+          (choice) => choice.id === ref.providerId,
+        );
+        if (
+          draft.enabled &&
+          profile.enabled &&
+          (!provider ||
+            (provider.hasCatalog && !provider.models.includes(ref.model)))
+        ) {
+          return t("orchestration.modelUnavailable", {
+            name: profile.displayName,
+            role: roleLabels[role],
+          });
+        }
+      }
       if (
         profile.verifier &&
         (!profile.verifier.providerId || !profile.verifier.model)
@@ -336,7 +407,7 @@ export function AgentsPanel({ onOpenChange }: AgentsPanelProps) {
       }
     }
     return undefined;
-  }, [draft.profiles]);
+  }, [draft.profiles, draft.enabled, providerChoices, t]);
 
   if (loading) {
     return (
@@ -365,7 +436,7 @@ export function AgentsPanel({ onOpenChange }: AgentsPanelProps) {
   }
 
   return (
-    <div className="px-6 flex flex-col flex-1 min-h-0 overflow-y-auto pb-12">
+    <div className="px-6 pt-6 flex flex-col flex-1 min-h-0 overflow-y-auto pb-12">
       <div className="mx-auto w-full max-w-6xl space-y-5">
         <div className="flex flex-wrap items-start justify-between gap-3">
           <div>
@@ -381,7 +452,7 @@ export function AgentsPanel({ onOpenChange }: AgentsPanelProps) {
               you opt in.
             </p>
           </div>
-          <div className="flex items-center gap-2">
+          <div className="flex items-center gap-2 pr-10">
             <Button variant="outline" size="sm" onClick={() => void reload()}>
               <RefreshCw className="h-4 w-4" />
               Refresh
@@ -421,6 +492,36 @@ export function AgentsPanel({ onOpenChange }: AgentsPanelProps) {
           <div className="flex items-start gap-2 rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-sm text-amber-700 dark:text-amber-300">
             <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
             <span>{validationMessage}</span>
+          </div>
+        )}
+
+        {draft.profiles.length > 0 && (
+          <div
+            role="status"
+            className="flex flex-wrap items-center justify-between gap-3 border-b border-border-default pb-4 text-sm"
+          >
+            <span>
+              {dirty
+                ? t("orchestration.unsaved")
+                : publicationError || projection?.state === "pending"
+                  ? t("orchestration.publicationPending")
+                  : !draft.enabled
+                    ? t("orchestration.disabled")
+                    : projection?.state === "ready"
+                      ? t("orchestration.publicationReady")
+                      : t("orchestration.routerRequired")}
+            </span>
+            {(publicationError || projection?.state === "pending") && (
+              <Button
+                variant="outline"
+                size="sm"
+                disabled={saving || !!validationMessage}
+                onClick={() => void save()}
+              >
+                <RefreshCw className="h-4 w-4" />
+                {t("orchestration.retryPublication")}
+              </Button>
+            )}
           </div>
         )}
 
@@ -633,7 +734,9 @@ export function AgentsPanel({ onOpenChange }: AgentsPanelProps) {
                                   handleAppTypeChange(role, value as AppType)
                                 }
                               >
-                                <SelectTrigger>
+                                <SelectTrigger
+                                  aria-label={`${roleLabels[role]} app`}
+                                >
                                   <SelectValue />
                                 </SelectTrigger>
                                 <SelectContent>
@@ -649,7 +752,9 @@ export function AgentsPanel({ onOpenChange }: AgentsPanelProps) {
                                   handleProviderChange(role, value)
                                 }
                               >
-                                <SelectTrigger>
+                                <SelectTrigger
+                                  aria-label={`${roleLabels[role]} provider`}
+                                >
                                   <SelectValue placeholder="Provider" />
                                 </SelectTrigger>
                                 <SelectContent>
@@ -670,29 +775,47 @@ export function AgentsPanel({ onOpenChange }: AgentsPanelProps) {
                                 </SelectContent>
                               </Select>
                             </div>
-                            <Select
-                              value={roleRef.model || undefined}
-                              onValueChange={(model) =>
-                                updateRole(role, { model })
-                              }
-                            >
-                              <SelectTrigger>
-                                <SelectValue placeholder="Model" />
-                              </SelectTrigger>
-                              <SelectContent>
-                                {models.length === 0 ? (
-                                  <SelectItem value="__none" disabled>
-                                    Add a model to this provider
-                                  </SelectItem>
-                                ) : (
-                                  models.map((model) => (
+                            {models.length > 0 ? (
+                              <Select
+                                value={roleRef.model || undefined}
+                                onValueChange={(model) =>
+                                  updateRole(role, { model })
+                                }
+                              >
+                                <SelectTrigger
+                                  aria-label={`${roleLabels[role]} model`}
+                                >
+                                  <SelectValue placeholder="Model" />
+                                </SelectTrigger>
+                                <SelectContent>
+                                  {models.map((model) => (
                                     <SelectItem key={model} value={model}>
                                       {model}
                                     </SelectItem>
-                                  ))
+                                  ))}
+                                </SelectContent>
+                              </Select>
+                            ) : selectedProvider?.hasCatalog ? (
+                              <Input
+                                disabled
+                                value=""
+                                placeholder={t(
+                                  "orchestration.noIncludedModels",
                                 )}
-                              </SelectContent>
-                            </Select>
+                                aria-label={`${roleLabels[role]} model ID`}
+                              />
+                            ) : (
+                              <Input
+                                value={roleRef.model}
+                                onChange={(event) =>
+                                  updateRole(role, {
+                                    model: event.target.value,
+                                  })
+                                }
+                                placeholder="Type the provider model ID"
+                                aria-label={`${roleLabels[role]} model ID`}
+                              />
+                            )}
                           </div>
                         );
                       },

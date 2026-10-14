@@ -7,7 +7,23 @@ import type {
   EnvInjectionSyncReport,
   SettingsSaveResult,
 } from "@/types";
+import type { RequestHealthConfig } from "@/types/proxy";
 import type { AppId } from "./types";
+
+export interface SettingsPatch {
+  firstRunNoticeConfirmed?: boolean;
+  usageConfirmed?: boolean;
+  commonConfigConfirmed?: boolean;
+  language?: Settings["language"];
+  enableStreamRetry?: boolean;
+  streamRetryMode?: Settings["streamRetryMode"];
+  streamRetryMaxAttempts?: number;
+  quotaCollaboration?: {
+    deviceName?: string;
+    mode?: "observe" | "enforce";
+    enforceRemainingPercent?: number;
+  };
+}
 
 export type RecoverySeverity = "info" | "warning" | "error";
 
@@ -133,6 +149,16 @@ export const settingsApi = {
           envInjection: disabledEnvInjectionReport(),
         }
       : result;
+  },
+
+  async saveRequestHealthConfig(
+    config: RequestHealthConfig,
+  ): Promise<RequestHealthConfig> {
+    return await invoke("save_request_health_settings", { config });
+  },
+
+  async patch(patch: SettingsPatch): Promise<void> {
+    await invoke("patch_settings", { patch });
   },
 
   async inspectEnvInjectionStatus(): Promise<EnvInjectionSyncReport> {

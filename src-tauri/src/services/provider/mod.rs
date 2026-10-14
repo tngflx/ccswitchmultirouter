@@ -91,8 +91,8 @@ fn validate_codex_manual_protocol_settings(provider: &Provider) -> Result<(), Ap
     if !has_model_overrides && !matches!(api_format, "openai_chat" | "openai_responses") {
         return Err(invalid("上游协议必须是 Responses 或 Chat Completions"));
     }
-    let has_model_level_protocol = catalog_models(&provider.settings_config)
-        .is_some_and(|models| {
+    let has_model_level_protocol =
+        catalog_models(&provider.settings_config).is_some_and(|models| {
             models
                 .iter()
                 .any(|model| model.get("apiFormat").is_some() || model.get("api_format").is_some())

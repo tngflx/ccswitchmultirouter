@@ -150,6 +150,62 @@ describe("RequestHealthPanel", () => {
     expect(screen.getByText(/wrong field type at model/)).toBeInTheDocument();
   });
 
+  it("keeps settings mode focused on configuration instead of live diagnostics", () => {
+    render(
+      <RequestHealthPanel
+        mode="settings"
+        snapshot={snapshot}
+        isRefreshing={false}
+        onRefresh={vi.fn()}
+        onSaved={vi.fn()}
+      />,
+    );
+
+    expect(
+      screen.getByRole("button", { name: "settings.requestHealth.save" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", {
+        name: "settings.requestHealth.refresh",
+      }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByText("settings.requestHealth.contractTitle"),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByText("settings.requestHealth.timeline"),
+    ).not.toBeInTheDocument();
+  });
+
+  it("keeps status mode focused on diagnostics instead of editable settings", () => {
+    render(
+      <RequestHealthPanel
+        mode="status"
+        snapshot={snapshot}
+        isRefreshing={false}
+        onRefresh={vi.fn()}
+      />,
+    );
+
+    expect(
+      screen.getByRole("button", { name: "settings.requestHealth.refresh" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "settings.requestHealth.save" }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("checkbox", {
+        name: "settings.requestHealth.enabled",
+      }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.getByText("settings.requestHealth.contractTitle"),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText("settings.requestHealth.timeline"),
+    ).toBeInTheDocument();
+  });
+
   it("hides stale diagnostics while request health advisories are disabled", () => {
     const disabledSnapshot: RequestHealthSnapshot = {
       ...snapshot,

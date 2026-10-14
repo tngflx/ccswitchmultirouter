@@ -94,7 +94,8 @@ function Test-CcsmGuardianMaintenance {
             -GetProcessIdentity { param($ProcessId) Get-CcsmGuardianProcessIdentity -ProcessId $ProcessId }
         return $leaseActive -or (Test-CcsmUpgradeProcessActive) -or
             -not (Test-CcsmGuardianWatchdogEnabled -ConfigPath $ConfigPath) -or
-            $devSession.Active -or $devSession.State -eq "stopping"
+            $devSession.Active -or $devSession.WatchdogActive -or $devSession.WatchdogOwnershipUnknown -or
+            $devSession.State -eq "stopping"
     }
     return $leaseActive -or (Test-CcsmUpgradeProcessActive) -or
         -not (Test-CcsmGuardianWatchdogEnabled -ConfigPath $ConfigPath)
@@ -168,13 +169,24 @@ function Invoke-CcsmGuardianRecoveryPolicy {
     # 只重启“异常死亡”的实例：应用正常退出（含托盘退出）时会自己移除运行标记，
     # 此时不重启，避免用户主动退出后被守护反复拉起。
     if ((-not $DevelopmentMode -or -not $devSession.Recoverable) -and -not $RestartOnCleanExit) {
-        $uncleanExit = Test-CcsmGuardianUncleanExit -ConfigPath $ConfigPath -GetProcessIdentity {
+        $uncleanExit = Test-CcsmGuardianUncleanExit -ConfigPath $ConfigPath `
+            -ExpectedExecutable $InstalledExecutable -GetProcessIdentity {
             param($ProcessId) Get-CcsmGuardianProcessIdentity -ProcessId $ProcessId
         }
         if (-not $uncleanExit) {
             Write-CcsmGuardianEvent -Level "info" -Event "restart-skipped-clean-exit" -Detail @{ Port = $Port }
             return
         }
+    }
+    if ($DevelopmentMode -and $devSession.Recoverable) {
+        Invoke-CcsmDevSessionRecovery -Plan $devSession -IsMaintenance $IsMaintenance `
+            -GetListenerOwner { Get-CcsmGuardianListenerOwner } `
+            -GetProcessIdentity { param($ProcessId) Get-CcsmGuardianProcessIdentity -ProcessId $ProcessId } `
+            -StartDevSession {
+                param($DevPlan)
+                return Start-CcsmDevSessionLauncher -Plan $DevPlan
+            } -WriteEvent $WriteEvent
+        return
     }
     $budgetOk = Test-CcsmGuardianRestartBudget -RestartTimesUtc $RestartTimesUtc.ToArray() `
         -NowUtc ([datetime]::UtcNow) -WindowMinutes $RestartWindowMinutes -MaxRestarts $MaxRestartsPerWindow
@@ -188,16 +200,6 @@ function Invoke-CcsmGuardianRecoveryPolicy {
         return
     }
     $RestartTimesUtc.Add([datetime]::UtcNow)
-    if ($DevelopmentMode -and $devSession.Recoverable) {
-        Invoke-CcsmDevSessionRecovery -Plan $devSession -IsMaintenance $IsMaintenance `
-            -GetListenerOwner { Get-CcsmGuardianListenerOwner } `
-            -GetProcessIdentity { param($ProcessId) Get-CcsmGuardianProcessIdentity -ProcessId $ProcessId } `
-            -StartDevSession {
-                param($DevPlan)
-                return Start-CcsmDevSessionLauncher -Plan $DevPlan
-            } -WriteEvent $WriteEvent
-        return
-    }
     Invoke-CcsmGuardianRecovery -InstalledExecutable $InstalledExecutable `
         -IsMaintenance $IsMaintenance `
         -InstalledExecutableExists { Test-Path -LiteralPath $InstalledExecutable -PathType Leaf } `

@@ -16,6 +16,9 @@ const upsertMock = vi.hoisted(() => {
   fn.mockResolvedValue(undefined);
   return fn;
 });
+const checkboxChangeHandlers = vi.hoisted(
+  () => new Map<string, (checked: boolean | "indeterminate") => void>(),
+);
 
 vi.mock("sonner", () => ({
   toast: {
@@ -91,15 +94,18 @@ vi.mock("@/components/JsonEditor", () => ({
 }));
 
 vi.mock("@/components/ui/checkbox", () => ({
-  Checkbox: ({ id, checked, onCheckedChange, ...rest }: any) => (
-    <input
-      type="checkbox"
-      id={id}
-      checked={checked ?? false}
-      onChange={(e) => onCheckedChange?.(e.target.checked)}
-      {...rest}
-    />
-  ),
+  Checkbox: ({ id, checked, onCheckedChange, ...rest }: any) => {
+    checkboxChangeHandlers.set(id, onCheckedChange);
+    return (
+      <input
+        type="checkbox"
+        id={id}
+        checked={checked ?? false}
+        onChange={(e) => onCheckedChange?.(e.target.checked)}
+        {...rest}
+      />
+    );
+  },
 }));
 
 vi.mock("@/components/ui/dialog", () => ({
@@ -145,6 +151,7 @@ describe("McpFormModal", () => {
     toastSuccessMock.mockClear();
     upsertMock.mockClear();
     upsertMock.mockResolvedValue(undefined);
+    checkboxChangeHandlers.clear();
   });
 
   const renderForm = (
@@ -449,6 +456,49 @@ type = "stdio"
     expect(onSave).toHaveBeenCalledTimes(1);
     expect(toastErrorMock).not.toHaveBeenCalled();
   });
+
+  it.each([
+    "claude",
+    "codex",
+    "gemini",
+    "grokbuild",
+    "opencode",
+    "hermes",
+  ] as const)(
+    "saves an indeterminate %s app checkbox as disabled",
+    async (app) => {
+      renderForm({
+        defaultEnabledApps: [
+          "claude",
+          "codex",
+          "gemini",
+          "grokbuild",
+          "opencode",
+          "openclaw",
+          "hermes",
+        ],
+      });
+      fireEvent.click(screen.getByText("preset-stdio"));
+
+      act(() => {
+        checkboxChangeHandlers.get(`enable-${app}`)?.("indeterminate");
+      });
+      fireEvent.click(screen.getByText("common.add"));
+
+      await waitFor(() => expect(upsertMock).toHaveBeenCalledTimes(1));
+      const [entry] = upsertMock.mock.calls.at(-1) ?? [];
+      expect(entry.apps).toEqual({
+        claude: true,
+        codex: true,
+        gemini: true,
+        grokbuild: true,
+        opencode: true,
+        openclaw: true,
+        hermes: true,
+        [app]: false,
+      });
+    },
+  );
 
   it("保存失败时展示翻译后的错误并恢复按钮", async () => {
     const failingSave = vi.fn().mockRejectedValue(new Error("保存失败"));

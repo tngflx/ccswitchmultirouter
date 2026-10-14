@@ -2168,6 +2168,8 @@ impl Database {
             // cache creation 是官方 pricing 页面单列的 cache writes，不与普通
             // input 混算，避免带 prompt cache 的请求少算费用。
             ("gpt-5.6-sol", "GPT-5.6 Sol", "5", "30", "0.50", "6.25"),
+            // GPT-6.1 Sol base pricing (models.dev, 2026-10).
+            ("gpt-6.1-sol", "GPT-6.1 Sol", "2", "10", "0.1", "2.5"),
             // 2026-07-30 OpenAI 降价：luna -80%、terra -20%，sol 不变（Fast mode 2× 价不入表）
             ("gpt-5.6-terra", "GPT-5.6 Terra", "2", "12", "0.20", "2.50"),
             (
@@ -2757,6 +2759,22 @@ impl Database {
             ),
             ("mimo-v2-pro", "MiMo V2 Pro", "0.435", "0.87", "0.0036", "0"),
             ("mimo-v2.5", "MiMo V2.5", "0.14", "0.29", "0.0028", "0"),
+            (
+                "mimo-v2.6-pro",
+                "MiMo V2.6 Pro",
+                "0.435",
+                "0.87",
+                "0.0036",
+                "0",
+            ),
+            (
+                "mimo-v2.6-flash",
+                "MiMo V2.6 Flash",
+                "0.14",
+                "0.28",
+                "0.0028",
+                "0",
+            ),
             (
                 "mimo-v2.5-pro",
                 "MiMo V2.5 Pro",

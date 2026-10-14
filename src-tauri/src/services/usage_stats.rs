@@ -6686,6 +6686,19 @@ mod tests {
             "应该能精确匹配 claude-sonnet-4-5-20250929"
         );
 
+        let gpt_61 = find_model_pricing_row(&conn, "gpt-6.1-sol")?
+            .expect("GPT-6.1 Sol should have seeded pricing");
+        assert_eq!(gpt_61.0, "2");
+        assert_eq!(gpt_61.1, "10");
+        let mimo_26 = find_model_pricing_row(&conn, "xiaomi/mimo-v2.6-pro")?
+            .expect("MiMo V2.6 Pro should have seeded pricing");
+        assert_eq!(mimo_26.0, "0.435");
+        assert_eq!(mimo_26.1, "0.87");
+        let mimo_26_flash = find_model_pricing_row(&conn, "xiaomi/mimo-v2.6-flash")?
+            .expect("MiMo V2.6 Flash should have seeded pricing");
+        assert_eq!(mimo_26_flash.0, "0.14");
+        assert_eq!(mimo_26_flash.1, "0.28");
+
         // 清洗：去除前缀和冒号后缀
         let result = find_model_pricing_row(&conn, "anthropic/claude-haiku-4.5")?;
         assert!(

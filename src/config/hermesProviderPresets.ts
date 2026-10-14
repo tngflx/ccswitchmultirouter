@@ -1541,6 +1541,38 @@ export const hermesProviderPresets: HermesProviderPreset[] = [
     },
   },
   {
+    name: "Kilo",
+    websiteUrl: "https://kilo.ai",
+    apiKeyUrl: "https://app.kilo.ai/profile",
+    settingsConfig: {
+      name: "kilo",
+      base_url: "https://api.kilo.ai/api/gateway",
+      api_key: "",
+      api_mode: "chat_completions",
+      models: [
+        {
+          id: "kilo-auto/free",
+          name: "Kilo Auto (Free)",
+        },
+        {
+          id: "minimax/minimax-m2.1:free",
+          name: "MiniMax M2.1 (Free)",
+        },
+        {
+          id: "z-ai/glm-5:free",
+          name: "GLM-5 (Free)",
+        },
+        {
+          id: "google/gemma-4-26b-a4b-it:free",
+          name: "Gemma 4 26B (Free)",
+        },
+      ],
+    },
+    category: "aggregator",
+    icon: "kilo",
+    iconColor: "#6E56CF",
+  },
+  {
     name: "TheRouter",
     websiteUrl: "https://therouter.ai",
     apiKeyUrl: "https://dashboard.therouter.ai",

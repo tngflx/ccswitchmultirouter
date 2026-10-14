@@ -14,6 +14,7 @@ import {
   X,
 } from "lucide-react";
 import { toast } from "sonner";
+import { confirmDialog } from "@/lib/dialog";
 
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -284,7 +285,7 @@ export function CodexHistoryRepairPanel({
     }
     const preview = await runHistoryRepair(true);
     if (!preview) return;
-    const confirmed = window.confirm(
+    const confirmed = await confirmDialog(
       [
         "Before confirming repair, fully exit the Codex / ChatGPT app.",
         "If the app is still running, CCSwitchMulti will refuse to write so the active app-server cannot overwrite the repair.",
@@ -310,6 +311,7 @@ export function CodexHistoryRepairPanel({
         "",
         "Write these changes now?",
       ].join("\n"),
+      { title: "Confirm history repair", kind: "warning" },
     );
     if (!confirmed) return;
     const applied = await runHistoryRepair(false);

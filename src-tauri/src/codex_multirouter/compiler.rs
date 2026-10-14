@@ -766,7 +766,7 @@ fn effective_capability_summary(
     } else if let Some(upstream) = string_field(model_entry, &["upstreamModel", "upstream_model"]) {
         let resolved = crate::reasoning_capabilities::resolve_codex_model_capability_core(
             &provider.settings_config,
-            None,
+            crate::reasoning_capabilities::provider_metadata::detect_platform(provider),
             upstream,
             None,
             None,

@@ -2531,6 +2531,55 @@ export const openclawProviderPresets: OpenClawProviderPreset[] = [
     },
   },
   {
+    name: "Kilo",
+    websiteUrl: "https://kilo.ai",
+    apiKeyUrl: "https://app.kilo.ai/profile",
+    settingsConfig: {
+      baseUrl: "https://api.kilo.ai/api/gateway",
+      apiKey: "",
+      api: "openai-completions",
+      models: [
+        {
+          id: "kilo-auto/free",
+          name: "Kilo Auto (Free)",
+        },
+        {
+          id: "minimax/minimax-m2.1:free",
+          name: "MiniMax M2.1 (Free)",
+        },
+        {
+          id: "z-ai/glm-5:free",
+          name: "GLM-5 (Free)",
+        },
+        {
+          id: "google/gemma-4-26b-a4b-it:free",
+          name: "Gemma 4 26B (Free)",
+        },
+      ],
+    },
+    category: "aggregator",
+    icon: "kilo",
+    iconColor: "#6E56CF",
+    templateValues: {
+      apiKey: {
+        label: "API Key",
+        placeholder: "kilo-...",
+        editorValue: "",
+      },
+    },
+    suggestedDefaults: {
+      model: { primary: "kilo/kilo-auto/free" },
+      modelCatalog: {
+        "kilo/kilo-auto/free": { alias: "Kilo Auto (Free)" },
+        "kilo/minimax/minimax-m2.1:free": { alias: "MiniMax M2.1 (Free)" },
+        "kilo/z-ai/glm-5:free": { alias: "GLM-5 (Free)" },
+        "kilo/google/gemma-4-26b-a4b-it:free": {
+          alias: "Gemma 4 26B (Free)",
+        },
+      },
+    },
+  },
+  {
     name: "TheRouter",
     websiteUrl: "https://therouter.ai",
     apiKeyUrl: "https://dashboard.therouter.ai",

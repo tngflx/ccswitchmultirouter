@@ -738,6 +738,15 @@ export const piModelCatalog = {
       maxTokens: 32_768,
     },
   },
+  "kilo/kilo-auto-free": {
+    capabilities: {
+      name: "Kilo Auto (Free)",
+      reasoning: false,
+      input: ["text"],
+      contextWindow: 256_000,
+      maxTokens: 32_768,
+    },
+  },
 } as const satisfies Record<string, PiModelCatalogEntry>;
 
 export type PiModelCatalogKey = keyof typeof piModelCatalog;

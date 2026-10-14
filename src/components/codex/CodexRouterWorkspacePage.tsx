@@ -58,6 +58,7 @@ import {
 } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import i18n from "@/i18n";
+import { confirmDialog } from "@/lib/dialog";
 import { Input } from "@/components/ui/input";
 import { applyCodexCatalogModelOrder } from "@/lib/codexModelCatalogOrder";
 import {
@@ -5511,12 +5512,18 @@ export function ModelOrderTab({
   async function hideModel(visibleModel: string) {
     const trimmed = visibleModel.trim();
     if (!trimmed) return;
-    const confirmed = window.confirm(
+    const confirmed = await confirmDialog(
       tr("codexRouterWorkspace.hideModelConfirm", {
         defaultValue:
           "Remove {{model}} from the Codex model picker?\n\nThe model will not appear in the picker or match MultiRouter routes. Restore it from Hidden models on this page.",
         model: trimmed,
       }),
+      {
+        title: tr("codexRouterWorkspace.hideModel", {
+          defaultValue: "Hide model",
+        }),
+        kind: "warning",
+      },
     );
     if (!confirmed) return;
     setIsSaving(true);
@@ -9293,6 +9300,7 @@ function StatusTab({
 
       {statusView === "request-health" && (
         <RequestHealthPanel
+          mode="status"
           snapshot={requestHealthSnapshot}
           isRefreshing={requestHealthLoading}
           onRefresh={() => void refreshRequestHealth()}

@@ -106,16 +106,6 @@ const CC_SWITCH_SUBAGENT_V2_POLICY_BEGIN: &str = "[CCSWITCHMULTI_SUBAGENT_V2_POL
 const CC_SWITCH_SUBAGENT_V2_POLICY_END: &str = "[CCSWITCHMULTI_SUBAGENT_V2_POLICY_END]";
 const CC_SWITCH_CODEX_AGENT_THREADS: i64 = 10;
 const CC_SWITCH_CODEX_AGENT_DEPTH: i64 = 1;
-const CODEX_REASONING_EFFORTS: &[(&str, &str)] = &[
-    ("low", "Fast responses with lighter reasoning"),
-    (
-        "medium",
-        "Balances speed and reasoning depth for everyday tasks",
-    ),
-    ("high", "Greater reasoning depth for complex problems"),
-    ("xhigh", "Extra high reasoning depth for complex problems"),
-];
-const CODEX_DEFAULT_REASONING_EFFORT: &str = "medium";
 const DEEPSEEK_WINDOWS_EXECUTION_GUIDANCE: &str = "On Windows, use PowerShell syntax and minimal directed commands. For content, use `rg <pattern> <named-path>`; for file discovery, use `rg --files <named-path>`. Use narrow `-g` includes and excludes, including `-g '!node_modules/**'`, `-g '!.git/**'`, `-g '!target/**'`, `-g '!dist/**'`, and `-g '!generated/**'`. First identify a narrow source or test subtree; never recursively scan a user profile/home, drive root, or broad repository root.\nDo not use Unix-only commands such as `wc`, and do not assume `Select-String -Recurse` exists; if `rg` is unavailable, only after identifying a narrow target use `Get-ChildItem -LiteralPath <narrow-target> -File -Recurse | Select-String`.\nFor ordinary read-only inspection, call tools without escalation metadata or a justification.\nStop and report as soon as the requested evidence is sufficient; do not keep scanning merely to be exhaustive.";
 
 /// Codex model catalog 的工具配置画像。
@@ -2025,13 +2015,18 @@ fn codex_catalog_model_specs(settings: &Value, config_text: &str) -> Vec<CodexCa
             .filter(|text| !text.is_empty())
             .map(ToString::to_string);
         // P2：catalog 投影与请求/Sub-Agent/inspect 走同一 resolver 核心，保证同一模型
-        // 四层 fingerprint 一致。catalog 是 provider-agnostic 投影：platform=None
-        // （official 来源生效）、detection=None（静态投影不读 TTL 检测缓存）。
+        // 四层 fingerprint 一致。草稿/已保存 Provider 的 base_url 会提供平台上下文，
+        // 让 OpenRouter/vLLM 的维护能力库条目也能命中；没有平台上下文时仍保持
+        // provider-agnostic 行为。detection=None（静态投影不读 TTL 检测缓存）。
         // 若 catalog 模型名是别名、上游模型名命中不同来源，则用上游名重试一次。
         let library = crate::reasoning_capabilities::catalog::global_library();
+        let platform =
+            crate::reasoning_capabilities::provider_metadata::detect_platform_from_settings(
+                &resolver_settings,
+            );
         let mut resolved = crate::reasoning_capabilities::resolve_codex_model_capability_core(
             &resolver_settings,
-            None,
+            platform,
             model,
             None,
             library.as_ref(),
@@ -2042,7 +2037,7 @@ fn codex_catalog_model_specs(settings: &Value, config_text: &str) -> Vec<CodexCa
                 let upstream_resolved =
                     crate::reasoning_capabilities::resolve_codex_model_capability_core(
                         &resolver_settings,
-                        None,
+                        platform,
                         upstream,
                         None,
                         library.as_ref(),
@@ -2646,13 +2641,7 @@ fn codex_provider_reasoning_efforts_toml_array(
                 })
                 .collect::<Vec<_>>()
         })
-        .filter(|levels| !levels.is_empty())
-        .unwrap_or_else(|| {
-            CODEX_REASONING_EFFORTS
-                .iter()
-                .map(|(effort, description)| (effort.to_string(), description.to_string()))
-                .collect()
-        });
+        .unwrap_or_default();
     for (effort, description) in normalized_levels {
         let mut level = InlineTable::new();
         level.insert(key, effort.into());
@@ -2776,7 +2765,8 @@ fn codex_provider_models_toml_array(
                     .or_else(|| entry.get("defaultReasoningEffort"))
             })
             .and_then(Value::as_str)
-            .unwrap_or(CODEX_DEFAULT_REASONING_EFFORT);
+            .map(str::trim)
+            .filter(|effort| !effort.is_empty());
         let supported_reasoning_levels =
             catalog_entry.and_then(|entry| entry.get("supported_reasoning_levels"));
         let mut model = InlineTable::new();
@@ -2802,9 +2792,11 @@ fn codex_provider_models_toml_array(
                 .unwrap_or(i64::MAX)
                 .into(),
         );
-        model.insert("default_reasoning_effort", default_reasoning_effort.into());
-        model.insert("default_reasoning_level", default_reasoning_effort.into());
-        model.insert("defaultReasoningEffort", default_reasoning_effort.into());
+        if let Some(default_reasoning_effort) = default_reasoning_effort {
+            model.insert("default_reasoning_effort", default_reasoning_effort.into());
+            model.insert("default_reasoning_level", default_reasoning_effort.into());
+            model.insert("defaultReasoningEffort", default_reasoning_effort.into());
+        }
         model.insert(
             "supported_reasoning_levels",
             codex_provider_reasoning_efforts_toml_array(supported_reasoning_levels, "effort"),
@@ -5302,9 +5294,12 @@ fn resolve_codex_model_reasoning_capability_value(
     let detection = crate::reasoning_capabilities::current_detection(provider_id, &model);
     let library = crate::reasoning_capabilities::catalog::global_library();
     let official_models = codex_official_models_cache().unwrap_or_default();
+    let platform = crate::reasoning_capabilities::provider_metadata::detect_platform_from_settings(
+        settings_config,
+    );
     let resolved = crate::reasoning_capabilities::resolve_codex_model_capability_core(
         settings_config,
-        None,
+        platform,
         &model,
         detection.as_ref(),
         library.as_ref(),
@@ -5320,7 +5315,10 @@ fn resolve_codex_model_reasoning_capability_value(
         source: resolved.source.as_str().to_string(),
         fingerprint: resolved.fingerprint,
         resolved: resolved_capability,
-        has_detection_candidate: detection.is_some(),
+        has_detection_candidate: detection
+            .as_ref()
+            .and_then(crate::reasoning_capabilities::snapshot_to_capability)
+            .is_some(),
         detection,
     }
 }
@@ -14852,6 +14850,46 @@ openai_base_url = "http://127.0.0.1:15721/v1"
         );
         assert!(entry.get("default_reasoning_level").is_none());
         assert_eq!(entry.get("supported_reasoning_levels"), Some(&json!([])));
+
+        let config = r#"model_provider = "codex_model_router_v2"
+
+[model_providers.codex_model_router_v2]
+base_url = "http://127.0.0.1:15721/v1"
+"#;
+        let projected = set_codex_model_catalog_projection_fields(
+            config,
+            Some(Path::new("catalog")),
+            Some(&[spec]),
+            Some(&json!({"models": [entry]})),
+            true,
+        )
+        .expect("project unknown model");
+        let parsed: toml::Value = toml::from_str(&projected).expect("parse projected config");
+        let inline = parsed["model_providers"]["codex_model_router_v2"]["models"]
+            .as_array()
+            .and_then(|models| models.first())
+            .expect("inline unknown model");
+        for field in [
+            "supported_reasoning_levels",
+            "supported_reasoning_efforts",
+            "supportedReasoningEfforts",
+        ] {
+            assert_eq!(
+                inline[field].as_array().map(Vec::len),
+                Some(0),
+                "unknown models must not inherit generic levels in {field}"
+            );
+        }
+        for field in [
+            "default_reasoning_level",
+            "default_reasoning_effort",
+            "defaultReasoningEffort",
+        ] {
+            assert!(
+                inline.get(field).is_none(),
+                "unknown models must not inherit a generic default in {field}"
+            );
+        }
     }
 
     #[test]
@@ -15145,7 +15183,9 @@ openai_base_url = "http://127.0.0.1:15721/v1"
     }
 
     #[test]
+    #[serial]
     fn codex_model_catalog_projects_distinct_step_model_efforts() {
+        let _home = TestHomeGuard::new();
         let settings = json!({
             "modelCatalog": { "models": [
                 {
@@ -15279,6 +15319,88 @@ openai_base_url = "http://127.0.0.1:15721/v1"
         );
         assert_eq!(spec.reasoning_fingerprint, resolved.fingerprint);
         assert_eq!(spec.reasoning_source, resolved.source.as_str());
+    }
+
+    #[test]
+    fn openrouter_catalog_uses_platform_specific_reasoning_library_entries() {
+        let settings = json!({
+            "providerName": "OpenRouter",
+            "base_url": "https://openrouter.ai/api/v1",
+            "modelCatalog": {
+                "models": [{ "model": "deepseek/deepseek-v4-pro" }]
+            }
+        });
+        let specs = codex_catalog_model_specs(&settings, "");
+        let spec = specs
+            .iter()
+            .find(|spec| spec.model == "deepseek/deepseek-v4-pro")
+            .expect("OpenRouter model spec");
+        assert_eq!(spec.reasoning_source, "library");
+        assert_eq!(
+            spec.reasoning
+                .as_ref()
+                .map(|capability| capability.supported_efforts.clone()),
+            Some(vec![
+                "max".to_string(),
+                "high".to_string(),
+                "low".to_string()
+            ])
+        );
+    }
+
+    #[test]
+    fn openrouter_mimo_v26_models_do_not_inherit_codex_medium_or_effort_levels() {
+        let settings = json!({
+            "providerName": "OpenRouter",
+            "base_url": "https://openrouter.ai/api/v1",
+            "modelCatalog": {
+                "models": [
+                    { "model": "xiaomi/mimo-v2.6-flash" },
+                    { "model": "xiaomi/mimo-v2.6-pro" }
+                ]
+            }
+        });
+        let specs = codex_catalog_model_specs(&settings, "");
+        let catalog = codex_model_catalog_from_specs(
+            &specs,
+            &json!({
+                "slug": "gpt-5.5",
+                "display_name": "GPT-5.5",
+                "default_reasoning_level": "medium",
+                "supported_reasoning_levels": [
+                    { "effort": "low" },
+                    { "effort": "medium" },
+                    { "effort": "high" }
+                ]
+            }),
+            CodexCatalogToolProfile::ProxyChat,
+            128_000,
+        );
+        let config = r#"model_provider = "codex_model_router_v2"
+
+[model_providers.codex_model_router_v2]
+base_url = "http://127.0.0.1:15721/v1"
+"#;
+        let projected = set_codex_model_catalog_projection_fields(
+            config,
+            Some(Path::new("catalog")),
+            Some(&specs),
+            Some(&catalog),
+            true,
+        )
+        .expect("project MiMo catalog");
+        let parsed: toml::Value = toml::from_str(&projected).expect("parse projected config");
+        let models = parsed["model_providers"]["codex_model_router_v2"]["models"]
+            .as_array()
+            .expect("inline MiMo models");
+        assert_eq!(models.len(), 2);
+        for model in models {
+            assert!(model.get("default_reasoning_level").is_none());
+            assert_eq!(
+                model["supported_reasoning_levels"].as_array().map(Vec::len),
+                Some(0)
+            );
+        }
     }
 
     // ===== P0 契约：三态 schema 的 catalog 投影 =====
@@ -18002,6 +18124,13 @@ models = [{ model = "stale-model" }]
             "display_name": "GPT-5.5",
             "model_messages": { "instructions_template": "template" },
             "context_window": 128000,
+            "default_reasoning_level": "medium",
+            "supported_reasoning_levels": [
+                { "effort": "low", "description": "Fast" },
+                { "effort": "medium", "description": "Balanced" },
+                { "effort": "high", "description": "Deep" },
+                { "effort": "xhigh", "description": "Extra deep" }
+            ],
             "additional_speed_tiers": ["fast"],
             "service_tiers": [{
                 "id": "priority",
@@ -18149,6 +18278,44 @@ base_url = "http://127.0.0.1:15721/v1"
         );
 
         let cache: Value = read_json_file(&get_codex_models_cache_path()).expect("read cache");
+        let catalog: Value = read_json_file(&get_codex_model_catalog_path()).expect("read catalog");
+        let inline_official_efforts = inline_official_model["supported_reasoning_levels"]
+            .as_array()
+            .expect("inline reasoning levels")
+            .iter()
+            .filter_map(|level| level["effort"].as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            inline_official_efforts,
+            vec!["low", "medium", "high", "xhigh"]
+        );
+        assert_eq!(
+            inline_official_model["default_reasoning_level"].as_str(),
+            Some("medium")
+        );
+        for projection in [&catalog, &cache] {
+            let official_model = projection["models"]
+                .as_array()
+                .expect("projected models")
+                .iter()
+                .find(|model| model["slug"].as_str() == Some("gpt-5.5"))
+                .expect("projected official model");
+            let efforts = official_model["supported_reasoning_levels"]
+                .as_array()
+                .expect("projected reasoning levels")
+                .iter()
+                .filter_map(|level| level["effort"].as_str())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                efforts, inline_official_efforts,
+                "catalog, cache, and inline models must preserve identical official effort choices"
+            );
+            assert_eq!(
+                official_model["default_reasoning_level"].as_str(),
+                inline_official_model["default_reasoning_level"].as_str(),
+                "catalog, cache, and inline models must preserve the official default effort"
+            );
+        }
         let slugs = cache
             .get("models")
             .and_then(|models| models.as_array())
@@ -18540,6 +18707,97 @@ wire_api = "responses"
             catalog["ccSwitchRoutingDependencyFingerprint"],
             "fingerprint-v2"
         );
+    }
+
+    #[test]
+    #[serial]
+    fn orchestration_save_projects_and_removes_models_from_every_codex_picker_file() {
+        let _home = TestHomeGuard::new();
+        let db = crate::database::Database::memory().expect("memory database");
+        let mut source = Provider::with_id(
+            "source".into(),
+            "Worker".into(),
+            json!({"modelCatalog": {"models": [{"model": "worker"}]}}),
+            None,
+        );
+        source.meta = Some(crate::provider::ProviderMeta {
+            api_format: Some("openai_responses".into()),
+            ..Default::default()
+        });
+        let router = Provider::with_id(
+            "router".into(),
+            "Router".into(),
+            json!({"codexRouting": {
+                "schemaVersion": 2, "enabled": true, "defaultRouteId": "worker",
+                "routes": [{"id": "worker", "enabled": true, "targetProviderId": "source",
+                    "modelSelection": {"mode": "all"}, "authPolicy": {"source": "provider_config"}}]
+            }}),
+            None,
+        );
+        db.save_provider("codex", &source).unwrap();
+        db.save_provider("codex", &router).unwrap();
+        write_codex_live_config_atomic(Some(
+            "model_provider = \"codex_model_router_v2\"\n\
+             [model_providers.codex_model_router_v2]\n\
+             base_url = \"http://127.0.0.1:15721/v1\"\nwire_api = \"responses\"\n",
+        ))
+        .unwrap();
+        seed_codex_models_cache(json!([]));
+        let mut settings = crate::orchestration::fixture();
+        settings.profiles[0].worker.provider_id = "source".into();
+        db.save_provider(
+            "claude",
+            &Provider::with_id("same".into(), "Planner".into(), json!({}), None),
+        )
+        .unwrap();
+        for enabled in [true, false, true] {
+            settings.enabled = enabled;
+            db.save_orchestration_settings(&settings).unwrap();
+            let artifact =
+                crate::codex_multirouter::projection::build_projection_artifact(&db, "router")
+                    .unwrap();
+            let readback = publish_codex_multirouter_projection_for_database(
+                &db,
+                &artifact.projection_settings,
+            )
+            .unwrap();
+            assert!(
+                readback.catalog_verified && readback.cache_verified && readback.config_verified
+            );
+            for path in [
+                get_codex_model_catalog_path(),
+                get_codex_models_cache_path(),
+            ] {
+                let catalog: Value = read_json_file(&path).unwrap();
+                let ids = catalog["models"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter_map(codex_model_stable_id)
+                    .collect::<Vec<_>>();
+                assert!(ids.iter().any(|id| id == "worker"));
+                assert_eq!(ids.iter().any(|id| id == "ccsm-orch/test"), enabled);
+                assert_eq!(ids.iter().any(|id| id == "ccsm-role/test/worker"), enabled);
+            }
+            let config: toml::Value = toml::from_str(&read_codex_config_text().unwrap()).unwrap();
+            let inline = config["model_providers"]["codex_model_router_v2"]["models"]
+                .as_array()
+                .unwrap();
+            assert_eq!(
+                inline
+                    .iter()
+                    .any(|row| row.get("model").and_then(toml::Value::as_str)
+                        == Some("ccsm-orch/test")),
+                enabled
+            );
+            assert_eq!(
+                db.get_provider_by_id("source", "codex")
+                    .unwrap()
+                    .unwrap()
+                    .settings_config,
+                source.settings_config
+            );
+        }
     }
 
     #[test]

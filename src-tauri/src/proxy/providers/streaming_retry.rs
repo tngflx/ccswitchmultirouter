@@ -128,6 +128,109 @@ fn emit_retry_activity(
     });
 }
 
+struct StreamRetryActivityGuard {
+    context: Option<StreamLogContext>,
+    stream_id: String,
+    retry_started: bool,
+    finished: bool,
+}
+
+impl StreamRetryActivityGuard {
+    fn new(context: Option<StreamLogContext>) -> Self {
+        Self {
+            stream_id: context
+                .as_ref()
+                .map(|_| uuid::Uuid::new_v4().to_string())
+                .unwrap_or_default(),
+            context,
+            retry_started: false,
+            finished: false,
+        }
+    }
+
+    fn emit(
+        &mut self,
+        stage: &str,
+        event: &str,
+        attempt: u32,
+        max_attempts: u32,
+        reason_class: Option<&str>,
+    ) {
+        if !self.finished {
+            self.retry_started |= matches!(event, "retry_scheduled" | "reconnect_failed");
+            self.report(event, attempt, reason_class);
+        }
+        emit_retry_activity(
+            self.context.as_ref(),
+            stage,
+            event,
+            attempt,
+            max_attempts,
+            reason_class,
+        );
+    }
+
+    fn report(&self, event: &str, attempt: u32, reason_class: Option<&str>) {
+        let Some(context) = self.context.as_ref() else {
+            return;
+        };
+        crate::watchdog::report_dev_retry_activity(
+            event,
+            &self.stream_id,
+            &context.provider_id,
+            attempt,
+            reason_class,
+        );
+        #[cfg(test)]
+        capture_test_dev_retry_activity(
+            event,
+            &self.stream_id,
+            &context.provider_id,
+            attempt,
+            reason_class,
+        );
+    }
+
+    fn finish(&mut self) {
+        if self.finished {
+            return;
+        }
+        self.finished = true;
+        if self.retry_started {
+            self.report("stream_finished", 0, None);
+        }
+    }
+}
+
+impl Drop for StreamRetryActivityGuard {
+    fn drop(&mut self) {
+        if self.retry_started && !self.finished {
+            self.report("stream_cancelled", 0, None);
+        }
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_DEV_RETRY_PACKETS: std::cell::RefCell<Vec<Value>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+#[cfg(test)]
+fn capture_test_dev_retry_activity(
+    event: &str,
+    stream_id: &str,
+    provider_id: &str,
+    attempt: u32,
+    reason_class: Option<&str>,
+) {
+    if let Some(packet) =
+        crate::watchdog::dev_retry_packet(event, stream_id, provider_id, attempt, reason_class)
+    {
+        TEST_DEV_RETRY_PACKETS.with(|packets| packets.borrow_mut().push(packet));
+    }
+}
+
 impl StreamReconnector {
     pub fn new(connect: ConnectFn, first_byte_timeout: Duration) -> Self {
         Self {
@@ -216,6 +319,7 @@ pub(crate) fn create_resilient_anthropic_upstream_sse_stream(
     log_context: Option<StreamLogContext>,
 ) -> impl Stream<Item = Result<Bytes, std::io::Error>> + Send {
     async_stream::stream! {
+        let mut retry_activity = StreamRetryActivityGuard::new(log_context.clone());
         let mut current = Some(initial);
         let mut semantic_output_seen = false;
         let mut retry_attempt = 0u32;
@@ -263,6 +367,7 @@ pub(crate) fn create_resilient_anthropic_upstream_sse_stream(
                     Ok(chunk) => chunk,
                     Err(error) => {
                         if semantic_output_seen {
+                            retry_activity.finish();
                             yield Err(error);
                             break 'attempts;
                         }
@@ -295,7 +400,17 @@ pub(crate) fn create_resilient_anthropic_upstream_sse_stream(
                         scaffold_forwarded = true;
                     }
                     semantic_output_seen |= anthropic_sse_block_is_semantic(&block);
+                    let terminal = matches!(
+                        raw_responses_sse_event_name(&block).as_deref(),
+                        Some("message_stop" | "error")
+                    );
+                    if terminal {
+                        retry_activity.finish();
+                    }
                     yield Ok(block);
+                    if terminal {
+                        break 'attempts;
+                    }
                 }
                 if swallowed_capacity_block.is_some() {
                     break;
@@ -307,6 +422,7 @@ pub(crate) fn create_resilient_anthropic_upstream_sse_stream(
             };
             let is_capacity_retry = swallowed_capacity_block.is_some();
             let Some(reconnector) = reconnector.as_ref() else {
+                retry_activity.finish();
                 if let Some(capacity_block) = swallowed_capacity_block {
                     yield Ok(capacity_block);
                 } else {
@@ -315,6 +431,7 @@ pub(crate) fn create_resilient_anthropic_upstream_sse_stream(
                 break;
             };
             if semantic_output_seen && !is_capacity_retry {
+                retry_activity.finish();
                 yield Err(std::io::Error::other(reason));
                 break;
             }
@@ -332,14 +449,14 @@ pub(crate) fn create_resilient_anthropic_upstream_sse_stream(
                     } else {
                         "transport_retry_exhausted"
                     };
-                    emit_retry_activity(
-                        log_context.as_ref(),
+                    retry_activity.emit(
                         "anthropic_messages",
                         "retries_exhausted",
                         retry_attempt,
                         retry_limit,
                         Some(exhausted_class),
                     );
+                    retry_activity.finish();
                     if let Some(capacity_block) = swallowed_capacity_block {
                         yield Ok(capacity_block);
                     } else {
@@ -349,8 +466,7 @@ pub(crate) fn create_resilient_anthropic_upstream_sse_stream(
                 }
 
                 retry_attempt += 1;
-                emit_retry_activity(
-                    log_context.as_ref(),
+                retry_activity.emit(
                     "anthropic_messages",
                     "retry_scheduled",
                     retry_attempt,
@@ -390,8 +506,7 @@ pub(crate) fn create_resilient_anthropic_upstream_sse_stream(
                 }
                 match reconnector.connect().await {
                     Ok(response) if response.status().is_success() => {
-                        emit_retry_activity(
-                            log_context.as_ref(),
+                        retry_activity.emit(
                             "anthropic_messages",
                             "reconnected",
                             retry_attempt,
@@ -404,8 +519,7 @@ pub(crate) fn create_resilient_anthropic_upstream_sse_stream(
                     Ok(response) => {
                         let status = response.status();
                         reason = format!("reconnect got HTTP {} from upstream", status.as_u16());
-                        emit_retry_activity(
-                            log_context.as_ref(),
+                        retry_activity.emit(
                             "anthropic_messages",
                             "reconnect_failed",
                             retry_attempt,
@@ -416,8 +530,7 @@ pub(crate) fn create_resilient_anthropic_upstream_sse_stream(
                     }
                     Err(error) => {
                         reason = format!("reconnect failed: {error}");
-                        emit_retry_activity(
-                            log_context.as_ref(),
+                        retry_activity.emit(
                             "anthropic_messages",
                             "reconnect_failed",
                             retry_attempt,
@@ -428,6 +541,7 @@ pub(crate) fn create_resilient_anthropic_upstream_sse_stream(
                 }
             }
         }
+        retry_activity.finish();
     }
 }
 
@@ -897,6 +1011,7 @@ pub(crate) fn create_resilient_responses_sse_stream_with_context(
     capacity_retry_enabled: bool,
 ) -> impl Stream<Item = Result<Bytes, std::io::Error>> + Send {
     async_stream::stream! {
+        let mut retry_activity = StreamRetryActivityGuard::new(log_context.clone());
         let mut retry_attempt = 0;
         let mut created_forwarded = false;
         let mut response_id: Option<String> = None;
@@ -935,6 +1050,7 @@ pub(crate) fn create_resilient_responses_sse_stream_with_context(
                     if semantic_output_forwarded {
                         let message = "Upstream Responses SSE ended without a terminal event after semantic output";
                         log::error!("[Codex/Responses] {message}");
+                        retry_activity.finish();
                         yield Ok(native_responses_failed_terminal_sse(
                             response_id.as_deref(),
                             "upstream_terminal_event_missing",
@@ -954,6 +1070,7 @@ pub(crate) fn create_resilient_responses_sse_stream_with_context(
                                 "[Codex/Responses] upstream stream failed after semantic output: {}; client_message={message}",
                                 crate::proxy::error::error_chain_message(&error)
                             );
+                            retry_activity.finish();
                             yield Ok(native_responses_failed_terminal_sse(
                                 response_id.as_deref(),
                                 "stream_error",
@@ -1001,6 +1118,7 @@ pub(crate) fn create_resilient_responses_sse_stream_with_context(
                             match disposition {
                                 NativeResponsesTerminalDisposition::Completed
                                 | NativeResponsesTerminalDisposition::Incomplete => {
+                                    retry_activity.finish();
                                     yield Ok(block);
                                 }
                                 NativeResponsesTerminalDisposition::Failed => {
@@ -1016,6 +1134,7 @@ pub(crate) fn create_resilient_responses_sse_stream_with_context(
                                         retrying_capacity = true;
                                         break 'stream "upstream reported model capacity pressure".into();
                                     }
+                                    retry_activity.finish();
                                     yield Ok(native_responses_client_failure(block, response_id.as_deref()));
                                 }
                                 NativeResponsesTerminalDisposition::ProtocolError {
@@ -1025,6 +1144,7 @@ pub(crate) fn create_resilient_responses_sse_stream_with_context(
                                     log::error!(
                                         "[Codex/Responses] rejected invalid terminal event: code={code}; {message}"
                                     );
+                                    retry_activity.finish();
                                     yield Ok(native_responses_failed_terminal_sse(
                                         response_id.as_deref(),
                                         code,
@@ -1050,6 +1170,7 @@ pub(crate) fn create_resilient_responses_sse_stream_with_context(
                         "Upstream Responses SSE ended without a terminal event"
                     };
                     log::error!("[Codex/Responses] {message}: {reason}");
+                    retry_activity.finish();
                     yield Ok(native_responses_failed_terminal_sse(
                         response_id.as_deref(),
                         "upstream_terminal_event_missing",
@@ -1064,8 +1185,7 @@ pub(crate) fn create_resilient_responses_sse_stream_with_context(
                     } else {
                         "上游响应流在输出正文前反复中断，自动重连已耗尽，请检查网络或代理后重试"
                     };
-                    emit_retry_activity(
-                        log_context.as_ref(),
+                    retry_activity.emit(
                         "native_responses",
                         "retries_exhausted",
                         retry_attempt,
@@ -1079,6 +1199,7 @@ pub(crate) fn create_resilient_responses_sse_stream_with_context(
                     log::error!(
                         "[Codex/Responses] stream failed after {retry_attempt} reconnect attempt(s): {reason}; client_message={message}"
                     );
+                    retry_activity.finish();
                     yield Ok(native_responses_failed_terminal_sse(
                         response_id.as_deref(),
                         if retrying_capacity { "capacity_retry_exhausted" } else { "stream_error" },
@@ -1096,8 +1217,7 @@ pub(crate) fn create_resilient_responses_sse_stream_with_context(
                         "[Codex/Responses] upstream stream dropped before semantic output ({reason}); reconnecting (attempt {retry_attempt}/{retry_limit})"
                     );
                 }
-                emit_retry_activity(
-                    log_context.as_ref(),
+                retry_activity.emit(
                     "native_responses",
                     "retry_scheduled",
                     retry_attempt,
@@ -1127,8 +1247,7 @@ pub(crate) fn create_resilient_responses_sse_stream_with_context(
                 }
                 match reconnector.connect().await {
                     Ok(response) if response.status().is_success() => {
-                        emit_retry_activity(
-                            log_context.as_ref(),
+                        retry_activity.emit(
                             "native_responses",
                             "reconnected",
                             retry_attempt,
@@ -1140,8 +1259,7 @@ pub(crate) fn create_resilient_responses_sse_stream_with_context(
                     }
                     Ok(response) => {
                         reason = format!("reconnect got HTTP {} from upstream", response.status().as_u16());
-                        emit_retry_activity(
-                            log_context.as_ref(),
+                        retry_activity.emit(
                             "native_responses",
                             "reconnect_failed",
                             retry_attempt,
@@ -1151,8 +1269,7 @@ pub(crate) fn create_resilient_responses_sse_stream_with_context(
                         crate::proxy::error_journal::capture_discarded_response(response);
                     }
                     Err(error) => {
-                        emit_retry_activity(
-                            log_context.as_ref(),
+                        retry_activity.emit(
                             "native_responses",
                             "reconnect_failed",
                             retry_attempt,
@@ -1164,6 +1281,7 @@ pub(crate) fn create_resilient_responses_sse_stream_with_context(
                 }
             }
         }
+        retry_activity.finish();
     }
 }
 
@@ -1178,6 +1296,7 @@ pub(crate) fn create_resilient_chat_sse_stream_with_context(
     log_context: Option<StreamLogContext>,
 ) -> impl Stream<Item = Result<Bytes, std::io::Error>> + Send {
     async_stream::stream! {
+        let mut retry_activity = StreamRetryActivityGuard::new(log_context.clone());
         let mut attempt = 0;
         let mut current = Some(initial);
         let mut scaffold_forwarded = false;
@@ -1240,6 +1359,7 @@ pub(crate) fn create_resilient_chat_sse_stream_with_context(
                                     attempt,
                                 );
                             }
+                            retry_activity.finish();
                             yield Ok(chat_transport_error_sse(message));
                             terminal = true;
                         } else {
@@ -1259,6 +1379,7 @@ pub(crate) fn create_resilient_chat_sse_stream_with_context(
                         ChatSseBlockDisposition::Comment => yield Ok(block),
                         ChatSseBlockDisposition::Done => {
                             terminal = true;
+                            retry_activity.finish();
                             yield Ok(block);
                             break;
                         }
@@ -1291,6 +1412,7 @@ pub(crate) fn create_resilient_chat_sse_stream_with_context(
                             }
                             semantic_output_forwarded = true;
                             terminal = true;
+                            retry_activity.finish();
                             yield Ok(block);
                             break;
                         }
@@ -1329,6 +1451,7 @@ pub(crate) fn create_resilient_chat_sse_stream_with_context(
                             attempt,
                         );
                     }
+                    retry_activity.finish();
                     yield Ok(chat_transport_error_sse(message));
                     break 'attempts;
                 }
@@ -1339,6 +1462,7 @@ pub(crate) fn create_resilient_chat_sse_stream_with_context(
                     if let Some(context) = log_context.as_ref() {
                         log_chat_stream_drop(context, &reason_class, &reason, attempt);
                     }
+                    retry_activity.finish();
                     yield Ok(chat_transport_error_sse(message));
                     break 'attempts;
                 };
@@ -1356,8 +1480,7 @@ pub(crate) fn create_resilient_chat_sse_stream_with_context(
                         log::error!(
                             "[Chat/Completions] stream failed after {attempt} reconnect attempt(s): {reason}"
                         );
-                        emit_retry_activity(
-                            log_context.as_ref(),
+                        retry_activity.emit(
                             "chat_completions",
                             "retries_exhausted",
                             attempt,
@@ -1367,13 +1490,13 @@ pub(crate) fn create_resilient_chat_sse_stream_with_context(
                         if let Some(context) = log_context.as_ref() {
                             log_chat_stream_drop(context, "retries_exhausted", &reason, attempt);
                         }
+                        retry_activity.finish();
                         yield Ok(chat_retries_exhausted_error_sse(message));
                         break 'attempts;
                     }
 
                     attempt = attempt.saturating_add(1);
-                    emit_retry_activity(
-                        log_context.as_ref(),
+                    retry_activity.emit(
                         "chat_completions",
                         "retry_scheduled",
                         attempt,
@@ -1411,8 +1534,7 @@ pub(crate) fn create_resilient_chat_sse_stream_with_context(
                     }
                     match reconnector.connect().await {
                         Ok(response) if response.status().is_success() => {
-                            emit_retry_activity(
-                                log_context.as_ref(),
+                            retry_activity.emit(
                                 "chat_completions",
                                 "reconnected",
                                 attempt,
@@ -1428,8 +1550,7 @@ pub(crate) fn create_resilient_chat_sse_stream_with_context(
                                 response.status().as_u16()
                             );
                             reason_class = "reconnect_http_failure".into();
-                            emit_retry_activity(
-                                log_context.as_ref(),
+                            retry_activity.emit(
                                 "chat_completions",
                                 "reconnect_failed",
                                 attempt,
@@ -1441,8 +1562,7 @@ pub(crate) fn create_resilient_chat_sse_stream_with_context(
                         Err(error) => {
                             reason = format!("reconnect failed: {error}");
                             reason_class = "reconnect_transport_failure".into();
-                            emit_retry_activity(
-                                log_context.as_ref(),
+                            retry_activity.emit(
                                 "chat_completions",
                                 "reconnect_failed",
                                 attempt,
@@ -1454,6 +1574,7 @@ pub(crate) fn create_resilient_chat_sse_stream_with_context(
                 }
             }
         }
+        retry_activity.finish();
     }
 }
 
@@ -1663,6 +1784,7 @@ fn scan_chunk(chunk: &str) -> Vec<ScannedEvent> {
         // 分类只关心这四种身份，映射为静态名以避免借用局部 buffer。
         let name_owned: &'static str = match name {
             "message_start" => "message_start",
+            "message_stop" => "message_stop",
             "ping" => "ping",
             "error" => "error",
             _ => "",
@@ -1723,6 +1845,7 @@ pub(crate) fn create_resilient_anthropic_sse_stream_from_responses_with_web_sear
     log_context: Option<StreamLogContext>,
 ) -> impl Stream<Item = Result<Bytes, std::io::Error>> + Send {
     async_stream::stream! {
+        let mut retry_activity = StreamRetryActivityGuard::new(log_context.clone());
         let Some(reconnector) = reconnector else {
             // 无重连工厂：不做重试，但思考期心跳与主循环保持同款语义。
             let translated = create_anthropic_sse_stream_from_responses_with_web_search_options(
@@ -1749,16 +1872,19 @@ pub(crate) fn create_resilient_anthropic_sse_stream_from_responses_with_web_sear
                 };
                 let Some(item) = next else { break };
                 if let Ok(chunk) = &item {
-                    if !message_start_forwarded
-                        && scan_chunk(&String::from_utf8_lossy(chunk))
-                            .iter()
-                            .any(|event| event.name == "message_start")
-                    {
+                    let events = scan_chunk(&String::from_utf8_lossy(chunk));
+                    if !message_start_forwarded && events.iter().any(|event| event.name == "message_start") {
                         message_start_forwarded = true;
                     }
+                    if events.iter().any(|event| matches!(event.name, "message_stop" | "error")) {
+                        retry_activity.finish();
+                    }
+                } else {
+                    retry_activity.finish();
                 }
                 yield item;
             }
+            retry_activity.finish();
             return;
         };
 
@@ -1844,6 +1970,7 @@ pub(crate) fn create_resilient_anthropic_sse_stream_from_responses_with_web_sear
                     Ok(chunk) => chunk,
                     // 当前转换器从不产出 Err；防御性透传并终止。
                     Err(error) => {
+                        retry_activity.finish();
                         yield Err(error);
                         return;
                     }
@@ -1865,6 +1992,9 @@ pub(crate) fn create_resilient_anthropic_sse_stream_from_responses_with_web_sear
                     } else if event.name != "ping" {
                         content_forwarded = true;
                     }
+                    if matches!(event.name, "message_stop" | "error") {
+                        retry_activity.finish();
+                    }
                     forward.push_str(&event.raw);
                 }
                 if !forward.is_empty() {
@@ -1883,8 +2013,7 @@ pub(crate) fn create_resilient_anthropic_sse_stream_from_responses_with_web_sear
             loop {
                 let retry_limit = reconnector.retry_limit();
                 if attempt >= retry_limit {
-                    emit_retry_activity(
-                        log_context.as_ref(),
+                    retry_activity.emit(
                         "anthropic_messages",
                         "retries_exhausted",
                         attempt,
@@ -1894,6 +2023,7 @@ pub(crate) fn create_resilient_anthropic_sse_stream_from_responses_with_web_sear
                     log::error!(
                         "[Claude/Responses] stream failed after {attempt} reconnect attempt(s): {reason}"
                     );
+                    retry_activity.finish();
                     yield Ok(anthropic_error_sse(
                         &format!(
                             "Responses upstream stream failed after {attempt} reconnect attempt(s): {reason}"
@@ -1906,8 +2036,7 @@ pub(crate) fn create_resilient_anthropic_sse_stream_from_responses_with_web_sear
                 log::warn!(
                     "[Claude/Responses] upstream stream dropped before any content reached the client ({reason}); reconnecting (attempt {attempt}/{retry_limit})"
                 );
-                emit_retry_activity(
-                    log_context.as_ref(),
+                retry_activity.emit(
                     "anthropic_messages",
                     "retry_scheduled",
                     attempt,
@@ -1935,8 +2064,7 @@ pub(crate) fn create_resilient_anthropic_sse_stream_from_responses_with_web_sear
                 };
                 match connect_result {
                     Ok(response) if response.status().is_success() => {
-                        emit_retry_activity(
-                            log_context.as_ref(),
+                        retry_activity.emit(
                             "anthropic_messages",
                             "reconnected",
                             attempt,
@@ -1951,8 +2079,7 @@ pub(crate) fn create_resilient_anthropic_sse_stream_from_responses_with_web_sear
                             "reconnect got HTTP {} from upstream",
                             response.status().as_u16()
                         );
-                        emit_retry_activity(
-                            log_context.as_ref(),
+                        retry_activity.emit(
                             "anthropic_messages",
                             "reconnect_failed",
                             attempt,
@@ -1962,8 +2089,7 @@ pub(crate) fn create_resilient_anthropic_sse_stream_from_responses_with_web_sear
                         crate::proxy::error_journal::capture_discarded_response(response);
                     }
                     Err(error) => {
-                        emit_retry_activity(
-                            log_context.as_ref(),
+                        retry_activity.emit(
                             "anthropic_messages",
                             "reconnect_failed",
                             attempt,
@@ -1975,6 +2101,7 @@ pub(crate) fn create_resilient_anthropic_sse_stream_from_responses_with_web_sear
                 }
             }
         }
+        retry_activity.finish();
     }
 }
 
@@ -2133,6 +2260,391 @@ mod tests {
             http::HeaderMap::new(),
             stream::iter(items),
         )
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum DevWatchdogProtocol {
+        Responses,
+        Chat,
+        Anthropic,
+        Translated,
+    }
+
+    const DEV_WATCHDOG_PROTOCOLS: [DevWatchdogProtocol; 4] = [
+        DevWatchdogProtocol::Responses,
+        DevWatchdogProtocol::Chat,
+        DevWatchdogProtocol::Anthropic,
+        DevWatchdogProtocol::Translated,
+    ];
+
+    fn dev_watchdog_frames(protocol: DevWatchdogProtocol) -> (String, String, String) {
+        match protocol {
+            DevWatchdogProtocol::Responses | DevWatchdogProtocol::Translated => {
+                (created(), text_delta("redacted-output"), completed())
+            }
+            DevWatchdogProtocol::Chat => (
+                "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\"}}]}\n\n".into(),
+                "data: {\"choices\":[{\"delta\":{\"content\":\"redacted-output\"}}]}\n\n".into(),
+                "data: [DONE]\n\n".into(),
+            ),
+            DevWatchdogProtocol::Anthropic => (
+                sse(
+                    "message_start",
+                    json!({"type":"message_start","message":{"id":"redacted-message"}}),
+                ),
+                sse(
+                    "content_block_delta",
+                    json!({"type":"content_block_delta","delta":{"type":"text_delta","text":"redacted-output"}}),
+                ),
+                sse("message_stop", json!({"type":"message_stop"})),
+            ),
+        }
+    }
+
+    fn dev_watchdog_stream(
+        protocol: DevWatchdogProtocol,
+        initial: ByteStream,
+        reconnector: StreamReconnector,
+    ) -> ByteStream {
+        let context = Some(StreamLogContext {
+            session_id: "redacted-session".into(),
+            provider_id: "redacted-provider".into(),
+            model: "redacted-model".into(),
+        });
+        match protocol {
+            DevWatchdogProtocol::Responses => Box::pin(
+                create_resilient_responses_sse_stream_with_context(
+                    initial,
+                    Some(reconnector),
+                    context,
+                    false,
+                ),
+            ),
+            DevWatchdogProtocol::Chat => Box::pin(
+                create_resilient_chat_sse_stream_with_context(initial, Some(reconnector), context),
+            ),
+            DevWatchdogProtocol::Anthropic => Box::pin(
+                create_resilient_anthropic_upstream_sse_stream(
+                    initial,
+                    Some(reconnector),
+                    false,
+                    context,
+                ),
+            ),
+            DevWatchdogProtocol::Translated => Box::pin(
+                create_resilient_anthropic_sse_stream_from_responses_with_web_search_options_and_context(
+                    initial,
+                    Some(reconnector),
+                    None,
+                    None,
+                    context,
+                ),
+            ),
+        }
+    }
+
+    fn take_dev_watchdog_packets() -> Vec<Value> {
+        TEST_DEV_RETRY_PACKETS.with(|packets| packets.take())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn dev_watchdog_finished_stream_clears_the_matching_retry_identity() {
+        for protocol in DEV_WATCHDOG_PROTOCOLS {
+            take_dev_watchdog_packets();
+            let (scaffold, content, terminal) = dev_watchdog_frames(protocol);
+            let recovered = [scaffold.clone(), content, terminal].concat();
+            let response = ProxyResponse::streamed(
+                http::StatusCode::OK,
+                http::HeaderMap::new(),
+                stream::once(async move { Ok(Bytes::from(recovered)) })
+                    .chain(stream::pending::<Result<Bytes, std::io::Error>>()),
+            );
+            let (reconnector, _) = scripted_reconnector(vec![Ok(response)]);
+            let mut stream = dev_watchdog_stream(
+                protocol,
+                chunks_then_error(&[scaffold.as_str()]),
+                reconnector,
+            );
+            let terminal_marker = match protocol {
+                DevWatchdogProtocol::Responses => "event: response.completed",
+                DevWatchdogProtocol::Chat => "data: [DONE]",
+                DevWatchdogProtocol::Anthropic | DevWatchdogProtocol::Translated => {
+                    "event: message_stop"
+                }
+            };
+            let mut finished = false;
+            for _ in 0..16 {
+                let chunk = stream.next().await.expect("terminal output").unwrap();
+                if String::from_utf8_lossy(&chunk).contains(terminal_marker) {
+                    finished = true;
+                    break;
+                }
+            }
+            assert!(finished, "{protocol:?}: missing terminal output");
+
+            let packets = take_dev_watchdog_packets();
+            assert_eq!(
+                packets
+                    .iter()
+                    .map(|packet| packet["event"].as_str().unwrap())
+                    .collect::<Vec<_>>(),
+                ["retry_scheduled", "stream_finished"],
+                "{protocol:?}: {packets:?}",
+            );
+            assert_eq!(packets[0]["key"], packets[1]["key"], "{protocol:?}");
+            let serialized = serde_json::to_string(&packets).unwrap();
+            for private in [
+                "redacted-session",
+                "redacted-provider",
+                "redacted-model",
+                "redacted-output",
+            ] {
+                assert!(!serialized.contains(private), "{protocol:?}");
+            }
+            drop(stream);
+            assert!(take_dev_watchdog_packets().is_empty(), "{protocol:?}");
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn dev_watchdog_dropped_retry_clears_only_its_request_identity() {
+        for protocol in DEV_WATCHDOG_PROTOCOLS {
+            take_dev_watchdog_packets();
+            let (scaffold, _, _) = dev_watchdog_frames(protocol);
+            let (reconnector, _) = scripted_reconnector(vec![]);
+            let mut stream = dev_watchdog_stream(
+                protocol,
+                chunks_then_error(&[scaffold.as_str()]),
+                reconnector,
+            );
+            for _ in 0..8 {
+                stream.next().await.expect("active retry output").unwrap();
+                if TEST_DEV_RETRY_PACKETS.with(|packets| !packets.borrow().is_empty()) {
+                    break;
+                }
+            }
+            drop(stream);
+
+            let packets = take_dev_watchdog_packets();
+            assert_eq!(
+                packets
+                    .iter()
+                    .map(|packet| packet["event"].as_str().unwrap())
+                    .collect::<Vec<_>>(),
+                ["retry_scheduled", "stream_cancelled"],
+                "{protocol:?}: {packets:?}",
+            );
+            assert_eq!(packets[0]["key"], packets[1]["key"], "{protocol:?}");
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn dev_watchdog_independent_requests_in_one_chat_have_distinct_keys() {
+        take_dev_watchdog_packets();
+        let mut keys = Vec::new();
+        for _ in 0..2 {
+            let (reconnector, _) = scripted_reconnector(vec![Ok(streamed_response(&[[
+                created(),
+                text_delta("redacted-output"),
+                completed(),
+            ]
+            .concat()
+            .as_str()]))]);
+            collect(dev_watchdog_stream(
+                DevWatchdogProtocol::Responses,
+                chunks_then_error(&[created().as_str()]),
+                reconnector,
+            ))
+            .await;
+            let packets = take_dev_watchdog_packets();
+            keys.push(packets[0]["key"].clone());
+        }
+        assert_ne!(keys[0], keys[1]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn dev_watchdog_socket_and_output_chunks_do_not_clear_an_active_retry() {
+        for protocol in DEV_WATCHDOG_PROTOCOLS {
+            take_dev_watchdog_packets();
+            let (scaffold, content, _) = dev_watchdog_frames(protocol);
+            let body = [scaffold.clone(), content].concat();
+            let recovered = ProxyResponse::streamed(
+                http::StatusCode::OK,
+                http::HeaderMap::new(),
+                stream::once(async move { Ok(Bytes::from(body)) })
+                    .chain(stream::pending::<Result<Bytes, std::io::Error>>()),
+            );
+            let (reconnector, _) = scripted_reconnector(vec![Ok(recovered)]);
+            let mut stream = dev_watchdog_stream(
+                protocol,
+                chunks_then_error(&[scaffold.as_str()]),
+                reconnector,
+            );
+            for _ in 0..16 {
+                let chunk = stream.next().await.expect("active stream output").unwrap();
+                if String::from_utf8_lossy(&chunk).contains("redacted-output") {
+                    break;
+                }
+            }
+            let packets = take_dev_watchdog_packets();
+            assert_eq!(
+                packets
+                    .iter()
+                    .map(|packet| packet["event"].as_str().unwrap())
+                    .collect::<Vec<_>>(),
+                ["retry_scheduled"],
+                "{protocol:?}: {packets:?}",
+            );
+            drop(stream);
+            assert_eq!(
+                take_dev_watchdog_packets()[0]["event"],
+                "stream_cancelled",
+                "{protocol:?}",
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn dev_watchdog_cancelled_connect_clears_the_active_request() {
+        for protocol in DEV_WATCHDOG_PROTOCOLS {
+            take_dev_watchdog_packets();
+            let (scaffold, _, _) = dev_watchdog_frames(protocol);
+            let calls = Arc::new(AtomicU32::new(0));
+            let connected = calls.clone();
+            let reconnector = StreamReconnector::new(
+                Box::new(move || {
+                    connected.fetch_add(1, Ordering::SeqCst);
+                    Box::pin(futures::future::pending())
+                }),
+                Duration::ZERO,
+            );
+            let mut stream = dev_watchdog_stream(
+                protocol,
+                chunks_then_error(&[scaffold.as_str()]),
+                reconnector,
+            );
+            for _ in 0..8 {
+                stream.next().await.expect("retry output").unwrap();
+                if TEST_DEV_RETRY_PACKETS.with(|packets| !packets.borrow().is_empty()) {
+                    break;
+                }
+            }
+            assert!(
+                tokio::time::timeout(Duration::from_secs(1), stream.next())
+                    .await
+                    .is_err(),
+                "{protocol:?}",
+            );
+            assert_eq!(calls.load(Ordering::SeqCst), 1, "{protocol:?}");
+            drop(stream);
+
+            let packets = take_dev_watchdog_packets();
+            assert_eq!(
+                packets
+                    .iter()
+                    .map(|packet| packet["event"].as_str().unwrap())
+                    .collect::<Vec<_>>(),
+                ["retry_scheduled", "stream_cancelled"],
+                "{protocol:?}: {packets:?}",
+            );
+            assert_eq!(packets[0]["key"], packets[1]["key"], "{protocol:?}");
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn dev_watchdog_exhausted_request_finishes_tracking_once() {
+        for protocol in DEV_WATCHDOG_PROTOCOLS {
+            take_dev_watchdog_packets();
+            let (scaffold, _, _) = dev_watchdog_frames(protocol);
+            let (reconnector, calls) = scripted_reconnector(vec![]);
+            let items: Vec<_> = dev_watchdog_stream(
+                protocol,
+                chunks_then_error(&[scaffold.as_str()]),
+                reconnector,
+            )
+            .collect()
+            .await;
+
+            let packets = take_dev_watchdog_packets();
+            assert_eq!(
+                items.last().unwrap().is_err(),
+                matches!(protocol, DevWatchdogProtocol::Anthropic),
+                "{protocol:?}",
+            );
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                STREAM_MAX_RETRIES,
+                "{protocol:?}"
+            );
+            assert_eq!(
+                packets
+                    .iter()
+                    .filter(|packet| packet["event"] == "stream_finished")
+                    .count(),
+                1,
+                "{protocol:?}: {packets:?}",
+            );
+            assert!(!packets
+                .iter()
+                .any(|packet| packet["event"] == "stream_cancelled"));
+            assert_eq!(
+                packets.first().unwrap()["key"],
+                packets.last().unwrap()["key"],
+                "{protocol:?}",
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn dev_watchdog_failed_terminal_finishes_before_yielding() {
+        for protocol in DEV_WATCHDOG_PROTOCOLS {
+            take_dev_watchdog_packets();
+            let (scaffold, _, _) = dev_watchdog_frames(protocol);
+            let terminal = match protocol {
+                DevWatchdogProtocol::Responses | DevWatchdogProtocol::Translated => sse(
+                    "response.failed",
+                    json!({"type":"response.failed","response":{"status":"failed","error":{"type":"authentication_error","message":"redacted-error"}}}),
+                ),
+                DevWatchdogProtocol::Chat | DevWatchdogProtocol::Anthropic => sse(
+                    "error",
+                    json!({"error":{"type":"authentication_error","message":"redacted-error"}}),
+                ),
+            };
+            let recovered = [scaffold.clone(), terminal].concat();
+            let response = ProxyResponse::streamed(
+                http::StatusCode::OK,
+                http::HeaderMap::new(),
+                stream::once(async move { Ok(Bytes::from(recovered)) })
+                    .chain(stream::pending::<Result<Bytes, std::io::Error>>()),
+            );
+            let (reconnector, _) = scripted_reconnector(vec![Ok(response)]);
+            let mut stream = dev_watchdog_stream(
+                protocol,
+                chunks_then_error(&[scaffold.as_str()]),
+                reconnector,
+            );
+            let mut finished = false;
+            for _ in 0..16 {
+                let chunk = stream.next().await.expect("failure output").unwrap();
+                if String::from_utf8_lossy(&chunk).contains("redacted-error") {
+                    finished = true;
+                    break;
+                }
+            }
+            assert!(finished, "{protocol:?}: missing failure output");
+            let packets = take_dev_watchdog_packets();
+            assert_eq!(
+                packets
+                    .iter()
+                    .map(|packet| packet["event"].as_str().unwrap())
+                    .collect::<Vec<_>>(),
+                ["retry_scheduled", "stream_finished"],
+                "{protocol:?}: {packets:?}",
+            );
+            assert_eq!(packets[0]["key"], packets[1]["key"], "{protocol:?}");
+            drop(stream);
+            assert!(take_dev_watchdog_packets().is_empty(), "{protocol:?}");
+        }
     }
 
     #[test]

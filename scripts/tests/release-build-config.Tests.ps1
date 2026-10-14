@@ -470,6 +470,7 @@ Remove-LocalReleaseCargoTargetDir -RepoRoot '$($fixtureRoot.Replace("'", "''"))'
         $repoRoot = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
         $fixtureRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("ccsm-export-target-" + [guid]::NewGuid().ToString("N"))
         $fixtureScripts = Join-Path $fixtureRoot "scripts"
+        $fixtureBin = Join-Path $fixtureRoot "bin"
         $fixtureTauri = Join-Path $fixtureRoot "src-tauri"
         $cargoTarget = Join-Path $fixtureRoot ".tmp\selected-cargo-target"
         $releaseDir = Join-Path $cargoTarget "release"
@@ -478,9 +479,12 @@ Remove-LocalReleaseCargoTargetDir -RepoRoot '$($fixtureRoot.Replace("'", "''"))'
         $hadPreviousTarget = Test-Path Env:CARGO_TARGET_DIR
         $previousTarget = $env:CARGO_TARGET_DIR
         $previousUserProfile = $env:USERPROFILE
+        $previousPath = $env:PATH
         [System.IO.Directory]::CreateDirectory($fixtureScripts) | Out-Null
+        [System.IO.Directory]::CreateDirectory($fixtureBin) | Out-Null
         [System.IO.Directory]::CreateDirectory($fixtureTauri) | Out-Null
         [System.IO.Directory]::CreateDirectory($bundleDir) | Out-Null
+        [System.IO.Directory]::CreateDirectory($outputRoot) | Out-Null
         [System.IO.Directory]::CreateDirectory((Join-Path $fixtureScripts "codex-history-tool")) | Out-Null
         try {
             Copy-Item -LiteralPath (Join-Path $repoRoot "scripts\export-latest-ccswitchmulti.ps1") -Destination $fixtureScripts
@@ -490,6 +494,12 @@ Remove-LocalReleaseCargoTargetDir -RepoRoot '$($fixtureRoot.Replace("'", "''"))'
                 '{"version":"9.9.9"}',
                 [System.Text.UTF8Encoding]::new($false)
             )
+            [System.IO.File]::WriteAllText(
+                (Join-Path $fixtureBin "pnpm.cmd"),
+                "@echo off`r`necho %*>`"%~dp0pnpm.log`"`r`nif not `"%~1`"==`"catalog:verify`" exit /b 9`r`nif not exist `"%~dp0..\exported\previous.txt`" exit /b 11`r`nexit /b 0`r`n",
+                [System.Text.Encoding]::ASCII
+            )
+            [System.IO.File]::WriteAllText((Join-Path $outputRoot "previous.txt"), "old release")
             [System.IO.File]::WriteAllText(
                 (Join-Path $bundleDir "CCSwitchMulti_9.9.9_x64-setup.exe"),
                 "fixture installer"
@@ -505,9 +515,13 @@ Remove-LocalReleaseCargoTargetDir -RepoRoot '$($fixtureRoot.Replace("'", "''"))'
             )
             $env:CARGO_TARGET_DIR = $cargoTarget
             $env:USERPROFILE = $fixtureRoot
+            $env:PATH = "$fixtureBin;$previousPath"
 
             & (Join-Path $fixtureScripts "export-latest-ccswitchmulti.ps1") -SkipBuild -ReleaseRoot $outputRoot
 
+            [System.IO.File]::ReadAllText((Join-Path $fixtureBin "pnpm.log")).Trim() |
+                Should Be "catalog:verify"
+            (Test-Path -LiteralPath (Join-Path $outputRoot "previous.txt")) | Should Be $false
             (Test-Path -LiteralPath (Join-Path $outputRoot "windows\installer\CCSwitchMulti_9.9.9_x64-setup.exe") -PathType Leaf) |
                 Should Be $true
             (Test-Path -LiteralPath (Join-Path $outputRoot "windows\raw-exe\CCSwitchMulti_9.9.9_x64.exe") -PathType Leaf) |
@@ -519,6 +533,47 @@ Remove-LocalReleaseCargoTargetDir -RepoRoot '$($fixtureRoot.Replace("'", "''"))'
                 Remove-Item Env:CARGO_TARGET_DIR -ErrorAction SilentlyContinue
             }
             $env:USERPROFILE = $previousUserProfile
+            $env:PATH = $previousPath
+            if (Test-Path -LiteralPath $fixtureRoot) {
+                [System.IO.Directory]::Delete($fixtureRoot, $true)
+            }
+        }
+    }
+
+    It "preserves existing release output when skipped-build catalog verification fails" {
+        $repoRoot = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
+        $fixtureRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("ccsm-export-gate-fail-" + [guid]::NewGuid().ToString("N"))
+        $fixtureScripts = Join-Path $fixtureRoot "scripts"
+        $fixtureBin = Join-Path $fixtureRoot "bin"
+        $outputRoot = Join-Path $fixtureRoot "exported"
+        $previousPath = $env:PATH
+        $previousLocation = (Get-Location).Path
+        [System.IO.Directory]::CreateDirectory($fixtureScripts) | Out-Null
+        [System.IO.Directory]::CreateDirectory($fixtureBin) | Out-Null
+        [System.IO.Directory]::CreateDirectory($outputRoot) | Out-Null
+        try {
+            Copy-Item -LiteralPath (Join-Path $repoRoot "scripts\export-latest-ccswitchmulti.ps1") -Destination $fixtureScripts
+            Copy-Item -LiteralPath (Join-Path $repoRoot "scripts\release-build-config.ps1") -Destination $fixtureScripts
+            [System.IO.File]::WriteAllText(
+                (Join-Path $fixtureBin "pnpm.cmd"),
+                "@echo off`r`necho %*>`"%~dp0pnpm.log`"`r`nexit /b 7`r`n",
+                [System.Text.Encoding]::ASCII
+            )
+            [System.IO.File]::WriteAllText((Join-Path $outputRoot "previous.txt"), "old release")
+            $env:PATH = "$fixtureBin;$previousPath"
+
+            {
+                & (Join-Path $fixtureScripts "export-latest-ccswitchmulti.ps1") -SkipBuild -ReleaseRoot $outputRoot
+            } | Should Throw "catalog verification failed with exit code 7"
+
+            [System.IO.File]::ReadAllText((Join-Path $fixtureBin "pnpm.log")).Trim() |
+                Should Be "catalog:verify"
+            [System.IO.File]::ReadAllText((Join-Path $outputRoot "previous.txt")) |
+                Should Be "old release"
+            @(Get-ChildItem -LiteralPath $outputRoot -Force).Count | Should Be 1
+            (Get-Location).Path | Should Be $previousLocation
+        } finally {
+            $env:PATH = $previousPath
             if (Test-Path -LiteralPath $fixtureRoot) {
                 [System.IO.Directory]::Delete($fixtureRoot, $true)
             }

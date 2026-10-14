@@ -1,4 +1,10 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import {
+  act,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+} from "@testing-library/react";
 import type { ComponentProps, PropsWithChildren } from "react";
 import { useForm } from "react-hook-form";
 import { beforeEach, describe, expect, it, vi } from "vitest";
@@ -15,6 +21,24 @@ const modelFetchApiMock = vi.hoisted(() => ({
   fetchModelsForConfig: vi.fn(),
   showFetchModelsError: vi.fn(),
 }));
+const selectChangeHandlers = vi.hoisted(
+  () => new Map<string, (value: string) => void>(),
+);
+
+vi.mock("@/components/ui/select", async () => {
+  const actual = await vi.importActual<typeof import("@/components/ui/select")>(
+    "@/components/ui/select",
+  );
+  return {
+    ...actual,
+    Select: (props: ComponentProps<typeof actual.Select>) => {
+      if (props.value && props.onValueChange) {
+        selectChangeHandlers.set(props.value, props.onValueChange);
+      }
+      return <actual.Select {...props} />;
+    },
+  };
+});
 
 vi.mock("@/lib/api/copilot", () => ({
   copilotGetModels: copilotApiMock.copilotGetModels,
@@ -127,6 +151,7 @@ describe("ClaudeFormFields", () => {
     copilotApiMock.copilotGetModelsForAccount.mockResolvedValue([]);
     modelFetchApiMock.fetchCodexOauthModels.mockResolvedValue([]);
     modelFetchApiMock.fetchModelsForConfig.mockResolvedValue([]);
+    selectChangeHandlers.clear();
   });
 
   it("不会在 Copilot 表单打开时自动获取模型列表", () => {
@@ -194,5 +219,29 @@ describe("ClaudeFormFields", () => {
       "CLAUDE_CODE_SUBAGENT_MODEL",
       "shared-model[1M]",
     );
+  });
+
+  it("accepts only listed Claude API formats from the select callback", () => {
+    const onApiFormatChange = vi.fn();
+    renderCopilotForm({ onApiFormatChange });
+    const onValueChange = selectChangeHandlers.get("anthropic");
+    expect(onValueChange).toBeDefined();
+
+    act(() => {
+      onValueChange?.("unknown");
+      onValueChange?.("openai_messages");
+    });
+    expect(onApiFormatChange).not.toHaveBeenCalled();
+
+    for (const format of [
+      "anthropic",
+      "openai_chat",
+      "openai_responses",
+      "gemini_native",
+    ]) {
+      act(() => onValueChange?.(format));
+      expect(onApiFormatChange).toHaveBeenLastCalledWith(format);
+    }
+    expect(onApiFormatChange).toHaveBeenCalledTimes(4);
   });
 });

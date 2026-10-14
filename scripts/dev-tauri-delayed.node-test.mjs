@@ -1,8 +1,11 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import { EventEmitter } from "node:events";
 import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
+
+import { createDevReconnectTracker } from "./dev-watchdog-policy.mjs";
 
 import {
   assertNormalCargoTargetDirectory,
@@ -11,6 +14,7 @@ import {
   createChangeEventBatcher,
   createExpectedExitRegistry,
   createQuietPeriodScheduler,
+  createDevWorkerRecovery,
   devAutoRestartDecision,
   devSessionEnvironment,
   devWorkerCommand,
@@ -19,10 +23,15 @@ import {
   isPathInside,
   isTauriAppStartedOutput,
   normalizeCliArgs,
+  observeDevChildTermination,
   parseDelayMs,
   parseNoRebuild,
   parsePort,
+  parseWindowsJsonQueryOutput,
+  readDevRestartTimesMs,
+  readDevRunMarkerPresent,
   readDevWatchdogEnabled,
+  resolveDevRunMarkerPath,
   resolveDevSettingsPath,
   parseWindowsListeners,
   resolveRepoRootBackendInput,
@@ -34,11 +43,14 @@ import {
   stopWindowsProcess,
   superviseDevSessions,
   waitForChildExit,
+  waitForDevSupervisorPublication,
   waitForWindowsListenersReleased,
   waitForWindowsProcessExit,
   windowsDevDescendants,
   windowsDevWorkerDescendants,
   windowsFrontendDescendants,
+  windowsJsonQueryCommand,
+  windowsProcessObservationCrashed,
   windowsProcessStartedAtUtc,
 } from "./dev-tauri-delayed.mjs";
 
@@ -156,6 +168,60 @@ test("development recovery reads the shared watchdog toggle safely", () => {
   );
 });
 
+test("development recovery uses the app run marker to detect code-zero crashes", () => {
+  assert.equal(
+    resolveDevRunMarkerPath({
+      CC_SWITCH_TEST_HOME: path.join("tmp", "cc-switch"),
+    }),
+    path.join("tmp", "cc-switch", ".cc-switch", "logs", "app-run-marker.json"),
+  );
+  const identity = {
+    pid: 42,
+    executablePath: path.resolve(
+      "src-tauri",
+      "target",
+      "debug",
+      "cc-switch.exe",
+    ),
+    processStartedAtTicks: 1_234,
+    markerPath: path.join("custom-config", "logs", "app-run-marker.json"),
+  };
+  const read = (markerPath) => {
+    assert.equal(markerPath, identity.markerPath);
+    return JSON.stringify(identity);
+  };
+  assert.equal(readDevRunMarkerPresent({}, read, identity), true);
+  assert.equal(
+    readDevRunMarkerPresent(
+      {},
+      () => JSON.stringify({ ...identity, pid: 43 }),
+      identity,
+    ),
+    false,
+  );
+  assert.equal(
+    readDevRunMarkerPresent(
+      {},
+      () => JSON.stringify({ ...identity, processStartedAtTicks: 1_235 }),
+      identity,
+    ),
+    false,
+  );
+  assert.equal(readDevRunMarkerPresent({}, read), false);
+  assert.equal(
+    readDevRunMarkerPresent(
+      {},
+      () => {
+        const error = new Error("marker removed after intentional quit");
+        error.code = "ENOENT";
+        throw error;
+      },
+      identity,
+    ),
+    false,
+  );
+});
+
 test("development recovery rebuilds after startup and runtime crashes", () => {
   assert.deepEqual(
     devAutoRestartDecision({
@@ -172,8 +238,19 @@ test("development recovery rebuilds after startup and runtime crashes", () => {
       exitCode: 0,
       signal: null,
       watchdogEnabled: true,
+      runMarkerPresent: false,
     }),
     { restart: false, reason: "clean-exit" },
+  );
+  assert.deepEqual(
+    devAutoRestartDecision({
+      appStarted: true,
+      exitCode: 0,
+      signal: null,
+      watchdogEnabled: true,
+      runMarkerPresent: true,
+    }),
+    { restart: true, reason: "unexpected-exit" },
   );
   assert.deepEqual(
     devAutoRestartDecision({
@@ -205,6 +282,29 @@ test("development recovery rebuilds after startup and runtime crashes", () => {
       restartTimesMs: [1, 2, 3, 4, 5],
     }),
     { restart: false, reason: "rate-limited" },
+  );
+  assert.deepEqual(
+    devAutoRestartDecision({
+      appStarted: true,
+      exitCode: null,
+      signal: "SIGINT",
+      watchdogEnabled: true,
+    }),
+    { restart: false, reason: "signal" },
+  );
+});
+
+test("live reconnect recovery respects an intentional quit that removed the run marker", () => {
+  assert.deepEqual(
+    devAutoRestartDecision({
+      appStarted: true,
+      appRunning: true,
+      exitCode: 1,
+      signal: null,
+      runMarkerPresent: false,
+      watchdogEnabled: true,
+    }),
+    { restart: false, reason: "clean-exit" },
   );
 });
 
@@ -404,6 +504,312 @@ test("development worker recovery respects intentional exits and restart budget"
   );
 });
 
+test("development restart history migrates legacy sessions without competing canonical state", () => {
+  const nowMs = 2_000_000;
+  const legacy = Array(4).fill(nowMs - 1_000);
+  assert.deepEqual(
+    readDevRestartTimesMs({ supervisorRestartTimesMs: legacy }, nowMs),
+    legacy,
+  );
+  assert.deepEqual(
+    readDevRestartTimesMs(
+      { restartTimesMs: [], supervisorRestartTimesMs: legacy },
+      nowMs,
+    ),
+    [],
+  );
+  assert.deepEqual(
+    readDevRestartTimesMs(
+      { restartTimesMs: [nowMs], supervisorRestartTimesMs: legacy },
+      nowMs,
+    ),
+    [nowMs],
+  );
+  assert.deepEqual(
+    readDevRestartTimesMs(
+      { restartTimesMs: null, supervisorRestartTimesMs: legacy },
+      nowMs,
+    ),
+    legacy,
+  );
+  assert.deepEqual(
+    readDevRestartTimesMs(
+      {
+        restartTimesMs: [
+          nowMs - 1_800_001,
+          nowMs - 1_800_000,
+          nowMs,
+          "2000000",
+          null,
+          NaN,
+          1.5,
+        ],
+      },
+      nowMs,
+    ),
+    [nowMs - 1_800_000, nowMs],
+  );
+  assert.deepEqual(readDevRestartTimesMs(undefined, nowMs), []);
+});
+
+test("live development recovery requests one worker failure without a second restart budget", () => {
+  const scheduled = [];
+  const recovered = [];
+  const recovery = createDevWorkerRecovery({
+    isCurrent: () => true,
+    readEnabled: () => true,
+    readMarkerPresent: () => true,
+    recover: (reason) => recovered.push(reason),
+    schedule: (callback, delayMs) => {
+      scheduled.push({ callback, delayMs });
+      return scheduled.length;
+    },
+  });
+
+  assert.equal(recovery.request("reconnect-loop"), true);
+  assert.equal(recovery.request("backend-process-crashed"), false);
+  assert.equal(scheduled.length, 1);
+  assert.equal(scheduled[0].delayMs, 1_000);
+  assert.deepEqual(recovered, []);
+  scheduled[0].callback();
+  assert.deepEqual(recovered, ["reconnect-loop"]);
+  assert.equal(recovery.request("backend-process-crashed"), false);
+});
+
+test("live development recovery requires an enabled current app with its exact run marker", () => {
+  for (const absent of ["current", "enabled", "marker"]) {
+    const recovery = createDevWorkerRecovery({
+      isCurrent: () => absent !== "current",
+      readEnabled: () => absent !== "enabled",
+      readMarkerPresent: () => absent !== "marker",
+      recover: () => assert.fail("an unverified app must not be recovered"),
+      schedule: () => assert.fail("an unverified app must not queue recovery"),
+    });
+    assert.equal(recovery.request("backend-process-crashed"), false);
+  }
+});
+
+test("live development recovery rereads quit markers and watchdog preferences before handing off", () => {
+  for (const cancelledState of ["current", "enabled", "marker"]) {
+    const state = { current: true, enabled: true, marker: true };
+    const scheduled = [];
+    const recovered = [];
+    const recovery = createDevWorkerRecovery({
+      isCurrent: () => state.current,
+      readEnabled: () => state.enabled,
+      readMarkerPresent: () => state.marker,
+      recover: (reason) => recovered.push(reason),
+      schedule: (callback) => {
+        scheduled.push(callback);
+        return scheduled.length;
+      },
+    });
+
+    assert.equal(recovery.request("reconnect-loop"), true);
+    state[cancelledState] = false;
+    scheduled[0]();
+    assert.deepEqual(recovered, []);
+    if (cancelledState !== "current") {
+      state[cancelledState] = true;
+      assert.equal(recovery.request("reconnect-loop"), true);
+      scheduled[1]();
+      assert.deepEqual(recovered, ["reconnect-loop"]);
+    }
+  }
+});
+
+for (const terminal of ["stream_finished", "stream_cancelled"]) {
+  test(`queued reconnect recovery revalidates ${terminal} before shutdown`, () => {
+    const tracker = createDevReconnectTracker();
+    const key = "0123456789abcdef";
+    let nowMs = 60_000;
+    const scheduled = [];
+    const recovered = [];
+    const recovery = createDevWorkerRecovery({
+      isCurrent: () => true,
+      readEnabled: () => true,
+      readMarkerPresent: () => true,
+      isRecoveryNeeded: (reason) =>
+        reason === "reconnect-loop" && tracker.recoveryReason(nowMs) === reason,
+      recover: (reason) => recovered.push(reason),
+      schedule: (callback) => {
+        scheduled.push(callback);
+        return scheduled.length;
+      },
+    });
+    for (const [attempt, time] of [
+      [1, 0],
+      [2, 30_000],
+      [3, 60_000],
+    ]) {
+      tracker.observe({ event: "retry_scheduled", key, attempt }, time);
+    }
+    assert.equal(recovery.request(tracker.recoveryReason(nowMs)), true);
+    tracker.observe({ event: terminal, key }, 60_500);
+    nowMs = 61_000;
+    scheduled[0]();
+    assert.deepEqual(recovered, []);
+
+    const nextKey = "fedcba9876543210";
+    for (const [attempt, time] of [
+      [1, 70_000],
+      [2, 100_000],
+      [3, 130_000],
+    ]) {
+      tracker.observe(
+        { event: "retry_scheduled", key: nextKey, attempt },
+        time,
+      );
+    }
+    nowMs = 130_000;
+    assert.equal(recovery.request(tracker.recoveryReason(nowMs)), true);
+    scheduled[0]();
+    assert.deepEqual(recovered, []);
+    scheduled[1]();
+    assert.deepEqual(recovered, ["reconnect-loop"]);
+  });
+}
+
+for (const stateBeforeTimer of ["running", "unavailable"]) {
+  test(`queued backend recovery skips the ${stateBeforeTimer} process probe and allows a later crash`, () => {
+    const observed = {
+      ProcessId: 42,
+      Name: "cc-switch.exe",
+      ExecutablePath: path.resolve(
+        "isolated",
+        "target",
+        "debug",
+        "cc-switch.exe",
+      ),
+      CreationDate: "2026-10-14T02:00:00Z",
+    };
+    let processState = "crashed";
+    const scheduled = [];
+    const recovered = [];
+    const recovery = createDevWorkerRecovery({
+      isCurrent: () => true,
+      readEnabled: () => true,
+      readMarkerPresent: () => true,
+      isRecoveryNeeded: (reason) => {
+        assert.equal(reason, "backend-process-crashed");
+        if (processState === "unavailable") {
+          throw new Error("isolated process identity query unavailable");
+        }
+        return windowsProcessObservationCrashed(
+          observed,
+          processState === "running" ? observed : undefined,
+        );
+      },
+      recover: (reason) => recovered.push(reason),
+      schedule: (callback) => {
+        scheduled.push(callback);
+        return scheduled.length;
+      },
+    });
+    assert.equal(recovery.request("backend-process-crashed"), true);
+    processState = stateBeforeTimer;
+    scheduled[0]();
+    assert.deepEqual(recovered, []);
+    processState = "crashed";
+    assert.equal(recovery.request("backend-process-crashed"), true);
+    scheduled[1]();
+    assert.deepEqual(recovered, ["backend-process-crashed"]);
+  });
+}
+
+for (const terminal of ["stream_finished", "stream_cancelled"]) {
+  test(`queued reconnect recovery preserves another failed stream after ${terminal}`, () => {
+    const tracker = createDevReconnectTracker();
+    const finishedKey = "0123456789abcdef";
+    const activeKey = "fedcba9876543210";
+    for (const key of [finishedKey, activeKey]) {
+      for (const [attempt, time] of [
+        [1, 0],
+        [2, 30_000],
+        [3, 60_000],
+      ]) {
+        tracker.observe({ event: "retry_scheduled", key, attempt }, time);
+      }
+    }
+    const scheduled = [];
+    const recovered = [];
+    const recovery = createDevWorkerRecovery({
+      isCurrent: () => true,
+      readEnabled: () => true,
+      readMarkerPresent: () => true,
+      isRecoveryNeeded: (reason) =>
+        reason === "reconnect-loop" &&
+        tracker.recoveryReason(61_000) === reason,
+      recover: (reason) => recovered.push(reason),
+      schedule: (callback) => {
+        scheduled.push(callback);
+        return 1;
+      },
+    });
+    assert.equal(recovery.request("reconnect-loop"), true);
+    tracker.observe({ event: terminal, key: finishedKey }, 60_500);
+    scheduled[0]();
+    assert.deepEqual(recovered, ["reconnect-loop"]);
+  });
+}
+
+test("queued recovery rechecks quit state after a blocking reason probe", () => {
+  for (const changed of ["current", "enabled", "marker"]) {
+    const state = { current: true, enabled: true, marker: true };
+    const scheduled = [];
+    const recovered = [];
+    const recovery = createDevWorkerRecovery({
+      isCurrent: () => state.current,
+      readEnabled: () => state.enabled,
+      readMarkerPresent: () => state.marker,
+      isRecoveryNeeded: () => {
+        state[changed] = false;
+        return true;
+      },
+      recover: (reason) => recovered.push(reason),
+      schedule: (callback) => {
+        scheduled.push(callback);
+        return 1;
+      },
+    });
+    assert.equal(recovery.request("backend-process-crashed"), true);
+    scheduled[0]();
+    assert.deepEqual(recovered, []);
+  }
+});
+
+test("expected source rebuilds cancel live recovery and reject old app signals during cleanup", () => {
+  let restartInProgress = false;
+  const scheduled = [];
+  const cancelled = [];
+  const recovered = [];
+  const recovery = createDevWorkerRecovery({
+    isCurrent: () => !restartInProgress,
+    readEnabled: () => true,
+    readMarkerPresent: () => true,
+    recover: (reason) => recovered.push(reason),
+    schedule: (callback) => {
+      scheduled.push(callback);
+      return scheduled.length;
+    },
+    cancelScheduled: (timer) => cancelled.push(timer),
+  });
+
+  assert.equal(recovery.request("reconnect-loop"), true);
+  restartInProgress = true;
+  recovery.cancel();
+  assert.deepEqual(cancelled, [1]);
+  assert.equal(recovery.request("backend-process-crashed"), false);
+  scheduled[0]();
+  assert.deepEqual(recovered, []);
+  restartInProgress = false;
+  assert.equal(recovery.request("reconnect-loop"), true);
+  scheduled[0]();
+  assert.deepEqual(recovered, []);
+  scheduled[1]();
+  assert.deepEqual(recovered, ["reconnect-loop"]);
+});
+
 function fakeDevWorker(pid) {
   const child = new EventEmitter();
   child.pid = pid;
@@ -462,6 +868,291 @@ test("development supervisor waits for cleanup before relaunching a full worker"
   assert.equal(await supervising, 0);
 });
 
+test("live reconnect recovery restarts the full dev session after cleanup even with no source rebuilds", async () => {
+  const args = ["--delay", "14400000", "--no-rebuild"];
+  const workers = [];
+  const scheduled = [];
+  const actions = [];
+  let releaseCleanup;
+  const cleanupBarrier = new Promise((resolve) => {
+    releaseCleanup = resolve;
+  });
+  const supervising = superviseDevSessions({
+    spawnSession: () => {
+      assert.deepEqual(devWorkerCommand(args).args.slice(2), args);
+      const child = fakeDevWorker(workers.length + 1);
+      workers.push(child);
+      actions.push(`launch-full-session:${child.pid}`);
+      if (child.pid === 1) {
+        child.recovery = createDevWorkerRecovery({
+          isCurrent: () => child.exitCode === null,
+          readEnabled: () => true,
+          readMarkerPresent: () => true,
+          recover: (reason) => {
+            actions.push(`worker-failure:${reason}`);
+            child.finish(1);
+          },
+          schedule: (callback, delayMs) => {
+            scheduled.push({ callback, delayMs });
+            return scheduled.length;
+          },
+        });
+      }
+      return child;
+    },
+    cleanSession: async (child) => {
+      actions.push(`cleanup-start:${child.pid}`);
+      if (child.pid === 1) await cleanupBarrier;
+      actions.push(`cleanup-done:${child.pid}`);
+    },
+    readEnabled: () => true,
+    waitToRestart: async () => actions.push("supervisor-restart-delay"),
+  });
+
+  assert.equal(parseDelayMs(args, {}), 14_400_000);
+  assert.equal(parseNoRebuild(args, {}), true);
+  const tracker = createDevReconnectTracker();
+  for (const [attempt, nowMs] of [
+    [1, 0],
+    [2, 30_000],
+    [3, 60_000],
+  ]) {
+    tracker.observe(
+      {
+        event: "retry_scheduled",
+        key: "0123456789abcdef",
+        attempt,
+      },
+      nowMs,
+    );
+  }
+  const reason = tracker.recoveryReason(60_000);
+  assert.equal(reason, "reconnect-loop");
+  assert.equal(workers[0].recovery.request(reason), true);
+  assert.equal(scheduled[0].delayMs, 1_000);
+  scheduled[0].callback();
+  await nextEventLoopTurn();
+  assert.equal(workers.length, 1);
+  assert.deepEqual(actions, [
+    "launch-full-session:1",
+    "worker-failure:reconnect-loop",
+    "cleanup-start:1",
+  ]);
+  releaseCleanup();
+  await nextEventLoopTurn();
+  assert.equal(workers.length, 2);
+  assert.deepEqual(actions.slice(3), [
+    "cleanup-done:1",
+    "supervisor-restart-delay",
+    "launch-full-session:2",
+  ]);
+  workers[1].finish(0);
+  assert.equal(await supervising, 0);
+});
+
+test("live reconnect and process crashes share the full-session five-restart limit", async () => {
+  let launches = 0;
+  let cleanups = 0;
+  const recoveryReasons = [];
+  const decisions = [];
+  const code = await superviseDevSessions({
+    spawnSession: () => {
+      const child = fakeDevWorker(++launches);
+      const reason =
+        launches % 2 === 0 ? "backend-process-crashed" : "reconnect-loop";
+      const recovery = createDevWorkerRecovery({
+        isCurrent: () => child.exitCode === null,
+        readEnabled: () => true,
+        readMarkerPresent: () => true,
+        recover: (recoveryReason) => {
+          recoveryReasons.push(recoveryReason);
+          child.finish(1);
+        },
+        schedule: (callback) => {
+          queueMicrotask(callback);
+          return launches;
+        },
+      });
+      recovery.request(reason);
+      return child;
+    },
+    cleanSession: async () => {
+      cleanups += 1;
+    },
+    readEnabled: () => true,
+    now: () => 2_000_000,
+    waitToRestart: async () => {},
+    onEvent: (decision) => decisions.push(decision.reason),
+  });
+
+  assert.equal(code, 1);
+  assert.equal(launches, 6);
+  assert.equal(cleanups, 6);
+  assert.deepEqual(recoveryReasons, [
+    "reconnect-loop",
+    "backend-process-crashed",
+    "reconnect-loop",
+    "backend-process-crashed",
+    "reconnect-loop",
+    "backend-process-crashed",
+  ]);
+  assert.equal(decisions.at(-1), "rate-limited");
+});
+
+test("replacement supervisors respect persisted worker and launcher restart history", async () => {
+  const nowMs = 2_000_000;
+  const restartTimesMs = Array(5).fill(nowMs - 1_000);
+  let launches = 0;
+  const decisions = [];
+  const code = await superviseDevSessions({
+    spawnSession: () => {
+      const child = fakeDevWorker(++launches);
+      queueMicrotask(() => child.finish(1));
+      return child;
+    },
+    cleanSession: async () => {},
+    readEnabled: () => true,
+    now: () => nowMs,
+    restartTimesMs,
+    waitToRestart: async () => {},
+    onEvent: (decision) => decisions.push(decision.reason),
+  });
+
+  assert.equal(code, 1);
+  assert.equal(launches, 1);
+  assert.deepEqual(decisions, ["rate-limited"]);
+  assert.deepEqual(restartTimesMs, Array(5).fill(nowMs - 1_000));
+});
+
+test("development rate limit exposes one durable event for the exact supervisor", async () => {
+  const nowMs = 2_000_000;
+  const events = [];
+  let launches = 0;
+  const code = await superviseDevSessions({
+    spawnSession: () => {
+      const child = fakeDevWorker(++launches);
+      queueMicrotask(() => child.finish(1));
+      return child;
+    },
+    cleanSession: async () => {},
+    readEnabled: () => true,
+    now: () => nowMs,
+    restartTimesMs: Array(5).fill(nowMs),
+    waitToRestart: async () =>
+      assert.fail("a limited supervisor must not launch another session"),
+    onEvent: (_decision, _outcome, watchdogEvent) => {
+      if (watchdogEvent) events.push(watchdogEvent);
+    },
+  });
+
+  assert.equal(code, 1);
+  assert.equal(launches, 1);
+  assert.deepEqual(events, [
+    {
+      event: "dev-session-restart-limited",
+      detail: { supervisorPid: process.pid, restartCount: 5 },
+    },
+  ]);
+});
+
+test("worker recovery persists the shared restart budget before its restart delay", async () => {
+  const nowMs = 2_000_000;
+  const session = { restartTimesMs: Array(4).fill(nowMs - 1_000) };
+  let persisted;
+  let launches = 0;
+  const code = await superviseDevSessions({
+    spawnSession: () => {
+      const child = fakeDevWorker(++launches);
+      queueMicrotask(() => child.finish(1));
+      return child;
+    },
+    cleanSession: async () => {},
+    readEnabled: () => true,
+    now: () => nowMs,
+    restartTimesMs: session.restartTimesMs,
+    onRestart: () => {
+      persisted = JSON.parse(JSON.stringify(session));
+    },
+    waitToRestart: async () => {
+      assert.deepEqual(persisted?.restartTimesMs, [
+        ...Array(4).fill(nowMs - 1_000),
+        nowMs,
+      ]);
+    },
+  });
+
+  assert.equal(code, 1);
+  assert.equal(launches, 2);
+  assert.equal(persisted.restartTimesMs.length, 5);
+});
+
+test("four worker recoveries and one launcher recovery block the next restart", async () => {
+  const nowMs = 2_000_000;
+  const session = { restartTimesMs: [] };
+  let persisted;
+  let workerLaunches = 0;
+  await assert.rejects(
+    superviseDevSessions({
+      spawnSession: () => {
+        const child = fakeDevWorker(++workerLaunches);
+        queueMicrotask(() => child.finish(1));
+        return child;
+      },
+      cleanSession: async () => {},
+      readEnabled: () => true,
+      now: () => nowMs,
+      restartTimesMs: session.restartTimesMs,
+      onRestart: () => {
+        persisted = JSON.parse(JSON.stringify(session));
+      },
+      waitToRestart: async () => {
+        if (persisted.restartTimesMs.length === 4) {
+          throw new Error("injected launcher crash during restart delay");
+        }
+      },
+    }),
+    /injected launcher crash/,
+  );
+  assert.equal(workerLaunches, 4);
+  assert.equal(persisted.restartTimesMs.length, 4);
+  const launcherHistory = readDevRestartTimesMs(persisted, nowMs);
+  assert.equal(
+    devWorkerRestartDecision({
+      exitCode: 1,
+      signal: null,
+      watchdogEnabled: true,
+      nowMs,
+      restartTimesMs: launcherHistory,
+    }).restart,
+    true,
+  );
+  persisted.restartTimesMs = [...launcherHistory, nowMs];
+  const replacementHistory = readDevRestartTimesMs(
+    JSON.parse(JSON.stringify(persisted)),
+    nowMs,
+  );
+  let replacementLaunches = 0;
+  const decisions = [];
+  const code = await superviseDevSessions({
+    spawnSession: () => {
+      const child = fakeDevWorker(++replacementLaunches);
+      queueMicrotask(() => child.finish(1));
+      return child;
+    },
+    cleanSession: async () => {},
+    readEnabled: () => true,
+    now: () => nowMs,
+    restartTimesMs: replacementHistory,
+    waitToRestart: async () =>
+      assert.fail("the replacement must not reset the full-session budget"),
+    onEvent: (decision) => decisions.push(decision.reason),
+  });
+
+  assert.equal(code, 1);
+  assert.equal(replacementLaunches, 1);
+  assert.deepEqual(decisions, ["rate-limited"]);
+});
+
 test("development supervisor rebuilds a new worker after a startup error", async () => {
   const actions = [];
   const outcomes = [];
@@ -510,6 +1201,8 @@ test("development supervisor leaves clean and disabled sessions stopped", async 
     let launches = 0;
     let cleanups = 0;
     const decisions = [];
+    const restartTimesMs = Array(4).fill(Date.now());
+    const previousHistory = [...restartTimesMs];
     const code = await superviseDevSessions({
       spawnSession: () => {
         const child = fakeDevWorker(++launches);
@@ -520,6 +1213,9 @@ test("development supervisor leaves clean and disabled sessions stopped", async 
         cleanups += 1;
       },
       readEnabled: () => enabled,
+      restartTimesMs,
+      onRestart: () =>
+        assert.fail("clean and disabled sessions must not record a restart"),
       waitToRestart: async () => {
         assert.fail("stopped sessions must not schedule a restart");
       },
@@ -531,6 +1227,7 @@ test("development supervisor leaves clean and disabled sessions stopped", async 
     assert.equal(launches, 1);
     assert.equal(cleanups, 1);
     assert.deepEqual(decisions, [reason]);
+    assert.deepEqual(restartTimesMs, previousHistory);
   }
 });
 
@@ -1477,6 +2174,67 @@ test("Windows listener parsing supports zero, one, or multiple endpoints", () =>
   );
 });
 
+test("Windows JSON queries explicitly select UTF-8 output without rewriting the pipeline", () => {
+  const pipeline = "Get-CimInstance Win32_Process | ConvertTo-Json -Compress";
+  const script = windowsJsonQueryCommand(pipeline);
+  assert.match(
+    script,
+    /^\[Console\]::OutputEncoding = \[System\.Text\.UTF8Encoding\]::new\(\$false\)\n/,
+  );
+  assert.match(script, /\n\$OutputEncoding = \[Console\]::OutputEncoding\n/);
+  assert.ok(script.endsWith(`\n${pipeline}`));
+});
+
+test("Windows malformed query diagnostics omit redacted process output", () => {
+  for (const queryName of ["process", "listener"]) {
+    assert.throws(
+      () =>
+        parseWindowsJsonQueryOutput(
+          '{"CommandLine":"[REDACTED_FIXTURE]"unescaped quote"}',
+          queryName,
+        ),
+      (error) => {
+        assert.equal(
+          error.message,
+          `PowerShell ${queryName} query returned malformed JSON.`,
+        );
+        assert.equal(Object.hasOwn(error, "cause"), false);
+        assert.equal(Object.hasOwn(error, "stdout"), false);
+        assert.equal(error.message.includes("REDACTED_FIXTURE"), false);
+        return true;
+      },
+    );
+  }
+});
+
+test(
+  "Windows JSON queries preserve Unicode quotes and prompt text under a legacy console",
+  { skip: process.platform !== "win32" },
+  () => {
+    const fixture = [
+      "$value = 'fixture ' + [char]0x201c + 'quoted prompt' + [char]0x201d + ' path caf' + [char]0x00e9 + ' unicode ' + [char]0x4e2d",
+      "[pscustomobject]@{CommandLine=$value;ProcessId=42} | ConvertTo-Json -Compress",
+    ].join("\n");
+    const script = [
+      "[Console]::OutputEncoding = [System.Text.Encoding]::GetEncoding(437)",
+      windowsJsonQueryCommand(fixture),
+    ].join("\n");
+    const result = spawnSync(
+      "powershell.exe",
+      ["-NoProfile", "-NonInteractive", "-Command", script],
+      { encoding: "utf8", windowsHide: true },
+    );
+    assert.equal(result.error, undefined);
+    assert.equal(result.status, 0, "harmless PowerShell JSON fixture failed");
+    const parsed = JSON.parse(result.stdout);
+    assert.equal(parsed.ProcessId, 42);
+    assert.equal(
+      parsed.CommandLine,
+      "fixture \u201cquoted prompt\u201d path caf\u00e9 unicode \u4e2d",
+    );
+  },
+);
+
 test("verified Windows app force-terminates its verified tree before rebuild", async () => {
   const app = {
     ProcessId: 30,
@@ -1666,6 +2424,51 @@ test("Windows shutdown identity rejects PID reuse", () => {
   );
 });
 
+test("Windows crash observations require complete baseline and current process identities", () => {
+  const observed = {
+    ProcessId: 42,
+    Name: "cc-switch.exe",
+    ExecutablePath: path.resolve(
+      "isolated",
+      "target",
+      "debug",
+      "cc-switch.exe",
+    ),
+    CreationDate: "2026-10-14T02:00:00Z",
+  };
+  for (const field of ["ProcessId", "Name", "ExecutablePath", "CreationDate"]) {
+    const incomplete = { ...observed, [field]: null };
+    assert.equal(
+      windowsProcessObservationCrashed(incomplete, undefined),
+      false,
+    );
+    assert.equal(windowsProcessObservationCrashed(observed, incomplete), false);
+  }
+});
+
+test("Windows crash observations distinguish a verified disappearance from PID reuse", () => {
+  const observed = {
+    ProcessId: 42,
+    Name: "cc-switch.exe",
+    ExecutablePath: path.resolve(
+      "isolated",
+      "target",
+      "debug",
+      "cc-switch.exe",
+    ),
+    CreationDate: "2026-10-14T02:00:00Z",
+  };
+  assert.equal(windowsProcessObservationCrashed(observed, observed), false);
+  assert.equal(windowsProcessObservationCrashed(observed, undefined), true);
+  assert.equal(
+    windowsProcessObservationCrashed(observed, {
+      ...observed,
+      CreationDate: "2026-10-14T02:01:00Z",
+    }),
+    true,
+  );
+});
+
 test("Windows process creation dates normalize PowerShell JSON and UTC forms", () => {
   const iso = "2026-10-13T04:00:00.000Z";
   const milliseconds = Date.parse(iso);
@@ -1742,4 +2545,364 @@ test("child exit synchronization rejects instead of overlapping generations", as
   child.signalCode = null;
 
   await assert.rejects(waitForChildExit(child, 10), /did not exit/);
+});
+
+test("Tauri exit observation recovers when orphaned stdio never closes", async () => {
+  const child = fakeDevWorker(72);
+  const outcomes = [];
+  observeDevChildTermination(
+    child,
+    (exitCode, signal) => outcomes.push({ exitCode, signal }),
+    { drainTimeoutMs: 10 },
+  );
+  child.finish(1);
+  assert.deepEqual(outcomes, []);
+  await new Promise((resolve) => setTimeout(resolve, 25));
+  assert.deepEqual(outcomes, [{ exitCode: 1, signal: null }]);
+  child.emit("close", 1, null);
+  assert.equal(outcomes.length, 1);
+});
+
+test("Tauri exit observation drains pending crash identity before classification", async () => {
+  const child = fakeDevWorker(73);
+  let runMarkerPresent = false;
+  const decisions = [];
+  observeDevChildTermination(
+    child,
+    (exitCode, signal) =>
+      decisions.push(
+        devAutoRestartDecision({
+          appStarted: true,
+          exitCode,
+          signal,
+          runMarkerPresent,
+          watchdogEnabled: true,
+        }),
+      ),
+    { drainTimeoutMs: 10 },
+  );
+  child.finish(0);
+  assert.deepEqual(decisions, []);
+  runMarkerPresent = true;
+  await new Promise((resolve) => setTimeout(resolve, 25));
+  assert.deepEqual(decisions, [{ restart: true, reason: "unexpected-exit" }]);
+});
+
+test("Tauri exit observation bounds the default drain and deduplicates close", () => {
+  const child = fakeDevWorker(74);
+  const scheduled = [];
+  const cancelled = [];
+  const outcomes = [];
+  observeDevChildTermination(
+    child,
+    (code, signal) => outcomes.push({ code, signal }),
+    {
+      schedule: (callback, delayMs) => {
+        scheduled.push({ callback, delayMs });
+        return 1;
+      },
+      cancelScheduled: (timer) => cancelled.push(timer),
+    },
+  );
+  child.finish(1);
+  assert.equal(scheduled.length, 1);
+  assert.equal(scheduled[0].delayMs, 250);
+  child.emit("close", 1, null);
+  scheduled[0].callback();
+  assert.deepEqual(outcomes, [{ code: 1, signal: null }]);
+  assert.deepEqual(cancelled, [1]);
+  assert.equal(child.listenerCount("exit"), 0);
+  assert.equal(child.listenerCount("close"), 0);
+});
+
+test("Tauri exit observation respects a clean quit during the drain", () => {
+  const child = fakeDevWorker(75);
+  const scheduled = [];
+  const decisions = [];
+  let runMarkerPresent = true;
+  observeDevChildTermination(
+    child,
+    (exitCode, signal) =>
+      decisions.push(
+        devAutoRestartDecision({
+          appStarted: true,
+          exitCode,
+          signal,
+          runMarkerPresent,
+          watchdogEnabled: true,
+        }),
+      ),
+    {
+      schedule: (callback) => {
+        scheduled.push(callback);
+        return 1;
+      },
+      cancelScheduled: () => {},
+    },
+  );
+  child.finish(0);
+  runMarkerPresent = false;
+  scheduled[0]();
+  child.emit("close", 0, null);
+  assert.deepEqual(decisions, [{ restart: false, reason: "clean-exit" }]);
+});
+
+test("Tauri exit observation consumes expected rebuild exits once without recovery", () => {
+  const child = fakeDevWorker(76);
+  const expectedExits = createExpectedExitRegistry();
+  const scheduled = [];
+  let classifications = 0;
+  let recoveries = 0;
+  expectedExits.mark(child);
+  observeDevChildTermination(
+    child,
+    () => {
+      classifications += 1;
+      if (!expectedExits.consume(child)) recoveries += 1;
+    },
+    {
+      schedule: (callback) => {
+        scheduled.push(callback);
+        return 1;
+      },
+      cancelScheduled: () => {},
+    },
+  );
+  child.finish(1);
+  scheduled[0]();
+  child.emit("close", 1, null);
+  assert.equal(classifications, 1);
+  assert.equal(recoveries, 0);
+  assert.equal(expectedExits.consume(child), false);
+});
+
+function replacementDevSession() {
+  const repoRoot = path.resolve("workspace", "ccswitchmulti");
+  return {
+    schemaVersion: 1,
+    state: "running",
+    supervisorPid: 200,
+    supervisorExecutablePath: path.resolve("runtime", "node.exe"),
+    supervisorStartedAtUtc: "2026-10-14T02:00:01.000Z",
+    startedAtUtc: "2026-10-14T02:00:02.000Z",
+    repoRoot,
+    scriptPath: path.join(repoRoot, "scripts", "dev-tauri-delayed.mjs"),
+    launchedAtMs: Date.parse("2026-10-14T02:00:00.000Z"),
+  };
+}
+
+test("detached watchdog publication does not release ownership at spawn acknowledgement", async () => {
+  const expected = replacementDevSession();
+  let session = { ...expected, supervisorPid: expected.supervisorPid - 1 };
+  let resumePublication;
+  let settled = false;
+  const publication = waitForDevSupervisorPublication({
+    expected,
+    readSession: () => session,
+    isRunning: () => true,
+    wait: () =>
+      new Promise((resolve) => {
+        resumePublication = resolve;
+      }),
+  }).then((recorded) => {
+    settled = true;
+    return recorded;
+  });
+  await nextEventLoopTurn();
+  assert.equal(settled, false);
+  assert.equal(typeof resumePublication, "function");
+  session = expected;
+  resumePublication();
+  assert.equal(await publication, expected);
+});
+
+test("detached watchdog publication rejects stale or foreign replacement markers", async () => {
+  const expected = replacementDevSession();
+  const markers = [
+    { ...expected, schemaVersion: 2 },
+    { ...expected, supervisorPid: expected.supervisorPid - 1 },
+    {
+      ...expected,
+      supervisorExecutablePath: path.resolve("foreign-runtime", "node.exe"),
+    },
+    { ...expected, supervisorStartedAtUtc: "2026-10-14T01:00:00.000Z" },
+    { ...expected, repoRoot: path.resolve("workspace", "another-repo") },
+    {
+      ...expected,
+      scriptPath: path.resolve("foreign", "dev-tauri-delayed.mjs"),
+    },
+    { ...expected, state: "stopping" },
+    { ...expected, startedAtUtc: "2026-10-14T01:59:59.000Z" },
+    expected,
+  ];
+  let reads = 0;
+  const recorded = await waitForDevSupervisorPublication({
+    expected,
+    readSession: () => markers[reads++],
+    isRunning: () => true,
+    wait: nextEventLoopTurn,
+  });
+  assert.equal(recorded, expected);
+  assert.equal(reads, markers.length);
+});
+
+test("detached watchdog publication waits through missing or malformed markers", async () => {
+  const expected = replacementDevSession();
+  let reads = 0;
+  const recorded = await waitForDevSupervisorPublication({
+    expected,
+    readSession: () => {
+      reads += 1;
+      if (reads === 1) {
+        const error = new Error("isolated marker not published");
+        error.code = "ENOENT";
+        throw error;
+      }
+      if (reads === 2) throw new SyntaxError("isolated marker incomplete");
+      return expected;
+    },
+    isRunning: () => true,
+    wait: nextEventLoopTurn,
+  });
+  assert.equal(recorded, expected);
+  assert.equal(reads, 3);
+});
+
+test("detached watchdog publication stops when the replacement dies before claiming", async () => {
+  const expected = replacementDevSession();
+  await assert.rejects(
+    waitForDevSupervisorPublication({
+      expected,
+      readSession: () =>
+        assert.fail("a dead replacement cannot publish a valid handoff"),
+      isRunning: () => false,
+      wait: () => assert.fail("a dead replacement must not wait until timeout"),
+    }),
+    /exited before publishing/,
+  );
+});
+
+test("detached watchdog publication reports timeout without accepting an unclaimed session", async () => {
+  const expected = replacementDevSession();
+  let nowMs = 0;
+  let polls = 0;
+  const diagnostics = [];
+  await assert.rejects(
+    waitForDevSupervisorPublication({
+      expected,
+      readSession: () => ({ ...expected, supervisorPid: 100 }),
+      isRunning: () => nowMs < 500,
+      timeoutMs: 300,
+      now: () => nowMs,
+      onTimeout: (error) => diagnostics.push(error.message),
+      wait: async (delayMs) => {
+        nowMs += delayMs;
+        polls += 1;
+      },
+    }),
+    /exited before publishing/,
+  );
+  assert.equal(polls, 5);
+  assert.equal(diagnostics.length, 1);
+  assert.match(
+    diagnostics[0],
+    /did not publish its owned session within 300ms/,
+  );
+});
+
+test("detached watchdog publication retains ownership while OS identity is unavailable", async () => {
+  const recorded = replacementDevSession();
+  const expected = { ...recorded, supervisorStartedAtUtc: undefined };
+  let identityChecks = 0;
+  const publication = await waitForDevSupervisorPublication({
+    expected,
+    readSession: () => recorded,
+    isRunning: () => true,
+    verifyOwnership: () => {
+      identityChecks += 1;
+      if (identityChecks === 1) {
+        throw new Error("isolated identity query temporarily unavailable");
+      }
+      return identityChecks >= 3;
+    },
+    wait: nextEventLoopTurn,
+  });
+  assert.equal(publication, recorded);
+  assert.equal(identityChecks, 3);
+});
+
+test("detached watchdog publication requires start identity or an ownership verifier", async () => {
+  const recorded = replacementDevSession();
+  const expected = { ...recorded, supervisorStartedAtUtc: undefined };
+  let nowMs = 0;
+  const diagnostics = [];
+  await assert.rejects(
+    waitForDevSupervisorPublication({
+      expected,
+      readSession: () => recorded,
+      isRunning: () => nowMs < 200,
+      timeoutMs: 100,
+      now: () => nowMs,
+      onTimeout: (error) => diagnostics.push(error.message),
+      wait: async (delayMs) => {
+        nowMs += delayMs;
+      },
+    }),
+    /exited before publishing/,
+  );
+  assert.equal(diagnostics.length, 1);
+  assert.match(diagnostics[0], /did not publish its owned session/);
+});
+
+test("detached watchdog publication timeout retains a live child until late ownership publication", async () => {
+  const expected = replacementDevSession();
+  let nowMs = 0;
+  const diagnostics = [];
+  const publication = await waitForDevSupervisorPublication({
+    expected,
+    readSession: () =>
+      nowMs >= 400 ? expected : { ...expected, supervisorPid: 100 },
+    isRunning: () => true,
+    timeoutMs: 100,
+    now: () => nowMs,
+    onTimeout: (error) => diagnostics.push(error.message),
+    wait: async (delayMs) => {
+      nowMs += delayMs;
+    },
+  });
+
+  assert.equal(publication, expected);
+  assert.equal(nowMs, 400);
+  assert.equal(diagnostics.length, 1);
+  assert.match(
+    diagnostics[0],
+    /did not publish its owned session within 100ms/,
+  );
+});
+
+test("detached watchdog publication timeout retains ownership until the unpublished child exits", async () => {
+  const expected = replacementDevSession();
+  let nowMs = 0;
+  const diagnostics = [];
+  await assert.rejects(
+    waitForDevSupervisorPublication({
+      expected,
+      readSession: () => ({ ...expected, supervisorPid: 100 }),
+      isRunning: () => nowMs < 400,
+      timeoutMs: 100,
+      now: () => nowMs,
+      onTimeout: (error) => diagnostics.push(error.message),
+      wait: async (delayMs) => {
+        nowMs += delayMs;
+      },
+    }),
+    /exited before publishing/,
+  );
+
+  assert.equal(nowMs, 400);
+  assert.equal(diagnostics.length, 1);
+  assert.match(
+    diagnostics[0],
+    /did not publish its owned session within 100ms/,
+  );
 });

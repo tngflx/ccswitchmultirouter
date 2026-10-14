@@ -1,4 +1,18 @@
 {
+  "orchestration": {
+    "title": "Multimodel orchestration",
+    "profileEditor": "Profile editor",
+    "saved": "Orchestration settings saved.",
+    "publicationPending": "Settings saved; Codex catalog publication is pending.",
+    "publicationReady": "Codex catalog published. Reopen Codex if its picker still shows the old list.",
+    "routerRequired": "Activate a schema-v2 Codex MultiRouter to publish these profiles.",
+    "retryPublication": "Retry publication",
+    "unsaved": "Unsaved profile changes.",
+    "disabled": "Orchestration disabled; profile models removed from the catalog.",
+    "nameRequired": "A profile name is required.",
+    "noIncludedModels": "No included models",
+    "modelUnavailable": "{{name}}: the {{role}} model is unavailable or excluded."
+  },
   "app": {
     "title": "CCSwitchMulti",
     "description": "All-in-One Assistant for Claude Code, Codex & Gemini CLI"
@@ -413,6 +427,7 @@
     "tabAdvanced": "Advanced",
     "tabProxy": "Routing",
     "tabRequestHealth": "Request Health",
+    "tabRequestHealthSettings": "Request Health Settings",
     "authCenter": {
       "title": "OAuth Authentication Center",
       "description": "Use your other subscriptions in Claude Code — please be mindful of compliance risks.",
