@@ -121,6 +121,14 @@ pub enum CodexProtocolChoiceSource {
     Manual,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CodexProtocolResolutionSource {
+    ProviderApi,
+    Probe,
+    Manual,
+}
+
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CodexProviderModelAdaptation {
@@ -129,6 +137,8 @@ pub struct CodexProviderModelAdaptation {
     pub choice: CodexProtocolChoice,
     pub choice_source: CodexProtocolChoiceSource,
     pub effective_transport: Option<crate::protocol_compatibility::TransportKind>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resolution_source: Option<CodexProtocolResolutionSource>,
     pub readiness: crate::protocol_compatibility::ProbeReadiness,
     pub responses: Option<crate::protocol_compatibility::ProtocolCompatibilityRecord>,
     pub chat: Option<crate::protocol_compatibility::ProtocolCompatibilityRecord>,
@@ -300,11 +310,7 @@ pub(crate) fn get_codex_provider_editor_snapshot_internal(
     for (public_model, upstream_model) in catalog_models {
         let key =
             crate::codex_multirouter::provider_set::normalize_codex_public_model_key(&public_model);
-        let protocol_override = logical_provider
-            .meta
-            .as_ref()
-            .and_then(|meta| meta.codex_protocol_overrides.get(&key))
-            .copied();
+        let protocol_override = codex_adaptation_protocol_override(&logical_provider, &key);
         let (choice, choice_source, manual_transport) = match protocol_override {
             Some(CodexProtocolOverride::OpenaiResponses) => (
                 CodexProtocolChoice::OpenaiResponses,
@@ -349,25 +355,48 @@ pub(crate) fn get_codex_provider_editor_snapshot_internal(
             crate::protocol_compatibility::TransportKind::OpenAiChat,
         );
         let selected_profile =
-            latest_codex_selection_profile(&profiles, &public_model, &upstream_model);
-        for record in [responses, chat, selected_profile].into_iter().flatten() {
-            any_evidence = true;
-            tested_at =
-                Some(tested_at.map_or(record.tested_at, |value: i64| value.max(record.tested_at)));
-            expires_at = Some(
-                expires_at.map_or(record.expires_at, |value: i64| value.min(record.expires_at)),
+            latest_codex_model_profile(&profiles, &public_model, &upstream_model);
+        any_evidence |= responses.is_some() || chat.is_some() || selected_profile.is_some();
+        let current_profile = profiles
+            .iter()
+            .filter(|profile| {
+                profile.target.public_model == public_model
+                    && profile.target.upstream_model == upstream_model
+                    && current_target(profile.target.transport)
+                        .as_ref()
+                        .is_some_and(|target| {
+                            codex_protocol_record_matches_current_target(profile, target)
+                                && codex_protocol_record_is_fresh(profile, now)
+                        })
+            })
+            .max_by_key(|profile| profile.tested_at);
+        let current_selected = current_profile
+            .filter(|profile| profile.result.selected_transport == Some(profile.target.transport));
+        let declared_transport =
+            crate::codex_multirouter::protocol_capability::provider_api_declared_transport(
+                &logical_provider,
+                &public_model,
             );
-        }
         let effective_transport = manual_transport
-            .or_else(|| persistence_transports.get(&key).copied())
-            .or_else(|| selected_profile.and_then(|profile| profile.result.selected_transport));
+            .or_else(|| current_selected.and_then(|profile| profile.result.selected_transport))
+            .or(declared_transport)
+            .or_else(|| persistence_transports.get(&key).copied());
+        let resolution_source = if manual_transport.is_some() {
+            Some(CodexProtocolResolutionSource::Manual)
+        } else if current_selected.is_some() {
+            Some(CodexProtocolResolutionSource::Probe)
+        } else if declared_transport.is_some() {
+            Some(CodexProtocolResolutionSource::ProviderApi)
+        } else {
+            None
+        };
         let current_selected_target = effective_transport.and_then(|transport| match transport {
             crate::protocol_compatibility::TransportKind::OpenAiResponses => {
                 responses_target.as_ref()
             }
             crate::protocol_compatibility::TransportKind::OpenAiChat => chat_target.as_ref(),
         });
-        let matching_profile = selected_profile.filter(|profile| {
+        let matching_profile = current_profile.filter(|profile| {
             current_selected_target
                 .is_some_and(|target| codex_protocol_record_matches_current_target(profile, target))
         });
@@ -380,20 +409,36 @@ pub(crate) fn get_codex_provider_editor_snapshot_internal(
             current_selected_target
                 .is_some_and(|target| codex_protocol_record_matches_current_target(record, target))
         });
-        let evidence_for_readiness = matching_profile.or(matching_observation);
+        let matching_evidence = if choice_source == CodexProtocolChoiceSource::Automatic {
+            current_profile.or(matching_observation)
+        } else {
+            matching_profile.or(matching_observation)
+        };
+        let evidence_for_readiness =
+            matching_evidence.filter(|record| codex_protocol_record_is_fresh(record, now));
+        if let Some(record) = evidence_for_readiness {
+            tested_at =
+                Some(tested_at.map_or(record.tested_at, |value: i64| value.max(record.tested_at)));
+            expires_at = Some(
+                expires_at.map_or(record.expires_at, |value: i64| value.min(record.expires_at)),
+            );
+        }
         let readiness = evidence_for_readiness
-            .map(|record| record.result.readiness)
+            .map(|record| {
+                if choice_source == CodexProtocolChoiceSource::Automatic
+                    && record.result.readiness
+                        == crate::protocol_compatibility::ProbeReadiness::Verified
+                    && record.result.selected_transport != Some(record.target.transport)
+                {
+                    crate::protocol_compatibility::ProbeReadiness::Unverified
+                } else {
+                    record.result.readiness
+                }
+            })
             .unwrap_or(crate::protocol_compatibility::ProbeReadiness::Unverified);
         let model_is_stale = effective_transport.is_some()
             && evidence_for_readiness.is_none()
             && (selected_profile.is_some() || effective_observation.is_some());
-        if let Some(record) = evidence_for_readiness {
-            if record.probe_version != crate::protocol_compatibility::PROBE_PROFILE_VERSION
-                || record.expires_at < now
-            {
-                any_stale = true;
-            }
-        }
         any_stale |= model_is_stale;
         any_verified |= readiness == crate::protocol_compatibility::ProbeReadiness::Verified;
         any_manual_without_verified_evidence |= choice_source == CodexProtocolChoiceSource::Manual
@@ -404,6 +449,7 @@ pub(crate) fn get_codex_provider_editor_snapshot_internal(
             choice,
             choice_source,
             effective_transport,
+            resolution_source,
             readiness,
             responses: responses.cloned(),
             chat: chat.cloned(),
@@ -526,11 +572,7 @@ pub(crate) fn build_codex_provider_adaptation_preview(
     for (public_model, upstream_model) in codex_adaptation_catalog_models(&logical_provider) {
         let key =
             crate::codex_multirouter::provider_set::normalize_codex_public_model_key(&public_model);
-        let protocol_override = logical_provider
-            .meta
-            .as_ref()
-            .and_then(|meta| meta.codex_protocol_overrides.get(&key))
-            .copied();
+        let protocol_override = codex_adaptation_protocol_override(&logical_provider, &key);
         let (choice, choice_source, manual_transport) = match protocol_override {
             Some(CodexProtocolOverride::OpenaiResponses) => (
                 CodexProtocolChoice::OpenaiResponses,
@@ -555,6 +597,32 @@ pub(crate) fn build_codex_provider_adaptation_preview(
                     && record.target.upstream_model == upstream_model
             })
             .max_by_key(|record| record.tested_at);
+        let candidate = crate::protocol_compatibility::compile_provider_probe_candidate_for_model(
+            &logical_provider,
+            public_model.clone(),
+            upstream_model.clone(),
+        )
+        .ok();
+        let matches_current_target =
+            |record: &crate::protocol_compatibility::ProtocolCompatibilityRecord| {
+                candidate
+                    .as_ref()
+                    .and_then(|candidate| candidate.target_key(record.target.transport).ok())
+                    .is_some_and(|target| {
+                        codex_protocol_record_matches_current_target(record, &target)
+                    })
+            };
+        let current_record = records
+            .iter()
+            .filter(|record| {
+                record.target.public_model == public_model
+                    && record.target.upstream_model == upstream_model
+                    && matches_current_target(record)
+                    && codex_protocol_record_is_fresh(record, now)
+            })
+            .max_by_key(|record| record.tested_at);
+        let current_selected = current_record
+            .filter(|record| record.result.selected_transport == Some(record.target.transport));
         let responses = latest_codex_protocol_record(
             observations,
             &public_model,
@@ -567,34 +635,67 @@ pub(crate) fn build_codex_provider_adaptation_preview(
             &upstream_model,
             crate::protocol_compatibility::TransportKind::OpenAiChat,
         );
-        for record in [responses, chat, selected].into_iter().flatten() {
-            any_evidence = true;
+        any_evidence |= responses.is_some() || chat.is_some() || selected.is_some();
+        let declared_transport =
+            crate::codex_multirouter::protocol_capability::provider_api_declared_transport(
+                &logical_provider,
+                &public_model,
+            );
+        let effective_transport = manual_transport
+            .or_else(|| current_selected.and_then(|record| record.result.selected_transport))
+            .or(declared_transport);
+        let resolution_source = if manual_transport.is_some() {
+            Some(CodexProtocolResolutionSource::Manual)
+        } else if current_selected.is_some() {
+            Some(CodexProtocolResolutionSource::Probe)
+        } else if declared_transport.is_some() {
+            Some(CodexProtocolResolutionSource::ProviderApi)
+        } else {
+            None
+        };
+        let effective_evidence = match effective_transport {
+            Some(crate::protocol_compatibility::TransportKind::OpenAiResponses) => responses,
+            Some(crate::protocol_compatibility::TransportKind::OpenAiChat) => chat,
+            None => selected,
+        };
+        let evidence_for_readiness = if choice_source == CodexProtocolChoiceSource::Automatic {
+            current_record
+        } else {
+            effective_evidence.filter(|record| {
+                matches_current_target(record) && codex_protocol_record_is_fresh(record, now)
+            })
+        };
+        if let Some(record) = evidence_for_readiness {
             tested_at =
                 Some(tested_at.map_or(record.tested_at, |value: i64| value.max(record.tested_at)));
             expires_at = Some(
                 expires_at.map_or(record.expires_at, |value: i64| value.min(record.expires_at)),
             );
         }
-        let effective_transport = manual_transport
-            .or_else(|| selected.and_then(|record| record.result.selected_transport));
-        let effective_evidence = match effective_transport {
-            Some(crate::protocol_compatibility::TransportKind::OpenAiResponses) => responses,
-            Some(crate::protocol_compatibility::TransportKind::OpenAiChat) => chat,
-            None => selected,
-        };
-        let readiness = if choice_source == CodexProtocolChoiceSource::Automatic {
-            selected
-                .map(|record| record.result.readiness)
-                .unwrap_or(crate::protocol_compatibility::ProbeReadiness::Unverified)
+        let readiness = evidence_for_readiness
+            .map(|record| {
+                if choice_source == CodexProtocolChoiceSource::Automatic
+                    && record.result.readiness
+                        == crate::protocol_compatibility::ProbeReadiness::Verified
+                    && record.result.selected_transport != Some(record.target.transport)
+                {
+                    crate::protocol_compatibility::ProbeReadiness::Unverified
+                } else {
+                    record.result.readiness
+                }
+            })
+            .unwrap_or(crate::protocol_compatibility::ProbeReadiness::Unverified);
+        let stale_evidence = if choice_source == CodexProtocolChoiceSource::Automatic {
+            current_record
+                .is_none()
+                .then_some(selected.or(effective_evidence))
+                .flatten()
         } else {
             effective_evidence
-                .map(|record| record.result.readiness)
-                .unwrap_or(crate::protocol_compatibility::ProbeReadiness::Unverified)
         };
-        if let Some(record) = effective_evidence {
-            any_stale |= record.probe_version
-                != crate::protocol_compatibility::PROBE_PROFILE_VERSION
-                || record.expires_at < now;
+        if let Some(record) = stale_evidence {
+            any_stale |=
+                !matches_current_target(record) || !codex_protocol_record_is_fresh(record, now);
         }
         any_verified |= readiness == crate::protocol_compatibility::ProbeReadiness::Verified;
         any_manual_without_verified_evidence |= choice_source == CodexProtocolChoiceSource::Manual
@@ -605,6 +706,7 @@ pub(crate) fn build_codex_provider_adaptation_preview(
             choice,
             choice_source,
             effective_transport,
+            resolution_source,
             readiness,
             responses: responses.cloned(),
             chat: chat.cloned(),
@@ -775,6 +877,27 @@ fn persisted_provider_transport(
     }
 }
 
+fn codex_adaptation_protocol_override(
+    provider: &Provider,
+    public_model_key: &str,
+) -> Option<CodexProtocolOverride> {
+    if provider.uses_manual_codex_protocol() && !provider.has_codex_protocol_overrides() {
+        return persisted_provider_transport(provider).map(|transport| match transport {
+            crate::protocol_compatibility::TransportKind::OpenAiResponses => {
+                CodexProtocolOverride::OpenaiResponses
+            }
+            crate::protocol_compatibility::TransportKind::OpenAiChat => {
+                CodexProtocolOverride::OpenaiChat
+            }
+        });
+    }
+    provider
+        .meta
+        .as_ref()
+        .and_then(|meta| meta.codex_protocol_overrides.get(public_model_key))
+        .copied()
+}
+
 fn latest_codex_protocol_record<'a>(
     records: &'a [crate::protocol_compatibility::ProtocolCompatibilityRecord],
     public_model: &str,
@@ -791,7 +914,7 @@ fn latest_codex_protocol_record<'a>(
         .max_by_key(|record| record.tested_at)
 }
 
-fn latest_codex_selection_profile<'a>(
+fn latest_codex_model_profile<'a>(
     records: &'a [crate::protocol_compatibility::ProtocolCompatibilityRecord],
     public_model: &str,
     upstream_model: &str,
@@ -801,7 +924,6 @@ fn latest_codex_selection_profile<'a>(
         .filter(|record| {
             record.target.public_model == public_model
                 && record.target.upstream_model == upstream_model
-                && record.result.selected_transport == Some(record.target.transport)
         })
         .max_by_key(|record| record.tested_at)
 }
@@ -817,6 +939,14 @@ fn codex_protocol_record_matches_current_target(
         && record.target.authentication_kind == current.authentication_kind
         && record.target.credential_fingerprint == current.credential_fingerprint
         && record.target.request_policy_fingerprint == current.request_policy_fingerprint
+}
+
+fn codex_protocol_record_is_fresh(
+    record: &crate::protocol_compatibility::ProtocolCompatibilityRecord,
+    now: i64,
+) -> bool {
+    record.probe_version == crate::protocol_compatibility::PROBE_PROFILE_VERSION
+        && record.expires_at >= now
 }
 
 fn aggregate_codex_effective_transport(
@@ -1301,6 +1431,26 @@ pub async fn force_repair_and_switch_codex_provider(
     .map_err(|error| format!("Codex 强制覆盖任务执行失败: {error}"))?
 }
 
+fn restore_codex_history_unify_settings(
+    current: &mut crate::settings::AppSettings,
+    previous: &crate::settings::AppSettings,
+) {
+    current.unify_codex_session_history = previous.unify_codex_session_history;
+    current.unify_codex_migrate_existing = previous.unify_codex_migrate_existing;
+    let previous_migration = previous
+        .local_migrations
+        .as_ref()
+        .and_then(|migrations| migrations.codex_official_history_unify_v1.clone());
+    if previous_migration.is_some() {
+        current
+            .local_migrations
+            .get_or_insert_with(Default::default)
+            .codex_official_history_unify_v1 = previous_migration;
+    } else if let Some(migrations) = current.local_migrations.as_mut() {
+        migrations.codex_official_history_unify_v1 = None;
+    }
+}
+
 /// 一键退出 Codex 接管、切回内建 OpenAI，并尽量把全部历史归并到 `openai` 桶。
 ///
 /// 官方切换复用既有链路以保留 OAuth `auth.json`。历史归桶仍要求
@@ -1322,7 +1472,9 @@ pub fn switch_codex_to_official_and_repair_history(
             Ok(result) => result,
             Err(error) => {
                 // provider 尚未切换成功时恢复统一历史开关，避免一次失败点击永久改变用户设置。
-                if let Err(restore_error) = crate::settings::update_settings(previous_settings) {
+                if let Err(restore_error) = crate::settings::mutate_settings(|current| {
+                    restore_codex_history_unify_settings(current, &previous_settings);
+                }) {
                     return Err(format!(
                         "切回 OpenAI 官方失败: {error}; 恢复原设置也失败: {restore_error}"
                     ));
@@ -2569,6 +2721,109 @@ pub fn get_opencode_live_provider_ids() -> Result<Vec<String>, String> {
 // ============================================================================
 
 #[cfg(test)]
+mod codex_history_rollback_tests {
+    use super::restore_codex_history_unify_settings;
+    use crate::settings::{
+        AppSettings, CodexOfficialHistoryUnifyMigration, CodexProviderTemplateMigration,
+        LocalMigrations, RequestHealthConfig,
+    };
+    use serde_json::json;
+
+    fn unify_migration() -> CodexOfficialHistoryUnifyMigration {
+        CodexOfficialHistoryUnifyMigration {
+            completed_at: "2026-10-15T00:00:00Z".to_string(),
+            target_provider_id: "codex-official".to_string(),
+            migrated_jsonl_files: 5,
+            migrated_state_rows: 5,
+            codex_config_dir: Some("C:/test/codex".to_string()),
+        }
+    }
+
+    #[test]
+    fn failed_official_switch_preserves_concurrent_request_health_and_unrelated_settings() {
+        let previous = AppSettings {
+            unify_codex_session_history: true,
+            unify_codex_migrate_existing: Some(true),
+            language: Some("en".to_string()),
+            local_migrations: Some(LocalMigrations {
+                codex_official_history_unify_v1: Some(unify_migration()),
+                ..LocalMigrations::default()
+            }),
+            ..AppSettings::default()
+        };
+        let mut current = previous.clone();
+        current.unify_codex_session_history = false;
+        current.unify_codex_migrate_existing = None;
+        let migrations = current.local_migrations.as_mut().unwrap();
+        migrations.codex_official_history_unify_v1 = None;
+        migrations.codex_provider_template_v1 = Some(CodexProviderTemplateMigration {
+            completed_at: "2026-10-15T00:01:00Z".to_string(),
+            migrated_provider_ids: vec!["concurrent-provider".to_string()],
+        });
+        current.language = Some("ja".to_string());
+        current.current_provider_claude = Some("concurrent-provider".to_string());
+        current.request_health = RequestHealthConfig {
+            enabled: false,
+            large_request_threshold_bytes: 512 * 1024,
+            windows_notifications_snoozed_until_ms: Some(9_999_999_999_999),
+            ..RequestHealthConfig::default()
+        };
+        let expected_request_health = current.request_health.clone();
+
+        restore_codex_history_unify_settings(&mut current, &previous);
+
+        assert_eq!(current.request_health, expected_request_health);
+        assert_eq!(current.language.as_deref(), Some("ja"));
+        assert_eq!(
+            current.current_provider_claude.as_deref(),
+            Some("concurrent-provider")
+        );
+        assert!(current.unify_codex_session_history);
+        assert_eq!(current.unify_codex_migrate_existing, Some(true));
+        let migrations = current.local_migrations.unwrap();
+        assert_eq!(
+            serde_json::to_value(migrations.codex_official_history_unify_v1).unwrap(),
+            json!(unify_migration())
+        );
+        assert_eq!(
+            migrations
+                .codex_provider_template_v1
+                .unwrap()
+                .migrated_provider_ids,
+            vec!["concurrent-provider"]
+        );
+    }
+
+    #[test]
+    fn failed_official_switch_keeps_migrations_created_after_its_snapshot() {
+        let previous = AppSettings::default();
+        let mut current = previous.clone();
+        current.local_migrations = Some(LocalMigrations {
+            codex_provider_template_v1: Some(CodexProviderTemplateMigration {
+                completed_at: "2026-10-15T00:01:00Z".to_string(),
+                migrated_provider_ids: vec!["concurrent-provider".to_string()],
+            }),
+            ..LocalMigrations::default()
+        });
+
+        restore_codex_history_unify_settings(&mut current, &previous);
+
+        assert!(current
+            .local_migrations
+            .as_ref()
+            .and_then(|migrations| migrations.codex_provider_template_v1.as_ref())
+            .is_some());
+        assert!(current
+            .local_migrations
+            .as_ref()
+            .and_then(|migrations| migrations.codex_official_history_unify_v1.as_ref())
+            .is_none());
+        assert!(!current.unify_codex_session_history);
+        assert_eq!(current.unify_codex_migrate_existing, None);
+    }
+}
+
+#[cfg(test)]
 mod import_claude_desktop_tests {
     use super::suggested_claude_desktop_routes;
     use crate::provider::{Provider, ProviderMeta};
@@ -2877,7 +3132,7 @@ mod codex_protocol_preflight_save_tests {
         build_codex_provider_adaptation_preview, get_codex_logical_provider_for_editing_internal,
         get_codex_provider_editor_snapshot_internal, update_provider_internal_with_probe,
         CodexAdaptationStatus, CodexEffectiveTransport, CodexProtocolChoice,
-        CodexProtocolChoiceSource, CodexProviderPersistence,
+        CodexProtocolChoiceSource, CodexProtocolResolutionSource, CodexProviderPersistence,
     };
     use crate::{
         app_config::AppType,
@@ -2948,6 +3203,42 @@ mod codex_protocol_preflight_save_tests {
         )
     }
 
+    fn api_declared_codex_provider(endpoint: &str) -> Provider {
+        let mut provider = codex_provider();
+        provider.settings_config["modelCatalog"]["models"] = json!([
+            {
+                "model": "qwen-visible",
+                "upstreamModel": "Qwen/Qwen3.8",
+                "protocolCapability": {
+                    "schemaVersion": 1,
+                    "source": "provider_api",
+                    "baseUrl": "https://vllm.example/v1",
+                    "upstreamModel": "Qwen/Qwen3.8",
+                    "supportedEndpoints": [endpoint],
+                    "supportsTools": true,
+                    "supportsStreaming": true,
+                    "supportsToolContinuation": true
+                }
+            },
+            {
+                "model": "qwen-coder-visible",
+                "upstreamModel": "Qwen/Qwen3-Coder",
+                "protocolCapability": {
+                    "schemaVersion": 1,
+                    "source": "provider_api",
+                    "baseUrl": "https://vllm.example/v1",
+                    "upstreamModel": "Qwen/Qwen3-Coder",
+                    "supportedEndpoints": [endpoint],
+                    "supportsTools": true,
+                    "supportsStreaming": true,
+                    "supportsToolContinuation": true
+                }
+            },
+            {"model": "excluded-unknown", "enabled": false}
+        ]);
+        provider
+    }
+
     fn chat_record() -> (ProbeCandidate, ProtocolCompatibilityRecord) {
         let candidate = crate::protocol_compatibility::compile_provider_probe_candidate_for_model(
             &codex_provider(),
@@ -2989,6 +3280,340 @@ mod codex_protocol_preflight_save_tests {
                 observation
             })
             .collect()
+    }
+
+    #[tokio::test]
+    async fn api_declared_models_save_and_reopen_without_inventing_verified_probes() {
+        for (endpoint, transport) in [
+            ("openai_responses", TransportKind::OpenAiResponses),
+            ("openai_chat", TransportKind::OpenAiChat),
+        ] {
+            let db = Arc::new(Database::memory().unwrap());
+            let state = AppState::new(db.clone());
+            let mut provider = api_declared_codex_provider(endpoint);
+            let now = chrono::Utc::now().timestamp();
+            let preview =
+                build_codex_provider_adaptation_preview(&provider, &[], &[], &HashMap::new(), now)
+                    .unwrap();
+            assert_eq!(preview.status, CodexAdaptationStatus::NotTested);
+            assert_eq!(preview.models.len(), 2);
+            for model in &preview.models {
+                assert_eq!(model.effective_transport, Some(transport));
+                assert_eq!(
+                    model.resolution_source,
+                    Some(CodexProtocolResolutionSource::ProviderApi)
+                );
+                assert_eq!(model.readiness, ProbeReadiness::Unverified);
+                assert!(model.responses.is_none());
+                assert!(model.chat.is_none());
+            }
+            db.save_provider("codex", &provider).unwrap();
+            let other = Provider::with_id(
+                "declaration-test-current".into(),
+                "Other current provider".into(),
+                json!({"auth": {}}),
+                None,
+            );
+            db.save_provider("codex", &other).unwrap();
+            db.set_current_provider("codex", &other.id).unwrap();
+            provider.notes = Some("declared-capability edit".into());
+            let calls = Arc::new(AtomicUsize::new(0));
+            let calls_for_probe = calls.clone();
+            update_provider_internal_with_probe(
+                &state,
+                AppType::Codex,
+                None,
+                provider.clone(),
+                move |_| {
+                    calls_for_probe.fetch_add(1, Ordering::SeqCst);
+                    std::future::ready(Err("probe must not run for explicit declarations".into()))
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+            let snapshot =
+                get_codex_provider_editor_snapshot_internal(&state, &provider.id, now).unwrap();
+            assert_eq!(snapshot.adaptation.status, CodexAdaptationStatus::NotTested);
+            assert_eq!(snapshot.adaptation.tested_at, None);
+            assert_eq!(snapshot.adaptation.expires_at, None);
+            assert_eq!(
+                snapshot.logical_provider.settings_config["modelCatalog"],
+                provider.settings_config["modelCatalog"]
+            );
+            for model in &snapshot.adaptation.models {
+                assert_eq!(model.effective_transport, Some(transport));
+                assert_eq!(
+                    model.resolution_source,
+                    Some(CodexProtocolResolutionSource::ProviderApi)
+                );
+                assert_eq!(model.readiness, ProbeReadiness::Unverified);
+            }
+            super::update_provider_internal(
+                &state,
+                AppType::Codex,
+                None,
+                snapshot.logical_provider,
+            )
+            .await
+            .unwrap();
+            assert!(db
+                .list_protocol_compatibility_profiles(&provider.id)
+                .unwrap()
+                .is_empty());
+            assert!(db
+                .list_protocol_probe_observations(&provider.id)
+                .unwrap()
+                .is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn changed_endpoint_or_upstream_invalidates_api_declared_save_readiness() {
+        for scenario in ["endpoint", "upstream"] {
+            let db = Arc::new(Database::memory().unwrap());
+            let state = AppState::new(db.clone());
+            let provider = api_declared_codex_provider("openai_chat");
+            db.save_provider("codex", &provider).unwrap();
+            let mut edited = provider.clone();
+            if scenario == "endpoint" {
+                edited.settings_config["config"] = json!(edited.settings_config["config"]
+                    .as_str()
+                    .unwrap()
+                    .replace("https://vllm.example/v1", "https://other.example/v1"));
+            } else {
+                edited.settings_config["modelCatalog"]["models"][0]["upstreamModel"] =
+                    json!("Qwen/Renamed");
+            }
+            let preview = build_codex_provider_adaptation_preview(
+                &edited,
+                &[],
+                &[],
+                &HashMap::new(),
+                chrono::Utc::now().timestamp(),
+            )
+            .unwrap();
+            assert_eq!(preview.models[0].effective_transport, None, "{scenario}");
+            assert_eq!(preview.models[0].resolution_source, None, "{scenario}");
+            assert_eq!(preview.models[0].readiness, ProbeReadiness::Unverified);
+            let error = super::update_provider_internal(&state, AppType::Codex, None, edited)
+                .await
+                .unwrap_err();
+            let error_message = error.to_string();
+            assert!(
+                error_message.contains("codex_provider_set_probe_required")
+                    || error_message.contains("codex_provider_set_model_blocked"),
+                "{scenario}: {error}"
+            );
+            assert_eq!(
+                serde_json::to_value(db.get_provider_by_id(&provider.id, "codex").unwrap())
+                    .unwrap(),
+                serde_json::to_value(Some(provider)).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn adaptation_uses_current_probes_before_api_declarations_and_rejects_old_targets() {
+        let db = Arc::new(Database::memory().unwrap());
+        let state = AppState::new(db.clone());
+        let mut provider = api_declared_codex_provider("openai_responses");
+        provider.settings_config["modelCatalog"]["models"]
+            .as_array_mut()
+            .unwrap()
+            .truncate(1);
+        db.save_provider("codex", &provider).unwrap();
+        let (candidate, record) = chat_record();
+        let observations = transport_observations(&candidate, &record);
+        db.save_protocol_probe_bundle(&record, &observations)
+            .unwrap();
+        let now = chrono::Utc::now().timestamp();
+        let preview = build_codex_provider_adaptation_preview(
+            &provider,
+            std::slice::from_ref(&record),
+            &observations,
+            &HashMap::new(),
+            now,
+        )
+        .unwrap();
+        let snapshot =
+            get_codex_provider_editor_snapshot_internal(&state, &provider.id, now).unwrap();
+        for view in [preview, snapshot.adaptation] {
+            assert_eq!(
+                view.models[0].effective_transport,
+                Some(TransportKind::OpenAiChat)
+            );
+            assert_eq!(
+                view.models[0].resolution_source,
+                Some(CodexProtocolResolutionSource::Probe)
+            );
+            assert_eq!(view.models[0].readiness, ProbeReadiness::Verified);
+        }
+        provider.settings_config["auth"]["OPENAI_API_KEY"] = json!("changed-test-key");
+        db.save_provider("codex", &provider).unwrap();
+        let preview = build_codex_provider_adaptation_preview(
+            &provider,
+            &[record],
+            &observations,
+            &HashMap::new(),
+            now,
+        )
+        .unwrap();
+        let snapshot =
+            get_codex_provider_editor_snapshot_internal(&state, &provider.id, now).unwrap();
+        for view in [preview, snapshot.adaptation] {
+            assert_eq!(
+                view.models[0].effective_transport,
+                Some(TransportKind::OpenAiResponses)
+            );
+            assert_eq!(
+                view.models[0].resolution_source,
+                Some(CodexProtocolResolutionSource::ProviderApi)
+            );
+            assert_eq!(view.models[0].readiness, ProbeReadiness::Unverified);
+        }
+    }
+
+    #[test]
+    fn whole_provider_manual_intent_remains_ahead_of_api_declarations() {
+        let db = Arc::new(Database::memory().unwrap());
+        let state = AppState::new(db.clone());
+        let mut provider = api_declared_codex_provider("openai_chat");
+        provider.meta.as_mut().unwrap().codex_protocol_mode = Some(CodexProtocolMode::Manual);
+        db.save_provider("codex", &provider).unwrap();
+        let now = chrono::Utc::now().timestamp();
+        let preview =
+            build_codex_provider_adaptation_preview(&provider, &[], &[], &HashMap::new(), now)
+                .unwrap();
+        let snapshot =
+            get_codex_provider_editor_snapshot_internal(&state, &provider.id, now).unwrap();
+        for view in [preview, snapshot.adaptation] {
+            assert_eq!(view.status, CodexAdaptationStatus::NotTested);
+            for model in view.models {
+                assert_eq!(model.choice, CodexProtocolChoice::OpenaiResponses);
+                assert_eq!(model.choice_source, CodexProtocolChoiceSource::Manual);
+                assert_eq!(
+                    model.resolution_source,
+                    Some(CodexProtocolResolutionSource::Manual)
+                );
+                assert_eq!(
+                    model.effective_transport,
+                    Some(TransportKind::OpenAiResponses)
+                );
+                assert_eq!(model.readiness, ProbeReadiness::Unverified);
+            }
+        }
+    }
+
+    #[test]
+    fn newer_unrelated_probe_does_not_mask_the_current_exact_probe() {
+        let db = Arc::new(Database::memory().unwrap());
+        let state = AppState::new(db.clone());
+        let mut provider = api_declared_codex_provider("openai_responses");
+        provider.settings_config["modelCatalog"]["models"]
+            .as_array_mut()
+            .unwrap()
+            .truncate(1);
+        db.save_provider("codex", &provider).unwrap();
+        let (candidate, mut current_record) = chat_record();
+        let now = chrono::Utc::now().timestamp();
+        current_record.tested_at = now - 60;
+        let expected_tested_at = current_record.tested_at;
+        let expected_expires_at = current_record.expires_at;
+        let current_observations = transport_observations(&candidate, &current_record);
+        db.save_protocol_probe_bundle(&current_record, &current_observations)
+            .unwrap();
+        let mut other_target_provider = provider.clone();
+        other_target_provider.settings_config["auth"]["OPENAI_API_KEY"] =
+            json!("redacted-other-test-key");
+        let other_candidate =
+            crate::protocol_compatibility::compile_provider_probe_candidate_for_model(
+                &other_target_provider,
+                "qwen-visible".into(),
+                "Qwen/Qwen3.8".into(),
+            )
+            .unwrap();
+        let mut unrelated_record = current_record.clone();
+        unrelated_record.target = other_candidate
+            .target_key(TransportKind::OpenAiResponses)
+            .unwrap();
+        unrelated_record.result.selected_transport = Some(TransportKind::OpenAiResponses);
+        unrelated_record.tested_at += 30;
+        unrelated_record.expires_at = now - 1;
+        let unrelated_observations = transport_observations(&other_candidate, &unrelated_record);
+        db.save_protocol_probe_bundle(&unrelated_record, &unrelated_observations)
+            .unwrap();
+        let preview = build_codex_provider_adaptation_preview(
+            &provider,
+            &[current_record, unrelated_record],
+            &[current_observations, unrelated_observations].concat(),
+            &HashMap::new(),
+            now,
+        )
+        .unwrap();
+        let snapshot =
+            get_codex_provider_editor_snapshot_internal(&state, &provider.id, now).unwrap();
+        for view in [preview, snapshot.adaptation] {
+            assert_eq!(view.status, CodexAdaptationStatus::Ready);
+            assert_eq!(view.tested_at, Some(expected_tested_at));
+            assert_eq!(view.expires_at, Some(expected_expires_at));
+            assert_eq!(
+                view.models[0].effective_transport,
+                Some(TransportKind::OpenAiChat)
+            );
+            assert_eq!(
+                view.models[0].resolution_source,
+                Some(CodexProtocolResolutionSource::Probe)
+            );
+            assert_eq!(view.models[0].readiness, ProbeReadiness::Verified);
+        }
+    }
+
+    #[test]
+    fn latest_unsuccessful_current_probe_cannot_appear_verified_on_reopen() {
+        let db = Arc::new(Database::memory().unwrap());
+        let state = AppState::new(db.clone());
+        let mut provider = api_declared_codex_provider("openai_responses");
+        provider.settings_config["modelCatalog"]["models"]
+            .as_array_mut()
+            .unwrap()
+            .truncate(1);
+        db.save_provider("codex", &provider).unwrap();
+        let (candidate, mut successful_record) = chat_record();
+        let now = chrono::Utc::now().timestamp();
+        successful_record.tested_at = now - 60;
+        successful_record.expires_at = now - 1;
+        let successful_observations = transport_observations(&candidate, &successful_record);
+        db.save_protocol_probe_bundle(&successful_record, &successful_observations)
+            .unwrap();
+        let mut unsuccessful_record = successful_record.clone();
+        unsuccessful_record.target = candidate
+            .target_key(TransportKind::OpenAiResponses)
+            .unwrap();
+        unsuccessful_record.result.selected_transport = None;
+        unsuccessful_record.result.readiness = ProbeReadiness::Partial;
+        unsuccessful_record.tested_at += 30;
+        unsuccessful_record.expires_at = now + 600;
+        let expected_tested_at = unsuccessful_record.tested_at;
+        let expected_expires_at = unsuccessful_record.expires_at;
+        db.save_protocol_compatibility_result(&unsuccessful_record)
+            .unwrap();
+        let preview = build_codex_provider_adaptation_preview(
+            &provider,
+            &[successful_record, unsuccessful_record],
+            &successful_observations,
+            &HashMap::new(),
+            now,
+        )
+        .unwrap();
+        let snapshot =
+            get_codex_provider_editor_snapshot_internal(&state, &provider.id, now).unwrap();
+        for view in [preview, snapshot.adaptation] {
+            assert_eq!(view.status, CodexAdaptationStatus::Failed);
+            assert_eq!(view.models[0].readiness, ProbeReadiness::Partial);
+            assert_eq!(view.tested_at, Some(expected_tested_at));
+            assert_eq!(view.expires_at, Some(expected_expires_at));
+        }
     }
 
     #[tokio::test]

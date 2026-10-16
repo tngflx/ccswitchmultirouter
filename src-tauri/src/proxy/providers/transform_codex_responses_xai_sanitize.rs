@@ -179,11 +179,7 @@ pub(crate) fn rewrite_xai_unknown_request_model(
 
 pub(crate) fn collect_xai_catalog_model_ids(settings: &Value) -> HashSet<String> {
     let mut ids = HashSet::new();
-    let Some(models) = settings
-        .get("modelCatalog")
-        .and_then(|catalog| catalog.get("models"))
-        .and_then(Value::as_array)
-    else {
+    let Some(models) = crate::codex_multirouter::catalog::catalog_models(settings) else {
         return ids;
     };
     for entry in models {

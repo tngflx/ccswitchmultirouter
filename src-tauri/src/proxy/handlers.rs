@@ -2119,10 +2119,8 @@ fn codex_image_generation_route_probe_models(
                 }
             }
         }
-    } else if let Some(entries) = provider
-        .settings_config
-        .pointer("/modelCatalog/models")
-        .and_then(|value| value.as_array())
+    } else if let Some(entries) =
+        crate::codex_multirouter::catalog::catalog_models(&provider.settings_config)
     {
         for entry in entries {
             if let Some(model) = codex_catalog_model_id(entry) {
@@ -2683,7 +2681,13 @@ fn external_openai_api_models_response(
             let provider = resolve_external_provider_source(state, profile)?.ok_or_else(|| {
                 ProxyError::InvalidRequest("External API provider target not found".to_string())
             })?;
-            external_provider_model_entries(&provider, profile)
+            if profile.app_type.as_deref() == Some("codex")
+                && codex_provider_has_v2_routing(&provider)
+            {
+                external_codex_router_model_entries(state, profile)?
+            } else {
+                external_provider_model_entries(&provider, profile)
+            }
         }
         ExternalOpenAiApiBackendType::CodexRouterRoute => {
             external_codex_router_model_entries(state, profile)?
@@ -2725,32 +2729,29 @@ fn external_provider_model_entries(
 ) -> Vec<Value> {
     let mut ids = Vec::new();
     let mut entries = Vec::new();
+    let catalog_models = crate::codex_multirouter::catalog::read_catalog(&provider.settings_config)
+        .and_then(|catalog| catalog.get("models"));
     // 官方 OAuth provider 的目录由前端通过专用 Codex 模型接口持久化；这里只读取
     // provider/profile 的真实数据，避免无条件混入与账号权限无关的旧静态模型。
-    collect_string_array(&mut ids, provider.settings_config.get("models"));
-    collect_string_array(&mut ids, provider.settings_config.get("modelList"));
-    collect_string_array(&mut ids, provider.settings_config.get("modelCatalog"));
-    collect_string_array(
-        &mut ids,
-        provider.settings_config.pointer("/modelCatalog/models"),
-    );
-    collect_model_objects(&mut entries, provider.settings_config.get("models"));
-    collect_model_objects(&mut entries, provider.settings_config.get("modelList"));
-    collect_model_objects(&mut entries, provider.settings_config.get("modelCatalog"));
-    collect_model_objects(
-        &mut entries,
-        provider.settings_config.pointer("/modelCatalog/models"),
-    );
-    if let Some(model) = provider
-        .settings_config
-        .get("model")
-        .or_else(|| provider.settings_config.get("defaultModel"))
-        .and_then(|value| value.as_str())
-    {
-        ids.push(model.to_string());
-    }
-    if let Some(model) = profile.default_model.as_deref() {
-        ids.push(model.to_string());
+    if catalog_models.is_some() {
+        collect_string_array(&mut ids, catalog_models);
+        collect_model_objects(&mut entries, catalog_models);
+    } else {
+        collect_string_array(&mut ids, provider.settings_config.get("models"));
+        collect_string_array(&mut ids, provider.settings_config.get("modelList"));
+        collect_model_objects(&mut entries, provider.settings_config.get("models"));
+        collect_model_objects(&mut entries, provider.settings_config.get("modelList"));
+        if let Some(model) = provider
+            .settings_config
+            .get("model")
+            .or_else(|| provider.settings_config.get("defaultModel"))
+            .and_then(|value| value.as_str())
+        {
+            ids.push(model.to_string());
+        }
+        if let Some(model) = profile.default_model.as_deref() {
+            ids.push(model.to_string());
+        }
     }
     ids.sort();
     ids.dedup();
@@ -2818,6 +2819,9 @@ fn external_codex_router_model_entries(
                 if let Some(reasoning) = model.capability_summary.reasoning {
                     source.insert("reasoning".to_string(), reasoning);
                 }
+                if let Some(supported) = model.capability_summary.supports_parallel_tool_calls {
+                    source.insert("supportsParallelToolCalls".to_string(), json!(supported));
+                }
                 openai_model_entry_with_source(
                     &model.visible_model,
                     "cc-switch",
@@ -2829,8 +2833,9 @@ fn external_codex_router_model_entries(
     }
     let mut ids = Vec::new();
     let mut entries = Vec::new();
-    let catalog_sources =
-        collect_model_sources_by_id(provider.settings_config.pointer("/modelCatalog/models"));
+    let catalog_models = crate::codex_multirouter::catalog::read_catalog(&provider.settings_config)
+        .and_then(|catalog| catalog.get("models"));
+    let catalog_sources = collect_model_sources_by_id(catalog_models);
     if let Some(routes) = provider
         .settings_config
         .pointer("/codexRouting/routes")
@@ -2891,6 +2896,9 @@ fn collect_string_array(ids: &mut Vec<String>, value: Option<&Value>) {
 fn collect_model_objects(entries: &mut Vec<Value>, value: Option<&Value>) {
     if let Some(values) = value.and_then(|value| value.as_array()) {
         for value in values {
+            if value.get("enabled").and_then(Value::as_bool) == Some(false) {
+                continue;
+            }
             if let Some(id) = value
                 .get("id")
                 .or_else(|| value.get("model"))
@@ -2947,6 +2955,49 @@ fn openai_model_entry_with_source(id: &str, owner: &str, source: &Value) -> Valu
             object.insert("contextWindow".to_string(), json!(context_window));
             object.insert("maxContextWindow".to_string(), json!(context_window));
         }
+    }
+    if let Some(source_object) = source.as_object() {
+        if let Some(modalities) =
+            crate::services::model_fetch::extract_input_modalities(source_object)
+        {
+            entry["input_modalities"] = json!(modalities);
+            entry["inputModalities"] = json!(modalities);
+        }
+        if let Some(supported) =
+            crate::services::model_fetch::extract_model_identity_fields(source_object)
+                .supports_parallel_tool_calls
+        {
+            entry["supports_parallel_tool_calls"] = json!(supported);
+            entry["supportsParallelToolCalls"] = json!(supported);
+        }
+    }
+    if let Some(capability) =
+        crate::proxy::providers::codex_reasoning::reasoning_capability_from_model_entry(source)
+    {
+        // Publish runtime fields only, never provider provenance or diagnostics.
+        let mut reasoning = json!({
+            "schemaVersion": 2,
+            "supportStatus": capability.effective_support_status(),
+            "controlKind": capability.effective_control_kind(),
+            "supportedEfforts": capability.supported_efforts,
+            "defaultEffort": capability.default_effort,
+            "disableAllowed": capability.disable_allowed,
+            "upstream": capability.upstream,
+        });
+        if let Some(ultra) = capability.codex_ultra_orchestration {
+            reasoning["codexUltraOrchestration"] = json!(ultra);
+        }
+        if let Some(format) = capability.output_format.filter(|format| {
+            format == "reasoning_content"
+                || crate::proxy::providers::codex_reasoning::validate_upstream_wire_contract(
+                    format,
+                    "reasoning_effort",
+                )
+                .is_ok()
+        }) {
+            reasoning["outputFormat"] = json!(format);
+        }
+        entry["reasoning"] = reasoning;
     }
     entry
 }
@@ -8949,6 +9000,124 @@ data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_deepseek\",\"
     }
 
     #[test]
+    fn external_models_response_treats_canonical_catalog_as_complete_inventory() {
+        for (models, expected) in [
+            (json!([]), Vec::<&str>::new()),
+            (
+                json!([
+                    { "model": "included", "contextWindow": 262144 },
+                    { "model": "excluded", "enabled": false }
+                ]),
+                vec!["included"],
+            ),
+        ] {
+            let db = Arc::new(Database::memory().expect("memory db"));
+            db.save_provider(
+                "codex",
+                &Provider::with_id(
+                    "catalog-provider".to_string(),
+                    "Catalog Provider".to_string(),
+                    json!({
+                        "model": "stale-model",
+                        "defaultModel": "stale-default",
+                        "models": ["stale-list-model", "excluded"],
+                        "modelList": [{ "id": "stale-object-model" }],
+                        "modelCatalog": { "models": models },
+                        "model_catalog": { "models": [{ "model": "stale-legacy-catalog" }] }
+                    }),
+                    None,
+                ),
+            )
+            .expect("save provider");
+            external_openai_api::update_profile(
+                &db,
+                ExternalOpenAiApiProfileUpdate {
+                    enabled: true,
+                    backend_type: ExternalOpenAiApiBackendType::Provider,
+                    app_type: Some("codex".to_string()),
+                    provider_id: Some("catalog-provider".to_string()),
+                    route_id: None,
+                    default_model: Some("excluded".to_string()),
+                    listen_address: None,
+                    listen_port: None,
+                },
+            )
+            .expect("save profile");
+            let profile = external_openai_api::load_profile(&db).expect("load profile");
+            let state = build_state(db);
+
+            let response = external_openai_api_models_response(&state, &profile).expect("models");
+            let ids = response["data"]
+                .as_array()
+                .expect("data array")
+                .iter()
+                .filter_map(|model| model.get("id").and_then(Value::as_str))
+                .collect::<Vec<_>>();
+
+            assert_eq!(ids, expected);
+        }
+    }
+
+    #[test]
+    fn external_models_response_recovers_absent_or_malformed_catalog_inventory() {
+        for catalog in [None, Some(json!({ "models": "malformed" }))] {
+            let db = Arc::new(Database::memory().expect("memory db"));
+            let mut settings = json!({
+                "models": ["legacy-model"],
+                "modelList": [{ "id": "legacy-object-model" }],
+                "defaultModel": "provider-default"
+            });
+            if let Some(catalog) = catalog {
+                settings["modelCatalog"] = catalog;
+            }
+            db.save_provider(
+                "codex",
+                &Provider::with_id(
+                    "legacy-provider".to_string(),
+                    "Legacy Provider".to_string(),
+                    settings,
+                    None,
+                ),
+            )
+            .expect("save provider");
+            external_openai_api::update_profile(
+                &db,
+                ExternalOpenAiApiProfileUpdate {
+                    enabled: true,
+                    backend_type: ExternalOpenAiApiBackendType::Provider,
+                    app_type: Some("codex".to_string()),
+                    provider_id: Some("legacy-provider".to_string()),
+                    route_id: None,
+                    default_model: Some("profile-default".to_string()),
+                    listen_address: None,
+                    listen_port: None,
+                },
+            )
+            .expect("save profile");
+            let profile = external_openai_api::load_profile(&db).expect("load profile");
+            let state = build_state(db);
+
+            let response = external_openai_api_models_response(&state, &profile).expect("models");
+            let ids = response["data"]
+                .as_array()
+                .expect("data array")
+                .iter()
+                .filter_map(|model| model.get("id").and_then(Value::as_str))
+                .collect::<Vec<_>>();
+
+            assert_eq!(
+                ids,
+                vec![
+                    "legacy-model",
+                    "legacy-object-model",
+                    "profile-default",
+                    "provider-default"
+                ]
+            );
+        }
+    }
+
+    #[test]
     fn external_models_response_reads_provider_model_catalog_object() {
         let db = Arc::new(Database::memory().expect("memory db"));
         db.save_provider(
@@ -8961,10 +9130,53 @@ data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_deepseek\",\"
                     "defaultModel": "gpt-5.4-mini",
                     "modelCatalog": {
                         "models": [
-                            { "model": "gpt-5.5", "contextWindow": 272000 },
+                            {
+                                "model": "gpt-5.5",
+                                "contextWindow": 272000,
+                                "inputModalities": ["text", "image"],
+                                "supportsParallelToolCalls": false,
+                                "reasoning": {
+                                    "schemaVersion": 2,
+                                    "supportStatus": "confirmed_supported",
+                                    "controlKind": "graded",
+                                    "supportedEfforts": ["low", "high", "xhigh", "max"],
+                                    "defaultEffort": "max",
+                                    "disableAllowed": false,
+                                    "upstream": {
+                                        "format": "string",
+                                        "parameter": "reasoning_effort",
+                                        "effortMap": {}
+                                    },
+                                    "codexUltraOrchestration": { "enabled": true },
+                                    "source": "REDACTED_SOURCE",
+                                    "providerKey": "REDACTED_PROVIDER",
+                                    "outputFormat": "REDACTED_OUTPUT_FORMAT",
+                                    "evidence": [{ "detail": "REDACTED_EVIDENCE" }]
+                                },
+                                "apiKey": "REDACTED_KEY",
+                                "baseUrl": "https://redacted.example/v1"
+                            },
                             { "model": "gpt-5.4" },
                             { "model": "gpt-5.4-mini" },
-                            { "model": "gpt-5.3-codex-spark" }
+                            { "model": "gpt-5.3-codex-spark" },
+                            {
+                                "model": "malformed-capabilities",
+                                "inputModalities": { "secret": "REDACTED_MODALITIES" },
+                                "supportsParallelToolCalls": "REDACTED_PARALLEL",
+                                "reasoning": {
+                                    "schemaVersion": 2,
+                                    "supportStatus": "confirmed_supported",
+                                    "controlKind": "graded",
+                                    "supportedEfforts": ["ultra"],
+                                    "defaultEffort": "ultra",
+                                    "disableAllowed": false,
+                                    "upstream": {
+                                        "format": "string",
+                                        "parameter": "reasoning_effort",
+                                        "effortMap": { "ultra": "ultra" }
+                                    }
+                                }
+                            }
                         ]
                     }
                 }),
@@ -9018,6 +9230,32 @@ data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_deepseek\",\"
                 .and_then(|value| value.as_u64()),
             Some(272_000)
         );
+        assert_eq!(gpt55["input_modalities"], json!(["text", "image"]));
+        assert_eq!(gpt55["supports_parallel_tool_calls"], json!(false));
+        assert_eq!(
+            gpt55["reasoning"]["supportedEfforts"],
+            json!(["low", "high", "xhigh", "max"])
+        );
+        assert_eq!(gpt55["reasoning"]["defaultEffort"], json!("max"));
+        assert_eq!(
+            gpt55["reasoning"]["codexUltraOrchestration"],
+            json!({ "enabled": true })
+        );
+        assert_eq!(
+            gpt55["reasoning"]["upstream"]["effortMap"]["max"],
+            json!("max")
+        );
+        let malformed = response["data"]
+            .as_array()
+            .expect("data array")
+            .iter()
+            .find(|model| model["id"] == "malformed-capabilities")
+            .expect("malformed-capability model remains in inventory");
+        assert!(malformed.get("reasoning").is_none());
+        assert!(malformed.get("input_modalities").is_none());
+        assert!(malformed.get("supports_parallel_tool_calls").is_none());
+        assert!(!response.to_string().contains("REDACTED_"));
+        assert!(!response.to_string().contains("https://redacted.example"));
     }
 
     #[test]
@@ -9033,7 +9271,26 @@ data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_deepseek\",\"
                     "auth": { "OPENAI_API_KEY": "secret" },
                     "modelCatalog": {
                         "models": [
-                            { "model": "deepseek-v4-flash", "contextWindow": 1000000 },
+                            {
+                                "model": "deepseek-v4-flash",
+                                "contextWindow": 1000000,
+                                "inputModalities": ["text", "image"],
+                                "supportsParallelToolCalls": false,
+                                "reasoning": {
+                                    "schemaVersion": 2,
+                                    "supportStatus": "confirmed_supported",
+                                    "controlKind": "graded",
+                                    "supportedEfforts": ["low", "high", "max"],
+                                    "defaultEffort": "max",
+                                    "disableAllowed": false,
+                                    "upstream": {
+                                        "format": "reasoning_object",
+                                        "parameter": "reasoning.effort",
+                                        "effortMap": {}
+                                    },
+                                    "outputFormat": "reasoning_content"
+                                }
+                            },
                             { "model": "deepseek-v4-pro", "contextWindow": 262144 }
                         ]
                     }
@@ -9066,49 +9323,70 @@ data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_deepseek\",\"
             ),
         )
         .expect("save provider");
-        external_openai_api::update_profile(
-            &db,
-            ExternalOpenAiApiProfileUpdate {
-                enabled: true,
-                backend_type: ExternalOpenAiApiBackendType::CodexRouterRoute,
-                app_type: Some("codex".to_string()),
-                provider_id: Some("codex-router".to_string()),
-                route_id: None,
-                default_model: Some("deepseek-v4-flash".to_string()),
-                listen_address: None,
-                listen_port: None,
-            },
-        )
-        .expect("save profile");
-        let profile = external_openai_api::load_profile(&db).expect("load profile");
-        let state = build_state(db);
+        for backend_type in [
+            ExternalOpenAiApiBackendType::Provider,
+            ExternalOpenAiApiBackendType::CodexRouterRoute,
+        ] {
+            external_openai_api::update_profile(
+                &db,
+                ExternalOpenAiApiProfileUpdate {
+                    enabled: true,
+                    backend_type,
+                    app_type: Some("codex".to_string()),
+                    provider_id: Some("codex-router".to_string()),
+                    route_id: None,
+                    default_model: Some("deepseek-v4-flash".to_string()),
+                    listen_address: None,
+                    listen_port: None,
+                },
+            )
+            .expect("save profile");
+            let profile = external_openai_api::load_profile(&db).expect("load profile");
+            let state = build_state(db.clone());
 
-        let response = external_openai_api_models_response(&state, &profile).expect("models");
-        let data = response["data"].as_array().expect("data array");
-        let deepseek = data
-            .iter()
-            .find(|model| model.get("id").and_then(|id| id.as_str()) == Some("deepseek-v4-flash"))
-            .expect("deepseek entry");
-        let deepseek_pro = data
-            .iter()
-            .find(|model| model.get("id").and_then(|id| id.as_str()) == Some("deepseek-v4-pro"))
-            .expect("deepseek pro entry");
+            let response = external_openai_api_models_response(&state, &profile).expect("models");
+            let data = response["data"].as_array().expect("data array");
+            let deepseek = data
+                .iter()
+                .find(|model| {
+                    model.get("id").and_then(|id| id.as_str()) == Some("deepseek-v4-flash")
+                })
+                .expect("deepseek entry");
+            let deepseek_pro = data
+                .iter()
+                .find(|model| model.get("id").and_then(|id| id.as_str()) == Some("deepseek-v4-pro"))
+                .expect("deepseek pro entry");
 
-        assert_eq!(
-            deepseek
-                .get("context_window")
-                .and_then(|value| value.as_u64()),
-            Some(1_000_000)
-        );
-        assert_eq!(
-            deepseek_pro
-                .get("context_window")
-                .and_then(|value| value.as_u64()),
-            Some(262_144)
-        );
-        assert!(data.iter().all(|model| {
-            model.get("id").and_then(|id| id.as_str()) != Some("stale-router-model")
-        }));
+            assert_eq!(
+                deepseek
+                    .get("context_window")
+                    .and_then(|value| value.as_u64()),
+                Some(1_000_000)
+            );
+            assert_eq!(
+                deepseek_pro
+                    .get("context_window")
+                    .and_then(|value| value.as_u64()),
+                Some(262_144)
+            );
+            assert_eq!(deepseek["input_modalities"], json!(["text", "image"]));
+            assert_eq!(deepseek["supports_parallel_tool_calls"], json!(false));
+            assert_eq!(
+                deepseek["reasoning"]["supportedEfforts"],
+                json!(["low", "high", "max"])
+            );
+            assert_eq!(
+                deepseek["reasoning"]["upstream"]["parameter"],
+                json!("reasoning.effort")
+            );
+            assert_eq!(
+                deepseek["reasoning"]["outputFormat"],
+                json!("reasoning_content")
+            );
+            assert!(data.iter().all(|model| {
+                model.get("id").and_then(|id| id.as_str()) != Some("stale-router-model")
+            }));
+        }
     }
 
     #[test]

@@ -1,5 +1,6 @@
 import type { Provider, UniversalProvider } from "@/types";
 import { readCodexCatalogSettings } from "@/lib/codexCatalogSchema";
+import { readCodexModelProtocolCapability } from "@/lib/codexProtocolCapability";
 import { normalizeCodexPublicModelKey } from "./codex-overrides";
 
 type ManualCodexApiFormat = "openai_chat" | "openai_responses";
@@ -60,7 +61,10 @@ export function prepareUnverifiedCodexProvider(provider: Provider): Provider {
               configuredFormat === "open_ai_responses" ||
               configuredFormat === "responses"
             ? "openai_responses"
-            : apiFormat),
+            : (readCodexModelProtocolCapability(provider, {
+                ...row,
+                model: publicModel,
+              }) ?? apiFormat)),
     );
   }
   const meta = {

@@ -16,7 +16,7 @@ use crate::settings;
 /// 读取设备级预设注册表设置。
 #[tauri::command]
 pub fn preset_registry_get_settings() -> Result<Option<PresetRegistrySettings>, String> {
-    Ok(settings::get_preset_registry_settings())
+    Ok(settings::get_preset_registry_settings_for_frontend())
 }
 
 /// 保存设备级预设注册表设置（含 WebDAV 凭据，属设备私有，不跨设备同步）。

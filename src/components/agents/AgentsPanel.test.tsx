@@ -41,7 +41,7 @@ describe("AgentsPanel orchestration profile editor", () => {
       publicationError: null,
     }));
   });
-  it("lets a catalog-less Claude provider use a typed model ID and enables projection on profile creation", async () => {
+  it("saves a new disabled draft without implicitly enabling routing", async () => {
     orchestrationMocks.getSettings.mockResolvedValue({
       enabled: false,
       profiles: [],
@@ -93,9 +93,10 @@ describe("AgentsPanel orchestration profile editor", () => {
     await waitFor(() =>
       expect(orchestrationMocks.saveSettings).toHaveBeenCalledWith(
         expect.objectContaining({
-          enabled: true,
+          enabled: false,
           profiles: [
             expect.objectContaining({
+              enabled: false,
               orchestrator: expect.objectContaining({
                 model: "claude-sonnet-4-20250514",
               }),
@@ -104,6 +105,9 @@ describe("AgentsPanel orchestration profile editor", () => {
         }),
       ),
     );
+    expect(
+      orchestrationMocks.saveSettings.mock.calls[0][0].activeProfileId,
+    ).toBeUndefined();
   });
 
   it("keeps an authoritative empty catalog closed and does not select router providers", async () => {
@@ -141,6 +145,10 @@ describe("AgentsPanel orchestration profile editor", () => {
     await screen.findByText("Multimodel orchestration");
     fireEvent.click(screen.getByTitle("Add profile"));
     expect(screen.getByLabelText("Worker model ID")).toBeDisabled();
+    // Empty authoritative inventories cannot route, but must not prevent
+    // persisting an incomplete, disabled draft.
+    expect(screen.getByRole("button", { name: "Save" })).toBeEnabled();
+    fireEvent.click(screen.getByLabelText("Profile enabled"));
     expect(screen.getByRole("button", { name: "Save" })).toBeDisabled();
     expect(screen.queryByText("A Router")).not.toBeInTheDocument();
     expect(screen.queryByText("excluded")).not.toBeInTheDocument();
@@ -166,6 +174,160 @@ describe("AgentsPanel orchestration profile editor", () => {
     fireEvent.click(screen.getByRole("button", { name: "Retry publication" }));
     await waitFor(() =>
       expect(orchestrationMocks.saveSettings).toHaveBeenCalledTimes(2),
+    );
+  });
+
+  function settingsWithProfiles() {
+    const role = {
+      appType: "codex",
+      providerId: "source",
+      model: "model",
+    };
+    return {
+      enabled: true,
+      activeProfileId: "primary",
+      defaultModeByApp: { claude: "direct", codex: "orchestrated" },
+      profiles: ["primary", "secondary"].map((id) => ({
+        id,
+        displayName: id,
+        enabled: true,
+        scope: "all",
+        orchestrator: role,
+        worker: role,
+        budget: {
+          maxRounds: 2,
+          maxWorkerCalls: 2,
+          maxParallelWorkers: 1,
+          timeoutSeconds: 300,
+          maxOutputTokens: 8192,
+        },
+        approvalPolicy: "client",
+        failureFallback: "fail_closed",
+        workerGuidance: "",
+      })),
+    };
+  }
+
+  function mockExistingProfiles() {
+    orchestrationMocks.getSettings.mockResolvedValue(settingsWithProfiles());
+    providerMocks.getAll.mockResolvedValue({
+      source: {
+        id: "source",
+        name: "Source",
+        settingsConfig: { modelCatalog: { models: ["model"] } },
+      },
+    });
+  }
+
+  it("does not activate a profile just by browsing it", async () => {
+    mockExistingProfiles();
+    render(<AgentsPanel onOpenChange={vi.fn()} />);
+    fireEvent.click(await screen.findByRole("button", { name: /secondary/ }));
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() =>
+      expect(orchestrationMocks.saveSettings).toHaveBeenCalledWith(
+        expect.objectContaining({ activeProfileId: "primary" }),
+      ),
+    );
+  });
+
+  it("preserves the active profile and default modes when adding a draft", async () => {
+    mockExistingProfiles();
+    render(<AgentsPanel onOpenChange={vi.fn()} />);
+    await screen.findByText("Multimodel orchestration");
+    fireEvent.click(screen.getByTitle("Add profile"));
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() =>
+      expect(orchestrationMocks.saveSettings).toHaveBeenCalledWith(
+        expect.objectContaining({
+          activeProfileId: "primary",
+          defaultModeByApp: { claude: "direct", codex: "orchestrated" },
+          profiles: expect.arrayContaining([
+            expect.objectContaining({ enabled: false }),
+          ]),
+        }),
+      ),
+    );
+  });
+
+  it("preserves the active profile when deleting another profile", async () => {
+    const settings = settingsWithProfiles();
+    settings.activeProfileId = "secondary";
+    orchestrationMocks.getSettings.mockResolvedValue(settings);
+    providerMocks.getAll.mockResolvedValue({
+      source: {
+        id: "source",
+        name: "Source",
+        settingsConfig: { model: "model" },
+      },
+    });
+    render(<AgentsPanel onOpenChange={vi.fn()} />);
+    fireEvent.click(await screen.findByRole("button", { name: /primary/ }));
+    fireEvent.click(screen.getByTitle("Delete profile"));
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() =>
+      expect(orchestrationMocks.saveSettings).toHaveBeenCalledWith(
+        expect.objectContaining({ activeProfileId: "secondary" }),
+      ),
+    );
+  });
+
+  it("can delete the last profile and return default routing to direct", async () => {
+    mockExistingProfiles();
+    const settings = settingsWithProfiles();
+    settings.profiles = settings.profiles.slice(0, 1);
+    orchestrationMocks.getSettings.mockResolvedValue(settings);
+    render(<AgentsPanel onOpenChange={vi.fn()} />);
+    await screen.findByText("Multimodel orchestration");
+    fireEvent.click(screen.getByTitle("Delete profile"));
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() =>
+      expect(orchestrationMocks.saveSettings).toHaveBeenCalledWith(
+        expect.objectContaining({
+          activeProfileId: undefined,
+          profiles: [],
+          defaultModeByApp: { claude: "direct", codex: "direct" },
+        }),
+      ),
+    );
+  });
+
+  it("can save incomplete disabled drafts without any providers", async () => {
+    providerMocks.getAll.mockResolvedValue({});
+    render(<AgentsPanel onOpenChange={vi.fn()} />);
+    await screen.findByText("Multimodel orchestration");
+    fireEvent.click(screen.getByTitle("Add profile"));
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() =>
+      expect(orchestrationMocks.saveSettings).toHaveBeenCalledWith(
+        expect.objectContaining({
+          enabled: false,
+          profiles: [
+            expect.objectContaining({
+              enabled: false,
+              worker: { appType: "codex", providerId: "", model: "" },
+            }),
+          ],
+        }),
+      ),
+    );
+  });
+
+  it("changes the active profile only through the explicit default-profile action", async () => {
+    mockExistingProfiles();
+    render(<AgentsPanel onOpenChange={vi.fn()} />);
+    fireEvent.click(await screen.findByRole("button", { name: /secondary/ }));
+    fireEvent.click(
+      screen.getByRole("button", { name: "Use as default profile" }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() =>
+      expect(orchestrationMocks.saveSettings).toHaveBeenCalledWith(
+        expect.objectContaining({
+          activeProfileId: "secondary",
+          defaultModeByApp: { claude: "direct", codex: "orchestrated" },
+        }),
+      ),
     );
   });
 });

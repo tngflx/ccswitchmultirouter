@@ -246,6 +246,112 @@ describe("useSettings hook", () => {
     expect(toastErrorMock).not.toHaveBeenCalled();
   });
 
+  it("auto-saves only explicit updates over the latest persisted settings", async () => {
+    settingsFormMock = createSettingsFormMock({
+      settings: {
+        ...serverSettings,
+        claudeConfigDir: "/unsaved/claude",
+        enableClaudePluginIntegration: true,
+      },
+    });
+    const latestPersisted = {
+      ...serverSettings,
+      codexConfigDir: "/latest/codex",
+      language: "ja",
+    };
+    getQueryDataMock.mockReturnValue(latestPersisted);
+    const { result } = renderHook(() => useSettings());
+
+    await act(async () => {
+      await result.current.autoSaveSettings({ minimizeToTrayOnClose: false });
+    });
+
+    expect(mutateAsyncMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        claudeConfigDir: serverSettings.claudeConfigDir,
+        codexConfigDir: "/latest/codex",
+        enableClaudePluginIntegration: false,
+        language: "ja",
+        minimizeToTrayOnClose: false,
+      }),
+    );
+    expect(applyClaudePluginConfigMock).not.toHaveBeenCalled();
+    expect(syncCurrentProvidersLiveMock).not.toHaveBeenCalled();
+    expect(settingsFormMock.settings.claudeConfigDir).toBe("/unsaved/claude");
+  });
+
+  it("does not replay device-local preset registry data through general autosave", async () => {
+    const latestPersisted = {
+      ...serverSettings,
+      presetRegistry: {
+        sources: [{ id: "private", password: "should-stay-backend-only" }],
+      },
+    } as Settings;
+    getQueryDataMock.mockReturnValue(latestPersisted);
+    const { result } = renderHook(() => useSettings());
+
+    await act(async () => {
+      await result.current.autoSaveSettings({ minimizeToTrayOnClose: false });
+    });
+
+    const payload = mutateAsyncMock.mock.calls[0][0] as Settings & {
+      presetRegistry?: unknown;
+    };
+    expect(payload.presetRegistry).toBeUndefined();
+  });
+
+  it("preserves both updates when autosaves overlap", async () => {
+    let persisted = serverSettings;
+    let finishFirstSave!: () => void;
+    const firstSavePending = new Promise<void>((resolve) => {
+      finishFirstSave = resolve;
+    });
+    let saveCount = 0;
+    getQueryDataMock.mockImplementation(() => persisted);
+    mutateAsyncMock.mockImplementation(async (payload: Settings) => {
+      saveCount += 1;
+      if (saveCount === 1) await firstSavePending;
+      persisted = payload;
+      return true;
+    });
+    const { result } = renderHook(() => useSettings());
+
+    await act(async () => {
+      const first = result.current.autoSaveSettings({ showInTray: false });
+      const second = result.current.autoSaveSettings({
+        minimizeToTrayOnClose: false,
+      });
+      finishFirstSave();
+      await Promise.all([first, second]);
+    });
+
+    expect(persisted.showInTray).toBe(false);
+    expect(persisted.minimizeToTrayOnClose).toBe(false);
+    expect(mutateAsyncMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("continues queued autosaves after a failed save", async () => {
+    mutateAsyncMock.mockRejectedValueOnce(new Error("first save failed"));
+    const { result } = renderHook(() => useSettings());
+
+    await act(async () => {
+      const first = result.current.autoSaveSettings({ showInTray: false });
+      const second = result.current.autoSaveSettings({
+        minimizeToTrayOnClose: false,
+      });
+      await expect(first).rejects.toThrow("first save failed");
+      await second;
+    });
+
+    expect(mutateAsyncMock).toHaveBeenCalledTimes(2);
+    expect(mutateAsyncMock).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        showInTray: true,
+        minimizeToTrayOnClose: false,
+      }),
+    );
+  });
+
   it("saves settings and flags restart when app config directory changes", async () => {
     serverSettings = {
       ...serverSettings,
@@ -420,7 +526,9 @@ describe("useSettings hook", () => {
     });
 
     // 修复生效：读的是缓存实时值 true，payload=false，差异触发 clear_claude_config
-    expect(applyClaudePluginConfigMock).toHaveBeenCalledWith({ official: true });
+    expect(applyClaudePluginConfigMock).toHaveBeenCalledWith({
+      official: true,
+    });
     expect(syncCurrentProvidersLiveMock).toHaveBeenCalled();
   });
 

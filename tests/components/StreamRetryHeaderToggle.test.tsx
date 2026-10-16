@@ -3,19 +3,25 @@ import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { StreamRetryHeaderToggle } from "@/components/proxy/StreamRetryHeaderToggle";
 
-const { mutate, query, mutation } = vi.hoisted(() => ({
-  mutate: vi.fn(),
+const { patch, query } = vi.hoisted(() => ({
+  patch: vi.fn(),
   query: vi.fn(),
-  mutation: vi.fn(),
 }));
 
 vi.mock("react-i18next", () => ({
   useTranslation: () => ({ t: (key: string) => key }),
 }));
 
+vi.mock("@tanstack/react-query", () => ({
+  useQueryClient: () => ({ invalidateQueries: vi.fn() }),
+}));
+
 vi.mock("@/lib/query", () => ({
   useSettingsQuery: query,
-  useSaveSettingsMutation: mutation,
+}));
+
+vi.mock("@/lib/api", () => ({
+  settingsApi: { patch },
 }));
 
 const settings = {
@@ -30,7 +36,8 @@ beforeEach(() => {
     data: settings,
     isLoading: false,
   });
-  mutation.mockReturnValue({ mutate, isPending: false });
+  patch.mockReset();
+  patch.mockResolvedValue(undefined);
 });
 
 describe("StreamRetryHeaderToggle", () => {
@@ -50,8 +57,7 @@ describe("StreamRetryHeaderToggle", () => {
 
     await user.click(screen.getByRole("switch"));
 
-    expect(mutate).toHaveBeenCalledWith({
-      ...settings,
+    expect(patch).toHaveBeenCalledWith({
       streamRetryMode: "safe",
       enableStreamRetry: true,
     });
@@ -70,8 +76,7 @@ describe("StreamRetryHeaderToggle", () => {
       screen.getByRole("button", { name: "streamRetry.mode.aggressive" }),
     );
 
-    expect(mutate).toHaveBeenCalledWith({
-      ...settings,
+    expect(patch).toHaveBeenCalledWith({
       streamRetryMode: "aggressive",
       enableStreamRetry: true,
     });
@@ -101,10 +106,7 @@ describe("StreamRetryHeaderToggle", () => {
     expect(slider).toHaveValue("3");
     fireEvent.change(slider, { target: { value: "1" } });
 
-    expect(mutate).toHaveBeenCalledWith({
-      ...settings,
-      enableStreamRetry: true,
-      streamRetryMode: "aggressive",
+    expect(patch).toHaveBeenCalledWith({
       streamRetryMaxAttempts: 1,
     });
   });
@@ -121,15 +123,23 @@ describe("StreamRetryHeaderToggle", () => {
     expect(openActivity).toHaveBeenCalledOnce();
   });
 
-  it("disables settings changes while persistence is pending", () => {
-    mutation.mockReturnValue({ mutate, isPending: true });
+  it("disables settings changes while persistence is pending", async () => {
+    let resolve!: () => void;
+    patch.mockReturnValueOnce(
+      new Promise<void>((res) => {
+        resolve = res;
+      }),
+    );
     render(<StreamRetryHeaderToggle />);
 
+    const user = userEvent.setup();
+    await user.click(screen.getByRole("switch"));
     expect(screen.getByRole("switch")).toBeDisabled();
     expect(
       screen.getByRole("button", {
         name: "streamRetry.label: streamRetry.mode.off",
       }),
     ).toBeDisabled();
+    resolve();
   });
 });

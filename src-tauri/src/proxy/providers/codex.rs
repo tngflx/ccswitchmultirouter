@@ -1203,10 +1203,7 @@ fn restore_isolated_key_group_bindings(
     mut projected_catalog: JsonValue,
     target_settings: &JsonValue,
 ) -> JsonValue {
-    let Some(target_rows) = target_settings
-        .get("modelCatalog")
-        .and_then(|catalog| catalog.get("models"))
-        .and_then(JsonValue::as_array)
+    let Some(target_rows) = crate::codex_multirouter::catalog::catalog_models(target_settings)
     else {
         return projected_catalog;
     };
@@ -1297,9 +1294,8 @@ pub fn materialize_codex_routed_provider_from_target(
     // 保留 route provider 的 modelCatalog，使 apply_codex_request_upstream_model
     // 能通过 catalog 把可见模型名映射回真实上游模型名。MultiRouter 的 modelCatalog
     // 只存在于 parent plan 中，target provider 通常不携带。
-    if let Some(catalog) = route_settings
-        .and_then(|settings| settings.get("modelCatalog"))
-        .cloned()
+    if let Some(catalog) =
+        crate::codex_multirouter::catalog::read_catalog(&route_provider.settings_config).cloned()
     {
         settings.insert(
             "modelCatalog".to_string(),
@@ -3197,19 +3193,15 @@ fn codex_provider_catalog_upstream_model_for_request(
     provider: &Provider,
     request_model: &str,
 ) -> Option<String> {
-    provider
-        .settings_config
-        .get("modelCatalog")
-        .and_then(|catalog| catalog.get("models"))
-        .and_then(|models| models.as_array())
-        .and_then(|models| {
+    crate::codex_multirouter::catalog::catalog_models(&provider.settings_config).and_then(
+        |models| {
             models.iter().find_map(|model| {
                 let visible_model = model
                     .get("model")
                     .and_then(|value| value.as_str())
                     .map(str::trim)
                     .filter(|model| !model.is_empty())?;
-                if visible_model != request_model {
+                if !visible_model.eq_ignore_ascii_case(request_model.trim()) {
                     return None;
                 }
                 let upstream_model = model
@@ -3221,7 +3213,8 @@ fn codex_provider_catalog_upstream_model_for_request(
                     .unwrap_or(visible_model);
                 Some(upstream_model.to_string())
             })
-        })
+        },
+    )
 }
 
 /// 将 Codex 请求体里的可见模型名改回真实上游模型名；route 显式覆盖优先于 catalog 默认映射。
@@ -4202,11 +4195,7 @@ impl CodexAdapter {
         provider: &'a Provider,
         request_model: &str,
     ) -> Option<&'a str> {
-        provider
-            .settings_config
-            .get("modelCatalog")
-            .and_then(|catalog| catalog.get("models"))
-            .and_then(JsonValue::as_array)
+        crate::codex_multirouter::catalog::catalog_models(&provider.settings_config)
             .and_then(|models| {
                 models.iter().find(|model| {
                     model
@@ -4483,25 +4472,18 @@ impl ProviderAdapter for CodexAdapter {
             return Ok(super::XAI_API_BASE_URL.to_string());
         }
 
-        // 1. 尝试直接获取 base_url 字段
-        if let Some(url) = provider
-            .settings_config
-            .get("base_url")
-            .and_then(|v| v.as_str())
-        {
-            return Ok(url.trim_end_matches('/').to_string());
+        for key in ["base_url", "baseURL", "baseUrl"] {
+            if let Some(url) = provider
+                .settings_config
+                .get(key)
+                .and_then(JsonValue::as_str)
+                .filter(|url| !url.trim().is_empty())
+            {
+                return Ok(url.trim_end_matches('/').to_string());
+            }
         }
 
-        // 2. 尝试 baseURL
-        if let Some(url) = provider
-            .settings_config
-            .get("baseURL")
-            .and_then(|v| v.as_str())
-        {
-            return Ok(url.trim_end_matches('/').to_string());
-        }
-
-        // 3. 尝试从 config 对象中获取
+        // Try the config object, then its selected TOML provider.
         if let Some(config) = provider.settings_config.get("config") {
             if let Some(url) = config.get("base_url").and_then(|v| v.as_str()) {
                 return Ok(url.trim_end_matches('/').to_string());
@@ -6590,6 +6572,95 @@ wire_api = "chat"
 
         let url = adapter.extract_base_url(&provider).unwrap();
         assert_eq!(url, "https://api.openai.com/v1");
+    }
+
+    #[test]
+    fn test_extract_base_url_direct_aliases() {
+        let adapter = CodexAdapter::new();
+        for settings in [
+            json!({ "baseURL": "https://gateway.example/v1/" }),
+            json!({ "baseUrl": "https://gateway.example/v1/" }),
+        ] {
+            let provider = create_provider(settings);
+            assert_eq!(
+                adapter.extract_base_url(&provider).unwrap(),
+                "https://gateway.example/v1"
+            );
+        }
+    }
+
+    #[test]
+    fn test_extract_base_url_direct_alias_precedence() {
+        let adapter = CodexAdapter::new();
+        let provider = create_provider(json!({
+            "base_url": "https://snake.example/v1",
+            "baseURL": "https://upper.example/v1",
+            "baseUrl": "https://camel.example/v1"
+        }));
+        assert_eq!(
+            adapter.extract_base_url(&provider).unwrap(),
+            "https://snake.example/v1"
+        );
+
+        let provider = create_provider(json!({
+            "baseURL": "https://upper.example/v1",
+            "baseUrl": "https://camel.example/v1"
+        }));
+        assert_eq!(
+            adapter.extract_base_url(&provider).unwrap(),
+            "https://upper.example/v1"
+        );
+    }
+
+    #[test]
+    fn test_extract_base_url_skips_blank_direct_aliases() {
+        let adapter = CodexAdapter::new();
+        for settings in [
+            json!({
+                "base_url": "",
+                "baseURL": "https://gateway.example/v1"
+            }),
+            json!({
+                "base_url": " \t",
+                "baseURL": "",
+                "baseUrl": "https://gateway.example/v1"
+            }),
+        ] {
+            let provider = create_provider(settings);
+            assert_eq!(
+                adapter.extract_base_url(&provider).unwrap(),
+                "https://gateway.example/v1"
+            );
+        }
+    }
+
+    #[test]
+    fn test_extract_base_url_skips_blank_direct_aliases_for_config_fallback() {
+        let adapter = CodexAdapter::new();
+        for config in [
+            json!({ "base_url": "https://selected.example/v1/" }),
+            json!(
+                r#"model_provider = "selected"
+
+[model_providers.inactive]
+base_url = "https://inactive.example/v1"
+
+[model_providers.selected]
+base_url = "https://selected.example/v1/"
+"#
+            ),
+        ] {
+            let provider = create_provider(json!({
+                "base_url": "",
+                "baseURL": " \t",
+                "baseUrl": "",
+                "config": config
+            }));
+            assert_eq!(
+                adapter.extract_base_url(&provider).unwrap(),
+                "https://selected.example/v1"
+            );
+        }
     }
 
     #[test]

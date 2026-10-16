@@ -58,6 +58,10 @@ pub struct CodexModelCapabilitySummary {
     pub input_modalities: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning: Option<Value>,
+    /// Sanitized copy of a malformed provider declaration for diagnostics only.
+    /// This field is never projected into the routable model catalog.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub declared_reasoning_diagnostic: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub codex_cache: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -749,7 +753,7 @@ fn effective_capability_summary(
         &provider.settings_config,
         &["reasoning", "codexChatReasoning", "codex_chat_reasoning"],
     )
-    .cloned()
+    .and_then(validated_provider_reasoning)
     .or_else(|| {
         provider
             .meta
@@ -757,34 +761,23 @@ fn effective_capability_summary(
             .and_then(|meta| meta.codex_chat_reasoning.as_ref())
             .and_then(|reasoning| serde_json::to_value(reasoning).ok())
     });
-    let (reasoning, reasoning_source) = if let Some(reasoning) =
-        value_field(model_entry, &["reasoning"]).cloned()
-    {
-        (Some(reasoning), "provider_model".to_string())
-    } else if let Some(reasoning) = provider_reasoning {
-        (Some(reasoning), "provider".to_string())
-    } else if let Some(upstream) = string_field(model_entry, &["upstreamModel", "upstream_model"]) {
-        let resolved = crate::reasoning_capabilities::resolve_codex_model_capability_core(
-            &provider.settings_config,
-            crate::reasoning_capabilities::provider_metadata::detect_platform(provider),
-            upstream,
-            None,
-            None,
-            official_models,
-        );
-        if resolved.source == crate::reasoning_capabilities::CapabilitySource::Official {
-            (
-                resolved
-                    .capability
-                    .and_then(|capability| serde_json::to_value(capability).ok()),
-                "official".to_string(),
-            )
-        } else {
-            (None, "unknown".to_string())
-        }
-    } else {
-        (None, "unknown".to_string())
-    };
+    let declared_model_reasoning = value_field(
+        model_entry,
+        &["reasoning", "codexChatReasoning", "codex_chat_reasoning"],
+    )
+    .filter(|value| !value.is_null())
+    .cloned();
+    let (reasoning, reasoning_source) =
+        effective_reasoning_capability(provider, model_entry, provider_reasoning, official_models);
+    // Keep a sanitized copy of an otherwise-unparseable model declaration in
+    // the compile diagnostic. It remains separate from `reasoning`, so the
+    // invalid declaration can never become a routable picker capability.
+    let declared_reasoning_diagnostic = reasoning
+        .is_none()
+        .then(|| {
+            declared_model_reasoning.and_then(|declared| sanitize_reasoning_diagnostic(&declared))
+        })
+        .flatten();
     let provider_cache = value_field(&provider.settings_config, &["codexCache", "codex_cache"])
         .cloned()
         .or_else(|| {
@@ -806,6 +799,7 @@ fn effective_capability_summary(
         context_window,
         input_modalities: input_modalities.unwrap_or_default(),
         reasoning: reasoning.map(|value| sanitize_capability_value(&value)),
+        declared_reasoning_diagnostic,
         codex_cache: codex_cache.map(|value| sanitize_capability_value(&value)),
         supports_parallel_tool_calls: bool_field(
             model_entry,
@@ -822,6 +816,99 @@ fn effective_capability_summary(
         reasoning_source,
         codex_cache_source,
     }
+}
+
+/// Model capabilities share the request/inspector resolver. Legacy provider
+/// transport settings are only a fallback, never a replacement for that chain.
+fn effective_reasoning_capability(
+    provider: &Provider,
+    model_entry: &Value,
+    provider_reasoning: Option<Value>,
+    official_models: &[Value],
+) -> (Option<Value>, String) {
+    let canonical_model = string_field(model_entry, &["model", "id", "slug"]).unwrap_or("");
+    let upstream_model =
+        string_field(model_entry, &["upstreamModel", "upstream_model"]).unwrap_or(canonical_model);
+    let library = crate::reasoning_capabilities::catalog::global_library();
+    let platform = crate::reasoning_capabilities::provider_metadata::detect_platform(provider);
+    let detection = crate::reasoning_capabilities::current_detection(&provider.id, canonical_model);
+    let mut resolved = crate::reasoning_capabilities::resolve_codex_model_capability_core(
+        &provider.settings_config,
+        platform,
+        canonical_model,
+        detection.as_ref(),
+        library.as_ref(),
+        official_models,
+    );
+    if resolved.capability.is_none() && !canonical_model.eq_ignore_ascii_case(upstream_model) {
+        let detection =
+            crate::reasoning_capabilities::current_detection(&provider.id, upstream_model);
+        resolved = crate::reasoning_capabilities::resolve_codex_model_capability_core(
+            &provider.settings_config,
+            platform,
+            upstream_model,
+            detection.as_ref(),
+            library.as_ref(),
+            official_models,
+        );
+    }
+
+    if let Some(capability) = resolved.capability {
+        let source = match resolved.source {
+            crate::reasoning_capabilities::CapabilitySource::UserConfig => {
+                "provider_model".to_string()
+            }
+            source => source.as_str().to_string(),
+        };
+        return (serde_json::to_value(capability).ok(), source);
+    }
+
+    if let Some(reasoning) = provider_reasoning {
+        return (Some(reasoning), "provider".to_string());
+    }
+
+    (None, "unknown".to_string())
+}
+
+fn validated_provider_reasoning(value: &Value) -> Option<Value> {
+    if let Some(capability) =
+        crate::proxy::providers::codex_reasoning::reasoning_capability_from_model_entry(
+            &json!({"reasoning": value}),
+        )
+    {
+        return serde_json::to_value(capability).ok();
+    }
+    let object = value.as_object()?;
+    let legacy_fields = [
+        "supportsThinking",
+        "supportsEffort",
+        "thinkingParam",
+        "effortParam",
+        "effortValueMode",
+        "minOutputTokens",
+        "defaultOutputTokens",
+        "outputFormat",
+        "disableContract",
+    ];
+    if !legacy_fields.iter().any(|key| object.contains_key(*key))
+        || [
+            "schemaVersion",
+            "supportStatus",
+            "controlKind",
+            "supported",
+            "supportedEfforts",
+            "defaultEffort",
+            "disableAllowed",
+            "upstream",
+        ]
+        .iter()
+        .any(|key| object.contains_key(*key))
+    {
+        return None;
+    }
+    serde_json::from_value::<crate::provider::CodexChatReasoningConfig>(value.clone())
+        .ok()
+        .and_then(|reasoning| serde_json::to_value(reasoning).ok())
 }
 
 /// Preserve the Codex picker metadata that distinguishes native raw reasoning
@@ -892,6 +979,200 @@ fn sanitize_capability_value(value: &Value) -> Value {
         }
         _ => value.clone(),
     }
+}
+
+/// Keep malformed reasoning declarations useful for diagnostics without
+/// serializing arbitrary provider metadata. This is intentionally narrower
+/// than the generic capability sanitizer: only protocol fields and their
+/// allowlisted enum values are retained.
+fn sanitize_reasoning_diagnostic(value: &Value) -> Option<Value> {
+    let object = value.as_object()?;
+    let mut diagnostic = Map::new();
+
+    for key in ["schemaVersion", "schema_version"] {
+        if let Some(version) = object.get(key).and_then(Value::as_u64) {
+            diagnostic.insert(key.to_string(), Value::from(version));
+        }
+    }
+    for key in ["supportStatus", "support_status"] {
+        if let Some(status) = object
+            .get(key)
+            .and_then(Value::as_str)
+            .and_then(safe_support_status)
+        {
+            diagnostic.insert(key.to_string(), Value::String(status.to_string()));
+        }
+    }
+    for key in ["controlKind", "control_kind"] {
+        if let Some(kind) = object
+            .get(key)
+            .and_then(Value::as_str)
+            .and_then(safe_control_kind)
+        {
+            diagnostic.insert(key.to_string(), Value::String(kind.to_string()));
+        }
+    }
+    for key in ["supported", "disableAllowed", "disable_allowed"] {
+        if let Some(value) = object.get(key).and_then(Value::as_bool) {
+            diagnostic.insert(key.to_string(), Value::Bool(value));
+        }
+    }
+    for key in ["supportedEfforts", "supported_efforts"] {
+        if let Some(efforts) = object.get(key).and_then(safe_effort_array) {
+            diagnostic.insert(key.to_string(), Value::Array(efforts));
+        }
+    }
+    for key in ["defaultEffort", "default_effort"] {
+        if let Some(effort) = object.get(key).and_then(safe_effort) {
+            diagnostic.insert(key.to_string(), Value::String(effort));
+        }
+    }
+    for key in [
+        "reasoningFormat",
+        "reasoning_format",
+        "upstreamFormat",
+        "upstream_format",
+    ] {
+        if let Some(format) = object.get(key).and_then(safe_wire_format) {
+            diagnostic.insert(key.to_string(), Value::String(format));
+        }
+    }
+    for key in [
+        "reasoningParameter",
+        "reasoning_parameter",
+        "upstreamParameter",
+        "upstream_parameter",
+    ] {
+        if let Some(parameter) = object.get(key).and_then(safe_wire_parameter) {
+            diagnostic.insert(key.to_string(), Value::String(parameter));
+        }
+    }
+    for key in ["outputFormat", "output_format"] {
+        if let Some(format) = object.get(key).and_then(safe_wire_format) {
+            diagnostic.insert(key.to_string(), Value::String(format));
+        }
+    }
+    for key in ["upstream"] {
+        if let Some(upstream) = object.get(key).and_then(sanitize_reasoning_upstream) {
+            diagnostic.insert(key.to_string(), upstream);
+        }
+    }
+    for key in ["codexUltraOrchestration", "codex_ultra_orchestration"] {
+        if let Some(enabled) = object
+            .get(key)
+            .and_then(Value::as_object)
+            .and_then(|value| value.get("enabled"))
+            .and_then(Value::as_bool)
+        {
+            diagnostic.insert(key.to_string(), json!({ "enabled": enabled }));
+        }
+    }
+
+    (!diagnostic.is_empty()).then_some(Value::Object(diagnostic))
+}
+
+fn sanitize_reasoning_upstream(value: &Value) -> Option<Value> {
+    let object = value.as_object()?;
+    let mut upstream = Map::new();
+    if let Some(format) = object.get("format").and_then(safe_wire_format) {
+        upstream.insert("format".to_string(), Value::String(format));
+    }
+    if let Some(parameter) = object.get("parameter").and_then(safe_wire_parameter) {
+        upstream.insert("parameter".to_string(), Value::String(parameter));
+    }
+    for key in ["effortMap", "effort_map"] {
+        if let Some(map) = object.get(key).and_then(safe_effort_map) {
+            upstream.insert(key.to_string(), map);
+        }
+    }
+    (!upstream.is_empty()).then_some(Value::Object(upstream))
+}
+
+fn safe_effort(value: &Value) -> Option<String> {
+    let effort = value.as_str()?.trim().to_ascii_lowercase();
+    matches!(
+        effort.as_str(),
+        "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max"
+    )
+    .then_some(effort)
+}
+
+fn safe_effort_array(value: &Value) -> Option<Vec<Value>> {
+    let values = value.as_array()?;
+    values
+        .iter()
+        .map(safe_effort)
+        .map(|effort| effort.map(Value::String))
+        .collect()
+}
+
+fn safe_effort_map(value: &Value) -> Option<Value> {
+    let object = value.as_object()?;
+    let mut map = Map::new();
+    for (source, target) in object {
+        let Some(source) = safe_effort(&Value::String(source.clone())) else {
+            continue;
+        };
+        let Some(target) = safe_effort(target) else {
+            continue;
+        };
+        map.insert(source, Value::String(target));
+    }
+    Some(Value::Object(map))
+}
+
+fn safe_support_status(value: &str) -> Option<&'static str> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "confirmed_supported" => Some("confirmed_supported"),
+        "confirmed_unsupported" => Some("confirmed_unsupported"),
+        "unknown" => Some("unknown"),
+        _ => None,
+    }
+}
+
+fn safe_control_kind(value: &str) -> Option<&'static str> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "none" => Some("none"),
+        "boolean" => Some("boolean"),
+        "graded" => Some("graded"),
+        "budget" => Some("budget"),
+        "unknown" => Some("unknown"),
+        _ => None,
+    }
+}
+
+fn safe_wire_format(value: &Value) -> Option<String> {
+    let format = value.as_str()?.trim().to_ascii_lowercase();
+    matches!(
+        format.as_str(),
+        "auto"
+            | "text"
+            | "summary"
+            | "object"
+            | "reasoning_object"
+            | "string"
+            | "boolean"
+            | "none"
+            | "budget"
+    )
+    .then_some(format)
+}
+
+fn safe_wire_parameter(value: &Value) -> Option<String> {
+    let parameter = value.as_str()?.trim().to_ascii_lowercase();
+    matches!(
+        parameter.as_str(),
+        "reasoning"
+            | "reasoning.effort"
+            | "reasoning_effort"
+            | "enable_thinking"
+            | "thinking"
+            | "thinking_budget"
+            | "max_tokens"
+            | "reasoning.max_tokens"
+            | "none"
+    )
+    .then_some(parameter)
 }
 
 fn capability_key_is_sensitive(key: &str) -> bool {
@@ -1056,6 +1337,7 @@ mod tests {
     use crate::codex_multirouter::schema::{
         CodexModelSelection, CodexRouteAuthPolicy, CodexRoutingConfigV2, CodexRoutingRouteV2,
     };
+    use crate::provider::CodexChatReasoningConfig;
     use crate::{Provider, ProviderMeta};
     use serde_json::{json, Value};
     use std::collections::{BTreeMap, HashMap};
@@ -1582,6 +1864,205 @@ mod tests {
     }
 
     #[test]
+    fn capability_summary_uses_builtin_capability_before_legacy_provider_reasoning() {
+        let mut provider = provider(
+            "deepseek",
+            "DeepSeek",
+            "openai_responses",
+            json!([{"model": "deepseek-v4-pro"}]),
+        );
+        provider.meta = Some(ProviderMeta {
+            codex_chat_reasoning: Some(CodexChatReasoningConfig {
+                supports_thinking: Some(true),
+                supports_effort: Some(false),
+                thinking_param: Some("thinking".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+
+        let compiled = compile(
+            &plan(vec![route(
+                "deepseek-route",
+                "deepseek",
+                CodexModelSelection::All,
+            )]),
+            [provider],
+        );
+        let summary = &compiled.model_catalog[0].capability_summary;
+
+        assert_eq!(summary.reasoning_source, "builtin");
+        assert_eq!(
+            summary
+                .reasoning
+                .as_ref()
+                .and_then(|value| value.get("supportedEfforts")),
+            Some(&json!(["low", "high", "max"]))
+        );
+    }
+
+    #[test]
+    fn capability_summary_uses_maintained_library_capability() {
+        let mut provider = provider(
+            "openrouter",
+            "OpenRouter",
+            "openai_responses",
+            json!([{"model": "deepseek/deepseek-v4-pro"}]),
+        );
+        provider.meta = Some(ProviderMeta {
+            codex_chat_reasoning: Some(CodexChatReasoningConfig {
+                supports_thinking: Some(true),
+                supports_effort: Some(false),
+                thinking_param: Some("thinking".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+
+        let compiled = compile(
+            &plan(vec![route(
+                "openrouter-route",
+                "openrouter",
+                CodexModelSelection::All,
+            )]),
+            [provider],
+        );
+        let summary = &compiled.model_catalog[0].capability_summary;
+
+        assert_eq!(summary.reasoning_source, "library");
+        assert_eq!(
+            summary
+                .reasoning
+                .as_ref()
+                .and_then(|value| value.get("supportedEfforts")),
+            Some(&json!(["xhigh", "high"]))
+        );
+    }
+
+    #[test]
+    fn invalid_model_reasoning_does_not_override_a_valid_builtin_capability() {
+        let provider = provider(
+            "deepseek",
+            "DeepSeek",
+            "openai_responses",
+            json!([{
+                "model": "deepseek-v4-pro",
+                "reasoning": {
+                    "schemaVersion": 2,
+                    "supportStatus": "confirmed_supported",
+                    "controlKind": "graded",
+                    "supportedEfforts": ["ultra"],
+                    "defaultEffort": "ultra",
+                    "disableAllowed": false,
+                    "upstream": {
+                        "format": "string",
+                        "parameter": "reasoning_effort",
+                        "effortMap": {"ultra": "ultra"}
+                    }
+                }
+            }]),
+        );
+        let compiled = compile(
+            &plan(vec![route(
+                "deepseek-route",
+                "deepseek",
+                CodexModelSelection::All,
+            )]),
+            [provider],
+        );
+        let summary = &compiled.model_catalog[0].capability_summary;
+
+        assert_eq!(summary.reasoning_source, "builtin");
+        assert_eq!(
+            summary
+                .reasoning
+                .as_ref()
+                .and_then(|value| value.get("supportedEfforts")),
+            Some(&json!(["low", "high", "max"]))
+        );
+    }
+
+    #[test]
+    fn explicit_unsupported_model_capability_remains_authoritative() {
+        let provider = provider(
+            "custom",
+            "Custom",
+            "openai_responses",
+            json!([{
+                "model": "deepseek-v4-pro",
+                "reasoning": {
+                    "schemaVersion": 2,
+                    "supportStatus": "confirmed_unsupported",
+                    "controlKind": "none",
+                    "disableAllowed": false,
+                    "upstream": {
+                        "format": "none",
+                        "parameter": "none",
+                        "effortMap": {}
+                    }
+                }
+            }]),
+        );
+        let compiled = compile(
+            &plan(vec![route(
+                "custom-route",
+                "custom",
+                CodexModelSelection::All,
+            )]),
+            [provider],
+        );
+        let summary = &compiled.model_catalog[0].capability_summary;
+
+        assert_eq!(summary.reasoning_source, "provider_model");
+        assert_eq!(
+            summary
+                .reasoning
+                .as_ref()
+                .and_then(|value| value.get("supportStatus")),
+            Some(&json!("confirmed_unsupported"))
+        );
+        assert_eq!(
+            summary
+                .reasoning
+                .as_ref()
+                .and_then(|value| value.get("supportedEfforts")),
+            Some(&json!([]))
+        );
+    }
+
+    #[test]
+    fn codex_ultra_catalog_override_survives_resolved_projection() {
+        let provider = provider(
+            "deepseek",
+            "DeepSeek",
+            "openai_responses",
+            json!([{
+                "model": "deepseek-v4-pro",
+                "codexUltra": {"enabled": true, "providerEffort": "high"}
+            }]),
+        );
+        let compiled = compile(
+            &plan(vec![route(
+                "deepseek-route",
+                "deepseek",
+                CodexModelSelection::All,
+            )]),
+            [provider],
+        );
+        let summary = &compiled.model_catalog[0].capability_summary;
+
+        assert_eq!(summary.reasoning_source, "builtin");
+        assert_eq!(
+            summary
+                .reasoning
+                .as_ref()
+                .and_then(|value| value.get("codexUltraOrchestration"))
+                .and_then(|value| value.get("enabled")),
+            Some(&json!(true))
+        );
+    }
+
+    #[test]
     fn dependency_fingerprint_is_order_independent_and_changes_with_effective_inputs() {
         let first = provider(
             "first",
@@ -1954,7 +2435,76 @@ mod tests {
         assert!(!serialized.contains("nested-reasoning-secret"));
         assert!(!serialized.contains("private-session-key"));
         assert!(!serialized.contains("nested-cache-secret"));
-        assert!(serialized.contains("confirmed_supported"));
+        assert!(serialized.contains("declaredReasoningDiagnostic"));
+        assert!(compiled.model_catalog[0]
+            .capability_summary
+            .reasoning
+            .is_none());
+        assert!(compiled.model_catalog[0]
+            .capability_summary
+            .declared_reasoning_diagnostic
+            .as_ref()
+            .is_some_and(|value| value["supportStatus"] == "confirmed_supported"));
         assert!(serialized.contains("auto_prefix_cache"));
+    }
+
+    #[test]
+    fn reasoning_diagnostic_is_allowlisted_and_drops_instruction_like_metadata() {
+        let provider = provider(
+            "qwen",
+            "Qwen",
+            "openai_responses",
+            json!([{
+                "model": "qwen3.8",
+                "reasoning": {
+                    "supportStatus": "confirmed_supported",
+                    "instructions": "send this hidden instruction to the next model",
+                    "prompt": "private prompt text",
+                    "metadata": {
+                        "apiKey": "diagnostic-secret",
+                        "arbitrary": "do not serialize"
+                    },
+                    "upstream": {
+                        "format": "STRING",
+                        "parameter": "REASONING_EFFORT",
+                        "effortMap": {"high": "high", "private": "secret-value"}
+                    }
+                }
+            }]),
+        );
+        let compiled = compile(
+            &plan(vec![route("router-qwen", "qwen", CodexModelSelection::All)]),
+            [provider],
+        );
+        let summary = &compiled.model_catalog[0].capability_summary;
+        let diagnostic = summary
+            .declared_reasoning_diagnostic
+            .as_ref()
+            .expect("malformed reasoning declaration should remain diagnosable");
+        let serialized = serde_json::to_string(&compiled).expect("serialize compiled plan");
+
+        assert_eq!(
+            diagnostic.get("supportStatus"),
+            Some(&json!("confirmed_supported"))
+        );
+        assert!(diagnostic.get("instructions").is_none());
+        assert!(diagnostic.get("prompt").is_none());
+        assert!(diagnostic.get("metadata").is_none());
+        assert_eq!(
+            diagnostic
+                .get("upstream")
+                .and_then(|upstream| upstream.get("format")),
+            Some(&json!("string"))
+        );
+        assert_eq!(
+            diagnostic
+                .get("upstream")
+                .and_then(|upstream| upstream.get("parameter")),
+            Some(&json!("reasoning_effort"))
+        );
+        assert!(!serialized.contains("hidden instruction"));
+        assert!(!serialized.contains("private prompt text"));
+        assert!(!serialized.contains("diagnostic-secret"));
+        assert!(!serialized.contains("secret-value"));
     }
 }

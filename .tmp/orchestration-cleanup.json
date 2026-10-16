@@ -1,0 +1,14 @@
+{
+  "action": "consolidated",
+  "removed": [
+    "profile-1791855841117-0"
+  ],
+  "kept": "research-ensemble",
+  "profileCount": 1,
+  "activeProfileId": "research-ensemble",
+  "defaultModeByApp": {
+    "claude": "direct",
+    "codex": "direct"
+  },
+  "backup": "C:\\Users\\Felix\\.cc-switch\\backups\\before-orchestration-cleanup-20261016-020053.db"
+}

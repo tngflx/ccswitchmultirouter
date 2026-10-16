@@ -64,7 +64,7 @@ export function AddProviderDialog({
     appId !== "claude-desktop";
   const isCodexRouterEntry = appId === "codex";
   const [activeTab, setActiveTab] = useState<"app-specific" | "universal">(
-    isCodexRouterEntry ? "universal" : "app-specific",
+    "app-specific",
   );
   const [universalFormOpen, setUniversalFormOpen] = useState(false);
   const [selectedUniversalPreset, setSelectedUniversalPreset] =
@@ -78,17 +78,14 @@ export function AddProviderDialog({
   const { persistCodexProviderSet, dialogs: codexProviderSetDialogs } =
     useCodexProviderSetSave();
   const codexDraftProviderIdRef = useRef<string | null>(null);
+  // The preset form mounts immediately, so its probe identity must exist on its first render.
+  if (open && isCodexRouterEntry && codexDraftProviderIdRef.current === null) {
+    codexDraftProviderIdRef.current = generateUUID();
+  }
 
   useEffect(() => {
-    // Codex 的添加入口实际是在创建多路路由，默认引导到模型源选择页。
-    setActiveTab(isCodexRouterEntry ? "universal" : "app-specific");
-    if (
-      open &&
-      isCodexRouterEntry &&
-      codexDraftProviderIdRef.current === null
-    ) {
-      codexDraftProviderIdRef.current = generateUUID();
-    } else if (!open) {
+    setActiveTab("app-specific");
+    if (!open) {
       codexDraftProviderIdRef.current = null;
     }
   }, [isCodexRouterEntry, open]);

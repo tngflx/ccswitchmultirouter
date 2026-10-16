@@ -840,12 +840,14 @@ describe("App integration with MSW", () => {
     ).toBeInTheDocument();
     expect(screen.getByText("Open workspace directly")).toBeInTheDocument();
 
-    const createOrchestration = screen.getByText("Create orchestration profile");
-    expect(createOrchestration.closest("button")?.parentElement).toHaveClass(
+    const manageOrchestration = screen.getByText(
+      "Manage orchestration profiles",
+    );
+    expect(manageOrchestration.closest("button")?.parentElement).toHaveClass(
       "min-h-0",
       "overflow-y-auto",
     );
-    fireEvent.click(createOrchestration);
+    fireEvent.click(manageOrchestration);
 
     expect(
       await screen.findByTestId("orchestration-profiles-panel"),
@@ -854,9 +856,7 @@ describe("App integration with MSW", () => {
 
     fireEvent.click(screen.getByText("close-orchestration-profiles"));
     await waitFor(() =>
-      expect(
-        screen.queryByTestId("orchestration-profiles-panel"),
-      ).toBeNull(),
+      expect(screen.queryByTestId("orchestration-profiles-panel")).toBeNull(),
     );
 
     fireEvent.click(screen.getByText("open-multirouter-entry"));

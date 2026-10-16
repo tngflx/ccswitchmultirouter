@@ -13,6 +13,74 @@ function createProvider(settingsConfig: Provider["settingsConfig"]): Provider {
 }
 
 describe("unverified Codex provider catalog selection", () => {
+  it("preserves API-declared transports while filling only unresolved models from the provider default", () => {
+    const provider = createProvider({
+      base_url: "https://provider.example/v1",
+      modelCatalog: {
+        models: [
+          {
+            model: "api-chat",
+            upstreamModel: "wire-chat",
+            protocolCapability: {
+              schemaVersion: 1,
+              source: "provider_api",
+              baseUrl: "https://provider.example/v1",
+              upstreamModel: "wire-chat",
+              supportedEndpoints: ["openai_chat"],
+              supportsTools: true,
+            },
+          },
+          { model: "unresolved" },
+        ],
+      },
+    });
+    const before = structuredClone(provider);
+
+    expect(
+      prepareUnverifiedCodexProvider(provider).meta?.codexProtocolOverrides,
+    ).toEqual({
+      "api-chat": "openai_chat",
+      unresolved: "openai_responses",
+    });
+    expect(provider).toEqual(before);
+  });
+
+  it("keeps explicit selections ahead of API metadata and rejects metadata outside the current target", () => {
+    const provider = createProvider({
+      base_url: "https://provider.example/v1",
+      modelCatalog: {
+        models: ["explicit", "legacy", "wrong-endpoint", "wrong-model"].map(
+          (model) => ({
+            model,
+            ...(model === "legacy" ? { apiFormat: "openai_responses" } : {}),
+            protocolCapability: {
+              schemaVersion: 1,
+              source: "provider_api",
+              baseUrl:
+                model === "wrong-endpoint"
+                  ? "https://other.example/v1"
+                  : "https://provider.example/v1",
+              upstreamModel: model === "wrong-model" ? "old-wire" : model,
+              supportedEndpoints: ["openai_chat"],
+            },
+          }),
+        ),
+      },
+    });
+    provider.meta!.codexProtocolOverrides = {
+      explicit: "openai_responses",
+    };
+
+    expect(
+      prepareUnverifiedCodexProvider(provider).meta?.codexProtocolOverrides,
+    ).toEqual({
+      explicit: "openai_responses",
+      legacy: "openai_responses",
+      "wrong-endpoint": "openai_responses",
+      "wrong-model": "openai_responses",
+    });
+  });
+
   it("preserves current model overrides and fills declared row protocols without mutating the draft", () => {
     const provider = createProvider({
       modelCatalog: {

@@ -6,6 +6,10 @@
 //! - `NotAdvertised`/`Unavailable`/`Invalid` 均不能自动生成 `confirmed_unsupported`。
 
 use crate::provider::Provider;
+use crate::proxy::providers::codex_reasoning::{
+    CapabilityConfidence, CodexModelReasoningCapability, CodexModelReasoningUpstream,
+    ReasoningControlKind, ReasoningSupportStatus,
+};
 use crate::reasoning_capabilities::{
     DiscoveryOutcome, ProviderCapabilitySnapshot, ReasoningCapabilitySnapshot,
 };
@@ -207,68 +211,74 @@ pub async fn discover_openrouter(provider: &Provider, model: &str) -> DiscoveryO
 
 /// Convert the allowlisted OpenRouter model metadata into a reasoning snapshot.
 ///
-/// OpenRouter currently advertises MiMo-V2.6's `reasoning` capability without
-/// advertising effort levels. Preserve that distinction: an empty effort list
-/// is evidence that no selectable effort was advertised, not permission to
-/// synthesize Codex's generic levels.
+/// OpenRouter sometimes advertises a positive `reasoning` capability without
+/// model-specific effort levels. In that case use OpenRouter's documented
+/// standard effort enum so the picker can represent the provider contract.
 fn openrouter_reasoning_snapshot(entry: &Value) -> Option<ReasoningCapabilitySnapshot> {
-    let reasoning = entry.get("reasoning")?;
-    if reasoning.is_null() {
+    let reasoning = entry
+        .get("reasoning")
+        .cloned()
+        .unwrap_or_else(|| Value::Object(Default::default()));
+    let reasoning_object = reasoning.as_object()?;
+    let supported_parameters = strict_openrouter_string_array(
+        entry
+            .get("supported_parameters")
+            .or_else(|| entry.get("supportedParameters")),
+    )?
+    .unwrap_or_default();
+    let supports_reasoning_object = supported_parameters
+        .iter()
+        .any(|parameter| parameter == "reasoning");
+    let supports_reasoning_effort = supported_parameters
+        .iter()
+        .any(|parameter| parameter == "reasoning_effort");
+    let (efforts_declared, mut supported_efforts) = collect_openrouter_efforts(reasoning_object)?;
+    if !efforts_declared && (supports_reasoning_object || supports_reasoning_effort) {
+        supported_efforts = ["minimal", "low", "medium", "high", "xhigh"]
+            .into_iter()
+            .map(ToString::to_string)
+            .collect();
+    }
+    let default_effort =
+        consistent_optional_string(reasoning_object, &["default_effort", "defaultEffort"])?;
+    if default_effort
+        .as_deref()
+        .is_some_and(|effort| !supported_efforts.iter().any(|item| item == effort))
+    {
         return None;
     }
-    let supported_efforts = reasoning
-        .get("supported_efforts")
-        .or_else(|| reasoning.get("supportedEfforts"))
-        .or_else(|| reasoning.get("efforts"))
-        .and_then(Value::as_array)
-        .map(|items| {
-            items
-                .iter()
-                .filter_map(Value::as_str)
-                .map(str::trim)
-                .filter(|effort| !effort.is_empty())
-                .map(ToString::to_string)
-                .collect()
-        })
-        .unwrap_or_default();
-    let default_effort = reasoning
-        .get("default_effort")
-        .or_else(|| reasoning.get("defaultEffort"))
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|effort| !effort.is_empty())
-        .map(ToString::to_string);
-    let mandatory = reasoning
-        .get("mandatory")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    let default_enabled = reasoning
-        .get("default_enabled")
-        .or_else(|| reasoning.get("defaultEnabled"))
-        .and_then(Value::as_bool);
-    let supports_max_tokens = reasoning
-        .get("supports_max_tokens")
-        .or_else(|| reasoning.get("supportsMaxTokens"))
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    let upstream_format = reasoning
-        .get("upstream_format")
-        .or_else(|| reasoning.get("upstreamFormat"))
-        .and_then(Value::as_str)
-        .map(ToString::to_string)
-        .or_else(|| Some("object".to_string()));
-    let upstream_parameter = reasoning
-        .get("upstream_parameter")
-        .or_else(|| reasoning.get("upstreamParameter"))
-        .and_then(Value::as_str)
-        .map(ToString::to_string)
-        .or_else(|| Some("reasoning.effort".to_string()));
-    let output_format = reasoning
-        .get("output_format")
-        .or_else(|| reasoning.get("outputFormat"))
-        .and_then(Value::as_str)
-        .map(ToString::to_string)
-        .or_else(|| Some("auto".to_string()));
+    let mandatory = consistent_optional_bool(reasoning_object, &["mandatory"])?.unwrap_or(false);
+    let default_enabled =
+        consistent_optional_bool(reasoning_object, &["default_enabled", "defaultEnabled"])?;
+    let supports_max_tokens = consistent_optional_bool(
+        reasoning_object,
+        &["supports_max_tokens", "supportsMaxTokens"],
+    )?
+    .unwrap_or(false);
+    let upstream_format = consistent_optional_wire_string(
+        reasoning_object,
+        &["upstream_format", "upstreamFormat"],
+        true,
+    )?
+    .or_else(|| Some("reasoning_object".to_string()));
+    let upstream_parameter = consistent_optional_wire_string(
+        reasoning_object,
+        &["upstream_parameter", "upstreamParameter"],
+        false,
+    )?
+    .or_else(|| {
+        if upstream_format.as_deref() == Some("string") {
+            Some("reasoning_effort".to_string())
+        } else {
+            Some("reasoning.effort".to_string())
+        }
+    });
+    let output_format = consistent_optional_wire_string(
+        reasoning_object,
+        &["output_format", "outputFormat"],
+        true,
+    )?
+    .or_else(|| Some("auto".to_string()));
 
     Some(ReasoningCapabilitySnapshot {
         supported_efforts,
@@ -280,6 +290,796 @@ fn openrouter_reasoning_snapshot(entry: &Value) -> Option<ReasoningCapabilitySna
         upstream_parameter,
         output_format,
     })
+}
+
+fn strict_openrouter_string_array(value: Option<&Value>) -> Option<Option<Vec<String>>> {
+    let Some(value) = value else {
+        return Some(None);
+    };
+    let items = value.as_array()?;
+    let mut values = Vec::with_capacity(items.len());
+    for item in items {
+        let value = item.as_str()?.trim().to_ascii_lowercase();
+        if value.is_empty() {
+            return None;
+        }
+        values.push(value);
+    }
+    values.dedup();
+    Some(Some(values))
+}
+
+fn collect_openrouter_efforts(
+    reasoning: &serde_json::Map<String, Value>,
+) -> Option<(bool, Vec<String>)> {
+    let mut declared = false;
+    let mut found: Option<Vec<String>> = None;
+    for key in ["supported_efforts", "supportedEfforts", "efforts"] {
+        let Some(value) = reasoning.get(key) else {
+            continue;
+        };
+        declared = true;
+        let values = strict_openrouter_string_array(Some(value))?;
+        let values = values?;
+        if values.iter().any(|value| {
+            !matches!(
+                value.as_str(),
+                "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | "ultra"
+            )
+        }) {
+            return None;
+        }
+        let mut normalized_values = values.clone();
+        normalized_values.sort();
+        let mut previous_values = found.clone().unwrap_or_default();
+        previous_values.sort();
+        if found.is_some() && previous_values != normalized_values {
+            return None;
+        }
+        found = Some(values);
+    }
+    Some((declared, found.unwrap_or_default()))
+}
+
+fn consistent_optional_string(
+    object: &serde_json::Map<String, Value>,
+    keys: &[&str],
+) -> Option<Option<String>> {
+    let mut found = None;
+    for key in keys {
+        let Some(value) = object.get(*key) else {
+            continue;
+        };
+        let value = value.as_str()?.trim().to_ascii_lowercase();
+        if value.is_empty() || found.as_ref().is_some_and(|previous| previous != &value) {
+            return None;
+        }
+        found = Some(value);
+    }
+    Some(found)
+}
+
+fn consistent_optional_bool(
+    object: &serde_json::Map<String, Value>,
+    keys: &[&str],
+) -> Option<Option<bool>> {
+    let mut found = None;
+    for key in keys {
+        let Some(value) = object.get(*key) else {
+            continue;
+        };
+        let value = value.as_bool()?;
+        if found.is_some_and(|previous| previous != value) {
+            return None;
+        }
+        found = Some(value);
+    }
+    Some(found)
+}
+
+fn consistent_optional_wire_string(
+    object: &serde_json::Map<String, Value>,
+    keys: &[&str],
+    format: bool,
+) -> Option<Option<String>> {
+    let value = consistent_optional_string(object, keys)?;
+    if value.as_deref().is_some_and(|value| {
+        if format {
+            !matches!(
+                value,
+                "auto"
+                    | "text"
+                    | "summary"
+                    | "object"
+                    | "reasoning_object"
+                    | "string"
+                    | "boolean"
+                    | "none"
+                    | "budget"
+            )
+        } else {
+            !matches!(
+                value,
+                "reasoning"
+                    | "reasoning.effort"
+                    | "reasoning_effort"
+                    | "enable_thinking"
+                    | "thinking"
+                    | "thinking_budget"
+                    | "max_tokens"
+                    | "reasoning.max_tokens"
+                    | "none"
+            )
+        }
+    }) {
+        return None;
+    }
+    Some(value.map(|value| {
+        if format && value == "object" {
+            "reasoning_object".to_string()
+        } else {
+            value
+        }
+    }))
+}
+
+/// Convert a raw OpenRouter `/models` entry into the same validated capability
+/// schema used by the resolver and Codex catalog projection.
+///
+/// This is intentionally strict about OpenRouter's `supported_parameters`
+/// contract: generic providers must not inherit OpenRouter's standard effort
+/// enum merely because they use a field named `reasoning`.
+pub fn openrouter_reasoning_capability_from_model_entry(
+    entry: &Value,
+) -> Option<CodexModelReasoningCapability> {
+    let supported_parameters = entry
+        .get("supported_parameters")
+        .or_else(|| entry.get("supportedParameters"))
+        .and_then(Value::as_array);
+    let is_openrouter_reasoning_entry = supported_parameters.is_some_and(|parameters| {
+        parameters.iter().any(|value| {
+            value.as_str().is_some_and(|parameter| {
+                matches!(
+                    parameter.trim().to_ascii_lowercase().as_str(),
+                    "reasoning" | "reasoning_effort"
+                )
+            })
+        })
+    });
+    if !is_openrouter_reasoning_entry {
+        return None;
+    }
+
+    let snapshot = openrouter_reasoning_snapshot(entry)?;
+    crate::reasoning_capabilities::snapshot_to_capability(&ProviderCapabilitySnapshot {
+        provider_key: "openrouter".to_string(),
+        model: entry
+            .get("id")
+            .or_else(|| entry.get("model"))
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        fetched_at: now_millis(),
+        source: "openrouter_api".to_string(),
+        reasoning: Some(snapshot),
+    })
+}
+
+pub fn provider_reasoning_capability_from_model_entry(
+    entry: &Value,
+    openrouter_contract: bool,
+) -> Option<CodexModelReasoningCapability> {
+    let object = entry.as_object()?;
+    let scopes = metadata_scopes(object);
+    let declared_supported = match lookup_bool(
+        &scopes,
+        &[
+            "supportsReasoning",
+            "supports_reasoning",
+            "reasoningSupported",
+            "reasoning_supported",
+            "supportsThinking",
+            "supports_thinking",
+        ],
+    ) {
+        Ok(value) => value,
+        Err(()) => return None,
+    };
+    let declared_reasoning_values = scopes
+        .iter()
+        .filter_map(|scope| scope.get("reasoning"))
+        .collect::<Vec<_>>();
+    if declared_reasoning_values
+        .windows(2)
+        .any(|values| values[0] != values[1])
+    {
+        return None;
+    }
+
+    // A present canonical declaration is authoritative for this response. Do
+    // not reinterpret a malformed canonical object as a weaker lightweight
+    // declaration: that would make a bad upstream row look supported.
+    if let Some(reasoning) = first_declared_value(&scopes, &["reasoning"]) {
+        if reasoning.is_null() {
+            return None;
+        }
+        if reasoning.is_object() {
+            if declared_supported == Some(false) {
+                return None;
+            }
+            if let Some(capability) = parse_canonical_provider_reasoning(reasoning) {
+                return Some(capability);
+            }
+            if looks_like_canonical_reasoning(reasoning) {
+                return None;
+            }
+            if let Some(capability) = parse_lightweight_reasoning_object(reasoning) {
+                return Some(capability);
+            }
+        } else if reasoning.is_boolean() {
+            return build_boolean_or_unknown_capability(
+                reasoning.as_bool()?,
+                match lookup_bool(&scopes, &["mandatory", "reasoningMandatory"]) {
+                    Ok(value) => value,
+                    Err(()) => return None,
+                },
+            );
+        } else {
+            return None;
+        }
+    }
+
+    // Explicit top-level/nested flags retain the distinction between absent,
+    // positive, and negative declarations. A positive flag alone proves only
+    // that reasoning exists; it does not invent effort levels or a wire shape.
+    let supported = declared_supported;
+    if let Some(supported) = supported {
+        return build_boolean_or_unknown_capability(
+            supported,
+            match lookup_bool(&scopes, &["mandatory", "reasoningMandatory"]) {
+                Ok(value) => value,
+                Err(()) => return None,
+            },
+        );
+    }
+
+    let supported_efforts = match collect_effort_declaration(&scopes) {
+        Ok(value) => value,
+        Err(()) => return None,
+    };
+    let supported_parameters = match collect_string_array_declaration(
+        &scopes,
+        &["supported_parameters", "supportedParameters"],
+    ) {
+        Ok(value) => value.unwrap_or_default(),
+        Err(()) => return None,
+    };
+
+    if supported_efforts.is_none() {
+        if openrouter_contract
+            && supported_parameters
+                .iter()
+                .any(|parameter| matches!(parameter.as_str(), "reasoning" | "reasoning_effort"))
+        {
+            return build_reasoning_capability(
+                vec![
+                    "minimal".to_string(),
+                    "low".to_string(),
+                    "medium".to_string(),
+                    "high".to_string(),
+                    "xhigh".to_string(),
+                ],
+                &scopes,
+                true,
+                Some("reasoning_object".to_string()),
+                Some("reasoning.effort".to_string()),
+            );
+        }
+        return None;
+    }
+
+    let efforts = supported_efforts.expect("checked above");
+    let format = lookup_wire_string(
+        &scopes,
+        &[
+            "reasoning_format",
+            "reasoningFormat",
+            "upstream_format",
+            "upstreamFormat",
+        ],
+    )?;
+    let parameter = lookup_wire_string(
+        &scopes,
+        &[
+            "reasoning_parameter",
+            "reasoningParameter",
+            "upstream_parameter",
+            "upstreamParameter",
+        ],
+    )?;
+    let format = format.or_else(|| Some("string".to_string()));
+    let parameter = parameter.or_else(|| {
+        if format.as_deref() == Some("reasoning_object") {
+            Some("reasoning.effort".to_string())
+        } else {
+            Some("reasoning_effort".to_string())
+        }
+    });
+    build_reasoning_capability(efforts, &scopes, false, format, parameter)
+}
+
+fn metadata_scopes(
+    object: &serde_json::Map<String, Value>,
+) -> Vec<&serde_json::Map<String, Value>> {
+    let mut scopes = vec![object];
+    for key in ["metadata", "capability", "capabilities"] {
+        if let Some(nested) = object.get(key).and_then(Value::as_object) {
+            scopes.push(nested);
+        }
+    }
+    scopes
+}
+
+fn first_declared_value<'a>(
+    scopes: &[&'a serde_json::Map<String, Value>],
+    keys: &[&str],
+) -> Option<&'a Value> {
+    scopes.iter().find_map(|scope| {
+        keys.iter()
+            .find_map(|key| scope.get(*key))
+            .filter(|value| !value.is_null())
+    })
+}
+
+fn lookup_bool(
+    scopes: &[&serde_json::Map<String, Value>],
+    keys: &[&str],
+) -> Result<Option<bool>, ()> {
+    let mut found = None;
+    for scope in scopes {
+        for key in keys {
+            let Some(value) = scope.get(*key) else {
+                continue;
+            };
+            let Some(value) = value.as_bool() else {
+                return Err(());
+            };
+            if found.is_some_and(|previous| previous != value) {
+                return Err(());
+            }
+            found = Some(value);
+        }
+    }
+    Ok(found)
+}
+
+fn collect_string_array_declaration(
+    scopes: &[&serde_json::Map<String, Value>],
+    keys: &[&str],
+) -> Result<Option<Vec<String>>, ()> {
+    let mut found: Option<Vec<String>> = None;
+    for scope in scopes {
+        for key in keys {
+            let Some(value) = scope.get(*key) else {
+                continue;
+            };
+            let Some(items) = value.as_array() else {
+                return Err(());
+            };
+            let mut normalized = Vec::with_capacity(items.len());
+            for item in items {
+                let Some(item) = item.as_str().map(str::trim).filter(|item| !item.is_empty())
+                else {
+                    return Err(());
+                };
+                normalized.push(item.to_ascii_lowercase());
+            }
+            normalized.dedup();
+            if found.as_ref().is_some_and(|previous| {
+                let mut previous = previous.clone();
+                previous.sort();
+                previous.dedup();
+                let mut current = normalized.clone();
+                current.sort();
+                current.dedup();
+                previous != current
+            }) {
+                return Err(());
+            }
+            found = Some(normalized);
+        }
+    }
+    Ok(found)
+}
+
+fn collect_effort_declaration(
+    scopes: &[&serde_json::Map<String, Value>],
+) -> Result<Option<Vec<String>>, ()> {
+    let keys = [
+        "supported_efforts",
+        "supportedEfforts",
+        "efforts",
+        "supported_reasoning_levels",
+        "supportedReasoningLevels",
+        "supported_reasoning_efforts",
+        "supportedReasoningEfforts",
+    ];
+    let mut found = None;
+    for scope in scopes {
+        for key in keys {
+            let Some(value) = scope.get(key) else {
+                continue;
+            };
+            let Some(items) = value.as_array() else {
+                return Err(());
+            };
+            let mut normalized = Vec::with_capacity(items.len());
+            for item in items {
+                let value = if let Some(value) = item.as_str() {
+                    let value = value.trim();
+                    if value.is_empty() {
+                        return Err(());
+                    }
+                    value.to_ascii_lowercase()
+                } else {
+                    let object = item.as_object().ok_or(())?;
+                    let mut declared = None;
+                    for field in ["effort", "reasoning_effort", "reasoningEffort"] {
+                        let Some(value) = object.get(field) else {
+                            continue;
+                        };
+                        let value = value.as_str().ok_or(())?.trim();
+                        if value.is_empty() {
+                            return Err(());
+                        }
+                        let value = value.to_ascii_lowercase();
+                        if declared.as_ref().is_some_and(|previous| previous != &value) {
+                            return Err(());
+                        }
+                        declared = Some(value);
+                    }
+                    declared.ok_or(())?
+                };
+                normalized.push(value);
+            }
+            if found.as_ref().is_some_and(|previous: &Vec<String>| {
+                let mut previous = previous.clone();
+                previous.sort();
+                previous.dedup();
+                let mut current = normalized.clone();
+                current.sort();
+                current.dedup();
+                previous != current
+            }) {
+                return Err(());
+            }
+            normalized.dedup();
+            found = Some(normalized);
+        }
+    }
+    Ok(found)
+}
+
+fn lookup_wire_string(
+    scopes: &[&serde_json::Map<String, Value>],
+    keys: &[&str],
+) -> Option<Option<String>> {
+    let mut found = None;
+    for scope in scopes {
+        for key in keys {
+            let Some(value) = scope.get(*key) else {
+                continue;
+            };
+            let value = value.as_str()?.trim().to_ascii_lowercase();
+            if value.is_empty() || !valid_wire_value(key, &value) {
+                return None;
+            }
+            if found
+                .as_ref()
+                .is_some_and(|previous: &String| previous != &value)
+            {
+                return None;
+            }
+            found = Some(value);
+        }
+    }
+    Some(found)
+}
+
+fn lookup_effort_string(
+    scopes: &[&serde_json::Map<String, Value>],
+    keys: &[&str],
+) -> Option<Option<String>> {
+    let mut found = None;
+    for scope in scopes {
+        for key in keys {
+            let Some(value) = scope.get(*key) else {
+                continue;
+            };
+            let value = value.as_str()?.trim().to_ascii_lowercase();
+            if value.is_empty()
+                || !matches!(
+                    value.as_str(),
+                    "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | "ultra"
+                )
+            {
+                return None;
+            }
+            if found
+                .as_ref()
+                .is_some_and(|previous: &String| previous != &value)
+            {
+                return None;
+            }
+            found = Some(value);
+        }
+    }
+    Some(found)
+}
+
+fn valid_wire_value(key: &str, value: &str) -> bool {
+    if key.to_ascii_lowercase().contains("format") {
+        matches!(
+            value,
+            "auto"
+                | "text"
+                | "summary"
+                | "object"
+                | "reasoning_object"
+                | "string"
+                | "boolean"
+                | "none"
+                | "budget"
+        )
+    } else {
+        matches!(
+            value,
+            "reasoning"
+                | "reasoning.effort"
+                | "reasoning_effort"
+                | "enable_thinking"
+                | "thinking"
+                | "thinking_budget"
+                | "max_tokens"
+                | "reasoning.max_tokens"
+                | "none"
+        )
+    }
+}
+
+fn parse_canonical_provider_reasoning(value: &Value) -> Option<CodexModelReasoningCapability> {
+    let wrapper = serde_json::json!({ "reasoning": value });
+    let capability =
+        crate::proxy::providers::codex_reasoning::reasoning_capability_from_model_entry(&wrapper)?;
+    let mut capability = capability.complete_identity_effort_map_for_read();
+    capability.source = Some("detection".to_string());
+    capability.confidence = Some(CapabilityConfidence::Verified);
+    capability.fetched_at = None;
+    capability.provider_key = None;
+    capability.model_revision = None;
+    capability.codex_ultra_orchestration = None;
+    capability.validate().ok()?;
+    Some(capability)
+}
+
+fn looks_like_canonical_reasoning(value: &Value) -> bool {
+    let Some(object) = value.as_object() else {
+        return false;
+    };
+    [
+        "schemaVersion",
+        "schema_version",
+        "supportStatus",
+        "support_status",
+        "controlKind",
+        "control_kind",
+        "disableAllowed",
+        "disable_allowed",
+        "upstream",
+    ]
+    .iter()
+    .any(|key| object.contains_key(*key))
+}
+
+fn parse_lightweight_reasoning_object(
+    value: &serde_json::Value,
+) -> Option<CodexModelReasoningCapability> {
+    let object = value.as_object()?;
+    let scopes = vec![object];
+    let efforts = collect_effort_declaration(&scopes).ok()??;
+    let format = lookup_wire_string(
+        &scopes,
+        &[
+            "upstream_format",
+            "upstreamFormat",
+            "reasoning_format",
+            "reasoningFormat",
+        ],
+    )?;
+    let parameter = lookup_wire_string(
+        &scopes,
+        &[
+            "upstream_parameter",
+            "upstreamParameter",
+            "reasoning_parameter",
+            "reasoningParameter",
+        ],
+    )?;
+    build_reasoning_capability(
+        efforts,
+        &scopes,
+        false,
+        format.or_else(|| Some("reasoning_object".to_string())),
+        parameter.or_else(|| Some("reasoning.effort".to_string())),
+    )
+}
+
+fn build_boolean_or_unknown_capability(
+    supported: bool,
+    mandatory: Option<bool>,
+) -> Option<CodexModelReasoningCapability> {
+    let capability = if supported {
+        CodexModelReasoningCapability {
+            schema_version: Some(2),
+            support_status: Some(ReasoningSupportStatus::ConfirmedSupported),
+            control_kind: Some(ReasoningControlKind::None),
+            supported: None,
+            supported_efforts: Vec::new(),
+            default_effort: None,
+            disable_allowed: false,
+            upstream: CodexModelReasoningUpstream {
+                format: "none".to_string(),
+                parameter: "reasoning".to_string(),
+                effort_map: Default::default(),
+            },
+            output_format: None,
+            source: Some("detection".to_string()),
+            confidence: Some(CapabilityConfidence::Verified),
+            fetched_at: None,
+            provider_key: None,
+            model_revision: None,
+            codex_ultra_orchestration: None,
+        }
+    } else {
+        CodexModelReasoningCapability {
+            schema_version: Some(2),
+            support_status: Some(ReasoningSupportStatus::ConfirmedUnsupported),
+            control_kind: Some(ReasoningControlKind::None),
+            supported: None,
+            supported_efforts: Vec::new(),
+            default_effort: None,
+            disable_allowed: false,
+            upstream: CodexModelReasoningUpstream {
+                format: "none".to_string(),
+                parameter: "reasoning".to_string(),
+                effort_map: Default::default(),
+            },
+            output_format: None,
+            source: Some("detection".to_string()),
+            confidence: Some(CapabilityConfidence::Authoritative),
+            fetched_at: None,
+            provider_key: None,
+            model_revision: None,
+            codex_ultra_orchestration: None,
+        }
+    };
+    if mandatory == Some(true) && supported {
+        return None;
+    }
+    capability.validate().ok().map(|_| capability)
+}
+
+fn build_reasoning_capability(
+    mut efforts: Vec<String>,
+    scopes: &[&serde_json::Map<String, Value>],
+    openrouter_default: bool,
+    format: Option<String>,
+    parameter: Option<String>,
+) -> Option<CodexModelReasoningCapability> {
+    efforts.dedup();
+    let codex_ultra_enabled = efforts.iter().any(|effort| effort == "ultra");
+    if codex_ultra_enabled && !efforts.iter().any(|effort| effort == "max") {
+        return None;
+    }
+    efforts.retain(|effort| effort != "ultra");
+    let mandatory = lookup_bool(scopes, &["mandatory", "reasoningMandatory"])
+        .ok()?
+        .unwrap_or(false);
+    let default_effort = lookup_effort_string(
+        scopes,
+        &[
+            "default_effort",
+            "defaultEffort",
+            "default_reasoning_level",
+            "defaultReasoningLevel",
+            "default_reasoning_effort",
+            "defaultReasoningEffort",
+        ],
+    )?;
+    let default_effort = match default_effort.map(|effort| {
+        if effort == "ultra" {
+            "max".to_string()
+        } else {
+            effort
+        }
+    }) {
+        Some(value) if efforts.contains(&value) => Some(value),
+        Some(_) => return None,
+        None => None,
+    };
+    let supports_max_tokens = lookup_bool(scopes, &["supports_max_tokens", "supportsMaxTokens"])
+        .ok()?
+        .unwrap_or(false);
+    let disable_allowed = lookup_bool(scopes, &["disable_allowed", "disableAllowed"])
+        .ok()?
+        .unwrap_or(!mandatory || efforts.iter().any(|effort| effort == "none"));
+    if mandatory && disable_allowed && !efforts.iter().any(|effort| effort == "none") {
+        return None;
+    }
+    let format = format.unwrap_or_else(|| {
+        if openrouter_default {
+            "reasoning_object".to_string()
+        } else {
+            "string".to_string()
+        }
+    });
+    let parameter = parameter.unwrap_or_else(|| {
+        if format == "reasoning_object" || format == "object" {
+            "reasoning.effort".to_string()
+        } else {
+            "reasoning_effort".to_string()
+        }
+    });
+    let mut effort_map = efforts
+        .iter()
+        .filter(|effort| effort.as_str() != "none")
+        .map(|effort| (effort.clone(), effort.clone()))
+        .collect::<std::collections::HashMap<_, _>>();
+    let control_kind = if !efforts
+        .iter()
+        .filter(|effort| effort.as_str() != "none")
+        .collect::<Vec<_>>()
+        .is_empty()
+    {
+        ReasoningControlKind::Graded
+    } else if supports_max_tokens {
+        ReasoningControlKind::Budget
+    } else {
+        ReasoningControlKind::None
+    };
+    if efforts.iter().any(|effort| effort == "none") {
+        effort_map.remove("none");
+    }
+    let capability = CodexModelReasoningCapability {
+        schema_version: Some(2),
+        support_status: Some(ReasoningSupportStatus::ConfirmedSupported),
+        control_kind: Some(control_kind),
+        supported: None,
+        supported_efforts: efforts,
+        default_effort,
+        disable_allowed,
+        upstream: CodexModelReasoningUpstream {
+            format: if format == "object" {
+                "reasoning_object".to_string()
+            } else {
+                format
+            },
+            parameter,
+            effort_map,
+        },
+        output_format: lookup_wire_string(scopes, &["output_format", "outputFormat"])?,
+        source: Some("detection".to_string()),
+        confidence: Some(CapabilityConfidence::Verified),
+        fetched_at: None,
+        provider_key: None,
+        model_revision: None,
+        codex_ultra_orchestration: codex_ultra_enabled.then_some(
+            crate::proxy::providers::codex_reasoning::CodexUltraOrchestrationCapability {
+                enabled: true,
+            },
+        ),
+    };
+    capability.validate().ok().map(|_| capability)
 }
 
 /// 归一化 OpenRouter models 端点：base 已含 `/api/v1` 时直接拼 `/models`。
@@ -516,15 +1316,21 @@ mod tests {
     }
 
     #[test]
-    fn openrouter_reasoning_metadata_preserves_missing_effort_levels() {
+    fn openrouter_reasoning_metadata_derives_standard_efforts_when_openrouter_omits_levels() {
         let snapshot = openrouter_reasoning_snapshot(&json!({
             "reasoning": {"mandatory": false},
             "supported_parameters": ["reasoning", "include_reasoning"]
         }))
         .expect("reasoning metadata");
-        assert!(snapshot.supported_efforts.is_empty());
+        assert_eq!(
+            snapshot.supported_efforts,
+            ["minimal", "low", "medium", "high", "xhigh"]
+        );
         assert_eq!(snapshot.default_effort, None);
-        assert_eq!(snapshot.upstream_format.as_deref(), Some("object"));
+        assert_eq!(
+            snapshot.upstream_format.as_deref(),
+            Some("reasoning_object")
+        );
         assert_eq!(
             snapshot.upstream_parameter.as_deref(),
             Some("reasoning.effort")
@@ -532,24 +1338,325 @@ mod tests {
     }
 
     #[test]
-    fn openrouter_reasoning_metadata_accepts_effort_aliases() {
+    fn openrouter_reasoning_metadata_uses_native_object_with_effort_alias() {
         let snapshot = openrouter_reasoning_snapshot(&json!({
             "reasoning": {
-                "supportedEfforts": ["low", "high"],
-                "defaultEffort": "high",
+                "supported_efforts": ["xhigh", "high"],
+                "default_effort": "high",
                 "mandatory": true,
-                "supportsMaxTokens": true,
-                "upstreamFormat": "object",
-                "upstreamParameter": "reasoning.effort"
-            }
+            },
+            "supported_parameters": [
+                "reasoning",
+                "reasoning_effort",
+                "include_reasoning"
+            ]
         }))
         .expect("reasoning metadata");
         assert_eq!(
             snapshot.supported_efforts,
-            vec!["low".to_string(), "high".to_string()]
+            vec!["xhigh".to_string(), "high".to_string()]
         );
         assert_eq!(snapshot.default_effort.as_deref(), Some("high"));
         assert!(snapshot.mandatory);
-        assert!(snapshot.supports_max_tokens);
+        assert_eq!(
+            snapshot.upstream_format.as_deref(),
+            Some("reasoning_object")
+        );
+        assert_eq!(
+            snapshot.upstream_parameter.as_deref(),
+            Some("reasoning.effort")
+        );
+    }
+
+    #[test]
+    fn openrouter_reasoning_metadata_rejects_malformed_efforts_and_wire_aliases() {
+        for entry in [
+            json!({
+                "reasoning": {"supported_efforts": ["high", 7]},
+                "supported_parameters": ["reasoning"]
+            }),
+            json!({
+                "reasoning": {"supported_efforts": [7]},
+                "supported_parameters": ["reasoning"]
+            }),
+            json!({
+                "reasoning": {
+                    "supported_efforts": ["high"],
+                    "supportedEfforts": ["max"]
+                },
+                "supported_parameters": ["reasoning"]
+            }),
+            json!({
+                "reasoning": {
+                    "supported_efforts": ["high"],
+                    "upstream_format": "server-command"
+                },
+                "supported_parameters": ["reasoning"]
+            }),
+            json!({
+                "reasoning": {
+                    "supported_efforts": ["high"],
+                    "upstream_parameter": "api_key"
+                },
+                "supported_parameters": ["reasoning"]
+            }),
+        ] {
+            assert!(openrouter_reasoning_snapshot(&entry).is_none(), "{entry}");
+        }
+    }
+
+    #[test]
+    fn openrouter_reasoning_capability_is_valid_for_mimo_without_advertised_levels() {
+        let capability = openrouter_reasoning_capability_from_model_entry(&json!({
+            "id": "xiaomi/mimo-v2.6-pro",
+            "supported_parameters": ["reasoning", "include_reasoning"],
+            "reasoning": {"mandatory": false}
+        }))
+        .expect("Mimo reasoning capability");
+        assert_eq!(
+            capability.supported_efforts,
+            ["minimal", "low", "medium", "high", "xhigh"]
+        );
+        assert_eq!(capability.upstream.format, "reasoning_object");
+        assert_eq!(capability.upstream.parameter, "reasoning.effort");
+        assert!(capability.disable_allowed);
+    }
+
+    #[test]
+    fn openrouter_reasoning_capability_keeps_deepseek_wire_schema() {
+        let capability = openrouter_reasoning_capability_from_model_entry(&json!({
+            "id": "deepseek/deepseek-v4-flash",
+            "supported_parameters": [
+                "reasoning",
+                "reasoning_effort",
+                "include_reasoning"
+            ],
+            "reasoning": {
+                "mandatory": false,
+                "supported_efforts": ["xhigh", "high"],
+                "default_effort": "high"
+            }
+        }))
+        .expect("DeepSeek reasoning capability");
+        assert_eq!(capability.supported_efforts, ["xhigh", "high"]);
+        assert_eq!(capability.upstream.format, "reasoning_object");
+        assert_eq!(capability.upstream.parameter, "reasoning.effort");
+        assert_eq!(capability.default_effort.as_deref(), Some("high"));
+    }
+
+    #[test]
+    fn openrouter_reasoning_capability_accepts_parameter_only_metadata() {
+        let capability = openrouter_reasoning_capability_from_model_entry(&json!({
+            "id": "provider/model",
+            "supported_parameters": ["reasoning", "include_reasoning"]
+        }))
+        .expect("parameter-only OpenRouter reasoning capability");
+        assert_eq!(
+            capability.supported_efforts,
+            ["minimal", "low", "medium", "high", "xhigh"]
+        );
+        assert_eq!(capability.upstream.format, "reasoning_object");
+        assert_eq!(capability.upstream.parameter, "reasoning.effort");
+    }
+
+    #[test]
+    fn provider_reasoning_metadata_keeps_explicit_levels_and_wire_contract() {
+        let capability = provider_reasoning_capability_from_model_entry(
+            &json!({
+                "id": "gateway-model",
+                "metadata": {
+                    "reasoning": {
+                        "supported_efforts": ["low", "high", "max"],
+                        "default_effort": "max",
+                        "mandatory": true,
+                        "upstream_format": "string",
+                        "upstream_parameter": "reasoning_effort"
+                    }
+                }
+            }),
+            false,
+        )
+        .expect("explicit provider reasoning contract");
+        assert_eq!(capability.supported_efforts, ["low", "high", "max"]);
+        assert_eq!(capability.default_effort.as_deref(), Some("max"));
+        assert!(!capability.disable_allowed);
+        assert_eq!(capability.upstream.format, "string");
+        assert_eq!(capability.upstream.parameter, "reasoning_effort");
+        assert_ne!(capability.source.as_deref(), Some("user"));
+        capability.validate().expect("valid canonical capability");
+    }
+
+    #[test]
+    fn provider_reasoning_metadata_normalizes_ultra_only_with_a_max_path() {
+        let capability = provider_reasoning_capability_from_model_entry(
+            &json!({
+                "id": "gateway-model",
+                "reasoning": {
+                    "supported_efforts": ["low", "max", "ultra"],
+                    "default_effort": "ultra",
+                    "upstream_format": "string",
+                    "upstream_parameter": "reasoning_effort"
+                }
+            }),
+            false,
+        )
+        .expect("a provider declaration with max can expose Codex Ultra");
+
+        assert_eq!(capability.supported_efforts, ["low", "max"]);
+        assert_eq!(capability.default_effort.as_deref(), Some("max"));
+        assert!(capability
+            .codex_ultra_orchestration
+            .as_ref()
+            .is_some_and(|ultra| ultra.enabled));
+        assert!(!capability.upstream.effort_map.contains_key("ultra"));
+        capability
+            .validate()
+            .expect("normalized capability is valid");
+
+        assert!(
+            provider_reasoning_capability_from_model_entry(
+                &json!({
+                    "id": "gateway-model",
+                    "reasoning": {"supported_efforts": ["low", "ultra"]}
+                }),
+                false,
+            )
+            .is_none(),
+            "Ultra without a valid max path must remain fail-closed"
+        );
+    }
+
+    #[test]
+    fn provider_reasoning_metadata_keeps_canonical_mapping_without_promoting_remote_instructions() {
+        let capability = provider_reasoning_capability_from_model_entry(
+            &json!({
+                "id": "gateway-model",
+                "reasoning": {
+                    "schemaVersion": 2,
+                    "supportStatus": "confirmed_supported",
+                    "controlKind": "graded",
+                    "supportedEfforts": ["high", "xhigh"],
+                    "defaultEffort": "high",
+                    "disableAllowed": false,
+                    "upstream": {
+                        "format": "reasoning_object",
+                        "parameter": "reasoning.effort",
+                        "effortMap": {"high": "high", "xhigh": "xhigh", "max": "xhigh"}
+                    },
+                    "source": "user",
+                    "providerKey": "[REDACTED]",
+                    "codexUltraOrchestration": {"enabled": true},
+                    "baseInstructions": "remote instructions"
+                }
+            }),
+            false,
+        )
+        .expect("canonical provider reasoning declaration");
+        assert_eq!(capability.supported_efforts, ["high", "xhigh"]);
+        assert_eq!(
+            capability
+                .upstream
+                .effort_map
+                .get("max")
+                .map(String::as_str),
+            Some("xhigh")
+        );
+        assert_ne!(capability.source.as_deref(), Some("user"));
+        assert!(capability.codex_ultra_orchestration.is_none());
+        assert!(capability.provider_key.is_none());
+        let serialized =
+            serde_json::to_string(&capability).expect("serialize canonical capability");
+        assert!(!serialized.contains("[REDACTED]"));
+        assert!(!serialized.contains("remote instructions"));
+    }
+
+    #[test]
+    fn provider_reasoning_metadata_distinguishes_absent_positive_and_explicit_false() {
+        use crate::proxy::providers::codex_reasoning::{
+            ReasoningControlKind, ReasoningSupportStatus,
+        };
+        for entry in [
+            json!({"id": "model", "reasoning": false}),
+            json!({"id": "model", "supportsReasoning": false}),
+            json!({"id": "model", "capabilities": {"reasoning": false}}),
+        ] {
+            let capability = provider_reasoning_capability_from_model_entry(&entry, false)
+                .expect("explicit unsupported declaration");
+            assert_eq!(
+                capability.effective_support_status(),
+                ReasoningSupportStatus::ConfirmedUnsupported
+            );
+            assert_eq!(
+                capability.effective_control_kind(),
+                ReasoningControlKind::None
+            );
+            assert!(capability.supported_efforts.is_empty());
+        }
+        let positive = provider_reasoning_capability_from_model_entry(
+            &json!({"id": "model", "capabilities": {"reasoning": true}}),
+            false,
+        )
+        .expect("positive reasoning evidence");
+        assert_eq!(
+            positive.effective_support_status(),
+            ReasoningSupportStatus::ConfirmedSupported
+        );
+        assert_eq!(
+            positive.effective_control_kind(),
+            ReasoningControlKind::None
+        );
+        assert!(positive.supported_efforts.is_empty());
+        for entry in [
+            json!({"id": "model"}),
+            json!({"id": "model", "reasoning": null}),
+            json!({"id": "model", "reasoning": {}}),
+            json!({"id": "model", "supported_parameters": ["reasoning"]}),
+        ] {
+            assert!(
+                provider_reasoning_capability_from_model_entry(&entry, false).is_none(),
+                "{entry}"
+            );
+        }
+    }
+
+    #[test]
+    fn provider_reasoning_metadata_does_not_invent_openrouter_efforts_for_generic_providers() {
+        let entry =
+            json!({"id": "model", "supported_parameters": ["reasoning", "include_reasoning"]});
+        assert!(provider_reasoning_capability_from_model_entry(&entry, false).is_none());
+        let openrouter = provider_reasoning_capability_from_model_entry(&entry, true)
+            .expect("verified OpenRouter contract may provide its documented enum");
+        assert_eq!(
+            openrouter.supported_efforts,
+            ["minimal", "low", "medium", "high", "xhigh"]
+        );
+    }
+
+    #[test]
+    fn provider_reasoning_metadata_rejects_invalid_or_conflicting_declarations_atomically() {
+        for entry in [
+            json!({"reasoning": {"supported_efforts": ["high", 7]}}),
+            json!({"reasoning": {"supported_efforts": ["high", "unsupported-level"]}}),
+            json!({"reasoning": {"supported_efforts": ["high"], "supportedEfforts": ["max"]}}),
+            json!({"reasoning": {"supported_efforts": ["high"], "default_effort": "max"}}),
+            json!({"reasoning": {"supported_efforts": ["high"], "mandatory": "true"}}),
+            json!({"reasoning": {"supported_efforts": ["high"], "upstream_format": "server-command"}}),
+            json!({"reasoning": {"supported_efforts": ["high"], "upstream_parameter": "api_key"}}),
+            json!({"reasoning": {"supported_efforts": ["high"], "mandatory": true, "disableAllowed": true}}),
+            json!({"supportsReasoning": false, "reasoning": {"supported_efforts": ["high"]}}),
+            json!({"reasoning": {"supported_efforts": ["high"]}, "metadata": {"reasoning": {"supported_efforts": ["max"]}}}),
+            json!({"reasoning": {"supported_efforts": [{"effort": "low", "reasoningEffort": "max"}]}}),
+            json!({"reasoning": {"supported_efforts": ["ultra"]}}),
+            json!({"reasoning": "yes"}),
+        ] {
+            assert!(
+                provider_reasoning_capability_from_model_entry(&entry, false).is_none(),
+                "{entry}"
+            );
+            assert!(
+                provider_reasoning_capability_from_model_entry(&entry, true).is_none(),
+                "{entry}"
+            );
+        }
     }
 }

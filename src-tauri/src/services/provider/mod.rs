@@ -5629,6 +5629,584 @@ requires_openai_auth = true
         )
     }
 
+    fn api_declared_codex_source() -> Provider {
+        Provider::with_id(
+            "declared-relay".to_string(),
+            "Declared relay".to_string(),
+            json!({
+                "auth": {"OPENAI_API_KEY": "test-key"},
+                "config": "model = \"model-a\"\nmodel_provider = \"relay\"\n[model_providers.relay]\nbase_url = \"https://example.invalid/v1\"\nwire_api = \"responses\"\n",
+                "modelCatalog": {"models": [{
+                    "model": "model-a",
+                    "upstreamModel": "upstream-a",
+                    "protocolCapability": {
+                        "schemaVersion": 1,
+                        "source": "provider_api",
+                        "baseUrl": "https://example.invalid/v1",
+                        "upstreamModel": "upstream-a",
+                        "supportedEndpoints": ["openai_responses"],
+                        "supportsTools": true,
+                        "supportsStreaming": true,
+                        "supportsToolContinuation": true
+                    }
+                }]}
+            }),
+            None,
+        )
+    }
+
+    #[test]
+    fn ordinary_codex_mutation_accepts_declared_capabilities_without_synthetic_profiles() {
+        let db = Arc::new(Database::memory().unwrap());
+        let state = AppState::new(db.clone());
+        let provider = api_declared_codex_source();
+
+        ProviderService::persist_provider_mutation(&state, &AppType::Codex, &provider, &[], &[])
+            .expect("explicit complete provider API declarations can save without paid probes");
+
+        let saved = db
+            .get_provider_by_id(&provider.id, "codex")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            saved.settings_config["modelCatalog"],
+            provider.settings_config["modelCatalog"]
+        );
+        assert!(db
+            .list_protocol_compatibility_profiles(&provider.id)
+            .unwrap()
+            .is_empty());
+        assert!(db
+            .list_protocol_probe_observations(&provider.id)
+            .unwrap()
+            .is_empty());
+        let mut edited = saved;
+        edited.notes = Some("reopened declaration-only edit".to_string());
+        ProviderService::persist_provider_mutation(&state, &AppType::Codex, &edited, &[], &[])
+            .expect("reopened declaration-only profiles must remain editable");
+        assert_eq!(
+            db.get_provider_by_id(&provider.id, "codex")
+                .unwrap()
+                .unwrap()
+                .notes,
+            edited.notes
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn api_declared_current_provider_publishes_its_committed_transport() {
+        with_test_home(|state, _| {
+            crate::settings::reload_settings().unwrap();
+            let mut provider = api_declared_codex_source();
+            provider.settings_config["modelCatalog"]["models"][0]["protocolCapability"]
+                ["supportedEndpoints"] = json!(["openai_chat"]);
+            state.db.save_provider("codex", &provider).unwrap();
+            state
+                .db
+                .set_current_provider("codex", &provider.id)
+                .unwrap();
+            crate::settings::set_current_provider(&AppType::Codex, Some(&provider.id)).unwrap();
+            provider.notes = Some("current API-declared Chat edit".into());
+
+            ProviderService::update(state, AppType::Codex, None, provider.clone())
+                .expect("API-declared current provider remains editable without paid probing");
+
+            let saved = state
+                .db
+                .get_provider_by_id(&provider.id, "codex")
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                saved
+                    .meta
+                    .as_ref()
+                    .and_then(|meta| meta.api_format.as_deref()),
+                Some("openai_chat")
+            );
+            let live = crate::codex_config::read_codex_config_text().unwrap();
+            let expected =
+                super::build_codex_live_config_for_provider(state.db.as_ref(), &saved).unwrap();
+            let expected = crate::codex_config::prepare_codex_provider_live_config(
+                &saved.settings_config["auth"],
+                &expected,
+            )
+            .unwrap();
+            assert_eq!(
+                live.parse::<toml::Value>().unwrap(),
+                expected.parse::<toml::Value>().unwrap(),
+                "live publication must read the normalized database provider, not the draft"
+            );
+        });
+    }
+
+    #[test]
+    fn ordinary_codex_mutation_keeps_current_real_probe_authority_over_api_declarations() {
+        use crate::protocol_compatibility::{
+            compile_provider_probe_candidate_for_model, ProbeReadiness,
+            ProtocolCompatibilityProbeResult, TransportKind,
+        };
+
+        for readiness in [ProbeReadiness::Verified, ProbeReadiness::Partial] {
+            let db = Arc::new(Database::memory().unwrap());
+            let state = AppState::new(db.clone());
+            let provider = api_declared_codex_source();
+            db.save_provider("codex", &provider).unwrap();
+            let before =
+                serde_json::to_value(db.get_provider_by_id(&provider.id, "codex").unwrap())
+                    .unwrap();
+            let candidate = compile_provider_probe_candidate_for_model(
+                &provider,
+                "model-a".into(),
+                "upstream-a".into(),
+            )
+            .unwrap();
+            let now = chrono::Utc::now().timestamp();
+            let record = ProtocolCompatibilityRecord::new(
+                candidate.target_key(TransportKind::OpenAiChat).unwrap(),
+                ProtocolCompatibilityProbeResult {
+                    selected_transport: (readiness == ProbeReadiness::Verified)
+                        .then_some(TransportKind::OpenAiChat),
+                    readiness,
+                    branches: Vec::new(),
+                },
+                now,
+                now + 600,
+            );
+            let observations = [TransportKind::OpenAiResponses, TransportKind::OpenAiChat]
+                .into_iter()
+                .map(|transport| {
+                    let mut observation = record.clone();
+                    observation.target = candidate.target_key(transport).unwrap();
+                    observation.result.readiness = ProbeReadiness::Unverified;
+                    observation
+                })
+                .collect::<Vec<_>>();
+            db.save_protocol_probe_bundle(&record, &observations)
+                .unwrap();
+            let result = ProviderService::persist_provider_mutation(
+                &state,
+                &AppType::Codex,
+                &provider,
+                &[],
+                &[],
+            );
+            if readiness == ProbeReadiness::Verified {
+                result.expect("current real transport result must survive declaration-only edit");
+                let saved = db
+                    .get_provider_by_id(&provider.id, "codex")
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(
+                    saved
+                        .meta
+                        .as_ref()
+                        .and_then(|meta| meta.api_format.as_deref()),
+                    Some("openai_chat")
+                );
+                let profiles = db
+                    .list_protocol_compatibility_profiles(&provider.id)
+                    .unwrap();
+                assert_eq!(profiles.len(), 1);
+                assert_eq!(profiles[0].tested_at, record.tested_at);
+                assert_eq!(profiles[0].expires_at, record.expires_at);
+                assert_eq!(profiles[0].result.readiness, ProbeReadiness::Verified);
+            } else {
+                assert!(
+                    result
+                        .unwrap_err()
+                        .to_string()
+                        .contains("codex_provider_set_model_blocked"),
+                    "an API declaration must not erase a current unsuccessful real probe"
+                );
+                assert_eq!(
+                    serde_json::to_value(db.get_provider_by_id(&provider.id, "codex").unwrap())
+                        .unwrap(),
+                    before
+                );
+                assert_eq!(
+                    db.list_protocol_compatibility_profiles(&provider.id)
+                        .unwrap()[0]
+                        .result
+                        .readiness,
+                    ProbeReadiness::Partial
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn partial_manual_overrides_do_not_erase_automatic_models_real_probe_authority() {
+        use crate::protocol_compatibility::{
+            compile_provider_probe_candidate_for_model, ProbeReadiness,
+            ProtocolCompatibilityProbeResult, TransportKind,
+        };
+        use crate::provider::{CodexProtocolMode, CodexProtocolOverride};
+
+        for universal in [false, true] {
+            for readiness in [ProbeReadiness::Verified, ProbeReadiness::Partial] {
+                let db = Arc::new(Database::memory().unwrap());
+                let state = AppState::new(db.clone());
+                let mut provider = api_declared_codex_source();
+                let mut automatic_row =
+                    provider.settings_config["modelCatalog"]["models"][0].clone();
+                automatic_row["model"] = json!("model-b");
+                automatic_row["upstreamModel"] = json!("upstream-b");
+                automatic_row["protocolCapability"]["upstreamModel"] = json!("upstream-b");
+                provider.settings_config["modelCatalog"]["models"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(automatic_row);
+                provider.meta = Some(ProviderMeta {
+                    api_format: Some("openai_responses".into()),
+                    codex_protocol_mode: Some(CodexProtocolMode::Manual),
+                    codex_protocol_overrides: [(
+                        "model-a".into(),
+                        CodexProtocolOverride::OpenaiChat,
+                    )]
+                    .into_iter()
+                    .collect(),
+                    ..ProviderMeta::default()
+                });
+                let mut definition = UniversalProvider::new(
+                    "declared-shared".into(),
+                    "Declared shared".into(),
+                    "custom".into(),
+                    "https://example.invalid/v1".into(),
+                    "redacted-test-key".into(),
+                );
+                definition.apps.codex = true;
+                definition.models.codex = Some(CodexModelConfig {
+                    model: Some("model-a".into()),
+                    reasoning_effort: None,
+                });
+                if universal {
+                    provider.id = definition.to_codex_provider().unwrap().id;
+                }
+                db.save_provider("codex", &provider).unwrap();
+                let candidate = compile_provider_probe_candidate_for_model(
+                    &provider,
+                    "model-b".into(),
+                    "upstream-b".into(),
+                )
+                .unwrap();
+                let now = chrono::Utc::now().timestamp();
+                let record = ProtocolCompatibilityRecord::new(
+                    candidate.target_key(TransportKind::OpenAiChat).unwrap(),
+                    ProtocolCompatibilityProbeResult {
+                        selected_transport: (readiness == ProbeReadiness::Verified)
+                            .then_some(TransportKind::OpenAiChat),
+                        readiness,
+                        branches: Vec::new(),
+                    },
+                    now,
+                    now + 600,
+                );
+                db.save_protocol_compatibility_result(&record).unwrap();
+                let result = if universal {
+                    ProviderService::save_and_sync_universal_to_apps_with_codex_protocol_state_and_publisher(
+                        &state,
+                        definition,
+                        Some(provider.clone()),
+                        &[],
+                        &[],
+                        |artifact| {
+                            Ok(crate::codex_multirouter::projection::ProjectionReadBack::verified(
+                                artifact.dependency_fingerprint.clone(),
+                            ))
+                        },
+                    )
+                    .map(|_| ())
+                } else {
+                    ProviderService::persist_provider_mutation(
+                        &state,
+                        &AppType::Codex,
+                        &provider,
+                        &[],
+                        &[],
+                    )
+                };
+                if readiness == ProbeReadiness::Verified {
+                    result.expect("automatic model must retain its real selected transport");
+                    let saved = db
+                        .get_provider_by_id(&provider.id, "codex")
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(
+                        saved
+                            .meta
+                            .as_ref()
+                            .and_then(|meta| meta.api_format.as_deref()),
+                        Some("openai_chat")
+                    );
+                } else {
+                    assert!(
+                        result.unwrap_err().to_string().contains("codex_provider_set_model_blocked"),
+                        "partial manual overrides must not hide an automatic model's unsuccessful probe"
+                    );
+                    assert_eq!(
+                        serde_json::to_value(db.get_provider_by_id(&provider.id, "codex").unwrap())
+                            .unwrap(),
+                        serde_json::to_value(Some(&provider)).unwrap()
+                    );
+                }
+                let profiles = db
+                    .list_protocol_compatibility_profiles(&provider.id)
+                    .unwrap();
+                assert_eq!(profiles.len(), 1);
+                assert_eq!(profiles[0].target.public_model, "model-b");
+                assert_eq!(profiles[0].tested_at, record.tested_at);
+                assert_eq!(profiles[0].result.readiness, readiness);
+            }
+        }
+    }
+
+    #[test]
+    fn restoring_one_model_does_not_overwrite_another_models_newer_probe_observations() {
+        use crate::protocol_compatibility::{
+            compile_provider_probe_candidate_for_model, ProbeReadiness,
+            ProtocolCompatibilityProbeResult, TransportKind,
+        };
+
+        let db = Arc::new(Database::memory().unwrap());
+        let state = AppState::new(db.clone());
+        let mut provider = api_declared_codex_source();
+        let mut second_row = provider.settings_config["modelCatalog"]["models"][0].clone();
+        second_row["model"] = json!("model-b");
+        second_row["upstreamModel"] = json!("upstream-b");
+        second_row["protocolCapability"]["upstreamModel"] = json!("upstream-b");
+        provider.settings_config["modelCatalog"]["models"]
+            .as_array_mut()
+            .unwrap()
+            .push(second_row);
+        db.save_provider("codex", &provider).unwrap();
+        let now = chrono::Utc::now().timestamp();
+        let bundle = |model: &str, upstream: &str, tested_at: i64| {
+            let candidate = compile_provider_probe_candidate_for_model(
+                &provider,
+                model.into(),
+                upstream.into(),
+            )
+            .unwrap();
+            let record = ProtocolCompatibilityRecord::new(
+                candidate
+                    .target_key(TransportKind::OpenAiResponses)
+                    .unwrap(),
+                ProtocolCompatibilityProbeResult {
+                    selected_transport: Some(TransportKind::OpenAiResponses),
+                    readiness: ProbeReadiness::Verified,
+                    branches: Vec::new(),
+                },
+                tested_at,
+                now + 600,
+            );
+            let observations = [TransportKind::OpenAiResponses, TransportKind::OpenAiChat]
+                .into_iter()
+                .map(|transport| {
+                    let mut observation = record.clone();
+                    observation.target = candidate.target_key(transport).unwrap();
+                    observation.result.readiness = ProbeReadiness::Unverified;
+                    observation
+                })
+                .collect::<Vec<_>>();
+            (record, observations)
+        };
+        let (old_first, old_first_observations) = bundle("model-a", "upstream-a", now - 120);
+        let (restored_second, restored_second_observations) =
+            bundle("model-b", "upstream-b", now - 120);
+        db.save_protocol_probe_bundle(&old_first, &old_first_observations)
+            .unwrap();
+        db.save_protocol_probe_bundle(&restored_second, &restored_second_observations)
+            .unwrap();
+        let (new_first, new_first_observations) = bundle("model-a", "upstream-a", now - 30);
+
+        ProviderService::persist_provider_mutation(
+            &state,
+            &AppType::Codex,
+            &provider,
+            std::slice::from_ref(&new_first),
+            &new_first_observations,
+        )
+        .unwrap();
+
+        let observations = db.list_protocol_probe_observations(&provider.id).unwrap();
+        let first_observations = observations
+            .iter()
+            .filter(|observation| observation.target.public_model == "model-a")
+            .collect::<Vec<_>>();
+        assert_eq!(first_observations.len(), 2);
+        assert!(first_observations.iter().all(|observation| {
+            observation.tested_at == new_first.tested_at
+                && observation.expires_at == new_first.expires_at
+        }));
+        let saved = db
+            .get_provider_by_id(&provider.id, "codex")
+            .unwrap()
+            .unwrap();
+        let restored =
+            crate::commands::collect_saved_provider_protocol_evidence(&state, saved, now)
+                .unwrap()
+                .unwrap();
+        assert_eq!(restored.records.len(), 2);
+        assert_eq!(restored.observations.len(), 4);
+        assert!(restored.records.iter().any(|record| {
+            record.target.public_model == "model-b" && record.tested_at == restored_second.tested_at
+        }));
+    }
+
+    #[test]
+    fn same_second_persisted_probe_keeps_its_pair_over_an_older_live_receipt() {
+        use crate::protocol_compatibility::{
+            compile_provider_probe_candidate_for_model, ProbeReadiness,
+            ProtocolCompatibilityProbeResult, TransportKind,
+        };
+        use std::time::{Duration, Instant};
+
+        let db = Arc::new(Database::memory().unwrap());
+        let state = AppState::new(db.clone());
+        let provider = api_declared_codex_source();
+        db.save_provider("codex", &provider).unwrap();
+        let candidate = compile_provider_probe_candidate_for_model(
+            &provider,
+            "model-a".into(),
+            "upstream-a".into(),
+        )
+        .unwrap();
+        let tested_at = chrono::Utc::now().timestamp();
+        let observations_for = |record: &ProtocolCompatibilityRecord| {
+            [TransportKind::OpenAiResponses, TransportKind::OpenAiChat]
+                .into_iter()
+                .map(|transport| {
+                    let mut observation = record.clone();
+                    observation.target = candidate.target_key(transport).unwrap();
+                    observation
+                })
+                .collect::<Vec<_>>()
+        };
+        let old_live = ProtocolCompatibilityRecord::new(
+            candidate.target_key(TransportKind::OpenAiChat).unwrap(),
+            ProtocolCompatibilityProbeResult {
+                selected_transport: Some(TransportKind::OpenAiChat),
+                readiness: ProbeReadiness::Verified,
+                branches: Vec::new(),
+            },
+            tested_at,
+            tested_at + 600,
+        );
+        let old_observations = observations_for(&old_live);
+        let order_origin = Instant::now();
+        state
+            .remember_observed_codex_provider_set_probe_receipt(
+                old_live.clone(),
+                old_observations.clone(),
+                order_origin,
+            )
+            .unwrap();
+        let persisted_new = ProtocolCompatibilityRecord::new(
+            candidate
+                .target_key(TransportKind::OpenAiResponses)
+                .unwrap(),
+            ProtocolCompatibilityProbeResult {
+                selected_transport: Some(TransportKind::OpenAiResponses),
+                readiness: ProbeReadiness::Verified,
+                branches: Vec::new(),
+            },
+            tested_at,
+            tested_at + 600,
+        );
+        let persisted_observations = observations_for(&persisted_new);
+        state
+            .remember_observed_codex_provider_set_probe_receipt(
+                persisted_new.clone(),
+                persisted_observations.clone(),
+                order_origin + Duration::from_millis(1),
+            )
+            .unwrap();
+        db.save_protocol_probe_bundle(&persisted_new, &persisted_observations)
+            .unwrap();
+
+        ProviderService::persist_provider_mutation(
+            &state,
+            &AppType::Codex,
+            &provider,
+            std::slice::from_ref(&old_live),
+            &old_observations,
+        )
+        .expect("persisted same-second aggregate should supersede older live receipt");
+
+        let profiles = db
+            .list_protocol_compatibility_profiles(&provider.id)
+            .unwrap();
+        assert_eq!(profiles.len(), 1);
+        assert_eq!(profiles[0], persisted_new);
+        let observations = db.list_protocol_probe_observations(&provider.id).unwrap();
+        assert_eq!(observations.len(), 2);
+        assert!(observations.iter().all(|observation| {
+            observation.tested_at == persisted_new.tested_at
+                && observation.result.selected_transport == Some(TransportKind::OpenAiResponses)
+        }));
+
+        let saved = db
+            .get_provider_by_id(&provider.id, "codex")
+            .unwrap()
+            .unwrap();
+        let restored =
+            crate::commands::collect_saved_provider_protocol_evidence(&state, saved, tested_at)
+                .unwrap()
+                .unwrap();
+        assert_eq!(restored.records, vec![persisted_new]);
+        assert_eq!(restored.observations, persisted_observations);
+    }
+
+    #[test]
+    fn ordinary_codex_mutation_still_requires_probe_for_unknown_or_changed_declarations() {
+        for scenario in ["unknown", "endpoint", "upstream", "unsupported"] {
+            let db = Arc::new(Database::memory().unwrap());
+            let state = AppState::new(db.clone());
+            let provider = api_declared_codex_source();
+            db.save_provider("codex", &provider).unwrap();
+            let before =
+                serde_json::to_value(db.get_provider_by_id(&provider.id, "codex").unwrap())
+                    .unwrap();
+            let mut edited = provider.clone();
+            let row = &mut edited.settings_config["modelCatalog"]["models"][0];
+            match scenario {
+                "unknown" => {
+                    row.as_object_mut().unwrap().remove("protocolCapability");
+                }
+                "endpoint" => {
+                    row["protocolCapability"]["baseUrl"] = json!("https://other.invalid/v1");
+                }
+                "upstream" => {
+                    row["upstreamModel"] = json!("renamed-upstream");
+                }
+                "unsupported" => {
+                    row["protocolCapability"]["supportsTools"] = json!(false);
+                }
+                _ => unreachable!(),
+            }
+            let error = ProviderService::persist_provider_mutation(
+                &state,
+                &AppType::Codex,
+                &edited,
+                &[],
+                &[],
+            )
+            .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("codex_provider_set_probe_required"),
+                "{scenario}: {error}"
+            );
+            assert_eq!(
+                serde_json::to_value(db.get_provider_by_id(&provider.id, "codex").unwrap())
+                    .unwrap(),
+                before
+            );
+        }
+    }
+
     #[test]
     fn codex_provider_list_hides_generated_provider_set_leaves() {
         let db = Arc::new(Database::memory().expect("memory db"));
@@ -6878,6 +7456,15 @@ impl ProviderService {
             protocol_observations,
         )?;
 
+        if app_type == AppType::Codex {
+            provider = state
+                .db
+                .get_provider_by_id(&provider.id, app_type.as_str())?
+                .ok_or_else(|| {
+                    AppError::InvalidInput("codex_provider_not_found_after_mutation".to_string())
+                })?;
+        }
+
         if codex_official_auth_changed {
             state
                 .proxy_service
@@ -7433,6 +8020,95 @@ impl ProviderService {
         Ok(provider)
     }
 
+    pub(crate) fn merge_saved_codex_protocol_state(
+        state: &AppState,
+        provider: &Provider,
+        protocol_profiles: &[ProtocolCompatibilityRecord],
+        protocol_observations: &[ProtocolCompatibilityRecord],
+        now: i64,
+    ) -> Result<
+        (
+            Vec<ProtocolCompatibilityRecord>,
+            Vec<ProtocolCompatibilityRecord>,
+        ),
+        AppError,
+    > {
+        let merged_profiles = crate::commands::merge_saved_provider_protocol_records(
+            state,
+            provider,
+            protocol_profiles,
+            now,
+        )
+        .map_err(AppError::InvalidInput)?;
+        let matching_pair =
+            |record: &ProtocolCompatibilityRecord, observations: &[ProtocolCompatibilityRecord]| {
+                let candidate =
+                    crate::protocol_compatibility::compile_provider_probe_candidate_for_model(
+                        provider,
+                        record.target.public_model.clone(),
+                        record.target.upstream_model.clone(),
+                    )
+                    .ok()?;
+                [
+                    crate::protocol_compatibility::TransportKind::OpenAiResponses,
+                    crate::protocol_compatibility::TransportKind::OpenAiChat,
+                ]
+                .into_iter()
+                .map(|transport| {
+                    let target = candidate.target_key(transport).ok()?;
+                    observations
+                        .iter()
+                        .find(|observation| {
+                            observation.target == target
+                                && observation.tested_at == record.tested_at
+                                && observation.probe_version == record.probe_version
+                                && observation.result.selected_transport
+                                    == record.result.selected_transport
+                                && observation.result.branches.iter().eq(record
+                                    .result
+                                    .branches
+                                    .iter()
+                                    .filter(|branch| branch.assessment.transport == transport))
+                        })
+                        .cloned()
+                })
+                .collect::<Option<Vec<_>>>()
+            };
+        let mut merged_observations = Vec::new();
+        let mut missing_pairs = Vec::new();
+        for record in &merged_profiles {
+            let incoming_pair = protocol_profiles
+                .contains(record)
+                .then(|| matching_pair(record, protocol_observations))
+                .flatten();
+            if let Some(pair) = incoming_pair {
+                merged_observations.extend(pair);
+            } else {
+                missing_pairs.push(record);
+            }
+        }
+        if !missing_pairs.is_empty() {
+            if let Some(saved) = crate::commands::collect_saved_provider_protocol_evidence(
+                state,
+                provider.clone(),
+                now,
+            )
+            .map_err(AppError::InvalidInput)?
+            {
+                for record in missing_pairs {
+                    // Same-second probes may share targets but not aggregate results.
+                    if !saved.records.contains(record) {
+                        continue;
+                    }
+                    if let Some(pair) = matching_pair(record, &saved.observations) {
+                        merged_observations.extend(pair);
+                    }
+                }
+            }
+        }
+        Ok((merged_profiles, merged_observations))
+    }
+
     fn persist_provider_mutation(
         state: &AppState,
         app_type: &AppType,
@@ -7446,6 +8122,26 @@ impl ProviderService {
 
         let is_router = Self::is_codex_schema_v2_router(app_type, provider);
         if !is_router && provider.uses_manual_codex_protocol() {
+            let now = chrono::Utc::now().timestamp();
+            let merged_protocol_state = if provider.has_codex_protocol_overrides() {
+                Some(Self::merge_saved_codex_protocol_state(
+                    state,
+                    provider,
+                    protocol_profiles,
+                    protocol_observations,
+                    now,
+                )?)
+            } else {
+                None
+            };
+            let protocol_profiles = merged_protocol_state
+                .as_ref()
+                .map(|(profiles, _)| profiles.as_slice())
+                .unwrap_or(protocol_profiles);
+            let protocol_observations = merged_protocol_state
+                .as_ref()
+                .map(|(_, observations)| observations.as_slice())
+                .unwrap_or(protocol_observations);
             let existing = state
                 .db
                 .get_all_providers(AppType::Codex.as_str())?
@@ -7456,7 +8152,7 @@ impl ProviderService {
                     provider,
                     protocol_profiles,
                     &existing,
-                    chrono::Utc::now().timestamp(),
+                    now,
                 )
             } else {
                 let api_format = provider
@@ -7482,10 +8178,7 @@ impl ProviderService {
                     }
                 };
                 crate::codex_multirouter::provider_set::plan_manual_codex_provider_set(
-                    provider,
-                    transport,
-                    &existing,
-                    chrono::Utc::now().timestamp(),
+                    provider, transport, &existing, now,
                 )
             }
             .map_err(|error| AppError::InvalidInput(error.to_string()))?;
@@ -7529,7 +8222,22 @@ impl ProviderService {
             && provider.category.as_deref() != Some("official")
             && !provider.uses_managed_account_auth();
         if requires_automatic_provider_set {
-            if protocol_profiles.is_empty() {
+            let now = chrono::Utc::now().timestamp();
+            let (merged_protocol_profiles, merged_protocol_observations) =
+                Self::merge_saved_codex_protocol_state(
+                    state,
+                    provider,
+                    protocol_profiles,
+                    protocol_observations,
+                    now,
+                )?;
+            let protocol_profiles = merged_protocol_profiles.as_slice();
+            if protocol_profiles.is_empty()
+                && crate::codex_multirouter::provider_set::requires_automatic_codex_protocol_probe(
+                    provider,
+                )
+                .map_err(|error| AppError::InvalidInput(error.to_string()))?
+            {
                 return Err(AppError::InvalidInput(
                     "codex_provider_set_probe_required".to_string(),
                 ));
@@ -7543,7 +8251,7 @@ impl ProviderService {
                 provider,
                 protocol_profiles,
                 &existing,
-                chrono::Utc::now().timestamp(),
+                now,
             )
             .map_err(|error| AppError::InvalidInput(error.to_string()))?;
             match &prepared.preview.plan {
@@ -7564,7 +8272,7 @@ impl ProviderService {
             let outcome = crate::codex_multirouter::mutation::apply_codex_provider_set_mutation_with_observations_and_publisher(
                 state.db.as_ref(),
                 prepared,
-                protocol_observations.to_vec(),
+                merged_protocol_observations,
                 |artifact| {
                     crate::codex_config::publish_codex_multirouter_projection_for_database(
                         state.db.as_ref(),
@@ -9937,8 +10645,7 @@ impl ProviderService {
             .get_provider_by_id(provider_id, AppType::Codex.as_str())?
             .ok_or_else(|| AppError::InvalidInput("Codex provider does not exist".to_string()))?;
         let effective = Self::codex_subagent_effective_settings(state, &provider, false)?;
-        Ok(effective
-            .get("modelCatalog")
+        Ok(crate::codex_multirouter::catalog::read_catalog(&effective)
             .cloned()
             .unwrap_or_else(|| serde_json::json!({"models": []})))
     }
@@ -10364,6 +11071,7 @@ impl ProviderService {
         // Plan the complete Codex Provider Set before the transaction starts. The same planner
         // owns ordinary Provider saves, so Universal cannot silently fall back to a mixed
         // request-time transport or save only one side of a split.
+        let mut committed_codex_observations = protocol_observations.to_vec();
         let prepared_codex_set_commit = if provider.apps.codex {
             let codex_provider = match prepared_codex_provider {
                 Some(codex_provider) => {
@@ -10407,6 +11115,24 @@ impl ProviderService {
                 .into_iter()
                 .collect::<HashMap<_, _>>();
             let now = chrono::Utc::now().timestamp();
+            let merged_protocol_state = if !codex_provider.uses_manual_codex_protocol()
+                || codex_provider.has_codex_protocol_overrides()
+            {
+                let (profiles, observations) = Self::merge_saved_codex_protocol_state(
+                    state,
+                    &codex_provider,
+                    protocol_profiles,
+                    protocol_observations,
+                    now,
+                )?;
+                committed_codex_observations = observations;
+                Some(profiles)
+            } else {
+                None
+            };
+            let protocol_profiles = merged_protocol_state
+                .as_deref()
+                .unwrap_or(protocol_profiles);
             let prepared = if codex_provider.uses_manual_codex_protocol()
                 && codex_provider.has_codex_protocol_overrides()
             {
@@ -10520,7 +11246,7 @@ impl ProviderService {
                     Vec::new(),
                 )
             };
-        transaction.observations = protocol_observations.to_vec();
+        transaction.observations = committed_codex_observations;
         if codex_current_before.is_none() {
             // Universal save/sync must not silently activate its generated Codex child. The
             // Provider Set planner normally activates the first ordinary Provider, but Universal

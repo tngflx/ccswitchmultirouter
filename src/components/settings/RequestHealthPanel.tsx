@@ -1,9 +1,11 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
   AlertTriangle,
   CheckCircle2,
+  CircleX,
   Clock3,
   DatabaseZap,
+  Info,
   RefreshCw,
   Save,
   ShieldCheck,
@@ -18,6 +20,8 @@ import { cn } from "@/lib/utils";
 import type {
   OpenAIResponsesContractStatus,
   RequestHealthConfig,
+  RequestHealthDiagnostic,
+  RequestHealthFinding,
   RequestHealthSnapshot,
 } from "@/types/proxy";
 
@@ -30,9 +34,77 @@ function bytes(value: number): string {
   return `${(value / 1024).toFixed(1)} KB`;
 }
 
+type DiagnosticSeverity = "error" | "warning" | "info" | "healthy";
+
+function findingSeverity(finding: RequestHealthFinding): DiagnosticSeverity {
+  if (finding.severity === "error" || finding.severity === "info") {
+    return finding.severity;
+  }
+  return "warning";
+}
+
+function diagnosticSeverity(
+  diagnostic: RequestHealthDiagnostic,
+): DiagnosticSeverity {
+  const findings = diagnostic.anomaly
+    ? [...diagnostic.findings, diagnostic.anomaly]
+    : diagnostic.findings;
+  if (
+    diagnostic.blocked ||
+    diagnostic.tokenLimitExceeded ||
+    findings.some((finding) => findingSeverity(finding) === "error")
+  ) {
+    return "error";
+  }
+  if (
+    diagnostic.thresholdExceeded ||
+    findings.some((finding) => findingSeverity(finding) === "warning")
+  ) {
+    return "warning";
+  }
+  return findings.length > 0 ? "info" : "healthy";
+}
+
+function findingClass(severity: DiagnosticSeverity): string {
+  if (severity === "error") return "text-red-800 dark:text-red-200";
+  if (severity === "warning") return "text-amber-700 dark:text-amber-300";
+  return "text-muted-foreground";
+}
+
+function newerContract(
+  current: OpenAIResponsesContractStatus | undefined,
+  incoming: OpenAIResponsesContractStatus,
+): OpenAIResponsesContractStatus {
+  if (
+    current?.checkedAt &&
+    (!incoming.checkedAt ||
+      Date.parse(current.checkedAt) > Date.parse(incoming.checkedAt))
+  ) {
+    return current;
+  }
+  return incoming;
+}
+
+function validNumber(
+  value: string,
+  min: number,
+  max: number,
+  integer = true,
+): boolean {
+  const number = Number(value);
+  return (
+    value.trim() !== "" &&
+    Number.isFinite(number) &&
+    (!integer || Number.isInteger(number)) &&
+    number >= min &&
+    number <= max
+  );
+}
+
 export function RequestHealthPanel({
   snapshot,
   isRefreshing,
+  loadError,
   onRefresh,
   onSaved,
   onSaveConfig,
@@ -40,9 +112,12 @@ export function RequestHealthPanel({
 }: {
   snapshot?: RequestHealthSnapshot;
   isRefreshing: boolean;
+  loadError?: string | null;
   onRefresh: () => void;
   onSaved?: (config: RequestHealthConfig) => void;
-  onSaveConfig?: (config: RequestHealthConfig) => Promise<boolean>;
+  onSaveConfig?: (
+    config: RequestHealthConfig,
+  ) => Promise<RequestHealthConfig | null>;
   mode?: "full" | "settings" | "status";
 }) {
   const { t } = useTranslation();
@@ -61,29 +136,80 @@ export function RequestHealthPanel({
   const [contractActionError, setContractActionError] = useState<string | null>(
     null,
   );
+  const saving = useRef(false);
+  const editVersion = useRef(0);
+  const fieldEditVersions = useRef(
+    new Map<keyof RequestHealthConfig, number>(),
+  );
+  const checkingContract = useRef(false);
+  const contractCheckBaseline = useRef<string | null>(null);
+
+  const adoptConfig = useCallback(
+    (
+      config: RequestHealthConfig,
+      preserveFields: Array<keyof RequestHealthConfig> = [],
+    ) => {
+      setDraft((current) => ({
+        ...config,
+        ...Object.fromEntries(
+          preserveFields.map((key) => [key, current?.[key] ?? config[key]]),
+        ),
+      }));
+      if (!preserveFields.includes("largeRequestThresholdBytes")) {
+        setThresholdKb(String(config.largeRequestThresholdBytes / 1024));
+      }
+      if (!preserveFields.includes("maxCodexInputTokens")) {
+        setMaxTokens(String(config.maxCodexInputTokens));
+      }
+      if (!preserveFields.includes("reviewTimeoutSeconds")) {
+        setTimeoutSeconds(String(config.reviewTimeoutSeconds));
+      }
+    },
+    [],
+  );
 
   useEffect(() => {
-    if (!snapshot?.config) return;
-    setDraft(snapshot.config);
-    setThresholdKb(
-      String(Math.round(snapshot.config.largeRequestThresholdBytes / 1024)),
-    );
-    setMaxTokens(String(snapshot.config.maxCodexInputTokens));
-    setTimeoutSeconds(String(snapshot.config.reviewTimeoutSeconds));
-  }, [snapshot?.config]);
+    if (!snapshot?.config || saving.current) return;
+    adoptConfig(snapshot.config, [...fieldEditVersions.current.keys()]);
+  }, [snapshot?.config, adoptConfig]);
 
   useEffect(() => {
-    if (snapshot?.contract) setContract(snapshot.contract);
+    if (snapshot?.contract) {
+      const incoming = snapshot.contract;
+      setContract((current) => newerContract(current, incoming));
+      if (
+        !checkingContract.current &&
+        incoming.checkedAt &&
+        (!contractCheckBaseline.current ||
+          Date.parse(incoming.checkedAt) >
+            Date.parse(contractCheckBaseline.current))
+      ) {
+        setContractActionError(null);
+      }
+    }
   }, [snapshot?.contract]);
+
+  const markEdited = (key: keyof RequestHealthConfig) => {
+    fieldEditVersions.current.set(key, ++editVersion.current);
+    setSaveMessage(null);
+  };
 
   const update = <K extends keyof RequestHealthConfig>(
     key: K,
     value: RequestHealthConfig[K],
-  ) =>
+  ) => {
+    markEdited(key);
     setDraft((current) => (current ? { ...current, [key]: value } : current));
+  };
+
+  const numericInputsValid =
+    validNumber(thresholdKb, 64, 16384, false) &&
+    validNumber(maxTokens, 1000, 2000000) &&
+    validNumber(timeoutSeconds, 15, 300);
 
   async function save() {
-    if (!draft) {
+    if (saving.current) return;
+    if (!draft || !numericInputsValid) {
       const message = t("settings.saveFailedGeneric", {
         defaultValue: "Save failed, please try again",
       });
@@ -91,76 +217,95 @@ export function RequestHealthPanel({
       toast.error(message, { closeButton: true });
       return;
     }
+    const submittedVersion = editVersion.current;
+    saving.current = true;
     setIsSaving(true);
     setSaveMessage(null);
     try {
-      if (onSaveConfig) {
-        const saved = await onSaveConfig(draft);
-        if (!saved) {
-          const message = t("settings.saveFailedGeneric", {
+      const saved = await (onSaveConfig ?? settingsApi.saveRequestHealthConfig)(
+        draft,
+      );
+      if (!saved || typeof saved.enabled !== "boolean") {
+        throw new Error(
+          t("settings.saveFailedGeneric", {
             defaultValue: "Save failed, please try again",
-          });
-          setSaveMessage(message);
-          toast.error(message, { closeButton: true });
-          return;
-        }
-      } else {
-        const settings = await settingsApi.get();
-        const result = await settingsApi.save({
-          ...settings,
-          requestHealth: draft,
-        });
-        if (
-          result !== true &&
-          !(typeof result === "object" && result?.settingsSaved === true)
-        ) {
-          throw new Error(
-            t("settings.saveFailedGeneric", {
-              defaultValue: "Save failed, please try again",
-            }),
-          );
-        }
+          }),
+        );
       }
-      const message = t("settings.requestHealth.saved");
+      // Keep edits made after submission while adopting backend normalization.
+      for (const [key, version] of fieldEditVersions.current) {
+        if (version <= submittedVersion) fieldEditVersions.current.delete(key);
+      }
+      const editedDuringSave = [...fieldEditVersions.current.keys()];
+      adoptConfig(saved, editedDuringSave);
+      const message = t(
+        editedDuringSave.length > 0
+          ? "settings.requestHealth.savedPendingEdits"
+          : "settings.requestHealth.saved",
+      );
       setSaveMessage(message);
       toast.success(message, { closeButton: true });
-      onSaved?.(draft);
+      onSaved?.(saved);
     } catch (error) {
       const message = errorMessage(error);
       setSaveMessage(message);
       toast.error(message, { closeButton: true });
     } finally {
+      saving.current = false;
       setIsSaving(false);
     }
   }
 
   async function checkContract() {
+    if (checkingContract.current) return;
+    checkingContract.current = true;
+    contractCheckBaseline.current = contract?.checkedAt ?? null;
     setIsCheckingContract(true);
     setContractActionError(null);
     try {
-      setContract(await proxyApi.checkOpenAIResponsesContract());
+      const checked = await proxyApi.checkOpenAIResponsesContract();
+      setContract((current) => newerContract(current, checked));
     } catch (error) {
       setContractActionError(errorMessage(error));
     } finally {
+      checkingContract.current = false;
       setIsCheckingContract(false);
     }
   }
 
-  const advisoriesActive =
-    draft?.enabled === true && draft.reviewMode !== "off";
-  const diagnostics = advisoriesActive ? (snapshot?.diagnostics ?? []) : [];
+  const diagnostics =
+    snapshot?.config.enabled === true ? (snapshot?.diagnostics ?? []) : [];
   const latest = diagnostics[0];
-  const hasWarnings = diagnostics.some(
-    (item) =>
-      item.thresholdExceeded ||
-      item.tokenLimitExceeded ||
-      item.findings.length > 0 ||
-      item.anomaly,
+  const latestAnomaly = latest?.anomaly;
+  const latestFindings = latest
+    ? latestAnomaly &&
+      !latest.findings.some(
+        (finding) =>
+          finding.code === latestAnomaly.code &&
+          finding.detail === latestAnomaly.detail,
+      )
+      ? [...latest.findings, latestAnomaly]
+      : latest.findings
+    : [];
+  const latestSeverity = latest ? diagnosticSeverity(latest) : "healthy";
+  const hasErrors = diagnostics.some(
+    (item) => diagnosticSeverity(item) === "error",
   );
+  const hasWarnings = diagnostics.some((item) =>
+    ["error", "warning"].includes(diagnosticSeverity(item)),
+  );
+  const severityLabel = {
+    error: t("settings.requestHealth.severityError"),
+    warning: t("settings.requestHealth.severityWarning"),
+    info: t("settings.requestHealth.severityInfo"),
+    healthy: t("settings.requestHealth.severityHealthy"),
+  };
   const ratio = latest
     ? Math.min(1, latest.optimizedBytes / Math.max(1, latest.thresholdBytes))
     : 0;
-  const contractStatus = contract?.status ?? "not_checked";
+  const contractStatus = contractActionError
+    ? "check_failed"
+    : (contract?.status ?? "not_checked");
   const contractStatusLabel =
     contractStatus === "up_to_date"
       ? t("settings.requestHealth.contractStatusCurrent")
@@ -183,7 +328,9 @@ export function RequestHealthPanel({
           <ShieldCheck className="mt-0.5 h-6 w-6 shrink-0 text-cyan-600 dark:text-cyan-300" />
           <div>
             <h4 className="text-sm font-semibold">
-              {t("settings.requestHealth.title")}
+              {mode === "settings"
+                ? t("settings.tabRequestHealthSettings")
+                : t("settings.requestHealth.title")}
             </h4>
             <p className="mt-1 max-w-3xl text-xs leading-relaxed text-muted-foreground">
               {t("settings.requestHealth.description")}
@@ -208,7 +355,7 @@ export function RequestHealthPanel({
             <Button
               size="sm"
               onClick={() => void save()}
-              disabled={!draft || isSaving}
+              disabled={!draft || !numericInputsValid || isSaving}
             >
               <Save className="mr-2 h-4 w-4" />
               {t("settings.requestHealth.save")}
@@ -216,6 +363,30 @@ export function RequestHealthPanel({
           ) : null}
         </div>
       </div>
+
+      {loadError ? (
+        <div
+          role="alert"
+          className="flex flex-wrap items-center justify-between gap-2 rounded-md border border-red-300/70 bg-red-50 px-3 py-2 text-xs text-red-800 dark:border-red-700/50 dark:bg-red-950/20 dark:text-red-200"
+        >
+          <span>
+            {t("settings.requestHealth.loadFailed", { message: loadError })}
+          </span>
+          <Button
+            size="sm"
+            variant="outline"
+            onClick={onRefresh}
+            disabled={isRefreshing}
+          >
+            <RefreshCw className="h-4 w-4" />
+            {t("settings.requestHealth.retry")}
+          </Button>
+        </div>
+      ) : showSettings && !draft ? (
+        <div role="status" className="text-xs text-muted-foreground">
+          {t("common.loading")}
+        </div>
+      ) : null}
 
       {showSettings && draft ? (
         <div className="rounded-md border border-border bg-background/50 p-3">
@@ -267,15 +438,20 @@ export function RequestHealthPanel({
                 type="number"
                 min={64}
                 max={16384}
+                step="any"
+                aria-invalid={!validNumber(thresholdKb, 64, 16384, false)}
                 value={thresholdKb}
                 onChange={(event) => {
                   setThresholdKb(event.target.value);
                   const value = Number(event.target.value);
-                  if (Number.isFinite(value) && value > 0)
+                  if (Number.isFinite(value) && value > 0) {
                     update(
                       "largeRequestThresholdBytes",
-                      Math.min(16384, Math.max(64, value)) * 1024,
+                      Math.round(Math.min(16384, Math.max(64, value)) * 1024),
                     );
+                  } else {
+                    markEdited("largeRequestThresholdBytes");
+                  }
                 }}
               />
             </label>
@@ -288,15 +464,20 @@ export function RequestHealthPanel({
                 type="number"
                 min={1000}
                 max={2000000}
+                step={1}
+                aria-invalid={!validNumber(maxTokens, 1000, 2000000)}
                 value={maxTokens}
                 onChange={(event) => {
                   setMaxTokens(event.target.value);
                   const value = Number(event.target.value);
-                  if (Number.isFinite(value) && value > 0)
+                  if (Number.isFinite(value) && value > 0) {
                     update(
                       "maxCodexInputTokens",
                       Math.min(2000000, Math.max(1000, Math.round(value))),
                     );
+                  } else {
+                    markEdited("maxCodexInputTokens");
+                  }
                 }}
               />
             </label>
@@ -334,15 +515,20 @@ export function RequestHealthPanel({
                 type="number"
                 min={15}
                 max={300}
+                step={1}
+                aria-invalid={!validNumber(timeoutSeconds, 15, 300)}
                 value={timeoutSeconds}
                 onChange={(event) => {
                   setTimeoutSeconds(event.target.value);
                   const value = Number(event.target.value);
-                  if (Number.isFinite(value) && value > 0)
+                  if (Number.isFinite(value) && value > 0) {
                     update(
                       "reviewTimeoutSeconds",
                       Math.min(300, Math.max(15, Math.round(value))),
                     );
+                  } else {
+                    markEdited("reviewTimeoutSeconds");
+                  }
                 }}
               />
             </label>
@@ -470,7 +656,7 @@ export function RequestHealthPanel({
               role="alert"
               className="mt-3 rounded-md border border-red-300/70 bg-red-50 px-3 py-2 text-xs text-red-800 dark:border-red-700/50 dark:bg-red-950/20 dark:text-red-200"
             >
-              {contract?.error ?? contractActionError}
+              {contractActionError ?? contract?.error}
             </div>
           ) : null}
         </section>
@@ -479,7 +665,12 @@ export function RequestHealthPanel({
       {showStatus && hasWarnings ? (
         <div
           role="status"
-          className="flex items-start gap-2 rounded-md border border-amber-300/60 bg-amber-50 px-3 py-3 text-sm text-amber-900 dark:border-amber-700/50 dark:bg-amber-950/20 dark:text-amber-100"
+          className={cn(
+            "flex items-start gap-2 rounded-md border px-3 py-3 text-sm",
+            hasErrors
+              ? "border-red-300/70 bg-red-50 text-red-800 dark:border-red-700/50 dark:bg-red-950/20 dark:text-red-200"
+              : "border-amber-300/60 bg-amber-50 text-amber-900 dark:border-amber-700/50 dark:bg-amber-950/20 dark:text-amber-100",
+          )}
         >
           <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
           {t("settings.requestHealth.historyWarning")}
@@ -490,11 +681,17 @@ export function RequestHealthPanel({
         <div className="space-y-3 rounded-md border border-border bg-background/50 p-3">
           <div className="flex flex-wrap items-center justify-between gap-2">
             <div className="flex items-center gap-2 text-sm font-semibold">
-              {latest.thresholdExceeded || latest.anomaly ? (
-                <AlertTriangle className="h-4 w-4 text-amber-500" />
-              ) : (
-                <CheckCircle2 className="h-4 w-4 text-emerald-500" />
-              )}
+              <span role="img" aria-label={severityLabel[latestSeverity]}>
+                {latestSeverity === "error" ? (
+                  <CircleX className="h-4 w-4 text-red-600 dark:text-red-300" />
+                ) : latestSeverity === "warning" ? (
+                  <AlertTriangle className="h-4 w-4 text-amber-500" />
+                ) : latestSeverity === "info" ? (
+                  <Info className="h-4 w-4 text-muted-foreground" />
+                ) : (
+                  <CheckCircle2 className="h-4 w-4 text-emerald-500" />
+                )}
+              </span>
               {latest.providerName} · {latest.model}
             </div>
             <Badge variant="outline">{bytes(latest.optimizedBytes)}</Badge>
@@ -543,13 +740,16 @@ export function RequestHealthPanel({
               style={{ width: `${Math.max(3, ratio * 100)}%` }}
             />
           </div>
-          {latest.findings.length > 0 ? (
+          {latestFindings.length > 0 ? (
             <div className="space-y-1 text-xs">
-              {latest.findings.map((finding) => (
+              {latestFindings.map((finding, index) => (
                 <div
-                  key={finding.code}
-                  className="text-amber-700 dark:text-amber-300"
+                  key={`${finding.code}-${index}`}
+                  className={findingClass(findingSeverity(finding))}
                 >
+                  <span className="mr-2 font-semibold">
+                    {severityLabel[findingSeverity(finding)]}
+                  </span>
                   <strong>{finding.code}</strong>: {finding.detail}
                 </div>
               ))}

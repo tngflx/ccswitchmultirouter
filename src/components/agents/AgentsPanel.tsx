@@ -14,11 +14,15 @@ import {
 import { toast } from "sonner";
 
 import { orchestrationApi, providersApi } from "@/lib/api";
-import { readCodexCatalogSettings } from "@/lib/codexCatalogSchema";
+import { queryClient } from "@/lib/query";
 import {
-  isUserCodexRoutingPlan,
-  isCodexProtocolSetMember,
-} from "@/lib/codexProviderKind";
+  createOrchestrationDraft,
+  firstOrchestrationModelRef as firstModelRef,
+  removeOrchestrationProfile,
+  toOrchestrationProviderChoices as toProviderChoices,
+  validateOrchestrationDraft,
+  type OrchestrationProviderChoice as ProviderChoice,
+} from "@/lib/orchestrationProfiles";
 import type { CodexRoutingProjectionStatus } from "@/lib/api/providers";
 import { useTranslation } from "react-i18next";
 import type {
@@ -55,25 +59,10 @@ interface AgentsPanelProps {
 type RoleKey = "orchestrator" | "worker" | "verifier";
 type AppType = "claude" | "codex";
 
-interface ProviderChoice {
-  id: string;
-  name: string;
-  models: string[];
-  hasCatalog: boolean;
-}
-
 const EMPTY_SETTINGS: OrchestrationSettings = {
   enabled: false,
   profiles: [],
   defaultModeByApp: { claude: "direct", codex: "direct" },
-};
-
-const EMPTY_BUDGET = {
-  maxRounds: 2,
-  maxWorkerCalls: 2,
-  maxParallelWorkers: 1,
-  timeoutSeconds: 300,
-  maxOutputTokens: 8192,
 };
 
 const roleLabels: Record<RoleKey, string> = {
@@ -81,116 +70,6 @@ const roleLabels: Record<RoleKey, string> = {
   worker: "Worker",
   verifier: "Verifier",
 };
-
-function asRecord(value: unknown): Record<string, unknown> | undefined {
-  return typeof value === "object" && value !== null && !Array.isArray(value)
-    ? (value as Record<string, unknown>)
-    : undefined;
-}
-
-function uniqueModels(values: string[]): string[] {
-  return [
-    ...new Set(
-      values
-        .map((value) => value.trim())
-        .filter((value) => value && !value.startsWith("ccsm-")),
-    ),
-  ];
-}
-
-function getProviderModels(provider: Provider): string[] {
-  const settings = asRecord(provider.settingsConfig);
-  const models: string[] = [];
-  const catalog = readCodexCatalogSettings(settings);
-  const catalogModels = catalog?.models;
-  const hasExplicitCatalog = Array.isArray(catalogModels);
-  if (hasExplicitCatalog) {
-    for (const item of catalogModels) {
-      if (typeof item === "string") {
-        models.push(item);
-        continue;
-      }
-      const entry = asRecord(item);
-      if (entry?.enabled === false) continue;
-      for (const key of ["model", "slug", "id", "name"]) {
-        if (typeof entry?.[key] === "string") {
-          models.push(entry[key] as string);
-          break;
-        }
-      }
-    }
-  }
-  if (hasExplicitCatalog) return uniqueModels(models);
-  for (const key of ["model", "haikuModel", "sonnetModel", "opusModel"]) {
-    if (typeof settings?.[key] === "string") {
-      models.push(settings[key] as string);
-    }
-  }
-  const nestedConfig = asRecord(settings?.config);
-  if (typeof nestedConfig?.model === "string") {
-    models.push(nestedConfig.model);
-  }
-  const env = asRecord(settings?.env);
-  for (const key of [
-    "ANTHROPIC_MODEL",
-    "ANTHROPIC_DEFAULT_HAIKU_MODEL",
-    "ANTHROPIC_DEFAULT_SONNET_MODEL",
-    "ANTHROPIC_DEFAULT_OPUS_MODEL",
-  ]) {
-    if (typeof env?.[key] === "string") models.push(env[key] as string);
-  }
-  return uniqueModels(models);
-}
-
-function toProviderChoices(
-  providers: Record<string, Provider>,
-): ProviderChoice[] {
-  return Object.values(providers)
-    .filter(
-      (provider) =>
-        !isUserCodexRoutingPlan(provider) &&
-        !isCodexProtocolSetMember(provider),
-    )
-    .map((provider) => ({
-      id: provider.id,
-      name: provider.name,
-      models: getProviderModels(provider),
-      hasCatalog:
-        readCodexCatalogSettings(provider.settingsConfig) !== undefined,
-    }))
-    .sort((a, b) => a.name.localeCompare(b.name));
-}
-
-function firstModelRef(
-  appType: AppType,
-  choices: Record<AppType, ProviderChoice[]>,
-): OrchestrationModelRef {
-  const provider = choices[appType][0];
-  return {
-    appType,
-    providerId: provider?.id ?? "",
-    model: provider?.models[0] ?? "",
-  };
-}
-
-function createProfile(
-  index: number,
-  choices: Record<AppType, ProviderChoice[]>,
-): OrchestrationProfile {
-  return {
-    id: `profile-${Date.now()}-${index}`,
-    displayName: "Claude planner + Sublyx worker",
-    enabled: true,
-    scope: "all",
-    orchestrator: firstModelRef("claude", choices),
-    worker: firstModelRef("codex", choices),
-    budget: { ...EMPTY_BUDGET },
-    approvalPolicy: "client",
-    failureFallback: "fail_closed",
-    workerGuidance:
-      "Break the task into bounded steps, preserve the user's intent, and report uncertainty instead of inventing facts.",
-  };
-}
 
 function statusVariant(
   status: string,
@@ -309,11 +188,14 @@ export function AgentsPanel({ onOpenChange }: AgentsPanelProps) {
   };
 
   const addProfile = () => {
-    const profile = createProfile(draft.profiles.length, providerChoices);
+    const profile = createOrchestrationDraft(
+      `profile-${crypto.randomUUID()}`,
+      providerChoices,
+      t("orchestration.defaultProfileName"),
+      t("orchestration.defaultGuidance"),
+    );
     setDraft((current) => ({
       ...current,
-      enabled: true,
-      activeProfileId: profile.id,
       profiles: [...current.profiles, profile],
     }));
     setSelectedProfileId(profile.id);
@@ -321,32 +203,32 @@ export function AgentsPanel({ onOpenChange }: AgentsPanelProps) {
 
   const removeSelectedProfile = () => {
     if (!selectedProfile) return;
-    const remaining = draft.profiles.filter(
-      (profile) => profile.id !== selectedProfile.id,
-    );
-    const nextActive = remaining[0]?.id;
-    setDraft((current) => ({
-      ...current,
-      activeProfileId: nextActive,
-      profiles: remaining,
-    }));
-    setSelectedProfileId(nextActive ?? "");
+    const remaining = removeOrchestrationProfile(draft, selectedProfile.id);
+    setDraft(remaining);
+    setSelectedProfileId(remaining.profiles[0]?.id ?? "");
   };
 
   const save = async () => {
+    const validation = validateOrchestrationDraft(draft, providerChoices);
+    if (validation) {
+      toast.error(t(validation.key, validation.values));
+      return;
+    }
     setSaving(true);
     try {
-      const result = await orchestrationApi.saveSettings({
-        ...draft,
-        activeProfileId: selectedProfileId || undefined,
-      });
+      const result = await orchestrationApi.saveSettings(draft);
       const saved = result.settings;
       setDraft(saved);
       setSavedSnapshot(JSON.stringify(saved));
       setProjection(result.codexProjection);
       setPublicationError(result.publicationError);
-      setSelectedProfileId(
-        saved.activeProfileId ?? saved.profiles[0]?.id ?? "",
+      await queryClient.invalidateQueries({
+        queryKey: ["orchestration"],
+      });
+      setSelectedProfileId((selected) =>
+        saved.profiles.some((profile) => profile.id === selected)
+          ? selected
+          : (saved.activeProfileId ?? saved.profiles[0]?.id ?? ""),
       );
       if (
         result.publicationError ||
@@ -372,42 +254,10 @@ export function AgentsPanel({ onOpenChange }: AgentsPanelProps) {
     }
   };
 
-  const validationMessage = useMemo(() => {
-    for (const profile of draft.profiles) {
-      for (const role of ["orchestrator", "worker"] as const) {
-        const ref = profile[role];
-        if (!ref.providerId || !ref.model) {
-          return `${profile.displayName}: choose a provider and model for the ${role}.`;
-        }
-      }
-      if (!profile.displayName.trim()) return t("orchestration.nameRequired");
-      for (const role of ["orchestrator", "worker", "verifier"] as const) {
-        const ref = profile[role];
-        if (!ref) continue;
-        const provider = providerChoices[ref.appType].find(
-          (choice) => choice.id === ref.providerId,
-        );
-        if (
-          draft.enabled &&
-          profile.enabled &&
-          (!provider ||
-            (provider.hasCatalog && !provider.models.includes(ref.model)))
-        ) {
-          return t("orchestration.modelUnavailable", {
-            name: profile.displayName,
-            role: roleLabels[role],
-          });
-        }
-      }
-      if (
-        profile.verifier &&
-        (!profile.verifier.providerId || !profile.verifier.model)
-      ) {
-        return `${profile.displayName}: choose a provider and model for the verifier.`;
-      }
-    }
-    return undefined;
-  }, [draft.profiles, draft.enabled, providerChoices, t]);
+  const validationIssue = validateOrchestrationDraft(draft, providerChoices);
+  const validationMessage = validationIssue
+    ? t(validationIssue.key, validationIssue.values)
+    : undefined;
 
   if (loading) {
     return (
@@ -525,6 +375,10 @@ export function AgentsPanel({ onOpenChange }: AgentsPanelProps) {
           </div>
         )}
 
+        <div className="rounded-lg border border-blue-500/20 bg-blue-500/5 px-3 py-2 text-xs text-muted-foreground">
+          {t("orchestration.pickerExplanation")}
+        </div>
+
         <div className="grid gap-5 lg:grid-cols-[220px_minmax(0,1fr)]">
           <div className="space-y-3">
             <div className="flex items-center justify-between">
@@ -558,13 +412,7 @@ export function AgentsPanel({ onOpenChange }: AgentsPanelProps) {
                   <button
                     key={profile.id}
                     type="button"
-                    onClick={() => {
-                      setSelectedProfileId(profile.id);
-                      setDraft((current) => ({
-                        ...current,
-                        activeProfileId: profile.id,
-                      }));
-                    }}
+                    onClick={() => setSelectedProfileId(profile.id)}
                     className={`w-full rounded-lg border px-3 py-2 text-left transition-colors ${
                       selectedProfileId === profile.id
                         ? "border-blue-500/60 bg-blue-500/10"
@@ -575,13 +423,15 @@ export function AgentsPanel({ onOpenChange }: AgentsPanelProps) {
                       <span className="truncate text-sm font-medium">
                         {profile.displayName}
                       </span>
-                      <span
-                        className={`h-2 w-2 shrink-0 rounded-full ${
+                      <Badge
+                        variant={profile.enabled ? "secondary" : "outline"}
+                      >
+                        {t(
                           profile.enabled
-                            ? "bg-emerald-500"
-                            : "bg-muted-foreground/40"
-                        }`}
-                      />
+                            ? "orchestration.enabledProfile"
+                            : "orchestration.draftProfile",
+                        )}
+                      </Badge>
                     </div>
                     <div className="mt-1 truncate text-xs text-muted-foreground">
                       {profile.id}
@@ -664,6 +514,31 @@ export function AgentsPanel({ onOpenChange }: AgentsPanelProps) {
                   </div>
                 </CardHeader>
                 <CardContent className="space-y-4">
+                  <div className="flex flex-wrap items-center justify-between gap-2 text-sm">
+                    <span className="text-muted-foreground">
+                      {t("orchestration.activeProfileExplanation")}
+                    </span>
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      disabled={
+                        !selectedProfile.enabled ||
+                        draft.activeProfileId === selectedProfile.id
+                      }
+                      onClick={() =>
+                        setDraft((current) => ({
+                          ...current,
+                          activeProfileId: selectedProfile.id,
+                        }))
+                      }
+                    >
+                      {t(
+                        draft.activeProfileId === selectedProfile.id
+                          ? "orchestration.activeProfile"
+                          : "orchestration.makeActiveProfile",
+                      )}
+                    </Button>
+                  </div>
                   <div className="grid gap-4 sm:grid-cols-2">
                     <label className="space-y-1.5 text-sm">
                       <span className="font-medium">Display name</span>

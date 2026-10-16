@@ -208,9 +208,12 @@ impl Settings {
                 return Err("Picker model must match the profile ID".into());
             }
             for (_, model) in p.roles() {
-                if model.provider_id.trim().is_empty()
+                // Disabled profiles are editable drafts. Incomplete references
+                // may persist, but all safety/shape limits still apply and an
+                // enabled profile must always have complete references.
+                if (p.enabled
+                    && (model.provider_id.trim().is_empty() || model.model.trim().is_empty()))
                     || model.provider_id.len() > 256
-                    || model.model.trim().is_empty()
                     || model.model.len() > 256
                     || model.model.starts_with("ccsm-")
                     || model.model.chars().any(char::is_control)
@@ -293,9 +296,12 @@ impl Settings {
         };
         models.retain(|m| {
             let id = m
-                .get("model")
-                .or_else(|| m.get("slug"))
-                .and_then(Value::as_str)
+                .as_str()
+                .or_else(|| {
+                    ["model", "slug", "id", "name"]
+                        .iter()
+                        .find_map(|key| m.get(key).and_then(Value::as_str))
+                })
                 .unwrap_or("");
             !id.starts_with(PROFILE_PREFIX) && !id.starts_with(ROLE_PREFIX)
         });
@@ -328,16 +334,14 @@ impl Settings {
     }
 
     pub fn project_settings(&self, settings: &mut Value) {
-        if !settings.get("modelCatalog").is_some_and(Value::is_object) {
-            settings["modelCatalog"] = json!({"models": []});
+        let mut catalog = crate::codex_multirouter::catalog::read_catalog(settings)
+            .cloned()
+            .unwrap_or_else(|| json!({"models": []}));
+        self.project_catalog(&mut catalog);
+        if let Some(settings) = settings.as_object_mut() {
+            settings.insert("modelCatalog".into(), catalog);
+            settings.remove("model_catalog");
         }
-        if !settings["modelCatalog"]
-            .get("models")
-            .is_some_and(Value::is_array)
-        {
-            settings["modelCatalog"]["models"] = json!([]);
-        }
-        self.project_catalog(&mut settings["modelCatalog"]);
     }
 }
 
@@ -468,6 +472,94 @@ mod tests {
         s.enabled = false;
         s.project_catalog(&mut c);
         assert_eq!(c["models"], json!([{"model": "ordinary-model"}]));
+    }
+
+    #[test]
+    fn disabled_draft_profiles_never_leak_into_the_codex_picker() {
+        let mut settings = fixture();
+        settings.profiles[0].enabled = false;
+        let mut catalog = json!({
+            "models": [
+                {"model": "ordinary-model"},
+                {"model": "ccsm-orch/test"},
+                {"model": "ccsm-role/test/worker"}
+            ]
+        });
+
+        settings.project_catalog(&mut catalog);
+
+        assert_eq!(catalog["models"], json!([{ "model": "ordinary-model" }]));
+    }
+
+    #[test]
+    fn incomplete_disabled_drafts_round_trip_but_cannot_be_enabled_or_resolved() {
+        let db = crate::database::Database::memory().unwrap();
+        let mut settings = fixture();
+        settings.active_profile_id = None;
+        settings.profiles[0].enabled = false;
+        settings.profiles[0].orchestrator.provider_id.clear();
+        settings.profiles[0].worker.model.clear();
+        settings.validate_providers(&db).unwrap();
+        db.save_orchestration_settings(&settings).unwrap();
+        let saved = db.get_orchestration_settings().unwrap();
+        assert_eq!(saved.profiles.len(), 1);
+        assert!(saved.resolve("codex", "ccsm-orch/test").is_err());
+        settings.profiles[0].enabled = true;
+        assert!(settings.validate().is_err());
+    }
+
+    #[test]
+    fn disabled_drafts_still_reject_recursive_models_and_invalid_limits() {
+        let mut settings = fixture();
+        settings.profiles[0].enabled = false;
+        settings.profiles[0].worker.model = "ccsm-orch/test".into();
+        assert!(settings.validate().is_err());
+        settings.profiles[0].worker.model.clear();
+        settings.profiles[0].budget.max_worker_calls = 0;
+        assert!(settings.validate().is_err());
+    }
+
+    #[test]
+    fn projection_migrates_only_the_authoritative_catalog_and_removes_legacy() {
+        let settings = fixture();
+        for canonical in [None, Some(json!({"models": "malformed"}))] {
+            let mut projection = json!({
+                "model_catalog": {"models": [{"model": "direct"}]}
+            });
+            if let Some(canonical) = canonical {
+                projection["modelCatalog"] = canonical;
+            }
+            settings.project_settings(&mut projection);
+            assert_eq!(projection["modelCatalog"]["models"][0]["model"], "direct");
+            assert!(projection.get("model_catalog").is_none());
+        }
+        let mut projection = json!({
+            "modelCatalog": {"models": []},
+            "model_catalog": {"models": [{"model": "stale"}]}
+        });
+        settings.project_settings(&mut projection);
+        assert!(!projection.to_string().contains("stale"));
+        assert!(projection.get("model_catalog").is_none());
+    }
+
+    #[test]
+    fn projection_removes_stale_aliases_in_every_supported_model_shape() {
+        let mut settings = fixture();
+        settings.enabled = false;
+        let mut catalog = json!({
+            "models": [
+                "direct", {"id": "another-direct"},
+                "ccsm-orch/deleted", "ccsm-role/deleted/worker",
+                {"id": "ccsm-orch/deleted"},
+                {"name": "ccsm-role/deleted/worker"},
+                {"model": null, "slug": "ccsm-orch/deleted"}
+            ]
+        });
+        settings.project_catalog(&mut catalog);
+        assert_eq!(
+            catalog["models"],
+            json!(["direct", {"id": "another-direct"}])
+        );
     }
 
     #[test]

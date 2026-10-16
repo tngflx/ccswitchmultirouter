@@ -1,0 +1,34 @@
+{
+  "state": "created",
+  "id": "research-ensemble",
+  "name": "Research Ensemble",
+  "profiles": 2,
+  "enabled": true,
+  "activeProfileUnchanged": true,
+  "defaultModesUnchanged": true,
+  "backup": "C:\\Users\\Felix\\.cc-switch\\backups\\before-research-ensemble-20261016-003054.db",
+  "projection": "not manually edited; backend refresh required",
+  "scope": "codex",
+  "orchestrator": {
+    "appType": "claude",
+    "providerId": "claude-official",
+    "model": "claude-sonnet-4-20250514"
+  },
+  "worker": {
+    "appType": "codex",
+    "providerId": "codex-official",
+    "model": "gpt-6.1-sol"
+  },
+  "verifier": {
+    "appType": "claude",
+    "providerId": "claude-official",
+    "model": "claude-sonnet-4-20250514"
+  },
+  "budget": {
+    "maxRounds": 3,
+    "maxWorkerCalls": 3,
+    "maxParallelWorkers": 1,
+    "timeoutSeconds": 600,
+    "maxOutputTokens": 8192
+  }
+}

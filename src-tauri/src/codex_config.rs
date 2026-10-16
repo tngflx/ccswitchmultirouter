@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use crate::app_config::AppType;
-use crate::codex_multirouter::catalog::catalog_models;
+use crate::codex_multirouter::catalog::{catalog_models, read_catalog};
 use crate::codex_subagent_profiles::{
     compile_subagent_v2_profiles, deepseek_role_identity_for_model, deepseek_role_models_match,
     initialize_legacy_subagent_v2, normalize_profile_key, parse_persisted_subagent_v2,
@@ -1264,10 +1264,7 @@ fn codex_catalog_capabilities_are_text_only(capabilities: &Value) -> Option<bool
 /// route 能力仍是最强声明；catalog 能力用于 provider 预设和 MultiRouter 聚合目录，
 /// 避免只靠模型名硬编码判断多模态能力。
 fn codex_catalog_capabilities_for_model<'a>(settings: &'a Value, model: &str) -> Option<&'a Value> {
-    let models = settings
-        .get("modelCatalog")?
-        .get("models")
-        .and_then(|value| value.as_array())?;
+    let models = catalog_models(settings)?;
 
     models
         .iter()
@@ -1584,6 +1581,9 @@ fn codex_catalog_model_entry(
         }
     }
 
+    // Native profiles remove `model_messages`, so check the instruction
+    // contract after projection as well as when loading a runtime template.
+    fill_template_fields_from_static(&mut entry);
     entry
 }
 
@@ -1633,8 +1633,7 @@ fn codex_catalog_model_priority_key(
 
 /// 读取用户在 CCSwitchMulti 中选择的 Codex 子 Agent 候选模型顺序。
 fn codex_spawn_agent_model_priority(settings: &Value) -> Vec<String> {
-    let Some(items) = settings
-        .get("modelCatalog")
+    let Some(items) = read_catalog(settings)
         .and_then(|catalog| {
             catalog
                 .get("spawnAgentModels")
@@ -1908,10 +1907,9 @@ pub(crate) fn store_codex_public_official_models_cache(models: &[Value]) -> Resu
 }
 
 fn codex_catalog_model_specs(settings: &Value, config_text: &str) -> Vec<CodexCatalogModelSpec> {
-    let Some(models) = settings
-        .get("modelCatalog")
+    let Some(models) = read_catalog(settings)
         .and_then(|catalog| catalog.get("models"))
-        .and_then(|models| models.as_array())
+        .and_then(Value::as_array)
     else {
         return Vec::new();
     };
@@ -2505,6 +2503,8 @@ fn codex_vendor_catalog_model_entry(
     {
         entry_obj.insert("base_instructions".to_string(), json!(base_instructions));
     }
+    apply_codex_model_reasoning_capability(entry_obj, spec.reasoning.as_ref());
+    project_codex_desktop_model_fields(entry_obj, spec);
 
     // Defensive: if a future codex parser requires a field the vendor file
     // predates, backfill only whitelisted parser-required keys.
@@ -2518,9 +2518,10 @@ fn codex_vendor_catalog_model_entry(
 /// 0.148-era Desktop parser but ignored as an unknown field by newer serde
 /// models after the capability was retired. Backfilling an explicit `false`
 /// compatibility default therefore keeps old clients parseable without claiming an
-/// unverified parallel-call capability. `base_instructions` is the other
-/// known required field; the templates always carry it and
-/// `codex_catalog_model_entry` handles it.
+/// unverified parallel-call capability. Instructions have an either/or
+/// contract: retain `base_instructions` or `model_messages.instructions_template`.
+/// The backfill below checks this separately so valid message-only templates
+/// do not gain a competing instruction source.
 /// When Codex requires a new field, add it here AND to the static templates.
 const CODEX_CATALOG_PARSER_REQUIRED_FIELDS: &[&str] = &[
     "supports_reasoning_summaries",
@@ -2535,7 +2536,7 @@ const CODEX_CATALOG_PARSER_REQUIRED_FIELDS: &[&str] = &[
 /// while a coexisting build kept rewriting the cache without it). Backfill
 /// ONLY parser-required fields from the bundled static template: optional
 /// capability fields keep their missing-means-default semantics, and existing
-/// values always win.
+/// valid instruction sources always win.
 fn fill_template_fields_from_static(template: &mut Value) {
     let Some(static_template) = load_codex_model_template_static() else {
         return;
@@ -2556,6 +2557,20 @@ fn fill_template_fields_from_static(template: &mut Value) {
             }
         }
     }
+    if !codex_catalog_has_instruction_source(template)
+        && static_obj
+            .get("base_instructions")
+            .is_some_and(Value::is_string)
+    {
+        template["base_instructions"] = static_obj["base_instructions"].clone();
+    }
+}
+
+fn codex_catalog_has_instruction_source(model: &Value) -> bool {
+    model.get("base_instructions").is_some_and(Value::is_string)
+        || model
+            .pointer("/model_messages/instructions_template")
+            .is_some_and(Value::is_string)
 }
 
 fn load_codex_model_catalog_template_uncached() -> Result<Value, AppError> {
@@ -5454,11 +5469,8 @@ fn reasoning_revision(provider: &Provider) -> String {
     let input = json!({
         "providerId": provider.id,
         "providerName": provider.name,
-        "models": provider
-            .settings_config
-            .get("modelCatalog")
-            .and_then(|catalog| catalog.get("models"))
-            .cloned()
+        "models": catalog_models(&provider.settings_config)
+            .map(|models| Value::Array(models.to_vec()))
             .unwrap_or_else(|| Value::Array(Vec::new())),
         "providerReasoning": provider
             .meta
@@ -5597,12 +5609,8 @@ fn build_codex_reasoning_provider_list(provider: &Provider) -> CodexReasoningPro
 }
 
 fn build_codex_reasoning_validation(provider: &Provider) -> CodexReasoningValidationResponse {
-    let models = provider
-        .settings_config
-        .get("modelCatalog")
-        .and_then(|catalog| catalog.get("models"))
-        .and_then(Value::as_array)
-        .cloned()
+    let models = catalog_models(&provider.settings_config)
+        .map(|models| models.to_vec())
         .unwrap_or_default();
     let mut diagnostics = Vec::new();
     for model in &models {
@@ -6177,7 +6185,11 @@ fn codex_model_stable_id(model: &Value) -> Option<String> {
 ///
 /// 路由字段继续覆盖模型标识、显式上下文和路由能力；官方模型已有的协议、工具、
 /// 展示和推理元数据保持权威，避免通用模板把新版模型降级成旧 transport。
-fn merge_codex_model_entry(official: Option<&Value>, routed: &Value) -> Value {
+fn merge_codex_model_entry_with_reasoning_authority(
+    official: Option<&Value>,
+    routed: &Value,
+    reasoning_authoritative: bool,
+) -> Value {
     let (Some(official_object), Some(routed_object)) =
         (official.and_then(Value::as_object), routed.as_object())
     else {
@@ -6185,13 +6197,30 @@ fn merge_codex_model_entry(official: Option<&Value>, routed: &Value) -> Value {
     };
 
     let mut merged = official_object.clone();
+    if reasoning_authoritative {
+        for field in [
+            "default_reasoning_level",
+            "default_reasoning_effort",
+            "defaultReasoningLevel",
+            "defaultReasoningEffort",
+            "supported_reasoning_levels",
+            "supported_reasoning_efforts",
+            "supportedReasoningLevels",
+            "supportedReasoningEfforts",
+        ] {
+            merged.remove(field);
+        }
+    }
     for (field, value) in routed_object {
-        if codex_official_picker_metadata_field(official_object, field) {
+        if !reasoning_authoritative && codex_official_picker_metadata_field(official_object, field)
+        {
             continue;
         }
         merged.insert(field.clone(), value.clone());
     }
-    project_official_picker_metadata_aliases(&mut merged, official_object);
+    if !reasoning_authoritative {
+        project_official_picker_metadata_aliases(&mut merged, official_object);
+    }
     Value::Object(merged)
 }
 
@@ -6332,7 +6361,16 @@ fn project_official_picker_metadata_aliases(
 ///
 /// 输出严格以已路由模型为边界；官方缓存只提供同 slug 元数据，不能把未勾选的
 /// 官方独有模型重新追加到 MultiRouter 目录。
+#[cfg(test)]
 fn merge_codex_models(official_models: &[Value], routed_models: &[Value]) -> Vec<Value> {
+    merge_codex_models_with_reasoning_authority(official_models, routed_models, &HashSet::new())
+}
+
+fn merge_codex_models_with_reasoning_authority(
+    official_models: &[Value],
+    routed_models: &[Value],
+    reasoning_authoritative_ids: &HashSet<String>,
+) -> Vec<Value> {
     let mut official_by_id = HashMap::new();
     for model in official_models {
         if let Some(model_id) = codex_model_stable_id(model) {
@@ -6353,13 +6391,23 @@ fn merge_codex_models(official_models: &[Value], routed_models: &[Value]) -> Vec
         let official_model = routed_id
             .as_ref()
             .and_then(|model_id| official_by_id.get(model_id).copied());
-        merged_models.push(merge_codex_model_entry(official_model, routed_model));
+        let reasoning_authoritative = routed_id
+            .as_ref()
+            .is_some_and(|model_id| reasoning_authoritative_ids.contains(model_id));
+        merged_models.push(merge_codex_model_entry_with_reasoning_authority(
+            official_model,
+            routed_model,
+            reasoning_authoritative,
+        ));
     }
     merged_models
 }
 
 /// 用接管前官方缓存补齐生成 catalog 的同 slug 模型元数据。
-fn enrich_codex_catalog_with_official_metadata(catalog: &Value) -> Result<Value, AppError> {
+fn enrich_codex_catalog_with_official_metadata_and_authority(
+    catalog: &Value,
+    reasoning_authoritative_ids: &HashSet<String>,
+) -> Result<Value, AppError> {
     let Some(routed_models) = catalog.get("models").and_then(Value::as_array) else {
         return Ok(catalog.clone());
     };
@@ -6369,7 +6417,11 @@ fn enrich_codex_catalog_with_official_metadata(catalog: &Value) -> Result<Value,
     if let Some(object) = enriched.as_object_mut() {
         object.insert(
             "models".to_string(),
-            Value::Array(merge_codex_models(&official_models, routed_models)),
+            Value::Array(merge_codex_models_with_reasoning_authority(
+                &official_models,
+                routed_models,
+                reasoning_authoritative_ids,
+            )),
         );
     }
     Ok(enriched)
@@ -6379,7 +6431,15 @@ fn enrich_codex_catalog_with_official_metadata(catalog: &Value) -> Result<Value,
 ///
 /// 这个函数解决运行中的 Codex 热切到 custom MultiRouter 后候选模型不刷新的问题：
 /// custom provider 不会主动请求 `/models`，但会接受 fresh `models_cache.json`。
+#[cfg(test)]
 fn sync_codex_models_cache_with_cc_switch_catalog(catalog: &Value) -> Result<(), AppError> {
+    sync_codex_models_cache_with_cc_switch_catalog_and_authority(catalog, &HashSet::new())
+}
+
+fn sync_codex_models_cache_with_cc_switch_catalog_and_authority(
+    catalog: &Value,
+    reasoning_authoritative_ids: &HashSet<String>,
+) -> Result<(), AppError> {
     let Some(models) = catalog.get("models").and_then(|models| models.as_array()) else {
         return Ok(());
     };
@@ -6431,7 +6491,11 @@ fn sync_codex_models_cache_with_cc_switch_catalog(catalog: &Value) -> Result<(),
         }
     }
 
-    let mut merged_models = merge_codex_models(&official_models, models);
+    let mut merged_models = merge_codex_models_with_reasoning_authority(
+        &official_models,
+        models,
+        reasoning_authoritative_ids,
+    );
     let routed_models_by_id = models
         .iter()
         .filter_map(|model| codex_model_stable_id(model).map(|model_id| (model_id, model)))
@@ -6528,6 +6592,20 @@ fn publish_codex_catalog_and_models_cache_transactionally<F>(
 where
     F: FnOnce() -> Result<(), AppError>,
 {
+    let models = catalog
+        .get("models")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            AppError::Message("Codex generated model catalog has no models array".to_string())
+        })?;
+    if let Some(index) = models
+        .iter()
+        .position(|model| !codex_catalog_has_instruction_source(model))
+    {
+        return Err(AppError::Message(format!(
+            "Codex generated model catalog entry {index} is missing both base_instructions and model_messages.instructions_template"
+        )));
+    }
     let _guard = codex_catalog_cache_publish_lock()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -6611,9 +6689,10 @@ pub(crate) fn prepare_codex_config_text_with_model_catalog_and_provider_context(
 /// remains untouched, and selecting a default never creates a supported tier.
 fn apply_codex_router_catalog_preferences(catalog: &mut Value, settings: &Value) -> Option<String> {
     settings.pointer("/codexRoutingProjection/dependencyFingerprint")?;
-    let source_models = settings.pointer("/modelCatalog/models")?.as_array()?;
-    let style = settings
-        .pointer("/modelCatalog/displayNameStyle")
+    let source_catalog = read_catalog(settings)?;
+    let source_models = source_catalog.get("models")?.as_array()?;
+    let style = source_catalog
+        .get("displayNameStyle")
         .and_then(Value::as_str)
         .unwrap_or("provider-model");
     let models = catalog.get_mut("models")?.as_array_mut()?;
@@ -6666,9 +6745,9 @@ fn apply_codex_router_catalog_preferences(catalog: &mut Value, settings: &Value)
             }
         }
     }
-    let requested = settings
-        .pointer("/modelCatalog/defaultReasoningEffort")?
-        .as_str()?;
+    let requested = source_catalog
+        .get("defaultReasoningEffort")
+        .and_then(Value::as_str)?;
     if !matches!(
         requested,
         "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max"
@@ -6767,22 +6846,24 @@ fn prepare_codex_config_text_with_model_catalog_impl(
     schedule_codex_public_official_catalog_refresh();
     let catalog_path = get_codex_model_catalog_path();
     let specs = codex_catalog_model_specs(settings, config_text);
+    let reasoning_authoritative_ids = specs
+        .iter()
+        .filter(|spec| spec.reasoning.is_some())
+        .map(|spec| spec.model.to_ascii_lowercase())
+        .collect::<HashSet<_>>();
     let projection_fingerprint = settings
         .pointer("/codexRoutingProjection/dependencyFingerprint")
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|fingerprint| !fingerprint.is_empty());
-    let has_catalog_inventory = settings
-        .pointer("/modelCatalog/models")
-        .and_then(Value::as_array)
-        .is_some_and(|models| {
-            models.iter().any(|model| {
-                model
-                    .get("model")
-                    .and_then(Value::as_str)
-                    .is_some_and(|model| !model.trim().is_empty())
-            })
-        });
+    let has_catalog_inventory = catalog_models(settings).is_some_and(|models| {
+        models.iter().any(|model| {
+            model
+                .get("model")
+                .and_then(Value::as_str)
+                .is_some_and(|model| !model.trim().is_empty())
+        })
+    });
 
     // 是否写入 provider 内联模型取决于已安装 Desktop 版本；严格诊断生效的
     // Desktop 只保留 catalog 指针。
@@ -6793,7 +6874,10 @@ fn prepare_codex_config_text_with_model_catalog_impl(
     if !specs.is_empty() || has_catalog_inventory || projection_fingerprint.is_some() {
         let generated_catalog = codex_model_catalog_from_settings(settings, config_text, profile)?
             .unwrap_or_else(|| json!({ "models": [] }));
-        let mut catalog = enrich_codex_catalog_with_official_metadata(&generated_catalog)?;
+        let mut catalog = enrich_codex_catalog_with_official_metadata_and_authority(
+            &generated_catalog,
+            &reasoning_authoritative_ids,
+        )?;
         let router_effort = apply_codex_router_catalog_preferences(&mut catalog, settings);
         if let Some(fingerprint) = projection_fingerprint {
             catalog["ccSwitchRoutingDependencyFingerprint"] =
@@ -6848,7 +6932,12 @@ fn prepare_codex_config_text_with_model_catalog_impl(
             &catalog,
             &get_codex_models_cache_path(),
             &get_codex_models_cache_backup_path(),
-            || sync_codex_models_cache_with_cc_switch_catalog(&catalog),
+            || {
+                sync_codex_models_cache_with_cc_switch_catalog_and_authority(
+                    &catalog,
+                    &reasoning_authoritative_ids,
+                )
+            },
         )?;
         sync_codex_managed_agent_files_with_settings(
             &specs,
@@ -7259,7 +7348,7 @@ pub(crate) fn prepare_codex_live_config_text_with_optional_catalog_and_provider_
     profile: CodexCatalogToolProfile,
     provider_context: &ProviderClassificationContext,
 ) -> Result<String, AppError> {
-    if settings.get("modelCatalog").is_some() {
+    if read_catalog(settings).is_some() {
         prepare_codex_config_text_with_model_catalog_and_provider_context(
             settings,
             config_text,
@@ -7281,7 +7370,7 @@ pub(crate) fn prepare_codex_live_config_text_for_verbatim_restore_without_provid
     config_text: &str,
     profile: CodexCatalogToolProfile,
 ) -> Result<String, AppError> {
-    if settings.get("modelCatalog").is_some() {
+    if read_catalog(settings).is_some() {
         prepare_codex_config_text_with_model_catalog_without_provider_context(
             settings,
             config_text,
@@ -13975,6 +14064,204 @@ openai_base_url = "http://127.0.0.1:15721/v1"
     }
 
     #[test]
+    fn catalog_instruction_backfill_repairs_missing_or_null_instruction_sources() {
+        let static_template = load_codex_model_template_static().expect("static template");
+        let expected = static_template["base_instructions"]
+            .as_str()
+            .filter(|text| !text.is_empty())
+            .expect("bundled instructions must be usable");
+        for mut template in [
+            json!({"slug": "gpt-5.5"}),
+            json!({"slug": "gpt-5.5", "base_instructions": null}),
+            json!({
+                "slug": "gpt-5.5",
+                "base_instructions": null,
+                "model_messages": {"instructions_template": null}
+            }),
+        ] {
+            fill_template_fields_from_static(&mut template);
+
+            assert_eq!(template["base_instructions"].as_str(), Some(expected));
+            assert!(template.get("apply_patch_tool_type").is_none());
+            assert!(template.get("supports_search_tool").is_none());
+        }
+    }
+
+    #[test]
+    fn catalog_instruction_backfill_preserves_valid_instruction_sources() {
+        for source in [
+            json!({"base_instructions": "provider instructions"}),
+            json!({"base_instructions": ""}),
+            json!({"model_messages": {"instructions_template": "model-specific template"}}),
+            json!({
+                "base_instructions": null,
+                "model_messages": {"instructions_template": "model-specific template"}
+            }),
+        ] {
+            let mut template = source.clone();
+            fill_template_fields_from_static(&mut template);
+
+            assert_eq!(
+                template.get("base_instructions"),
+                source.get("base_instructions")
+            );
+            assert_eq!(template.get("model_messages"), source.get("model_messages"));
+        }
+    }
+
+    #[test]
+    fn catalog_instruction_backfill_keeps_last_files_when_final_publication_is_invalid() {
+        let temp = tempfile::tempdir().expect("temp output directory");
+        let catalog_path = temp.path().join("cc-switch-model-catalog.json");
+        let cache_path = temp.path().join("models_cache.json");
+        let backup_path = temp.path().join("models_cache.cc-switch-backup.json");
+        for path in [&catalog_path, &cache_path, &backup_path] {
+            std::fs::write(path, b"last-usable-file").expect("seed last usable files");
+        }
+        let mut sync_called = false;
+        let error = publish_codex_catalog_and_models_cache_transactionally(
+            &catalog_path,
+            &json!({"models": [{"slug": "invalid-model", "base_instructions": null}]}),
+            &cache_path,
+            &backup_path,
+            || {
+                sync_called = true;
+                Ok(())
+            },
+        )
+        .expect_err("an instruction-less catalog must never replace a usable file");
+
+        assert!(error.to_string().contains("missing both"));
+        assert!(!sync_called);
+        for path in [&catalog_path, &cache_path, &backup_path] {
+            assert_eq!(
+                std::fs::read(path).expect("preserved file"),
+                b"last-usable-file"
+            );
+        }
+    }
+
+    #[test]
+    fn catalog_instruction_backfill_runs_after_tool_profile_projection() {
+        let specs = codex_catalog_model_specs(
+            &json!({"modelCatalog": {"models": [{"model": "custom-model"}]}}),
+            "",
+        );
+        let static_template = load_codex_model_template_static().expect("static template");
+        for profile in [
+            CodexCatalogToolProfile::ProxyChat,
+            CodexCatalogToolProfile::NativeResponses,
+            CodexCatalogToolProfile::Anthropic,
+        ] {
+            for template in [
+                json!({"slug": "gpt-5.5"}),
+                json!({
+                    "slug": "gpt-5.5",
+                    "model_messages": {"instructions_template": "model-specific template"}
+                }),
+            ] {
+                let entry = codex_catalog_model_entry(&template, &specs[0], 0, profile, 128_000);
+                let retains_messages = profile == CodexCatalogToolProfile::ProxyChat
+                    && template.get("model_messages").is_some();
+                if retains_messages {
+                    assert_eq!(entry.get("model_messages"), template.get("model_messages"));
+                    assert!(entry.get("base_instructions").is_none());
+                } else {
+                    assert_eq!(
+                        entry.get("base_instructions"),
+                        static_template.get("base_instructions"),
+                        "{profile:?} must retain instructions after removing model_messages"
+                    );
+                }
+                if profile != CodexCatalogToolProfile::ProxyChat {
+                    assert!(entry.get("model_messages").is_none());
+                    assert!(entry.get("apply_patch_tool_type").is_none());
+                }
+            }
+        }
+
+        let specs = codex_catalog_model_specs(
+            &json!({"modelCatalog": {"models": [{
+                "model": "custom-model",
+                "baseInstructions": "provider instructions"
+            }]}}),
+            "",
+        );
+        for profile in [
+            CodexCatalogToolProfile::NativeResponses,
+            CodexCatalogToolProfile::Anthropic,
+        ] {
+            let entry = codex_catalog_model_entry(&json!({}), &specs[0], 0, profile, 128_000);
+            assert_eq!(entry["base_instructions"], "provider instructions");
+        }
+        let vendor_entry =
+            codex_vendor_catalog_model_entry(&[json!({"slug": "custom-model"})], &specs[0], 0);
+        assert_eq!(vendor_entry["base_instructions"], "provider instructions");
+        let vendor_entry = codex_vendor_catalog_model_entry(
+            &[json!({"slug": "custom-model"})],
+            &CodexCatalogModelSpec {
+                base_instructions: None,
+                ..specs[0].clone()
+            },
+            0,
+        );
+        assert_eq!(
+            vendor_entry.get("base_instructions"),
+            static_template.get("base_instructions")
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn catalog_instruction_backfill_survives_repeated_slim_cache_publication() {
+        let _home = TestHomeGuard::new();
+        seed_codex_models_cache(json!([{
+            "slug": "gpt-5.5",
+            "display_name": "GPT-5.5",
+            "context_window": 272000
+        }]));
+        let settings = json!({"modelCatalog": {"models": [
+            {"model": "custom-model"},
+            {"model": "excluded-model", "enabled": false}
+        ]}});
+        let config = r#"model_provider = "custom"
+
+[model_providers.custom]
+base_url = "http://127.0.0.1:15721/v1"
+"#;
+        for _ in 0..2 {
+            let projected = prepare_codex_config_text_with_model_catalog_without_provider_context(
+                &settings,
+                config,
+                CodexCatalogToolProfile::ProxyChat,
+            )
+            .expect("publish catalog and picker cache from a slim source");
+            assert!(projected.contains("model_catalog_json"));
+
+            for path in [
+                get_codex_model_catalog_path(),
+                get_codex_models_cache_path(),
+            ] {
+                let catalog: Value = read_json_file(&path).expect("read published models");
+                let models = catalog["models"].as_array().expect("model entries");
+                assert_eq!(models.len(), 1, "excluded models must remain excluded");
+                assert_eq!(models[0]["slug"], "custom-model");
+                assert!(
+                    models[0]
+                        .get("base_instructions")
+                        .and_then(Value::as_str)
+                        .is_some()
+                        || models[0]
+                            .pointer("/model_messages/instructions_template")
+                            .and_then(Value::as_str)
+                            .is_some(),
+                    "published catalog and cache must satisfy the instruction contract"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn proxy_chat_catalog_entries_carry_reasoning_summaries_flag() {
         // End to end: a stale dynamic template, once backfilled, must yield
         // catalog entries codex 0.144.5+ can parse.
@@ -14168,6 +14455,7 @@ openai_base_url = "http://127.0.0.1:15721/v1"
             }
         });
         let config = r#"
+            model_provider = "vendor"
             [[model_providers.vendor.models]]
             id = "vendor-reasoning-model"
             supported_reasoning_levels = [{ effort = "low" }, { effort = "high" }]
@@ -15340,11 +15628,7 @@ base_url = "http://127.0.0.1:15721/v1"
             spec.reasoning
                 .as_ref()
                 .map(|capability| capability.supported_efforts.clone()),
-            Some(vec![
-                "max".to_string(),
-                "high".to_string(),
-                "low".to_string()
-            ])
+            Some(vec!["xhigh".to_string(), "high".to_string()])
         );
     }
 
@@ -17749,6 +18033,183 @@ model_catalog_json = "cc-switch-model-catalog.json"
     }
 
     #[test]
+    #[serial]
+    fn canonical_reasoning_survives_catalog_and_cache_official_merges() {
+        let _home = TestHomeGuard::new();
+        seed_codex_models_cache(json!([{
+            "slug": "provider-declared-model",
+            "display_name": "Provider Declared Model",
+            "default_reasoning_level": "medium",
+            "supported_reasoning_levels": [
+                {"effort": "low"},
+                {"effort": "medium"},
+                {"effort": "high"},
+                {"effort": "xhigh"},
+                {"effort": "max"},
+                {"effort": "ultra"}
+            ],
+            "use_responses_lite": true,
+            "tool_mode": "direct",
+            "apply_patch_tool_type": "freeform"
+        }]));
+        let config = r#"model_provider = "custom"
+
+[model_providers.custom]
+base_url = "https://provider.example/v1"
+"#;
+        for (reasoning, expected_efforts, expected_default) in [
+            (
+                json!({
+                    "schemaVersion": 2,
+                    "supportStatus": "confirmed_supported",
+                    "controlKind": "graded",
+                    "supportedEfforts": ["high"],
+                    "disableAllowed": false,
+                    "upstream": {"format": "string", "parameter": "reasoning_effort"},
+                    "source": "user"
+                }),
+                vec!["high"],
+                None,
+            ),
+            (
+                json!({
+                    "schemaVersion": 2,
+                    "supportStatus": "confirmed_unsupported",
+                    "controlKind": "none",
+                    "supportedEfforts": [],
+                    "disableAllowed": false,
+                    "upstream": {"format": "none", "parameter": ""},
+                    "source": "user"
+                }),
+                Vec::new(),
+                None,
+            ),
+            (
+                json!({
+                    "schemaVersion": 2,
+                    "supportStatus": "confirmed_supported",
+                    "controlKind": "graded",
+                    "supportedEfforts": ["low", "high", "max"],
+                    "defaultEffort": "high",
+                    "disableAllowed": false,
+                    "upstream": {"format": "string", "parameter": "reasoning_effort"},
+                    "source": "detection"
+                }),
+                vec!["low", "high", "max"],
+                Some("high"),
+            ),
+        ] {
+            let settings = json!({
+                "modelCatalog": {"models": [{
+                    "model": "provider-declared-model",
+                    "reasoning": reasoning,
+                    "codexUltra": {"enabled": false}
+                }]}
+            });
+            for _ in 0..2 {
+                let prepared =
+                    prepare_codex_config_text_with_model_catalog_without_provider_context(
+                        &settings,
+                        config,
+                        CodexCatalogToolProfile::ProxyChat,
+                    )
+                    .expect("publish provider reasoning without restoring stale official efforts");
+                let inline: toml::Value = toml::from_str(&prepared).expect("prepared config");
+                let inline =
+                    serde_json::to_value(&inline["model_providers"]["custom"]["models"][0])
+                        .expect("inline projection");
+                let catalog: Value =
+                    read_json_file(&get_codex_model_catalog_path()).expect("catalog projection");
+                let cache: Value =
+                    read_json_file(&get_codex_models_cache_path()).expect("cache projection");
+                for model in [&catalog["models"][0], &cache["models"][0], &inline] {
+                    for field in ["supported_reasoning_levels", "supportedReasoningEfforts"] {
+                        let efforts = model
+                            .get(field)
+                            .and_then(Value::as_array)
+                            .map(|levels| {
+                                levels
+                                    .iter()
+                                    .filter_map(codex_reasoning_effort_name)
+                                    .collect::<Vec<_>>()
+                            })
+                            .unwrap_or_default();
+                        assert_eq!(
+                            efforts, expected_efforts,
+                            "{field} must follow the canonical capability, not the official snapshot"
+                        );
+                    }
+                    for field in ["default_reasoning_level", "defaultReasoningEffort"] {
+                        assert_eq!(
+                            model.get(field).and_then(Value::as_str),
+                            expected_default,
+                            "absent canonical defaults must not be restored from official metadata"
+                        );
+                    }
+                    if model.get("default_reasoning_effort").is_some() {
+                        assert_eq!(
+                            model
+                                .get("default_reasoning_effort")
+                                .and_then(Value::as_str),
+                            expected_default
+                        );
+                    }
+                }
+                for model in [&catalog["models"][0], &cache["models"][0]] {
+                    assert_eq!(model["use_responses_lite"], true);
+                    assert_eq!(model["tool_mode"], "direct");
+                    assert_eq!(model["apply_patch_tool_type"], "freeform");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn vendor_catalog_reasoning_follows_canonical_override() {
+        let vendor = json!({
+            "slug": "vendor-model",
+            "default_reasoning_level": "low",
+            "supported_reasoning_levels": [{"effort": "low"}, {"effort": "max"}],
+            "base_instructions": "Vendor instructions",
+            "apply_patch_tool_type": "freeform"
+        });
+        let mut spec = review_codex_catalog_spec("vendor-model");
+        spec.reasoning = Some(
+            serde_json::from_value(json!({
+                "schemaVersion": 2,
+                "supportStatus": "confirmed_supported",
+                "controlKind": "graded",
+                "supportedEfforts": ["high"],
+                "defaultEffort": "high",
+                "disableAllowed": false,
+                "upstream": {
+                    "format": "string",
+                    "parameter": "reasoning_effort",
+                    "effortMap": {"high": "high"}
+                },
+                "source": "user"
+            }))
+            .expect("canonical provider override"),
+        );
+
+        let projected = codex_vendor_catalog_model_entry(&[vendor], &spec, 0);
+
+        assert_eq!(projected["default_reasoning_level"], "high");
+        assert_eq!(projected["defaultReasoningEffort"], "high");
+        assert_eq!(
+            projected["supported_reasoning_levels"]
+                .as_array()
+                .expect("canonical vendor reasoning")
+                .iter()
+                .filter_map(codex_reasoning_effort_name)
+                .collect::<Vec<_>>(),
+            vec!["high"]
+        );
+        assert_eq!(projected["base_instructions"], "Vendor instructions");
+        assert_eq!(projected["apply_patch_tool_type"], "freeform");
+    }
+
+    #[test]
     fn official_models_use_bundled_catalog_when_backup_is_empty() {
         let owned_cache = json!({
             "etag": CC_SWITCH_CODEX_MODELS_CACHE_ETAG,
@@ -19210,7 +19671,7 @@ wire_api = "responses"
 
         let error = publish_codex_catalog_and_models_cache_transactionally(
             &catalog_path,
-            &json!({"models": [{"slug": "fresh"}]}),
+            &json!({"models": [{"slug": "fresh", "base_instructions": "fixture instructions"}]}),
             &cache_path,
             &backup_path,
             || {

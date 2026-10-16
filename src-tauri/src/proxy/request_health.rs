@@ -499,14 +499,6 @@ pub(crate) fn record_usage(
         return None;
     }
     let target_session_id = target.session_id.clone();
-    if !target.threshold_exceeded {
-        drop(store);
-        session_review_risks()
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .remove(&target_session_id);
-        return None;
-    }
     refresh_session_review_risk(&mut store, &target_session_id);
     let finding = session_review_risks()
         .lock()
@@ -522,22 +514,7 @@ fn refresh_session_review_risk(
     diagnostics: &mut VecDeque<RequestHealthDiagnostic>,
     session_id: &str,
 ) {
-    let recent = diagnostics
-        .iter()
-        .rev()
-        .filter(|candidate| {
-            candidate.session_id == session_id
-                && candidate.app_type == "codex"
-                && candidate.session_client_provided
-                && !candidate.compaction_request
-                && candidate.threshold_exceeded
-                // A large inline image is valid payload, not replayed history
-                // growth. Keep it out of the sustained-growth detector.
-                && !candidate.media_dominated
-        })
-        .take(3)
-        .collect::<Vec<_>>();
-    let finding = sustained_growth_finding(&recent);
+    let finding = session_growth_finding(diagnostics, session_id, None);
     if let Some(current) = diagnostics
         .iter_mut()
         .rfind(|candidate| candidate.session_id == session_id)
@@ -555,10 +532,40 @@ fn refresh_session_review_risk(
     }
 }
 
-fn sustained_growth_finding(recent: &[&RequestHealthDiagnostic]) -> Option<RequestHealthFinding> {
+fn session_growth_finding(
+    diagnostics: &VecDeque<RequestHealthDiagnostic>,
+    session_id: &str,
+    threshold_bytes: Option<usize>,
+) -> Option<RequestHealthFinding> {
+    let recent = diagnostics
+        .iter()
+        .rev()
+        .filter(|candidate| {
+            candidate.session_id == session_id
+                && candidate.app_type == "codex"
+                && candidate.session_client_provided
+        })
+        .take(3)
+        .collect::<Vec<_>>();
+    sustained_growth_finding(&recent, threshold_bytes)
+}
+
+fn sustained_growth_finding(
+    recent: &[&RequestHealthDiagnostic],
+    threshold_bytes: Option<usize>,
+) -> Option<RequestHealthFinding> {
     let [newest, middle, oldest] = recent else {
         return None;
     };
+    // A healthy or compacted turn breaks the sequence; do not skip it and
+    // re-arm a warning from older large requests.
+    if recent.iter().any(|candidate| {
+        candidate.compaction_request
+            || candidate.optimized_bytes < threshold_bytes.unwrap_or(candidate.threshold_bytes)
+            || candidate.media_dominated
+    }) {
+        return None;
+    }
 
     let fresh_values = [
         oldest.fresh_input_tokens,
@@ -697,8 +704,12 @@ fn resolve_pending_review(token: &str, body_hash: &str, decision: ReviewDecision
 /// user has explicitly turned the gate off; stale injected warnings are hidden
 /// by the caller that changes the setting.
 pub(crate) fn cancel_pending_reviews() -> usize {
+    cancel_reviews_in(pending_reviews())
+}
+
+fn cancel_reviews_in(reviews: &Mutex<HashMap<String, PendingReview>>) -> usize {
     let pending = {
-        let mut reviews = pending_reviews()
+        let mut reviews = reviews
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         reviews
@@ -718,15 +729,13 @@ fn review_finding(
     trace_id: &str,
     session_id: &str,
 ) -> Option<RequestHealthFinding> {
-    let sustained_risk = session_review_risks()
+    let diagnostics = diagnostics_store()
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .get(session_id)
-        .cloned();
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let threshold_bytes = config.large_request_threshold_bytes.max(64 * 1024) as usize;
+    let sustained_risk = session_growth_finding(&diagnostics, session_id, Some(threshold_bytes));
     let immediate_risk = || {
-        diagnostics_store()
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+        diagnostics
             .iter()
             .rev()
             .find(|diagnostic| {
@@ -735,9 +744,10 @@ fn review_finding(
                     && diagnostic.app_type == "codex"
                     && diagnostic.session_client_provided
                     && !diagnostic.compaction_request
-                    && (diagnostic.threshold_exceeded || diagnostic.token_limit_exceeded)
             })
-            .filter(|diagnostic| diagnostic.threshold_exceeded && !diagnostic.media_dominated)
+            .filter(|diagnostic| {
+                diagnostic.optimized_bytes >= threshold_bytes && !diagnostic.media_dominated
+            })
             .map(|diagnostic| RequestHealthFinding {
                 code: "oversized_request_preflight".to_string(),
                 severity: "error".to_string(),
@@ -745,7 +755,7 @@ fn review_finding(
                 detail: format!(
                     "This request is {:.1} KB, above the configured {:.1} KB threshold",
                     diagnostic.optimized_bytes as f64 / 1024.0,
-                    diagnostic.threshold_bytes as f64 / 1024.0
+                    threshold_bytes as f64 / 1024.0
                 ),
             })
     };
@@ -756,9 +766,78 @@ fn review_finding(
     }
 }
 
+#[cfg(any(target_os = "windows", test))]
+enum ReviewRegistration {
+    Skipped(PreflightReviewOutcome),
+    Waiting(RequestHealthConfig),
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn register_pending_review(
+    reviews: &Mutex<HashMap<String, PendingReview>>,
+    token: &str,
+    review: PendingReview,
+    read_config: impl FnOnce() -> RequestHealthConfig,
+    show_review: impl FnOnce(&RequestHealthConfig) -> Result<Option<PreflightReviewOutcome>, String>,
+    cleanup_failed_review: impl FnOnce(),
+) -> Result<ReviewRegistration, String> {
+    let mut reviews = reviews
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    reviews.insert(token.to_string(), review);
+    // Settings writers release their write lock before cancelling reviews.
+    // Keep registration, the canonical recheck, and display in one critical
+    // section so a concurrent disable cannot miss a newly registered waiter.
+    let config = read_config();
+    let outcome = if crate::settings::request_health_windows_notifications_active(&config) {
+        show_review(&config)
+    } else {
+        Ok(Some(PreflightReviewOutcome::ContinueOnce))
+    };
+    match outcome {
+        Ok(None) => Ok(ReviewRegistration::Waiting(config)),
+        Ok(Some(outcome)) => {
+            reviews.remove(token);
+            Ok(ReviewRegistration::Skipped(outcome))
+        }
+        Err(error) => {
+            reviews.remove(token);
+            drop(reviews);
+            cleanup_failed_review();
+            Err(error)
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn review_before_upstream(
-    config: &RequestHealthConfig,
+    _inspected_config: &RequestHealthConfig,
+    trace_id: &str,
+    session_id: &str,
+    session_client_provided: bool,
+    model: &str,
+    transformed_json: &[u8],
+    wire_body: &[u8],
+    dispatch_scope: &str,
+    compaction_request: bool,
+) -> Result<PreflightReviewOutcome, String> {
+    review_before_upstream_with_config(
+        || crate::settings::get_settings().request_health,
+        trace_id,
+        session_id,
+        session_client_provided,
+        model,
+        transformed_json,
+        wire_body,
+        dispatch_scope,
+        compaction_request,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn review_before_upstream_with_config(
+    read_config: impl Fn() -> RequestHealthConfig,
     trace_id: &str,
     session_id: &str,
     session_client_provided: bool,
@@ -775,6 +854,7 @@ pub(crate) async fn review_before_upstream(
         return Ok(PreflightReviewOutcome::NotRequired);
     }
 
+    let config = read_config();
     if !config.enabled
         || config.review_mode == RequestHealthReviewMode::Off
         || trace_id.is_empty()
@@ -798,58 +878,59 @@ pub(crate) async fn review_before_upstream(
 
     #[cfg(target_os = "windows")]
     {
-        if !crate::settings::request_health_windows_notifications_active(config) {
-            return Ok(PreflightReviewOutcome::ContinueOnce);
-        }
-        let risk = review_finding(config, trace_id, session_id);
-        let Some(risk) = risk else {
-            return Ok(PreflightReviewOutcome::NotRequired);
-        };
-
         let body_hash = wire_body_hash(wire_body);
         let dispatch_hash = wire_body_hash(dispatch_scope.as_bytes());
-        if payload_was_approved(trace_id, session_id, &body_hash, &dispatch_hash) {
-            return Ok(PreflightReviewOutcome::ContinueOnce);
-        }
-
         let token = uuid::Uuid::new_v4().simple().to_string();
         let (sender, receiver) = oneshot::channel();
-        pending_reviews()
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert(
-                token.clone(),
-                PendingReview {
-                    trace_id: trace_id.to_string(),
-                    session_id: session_id.to_string(),
-                    body_hash: body_hash.clone(),
-                    dispatch_hash,
-                    sender,
-                },
-            );
+        let registration = register_pending_review(
+            pending_reviews(),
+            &token,
+            PendingReview {
+                trace_id: trace_id.to_string(),
+                session_id: session_id.to_string(),
+                body_hash: body_hash.clone(),
+                dispatch_hash: dispatch_hash.clone(),
+                sender,
+            },
+            read_config,
+            |current_config| {
+                let Some(risk) = review_finding(current_config, trace_id, session_id) else {
+                    return Ok(Some(PreflightReviewOutcome::NotRequired));
+                };
+                if payload_was_approved(trace_id, session_id, &body_hash, &dispatch_hash) {
+                    return Ok(Some(PreflightReviewOutcome::ContinueOnce));
+                }
+                let diagnostic = diagnostics_store()
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .iter()
+                    .rev()
+                    .find(|diagnostic| diagnostic.trace_id.as_deref() == Some(trace_id))
+                    .cloned();
+
+                show_windows_review_notification(
+                    &token,
+                    &body_hash,
+                    model,
+                    wire_body.len(),
+                    &risk,
+                    current_config.review_timeout_seconds,
+                    current_config.summarize_and_restart_enabled,
+                    diagnostic.as_ref(),
+                )
+                .map_err(|error| format!("Windows Request Health notification failed: {error}"))?;
+                Ok(None)
+            },
+            || crate::codex_desktop::hide_codex_request_health_warning(&token),
+        )?;
+        let config = match registration {
+            ReviewRegistration::Skipped(outcome) => return Ok(outcome),
+            ReviewRegistration::Waiting(config) => config,
+        };
         let _guard = PendingReviewGuard {
             token: token.clone(),
             body_hash: body_hash.clone(),
         };
-        let diagnostic = diagnostics_store()
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .iter()
-            .rev()
-            .find(|diagnostic| diagnostic.trace_id.as_deref() == Some(trace_id))
-            .cloned();
-
-        show_windows_review_notification(
-            &token,
-            &body_hash,
-            model,
-            wire_body.len(),
-            &risk,
-            config.review_timeout_seconds,
-            config.summarize_and_restart_enabled,
-            diagnostic.as_ref(),
-        )
-        .map_err(|error| format!("Windows Request Health notification failed: {error}"))?;
 
         let timeout_seconds = u64::from(config.review_timeout_seconds)
             .clamp(MIN_REVIEW_TIMEOUT_SECONDS, MAX_REVIEW_TIMEOUT_SECONDS);
@@ -885,8 +966,8 @@ fn is_manual_summary_request(body: &[u8]) -> bool {
     let Ok(text) = std::str::from_utf8(body) else {
         return false;
     };
-    text.contains("[CCSwitch internal request: manual-summary-v1]")
-        && text.contains("This is a manual coding-agent summary, not context compaction.")
+    text.contains(crate::codex_desktop::MANUAL_SUMMARY_REQUEST_MARKER)
+        && text.contains(crate::codex_desktop::MANUAL_SUMMARY_REQUEST_INSTRUCTION)
 }
 
 fn is_active_manual_summary_request(session_id: &str, body: &[u8]) -> bool {
@@ -1275,13 +1356,13 @@ fn analyze_conversation_items(body: &Value, analysis: &mut Analysis) {
         };
         let item_type = object.get("type").and_then(Value::as_str).unwrap_or("");
         if is_call_type(item_type) {
-            if let Some(call_id) = structural_id(object) {
+            if let Some(call_id) = tool_call_correlation_id(object) {
                 if !analysis.calls.insert(call_id.to_string()) {
                     analysis.duplicate_calls += 1;
                 }
             }
         } else if is_output_type(item_type) {
-            if let Some(call_id) = structural_id(object) {
+            if let Some(call_id) = tool_call_correlation_id(object) {
                 analysis.outputs.push(call_id.to_string());
             }
         }
@@ -1330,13 +1411,13 @@ fn item_category(item: &Value) -> String {
         .unwrap_or_else(|| "object".to_string())
 }
 
-fn structural_id(object: &Map<String, Value>) -> Option<&str> {
-    object
-        .get("call_id")
-        .or_else(|| object.get("tool_call_id"))
-        .or_else(|| object.get("id"))
-        .and_then(Value::as_str)
-        .filter(|value| !value.is_empty())
+fn tool_call_correlation_id(object: &Map<String, Value>) -> Option<&str> {
+    ["call_id", "tool_call_id"].into_iter().find_map(|key| {
+        object
+            .get(key)
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+    })
 }
 
 fn is_call_type(item_type: &str) -> bool {
@@ -1362,20 +1443,36 @@ fn is_output_type(item_type: &str) -> bool {
     )
 }
 
-fn remove_safe_transport_metadata(value: &mut Value) {
-    match value {
-        Value::Object(object) => {
-            object.remove("internal_chat_message_metadata_passthrough");
-            for child in object.values_mut() {
-                remove_safe_transport_metadata(child);
+fn remove_safe_transport_metadata(body: &mut Value) {
+    for key in ["input", "messages", "contents"] {
+        let Some(items) = body.get_mut(key).and_then(Value::as_array_mut) else {
+            continue;
+        };
+        for item in items {
+            let Some(object) = item.as_object_mut() else {
+                continue;
+            };
+            let is_transport_envelope = match object.get("type").and_then(Value::as_str) {
+                Some("message") => true,
+                Some("reasoning") if key == "input" => true,
+                None => matches!(
+                    object.get("role").and_then(Value::as_str),
+                    Some(
+                        "user"
+                            | "assistant"
+                            | "system"
+                            | "developer"
+                            | "tool"
+                            | "function"
+                            | "model"
+                    )
+                ),
+                _ => false,
+            };
+            if is_transport_envelope {
+                object.remove("internal_chat_message_metadata_passthrough");
             }
         }
-        Value::Array(items) => {
-            for item in items {
-                remove_safe_transport_metadata(item);
-            }
-        }
-        _ => {}
     }
 }
 
@@ -1422,6 +1519,105 @@ mod tests {
     }
 
     #[test]
+    fn correlation_ids_match_outputs_and_detect_duplicate_calls() {
+        let mut matched = json!({
+            "input": [{
+                "type": "function_call",
+                "id": "first-call-item",
+                "call_id": "shared-call",
+                "name": "fixture",
+                "arguments": "{}"
+            }, {
+                "type": "function_call",
+                "id": "second-call-item",
+                "call_id": "shared-call",
+                "name": "fixture",
+                "arguments": "{}"
+            }, {
+                "type": "function_call_output",
+                "id": "separate-output-item",
+                "call_id": "shared-call",
+                "output": "redacted fixture"
+            }]
+        });
+        let diagnostic = inspect_and_optimize(
+            &mut matched,
+            &RequestHealthConfig::default(),
+            RequestHealthContext {
+                trace_id: Some("item-id-matched-output"),
+                session_id: "item-id-matched-session",
+                ..context()
+            },
+        )
+        .expect("diagnostic");
+        assert!(!diagnostic
+            .findings
+            .iter()
+            .any(|finding| finding.code == "orphaned_tool_output"));
+        assert!(diagnostic
+            .findings
+            .iter()
+            .any(|finding| finding.code == "duplicate_tool_call_id" && finding.count == 1));
+    }
+
+    #[test]
+    fn regression_item_ids_are_not_tool_call_correlation_ids() {
+        let mut output_only = json!({
+            "input": [{
+                "type": "function_call_output",
+                "id": "output-item",
+                "output": "redacted fixture"
+            }, {
+                "type": "tool_search_output",
+                "id": "search-output-item",
+                "tools": []
+            }]
+        });
+        let diagnostic = inspect_and_optimize(
+            &mut output_only,
+            &RequestHealthConfig::default(),
+            RequestHealthContext {
+                trace_id: Some("item-id-only-output"),
+                session_id: "item-id-only-session",
+                ..context()
+            },
+        )
+        .expect("diagnostic");
+        assert!(!diagnostic
+            .findings
+            .iter()
+            .any(|finding| finding.code == "orphaned_tool_output"));
+
+        let mut mismatched = json!({
+            "input": [{
+                "type": "function_call",
+                "id": "call-item",
+                "call_id": "actual-call",
+                "name": "fixture",
+                "arguments": "{}"
+            }, {
+                "type": "function_call_output",
+                "call_id": "call-item",
+                "output": "redacted fixture"
+            }]
+        });
+        let diagnostic = inspect_and_optimize(
+            &mut mismatched,
+            &RequestHealthConfig::default(),
+            RequestHealthContext {
+                trace_id: Some("item-id-mismatched-output"),
+                session_id: "item-id-mismatched-session",
+                ..context()
+            },
+        )
+        .expect("diagnostic");
+        assert!(diagnostic
+            .findings
+            .iter()
+            .any(|finding| finding.code == "orphaned_tool_output"));
+    }
+
+    #[test]
     fn snapshot_hides_historical_diagnostics_when_advisories_are_disabled() {
         let mut body = json!({
             "input": [{
@@ -1458,7 +1654,7 @@ mod tests {
     }
 
     #[test]
-    fn review_mode_off_skips_diagnostics_and_does_not_retain_findings() {
+    fn review_mode_off_keeps_diagnostics_without_requiring_approval() {
         let mut body = json!({
             "input": [{
                 "type": "function_call_output",
@@ -1471,8 +1667,22 @@ mod tests {
             ..RequestHealthConfig::default()
         };
 
-        assert!(inspect_and_optimize(&mut body, &config, context()).is_none());
-        assert!(snapshot(config).diagnostics.is_empty());
+        let request_context = RequestHealthContext {
+            trace_id: Some("review-off-diagnostic"),
+            session_id: "review-off-session",
+            ..context()
+        };
+        let diagnostic = inspect_and_optimize(&mut body, &config, request_context)
+            .expect("diagnostics remain enabled");
+        assert!(diagnostic
+            .findings
+            .iter()
+            .any(|finding| finding.code == "orphaned_tool_output"));
+        assert!(review_finding(&config, "review-off-diagnostic", "review-off-session").is_none());
+        assert!(snapshot(config)
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.trace_id.as_deref() == Some("review-off-diagnostic")));
     }
 
     #[test]
@@ -1617,6 +1827,97 @@ mod tests {
             .get("internal_chat_message_metadata_passthrough")
             .is_none());
         assert!(diagnostic.bytes_removed > 0);
+    }
+
+    #[test]
+    fn regression_safe_cleanup_preserves_tool_schemas_and_structured_payloads() {
+        let mut body = json!({
+            "metadata": {"internal_chat_message_metadata_passthrough": "application value"},
+            "tools": [{
+                "type": "function",
+                "name": "inspect_metadata",
+                "strict": true,
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "internal_chat_message_metadata_passthrough": {"type": "string"}
+                    },
+                    "required": ["internal_chat_message_metadata_passthrough"],
+                    "additionalProperties": false
+                }
+            }],
+            "input": [{
+                "type": "message",
+                "role": "user",
+                "content": [{
+                    "type": "input_text",
+                    "text": "redacted fixture",
+                    "internal_chat_message_metadata_passthrough": {"application": true}
+                }],
+                "internal_chat_message_metadata_passthrough": {"transport": true}
+            }, {
+                "type": "function_call_output",
+                "output": [{
+                    "type": "input_text",
+                    "text": "redacted fixture",
+                    "internal_chat_message_metadata_passthrough": {"application": true}
+                }]
+            }, {
+                "type": "future_item",
+                "internal_chat_message_metadata_passthrough": {"application": true}
+            }]
+        });
+        let mut expected = body.clone();
+        expected["input"][0]
+            .as_object_mut()
+            .expect("message")
+            .remove("internal_chat_message_metadata_passthrough");
+
+        let diagnostic = inspect_and_optimize(
+            &mut body,
+            &RequestHealthConfig::default(),
+            RequestHealthContext {
+                trace_id: Some("safe-schema-preservation"),
+                session_id: "safe-schema-session",
+                ..context()
+            },
+        )
+        .expect("diagnostic");
+
+        assert_eq!(body, expected);
+        assert!(diagnostic.bytes_removed > 0);
+    }
+
+    #[test]
+    fn safe_cleanup_recognizes_message_and_reasoning_envelopes() {
+        for (key, item) in [
+            ("messages", json!({"role":"assistant","content":"fixture"})),
+            (
+                "contents",
+                json!({"role":"model","parts":[{"text":"fixture"}]}),
+            ),
+            (
+                "input",
+                json!({
+                    "type":"reasoning",
+                    "summary":[{
+                        "type":"summary_text",
+                        "text":"fixture",
+                        "internal_chat_message_metadata_passthrough":{"application":true}
+                    }],
+                    "encrypted_content":"redacted opaque fixture"
+                }),
+            ),
+        ] {
+            let mut body = json!({key:[item]});
+            let expected = body.clone();
+            body[key][0].as_object_mut().expect("message").insert(
+                "internal_chat_message_metadata_passthrough".to_string(),
+                json!({"transport":true}),
+            );
+            remove_safe_transport_metadata(&mut body);
+            assert_eq!(body, expected);
+        }
     }
 
     #[test]
@@ -1796,6 +2097,159 @@ mod tests {
     }
 
     #[test]
+    fn regression_growth_risk_resets_after_small_media_or_compaction_turns() {
+        let config = RequestHealthConfig {
+            large_request_threshold_bytes: 64 * 1024,
+            review_mode: RequestHealthReviewMode::SustainedGrowth,
+            ..RequestHealthConfig::default()
+        };
+        for (kind, session_id) in [
+            ("small", "growth-reset-small-session"),
+            ("media", "growth-reset-media-session"),
+            ("compaction", "growth-reset-compaction-session"),
+        ] {
+            for (index, payload_bytes) in [70_000, 75_000, 80_000].into_iter().enumerate() {
+                let trace_id = format!("growth-reset-{kind}-{index}");
+                let mut body = json!({"input":"x".repeat(payload_bytes)});
+                inspect_and_optimize(
+                    &mut body,
+                    &config,
+                    RequestHealthContext {
+                        trace_id: Some(&trace_id),
+                        session_id,
+                        ..context()
+                    },
+                )
+                .expect("diagnostic");
+            }
+            assert!(review_finding(&config, "unused", session_id).is_some());
+
+            let mut body = match kind {
+                "media" => json!({"input":[{
+                    "type":"message",
+                    "role":"user",
+                    "content":[{
+                        "type":"input_image",
+                        "image_url":format!("data:image/png;base64,{}", "a".repeat(120_000))
+                    }]
+                }]}),
+                "compaction" => json!({"input":"x".repeat(90_000)}),
+                _ => json!({"input":"recovered"}),
+            };
+            let reset_trace = format!("growth-reset-{kind}-boundary");
+            inspect_and_optimize(
+                &mut body,
+                &config,
+                RequestHealthContext {
+                    trace_id: Some(&reset_trace),
+                    session_id,
+                    compaction_request: kind == "compaction",
+                    ..context()
+                },
+            )
+            .expect("diagnostic");
+            assert!(
+                review_finding(&config, &reset_trace, session_id).is_none(),
+                "{kind} should reset sustained growth"
+            );
+
+            let mut next_body = json!({"input":"still recovered"});
+            let next_trace = format!("growth-reset-{kind}-next");
+            inspect_and_optimize(
+                &mut next_body,
+                &config,
+                RequestHealthContext {
+                    trace_id: Some(&next_trace),
+                    session_id,
+                    ..context()
+                },
+            )
+            .expect("diagnostic");
+            assert!(review_finding(&config, &next_trace, session_id).is_none());
+        }
+    }
+
+    #[test]
+    fn regression_preflight_risk_uses_current_threshold() {
+        let inspected_config = RequestHealthConfig {
+            large_request_threshold_bytes: 64 * 1024,
+            ..RequestHealthConfig::default()
+        };
+        let session_id = "current-review-threshold-session";
+        for (index, payload_bytes) in [70_000, 75_000, 80_000].into_iter().enumerate() {
+            let trace_id = format!("current-review-threshold-{index}");
+            let mut body = json!({"input":"x".repeat(payload_bytes)});
+            inspect_and_optimize(
+                &mut body,
+                &inspected_config,
+                RequestHealthContext {
+                    trace_id: Some(&trace_id),
+                    session_id,
+                    ..context()
+                },
+            )
+            .expect("diagnostic");
+        }
+        assert!(
+            review_finding(&inspected_config, "current-review-threshold-2", session_id).is_some()
+        );
+
+        let mut current_config = inspected_config;
+        current_config.large_request_threshold_bytes = 128 * 1024;
+        for mode in [
+            RequestHealthReviewMode::FirstLargeRequest,
+            RequestHealthReviewMode::SustainedGrowth,
+        ] {
+            current_config.review_mode = mode;
+            assert!(
+                review_finding(&current_config, "current-review-threshold-2", session_id).is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn delayed_usage_for_an_old_small_turn_does_not_clear_current_growth() {
+        let config = RequestHealthConfig {
+            large_request_threshold_bytes: 64 * 1024,
+            review_mode: RequestHealthReviewMode::SustainedGrowth,
+            ..RequestHealthConfig::default()
+        };
+        let session_id = "delayed-usage-current-growth-session";
+        let mut small = json!({"input":"small fixture"});
+        inspect_and_optimize(
+            &mut small,
+            &config,
+            RequestHealthContext {
+                trace_id: Some("delayed-usage-old-small"),
+                session_id,
+                ..context()
+            },
+        )
+        .expect("diagnostic");
+        for (index, payload_bytes) in [70_000, 75_000, 80_000].into_iter().enumerate() {
+            let trace_id = format!("delayed-usage-large-{index}");
+            let mut body = json!({"input":"x".repeat(payload_bytes)});
+            inspect_and_optimize(
+                &mut body,
+                &config,
+                RequestHealthContext {
+                    trace_id: Some(&trace_id),
+                    session_id,
+                    ..context()
+                },
+            )
+            .expect("diagnostic");
+        }
+
+        assert!(record_usage("delayed-usage-old-small", 100, 0).is_some());
+        assert!(review_finding(&config, "delayed-usage-large-2", session_id).is_some());
+        assert!(session_review_risks()
+            .lock()
+            .expect("risks")
+            .contains_key(session_id));
+    }
+
+    #[test]
     fn fallback_replaces_the_same_trace_without_counting_as_another_turn() {
         let config = RequestHealthConfig {
             large_request_threshold_bytes: 64 * 1024,
@@ -1936,6 +2390,135 @@ mod tests {
         ));
     }
 
+    fn pending_review_fixture(sender: oneshot::Sender<ReviewDecision>) -> PendingReview {
+        PendingReview {
+            trace_id: "registration-fixture-trace".to_string(),
+            session_id: "registration-fixture-session".to_string(),
+            body_hash: wire_body_hash(b"redacted fixture"),
+            dispatch_hash: wire_body_hash(b"provider|POST|https://example.test/responses"),
+            sender,
+        }
+    }
+
+    #[test]
+    fn regression_registration_rechecks_canonical_notification_state() {
+        for config in [
+            RequestHealthConfig {
+                enabled: false,
+                ..RequestHealthConfig::default()
+            },
+            RequestHealthConfig {
+                review_mode: RequestHealthReviewMode::Off,
+                ..RequestHealthConfig::default()
+            },
+            RequestHealthConfig {
+                windows_notifications_enabled: false,
+                ..RequestHealthConfig::default()
+            },
+            RequestHealthConfig {
+                windows_notifications_snoozed_until_ms: Some(i64::MAX),
+                ..RequestHealthConfig::default()
+            },
+        ] {
+            let reviews = Mutex::new(HashMap::new());
+            assert_eq!(cancel_reviews_in(&reviews), 0);
+            let (sender, _receiver) = oneshot::channel();
+            let result = register_pending_review(
+                &reviews,
+                "canonical-disabled-token",
+                pending_review_fixture(sender),
+                || config,
+                |_| panic!("disabled canonical settings must not display a review"),
+                || panic!("skipped review needs no failure cleanup"),
+            )
+            .expect("registration");
+
+            assert!(matches!(
+                result,
+                ReviewRegistration::Skipped(PreflightReviewOutcome::ContinueOnce)
+            ));
+            assert!(reviews.lock().expect("reviews").is_empty());
+        }
+    }
+
+    #[test]
+    fn regression_disable_cancellation_cannot_miss_review_during_display() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{Arc, Barrier, TryLockError};
+
+        let reviews = Arc::new(Mutex::new(HashMap::new()));
+        let enabled = Arc::new(AtomicBool::new(true));
+        let showing = Arc::new(Barrier::new(2));
+        let release_display = Arc::new(Barrier::new(2));
+        let (sender, receiver) = oneshot::channel();
+
+        let registration = {
+            let reviews = Arc::clone(&reviews);
+            let enabled = Arc::clone(&enabled);
+            let showing = Arc::clone(&showing);
+            let release_display = Arc::clone(&release_display);
+            std::thread::spawn(move || {
+                register_pending_review(
+                    &reviews,
+                    "disable-during-display-token",
+                    pending_review_fixture(sender),
+                    || RequestHealthConfig {
+                        enabled: enabled.load(Ordering::SeqCst),
+                        ..RequestHealthConfig::default()
+                    },
+                    |_| {
+                        showing.wait();
+                        release_display.wait();
+                        Ok(None)
+                    },
+                    || panic!("successful display needs no failure cleanup"),
+                )
+            })
+        };
+        showing.wait();
+        let registration_holds_lock = matches!(reviews.try_lock(), Err(TryLockError::WouldBlock));
+        enabled.store(false, Ordering::SeqCst);
+        let cancellation = {
+            let reviews = Arc::clone(&reviews);
+            std::thread::spawn(move || cancel_reviews_in(&reviews))
+        };
+        release_display.wait();
+
+        assert!(matches!(
+            registration.join().expect("registration thread"),
+            Ok(ReviewRegistration::Waiting(_))
+        ));
+        assert_eq!(cancellation.join().expect("cancellation thread"), 1);
+        assert_eq!(
+            receiver.blocking_recv().expect("cancelled review"),
+            ReviewDecision::ContinueOnce
+        );
+        assert!(registration_holds_lock);
+        assert!(reviews.lock().expect("reviews").is_empty());
+    }
+
+    #[test]
+    fn regression_notification_display_failure_removes_pending_review() {
+        let overlay_visible = std::cell::Cell::new(false);
+        let reviews = Mutex::new(HashMap::new());
+        let (sender, _receiver) = oneshot::channel();
+        let result = register_pending_review(
+            &reviews,
+            "failed-display-token",
+            pending_review_fixture(sender),
+            RequestHealthConfig::default,
+            |_| {
+                overlay_visible.set(true);
+                Err("fixture display failure".to_string())
+            },
+            || overlay_visible.set(false),
+        );
+
+        assert!(matches!(result, Err(error) if error == "fixture display failure"));
+        assert!(reviews.lock().expect("reviews").is_empty());
+        assert!(!overlay_visible.get());
+    }
+
     #[test]
     fn summary_handoff_guard_blocks_retries_until_released() {
         let session_id = "summary-handoff-retry-session";
@@ -1953,8 +2536,8 @@ mod tests {
     async fn active_summary_handoff_rejects_a_codex_retry_before_risk_recalculation() {
         let session_id = "summary-handoff-preflight-session";
         let _guard = begin_summary_handoff(session_id).expect("acquire handoff guard");
-        let result = review_before_upstream(
-            &RequestHealthConfig::default(),
+        let result = review_before_upstream_with_config(
+            RequestHealthConfig::default,
             "retry-trace",
             session_id,
             true,
@@ -1976,15 +2559,22 @@ mod tests {
     async fn manual_summary_turn_bypasses_active_handoff_guard() {
         let session_id = "summary-handoff-summary-turn";
         let _guard = begin_summary_handoff(session_id).expect("acquire handoff guard");
-        let body = br#"{"input":[{"type":"message","content":"[CCSwitch internal request: manual-summary-v1] Create a faithful handoff summary of this coding session for a fresh session. This is a manual coding-agent summary, not context compaction."}]}"#;
+        let body = serde_json::to_vec(&json!({
+            "input":[{
+                "type":"message",
+                "role":"user",
+                "content":crate::codex_desktop::manual_summary_request_prompt()
+            }]
+        }))
+        .expect("summary body");
 
-        let result = review_before_upstream(
-            &RequestHealthConfig::default(),
+        let result = review_before_upstream_with_config(
+            RequestHealthConfig::default,
             "summary-trace",
             session_id,
             true,
             "gpt-test",
-            body,
+            &body,
             b"compressed-or-otherwise-encoded-wire-body",
             "provider|POST|https://example.test/responses",
             false,
@@ -1997,10 +2587,17 @@ mod tests {
     #[test]
     fn forged_manual_summary_marker_is_not_internal_without_active_handoff() {
         let session_id = "forged-summary-marker";
-        let body = br#"{"input":[{"type":"message","content":"[CCSwitch internal request: manual-summary-v1] Create a faithful handoff summary of this coding session for a fresh session. This is a manual coding-agent summary, not context compaction."}]}"#;
+        let body = serde_json::to_vec(&json!({
+            "input":[{
+                "type":"message",
+                "role":"user",
+                "content":crate::codex_desktop::manual_summary_request_prompt()
+            }]
+        }))
+        .expect("summary body");
 
-        assert!(is_manual_summary_request(body));
-        assert!(!is_active_manual_summary_request(session_id, body));
+        assert!(is_manual_summary_request(&body));
+        assert!(!is_active_manual_summary_request(session_id, &body));
     }
 
     #[cfg(target_os = "windows")]
@@ -2010,8 +2607,8 @@ mod tests {
             windows_notifications_enabled: false,
             ..RequestHealthConfig::default()
         };
-        let result = review_before_upstream(
-            &config,
+        let result = review_before_upstream_with_config(
+            || config.clone(),
             "notifications-disabled-trace",
             "notifications-disabled-session",
             true,
@@ -2027,7 +2624,8 @@ mod tests {
         assert!(pending_reviews()
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .is_empty());
+            .values()
+            .all(|review| review.trace_id != "notifications-disabled-trace"));
     }
 
     #[test]

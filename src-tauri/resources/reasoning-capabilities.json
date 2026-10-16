@@ -9,11 +9,11 @@
         "schemaVersion": 2,
         "supportStatus": "confirmed_supported",
         "controlKind": "graded",
-        "supportedEfforts": ["max", "high", "low"],
+        "supportedEfforts": ["xhigh", "high"],
         "defaultEffort": "high",
-        "disableAllowed": false,
+        "disableAllowed": true,
         "upstream": {
-          "format": "object",
+          "format": "reasoning_object",
           "parameter": "reasoning.effort",
           "effortMap": {}
         },
@@ -31,11 +31,11 @@
         "schemaVersion": 2,
         "supportStatus": "confirmed_supported",
         "controlKind": "graded",
-        "supportedEfforts": ["max", "high", "low"],
+        "supportedEfforts": ["xhigh", "high"],
         "defaultEffort": "high",
-        "disableAllowed": false,
+        "disableAllowed": true,
         "upstream": {
-          "format": "object",
+          "format": "reasoning_object",
           "parameter": "reasoning.effort",
           "effortMap": {}
         },

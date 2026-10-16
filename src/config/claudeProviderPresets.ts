@@ -1279,6 +1279,25 @@ export const providerPresets: ProviderPreset[] = [
     iconColor: "#6E56CF",
   },
   {
+    name: "Opper",
+    websiteUrl: "https://opper.ai",
+    apiKeyUrl: "https://platform.opper.ai",
+    settingsConfig: {
+      env: {
+        ANTHROPIC_BASE_URL: "https://api.opper.ai/v3/compat",
+        ANTHROPIC_AUTH_TOKEN: "",
+        ANTHROPIC_MODEL: "deepseek/deepseek-v4-flash-0731",
+        ANTHROPIC_DEFAULT_HAIKU_MODEL: "deepseek/deepseek-v4-flash-0731",
+        ANTHROPIC_DEFAULT_SONNET_MODEL: "deepseek/deepseek-v4-flash-0731",
+        ANTHROPIC_DEFAULT_OPUS_MODEL: "deepseek/deepseek-v4-flash-0731",
+      },
+    },
+    category: "aggregator",
+    apiFormat: "openai_chat",
+    modelsUrl: "https://api.opper.ai/v3/compat/models",
+    endpointCandidates: ["https://api.opper.ai/v3/compat"],
+  },
+  {
     name: "TheRouter",
     websiteUrl: "https://therouter.ai",
     apiKeyUrl: "https://dashboard.therouter.ai",

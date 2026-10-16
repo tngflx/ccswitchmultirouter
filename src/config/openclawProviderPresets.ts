@@ -2543,18 +2543,6 @@ export const openclawProviderPresets: OpenClawProviderPreset[] = [
           id: "kilo-auto/free",
           name: "Kilo Auto (Free)",
         },
-        {
-          id: "minimax/minimax-m2.1:free",
-          name: "MiniMax M2.1 (Free)",
-        },
-        {
-          id: "z-ai/glm-5:free",
-          name: "GLM-5 (Free)",
-        },
-        {
-          id: "google/gemma-4-26b-a4b-it:free",
-          name: "Gemma 4 26B (Free)",
-        },
       ],
     },
     category: "aggregator",
@@ -2571,10 +2559,38 @@ export const openclawProviderPresets: OpenClawProviderPreset[] = [
       model: { primary: "kilo/kilo-auto/free" },
       modelCatalog: {
         "kilo/kilo-auto/free": { alias: "Kilo Auto (Free)" },
-        "kilo/minimax/minimax-m2.1:free": { alias: "MiniMax M2.1 (Free)" },
-        "kilo/z-ai/glm-5:free": { alias: "GLM-5 (Free)" },
-        "kilo/google/gemma-4-26b-a4b-it:free": {
-          alias: "Gemma 4 26B (Free)",
+      },
+    },
+  },
+  {
+    name: "Opper",
+    websiteUrl: "https://opper.ai",
+    apiKeyUrl: "https://platform.opper.ai",
+    settingsConfig: {
+      baseUrl: "https://api.opper.ai/v3/compat",
+      apiKey: "",
+      api: "openai-completions",
+      models: [
+        {
+          id: "deepseek/deepseek-v4-flash-0731",
+          name: "DeepSeek V4 Flash (0731)",
+          contextWindow: 1048576,
+        },
+      ],
+    },
+    category: "aggregator",
+    templateValues: {
+      apiKey: {
+        label: "API Key",
+        placeholder: "",
+        editorValue: "",
+      },
+    },
+    suggestedDefaults: {
+      model: { primary: "opper/deepseek/deepseek-v4-flash-0731" },
+      modelCatalog: {
+        "opper/deepseek/deepseek-v4-flash-0731": {
+          alias: "DeepSeek V4 Flash (0731)",
         },
       },
     },

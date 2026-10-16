@@ -1,0 +1,23 @@
+model_provider = "custom"
+model = "qwen-visible"
+model_reasoning_effort = "medium"
+disable_response_storage = true
+web_search = "live"
+model_catalog_json = 'H:\repos\ccswitchmulti-refork\.tmp\protocol-test-home\.codex\cc-switch-model-catalog.json'
+
+[model_providers.custom]
+name = "NewAPI"
+base_url = "https://gateway.example/v1"
+wire_api = "responses"
+models = [{ model = "qwen-visible", slug = "qwen-visible", id = "qwen-visible", upstreamModel = "Qwen/Qwen3.8", upstream_model = "Qwen/Qwen3.8", display_name = "[UUPes] qwen-visible", displayName = "[UUPes] qwen-visible", description = "[UUPes] qwen-visible", context_window = 128000, contextWindow = 128000, supported_reasoning_levels = [], supported_reasoning_efforts = [], supportedReasoningEfforts = [], additional_speed_tiers = [], additionalSpeedTiers = [], service_tiers = [], serviceTiers = [], input_modalities = ["text", "image"], inputModalities = ["text", "image"], multi_agent_version = "v2", multiAgentVersion = "v2", visibility = "list", show_in_picker = true, supported_in_api = true, hidden = false, isDefault = true }, { model = "glm-visible", slug = "glm-visible", id = "glm-visible", upstreamModel = "zai-org/GLM-4.5", upstream_model = "zai-org/GLM-4.5", display_name = "[UUPat] glm-visible", displayName = "[UUPat] glm-visible", description = "[UUPat] glm-visible", context_window = 128000, contextWindow = 128000, supported_reasoning_levels = [], supported_reasoning_efforts = [], supportedReasoningEfforts = [], additional_speed_tiers = [], additionalSpeedTiers = [], service_tiers = [], serviceTiers = [], input_modalities = ["text", "image"], inputModalities = ["text", "image"], multi_agent_version = "v2", multiAgentVersion = "v2", visibility = "list", show_in_picker = true, supported_in_api = true, hidden = false, isDefault = false }]
+
+[agents]
+max_concurrent_threads_per_session = 10
+max_depth = 1
+
+[features]
+
+[features.multi_agent_v2]
+enabled = true
+hide_spawn_agent_metadata = true
+tool_namespace = "agents"

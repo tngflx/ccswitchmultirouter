@@ -178,6 +178,7 @@ import { CodexEgressTimezoneStatusCard } from "./CodexEgressTimezoneStatusCard";
 import { CodexSessionTrafficPanel } from "./CodexSessionTrafficPanel";
 import { StreamRetryActivityPanel } from "./StreamRetryActivityPanel";
 import { RequestHealthPanel } from "@/components/settings/RequestHealthPanel";
+import { useRequestHealthDiagnostics } from "@/hooks/useRequestHealthDiagnostics";
 import type {
   CodexModelDisplayStyle,
   CodexOfficialAuthConfig,
@@ -200,7 +201,6 @@ import type {
   CodexRouterLogEvent,
   GlobalProxyConfig,
   ProxyStatus,
-  RequestHealthSnapshot,
 } from "@/types/proxy";
 
 export type WorkspaceTab =
@@ -983,8 +983,6 @@ export function providerWithFetchedModelCatalog(
 ): Provider {
   const currentCatalog = readCodexModelCatalog(provider);
   const fetchConfig = getProviderModelFetchConfig(provider);
-  const shouldAppendFetchedModels =
-    currentCatalog.models.length === 0 || isWizardCodexOAuthSource(provider);
   const result = reconcileFetchedCodexCatalogRows(
     currentCatalog.models,
     fetchedModels,
@@ -994,7 +992,9 @@ export function providerWithFetchedModelCatalog(
       baseUrl: fetchConfig.baseUrl,
     },
     {
-      appendNew: shouldAppendFetchedModels,
+      // Keep the full fetched inventory visible while preserving the current
+      // route selection. New rows are disabled when a catalog already exists.
+      appendNew: true,
       createRow: (seed) => seed as CodexCatalogModel,
       existingMetadataMode: "refresh",
       // A successful fetch is the source of truth for routing. Rows omitted
@@ -8511,9 +8511,12 @@ function StatusTab({
   const [statusView, setStatusView] = useState<StatusView>("link");
   const trafficViewActive = statusView === "traffic";
   const requestHealthViewActive = statusView === "request-health";
-  const [requestHealthSnapshot, setRequestHealthSnapshot] =
-    useState<RequestHealthSnapshot>();
-  const [requestHealthLoading, setRequestHealthLoading] = useState(false);
+  const {
+    snapshot: requestHealthSnapshot,
+    isRefreshing: requestHealthLoading,
+    error: requestHealthError,
+    refresh: refreshRequestHealth,
+  } = useRequestHealthDiagnostics(requestHealthViewActive);
   const { data: requestLogs, isLoading } = useRequestLogs({
     filters: { appType: "codex" },
     range,
@@ -8580,26 +8583,6 @@ function StatusTab({
   const [sessionSyncMessage, setSessionSyncMessage] = useState<string | null>(
     null,
   );
-
-  async function refreshRequestHealth() {
-    setRequestHealthLoading(true);
-    try {
-      setRequestHealthSnapshot(await proxyApi.getRequestHealthDiagnostics());
-    } catch (error) {
-      console.error(
-        "[StatusTab] Failed to load request-health diagnostics",
-        error,
-      );
-    } finally {
-      setRequestHealthLoading(false);
-    }
-  }
-
-  useEffect(() => {
-    if (requestHealthViewActive) {
-      void refreshRequestHealth();
-    }
-  }, [requestHealthViewActive]);
 
   const logs = requestLogs?.data ?? [];
   const proxyLogs = logs.filter(
@@ -9303,8 +9286,8 @@ function StatusTab({
           mode="status"
           snapshot={requestHealthSnapshot}
           isRefreshing={requestHealthLoading}
+          loadError={requestHealthError}
           onRefresh={() => void refreshRequestHealth()}
-          onSaved={() => void refreshRequestHealth()}
         />
       )}
 

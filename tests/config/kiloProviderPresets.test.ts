@@ -9,15 +9,15 @@ import { piProviderPresets } from "@/config/piProviderPresets";
 
 const KILO_BASE_URL = "https://api.kilo.ai/api/gateway";
 const KILO_API_KEY_URL = "https://app.kilo.ai/profile";
-const KILO_MODELS = [
-  "kilo-auto/free",
+const KILO_MODEL = "kilo-auto/free";
+const STALE_KILO_MODELS = [
   "minimax/minimax-m2.1:free",
   "z-ai/glm-5:free",
   "google/gemma-4-26b-a4b-it:free",
 ];
 
 describe("Kilo provider presets", () => {
-  it("exposes the gateway and free model catalog in every OpenAI-compatible app", () => {
+  it("exposes the gateway with one stable model seed in every OpenAI-compatible app", () => {
     const codex = codexProviderPresets.find((preset) => preset.name === "Kilo");
     const claude = providerPresets.find((preset) => preset.name === "Kilo");
     const desktop = claudeDesktopProviderPresets.find(
@@ -39,9 +39,15 @@ describe("Kilo provider presets", () => {
       apiKeyUrl: KILO_API_KEY_URL,
       endpointCandidates: [KILO_BASE_URL],
       apiFormat: "openai_chat",
-      modelCatalog: expect.arrayContaining(
-        KILO_MODELS.map((model) => expect.objectContaining({ model })),
-      ),
+      modelCatalog: [
+        expect.objectContaining({
+          model: KILO_MODEL,
+          reasoning: expect.objectContaining({
+            supportStatus: "unknown",
+            controlKind: "unknown",
+          }),
+        }),
+      ],
     });
     expect(codex?.config).toContain(`base_url = "${KILO_BASE_URL}"`);
 
@@ -106,8 +112,25 @@ describe("Kilo provider presets", () => {
         api: "openai-completions",
       },
     });
-    expect(pi?.settingsConfig.models.map((model) => model.id)).toEqual(
-      KILO_MODELS,
-    );
+    expect(pi?.settingsConfig.models.map((model) => model.id)).toEqual([
+      KILO_MODEL,
+    ]);
+    expect(pi?.settingsConfig.models[0]).toMatchObject({
+      contextWindow: 256_000,
+      maxTokens: 32_768,
+    });
+
+    const serializedPresets = JSON.stringify([
+      codex,
+      claude,
+      desktop,
+      opencode,
+      openclaw,
+      hermes,
+      pi,
+    ]);
+    for (const staleModel of STALE_KILO_MODELS) {
+      expect(serializedPresets).not.toContain(staleModel);
+    }
   });
 });

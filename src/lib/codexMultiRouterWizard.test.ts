@@ -476,6 +476,48 @@ describe("buildCodexMultiRouterWizardPlan subagent version", () => {
     ]);
   });
 
+  it("writes only the canonical catalog while preserving fetched provider metadata", () => {
+    const source: Provider = {
+      ...deepseekSource,
+      settingsConfig: {
+        ...deepseekSource.settingsConfig,
+        modelCatalog: undefined,
+        model_catalog: {
+          models: [
+            {
+              model: "public-model",
+              upstreamModel: "wire-model",
+              displayName: "My Model",
+            },
+          ],
+        },
+      },
+    };
+
+    const refreshed = mergeFetchedModelsIntoWizardProvider(source, [
+      {
+        id: "provider-model",
+        ownedBy: null,
+        upstreamModel: "wire-model",
+        displayName: "Provider Model",
+        canonicalSlug: "provider-family",
+        aliases: { "previous-model": "provider-model" },
+      },
+    ]);
+
+    expect(refreshed.settingsConfig).not.toHaveProperty("model_catalog");
+    expect(refreshed.settingsConfig.modelCatalog.models).toEqual([
+      expect.objectContaining({
+        model: "public-model",
+        upstreamModel: "wire-model",
+        displayName: "My Model",
+        canonicalSlug: "provider-family",
+        aliases: { "previous-model": "provider-model" },
+      }),
+    ]);
+    expect(source.settingsConfig).toHaveProperty("model_catalog");
+  });
+
   it("restores mixed route selections only from current included source catalogs", () => {
     const source = {
       ...deepseekSource,

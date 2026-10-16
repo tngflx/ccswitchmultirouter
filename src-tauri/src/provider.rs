@@ -854,8 +854,9 @@ impl ProviderMeta {
             return true;
         }
 
-        self.codex_local_model_mapping
-            .unwrap_or_else(|| settings_config.get("modelCatalog").is_some())
+        self.codex_local_model_mapping.unwrap_or_else(|| {
+            crate::codex_multirouter::catalog::read_catalog(settings_config).is_some()
+        })
     }
 
     /// 经校验的 Provider 级自定义 User-Agent。见 [`parse_custom_user_agent`]。

@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { Loader2, RadioTower, RefreshCw, Settings2 } from "lucide-react";
 import { useTranslation } from "react-i18next";
+import { useQueryClient } from "@tanstack/react-query";
 import {
   Popover,
   PopoverContent,
@@ -35,6 +36,7 @@ export function StreamRetryHeaderToggle({
   onOpenActivity,
 }: StreamRetryHeaderToggleProps) {
   const { t } = useTranslation();
+  const queryClient = useQueryClient();
   const { data: settings, isLoading } = useSettingsQuery();
   const mode = resolveMode(
     settings?.streamRetryMode,
@@ -54,6 +56,7 @@ export function StreamRetryHeaderToggle({
     setIsSaving(true);
     try {
       await settingsApi.patch(patch);
+      await queryClient.invalidateQueries({ queryKey: ["settings"] });
     } finally {
       setIsSaving(false);
     }

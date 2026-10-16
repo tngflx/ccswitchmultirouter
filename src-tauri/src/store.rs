@@ -1,8 +1,9 @@
 use crate::database::Database;
 use crate::protocol_compatibility::{
-    ProtocolCompatibilityProbeResult, ProtocolCompatibilityRecord,
+    ProbeReadiness, ProtocolCompatibilityProbeResult, ProtocolCompatibilityRecord, TransportKind,
 };
 use crate::services::{ProxyService, UsageCache};
+use sha2::{Digest, Sha256};
 use std::{
     collections::{HashMap, HashSet},
     sync::{
@@ -22,7 +23,7 @@ pub struct AppState {
     protocol_probes_in_flight: Arc<Mutex<HashSet<String>>>,
     protocol_probe_released: Arc<tokio::sync::Notify>,
     protocol_probe_receipts: Arc<Mutex<HashMap<String, ProtocolProbeReceipt>>>,
-    codex_provider_set_probe_receipts: Arc<Mutex<HashMap<String, CodexProviderSetProbeReceipt>>>,
+    codex_provider_set_probe_receipts: Arc<Mutex<CodexProviderSetProbeReceiptState>>,
     codex_startup_reconciliation_pending: AtomicBool,
 }
 
@@ -36,8 +37,82 @@ struct ProtocolProbeReceipt {
 struct CodexProviderSetProbeReceipt {
     record: ProtocolCompatibilityRecord,
     observations: Vec<ProtocolCompatibilityRecord>,
+    observation_order: CodexProviderSetProbeObservationOrder,
+    binding_key: String,
     expires_at: Instant,
     claim_token: Option<String>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct CodexProviderSetProbeObservationOrder {
+    tested_at: i64,
+    observed_at: Option<Instant>,
+}
+
+#[derive(Default)]
+struct CodexProviderSetProbeReceiptState {
+    receipts: HashMap<String, CodexProviderSetProbeReceipt>,
+    observation_orders: HashMap<String, (CodexProviderSetProbeObservationOrder, i64)>,
+    committed_verified: HashMap<String, (CodexProviderSetProbeObservationOrder, i64)>,
+}
+
+impl CodexProviderSetProbeReceiptState {
+    fn record_order(
+        &self,
+        record: &ProtocolCompatibilityRecord,
+    ) -> CodexProviderSetProbeObservationOrder {
+        self.observation_orders
+            .get(&provider_set_probe_record_identity(record))
+            .map(|(order, _)| *order)
+            .unwrap_or(CodexProviderSetProbeObservationOrder {
+                tested_at: record.tested_at,
+                observed_at: None,
+            })
+    }
+
+    fn is_superseded(&self, receipt: &CodexProviderSetProbeReceipt) -> bool {
+        provider_set_record_is_adverse(&receipt.record)
+            && self
+                .committed_verified
+                .get(&receipt.binding_key)
+                .is_some_and(|(order, _)| *order > receipt.observation_order)
+    }
+
+    fn retire_superseded_unclaimed(&mut self) {
+        let committed_verified = &self.committed_verified;
+        self.receipts.retain(|_, receipt| {
+            receipt.claim_token.is_some()
+                || !provider_set_record_is_adverse(&receipt.record)
+                || committed_verified
+                    .get(&receipt.binding_key)
+                    .is_none_or(|(order, _)| *order <= receipt.observation_order)
+        });
+    }
+}
+
+fn provider_set_record_is_adverse(record: &ProtocolCompatibilityRecord) -> bool {
+    record.result.readiness != ProbeReadiness::Verified
+        || record.result.selected_transport != Some(record.target.transport)
+}
+
+fn provider_set_probe_record_identity(record: &ProtocolCompatibilityRecord) -> String {
+    let encoded = serde_json::to_vec(record).expect("protocol probe records serialize");
+    hex::encode(Sha256::digest(encoded))
+}
+
+fn provider_set_probe_binding_key(observations: &[ProtocolCompatibilityRecord]) -> String {
+    let targets = [TransportKind::OpenAiResponses, TransportKind::OpenAiChat]
+        .into_iter()
+        .map(|transport| {
+            &observations
+                .iter()
+                .find(|observation| observation.target.transport == transport)
+                .expect("validated receipt contains both transport observations")
+                .target
+        })
+        .collect::<Vec<_>>();
+    let encoded = serde_json::to_vec(&targets).expect("protocol probe targets serialize");
+    hex::encode(Sha256::digest(encoded))
 }
 
 #[derive(Clone)]
@@ -50,7 +125,7 @@ pub(crate) struct CodexProviderSetProbeReceiptClaim {
     receipt_ids: Vec<String>,
     claim_token: String,
     bundles: Vec<CodexProviderSetProbeReceiptBundle>,
-    receipts: Arc<Mutex<HashMap<String, CodexProviderSetProbeReceipt>>>,
+    receipts: Arc<Mutex<CodexProviderSetProbeReceiptState>>,
     finished: bool,
 }
 
@@ -71,17 +146,31 @@ impl CodexProviderSetProbeReceiptClaim {
         };
         for receipt_id in &self.receipt_ids {
             let owned = receipts
+                .receipts
                 .get(receipt_id)
                 .and_then(|receipt| receipt.claim_token.as_deref())
                 == Some(self.claim_token.as_str());
             if owned {
-                receipts.remove(receipt_id);
+                let receipt = receipts
+                    .receipts
+                    .remove(receipt_id)
+                    .expect("owned Provider Set receipt remains present while locked");
+                if !provider_set_record_is_adverse(&receipt.record) {
+                    let verified = receipts
+                        .committed_verified
+                        .entry(receipt.binding_key)
+                        .or_insert((receipt.observation_order, receipt.record.expires_at));
+                    if receipt.observation_order > verified.0 {
+                        *verified = (receipt.observation_order, receipt.record.expires_at);
+                    }
+                }
             } else {
                 log::error!(
                     "Committed Codex Provider Set receipt claim lost ownership before consumption: {receipt_id}"
                 );
             }
         }
+        receipts.retire_superseded_unclaimed();
         self.finished = true;
     }
 }
@@ -96,12 +185,13 @@ impl Drop for CodexProviderSetProbeReceiptClaim {
             Err(poisoned) => poisoned.into_inner(),
         };
         for receipt_id in &self.receipt_ids {
-            if let Some(receipt) = receipts.get_mut(receipt_id) {
+            if let Some(receipt) = receipts.receipts.get_mut(receipt_id) {
                 if receipt.claim_token.as_deref() == Some(self.claim_token.as_str()) {
                     receipt.claim_token = None;
                 }
             }
         }
+        receipts.retire_superseded_unclaimed();
     }
 }
 
@@ -132,7 +222,9 @@ impl AppState {
             protocol_probes_in_flight: Arc::new(Mutex::new(HashSet::new())),
             protocol_probe_released: Arc::new(tokio::sync::Notify::new()),
             protocol_probe_receipts: Arc::new(Mutex::new(HashMap::new())),
-            codex_provider_set_probe_receipts: Arc::new(Mutex::new(HashMap::new())),
+            codex_provider_set_probe_receipts: Arc::new(Mutex::new(
+                CodexProviderSetProbeReceiptState::default(),
+            )),
             // Tests, CLI helpers and command-only AppState instances do not run the
             // Desktop startup recovery pipeline. The real app explicitly opens the
             // gate before exposing its renderer.
@@ -226,10 +318,45 @@ impl AppState {
         Ok(receipts.remove(key).map(|receipt| receipt.result))
     }
 
+    #[cfg(test)]
     pub(crate) fn remember_codex_provider_set_probe_receipt(
         &self,
         record: ProtocolCompatibilityRecord,
         observations: Vec<ProtocolCompatibilityRecord>,
+    ) -> Result<String, String> {
+        self.remember_observed_codex_provider_set_probe_receipt(
+            record,
+            observations,
+            Instant::now(),
+        )
+    }
+
+    pub(crate) fn remember_observed_codex_provider_set_probe_receipt(
+        &self,
+        record: ProtocolCompatibilityRecord,
+        observations: Vec<ProtocolCompatibilityRecord>,
+        observed_at: Instant,
+    ) -> Result<String, String> {
+        self.remember_codex_provider_set_probe_receipt_with_origin(
+            record,
+            observations,
+            Some(observed_at),
+        )
+    }
+
+    pub(crate) fn remember_restored_codex_provider_set_probe_receipt(
+        &self,
+        record: ProtocolCompatibilityRecord,
+        observations: Vec<ProtocolCompatibilityRecord>,
+    ) -> Result<String, String> {
+        self.remember_codex_provider_set_probe_receipt_with_origin(record, observations, None)
+    }
+
+    fn remember_codex_provider_set_probe_receipt_with_origin(
+        &self,
+        record: ProtocolCompatibilityRecord,
+        observations: Vec<ProtocolCompatibilityRecord>,
+        observed_at: Option<Instant>,
     ) -> Result<String, String> {
         let logical_target_matches = |observation: &ProtocolCompatibilityRecord| {
             observation.target.provider_id == record.target.provider_id
@@ -237,17 +364,17 @@ impl AppState {
                 && observation.target.public_model == record.target.public_model
                 && observation.target.upstream_model == record.target.upstream_model
                 && observation.result.selected_transport == record.result.selected_transport
+                && observation.tested_at == record.tested_at
+                && observation.probe_version == record.probe_version
         };
         if observations.len() != 2
             || !observations.iter().all(logical_target_matches)
-            || !observations.iter().any(|observation| {
-                observation.target.transport
-                    == crate::protocol_compatibility::TransportKind::OpenAiResponses
-            })
-            || !observations.iter().any(|observation| {
-                observation.target.transport
-                    == crate::protocol_compatibility::TransportKind::OpenAiChat
-            })
+            || !observations
+                .iter()
+                .any(|observation| observation.target.transport == TransportKind::OpenAiResponses)
+            || !observations
+                .iter()
+                .any(|observation| observation.target.transport == TransportKind::OpenAiChat)
         {
             return Err("codex_provider_set_probe_observation_mismatch".to_string());
         }
@@ -256,18 +383,58 @@ impl AppState {
             .codex_provider_set_probe_receipts
             .lock()
             .map_err(|_| "Codex Provider Set receipt state is unavailable".to_string())?;
-        receipts.retain(|_, receipt| receipt.expires_at > now || receipt.claim_token.is_some());
+        receipts
+            .receipts
+            .retain(|_, receipt| receipt.expires_at > now || receipt.claim_token.is_some());
+        let evidence_now = chrono::Utc::now().timestamp();
+        receipts
+            .observation_orders
+            .retain(|_, (_, expires_at)| *expires_at >= evidence_now);
+        receipts
+            .committed_verified
+            .retain(|_, (_, expires_at)| *expires_at >= evidence_now);
+        let observation_order = observed_at
+            .map(|observed_at| CodexProviderSetProbeObservationOrder {
+                tested_at: record.tested_at,
+                observed_at: Some(observed_at),
+            })
+            // Reissuing a receipt is not a new observation. Unknown persisted
+            // evidence stays below a genuine live observation in the same second.
+            .unwrap_or_else(|| receipts.record_order(&record));
+        let identity = provider_set_probe_record_identity(&record);
+        let original_order = receipts
+            .observation_orders
+            .entry(identity)
+            .or_insert((observation_order, record.expires_at));
+        if observation_order > original_order.0 {
+            *original_order = (observation_order, record.expires_at);
+        }
+        let binding_key = provider_set_probe_binding_key(&observations);
         let receipt_id = uuid::Uuid::new_v4().to_string();
-        receipts.insert(
+        receipts.receipts.insert(
             receipt_id.clone(),
             CodexProviderSetProbeReceipt {
                 record,
                 observations,
+                observation_order,
+                binding_key,
                 expires_at: now + PROTOCOL_PROBE_RECEIPT_TTL,
                 claim_token: None,
             },
         );
+        receipts.retire_superseded_unclaimed();
         Ok(receipt_id)
+    }
+
+    pub(crate) fn codex_provider_set_probe_record_order(
+        &self,
+        record: &ProtocolCompatibilityRecord,
+    ) -> Result<CodexProviderSetProbeObservationOrder, String> {
+        let receipts = self
+            .codex_provider_set_probe_receipts
+            .lock()
+            .map_err(|_| "Codex Provider Set receipt state is unavailable".to_string())?;
+        Ok(receipts.record_order(record))
     }
 
     pub(crate) fn get_codex_provider_set_probe_receipts(
@@ -279,7 +446,9 @@ impl AppState {
             .codex_provider_set_probe_receipts
             .lock()
             .map_err(|_| "Codex Provider Set receipt state is unavailable".to_string())?;
-        receipts.retain(|_, receipt| receipt.expires_at > now || receipt.claim_token.is_some());
+        receipts
+            .receipts
+            .retain(|_, receipt| receipt.expires_at > now || receipt.claim_token.is_some());
         let mut seen = HashSet::new();
         receipt_ids
             .iter()
@@ -290,6 +459,7 @@ impl AppState {
                     ));
                 }
                 receipts
+                    .receipts
                     .get(receipt_id)
                     .map(|receipt| CodexProviderSetProbeReceiptBundle {
                         record: receipt.record.clone(),
@@ -298,6 +468,29 @@ impl AppState {
                     .ok_or_else(|| format!("codex_provider_set_probe_required: {receipt_id}"))
             })
             .collect()
+    }
+
+    pub(crate) fn list_live_codex_provider_set_probe_receipts(
+        &self,
+    ) -> Result<Vec<CodexProviderSetProbeReceiptBundle>, String> {
+        let now = Instant::now();
+        let receipts = self
+            .codex_provider_set_probe_receipts
+            .lock()
+            .map_err(|_| "Codex Provider Set receipt state is unavailable".to_string())?;
+        let mut live = receipts
+            .receipts
+            .values()
+            .filter(|receipt| receipt.expires_at > now && !receipts.is_superseded(receipt))
+            .collect::<Vec<_>>();
+        live.sort_by_key(|receipt| receipt.observation_order);
+        Ok(live
+            .into_iter()
+            .map(|receipt| CodexProviderSetProbeReceiptBundle {
+                record: receipt.record.clone(),
+                observations: receipt.observations.clone(),
+            })
+            .collect())
     }
 
     pub(crate) fn claim_codex_provider_set_probe_receipts(
@@ -309,7 +502,9 @@ impl AppState {
             .codex_provider_set_probe_receipts
             .lock()
             .map_err(|_| "Codex Provider Set receipt state is unavailable".to_string())?;
-        receipts.retain(|_, receipt| receipt.expires_at > now || receipt.claim_token.is_some());
+        receipts
+            .receipts
+            .retain(|_, receipt| receipt.expires_at > now || receipt.claim_token.is_some());
         let mut seen = HashSet::new();
         for receipt_id in receipt_ids {
             if !seen.insert(receipt_id.as_str()) {
@@ -318,6 +513,7 @@ impl AppState {
                 ));
             }
             let receipt = receipts
+                .receipts
                 .get(receipt_id)
                 .ok_or_else(|| format!("codex_provider_set_probe_required: {receipt_id}"))?;
             if receipt.claim_token.is_some() {
@@ -332,6 +528,7 @@ impl AppState {
             .iter()
             .map(|receipt_id| {
                 let receipt = receipts
+                    .receipts
                     .get_mut(receipt_id)
                     .expect("validated Provider Set receipt must remain present while locked");
                 receipt.claim_token = Some(claim_token.clone());
@@ -489,9 +686,24 @@ mod tests {
             .codex_provider_set_probe_receipts
             .lock()
             .expect("Provider Set receipt lock")
+            .receipts
             .get_mut(&receipt_id)
             .expect("stored Provider Set receipt")
             .expires_at = Instant::now() - Duration::from_secs(1);
+        assert!(state
+            .list_live_codex_provider_set_probe_receipts()
+            .expect("inspect live receipt evidence")
+            .is_empty());
+        assert_eq!(
+            state
+                .codex_provider_set_probe_receipts
+                .lock()
+                .unwrap()
+                .receipts
+                .len(),
+            1,
+            "read-only inspection must not prune or consume stored receipts"
+        );
         let expired = match state.get_codex_provider_set_probe_receipts(&[receipt_id]) {
             Ok(_) => panic!("expired Provider Set receipt must not be returned"),
             Err(error) => error,
@@ -501,6 +713,7 @@ mod tests {
             .codex_provider_set_probe_receipts
             .lock()
             .expect("Provider Set receipt lock")
+            .receipts
             .is_empty());
     }
 
@@ -574,5 +787,177 @@ mod tests {
             Err(error) => error,
         };
         assert!(consumed.contains("codex_provider_set_probe_required"));
+    }
+
+    fn ordered_provider_set_bundle(
+        provider_id: &str,
+        public_model: &str,
+        credential: &str,
+        selected_transport: Option<TransportKind>,
+        tested_at: i64,
+    ) -> (
+        ProtocolCompatibilityRecord,
+        Vec<ProtocolCompatibilityRecord>,
+    ) {
+        let record_for = |transport| {
+            ProtocolCompatibilityRecord::new(
+                crate::protocol_compatibility::ProbeTargetKey::new(
+                    provider_id,
+                    None::<String>,
+                    public_model,
+                    "upstream-a",
+                    transport,
+                    match transport {
+                        TransportKind::OpenAiResponses => "https://relay.example/v1/responses",
+                        TransportKind::OpenAiChat => "https://relay.example/v1/chat/completions",
+                    },
+                    "bearer",
+                )
+                .unwrap()
+                .with_credential(credential),
+                ProtocolCompatibilityProbeResult {
+                    selected_transport,
+                    readiness: if selected_transport.is_some() {
+                        ProbeReadiness::Verified
+                    } else {
+                        ProbeReadiness::Unverified
+                    },
+                    branches: Vec::new(),
+                },
+                tested_at,
+                tested_at + 600,
+            )
+        };
+        (
+            record_for(selected_transport.unwrap_or(TransportKind::OpenAiResponses)),
+            vec![
+                record_for(TransportKind::OpenAiResponses),
+                record_for(TransportKind::OpenAiChat),
+            ],
+        )
+    }
+
+    #[test]
+    fn committed_success_preserves_later_claimed_and_unrelated_receipt_evidence() {
+        let state = AppState::new(Arc::new(Database::memory().unwrap()));
+        let tested_at = chrono::Utc::now().timestamp();
+        let original_time = Instant::now();
+        let mut order = 0;
+        let mut remember = |provider_id, model, credential, selected| {
+            let (record, observations) =
+                ordered_provider_set_bundle(provider_id, model, credential, selected, tested_at);
+            order += 1;
+            state
+                .remember_observed_codex_provider_set_probe_receipt(
+                    record,
+                    observations,
+                    original_time + Duration::from_millis(order),
+                )
+                .unwrap()
+        };
+        let old_failed = remember("provider-a", "model-a", "redacted-key-a", None);
+        let claimed_failed = remember("provider-a", "model-a", "redacted-key-a", None);
+        let other_provider = remember("provider-b", "model-a", "redacted-key-a", None);
+        let other_model = remember("provider-a", "model-b", "redacted-key-a", None);
+        let other_credential = remember("provider-a", "model-a", "redacted-key-b", None);
+        let old_claim = state
+            .claim_codex_provider_set_probe_receipts(std::slice::from_ref(&claimed_failed))
+            .unwrap();
+        let verified = remember(
+            "provider-a",
+            "model-a",
+            "redacted-key-a",
+            Some(TransportKind::OpenAiChat),
+        );
+        let later_failed = remember("provider-a", "model-a", "redacted-key-a", None);
+        let later_record = state
+            .get_codex_provider_set_probe_receipts(std::slice::from_ref(&later_failed))
+            .unwrap()[0]
+            .record
+            .clone();
+        state
+            .claim_codex_provider_set_probe_receipts(std::slice::from_ref(&verified))
+            .unwrap()
+            .consume_after_database_commit();
+
+        assert!(state
+            .get_codex_provider_set_probe_receipts(&[old_failed, verified])
+            .is_err());
+        assert_eq!(old_claim.bundles().len(), 1);
+        assert!(state
+            .get_codex_provider_set_probe_receipts(std::slice::from_ref(&claimed_failed))
+            .is_ok());
+        assert!(state
+            .get_codex_provider_set_probe_receipts(&[
+                other_provider,
+                other_model,
+                other_credential,
+                later_failed,
+            ])
+            .is_ok());
+        let live = state.list_live_codex_provider_set_probe_receipts().unwrap();
+        assert_eq!(
+            live.len(),
+            4,
+            "superseded claimed proof is not current authority"
+        );
+        assert_eq!(live.last().unwrap().record, later_record);
+        drop(old_claim);
+        assert!(state
+            .get_codex_provider_set_probe_receipts(&[claimed_failed])
+            .is_err());
+    }
+
+    #[test]
+    fn receipt_registration_delay_and_reissue_do_not_change_observation_order() {
+        let state = AppState::new(Arc::new(Database::memory().unwrap()));
+        let tested_at = chrono::Utc::now().timestamp();
+        let original_time = Instant::now();
+        let (failed, failed_observations) =
+            ordered_provider_set_bundle("provider-a", "model-a", "redacted-key", None, tested_at);
+        let (verified, verified_observations) = ordered_provider_set_bundle(
+            "provider-a",
+            "model-a",
+            "redacted-key",
+            Some(TransportKind::OpenAiChat),
+            tested_at,
+        );
+        let verified_id = state
+            .remember_observed_codex_provider_set_probe_receipt(
+                verified.clone(),
+                verified_observations,
+                original_time + Duration::from_millis(1),
+            )
+            .unwrap();
+        state
+            .remember_observed_codex_provider_set_probe_receipt(
+                failed.clone(),
+                failed_observations.clone(),
+                original_time,
+            )
+            .unwrap();
+        state
+            .remember_restored_codex_provider_set_probe_receipt(
+                failed.clone(),
+                failed_observations.clone(),
+            )
+            .unwrap();
+        let live = state.list_live_codex_provider_set_probe_receipts().unwrap();
+        assert_eq!(live.last().unwrap().record, verified);
+        state
+            .claim_codex_provider_set_probe_receipts(&[verified_id])
+            .unwrap()
+            .consume_after_database_commit();
+        assert!(state
+            .list_live_codex_provider_set_probe_receipts()
+            .unwrap()
+            .is_empty());
+        state
+            .remember_restored_codex_provider_set_probe_receipt(failed, failed_observations)
+            .unwrap();
+        assert!(state
+            .list_live_codex_provider_set_probe_receipts()
+            .unwrap()
+            .is_empty());
     }
 }

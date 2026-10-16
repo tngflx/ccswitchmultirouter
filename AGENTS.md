@@ -83,3 +83,12 @@ Before a renderer or desktop release, use the repository's gated build path
 the build. Source checks do not prove that an installed application was
 rebuilt, that a release artifact was installed, or that live provider
 requests work; report those boundaries explicitly.
+
+## Live Audit Tooling
+
+- For live runtime/CDP/provider audits, use the repository's configured background automation/monitor instead of directly driving the full workspace UI or broad workspace-wide scans.
+- Keep live audits scoped to the target app, its configured log directory, and the active provider/session. Do not use Computer Use or whole-workspace searches for routine live diagnostics unless the user explicitly asks for UI automation.
+- When a background automation is available, prefer its structured diagnostics and attach the resulting evidence to the current investigation.
+- If the configured monitor/tool is unavailable, report that limitation instead
+  of substituting UI automation or broad scans. Source inspection and passing
+  tests must not be presented as a completed live audit.

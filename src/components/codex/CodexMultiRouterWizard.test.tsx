@@ -9,6 +9,7 @@ import {
 import * as modelFetchApi from "@/lib/api/model-fetch";
 import { describe, expect, it, vi } from "vitest";
 import type { Provider } from "@/types";
+import type { CodexProviderProtocolPreflightOutcome } from "@/lib/api/protocol-compatibility";
 import type { ComponentProps } from "react";
 import { providersApi } from "@/lib/api/providers";
 import {
@@ -116,7 +117,774 @@ function renderWizard(
   };
 }
 
+function protocolOutcome(
+  source: Provider,
+  models: Array<{
+    model: string;
+    transport: "open_ai_responses" | "open_ai_chat";
+    verified?: boolean;
+  }>,
+  receiptModels: Record<string, string>,
+): CodexProviderProtocolPreflightOutcome {
+  return {
+    provider: source,
+    protocolApplied: false,
+    adaptationPreview: {
+      persistence: "single",
+      status: "partial",
+      effectiveTransport: null,
+      models: [],
+    },
+    observations: [],
+    receiptIds: Object.keys(receiptModels),
+    receiptModels,
+    records: models.map(({ model, transport, verified = true }) => ({
+      probeVersion: 1,
+      testedAt: 100,
+      expiresAt: 4102444800,
+      target: {
+        provider_id: source.id,
+        route_id: null,
+        public_model: model,
+        upstream_model: model,
+        transport,
+        authentication_kind: "bearer",
+        endpoint_fingerprint: "endpoint",
+        credential_fingerprint: "credential",
+        request_policy_fingerprint: "policy",
+      },
+      result: {
+        readiness: verified ? "verified" : "unverified",
+        selected_transport: verified ? transport : null,
+        branches: [],
+      },
+    })),
+  };
+}
+
+function savedProtocolPlan(source: Provider): Provider {
+  return {
+    id: "partial-evidence-plan",
+    name: "Partial Evidence Plan",
+    settingsConfig: {
+      codexRouting: {
+        schemaVersion: 2,
+        enabled: true,
+        routes: [
+          {
+            id: "partial-route",
+            targetProviderId: source.id,
+            modelSelection: { mode: "all" },
+          },
+        ],
+      },
+    },
+  };
+}
+
 describe("CodexMultiRouterWizard", () => {
+  it("can repair a failed API-declared model without probing healthy declarations", async () => {
+    const source: Provider = {
+      id: "incorrect-api",
+      name: "Incorrect API",
+      settingsConfig: {
+        baseUrl: "https://example.invalid/v1",
+        auth: { OPENAI_API_KEY: "test-only" },
+        modelCatalog: {
+          models: ["incorrect", "healthy"].map((model) => ({
+            model,
+            protocolCapability: {
+              schemaVersion: 1,
+              source: "provider_api",
+              baseUrl: "https://example.invalid/v1",
+              upstreamModel: model,
+              supportedEndpoints: ["openai_responses"],
+            },
+          })),
+        },
+      },
+    };
+    const plan = savedProtocolPlan(source);
+    restoreCodexProviderProtocolEvidence.mockResolvedValueOnce(
+      protocolOutcome(
+        source,
+        [
+          {
+            model: "incorrect",
+            transport: "open_ai_responses",
+            verified: false,
+          },
+        ],
+        {},
+      ),
+    );
+    let complete!: (outcome: CodexProviderProtocolPreflightOutcome) => void;
+    preflightCodexProviderProtocolCompatibility.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          complete = resolve;
+        }),
+    );
+    renderWizard([source, plan], { mode: "edit", planId: plan.id });
+    fireEvent.click(
+      screen.getByRole("button", { name: "Protocol deep probe" }),
+    );
+    await screen.findByText(/Saved records checked: reusing 1/);
+    expect(
+      screen.getByRole("button", { name: "Choose models" }),
+    ).toHaveAttribute("data-read-only", "true");
+    fireEvent.click(
+      screen.getByRole("button", {
+        name: "Run compatibility deep probe again",
+      }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Confirm test" }));
+    await screen.findByText(/Validating models 0\/1;/);
+    expect(preflightCodexProviderProtocolCompatibility).toHaveBeenCalledTimes(
+      1,
+    );
+    await act(async () =>
+      complete(
+        protocolOutcome(
+          source,
+          [{ model: "incorrect", transport: "open_ai_chat" }],
+          { "corrected-receipt": "incorrect" },
+        ),
+      ),
+    );
+    await screen.findByText("State machine:connectivityPartial");
+    fireEvent.click(screen.getByRole("button", { name: "Close" }));
+    fireEvent.click(screen.getByRole("button", { name: "Save and enable" }));
+    expect(
+      screen.getByRole("button", { name: "Save and publish" }),
+    ).toBeEnabled();
+  });
+
+  it("keeps receipt associations when partial restoration has records without receipts", async () => {
+    const source: Provider = {
+      id: "partial-receipts",
+      name: "Partial Receipts",
+      settingsConfig: {
+        baseUrl: "https://example.invalid/v1",
+        auth: { OPENAI_API_KEY: "test-only" },
+        modelCatalog: { models: [{ model: "a" }, { model: "b" }] },
+      },
+    };
+    const plan = savedProtocolPlan(source);
+    restoreCodexProviderProtocolEvidence.mockResolvedValueOnce(
+      protocolOutcome(
+        source,
+        [
+          { model: "a", transport: "open_ai_chat", verified: false },
+          { model: "b", transport: "open_ai_responses" },
+        ],
+        { "receipt-b": "b" },
+      ),
+    );
+    prepareCodexProviderSetBatch.mockResolvedValue({
+      digest: "partial-receipts",
+      sourcePreviews: [],
+      blocked: false,
+    });
+    commitCodexProviderSetBatch.mockImplementation(async (sources, router) => ({
+      router,
+      editorRouter: router,
+      sourceSnapshots: sources.map((item: { provider: Provider }) => ({
+        logicalProvider: item.provider,
+      })),
+      projections: [],
+      status: "committed",
+    }));
+    renderWizard([source, plan], { mode: "edit", planId: plan.id });
+    fireEvent.click(
+      screen.getByRole("button", { name: "Protocol deep probe" }),
+    );
+    await screen.findByText(/Saved records checked: reusing 1/);
+    fireEvent.click(
+      screen.getByRole("checkbox", { name: "Keep Partial Receipts / a" }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Save and enable" }));
+    fireEvent.click(screen.getByRole("button", { name: "Save and publish" }));
+    await screen.findByText("State machine:published");
+    expect(
+      prepareCodexProviderSetBatch.mock.calls.at(-1)![0][0].receiptIds,
+    ).toEqual(["receipt-b"]);
+    expect(preflightCodexProviderProtocolCompatibility).not.toHaveBeenCalled();
+  });
+
+  it("preserves stronger saved evidence for API-declared models while probing unresolved models", async () => {
+    const source: Provider = {
+      id: "partial-model-evidence",
+      name: "Partial Model Evidence",
+      settingsConfig: {
+        baseUrl: "https://example.invalid/v1",
+        auth: { OPENAI_API_KEY: "test-only" },
+        modelCatalog: {
+          models: [
+            {
+              model: "a",
+              protocolCapability: {
+                schemaVersion: 1,
+                source: "provider_api",
+                baseUrl: "https://example.invalid/v1",
+                upstreamModel: "a",
+                supportedEndpoints: ["openai_responses"],
+              },
+            },
+            { model: "b" },
+          ],
+        },
+      },
+    };
+    const plan = savedProtocolPlan(source);
+    restoreCodexProviderProtocolEvidence.mockResolvedValueOnce(
+      protocolOutcome(source, [{ model: "a", transport: "open_ai_chat" }], {
+        "receipt-a": "a",
+      }),
+    );
+    preflightCodexProviderProtocolCompatibility.mockResolvedValueOnce(
+      protocolOutcome(
+        source,
+        [{ model: "b", transport: "open_ai_responses" }],
+        { "receipt-b": "b" },
+      ),
+    );
+    renderWizard([source, plan], { mode: "edit", planId: plan.id });
+    fireEvent.click(
+      screen.getByRole("button", { name: "Protocol deep probe" }),
+    );
+    await screen.findByText(/Saved records checked: reusing 1/);
+    fireEvent.click(
+      screen.getByRole("button", {
+        name: "Run compatibility deep probe again",
+      }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Confirm test" }));
+    await screen.findByText("State machine:connectivityPassed");
+    fireEvent.click(screen.getByRole("button", { name: "Close" }));
+    fireEvent.click(
+      screen.getByRole("button", { name: "Protocol deep probe" }),
+    );
+    expect(
+      screen.getByText(
+        "Full Codex transaction verified; selected Chat Completions.",
+      ),
+    ).toBeVisible();
+    expect(
+      screen.getByText("Full Codex transaction verified; selected Responses."),
+    ).toBeVisible();
+    expect(screen.queryByText(/Provider API declares/)).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Save and enable" }));
+    fireEvent.click(screen.getByRole("button", { name: "Save and publish" }));
+    await screen.findByText("State machine:published");
+    expect(
+      prepareCodexProviderSetBatch.mock.calls.at(-1)![0][0].receiptIds,
+    ).toEqual(["receipt-a", "receipt-b"]);
+  });
+
+  it("restores partial evidence, probes only the unresolved model, and reuses refreshed receipts", async () => {
+    const source: Provider = {
+      id: "partial-restoration",
+      name: "Partial Restoration",
+      settingsConfig: {
+        baseUrl: "https://example.invalid/v1",
+        auth: { OPENAI_API_KEY: "test-only" },
+        modelCatalog: {
+          models: [
+            { model: "a" },
+            { model: "b" },
+            { model: "excluded", enabled: false },
+          ],
+        },
+      },
+    };
+    const plan = savedProtocolPlan(source);
+    const restoredA = protocolOutcome(
+      source,
+      [{ model: "a", transport: "open_ai_chat" }],
+      { "receipt-a": "a" },
+    );
+    const probedB = protocolOutcome(
+      source,
+      [{ model: "b", transport: "open_ai_responses" }],
+      { "receipt-b": "b" },
+    );
+    const restoredBoth = protocolOutcome(
+      source,
+      [
+        { model: "a", transport: "open_ai_chat" },
+        { model: "b", transport: "open_ai_responses" },
+      ],
+      { "fresh-receipt-a": "a", "fresh-receipt-b": "b" },
+    );
+    restoreCodexProviderProtocolEvidence
+      .mockResolvedValueOnce(restoredA)
+      .mockResolvedValueOnce(restoredBoth);
+    const progressModels: string[] = [];
+    let complete!: (outcome: CodexProviderProtocolPreflightOutcome) => void;
+    preflightCodexProviderProtocolCompatibility.mockImplementationOnce(
+      (_provider, onProgress) =>
+        new Promise((resolve) => {
+          onProgress({ kind: "candidate_started", model: "b" });
+          progressModels.push("b");
+          complete = resolve;
+        }),
+    );
+    prepareCodexProviderSetBatch.mockImplementation(async () => ({
+      digest: "partial-restoration",
+      sourcePreviews: [],
+      blocked: false,
+    }));
+    commitCodexProviderSetBatch.mockImplementation(async (sources, router) => ({
+      router,
+      editorRouter: router,
+      sourceSnapshots: sources.map((item: { provider: Provider }) => ({
+        logicalProvider: item.provider,
+      })),
+      projections: [],
+      status: "committed",
+    }));
+
+    renderWizard([source, plan], { mode: "edit", planId: plan.id });
+    fireEvent.click(
+      screen.getByRole("button", { name: "Protocol deep probe" }),
+    );
+    await screen.findByText(/Saved records checked: reusing 1/);
+    fireEvent.click(
+      screen.getByRole("button", {
+        name: "Run compatibility deep probe again",
+      }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Confirm test" }));
+
+    expect(await screen.findByText(/Validating models 0\/1;/)).toBeVisible();
+    expect(
+      screen.queryByText(/Validating models 0\/2;/),
+    ).not.toBeInTheDocument();
+    expect(preflightCodexProviderProtocolCompatibility).toHaveBeenCalledTimes(
+      1,
+    );
+    expect(progressModels).toEqual(["b"]);
+    await act(async () => complete(probedB));
+    expect(
+      await screen.findByText(
+        "Completed 1 models: Verified 1, Partial 0, Failed 0.",
+      ),
+    ).toBeVisible();
+    expect(screen.queryByText(/Completed 2 models:/)).not.toBeInTheDocument();
+    expect(
+      screen.queryByText(/Validating models 1\/2;/),
+    ).not.toBeInTheDocument();
+    await screen.findByText("State machine:connectivityPassed");
+    fireEvent.click(screen.getByRole("button", { name: "Close" }));
+
+    fireEvent.click(
+      screen.getByRole("button", { name: "Protocol deep probe" }),
+    );
+    expect(
+      screen.getByText(
+        "Full Codex transaction verified; selected Chat Completions.",
+      ),
+    ).toBeVisible();
+    expect(
+      screen.getByText("Full Codex transaction verified; selected Responses."),
+    ).toBeVisible();
+
+    fireEvent.click(screen.getByRole("button", { name: "Save and enable" }));
+    fireEvent.click(screen.getByRole("button", { name: "Save and publish" }));
+    await screen.findByText("State machine:published");
+    const [firstSources] = prepareCodexProviderSetBatch.mock.calls.at(-1)!;
+    expect(firstSources[0].receiptIds).toEqual(["receipt-a", "receipt-b"]);
+    expect(firstSources[0].provider.settingsConfig.modelCatalog.models).toEqual(
+      source.settingsConfig.modelCatalog.models,
+    );
+    const [firstCommitSources] = commitCodexProviderSetBatch.mock.calls[0]!;
+    expect(firstCommitSources[0].receiptIds).toEqual([
+      "receipt-a",
+      "receipt-b",
+    ]);
+    expect(
+      firstCommitSources[0].provider.settingsConfig.modelCatalog.models,
+    ).toEqual(source.settingsConfig.modelCatalog.models);
+
+    fireEvent.click(screen.getByRole("button", { name: "Save and enable" }));
+    fireEvent.click(screen.getByRole("button", { name: "Save and publish" }));
+    await waitFor(() =>
+      expect(commitCodexProviderSetBatch).toHaveBeenCalledTimes(2),
+    );
+    const [secondSources] = prepareCodexProviderSetBatch.mock.calls.at(-1)!;
+    expect(secondSources[0].receiptIds).toEqual([
+      "fresh-receipt-a",
+      "fresh-receipt-b",
+    ]);
+    expect(
+      secondSources[0].provider.settingsConfig.modelCatalog.models,
+    ).toEqual(source.settingsConfig.modelCatalog.models);
+    const [secondCommitSources] = commitCodexProviderSetBatch.mock.calls[1]!;
+    expect(secondCommitSources[0].receiptIds).toEqual([
+      "fresh-receipt-a",
+      "fresh-receipt-b",
+    ]);
+    expect(restoreCodexProviderProtocolEvidence).toHaveBeenCalledTimes(2);
+    expect(preflightCodexProviderProtocolCompatibility).toHaveBeenCalledTimes(
+      1,
+    );
+  });
+
+  it("restores new receipts after a stale-retry commit instead of re-probing a second save", async () => {
+    const source: Provider = {
+      id: "retry-receipts",
+      name: "Retry Receipts",
+      settingsConfig: {
+        baseUrl: "https://example.invalid/v1",
+        auth: { OPENAI_API_KEY: "test-only" },
+        modelCatalog: { models: [{ model: "known" }] },
+      },
+    };
+    const committedSource: Provider = {
+      ...source,
+      meta: { apiFormat: "openai_responses" },
+    };
+    const plan = savedProtocolPlan(source);
+    restoreCodexProviderProtocolEvidence
+      .mockResolvedValueOnce(
+        protocolOutcome(
+          source,
+          [{ model: "known", transport: "open_ai_chat" }],
+          { "old-receipt": "known" },
+        ),
+      )
+      .mockResolvedValueOnce(
+        protocolOutcome(
+          committedSource,
+          [{ model: "known", transport: "open_ai_responses" }],
+          { "restored-after-commit": "known" },
+        ),
+      );
+    preflightCodexProviderProtocolCompatibility.mockResolvedValue(
+      protocolOutcome(
+        source,
+        [{ model: "known", transport: "open_ai_responses" }],
+        { "retry-receipt": "known" },
+      ),
+    );
+    let firstPrepare = true;
+    const consumedReceipts = new Set<string>();
+    prepareCodexProviderSetBatch.mockImplementation(async (sources) => {
+      if (firstPrepare) {
+        firstPrepare = false;
+        throw new Error("codex_provider_set_dependency_changed");
+      }
+      if (
+        sources.some((source: { receiptIds: string[] }) =>
+          source.receiptIds.some((id) => consumedReceipts.has(id)),
+        )
+      ) {
+        throw new Error("codex_provider_set_probe_required");
+      }
+      return { digest: "retry-receipts", sourcePreviews: [], blocked: false };
+    });
+    commitCodexProviderSetBatch.mockImplementation(async (sources, router) => {
+      sources
+        .flatMap((source: { receiptIds: string[] }) => source.receiptIds)
+        .forEach((id: string) => consumedReceipts.add(id));
+      return {
+        router,
+        editorRouter: router,
+        sourceSnapshots: [{ logicalProvider: committedSource }],
+        projections: [],
+        status: "committed",
+      };
+    });
+    renderWizard([source, plan], { mode: "edit", planId: plan.id });
+    await waitFor(() =>
+      expect(
+        screen.getByRole("button", { name: "Choose models" }),
+      ).not.toHaveAttribute("data-read-only", "true"),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Save and enable" }));
+    fireEvent.click(screen.getByRole("button", { name: "Save and publish" }));
+    await screen.findByText("State machine:published");
+    expect(preflightCodexProviderProtocolCompatibility).toHaveBeenCalledTimes(
+      1,
+    );
+    fireEvent.click(
+      screen.getByRole("button", { name: "Protocol deep probe" }),
+    );
+    expect(
+      screen.getByText("Full Codex transaction verified; selected Responses."),
+    ).toBeVisible();
+    expect(
+      screen.queryByText(
+        "Full Codex transaction verified; selected Chat Completions.",
+      ),
+    ).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Save and enable" }));
+    fireEvent.click(screen.getByRole("button", { name: "Save and publish" }));
+    await waitFor(() =>
+      expect(commitCodexProviderSetBatch).toHaveBeenCalledTimes(2),
+    );
+    expect(
+      prepareCodexProviderSetBatch.mock.calls.at(-1)![0][0].receiptIds,
+    ).toEqual(["restored-after-commit"]);
+    expect(preflightCodexProviderProtocolCompatibility).toHaveBeenCalledTimes(
+      1,
+    );
+    preflightCodexProviderProtocolCompatibility.mockReset();
+  });
+
+  it.each([2, 28, 101])(
+    "reopens and saves all %i API-declared models without requiring complete probe receipts",
+    async (modelCount) => {
+      const source: Provider = {
+        id: "api-declared",
+        name: "API Declared",
+        settingsConfig: {
+          baseUrl: "https://example.invalid/v1",
+          auth: { OPENAI_API_KEY: "test-only" },
+          modelCatalog: {
+            models: Array.from({ length: modelCount }, (_, index) => ({
+              model: `model-${index}`,
+              protocolCapability: {
+                schemaVersion: 1,
+                source: "provider_api",
+                baseUrl: "https://example.invalid/v1",
+                upstreamModel: `model-${index}`,
+                supportedEndpoints: [
+                  index % 2 === 0 ? "openai_chat" : "openai_responses",
+                ],
+                supportsTools: true,
+              },
+            })),
+          },
+        },
+      };
+      const plan: Provider = {
+        id: "api-plan",
+        name: "API Plan",
+        settingsConfig: {
+          codexRouting: {
+            schemaVersion: 2,
+            enabled: true,
+            routes: [
+              {
+                id: "api-route",
+                targetProviderId: source.id,
+                modelSelection: { mode: "all" },
+              },
+            ],
+          },
+        },
+      };
+      restoreCodexProviderProtocolEvidence.mockResolvedValueOnce(null);
+      prepareCodexProviderSetBatch.mockResolvedValue({
+        digest: "api-declared",
+        sourcePreviews: [],
+        blocked: false,
+      });
+      commitCodexProviderSetBatch.mockImplementation(
+        async (sources, router) => ({
+          router,
+          editorRouter: router,
+          sourceSnapshots: sources.map((item: { provider: Provider }) => ({
+            logicalProvider: item.provider,
+          })),
+          projections: [],
+          status: "committed",
+        }),
+      );
+      const probeCalls =
+        preflightCodexProviderProtocolCompatibility.mock.calls.length;
+      renderWizard([source, plan], { mode: "edit", planId: plan.id });
+      await waitFor(() =>
+        expect(
+          screen.getByRole("button", { name: "Choose models" }),
+        ).not.toHaveAttribute("data-read-only", "true"),
+      );
+      fireEvent.click(
+        screen.getByRole("button", { name: "Protocol deep probe" }),
+      );
+      expect(screen.getAllByText(/Provider API declares/)).toHaveLength(
+        modelCount,
+      );
+      expect(screen.queryByText(/Full Codex transaction verified/)).toBeNull();
+      fireEvent.click(screen.getByRole("button", { name: "Save and enable" }));
+      expect(
+        screen.getByRole("button", { name: "Save and publish" }),
+      ).toBeEnabled();
+      fireEvent.click(screen.getByRole("button", { name: "Save and publish" }));
+      await screen.findByText("State machine:published");
+      const [sources] = prepareCodexProviderSetBatch.mock.calls.at(-1)!;
+      expect(sources[0].receiptIds).toEqual([]);
+      expect(sources[0].provider.settingsConfig.modelCatalog.models).toEqual(
+        source.settingsConfig.modelCatalog.models,
+      );
+      expect(
+        preflightCodexProviderProtocolCompatibility.mock.calls.length,
+      ).toBe(probeCalls);
+    },
+  );
+
+  it("uses refreshed API declarations immediately and keeps them after a failed refresh", async () => {
+    const source: Provider = {
+      id: "fetch-declared",
+      name: "Fetch Declared",
+      settingsConfig: {
+        baseUrl: "https://example.invalid/v1",
+        auth: { OPENAI_API_KEY: "test-only" },
+        modelCatalog: { models: [{ model: "known" }] },
+      },
+    };
+    const fetchSpy = vi
+      .spyOn(modelFetchApi, "fetchModelsForConfig")
+      .mockResolvedValueOnce([
+        {
+          id: "known",
+          ownedBy: null,
+          protocolCapability: {
+            schemaVersion: 1,
+            source: "provider_api",
+            baseUrl: "https://example.invalid/v1",
+            upstreamModel: "known",
+            supportedEndpoints: ["openai_chat"],
+          },
+        },
+      ])
+      .mockRejectedValueOnce(new Error("catalog unavailable"));
+    const consoleError = vi
+      .spyOn(console, "error")
+      .mockImplementation(() => {});
+    const probeCalls =
+      preflightCodexProviderProtocolCompatibility.mock.calls.length;
+    try {
+      renderWizard([source]);
+      fireEvent.click(screen.getByRole("button", { name: "Save and enable" }));
+      expect(
+        screen.getByRole("button", { name: "Save and publish" }),
+      ).toBeDisabled();
+      fireEvent.click(
+        screen.getByRole("button", { name: "Sync model catalogs" }),
+      );
+      fireEvent.click(
+        screen.getByRole("button", { name: "Fetch model lists automatically" }),
+      );
+      await waitFor(() =>
+        expect(
+          screen.getByRole("button", { name: "Choose models" }),
+        ).not.toHaveAttribute("data-read-only", "true"),
+      );
+      fireEvent.click(screen.getByRole("button", { name: "Save and enable" }));
+      await waitFor(() =>
+        expect(
+          screen.getByRole("button", { name: "Save and publish" }),
+        ).toBeEnabled(),
+      );
+      fireEvent.click(
+        screen.getByRole("button", { name: "Sync model catalogs" }),
+      );
+      fireEvent.click(
+        screen.getByRole("button", { name: "Fetch model lists automatically" }),
+      );
+      await screen.findByText("Model-list fetch failed");
+      fireEvent.click(screen.getByRole("button", { name: "Save and enable" }));
+      await waitFor(() =>
+        expect(
+          screen.getByRole("button", { name: "Save and publish" }),
+        ).toBeEnabled(),
+      );
+      expect(
+        preflightCodexProviderProtocolCompatibility.mock.calls.length,
+      ).toBe(probeCalls);
+      expect(source.settingsConfig.modelCatalog.models[0]).not.toHaveProperty(
+        "protocolCapability",
+      );
+    } finally {
+      fetchSpy.mockRestore();
+      consoleError.mockRestore();
+    }
+  });
+
+  it("requires fallback evidence for each unresolved model without reproving API-declared rows", async () => {
+    const source: Provider = {
+      id: "partial-api",
+      name: "Partial API",
+      settingsConfig: {
+        baseUrl: "https://example.invalid/v1",
+        auth: { OPENAI_API_KEY: "test-only" },
+        modelCatalog: {
+          models: [
+            {
+              model: "declared",
+              protocolCapability: {
+                schemaVersion: 1,
+                source: "provider_api",
+                baseUrl: "https://example.invalid/v1",
+                upstreamModel: "declared",
+                supportedEndpoints: ["openai_chat"],
+              },
+            },
+            { model: "unknown-a" },
+            { model: "unknown-b" },
+            { model: "excluded", enabled: false },
+          ],
+        },
+      },
+    };
+    const outcome: CodexProviderProtocolPreflightOutcome = {
+      provider: source,
+      receiptIds: ["only-unknown-a"],
+      observations: [],
+      protocolApplied: false,
+      adaptationPreview: {
+        persistence: "single",
+        status: "partial",
+        effectiveTransport: "open_ai_chat",
+        models: [],
+      },
+      records: [
+        {
+          probeVersion: 1,
+          testedAt: 100,
+          expiresAt: 4102444800,
+          target: {
+            provider_id: source.id,
+            route_id: null,
+            public_model: "unknown-a",
+            upstream_model: "unknown-a",
+            transport: "open_ai_chat",
+            authentication_kind: "bearer",
+            endpoint_fingerprint: "endpoint",
+            credential_fingerprint: "credential",
+            request_policy_fingerprint: "policy",
+          },
+          result: {
+            readiness: "verified",
+            selected_transport: "open_ai_chat",
+            branches: [],
+          },
+        },
+      ],
+    };
+    expect(
+      buildWizardConnectivityResultsFromBatchOutcome(
+        [source],
+        {
+          sources: [{ provider: source, receiptIds: outcome.receiptIds }],
+          outcomes: [{ providerId: source.id, inputProvider: source, outcome }],
+        },
+        false,
+      ).map(({ model, canContinue, status }) => ({
+        model,
+        canContinue,
+        status,
+      })),
+    ).toEqual([
+      { model: "declared", canContinue: true, status: "skipped" },
+      { model: "unknown-a", canContinue: true, status: "pass" },
+      { model: "unknown-b", canContinue: false, status: "fail" },
+    ]);
+  });
+
   it("keeps official authentication out of the routing review step", () => {
     const official: Provider = {
       id: "codex-official",
@@ -914,11 +1682,31 @@ describe("CodexMultiRouterWizard", () => {
     const makeSource = (id: string): Provider => ({
       id,
       name: id,
-      meta: { codexProtocolMode: "manual", apiFormat: "openai_responses" },
+      meta:
+        id === "source-a"
+          ? { apiFormat: "openai_responses" }
+          : { codexProtocolMode: "manual", apiFormat: "openai_responses" },
       settingsConfig: {
         baseUrl: "https://example.invalid/v1",
         auth: { OPENAI_API_KEY: "test-only" },
-        modelCatalog: { models: [{ model: `${id}-model` }] },
+        modelCatalog: {
+          models: [
+            {
+              model: `${id}-model`,
+              ...(id === "source-a"
+                ? {
+                    protocolCapability: {
+                      schemaVersion: 1,
+                      source: "provider_api",
+                      baseUrl: "https://example.invalid/v1",
+                      upstreamModel: `${id}-model`,
+                      supportedEndpoints: ["openai_responses"],
+                    },
+                  }
+                : {}),
+            },
+          ],
+        },
       },
     });
     const a = makeSource("source-a");
@@ -1089,7 +1877,7 @@ describe("CodexMultiRouterWizard", () => {
     );
 
     const contract = screen.getByText(
-      /Each standard provider\/model verifies Responses and Chat/,
+      /Each unresolved provider\/model verifies Responses and Chat/,
     );
     expect(contract).toHaveTextContent("streaming SSE");
     expect(contract).toHaveTextContent("reasoning semantics");

@@ -1,0 +1,111 @@
+{
+  "ccSwitchRoutingDependencyFingerprint": "f2dec44b47b6d9b7",
+  "models": [
+    {
+      "additionalSpeedTiers": [],
+      "additional_speed_tiers": [],
+      "availabilityNux": null,
+      "availability_nux": null,
+      "base_instructions": "You are Codex, a coding agent. You and the user share the same workspace and collaborate to achieve the user's goals.",
+      "contextWindow": 128000,
+      "context_window": 128000,
+      "default_reasoning_summary": "none",
+      "description": "[UUPes] qwen-visible",
+      "displayName": "[UUPes] qwen-visible",
+      "display_name": "[UUPes] qwen-visible",
+      "effective_context_window_percent": 95,
+      "experimental_supported_tools": [],
+      "hidden": false,
+      "id": "qwen-visible",
+      "inputModalities": [
+        "text",
+        "image"
+      ],
+      "input_modalities": [
+        "text",
+        "image"
+      ],
+      "isDefault": true,
+      "maxContextWindow": 128000,
+      "max_context_window": 128000,
+      "model": "qwen-visible",
+      "multiAgentVersion": "v2",
+      "multi_agent_version": "v2",
+      "priority": 1000,
+      "serviceTiers": [],
+      "service_tiers": [],
+      "shell_type": "shell_command",
+      "show_in_picker": true,
+      "slug": "qwen-visible",
+      "support_verbosity": false,
+      "supported_in_api": true,
+      "supported_reasoning_levels": [],
+      "supportsImageDetailOriginal": true,
+      "supports_image_detail_original": true,
+      "supports_parallel_tool_calls": false,
+      "supports_reasoning_summaries": true,
+      "supports_search_tool": false,
+      "truncation_policy": {
+        "limit": 10000,
+        "mode": "bytes"
+      },
+      "upgrade": null,
+      "upstreamModel": "Qwen/Qwen3.8",
+      "upstream_model": "Qwen/Qwen3.8",
+      "visibility": "list"
+    },
+    {
+      "additionalSpeedTiers": [],
+      "additional_speed_tiers": [],
+      "availabilityNux": null,
+      "availability_nux": null,
+      "base_instructions": "You are Codex, a coding agent. You and the user share the same workspace and collaborate to achieve the user's goals.",
+      "contextWindow": 128000,
+      "context_window": 128000,
+      "default_reasoning_summary": "none",
+      "description": "[UUPat] glm-visible",
+      "displayName": "[UUPat] glm-visible",
+      "display_name": "[UUPat] glm-visible",
+      "effective_context_window_percent": 95,
+      "experimental_supported_tools": [],
+      "hidden": false,
+      "id": "glm-visible",
+      "inputModalities": [
+        "text",
+        "image"
+      ],
+      "input_modalities": [
+        "text",
+        "image"
+      ],
+      "isDefault": false,
+      "maxContextWindow": 128000,
+      "max_context_window": 128000,
+      "model": "glm-visible",
+      "multiAgentVersion": "v2",
+      "multi_agent_version": "v2",
+      "priority": 1001,
+      "serviceTiers": [],
+      "service_tiers": [],
+      "shell_type": "shell_command",
+      "show_in_picker": true,
+      "slug": "glm-visible",
+      "support_verbosity": false,
+      "supported_in_api": true,
+      "supported_reasoning_levels": [],
+      "supportsImageDetailOriginal": true,
+      "supports_image_detail_original": true,
+      "supports_parallel_tool_calls": false,
+      "supports_reasoning_summaries": true,
+      "supports_search_tool": false,
+      "truncation_policy": {
+        "limit": 10000,
+        "mode": "bytes"
+      },
+      "upgrade": null,
+      "upstreamModel": "zai-org/GLM-4.5",
+      "upstream_model": "zai-org/GLM-4.5",
+      "visibility": "list"
+    }
+  ]
+}

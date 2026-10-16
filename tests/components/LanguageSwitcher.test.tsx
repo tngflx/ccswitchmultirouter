@@ -4,9 +4,12 @@ import i18n from "i18next";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { LanguageSwitcher } from "@/components/settings/LanguageSwitcher";
 
+vi.mock("@tanstack/react-query", () => ({
+  useQueryClient: () => ({ invalidateQueries: vi.fn() }),
+}));
+
 const useSettingsQueryMock = vi.fn();
-const useSaveSettingsMutationMock = vi.fn();
-const mutateMock = vi.fn();
+const patchMock = vi.fn();
 const settingsData = {
   showInTray: true,
   minimizeToTrayOnClose: true,
@@ -15,7 +18,10 @@ const settingsData = {
 
 vi.mock("@/lib/query", () => ({
   useSettingsQuery: () => useSettingsQueryMock(),
-  useSaveSettingsMutation: () => useSaveSettingsMutationMock(),
+}));
+
+vi.mock("@/lib/api", () => ({
+  settingsApi: { patch: (...args: unknown[]) => patchMock(...args) },
 }));
 
 describe("LanguageSwitcher", () => {
@@ -23,10 +29,8 @@ describe("LanguageSwitcher", () => {
     window.localStorage.clear();
     await i18n.changeLanguage("zh");
     useSettingsQueryMock.mockReturnValue({ data: settingsData });
-    useSaveSettingsMutationMock.mockReturnValue({
-      mutate: mutateMock,
-      isPending: false,
-    });
+    patchMock.mockReset();
+    patchMock.mockResolvedValue(undefined);
   });
 
   it("changes the UI language and persists it through the settings mutation", async () => {
@@ -42,10 +46,7 @@ describe("LanguageSwitcher", () => {
 
     expect(i18n.language).toBe("en");
     expect(window.localStorage.getItem("language")).toBe("en");
-    expect(mutateMock).toHaveBeenCalledWith(
-      expect.objectContaining({ language: "en" }),
-      expect.objectContaining({ onError: expect.any(Function) }),
-    );
+    expect(patchMock).toHaveBeenCalledWith({ language: "en" });
   });
 
   it("restores the previous language when the settings save fails", async () => {
@@ -53,16 +54,14 @@ describe("LanguageSwitcher", () => {
     const user = userEvent.setup();
     render(<LanguageSwitcher />);
 
+    patchMock.mockRejectedValueOnce(new Error("save failed"));
     await user.click(screen.getByTitle("settings.language"));
     await user.click(
       await screen.findByRole("menuitem", {
         name: "settings.languageOptionEnglish",
       }),
     );
-
-    const options = mutateMock.mock.calls[0][1];
     await act(async () => {
-      options.onError(new Error("save failed"));
       await Promise.resolve();
     });
 

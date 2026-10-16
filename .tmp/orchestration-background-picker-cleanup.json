@@ -1,0 +1,25 @@
+{
+  "expected": [
+    "ccsm-orch/research-ensemble",
+    "ccsm-role/research-ensemble/worker"
+  ],
+  "inlineConfigMode": "catalog_pointer_only",
+  "missing": {
+    "managedCatalog": [],
+    "codexCache": [],
+    "localModelsEndpoint": [],
+    "installedCodexModelList": []
+  },
+  "installedCodexModels": [
+    {
+      "id": "ccsm-orch/research-ensemble",
+      "displayName": "Research Ensemble",
+      "hidden": false
+    },
+    {
+      "id": "ccsm-role/research-ensemble/worker",
+      "displayName": "Research Ensemble: worker (gpt-6.1-sol)",
+      "hidden": false
+    }
+  ]
+}

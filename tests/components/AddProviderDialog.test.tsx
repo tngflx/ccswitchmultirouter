@@ -123,6 +123,7 @@ vi.mock("@/components/providers/forms/ProviderForm", () => ({
     return (
       <form
         id="provider-form"
+        data-testid="app-specific-provider-form"
         onSubmit={(event) => {
           event.preventDefault();
           onSubmit(mockFormValues);
@@ -218,6 +219,75 @@ describe("AddProviderDialog", () => {
         codex: null,
       },
     });
+  });
+
+  it("opens Codex on its provider presets and keeps universal sources available", async () => {
+    const user = userEvent.setup();
+    render(
+      <AddProviderDialog
+        open
+        onOpenChange={vi.fn()}
+        appId="codex"
+        onSubmit={vi.fn()}
+      />,
+    );
+
+    expect(
+      screen.getByRole("tab", { name: "Connect a single model source" }),
+    ).toHaveAttribute("aria-selected", "true");
+    await waitFor(() =>
+      expect(screen.getByTestId("app-specific-provider-form")).toBeVisible(),
+    );
+    expect(providerFormProbe.providerId).toEqual(expect.any(String));
+    const draftProviderId = providerFormProbe.providerId;
+    expect(
+      screen.queryByRole("button", { name: "Add model source" }),
+    ).not.toBeInTheDocument();
+
+    await user.click(screen.getByRole("tab", { name: "Select model sources" }));
+    expect(
+      screen.getByRole("tab", { name: "Select model sources" }),
+    ).toHaveAttribute("aria-selected", "true");
+    expect(
+      screen.queryByTestId("app-specific-provider-form"),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "Add model source" }),
+    ).toBeVisible();
+
+    await user.click(
+      screen.getByRole("tab", { name: "Connect a single model source" }),
+    );
+    expect(screen.getByTestId("app-specific-provider-form")).toBeVisible();
+    expect(providerFormProbe.providerId).toBe(draftProviderId);
+  });
+
+  it("returns Codex to provider presets after closing and reopening", async () => {
+    const user = userEvent.setup();
+    const props = {
+      onOpenChange: vi.fn(),
+      appId: "codex" as const,
+      onSubmit: vi.fn(),
+    };
+    const { rerender } = render(<AddProviderDialog {...props} open />);
+    const previousDraftProviderId = providerFormProbe.providerId;
+
+    await user.click(screen.getByRole("tab", { name: "Select model sources" }));
+    expect(
+      screen.getByRole("tab", { name: "Select model sources" }),
+    ).toHaveAttribute("aria-selected", "true");
+
+    rerender(<AddProviderDialog {...props} open={false} />);
+    rerender(<AddProviderDialog {...props} open />);
+
+    await waitFor(() =>
+      expect(
+        screen.getByRole("tab", { name: "Connect a single model source" }),
+      ).toHaveAttribute("aria-selected", "true"),
+    );
+    expect(screen.getByTestId("app-specific-provider-form")).toBeVisible();
+    expect(providerFormProbe.providerId).toEqual(expect.any(String));
+    expect(providerFormProbe.providerId).not.toBe(previousDraftProviderId);
   });
 
   it("普通 Codex 新增使用已有 receipt 提交 Provider Set 且不调用旧新增接口", async () => {
@@ -427,6 +497,7 @@ describe("AddProviderDialog", () => {
   });
 
   it("新增模型源使用 Provider Set 事务而不是旧 saveAndSync", async () => {
+    const user = userEvent.setup();
     const handleOpenChange = vi.fn();
 
     render(
@@ -438,6 +509,7 @@ describe("AddProviderDialog", () => {
       />,
     );
 
+    await user.click(screen.getByRole("tab", { name: "Select model sources" }));
     fireEvent.click(screen.getByRole("button", { name: "Add model source" }));
     fireEvent.click(
       screen.getByRole("button", { name: "submit-universal-provider" }),

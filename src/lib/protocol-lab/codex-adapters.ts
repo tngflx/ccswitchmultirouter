@@ -21,10 +21,11 @@ import {
   commitCodexProviderSetBatch,
   prepareCodexProviderSetBatch,
 } from "@/lib/api/protocol-compatibility";
-import type { Provider, UniversalProvider } from "@/types";
+import type { CodexCatalogModel, Provider, UniversalProvider } from "@/types";
 
 import { normalizeCodexPublicModelKey } from "./codex-overrides";
 import { readCodexCatalogSettings } from "@/lib/codexCatalogSchema";
+import { readCodexModelProtocolCapability } from "@/lib/codexProtocolCapability";
 import type { ProtocolLabAdapter } from "./useProtocolLabWorkflow";
 
 interface SingleCodexProtocolLabApi {
@@ -182,6 +183,9 @@ export function createUniversalCodexProtocolLabAdapter(
 export interface CodexProviderSetBatchDraft {
   sources: CodexProviderSetBatchSource[];
   router: Provider;
+  /** Transient fallback requests derived from current backend failure evidence. */
+  forceProbeSourceIds?: string[];
+  forceProbeTargets?: CodexProviderProtocolProbeTarget[];
 }
 
 export interface CodexProviderSetBatchProbeOutcome {
@@ -234,8 +238,10 @@ export function createBatchCodexProtocolLabAdapter(
     requiresProbe(draft) {
       return draft.sources.some(
         (source) =>
-          sourceNeedsProtocolProbe(source.provider) &&
-          source.receiptIds.length === 0,
+          sourceNeedsProtocolProbe(
+            source.provider,
+            draft.forceProbeSourceIds,
+          ) && source.receiptIds.length === 0,
       );
     },
     isManual() {
@@ -243,7 +249,7 @@ export function createBatchCodexProtocolLabAdapter(
       // source choices are already compiled into each source plan.
       return false;
     },
-    async preflight(draft, onProgress) {
+    async preflight(draft, onProgress, context) {
       const outcomesByIndex = new Map<
         number,
         CodexProviderSetBatchProbeOutcome["outcomes"][number]
@@ -257,7 +263,12 @@ export function createBatchCodexProtocolLabAdapter(
         // Preflight is an explicit test or a stale-receipt retry. The workflow
         // already skips preflight for reusable receipts via requiresProbe;
         // keeping nested receiptIds here would reuse expired evidence forever.
-        if (!sourceNeedsProtocolProbe(source.provider)) {
+        if (
+          !sourceNeedsProtocolProbe(source.provider, draft.forceProbeSourceIds)
+        ) {
+          if (context?.staleRetry && source.receiptIds.length > 0) {
+            sources[index] = { ...source, receiptIds: [] };
+          }
           return;
         }
         const outcome = await api.preflightCodexProviderProtocolCompatibility(
@@ -320,13 +331,24 @@ export function createBatchCodexProtocolLabAdapter(
         ? "split"
         : "single";
     },
-    async commit(draft, _receiptIds, preview) {
-      const outcome = await api.commitCodexProviderSetBatch(
+    async commit(draft, _receiptIds, preview, _intent, context) {
+      const consumedReceiptIds = draft.sources.flatMap(
+        (source) => source.receiptIds,
+      );
+      const committedEvidence = context?.probeOutcome?.outcomes.map(
+        ({ outcome }) => outcome,
+      );
+      const backendOutcome = await api.commitCodexProviderSetBatch(
         draft.sources,
         draft.router,
         preview.digest,
         "accept_auto",
       );
+      const outcome = {
+        ...backendOutcome,
+        consumedReceiptIds,
+        ...(committedEvidence ? { committedEvidence } : {}),
+      };
       return {
         outcome,
         snapshot: outcome,
@@ -347,7 +369,9 @@ export function providerHasAutomaticCodexModels(provider: Provider): boolean {
   if (provider.meta?.codexProtocolMode === "manual" && models.length === 0) {
     return false;
   }
-  if (models.length === 0) return true;
+  if (models.length === 0) {
+    return readCodexCatalogSettings(provider.settingsConfig) === undefined;
+  }
   return codexProviderModelsRequiringProtocolProbe(provider).length > 0;
 }
 
@@ -365,9 +389,13 @@ export function codexProviderModelsRequiringProtocolProbe(
   ) {
     return [];
   }
-  return enabledPublicModels(provider).filter(
-    (model) => !normalizedOverrides.has(normalizeCodexPublicModelKey(model)),
-  );
+  return enabledCatalogModels(provider)
+    .filter(
+      (model) =>
+        !normalizedOverrides.has(normalizeCodexPublicModelKey(model.model)) &&
+        !readCodexModelProtocolCapability(provider, model),
+    )
+    .map((model) => model.model.trim());
 }
 
 export function codexProtocolLabErrorCode(error: unknown): string | undefined {
@@ -402,16 +430,31 @@ function isRetryableCodexEvidenceChange(error: unknown): boolean {
 }
 
 function enabledPublicModels(provider: Provider): string[] {
-  const catalog = readCodexCatalogSettings(provider.settingsConfig) as
-    { models?: Array<{ model?: unknown; enabled?: unknown }> } | undefined;
-  return (catalog?.models ?? [])
-    .filter((model) => model.enabled !== false)
-    .map((model) => (typeof model.model === "string" ? model.model.trim() : ""))
-    .filter(Boolean);
+  return enabledCatalogModels(provider).map((model) => model.model.trim());
 }
 
-function sourceNeedsProtocolProbe(provider: Provider): boolean {
-  return providerHasAutomaticCodexModels(provider);
+function enabledCatalogModels(provider: Provider): CodexCatalogModel[] {
+  const catalog = readCodexCatalogSettings(provider.settingsConfig);
+  if (!Array.isArray(catalog?.models)) return [];
+  return catalog.models.filter(
+    (model): model is CodexCatalogModel =>
+      model !== null &&
+      typeof model === "object" &&
+      !Array.isArray(model) &&
+      model.enabled !== false &&
+      typeof model.model === "string" &&
+      Boolean(model.model.trim()),
+  );
+}
+
+function sourceNeedsProtocolProbe(
+  provider: Provider,
+  forceProbeSourceIds?: string[],
+): boolean {
+  return (
+    forceProbeSourceIds?.includes(provider.id) === true ||
+    providerHasAutomaticCodexModels(provider)
+  );
 }
 
 function hasExplicitCodexProtocolSelection(

@@ -1,6 +1,7 @@
 import { http, HttpResponse } from "msw";
 import type { AppId } from "@/lib/api/types";
 import type { McpServer, Provider, Settings } from "@/types";
+import type { RequestHealthConfig } from "@/types/proxy";
 import type {
   CodexSubagentProfilePreview,
   CodexSubagentProfileStatuses,
@@ -186,6 +187,17 @@ export const handlers = [
   ),
   http.post(`${TAURI_ENDPOINT}/get_pending_recovery_outcomes`, () =>
     success([]),
+  ),
+  http.post(`${TAURI_ENDPOINT}/get_orchestration_settings`, () =>
+    success({
+      enabled: false,
+      profiles: [],
+      defaultModeByApp: { claude: "direct", codex: "direct" },
+    }),
+  ),
+  http.post(
+    `${TAURI_ENDPOINT}/inspect_active_codex_multirouter_projection`,
+    () => success(null),
   ),
   http.post(`${TAURI_ENDPOINT}/preset_catalog_get`, () => success(null)),
   http.post(`${TAURI_ENDPOINT}/detect_codex_plugin_registration`, () =>
@@ -452,7 +464,82 @@ export const handlers = [
 
   http.post(`${TAURI_ENDPOINT}/save_settings`, async ({ request }) => {
     const { settings } = await withJson<{ settings: Settings }>(request);
-    setSettings(settings);
+    setSettings({ ...settings, requestHealth: getSettings().requestHealth });
+    return success(true);
+  }),
+
+  http.post(
+    `${TAURI_ENDPOINT}/save_request_health_settings`,
+    async ({ request }) => {
+      const { config } = await withJson<{ config: RequestHealthConfig }>(
+        request,
+      );
+      const canonical: RequestHealthConfig = {
+        ...config,
+        windowsNotificationsSnoozedUntilMs:
+          getSettings().requestHealth?.windowsNotificationsSnoozedUntilMs ??
+          null,
+      };
+      setSettings({ requestHealth: canonical });
+      return success(canonical);
+    },
+  ),
+
+  http.post(`${TAURI_ENDPOINT}/patch_settings`, async ({ request }) => {
+    const { patch = {} } = await withJson<{
+      patch?: {
+        firstRunNoticeConfirmed?: boolean;
+        usageConfirmed?: boolean;
+        commonConfigConfirmed?: boolean;
+        language?: Settings["language"];
+        enableStreamRetry?: boolean;
+        streamRetryMode?: Settings["streamRetryMode"];
+        streamRetryMaxAttempts?: number;
+        quotaCollaboration?: Partial<
+          NonNullable<Settings["quotaCollaboration"]>
+        >;
+      };
+    }>(request);
+    const current = getSettings();
+    const next: Partial<Settings> = {};
+
+    if ("firstRunNoticeConfirmed" in patch) {
+      next.firstRunNoticeConfirmed = patch.firstRunNoticeConfirmed;
+    }
+    if ("usageConfirmed" in patch) {
+      next.usageConfirmed = patch.usageConfirmed;
+    }
+    if ("commonConfigConfirmed" in patch) {
+      next.commonConfigConfirmed = patch.commonConfigConfirmed;
+    }
+    if ("language" in patch) {
+      next.language = patch.language;
+    }
+    if ("enableStreamRetry" in patch) {
+      next.enableStreamRetry = patch.enableStreamRetry;
+    }
+    if ("streamRetryMode" in patch) {
+      next.streamRetryMode = patch.streamRetryMode;
+    }
+    if ("streamRetryMaxAttempts" in patch) {
+      next.streamRetryMaxAttempts = patch.streamRetryMaxAttempts;
+    }
+    if (patch.quotaCollaboration) {
+      next.quotaCollaboration = {
+        deviceId: current.quotaCollaboration?.deviceId ?? "",
+        deviceName: current.quotaCollaboration?.deviceName ?? "",
+        mode: current.quotaCollaboration?.mode ?? "observe",
+        enforceRemainingPercent:
+          current.quotaCollaboration?.enforceRemainingPercent ?? 20,
+        latestWindowUtilization:
+          current.quotaCollaboration?.latestWindowUtilization,
+        latestWindowCapturedAt:
+          current.quotaCollaboration?.latestWindowCapturedAt,
+        ...patch.quotaCollaboration,
+      };
+    }
+
+    setSettings(next);
     return success(true);
   }),
 

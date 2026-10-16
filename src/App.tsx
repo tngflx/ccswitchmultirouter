@@ -111,6 +111,7 @@ import UnifiedSkillsPanel, {
 import { DeepLinkImportDialog } from "@/components/DeepLinkImportDialog";
 import { FirstRunNoticeDialog } from "@/components/FirstRunNoticeDialog";
 import { AgentsPanel } from "@/components/agents/AgentsPanel";
+import { OrchestrationSummaryCard } from "@/components/agents/OrchestrationSummaryCard";
 import { UniversalProviderPanel } from "@/components/universal";
 import { McpIcon } from "@/components/BrandIcons";
 import { Button } from "@/components/ui/button";
@@ -1587,6 +1588,11 @@ function App() {
                     transition={{ duration: 0.15 }}
                     className="space-y-4"
                   >
+                    {activeApp === "codex" && (
+                      <OrchestrationSummaryCard
+                        onOpen={handleOpenOrchestrationProfiles}
+                      />
+                    )}
                     <ProviderList
                       providers={providers}
                       currentProviderId={currentProviderId}
@@ -2426,11 +2432,10 @@ function App() {
             >
               <div className="flex items-center gap-2 font-medium">
                 <Bot className="h-4 w-4 text-emerald-500" />
-                Create orchestration profile
+                {t("orchestration.manageProfiles")}
               </div>
               <p className="mt-2 text-sm leading-6 text-muted-foreground">
-                Choose the Claude mastermind, Codex/Sublyx worker, verifier,
-                budgets, and default routing mode.
+                {t("orchestration.manageProfilesDescription")}
               </p>
             </button>
           </div>

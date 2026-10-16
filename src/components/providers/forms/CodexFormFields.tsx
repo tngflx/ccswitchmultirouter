@@ -76,8 +76,12 @@ import {
   isCompleteCodexCatalogFetch,
   reconcileFetchedCodexCatalogRows,
 } from "@/lib/codexCatalogReconciliation";
+import { enableOnlyConfirmedFreeCatalogModels } from "@/lib/freeModelCatalog";
 import { pruneOutdatedCodexCatalogModels } from "@/lib/codexCatalogVersionPruning";
-import { normalizeModelIdentityMetadata } from "@/lib/modelIdentities";
+import {
+  modelIdentityValues,
+  normalizeModelIdentityMetadata,
+} from "@/lib/modelIdentities";
 import {
   buildCodexInputCapabilityReferenceMap,
   codexInputCapabilityPatch,
@@ -413,7 +417,7 @@ function capabilityFromReasoningDetection(
       reasoning.defaultEffort as CodexReasoningEffort,
     )
       ? (reasoning.defaultEffort as CodexReasoningEffort)
-      : supportedEfforts[0],
+      : undefined,
     disableAllowed: !reasoning.mandatory,
     upstream: { format: "reasoning_object", parameter: "reasoning.effort" },
     outputFormat: "auto",
@@ -475,6 +479,9 @@ function createCatalogRow(seed?: Partial<CodexCatalogModel>): CodexCatalogRow {
     ...(seed?.reasoning ? { reasoning: seed.reasoning } : {}),
     ...(seed?.codexUltra ? { codexUltra: seed.codexUltra } : {}),
     ...(seed?.apiFormat ? { apiFormat: seed.apiFormat } : {}),
+    ...(seed?.protocolCapability
+      ? { protocolCapability: seed.protocolCapability }
+      : {}),
     ...(seed?.codexCache ? { codexCache: seed.codexCache } : {}),
     ...(seed?.enabled !== undefined ? { enabled: seed.enabled } : {}),
     ...(seed?.sortIndex !== undefined ? { sortIndex: seed.sortIndex } : {}),
@@ -520,6 +527,7 @@ function catalogRowsMatchModels(
       | "reasoning"
       | "codexUltra"
       | "apiFormat"
+      | "protocolCapability"
       | "codexCache"
       | "enabled"
       | "sortIndex"
@@ -558,6 +566,8 @@ function catalogRowsMatchModels(
         JSON.stringify(incoming.codexUltra ?? null) &&
       (row.apiFormat ?? null) ===
         (incoming.apiFormat ?? incoming.api_format ?? null) &&
+      JSON.stringify(row.protocolCapability ?? null) ===
+        JSON.stringify(incoming.protocolCapability ?? null) &&
       JSON.stringify(row.codexCache ?? null) ===
         JSON.stringify(incoming.codexCache ?? incoming.codex_cache ?? null) &&
       (row.enabled ?? true) === (incoming.enabled ?? true) &&
@@ -664,6 +674,8 @@ function buildCodexProviderReadinessIdentity({
       reasoning: model.reasoning ?? null,
       codexUltra: model.codexUltra ?? null,
       codexCache: model.codexCache ?? model.codex_cache ?? null,
+      protocolCapability: model.protocolCapability ?? null,
+      enabled: model.enabled !== false,
       sortIndex: model.sortIndex ?? null,
     })),
   });
@@ -937,15 +949,34 @@ export function CodexFormFields({
     () => catalogViewportItems.filter(({ row }) => row.enabled !== false),
     [catalogViewportItems],
   );
-  const includedModelOptions = useMemo(
-    () =>
-      catalogRows.length > 0
-        ? catalogRows
-            .filter((row) => row.enabled !== false && row.model.trim())
-            .map((row) => ({ id: row.model, ownedBy: null }))
-        : fetchedModels,
-    [catalogRows, fetchedModels],
-  );
+  const includedModelOptions = useMemo(() => {
+    if (catalogRows.length === 0) return fetchedModels;
+    const fetchedByIdentity = new Map<
+      string,
+      FetchedModel & { isFree?: boolean | null }
+    >();
+    for (const fetched of fetchedModels) {
+      for (const identity of modelIdentityValues(fetched)) {
+        if (!fetchedByIdentity.has(identity)) {
+          fetchedByIdentity.set(identity, fetched);
+        }
+      }
+    }
+    return catalogRows
+      .filter((row) => row.enabled !== false && row.model.trim())
+      .map((row) => {
+        const fetched = modelIdentityValues(row)
+          .map((identity) => fetchedByIdentity.get(identity))
+          .find(Boolean);
+        return {
+          id: row.model,
+          ownedBy: null,
+          ...(typeof fetched?.isFree === "boolean"
+            ? { isFree: fetched.isFree }
+            : {}),
+        };
+      });
+  }, [catalogRows, fetchedModels]);
 
   const reasoningSettingsConfig = useMemo(
     () => ({
@@ -1415,6 +1446,70 @@ export function CodexFormFields({
     selectedXaiAccountId,
     t,
   ]);
+
+  const confirmedFreeModelCount = useMemo(
+    () => fetchedModels.filter((model) => model.isFree === true).length,
+    [fetchedModels],
+  );
+  const canUseFreeModelsOnly = isCompleteCodexCatalogFetch(apiKeyGroups);
+  const handleUseFreeModelsOnly = useCallback(() => {
+    if (!onCatalogModelsChange) return;
+    const confirmedFreeModels = fetchedModels.filter(
+      (model) => model.isFree === true,
+    );
+    if (confirmedFreeModels.length === 0) {
+      toast.info(
+        t("codexConfig.noConfirmedFreeModels", {
+          defaultValue:
+            "No models were explicitly confirmed as free by this provider.",
+        }),
+      );
+      return;
+    }
+    if (!isCompleteCodexCatalogFetch(apiKeyGroupsRef.current)) {
+      toast.info(
+        t("codexConfig.freeModelsRequiresCompleteFetch", {
+          defaultValue:
+            "Use free models only after syncing a complete provider catalog.",
+        }),
+      );
+      return;
+    }
+
+    const nextRows = enableOnlyConfirmedFreeCatalogModels(
+      catalogRowsRef.current,
+      confirmedFreeModels,
+    );
+    const enabledRows = nextRows.filter((row) => row.enabled !== false);
+    if (enabledRows.length === 0) {
+      toast.info(
+        t("codexConfig.noConfirmedFreeCatalogMatches", {
+          defaultValue:
+            "The provider returned free models, but none matched the current catalog.",
+        }),
+      );
+      return;
+    }
+    catalogRowsRef.current = nextRows;
+    setCatalogRows(nextRows);
+
+    const currentDefault = codexModel.trim().toLowerCase();
+    const currentDefaultStillEnabled = enabledRows.some((row) =>
+      modelIdentityValues(row).includes(currentDefault),
+    );
+    if (!currentDefaultStillEnabled && onModelChange) {
+      const nextDefault =
+        enabledRows[0].model.trim() ||
+        catalogRowUpstreamModel(enabledRows[0]).trim();
+      if (nextDefault) onModelChange(nextDefault);
+    }
+    toast.success(
+      t("codexConfig.freeModelsOnlyApplied", {
+        count: enabledRows.length,
+        defaultValue: `Enabled ${enabledRows.length} confirmed free model(s).`,
+      }),
+    );
+  }, [codexModel, fetchedModels, onCatalogModelsChange, onModelChange, t]);
 
   const handleProtocolProbe = useCallback(async () => {
     if (!codexBaseUrl || !codexApiKey) {
@@ -2169,11 +2264,27 @@ export function CodexFormFields({
       {category !== "official" && canEditCatalog && (
         <CodexProviderReadinessSection
           models={catalogRows}
+          provider={{
+            settingsConfig: {
+              base_url: codexBaseUrl,
+              apiFormat,
+              modelCatalog: { models: catalogRows },
+            },
+            meta: {
+              apiFormat,
+              isFullUrl,
+              codexProtocolMode: protocolMode,
+              codexProtocolOverrides: protocolOverrides,
+            },
+          }}
           defaultModel={codexModel}
           apiFormat={apiFormat}
           adaptation={displayedAdaptation}
           isMaintainedPreset={isMaintainedPreset}
           isSyncingModels={isFetchingModels}
+          confirmedFreeModelCount={confirmedFreeModelCount}
+          canUseFreeModelsOnly={canUseFreeModelsOnly}
+          onUseFreeModelsOnly={handleUseFreeModelsOnly}
           isValidatingConnection={
             isProbingProtocol && isProtocolProbeStateCurrent
           }
@@ -2271,13 +2382,14 @@ export function CodexFormFields({
                     presetReasoningByModel.get(catalogRowUpstreamModel(row));
                   const isBuiltinReasoning =
                     row.reasoning?.source === "builtin";
+                  const isUserReasoning = row.reasoning?.source === "user";
                   const isUserPresetOverride =
                     Boolean(presetReasoning) &&
                     row.reasoning?.source === "user";
                   const reasoningSourceMode: CodexReasoningCapabilitySourceMode =
                     isBuiltinReasoning
                       ? "builtin"
-                      : row.reasoning
+                      : isUserReasoning
                         ? "manual"
                         : "automatic";
                   const isReasoningEditorExpanded =
@@ -2286,13 +2398,19 @@ export function CodexFormFields({
                     ? "CCSM-maintained declaration"
                     : isUserPresetOverride
                       ? "User declaration (overrides maintained value)"
-                      : row.reasoning
+                      : isUserReasoning
                         ? "User declaration"
-                        : reasoningResolution?.source === "detection"
-                          ? "Automatic detection"
-                          : reasoningResolution?.source === "library"
+                        : row.reasoning?.source === "detection"
+                          ? "Automatic provider metadata"
+                          : row.reasoning?.source === "library"
                             ? "Maintained capability catalog"
-                            : "Automatic discovery or server default";
+                            : row.reasoning
+                              ? "Automatic provider metadata"
+                              : reasoningResolution?.source === "detection"
+                                ? "Automatic detection"
+                                : reasoningResolution?.source === "library"
+                                  ? "Maintained capability catalog"
+                                  : "Automatic discovery or server default";
                   const selectableEfforts =
                     reasoningResolution?.resolved.codexSelectableEfforts ??
                     row.reasoning?.supportedEfforts ??

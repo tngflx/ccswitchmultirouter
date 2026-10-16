@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{OnceLock, RwLock};
 
 use crate::app_config::AppType;
@@ -903,7 +903,7 @@ impl AppSettings {
     }
 
     pub(crate) fn settings_path() -> Option<PathBuf> {
-        // settings.json 保留用于旧版本迁移和无数据库场景
+        // Device-local settings live outside the synced SQLite database.
         Some(
             crate::config::get_home_dir()
                 .join(".cc-switch")
@@ -1002,7 +1002,11 @@ impl AppSettings {
         let Some(path) = Self::settings_path() else {
             return Self::default();
         };
-        if let Ok(content) = fs::read_to_string(&path) {
+        Self::load_from_path(&path)
+    }
+
+    fn load_from_path(path: &Path) -> Self {
+        if let Ok(content) = fs::read_to_string(path) {
             match serde_json::from_str::<AppSettings>(&content) {
                 Ok(mut settings) => {
                     settings.normalize_paths();
@@ -1024,41 +1028,18 @@ impl AppSettings {
 }
 
 fn save_settings_file(settings: &AppSettings) -> Result<(), AppError> {
-    let mut normalized = settings.clone();
-    normalized.normalize_paths();
     let Some(path) = AppSettings::settings_path() else {
         return Err(AppError::Config("无法获取用户主目录".to_string()));
     };
+    save_settings_file_to_path(settings, &path)
+}
 
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|e| AppError::io(parent, e))?;
-    }
-
+fn save_settings_file_to_path(settings: &AppSettings, path: &Path) -> Result<(), AppError> {
+    let mut normalized = settings.clone();
+    normalized.normalize_paths();
     let json = serde_json::to_string_pretty(&normalized)
         .map_err(|e| AppError::JsonSerialize { source: e })?;
-    #[cfg(unix)]
-    {
-        use std::fs::OpenOptions;
-        use std::io::Write;
-        use std::os::unix::fs::OpenOptionsExt;
-
-        let mut file = OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(&path)
-            .map_err(|e| AppError::io(&path, e))?;
-        file.write_all(json.as_bytes())
-            .map_err(|e| AppError::io(&path, e))?;
-    }
-
-    #[cfg(not(unix))]
-    {
-        fs::write(&path, json).map_err(|e| AppError::io(&path, e))?;
-    }
-
-    Ok(())
+    crate::config::atomic_write_private(path, json.as_bytes())
 }
 
 static SETTINGS_STORE: OnceLock<RwLock<AppSettings>> = OnceLock::new();
@@ -1097,14 +1078,58 @@ pub fn get_settings() -> AppSettings {
 
 pub fn get_settings_for_frontend() -> AppSettings {
     let mut settings = get_settings();
+    redact_frontend_secrets(&mut settings);
+    settings
+}
+
+/// Return device-local preset registry settings without exposing credentials to
+/// renderer code. The backend-only getter remains available to request
+/// execution paths that need the WebDAV password.
+pub fn get_preset_registry_settings_for_frontend() -> Option<PresetRegistrySettings> {
+    let mut settings = get_preset_registry_settings();
+    if let Some(registry) = &mut settings {
+        redact_preset_registry_passwords(registry);
+    }
+    settings
+}
+
+fn redact_preset_registry_passwords(registry: &mut PresetRegistrySettings) {
+    for source in &mut registry.sources {
+        source.password.clear();
+    }
+}
+
+fn preserve_preset_registry_passwords(
+    incoming: &mut Option<PresetRegistrySettings>,
+    existing: Option<&PresetRegistrySettings>,
+) {
+    let (Some(incoming), Some(existing)) = (incoming, existing) else {
+        return;
+    };
+    for source in &mut incoming.sources {
+        if source.password.is_empty() {
+            if let Some(previous) = existing
+                .sources
+                .iter()
+                .find(|candidate| candidate.id == source.id)
+            {
+                source.password = previous.password.clone();
+            }
+        }
+    }
+}
+
+fn redact_frontend_secrets(settings: &mut AppSettings) {
     if let Some(sync) = &mut settings.webdav_sync {
         sync.password.clear();
     }
     if let Some(s3) = &mut settings.s3_sync {
         s3.secret_access_key.clear();
     }
+    if let Some(registry) = &mut settings.preset_registry {
+        redact_preset_registry_passwords(registry);
+    }
     settings.webdav_backup = None;
-    settings
 }
 
 pub fn update_settings(mut new_settings: AppSettings) -> Result<(), AppError> {
@@ -1131,24 +1156,80 @@ pub fn update_settings(mut new_settings: AppSettings) -> Result<(), AppError> {
     Ok(())
 }
 
-pub fn update_settings_preserving_tool_auto_update(
+pub(crate) fn preserve_dedicated_settings(incoming: &mut AppSettings, existing: &AppSettings) {
+    incoming.tool_auto_update = existing.tool_auto_update.clone();
+    incoming.auto_update_codex_cli = existing.auto_update_codex_cli;
+    incoming.request_health = existing.request_health.clone();
+    incoming.current_provider_claude = existing.current_provider_claude.clone();
+    incoming.current_provider_claude_desktop = existing.current_provider_claude_desktop.clone();
+    incoming.current_provider_codex = existing.current_provider_codex.clone();
+    incoming.current_provider_gemini = existing.current_provider_gemini.clone();
+    incoming.current_provider_grokbuild = existing.current_provider_grokbuild.clone();
+    incoming.current_provider_opencode = existing.current_provider_opencode.clone();
+    incoming.current_provider_openclaw = existing.current_provider_openclaw.clone();
+    incoming.current_provider_hermes = existing.current_provider_hermes.clone();
+    incoming.local_migrations = existing.local_migrations.clone();
+    // Quota window evidence is backend-owned and updated independently of the
+    // settings form. Policy changes use `patch_settings`, so preserve the
+    // complete canonical cache during stale full saves.
+    incoming.quota_collaboration = existing.quota_collaboration.clone();
+    // Cloud-sync settings and status are owned by their dedicated commands;
+    // frontend full settings payloads intentionally omit these fields.
+    incoming.webdav_sync = existing.webdav_sync.clone();
+    incoming.s3_sync = existing.s3_sync.clone();
+    // Preset registry sources and accepted-version metadata are likewise
+    // maintained by dedicated registry commands, not the general form.
+    incoming.preset_registry = existing.preset_registry.clone();
+
+    // Probe and launch evidence can change after the initial form merge.
+    if incoming.codex_egress_timezone.mode == CodexEgressTimezoneMode::Auto
+        && existing.codex_egress_timezone.mode == CodexEgressTimezoneMode::Auto
+        && existing.codex_egress_timezone.detected_at > incoming.codex_egress_timezone.detected_at
+    {
+        incoming.codex_egress_timezone.detected_timezone =
+            existing.codex_egress_timezone.detected_timezone.clone();
+        incoming.codex_egress_timezone.detected_at = existing.codex_egress_timezone.detected_at;
+        incoming.codex_egress_timezone.detected_egress_ip =
+            existing.codex_egress_timezone.detected_egress_ip.clone();
+        incoming.codex_egress_timezone.detected_country_code =
+            existing.codex_egress_timezone.detected_country_code.clone();
+        incoming.codex_egress_timezone.detected_region =
+            existing.codex_egress_timezone.detected_region.clone();
+        incoming.codex_egress_timezone.detected_city =
+            existing.codex_egress_timezone.detected_city.clone();
+        incoming.codex_egress_timezone.detected_colo =
+            existing.codex_egress_timezone.detected_colo.clone();
+        incoming.codex_egress_timezone.last_probe_trigger =
+            existing.codex_egress_timezone.last_probe_trigger.clone();
+    }
+    incoming.codex_egress_timezone.last_applied_timezone =
+        existing.codex_egress_timezone.last_applied_timezone.clone();
+    incoming.codex_egress_timezone.last_applied_at = existing.codex_egress_timezone.last_applied_at;
+}
+
+pub fn update_settings_preserving_dedicated_settings(
     mut new_settings: AppSettings,
 ) -> Result<(), AppError> {
     new_settings.env_injection.validate()?;
     crate::codex_egress_timezone::validate_timezone_settings(&new_settings.codex_egress_timezone)
         .map_err(AppError::InvalidInput)?;
     mutate_settings(|existing| {
-        // Read under the same write lock as the dedicated card setter, not from
-        // the settings page's potentially stale snapshot.
-        new_settings.tool_auto_update = existing.tool_auto_update.clone();
-        new_settings.auto_update_codex_cli = existing.auto_update_codex_cli;
+        // Dedicated setters and full saves must share the same current state,
+        // including updates made after the settings page loaded.
+        preserve_dedicated_settings(&mut new_settings, existing);
         *existing = new_settings;
     })
 }
 
 /// Persist only the Request Health configuration without replaying a stale
 /// full settings snapshot from the renderer.
-fn replace_request_health_config(settings: &mut AppSettings, request_health: RequestHealthConfig) {
+fn replace_request_health_config(
+    settings: &mut AppSettings,
+    mut request_health: RequestHealthConfig,
+) {
+    request_health.windows_notifications_snoozed_until_ms = settings
+        .request_health
+        .windows_notifications_snoozed_until_ms;
     settings.request_health = request_health;
 }
 
@@ -1157,8 +1238,8 @@ pub fn update_request_health_config(
 ) -> Result<RequestHealthConfig, AppError> {
     mutate_settings(|settings| {
         replace_request_health_config(settings, request_health);
-    })?;
-    Ok(get_settings().request_health)
+        settings.request_health.clone()
+    })
 }
 
 pub fn set_tool_auto_update(tool: &str, enabled: bool) -> Result<(), AppError> {
@@ -1183,6 +1264,7 @@ pub fn snooze_request_health_windows_notifications() -> Result<(), AppError> {
 
 pub fn request_health_windows_notifications_active(config: &RequestHealthConfig) -> bool {
     request_health_diagnostics_active(config)
+        && config.review_mode != RequestHealthReviewMode::Off
         && config.windows_notifications_enabled
         && config
             .windows_notifications_snoozed_until_ms
@@ -1190,7 +1272,7 @@ pub fn request_health_windows_notifications_active(config: &RequestHealthConfig)
 }
 
 pub fn request_health_diagnostics_active(config: &RequestHealthConfig) -> bool {
-    config.enabled && config.review_mode != RequestHealthReviewMode::Off
+    config.enabled
 }
 
 pub(crate) fn mutate_settings<F, R>(mutator: F) -> Result<R, AppError>
@@ -1614,9 +1696,13 @@ pub fn get_preset_registry_settings() -> Option<PresetRegistrySettings> {
 
 /// 保存预设注册表设置。
 pub fn set_preset_registry_settings(
-    settings: Option<PresetRegistrySettings>,
+    mut settings: Option<PresetRegistrySettings>,
 ) -> Result<(), AppError> {
     mutate_settings(|current| {
+        // Renderer payloads intentionally omit credentials. Preserve the
+        // existing password for matching sources instead of erasing it when
+        // the registry form is saved after a read.
+        preserve_preset_registry_passwords(&mut settings, current.preset_registry.as_ref());
         current.preset_registry = settings;
     })
 }
@@ -1725,7 +1811,7 @@ mod tests {
     }
 
     #[test]
-    fn request_health_advisories_follow_all_user_visible_disable_paths() {
+    fn request_health_diagnostics_and_notification_controls_are_independent() {
         let defaults = RequestHealthConfig::default();
         assert!(request_health_diagnostics_active(&defaults));
         assert!(request_health_windows_notifications_active(&defaults));
@@ -1736,7 +1822,8 @@ mod tests {
 
         let mut review_off = defaults.clone();
         review_off.review_mode = RequestHealthReviewMode::Off;
-        assert!(!request_health_diagnostics_active(&review_off));
+        assert!(request_health_diagnostics_active(&review_off));
+        assert!(!request_health_windows_notifications_active(&review_off));
 
         let mut notifications_off = defaults;
         assert!(request_health_diagnostics_active(&notifications_off));
@@ -1763,6 +1850,356 @@ mod tests {
         assert_eq!(settings.request_health, request_health);
         assert_eq!(settings.language.as_deref(), Some("en"));
         assert_eq!(settings.tool_auto_update.get("codex"), Some(&true));
+    }
+
+    #[test]
+    fn request_health_save_preserves_backend_owned_snooze() {
+        let mut settings = AppSettings::default();
+        settings
+            .request_health
+            .windows_notifications_snoozed_until_ms = Some(9_999_999_999_999);
+        let mut stale_form = RequestHealthConfig::default();
+        stale_form.large_request_threshold_bytes = 512 * 1024;
+
+        replace_request_health_config(&mut settings, stale_form);
+
+        assert_eq!(
+            settings
+                .request_health
+                .windows_notifications_snoozed_until_ms,
+            Some(9_999_999_999_999)
+        );
+        assert_eq!(
+            settings.request_health.large_request_threshold_bytes,
+            512 * 1024
+        );
+    }
+
+    #[test]
+    fn full_save_preserves_backend_owned_updates_after_its_initial_snapshot() {
+        let mut stale_save = AppSettings::default();
+        stale_save.language = Some("ja".to_string());
+        let mut current = AppSettings::default();
+        current.current_provider_claude = Some("current-claude".to_string());
+        current.current_provider_claude_desktop = Some("current-claude-desktop".to_string());
+        current.current_provider_codex = Some("current-codex".to_string());
+        current.current_provider_gemini = Some("current-gemini".to_string());
+        current.current_provider_grokbuild = Some("current-grokbuild".to_string());
+        current.current_provider_opencode = Some("current-opencode".to_string());
+        current.current_provider_openclaw = Some("current-openclaw".to_string());
+        current.current_provider_hermes = Some("current-hermes".to_string());
+        current.local_migrations = Some(LocalMigrations {
+            codex_provider_template_v1: Some(CodexProviderTemplateMigration {
+                completed_at: "2026-10-15T00:00:00Z".to_string(),
+                migrated_provider_ids: vec!["current-codex".to_string()],
+            }),
+            ..LocalMigrations::default()
+        });
+
+        preserve_dedicated_settings(&mut stale_save, &current);
+
+        assert_eq!(
+            stale_save.current_provider_claude,
+            current.current_provider_claude
+        );
+        assert_eq!(
+            stale_save.current_provider_claude_desktop,
+            current.current_provider_claude_desktop
+        );
+        assert_eq!(
+            stale_save.current_provider_codex,
+            current.current_provider_codex
+        );
+        assert_eq!(
+            stale_save.current_provider_gemini,
+            current.current_provider_gemini
+        );
+        assert_eq!(
+            stale_save.current_provider_grokbuild,
+            current.current_provider_grokbuild
+        );
+        assert_eq!(
+            stale_save.current_provider_opencode,
+            current.current_provider_opencode
+        );
+        assert_eq!(
+            stale_save.current_provider_openclaw,
+            current.current_provider_openclaw
+        );
+        assert_eq!(
+            stale_save.current_provider_hermes,
+            current.current_provider_hermes
+        );
+        assert_eq!(
+            serde_json::to_value(stale_save.local_migrations).unwrap(),
+            serde_json::to_value(current.local_migrations).unwrap()
+        );
+        assert_eq!(stale_save.language.as_deref(), Some("ja"));
+    }
+
+    #[test]
+    fn full_save_preserves_timezone_evidence_updated_after_its_initial_snapshot() {
+        let mut stale_save = AppSettings::default();
+        stale_save.codex_egress_timezone.mode = CodexEgressTimezoneMode::Auto;
+        stale_save.codex_egress_timezone.detected_at = Some(100);
+        stale_save.codex_egress_timezone.monitor_interval_minutes = 30;
+        let mut current = AppSettings::default();
+        current.codex_egress_timezone = CodexEgressTimezoneSettings {
+            mode: CodexEgressTimezoneMode::Auto,
+            detected_timezone: Some("Asia/Singapore".to_string()),
+            detected_at: Some(200),
+            last_applied_timezone: Some("Asia/Taipei".to_string()),
+            last_applied_at: Some(150),
+            ..CodexEgressTimezoneSettings::default()
+        };
+
+        preserve_dedicated_settings(&mut stale_save, &current);
+
+        assert_eq!(stale_save.codex_egress_timezone.detected_at, Some(200));
+        assert_eq!(
+            stale_save
+                .codex_egress_timezone
+                .detected_timezone
+                .as_deref(),
+            Some("Asia/Singapore")
+        );
+        assert_eq!(
+            stale_save
+                .codex_egress_timezone
+                .last_applied_timezone
+                .as_deref(),
+            Some("Asia/Taipei")
+        );
+        assert_eq!(stale_save.codex_egress_timezone.last_applied_at, Some(150));
+        assert_eq!(
+            stale_save.codex_egress_timezone.monitor_interval_minutes,
+            30
+        );
+    }
+
+    #[test]
+    fn full_save_preserves_backend_owned_quota_window_cache() {
+        let mut stale_save = AppSettings::default();
+        stale_save.quota_collaboration.latest_window_captured_at = None;
+        let mut current = AppSettings::default();
+        current.quota_collaboration.latest_window_utilization =
+            [("five_hour".to_string(), 82.5)].into_iter().collect();
+        current.quota_collaboration.latest_window_captured_at = Some(1_900);
+
+        preserve_dedicated_settings(&mut stale_save, &current);
+
+        assert_eq!(
+            stale_save.quota_collaboration.latest_window_utilization,
+            current.quota_collaboration.latest_window_utilization
+        );
+        assert_eq!(
+            stale_save.quota_collaboration.latest_window_captured_at,
+            Some(1_900)
+        );
+    }
+
+    #[test]
+    fn full_save_preserves_dedicated_cloud_sync_settings() {
+        let mut stale_save = AppSettings::default();
+        stale_save.webdav_sync = None;
+        stale_save.s3_sync = None;
+        let mut current = AppSettings::default();
+        current.webdav_sync = Some(WebDavSyncSettings {
+            enabled: true,
+            base_url: "https://dav.example.test/root".to_string(),
+            username: "alice".to_string(),
+            password: "secret".to_string(),
+            ..WebDavSyncSettings::default()
+        });
+        current.s3_sync = Some(S3SyncSettings {
+            enabled: true,
+            region: "us-east-1".to_string(),
+            bucket: "settings".to_string(),
+            access_key_id: "AKIA".to_string(),
+            secret_access_key: "secret".to_string(),
+            ..S3SyncSettings::default()
+        });
+
+        preserve_dedicated_settings(&mut stale_save, &current);
+
+        assert_eq!(
+            stale_save
+                .webdav_sync
+                .as_ref()
+                .map(|settings| &settings.base_url),
+            current
+                .webdav_sync
+                .as_ref()
+                .map(|settings| &settings.base_url)
+        );
+        assert_eq!(
+            stale_save.s3_sync.as_ref().map(|settings| &settings.bucket),
+            current.s3_sync.as_ref().map(|settings| &settings.bucket)
+        );
+    }
+
+    #[test]
+    fn full_save_preserves_dedicated_preset_registry_metadata() {
+        let mut stale_save = AppSettings::default();
+        stale_save.preset_registry = None;
+        let mut current = AppSettings::default();
+        current.preset_registry = Some(PresetRegistrySettings {
+            schema_version: 1,
+            sources: vec![crate::services::preset_registry::PresetSource {
+                id: "team".to_string(),
+                kind: crate::services::preset_registry::PresetSourceKind::Https,
+                trust: crate::services::preset_registry::PresetTrust::Local,
+                enabled: true,
+                base_url: "https://presets.example.test".to_string(),
+                username: String::new(),
+                password: String::new(),
+                remote_root: String::new(),
+                profile: String::new(),
+                public_key: String::new(),
+                last_checked_at: 1_900,
+                last_accepted_version: "2026.10.15".to_string(),
+            }],
+        });
+
+        preserve_dedicated_settings(&mut stale_save, &current);
+
+        assert_eq!(
+            stale_save
+                .preset_registry
+                .as_ref()
+                .and_then(|registry| registry.sources.first())
+                .map(|source| source.last_accepted_version.as_str()),
+            Some("2026.10.15")
+        );
+    }
+
+    #[test]
+    fn frontend_settings_redact_all_preset_registry_passwords() {
+        let mut settings = AppSettings::default();
+        settings.preset_registry = Some(PresetRegistrySettings {
+            schema_version: 1,
+            sources: vec![crate::services::preset_registry::PresetSource {
+                id: "team".to_string(),
+                kind: crate::services::preset_registry::PresetSourceKind::WebDav,
+                trust: crate::services::preset_registry::PresetTrust::Local,
+                enabled: true,
+                base_url: "https://presets.example.test".to_string(),
+                username: "fixture-user".to_string(),
+                password: "fixture-password-not-real".to_string(),
+                remote_root: "presets".to_string(),
+                profile: "default".to_string(),
+                public_key: String::new(),
+                last_checked_at: 1_900,
+                last_accepted_version: "2026.10.15".to_string(),
+            }],
+        });
+
+        redact_frontend_secrets(&mut settings);
+
+        assert_eq!(
+            settings
+                .preset_registry
+                .as_ref()
+                .and_then(|registry| registry.sources.first())
+                .map(|source| source.password.as_str()),
+            Some("")
+        );
+    }
+
+    #[test]
+    fn frontend_preset_registry_serialization_omits_source_passwords() {
+        let mut registry = PresetRegistrySettings {
+            schema_version: 1,
+            sources: vec![crate::services::preset_registry::PresetSource {
+                id: "team".to_string(),
+                kind: crate::services::preset_registry::PresetSourceKind::WebDav,
+                trust: crate::services::preset_registry::PresetTrust::Local,
+                enabled: true,
+                base_url: "https://presets.example.test".to_string(),
+                username: "fixture-user".to_string(),
+                password: "fixture-password-not-real".to_string(),
+                remote_root: "presets".to_string(),
+                profile: "default".to_string(),
+                public_key: String::new(),
+                last_checked_at: 1_900,
+                last_accepted_version: "2026.10.15".to_string(),
+            }],
+        };
+
+        redact_preset_registry_passwords(&mut registry);
+
+        let serialized = serde_json::to_value(registry).expect("serialize frontend registry");
+        assert!(
+            serialized["sources"][0].get("password").is_none(),
+            "frontend serialization must not expose a password field"
+        );
+        assert!(
+            !serialized.to_string().contains("fixture-password-not-real"),
+            "frontend serialization must not contain the source password"
+        );
+    }
+
+    #[test]
+    fn redacted_preset_registry_save_preserves_existing_password_by_source_id() {
+        let existing = PresetRegistrySettings {
+            schema_version: 1,
+            sources: vec![crate::services::preset_registry::PresetSource {
+                id: "team".to_string(),
+                kind: crate::services::preset_registry::PresetSourceKind::WebDav,
+                trust: crate::services::preset_registry::PresetTrust::Local,
+                enabled: true,
+                base_url: "https://presets.example.test".to_string(),
+                username: "fixture-user".to_string(),
+                password: "fixture-password-not-real".to_string(),
+                remote_root: "presets".to_string(),
+                profile: "default".to_string(),
+                public_key: String::new(),
+                last_checked_at: 1_900,
+                last_accepted_version: "2026.10.15".to_string(),
+            }],
+        };
+        let mut incoming = existing.clone();
+        incoming.sources[0].password.clear();
+
+        let mut incoming = Some(incoming);
+        preserve_preset_registry_passwords(&mut incoming, Some(&existing));
+
+        assert_eq!(
+            incoming
+                .as_ref()
+                .and_then(|registry| registry.sources.first())
+                .map(|source| source.password.as_str()),
+            Some("fixture-password-not-real")
+        );
+    }
+
+    #[test]
+    fn settings_save_atomically_replaces_complete_request_health_configuration() {
+        use std::io::Read;
+
+        let directory = tempfile::tempdir().expect("temporary settings directory");
+        let path = directory.path().join("settings.json");
+        let initial = AppSettings::default();
+        save_settings_file_to_path(&initial, &path).expect("save initial settings");
+        let mut original_file = fs::File::open(&path).expect("open original settings");
+        let mut edited = initial.clone();
+        edited.request_health.enabled = false;
+        edited.request_health.review_mode = RequestHealthReviewMode::Off;
+        edited.request_health.large_request_threshold_bytes = 512 * 1024;
+        edited.request_health.windows_notifications_snoozed_until_ms = Some(9_999_999_999_999);
+
+        save_settings_file_to_path(&edited, &path).expect("replace settings");
+
+        let reloaded = AppSettings::load_from_path(&path);
+        assert_eq!(reloaded.request_health, edited.request_health);
+        let mut original_contents = String::new();
+        original_file
+            .read_to_string(&mut original_contents)
+            .expect("read original file handle");
+        let original: AppSettings =
+            serde_json::from_str(&original_contents).expect("original JSON remains complete");
+        assert_eq!(original.request_health, initial.request_health);
+        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 1);
     }
 
     #[test]

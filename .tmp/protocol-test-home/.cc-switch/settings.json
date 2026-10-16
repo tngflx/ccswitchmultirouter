@@ -1,0 +1,54 @@
+{
+  "showInTray": true,
+  "minimizeToTrayOnClose": true,
+  "useAppWindowControls": false,
+  "enableClaudePluginIntegration": false,
+  "skipClaudeOnboarding": false,
+  "launchOnStartup": false,
+  "launchCodexDesktopWithCcswitch": false,
+  "toolAutoUpdate": {},
+  "autoUpdateCodexCli": false,
+  "codexEgressTimezone": {
+    "mode": "off",
+    "monitorIntervalMinutes": 15
+  },
+  "watchdogEnabled": true,
+  "silentStartup": false,
+  "enableLocalProxy": false,
+  "enableFailoverToggle": false,
+  "enableStreamRetry": true,
+  "streamRetryMode": "safe",
+  "streamRetryMaxAttempts": 3,
+  "requestHealth": {
+    "enabled": true,
+    "optimizationMode": "safe",
+    "largeRequestThresholdBytes": 393216,
+    "maxCodexInputTokens": 200000,
+    "reviewTimeoutSeconds": 60,
+    "reviewMode": "first_large_request",
+    "summarizeAndRestartEnabled": true,
+    "windowsNotificationsEnabled": true,
+    "windowsNotificationSnoozeHours": 4
+  },
+  "showProfileSwitcher": true,
+  "preserveCodexOfficialAuthOnSwitch": false,
+  "unifyCodexSessionHistory": false,
+  "currentProviderClaudeDesktop": "p1",
+  "skillSyncMethod": "auto",
+  "skillStorageLocation": "cc_switch",
+  "quotaCollaboration": {
+    "deviceId": "d0973505-8209-4de5-b044-6b4cc6e368f0",
+    "deviceName": "",
+    "mode": "observe",
+    "enforceRemainingPercent": 20.0,
+    "latestWindowUtilization": {}
+  },
+  "envInjection": {
+    "enabled": false,
+    "targets": {
+      "claude": true,
+      "codex": true
+    },
+    "variables": {}
+  }
+}

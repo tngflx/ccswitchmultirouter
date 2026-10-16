@@ -19,6 +19,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::env;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 #[cfg(windows)]
 use std::process::Command;
@@ -1608,13 +1609,16 @@ fn codex_json_string_array(value: &Value, key: &str) -> Vec<String> {
 }
 
 /// 读取 Codex router 本地诊断日志，并提取最近事件和错误。
+const CODEX_ROUTER_LOG_DIAGNOSTICS_MAX_BYTES: u64 = 2 * 1024 * 1024;
+const CODEX_ROUTER_LOG_DIAGNOSTICS_MAX_LINES: usize = 500;
+
 fn codex_router_log_diagnostics(provider_id: Option<&str>) -> CodexRouterLogDiagnostics {
     let path = crate::config::get_app_config_dir()
         .join("logs")
         .join("codex-router.log");
     let path_text = path.display().to_string();
     let exists = path.exists();
-    let text = match std::fs::read_to_string(&path) {
+    let text = match read_codex_router_log_tail(&path) {
         Ok(text) => text,
         Err(_) => {
             return CodexRouterLogDiagnostics {
@@ -1632,6 +1636,49 @@ fn codex_router_log_diagnostics(provider_id: Option<&str>) -> CodexRouterLogDiag
     };
 
     codex_router_log_diagnostics_from_text(path_text, exists, &text, provider_id)
+}
+
+/// Read only the tail needed by the diagnostics summary.  The router log is an
+/// append-only timeline and can grow to hundreds of megabytes during a busy
+/// Codex session; loading the complete file on every Settings/health refresh
+/// blocks the Tauri command thread and makes the app appear frozen.
+fn read_codex_router_log_tail(path: &Path) -> std::io::Result<String> {
+    let mut file = std::fs::File::open(path)?;
+    let length = file.metadata()?.len();
+    let start = length.saturating_sub(CODEX_ROUTER_LOG_DIAGNOSTICS_MAX_BYTES);
+    file.seek(SeekFrom::Start(start))?;
+
+    let mut bytes = Vec::with_capacity((length - start) as usize);
+    file.take(CODEX_ROUTER_LOG_DIAGNOSTICS_MAX_BYTES)
+        .read_to_end(&mut bytes)?;
+    if start > 0 {
+        if let Some(newline) = bytes.iter().position(|byte| *byte == b'\n') {
+            bytes.drain(..=newline);
+        } else {
+            bytes.clear();
+        }
+    }
+
+    // Keep the same bounded scan contract as the in-memory test helper.  We
+    // retain the newest 500 physical lines without decoding the preceding log.
+    let mut first_line = 0usize;
+    let mut line_count = bytes.iter().filter(|byte| **byte == b'\n').count();
+    if !bytes.is_empty() && bytes.last() != Some(&b'\n') {
+        line_count += 1;
+    }
+    while line_count > CODEX_ROUTER_LOG_DIAGNOSTICS_MAX_LINES {
+        if let Some(relative) = bytes[first_line..].iter().position(|byte| *byte == b'\n') {
+            first_line += relative + 1;
+            line_count -= 1;
+        } else {
+            break;
+        }
+    }
+    if first_line > 0 {
+        bytes.drain(..first_line);
+    }
+
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
 /// 从 router 日志文本生成诊断摘要，先按当前 MultiRouter provider 过滤再判断“近期请求”。
@@ -2019,6 +2066,54 @@ mod codex_router_log_diagnostics_tests {
     fn proxy_env_test_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    #[test]
+    fn router_log_tail_reads_only_the_newest_bounded_window() {
+        let temp_dir = tempfile::tempdir().expect("temporary log directory");
+        let path = temp_dir.path().join("codex-router.log");
+        let mut text = String::new();
+        for index in 0..700 {
+            text.push_str(&format!(
+                "2026-06-13 00:{:02}:00.000 event=route_resolved trace={index}\n",
+                index % 60
+            ));
+        }
+        std::fs::write(&path, text).expect("write test log");
+
+        let tail = read_codex_router_log_tail(&path).expect("read log tail");
+        assert!(!tail.contains("trace=0\n"));
+        assert!(tail.contains("trace=699\n"));
+        assert_eq!(tail.lines().count(), CODEX_ROUTER_LOG_DIAGNOSTICS_MAX_LINES);
+    }
+
+    #[test]
+    fn router_log_tail_counts_an_unterminated_last_line_in_its_limit() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let path = temp_dir.path().join("codex-router.log");
+        let text = (0..700)
+            .map(|index| format!("event=route_resolved trace={index}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(&path, text).unwrap();
+        let tail = read_codex_router_log_tail(&path).unwrap();
+        assert_eq!(tail.lines().count(), CODEX_ROUTER_LOG_DIAGNOSTICS_MAX_LINES);
+        assert!(tail.ends_with("trace=699"));
+    }
+
+    #[test]
+    fn router_log_tail_drops_an_oversized_partial_line_at_the_byte_boundary() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let path = temp_dir.path().join("codex-router.log");
+        let latest = "event=route_resolved trace=latest\n";
+        let text = format!(
+            "{}\n{latest}",
+            "x".repeat(CODEX_ROUTER_LOG_DIAGNOSTICS_MAX_BYTES as usize + 16)
+        );
+        std::fs::write(&path, text).unwrap();
+        let tail = read_codex_router_log_tail(&path).unwrap();
+        assert_eq!(tail, latest);
+        assert!(tail.len() <= CODEX_ROUTER_LOG_DIAGNOSTICS_MAX_BYTES as usize);
     }
 
     #[test]

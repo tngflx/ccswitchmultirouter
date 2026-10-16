@@ -4,7 +4,7 @@
 //! which is not an OpenAI-compatible `/v1/models` endpoint.
 
 use crate::proxy::providers::CODEX_OAUTH_ORIGINATOR;
-use crate::services::model_fetch::FetchedModel;
+use crate::services::model_fetch::{extract_model_identity_fields, FetchedModel};
 use once_cell::sync::Lazy;
 use serde::Serialize;
 use serde_json::Value;
@@ -512,6 +512,9 @@ fn push_model_entry(models: &mut Vec<FetchedModel>, entry: &Value, fallback_id: 
             owned_by: Some("Codex".to_string()),
             supports_image: None,
             reasoning: None,
+            protocol_capability: None,
+            is_free: None,
+            ..Default::default()
         });
         return;
     }
@@ -525,6 +528,9 @@ fn push_model_entry(models: &mut Vec<FetchedModel>, entry: &Value, fallback_id: 
                 owned_by: Some("Codex".to_string()),
                 supports_image: None,
                 reasoning: None,
+                protocol_capability: None,
+                is_free: None,
+                ..Default::default()
             });
         }
         return;
@@ -553,6 +559,7 @@ fn push_model_entry(models: &mut Vec<FetchedModel>, entry: &Value, fallback_id: 
     let context_window = extract_context_window(obj);
     let input_modalities = extract_input_modalities(obj);
     let supports_image = extract_supports_image(obj, input_modalities.as_deref());
+    let identity = extract_model_identity_fields(obj);
     let reasoning =
         crate::proxy::providers::codex_reasoning::official_reasoning_capability_for_model(
             &id,
@@ -566,7 +573,16 @@ fn push_model_entry(models: &mut Vec<FetchedModel>, entry: &Value, fallback_id: 
         input_modalities,
         owned_by,
         supports_image,
+        display_name: identity.display_name,
+        canonical_slug: identity.canonical_slug,
+        slug: identity.slug,
+        name: identity.name,
+        aliases: identity.aliases,
+        upstream_model: None,
+        supports_parallel_tool_calls: identity.supports_parallel_tool_calls,
         reasoning,
+        protocol_capability: None,
+        is_free: None,
     });
 }
 
@@ -865,6 +881,30 @@ mod tests {
             models.into_iter().map(|model| model.id).collect::<Vec<_>>(),
             vec!["gpt-5.3-codex".to_string(), "gpt-5.5".to_string()]
         );
+    }
+
+    #[test]
+    fn parse_codex_oauth_models_keeps_safe_identity_metadata() {
+        let models = parse_models(json!({
+            "models": [{
+                "slug": "wire-model",
+                "display_name": "Provider Model",
+                "canonical_slug": "catalog-family",
+                "aliases": {"previous-model": "wire-model"},
+                "supports_parallel_tool_calls": false,
+                "baseInstructions": "[REDACTED]",
+                "upstreamModel": "untrusted-wire-override"
+            }]
+        }));
+
+        let model = serde_json::to_value(&models[0]).unwrap();
+        assert_eq!(model["id"], "wire-model");
+        assert_eq!(model["displayName"], "Provider Model");
+        assert_eq!(model["canonicalSlug"], "catalog-family");
+        assert_eq!(model["aliases"], json!({"previous-model": "wire-model"}));
+        assert_eq!(model["supportsParallelToolCalls"], false);
+        assert!(model.get("baseInstructions").is_none());
+        assert!(model.get("upstreamModel").is_none());
     }
 
     #[test]

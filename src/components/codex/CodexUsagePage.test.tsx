@@ -25,7 +25,7 @@ vi.mock("@/lib/query", () => ({
 
 vi.mock("@/lib/api", () => ({
   settingsApi: {
-    save: vi.fn(),
+    patch: vi.fn(),
     openExternal: vi.fn(),
   },
 }));
@@ -129,7 +129,7 @@ describe("CodexUsagePage", () => {
     mockedUseQuotaCollaborationOverview.mockReset();
     mockedUseSyncQuotaCollaboration.mockReset();
     mockedUseSettingsQuery.mockReset();
-    mockedSettingsApi.save.mockReset();
+    mockedSettingsApi.patch.mockReset();
     mockedSettingsApi.openExternal.mockReset();
     invalidateQueries.mockReset();
     mockEmptyLocalUsage();
@@ -278,7 +278,7 @@ describe("CodexUsagePage", () => {
 
   it("guides an unconfigured device and saves enforce only after acknowledgement", async () => {
     const user = userEvent.setup();
-    mockedSettingsApi.save.mockResolvedValue(true);
+    mockedSettingsApi.patch.mockResolvedValue(undefined);
     mockQuotaResult({
       tool: "codex",
       credentialStatus: "valid",
@@ -315,15 +315,13 @@ describe("CodexUsagePage", () => {
     );
 
     await waitFor(() => {
-      expect(mockedSettingsApi.save).toHaveBeenCalledWith(
-        expect.objectContaining({
-          quotaCollaboration: expect.objectContaining({
-            deviceName: "测试设备",
-            mode: "enforce",
-            enforceRemainingPercent: 20,
-          }),
-        }),
-      );
+      expect(mockedSettingsApi.patch).toHaveBeenCalledWith({
+        quotaCollaboration: {
+          deviceName: "测试设备",
+          mode: "enforce",
+          enforceRemainingPercent: 20,
+        },
+      });
     });
     expect(invalidateQueries).toHaveBeenCalledTimes(2);
   });

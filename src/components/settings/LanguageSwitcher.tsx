@@ -1,5 +1,6 @@
 import { Check, Languages } from "lucide-react";
 import { useState } from "react";
+import { useQueryClient } from "@tanstack/react-query";
 import { useTranslation } from "react-i18next";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
@@ -58,6 +59,7 @@ function writeStoredLanguage(value: string | null): void {
 
 export function LanguageSwitcher() {
   const { t, i18n } = useTranslation();
+  const queryClient = useQueryClient();
   const { data: settings } = useSettingsQuery();
   const [isSaving, setIsSaving] = useState(false);
   const [selectedLanguage, setSelectedLanguage] =
@@ -90,6 +92,7 @@ export function LanguageSwitcher() {
     setIsSaving(true);
     void settingsApi
       .patch({ language })
+      .then(() => queryClient.invalidateQueries({ queryKey: ["settings"] }))
       .catch((error) => {
         setSelectedLanguage(previousLanguage);
         void i18n.changeLanguage(previousLanguage);

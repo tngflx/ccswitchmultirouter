@@ -9,6 +9,14 @@ import type {
 
 export type ProtocolLabCommitIntent = "accept_auto" | "confirm_manual";
 
+export interface ProtocolLabPreflightContext {
+  staleRetry: boolean;
+}
+
+export interface ProtocolLabCommitContext<TProbeOutcome> {
+  probeOutcome?: TProbeOutcome;
+}
+
 export interface ProtocolLabPreflightResult<
   TDraft,
   TAdaptation,
@@ -41,6 +49,7 @@ export interface ProtocolLabAdapter<
   preflight: (
     draft: TDraft,
     onProgress: (progress: TProgress) => void,
+    context?: ProtocolLabPreflightContext,
   ) => Promise<ProtocolLabPreflightResult<TDraft, TAdaptation, TProbeOutcome>>;
   prepare: (draft: TDraft, receiptIds: string[]) => Promise<TPreparePreview>;
   plan: (preview: TPreparePreview) => ProtocolLabPreparedPlan;
@@ -49,6 +58,7 @@ export interface ProtocolLabAdapter<
     receiptIds: string[],
     preview: TPreparePreview,
     intent: ProtocolLabCommitIntent,
+    context?: ProtocolLabCommitContext<TProbeOutcome>,
   ) => Promise<ProtocolLabCommitResult<TSnapshot, TCommitOutcome>>;
   isDependencyChanged: (error: unknown) => boolean;
   loadSnapshot?: (
@@ -57,10 +67,11 @@ export interface ProtocolLabAdapter<
   errorCode?: (error: unknown) => string | undefined;
 }
 
-interface ActiveOperation<TDraft> {
+interface ActiveOperation<TDraft, TProbeOutcome> {
   kind: "validate" | "save";
   draft: TDraft;
   receiptIds: string[];
+  probeOutcome?: TProbeOutcome;
   resolve: (outcome: unknown) => void;
   reject: (error: unknown) => void;
 }
@@ -108,13 +119,18 @@ export function useProtocolLabWorkflow<
 
   const [state, setState] = useState<State>(() => createProtocolLabState());
   const stateRef = useRef(state);
-  const activeOperation = useRef<ActiveOperation<TDraft> | null>(null);
+  const activeOperation = useRef<ActiveOperation<TDraft, TProbeOutcome> | null>(
+    null,
+  );
   const runProbeRef = useRef<
-    (operation: ActiveOperation<TDraft>, staleRetry: boolean) => Promise<void>
+    (
+      operation: ActiveOperation<TDraft, TProbeOutcome>,
+      staleRetry: boolean,
+    ) => Promise<void>
   >(async () => undefined);
   const runPrepareRef = useRef<
     (
-      operation: ActiveOperation<TDraft>,
+      operation: ActiveOperation<TDraft, TProbeOutcome>,
       staleRetryCount: number,
     ) => Promise<void>
   >(async () => undefined);
@@ -135,7 +151,7 @@ export function useProtocolLabWorkflow<
   );
 
   const finish = useCallback(
-    (operation: ActiveOperation<TDraft>, outcome: unknown) => {
+    (operation: ActiveOperation<TDraft, TProbeOutcome>, outcome: unknown) => {
       if (activeOperation.current !== operation) return;
       activeOperation.current = null;
       operation.resolve(outcome);
@@ -161,6 +177,7 @@ export function useProtocolLabWorkflow<
         operation.receiptIds,
         preview,
         adapter.isManual(operation.draft) ? "confirm_manual" : "accept_auto",
+        { probeOutcome: operation.probeOutcome },
       );
       if (activeOperation.current !== operation) return;
       transition({
@@ -203,13 +220,18 @@ export function useProtocolLabWorkflow<
       type: staleRetry ? "stale_retry_started" : "probe_consented",
     });
     try {
-      const result = await adapter.preflight(operation.draft, (progress) => {
-        if (activeOperation.current === operation) {
-          transition({ type: "probe_progress", progress });
-        }
-      });
+      const result = await adapter.preflight(
+        operation.draft,
+        (progress) => {
+          if (activeOperation.current === operation) {
+            transition({ type: "probe_progress", progress });
+          }
+        },
+        { staleRetry },
+      );
       if (activeOperation.current !== operation) return;
       operation.receiptIds = [...result.receiptIds];
+      operation.probeOutcome = result.outcome;
       if (result.draft !== undefined) {
         operation.draft = result.draft;
       }
@@ -237,10 +259,13 @@ export function useProtocolLabWorkflow<
 
   const createOperation = useCallback(
     <TOutcome>(
-      kind: ActiveOperation<TDraft>["kind"],
+      kind: ActiveOperation<TDraft, TProbeOutcome>["kind"],
       draft: TDraft,
       receiptIds: string[],
-    ): { operation: ActiveOperation<TDraft>; promise: Promise<TOutcome> } => {
+    ): {
+      operation: ActiveOperation<TDraft, TProbeOutcome>;
+      promise: Promise<TOutcome>;
+    } => {
       if (activeOperation.current) {
         throw new Error("protocol_lab_operation_in_progress");
       }

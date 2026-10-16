@@ -1231,6 +1231,54 @@ const piProviderPresetDefinitions: PiProviderPreset[] = [
     iconColor: "#624AFF",
   },
   {
+    name: "SiliconFlow",
+    providerKey: "cc-switch-siliconflow",
+    websiteUrl: "https://siliconflow.cn",
+    apiKeyUrl: "https://cloud.siliconflow.cn/account/ak",
+    settingsConfig: {
+      name: "SiliconFlow",
+      baseUrl: "https://api.siliconflow.cn/v1",
+      api: "openai-completions",
+      apiKey: "",
+      models: [
+        piModel("minimax/minimax-m2.7", {
+          id: "Pro/MiniMaxAI/MiniMax-M2.7",
+          name: "Pro / MiniMax M2.7",
+          contextWindow: 200_000,
+        }),
+      ],
+    },
+    category: "aggregator",
+    isPartner: true,
+    partnerPromotionKey: "siliconflow",
+    icon: "siliconflow",
+    iconColor: "#6E29F6",
+  },
+  {
+    name: "SiliconFlow en",
+    providerKey: "cc-switch-siliconflow-en",
+    websiteUrl: "https://siliconflow.com",
+    apiKeyUrl: "https://cloud.siliconflow.com",
+    settingsConfig: {
+      name: "SiliconFlow en",
+      baseUrl: "https://api.siliconflow.com/v1",
+      api: "openai-completions",
+      apiKey: "",
+      models: [
+        piModel("minimax/minimax-m2.7", {
+          id: "MiniMaxAI/MiniMax-M2.7",
+          name: "MiniMax M2.7",
+          contextWindow: 200_000,
+        }),
+      ],
+    },
+    category: "aggregator",
+    isPartner: true,
+    partnerPromotionKey: "siliconflow",
+    icon: "siliconflow",
+    iconColor: "#000000",
+  },
+  {
     name: "KAT-Coder",
     providerKey: "cc-switch-kat-coder",
     websiteUrl: "https://console.streamlake.ai",
@@ -1518,25 +1566,32 @@ const piProviderPresetDefinitions: PiProviderPreset[] = [
       baseUrl: "https://api.kilo.ai/api/gateway",
       api: "openai-completions",
       apiKey: "",
-      models: [
-        piModel("kilo/kilo-auto-free", { id: "kilo-auto/free" }),
-        piModel("kilo/kilo-auto-free", {
-          id: "minimax/minimax-m2.1:free",
-          name: "MiniMax M2.1 (Free)",
-        }),
-        piModel("kilo/kilo-auto-free", {
-          id: "z-ai/glm-5:free",
-          name: "GLM-5 (Free)",
-        }),
-        piModel("kilo/kilo-auto-free", {
-          id: "google/gemma-4-26b-a4b-it:free",
-          name: "Gemma 4 26B (Free)",
-        }),
-      ],
+      models: [piModel("kilo/kilo-auto-free", { id: "kilo-auto/free" })],
     },
     category: "aggregator",
     icon: "kilo",
     iconColor: "#6E56CF",
+  },
+  {
+    name: "Opper",
+    providerKey: "cc-switch-opper",
+    websiteUrl: "https://opper.ai",
+    apiKeyUrl: "https://platform.opper.ai",
+    settingsConfig: {
+      name: "Opper",
+      baseUrl: "https://api.opper.ai/v3/compat",
+      api: "openai-completions",
+      apiKey: "",
+      models: [
+        piModel("deepseek/deepseek-v4-flash", {
+          id: "deepseek/deepseek-v4-flash-0731",
+          name: "DeepSeek V4 Flash (0731)",
+          contextWindow: 1_048_576,
+          maxTokens: 393_216,
+        }),
+      ],
+    },
+    category: "aggregator",
   },
   {
     name: "TheRouter",

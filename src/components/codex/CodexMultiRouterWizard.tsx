@@ -2,6 +2,7 @@ import { useEffect, useMemo, useReducer, useRef, useState } from "react";
 import { Checkbox } from "@/components/ui/checkbox";
 import { createPortal } from "react-dom";
 import { useQueryClient } from "@tanstack/react-query";
+import { useTranslation } from "react-i18next";
 import {
   ArrowDown,
   ArrowLeft,
@@ -88,6 +89,9 @@ import {
   type WizardModelFetchConfig,
 } from "@/lib/codexMultiRouterWizard";
 import { readCodexCatalogSettings } from "@/lib/codexCatalogSchema";
+import { readCodexModelProtocolCapability } from "@/lib/codexProtocolCapability";
+import { normalizeCodexPublicModelKey } from "@/lib/protocol-lab/codex-overrides";
+import i18n from "@/i18n";
 import {
   DEFAULT_HOSTED_TOOLS_CONFIG,
   readHostedToolsConfig,
@@ -707,13 +711,88 @@ function skipsWizardDeepProtocolProbe(provider: Provider): boolean {
   return !providerHasAutomaticCodexModels(provider);
 }
 
+function wizardReceiptModels(
+  outcome: CodexProviderProtocolPreflightOutcome,
+): Record<string, string> {
+  return (
+    outcome.receiptModels ??
+    Object.fromEntries(
+      outcome.receiptIds.flatMap((receiptId, index) => {
+        const model = outcome.records[index]?.target.public_model;
+        return model ? [[receiptId, model]] : [];
+      }),
+    )
+  );
+}
+
+function mergeWizardProtocolOutcomes(
+  entries: CodexProviderSetBatchProbeOutcome["outcomes"],
+): Map<string, CodexProviderSetBatchProbeOutcome["outcomes"][number]> {
+  const byProvider = new Map<
+    string,
+    CodexProviderSetBatchProbeOutcome["outcomes"][number]
+  >();
+  for (const entry of entries) {
+    const previous = byProvider.get(entry.providerId);
+    if (!previous) {
+      byProvider.set(entry.providerId, entry);
+      continue;
+    }
+    const replacedModels = new Set(
+      entry.outcome.records.map((record) => record.target.public_model),
+    );
+    const previousReceiptModels = wizardReceiptModels(previous.outcome);
+    const retainedReceiptIds = previous.outcome.receiptIds.filter(
+      (id) => !replacedModels.has(previousReceiptModels[id]),
+    );
+    const receiptModels = {
+      ...Object.fromEntries(
+        retainedReceiptIds.map((id) => [id, previousReceiptModels[id]]),
+      ),
+      ...wizardReceiptModels(entry.outcome),
+    };
+    const observations = new Map(
+      [...previous.outcome.observations, ...entry.outcome.observations].map(
+        (record) => [
+          `${record.target.public_model}\u0000${record.target.transport}`,
+          record,
+        ],
+      ),
+    );
+    byProvider.set(entry.providerId, {
+      ...entry,
+      outcome: {
+        ...entry.outcome,
+        records: [
+          ...previous.outcome.records.filter(
+            (record) => !replacedModels.has(record.target.public_model),
+          ),
+          ...entry.outcome.records,
+        ],
+        observations: [...observations.values()],
+        receiptIds: [
+          ...new Set([...retainedReceiptIds, ...entry.outcome.receiptIds]),
+        ],
+        receiptModels,
+      },
+    });
+  }
+  return byProvider;
+}
+
 async function restoreWizardProtocolEvidence(
   sources: Provider[],
 ): Promise<CodexProviderSetBatchProbeOutcome> {
   const outcomes = (
     await Promise.all(
       sources.map(async (provider) => {
-        if (skipsWizardDeepProtocolProbe(provider)) return null;
+        if (
+          skipsWizardDeepProtocolProbe(provider) &&
+          !readIncludedWizardModelCatalog(provider).some((model) =>
+            readCodexModelProtocolCapability(provider, model),
+          )
+        )
+          return null;
         try {
           const outcome = await restoreCodexProviderProtocolEvidence(provider);
           return outcome
@@ -811,7 +890,16 @@ export function buildWizardConnectivityResultsFromBatchOutcome(
     const provider =
       outcomeSourceByProviderId.get(expectedProvider.id) ?? expectedProvider;
     const models = getWizardConnectivityProbeModels(provider);
-    if (skipsWizardDeepProtocolProbe(provider)) {
+    const declaredModels = readIncludedWizardModelCatalog(provider).filter(
+      (model) => readCodexModelProtocolCapability(provider, model),
+    );
+    const manualWholeProvider =
+      provider.meta?.codexProtocolMode === "manual" &&
+      Object.keys(provider.meta.codexProtocolOverrides ?? {}).length === 0;
+    if (
+      skipsWizardDeepProtocolProbe(provider) &&
+      (declaredModels.length === 0 || manualWholeProvider)
+    ) {
       results.push(
         skippedWizardDeepProbeResult(
           provider,
@@ -834,18 +922,86 @@ export function buildWizardConnectivityResultsFromBatchOutcome(
       continue;
     }
     const probeOutcome = outcomeByProviderId.get(provider.id);
-    if (probeOutcome) {
-      results.push(...deepProbeConnectivityResults(provider, probeOutcome));
-    } else {
-      results.push({
-        providerId: provider.id,
-        providerName: provider.name,
-        model: "*",
-        status: "fail",
-        canContinue: false,
-        detail:
-          "The backend returned no compatibility result for this model source.",
-      });
+    const probedModels = new Map(
+      probeOutcome
+        ? deepProbeConnectivityResults(provider, probeOutcome)
+            .filter((result) => result.model !== "*")
+            .map((result) => [result.model, result])
+        : [],
+    );
+    const unresolvedModels = new Set(
+      codexProviderModelsRequiringProtocolProbe(provider),
+    );
+    for (const model of models) {
+      const manualTransport = Object.entries(
+        provider.meta?.codexProtocolOverrides ?? {},
+      ).find(
+        ([key]) =>
+          normalizeCodexPublicModelKey(key) ===
+          normalizeCodexPublicModelKey(model),
+      )?.[1];
+      if (manualTransport) {
+        results.push({
+          providerId: provider.id,
+          providerName: provider.name,
+          model,
+          status: "skipped",
+          canContinue: true,
+          detail: i18n.t("codexWizardProtocol.manualDeclared", {
+            defaultValue:
+              "The provider has an explicit protocol selection; automatic probing will not override it.",
+          }),
+        });
+        continue;
+      }
+      const probed = probedModels.get(model);
+      if (probed) {
+        results.push(probed);
+        continue;
+      }
+      const declared = readCodexModelProtocolCapability(provider, model);
+      if (declared) {
+        results.push({
+          providerId: provider.id,
+          providerName: provider.name,
+          model,
+          status: "skipped",
+          canContinue: true,
+          recommendedApiFormat: declared,
+          detail: i18n.t("codexWizardProtocol.apiDeclared", {
+            defaultValue:
+              "Provider API declares {{protocol}} support; no complete probe is required. Live requests have not been verified.",
+            protocol:
+              declared === "openai_chat" ? "Chat Completions" : "Responses",
+          }),
+        });
+      } else if (!unresolvedModels.has(model)) {
+        results.push({
+          providerId: provider.id,
+          providerName: provider.name,
+          model,
+          status: "skipped",
+          canContinue: true,
+          detail: i18n.t("codexWizardProtocol.manualDeclared", {
+            defaultValue:
+              "The provider has an explicit protocol selection; automatic probing will not override it.",
+          }),
+        });
+      } else {
+        results.push({
+          providerId: provider.id,
+          providerName: provider.name,
+          model,
+          status: "fail",
+          canContinue: false,
+          detail: probeOutcome
+            ? i18n.t("codexWizardProtocol.unresolvedModel", {
+                defaultValue:
+                  "This model has neither a usable provider API protocol declaration nor reusable probe evidence.",
+              })
+            : "The backend returned no compatibility result for this model source.",
+        });
+      }
     }
   }
   return results;
@@ -865,6 +1021,7 @@ export function CodexMultiRouterWizard({
   onEnablePlan,
 }: CodexMultiRouterWizardProps) {
   const queryClient = useQueryClient();
+  const { t } = useTranslation();
   const batchProtocolLabAdapter = useMemo(
     () => createBatchCodexProtocolLabAdapter(),
     [],
@@ -892,7 +1049,7 @@ export function CodexMultiRouterWizard({
     [],
   );
   const [savedPlan, setSavedPlan] = useState<Provider | null>(null);
-  const [connectivityResults, setConnectivityResults] = useState<
+  const [lastConnectivityResults, setConnectivityResults] = useState<
     WizardConnectivityResult[]
   >([]);
   const [probeDialogOpen, setProbeDialogOpen] = useState(false);
@@ -968,12 +1125,40 @@ export function CodexMultiRouterWizard({
     () => collectWizardModelNameCollisions(draftSources),
     [draftSources],
   );
-  const protocolLabOutcomeById = new Map(
+  const protocolLabOutcomeById = mergeWizardProtocolOutcomes(
     [
       ...(restoredEvidence?.outcomes ?? []),
       ...(batchProtocolLab.probeOutcome?.outcomes ?? []),
-    ].map((entry) => [entry.providerId, entry]),
+    ].filter((entry) =>
+      draftSources.some(
+        (provider) =>
+          provider.id === entry.providerId &&
+          protocolProbeProviderSignature(entry.inputProvider) ===
+            protocolProbeProviderSignature(provider),
+      ),
+    ),
   );
+  const currentProtocolOutcomes = [...protocolLabOutcomeById.values()];
+  const connectivityResults = buildWizardConnectivityResultsFromBatchOutcome(
+    draftSources,
+    {
+      outcomes: currentProtocolOutcomes,
+      sources: currentProtocolOutcomes.map((entry) => ({
+        provider: entry.outcome.provider,
+        receiptIds: entry.outcome.receiptIds,
+      })),
+    },
+    hasCodexOauthAccount,
+  ).map((result) => {
+    if (result.canContinue) return result;
+    const previous = lastConnectivityResults.find(
+      (item) =>
+        item.providerId === result.providerId &&
+        (item.model === result.model || item.model === "*") &&
+        !item.canContinue,
+    );
+    return previous ? { ...result, detail: previous.detail } : result;
+  });
   const excludedProbeModelSet = new Set(excludedProbeModels);
   const probeModelKey = (providerId: string, model: string) =>
     `${providerId}\u0000${model}`;
@@ -2116,52 +2301,103 @@ export function CodexMultiRouterWizard({
         },
       },
     );
-    const previousSources = new Map(
-      [
-        ...(restoredEvidence?.sources ?? []),
-        ...(batchProtocolLab.state.draft?.sources ?? []),
-      ].map((source) => [source.provider.id, source]),
-    );
     const currentInputSources = new Map(
       draftSources.map((source) => [source.id, source]),
     );
+    const forceProbeTargets = retainedConnectivityResults.flatMap((result) => {
+      const source = currentInputSources.get(result.providerId);
+      if (!source || result.canContinue || result.model === "*") return [];
+      const includedModel = readIncludedWizardModelCatalog(source).find(
+        (model) =>
+          normalizeCodexPublicModelKey(model.model) ===
+          normalizeCodexPublicModelKey(result.model),
+      );
+      if (!includedModel) return [];
+      const manualTransport = Object.entries(
+        source.meta?.codexProtocolOverrides ?? {},
+      ).find(
+        ([key]) =>
+          normalizeCodexPublicModelKey(key) ===
+          normalizeCodexPublicModelKey(result.model),
+      )?.[1];
+      if (manualTransport) return [];
+      return [
+        {
+          providerId: source.id,
+          providerName: source.name,
+          model: includedModel.model,
+        },
+      ];
+    });
+    const forceProbeSourceIds = [
+      ...new Set(
+        forceProbeTargets
+          .filter((target) => {
+            const source = currentInputSources.get(target.providerId);
+            return (
+              source && readCodexModelProtocolCapability(source, target.model)
+            );
+          })
+          .map((target) => target.providerId),
+      ),
+    ];
     return {
-      sources: routeReadySources.map((source) => ({
-        provider: source,
-        receiptIds:
-          reuseReceipts &&
-          protocolLabOutcomeById.has(source.id) &&
-          protocolProbeProviderSignature(
-            protocolLabOutcomeById.get(source.id)!.inputProvider,
-          ) ===
-            protocolProbeProviderSignature(
-              currentInputSources.get(source.id) ?? source,
-            )
-            ? (previousSources.get(source.id)?.receiptIds ?? []).filter(
-                (_, index) => {
-                  const record = protocolLabOutcomeById.get(source.id)?.outcome
-                    .records[index];
-                  return (
-                    record &&
-                    !consumedReceiptIdsRef.current.has(
-                      (previousSources.get(source.id)?.receiptIds ?? [])[index],
-                    ) &&
-                    !isProbeModelExcluded(source.id, record.target.public_model)
-                  );
-                },
+      sources: routeReadySources.map((source) => {
+        const entry = protocolLabOutcomeById.get(source.id);
+        const includedModels = new Set(
+          readIncludedWizardModelCatalog(source).map((model) => model.model),
+        );
+        const receiptModels = entry ? wizardReceiptModels(entry.outcome) : {};
+        return {
+          provider: source,
+          receiptIds:
+            reuseReceipts &&
+            entry &&
+            protocolProbeProviderSignature(entry.inputProvider) ===
+              protocolProbeProviderSignature(
+                currentInputSources.get(source.id) ?? source,
               )
-            : [],
-      })),
+              ? entry.outcome.receiptIds.filter((id) => {
+                  const model = receiptModels[id];
+                  return (
+                    model &&
+                    includedModels.has(model) &&
+                    !consumedReceiptIdsRef.current.has(id) &&
+                    !isProbeModelExcluded(source.id, model)
+                  );
+                })
+              : [],
+        };
+      }),
       router: result.plan,
+      forceProbeSourceIds,
+      forceProbeTargets,
     };
   };
 
   const applyConnectivityProbeOutcome = (
     outcome: CodexProviderSetBatchProbeOutcome,
   ) => {
+    const freshEntries = outcome.outcomes.map((entry) => ({
+      ...entry,
+      inputProvider:
+        draftSources.find((source) => source.id === entry.providerId) ??
+        entry.inputProvider,
+    }));
+    const combinedEntries = [
+      ...mergeWizardProtocolOutcomes([
+        ...currentProtocolOutcomes,
+        ...freshEntries,
+      ]).values(),
+    ];
+    const combinedOutcome = {
+      ...outcome,
+      outcomes: combinedEntries,
+    };
+    setRestoredEvidence(combinedOutcome);
     const results = buildWizardConnectivityResultsFromBatchOutcome(
       draftSources,
-      outcome,
+      combinedOutcome,
       hasCodexOauthAccount,
     );
     const summary = {
@@ -2287,24 +2523,64 @@ export function CodexMultiRouterWizard({
       );
     })()
       .then(async (outcome) => {
-        draft.sources
-          .flatMap((source) => source.receiptIds)
-          .forEach((id) => consumedReceiptIdsRef.current.add(id));
+        [
+          ...draft.sources.flatMap((source) => source.receiptIds),
+          ...(outcome.consumedReceiptIds ?? []),
+        ].forEach((id) => consumedReceiptIdsRef.current.add(id));
         if (targetGeneration !== targetGenerationRef.current) return;
         setSavedPlan(outcome.editorRouter);
+        // A successful atomic commit validates the backend's normalized source
+        // snapshots. Keep that evidence applicable to the committed draft, but
+        // do not reuse its consumed receipts for a subsequent save.
+        const committedSources =
+          outcome.sourceSnapshots.length > 0
+            ? outcome.sourceSnapshots.map(
+                (snapshot) => snapshot.logicalProvider,
+              )
+            : draft.sources.map((source) => source.provider);
+        setRestoredEvidence({
+          sources: committedSources.map((provider) => ({
+            provider,
+            receiptIds: [],
+          })),
+          outcomes: committedSources.flatMap((provider) => {
+            const entry = protocolLabOutcomeById.get(provider.id);
+            const committedOutcome =
+              outcome.committedEvidence?.find(
+                (evidence) => evidence.provider.id === provider.id,
+              ) ?? entry?.outcome;
+            if (!committedOutcome) return [];
+            const models = readIncludedWizardModelCatalog(provider);
+            return [
+              {
+                providerId: provider.id,
+                inputProvider: provider,
+                outcome: {
+                  ...committedOutcome,
+                  provider,
+                  receiptIds: [],
+                  receiptModels: {},
+                  records: committedOutcome.records.filter((record) =>
+                    models.some(
+                      (model) =>
+                        model.model === record.target.public_model &&
+                        (model.upstreamModel ??
+                          model.upstream_model ??
+                          model.model) === record.target.upstream_model,
+                    ),
+                  ),
+                },
+              },
+            ];
+          }),
+        });
         committedSourceFactsRef.current = new Map(
           outcome.sourceSnapshots.map((snapshot) => [
             snapshot.logicalProvider.id,
             protocolProbeProviderSignature(snapshot.logicalProvider),
           ]),
         );
-        setDraftSources(
-          outcome.sourceSnapshots.length > 0
-            ? outcome.sourceSnapshots.map(
-                (snapshot) => snapshot.logicalProvider,
-              )
-            : draft.sources.map((source) => source.provider),
-        );
+        setDraftSources(committedSources);
         await queryClient.invalidateQueries({
           queryKey: ["providers", "codex"],
         });
@@ -2456,7 +2732,12 @@ export function CodexMultiRouterWizard({
                 {currentStep.title}
               </h2>
               <p className="mt-1 text-sm text-muted-foreground">
-                {currentStep.description}
+                {currentStep.key === "protocol"
+                  ? t("codexWizardProtocol.description", {
+                      defaultValue:
+                        "Resolve model protocols from provider API declarations or saved evidence; deep probing is the fallback for unresolved models.",
+                    })
+                  : currentStep.description}
               </p>
             </div>
           </div>
@@ -3099,14 +3380,21 @@ export function CodexMultiRouterWizard({
               {currentStep.key === "protocol" && (
                 <div className="space-y-4">
                   <div className="rounded-lg border p-3 text-sm leading-6">
-                    There is no separate save here after probing. Deselect
-                    failed models, click “Next,” then save the plan on “Save and
-                    enable.” Deselected models are disabled during final save; a
-                    source is omitted if all of its models are deselected. The
-                    unsaved draft remains for this app session. Editing a saved
-                    plan restores valid probe evidence automatically; probe
-                    again when evidence is missing, stale, or the source
-                    changes.
+                    {t("codexWizardProtocol.summary", {
+                      defaultValue:
+                        "API-declared: {{declared}} models. Deep-verified: {{verified}} models. Unresolved: {{unresolved}} models.",
+                      declared: connectivityResults.filter(
+                        (result) =>
+                          result.status === "skipped" &&
+                          result.recommendedApiFormat,
+                      ).length,
+                      verified: connectivityResults.filter(
+                        (result) => result.status === "pass",
+                      ).length,
+                      unresolved: retainedConnectivityResults.filter(
+                        (result) => !result.canContinue,
+                      ).length,
+                    })}
                   </div>
                   {isRestoringEvidence && (
                     <p role="status">
@@ -3116,18 +3404,20 @@ export function CodexMultiRouterWizard({
                   )}
                   {restoredEvidence && (
                     <p role="status">
-                      Saved records checked: reusing{" "}
-                      {restoredEvidence.outcomes.length} source evidence.
-                      Unrestored sources still need probing.
+                      {t("codexWizardProtocol.restoredSummary", {
+                        defaultValue:
+                          "Saved records checked: reusing {{count}} source evidence.",
+                        count: restoredEvidence.outcomes.filter(
+                          (entry) => entry.outcome.records.length > 0,
+                        ).length,
+                      })}
                     </p>
                   )}
                   <div className="rounded-lg border border-amber-500/30 bg-amber-500/10 p-3 text-sm leading-6 text-amber-900 dark:text-amber-200">
-                    Each standard provider/model verifies Responses and Chat
-                    Completions base responses, streaming SSE, reasoning
-                    semantics, forced tool calls, and tool-result continuation.
-                    401/403/429, network errors, and 5xx are marked as
-                    authentication or upstream availability issues, not protocol
-                    incompatibility.
+                    {t("codexWizardProtocol.fallbackScope", {
+                      defaultValue:
+                        "Each unresolved provider/model verifies Responses and Chat Completions base responses, streaming SSE, reasoning semantics, forced tool calls, and tool-result continuation when a deep probe is requested. Authentication failures, rate limits, network errors, and 5xx remain availability issues, not protocol incompatibility.",
+                    })}
                   </div>
                   <Button
                     onClick={requestConnectivityProbe}
@@ -3528,6 +3818,7 @@ export function CodexMultiRouterWizard({
                       onClick={saveMultiRouterPlan}
                       disabled={
                         isSavingPlan ||
+                        isRestoringEvidence ||
                         editingTargetMissing ||
                         draftSources.length === 0 ||
                         aliasSelectionIssues.length > 0 ||
@@ -3713,17 +4004,24 @@ export function CodexMultiRouterWizard({
         <CodexProtocolProbeProgressDialog
           open={probeDialogOpen}
           running={batchProtocolLab.state.phase === "probing"}
-          expectedTargets={(
-            batchProtocolLab.state.draft?.sources ?? []
-          ).flatMap((source) =>
-            codexProviderModelsRequiringProtocolProbe(source.provider).map(
-              (model) => ({
+          expectedTargets={(() => {
+            const draft = batchProtocolLab.state.draft;
+            const forcedTargets = draft?.forceProbeTargets ?? [];
+            const hasTargetSnapshot = Array.isArray(draft?.forceProbeTargets);
+            return (draft?.sources ?? []).flatMap((source) => {
+              const sourceTargets = forcedTargets
+                .filter((target) => target.providerId === source.provider.id)
+                .map((target) => target.model);
+              const models = hasTargetSnapshot
+                ? sourceTargets
+                : codexProviderModelsRequiringProtocolProbe(source.provider);
+              return [...new Set(models)].map((model) => ({
                 providerId: source.provider.id,
                 providerName: source.provider.name,
                 model,
-              }),
-            ),
-          )}
+              }));
+            });
+          })()}
           events={batchProtocolLab.state.progress}
           outcome={
             batchProtocolLab.probeOutcome?.outcomes.at(-1)?.outcome ?? null

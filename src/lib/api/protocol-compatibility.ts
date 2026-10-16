@@ -185,6 +185,8 @@ export interface CodexProviderProtocolPreflightOutcome {
   records: CodexProtocolCompatibilityRecord[];
   observations: CodexProtocolCompatibilityRecord[];
   receiptIds: string[];
+  /** Explicit model association; older releases issued one receipt per record. */
+  receiptModels?: Record<string, string>;
   protocolApplied: boolean;
   /** Missing only on receipts created by releases before probe-usage accounting. */
   probeUsage?: CodexProtocolProbeUsageSummary;
@@ -259,6 +261,10 @@ export interface CodexProviderSetBatchCommitOutcome {
   projections: CodexRoutingProjectionStatus[];
   status: "committed" | "committed_with_projection_error";
   projectionErrorCode?: string | null;
+  /** Frontend workflow leases used by the successful commit, including retries. */
+  consumedReceiptIds?: string[];
+  /** Actual evidence produced by this commit operation, including retries. */
+  committedEvidence?: CodexProviderProtocolPreflightOutcome[];
 }
 
 export interface UniversalProviderSetPreview {
@@ -287,6 +293,7 @@ export interface CodexProviderModelAdaptation {
   choice: CodexProtocolChoice;
   choiceSource: "automatic" | "manual";
   effectiveTransport: CodexProtocolTransport | null;
+  resolutionSource?: "provider_api" | "probe" | "manual";
   readiness: CodexProtocolProbeReadiness;
   responses: CodexProtocolCompatibilityRecord | null;
   chat: CodexProtocolCompatibilityRecord | null;

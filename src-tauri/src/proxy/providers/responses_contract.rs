@@ -12,6 +12,7 @@ struct Contract {
     field_types: BTreeMap<String, Vec<String>>,
     input_types: Vec<String>,
     tool_types: Vec<String>,
+    tool_choice_types: Vec<String>,
 }
 
 fn contract() -> &'static Contract {
@@ -159,8 +160,27 @@ pub(crate) fn inspect(body: &Value, check_search_history: bool) -> Vec<ContractF
                 continue;
             }
             let kind = item.get("type").and_then(Value::as_str).unwrap_or("");
+            let inferred_reference = matches!(item.get("type"), None | Some(Value::Null))
+                && item.get("id").is_some()
+                && item.as_object().is_some_and(|object| {
+                    object
+                        .keys()
+                        .all(|key| matches!(key.as_str(), "id" | "type"))
+                });
             if let Some(value) = item.get("type") {
-                checks.typed(Some(value), &["string"], true, &format!("{path}.type"));
+                checks.typed(
+                    Some(value),
+                    if inferred_reference {
+                        &["string", "null"]
+                    } else {
+                        &["string"]
+                    },
+                    true,
+                    &format!("{path}.type"),
+                );
+            }
+            if inferred_reference || kind == "item_reference" {
+                checks.typed(item.get("id"), &["string"], true, &format!("{path}.id"));
             }
             if !kind.is_empty() && !contract().input_types.iter().any(|t| t == kind) {
                 checks.unknown();
@@ -345,7 +365,11 @@ fn inspect_choice(choice: Option<&Value>, tools: &[&Value], checks: &mut Checks,
         }
         return;
     }
-    if !contract().tool_types.iter().any(|t| t == kind) {
+    // The create reference retains preview search choices; the search guide
+    // also permits a specific modern web-search choice.
+    if !contract().tool_choice_types.iter().any(|t| t == kind)
+        && !matches!(kind, "web_search" | "web_search_2025_08_26")
+    {
         checks.unknown();
         return;
     }
@@ -355,7 +379,12 @@ fn inspect_choice(choice: Option<&Value>, tools: &[&Value], checks: &mut Checks,
     let matches = tools.iter().any(|tool| {
         let declared_kind = tool.get("type").and_then(Value::as_str).unwrap_or("");
         (kind == declared_kind
-            || (kind.starts_with("web_search") && declared_kind.starts_with("web_search")))
+            || (kind.starts_with("web_search") && declared_kind.starts_with("web_search"))
+            || (matches!(kind, "computer" | "computer_use" | "computer_use_preview")
+                && matches!(
+                    declared_kind,
+                    "computer" | "computer_use" | "computer_use_preview"
+                )))
             && (!matches!(kind, "function" | "custom") || choice.get("name") == tool.get("name"))
             && (kind != "mcp" || choice.get("server_label") == tool.get("server_label"))
     });
@@ -475,5 +504,61 @@ mod tests {
         assert_eq!(findings[0].count, 4);
         assert_eq!(findings[0].severity, "info");
         assert!(!findings[0].detail.contains("private"));
+    }
+
+    #[test]
+    fn accepts_nullable_item_references_without_weakening_other_item_types() {
+        for item in [
+            json!({"id":"server-item"}),
+            json!({"id":"server-item","type":null}),
+            json!({"id":"server-item","type":"item_reference"}),
+        ] {
+            assert!(codes(json!({"input":[item]})).is_empty());
+        }
+        for item in [
+            json!({"id":false,"type":null}),
+            json!({"type":"item_reference"}),
+            json!({"id":"server-item","type":null,"role":"user","content":"text"}),
+            json!({"id":"server-item","type":null,"call_id":"call","name":"tool","arguments":"{}"}),
+        ] {
+            assert_eq!(codes(json!({"input":[item]})), vec!["responses_field_type"]);
+        }
+    }
+
+    #[test]
+    fn tool_choices_use_their_own_union_and_computer_aliases() {
+        for (choice, declared) in [
+            ("computer", "computer"),
+            ("computer_use", "computer"),
+            ("computer_use_preview", "computer_use_preview"),
+            ("web_search", "web_search"),
+            ("web_search", "web_search_preview"),
+            ("web_search_preview_2025_03_11", "web_search_2025_08_26"),
+        ] {
+            assert!(
+                codes(json!({
+                    "tools":[{"type":declared}],
+                    "tool_choice":{"type":choice}
+                }))
+                .is_empty(),
+                "{choice} must match its {declared} declaration"
+            );
+        }
+        assert_eq!(
+            codes(json!({"tool_choice":{"type":"computer_use"}})),
+            vec!["undeclared_tool_choice"]
+        );
+        for kind in ["namespace", "tool_search", "local_shell"] {
+            let findings = inspect(
+                &json!({
+                    "tools":[{"type":kind,"name":"fixture","tools":[]}],
+                    "tool_choice":{"type":kind}
+                }),
+                false,
+            );
+            assert_eq!(findings.len(), 1);
+            assert_eq!(findings[0].code, "responses_unverified_extension");
+            assert_eq!(findings[0].severity, "info");
+        }
     }
 }

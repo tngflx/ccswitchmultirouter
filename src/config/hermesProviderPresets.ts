@@ -1554,23 +1554,36 @@ export const hermesProviderPresets: HermesProviderPreset[] = [
           id: "kilo-auto/free",
           name: "Kilo Auto (Free)",
         },
-        {
-          id: "minimax/minimax-m2.1:free",
-          name: "MiniMax M2.1 (Free)",
-        },
-        {
-          id: "z-ai/glm-5:free",
-          name: "GLM-5 (Free)",
-        },
-        {
-          id: "google/gemma-4-26b-a4b-it:free",
-          name: "Gemma 4 26B (Free)",
-        },
       ],
     },
     category: "aggregator",
     icon: "kilo",
     iconColor: "#6E56CF",
+  },
+  {
+    name: "Opper",
+    websiteUrl: "https://opper.ai",
+    apiKeyUrl: "https://platform.opper.ai",
+    settingsConfig: {
+      name: "opper",
+      base_url: "https://api.opper.ai/v3/compat",
+      api_key: "",
+      api_mode: "chat_completions",
+      models: [
+        {
+          id: "deepseek/deepseek-v4-flash-0731",
+          name: "DeepSeek V4 Flash (0731)",
+          context_length: 1048576,
+        },
+      ],
+    },
+    category: "aggregator",
+    suggestedDefaults: {
+      model: {
+        default: "deepseek/deepseek-v4-flash-0731",
+        provider: "opper",
+      },
+    },
   },
   {
     name: "TheRouter",

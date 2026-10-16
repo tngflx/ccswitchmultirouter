@@ -251,10 +251,23 @@ vi.mock("@tauri-apps/api/core", () => ({
         );
         return {
           provider: source,
+          adaptationPreview: {
+            persistence: "single",
+            status: "ready",
+            effectiveTransport: "open_ai_responses",
+            models: [],
+          },
           receiptIds: models.map(
             (model: string) => `receipt:${source.id}:${model}`,
           ),
+          receiptModels: Object.fromEntries(
+            models.map((model: string) => [
+              `receipt:${source.id}:${model}`,
+              model,
+            ]),
+          ),
           protocolApplied: false,
+          observations: [],
           records: models.map((model: string) => ({
             probeVersion: 1,
             target: {
@@ -266,6 +279,7 @@ vi.mock("@tauri-apps/api/core", () => ({
               endpoint_fingerprint: "endpoint",
               authentication_kind: "bearer",
               credential_fingerprint: "credential",
+              request_policy_fingerprint: "policy",
             },
             result: {
               selected_transport: "open_ai_responses",

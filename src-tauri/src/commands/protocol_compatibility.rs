@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap},
     future::Future,
     str::FromStr,
     sync::{Mutex, OnceLock},
@@ -17,9 +17,10 @@ use uuid::Uuid;
 use crate::{
     app_config::AppType,
     codex_multirouter::projection::{CodexRoutingProjectionStatus, ProjectionState},
+    codex_multirouter::protocol_capability::provider_api_declared_transport,
     codex_multirouter::provider_set::{
-        plan_codex_provider_set, plan_manual_codex_provider_set, CodexProviderSetPlan,
-        CodexProviderSetPreview,
+        plan_codex_provider_set, plan_manual_codex_provider_set,
+        requires_automatic_codex_protocol_probe, CodexProviderSetPlan, CodexProviderSetPreview,
     },
     protocol_compatibility::{
         compile_codex_router_probe_candidates, compile_provider_probe_candidates,
@@ -121,6 +122,7 @@ pub struct CodexProviderProtocolPreflightOutcome {
     pub records: Vec<ProtocolCompatibilityRecord>,
     pub observations: Vec<ProtocolCompatibilityRecord>,
     pub receipt_ids: Vec<String>,
+    pub receipt_models: BTreeMap<String, String>,
     pub protocol_applied: bool,
     pub probe_usage: CodexProtocolProbeUsageSummary,
 }
@@ -451,17 +453,22 @@ fn prepare_codex_provider_set_batch_internal(
         {
             Vec::new()
         } else {
-            if source.receipt_ids.is_empty() && !provider.uses_manual_codex_protocol() {
+            if source.receipt_ids.is_empty()
+                && !provider.uses_manual_codex_protocol()
+                && requires_automatic_codex_protocol_probe(&provider)
+                    .map_err(|error| error.to_string())?
+            {
                 return Err("codex_provider_set_probe_required".to_string());
             }
-            if source.receipt_ids.is_empty() {
+            let records = if source.receipt_ids.is_empty() {
                 Vec::new()
             } else {
                 let (records, _) =
                     load_codex_provider_set_probe_receipts(state, &source.receipt_ids)?;
                 validate_codex_provider_set_probe_records(&provider, &records)?;
                 records
-            }
+            };
+            merge_saved_provider_protocol_records(state, &provider, &records, now)?
         };
         sources.push((provider, records));
     }
@@ -511,6 +518,11 @@ where
         .iter()
         .flat_map(|source| source.receipt_ids.iter().cloned())
         .collect::<Vec<_>>();
+    let source_providers = request
+        .sources
+        .iter()
+        .map(|source| source.provider.clone())
+        .collect::<Vec<_>>();
     let receipt_claim = state.claim_codex_provider_set_probe_receipts(&receipt_ids)?;
     let (prepared, preview) = prepare_codex_provider_set_batch_internal(
         state,
@@ -533,8 +545,36 @@ where
     let router = prepared.router.clone();
     let editor_router = prepared.editor_router.clone();
     let projection_router_ids = prepared.projection_router_ids.clone();
-    let (_, observations) =
-        protocol_state_from_provider_set_receipt_bundles(receipt_claim.bundles());
+    let bundles = receipt_claim.bundles();
+    let mut observations = Vec::new();
+    for source in source_providers {
+        let source = ProviderService::prepare_provider_for_mutation(state, &AppType::Codex, source)
+            .map_err(|error| error.to_string())?;
+        let source_bundles = bundles
+            .iter()
+            .filter(|bundle| bundle.record.target.provider_id == source.id)
+            .collect::<Vec<_>>();
+        if source_bundles.is_empty() {
+            continue;
+        }
+        let source_records = source_bundles
+            .iter()
+            .map(|bundle| bundle.record.clone())
+            .collect::<Vec<_>>();
+        let source_observations = source_bundles
+            .iter()
+            .flat_map(|bundle| bundle.observations.iter().cloned())
+            .collect::<Vec<_>>();
+        let (_, reconciled) = ProviderService::merge_saved_codex_protocol_state(
+            state,
+            &source,
+            &source_records,
+            &source_observations,
+            now,
+        )
+        .map_err(|error| error.to_string())?;
+        observations.extend(reconciled);
+    }
     let mut transaction = prepared
         .transaction
         .ok_or_else(|| "codex_provider_set_batch_blocked".to_string())?;
@@ -647,6 +687,7 @@ pub(crate) fn prepare_codex_provider_set_internal(
             validate_codex_provider_set_probe_records(&provider, &records)?;
             records
         };
+        let records = merge_saved_provider_protocol_records(state, &provider, &records, now)?;
         return if provider.has_codex_protocol_overrides() {
             plan_codex_provider_set(&provider, &records, &providers, now)
         } else {
@@ -656,11 +697,14 @@ pub(crate) fn prepare_codex_provider_set_internal(
         .map(|prepared| prepared.preview)
         .map_err(|error| error.to_string());
     }
-    if request.receipt_ids.is_empty() {
+    if request.receipt_ids.is_empty()
+        && requires_automatic_codex_protocol_probe(&provider).map_err(|error| error.to_string())?
+    {
         return Err("codex_provider_set_probe_required".to_string());
     }
     let (records, _) = load_codex_provider_set_probe_receipts(state, &request.receipt_ids)?;
     validate_codex_provider_set_probe_records(&provider, &records)?;
+    let records = merge_saved_provider_protocol_records(state, &provider, &records, now)?;
     plan_codex_provider_set(&provider, &records, &providers, now)
         .map(|prepared| prepared.preview)
         .map_err(|error| error.to_string())
@@ -698,12 +742,23 @@ where
             claimed_records
         }
     } else {
-        if request.receipt_ids.is_empty() {
+        if request.receipt_ids.is_empty()
+            && requires_automatic_codex_protocol_probe(&provider)
+                .map_err(|error| error.to_string())?
+        {
             return Err("codex_provider_set_probe_required".to_string());
         }
         validate_codex_provider_set_probe_records(&provider, &claimed_records)?;
         claimed_records
     };
+    let (records, observations) = ProviderService::merge_saved_codex_protocol_state(
+        state,
+        &provider,
+        &records,
+        &observations,
+        now,
+    )
+    .map_err(|error| error.to_string())?;
     let prepared = if is_manual && provider.has_codex_protocol_overrides() {
         plan_codex_provider_set(&provider, &records, &existing, now)
     } else if is_manual {
@@ -910,8 +965,10 @@ fn restore_provider_protocol_evidence(
     let Some(mut outcome) = collect_saved_provider_protocol_evidence(state, provider, now)? else {
         return Ok(None);
     };
-    outcome.receipt_ids =
-        remember_candidate_batch_receipts(state, &outcome.records, &outcome.observations)?;
+    let (receipt_ids, receipt_models) =
+        remember_restored_candidate_receipts(state, &outcome.records, &outcome.observations)?;
+    outcome.receipt_ids = receipt_ids;
+    outcome.receipt_models = receipt_models;
     Ok(Some(outcome))
 }
 
@@ -928,15 +985,28 @@ pub(crate) fn collect_saved_provider_protocol_evidence(
         .map_err(|error| error.to_string())?
         .into_iter()
         .collect::<HashMap<_, _>>();
-    let (candidates, is_router) = compile_preflight_candidates(
-        &provider,
-        &providers,
-        CodexProtocolProbeScope::AutomaticModels,
-    )?;
     // This endpoint restores source evidence, never an arbitrary router graph.
-    if is_router || candidates.is_empty() {
+    if provider.settings_config.get("codexRouting").is_some()
+        || provider.uses_fixed_codex_responses_transport()
+        || (provider.uses_manual_codex_protocol() && !provider.has_codex_protocol_overrides())
+    {
         return Ok(None);
     }
+    let candidates = compile_provider_probe_candidates(&provider)?
+        .into_iter()
+        .filter(|candidate| {
+            crate::codex_multirouter::provider_set::codex_model_follows_automatic_protocol(
+                &provider,
+                &candidate.public_model,
+            )
+        })
+        .collect::<Vec<_>>();
+    if candidates.is_empty() {
+        return Ok(None);
+    }
+    let has_declaration = candidates.iter().any(|candidate| {
+        provider_api_declared_transport(&provider, &candidate.public_model).is_some()
+    });
     // Persisted split profiles belong to owned leaves, while original observations
     // belong to the logical source. Rebind only within a validated Provider Set.
     let mut related_ids = vec![provider.id.clone()];
@@ -980,16 +1050,15 @@ pub(crate) fn collect_saved_provider_protocol_evidence(
                 if rebound.target == target
                     && rebound.probe_version == PROBE_PROFILE_VERSION
                     && rebound.expires_at >= now
-                    && rebound.result.readiness == ProbeReadiness::Verified
-                    && rebound.result.selected_transport == Some(transport)
                 {
                     matching.push(rebound);
                 }
             }
         }
         let Some(record) = matching.into_iter().max_by_key(|record| record.tested_at) else {
-            return Ok(None);
+            continue;
         };
+        let mut paired_observations = Vec::new();
         for transport in [TransportKind::OpenAiResponses, TransportKind::OpenAiChat] {
             let target = target_for_candidate(&candidate, transport)?;
             let Some(observation) = stored
@@ -1006,11 +1075,47 @@ pub(crate) fn collect_saved_provider_protocol_evidence(
                         && observation.probe_version == record.probe_version
                 })
             else {
-                return Ok(None);
+                paired_observations.clear();
+                break;
             };
-            observations.push(observation);
+            paired_observations.push(observation);
         }
+        observations.extend(paired_observations);
         records.push(record);
+    }
+    let live_bundles = state.list_live_codex_provider_set_probe_receipts()?;
+    for active in collect_active_failed_provider_protocol_records(state, &provider, now)? {
+        let active_order = state.codex_provider_set_probe_record_order(&active)?;
+        let saved_orders = records
+            .iter()
+            .filter(|record| {
+                record.target.public_model == active.target.public_model
+                    && record.target.upstream_model == active.target.upstream_model
+            })
+            .map(|record| state.codex_provider_set_probe_record_order(record))
+            .collect::<Result<Vec<_>, _>>()?;
+        if saved_orders.into_iter().any(|order| order > active_order) {
+            continue;
+        }
+        records.retain(|record| {
+            record.target.public_model != active.target.public_model
+                || record.target.upstream_model != active.target.upstream_model
+        });
+        observations.retain(|observation| {
+            observation.target.public_model != active.target.public_model
+                || observation.target.upstream_model != active.target.upstream_model
+        });
+        if let Some(bundle) = live_bundles
+            .iter()
+            .rev()
+            .find(|bundle| bundle.record == active)
+        {
+            observations.extend(bundle.observations.clone());
+        }
+        records.push(active);
+    }
+    if records.is_empty() && !has_declaration {
+        return Ok(None);
     }
     let adaptation_preview = crate::commands::provider::build_codex_provider_adaptation_preview(
         &provider,
@@ -1026,9 +1131,146 @@ pub(crate) fn collect_saved_provider_protocol_evidence(
         records,
         observations,
         receipt_ids: Vec::new(),
+        receipt_models: BTreeMap::new(),
         protocol_applied: false,
         probe_usage: CodexProtocolProbeUsageSummary::default(),
     }))
+}
+
+fn remember_restored_candidate_receipts(
+    state: &AppState,
+    records: &[ProtocolCompatibilityRecord],
+    observations: &[ProtocolCompatibilityRecord],
+) -> Result<(Vec<String>, BTreeMap<String, String>), String> {
+    let mut complete_records = Vec::new();
+    let mut paired_observations = Vec::new();
+    for record in records {
+        let pair = [TransportKind::OpenAiResponses, TransportKind::OpenAiChat]
+            .into_iter()
+            .map(|transport| {
+                observations.iter().find(|observation| {
+                    observation.target.provider_id == record.target.provider_id
+                        && observation.target.route_id == record.target.route_id
+                        && observation.target.public_model == record.target.public_model
+                        && observation.target.upstream_model == record.target.upstream_model
+                        && observation.target.transport == transport
+                        && observation.tested_at == record.tested_at
+                        && observation.probe_version == record.probe_version
+                })
+            })
+            .collect::<Option<Vec<_>>>();
+        let Some(pair) = pair else {
+            continue;
+        };
+        complete_records.push(record.clone());
+        paired_observations.extend(pair.into_iter().cloned());
+    }
+    let receipt_ids = complete_records
+        .iter()
+        .cloned()
+        .zip(paired_observations.chunks_exact(2))
+        .map(|(record, observations)| {
+            state.remember_restored_codex_provider_set_probe_receipt(record, observations.to_vec())
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let receipt_models = receipt_ids
+        .iter()
+        .zip(&complete_records)
+        .map(|(receipt_id, record)| (receipt_id.clone(), record.target.public_model.clone()))
+        .collect();
+    Ok((receipt_ids, receipt_models))
+}
+
+pub(crate) fn merge_saved_provider_protocol_records(
+    state: &AppState,
+    provider: &Provider,
+    records: &[ProtocolCompatibilityRecord],
+    now: i64,
+) -> Result<Vec<ProtocolCompatibilityRecord>, String> {
+    let mut merged = records.to_vec();
+    let saved_records = collect_saved_provider_protocol_evidence(state, provider.clone(), now)?
+        .map(|saved| saved.records)
+        .unwrap_or_default();
+    for saved_record in saved_records {
+        let newest_incoming_order = records
+            .iter()
+            .filter(|record| {
+                record.target.public_model == saved_record.target.public_model
+                    && record.target.upstream_model == saved_record.target.upstream_model
+                    && record.probe_version == PROBE_PROFILE_VERSION
+                    && record.expires_at >= now
+                    && crate::protocol_compatibility::compile_provider_probe_candidate_for_model(
+                        provider,
+                        record.target.public_model.clone(),
+                        record.target.upstream_model.clone(),
+                    )
+                    .ok()
+                    .and_then(|candidate| candidate.target_key(record.target.transport).ok())
+                    .as_ref()
+                        == Some(&record.target)
+            })
+            .map(|record| state.codex_provider_set_probe_record_order(record))
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .max();
+        let saved_order = state.codex_provider_set_probe_record_order(&saved_record)?;
+        if newest_incoming_order.is_some_and(|order| order >= saved_order) {
+            continue;
+        }
+        merged.retain(|record| {
+            record.target.public_model != saved_record.target.public_model
+                || record.target.upstream_model != saved_record.target.upstream_model
+        });
+        merged.push(saved_record);
+    }
+    Ok(merged)
+}
+
+fn collect_active_failed_provider_protocol_records(
+    state: &AppState,
+    provider: &Provider,
+    now: i64,
+) -> Result<Vec<ProtocolCompatibilityRecord>, String> {
+    if provider.settings_config.get("codexRouting").is_some()
+        || provider.uses_fixed_codex_responses_transport()
+        || (provider.uses_manual_codex_protocol() && !provider.has_codex_protocol_overrides())
+    {
+        return Ok(Vec::new());
+    }
+    let candidates = compile_provider_probe_candidates(provider)?;
+    let mut current = BTreeMap::new();
+    for bundle in state.list_live_codex_provider_set_probe_receipts()? {
+        let record = bundle.record;
+        if record.probe_version != PROBE_PROFILE_VERSION || record.expires_at < now {
+            continue;
+        }
+        let Some(candidate) = candidates.iter().find(|candidate| {
+            candidate.public_model == record.target.public_model
+                && candidate.upstream_model == record.target.upstream_model
+                && crate::codex_multirouter::provider_set::codex_model_follows_automatic_protocol(
+                    provider,
+                    &candidate.public_model,
+                )
+        }) else {
+            continue;
+        };
+        if candidate.target_key(record.target.transport)? != record.target {
+            continue;
+        }
+        if record.result.readiness == ProbeReadiness::Verified
+            && record.result.selected_transport == Some(record.target.transport)
+        {
+            continue;
+        }
+        current.insert(
+            (
+                record.target.public_model.clone(),
+                record.target.upstream_model.clone(),
+            ),
+            record,
+        );
+    }
+    Ok(current.into_values().collect())
 }
 
 #[tauri::command]
@@ -1115,7 +1357,8 @@ where
         .map_err(|error| error.to_string())?
         .into_iter()
         .collect::<HashMap<_, _>>();
-    let (candidates, _is_router) = compile_preflight_candidates(&provider, &providers, scope)?;
+    let (candidates, is_router) =
+        compile_preflight_candidates_with_saved_evidence(state, &provider, &providers, scope)?;
     if scope == CodexProtocolProbeScope::AllEnabledModels && candidates.is_empty() {
         return Err("codex_protocol_probe_no_enabled_models".to_string());
     }
@@ -1126,29 +1369,103 @@ where
         })
     })
     .await?;
-    let records = batch.records;
-    let receipt_ids = remember_candidate_batch_receipts(state, &records, &batch.observations)?;
+    if batch.observations.len() != batch.records.len() * 2 {
+        return Err("codex_provider_set_probe_observation_mismatch".to_string());
+    }
+    let fresh_receipt_ids = batch
+        .records
+        .iter()
+        .cloned()
+        .zip(batch.observations.chunks_exact(2))
+        .zip(&batch.observed_at)
+        .map(|((record, observations), observed_at)| {
+            state.remember_observed_codex_provider_set_probe_receipt(
+                record,
+                observations.to_vec(),
+                *observed_at,
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let probe_usage = summarize_protocol_probe_usage(state, &provider, &batch.records).await;
+    reporter(batch_finished_event(total, &batch.records));
+    let fresh_records = batch.records.clone();
+    let records = if is_router {
+        batch.records
+    } else {
+        merge_saved_provider_protocol_records(
+            state,
+            &provider,
+            &batch.records,
+            Utc::now().timestamp(),
+        )?
+    };
+    let mut observations = batch.observations;
+    for fresh_record in &fresh_records {
+        if !records.contains(fresh_record) {
+            observations.retain(|observation| {
+                observation.target.public_model != fresh_record.target.public_model
+                    || observation.target.upstream_model != fresh_record.target.upstream_model
+            });
+        }
+    }
+    if !is_router {
+        if let Some(saved) = collect_saved_provider_protocol_evidence(
+            state,
+            provider.clone(),
+            Utc::now().timestamp(),
+        )? {
+            for observation in saved.observations {
+                let selected_saved = records.iter().any(|record| {
+                    record.target.public_model == observation.target.public_model
+                        && record.target.upstream_model == observation.target.upstream_model
+                        && record.tested_at == observation.tested_at
+                        && record.probe_version == observation.probe_version
+                });
+                if selected_saved
+                    && !observations.iter().any(|existing| {
+                        existing.target == observation.target
+                            && existing.tested_at == observation.tested_at
+                    })
+                {
+                    observations.push(observation);
+                }
+            }
+        }
+    }
+    let retained_saved_records = records
+        .iter()
+        .filter(|record| !fresh_records.contains(record))
+        .cloned()
+        .collect::<Vec<_>>();
+    let (mut receipt_ids, mut receipt_models) =
+        remember_restored_candidate_receipts(state, &retained_saved_records, &observations)?;
+    for (record, receipt_id) in fresh_records.iter().zip(fresh_receipt_ids) {
+        if records.contains(record) {
+            receipt_models.insert(receipt_id.clone(), record.target.public_model.clone());
+            receipt_ids.push(receipt_id);
+        }
+    }
     let adaptation_preview = crate::commands::provider::build_codex_provider_adaptation_preview(
         &provider,
         &records,
-        &batch.observations,
+        &observations,
         &providers,
         chrono::Utc::now().timestamp(),
     )
     .map_err(|error| error.to_string())?;
-    let probe_usage = summarize_protocol_probe_usage(state, &provider, &records).await;
-    reporter(batch_finished_event(total, &records));
     Ok(CodexProviderProtocolPreflightOutcome {
         provider,
         adaptation_preview,
         records,
-        observations: batch.observations,
+        observations,
         receipt_ids,
+        receipt_models,
         protocol_applied: false,
         probe_usage,
     })
 }
 
+#[cfg(test)]
 fn remember_candidate_batch_receipts(
     state: &AppState,
     records: &[ProtocolCompatibilityRecord],
@@ -1188,7 +1505,8 @@ pub(crate) async fn automatic_codex_provider_preflight(
         .map_err(|error| error.to_string())?
         .into_iter()
         .collect::<HashMap<_, _>>();
-    let (candidates, _is_router) = compile_preflight_candidates(
+    let (candidates, _is_router) = compile_preflight_candidates_with_saved_evidence(
+        state,
         &provider,
         &providers,
         CodexProtocolProbeScope::AutomaticModels,
@@ -1203,14 +1521,104 @@ pub(crate) async fn automatic_codex_provider_preflight(
     Ok((provider, batch.records, batch.observations))
 }
 
+fn compile_preflight_candidates_with_saved_evidence(
+    state: &AppState,
+    provider: &Provider,
+    providers: &HashMap<String, Provider>,
+    scope: CodexProtocolProbeScope,
+) -> Result<(Vec<ProbeCandidate>, bool), String> {
+    let (mut candidates, is_router) = compile_preflight_candidates(provider, providers, scope)?;
+    if is_router
+        || scope != CodexProtocolProbeScope::AutomaticModels
+        || (provider.uses_manual_codex_protocol() && !provider.has_codex_protocol_overrides())
+    {
+        return Ok((candidates, is_router));
+    }
+    let now = Utc::now().timestamp();
+    let current_records = merge_saved_provider_protocol_records(state, provider, &[], now)?;
+    let (saved_profiles, saved_observations) =
+        ProviderService::merge_saved_codex_protocol_state(state, provider, &[], &[], now)
+            .map_err(|error| error.to_string())?;
+    let reusable_verified_models = saved_profiles
+        .into_iter()
+        .filter(|record| {
+            record.result.readiness == ProbeReadiness::Verified
+                && record.result.selected_transport == Some(record.target.transport)
+                && [TransportKind::OpenAiResponses, TransportKind::OpenAiChat]
+                    .into_iter()
+                    .all(|transport| {
+                        saved_observations.iter().any(|observation| {
+                            observation.target.provider_id == record.target.provider_id
+                                && observation.target.route_id == record.target.route_id
+                                && observation.target.public_model == record.target.public_model
+                                && observation.target.upstream_model == record.target.upstream_model
+                                && observation.target.transport == transport
+                                && observation.tested_at == record.tested_at
+                                && observation.probe_version == record.probe_version
+                                && observation.result.selected_transport
+                                    == record.result.selected_transport
+                                && observation.result.branches.iter().eq(record
+                                    .result
+                                    .branches
+                                    .iter()
+                                    .filter(|branch| branch.assessment.transport == transport))
+                        })
+                    })
+        })
+        .map(|record| (record.target.public_model, record.target.upstream_model))
+        .collect::<BTreeSet<_>>();
+    candidates.retain(|candidate| {
+        !reusable_verified_models.contains(&(
+            candidate.public_model.clone(),
+            candidate.upstream_model.clone(),
+        ))
+    });
+    for record in current_records {
+        if record.result.readiness == ProbeReadiness::Verified
+            && record.result.selected_transport == Some(record.target.transport)
+        {
+            continue;
+        }
+        if candidates.iter().any(|candidate| {
+            candidate.public_model == record.target.public_model
+                && candidate.upstream_model == record.target.upstream_model
+        }) {
+            continue;
+        }
+        candidates.push(
+            crate::protocol_compatibility::compile_provider_probe_candidate_for_model(
+                provider,
+                record.target.public_model,
+                record.target.upstream_model,
+            )?,
+        );
+    }
+    Ok((candidates, false))
+}
+
 fn compile_preflight_candidates(
     provider: &Provider,
     providers: &HashMap<String, Provider>,
     scope: CodexProtocolProbeScope,
 ) -> Result<(Vec<ProbeCandidate>, bool), String> {
     if provider.settings_config.get("codexRouting").is_some() {
-        return compile_codex_router_probe_candidates(provider, providers)
-            .map(|candidates| (candidates, true));
+        let mut candidates = compile_codex_router_probe_candidates(provider, providers)?;
+        if scope == CodexProtocolProbeScope::AutomaticModels {
+            candidates.retain(|candidate| {
+                let effective = crate::proxy::providers::resolve_codex_v2_routed_provider(
+                    provider,
+                    &json!({"model": candidate.public_model}),
+                    providers,
+                )
+                .ok()
+                .flatten()
+                .map(|resolved| resolved.into_effective_provider());
+                effective.as_ref().is_none_or(|effective| {
+                    provider_api_declared_transport(effective, &candidate.public_model).is_none()
+                })
+            });
+        }
+        return Ok((candidates, true));
     }
     if scope == CodexProtocolProbeScope::AllEnabledModels {
         return compile_provider_probe_candidates(provider).map(|candidates| (candidates, false));
@@ -1226,7 +1634,8 @@ fn compile_preflight_candidates(
                     crate::codex_multirouter::provider_set::codex_model_follows_automatic_protocol(
                         provider,
                         &candidate.public_model,
-                    )
+                    ) && provider_api_declared_transport(provider, &candidate.public_model)
+                        .is_none()
                 })
                 .collect(),
             false,
@@ -1260,8 +1669,11 @@ async fn run_candidate_and_persist(
 ) -> Result<ProtocolCompatibilityRecord, String> {
     let observation_candidate = candidate.clone();
     let record = run_candidate(state, candidate).await?;
-    let observations =
-        build_observation_records_for_result(&observation_candidate, &record.result)?;
+    let observations = build_observation_records_for_result(
+        &observation_candidate,
+        &record.result,
+        record.tested_at,
+    )?;
     state
         .db
         .save_protocol_probe_bundle(&record, &observations)
@@ -1404,6 +1816,7 @@ where
 struct CandidateBatchRecords {
     records: Vec<ProtocolCompatibilityRecord>,
     observations: Vec<ProtocolCompatibilityRecord>,
+    observed_at: Vec<Instant>,
 }
 
 async fn run_candidate_batch_with_observations<F, Fut>(
@@ -1422,37 +1835,46 @@ where
         .filter(|candidate| seen.insert(candidate.lease_key()))
         .cloned()
         .collect::<Vec<_>>();
-    let results_by_target: HashMap<String, ProtocolCompatibilityProbeResult> =
+    let results_by_target: HashMap<String, (ProtocolCompatibilityProbeResult, i64, Instant)> =
         stream::iter(unique_candidates)
             .map(|candidate| {
                 let key = candidate.lease_key();
                 let result = execute(candidate);
-                async move { result.await.map(|result| (key, result)) }
+                async move {
+                    result
+                        .await
+                        .map(|result| (key, (result, Utc::now().timestamp(), Instant::now())))
+                }
             })
             .buffer_unordered(PROBE_MODEL_CONCURRENCY)
             .try_collect()
             .await?;
     let mut records = Vec::with_capacity(candidates.len());
     let mut observations = Vec::with_capacity(candidates.len() * 2);
+    let mut observed_at = Vec::with_capacity(candidates.len());
     for candidate in candidates {
         let execution_key = candidate.lease_key();
-        let result = results_by_target[&execution_key].clone();
-        observations.extend(build_observation_records_for_result(&candidate, &result)?);
-        records.push(build_record_for_result(&candidate, result)?);
+        let (result, tested_at, original_observed_at) = results_by_target[&execution_key].clone();
+        observations.extend(build_observation_records_for_result(
+            &candidate, &result, tested_at,
+        )?);
+        records.push(build_record_for_result(&candidate, result, tested_at)?);
+        observed_at.push(original_observed_at);
     }
     Ok(CandidateBatchRecords {
         records,
         observations,
+        observed_at,
     })
 }
 
 fn build_record_for_result(
     candidate: &ProbeCandidate,
     result: ProtocolCompatibilityProbeResult,
+    tested_at: i64,
 ) -> Result<ProtocolCompatibilityRecord, String> {
     let selected_transport = result.selected_transport.unwrap_or(candidate.transport);
     let target = target_for_candidate(candidate, selected_transport)?;
-    let tested_at = Utc::now().timestamp();
     let ttl = if result.readiness == ProbeReadiness::Verified {
         VERIFIED_TTL_SECONDS
     } else {
@@ -1469,8 +1891,8 @@ fn build_record_for_result(
 fn build_observation_records_for_result(
     candidate: &ProbeCandidate,
     result: &ProtocolCompatibilityProbeResult,
+    tested_at: i64,
 ) -> Result<Vec<ProtocolCompatibilityRecord>, String> {
-    let tested_at = Utc::now().timestamp();
     [TransportKind::OpenAiResponses, TransportKind::OpenAiChat]
         .into_iter()
         .map(|transport| {
@@ -1866,6 +2288,7 @@ mod tests {
                 readiness,
                 branches: Vec::new(),
             },
+            chrono::Utc::now().timestamp(),
         )
         .expect("build record")
     }
@@ -1987,17 +2410,1103 @@ mod tests {
         state: &AppState,
         record: ProtocolCompatibilityRecord,
     ) -> String {
+        let fixture_provider = ordinary_provider();
         let observations = [TransportKind::OpenAiResponses, TransportKind::OpenAiChat]
             .into_iter()
             .map(|transport| {
-                let mut observation = record.clone();
-                observation.target.transport = transport;
-                observation
+                let candidate =
+                    crate::protocol_compatibility::compile_provider_probe_candidate_for_model(
+                        &fixture_provider,
+                        record.target.public_model.clone(),
+                        record.target.upstream_model.clone(),
+                    )
+                    .expect("compile fixture Provider Set candidate");
+                let mut target = candidate
+                    .target_key(transport)
+                    .expect("fixture Provider Set target");
+                target.provider_id = record.target.provider_id.clone();
+                target.route_id = record.target.route_id.clone();
+                target.credential_fingerprint = record.target.credential_fingerprint.clone();
+                target.request_policy_fingerprint =
+                    record.target.request_policy_fingerprint.clone();
+                ProtocolCompatibilityRecord::new(
+                    target,
+                    ProtocolCompatibilityProbeResult {
+                        selected_transport: record.result.selected_transport,
+                        readiness: record.result.readiness,
+                        branches: record
+                            .result
+                            .branches
+                            .iter()
+                            .filter(|branch| branch.assessment.transport == transport)
+                            .cloned()
+                            .collect(),
+                    },
+                    record.tested_at,
+                    record.expires_at,
+                )
             })
             .collect();
         state
             .remember_codex_provider_set_probe_receipt(record, observations)
             .expect("remember Provider Set receipt bundle")
+    }
+
+    fn api_declared_provider(chat_only: bool) -> Provider {
+        let mut provider = ordinary_provider();
+        for (index, model) in provider.settings_config["modelCatalog"]["models"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .enumerate()
+        {
+            model["protocolCapability"] = json!({
+                "schemaVersion": 1,
+                "source": "provider_api",
+                "baseUrl": "https://example.test/v1",
+                "upstreamModel": model["upstreamModel"],
+                "supportedEndpoints": [if chat_only || index == 0 {
+                    "openai_chat"
+                } else {
+                    "openai_responses"
+                }],
+                "supportsTools": true
+            });
+        }
+        provider
+    }
+
+    fn provider_set_observations(
+        provider: &Provider,
+        record: &ProtocolCompatibilityRecord,
+    ) -> Vec<ProtocolCompatibilityRecord> {
+        [TransportKind::OpenAiResponses, TransportKind::OpenAiChat]
+            .into_iter()
+            .map(|transport| {
+                let mut observation = provider_set_record(
+                    provider,
+                    &record.target.public_model,
+                    &record.target.upstream_model,
+                    transport,
+                    record.tested_at,
+                );
+                observation.result.selected_transport = record.result.selected_transport;
+                observation.result.readiness = record.result.readiness;
+                observation
+            })
+            .collect()
+    }
+
+    fn commit_verified_provider_set_record(
+        state: &AppState,
+        provider: Provider,
+        record: &ProtocolCompatibilityRecord,
+        now: i64,
+    ) -> Provider {
+        let receipt_id = state
+            .remember_codex_provider_set_probe_receipt(
+                record.clone(),
+                provider_set_observations(&provider, record),
+            )
+            .unwrap();
+        let preview = prepare_codex_provider_set_internal(
+            state,
+            PrepareCodexProviderSetRequest {
+                provider: provider.clone(),
+                receipt_ids: vec![receipt_id.clone()],
+            },
+            now,
+        )
+        .unwrap();
+        commit_codex_provider_set_internal_with_publisher(
+            state,
+            CommitCodexProviderSetRequest {
+                provider,
+                receipt_ids: vec![receipt_id],
+                digest: preview.digest,
+                intent: CodexProviderSetCommitIntent::AcceptAuto,
+            },
+            now,
+            |artifact| {
+                Ok(
+                    crate::codex_multirouter::projection::ProjectionReadBack::verified(
+                        artifact.dependency_fingerprint.clone(),
+                    ),
+                )
+            },
+        )
+        .unwrap()
+        .snapshot
+        .logical_provider
+    }
+
+    #[test]
+    fn same_second_successful_retry_commit_retires_prior_failed_probe() {
+        let state = AppState::new(Arc::new(Database::memory().unwrap()));
+        let provider = api_declared_provider(true);
+        let now = chrono::Utc::now().timestamp();
+        let mut failed = provider_set_record(
+            &provider,
+            "model-a",
+            "model-a",
+            TransportKind::OpenAiResponses,
+            now,
+        );
+        failed.result.selected_transport = None;
+        failed.result.readiness = ProbeReadiness::Unverified;
+        state
+            .remember_codex_provider_set_probe_receipt(
+                failed.clone(),
+                provider_set_observations(&provider, &failed),
+            )
+            .unwrap();
+        let passed = provider_set_record(
+            &provider,
+            "model-a",
+            "model-a",
+            TransportKind::OpenAiChat,
+            now,
+        );
+        let saved = commit_verified_provider_set_record(&state, provider, &passed, now);
+        let restored = super::restore_provider_protocol_evidence(&state, saved.clone(), now)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            restored.records,
+            vec![passed],
+            "an older same-second failure cannot revive after the successful retry commits"
+        );
+        assert!(
+            super::collect_active_failed_provider_protocol_records(&state, &saved, now)
+                .unwrap()
+                .is_empty()
+        );
+        let preview = prepare_codex_provider_set_internal(
+            &state,
+            PrepareCodexProviderSetRequest {
+                provider: saved,
+                receipt_ids: restored.receipt_ids,
+            },
+            now,
+        )
+        .unwrap();
+        assert!(matches!(
+            preview.plan,
+            crate::codex_multirouter::provider_set::CodexProviderSetPlan::Single {
+                transport: TransportKind::OpenAiChat
+            }
+        ));
+    }
+
+    #[test]
+    fn same_second_failure_after_successful_commit_still_blocks() {
+        let state = AppState::new(Arc::new(Database::memory().unwrap()));
+        let provider = api_declared_provider(true);
+        let now = chrono::Utc::now().timestamp();
+        let passed = provider_set_record(
+            &provider,
+            "model-a",
+            "model-a",
+            TransportKind::OpenAiChat,
+            now,
+        );
+        let saved = commit_verified_provider_set_record(&state, provider, &passed, now);
+        let mut failed = provider_set_record(
+            &saved,
+            "model-a",
+            "model-a",
+            TransportKind::OpenAiResponses,
+            now,
+        );
+        failed.result.selected_transport = None;
+        failed.result.readiness = ProbeReadiness::Unverified;
+        state
+            .remember_codex_provider_set_probe_receipt(
+                failed.clone(),
+                provider_set_observations(&saved, &failed),
+            )
+            .unwrap();
+        let restored = super::restore_provider_protocol_evidence(&state, saved.clone(), now)
+            .unwrap()
+            .unwrap();
+        assert_eq!(restored.records, vec![failed]);
+        let preview = prepare_codex_provider_set_internal(
+            &state,
+            PrepareCodexProviderSetRequest {
+                provider: saved,
+                receipt_ids: Vec::new(),
+            },
+            now,
+        )
+        .unwrap();
+        let crate::codex_multirouter::provider_set::CodexProviderSetPlan::Blocked { models } =
+            preview.plan
+        else {
+            panic!("a genuinely newer same-second failed probe must remain authoritative");
+        };
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].model, "model-a");
+    }
+
+    #[test]
+    fn same_second_new_failure_blocks_an_older_positive_receipt_before_commit() {
+        let state = AppState::new(Arc::new(Database::memory().unwrap()));
+        let provider = api_declared_provider(true);
+        let now = chrono::Utc::now().timestamp();
+        let passed = provider_set_record(
+            &provider,
+            "model-a",
+            "model-a",
+            TransportKind::OpenAiChat,
+            now,
+        );
+        let passed_id = state
+            .remember_codex_provider_set_probe_receipt(
+                passed.clone(),
+                provider_set_observations(&provider, &passed),
+            )
+            .unwrap();
+        let mut failed = provider_set_record(
+            &provider,
+            "model-a",
+            "model-a",
+            TransportKind::OpenAiResponses,
+            now,
+        );
+        failed.result.selected_transport = None;
+        failed.result.readiness = ProbeReadiness::Unverified;
+        state
+            .remember_codex_provider_set_probe_receipt(
+                failed.clone(),
+                provider_set_observations(&provider, &failed),
+            )
+            .unwrap();
+        let preview = prepare_codex_provider_set_internal(
+            &state,
+            PrepareCodexProviderSetRequest {
+                provider,
+                receipt_ids: vec![passed_id],
+            },
+            now,
+        )
+        .unwrap();
+        let crate::codex_multirouter::provider_set::CodexProviderSetPlan::Blocked { models } =
+            preview.plan
+        else {
+            panic!("receipt issuance and commit time cannot supersede a newer failed test");
+        };
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].model, "model-a");
+    }
+
+    #[test]
+    fn uncommitted_positive_receipt_cannot_hide_an_older_active_failure() {
+        let state = AppState::new(Arc::new(Database::memory().unwrap()));
+        let provider = api_declared_provider(true);
+        let now = chrono::Utc::now().timestamp();
+        let mut failed = provider_set_record(
+            &provider,
+            "model-a",
+            "model-a",
+            TransportKind::OpenAiResponses,
+            now,
+        );
+        failed.result.selected_transport = None;
+        failed.result.readiness = ProbeReadiness::Unverified;
+        state
+            .remember_codex_provider_set_probe_receipt(
+                failed.clone(),
+                provider_set_observations(&provider, &failed),
+            )
+            .unwrap();
+        let positive = provider_set_record(
+            &provider,
+            "model-a",
+            "model-a",
+            TransportKind::OpenAiChat,
+            now,
+        );
+        state
+            .remember_codex_provider_set_probe_receipt(
+                positive.clone(),
+                provider_set_observations(&provider, &positive),
+            )
+            .unwrap();
+
+        let active =
+            super::collect_active_failed_provider_protocol_records(&state, &provider, now).unwrap();
+        assert_eq!(
+            active,
+            vec![failed],
+            "a positive receipt is not authoritative until its database commit succeeds"
+        );
+    }
+
+    #[test]
+    fn same_second_restored_old_failure_keeps_original_observation_order() {
+        let state = AppState::new(Arc::new(Database::memory().unwrap()));
+        let provider = api_declared_provider(true);
+        let now = chrono::Utc::now().timestamp();
+        let mut failed = provider_set_record(
+            &provider,
+            "model-a",
+            "model-a",
+            TransportKind::OpenAiResponses,
+            now,
+        );
+        failed.result.selected_transport = None;
+        failed.result.readiness = ProbeReadiness::Unverified;
+        let failed_observations = provider_set_observations(&provider, &failed);
+        state
+            .remember_codex_provider_set_probe_receipt(failed.clone(), failed_observations.clone())
+            .unwrap();
+        let passed = provider_set_record(
+            &provider,
+            "model-a",
+            "model-a",
+            TransportKind::OpenAiChat,
+            now,
+        );
+        state
+            .remember_codex_provider_set_probe_receipt(
+                passed.clone(),
+                provider_set_observations(&provider, &passed),
+            )
+            .unwrap();
+        let (reissued_ids, _) = super::remember_restored_candidate_receipts(
+            &state,
+            std::slice::from_ref(&failed),
+            &failed_observations,
+        )
+        .unwrap();
+        assert_eq!(
+            super::collect_active_failed_provider_protocol_records(&state, &provider, now)
+                .unwrap(),
+            vec![failed.clone()],
+            "restoring an old failure cannot make it newer, but it remains blocking until success commits"
+        );
+        let saved = commit_verified_provider_set_record(&state, provider, &passed, now);
+        assert!(
+            super::collect_active_failed_provider_protocol_records(&state, &saved, now)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(state
+            .get_codex_provider_set_probe_receipts(&reissued_ids)
+            .is_err());
+        let restored = super::restore_provider_protocol_evidence(&state, saved, now)
+            .unwrap()
+            .unwrap();
+        assert_eq!(restored.records, vec![passed]);
+    }
+
+    #[test]
+    fn observations_keep_the_original_selection_timestamp() {
+        let provider = api_declared_provider(true);
+        let record = provider_set_record(
+            &provider,
+            "model-a",
+            "model-a",
+            TransportKind::OpenAiChat,
+            100,
+        );
+        let candidate = crate::protocol_compatibility::compile_provider_probe_candidate_for_model(
+            &provider,
+            "model-a".to_string(),
+            "model-a".to_string(),
+        )
+        .unwrap();
+        let observations =
+            build_observation_records_for_result(&candidate, &record.result, record.tested_at)
+                .unwrap();
+        assert_eq!(observations.len(), 2);
+        assert!(
+            observations
+                .iter()
+                .all(|observation| observation.tested_at == record.tested_at),
+            "creating observations later must not invent a different test timestamp"
+        );
+    }
+
+    fn superseded_positive_receipt_fixture(
+        state: &AppState,
+        now: i64,
+    ) -> (Provider, String, Vec<ProtocolCompatibilityRecord>) {
+        let provider = api_declared_provider(false);
+        let older = provider_set_record(
+            &provider,
+            "model-a",
+            "model-a",
+            TransportKind::OpenAiChat,
+            now,
+        );
+        let older_id = state
+            .remember_codex_provider_set_probe_receipt(
+                older.clone(),
+                provider_set_observations(&provider, &older),
+            )
+            .unwrap();
+        let newer = provider_set_record(
+            &provider,
+            "model-a",
+            "model-a",
+            TransportKind::OpenAiResponses,
+            now,
+        );
+        let expected_observations = provider_set_observations(&provider, &newer);
+        let saved = commit_verified_provider_set_record(state, provider, &newer, now);
+        (saved, older_id, expected_observations)
+    }
+
+    #[test]
+    fn same_second_single_recommit_preserves_the_retained_selected_observation_pair() {
+        let state = AppState::new(Arc::new(Database::memory().unwrap()));
+        let now = chrono::Utc::now().timestamp();
+        let (provider, older_id, expected_observations) =
+            superseded_positive_receipt_fixture(&state, now);
+        let preview = prepare_codex_provider_set_internal(
+            &state,
+            PrepareCodexProviderSetRequest {
+                provider: provider.clone(),
+                receipt_ids: vec![older_id.clone()],
+            },
+            now,
+        )
+        .unwrap();
+        assert!(matches!(
+            preview.plan,
+            crate::codex_multirouter::provider_set::CodexProviderSetPlan::Single {
+                transport: TransportKind::OpenAiResponses
+            }
+        ));
+        let committed = commit_codex_provider_set_internal_with_publisher(
+            &state,
+            CommitCodexProviderSetRequest {
+                provider,
+                receipt_ids: vec![older_id],
+                digest: preview.digest,
+                intent: CodexProviderSetCommitIntent::AcceptAuto,
+            },
+            now,
+            |artifact| {
+                Ok(
+                    crate::codex_multirouter::projection::ProjectionReadBack::verified(
+                        artifact.dependency_fingerprint.clone(),
+                    ),
+                )
+            },
+        )
+        .unwrap();
+        let mut saved_observations = state
+            .db
+            .list_protocol_probe_observations("provider-a")
+            .unwrap();
+        saved_observations
+            .sort_by_key(|record| record.target.transport == TransportKind::OpenAiChat);
+        let mut expected_observations = expected_observations;
+        expected_observations
+            .sort_by_key(|record| record.target.transport == TransportKind::OpenAiChat);
+        assert_eq!(
+            saved_observations, expected_observations,
+            "supplied superseded proof cannot overwrite the retained aggregate's pair"
+        );
+        let restored = super::restore_provider_protocol_evidence(
+            &state,
+            committed.snapshot.logical_provider,
+            now,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(restored.receipt_ids.len(), 1);
+    }
+
+    #[test]
+    fn same_second_batch_recommit_preserves_the_retained_selected_observation_pair() {
+        let state = AppState::new(Arc::new(Database::memory().unwrap()));
+        let now = chrono::Utc::now().timestamp();
+        let (provider, older_id, expected_observations) =
+            superseded_positive_receipt_fixture(&state, now);
+        let sources = vec![CodexProviderSetBatchSourceRequest {
+            provider: provider.clone(),
+            receipt_ids: vec![older_id],
+        }];
+        let router = router_provider(&provider.id);
+        let (_, preview) = prepare_codex_provider_set_batch_internal(
+            &state,
+            PrepareCodexProviderSetBatchRequest {
+                sources: sources.clone(),
+                router: router.clone(),
+            },
+            now,
+        )
+        .unwrap();
+        let committed = commit_codex_provider_set_batch_internal_with_publisher(
+            &state,
+            CommitCodexProviderSetBatchRequest {
+                sources,
+                router,
+                digest: preview.digest,
+                intent: CodexProviderSetCommitIntent::AcceptAuto,
+            },
+            now,
+            |artifact| {
+                Ok(
+                    crate::codex_multirouter::projection::ProjectionReadBack::verified(
+                        artifact.dependency_fingerprint.clone(),
+                    ),
+                )
+            },
+        )
+        .unwrap();
+        let mut saved_observations = state
+            .db
+            .list_protocol_probe_observations("provider-a")
+            .unwrap();
+        saved_observations
+            .sort_by_key(|record| record.target.transport == TransportKind::OpenAiChat);
+        let mut expected_observations = expected_observations;
+        expected_observations
+            .sort_by_key(|record| record.target.transport == TransportKind::OpenAiChat);
+        assert_eq!(
+            saved_observations, expected_observations,
+            "batch commit must keep the retained aggregate and its pair together"
+        );
+        let restored = super::restore_provider_protocol_evidence(
+            &state,
+            committed.source_snapshots[0].logical_provider.clone(),
+            now,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(restored.receipt_ids.len(), 1);
+    }
+
+    #[test]
+    fn api_declared_provider_prepare_commit_and_restore_need_no_probe_receipts() {
+        let db = Arc::new(Database::memory().unwrap());
+        let state = AppState::new(db.clone());
+        let provider = api_declared_provider(true);
+        let preview = prepare_codex_provider_set_internal(
+            &state,
+            PrepareCodexProviderSetRequest {
+                provider: provider.clone(),
+                receipt_ids: Vec::new(),
+            },
+            200,
+        )
+        .expect("declared transport can be prepared without inference requests");
+        assert!(db.get_all_providers("codex").unwrap().is_empty());
+        assert!(matches!(
+            preview.plan,
+            crate::codex_multirouter::provider_set::CodexProviderSetPlan::Single {
+                transport: TransportKind::OpenAiChat
+            }
+        ));
+        let committed = commit_codex_provider_set_internal_with_publisher(
+            &state,
+            CommitCodexProviderSetRequest {
+                provider,
+                receipt_ids: Vec::new(),
+                digest: preview.digest,
+                intent: CodexProviderSetCommitIntent::AcceptAuto,
+            },
+            200,
+            |artifact| {
+                Ok(
+                    crate::codex_multirouter::projection::ProjectionReadBack::verified(
+                        artifact.dependency_fingerprint.clone(),
+                    ),
+                )
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            committed.snapshot.logical_provider.settings_config["apiFormat"],
+            "openai_chat"
+        );
+        let restored = super::restore_provider_protocol_evidence(
+            &state,
+            committed.snapshot.logical_provider,
+            201,
+        )
+        .unwrap()
+        .expect("reopening uses declarations without fabricated probe evidence");
+        assert!(restored.records.is_empty());
+        assert!(restored.observations.is_empty());
+        assert!(restored.receipt_ids.is_empty());
+        assert!(db
+            .list_protocol_compatibility_profiles("provider-a")
+            .unwrap()
+            .is_empty());
+        assert!(db
+            .list_protocol_probe_observations("provider-a")
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn api_declared_batch_preserves_mixed_protocols_without_probe_profiles() {
+        let db = Arc::new(Database::memory().unwrap());
+        let state = AppState::new(db.clone());
+        let provider = api_declared_provider(false);
+        let sources = vec![CodexProviderSetBatchSourceRequest {
+            provider: provider.clone(),
+            receipt_ids: Vec::new(),
+        }];
+        let router = router_provider(&provider.id);
+        let (_, preview) = prepare_codex_provider_set_batch_internal(
+            &state,
+            PrepareCodexProviderSetBatchRequest {
+                sources: sources.clone(),
+                router: router.clone(),
+            },
+            200,
+        )
+        .unwrap();
+        assert!(!preview.blocked);
+        assert!(db.get_all_providers("codex").unwrap().is_empty());
+        let committed = commit_codex_provider_set_batch_internal_with_publisher(
+            &state,
+            CommitCodexProviderSetBatchRequest {
+                sources,
+                router,
+                digest: preview.digest,
+                intent: CodexProviderSetCommitIntent::AcceptAuto,
+            },
+            200,
+            |artifact| {
+                Ok(
+                    crate::codex_multirouter::projection::ProjectionReadBack::verified(
+                        artifact.dependency_fingerprint.clone(),
+                    ),
+                )
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            committed.preview.source_previews[0].plan,
+            crate::codex_multirouter::provider_set::CodexProviderSetPlan::Split { .. }
+        ));
+        for id in [
+            "provider-a",
+            "provider-a--ccsm-chat",
+            "provider-a--ccsm-responses",
+        ] {
+            assert!(db
+                .list_protocol_compatibility_profiles(id)
+                .unwrap()
+                .is_empty());
+            assert!(db.list_protocol_probe_observations(id).unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn partial_saved_evidence_restores_without_certifying_missing_models() {
+        let db = Arc::new(Database::memory().unwrap());
+        let state = AppState::new(db.clone());
+        let provider = ordinary_provider();
+        db.save_provider("codex", &provider).unwrap();
+        let record = provider_set_record(
+            &provider,
+            "model-a",
+            "model-a",
+            TransportKind::OpenAiResponses,
+            100,
+        );
+        let observations = [TransportKind::OpenAiResponses, TransportKind::OpenAiChat]
+            .into_iter()
+            .map(|transport| {
+                let mut observation =
+                    provider_set_record(&provider, "model-a", "model-a", transport, 100);
+                observation.result.selected_transport = record.result.selected_transport;
+                observation
+            })
+            .collect::<Vec<_>>();
+        db.save_protocol_probe_bundle(&record, &observations)
+            .unwrap();
+
+        let restored = super::restore_provider_protocol_evidence(&state, provider.clone(), 200)
+            .unwrap()
+            .expect("one missing row must not discard another row's evidence");
+        assert_eq!(restored.records.len(), 1);
+        assert_eq!(restored.observations.len(), 2);
+        assert_eq!(restored.receipt_ids.len(), 1);
+        let preview = prepare_codex_provider_set_internal(
+            &state,
+            PrepareCodexProviderSetRequest {
+                provider,
+                receipt_ids: restored.receipt_ids,
+            },
+            200,
+        )
+        .unwrap();
+        let crate::codex_multirouter::provider_set::CodexProviderSetPlan::Blocked { models } =
+            preview.plan
+        else {
+            panic!("the missing model still requires protocol evidence");
+        };
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].model, "model-b");
+        assert_eq!(models[0].reason, "probe_required");
+    }
+
+    #[test]
+    fn restored_receipt_model_associations_do_not_shift_when_a_profile_has_no_pair() {
+        let db = Arc::new(Database::memory().unwrap());
+        let state = AppState::new(db.clone());
+        let provider = api_declared_provider(true);
+        db.save_provider("codex", &provider).unwrap();
+        for model in ["model-a", "model-b"] {
+            let record =
+                provider_set_record(&provider, model, model, TransportKind::OpenAiChat, 100);
+            db.save_protocol_compatibility_result(&record).unwrap();
+            if model == "model-b" {
+                let observations = [TransportKind::OpenAiResponses, TransportKind::OpenAiChat]
+                    .into_iter()
+                    .map(|transport| {
+                        let mut observation =
+                            provider_set_record(&provider, model, model, transport, 100);
+                        observation.result.selected_transport = record.result.selected_transport;
+                        observation
+                    })
+                    .collect::<Vec<_>>();
+                db.save_protocol_probe_observations(&observations).unwrap();
+            }
+        }
+        let restored = super::restore_provider_protocol_evidence(&state, provider, 200)
+            .unwrap()
+            .unwrap();
+        assert_eq!(restored.records.len(), 2);
+        assert_eq!(restored.receipt_ids.len(), 1);
+        assert_eq!(
+            restored
+                .receipt_models
+                .get(&restored.receipt_ids[0])
+                .map(String::as_str),
+            Some("model-b")
+        );
+        let (records, _) =
+            super::load_codex_provider_set_probe_receipts(&state, &restored.receipt_ids).unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].target.public_model, "model-b");
+    }
+
+    #[test]
+    fn stored_current_failure_blocks_metadata_only_prepare_without_receipts() {
+        let db = Arc::new(Database::memory().unwrap());
+        let state = AppState::new(db.clone());
+        let provider = api_declared_provider(true);
+        db.save_provider("codex", &provider).unwrap();
+        let mut record = provider_set_record(
+            &provider,
+            "model-a",
+            "model-a",
+            TransportKind::OpenAiResponses,
+            100,
+        );
+        record.result.selected_transport = None;
+        record.result.readiness = ProbeReadiness::Unverified;
+        db.save_protocol_compatibility_result(&record).unwrap();
+        let before = serde_json::to_value(db.get_all_providers("codex").unwrap()).unwrap();
+        let preview = prepare_codex_provider_set_internal(
+            &state,
+            PrepareCodexProviderSetRequest {
+                provider,
+                receipt_ids: Vec::new(),
+            },
+            200,
+        )
+        .unwrap();
+        let crate::codex_multirouter::provider_set::CodexProviderSetPlan::Blocked { models } =
+            preview.plan
+        else {
+            panic!("API declarations cannot erase observed current failures");
+        };
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].reason, "probe_not_verified");
+        assert_eq!(
+            before,
+            serde_json::to_value(db.get_all_providers("codex").unwrap()).unwrap()
+        );
+        assert_eq!(
+            db.get_protocol_compatibility_result(&record.target)
+                .unwrap(),
+            Some(record)
+        );
+    }
+
+    #[test]
+    fn automatic_probe_scope_targets_only_models_without_api_protocol_declarations() {
+        let mut provider = api_declared_provider(true);
+        provider.settings_config["modelCatalog"]["models"][1]
+            .as_object_mut()
+            .unwrap()
+            .remove("protocolCapability");
+        let (automatic, _) = compile_preflight_candidates(
+            &provider,
+            &HashMap::new(),
+            CodexProtocolProbeScope::AutomaticModels,
+        )
+        .unwrap();
+        assert_eq!(automatic.len(), 1);
+        assert_eq!(automatic[0].public_model, "model-b");
+        let (explicit, _) = compile_preflight_candidates(
+            &provider,
+            &HashMap::new(),
+            CodexProtocolProbeScope::AllEnabledModels,
+        )
+        .unwrap();
+        assert_eq!(explicit.len(), 2);
+    }
+
+    #[test]
+    fn automatic_probe_scope_reuses_current_verified_rows_and_targets_only_unresolved_rows() {
+        let db = Arc::new(Database::memory().unwrap());
+        let state = AppState::new(db.clone());
+        let mut provider = ordinary_provider();
+        provider.settings_config["modelCatalog"]["models"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"model": "model-c", "upstreamModel": "model-c"}));
+        let now = chrono::Utc::now().timestamp();
+        let verified = provider_set_record(
+            &provider,
+            "model-a",
+            "model-a",
+            TransportKind::OpenAiResponses,
+            now,
+        );
+        db.save_protocol_probe_bundle(&verified, &provider_set_observations(&provider, &verified))
+            .unwrap();
+        let incomplete = provider_set_record(
+            &provider,
+            "model-c",
+            "model-c",
+            TransportKind::OpenAiChat,
+            now,
+        );
+        db.save_protocol_compatibility_result(&incomplete).unwrap();
+        let automatic = |draft: &Provider| {
+            super::compile_preflight_candidates_with_saved_evidence(
+                &state,
+                draft,
+                &HashMap::new(),
+                CodexProtocolProbeScope::AutomaticModels,
+            )
+            .unwrap()
+            .0
+        };
+        let unresolved = automatic(&provider);
+        assert_eq!(
+            unresolved
+                .iter()
+                .map(|candidate| candidate.public_model.as_str())
+                .collect::<Vec<_>>(),
+            vec!["model-b", "model-c"],
+            "only complete current verified rows may be removed from automatic probing"
+        );
+        let (explicit, _) = super::compile_preflight_candidates_with_saved_evidence(
+            &state,
+            &provider,
+            &HashMap::new(),
+            CodexProtocolProbeScope::AllEnabledModels,
+        )
+        .unwrap();
+        assert_eq!(explicit.len(), 3);
+
+        let mut changed_endpoint = provider.clone();
+        changed_endpoint.settings_config["baseUrl"] = json!("https://changed.example.test/v1");
+        assert_eq!(automatic(&changed_endpoint).len(), 3);
+        let mut changed_key = provider.clone();
+        changed_key.settings_config["auth"]["OPENAI_API_KEY"] = json!("redacted-rotated-key");
+        assert_eq!(automatic(&changed_key).len(), 3);
+        let mut expired = verified.clone();
+        expired.expires_at = now - 1;
+        db.save_protocol_compatibility_result(&expired).unwrap();
+        assert_eq!(automatic(&provider).len(), 3);
+        let mut failed = verified;
+        failed.result.selected_transport = None;
+        failed.result.readiness = ProbeReadiness::Unverified;
+        db.save_protocol_compatibility_result(&failed).unwrap();
+        assert_eq!(automatic(&provider).len(), 3);
+    }
+
+    #[test]
+    fn automatic_probe_scope_includes_current_failed_declarations_for_fallback() {
+        let db = Arc::new(Database::memory().unwrap());
+        let state = AppState::new(db.clone());
+        let provider = api_declared_provider(true);
+        db.save_provider("codex", &provider).unwrap();
+        let now = chrono::Utc::now().timestamp();
+        let mut record = provider_set_record(
+            &provider,
+            "model-a",
+            "model-a",
+            TransportKind::OpenAiResponses,
+            now,
+        );
+        record.result.selected_transport = None;
+        record.result.readiness = ProbeReadiness::Unverified;
+        db.save_protocol_compatibility_result(&record).unwrap();
+
+        let (candidates, is_router) = super::compile_preflight_candidates_with_saved_evidence(
+            &state,
+            &provider,
+            &HashMap::new(),
+            CodexProtocolProbeScope::AutomaticModels,
+        )
+        .unwrap();
+        assert!(!is_router);
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].public_model, "model-a");
+
+        let mut manual = provider;
+        manual.meta.as_mut().unwrap().codex_protocol_mode = Some(CodexProtocolMode::Manual);
+        let (candidates, _) = super::compile_preflight_candidates_with_saved_evidence(
+            &state,
+            &manual,
+            &HashMap::new(),
+            CodexProtocolProbeScope::AutomaticModels,
+        )
+        .unwrap();
+        assert!(
+            candidates.is_empty(),
+            "whole-provider manual intent remains explicit"
+        );
+    }
+
+    #[tokio::test]
+    async fn transient_failed_api_probe_blocks_receiptless_save_and_only_retries_its_model() {
+        let db = Arc::new(Database::memory().unwrap());
+        let state = AppState::new(db.clone());
+        let provider = api_declared_provider(true);
+        let candidate = crate::protocol_compatibility::compile_provider_probe_candidate_for_model(
+            &provider,
+            "model-a".to_string(),
+            "model-a".to_string(),
+        )
+        .unwrap();
+        let batch = run_candidate_batch_with_observations(vec![candidate], |_| async {
+            Ok(ProtocolCompatibilityProbeResult {
+                selected_transport: None,
+                readiness: ProbeReadiness::Unverified,
+                branches: Vec::new(),
+            })
+        })
+        .await
+        .unwrap();
+        let receipt_ids =
+            remember_candidate_batch_receipts(&state, &batch.records, &batch.observations).unwrap();
+        let (retry, _) = super::compile_preflight_candidates_with_saved_evidence(
+            &state,
+            &provider,
+            &HashMap::new(),
+            CodexProtocolProbeScope::AutomaticModels,
+        )
+        .unwrap();
+        assert_eq!(retry.len(), 1);
+        assert_eq!(retry[0].public_model, "model-a");
+
+        let preview = prepare_codex_provider_set_internal(
+            &state,
+            PrepareCodexProviderSetRequest {
+                provider: provider.clone(),
+                receipt_ids: Vec::new(),
+            },
+            chrono::Utc::now().timestamp(),
+        )
+        .unwrap();
+        let crate::codex_multirouter::provider_set::CodexProviderSetPlan::Blocked { models } =
+            preview.plan
+        else {
+            panic!("an unsaved current failure must not be hidden by API metadata");
+        };
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].model, "model-a");
+        assert_eq!(models[0].reason, "probe_not_verified");
+        let restored = super::restore_provider_protocol_evidence(
+            &state,
+            provider.clone(),
+            chrono::Utc::now().timestamp(),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(restored.records, batch.records);
+        assert_eq!(restored.observations, batch.observations);
+        assert_eq!(
+            super::load_codex_provider_set_probe_receipts(&state, &receipt_ids)
+                .unwrap()
+                .0,
+            batch.records,
+            "reading failure evidence must not consume its receipt"
+        );
+        assert!(db.get_all_providers("codex").unwrap().is_empty());
+        assert!(db
+            .list_protocol_compatibility_profiles("provider-a")
+            .unwrap()
+            .is_empty());
+        assert!(db
+            .list_protocol_probe_observations("provider-a")
+            .unwrap()
+            .is_empty());
+
+        let mut rotated = provider;
+        rotated.settings_config["auth"]["OPENAI_API_KEY"] = json!("rotated-test-key");
+        let (retry, _) = super::compile_preflight_candidates_with_saved_evidence(
+            &state,
+            &rotated,
+            &HashMap::new(),
+            CodexProtocolProbeScope::AutomaticModels,
+        )
+        .unwrap();
+        assert!(
+            retry.is_empty(),
+            "a receipt from old credentials is not current evidence"
+        );
+    }
+
+    #[test]
+    fn unsupplied_transient_verified_receipt_is_not_automatic_transaction_proof() {
+        let db = Arc::new(Database::memory().unwrap());
+        let state = AppState::new(db.clone());
+        let provider = api_declared_provider(true);
+        let record = provider_set_record(
+            &provider,
+            "model-a",
+            "model-a",
+            TransportKind::OpenAiResponses,
+            chrono::Utc::now().timestamp(),
+        );
+        let receipt_id = remember_provider_set_receipt(&state, record);
+        let restored = super::collect_saved_provider_protocol_evidence(
+            &state,
+            provider.clone(),
+            chrono::Utc::now().timestamp(),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(restored.records.is_empty());
+        assert!(restored.observations.is_empty());
+        let preview = prepare_codex_provider_set_internal(
+            &state,
+            PrepareCodexProviderSetRequest {
+                provider,
+                receipt_ids: Vec::new(),
+            },
+            chrono::Utc::now().timestamp(),
+        )
+        .unwrap();
+        assert!(matches!(
+            preview.plan,
+            crate::codex_multirouter::provider_set::CodexProviderSetPlan::Single {
+                transport: TransportKind::OpenAiChat
+            }
+        ));
+        assert!(db.get_all_providers("codex").unwrap().is_empty());
+        assert!(state
+            .get_codex_provider_set_probe_receipts(&[receipt_id])
+            .is_ok());
     }
 
     #[test]
@@ -3785,7 +5294,7 @@ mod tests {
         }))
         .expect("deserialize probe result");
 
-        let observations = build_observation_records_for_result(&candidate, &result)
+        let observations = build_observation_records_for_result(&candidate, &result, 100)
             .expect("materialize observations");
 
         assert_eq!(observations.len(), 2);
@@ -3849,7 +5358,7 @@ mod tests {
         }))
         .expect("deserialize probe result");
 
-        let observations = build_observation_records_for_result(&candidate, &result)
+        let observations = build_observation_records_for_result(&candidate, &result, 100)
             .expect("materialize observations");
         let responses = observations
             .iter()
@@ -3879,8 +5388,12 @@ mod tests {
             readiness: ProbeReadiness::Verified,
             branches: Vec::new(),
         };
-        let mut current = super::build_record_for_result(&candidate, result.clone())
-            .expect("build current record");
+        let mut current = super::build_record_for_result(
+            &candidate,
+            result.clone(),
+            chrono::Utc::now().timestamp(),
+        )
+        .expect("build current record");
         current.tested_at = 100;
         current.expires_at = 200;
         db.save_protocol_compatibility_result(&current)

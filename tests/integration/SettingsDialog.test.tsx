@@ -4,9 +4,12 @@ import { render, screen, waitFor, fireEvent } from "@testing-library/react";
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { http, HttpResponse } from "msw";
 import { SettingsPage } from "@/components/settings/SettingsPage";
+import type { Settings } from "@/types";
+import type { RequestHealthConfig } from "@/types/proxy";
 import {
   resetProviderState,
   getSettings,
+  setSettings,
   getAppConfigDirOverride,
 } from "../msw/state";
 import { server } from "../msw/server";
@@ -249,6 +252,143 @@ describe("SettingsPage integration", () => {
 
     fireEvent.click(resetButtons[1]);
     await waitFor(() => expect(claudeInput.value).toBe("/home/mock/.claude"));
+  });
+
+  it("adopts canonical Request Health saves without discarding unsaved Advanced edits", async () => {
+    const config: RequestHealthConfig = {
+      enabled: true,
+      optimizationMode: "diagnose",
+      largeRequestThresholdBytes: 384 * 1024,
+      maxCodexInputTokens: 200_000,
+      reviewTimeoutSeconds: 60,
+      reviewMode: "off",
+      summarizeAndRestartEnabled: false,
+      windowsNotificationsEnabled: false,
+      windowsNotificationSnoozeHours: 4,
+      windowsNotificationsSnoozedUntilMs: null,
+    };
+    setSettings({ requestHealth: config });
+    const saveRequestHealth = vi.fn();
+    const fullSave = vi.fn();
+    const snoozedUntil = 123_456_789;
+    server.use(
+      http.post("http://tauri.local/get_request_health_diagnostics", () =>
+        HttpResponse.json({
+          config: getSettings().requestHealth,
+          diagnostics: [],
+        }),
+      ),
+      http.post(
+        "http://tauri.local/save_request_health_settings",
+        async ({ request }) => {
+          const { config: submitted } = (await request.json()) as {
+            config: RequestHealthConfig;
+          };
+          saveRequestHealth(submitted);
+          const canonical = {
+            ...submitted,
+            windowsNotificationsSnoozedUntilMs: snoozedUntil,
+          };
+          setSettings({ requestHealth: canonical });
+          return HttpResponse.json(canonical);
+        },
+      ),
+      http.post("http://tauri.local/save_settings", async ({ request }) => {
+        const { settings } = (await request.json()) as { settings: Settings };
+        fullSave(settings);
+        setSettings({
+          ...settings,
+          requestHealth: getSettings().requestHealth,
+        });
+        return HttpResponse.json(true);
+      }),
+    );
+    renderDialog();
+    await screen.findByText("language:zh");
+    fireEvent.click(screen.getByText("settings.tabAdvanced"));
+    fireEvent.click(screen.getByText("settings.advanced.configDir.title"));
+    const initialInput = await screen.findByPlaceholderText(
+      "settings.browsePlaceholderClaude",
+    );
+    fireEvent.change(initialInput, {
+      target: { value: "/unsaved/claude-directory" },
+    });
+
+    fireEvent.click(screen.getByText("settings.tabRequestHealthSettings"));
+    const threshold = await screen.findByRole("spinbutton", {
+      name: "settings.requestHealth.threshold",
+    });
+    fireEvent.change(threshold, { target: { value: "512" } });
+    fireEvent.click(
+      screen.getByRole("button", { name: "settings.requestHealth.save" }),
+    );
+    await waitFor(() => expect(saveRequestHealth).toHaveBeenCalledOnce());
+    await screen.findByText("settings.requestHealth.saved");
+    expect(fullSave).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByText("settings.tabAdvanced"));
+    fireEvent.click(screen.getByText("settings.advanced.configDir.title"));
+    const preservedInput = await screen.findByPlaceholderText(
+      "settings.browsePlaceholderClaude",
+    );
+    expect(preservedInput).toHaveValue("/unsaved/claude-directory");
+    fireEvent.click(screen.getByText("common.save"));
+    await waitFor(() => expect(fullSave).toHaveBeenCalledOnce());
+    expect(fullSave).toHaveBeenCalledWith(
+      expect.objectContaining({
+        claudeConfigDir: "/unsaved/claude-directory",
+        requestHealth: expect.objectContaining({
+          largeRequestThresholdBytes: 512 * 1024,
+          windowsNotificationsSnoozedUntilMs: snoozedUntil,
+        }),
+      }),
+    );
+  });
+
+  it("recovers from an initial Request Health load failure using Retry", async () => {
+    let attempts = 0;
+    server.use(
+      http.post("http://tauri.local/get_request_health_diagnostics", () => {
+        attempts += 1;
+        if (attempts === 1) {
+          return new HttpResponse("offline", { status: 503 });
+        }
+        return HttpResponse.json({
+          config: {
+            enabled: true,
+            optimizationMode: "diagnose",
+            largeRequestThresholdBytes: 384 * 1024,
+            maxCodexInputTokens: 200_000,
+            reviewTimeoutSeconds: 60,
+            reviewMode: "off",
+            summarizeAndRestartEnabled: false,
+            windowsNotificationsEnabled: false,
+            windowsNotificationSnoozeHours: 4,
+            windowsNotificationsSnoozedUntilMs: null,
+          } satisfies RequestHealthConfig,
+          diagnostics: [],
+        });
+      }),
+    );
+    renderDialog({ defaultTab: "request-health" });
+    await screen.findByText("settings.requestHealth.loadFailed");
+    expect(
+      screen.getByRole("button", { name: "settings.requestHealth.save" }),
+    ).toBeDisabled();
+
+    fireEvent.click(
+      screen.getByRole("button", { name: "settings.requestHealth.retry" }),
+    );
+    await screen.findByRole("checkbox", {
+      name: "settings.requestHealth.enabled",
+    });
+    expect(
+      screen.getByRole("button", { name: "settings.requestHealth.save" }),
+    ).toBeEnabled();
+    expect(
+      screen.queryByText("settings.requestHealth.loadFailed"),
+    ).not.toBeInTheDocument();
+    expect(attempts).toBe(2);
   });
 
   it("notifies when export fails", async () => {

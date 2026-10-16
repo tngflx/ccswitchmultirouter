@@ -1,7 +1,8 @@
-import { useState } from "react";
+import { useId, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { ChevronDown } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import { Checkbox } from "@/components/ui/checkbox";
 import {
   Command,
   CommandEmpty,
@@ -26,10 +27,20 @@ export function ModelDropdown({
 }) {
   const { t } = useTranslation();
   const [open, setOpen] = useState(false);
+  const [freeOnly, setFreeOnly] = useState(false);
+  const freeFilterId = useId();
+  const hasFreeMetadata = models.some(
+    (model) => typeof model.isFree === "boolean",
+  );
+  const confirmedFreeModelCount = models.filter(
+    (model) => model.isFree === true,
+  ).length;
+  const filterFreeModels = freeOnly && hasFreeMetadata;
 
   // Group models by vendor; missing ownedBy falls back to "Other"
   const grouped: Record<string, FetchedModel[]> = {};
   for (const model of models) {
+    if (filterFreeModels && model.isFree !== true) continue;
     const vendor = model.ownedBy || "Other";
     if (!grouped[vendor]) grouped[vendor] = [];
     grouped[vendor].push(model);
@@ -56,6 +67,23 @@ export function ModelDropdown({
         collisionPadding={8}
         className="z-[200] w-72 p-0"
       >
+        {hasFreeMetadata && (
+          <div className="flex items-center gap-2 border-b px-3 py-2">
+            <Checkbox
+              id={freeFilterId}
+              checked={freeOnly}
+              onCheckedChange={(checked) => setFreeOnly(checked === true)}
+            />
+            <label
+              htmlFor={freeFilterId}
+              className="cursor-pointer text-xs font-medium"
+            >
+              {t("providerForm.freeModelsOnly", {
+                defaultValue: "Free models only",
+              })}
+            </label>
+          </div>
+        )}
         <Command
           label={t("providerForm.searchModelPlaceholder", {
             defaultValue: "Search models...",
@@ -68,9 +96,15 @@ export function ModelDropdown({
           />
           <CommandList className="max-h-64">
             <CommandEmpty>
-              {t("providerForm.searchModelEmpty", {
-                defaultValue: "No matching models.",
-              })}
+              {filterFreeModels &&
+              confirmedFreeModelCount === 0 &&
+              vendors.length === 0
+                ? t("providerForm.noFreeModels", {
+                    defaultValue: "No confirmed free models.",
+                  })
+                : t("providerForm.searchModelEmpty", {
+                    defaultValue: "No matching models.",
+                  })}
             </CommandEmpty>
             {vendors.map((vendor) => (
               <CommandGroup key={vendor} heading={vendor}>
@@ -86,7 +120,14 @@ export function ModelDropdown({
                       setOpen(false);
                     }}
                   >
-                    {m.id}
+                    <span className="min-w-0 break-all">{m.id}</span>
+                    {m.isFree === true && (
+                      <span className="ml-auto shrink-0 text-[10px] font-medium text-muted-foreground">
+                        {t("providerForm.freeModel", {
+                          defaultValue: "Free",
+                        })}
+                      </span>
+                    )}
                   </CommandItem>
                 ))}
               </CommandGroup>

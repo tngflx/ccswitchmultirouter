@@ -60,6 +60,7 @@ describe("useProtocolLabWorkflow", () => {
       ["receipt-one"],
       { plan: "split" },
       "accept_auto",
+      { probeOutcome: "probe-outcome" },
     );
     expect(result.current.state.phase).toBe("committed");
   });
@@ -73,7 +74,19 @@ describe("useProtocolLabWorkflow", () => {
         snapshot: "snapshot-two",
         projectionWarning: false,
       });
-    const adapter = createAdapter({ commit });
+    const preflight = vi
+      .fn()
+      .mockResolvedValueOnce({
+        outcome: "initial-chat-evidence",
+        receiptIds: ["initial-chat-receipt"],
+        adaptationPreview: "chat",
+      })
+      .mockResolvedValueOnce({
+        outcome: "retry-responses-evidence",
+        receiptIds: ["retry-responses-receipt"],
+        adaptationPreview: "responses",
+      });
+    const adapter = createAdapter({ commit, preflight });
     const { result } = renderHook(() => useProtocolLabWorkflow(adapter));
     let savePromise!: Promise<string>;
 
@@ -86,9 +99,49 @@ describe("useProtocolLabWorkflow", () => {
     });
 
     expect(adapter.preflight).toHaveBeenCalledTimes(2);
+    expect(vi.mocked(adapter.preflight).mock.calls[0][2]).toEqual({
+      staleRetry: false,
+    });
+    expect(vi.mocked(adapter.preflight).mock.calls[1][2]).toEqual({
+      staleRetry: true,
+    });
     expect(adapter.commit).toHaveBeenCalledTimes(2);
+    expect(commit.mock.calls[0][4]).toEqual({
+      probeOutcome: "initial-chat-evidence",
+    });
+    expect(commit.mock.calls[1][4]).toEqual({
+      probeOutcome: "retry-responses-evidence",
+    });
     expect(result.current.state.staleRetryCount).toBe(1);
     expect(result.current.state.phase).toBe("committed");
+  });
+
+  it("does not attach another operation's probe evidence to a direct restored save", async () => {
+    const adapter = createAdapter({ requiresProbe: () => false });
+    const { result } = renderHook(() => useProtocolLabWorkflow(adapter));
+    let validationPromise!: Promise<string>;
+    act(() => {
+      validationPromise = result.current.validate({ id: "previous-provider" });
+    });
+    await act(async () => {
+      await result.current.confirmProbe();
+      await validationPromise;
+    });
+    expect(result.current.probeOutcome).toBe("probe-outcome");
+
+    await act(async () => {
+      await result.current.save({ id: "restored-provider" }, [
+        "restored-current-receipt",
+      ]);
+    });
+
+    expect(adapter.commit).toHaveBeenCalledWith(
+      { id: "restored-provider" },
+      ["restored-current-receipt"],
+      { plan: "split" },
+      "accept_auto",
+      { probeOutcome: undefined },
+    );
   });
 
   it("keeps projection failure as a committed warning", async () => {

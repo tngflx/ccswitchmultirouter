@@ -1723,6 +1723,80 @@ export const opencodeProviderPresets: OpenCodeProviderPreset[] = [
     },
   },
   {
+    name: "SiliconFlow",
+    websiteUrl: "https://siliconflow.cn",
+    apiKeyUrl: "https://cloud.siliconflow.cn/account/ak",
+    settingsConfig: {
+      npm: "@ai-sdk/openai-compatible",
+      name: "SiliconFlow",
+      options: {
+        baseURL: "https://api.siliconflow.cn/v1",
+        apiKey: "",
+        setCacheKey: true,
+      },
+      models: {
+        "Pro/MiniMaxAI/MiniMax-M2.7": {
+          name: "Pro / MiniMax M2.7",
+        },
+      },
+    },
+    category: "aggregator",
+    isPartner: true,
+    partnerPromotionKey: "siliconflow",
+    icon: "siliconflow",
+    iconColor: "#6E29F6",
+    templateValues: {
+      baseURL: {
+        label: "Base URL",
+        placeholder: "https://api.siliconflow.cn/v1",
+        defaultValue: "https://api.siliconflow.cn/v1",
+        editorValue: "",
+      },
+      apiKey: {
+        label: "API Key",
+        placeholder: "",
+        editorValue: "",
+      },
+    },
+  },
+  {
+    name: "SiliconFlow en",
+    websiteUrl: "https://siliconflow.com",
+    apiKeyUrl: "https://cloud.siliconflow.com",
+    settingsConfig: {
+      npm: "@ai-sdk/openai-compatible",
+      name: "SiliconFlow en",
+      options: {
+        baseURL: "https://api.siliconflow.com/v1",
+        apiKey: "",
+        setCacheKey: true,
+      },
+      models: {
+        "MiniMaxAI/MiniMax-M2.7": {
+          name: "MiniMax M2.7",
+        },
+      },
+    },
+    category: "aggregator",
+    isPartner: true,
+    partnerPromotionKey: "siliconflow",
+    icon: "siliconflow",
+    iconColor: "#000000",
+    templateValues: {
+      baseURL: {
+        label: "Base URL",
+        placeholder: "https://api.siliconflow.com/v1",
+        defaultValue: "https://api.siliconflow.com/v1",
+        editorValue: "",
+      },
+      apiKey: {
+        label: "API Key",
+        placeholder: "",
+        editorValue: "",
+      },
+    },
+  },
+  {
     name: "KAT-Coder",
     websiteUrl: "https://console.streamlake.ai",
     apiKeyUrl: "https://console.streamlake.ai/console/api-key",
@@ -2108,11 +2182,6 @@ export const opencodeProviderPresets: OpenCodeProviderPreset[] = [
       },
       models: {
         "kilo-auto/free": { name: "Kilo Auto (Free)" },
-        "minimax/minimax-m2.1:free": { name: "MiniMax M2.1 (Free)" },
-        "z-ai/glm-5:free": { name: "GLM-5 (Free)" },
-        "google/gemma-4-26b-a4b-it:free": {
-          name: "Gemma 4 26B (Free)",
-        },
       },
     },
     category: "aggregator",
@@ -2128,6 +2197,39 @@ export const opencodeProviderPresets: OpenCodeProviderPreset[] = [
       apiKey: {
         label: "API Key",
         placeholder: "kilo-...",
+        editorValue: "",
+      },
+    },
+  },
+  {
+    name: "Opper",
+    websiteUrl: "https://opper.ai",
+    apiKeyUrl: "https://platform.opper.ai",
+    settingsConfig: {
+      npm: "@ai-sdk/openai-compatible",
+      name: "Opper",
+      options: {
+        baseURL: "https://api.opper.ai/v3/compat",
+        apiKey: "",
+        setCacheKey: true,
+      },
+      models: {
+        "deepseek/deepseek-v4-flash-0731": {
+          name: "DeepSeek V4 Flash (0731)",
+        },
+      },
+    },
+    category: "aggregator",
+    templateValues: {
+      baseURL: {
+        label: "Base URL",
+        placeholder: "https://api.opper.ai/v3/compat",
+        defaultValue: "https://api.opper.ai/v3/compat",
+        editorValue: "",
+      },
+      apiKey: {
+        label: "API Key",
+        placeholder: "",
         editorValue: "",
       },
     },

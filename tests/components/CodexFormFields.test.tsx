@@ -346,6 +346,7 @@ function renderCatalogHarness(
     providerName?: string;
     partnerPromotionKey?: string;
     baseUrl?: string;
+    apiFormat?: CodexApiFormat;
     apiKey?: string;
     planAccessKeyId?: string;
     planSecretAccessKey?: string;
@@ -383,7 +384,9 @@ function renderCatalogHarness(
       latestCatalog = next;
       setCatalog(next);
     };
-    const [apiFormat, setApiFormat] = useState<CodexApiFormat>("openai_chat");
+    const [apiFormat, setApiFormat] = useState<CodexApiFormat>(
+      options.apiFormat ?? "openai_chat",
+    );
     const [defaultModel, setDefaultModel] = useState(latestDefaultModel);
     const [protocolOverrides, setProtocolOverrides] = useState<
       Record<string, CodexProtocolOverride>
@@ -2036,6 +2039,217 @@ describe("CodexFormFields local model routing", () => {
     expect(screen.queryByText("Ready for MultiRouter")).not.toBeInTheDocument();
     expect(screen.getByText(/expired/)).toBeInTheDocument();
   });
+
+  it("invalidates saved readiness when an excluded model becomes included", async () => {
+    const included = {
+      model: "model-a",
+      upstreamModel: "model-a",
+      inputModalities: ["text"],
+      supportsImage: false,
+    };
+    const excluded = {
+      model: "model-b",
+      upstreamModel: "model-b",
+      inputModalities: ["text"],
+      supportsImage: false,
+      enabled: false,
+    };
+    const { updateIdentity } = renderReadinessIdentityHarness(
+      { catalog: [included, excluded] },
+      {
+        logicalProvider: {
+          id: "identity-provider",
+          name: "Identity Provider",
+          settingsConfig: { modelCatalog: { models: [included, excluded] } },
+        },
+        adaptation: {
+          persistence: "single",
+          status: "ready",
+          effectiveTransport: "open_ai_chat",
+          testedAt: Math.floor(Date.now() / 1000) - 60,
+          expiresAt: Math.floor(Date.now() / 1000) + 3600,
+          models: [],
+        },
+      },
+    );
+    await waitForReasoningResolution();
+    expect(screen.getByText("Ready for MultiRouter")).toBeInTheDocument();
+
+    updateIdentity({
+      catalog: [included, { ...excluded, enabled: true }],
+    });
+    await waitFor(() =>
+      expect(
+        screen.getByText("Validate the connection first"),
+      ).toBeInTheDocument(),
+    );
+    expect(screen.queryByText("Ready for MultiRouter")).not.toBeInTheDocument();
+    expect(preflightCodexProviderProtocolCompatibility).not.toHaveBeenCalled();
+  });
+
+  it("reopens an API-ready source and preserves scoped capabilities while editing", async () => {
+    const protocolCapability: NonNullable<
+      CodexCatalogModel["protocolCapability"]
+    > = {
+      schemaVersion: 1,
+      source: "provider_api",
+      baseUrl: "https://api.thirdparty.example/v1",
+      upstreamModel: "api-model",
+      supportedEndpoints: ["openai_chat"],
+      supportsTools: true,
+      supportsStreaming: true,
+      supportsToolContinuation: true,
+    };
+    const { latestCatalog, updateCatalog } = renderCatalogHarness([
+      {
+        model: "api-alias",
+        upstreamModel: "api-model",
+        protocolCapability,
+      },
+    ]);
+    await waitForReasoningResolution();
+
+    expect(screen.getByText("Ready for MultiRouter")).toBeInTheDocument();
+    expect(screen.getByText("API-declared: 1 model(s)")).toBeInTheDocument();
+    expect(preflightCodexProviderProtocolCompatibility).not.toHaveBeenCalled();
+
+    fireEvent.change(screen.getByLabelText("Menu display name"), {
+      target: { value: "Renamed display label" },
+    });
+    await waitFor(() => {
+      expect(latestCatalog()).toEqual([
+        expect.objectContaining({
+          model: "api-alias",
+          displayName: "Renamed display label",
+          protocolCapability,
+        }),
+      ]);
+    });
+    expect(screen.getByText("Ready for MultiRouter")).toBeInTheDocument();
+
+    const changedCapability = {
+      ...protocolCapability,
+      supportedEndpoints: ["openai_responses"] as const,
+    };
+    updateCatalog(
+      latestCatalog().map((model) => ({
+        ...model,
+        protocolCapability: {
+          ...changedCapability,
+          supportedEndpoints: [...changedCapability.supportedEndpoints],
+        },
+      })),
+    );
+    await waitFor(() =>
+      expect(latestCatalog()[0].protocolCapability?.supportedEndpoints).toEqual(
+        ["openai_responses"],
+      ),
+    );
+    expect(
+      within(screen.getByText("Effective protocol").parentElement!).getByText(
+        "Responses",
+      ),
+    ).toBeInTheDocument();
+    expect(preflightCodexProviderProtocolCompatibility).not.toHaveBeenCalled();
+  });
+
+  it("invalidates API-declared readiness after endpoint or upstream-model edits", async () => {
+    const model: CodexCatalogModel = {
+      model: "model-a",
+      upstreamModel: "model-a",
+      protocolCapability: {
+        schemaVersion: 1,
+        source: "provider_api",
+        baseUrl: "https://old.example/v1",
+        upstreamModel: "model-a",
+        supportedEndpoints: ["openai_chat"],
+        supportsTools: true,
+        supportsStreaming: true,
+        supportsToolContinuation: true,
+      },
+    };
+    const { updateIdentity } = renderReadinessIdentityHarness({
+      catalog: [model],
+    });
+    await waitForReasoningResolution();
+    expect(screen.getByText("Ready for MultiRouter")).toBeInTheDocument();
+
+    updateIdentity({ baseUrl: "https://changed.example/v1" });
+    await waitFor(() =>
+      expect(
+        screen.getByText("Validate the connection first"),
+      ).toBeInTheDocument(),
+    );
+    expect(screen.queryByText("Ready for MultiRouter")).not.toBeInTheDocument();
+
+    updateIdentity({
+      baseUrl: "https://old.example/v1",
+      catalog: [{ ...model, upstreamModel: "different-model" }],
+    });
+    await waitFor(() =>
+      expect(
+        screen.getByText("Validate the connection first"),
+      ).toBeInTheDocument(),
+    );
+    expect(screen.queryByText("Ready for MultiRouter")).not.toBeInTheDocument();
+    expect(preflightCodexProviderProtocolCompatibility).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    {
+      endpoint: "custom full URL",
+      baseUrl: "https://api.thirdparty.example/inference",
+      apiFormat: "openai_responses" as const,
+    },
+    {
+      endpoint: "known Responses full URL",
+      baseUrl: "https://api.thirdparty.example/v1/responses",
+      apiFormat: "openai_chat" as const,
+    },
+  ])(
+    "does not mark a $endpoint ready from conflicting Chat-only API data",
+    async ({ baseUrl, apiFormat }) => {
+      renderCatalogHarness(
+        [
+          {
+            model: "api-model",
+            upstreamModel: "api-model",
+            protocolCapability: {
+              schemaVersion: 1,
+              source: "provider_api",
+              baseUrl,
+              upstreamModel: "api-model",
+              supportedEndpoints: ["openai_chat"],
+              supportsTools: true,
+              supportsStreaming: true,
+              supportsToolContinuation: true,
+            },
+          },
+        ],
+        {
+          baseUrl,
+          apiFormat,
+          apiKey: "[redacted]",
+          isFullUrl: true,
+          openAdvancedOptions: false,
+        },
+      );
+      await waitForReasoningResolution();
+
+      expect(
+        screen.getByText("Validate the connection first"),
+      ).toBeInTheDocument();
+      expect(
+        screen.queryByText("Ready for MultiRouter"),
+      ).not.toBeInTheDocument();
+      expect(
+        screen.queryByText("API-declared: 1 model(s)"),
+      ).not.toBeInTheDocument();
+      expect(
+        preflightCodexProviderProtocolCompatibility,
+      ).not.toHaveBeenCalled();
+    },
+  );
 
   it("retains probe evidence when manual mode overrides the final protocol", async () => {
     const records = [createDeepProbeRecord("model-a", "open_ai_responses")];

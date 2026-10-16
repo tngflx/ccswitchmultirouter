@@ -747,7 +747,6 @@ const QuotaCollaborationPanel: React.FC<{
     }
     setIsSaving(true);
     try {
-      const current = settings.quotaCollaboration;
       await settingsApi.patch({
         quotaCollaboration: {
           deviceName: deviceName.trim(),

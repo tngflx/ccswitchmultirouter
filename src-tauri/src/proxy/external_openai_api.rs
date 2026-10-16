@@ -666,11 +666,10 @@ fn router_backend_options(
             .as_ref()
             .map(|error| (false, Some(error.clone())))
             .unwrap_or_else(|| route_backend_availability(provider, route, providers));
-        let models = compiled_route_models
-            .as_ref()
-            .and_then(|models| models.get(route_id))
-            .cloned()
-            .unwrap_or_else(|| collect_route_models(route));
+        let models = match compiled_route_models.as_ref() {
+            Some(models) => models.get(route_id).cloned().unwrap_or_default(),
+            None => collect_route_models(route),
+        };
         options.push(ExternalOpenAiApiBackendOptionView {
             key: build_backend_key(
                 ExternalOpenAiApiBackendType::CodexRouterRoute,
@@ -902,15 +901,16 @@ fn codex_router_routes(provider: &Provider) -> Vec<&Value> {
 /// 从 provider 配置中提取页面和 /v1/models 可展示的模型 id。
 fn collect_provider_models(provider: &Provider) -> Vec<String> {
     let mut ids = BTreeSet::new();
-    collect_model_string(&mut ids, provider.settings_config.get("model"));
-    collect_model_string(&mut ids, provider.settings_config.get("defaultModel"));
-    collect_model_array(&mut ids, provider.settings_config.get("models"));
-    collect_model_array(&mut ids, provider.settings_config.get("modelList"));
-    collect_model_array(&mut ids, provider.settings_config.get("modelCatalog"));
-    collect_model_array(
-        &mut ids,
-        provider.settings_config.pointer("/modelCatalog/models"),
-    );
+    let catalog_models = crate::codex_multirouter::catalog::read_catalog(&provider.settings_config)
+        .and_then(|catalog| catalog.get("models"));
+    if catalog_models.is_some() {
+        collect_model_array(&mut ids, catalog_models);
+    } else {
+        collect_model_string(&mut ids, provider.settings_config.get("model"));
+        collect_model_string(&mut ids, provider.settings_config.get("defaultModel"));
+        collect_model_array(&mut ids, provider.settings_config.get("models"));
+        collect_model_array(&mut ids, provider.settings_config.get("modelList"));
+    }
     ids.into_iter().collect()
 }
 
@@ -959,6 +959,9 @@ fn collect_model_array(ids: &mut BTreeSet<String>, value: Option<&Value>) {
         return;
     };
     for value in values {
+        if value.get("enabled").and_then(Value::as_bool) == Some(false) {
+            continue;
+        }
         if let Some(model) = value.as_str() {
             collect_model_string(ids, Some(&Value::String(model.to_string())));
         } else {
@@ -1376,6 +1379,83 @@ mod tests {
     }
 
     #[test]
+    fn backend_options_treat_catalog_as_complete_inventory() {
+        for (models, expected) in [
+            (json!([]), Vec::<&str>::new()),
+            (
+                json!([
+                    { "model": "included" },
+                    { "model": "excluded", "enabled": false }
+                ]),
+                vec!["included"],
+            ),
+        ] {
+            let db = Database::memory().expect("memory db");
+            db.save_provider(
+                "codex",
+                &Provider::with_id(
+                    "catalog-provider".to_string(),
+                    "Catalog Provider".to_string(),
+                    json!({
+                        "model": "stale-model",
+                        "defaultModel": "stale-default",
+                        "models": ["stale-list-model", "excluded"],
+                        "modelList": [{ "id": "stale-object-model" }],
+                        "modelCatalog": { "models": models },
+                        "model_catalog": { "models": [{ "model": "stale-legacy-catalog" }] }
+                    }),
+                    None,
+                ),
+            )
+            .expect("save provider");
+
+            let backend = list_backend_options(&db)
+                .expect("backend options")
+                .into_iter()
+                .find(|option| option.provider_id == "catalog-provider")
+                .expect("catalog backend option");
+
+            assert_eq!(backend.models, expected);
+        }
+    }
+
+    #[test]
+    fn backend_options_recover_absent_or_malformed_catalog_inventory() {
+        for catalog in [None, Some(json!({ "models": "malformed" }))] {
+            let db = Database::memory().expect("memory db");
+            let mut settings = json!({
+                "models": ["legacy-model"],
+                "modelList": [{ "id": "legacy-object-model" }],
+                "defaultModel": "provider-default"
+            });
+            if let Some(catalog) = catalog {
+                settings["modelCatalog"] = catalog;
+            }
+            db.save_provider(
+                "codex",
+                &Provider::with_id(
+                    "legacy-provider".to_string(),
+                    "Legacy Provider".to_string(),
+                    settings,
+                    None,
+                ),
+            )
+            .expect("save provider");
+
+            let backend = list_backend_options(&db)
+                .expect("backend options")
+                .into_iter()
+                .find(|option| option.provider_id == "legacy-provider")
+                .expect("legacy backend option");
+
+            assert_eq!(
+                backend.models,
+                vec!["legacy-model", "legacy-object-model", "provider-default"]
+            );
+        }
+    }
+
+    #[test]
     fn runtime_status_marks_codex_chatgpt_backend_as_managed_oauth() {
         let db = Database::memory().expect("memory db");
         let provider = Provider::with_id(
@@ -1587,6 +1667,50 @@ mod tests {
             .models
             .iter()
             .any(|model| model == "stale-router-model"));
+    }
+
+    #[test]
+    fn backend_options_do_not_restore_saved_route_models_after_v2_compile_failure() {
+        let db = Database::memory().expect("memory db");
+        db.save_provider(
+            "codex",
+            &Provider::with_id(
+                "broken-router-v2".to_string(),
+                "Broken Router V2".to_string(),
+                json!({
+                    "modelCatalog": { "models": [{ "model": "stale-router-model" }] },
+                    "codexRouting": {
+                        "schemaVersion": 2,
+                        "enabled": true,
+                        "routes": [{
+                            "id": "missing-target",
+                            "targetProviderId": "removed-provider",
+                            "modelSelection": { "mode": "all" },
+                            "match": { "models": ["stale-match-model"] },
+                            "models": ["stale-route-model"]
+                        }]
+                    }
+                }),
+                None,
+            ),
+        )
+        .expect("save router");
+
+        let options = list_backend_options(&db).expect("backend options");
+        let router_options = options
+            .iter()
+            .filter(|option| option.provider_id == "broken-router-v2")
+            .collect::<Vec<_>>();
+
+        assert_eq!(router_options.len(), 2);
+        for option in router_options {
+            assert!(!option.available);
+            assert!(option.models.is_empty());
+            assert!(option
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("compile failed")));
+        }
     }
 
     #[test]

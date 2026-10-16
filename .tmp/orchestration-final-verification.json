@@ -1,0 +1,12 @@
+{
+  "typecheck": 0,
+  "catalog": 0,
+  "format": 1,
+  "cargoFormat": 1,
+  "multirouter": 101,
+  "orchestration": 0,
+  "clippy": 101,
+  "unit": 1,
+  "renderer": 0,
+  "diffcheck": 0
+}

@@ -285,6 +285,79 @@ describe("useSettingsForm Hook", () => {
     expect(result.current.initialLanguage).toBe("en");
   });
 
+  it("rebases a new persisted snapshot without discarding local drafts", () => {
+    const saved = {
+      showInTray: true,
+      minimizeToTrayOnClose: true,
+      claudeConfigDir: "/saved/claude",
+      codexConfigDir: "/saved/codex",
+      language: "en" as const,
+    };
+    useSettingsQueryMock.mockReturnValue({ data: saved, isLoading: false });
+    const { result, rerender } = renderHook(() => useSettingsForm());
+
+    act(() => {
+      result.current.updateSettings({
+        claudeConfigDir: "/draft/claude",
+        language: "ja",
+      });
+    });
+    useSettingsQueryMock.mockReturnValue({
+      data: {
+        ...saved,
+        minimizeToTrayOnClose: false,
+        codexConfigDir: "/latest/codex",
+      },
+      isLoading: false,
+    });
+    rerender();
+
+    expect(result.current.settings?.claudeConfigDir).toBe("/draft/claude");
+    expect(result.current.settings?.language).toBe("ja");
+    expect(result.current.settings?.codexConfigDir).toBe("/latest/codex");
+    expect(result.current.settings?.minimizeToTrayOnClose).toBe(false);
+    expect(i18n.language).toBe("ja");
+    expect(result.current.initialLanguage).toBe("en");
+
+    act(() => {
+      result.current.resetSettings({
+        ...saved,
+        minimizeToTrayOnClose: false,
+        codexConfigDir: "/latest/codex",
+      });
+    });
+    expect(result.current.settings?.claudeConfigDir).toBe("/saved/claude");
+    expect(result.current.settings?.language).toBe("en");
+  });
+
+  it("adopts later canonical changes after a local draft is persisted", () => {
+    const saved = {
+      showInTray: true,
+      minimizeToTrayOnClose: true,
+      claudeConfigDir: "/saved/claude",
+      language: "en" as const,
+    };
+    useSettingsQueryMock.mockReturnValue({ data: saved, isLoading: false });
+    const { result, rerender } = renderHook(() => useSettingsForm());
+    act(() => {
+      result.current.updateSettings({ claudeConfigDir: "/draft/claude" });
+    });
+
+    useSettingsQueryMock.mockReturnValue({
+      data: { ...saved, claudeConfigDir: "/draft/claude" },
+      isLoading: false,
+    });
+    rerender();
+    expect(result.current.settings?.claudeConfigDir).toBe("/draft/claude");
+
+    useSettingsQueryMock.mockReturnValue({
+      data: { ...saved, claudeConfigDir: "/external/claude" },
+      isLoading: false,
+    });
+    rerender();
+    expect(result.current.settings?.claudeConfigDir).toBe("/external/claude");
+  });
+
   it("applies a newer query snapshot after an explicit reset", () => {
     const saved = {
       showInTray: true,

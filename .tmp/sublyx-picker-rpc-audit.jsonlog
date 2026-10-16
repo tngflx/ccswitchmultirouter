@@ -1,0 +1,213 @@
+{
+  "installedAppServerModels": [
+    {
+      "id": "gpt-6.1-sol-sublyx",
+      "hidden": false,
+      "supportedReasoningEfforts": [
+        {
+          "reasoningEffort": "low",
+          "description": "low effort"
+        },
+        {
+          "reasoningEffort": "medium",
+          "description": "medium effort"
+        },
+        {
+          "reasoningEffort": "high",
+          "description": "high effort"
+        },
+        {
+          "reasoningEffort": "xhigh",
+          "description": "xhigh effort"
+        },
+        {
+          "reasoningEffort": "max",
+          "description": "max effort"
+        },
+        {
+          "reasoningEffort": "ultra",
+          "description": "ultra effort"
+        }
+      ],
+      "defaultReasoningEffort": "xhigh"
+    },
+    {
+      "id": "gpt-6-astra-sublyx",
+      "hidden": false,
+      "supportedReasoningEfforts": [
+        {
+          "reasoningEffort": "low",
+          "description": "low effort"
+        },
+        {
+          "reasoningEffort": "medium",
+          "description": "medium effort"
+        },
+        {
+          "reasoningEffort": "high",
+          "description": "high effort"
+        },
+        {
+          "reasoningEffort": "xhigh",
+          "description": "xhigh effort"
+        },
+        {
+          "reasoningEffort": "max",
+          "description": "max effort"
+        },
+        {
+          "reasoningEffort": "ultra",
+          "description": "ultra effort"
+        }
+      ],
+      "defaultReasoningEffort": "low"
+    },
+    {
+      "id": "gpt-6-luna-sublyx",
+      "hidden": false,
+      "supportedReasoningEfforts": [
+        {
+          "reasoningEffort": "low",
+          "description": "low effort"
+        },
+        {
+          "reasoningEffort": "medium",
+          "description": "medium effort"
+        },
+        {
+          "reasoningEffort": "high",
+          "description": "high effort"
+        },
+        {
+          "reasoningEffort": "xhigh",
+          "description": "xhigh effort"
+        },
+        {
+          "reasoningEffort": "max",
+          "description": "max effort"
+        }
+      ],
+      "defaultReasoningEffort": "medium"
+    },
+    {
+      "id": "gpt-6-sol-sublyx",
+      "hidden": false,
+      "supportedReasoningEfforts": [
+        {
+          "reasoningEffort": "low",
+          "description": "low effort"
+        },
+        {
+          "reasoningEffort": "medium",
+          "description": "medium effort"
+        },
+        {
+          "reasoningEffort": "high",
+          "description": "high effort"
+        },
+        {
+          "reasoningEffort": "xhigh",
+          "description": "xhigh effort"
+        },
+        {
+          "reasoningEffort": "max",
+          "description": "max effort"
+        },
+        {
+          "reasoningEffort": "ultra",
+          "description": "ultra effort"
+        }
+      ],
+      "defaultReasoningEffort": "medium"
+    },
+    {
+      "id": "gpt-5.6-luna-sublyx",
+      "hidden": false,
+      "supportedReasoningEfforts": [
+        {
+          "reasoningEffort": "low",
+          "description": "low effort"
+        },
+        {
+          "reasoningEffort": "medium",
+          "description": "medium effort"
+        },
+        {
+          "reasoningEffort": "high",
+          "description": "high effort"
+        },
+        {
+          "reasoningEffort": "xhigh",
+          "description": "xhigh effort"
+        },
+        {
+          "reasoningEffort": "max",
+          "description": "max effort"
+        }
+      ],
+      "defaultReasoningEffort": "medium"
+    },
+    {
+      "id": "gpt-5.6-sol-sublyx",
+      "hidden": false,
+      "supportedReasoningEfforts": [
+        {
+          "reasoningEffort": "low",
+          "description": "low effort"
+        },
+        {
+          "reasoningEffort": "medium",
+          "description": "medium effort"
+        },
+        {
+          "reasoningEffort": "high",
+          "description": "high effort"
+        },
+        {
+          "reasoningEffort": "xhigh",
+          "description": "xhigh effort"
+        },
+        {
+          "reasoningEffort": "max",
+          "description": "max effort"
+        },
+        {
+          "reasoningEffort": "ultra",
+          "description": "ultra effort"
+        }
+      ],
+      "defaultReasoningEffort": "low"
+    },
+    {
+      "id": "gpt-5.6-terra-sublyx",
+      "hidden": false,
+      "supportedReasoningEfforts": [
+        {
+          "reasoningEffort": "low",
+          "description": "low effort"
+        },
+        {
+          "reasoningEffort": "medium",
+          "description": "medium effort"
+        },
+        {
+          "reasoningEffort": "high",
+          "description": "high effort"
+        },
+        {
+          "reasoningEffort": "xhigh",
+          "description": "xhigh effort"
+        },
+        {
+          "reasoningEffort": "max",
+          "description": "max effort"
+        },
+        {
+          "reasoningEffort": "ultra",
+          "description": "ultra effort"
+        }
+      ],
+      "defaultReasoningEffort": "medium"
+    }
+  ]
+}

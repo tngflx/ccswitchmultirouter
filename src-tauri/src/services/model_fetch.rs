@@ -7,20 +7,40 @@
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue, AUTHORIZATION, USER_AGENT};
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::Duration;
 
+use crate::codex_multirouter::protocol_capability::normalize_protocol_capability_base_url;
+
 /// 获取到的模型信息
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FetchedModel {
     pub id: String,
     pub owned_by: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub canonical_slug: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slug: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub aliases: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supports_parallel_tool_calls: Option<bool>,
     pub context_window: Option<u64>,
     pub input_modalities: Option<Vec<String>>,
     pub supports_image: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protocol_capability: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub is_free: Option<bool>,
 }
 
 /// 模型列表获取服务的统一入参。
@@ -54,10 +74,27 @@ pub struct VolcengineModelListRequest<'a> {
 #[derive(Debug, Deserialize)]
 struct ModelsResponse {
     data: Option<Vec<ModelEntry>>,
+    /// Opper's public catalog uses `models` instead of OpenAI's `data` array.
+    #[serde(default)]
+    models: Option<serde_json::Value>,
     #[serde(default)]
     msg: Option<String>,
     #[serde(default)]
     error: Option<ModelFetchError>,
+    #[serde(default)]
+    success: Option<bool>,
+    #[serde(default, alias = "hasMore")]
+    has_more: Option<bool>,
+    #[serde(default, alias = "nextCursor")]
+    next_cursor: Option<String>,
+    #[serde(default)]
+    total: Option<serde_json::Value>,
+    #[serde(default)]
+    pagination: Option<serde_json::Value>,
+    #[serde(default)]
+    links: Option<serde_json::Value>,
+    #[serde(flatten)]
+    extra: serde_json::Map<String, serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -80,15 +117,201 @@ impl ModelsResponse {
                     .filter(|message| !message.is_empty())
             })
     }
+
+    fn explicit_failure(&self) -> bool {
+        self.success == Some(false)
+            || self.error.is_some()
+            || self.extra.get("ok").and_then(serde_json::Value::as_bool) == Some(false)
+    }
+
+    fn incomplete_inventory(&self, returned: usize) -> bool {
+        if self.has_more == Some(true)
+            || self
+                .next_cursor
+                .as_deref()
+                .is_some_and(|cursor| !cursor.trim().is_empty())
+        {
+            return true;
+        }
+
+        let (extra_incomplete, extra_total) = pagination_object_signals(&self.extra);
+        let mut pagination_total = self
+            .total
+            .as_ref()
+            .and_then(parse_nonnegative_u64)
+            .into_iter()
+            .chain(extra_total)
+            .max();
+        let mut pagination_incomplete = extra_incomplete;
+        for value in [&self.pagination, &self.links].into_iter().flatten() {
+            let (incomplete, total) = pagination_signals(value);
+            pagination_incomplete |= incomplete;
+            pagination_total = pagination_total.into_iter().chain(total).max();
+        }
+        pagination_incomplete || pagination_total.is_some_and(|total| total > returned as u64)
+    }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug)]
 struct ModelEntry {
     id: String,
     owned_by: Option<String>,
+    extra: serde_json::Map<String, serde_json::Value>,
+}
+
+impl<'de> Deserialize<'de> for ModelEntry {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let object = serde_json::Map::<String, serde_json::Value>::deserialize(deserializer)?;
+        // The authoritative OpenAI-compatible `data` inventory needs a
+        // requestable identifier. A display-only `name` is valid for rich
+        // descriptors, but must not turn a corrupt data row into a route.
+        let id = ["id", "slug", "model"]
+            .iter()
+            .filter_map(|key| object.get(*key))
+            .find_map(|value| {
+                value
+                    .as_str()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_string)
+            })
+            .ok_or_else(|| serde::de::Error::custom("missing model identifier"))?;
+        let owned_by = ["owned_by", "ownedBy"]
+            .iter()
+            .filter_map(|key| object.get(*key))
+            .find_map(|value| value.as_str().map(str::to_string));
+        Ok(Self {
+            id,
+            owned_by,
+            extra: object,
+        })
+    }
+}
+
+/// Normalized view of Opper's public `/v3/models` catalog entries.
+///
+/// The endpoint is not OpenAI-shaped: it returns `models`, keeps the public
+/// model identity in `id`, and nests the upstream owner under `provider.slug`.
+/// Keep the full entry in `extra` so pricing and capability metadata remain
+/// available to the common classifier.
+#[derive(Debug, Deserialize)]
+struct OpperModelEntry {
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    #[serde(alias = "modelId")]
+    model_id: Option<String>,
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    #[serde(alias = "ownedBy")]
+    owned_by: Option<String>,
+    #[serde(default)]
+    provider: Option<serde_json::Value>,
     #[serde(flatten)]
     extra: serde_json::Map<String, serde_json::Value>,
 }
+
+impl OpperModelEntry {
+    fn into_model_entry(self) -> Option<ModelEntry> {
+        let mut extra = self.extra;
+        for (key, value) in [
+            ("id", self.id.as_ref()),
+            ("model_id", self.model_id.as_ref()),
+            ("model", self.model.as_ref()),
+        ] {
+            if let Some(value) = value {
+                extra.insert(key.to_string(), serde_json::json!(value));
+            }
+        }
+        let id = self
+            .id
+            .or(self.model_id)
+            .or(self.model)
+            .or_else(|| {
+                ["slug", "canonical_slug", "canonicalSlug"]
+                    .iter()
+                    .find_map(|key| {
+                        extra
+                            .get(*key)
+                            .and_then(serde_json::Value::as_str)
+                            .map(str::to_string)
+                    })
+            })
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())?;
+        let owned_by = self.owned_by.or_else(|| {
+            self.provider
+                .as_ref()
+                .and_then(serde_json::Value::as_object)
+                .and_then(|provider| {
+                    provider
+                        .get("slug")
+                        .or_else(|| provider.get("id"))
+                        .and_then(serde_json::Value::as_str)
+                })
+                .map(str::to_string)
+        });
+        Some(ModelEntry {
+            id,
+            owned_by,
+            extra,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PriceSign {
+    Zero,
+    Positive,
+    Negative,
+    Invalid,
+}
+
+#[derive(Debug, Default)]
+struct PricingEvidence {
+    prompt: Option<PriceSign>,
+    completion: Option<PriceSign>,
+    has_charge_fields: bool,
+    has_positive: bool,
+    has_invalid: bool,
+    has_negative: bool,
+}
+
+const NESTED_CACHE_PRICE_KEYS: &[&str] = &["read", "write"];
+
+/// Pricing fields that represent a billable request, token, modality, or cache
+/// charge. `discount` and other descriptive metadata are deliberately omitted.
+const PRICING_CHARGE_KEYS: &[&str] = &[
+    "prompt",
+    "completion",
+    "input",
+    "output",
+    "request",
+    "image",
+    "image_generation",
+    "web_search",
+    "search",
+    "internal_reasoning",
+    "reasoning",
+    "input_cache_read",
+    "input_cache_write",
+    "output_cache_read",
+    "output_cache_write",
+    "cache_read",
+    "cache_write",
+    "input_audio",
+    "output_audio",
+    "audio",
+    "video",
+    "embedding",
+    "embeddings",
+    "tool_call",
+    "tool_calls",
+];
 
 const FETCH_TIMEOUT_SECS: u64 = 15;
 const MAX_REQUEST_HEADERS: usize = 64;
@@ -242,8 +465,14 @@ pub async fn fetch_models(options: FetchModelsRequest<'_>) -> Result<Vec<Fetched
         let status = response.status();
 
         if status.is_success() {
+            let resolved_models_url = response.url().clone();
             let body = response.text().await.unwrap_or_default();
-            let mut models = parse_models_response(&body, &log_secrets)?;
+            let mut models = parse_provider_models_response(
+                &body,
+                &log_secrets,
+                options.base_url,
+                resolved_models_url.as_str(),
+            )?;
 
             enrich_missing_context_windows(&client, url, &mut models).await;
             models.sort_by(|a, b| a.id.cmp(&b.id));
@@ -270,31 +499,1027 @@ pub async fn fetch_models(options: FetchModelsRequest<'_>) -> Result<Vec<Fetched
     ))
 }
 
+#[cfg(test)]
 fn parse_models_response(
     body: &str,
     known_secrets: &[String],
 ) -> Result<Vec<FetchedModel>, String> {
-    let response: ModelsResponse =
-        serde_json::from_str(body).map_err(|error| format!("Failed to parse response: {error}"))?;
-    let Some(entries) = response.data else {
+    parse_provider_models_response(body, known_secrets, "", "")
+}
+
+fn parse_provider_models_response(
+    body: &str,
+    known_secrets: &[String],
+    base_url: &str,
+    models_url: &str,
+) -> Result<Vec<FetchedModel>, String> {
+    let response: ModelsResponse = serde_json::from_str(body).map_err(|error| {
+        let detail = format!("Failed to parse response: {error}");
+        crate::redact_known_secrets(&detail, known_secrets)
+    })?;
+    if response.explicit_failure() {
         let detail = response
             .error_message()
             .map(|message| crate::redact_known_secrets(message, known_secrets))
-            .unwrap_or_else(|| redact_model_fetch_error_body(body.to_string(), known_secrets));
+            .unwrap_or_else(|| "provider reported model-list failure".to_string());
         return Err(format!("Model fetch failed: {detail}"));
+    }
+    let error_detail = response
+        .error_message()
+        .map(|message| crate::redact_known_secrets(message, known_secrets))
+        .unwrap_or_else(|| redact_model_fetch_error_body(body.to_string(), known_secrets));
+    let inventory_size = response
+        .data
+        .as_ref()
+        .map(Vec::len)
+        .or_else(|| response.models.as_ref().map(rich_model_count))
+        .unwrap_or_default();
+    if response.incomplete_inventory(inventory_size) {
+        return Err(
+            "Model fetch response is incomplete; pagination must be resolved first".to_string(),
+        );
+    }
+    let data = response.data;
+    let rich_models = response.models;
+    let entries = match (data, rich_models) {
+        (Some(mut data), Some(rich)) => {
+            let rich = normalize_rich_model_entries(rich)?;
+            validate_rich_model_entries(&rich)?;
+            if data.is_empty() && !rich.is_empty() {
+                return Err(
+                    "Model fetch response contained contradictory data and models inventories"
+                        .to_string(),
+                );
+            }
+            enrich_data_model_entries(&mut data, &rich)?;
+            data
+        }
+        (Some(data), None) => data,
+        (None, Some(rich)) => {
+            let rich = normalize_rich_model_entries(rich)?;
+            validate_rich_model_entries(&rich)?;
+            rich
+        }
+        (None, None) => return Err(format!("Model fetch failed: {error_detail}")),
     };
+    validate_model_entries(&entries)?;
 
     Ok(entries
         .into_iter()
-        .map(|entry| FetchedModel {
-            context_window: extract_context_window(&entry.extra),
-            id: entry.id,
-            input_modalities: extract_input_modalities(&entry.extra),
-            owned_by: entry.owned_by,
-            supports_image: extract_supports_image(&entry.extra),
-            reasoning: None,
+        .map(|entry| {
+            let is_free = classify_model_free_status(&entry.id, &entry.extra);
+            let protocol_capability =
+                extract_protocol_capability(&entry.id, &entry.extra, base_url, models_url);
+            let identity = extract_model_identity_fields(&entry.extra);
+            FetchedModel {
+                context_window: extract_context_window(&entry.extra),
+                id: entry.id,
+                input_modalities: extract_input_modalities(&entry.extra),
+                owned_by: entry.owned_by,
+                supports_image: extract_supports_image(&entry.extra),
+                display_name: identity.display_name,
+                canonical_slug: identity.canonical_slug,
+                slug: identity.slug,
+                name: identity.name,
+                aliases: identity.aliases,
+                upstream_model: None,
+                supports_parallel_tool_calls: identity.supports_parallel_tool_calls,
+                reasoning: crate::reasoning_capabilities::provider_metadata::
+                    provider_reasoning_capability_from_model_entry(
+                        &serde_json::Value::Object(entry.extra.clone()),
+                        is_openrouter_api_url(base_url, "/api/v1")
+                            && is_openrouter_api_url(models_url, "/api/v1/models"),
+                    )
+                    .and_then(|capability| serde_json::to_value(capability).ok()),
+                protocol_capability,
+                is_free,
+            }
         })
         .collect())
+}
+
+fn normalize_rich_model_entries(value: serde_json::Value) -> Result<Vec<ModelEntry>, String> {
+    let entries = match value {
+        serde_json::Value::Array(entries) => entries
+            .into_iter()
+            .map(|entry| (None, entry))
+            .collect::<Vec<_>>(),
+        serde_json::Value::Object(entries) => entries
+            .into_iter()
+            .map(|(key, entry)| (Some(key), entry))
+            .collect::<Vec<_>>(),
+        _ => {
+            return Err("Model fetch response contained an invalid models envelope".to_string());
+        }
+    };
+    let mut normalized = Vec::with_capacity(entries.len());
+    for (fallback_id, value) in entries {
+        let mut entry: OpperModelEntry = serde_json::from_value(value).map_err(|_| {
+            "Model fetch response contained an invalid model descriptor".to_string()
+        })?;
+        if entry.id.is_none()
+            && entry.model_id.is_none()
+            && entry.model.is_none()
+            && entry
+                .extra
+                .get("slug")
+                .and_then(serde_json::Value::as_str)
+                .is_none()
+            && !["canonical_slug", "canonicalSlug"].iter().any(|key| {
+                entry
+                    .extra
+                    .get(*key)
+                    .and_then(serde_json::Value::as_str)
+                    .is_some()
+            })
+        {
+            entry.id = fallback_id;
+        }
+        let Some(entry) = entry.into_model_entry() else {
+            return Err("Model fetch response contained a model without an identifier".to_string());
+        };
+        normalized.push(entry);
+    }
+    Ok(normalized)
+}
+
+fn rich_model_count(value: &serde_json::Value) -> usize {
+    match value {
+        serde_json::Value::Array(values) => values.len(),
+        serde_json::Value::Object(values) => values.len(),
+        _ => 0,
+    }
+}
+
+fn validate_rich_model_entries(entries: &[ModelEntry]) -> Result<(), String> {
+    for (index, entry) in entries.iter().enumerate() {
+        let identities = model_entry_identity_values(entry);
+        for other in entries.iter().skip(index + 1) {
+            if model_entry_identity_values(other)
+                .iter()
+                .any(|identity| identities.iter().any(|candidate| identity == candidate))
+            {
+                return Err(
+                    "Model fetch response contained ambiguous model descriptors".to_string()
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn enrich_data_model_entries(data: &mut [ModelEntry], rich: &[ModelEntry]) -> Result<(), String> {
+    let mut descriptor_matches = Vec::with_capacity(data.len());
+    let mut used_descriptors = HashSet::new();
+    for entry in data.iter() {
+        let data_id = normalize_model_identity(&entry.id);
+        let exact = rich
+            .iter()
+            .position(|candidate| normalize_model_identity(&candidate.id) == data_id);
+        let descriptor_index = if exact.is_some() {
+            exact
+        } else {
+            let identities = model_entry_identity_values(entry);
+            let mut candidates = rich.iter().enumerate().filter_map(|(index, candidate)| {
+                model_entry_identity_values(candidate)
+                    .iter()
+                    .any(|identity| identities.contains(identity))
+                    .then_some(index)
+            });
+            let candidate = candidates.next();
+            if candidates.next().is_some() {
+                return Err(
+                    "Model fetch response contained ambiguous model descriptors".to_string()
+                );
+            }
+            candidate
+        };
+        if let Some(index) = descriptor_index {
+            if !used_descriptors.insert(index) {
+                return Err(
+                    "Model fetch response contained ambiguous model descriptors".to_string()
+                );
+            }
+        }
+        descriptor_matches.push(descriptor_index);
+    }
+    for (entry, descriptor_index) in data.iter_mut().zip(descriptor_matches) {
+        let Some(descriptor) = descriptor_index.map(|index| &rich[index]) else {
+            continue;
+        };
+        let mut owned_fields = HashSet::new();
+        collect_declared_model_metadata_fields(&entry.extra, &mut owned_fields);
+        merge_missing_model_metadata(&mut entry.extra, &descriptor.extra, &owned_fields);
+        if entry.owned_by.is_none() {
+            entry.owned_by = descriptor.owned_by.clone();
+        }
+    }
+    Ok(())
+}
+
+fn model_metadata_field(key: &str) -> Option<&'static str> {
+    match key {
+        "context" | "context_window" | "context_length" | "contextLength" | "ContextWindow"
+        | "ContextLength" | "max_context_window" | "max_context_length" | "contextWindow"
+        | "maxContextWindow" | "maxContextLength" | "max_model_len" | "maxModelLen"
+        | "max_input_tokens" | "maxInputTokens" | "max_prompt_tokens" | "maxPromptTokens"
+        | "input_token_limit" | "inputTokenLimit" => Some("context"),
+        "input_modalities"
+        | "inputModalities"
+        | "modalities"
+        | "input"
+        | "inputs"
+        | "supports_image"
+        | "supportsImage"
+        | "vision"
+        | "supports_vision"
+        | "supportsVision"
+        | "supports_image_detail_original"
+        | "supportsImageDetailOriginal" => Some("input"),
+        "supports_parallel_tool_calls" | "supportsParallelToolCalls" => Some("parallel"),
+        "display_name" | "displayName" => Some("display"),
+        "canonical_slug" | "canonicalSlug" => Some("canonical"),
+        "slug" => Some("slug"),
+        "name" => Some("name"),
+        "aliases" | "alias" | "model_aliases" | "modelAliases" => Some("aliases"),
+        "is_free" | "isFree" | "pricing" | "cost" => Some("pricing"),
+        "reasoning"
+        | "supportsReasoning"
+        | "supports_reasoning"
+        | "reasoningSupported"
+        | "reasoning_supported"
+        | "supportsThinking"
+        | "supports_thinking"
+        | "supported_efforts"
+        | "supportedEfforts"
+        | "efforts"
+        | "supported_reasoning_levels"
+        | "supportedReasoningLevels"
+        | "supported_reasoning_efforts"
+        | "supportedReasoningEfforts"
+        | "default_effort"
+        | "defaultEffort"
+        | "default_reasoning_level"
+        | "default_reasoning_effort"
+        | "defaultReasoningLevel"
+        | "defaultReasoningEffort"
+        | "reasoning_format"
+        | "reasoningFormat"
+        | "upstream_format"
+        | "upstreamFormat"
+        | "reasoning_parameter"
+        | "reasoningParameter"
+        | "upstream_parameter"
+        | "upstreamParameter"
+        | "mandatory"
+        | "reasoningMandatory"
+        | "default_enabled"
+        | "defaultEnabled"
+        | "supports_max_tokens"
+        | "supportsMaxTokens" => Some("reasoning"),
+        "supported_endpoints" | "supportedEndpoints" | "endpoints" => Some("endpoints"),
+        "supportsTools"
+        | "supports_tools"
+        | "tools"
+        | "tool_calling"
+        | "toolCalling"
+        | "supports_function_calling"
+        | "supportsFunctionCalling"
+        | "function_calling"
+        | "functionCalling" => Some("tools"),
+        "supportsStreaming" | "supports_streaming" | "supportsStream" | "supports_stream"
+        | "streaming" | "stream" => Some("streaming"),
+        "supportsToolContinuation"
+        | "supports_tool_continuation"
+        | "toolContinuation"
+        | "tool_continuation" => Some("continuation"),
+        "supported_parameters" | "supportedParameters" => Some("parameters"),
+        _ => None,
+    }
+}
+
+fn collect_declared_model_metadata_fields(
+    object: &serde_json::Map<String, serde_json::Value>,
+    fields: &mut HashSet<&'static str>,
+) {
+    for (key, value) in object {
+        if value.is_null() {
+            continue;
+        }
+        if let Some(field) = model_metadata_field(key) {
+            fields.insert(field);
+            if field == "parameters"
+                && value.as_array().is_some_and(|parameters| {
+                    parameters.iter().any(|parameter| {
+                        parameter
+                            .as_str()
+                            .is_some_and(|parameter| parameter.eq_ignore_ascii_case("tools"))
+                    })
+                })
+            {
+                fields.insert("tools");
+            }
+        } else if ["metadata", "capability", "capabilities", "limit", "limits"]
+            .contains(&key.as_str())
+        {
+            if let Some(nested) = value.as_object() {
+                collect_declared_model_metadata_fields(nested, fields);
+            }
+        }
+    }
+}
+
+fn merge_missing_model_metadata(
+    target: &mut serde_json::Map<String, serde_json::Value>,
+    descriptor: &serde_json::Map<String, serde_json::Value>,
+    declared: &HashSet<&'static str>,
+) {
+    for (key, value) in descriptor {
+        if let Some(field) = model_metadata_field(key) {
+            if declared.contains(field) || (field == "parameters" && declared.contains("tools")) {
+                continue;
+            }
+        } else if ["metadata", "capability", "capabilities", "limit", "limits"]
+            .contains(&key.as_str())
+        {
+            if let Some(nested) = value.as_object() {
+                let entry = target
+                    .entry(key.clone())
+                    .or_insert_with(|| serde_json::json!({}));
+                if let Some(object) = entry.as_object_mut() {
+                    merge_missing_model_metadata(object, nested, declared);
+                }
+                continue;
+            }
+        }
+        if target.get(key).is_none_or(serde_json::Value::is_null) {
+            target.insert(key.clone(), value.clone());
+        }
+    }
+}
+
+fn model_entry_identity_values(entry: &ModelEntry) -> Vec<String> {
+    let mut values = Vec::new();
+    push_model_identity(&mut values, &entry.id);
+    for object in [
+        Some(&entry.extra),
+        entry
+            .extra
+            .get("metadata")
+            .and_then(serde_json::Value::as_object),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        for key in [
+            "model",
+            "model_id",
+            "modelId",
+            "canonical_slug",
+            "canonicalSlug",
+            "slug",
+            "name",
+        ] {
+            if let Some(value) = object.get(key).and_then(serde_json::Value::as_str) {
+                push_model_identity(&mut values, value);
+            }
+        }
+        for key in ["aliases", "alias", "model_aliases", "modelAliases"] {
+            if let Some(value) = object.get(key) {
+                push_alias_identities(&mut values, value);
+            }
+        }
+    }
+    values
+}
+
+fn normalize_model_identity(value: &str) -> String {
+    value.trim().to_ascii_lowercase()
+}
+
+fn push_model_identity(values: &mut Vec<String>, value: &str) {
+    let normalized = normalize_model_identity(value);
+    if !normalized.is_empty() && !values.iter().any(|item| item == &normalized) {
+        values.push(normalized);
+    }
+}
+
+fn push_alias_identities(values: &mut Vec<String>, value: &serde_json::Value) {
+    match value {
+        serde_json::Value::Array(items) => {
+            for item in items {
+                if let Some(alias) = item.as_str() {
+                    push_model_identity(values, alias);
+                }
+            }
+        }
+        serde_json::Value::Object(items) => {
+            for (alias, target) in items {
+                push_model_identity(values, alias);
+                if let Some(target) = target.as_str() {
+                    push_model_identity(values, target);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn validate_model_entries(entries: &[ModelEntry]) -> Result<(), String> {
+    let mut seen_ids = HashSet::new();
+    for entry in entries {
+        let id = normalize_model_identity(&entry.id);
+        if id.is_empty() {
+            return Err("Model fetch response contained a model without an identifier".to_string());
+        }
+        if !seen_ids.insert(id) {
+            return Err("Model fetch response contained duplicate model identifiers".to_string());
+        }
+    }
+    Ok(())
+}
+
+fn parse_nonnegative_u64(value: &serde_json::Value) -> Option<u64> {
+    value
+        .as_u64()
+        .or_else(|| value.as_str()?.trim().parse::<u64>().ok())
+}
+
+fn pagination_signals(value: &serde_json::Value) -> (bool, Option<u64>) {
+    let Some(object) = value.as_object() else {
+        return (false, None);
+    };
+    pagination_object_signals(object)
+}
+
+fn pagination_object_signals(
+    object: &serde_json::Map<String, serde_json::Value>,
+) -> (bool, Option<u64>) {
+    let has_more = ["has_more", "hasMore", "more"]
+        .iter()
+        .filter_map(|key| object.get(*key))
+        .any(|value| value.as_bool() == Some(true));
+    let next = [
+        "next_cursor",
+        "nextCursor",
+        "next_page_token",
+        "nextPageToken",
+    ]
+    .iter()
+    .filter_map(|key| object.get(*key))
+    .any(|value| value.as_str().is_some_and(|value| !value.trim().is_empty()));
+    let total = ["total", "total_count", "totalCount"]
+        .iter()
+        .find_map(|key| object.get(*key).and_then(parse_nonnegative_u64));
+    let page = ["page", "current_page", "currentPage"]
+        .iter()
+        .find_map(|key| object.get(*key).and_then(parse_nonnegative_u64));
+    let page_count = ["total_pages", "totalPages", "page_count", "pageCount"]
+        .iter()
+        .find_map(|key| object.get(*key).and_then(parse_nonnegative_u64));
+    let page_incomplete = page
+        .zip(page_count)
+        .is_some_and(|(page, total_pages)| total_pages > page && total_pages > 0);
+    let nested = ["pagination", "meta", "links"]
+        .iter()
+        .filter_map(|key| object.get(*key))
+        .map(pagination_signals)
+        .fold(
+            (false, None),
+            |(left_incomplete, left_total), (right_incomplete, right_total)| {
+                (
+                    left_incomplete || right_incomplete,
+                    left_total.or(right_total),
+                )
+            },
+        );
+    (
+        has_more
+            || next
+            || page_incomplete
+            || nested.0
+            || object.get("next").is_some_and(|value| {
+                !value.is_null() && (!value.as_str().is_some_and(|value| value.trim().is_empty()))
+            }),
+        total.or(nested.1),
+    )
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct ModelIdentityFields {
+    pub display_name: Option<String>,
+    pub canonical_slug: Option<String>,
+    pub slug: Option<String>,
+    pub name: Option<String>,
+    pub aliases: Option<serde_json::Value>,
+    pub supports_parallel_tool_calls: Option<bool>,
+}
+
+/// Extract only stable model identity fields advertised by a provider catalog.
+///
+/// Arbitrary model-entry properties are intentionally not forwarded to the
+/// renderer. `metadata` is accepted as a fallback envelope because several
+/// OpenAI-compatible providers nest these same fields there.
+pub(crate) fn extract_model_identity_fields(
+    object: &serde_json::Map<String, serde_json::Value>,
+) -> ModelIdentityFields {
+    let nested = object
+        .get("metadata")
+        .and_then(serde_json::Value::as_object);
+    let get_string = |keys: &[&str]| {
+        keys.iter()
+            .filter_map(|key| {
+                object
+                    .get(*key)
+                    .or_else(|| nested.and_then(|m| m.get(*key)))
+            })
+            .find_map(|value| {
+                value
+                    .as_str()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_string)
+            })
+    };
+    let aliases = ["aliases", "alias", "model_aliases", "modelAliases"]
+        .iter()
+        .filter_map(|key| {
+            object
+                .get(*key)
+                .or_else(|| nested.and_then(|m| m.get(*key)))
+        })
+        .find_map(sanitize_model_aliases);
+
+    ModelIdentityFields {
+        display_name: get_string(&["display_name", "displayName"]),
+        canonical_slug: get_string(&["canonical_slug", "canonicalSlug"]),
+        slug: get_string(&["slug"]),
+        name: get_string(&["name"]),
+        aliases,
+        supports_parallel_tool_calls: ["supportsParallelToolCalls", "supports_parallel_tool_calls"]
+            .iter()
+            .filter_map(|key| {
+                object
+                    .get(*key)
+                    .or_else(|| nested.and_then(|m| m.get(*key)))
+            })
+            .find_map(serde_json::Value::as_bool),
+    }
+}
+
+fn sanitize_model_aliases(value: &serde_json::Value) -> Option<serde_json::Value> {
+    match value {
+        serde_json::Value::Array(values) => {
+            let mut aliases = Vec::new();
+            for alias in values {
+                let Some(alias) = alias.as_str().map(str::trim).filter(|v| !v.is_empty()) else {
+                    continue;
+                };
+                if !aliases.iter().any(|existing| existing == alias) {
+                    aliases.push(alias.to_string());
+                }
+            }
+            (!aliases.is_empty()).then_some(serde_json::json!(aliases))
+        }
+        serde_json::Value::Object(values) => {
+            let mut aliases = BTreeMap::new();
+            for (alias, target) in values {
+                let alias = alias.trim();
+                let Some(target) = target.as_str().map(str::trim).filter(|v| !v.is_empty()) else {
+                    continue;
+                };
+                if !alias.is_empty() {
+                    aliases.insert(alias.to_string(), target.to_string());
+                }
+            }
+            (!aliases.is_empty()).then_some(serde_json::json!(aliases))
+        }
+        _ => None,
+    }
+}
+
+#[derive(Default)]
+struct ProviderProtocolMetadata {
+    endpoints: Option<Vec<&'static str>>,
+    supports_tools: Option<bool>,
+    supports_streaming: Option<bool>,
+    supports_tool_continuation: Option<bool>,
+    parameters_support_tools: Option<bool>,
+    invalid: bool,
+}
+
+/// Provider declarations identify usable transports, not a completed runtime
+/// probe. Binding them locally prevents upstream metadata from changing scope.
+fn extract_protocol_capability(
+    model_id: &str,
+    metadata: &serde_json::Map<String, serde_json::Value>,
+    base_url: &str,
+    models_url: &str,
+) -> Option<serde_json::Value> {
+    let base_url = normalize_protocol_capability_base_url(base_url)?;
+    if !model_discovery_has_same_origin(&base_url, models_url) {
+        return None;
+    }
+    let upstream_model = model_id.trim();
+    if upstream_model.is_empty() {
+        return None;
+    }
+
+    let mut evidence = ProviderProtocolMetadata::default();
+    collect_protocol_metadata(metadata, &mut evidence, 0);
+    if evidence.parameters_support_tools == Some(true) {
+        evidence.invalid |= !merge_protocol_declaration(&mut evidence.supports_tools, true);
+    }
+    if evidence.invalid {
+        return None;
+    }
+
+    let endpoints = match evidence.endpoints {
+        Some(endpoints) => endpoints,
+        None if evidence.supports_tools == Some(true)
+            && is_openrouter_api_url(&base_url, "/api/v1")
+            && is_openrouter_api_url(models_url, "/api/v1/models") =>
+        {
+            vec!["openai_chat"]
+        }
+        None => return None,
+    };
+    if endpoints.is_empty() {
+        return None;
+    }
+
+    let mut capability = serde_json::json!({
+        "schemaVersion": 1,
+        "source": "provider_api",
+        "baseUrl": base_url,
+        "upstreamModel": upstream_model,
+        "supportedEndpoints": endpoints,
+    });
+    for (key, value) in [
+        ("supportsTools", evidence.supports_tools),
+        ("supportsStreaming", evidence.supports_streaming),
+        (
+            "supportsToolContinuation",
+            evidence.supports_tool_continuation,
+        ),
+    ] {
+        if let Some(value) = value {
+            capability[key] = serde_json::json!(value);
+        }
+    }
+    Some(capability)
+}
+
+fn collect_protocol_metadata(
+    metadata: &serde_json::Map<String, serde_json::Value>,
+    evidence: &mut ProviderProtocolMetadata,
+    depth: u8,
+) {
+    if depth > 8 {
+        evidence.invalid = true;
+        return;
+    }
+    for value in ["supported_endpoints", "supportedEndpoints", "endpoints"]
+        .iter()
+        .filter_map(|key| metadata.get(*key))
+    {
+        match parse_protocol_endpoints(value) {
+            Some(endpoints) => {
+                evidence.invalid |= !merge_protocol_declaration(&mut evidence.endpoints, endpoints);
+            }
+            None => evidence.invalid = true,
+        }
+    }
+    evidence.invalid |= !collect_protocol_flag(
+        metadata,
+        &[
+            "supportsTools",
+            "supports_tools",
+            "tools",
+            "tool_calling",
+            "toolCalling",
+            "supports_function_calling",
+            "supportsFunctionCalling",
+            "function_calling",
+            "functionCalling",
+        ],
+        &mut evidence.supports_tools,
+    );
+    evidence.invalid |= !collect_protocol_flag(
+        metadata,
+        &[
+            "supportsStreaming",
+            "supports_streaming",
+            "supportsStream",
+            "supports_stream",
+            "streaming",
+            "stream",
+        ],
+        &mut evidence.supports_streaming,
+    );
+    evidence.invalid |= !collect_protocol_flag(
+        metadata,
+        &[
+            "supportsToolContinuation",
+            "supports_tool_continuation",
+            "toolContinuation",
+            "tool_continuation",
+        ],
+        &mut evidence.supports_tool_continuation,
+    );
+    for value in ["supported_parameters", "supportedParameters"]
+        .iter()
+        .filter_map(|key| metadata.get(*key))
+    {
+        let Some(parameters) = value.as_array().and_then(|parameters| {
+            parameters
+                .iter()
+                .map(|value| {
+                    value
+                        .as_str()
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                })
+                .collect::<Option<Vec<_>>>()
+        }) else {
+            evidence.invalid = true;
+            continue;
+        };
+        let supports_tools = parameters
+            .iter()
+            .any(|parameter| parameter.eq_ignore_ascii_case("tools"));
+        evidence.invalid |=
+            !merge_protocol_declaration(&mut evidence.parameters_support_tools, supports_tools);
+    }
+    for nested in ["capability", "capabilities", "metadata"]
+        .iter()
+        .filter_map(|key| metadata.get(*key).and_then(serde_json::Value::as_object))
+    {
+        collect_protocol_metadata(nested, evidence, depth + 1);
+    }
+}
+
+fn collect_protocol_flag(
+    metadata: &serde_json::Map<String, serde_json::Value>,
+    keys: &[&str],
+    declared: &mut Option<bool>,
+) -> bool {
+    let mut valid = true;
+    for value in keys.iter().filter_map(|key| metadata.get(*key)) {
+        valid &= value
+            .as_bool()
+            .is_some_and(|value| merge_protocol_declaration(declared, value));
+    }
+    valid
+}
+
+fn merge_protocol_declaration<T: PartialEq>(declared: &mut Option<T>, value: T) -> bool {
+    match declared {
+        Some(previous) => *previous == value,
+        None => {
+            *declared = Some(value);
+            true
+        }
+    }
+}
+
+fn parse_protocol_endpoints(value: &serde_json::Value) -> Option<Vec<&'static str>> {
+    let mut endpoints = Vec::new();
+    for value in value.as_array()? {
+        let name = value.as_str()?.trim();
+        if name.is_empty() {
+            return None;
+        }
+        let endpoint = match name.to_ascii_lowercase().as_str() {
+            "openai_responses" | "openai-responses" | "responses" | "/responses"
+            | "v1/responses" | "/v1/responses" => Some("openai_responses"),
+            "openai_chat"
+            | "openai-chat"
+            | "chat"
+            | "chat_completions"
+            | "chat-completions"
+            | "chat.completions"
+            | "chat/completions"
+            | "/chat/completions"
+            | "v1/chat/completions"
+            | "/v1/chat/completions" => Some("openai_chat"),
+            _ => None,
+        };
+        if let Some(endpoint) = endpoint {
+            endpoints.push(endpoint);
+        }
+    }
+    endpoints.sort_unstable();
+    endpoints.dedup();
+    Some(endpoints)
+}
+
+fn model_discovery_has_same_origin(base_url: &str, models_url: &str) -> bool {
+    let (Ok(base), Ok(models)) = (
+        reqwest::Url::parse(base_url),
+        reqwest::Url::parse(models_url.trim()),
+    ) else {
+        return false;
+    };
+    models.username().is_empty()
+        && models.password().is_none()
+        && models.fragment().is_none()
+        && base.origin() == models.origin()
+}
+
+fn is_openrouter_api_url(value: &str, expected_path: &str) -> bool {
+    let Ok(url) = reqwest::Url::parse(value.trim()) else {
+        return false;
+    };
+    url.scheme() == "https"
+        && url.host_str() == Some("openrouter.ai")
+        && url.port().is_none()
+        && url.username().is_empty()
+        && url.password().is_none()
+        && url.query().is_none()
+        && url.fragment().is_none()
+        && url.path().trim_end_matches('/') == expected_path
+}
+
+/// Derive a conservative free/paid signal from provider model metadata.
+///
+/// This is intentionally tri-state: `None` means the provider did not give us
+/// enough trustworthy billing metadata. A terminal `:free` suffix is accepted
+/// only when no conflicting pricing metadata is present; model names and
+/// unrelated fields such as `access: "open"` never prove free access.
+fn classify_model_free_status(
+    model_id: &str,
+    metadata: &serde_json::Map<String, serde_json::Value>,
+) -> Option<bool> {
+    let explicit = match metadata.get("isFree").or_else(|| metadata.get("is_free")) {
+        None => None,
+        Some(serde_json::Value::Bool(value)) => Some(*value),
+        Some(_) => return None,
+    };
+    let has_free_suffix = model_id.trim().to_ascii_lowercase().ends_with(":free");
+    let aggregate_cost = metadata
+        .get("cost")
+        .map(classify_price_value)
+        .filter(|sign| *sign != PriceSign::Invalid);
+
+    if explicit == Some(false) {
+        return Some(false);
+    }
+
+    let Some(pricing) = metadata.get("pricing") else {
+        return match aggregate_cost {
+            Some(PriceSign::Positive) => Some(false),
+            Some(PriceSign::Zero) => Some(true),
+            Some(PriceSign::Negative) => None,
+            Some(PriceSign::Invalid) | None => explicit.or_else(|| has_free_suffix.then_some(true)),
+        };
+    };
+
+    let Some(pricing_object) = pricing.as_object() else {
+        return match explicit {
+            Some(false) => Some(false),
+            _ => None,
+        };
+    };
+
+    let evidence = pricing_evidence(pricing_object);
+    if explicit == Some(false) || evidence.has_positive {
+        return Some(false);
+    }
+    if evidence.has_invalid || evidence.has_negative {
+        return None;
+    }
+    if evidence.has_charge_fields {
+        return match (evidence.prompt, evidence.completion, aggregate_cost) {
+            (Some(PriceSign::Zero), Some(PriceSign::Zero), _) => Some(true),
+            (None, None, Some(PriceSign::Zero)) => Some(true),
+            _ => None,
+        };
+    }
+
+    match aggregate_cost {
+        Some(PriceSign::Positive) => Some(false),
+        Some(PriceSign::Zero) => Some(true),
+        Some(PriceSign::Negative) => None,
+        Some(PriceSign::Invalid) | None => explicit.or_else(|| has_free_suffix.then_some(true)),
+    }
+}
+
+fn pricing_evidence(pricing: &serde_json::Map<String, serde_json::Value>) -> PricingEvidence {
+    let mut evidence = PricingEvidence::default();
+    collect_pricing_evidence(pricing, None, &mut evidence);
+    evidence
+}
+
+fn collect_pricing_evidence(
+    object: &serde_json::Map<String, serde_json::Value>,
+    parent_key: Option<&str>,
+    evidence: &mut PricingEvidence,
+) {
+    for (key, value) in object {
+        let normalized_key = normalize_pricing_key(key);
+        let is_charge = PRICING_CHARGE_KEYS.contains(&normalized_key.as_str())
+            || (parent_key == Some("cache")
+                && NESTED_CACHE_PRICE_KEYS.contains(&normalized_key.as_str()));
+        if is_charge {
+            evidence.has_charge_fields = true;
+            let sign = classify_price_value(value);
+            match normalized_key.as_str() {
+                "prompt" => evidence.prompt = Some(sign),
+                "completion" => evidence.completion = Some(sign),
+                _ => {}
+            }
+            match sign {
+                PriceSign::Positive => evidence.has_positive = true,
+                PriceSign::Negative => evidence.has_negative = true,
+                PriceSign::Invalid => evidence.has_invalid = true,
+                PriceSign::Zero => {}
+            }
+        }
+        if let Some(child) = value.as_object() {
+            collect_pricing_evidence(child, Some(normalized_key.as_str()), evidence);
+        }
+    }
+}
+
+fn normalize_pricing_key(value: &str) -> String {
+    value
+        .trim()
+        .chars()
+        .map(|character| match character {
+            '-' | ' ' => '_',
+            character => character.to_ascii_lowercase(),
+        })
+        .collect()
+}
+
+/// Classify a JSON number/string without floating-point underflow.
+fn classify_price_value(value: &serde_json::Value) -> PriceSign {
+    let text = match value {
+        serde_json::Value::Number(number) => number.to_string(),
+        serde_json::Value::String(text) => text.trim().to_string(),
+        _ => return PriceSign::Invalid,
+    };
+    classify_decimal_text(&text)
+}
+
+fn classify_decimal_text(value: &str) -> PriceSign {
+    let value = value.trim();
+    if value.is_empty() {
+        return PriceSign::Invalid;
+    }
+
+    let (negative, unsigned) = match value.as_bytes()[0] {
+        b'+' => (false, &value[1..]),
+        b'-' => (true, &value[1..]),
+        _ => (false, value),
+    };
+    if unsigned.is_empty() {
+        return PriceSign::Invalid;
+    }
+
+    let (mantissa, exponent) = match unsigned.split_once(['e', 'E']) {
+        Some((mantissa, exponent)) => (mantissa, Some(exponent)),
+        None => (unsigned, None),
+    };
+    if let Some(exponent) = exponent {
+        let exponent = exponent
+            .strip_prefix('+')
+            .or_else(|| exponent.strip_prefix('-'))
+            .unwrap_or(exponent);
+        if exponent.is_empty() || !exponent.bytes().all(|byte| byte.is_ascii_digit()) {
+            return PriceSign::Invalid;
+        }
+    }
+
+    let mut digit_count = 0;
+    let mut nonzero = false;
+    let mut decimal_points = 0;
+    for byte in mantissa.bytes() {
+        match byte {
+            b'0'..=b'9' => {
+                digit_count += 1;
+                nonzero |= byte != b'0';
+            }
+            b'.' => {
+                decimal_points += 1;
+                if decimal_points > 1 {
+                    return PriceSign::Invalid;
+                }
+            }
+            _ => return PriceSign::Invalid,
+        }
+    }
+    if digit_count == 0 {
+        return PriceSign::Invalid;
+    }
+    if !nonzero {
+        PriceSign::Zero
+    } else if negative {
+        PriceSign::Negative
+    } else {
+        PriceSign::Positive
+    }
 }
 
 fn redact_model_fetch_error_body(body: String, known_secrets: &[String]) -> String {
@@ -413,7 +1638,7 @@ fn extract_context_window(obj: &serde_json::Map<String, serde_json::Value>) -> O
 /// 从 OpenAI-compatible `/models` 的供应商扩展字段中读取输入模态。
 ///
 /// 只有上游明确声明时才透传，避免把未知能力误推成支持图片。
-fn extract_input_modalities(
+pub(crate) fn extract_input_modalities(
     obj: &serde_json::Map<String, serde_json::Value>,
 ) -> Option<Vec<String>> {
     [
@@ -529,6 +1754,9 @@ fn parse_volcengine_plan_model_entry(entry: &serde_json::Value) -> Option<Fetche
             input_modalities: None,
             supports_image: None,
             reasoning: None,
+            protocol_capability: None,
+            is_free: None,
+            ..Default::default()
         });
     }
 
@@ -555,6 +1783,9 @@ fn parse_volcengine_plan_model_entry(entry: &serde_json::Value) -> Option<Fetche
         input_modalities: extract_input_modalities(obj),
         supports_image: extract_supports_image(obj),
         reasoning: None,
+        protocol_capability: None,
+        is_free: None,
+        ..Default::default()
     })
 }
 
@@ -1101,6 +2332,9 @@ pub fn build_models_url_candidates(
     // These vendors expose model discovery outside their Anthropic API tree.
     // Resolve saved providers too; an explicit user override above always wins.
     if let Ok(mut url) = reqwest::Url::parse(trimmed) {
+        if let Some(models_url) = known_gateway_models_url(&url) {
+            return Ok(vec![models_url]);
+        }
         if url.scheme() == "https"
             && matches!(url.host_str(), Some("api.novita.ai" | "api.jiekou.ai"))
             && url.path().trim_end_matches('/') == "/anthropic"
@@ -1142,6 +2376,35 @@ pub fn build_models_url_candidates(
     }
 
     Ok(unique)
+}
+
+/// Resolve exact, documented model-list paths for gateways that do not use the
+/// generic `/v1/models` convention. Host and path checks are intentionally
+/// strict so a lookalike host cannot redirect discovery to an attacker URL.
+fn known_gateway_models_url(url: &reqwest::Url) -> Option<String> {
+    if url.scheme() != "https"
+        || url.port().is_some()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return None;
+    }
+
+    let host = url.host_str()?;
+    let path = url.path().trim_end_matches('/');
+    let models_path = if host.eq_ignore_ascii_case("api.kilo.ai") && path == "/api/gateway" {
+        "/api/gateway/models"
+    } else if host.eq_ignore_ascii_case("api.opper.ai") && path == "/v3/compat" {
+        "/v3/compat/models"
+    } else {
+        return None;
+    };
+
+    let mut models_url = url.clone();
+    models_url.set_path(models_path);
+    Some(models_url.to_string())
 }
 
 /// 截断响应体到 [`ERROR_BODY_MAX_CHARS`] 字符，避免 HTML 404 页占用错误串。
@@ -1204,6 +2467,56 @@ mod tests {
                 .unwrap()[0],
             "https://api.novita.ai.evil.test/anthropic/v1/models",
         );
+    }
+
+    #[test]
+    fn known_gateway_model_directories_use_exact_official_paths() {
+        for (base, endpoint) in [
+            (
+                "https://api.kilo.ai/api/gateway",
+                "https://api.kilo.ai/api/gateway/models",
+            ),
+            (
+                "https://api.opper.ai/v3/compat",
+                "https://api.opper.ai/v3/compat/models",
+            ),
+        ] {
+            for base in [base.to_string(), format!("{base}/")] {
+                assert_eq!(
+                    build_models_url_candidates(&base, false, None).unwrap(),
+                    vec![endpoint],
+                );
+                assert_eq!(
+                    build_models_url_candidates(
+                        &base,
+                        false,
+                        Some("https://custom.test/model-directory"),
+                    )
+                    .unwrap(),
+                    vec!["https://custom.test/model-directory"],
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn known_gateway_model_directory_rules_do_not_match_spoofed_hosts_or_other_paths() {
+        for base in [
+            "https://api.kilo.ai.evil.test/api/gateway",
+            "https://api.kilo.ai@evil.test/api/gateway",
+            "https://api.opper.ai.evil.test/v3/compat",
+            "https://api.opper.ai@evil.test/v3/compat",
+            "https://custom.test/api/gateway",
+            "https://api.kilo.ai/other/api/gateway",
+            "https://api.opper.ai/other/v3/compat",
+            "http://api.kilo.ai/api/gateway",
+            "http://api.opper.ai/v3/compat",
+        ] {
+            assert_eq!(
+                build_models_url_candidates(base, false, None).unwrap(),
+                vec![format!("{base}/v1/models")],
+            );
+        }
     }
 
     #[test]
@@ -1544,6 +2857,1017 @@ mod tests {
     }
 
     #[test]
+    fn parse_models_response_preserves_safe_identity_metadata_and_explicit_parallel_false() {
+        let models = parse_models_response(
+            r#"{"data":[
+                {
+                    "id":"wire-model",
+                    "display_name":" Provider Model ",
+                    "canonical_slug":" catalog-family ",
+                    "slug":" catalog-slug ",
+                    "name":" upstream-name ",
+                    "aliases":[" old-model ","old-model",null,""],
+                    "supports_parallel_tool_calls":false,
+                    "upstreamModel":"untrusted-wire-override",
+                    "baseInstructions":"[REDACTED]",
+                    "apiKey":"[REDACTED]"
+                },
+                {
+                    "id":"nested-model",
+                    "metadata":{
+                        "displayName":" Nested Model ",
+                        "canonicalSlug":" nested-family ",
+                        "aliases":{" old-nested ":" nested-model ","invalid":null},
+                        "supportsParallelToolCalls":true
+                    }
+                }
+            ]}"#,
+            &[],
+        )
+        .expect("safe identity metadata");
+        let first = serde_json::to_value(&models[0]).unwrap();
+        assert_eq!(first["id"], "wire-model");
+        assert_eq!(first["displayName"], "Provider Model");
+        assert_eq!(first["canonicalSlug"], "catalog-family");
+        assert_eq!(first["slug"], "catalog-slug");
+        assert_eq!(first["name"], "upstream-name");
+        assert_eq!(first["aliases"], serde_json::json!(["old-model"]));
+        assert_eq!(first["supportsParallelToolCalls"], false);
+        assert!(first.get("upstreamModel").is_none());
+        assert!(first.get("baseInstructions").is_none());
+        assert!(first.get("apiKey").is_none());
+        assert!(!first.to_string().contains("[REDACTED]"));
+
+        let second = serde_json::to_value(&models[1]).unwrap();
+        assert_eq!(second["displayName"], "Nested Model");
+        assert_eq!(second["canonicalSlug"], "nested-family");
+        assert_eq!(
+            second["aliases"],
+            serde_json::json!({"old-nested":"nested-model"})
+        );
+        assert_eq!(second["supportsParallelToolCalls"], true);
+    }
+
+    #[test]
+    fn parse_models_response_enriches_data_inventory_from_matching_rich_models() {
+        let models = parse_models_response(
+            r#"{
+                "data":[{"id":"wire-model","owned_by":"provider"},{"id":"other-model"}],
+                "models":[
+                    {
+                        "slug":"wire-model",
+                        "display_name":"Provider Model",
+                        "canonical_slug":"catalog-family",
+                        "aliases":["previous-model"],
+                        "context_window":262144,
+                        "input_modalities":["text","image"],
+                        "supports_parallel_tool_calls":false
+                    },
+                    {"id":"not-in-data","context_window":1000000}
+                ]
+            }"#,
+            &[],
+        )
+        .expect("data inventory with matching rich descriptors");
+
+        assert_eq!(models.len(), 2);
+        let first = serde_json::to_value(&models[0]).unwrap();
+        assert_eq!(first["id"], "wire-model");
+        assert_eq!(first["ownedBy"], "provider");
+        assert_eq!(first["displayName"], "Provider Model");
+        assert_eq!(first["contextWindow"], 262144);
+        assert_eq!(
+            first["inputModalities"],
+            serde_json::json!(["text", "image"])
+        );
+        assert_eq!(first["supportsImage"], true);
+        assert_eq!(first["supportsParallelToolCalls"], false);
+        assert!(models.iter().all(|model| model.id != "not-in-data"));
+    }
+
+    #[test]
+    fn parse_models_response_matches_rich_identity_metadata_case_insensitively() {
+        let models = parse_models_response(
+            r#"{
+                "data":[
+                    {"id":"WIRE-MODEL"},
+                    {"id":"name-model"},
+                    {"id":"alias-model"}
+                ],
+                "models":[
+                    {
+                        "id":"descriptor-canonical",
+                        "canonicalSlug":"wire-model",
+                        "context_window":128000
+                    },
+                    {
+                        "id":"descriptor-name",
+                        "name":"Name-Model",
+                        "context_window":256000
+                    },
+                    {
+                        "id":"descriptor-alias",
+                        "aliases":["Alias-Model"],
+                        "context_window":512000
+                    }
+                ]
+            }"#,
+            &[],
+        )
+        .expect("rich identity metadata should bind to data rows");
+
+        assert_eq!(models[0].context_window, Some(128_000));
+        assert_eq!(models[1].context_window, Some(256_000));
+        assert_eq!(models[2].context_window, Some(512_000));
+    }
+
+    #[test]
+    fn parse_models_response_rejects_empty_or_ambiguous_dual_envelopes() {
+        for body in [
+            r#"{"data":[],"models":[{"slug":"wire-model"}]}"#,
+            r#"{
+                "data":[{"id":"wire-model"}],
+                "models":[
+                    {"id":"descriptor-a","slug":"wire-model","context_window":128000},
+                    {"id":"descriptor-b","slug":"wire-model","context_window":256000}
+                ]
+            }"#,
+        ] {
+            assert!(
+                parse_models_response(body, &[]).is_err(),
+                "contradictory descriptor inventories must not replace a usable catalog"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_models_response_keeps_explicit_data_fields_when_enriching_rich_models() {
+        let models = parse_models_response(
+            r#"{
+                "data":[{
+                    "id":"wire-model",
+                    "context_window":64000,
+                    "supports_image":false,
+                    "supports_parallel_tool_calls":false
+                }],
+                "models":[{
+                    "id":"descriptor-id",
+                    "slug":"wire-model",
+                    "display_name":"Provider Model",
+                    "context_window":128000,
+                    "supports_image":true,
+                    "supports_parallel_tool_calls":true
+                }]
+            }"#,
+            &[],
+        )
+        .expect("rich descriptor fills missing data metadata");
+
+        assert_eq!(models[0].id, "wire-model");
+        assert_eq!(models[0].context_window, Some(64000));
+        assert_eq!(models[0].supports_image, Some(false));
+        assert_eq!(models[0].supports_parallel_tool_calls, Some(false));
+        assert_eq!(models[0].display_name.as_deref(), Some("Provider Model"));
+    }
+
+    #[test]
+    fn parse_models_response_keeps_data_authority_across_semantic_aliases() {
+        for (data, descriptor) in [
+            (
+                serde_json::json!({
+                    "id": "wire-model",
+                    "contextWindow": 64000,
+                    "supports_parallel_tool_calls": false,
+                    "displayName": "Data Model",
+                    "canonicalSlug": "data-family",
+                    "aliases": ["data-alias"],
+                    "supportsImage": false
+                }),
+                serde_json::json!({
+                    "id": "wire-model",
+                    "context_window": 128000,
+                    "supportsParallelToolCalls": true,
+                    "display_name": "Descriptor Model",
+                    "canonical_slug": "descriptor-family",
+                    "alias": ["descriptor-alias"],
+                    "input_modalities": ["text", "image"]
+                }),
+            ),
+            (
+                serde_json::json!({
+                    "id": "wire-model",
+                    "metadata": {
+                        "contextWindow": 64000,
+                        "supports_parallel_tool_calls": false,
+                        "displayName": "Data Model",
+                        "canonicalSlug": "data-family",
+                        "aliases": ["data-alias"],
+                        "supportsImage": false
+                    }
+                }),
+                serde_json::json!({
+                    "id": "wire-model",
+                    "context_window": 128000,
+                    "supportsParallelToolCalls": true,
+                    "display_name": "Descriptor Model",
+                    "canonical_slug": "descriptor-family",
+                    "alias": ["descriptor-alias"],
+                    "input_modalities": ["text", "image"]
+                }),
+            ),
+        ] {
+            let body = serde_json::json!({"data": [data], "models": [descriptor]});
+            let models = parse_models_response(&body.to_string(), &[])
+                .expect("data aliases remain authoritative");
+            assert_eq!(models[0].context_window, Some(64000));
+            assert_eq!(models[0].supports_parallel_tool_calls, Some(false));
+            assert_eq!(models[0].display_name.as_deref(), Some("Data Model"));
+            assert_eq!(models[0].canonical_slug.as_deref(), Some("data-family"));
+            assert_eq!(models[0].aliases, Some(serde_json::json!(["data-alias"])));
+            assert_eq!(models[0].supports_image, Some(false));
+            assert!(models[0]
+                .input_modalities
+                .as_ref()
+                .is_none_or(|modalities| !modalities.iter().any(|value| value == "image")));
+        }
+    }
+
+    #[test]
+    fn parse_models_response_keeps_data_reasoning_and_protocol_aliases_authoritative() {
+        let body = serde_json::json!({
+            "data": [{
+                "id": "wire-model",
+                "supportedReasoningEfforts": [{"reasoningEffort": "max"}],
+                "defaultReasoningEffort": "max",
+                "supportedEndpoints": ["responses"],
+                "supports_tools": false,
+                "supports_streaming": false
+            }],
+            "models": [{
+                "id": "wire-model",
+                "supported_reasoning_levels": ["low", "medium", "high", "xhigh"],
+                "default_reasoning_level": "high",
+                "endpoints": ["chat/completions"],
+                "supportsTools": true,
+                "supportsStreaming": true
+            }]
+        });
+        let models = parse_provider_models_response(
+            &body.to_string(),
+            &[],
+            "https://provider.test/v1",
+            "https://provider.test/v1/models",
+        )
+        .expect("data reasoning and protocol aliases remain authoritative");
+
+        let reasoning = models[0]
+            .reasoning
+            .as_ref()
+            .expect("data reasoning metadata");
+        assert_eq!(reasoning["supportedEfforts"], serde_json::json!(["max"]));
+        assert_eq!(reasoning["defaultEffort"], "max");
+        let protocol = models[0]
+            .protocol_capability
+            .as_ref()
+            .expect("data protocol metadata");
+        assert_eq!(
+            protocol["supportedEndpoints"],
+            serde_json::json!(["openai_responses"])
+        );
+        assert_eq!(protocol["supportsTools"], false);
+        assert_eq!(protocol["supportsStreaming"], false);
+    }
+
+    #[test]
+    fn parse_models_response_joins_both_data_and_rich_explicit_identity_metadata() {
+        for identity in [
+            serde_json::json!({"slug": "descriptor-model"}),
+            serde_json::json!({"canonicalSlug": "descriptor-model"}),
+            serde_json::json!({"aliases": ["descriptor-model"]}),
+        ] {
+            let mut data = identity;
+            data["id"] = serde_json::json!("wire-model");
+            let body = serde_json::json!({
+                "data": [data],
+                "models": [{
+                    "id": "DESCRIPTOR-MODEL",
+                    "context_window": 128000
+                }]
+            });
+            let models = parse_models_response(&body.to_string(), &[])
+                .expect("explicit data identity binds matching descriptor metadata");
+            assert_eq!(models[0].id, "wire-model");
+            assert_eq!(models[0].context_window, Some(128000));
+        }
+    }
+
+    #[test]
+    fn parse_models_response_keeps_model_and_model_id_rich_binding_identities() {
+        for field in ["model", "model_id", "modelId"] {
+            let mut descriptor = serde_json::json!({
+                "id": "descriptor-model",
+                "context_window": 128000
+            });
+            descriptor[field] = serde_json::json!("wire-model");
+            let body = serde_json::json!({
+                "data": [{"id": "wire-model"}],
+                "models": [descriptor]
+            });
+            let models = parse_models_response(&body.to_string(), &[])
+                .expect("rich request-model identities remain available for metadata matching");
+            assert_eq!(models[0].id, "wire-model");
+            assert_eq!(models[0].context_window, Some(128000), "{field}");
+        }
+    }
+
+    #[test]
+    fn parse_models_response_accepts_explicitly_complete_pagination_markers() {
+        let models = parse_models_response(
+            r#"{
+                "data":[{"id":"wire-model"}],
+                "has_more":false,
+                "next_cursor":null,
+                "total":1,
+                "pagination":{"page":1,"total_pages":1},
+                "links":{"next":null}
+            }"#,
+            &[],
+        )
+        .expect("complete model inventory");
+        assert_eq!(models.len(), 1);
+    }
+
+    #[test]
+    fn parse_models_response_accepts_slug_models_and_valid_empty_inventory() {
+        let models = parse_models_response(
+            r#"{"models":[{"slug":"wire-model","display_name":"Provider Model"}]}"#,
+            &[],
+        )
+        .expect("slug-shaped rich model descriptors");
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].id, "wire-model");
+        assert_eq!(models[0].display_name.as_deref(), Some("Provider Model"));
+        assert!(parse_models_response(r#"{"data":[]}"#, &[])
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn parse_models_response_accepts_canonical_slug_only_descriptors() {
+        let models = parse_models_response(
+            r#"{"models":[{"canonical_slug":"catalog-only","display_name":"Catalog Only"}]}"#,
+            &[],
+        )
+        .expect("canonical slug is a usable rich model identity");
+
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].id, "catalog-only");
+        assert_eq!(models[0].display_name.as_deref(), Some("Catalog Only"));
+    }
+
+    #[test]
+    fn parse_models_response_rejects_duplicate_data_identifiers() {
+        let error =
+            parse_models_response(r#"{"data":[{"id":"wire-model"},{"id":"WIRE-MODEL"}]}"#, &[])
+                .expect_err("duplicate model identifiers must not create ambiguous routes");
+
+        assert!(error.contains("duplicate model identifiers"));
+    }
+
+    #[test]
+    fn parse_models_response_handles_models_map_with_key_fallback() {
+        let models = parse_models_response(
+            r#"{"models":{"wire-model":{"display_name":"Provider Model"}}}"#,
+            &[],
+        )
+        .expect("models map with key fallback");
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].id, "wire-model");
+        assert_eq!(models[0].display_name.as_deref(), Some("Provider Model"));
+    }
+
+    #[test]
+    fn parse_models_response_rejects_explicit_failure_even_with_inventory() {
+        let secret = "sk-model-list-secret";
+        for body in [
+            r#"{"success":false,"data":[],"msg":"invalid key sk-model-list-secret"}"#,
+            r#"{"error":{"message":"invalid key sk-model-list-secret"},"data":[{"id":"model"}]}"#,
+        ] {
+            let error = parse_models_response(body, &[secret.to_string()])
+                .expect_err("a failure envelope is not authoritative model inventory");
+            assert!(!error.contains(secret));
+        }
+    }
+
+    #[test]
+    fn parse_models_response_rejects_explicitly_incomplete_inventory() {
+        for marker in [
+            serde_json::json!({"has_more": true}),
+            serde_json::json!({"hasMore": true}),
+            serde_json::json!({"next_cursor": "opaque-cursor"}),
+            serde_json::json!({"nextPageToken": "opaque-cursor"}),
+            serde_json::json!({"total": 2}),
+            serde_json::json!({"pagination": {"total": 2}}),
+            serde_json::json!({"pagination": {"page": 1, "total_pages": 2}}),
+            serde_json::json!({"links": {"next": "https://provider.test/models?page=2"}}),
+        ] {
+            let mut body = marker;
+            body["data"] = serde_json::json!([{"id": "model"}]);
+            let error = parse_models_response(&body.to_string(), &[])
+                .expect_err("partial inventory must not disable omitted models");
+            assert!(error.contains("incomplete"), "{body}");
+            assert!(!error.contains("opaque-cursor"));
+        }
+    }
+
+    #[test]
+    fn parse_models_response_rejects_corrupt_inventory_instead_of_dropping_rows() {
+        for body in [
+            r#"{"data":[{"id":""}]}"#,
+            r#"{"data":[{"id":"  "}]}"#,
+            r#"{"models":[{"name":"label-with-no-request-id"}]}"#,
+            r#"{"models":[{"id":"kept"},{"display_name":"corrupt"}]}"#,
+        ] {
+            assert!(
+                parse_models_response(body, &[]).is_err(),
+                "malformed rows must not be mistaken for complete inventory: {body}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_models_response_accepts_opper_public_catalog_shape() {
+        let models = parse_models_response(
+            r#"{"models":[
+                {
+                    "id":"alibaba:global/deepseek-v4-flash-0731",
+                    "model_id":"deepseek-v4-flash-0731",
+                    "model":"deepseek-v4-flash-0731",
+                    "context_window":1048576,
+                    "cost":0.42,
+                    "provider":{"slug":"alibaba","display_name":"Alibaba"}
+                },
+                {
+                    "id":"vendor/free-model",
+                    "cost":0
+                }
+            ]}"#,
+            &[],
+        )
+        .expect("parse Opper's public model catalog");
+
+        assert_eq!(models.len(), 2);
+        assert_eq!(models[0].id, "alibaba:global/deepseek-v4-flash-0731");
+        assert_eq!(models[0].owned_by.as_deref(), Some("alibaba"));
+        assert_eq!(models[0].context_window, Some(1_048_576));
+        assert_eq!(models[0].is_free, Some(false));
+        assert_eq!(models[1].id, "vendor/free-model");
+        assert_eq!(models[1].is_free, Some(true));
+    }
+
+    #[test]
+    fn parse_models_response_classifies_free_models_conservatively() {
+        use serde_json::json;
+
+        let cases = [
+            (json!({"id": "unknown"}), None),
+            (json!({"id": "vendor/model:free"}), Some(true)),
+            (
+                json!({"id": "vendor/free-model", "name": "Free model"}),
+                None,
+            ),
+            (json!({"id": "vendor/model", "access": "open"}), None),
+            (json!({"id": "kilo-auto/free", "isFree": true}), Some(true)),
+            (
+                json!({"id": "vendor/model:free", "isFree": false}),
+                Some(false),
+            ),
+            (json!({"id": "vendor/model:free", "isFree": null}), None),
+            (json!({"id": "vendor/model:free", "isFree": "true"}), None),
+            (json!({"id": "model", "cost": 0}), Some(true)),
+            (json!({"id": "model", "cost": 0.42}), Some(false)),
+            (json!({"id": "vendor/model:free", "pricing": null}), None),
+            (json!({"id": "vendor/model:free", "pricing": []}), None),
+            (
+                json!({"id": "model", "pricing": {"prompt": 0, "completion": 0}}),
+                Some(true),
+            ),
+            (
+                json!({"id": "model", "pricing": {"prompt": " 0.000 ", "completion": "0e-30", "discount": 25}}),
+                Some(true),
+            ),
+            (json!({"id": "model", "pricing": {"prompt": 0}}), None),
+            (
+                json!({"id": "model", "pricing": {"prompt": 0, "completion": null}}),
+                None,
+            ),
+            (
+                json!({"id": "vendor/model:free", "pricing": {"prompt": -1, "completion": 0}}),
+                None,
+            ),
+            (
+                json!({"id": "model", "pricing": {"prompt": "free", "completion": 0}}),
+                None,
+            ),
+            (
+                json!({"id": "model", "pricing": {"prompt": "", "completion": 0}}),
+                None,
+            ),
+            (
+                json!({"id": "model", "pricing": {"prompt": false, "completion": 0}}),
+                None,
+            ),
+            (
+                json!({"id": "model", "pricing": {"prompt": "NaN", "completion": 0}}),
+                None,
+            ),
+            (
+                json!({"id": "model", "pricing": {"prompt": "Infinity", "completion": 0}}),
+                None,
+            ),
+            (
+                json!({"id": "vendor/model:free", "pricing": {"prompt": "0.000001", "completion": 0}}),
+                Some(false),
+            ),
+            (
+                json!({"id": "model", "pricing": {"prompt": "1e-999", "completion": 0}}),
+                Some(false),
+            ),
+            (
+                json!({"id": "model", "isFree": true, "pricing": {"prompt": 0, "completion": 0, "request": "0.01"}}),
+                Some(false),
+            ),
+            (
+                json!({"id": "model", "isFree": true, "pricing": {"prompt": 0, "completion": null}}),
+                None,
+            ),
+            (
+                json!({"id": "model", "isFree": false, "pricing": null}),
+                Some(false),
+            ),
+            (
+                json!({"id": "vendor/model:free", "pricing": {"prompt": 0, "completion": 0, "image": null}}),
+                None,
+            ),
+        ];
+
+        for (entry, expected) in cases {
+            let body = json!({"data": [entry.clone()]}).to_string();
+            let models = parse_models_response(&body, &[]).expect("parse model pricing metadata");
+            let model = serde_json::to_value(&models[0]).expect("serialize fetched model");
+            assert_eq!(
+                model.get("isFree").and_then(serde_json::Value::as_bool),
+                expected,
+                "{entry}",
+            );
+            if expected.is_none() {
+                assert!(model.get("isFree").is_none(), "{entry}");
+            }
+        }
+    }
+
+    #[test]
+    fn parse_models_response_does_not_call_usage_charges_free() {
+        use serde_json::json;
+
+        for field in [
+            "prompt",
+            "completion",
+            "request",
+            "image",
+            "web_search",
+            "internal_reasoning",
+            "input_cache_read",
+            "input_cache_write",
+            "input_audio",
+            "output_audio",
+        ] {
+            let mut pricing = json!({"prompt": 0, "completion": 0});
+            pricing[field] = json!("0.000001");
+            let body = json!({"data": [{
+                "id": "vendor/model:free",
+                "isFree": true,
+                "pricing": pricing,
+            }]})
+            .to_string();
+            let models = parse_models_response(&body, &[]).expect("parse usage charges");
+            let model = serde_json::to_value(&models[0]).expect("serialize fetched model");
+            assert_eq!(model["isFree"], json!(false), "{field}");
+        }
+    }
+
+    #[test]
+    fn parse_models_response_normalizes_openrouter_reasoning_metadata() {
+        let models = parse_provider_models_response(
+            r#"{"object":"list","data":[
+                {
+                    "id":"xiaomi/mimo-v2.6-pro",
+                    "supported_parameters":["reasoning","include_reasoning"],
+                    "reasoning":{"mandatory":false}
+                },
+                {
+                    "id":"deepseek/deepseek-v4-flash",
+                    "supported_parameters":["reasoning","reasoning_effort","include_reasoning"],
+                    "reasoning":{
+                        "mandatory":false,
+                        "supported_efforts":["xhigh","high"],
+                        "default_effort":"high"
+                    }
+                }
+            ]}"#,
+            &[],
+            "https://openrouter.ai/api/v1",
+            "https://openrouter.ai/api/v1/models",
+        )
+        .expect("parse OpenRouter model metadata");
+
+        let mimo = models
+            .iter()
+            .find(|model| model.id == "xiaomi/mimo-v2.6-pro")
+            .and_then(|model| model.reasoning.as_ref())
+            .expect("Mimo reasoning");
+        assert_eq!(
+            mimo["supportedEfforts"],
+            serde_json::json!(["minimal", "low", "medium", "high", "xhigh"])
+        );
+        assert_eq!(mimo["upstream"]["format"], "reasoning_object");
+        assert_eq!(mimo["upstream"]["parameter"], "reasoning.effort");
+
+        let deepseek = models
+            .iter()
+            .find(|model| model.id == "deepseek/deepseek-v4-flash")
+            .and_then(|model| model.reasoning.as_ref())
+            .expect("DeepSeek reasoning");
+        assert_eq!(
+            deepseek["supportedEfforts"],
+            serde_json::json!(["xhigh", "high"])
+        );
+        assert_eq!(deepseek["upstream"]["format"], "reasoning_object");
+        assert_eq!(deepseek["upstream"]["parameter"], "reasoning.effort");
+        assert_eq!(deepseek["defaultEffort"], "high");
+    }
+
+    fn parse_protocol_metadata(
+        base_url: &str,
+        models_url: &str,
+        entry: serde_json::Value,
+    ) -> Option<serde_json::Value> {
+        let body = serde_json::json!({ "data": [entry] }).to_string();
+        let models = parse_provider_models_response(&body, &[], base_url, models_url)
+            .expect("parse provider protocol metadata");
+        serde_json::to_value(&models[0])
+            .expect("serialize fetched model")
+            .get("protocolCapability")
+            .cloned()
+    }
+
+    #[test]
+    fn protocol_metadata_binds_explicit_endpoints_to_original_provider_and_model() {
+        let models = parse_provider_models_response(
+            r#"{"data":[
+                {
+                    "id":" model-a ",
+                    "supported_endpoints":["/v1/responses","chat/completions"],
+                    "supports_tools":true,
+                    "supports_streaming":true,
+                    "supports_tool_continuation":true,
+                    "baseUrl":"https://unrelated.test",
+                    "upstreamModel":"wrong-model"
+                },
+                {
+                    "id":"model-b",
+                    "metadata":{"capabilities":{"endpoints":["openai_chat"]}}
+                }
+            ]}"#,
+            &[],
+            " https://API.PROVIDER.test/v1/// ",
+            "https://api.provider.test/model-catalog?scope=account",
+        )
+        .expect("parse explicit provider protocol declarations");
+
+        assert_eq!(
+            models[0].protocol_capability,
+            Some(serde_json::json!({
+                "schemaVersion": 1,
+                "source": "provider_api",
+                "baseUrl": "https://api.provider.test/v1",
+                "upstreamModel": "model-a",
+                "supportedEndpoints": ["openai_chat", "openai_responses"],
+                "supportsTools": true,
+                "supportsStreaming": true,
+                "supportsToolContinuation": true,
+            }))
+        );
+        assert_eq!(
+            models[1].protocol_capability,
+            Some(serde_json::json!({
+                "schemaVersion": 1,
+                "source": "provider_api",
+                "baseUrl": "https://api.provider.test/v1",
+                "upstreamModel": "model-b",
+                "supportedEndpoints": ["openai_chat"],
+            }))
+        );
+    }
+
+    #[test]
+    fn protocol_metadata_accepts_endpoint_aliases_and_matching_nested_declarations() {
+        for entry in [
+            serde_json::json!({
+                "id": "model",
+                "supportedEndpoints": ["responses", "/v1/responses", "openai_responses"],
+            }),
+            serde_json::json!({
+                "id": "model",
+                "supported_endpoints": ["/v1/responses", "/v1/embeddings", "anthropic_messages"],
+            }),
+            serde_json::json!({
+                "id": "model",
+                "capability": {
+                    "endpoints": ["openai_responses"],
+                    "supportsTools": true,
+                },
+                "metadata": {
+                    "supported_endpoints": ["responses"],
+                    "supported_parameters": ["tools", "tool_choice"],
+                },
+            }),
+        ] {
+            let capability = parse_protocol_metadata(
+                "https://provider.test/v1",
+                "https://provider.test/v1/models",
+                entry,
+            )
+            .expect("explicit Responses capability");
+            assert_eq!(
+                capability["supportedEndpoints"],
+                serde_json::json!(["openai_responses"])
+            );
+        }
+    }
+
+    #[test]
+    fn protocol_metadata_preserves_explicit_false_flags_without_certifying_tools() {
+        let capability = parse_protocol_metadata(
+            "https://provider.test/v1",
+            "https://provider.test/v1/models",
+            serde_json::json!({
+                "id": "model",
+                "endpoints": ["chat/completions"],
+                "capabilities": {
+                    "tools": false,
+                    "stream": false,
+                    "tool_continuation": false,
+                },
+            }),
+        )
+        .expect("explicit protocol metadata");
+        assert_eq!(capability["supportsTools"], serde_json::json!(false));
+        assert_eq!(capability["supportsStreaming"], serde_json::json!(false));
+        assert_eq!(
+            capability["supportsToolContinuation"],
+            serde_json::json!(false)
+        );
+    }
+
+    #[test]
+    fn protocol_metadata_infers_chat_only_for_actual_openrouter_api_with_tools() {
+        for (base_url, models_url) in [
+            (
+                "https://openrouter.ai/api/v1",
+                "https://openrouter.ai/api/v1/models",
+            ),
+            (
+                "https://OPENROUTER.AI:443/api/v1/",
+                "https://OPENROUTER.AI:443/api/v1/models/",
+            ),
+        ] {
+            let capability = parse_protocol_metadata(
+                base_url,
+                models_url,
+                serde_json::json!({
+                    "id": "unrelated-vendor/opaque-model",
+                    "supported_parameters": ["tools"],
+                }),
+            )
+            .expect("OpenRouter advertised tools");
+            assert_eq!(
+                capability["supportedEndpoints"],
+                serde_json::json!(["openai_chat"])
+            );
+            assert_eq!(capability["supportsTools"], serde_json::json!(true));
+            assert!(capability.get("supportsStreaming").is_none());
+            assert!(capability.get("supportsToolContinuation").is_none());
+        }
+        let capability = parse_protocol_metadata(
+            "https://openrouter.ai/api/v1",
+            "https://openrouter.ai/api/v1/models",
+            serde_json::json!({
+                "id": "opaque-model",
+                "supportsTools": true,
+                "supported_parameters": ["tool_choice"],
+            }),
+        )
+        .expect("explicit advertised tool support");
+        assert_eq!(
+            capability["supportedEndpoints"],
+            serde_json::json!(["openai_chat"])
+        );
+        assert_eq!(capability["supportsTools"], serde_json::json!(true));
+    }
+
+    #[test]
+    fn protocol_metadata_does_not_infer_protocol_from_model_identity_or_catalog_facts() {
+        for entry in [
+            serde_json::json!({"id": "openai/gpt-5", "context_window": 128000}),
+            serde_json::json!({
+                "id": "openrouter/openai/gpt-5",
+                "owned_by": "OpenRouter",
+                "supported_parameters": ["reasoning", "include_reasoning"],
+                "reasoning": {"mandatory": false},
+            }),
+            serde_json::json!({
+                "id": "model",
+                "supported_parameters": [],
+                "supports_tools": false,
+            }),
+            serde_json::json!({
+                "id": "model",
+                "supported_parameters": ["tools_choice"],
+            }),
+            serde_json::json!({
+                "id": "model",
+                "supported_parameters": ["tool_choice"],
+            }),
+        ] {
+            assert!(parse_protocol_metadata(
+                "https://openrouter.ai/api/v1",
+                "https://openrouter.ai/api/v1/models",
+                entry,
+            )
+            .is_none());
+        }
+    }
+
+    #[test]
+    fn protocol_metadata_requires_known_inference_and_final_discovery_url_scopes() {
+        let trusted_base = "https://openrouter.ai/api/v1";
+        let trusted_models = "https://openrouter.ai/api/v1/models";
+        for (base_url, models_url) in [
+            ("https://provider.test/v1", trusted_models),
+            (trusted_base, "https://catalog-directory.test/models"),
+            (
+                "https://openrouter.ai.evil.test/api/v1",
+                "https://openrouter.ai.evil.test/api/v1/models",
+            ),
+            (
+                "https://openrouter.ai@evil.test/api/v1",
+                "https://openrouter.ai@evil.test/api/v1/models",
+            ),
+            ("http://openrouter.ai/api/v1", trusted_models),
+            ("https://openrouter.ai:8443/api/v1", trusted_models),
+            ("https://openrouter.ai/other/api/v1", trusted_models),
+            (trusted_base, "https://openrouter.ai/other/api/v1/models"),
+            (
+                "https://openrouter.provider.test/api/v1",
+                "https://openrouter.provider.test/api/v1/models",
+            ),
+            (
+                trusted_base,
+                "https://openrouter.ai/api/v1/models?scope=other",
+            ),
+            (trusted_base, "https://openrouter.ai/api/v1/models#other"),
+        ] {
+            assert!(
+                parse_protocol_metadata(
+                    base_url,
+                    models_url,
+                    serde_json::json!({
+                        "id": "model",
+                        "supported_parameters": ["tools", "tool_choice"],
+                    }),
+                )
+                .is_none(),
+                "unexpected inferred protocol for {base_url} / {models_url}",
+            );
+        }
+    }
+
+    #[test]
+    fn protocol_metadata_rejects_external_or_unsafe_discovery_with_explicit_endpoints() {
+        for models_url in [
+            "https://catalog-directory.test/models",
+            "https://models.dev/api.json",
+            "https://openrouter.ai/api/v1/models",
+            "http://provider.test/v1/models",
+            "https://provider.test:8443/v1/models",
+            "https://[REDACTED]@provider.test/v1/models",
+            "https://provider.test/v1/models#[REDACTED]",
+            "relative/models",
+        ] {
+            assert!(
+                parse_protocol_metadata(
+                    "https://provider.test/v1",
+                    models_url,
+                    serde_json::json!({
+                        "id": "model",
+                        "supported_endpoints": ["responses", "chat/completions"],
+                        "supported_parameters": ["tools", "tool_choice"],
+                    }),
+                )
+                .is_none(),
+                "external or unsafe discovery must not certify the provider",
+            );
+        }
+    }
+
+    #[test]
+    fn protocol_metadata_rejects_malformed_empty_or_conflicting_declarations() {
+        for entry in [
+            serde_json::json!({"id": "model", "endpoints": []}),
+            serde_json::json!({"id": "model", "endpoints": ["anthropic_messages"]}),
+            serde_json::json!({"id": "model", "endpoints": "responses"}),
+            serde_json::json!({"id": "model", "endpoints": ["responses", null]}),
+            serde_json::json!({"id": "model", "endpoints": ["responses", " "]}),
+            serde_json::json!({"id": "model", "endpoints": ["https://wrong.test/responses"]}),
+            serde_json::json!({
+                "id": "model",
+                "supported_endpoints": ["responses"],
+                "supportedEndpoints": ["chat/completions"],
+            }),
+            serde_json::json!({
+                "id": "model",
+                "endpoints": ["responses"],
+                "supportsTools": true,
+                "capabilities": {"supports_tools": false},
+            }),
+            serde_json::json!({
+                "id": "model",
+                "endpoints": ["responses"],
+                "supportsStreaming": "true",
+            }),
+            serde_json::json!({
+                "id": "model",
+                "endpoints": ["responses"],
+                "supportsToolContinuation": null,
+            }),
+            serde_json::json!({
+                "id": "model",
+                "endpoints": ["responses"],
+                "supported_parameters": ["tools"],
+                "supportsTools": false,
+            }),
+            serde_json::json!({
+                "id": "model",
+                "endpoints": ["responses"],
+                "supported_parameters": ["tools", 1],
+            }),
+        ] {
+            let mut entry = entry;
+            if entry.get("supported_parameters").is_none() {
+                entry["supported_parameters"] = serde_json::json!(["tools"]);
+            }
+            assert!(
+                parse_protocol_metadata(
+                    "https://openrouter.ai/api/v1",
+                    "https://openrouter.ai/api/v1/models",
+                    entry.clone(),
+                )
+                .is_none(),
+                "unexpected protocol capability for {entry}",
+            );
+        }
+    }
+
+    #[test]
+    fn protocol_metadata_rejects_unsafe_base_urls_without_serializing_url_data() {
+        for base_url in [
+            "",
+            "not a url",
+            "https://[REDACTED]@provider.test/v1",
+            "https://user:[REDACTED]@provider.test/v1",
+            "https://provider.test/v1?api_key=[REDACTED]",
+            "https://provider.test/v1#[REDACTED]",
+        ] {
+            let body = r#"{"data":[{"id":"model","endpoints":["responses"]}]}"#;
+            let models = parse_provider_models_response(
+                body,
+                &[],
+                base_url,
+                "https://provider.test/v1/models",
+            )
+            .expect("unsafe URL must not affect model discovery");
+            assert!(models[0].protocol_capability.is_none());
+            assert!(
+                !serde_json::to_string(&models)
+                    .unwrap()
+                    .contains("[REDACTED]"),
+                "unsafe binding data must not be serialized",
+            );
+        }
+    }
+
+    #[test]
     fn test_parse_response_extracts_context_window() {
         let json = r#"{"object":"list","data":[{"id":"model-a","context_window":262144},{"id":"model-b","maxContextWindow":"1000000"},{"id":"model-c","max_model_len":262144},{"id":"model-d","maxModelLen":"131072"},{"id":"model-e","contextWindow":"128000 tokens"},{"id":"model-f","context_length":200000},{"id":"model-g","max_context_length":"204800"},{"id":"model-h","max_input_tokens":1000000},{"id":"model-i","limit":{"context":262144}},{"id":"model-j","limits":{"context_window":"32768"}},{"id":"model-k","metadata":{"maxContextLength":65536}}]}"#;
         let resp: ModelsResponse = serde_json::from_str(json).unwrap();
@@ -1558,6 +3882,9 @@ mod tests {
                 owned_by: entry.owned_by,
                 supports_image: None,
                 reasoning: None,
+                protocol_capability: None,
+                is_free: None,
+                ..Default::default()
             })
             .collect::<Vec<_>>();
 
@@ -1826,6 +4153,9 @@ Coding 能力开源 SOTA，从代码生成走向工程交付 | 1M | 128K |
                 input_modalities: None,
                 supports_image: None,
                 reasoning: None,
+                protocol_capability: None,
+                is_free: None,
+                ..Default::default()
             },
             FetchedModel {
                 id: "glm-5.1".to_string(),
@@ -1834,6 +4164,9 @@ Coding 能力开源 SOTA，从代码生成走向工程交付 | 1M | 128K |
                 input_modalities: None,
                 supports_image: None,
                 reasoning: None,
+                protocol_capability: None,
+                is_free: None,
+                ..Default::default()
             },
         ];
 
@@ -1857,6 +4190,9 @@ Coding 能力开源 SOTA，从代码生成走向工程交付 | 1M | 128K |
                 input_modalities: Some(vec!["text".to_string()]),
                 supports_image: Some(false),
                 reasoning: None,
+                protocol_capability: None,
+                is_free: None,
+                ..Default::default()
             },
             FetchedModel {
                 id: "gpt-5.6".to_string(),
@@ -1865,6 +4201,9 @@ Coding 能力开源 SOTA，从代码生成走向工程交付 | 1M | 128K |
                 input_modalities: None,
                 supports_image: None,
                 reasoning: None,
+                protocol_capability: None,
+                is_free: None,
+                ..Default::default()
             },
         ];
         let entry = serde_json::json!({

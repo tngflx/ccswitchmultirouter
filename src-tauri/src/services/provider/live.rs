@@ -816,12 +816,15 @@ fn codex_settings_for_live_projection(provider: &Provider) -> Result<Value, AppE
         .meta
         .as_ref()
         .map(|meta| meta.codex_model_catalog_projection_enabled(&provider.settings_config))
-        .unwrap_or_else(|| provider.settings_config.get("modelCatalog").is_some());
+        .unwrap_or_else(|| {
+            crate::codex_multirouter::catalog::read_catalog(&provider.settings_config).is_some()
+        });
 
     let mut settings = provider.settings_config.clone();
     if !should_project {
         if let Some(obj) = settings.as_object_mut() {
             obj.remove("modelCatalog");
+            obj.remove("model_catalog");
         }
     }
 

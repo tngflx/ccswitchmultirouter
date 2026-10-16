@@ -107,16 +107,20 @@ pub(crate) fn is_confirmed_text_only_model(model: &str) -> bool {
 }
 
 fn declared_model_image_support(settings: &Value, model: &str) -> Option<bool> {
-    [
-        settings
-            .get("modelCatalog")
-            .and_then(|catalog| catalog.get("models")),
-        settings.get("modelCatalog"),
-        settings.get("models"),
-    ]
-    .into_iter()
-    .flatten()
-    .find_map(|value| declared_model_image_support_in_value(value, model))
+    if let Some(models) = crate::codex_multirouter::catalog::catalog_models(settings) {
+        return models.iter().find_map(|entry| {
+            model_entry_matches(entry, None, model).then(|| explicit_image_support(entry))?
+        });
+    }
+    // Only malformed/absent canonical catalogs may use the legacy recovery
+    // shape. A valid catalog, including `{ models: [] }`, is authoritative.
+    crate::codex_multirouter::catalog::read_catalog(settings)
+        .and_then(|catalog| declared_model_image_support_in_value(catalog, model))
+        .or_else(|| {
+            settings
+                .get("models")
+                .and_then(|models| declared_model_image_support_in_value(models, model))
+        })
 }
 
 fn declared_model_image_support_in_value(value: &Value, model: &str) -> Option<bool> {
@@ -290,6 +294,19 @@ mod tests {
         assert_eq!(
             image_input_capability_from_settings(&settings, "text", true),
             ImageInputCapability::Unsupported
+        );
+    }
+
+    #[test]
+    fn valid_empty_canonical_catalog_does_not_resurrect_legacy_model_metadata() {
+        let settings = json!({
+            "modelCatalog": { "models": [] },
+            "models": [{ "model": "vision", "inputModalities": ["text", "image"] }]
+        });
+
+        assert_eq!(
+            image_input_capability_from_settings(&settings, "vision", true),
+            ImageInputCapability::Unknown
         );
     }
 }

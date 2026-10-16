@@ -1180,6 +1180,36 @@ mod tests {
     }
 
     #[test]
+    fn projection_does_not_publish_invalid_reasoning_diagnostics_as_capabilities() {
+        let db = Database::memory().expect("memory db");
+        let router = router();
+        let target = Provider::with_id(
+            "qwen".to_string(),
+            "Malformed reasoning".to_string(),
+            json!({
+                "base_url": "https://qwen.example/v1",
+                "modelCatalog": {"models": [{
+                    "model": "broken-model",
+                    "reasoning": {
+                        "supportedEfforts": ["ultra"],
+                        "defaultEffort": "ultra"
+                    }
+                }]}
+            }),
+            None,
+        );
+        db.save_provider("codex", &router).expect("save router");
+        db.save_provider("codex", &target).expect("save target");
+
+        let artifact = build_projection_artifact(&db, "router").expect("projection artifact");
+        let model = &artifact.projection_settings["modelCatalog"]["models"][0];
+        assert!(
+            model.get("reasoning").is_none(),
+            "invalid effort declarations must stay diagnostic-only"
+        );
+    }
+
+    #[test]
     fn projection_owned_merge_keeps_effective_settings_and_carries_fingerprint() {
         let mut target = json!({
             "auth": {"type": "api_key"},

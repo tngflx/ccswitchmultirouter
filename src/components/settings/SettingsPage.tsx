@@ -6,7 +6,6 @@ import {
   useRef,
   useState,
 } from "react";
-import { useQueryClient } from "@tanstack/react-query";
 import { motion } from "framer-motion";
 import {
   Loader2,
@@ -64,11 +63,10 @@ import { RequestHealthPanel } from "@/components/settings/RequestHealthPanel";
 import { useInstalledSkills } from "@/hooks/useSkills";
 import { useSettings } from "@/hooks/useSettings";
 import { useImportExport } from "@/hooks/useImportExport";
+import { useRequestHealthDiagnostics } from "@/hooks/useRequestHealthDiagnostics";
 import { useTranslation } from "react-i18next";
 import type { SettingsFormState } from "@/hooks/useSettings";
 import type { EnvInjectionSettings as EnvInjectionSettingsValue } from "@/types";
-import type { RequestHealthSnapshot } from "@/types/proxy";
-import { proxyApi } from "@/lib/api/proxy";
 
 interface SettingsDialogProps {
   open: boolean;
@@ -84,7 +82,6 @@ export function SettingsPage({
   defaultTab = "general",
 }: SettingsDialogProps) {
   const { t } = useTranslation();
-  const queryClient = useQueryClient();
   const {
     settings,
     isLoading,
@@ -122,10 +119,14 @@ export function SettingsPage({
 
   const [activeTab, setActiveTab] = useState<string>("general");
   const [showRestartPrompt, setShowRestartPrompt] = useState(false);
-  const [requestHealthSnapshot, setRequestHealthSnapshot] =
-    useState<RequestHealthSnapshot>();
-  const [requestHealthLoading, setRequestHealthLoading] = useState(false);
   const tabScrollContainerRef = useRef<HTMLDivElement>(null);
+  const {
+    snapshot: requestHealthSnapshot,
+    isRefreshing: requestHealthLoading,
+    error: requestHealthError,
+    refresh: refreshRequestHealth,
+    acceptSavedConfig: acceptSavedRequestHealthConfig,
+  } = useRequestHealthDiagnostics(open && activeTab === "request-health");
 
   useEffect(() => {
     if (open) {
@@ -145,26 +146,6 @@ export function SettingsPage({
       tabScrollContainerRef.current.scrollTop = 0;
     }
   }, [activeTab]);
-
-  const refreshRequestHealth = useCallback(async () => {
-    setRequestHealthLoading(true);
-    try {
-      setRequestHealthSnapshot(await proxyApi.getRequestHealthDiagnostics());
-    } catch (error) {
-      console.error(
-        "[SettingsPage] Failed to load request-health diagnostics",
-        error,
-      );
-    } finally {
-      setRequestHealthLoading(false);
-    }
-  }, []);
-
-  useEffect(() => {
-    if (open && activeTab === "request-health") {
-      void refreshRequestHealth();
-    }
-  }, [activeTab, open, refreshRequestHealth]);
 
   const closeAfterSave = useCallback(() => {
     // 保存成功后关闭：不再重置语言，避免需要“保存两次”才生效
@@ -626,23 +607,13 @@ export function SettingsPage({
                   mode="settings"
                   snapshot={requestHealthSnapshot}
                   isRefreshing={requestHealthLoading}
+                  loadError={requestHealthError}
                   onRefresh={() => void refreshRequestHealth()}
-                  onSaveConfig={async (config) => {
-                    await settingsApi.saveRequestHealthConfig(config);
-                    return true;
-                  }}
                   onSaved={(config) => {
-                    // Keep the shared settings form in sync with the panel's
-                    // dedicated save so a later autosave cannot restore an
-                    // older Request Health configuration.
+                    // Keep the local form current without replacing its other
+                    // unsaved fields through a query-cache refresh.
                     updateSettings({ requestHealth: config });
-                    queryClient.setQueryData<SettingsFormState>(
-                      ["settings"],
-                      (current) =>
-                        current
-                          ? { ...current, requestHealth: config }
-                          : current,
-                    );
+                    acceptSavedRequestHealthConfig(config);
                     void refreshRequestHealth();
                   }}
                 />

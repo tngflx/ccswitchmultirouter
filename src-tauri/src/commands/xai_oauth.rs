@@ -2,7 +2,7 @@
 
 use crate::proxy::providers::xai_oauth_auth::XaiOAuthManager;
 use crate::proxy::providers::XAI_API_BASE_URL;
-use crate::services::model_fetch::FetchedModel;
+use crate::services::model_fetch::{extract_model_identity_fields, FetchedModel};
 use crate::services::subscription::{CredentialStatus, SubscriptionQuota};
 use serde::Deserialize;
 use std::sync::Arc;
@@ -85,6 +85,8 @@ struct ModelEntry {
     id: String,
     #[serde(default)]
     owned_by: Option<String>,
+    #[serde(flatten)]
+    extra: serde_json::Map<String, serde_json::Value>,
 }
 
 #[tauri::command(rename_all = "camelCase")]
@@ -125,13 +127,25 @@ pub async fn get_xai_oauth_models(
     let mut models: Vec<FetchedModel> = payload
         .data
         .into_iter()
-        .map(|model| FetchedModel {
-            id: model.id,
-            owned_by: model.owned_by,
-            context_window: None,
-            input_modalities: None,
-            supports_image: None,
-            reasoning: None,
+        .map(|model| {
+            let identity = extract_model_identity_fields(&model.extra);
+            FetchedModel {
+                display_name: identity.display_name,
+                canonical_slug: identity.canonical_slug,
+                slug: identity.slug,
+                name: identity.name,
+                aliases: identity.aliases,
+                upstream_model: None,
+                supports_parallel_tool_calls: identity.supports_parallel_tool_calls,
+                id: model.id,
+                owned_by: model.owned_by,
+                context_window: None,
+                input_modalities: None,
+                supports_image: None,
+                reasoning: None,
+                protocol_capability: None,
+                is_free: None,
+            }
         })
         .collect();
     models.sort_by(|a, b| a.id.cmp(&b.id));

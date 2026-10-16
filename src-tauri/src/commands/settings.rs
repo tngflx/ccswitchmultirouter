@@ -58,6 +58,8 @@ fn merge_settings_for_save(
     mut incoming: crate::settings::AppSettings,
     existing: &crate::settings::AppSettings,
 ) -> crate::settings::AppSettings {
+    let incoming_webdav_present = incoming.webdav_sync.is_some();
+    let incoming_s3_present = incoming.s3_sync.is_some();
     match (&mut incoming.webdav_sync, &existing.webdav_sync) {
         // incoming 没有 webdav → 保留现有
         (None, _) => {
@@ -87,42 +89,39 @@ fn merge_settings_for_save(
         }
         _ => {}
     }
-    // 自动监测会在设置页打开期间独立写回新的出口证据。前端全量保存若仍携带
-    // 打开页面时的旧快照，不能把更晚的后台探测覆盖回去；用户选择的模式、
-    // 周期和手动时区仍以本次提交为准。
-    if incoming.codex_egress_timezone.mode == crate::settings::CodexEgressTimezoneMode::Auto
-        && existing.codex_egress_timezone.mode == crate::settings::CodexEgressTimezoneMode::Auto
-        && existing.codex_egress_timezone.detected_at > incoming.codex_egress_timezone.detected_at
-    {
-        incoming.codex_egress_timezone.detected_timezone =
-            existing.codex_egress_timezone.detected_timezone.clone();
-        incoming.codex_egress_timezone.detected_at = existing.codex_egress_timezone.detected_at;
-        incoming.codex_egress_timezone.detected_egress_ip =
-            existing.codex_egress_timezone.detected_egress_ip.clone();
-        incoming.codex_egress_timezone.detected_country_code =
-            existing.codex_egress_timezone.detected_country_code.clone();
-        incoming.codex_egress_timezone.detected_region =
-            existing.codex_egress_timezone.detected_region.clone();
-        incoming.codex_egress_timezone.detected_city =
-            existing.codex_egress_timezone.detected_city.clone();
-        incoming.codex_egress_timezone.detected_colo =
-            existing.codex_egress_timezone.detected_colo.clone();
-        incoming.codex_egress_timezone.last_probe_trigger =
-            existing.codex_egress_timezone.last_probe_trigger.clone();
+    let merged_webdav = incoming.webdav_sync.clone();
+    let merged_s3 = incoming.s3_sync.clone();
+    crate::settings::preserve_dedicated_settings(&mut incoming, existing);
+    // Preserve the historical merge contract for explicit cloud payloads.
+    // Preset registry settings are device-local and owned by their dedicated
+    // command, so full renderer saves must never replay a stale/redacted copy.
+    if incoming_webdav_present {
+        incoming.webdav_sync = merged_webdav;
     }
-    // 运行中的 Codex 实际应用了哪个 TZ 只能由后端启动链路确认。任何前端
-    // 全量保存都不得覆盖这份运行态证据，否则 CCSM 重启后会漏报安全刷新。
-    incoming.codex_egress_timezone.last_applied_timezone =
-        existing.codex_egress_timezone.last_applied_timezone.clone();
-    incoming.codex_egress_timezone.last_applied_at = existing.codex_egress_timezone.last_applied_at;
-    // local_migrations 是纯后端状态（迁移完成标记），前端没有合法的修改场景，
-    // 无条件取现有值。若按 incoming 透传：后端清掉 marker（如关闭统一会话
-    // 开关）后、前端 query 缓存刷新前的一次全量保存会把旧 marker 重放回来，
-    // 重新开启时被"复活"的标记挡住而漏迁。
-    incoming.local_migrations = existing.local_migrations.clone();
-    incoming.tool_auto_update = existing.tool_auto_update.clone();
-    incoming.auto_update_codex_cli = existing.auto_update_codex_cli;
+    if incoming_s3_present {
+        incoming.s3_sync = merged_s3;
+    }
     incoming
+}
+
+fn restore_codex_history_unify_settings(
+    current: &mut crate::settings::AppSettings,
+    previous: &crate::settings::AppSettings,
+) {
+    current.unify_codex_session_history = previous.unify_codex_session_history;
+    current.unify_codex_migrate_existing = previous.unify_codex_migrate_existing;
+    let previous_migration = previous
+        .local_migrations
+        .as_ref()
+        .and_then(|migrations| migrations.codex_official_history_unify_v1.clone());
+    if previous_migration.is_some() {
+        current
+            .local_migrations
+            .get_or_insert_with(Default::default)
+            .codex_official_history_unify_v1 = previous_migration;
+    } else if let Some(migrations) = current.local_migrations.as_mut() {
+        migrations.codex_official_history_unify_v1 = None;
+    }
 }
 
 /// 获取设置
@@ -193,10 +192,7 @@ pub struct QuotaCollaborationPatch {
     pub enforce_remaining_percent: Option<f64>,
 }
 
-fn apply_settings_patch(
-    settings: &mut crate::settings::AppSettings,
-    patch: SettingsPatch,
-) {
+fn apply_settings_patch(settings: &mut crate::settings::AppSettings, patch: SettingsPatch) {
     if let Some(value) = patch.first_run_notice_confirmed {
         settings.first_run_notice_confirmed = Some(value);
     }
@@ -250,7 +246,7 @@ pub async fn save_settings(
     let unify_codex_changed =
         merged.unify_codex_session_history != existing.unify_codex_session_history;
     let unify_codex_enabled = merged.unify_codex_session_history;
-    crate::settings::update_settings_preserving_tool_auto_update(merged)
+    crate::settings::update_settings_preserving_dedicated_settings(merged)
         .map_err(|e| e.to_string())?;
 
     // 统一会话开关变更时立即重写当前官方 Codex 供应商的 live 配置，
@@ -265,9 +261,9 @@ pub async fn save_settings(
             crate::services::provider::reapply_current_codex_official_live(state.inner())
         {
             log::warn!("统一 Codex 会话历史开关变更后重写 live 配置失败，回滚设置: {err}");
-            if let Err(rollback_err) =
-                crate::settings::update_settings_preserving_tool_auto_update(existing)
-            {
+            if let Err(rollback_err) = crate::settings::mutate_settings(|current| {
+                restore_codex_history_unify_settings(current, &existing);
+            }) {
                 log::error!("回滚统一会话开关设置失败: {rollback_err}");
             }
             return Err(format!(
@@ -560,7 +556,10 @@ pub async fn set_auto_launch(enabled: bool) -> Result<bool, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_app_update_info, merge_settings_for_save};
+    use super::{
+        apply_settings_patch, build_app_update_info, merge_settings_for_save,
+        restore_codex_history_unify_settings, SettingsPatch,
+    };
     use crate::settings::{CodexEgressTimezoneMode, CodexEgressTimezoneSettings};
 
     #[test]
@@ -574,6 +573,23 @@ mod tests {
         let merged = merge_settings_for_save(incoming, &existing);
         assert_eq!(merged.tool_auto_update, existing.tool_auto_update);
         assert!(merged.auto_update_codex_cli);
+        assert_eq!(merged.language.as_deref(), Some("ja"));
+    }
+
+    #[test]
+    fn stale_general_save_preserves_dedicated_request_health_configuration() {
+        let mut existing = AppSettings::default();
+        existing.request_health.enabled = false;
+        existing.request_health.large_request_threshold_bytes = 512 * 1024;
+        existing
+            .request_health
+            .windows_notifications_snoozed_until_ms = Some(9_999_999_999_999);
+        let mut stale_form = AppSettings::default();
+        stale_form.language = Some("ja".to_string());
+
+        let merged = merge_settings_for_save(stale_form, &existing);
+
+        assert_eq!(merged.request_health, existing.request_health);
         assert_eq!(merged.language.as_deref(), Some("ja"));
     }
 
@@ -636,6 +652,50 @@ mod tests {
         );
         assert_eq!(merged.codex_egress_timezone.last_applied_at, Some(1_900));
     }
+
+    #[test]
+    fn settings_patch_changes_only_requested_fields_and_clamps_retry_values() {
+        let mut settings = crate::settings::AppSettings {
+            language: Some("zh".to_string()),
+            first_run_notice_confirmed: Some(false),
+            stream_retry_max_attempts: 3,
+            ..crate::settings::AppSettings::default()
+        };
+        let patch = SettingsPatch {
+            language: Some("en".to_string()),
+            first_run_notice_confirmed: Some(true),
+            stream_retry_max_attempts: Some(99),
+            ..SettingsPatch::default()
+        };
+
+        apply_settings_patch(&mut settings, patch);
+
+        assert_eq!(settings.language.as_deref(), Some("en"));
+        assert_eq!(settings.first_run_notice_confirmed, Some(true));
+        assert_eq!(settings.stream_retry_max_attempts, 3);
+        assert_eq!(settings.common_config_confirmed, None);
+        assert_eq!(settings.quota_collaboration.mode, "observe");
+    }
+
+    #[test]
+    fn history_reapply_rollback_preserves_concurrent_user_settings() {
+        let mut previous = AppSettings::default();
+        previous.unify_codex_session_history = true;
+        previous.unify_codex_migrate_existing = Some(true);
+        let mut current = previous.clone();
+        current.unify_codex_session_history = false;
+        current.unify_codex_migrate_existing = None;
+        current.language = Some("ja".to_string());
+        current.request_health.enabled = false;
+
+        restore_codex_history_unify_settings(&mut current, &previous);
+
+        assert!(current.unify_codex_session_history);
+        assert_eq!(current.unify_codex_migrate_existing, Some(true));
+        assert_eq!(current.language.as_deref(), Some("ja"));
+        assert!(!current.request_health.enabled);
+    }
+    use crate::services::preset_registry::PresetRegistrySettings;
     use crate::settings::{
         AppSettings, CodexOfficialHistoryUnifyMigration, CodexProviderTemplateMigration,
         CodexThirdPartyHistoryProviderBucketMigration, LocalMigrations, S3SyncSettings,
@@ -839,6 +899,50 @@ mod tests {
                 .map(|v| v.secret_access_key.as_str()),
             Some("secret")
         );
+    }
+
+    #[test]
+    fn save_settings_should_ignore_redacted_incoming_preset_registry() {
+        let existing = AppSettings {
+            preset_registry: Some(PresetRegistrySettings {
+                schema_version: 1,
+                sources: vec![crate::services::preset_registry::PresetSource {
+                    id: "team".to_string(),
+                    kind: crate::services::preset_registry::PresetSourceKind::WebDav,
+                    trust: crate::services::preset_registry::PresetTrust::Local,
+                    enabled: true,
+                    base_url: "https://presets.example.test".to_string(),
+                    username: "fixture-user".to_string(),
+                    password: "fixture-password-not-real".to_string(),
+                    remote_root: "presets".to_string(),
+                    profile: "default".to_string(),
+                    public_key: String::new(),
+                    last_checked_at: 1_900,
+                    last_accepted_version: "2026.10.15".to_string(),
+                }],
+            }),
+            ..AppSettings::default()
+        };
+        let mut incoming = existing.clone();
+        let source = incoming
+            .preset_registry
+            .as_mut()
+            .and_then(|registry| registry.sources.first_mut())
+            .expect("incoming registry source");
+        source.base_url = "https://stale.example.test".to_string();
+        source.password.clear();
+        source.last_accepted_version = "stale".to_string();
+
+        let merged = merge_settings_for_save(incoming, &existing);
+        let source = merged
+            .preset_registry
+            .as_ref()
+            .and_then(|registry| registry.sources.first())
+            .expect("merged registry source");
+
+        assert_eq!(source.base_url, "https://presets.example.test");
+        assert_eq!(source.password, "fixture-password-not-real");
+        assert_eq!(source.last_accepted_version, "2026.10.15");
     }
 
     #[test]

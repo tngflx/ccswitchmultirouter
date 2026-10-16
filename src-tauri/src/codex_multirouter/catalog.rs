@@ -199,6 +199,87 @@ pub(crate) fn catalog_models(settings: &Value) -> Option<&[Value]> {
         .map(Vec::as_slice)
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum CatalogModelLookup<'a> {
+    Missing,
+    Found(&'a Value),
+    Ambiguous,
+}
+
+/// Select the same catalog row for exclusion, capability, and product settings.
+/// Public model/id matches outrank aliases; either tier must identify one row.
+pub(crate) fn lookup_catalog_model<'a>(
+    settings: &'a Value,
+    model: &str,
+) -> CatalogModelLookup<'a> {
+    let model = model.trim();
+    if model.is_empty() {
+        return CatalogModelLookup::Missing;
+    }
+    let Some(models) = catalog_models(settings) else {
+        return CatalogModelLookup::Missing;
+    };
+    let exact = unique_model_match(models.iter().filter(|entry| {
+        model_identity_matches(entry, model, &["model", "id"])
+    }));
+    if !matches!(exact, CatalogModelLookup::Missing) {
+        return exact;
+    }
+    unique_model_match(
+        models
+            .iter()
+            .filter(|entry| fallback_model_identity_matches(entry, model)),
+    )
+}
+
+fn unique_model_match<'a>(
+    mut entries: impl Iterator<Item = &'a Value>,
+) -> CatalogModelLookup<'a> {
+    let Some(entry) = entries.next() else {
+        return CatalogModelLookup::Missing;
+    };
+    if entries.next().is_some() {
+        CatalogModelLookup::Ambiguous
+    } else {
+        CatalogModelLookup::Found(entry)
+    }
+}
+
+fn model_identity_matches(entry: &Value, model: &str, fields: &[&str]) -> bool {
+    fields
+        .iter()
+        .filter_map(|field| entry.get(*field).and_then(Value::as_str))
+        .any(|candidate| candidate.trim().eq_ignore_ascii_case(model))
+}
+
+fn fallback_model_identity_matches(entry: &Value, model: &str) -> bool {
+    model_identity_matches(
+        entry,
+        model,
+        &[
+            "slug",
+            "canonicalSlug",
+            "canonical_slug",
+            "upstreamModel",
+            "upstream_model",
+            "name",
+        ],
+    ) || ["aliases", "alias"]
+        .iter()
+        .any(|field| match entry.get(*field) {
+            Some(Value::Array(values)) => values
+                .iter()
+                .filter_map(Value::as_str)
+                .any(|candidate| candidate.trim().eq_ignore_ascii_case(model)),
+            Some(Value::Object(values)) => values
+                .keys()
+                .map(String::as_str)
+                .chain(values.values().filter_map(Value::as_str))
+                .any(|candidate| candidate.trim().eq_ignore_ascii_case(model)),
+            _ => false,
+        })
+}
+
 pub(crate) fn normalize_settings(settings: &mut Value) {
     let selected_catalog = read_catalog(settings).cloned();
     normalize_aliases(settings, "settings");
@@ -295,6 +376,85 @@ mod tests {
         assert_eq!(settings["model_catalog"]["enabled"], json!(true));
         settings["model_catalog"]["models"] = json!(null);
         assert!(read_catalog_mut(settings.as_object_mut().unwrap()).is_none());
+    }
+
+    #[test]
+    fn model_lookup_prefers_exact_public_identity_over_broad_siblings() {
+        for public_field in ["model", "id"] {
+            for fallback in [
+                json!({"upstreamModel": "wire"}),
+                json!({"canonicalSlug": "wire"}),
+                json!({"name": "wire"}),
+                json!({"aliases": ["wire"]}),
+                json!({"alias": {"wire": "sibling"}}),
+            ] {
+                let mut sibling = fallback;
+                sibling["model"] = json!("sibling");
+                let mut exact = json!({"enabled": true});
+                exact[public_field] = json!("wire");
+                for rows in [
+                    vec![sibling.clone(), exact.clone()],
+                    vec![exact.clone(), sibling.clone()],
+                ] {
+                    let settings = json!({"modelCatalog": {"models": rows}});
+                    assert_eq!(
+                        lookup_catalog_model(&settings, " WIRE "),
+                        CatalogModelLookup::Found(&exact)
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn model_lookup_requires_unique_identity_in_the_selected_tier() {
+        for field in ["model", "id", "upstreamModel", "canonicalSlug", "name"] {
+            let mut first = json!({"model": "first"});
+            first[field] = json!("shared");
+            let mut second = json!({"model": "second", "enabled": false});
+            second[field] = json!(" SHARED ");
+            let settings = json!({"modelCatalog": {"models": [first, second]}});
+            assert_eq!(
+                lookup_catalog_model(&settings, "shared"),
+                CatalogModelLookup::Ambiguous
+            );
+        }
+        for aliases in [
+            json!({"aliases": ["shared"]}),
+            json!({"alias": {"shared": "wire"}}),
+        ] {
+            let mut first = aliases.clone();
+            first["model"] = json!("first");
+            let mut second = aliases;
+            second["model"] = json!("second");
+            let settings = json!({"modelCatalog": {"models": [first, second]}});
+            assert_eq!(
+                lookup_catalog_model(&settings, "shared"),
+                CatalogModelLookup::Ambiguous
+            );
+        }
+    }
+
+    #[test]
+    fn model_lookup_preserves_catalog_authority_and_rejects_blank_identities() {
+        let mut settings = json!({
+            "modelCatalog": {"models": []},
+            "model_catalog": {"models": [{"model": "legacy"}]}
+        });
+        assert_eq!(
+            lookup_catalog_model(&settings, "legacy"),
+            CatalogModelLookup::Missing
+        );
+        settings["modelCatalog"] = json!({"models": null});
+        assert!(matches!(
+            lookup_catalog_model(&settings, "legacy"),
+            CatalogModelLookup::Found(_)
+        ));
+        settings["modelCatalog"] = json!({"models": [{"model": " ", "aliases": [""]}]});
+        assert_eq!(
+            lookup_catalog_model(&settings, " "),
+            CatalogModelLookup::Missing
+        );
     }
 
     #[test]

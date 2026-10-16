@@ -32,4 +32,56 @@ describe("Codex catalog authority", () => {
       modelCatalog: { models: [{ model: "legacy-model" }] },
     });
   });
+
+  it("preserves canonical API protocol declarations without promoting old format snapshots", () => {
+    const protocolCapability = {
+      schemaVersion: 1,
+      source: "provider_api",
+      baseUrl: "https://relay.example/v1",
+      upstreamModel: "wire-model",
+      supportedEndpoints: ["openai_chat"],
+    };
+    expect(
+      normalizeCodexCatalogSettings({
+        modelCatalog: {
+          models: [
+            {
+              model: "public-model",
+              upstream_model: "wire-model",
+              protocolCapability,
+            },
+            {
+              model: "legacy-model",
+              api_format: "openai_responses",
+              api_format_source: "probe",
+            },
+          ],
+        },
+      }),
+    ).toMatchObject({
+      modelCatalog: {
+        models: [
+          {
+            model: "public-model",
+            upstreamModel: "wire-model",
+            protocolCapability,
+          },
+          {
+            model: "legacy-model",
+            apiFormat: "openai_responses",
+            apiFormatSource: "probe",
+          },
+        ],
+      },
+    });
+    const normalized = normalizeCodexCatalogSettings({
+      modelCatalog: {
+        models: [{ model: "legacy-model", api_format: "openai_responses" }],
+      },
+    });
+    const catalog = readCodexCatalogSettings(normalized);
+    expect((catalog?.models as unknown[])[0]).not.toHaveProperty(
+      "protocolCapability",
+    );
+  });
 });

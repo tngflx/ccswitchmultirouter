@@ -60,6 +60,7 @@ export function useSettingsForm(): UseSettingsFormResult {
 
   const initialLanguageRef = useRef<SupportedLanguage>(DEFAULT_LANGUAGE);
   const lastAppliedDataRef = useRef<Settings | null>(null);
+  const lastNormalizedDataRef = useRef<SettingsFormState | null>(null);
 
   const readPersistedLanguage = useCallback((): SupportedLanguage => {
     if (typeof window !== "undefined") {
@@ -121,10 +122,26 @@ export function useSettingsForm(): UseSettingsFormResult {
       language: normalizedLanguage,
     };
 
-    setSettingsState(normalized);
+    const previous = lastNormalizedDataRef.current;
+    const rebased = { ...normalized };
+    if (settingsState && previous) {
+      // Refetches acknowledge saved fields without discarding unrelated drafts.
+      for (const key of Object.keys(settingsState) as Array<
+        keyof SettingsFormState
+      >) {
+        if (
+          JSON.stringify(settingsState[key]) !== JSON.stringify(previous[key])
+        ) {
+          Object.assign(rebased, { [key]: settingsState[key] });
+        }
+      }
+    }
+
+    lastNormalizedDataRef.current = normalized;
+    setSettingsState(rebased);
     initialLanguageRef.current = normalizedLanguage;
-    syncLanguage(normalizedLanguage);
-  }, [data, readPersistedLanguage, syncLanguage]);
+    syncLanguage(rebased.language);
+  }, [data, readPersistedLanguage, settingsState, syncLanguage]);
 
   const updateSettings = useCallback(
     (updates: Partial<SettingsFormState>) => {
@@ -207,6 +224,7 @@ export function useSettingsForm(): UseSettingsFormResult {
       // Language synchronization can rerender this hook before the query
       // publishes a newer snapshot. Do not let that stale snapshot undo reset.
       lastAppliedDataRef.current = data ?? serverData;
+      lastNormalizedDataRef.current = normalized;
       setSettingsState(normalized);
       syncLanguage(initialLanguageRef.current);
     },

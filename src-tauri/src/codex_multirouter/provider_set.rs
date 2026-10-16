@@ -1,4 +1,5 @@
 use super::catalog::{catalog_models, read_catalog, read_catalog_mut};
+use super::protocol_capability::{configured_transport, provider_api_declared_model_transport};
 use super::schema::{
     CodexModelSelection, CodexRoutingConfigV2, CodexRoutingDocument, CodexRoutingRouteV2,
 };
@@ -183,6 +184,7 @@ pub fn plan_codex_provider_set(
     let catalog = source_catalog(source)?;
     let mut blocked = Vec::new();
     let mut selections = Vec::new();
+    let mut selected_probe_records = Vec::new();
     let mut enabled_names = HashSet::new();
 
     for model in catalog.iter().filter(|model| model.enabled) {
@@ -194,13 +196,43 @@ pub fn plan_codex_provider_set(
             selections.push((model.clone(), selected));
             continue;
         }
-        let matches = records
+        let records_for_model = records
             .iter()
             .filter(|record| {
                 record.target.public_model == model.public_model
                     && record.target.upstream_model == model.upstream_model
             })
             .collect::<Vec<_>>();
+        let candidate = compile_provider_probe_candidate_for_model(
+            source,
+            model.public_model.clone(),
+            model.upstream_model.clone(),
+        );
+        let current_records = records_for_model
+            .iter()
+            .copied()
+            .filter(|record| {
+                record.probe_version == PROBE_PROFILE_VERSION
+                    && record.expires_at >= now
+                    && candidate
+                        .as_ref()
+                        .ok()
+                        .and_then(|candidate| candidate.target_key(record.target.transport).ok())
+                        .as_ref()
+                        == Some(&record.target)
+            })
+            .collect::<Vec<_>>();
+        if current_records.is_empty() {
+            if let Some(selected) = provider_api_declared_model_transport(source, &model.value) {
+                selections.push((model.clone(), selected));
+                continue;
+            }
+        }
+        let matches = if current_records.is_empty() {
+            records_for_model
+        } else {
+            current_records
+        };
         let Some(record) = matches.first().copied() else {
             blocked.push(blocked_model(model, "probe_required", None));
             continue;
@@ -209,12 +241,8 @@ pub fn plan_codex_provider_set(
             blocked.push(blocked_model(model, "conflicting_probe_records", None));
             continue;
         }
-        let expected_target = compile_provider_probe_candidate_for_model(
-            source,
-            model.public_model.clone(),
-            model.upstream_model.clone(),
-        )
-        .and_then(|candidate| candidate.target_key(record.target.transport));
+        let expected_target =
+            candidate.and_then(|candidate| candidate.target_key(record.target.transport));
         if expected_target.as_ref() != Ok(&record.target) {
             blocked.push(blocked_model(model, "probe_target_mismatch", Some(record)));
             continue;
@@ -235,6 +263,7 @@ pub fn plan_codex_provider_set(
             blocked.push(blocked_model(model, "probe_target_mismatch", Some(record)));
             continue;
         }
+        selected_probe_records.push(record.clone());
         selections.push((model.clone(), selected));
     }
 
@@ -341,7 +370,12 @@ pub fn plan_codex_provider_set(
         },
         CodexProviderSetPersistence::Blocked => unreachable!("blocked plans return above"),
     };
-    let profiles = rebind_profiles(&persistence, records, &responses_models, &chat_models)?;
+    let profiles = rebind_profiles(
+        &persistence,
+        &selected_probe_records,
+        &responses_models,
+        &chat_models,
+    )?;
     let delete_provider_ids = match &persistence {
         CodexProviderSetPersistence::Single { .. } => {
             owned_existing_leaf_ids(source, existing_providers)
@@ -532,7 +566,10 @@ pub fn requires_automatic_codex_protocol_probe(
     Ok(source_catalog(provider)?
         .iter()
         .filter(|model| model.enabled)
-        .any(|model| codex_model_follows_automatic_protocol(provider, &model.public_model)))
+        .any(|model| {
+            codex_model_follows_automatic_protocol(provider, &model.public_model)
+                && provider_api_declared_model_transport(provider, &model.value).is_none()
+        }))
 }
 
 pub fn codex_model_follows_automatic_protocol(provider: &Provider, public_model: &str) -> bool {
@@ -749,12 +786,35 @@ pub fn restore_logical_codex_provider(
             "Facade does not contain its authoritative source model catalog",
         )
     })?;
+    let source_transport = marker
+        .get("sourceApiFormat")
+        .map(|format| {
+            format
+                .as_str()
+                .and_then(parse_protocol_override)
+                .map(|transport| match transport {
+                    crate::provider::CodexProtocolOverride::OpenaiResponses => {
+                        TransportKind::OpenAiResponses
+                    }
+                    crate::provider::CodexProtocolOverride::OpenaiChat => TransportKind::OpenAiChat,
+                })
+                .ok_or_else(|| {
+                    error(
+                        "codex_provider_set_invalid_facade",
+                        "Facade contains an invalid source protocol preference",
+                    )
+                })
+        })
+        .transpose()?;
 
     let mut restored = facade.clone();
     let settings = settings_object_mut(&mut restored)?;
     settings.remove("codexRouting");
     settings.remove("codexProtocolSet");
     settings.insert("modelCatalog".to_string(), source_catalog);
+    if let Some(transport) = source_transport {
+        normalize_provider_transport(&mut restored, transport)?;
+    }
     Ok(restored)
 }
 
@@ -1495,6 +1555,7 @@ fn build_facade(
     default_transport: TransportKind,
 ) -> Result<Provider, CodexProviderSetError> {
     let mut facade = source.clone();
+    let source_transport = configured_transport(source).unwrap_or(TransportKind::OpenAiResponses);
     remove_provider_set_fields(&mut facade);
     normalize_provider_transport(&mut facade, TransportKind::OpenAiResponses)?;
     let mut source_catalog = read_catalog(&source.settings_config)
@@ -1516,7 +1577,11 @@ fn build_facade(
             "role": "facade",
             "responsesProviderId": responses_provider.id,
             "chatProviderId": chat_provider.id,
-            "sourceModelCatalog": source_catalog
+            "sourceModelCatalog": source_catalog,
+            "sourceApiFormat": match source_transport {
+                TransportKind::OpenAiResponses => "openai_responses",
+                TransportKind::OpenAiChat => "openai_chat",
+            }
         }),
     );
     settings.insert(
@@ -1693,9 +1758,9 @@ fn error(code: impl Into<String>, message: impl Into<String>) -> CodexProviderSe
 mod tests {
     use super::{
         chat_leaf_id, migrate_legacy_codex_protocol_overrides_for_save, plan_codex_provider_set,
-        plan_manual_codex_provider_set, responses_leaf_id, restore_logical_codex_provider,
-        rewrite_dependent_routers_for_provider_set, CodexProviderSetPersistence,
-        CodexProviderSetPlan, CODEX_PROTOCOL_SET_VERSION,
+        plan_manual_codex_provider_set, requires_automatic_codex_protocol_probe, responses_leaf_id,
+        restore_logical_codex_provider, rewrite_dependent_routers_for_provider_set,
+        CodexProviderSetPersistence, CodexProviderSetPlan, CODEX_PROTOCOL_SET_VERSION,
     };
     use crate::protocol_compatibility::{
         ProbeReadiness, ProtocolCompatibilityProbeResult, ProtocolCompatibilityRecord,
@@ -1822,6 +1887,168 @@ mod tests {
             record("model-a", "upstream-a", Some(a), ProbeReadiness::Verified),
             record("model-b", "upstream-b", Some(b), ProbeReadiness::Verified),
         ]
+    }
+
+    fn source_with_protocol_declarations() -> Provider {
+        let mut source = source_provider();
+        let rows = source.settings_config["modelCatalog"]["models"]
+            .as_array_mut()
+            .unwrap();
+        for (row, endpoint) in rows.iter_mut().zip(["openai_chat", "openai_responses"]) {
+            row["protocolCapability"] = json!({
+                "schemaVersion": 1,
+                "source": "provider_api",
+                "baseUrl": "https://relay.example/v1",
+                "upstreamModel": row["upstreamModel"],
+                "supportedEndpoints": [endpoint],
+                "supportsTools": true
+            });
+        }
+        source
+    }
+
+    #[test]
+    fn api_protocol_declarations_plan_every_enabled_model_without_fake_probe_profiles() {
+        let source = source_with_protocol_declarations();
+        let prepared = plan_codex_provider_set(&source, &[], &HashMap::new(), 150)
+            .expect("provider metadata can plan declared protocols");
+
+        assert!(matches!(
+            prepared.preview.plan,
+            CodexProviderSetPlan::Split { .. }
+        ));
+        assert_eq!(prepared.preview.chat_models, vec!["model-a"]);
+        assert_eq!(prepared.preview.responses_models, vec!["model-b"]);
+        assert!(prepared.profiles.is_empty());
+        assert!(!requires_automatic_codex_protocol_probe(&source).unwrap());
+    }
+
+    #[test]
+    fn api_protocol_declarations_and_verified_probe_profiles_share_one_plan() {
+        let mut source = source_with_protocol_declarations();
+        source.settings_config["modelCatalog"]["models"][1]
+            .as_object_mut()
+            .unwrap()
+            .remove("protocolCapability");
+        let prepared = plan_codex_provider_set(
+            &source,
+            &[record_for_source(
+                &source,
+                "model-b",
+                "upstream-b",
+                Some(TransportKind::OpenAiResponses),
+                ProbeReadiness::Verified,
+            )],
+            &HashMap::new(),
+            150,
+        )
+        .expect("API metadata and observed evidence can resolve different rows");
+
+        assert!(matches!(
+            prepared.preview.plan,
+            CodexProviderSetPlan::Split { .. }
+        ));
+        assert_eq!(prepared.profiles.len(), 1);
+        assert_eq!(prepared.profiles[0].target.public_model, "model-b");
+        assert!(requires_automatic_codex_protocol_probe(&source).unwrap());
+    }
+
+    #[test]
+    fn current_failed_probe_evidence_outranks_api_protocol_declarations() {
+        let source = source_with_protocol_declarations();
+        let prepared = plan_codex_provider_set(
+            &source,
+            &[record_for_source(
+                &source,
+                "model-a",
+                "upstream-a",
+                None,
+                ProbeReadiness::Unverified,
+            )],
+            &HashMap::new(),
+            150,
+        )
+        .expect("a known incompatibility remains blocked");
+        let CodexProviderSetPlan::Blocked { models } = prepared.preview.plan else {
+            panic!("provider API declarations must not overrule current observed failures");
+        };
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].reason, "probe_not_verified");
+    }
+
+    #[test]
+    fn expired_or_foreign_probe_profiles_do_not_override_current_api_declarations() {
+        let source = source_with_protocol_declarations();
+        let mut expired = record_for_source(
+            &source,
+            "model-a",
+            "upstream-a",
+            Some(TransportKind::OpenAiResponses),
+            ProbeReadiness::Verified,
+        );
+        expired.expires_at = 149;
+        let mut foreign = record_for_source(
+            &source,
+            "model-b",
+            "upstream-b",
+            Some(TransportKind::OpenAiChat),
+            ProbeReadiness::Verified,
+        );
+        foreign.target.request_policy_fingerprint = "unrelated-policy".to_string();
+        let prepared =
+            plan_codex_provider_set(&source, &[expired, foreign], &HashMap::new(), 150).unwrap();
+        assert!(matches!(
+            prepared.preview.plan,
+            CodexProviderSetPlan::Split { .. }
+        ));
+        assert_eq!(prepared.preview.chat_models, vec!["model-a"]);
+        assert_eq!(prepared.preview.responses_models, vec!["model-b"]);
+        assert!(
+            prepared.profiles.is_empty(),
+            "invalid profiles must not be rebound"
+        );
+    }
+
+    #[test]
+    fn api_declared_split_preserves_logical_protocol_preference_across_reediting() {
+        let mut source = source_with_protocol_declarations();
+        source.meta.as_mut().unwrap().api_format = Some("openai_chat".to_string());
+        source.settings_config["modelCatalog"]["models"][0]["protocolCapability"]
+            ["supportedEndpoints"] = json!(["openai_chat", "openai_responses"]);
+        let first = plan_codex_provider_set(&source, &[], &HashMap::new(), 150).unwrap();
+        let CodexProviderSetPersistence::Split {
+            facade,
+            responses_provider,
+            chat_provider,
+        } = &first.persistence
+        else {
+            panic!("one declared Responses-only model requires a split");
+        };
+        assert_eq!(facade.settings_config["apiFormat"], "openai_responses");
+        assert_eq!(
+            facade.settings_config["codexProtocolSet"]["sourceApiFormat"],
+            "openai_chat"
+        );
+        let existing = [facade, responses_provider, chat_provider]
+            .into_iter()
+            .map(|provider| (provider.id.clone(), provider.clone()))
+            .collect::<HashMap<_, _>>();
+        let restored = restore_logical_codex_provider(facade, &existing).unwrap();
+        assert_eq!(
+            restored.meta.as_ref().unwrap().api_format.as_deref(),
+            Some("openai_chat")
+        );
+        let second = plan_codex_provider_set(&restored, &[], &existing, 151).unwrap();
+        assert!(matches!(
+            second.persistence,
+            CodexProviderSetPersistence::Split { .. }
+        ));
+        assert_eq!(first.preview.chat_models, second.preview.chat_models);
+        assert_eq!(
+            first.preview.responses_models,
+            second.preview.responses_models
+        );
+        assert!(second.profiles.is_empty());
     }
 
     fn model_names(provider: &Provider) -> Vec<String> {

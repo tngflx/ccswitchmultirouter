@@ -232,6 +232,14 @@ impl CodexModelReasoningCapability {
     /// 仅在读取/解析消费者入口调用；新写入仍必须直接通过 `validate()`，
     /// 从而维持“read old, write complete”的持久化契约。
     pub fn complete_identity_effort_map_for_read(mut self) -> Self {
+        if let Some(format) = normalize_upstream_format(&self.upstream.format) {
+            self.upstream.format = format;
+        }
+        if let Some(parameter) =
+            normalize_upstream_parameter(&self.upstream.parameter, &self.upstream.format)
+        {
+            self.upstream.parameter = parameter;
+        }
         if self.effective_support_status() == ReasoningSupportStatus::ConfirmedSupported
             && self.effective_control_kind() == ReasoningControlKind::Graded
             && !matches!(self.upstream.format.as_str(), "none" | "boolean")
@@ -276,6 +284,7 @@ impl CodexModelReasoningCapability {
     }
 
     pub fn validate(&self) -> Result<(), String> {
+        validate_upstream_wire_contract(&self.upstream.format, &self.upstream.parameter)?;
         if let (Some(status), Some(legacy)) = (self.support_status, self.supported) {
             let legacy_status = if legacy {
                 ReasoningSupportStatus::ConfirmedSupported
@@ -373,6 +382,57 @@ impl CodexModelReasoningCapability {
         }
         Ok(())
     }
+}
+
+pub fn validate_upstream_wire_contract(format: &str, parameter: &str) -> Result<(), String> {
+    let normalized_format = normalize_upstream_format(format)
+        .ok_or_else(|| "upstream format is not supported".to_string())?;
+    let normalized_parameter = normalize_upstream_parameter(parameter, &normalized_format)
+        .ok_or_else(|| "upstream parameter is not supported".to_string())?;
+    if format.trim() != normalized_format {
+        return Err("upstream format is not supported".to_string());
+    }
+    if parameter.trim() != normalized_parameter {
+        return Err("upstream parameter is not supported".to_string());
+    }
+    Ok(())
+}
+
+fn normalize_upstream_format(value: &str) -> Option<String> {
+    let format = value.trim().to_ascii_lowercase();
+    matches!(
+        format.as_str(),
+        "auto"
+            | "text"
+            | "summary"
+            | "object"
+            | "reasoning_object"
+            | "string"
+            | "boolean"
+            | "none"
+            | "budget"
+    )
+    .then_some(format)
+}
+
+fn normalize_upstream_parameter(value: &str, format: &str) -> Option<String> {
+    let parameter = value.trim().to_ascii_lowercase();
+    if parameter.is_empty() && format == "none" {
+        return Some(parameter);
+    }
+    matches!(
+        parameter.as_str(),
+        "reasoning"
+            | "reasoning.effort"
+            | "reasoning_effort"
+            | "enable_thinking"
+            | "thinking"
+            | "thinking_budget"
+            | "max_tokens"
+            | "reasoning.max_tokens"
+            | "none"
+    )
+    .then_some(parameter)
 }
 
 /// 稳定能力指纹：只覆盖影响运行的规范化字段。
@@ -811,21 +871,37 @@ pub fn reasoning_capability_from_model_entry(
         .get("model")
         .and_then(Value::as_str)
         .unwrap_or("?");
-    let capability: CodexModelReasoningCapability = match serde_json::from_value::<
+    let mut capability: CodexModelReasoningCapability = match serde_json::from_value::<
         CodexModelReasoningCapability,
     >(value.clone())
     {
         Ok(capability) => capability,
         Err(error) => {
-            // 声明存在但无法解析：打日志暴露问题，避免用户手动声明
-            // 被静默当作"未声明"而清空（v27/v28 回归）。
-            log::warn!(
-                "Codex reasoning declaration for model {model} is not parseable and will be ignored: {error}"
-            );
-            return None;
+            // A number of older provider catalogs use the compact
+            // `supportedEfforts`/`defaultEffort` form without the full
+            // schema-v2 `upstream` object. Preserve that valid declaration
+            // through the same validation path, but never reinterpret an
+            // object that already contains canonical fields.
+            if let Some(capability) = lightweight_reasoning_capability(value) {
+                capability
+            } else {
+                // 声明存在但无法解析：打日志暴露问题，避免用户手动声明
+                // 被静默当作"未声明"而清空（v27/v28 回归）。
+                log::warn!(
+                        "Codex reasoning declaration for model {model} is not parseable and will be ignored: {error}"
+                    );
+                return None;
+            }
         }
-    }
-    .complete_identity_effort_map_for_read();
+    };
+    // Normalize provider/catalog input at the parser boundary. Validation
+    // remains strict so manually constructed capabilities cannot carry a
+    // mixed-case value into runtime exact comparisons.
+    let format = normalize_upstream_format(&capability.upstream.format)?;
+    let parameter = normalize_upstream_parameter(&capability.upstream.parameter, &format)?;
+    capability.upstream.format = format;
+    capability.upstream.parameter = parameter;
+    let capability = capability.complete_identity_effort_map_for_read();
     if let Err(error) = capability.validate() {
         log::warn!(
             "Codex reasoning declaration for model {model} is invalid and will be ignored: {error}"
@@ -833,6 +909,189 @@ pub fn reasoning_capability_from_model_entry(
         return None;
     }
     Some(capability)
+}
+
+/// Parse the compact catalog shape used by older provider/model entries.
+///
+/// This is intentionally narrower than the canonical schema: if any
+/// schema-v2 marker is present, callers must provide the complete object and
+/// malformed declarations remain invalid instead of falling through here.
+fn lightweight_reasoning_capability(value: &Value) -> Option<CodexModelReasoningCapability> {
+    let object = value.as_object()?;
+    let canonical_markers = [
+        "schemaVersion",
+        "schema_version",
+        "supportStatus",
+        "support_status",
+        "controlKind",
+        "control_kind",
+        "supported",
+        "disableAllowed",
+        "disable_allowed",
+        "upstream",
+        "source",
+        "confidence",
+    ];
+    if canonical_markers
+        .iter()
+        .any(|field| object.contains_key(*field))
+    {
+        return None;
+    }
+    let compact_fields = [
+        "supportedEfforts",
+        "supported_efforts",
+        "defaultEffort",
+        "default_effort",
+        "reasoningFormat",
+        "reasoning_format",
+        "upstreamFormat",
+        "upstream_format",
+        "reasoningParameter",
+        "reasoning_parameter",
+        "upstreamParameter",
+        "upstream_parameter",
+        "outputFormat",
+        "output_format",
+    ];
+    if object
+        .keys()
+        .any(|field| !compact_fields.contains(&field.as_str()))
+    {
+        return None;
+    }
+
+    let parse_levels = |value: &Value| -> Option<Vec<String>> {
+        let values = value.as_array()?;
+        let mut efforts = Vec::with_capacity(values.len());
+        for value in values {
+            let effort = value.as_str()?.trim().to_ascii_lowercase();
+            if effort.is_empty() || !VALID_PROVIDER_EFFORTS.contains(&effort.as_str()) {
+                return None;
+            }
+            if !efforts.contains(&effort) {
+                efforts.push(effort);
+            }
+        }
+        Some(efforts)
+    };
+    let levels = match (
+        object.get("supportedEfforts"),
+        object.get("supported_efforts"),
+    ) {
+        (Some(camel), Some(snake)) => {
+            let camel = parse_levels(camel)?;
+            let snake = parse_levels(snake)?;
+            let mut left = camel.clone();
+            let mut right = snake;
+            left.sort();
+            right.sort();
+            (left == right).then_some(camel)?
+        }
+        (Some(value), None) | (None, Some(value)) => parse_levels(value)?,
+        (None, None) => return None,
+    };
+    let supported_efforts = levels;
+    let default_effort = match (object.get("defaultEffort"), object.get("default_effort")) {
+        (Some(camel), Some(snake)) => {
+            let camel = camel.as_str()?.trim().to_ascii_lowercase();
+            let snake = snake.as_str()?.trim().to_ascii_lowercase();
+            if camel.is_empty() || camel != snake {
+                return None;
+            }
+            Some(camel)
+        }
+        (Some(value), None) | (None, Some(value)) => {
+            let effort = value.as_str()?.trim().to_ascii_lowercase();
+            if effort.is_empty() {
+                return None;
+            }
+            Some(effort)
+        }
+        (None, None) => None,
+    };
+    if let Some(default_effort) = default_effort.as_deref() {
+        if !supported_efforts
+            .iter()
+            .any(|effort| effort == default_effort)
+        {
+            return None;
+        }
+    }
+
+    let format = object
+        .get("reasoningFormat")
+        .or_else(|| object.get("reasoning_format"))
+        .or_else(|| object.get("upstreamFormat"))
+        .or_else(|| object.get("upstream_format"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|format| !format.is_empty())
+        .unwrap_or("string");
+    let format = normalize_upstream_format(format)?;
+    let parameter = object
+        .get("reasoningParameter")
+        .or_else(|| object.get("reasoning_parameter"))
+        .or_else(|| object.get("upstreamParameter"))
+        .or_else(|| object.get("upstream_parameter"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|parameter| !parameter.is_empty())
+        .unwrap_or("reasoning_effort");
+    let parameter = normalize_upstream_parameter(parameter, &format)?;
+    let output_format = object
+        .get("outputFormat")
+        .or_else(|| object.get("output_format"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|format| !format.is_empty())
+        .map(ToString::to_string);
+    if output_format.as_deref().is_some_and(|format| {
+        !matches!(
+            format,
+            "auto"
+                | "text"
+                | "summary"
+                | "object"
+                | "reasoning_object"
+                | "string"
+                | "boolean"
+                | "none"
+                | "budget"
+        )
+    }) {
+        return None;
+    }
+    let capability = CodexModelReasoningCapability {
+        schema_version: Some(2),
+        support_status: Some(ReasoningSupportStatus::ConfirmedSupported),
+        control_kind: Some(if supported_efforts.is_empty() {
+            ReasoningControlKind::None
+        } else {
+            ReasoningControlKind::Graded
+        }),
+        supported: None,
+        supported_efforts: supported_efforts.clone(),
+        default_effort,
+        disable_allowed: supported_efforts.iter().any(|effort| effort == "none"),
+        upstream: CodexModelReasoningUpstream {
+            format,
+            parameter,
+            effort_map: supported_efforts
+                .iter()
+                .filter(|effort| effort.as_str() != "none")
+                .map(|effort| (effort.clone(), effort.clone()))
+                .collect(),
+        },
+        output_format,
+        source: None,
+        confidence: None,
+        fetched_at: None,
+        provider_key: None,
+        model_revision: None,
+        codex_ultra_orchestration: None,
+    };
+    capability.validate().ok().map(|_| capability)
 }
 
 /// Parse a reasoning declaration embedded in a Codex provider's inline
@@ -846,42 +1105,23 @@ pub fn reasoning_capability_from_model_entry(
 pub fn reasoning_capability_from_provider_model_entry(
     model_entry: &Value,
 ) -> Option<CodexModelReasoningCapability> {
+    if let Some(reasoning) = model_entry.get("reasoning") {
+        if !reasoning.is_null() {
+            let mut capability = reasoning_capability_from_model_entry(model_entry)?;
+            capability.source = Some("provider_config".to_string());
+            capability.confidence = Some(CapabilityConfidence::Authoritative);
+            return capability.validate().ok().map(|_| capability);
+        }
+    }
     if let Some(mut capability) = reasoning_capability_from_model_entry(model_entry) {
         capability.source = Some("provider_config".to_string());
         capability.confidence = Some(CapabilityConfidence::Authoritative);
         return capability.validate().ok().map(|_| capability);
     }
 
-    let levels = model_entry
-        .get("supported_reasoning_levels")
-        .or_else(|| model_entry.get("supported_reasoning_efforts"))
-        .or_else(|| model_entry.get("supportedReasoningEfforts"))
-        .and_then(Value::as_array)?;
-    let supported_efforts = levels
-        .iter()
-        .filter_map(|level| {
-            level
-                .as_str()
-                .or_else(|| level.get("effort").and_then(Value::as_str))
-                .or_else(|| level.get("reasoning_effort").and_then(Value::as_str))
-                .or_else(|| level.get("reasoningEffort").and_then(Value::as_str))
-        })
-        .map(str::trim)
-        .filter(|effort| !effort.is_empty())
-        .map(ToString::to_string)
-        .collect::<Vec<_>>();
-    if supported_efforts.is_empty() {
-        return None;
-    }
-
-    let default_effort = model_entry
-        .get("default_reasoning_level")
-        .or_else(|| model_entry.get("default_reasoning_effort"))
-        .or_else(|| model_entry.get("defaultReasoningEffort"))
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|effort| !effort.is_empty())
-        .map(ToString::to_string);
+    let supported_efforts = strict_official_levels(model_entry)?;
+    let default_effort = strict_official_default(model_entry)?
+        .and_then(|effort| supported_efforts.contains(&effort).then_some(effort));
     let format = model_entry
         .get("reasoning_format")
         .or_else(|| model_entry.get("reasoningFormat"))
@@ -892,8 +1132,13 @@ pub fn reasoning_capability_from_provider_model_entry(
         .get("reasoning_parameter")
         .or_else(|| model_entry.get("reasoningParameter"))
         .and_then(Value::as_str)
-        .unwrap_or("reasoning_effort")
-        .to_string();
+        .map(|value| {
+            normalize_upstream_parameter(value, "string")
+                .unwrap_or_else(|| value.trim().to_ascii_lowercase())
+        })
+        .unwrap_or_else(|| "reasoning_effort".to_string());
+    let format =
+        normalize_upstream_format(&format).unwrap_or_else(|| format.trim().to_ascii_lowercase());
     let capability = CodexModelReasoningCapability {
         schema_version: Some(2),
         support_status: Some(ReasoningSupportStatus::ConfirmedSupported),
@@ -929,18 +1174,118 @@ pub fn resolve_reasoning_capability_from_settings(
     settings: &Value,
     model: &str,
 ) -> Option<CodexModelReasoningCapability> {
-    settings
-        .get("modelCatalog")?
-        .get("models")?
-        .as_array()?
-        .iter()
-        .find(|entry| {
-            ["model", "id", "slug", "upstreamModel", "upstream_model"]
-                .into_iter()
-                .filter_map(|field| entry.get(field).and_then(Value::as_str))
-                .any(|candidate| candidate.trim().eq_ignore_ascii_case(model.trim()))
-        })
-        .and_then(reasoning_capability_from_model_entry)
+    let crate::codex_multirouter::catalog::CatalogModelLookup::Found(entry) =
+        crate::codex_multirouter::catalog::lookup_catalog_model(settings, model)
+    else {
+        return None;
+    };
+    if entry.get("enabled").and_then(Value::as_bool) == Some(false) {
+        return None;
+    }
+    reasoning_capability_from_model_entry(entry)
+}
+
+fn official_model_identity_values(entry: &Value) -> Vec<&str> {
+    let mut values = Vec::new();
+    for field in ["slug", "id", "canonicalSlug", "canonical_slug", "name"] {
+        if let Some(value) = entry.get(field).and_then(Value::as_str) {
+            values.push(value);
+        }
+    }
+    for field in ["aliases", "alias"] {
+        match entry.get(field) {
+            Some(Value::Array(values_array)) => {
+                values.extend(values_array.iter().filter_map(Value::as_str));
+            }
+            Some(Value::Object(values_object)) => {
+                values.extend(values_object.keys().map(String::as_str));
+                values.extend(values_object.values().filter_map(Value::as_str));
+            }
+            _ => {}
+        }
+    }
+    values
+}
+
+fn strict_reasoning_levels(value: &Value) -> Option<Vec<String>> {
+    let values = value.as_array()?;
+    let mut levels = Vec::with_capacity(values.len());
+    for value in values {
+        let effort = if let Some(value) = value.as_str() {
+            value.trim().to_ascii_lowercase()
+        } else {
+            let object = value.as_object()?;
+            let mut declared = Vec::new();
+            for field in ["effort", "reasoning_effort", "reasoningEffort"] {
+                if let Some(value) = object.get(field) {
+                    declared.push(value.as_str()?.trim().to_ascii_lowercase());
+                }
+            }
+            if declared.is_empty()
+                || declared.iter().any(|value| value.is_empty())
+                || declared.windows(2).any(|values| values[0] != values[1])
+            {
+                return None;
+            }
+            declared.remove(0)
+        };
+        if effort.is_empty() {
+            return None;
+        }
+        if !VALID_CODEX_EFFORTS.contains(&effort.as_str()) {
+            return None;
+        }
+        levels.push(effort);
+    }
+    (!levels.is_empty()).then_some(levels)
+}
+
+fn strict_official_levels(entry: &Value) -> Option<Vec<String>> {
+    let snake = entry.get("supported_reasoning_levels");
+    let camel = entry
+        .get("supportedReasoningLevels")
+        .or_else(|| entry.get("supported_reasoning_efforts"))
+        .or_else(|| entry.get("supportedReasoningEfforts"));
+    let snake = match snake {
+        Some(value) => Some(strict_reasoning_levels(value)?),
+        None => None,
+    };
+    let camel = match camel {
+        Some(value) => Some(strict_reasoning_levels(value)?),
+        None => None,
+    };
+    match (snake, camel) {
+        (Some(left), Some(right)) if left != right => None,
+        (Some(levels), _) | (_, Some(levels)) => Some(levels),
+        (None, None) => None,
+    }
+}
+
+fn strict_official_default(entry: &Value) -> Option<Option<String>> {
+    let fields = [
+        "default_reasoning_level",
+        "default_reasoning_effort",
+        "defaultReasoningLevel",
+        "defaultReasoningEffort",
+    ];
+    let mut found = None;
+    for field in fields {
+        let Some(value) = entry.get(field) else {
+            continue;
+        };
+        let value = value.as_str()?.trim().to_ascii_lowercase();
+        if value.is_empty() || !VALID_CODEX_EFFORTS.contains(&value.as_str()) {
+            return None;
+        }
+        if found
+            .as_ref()
+            .is_some_and(|previous: &String| previous != &value)
+        {
+            return None;
+        }
+        found = Some(value);
+    }
+    Some(found)
 }
 
 /// 从 Codex 官方模型缓存为指定 slug 构造 reasoning capability（P2：official 来源）。
@@ -958,45 +1303,22 @@ pub fn official_reasoning_capability_for_model(
     official_models: &[Value],
 ) -> Option<CodexModelReasoningCapability> {
     let entry = official_models.iter().find(|entry| {
-        entry
-            .get("slug")
-            .and_then(Value::as_str)
-            .is_some_and(|slug| slug.eq_ignore_ascii_case(model))
+        official_model_identity_values(entry)
+            .into_iter()
+            .any(|candidate| candidate.eq_ignore_ascii_case(model))
     })?;
-    let mut levels: Vec<String> = entry
-        .get("supported_reasoning_levels")
-        .and_then(Value::as_array)?
-        .iter()
-        .filter_map(|level| {
-            level
-                .as_str()
-                .or_else(|| level.get("effort").and_then(Value::as_str))
-                .map(str::trim)
-                .map(ToString::to_string)
-        })
-        .filter(|level| !level.is_empty())
-        .filter(|level| VALID_CODEX_EFFORTS.contains(&level.as_str()))
-        .collect();
-    if levels.is_empty() {
-        return None;
-    }
+    let mut levels = strict_official_levels(entry)?;
     // 官方目录里的 ultra 同样是 Codex 产品层的编排语义：请求边界仍会变成
     // max。因此将其从 Provider 原生档位剥离，避免下游把 ultra 透传给 API。
     let codex_ultra_enabled = levels.iter().any(|level| level == "ultra");
     levels.retain(|level| level != "ultra");
-    let default_effort = entry
-        .get("default_reasoning_level")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|level| !level.is_empty())
-        .map(ToString::to_string)
-        .and_then(|default_effort| {
-            if default_effort == "ultra" {
-                Some("max".to_string())
-            } else {
-                levels.contains(&default_effort).then_some(default_effort)
-            }
-        });
+    let default_effort = strict_official_default(entry)?.and_then(|default_effort| {
+        if default_effort == "ultra" {
+            Some("max".to_string())
+        } else {
+            levels.contains(&default_effort).then_some(default_effort)
+        }
+    });
     let mut effort_map = levels
         .iter()
         .map(|level| (level.clone(), level.clone()))
@@ -1363,6 +1685,102 @@ mod tests {
     }
 
     #[test]
+    fn rejects_unknown_upstream_wire_contract_values() {
+        let mut capability = deepseek_capability();
+        capability.upstream.format = "server-command".to_string();
+        assert_eq!(
+            capability.validate(),
+            Err("upstream format is not supported".to_string())
+        );
+        let mut capability = deepseek_capability();
+        capability.upstream.parameter = "api_key".to_string();
+        assert_eq!(
+            capability.validate(),
+            Err("upstream parameter is not supported".to_string())
+        );
+    }
+
+    #[test]
+    fn rejects_noncanonical_upstream_wire_case_before_runtime_comparison() {
+        let mut capability = deepseek_capability();
+        capability.upstream.format = "STRING".to_string();
+        assert_eq!(
+            capability.validate(),
+            Err("upstream format is not supported".to_string())
+        );
+
+        let mut capability = deepseek_capability();
+        capability.upstream.parameter = "REASONING_EFFORT".to_string();
+        assert_eq!(
+            capability.validate(),
+            Err("upstream parameter is not supported".to_string())
+        );
+    }
+
+    #[test]
+    fn read_normalization_canonicalizes_legacy_wire_case_before_resolution() {
+        let mut capability = deepseek_capability();
+        capability.upstream.format = "STRING".to_string();
+        capability.upstream.parameter = "REASONING_EFFORT".to_string();
+        let capability = capability.complete_identity_effort_map_for_read();
+        assert_eq!(capability.upstream.format, "string");
+        assert_eq!(capability.upstream.parameter, "reasoning_effort");
+        assert!(capability.validate().is_ok());
+    }
+
+    #[test]
+    fn parser_normalizes_mixed_case_upstream_wire_metadata() {
+        let canonical_entry = json!({
+            "model": "canonical-mixed-case-model",
+            "reasoning": {
+                "schemaVersion": 2,
+                "supportStatus": "confirmed_supported",
+                "controlKind": "graded",
+                "supportedEfforts": ["low", "high"],
+                "defaultEffort": "high",
+                "disableAllowed": false,
+                "upstream": {
+                    "format": "STRING",
+                    "parameter": "REASONING_EFFORT",
+                    "effortMap": {"low": "low", "high": "high"}
+                }
+            }
+        });
+        let capability = reasoning_capability_from_model_entry(&canonical_entry)
+            .expect("mixed-case canonical declaration should normalize");
+        assert_eq!(capability.upstream.format, "string");
+        assert_eq!(capability.upstream.parameter, "reasoning_effort");
+        assert!(capability.validate().is_ok());
+
+        let entry = json!({
+            "model": "mixed-case-model",
+            "reasoning": {
+                "supportedEfforts": ["low", "high"],
+                "defaultEffort": "high",
+                "reasoningFormat": "STRING",
+                "reasoningParameter": "REASONING_EFFORT"
+            }
+        });
+        let capability = reasoning_capability_from_model_entry(&entry)
+            .expect("mixed-case compact declaration should normalize");
+        assert_eq!(capability.upstream.format, "string");
+        assert_eq!(capability.upstream.parameter, "reasoning_effort");
+        assert!(capability.validate().is_ok());
+
+        let provider_entry = json!({
+            "id": "provider-model",
+            "supported_reasoning_levels": ["low", "high"],
+            "reasoning_format": "STRING",
+            "reasoning_parameter": "REASONING_EFFORT"
+        });
+        let capability = reasoning_capability_from_provider_model_entry(&provider_entry)
+            .expect("mixed-case provider declaration should normalize");
+        assert_eq!(capability.upstream.format, "string");
+        assert_eq!(capability.upstream.parameter, "reasoning_effort");
+        assert!(capability.validate().is_ok());
+    }
+
+    #[test]
     fn rejects_incomplete_graded_effort_mapping() {
         let mut capability = deepseek_capability();
         capability.upstream.effort_map.remove("low");
@@ -1402,6 +1820,266 @@ mod tests {
             Some("max".to_string())
         );
         assert!(resolve_reasoning_capability_from_settings(&settings, "glm-5.2").is_some());
+    }
+
+    #[test]
+    fn catalog_reasoning_selects_exact_row_before_exclusion_or_parsing() {
+        let sibling = json!({
+            "model": "sibling", "upstreamModel": "exact",
+            "reasoning": {
+                "supported": true, "supportedEfforts": ["low", "high"],
+                "defaultEffort": "high", "disableAllowed": false,
+                "upstream": {"format": "string", "parameter": "reasoning_effort"}
+            }
+        });
+        for exact in [
+            json!({"model": "exact", "enabled": false, "reasoning": sibling["reasoning"]}),
+            json!({"model": "exact"}),
+            json!({"model": "exact", "reasoning": {"supportedEfforts": ["invalid"]}}),
+        ] {
+            for rows in [
+                vec![sibling.clone(), exact.clone()],
+                vec![exact.clone(), sibling.clone()],
+            ] {
+                let settings = json!({"modelCatalog": {"models": rows}});
+                assert!(resolve_reasoning_capability_from_settings(&settings, "exact").is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn catalog_reasoning_rejects_ambiguous_upstream_and_alias_matches() {
+        for identity in [
+            json!({"upstreamModel": "shared"}),
+            json!({"aliases": ["shared"]}),
+            json!({"alias": {"shared": "wire"}}),
+        ] {
+            let mut first = identity.clone();
+            first["model"] = json!("first");
+            first["reasoning"] = json!({
+                "supported": true, "supportedEfforts": ["high", "max"],
+                "defaultEffort": "max", "disableAllowed": false,
+                "upstream": {"format": "string", "parameter": "reasoning_effort"}
+            });
+            let mut second = identity;
+            second["model"] = json!("second");
+            for rows in [
+                vec![first.clone(), second.clone()],
+                vec![second.clone(), first.clone()],
+            ] {
+                let settings = json!({"modelCatalog": {"models": rows}});
+                assert!(resolve_reasoning_capability_from_settings(&settings, "shared").is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn catalog_reasoning_uses_legacy_only_when_canonical_is_unusable() {
+        let entry = json!({
+            "model": "catalog-model",
+            "reasoning": {
+                "supported": true, "supportedEfforts": ["low", "max"],
+                "defaultEffort": "max", "disableAllowed": false,
+                "upstream": {"format": "string", "parameter": "reasoning_effort"}
+            }
+        });
+        let mut settings = json!({"model_catalog": {"models": [entry]}});
+        assert!(resolve_reasoning_capability_from_settings(&settings, "catalog-model").is_some());
+        settings["modelCatalog"] = json!({"models": []});
+        assert!(resolve_reasoning_capability_from_settings(&settings, "catalog-model").is_none());
+        settings["modelCatalog"] = json!({"models": null});
+        assert!(resolve_reasoning_capability_from_settings(&settings, "catalog-model").is_some());
+    }
+
+    #[test]
+    fn catalog_reasoning_does_not_resolve_excluded_rows_or_their_aliases() {
+        let settings = json!({"modelCatalog": {"models": [{
+            "model": "excluded-model", "upstreamModel": "upstream-model",
+            "aliases": ["alias-model"], "enabled": false,
+            "reasoning": {
+                "supported": true, "supportedEfforts": ["low", "max"],
+                "defaultEffort": "max", "disableAllowed": false,
+                "upstream": {"format": "string", "parameter": "reasoning_effort"}
+            }
+        }]}});
+        for model in ["excluded-model", "upstream-model", "alias-model"] {
+            assert!(
+                resolve_reasoning_capability_from_settings(&settings, model).is_none(),
+                "{model} must not resolve from an excluded catalog row"
+            );
+        }
+    }
+
+    #[test]
+    fn catalog_reasoning_resolves_canonical_identity_and_declared_aliases() {
+        for aliases in [
+            json!(["alias-model"]),
+            json!({"alias-model": "public-model"}),
+        ] {
+            let settings = json!({"modelCatalog": {"models": [{
+                "model": "public-model", "canonicalSlug": "canonical-model",
+                "aliases": aliases,
+                "reasoning": {
+                    "supported": true, "supportedEfforts": ["low", "max"],
+                    "defaultEffort": "max", "disableAllowed": false,
+                    "upstream": {"format": "string", "parameter": "reasoning_effort"}
+                }
+            }]}});
+            for model in ["public-model", "canonical-model", "alias-model"] {
+                assert!(
+                    resolve_reasoning_capability_from_settings(&settings, model).is_some(),
+                    "{model} must resolve from the same canonical row"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn provider_model_reasoning_accepts_camel_case_levels_and_default() {
+        let entry = json!({
+            "id": "provider-model",
+            "supportedReasoningLevels": [
+                {"reasoningEffort": "low"}, {"effort": "high"}, "max"
+            ],
+            "defaultReasoningLevel": "max"
+        });
+        let capability = reasoning_capability_from_provider_model_entry(&entry)
+            .expect("camel-case provider reasoning");
+        assert_eq!(capability.supported_efforts, vec!["low", "high", "max"]);
+        assert_eq!(capability.default_effort.as_deref(), Some("max"));
+    }
+
+    #[test]
+    fn catalog_reasoning_accepts_compact_supported_efforts_declaration() {
+        let settings = json!({"modelCatalog":{"models":[{
+            "model": "compact-model",
+            "reasoning": {
+                "supportedEfforts": ["low", "high"],
+                "defaultEffort": "low"
+            }
+        }]}});
+        let capability = resolve_reasoning_capability_from_settings(&settings, "compact-model")
+            .expect("compact catalog declaration");
+        assert_eq!(capability.supported_efforts, vec!["low", "high"]);
+        assert_eq!(capability.default_effort.as_deref(), Some("low"));
+        assert_eq!(capability.upstream.format, "string");
+        assert_eq!(capability.upstream.parameter, "reasoning_effort");
+    }
+
+    #[test]
+    fn compact_empty_efforts_remain_authoritative_without_library_fallback() {
+        let settings = json!({"modelCatalog":{"models":[{
+            "model": "compact-no-levels",
+            "reasoning": {"supportedEfforts": []}
+        }]}});
+        let capability = resolve_reasoning_capability_from_settings(&settings, "compact-no-levels")
+            .expect("explicit empty compact declaration");
+        assert!(capability.supported_efforts.is_empty());
+        assert_eq!(
+            capability.effective_control_kind(),
+            ReasoningControlKind::None
+        );
+    }
+
+    #[test]
+    fn compact_reasoning_does_not_rescue_malformed_canonical_declaration() {
+        let settings = json!({"modelCatalog":{"models":[{
+            "model": "broken-model",
+            "reasoning": {
+                "supportStatus": "confirmed_supported",
+                "supportedEfforts": ["low"],
+                "defaultEffort": "high"
+            }
+        }]}});
+        assert!(
+            resolve_reasoning_capability_from_settings(&settings, "broken-model").is_none(),
+            "canonical markers must stay fail-closed when the full declaration is invalid"
+        );
+    }
+
+    #[test]
+    fn provider_model_reasoning_rejects_partial_or_conflicting_effort_metadata() {
+        for levels in [
+            json!(["low", 7, "max"]),
+            json!(["low", "", "max"]),
+            json!(["low", {"description": "missing effort"}, "max"]),
+            json!([{"effort": "low", "reasoningEffort": "max"}]),
+        ] {
+            let entry = json!({"supported_reasoning_levels": levels});
+            assert!(
+                reasoning_capability_from_provider_model_entry(&entry).is_none(),
+                "malformed entries must reject the whole declared effort list"
+            );
+        }
+        let conflict = json!({
+            "supported_reasoning_levels": ["low"],
+            "supportedReasoningLevels": ["max"]
+        });
+        assert!(reasoning_capability_from_provider_model_entry(&conflict).is_none());
+        let conflict = json!({
+            "supported_reasoning_levels": ["low", "max"],
+            "default_reasoning_level": "low",
+            "defaultReasoningLevel": "max"
+        });
+        assert!(reasoning_capability_from_provider_model_entry(&conflict).is_none());
+        let malformed_default = json!({
+            "supported_reasoning_levels": ["low", "max"],
+            "default_reasoning_level": 7
+        });
+        assert!(reasoning_capability_from_provider_model_entry(&malformed_default).is_none());
+    }
+
+    #[test]
+    fn provider_model_reasoning_does_not_hide_invalid_canonical_declaration() {
+        let entry = json!({
+            "reasoning": {
+                "supported": true, "supportedEfforts": ["low"],
+                "defaultEffort": "max", "disableAllowed": false,
+                "upstream": {"format": "string", "parameter": "reasoning_effort"}
+            },
+            "supported_reasoning_levels": ["low", "max"]
+        });
+        assert!(reasoning_capability_from_provider_model_entry(&entry).is_none());
+    }
+
+    #[test]
+    fn official_reasoning_accepts_model_id_aliases_and_camel_case_levels() {
+        let official = vec![json!({
+            "id": "official-model", "canonicalSlug": "official-canonical",
+            "aliases": ["official-alias"],
+            "supportedReasoningLevels": ["low", {"reasoningEffort": "max"}, "ultra"],
+            "defaultReasoningLevel": "ultra"
+        })];
+        for model in ["official-model", "official-canonical", "official-alias"] {
+            let capability = official_reasoning_capability_for_model(model, &official)
+                .expect("all declared identities resolve");
+            assert_eq!(capability.supported_efforts, vec!["low", "max"]);
+            assert_eq!(capability.default_effort.as_deref(), Some("max"));
+            assert!(capability
+                .codex_ultra_orchestration
+                .is_some_and(|ultra| ultra.enabled));
+            assert!(!capability.upstream.effort_map.contains_key("ultra"));
+        }
+    }
+
+    #[test]
+    fn official_reasoning_rejects_partial_or_conflicting_effort_metadata() {
+        for levels in [
+            json!(["low", 7, "max"]),
+            json!(["low", "unknown-effort", "max"]),
+            json!(["low", "", "max"]),
+            json!([{"effort": "low", "reasoningEffort": "max"}]),
+        ] {
+            let official = vec![json!({
+                "slug": "official-model", "supported_reasoning_levels": levels
+            })];
+            assert!(official_reasoning_capability_for_model("official-model", &official).is_none());
+        }
+        let official = vec![json!({
+            "slug": "official-model", "supported_reasoning_levels": ["low"],
+            "supportedReasoningLevels": ["max"]
+        })];
+        assert!(official_reasoning_capability_for_model("official-model", &official).is_none());
     }
 
     #[test]

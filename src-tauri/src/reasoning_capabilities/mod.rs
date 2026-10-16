@@ -238,20 +238,12 @@ fn apply_catalog_ultra_setting(
     model: &str,
     capability: CodexModelReasoningCapability,
 ) -> CodexModelReasoningCapability {
-    let setting = settings
-        .get("modelCatalog")
-        .and_then(|catalog| catalog.get("models"))
-        .and_then(Value::as_array)
-        .and_then(|models| {
-            models.iter().find(|entry| {
-                ["model", "id", "slug", "upstreamModel", "upstream_model"]
-                    .into_iter()
-                    .filter_map(|field| entry.get(field).and_then(Value::as_str))
-                    .any(|candidate| candidate.trim().eq_ignore_ascii_case(model.trim()))
-            })
-        })
-        .and_then(|entry| entry.get("codexUltra"))
-        .and_then(Value::as_object);
+    let crate::codex_multirouter::catalog::CatalogModelLookup::Found(entry) =
+        crate::codex_multirouter::catalog::lookup_catalog_model(settings, model)
+    else {
+        return capability;
+    };
+    let setting = entry.get("codexUltra").and_then(Value::as_object);
     let Some(setting) = setting else {
         return capability;
     };
@@ -341,6 +333,25 @@ pub fn resolve_codex_model_capability_core(
     library: Option<&catalog::CapabilityLibrary>,
     official_models: &[Value],
 ) -> ResolvedModelCapability {
+    // Catalog row selection precedes exclusion or capability parsing, so an
+    // exact public model is never replaced by a sibling's upstream alias.
+    // An excluded or ambiguous identity cannot be revived by lower sources.
+    let catalog_model = crate::codex_multirouter::catalog::lookup_catalog_model(settings, model);
+    if matches!(
+        catalog_model,
+        crate::codex_multirouter::catalog::CatalogModelLookup::Ambiguous
+    ) || matches!(
+        catalog_model,
+        crate::codex_multirouter::catalog::CatalogModelLookup::Found(entry)
+            if entry.get("enabled").and_then(Value::as_bool) == Some(false)
+    ) {
+        return ResolvedModelCapability {
+            capability: None,
+            source: CapabilitySource::Unknown,
+            fingerprint: String::new(),
+        };
+    }
+
     // 1. 用户模型级声明（始终最高优先级）
     if let Some(capability) = resolve_reasoning_capability_from_settings(settings, model) {
         return resolved_with_catalog_ultra_setting(
@@ -421,26 +432,32 @@ fn resolve_reasoning_capability_from_provider_config(
 ) -> Option<CodexModelReasoningCapability> {
     let config_text = settings.get("config").and_then(Value::as_str)?;
     let config = toml::from_str::<toml::Value>(config_text).ok()?;
+    let active_provider = config
+        .get("model_provider")
+        .and_then(toml::Value::as_str)
+        .map(str::trim)
+        .filter(|provider| !provider.is_empty());
     let providers = config.get("model_providers")?.as_table()?;
-
-    for provider in providers.values() {
-        let Some(models) = provider.get("models").and_then(toml::Value::as_array) else {
+    // Inline metadata is authoritative only for the explicitly selected
+    // provider. A sole table is not an active-provider declaration: drafts
+    // and stale configs can retain an unselected table, so guessing here
+    // reintroduces capabilities that Codex will not actually use.
+    let provider_id = active_provider?;
+    let provider = providers.get(provider_id)?;
+    let models = provider.get("models").and_then(toml::Value::as_array)?;
+    for model_entry in models {
+        let Ok(model_json) = serde_json::to_value(model_entry) else {
             continue;
         };
-        for model_entry in models {
-            let Ok(model_json) = serde_json::to_value(model_entry) else {
-                continue;
-            };
-            let matches_model = ["model", "id", "slug", "upstreamModel", "upstream_model"]
-                .into_iter()
-                .filter_map(|field| model_json.get(field).and_then(Value::as_str))
-                .any(|candidate| candidate.trim().eq_ignore_ascii_case(model.trim()));
-            if !matches_model {
-                continue;
-            }
-            if let Some(capability) = reasoning_capability_from_provider_model_entry(&model_json) {
-                return Some(capability);
-            }
+        let matches_model = ["model", "id", "slug", "upstreamModel", "upstream_model"]
+            .into_iter()
+            .filter_map(|field| model_json.get(field).and_then(Value::as_str))
+            .any(|candidate| candidate.trim().eq_ignore_ascii_case(model.trim()));
+        if !matches_model {
+            continue;
+        }
+        if let Some(capability) = reasoning_capability_from_provider_model_entry(&model_json) {
+            return Some(capability);
         }
     }
     None
@@ -460,8 +477,28 @@ pub fn snapshot_to_capability(
         .map(|effort| effort.trim().to_ascii_lowercase())
         .filter(|effort| !effort.is_empty())
         .collect();
+    let codex_ultra_enabled = efforts.iter().any(|effort| effort == "ultra");
+    if codex_ultra_enabled && !efforts.iter().any(|effort| effort == "max") {
+        return None;
+    }
+    let efforts = efforts
+        .into_iter()
+        .filter(|effort| effort != "ultra")
+        .collect::<Vec<_>>();
+    let default_effort = reasoning
+        .default_effort
+        .as_deref()
+        .map(str::trim)
+        .map(str::to_ascii_lowercase);
+    let default_effort = default_effort.map(|effort| {
+        if effort == "ultra" {
+            "max".to_string()
+        } else {
+            effort
+        }
+    });
 
-    let disable_allowed = efforts.iter().any(|effort| effort == "none");
+    let disable_allowed = !reasoning.mandatory || efforts.iter().any(|effort| effort == "none");
     let graded_efforts: Vec<String> = efforts
         .iter()
         .filter(|effort| **effort != "none")
@@ -480,8 +517,12 @@ pub fn snapshot_to_capability(
         ReasoningControlKind::None
     };
 
+    // `none` is a Codex control sentinel, not an OpenRouter/provider effort.
+    // Preserve it only when the provider explicitly advertised it; do not add
+    // it merely because reasoning can be disabled, otherwise library and
+    // detected capabilities get different fingerprints for the same contract.
     let mut supported_efforts = graded_efforts.clone();
-    if disable_allowed {
+    if efforts.iter().any(|effort| effort == "none") {
         supported_efforts.insert(0, "none".to_string());
     }
 
@@ -491,7 +532,7 @@ pub fn snapshot_to_capability(
         control_kind: Some(control_kind),
         supported: None,
         supported_efforts,
-        default_effort: reasoning.default_effort.clone(),
+        default_effort,
         disable_allowed,
         upstream: CodexModelReasoningUpstream {
             format: reasoning
@@ -513,7 +554,11 @@ pub fn snapshot_to_capability(
         fetched_at: Some(snapshot.fetched_at.to_string()),
         provider_key: Some(snapshot.provider_key.clone()),
         model_revision: None,
-        codex_ultra_orchestration: None,
+        codex_ultra_orchestration: codex_ultra_enabled.then_some(
+            crate::proxy::providers::codex_reasoning::CodexUltraOrchestrationCapability {
+                enabled: true,
+            },
+        ),
     };
 
     capability.validate().ok().map(|_| capability)
@@ -609,7 +654,7 @@ mod tests {
                         "controlKind": "graded",
                         "supportedEfforts": ["max", "high", "low"],
                         "defaultEffort": "high",
-                        "disableAllowed": false,
+                        "disableAllowed": true,
                         "upstream": {"format": "object", "parameter": "reasoning.effort"},
                         "outputFormat": "auto",
                         "source": "library"
@@ -728,8 +773,14 @@ mod tests {
 
     #[test]
     fn invalid_detection_snapshot_falls_through_to_library() {
-        // default_effort 不在 supported_efforts 内 → 快照非法 → 落到库。
+        // ultra 没有可用的 max path → 快照非法 → 落到库。
         let mut detection = openrouter_detection_snapshot();
+        detection
+            .reasoning
+            .as_mut()
+            .unwrap()
+            .supported_efforts
+            .retain(|effort| effort != "max");
         detection.reasoning.as_mut().unwrap().default_effort = Some("ultra".into());
         let provider = plain_provider("OpenRouter", "https://openrouter.ai/api/v1");
         let library = library_with_openrouter_deepseek();
@@ -751,6 +802,28 @@ mod tests {
         assert!(capability.disable_allowed);
         assert_eq!(capability.supported_efforts, vec!["none", "high"]);
         assert_eq!(capability.control_kind, Some(ReasoningControlKind::Graded));
+    }
+
+    #[test]
+    fn snapshot_to_capability_normalizes_ultra_only_with_a_max_path() {
+        let mut snapshot = openrouter_detection_snapshot();
+        snapshot.reasoning.as_mut().unwrap().supported_efforts =
+            vec!["low".into(), "max".into(), "ultra".into()];
+        snapshot.reasoning.as_mut().unwrap().default_effort = Some("ultra".into());
+        let capability = snapshot_to_capability(&snapshot).expect("valid Ultra snapshot");
+        assert_eq!(capability.supported_efforts, vec!["low", "max"]);
+        assert_eq!(capability.default_effort.as_deref(), Some("max"));
+        assert!(capability
+            .codex_ultra_orchestration
+            .as_ref()
+            .is_some_and(|ultra| ultra.enabled));
+        assert!(!capability.upstream.effort_map.contains_key("ultra"));
+
+        snapshot.reasoning.as_mut().unwrap().supported_efforts = vec!["ultra".into()];
+        assert!(
+            snapshot_to_capability(&snapshot).is_none(),
+            "Ultra without max must not become a guessed provider capability"
+        );
     }
 
     #[test]
@@ -917,5 +990,244 @@ mod tests {
             resolve_codex_model_capability_core(&settings, None, "gpt-5.4", None, None, &[]);
         assert_eq!(resolved.source, CapabilitySource::Unknown);
         assert!(resolved.capability.is_none());
+    }
+
+    #[test]
+    fn resolver_reads_only_the_active_inline_provider() {
+        let settings = json!({
+            "config": r#"
+model_provider = "active"
+[[model_providers.inactive.models]]
+id = "inline-model"
+supported_reasoning_levels = ["low"]
+[[model_providers.active.models]]
+id = "inline-model"
+supportedReasoningLevels = ["high", "max"]
+defaultReasoningLevel = "max"
+"#
+        });
+        let resolved =
+            resolve_codex_model_capability_core(&settings, None, "inline-model", None, None, &[]);
+        assert_eq!(resolved.source, CapabilitySource::ProviderConfig);
+        assert_eq!(
+            resolved
+                .capability
+                .expect("active capability")
+                .supported_efforts,
+            vec!["high", "max"]
+        );
+    }
+
+    #[test]
+    fn resolver_does_not_guess_an_active_inline_provider() {
+        for config in [
+            r#"
+[[model_providers.inactive.models]]
+id = "inline-model"
+supported_reasoning_levels = ["max"]
+"#,
+            r#"
+model_provider = "missing"
+[[model_providers.inactive.models]]
+id = "inline-model"
+supported_reasoning_levels = ["max"]
+"#,
+        ] {
+            let resolved = resolve_codex_model_capability_core(
+                &json!({"config": config}),
+                None,
+                "inline-model",
+                None,
+                None,
+                &[],
+            );
+            assert_eq!(resolved.source, CapabilitySource::Unknown);
+            assert!(resolved.capability.is_none());
+        }
+    }
+
+    #[test]
+    fn excluded_catalog_rows_cannot_reappear_from_lower_priority_sources() {
+        let settings = json!({
+            "modelCatalog": {"models": [{
+                "model": "public-model", "upstreamModel": "gpt-5.4",
+                "canonicalSlug": "canonical-model",
+                "aliases": ["alias-model"], "enabled": false,
+                "reasoning": user_declared_reasoning(),
+                "codexUltra": {"enabled": true, "providerEffort": "high"}
+            }]}
+        });
+        for model in ["public-model", "gpt-5.4", "canonical-model", "alias-model"] {
+            let resolved = resolve_codex_model_capability_core(
+                &settings,
+                None,
+                model,
+                Some(&openrouter_detection_snapshot()),
+                Some(&library_with_openrouter_deepseek()),
+                &official_models_fixture(),
+            );
+            assert_eq!(resolved.source, CapabilitySource::Unknown);
+            assert!(resolved.capability.is_none());
+        }
+    }
+
+    #[test]
+    fn ultra_overlay_follows_catalog_authority_and_identity_aliases() {
+        let entry = json!({
+            "model": "public-model", "aliases": ["gpt-5.4"],
+            "codexUltra": {"enabled": true, "providerEffort": "high"}
+        });
+        let mut settings = json!({"model_catalog": {"models": [entry]}});
+        let official = official_models_fixture();
+        let resolved =
+            resolve_codex_model_capability_core(&settings, None, "gpt-5.4", None, None, &official);
+        assert!(resolved
+            .capability
+            .expect("official capability with legacy overlay")
+            .codex_ultra_orchestration
+            .is_some_and(|ultra| ultra.enabled));
+        settings["modelCatalog"] = json!({"models": []});
+        let resolved =
+            resolve_codex_model_capability_core(&settings, None, "gpt-5.4", None, None, &official);
+        assert!(resolved
+            .capability
+            .expect("official capability without stale legacy overlay")
+            .codex_ultra_orchestration
+            .is_none());
+    }
+
+    #[test]
+    fn catalog_identity_exact_enabled_row_beats_disabled_upstream_sibling() {
+        for identity_field in ["model", "id"] {
+            let disabled = json!({
+                "model": "old", "upstreamModel": "wire", "aliases": ["excluded-alias"],
+                "enabled": false, "reasoning": user_declared_reasoning()
+            });
+            let mut exact = json!({
+                "enabled": true, "reasoning": user_declared_reasoning()
+            });
+            exact[identity_field] = json!("wire");
+            for rows in [
+                vec![disabled.clone(), exact.clone()],
+                vec![exact.clone(), disabled.clone()],
+            ] {
+                let settings = json!({"modelCatalog": {"models": rows}});
+                let resolved = resolve_codex_model_capability_core(
+                    &settings, None, "wire", None, None, &[],
+                );
+                assert_eq!(resolved.source, CapabilitySource::UserConfig);
+                assert_eq!(
+                    resolved.capability.expect("exact enabled row").supported_efforts,
+                    vec!["low", "high"]
+                );
+                for excluded in ["old", "excluded-alias"] {
+                    let resolved = resolve_codex_model_capability_core(
+                        &settings,
+                        None,
+                        excluded,
+                        Some(&openrouter_detection_snapshot()),
+                        None,
+                        &[],
+                    );
+                    assert_eq!(resolved.source, CapabilitySource::Unknown);
+                    assert!(resolved.capability.is_none());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn catalog_identity_exact_row_owns_reasoning_and_ultra() {
+        for exact_ultra in [true, false] {
+            let sibling = json!({
+                "model": "old", "upstreamModel": "wire",
+                "reasoning": user_declared_reasoning(),
+                "codexUltra": {"enabled": !exact_ultra, "providerEffort": "high"}
+            });
+            let mut exact_reasoning = user_declared_reasoning();
+            exact_reasoning["supportedEfforts"] = json!(["medium", "max"]);
+            exact_reasoning["defaultEffort"] = json!("medium");
+            let exact = json!({
+                "model": "wire", "reasoning": exact_reasoning,
+                "codexUltra": {"enabled": exact_ultra, "providerEffort": "max"}
+            });
+            for rows in [
+                vec![sibling.clone(), exact.clone()],
+                vec![exact.clone(), sibling.clone()],
+            ] {
+                let settings = json!({"modelCatalog": {"models": rows}});
+                let capability = resolve_codex_model_capability_core(
+                    &settings, None, "wire", None, None, &[],
+                )
+                .capability
+                .expect("exact row capability");
+                assert_eq!(capability.supported_efforts, vec!["medium", "max"]);
+                assert_eq!(capability.default_effort.as_deref(), Some("medium"));
+                assert_eq!(
+                    capability
+                        .codex_ultra_orchestration
+                        .is_some_and(|ultra| ultra.enabled),
+                    exact_ultra
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn catalog_identity_exact_row_owns_ultra_when_capability_comes_from_official() {
+        for exact_ultra in [true, false] {
+            let settings = json!({"modelCatalog": {"models": [
+                {
+                    "model": "old", "upstreamModel": "gpt-5.4",
+                    "codexUltra": {"enabled": !exact_ultra, "providerEffort": "high"}
+                },
+                {
+                    "model": "gpt-5.4",
+                    "codexUltra": {"enabled": exact_ultra, "providerEffort": "max"}
+                }
+            ]}});
+            let capability = resolve_codex_model_capability_core(
+                &settings, None, "gpt-5.4", None, None, &official_models_fixture(),
+            )
+            .capability
+            .expect("official capability for exact catalog row");
+            assert_eq!(
+                capability
+                    .codex_ultra_orchestration
+                    .is_some_and(|ultra| ultra.enabled),
+                exact_ultra
+            );
+        }
+    }
+
+    #[test]
+    fn catalog_identity_ambiguous_fallback_cannot_choose_a_sibling() {
+        for identity in [
+            json!({"upstreamModel": "shared"}),
+            json!({"aliases": ["shared"]}),
+            json!({"alias": {"shared": "wire"}}),
+        ] {
+            let mut first = json!({
+                "model": "first", "reasoning": user_declared_reasoning(),
+                "codexUltra": {"enabled": true, "providerEffort": "high"}
+            });
+            first
+                .as_object_mut()
+                .expect("first row")
+                .extend(identity.as_object().expect("identity").clone());
+            let mut second = first.clone();
+            second["model"] = json!("second");
+            let settings = json!({"modelCatalog": {"models": [first, second]}});
+            let resolved = resolve_codex_model_capability_core(
+                &settings,
+                None,
+                "shared",
+                Some(&openrouter_detection_snapshot()),
+                None,
+                &[],
+            );
+            assert_eq!(resolved.source, CapabilitySource::Unknown);
+            assert!(resolved.capability.is_none());
+        }
     }
 }

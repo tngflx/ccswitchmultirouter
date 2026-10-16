@@ -115,29 +115,58 @@ fn top_level_signatures(body: &str) -> Vec<(String, String, usize)> {
         .collect()
 }
 
-fn section_literals(body: &str, start_line: usize, end_line: usize, indent: usize) -> Vec<String> {
-    let prefix = format!("{}- `type: ", " ".repeat(indent));
+fn section_literals(
+    body: &str,
+    start_line: usize,
+    end_line: usize,
+    indent: usize,
+    expand_enums: bool,
+) -> Vec<String> {
     let mut values = Vec::new();
+    let mut expanding_type = false;
     for line in body
         .lines()
         .skip(start_line)
         .take(end_line.saturating_sub(start_line))
     {
-        let Some(rest) = line.strip_prefix(&prefix) else {
+        let content = line.trim_start_matches(' ');
+        let depth = line.len() - content.len();
+        let Some(rest) = content.strip_prefix("- `") else {
             continue;
         };
         let Some(end) = rest.find('`') else {
             continue;
         };
         let declaration = &rest[..end];
-        let mut remaining = declaration;
-        while let Some(start) = remaining.find('"') {
-            let after_start = &remaining[start + 1..];
-            let Some(end) = after_start.find('"') else {
-                break;
-            };
-            values.push(after_start[..end].to_string());
-            remaining = &after_start[end + 1..];
+        if depth <= indent {
+            expanding_type = false;
+        }
+        if depth == indent && declaration.starts_with("type: ") {
+            let mut remaining = declaration;
+            while let Some(start) = remaining.find('"') {
+                let after_start = &remaining[start + 1..];
+                let Some(end) = after_start.find('"') else {
+                    break;
+                };
+                values.push(after_start[..end].to_string());
+                remaining = &after_start[end + 1..];
+            }
+            expanding_type = expand_enums
+                && declaration
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .windows(3)
+                    .any(|words| {
+                        words[0] == "or" && words[1].parse::<usize>().is_ok() && words[2] == "more"
+                    });
+        } else if expanding_type && depth == indent + 2 {
+            if let Some(literal) = declaration
+                .strip_prefix('"')
+                .and_then(|value| value.strip_suffix('"'))
+                .filter(|value| !value.is_empty() && !value.contains('"'))
+            {
+                values.push(literal.to_string());
+            }
         }
     }
     values.sort();
@@ -146,6 +175,7 @@ fn section_literals(body: &str, start_line: usize, end_line: usize, indent: usiz
 }
 
 fn extract_contract(markdown: &str) -> Result<Value, String> {
+    let markdown = markdown.replace("\r\n", "\n");
     let body = markdown
         .split("### Body Parameters\n")
         .nth(1)
@@ -177,15 +207,23 @@ fn extract_contract(markdown: &str) -> Result<Value, String> {
         .ok_or_else(|| "Official reference input section is missing".to_string())?;
     let (tools_start, tools_end) =
         section("tools").ok_or_else(|| "Official reference tool section is missing".to_string())?;
+    let (choice_start, choice_end) = section("tool_choice")
+        .ok_or_else(|| "Official reference tool choice section is missing".to_string())?;
+    let tool_choice_types = section_literals(body, choice_start, choice_end, 4, true);
+    if tool_choice_types.is_empty() {
+        return Err("Official reference tool choice extraction is incomplete".to_string());
+    }
 
     let declarations = body
         .lines()
         .filter_map(|line| {
-            let dash = line.find("- `")?;
-            let declaration = line[dash + 3..].split('`').next()?;
+            let content = line.trim_start_matches(' ');
+            let depth = line.len() - content.len();
+            let rest = content.strip_prefix("- `")?;
+            let declaration = &rest[..rest.find('`')?];
             Some(format!(
                 "{}:{}",
-                dash,
+                depth,
                 declaration.split_whitespace().collect::<Vec<_>>().join(" ")
             ))
         })
@@ -196,9 +234,11 @@ fn extract_contract(markdown: &str) -> Result<Value, String> {
 
     Ok(json!({
         "declarations_sha256": declarations_sha256,
+        "declarations": declarations,
         "top_level_signatures": top_level_signatures_map,
-        "input_types": section_literals(body, input_start, input_end, 6),
-        "tool_types": section_literals(body, tools_start, tools_end, 4),
+        "input_types": section_literals(body, input_start, input_end, 6, false),
+        "tool_types": section_literals(body, tools_start, tools_end, 4, false),
+        "tool_choice_types": tool_choice_types,
     }))
 }
 
@@ -208,6 +248,7 @@ fn changed_sections(snapshot: &Value, current: &Value) -> Vec<String> {
         ("top_level_signatures", "top-level fields"),
         ("input_types", "input item types"),
         ("tool_types", "tool types"),
+        ("tool_choice_types", "tool choice types"),
     ]
     .into_iter()
     .filter(|(key, _)| snapshot.get(key) != current.get(key))
@@ -297,6 +338,44 @@ mod tests {
     }
 
     #[test]
+    fn reviewed_cli_snapshot_round_trips_through_rust_extraction() {
+        let snapshot = embedded_snapshot();
+        let declarations = snapshot["declarations"]
+            .as_array()
+            .expect("reviewed public declaration baseline");
+        let body = declarations
+            .iter()
+            .map(|value| {
+                let (indent, declaration) = value
+                    .as_str()
+                    .expect("public declaration")
+                    .split_once(':')
+                    .expect("declaration indentation");
+                format!(
+                    "{}- `{declaration}`",
+                    " ".repeat(indent.parse::<usize>().expect("indentation count"))
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let markdown = format!("### Body Parameters\n{body}\n### Returns");
+        let current = extract_contract(&markdown).expect("reviewed contract extraction");
+        for key in [
+            "declarations_sha256",
+            "declarations",
+            "top_level_signatures",
+            "input_types",
+            "tool_types",
+            "tool_choice_types",
+        ] {
+            assert_eq!(
+                current[key], snapshot[key],
+                "{key} differs between extractors"
+            );
+        }
+    }
+
+    #[test]
     fn extracts_reviewed_shape_from_reference_fixture() {
         let fixture = include_str!("../../../contracts/openai-responses.v1.json");
         let markdown = format!(
@@ -321,6 +400,8 @@ mod tests {
             "      - `input: string`",
             "      - `type: \"custom_tool_call\"`",
             "- `instructions: optional string`",
+            "- `tool_choice: optional object`",
+            "    - `type: \"allowed_tools\"`",
             "- `tools: optional array`",
             "    - `type: \"web_search\" or \"web_search_preview\"`",
             "- `top_logprobs: optional number`",
@@ -335,6 +416,75 @@ mod tests {
         assert_eq!(
             current["tool_types"],
             json!(["web_search", "web_search_preview"])
+        );
+    }
+
+    #[test]
+    fn retains_declarations_and_expands_only_tool_choice_type_enums() {
+        let fields = (0..20)
+            .map(|index| format!("- `field{index}: optional string`"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let markdown = [
+            "### Body Parameters",
+            fields.as_str(),
+            "- `input: optional string or array`",
+            "      - `type: \"item_reference\"`",
+            "- `tool_choice: optional ToolChoiceTypes or ToolChoiceFunction`",
+            "  - `ToolChoiceTypes object { type }`",
+            "    - `type: \"file_search\" or \"computer\" or 1 more`",
+            "      - `\"file_search\"`",
+            "      - `\"computer\"`",
+            "      - `\"computer_use\"`",
+            "    - `mode: \"auto\" or \"required\"`",
+            "      - `\"auto\"`",
+            "      - `\"required\"`",
+            "  - `ToolChoiceFunction object { name, type }`",
+            "    - `name: string`",
+            "    - `type: \"function\"`",
+            "- `tools: optional array`",
+            "    - `type: \"function\"`",
+            "    - `type: \"namespace\"`",
+            "### Returns",
+        ]
+        .join("\n");
+        let current = extract_contract(&markdown).expect("contract shape");
+        assert_eq!(
+            current["tool_choice_types"],
+            json!(["computer", "computer_use", "file_search", "function"])
+        );
+        let declarations = current["declarations"]
+            .as_array()
+            .expect("auditable public declarations");
+        assert!(declarations.contains(&json!("6:\"computer_use\"")));
+        let normalized = declarations
+            .iter()
+            .map(|declaration| declaration.as_str().expect("declaration string"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(
+            current["declarations_sha256"],
+            hex::encode(Sha256::digest(normalized))
+        );
+        assert_eq!(
+            extract_contract(&markdown.replace('\n', "\r\n")).expect("CRLF reference"),
+            current
+        );
+        assert!(extract_contract(&markdown.replace(
+            "- `tool_choice: optional ToolChoiceTypes or ToolChoiceFunction`",
+            "- `unrelated: optional object`"
+        ))
+        .is_err());
+    }
+
+    #[test]
+    fn reports_tool_choice_union_drift() {
+        assert_eq!(
+            changed_sections(
+                &json!({"tool_choice_types":["function"]}),
+                &json!({"tool_choice_types":["function","computer_use"]})
+            ),
+            vec!["tool choice types"]
         );
     }
 }

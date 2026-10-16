@@ -23,6 +23,10 @@ const CDP_CONNECT_TIMEOUT: Duration = Duration::from_secs(4);
 const CDP_COMMAND_TIMEOUT: Duration = Duration::from_secs(4);
 const MODEL_PICKER_PATCH_KEY: &str = "__ccSwitchCodexAppCompatibilityV9";
 const REMEMBERED_CODEX_DESKTOP_EXECUTABLE_FILENAME: &str = "codex-desktop-executable.json";
+pub(crate) const MANUAL_SUMMARY_REQUEST_MARKER: &str =
+    "[CCSwitch internal request: manual-summary-v1]";
+pub(crate) const MANUAL_SUMMARY_REQUEST_INSTRUCTION: &str =
+    "This is a manual coding-agent summary, not context compaction.";
 static CODEX_REQUEST_HEALTH_WARNINGS: OnceLock<Mutex<HashMap<String, CodexRequestHealthWarning>>> =
     OnceLock::new();
 static CODEX_REQUEST_HEALTH_WARNING_SYNC: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
@@ -92,12 +96,18 @@ fn spawn_codex_request_health_warning_sync() {
 
 async fn sync_codex_request_health_warnings() -> Result<usize, String> {
     let _sync_guard = codex_request_health_warning_sync_lock().lock().await;
+    let settings = crate::settings::get_settings();
+    let suppressed = CODEX_REQUEST_HEALTH_WARNINGS_SUPPRESSED.load(Ordering::Acquire)
+        || !crate::settings::request_health_windows_notifications_active(&settings.request_health);
     let mut warnings = codex_request_health_warnings()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .values()
         .cloned()
         .collect::<Vec<_>>();
+    if suppressed {
+        warnings.clear();
+    }
     warnings.sort_by(|left, right| left.token.cmp(&right.token));
     let warnings_json = serde_json::to_string(&warnings)
         .map_err(|error| format!("Failed to serialize Codex Request Health warnings: {error}"))?;
@@ -105,7 +115,7 @@ async fn sync_codex_request_health_warnings() -> Result<usize, String> {
         r#"(() => {{
           const state = window[{patch_key:?}];
           if (!state || typeof state.syncRequestHealthWarnings !== "function") return false;
-          state.syncRequestHealthWarnings({warnings_json});
+          state.syncRequestHealthWarnings({warnings_json}, {suppressed});
           return true;
         }})()"#,
         patch_key = MODEL_PICKER_PATCH_KEY,
@@ -174,6 +184,7 @@ pub(crate) struct CodexAppCompatibilityEvidence {
 pub(crate) struct CodexModelCatalogProjection {
     default_model: Option<String>,
     model_provider: Option<String>,
+    catalog_available: bool,
     model_names: Vec<String>,
     models: Vec<Value>,
 }
@@ -184,6 +195,7 @@ impl CodexModelCatalogProjection {
         Self {
             default_model: None,
             model_provider: None,
+            catalog_available: false,
             model_names: Vec::new(),
             models: Vec::new(),
         }
@@ -394,22 +406,109 @@ pub(crate) fn load_cc_switch_model_catalog_projection(
     ))
 }
 
-/// 从单个目录值构造 renderer 投影；空目录返回 `None` 以便调用方继续尝试回退源。
+/// 从单个目录值构造 renderer 投影。
+///
+/// `models: []` 是一个结构上完整且权威的目录，不能继续回退到陈旧缓存；
+/// 只有缺少数组或形状损坏的值才返回 `None`，让调用方尝试下一个来源。
 fn codex_model_catalog_projection_from_value(
     catalog: &Value,
     default_model: Option<String>,
     model_provider: Option<String>,
 ) -> Option<CodexModelCatalogProjection> {
-    let (model_names, models) = codex_model_entries_from_catalog_value(catalog);
-    if model_names.is_empty() {
+    let has_structural_models_array =
+        catalog.get("models").is_some_and(Value::is_array) || catalog.is_array();
+    if !has_structural_models_array {
         return None;
     }
+    let (model_names, models) = codex_model_entries_from_catalog_value(catalog);
     Some(CodexModelCatalogProjection {
         default_model: default_model.or_else(|| model_names.first().cloned()),
         model_provider,
+        catalog_available: true,
         model_names,
         models,
     })
+}
+
+/// Select the payload to expose to the renderer across repeated compatibility
+/// injections. A transiently unavailable source may reuse the last complete
+/// catalog for the same provider, but it must never cross a provider boundary.
+fn catalog_payload_selection_core_script() -> &'static str {
+    r#"
+  const normalizedCatalogProvider = (value) =>
+    typeof value === "string" && value.trim() ? value.trim() : null;
+  const selectCatalogPayload = (previousPayload, incomingPayload) => {
+    const incomingProvider = normalizedCatalogProvider(incomingPayload?.modelProvider);
+    const previousProvider = normalizedCatalogProvider(previousPayload?.modelProvider);
+    const preservePreviousCatalog =
+      incomingPayload?.catalogAvailable !== true &&
+      previousPayload?.catalogAvailable === true &&
+      incomingProvider !== null &&
+      incomingProvider === previousProvider;
+    if (!preservePreviousCatalog) return incomingPayload;
+    return {
+      ...incomingPayload,
+      defaultModel: previousPayload.defaultModel,
+      modelNames: Array.isArray(previousPayload.modelNames)
+        ? [...previousPayload.modelNames]
+        : [],
+      models: Array.isArray(previousPayload.models)
+        ? [...previousPayload.models]
+        : [],
+      catalogAvailable: true,
+    };
+  };
+"#
+}
+
+fn app_server_model_list_scope_core_script() -> &'static str {
+    r#"
+  const normalizedHostId = (value) =>
+    typeof value === "string" && value.trim() ? value.trim() : null;
+  const requestHostIds = (client, params) => [
+    client?.hostId,
+    client?.host_id,
+    params?.hostId,
+    params?.host_id,
+    params?.host?.hostId,
+    params?.host?.host_id,
+    params?.params?.hostId,
+    params?.params?.host_id,
+    params?.params?.host?.hostId,
+    params?.params?.host?.host_id,
+  ].map(normalizedHostId).filter(Boolean);
+  const isLocalAppServerTarget = (client, params, sourceIsLocalView = false) => {
+    const hosts = requestHostIds(client, params);
+    return hosts.length > 0
+      ? hosts.every((hostId) => hostId === "local")
+      : sourceIsLocalView;
+  };
+  const currentManagedCatalogProvider = () => {
+    const provider = currentModelProvider();
+    return provider && provider !== "openai" && state.payload?.catalogAvailable === true
+      ? provider
+      : null;
+  };
+  const isModelListMethod = (method) =>
+    method === "list-models-for-host" || method === "model/list";
+  const captureModelListScope = (method, params, client, sourceIsLocalView = false) => {
+    if (!isModelListMethod(method) ||
+        !isLocalAppServerTarget(client, params, sourceIsLocalView)) return null;
+    const provider = currentManagedCatalogProvider();
+    const providers = [
+      params?.modelProvider, params?.model_provider,
+      params?.params?.modelProvider, params?.params?.model_provider,
+    ].map(normalizedCatalogProvider).filter(Boolean);
+    return provider && providers.every((value) => value === provider)
+      ? { provider, hostId: "local", providerEpoch: state.catalogProviderEpoch || 0 }
+      : null;
+  };
+  const isCurrentModelListScope = (scope, client, params) =>
+    Boolean(scope) &&
+    scope.provider === currentManagedCatalogProvider() &&
+    scope.providerEpoch === (state.catalogProviderEpoch || 0) &&
+    isLocalAppServerTarget(client || scope, params);
+"#
 }
 
 /// 从当前活动 provider 的 TOML 内联 `models` 读取最后一道模型菜单回退。
@@ -1032,7 +1131,7 @@ fn guardian_v2_compatibility_patch_core_script() -> &'static str {
 /// 覆盖历史线程保存的旧入口标签，使跨 Provider 历史在冷恢复后重新经过 CCSM Router。
 fn app_server_request_normalization_core_script() -> &'static str {
     r#"
-  const appServerRequestPatchVersion = "10";
+  const appServerRequestPatchVersion = "11";
   const appServerRequestClientNeedsPatch = (client) => client?.__ccSwitchModelRequestPatch !== appServerRequestPatchVersion;
   const appServerMethod = (method, params) => method === "send-cli-request-for-host" && params?.method ? String(params.method) : String(method || "");
   const currentModelProvider = () => {
@@ -1174,7 +1273,7 @@ fn app_server_module_client_discovery_core_script() -> &'static str {
 fn request_health_warning_core_script(suppressed: bool) -> String {
     let suppressed = if suppressed { "true" } else { "false" };
     (r###"
-  const requestHealthWarningsSuppressed = {suppressed};
+  state.requestHealthWarningsSuppressed = {suppressed};
   const requestHealthWarningStorageKey = "ccswitch-request-health-warnings-v1";
   const requestHealthWarningContainerId = "ccswitch-request-health-warning-container";
   const readStoredRequestHealthWarnings = () => {
@@ -1184,7 +1283,7 @@ fn request_health_warning_core_script(suppressed: bool) -> String {
     } catch { return []; }
   };
   const renderRequestHealthWarnings = (warnings) => {
-    if (requestHealthWarningsSuppressed) {
+    if (state.requestHealthWarningsSuppressed) {
       try { localStorage.removeItem(requestHealthWarningStorageKey); } catch {}
       document.getElementById(requestHealthWarningContainerId)?.remove();
       if (state.requestHealthWarningExpiryTimer) clearTimeout(state.requestHealthWarningExpiryTimer);
@@ -1240,16 +1339,17 @@ fn request_health_warning_core_script(suppressed: bool) -> String {
     if (state.requestHealthWarningExpiryTimer) clearTimeout(state.requestHealthWarningExpiryTimer);
     const nextExpiry = Math.min(...active.map((warning) => Number(warning.expiresAtMs)));
     state.requestHealthWarningExpiryTimer = setTimeout(() => {
-      if (!requestHealthWarningsSuppressed) {
+      if (!state.requestHealthWarningsSuppressed) {
         renderRequestHealthWarnings(readStoredRequestHealthWarnings());
       }
     }, Math.max(50, nextExpiry - now + 25));
     return { active: active.length };
   };
-  state.syncRequestHealthWarnings = (warnings) => {
-    if (!requestHealthWarningsSuppressed) renderRequestHealthWarnings(warnings);
+  state.syncRequestHealthWarnings = (warnings, suppressed = state.requestHealthWarningsSuppressed) => {
+    state.requestHealthWarningsSuppressed = Boolean(suppressed);
+    return renderRequestHealthWarnings(warnings);
   };
-  if (requestHealthWarningsSuppressed) {
+  if (state.requestHealthWarningsSuppressed) {
     try { localStorage.removeItem(requestHealthWarningStorageKey); } catch {}
     renderRequestHealthWarnings([]);
   } else {
@@ -1259,12 +1359,26 @@ fn request_health_warning_core_script(suppressed: bool) -> String {
         .replace("{suppressed}", suppressed)
 }
 
+pub(crate) fn manual_summary_request_prompt() -> String {
+    [
+        MANUAL_SUMMARY_REQUEST_MARKER,
+        MANUAL_SUMMARY_REQUEST_INSTRUCTION,
+        "Create a faithful handoff summary of this coding session for a fresh session.",
+        "Do not call tools, inspect files, change files, or continue implementation; summarize only the conversation already present.",
+        "Return plain text with these headings on separate lines: Goal; Decisions and rationale; Changed files or areas; Current state; Failures and unresolved issues; Tests and verification; Not tested; Exact next action.",
+        "Never claim a test ran unless the conversation records its result, and preserve recorded failures and user constraints.",
+    ]
+    .join(" ")
+}
+
 ///
 /// The fresh refork discovers app-server clients from the same patched client
 /// registry used by routing compatibility. This core only owns the handoff
 /// workflow and never touches rollout files or the proxy request history.
-fn summary_handoff_core_script() -> &'static str {
-    r#"
+fn summary_handoff_core_script() -> String {
+    let prompt = serde_json::to_string(&manual_summary_request_prompt())
+        .expect("serialize manual summary request prompt");
+    (r#"
   const rememberHandoffClient = (client) => {
     if (!client || typeof client.sendRequest !== "function") return;
     state.appServerClients = Array.isArray(state.appServerClients) ? state.appServerClients : [];
@@ -1327,13 +1441,7 @@ fn summary_handoff_core_script() -> &'static str {
         mutationAttempted = true;
         const started = await client.sendRequest("turn/start", {
           threadId: normalizedThreadId,
-          input: [{ type: "text", text: [
-            "[CCSwitch internal request: manual-summary-v1]",
-            "Create a faithful handoff summary of this coding session for a fresh session.",
-            "Do not call tools, inspect files, change files, or continue implementation; summarize only the conversation already present.",
-            "Return plain text with these headings on separate lines: Goal; Decisions and rationale; Changed files or areas; Current state; Failures and unresolved issues; Tests and verification; Not tested; Exact next action.",
-            "Never claim a test ran unless the conversation records its result, and preserve recorded failures and user constraints."
-          ].join(" ") }],
+          input: [{ type: "text", text: __CCSWITCH_MANUAL_SUMMARY_PROMPT__ }],
         });
         const summaryTurnId = String(started?.turn?.id || started?.turnId || started?.turn_id || "").trim();
         if (!summaryTurnId) throw new Error("Codex did not return the manual summary turn id");
@@ -1450,7 +1558,8 @@ fn summary_handoff_core_script() -> &'static str {
     return { started: true, jobId };
   };
   state.readFreshSessionJob = (jobId) => state.freshSessionJobs[String(jobId || "")] || null;
-"#
+"#)
+        .replace("__CCSWITCH_MANUAL_SUMMARY_PROMPT__", &prompt)
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1821,6 +1930,8 @@ pub(crate) async fn submit_codex_continuation(
 /// 构造 renderer 注入脚本：触发新版本地历史目录同步，并修复模型白名单和缓存。
 fn build_model_picker_unlock_script(catalog: &CodexModelCatalogProjection) -> String {
     let payload = serde_json::to_string(catalog).unwrap_or_else(|_| "{}".to_string());
+    let catalog_payload_selection_core = catalog_payload_selection_core_script();
+    let app_server_model_list_scope_core = app_server_model_list_scope_core_script();
     let model_patch_core = model_picker_patch_core_script();
     let guardian_v2_patch_core = guardian_v2_compatibility_patch_core_script();
     let request_normalization_core = app_server_request_normalization_core_script();
@@ -1837,17 +1948,18 @@ fn build_model_picker_unlock_script(catalog: &CodexModelCatalogProjection) -> St
     format!(
         r#"
 (async () => {{
-  const payload = {payload};
+  const incomingPayload = {payload};
   const patchKey = "{MODEL_PICKER_PATCH_KEY}";
   const state = window[patchKey] || {{}};
-  state.payload = payload;
-  state.requestIds = state.requestIds || new Set();
-  state.modulePromises = state.modulePromises || new Map();
-  state.failures = state.failures || [];
+{catalog_payload_selection_core}
+  const previousPayload = state.payload;
+  const payload = selectCatalogPayload(previousPayload, incomingPayload);
+  const preservePreviousCatalog =
+    payload !== incomingPayload && payload?.catalogAvailable === true;
   // Bump this whenever the injected app-server/request patch changes. The
   // scheduler closure captures those functions; leaving an older interval
   // alive would reapply stale recovery hooks over the new patch.
-  const rendererSchedulerVersion = "4";
+  const rendererSchedulerVersion = "6";
   if (state.rendererSchedulerVersion !== rendererSchedulerVersion) {{
     if (state.interval) clearInterval(state.interval);
     try {{ state.reactRootObserver?.disconnect(); }} catch {{}}
@@ -1858,6 +1970,9 @@ fn build_model_picker_unlock_script(catalog: &CodexModelCatalogProjection) -> St
     // Older discovery admitted dynamic RPC stubs before patching failed. Drop
     // that registry so continuation can use only declared request clients.
     state.appServerClients = [];
+    state.requestIds = new Set();
+    state.modelListRequestScopes = new Map();
+    state.messagePatchInstalled = false;
     state.appServerModuleRetryAt = 0;
     state.scopedAppServerScopes = new Set();
     state.pendingReactNodes = new Set();
@@ -1865,6 +1980,16 @@ fn build_model_picker_unlock_script(catalog: &CodexModelCatalogProjection) -> St
     state.lastReactIncrementalScanAt = 0;
     state.rendererSchedulerVersion = rendererSchedulerVersion;
   }}
+  if (normalizedCatalogProvider(previousPayload?.modelProvider) !==
+      normalizedCatalogProvider(payload?.modelProvider)) {{
+    state.catalogProviderEpoch = (state.catalogProviderEpoch || 0) + 1;
+  }}
+  state.payload = payload;
+  state.catalogPayloadPreserved = preservePreviousCatalog;
+  state.requestIds = state.requestIds instanceof Map ? state.requestIds : new Map();
+  state.modelListRequestScopes = state.modelListRequestScopes || new Map();
+  state.modulePromises = state.modulePromises || new Map();
+  state.failures = state.failures || [];
   state.pendingReactNodes = state.pendingReactNodes || new Set();
   state.historyManagerCandidates = state.historyManagerCandidates || new Set();
   const recordFailure = (error) => {{
@@ -2052,7 +2177,7 @@ fn build_model_picker_unlock_script(catalog: &CodexModelCatalogProjection) -> St
     }});
     return await state.historySyncPromise;
   }};
-  const isModelListMethod = (method) => method === "list-models-for-host" || method === "model/list";
+{app_server_model_list_scope_core}
   const patchModelListResult = (result) => {{
     if (result == null) return false;
     let changed = false;
@@ -2068,13 +2193,14 @@ fn build_model_picker_unlock_script(catalog: &CodexModelCatalogProjection) -> St
     if (patchModelContainer(result)) changed = true;
     return changed;
   }};
-  const patchAppServerResult = (method, result) => {{
-    if (!isModelListMethod(method)) return result;
+  const patchAppServerResult = (method, result, scope, client, params) => {{
+    if (!isModelListMethod(method) || !isCurrentModelListScope(scope, client, params)) return result;
     patchModelListResult(result);
     return result;
   }};
   const patchRequestClient = (client) => {{
     if (!client || typeof client.sendRequest !== "function") return false;
+    if (!isLocalAppServerTarget(client, null)) return false;
     state.appServerClients = Array.isArray(state.appServerClients) ? state.appServerClients : [];
     if (!state.appServerClients.includes(client)) state.appServerClients.push(client);
     if (!appServerRequestClientNeedsPatch(client)) return true;
@@ -2085,16 +2211,17 @@ fn build_model_picker_unlock_script(catalog: &CodexModelCatalogProjection) -> St
         rememberCodexUserTurnAction(method, params);
         const normalizedParams = normalizeAppServerRequestParams(method, params);
         const actualMethod = appServerMethod(method, params);
+        const modelListScope = captureModelListScope(actualMethod, normalizedParams, client);
         try {{
           const result = await original(method, normalizedParams, options);
-          return patchAppServerResult(actualMethod, result);
+          return patchAppServerResult(actualMethod, result, modelListScope, client, normalizedParams);
         }} catch (error) {{
           if (!isGuardianV2FeatureTomlError(error)) throw error;
           const fallbackParams = guardianV2FallbackRequestParams(method, normalizedParams);
           if (fallbackParams === normalizedParams) throw error;
           state.guardianV2FallbackCount = (state.guardianV2FallbackCount || 0) + 1;
           const result = await original(method, fallbackParams, options);
-          return patchAppServerResult(actualMethod, result);
+          return patchAppServerResult(actualMethod, result, modelListScope, client, fallbackParams);
         }}
       }};
       client.__ccSwitchModelRequestPatch = appServerRequestPatchVersion;
@@ -2325,6 +2452,10 @@ fn build_model_picker_unlock_script(catalog: &CodexModelCatalogProjection) -> St
       refreshRequested: Boolean(state.historyQueryRefreshCompleted),
       lineageHydration: state.historyLineageHydration || null,
     }};
+    for (const scope of state.scopedAppServerScopes || []) {{
+      try {{ patchCodexModelReasoningQueryCache(scope.queryClient?.getQueryCache()); }}
+      catch (error) {{ recordFailure(error); }}
+    }}
     state.appServerPatchInstalled = patched > 0;
     if (patched > 0 && state.historyQueryRefreshCompleted) {{
       state.reactRequestClientPatchVersion = appServerRequestPatchVersion;
@@ -2335,8 +2466,11 @@ fn build_model_picker_unlock_script(catalog: &CodexModelCatalogProjection) -> St
     if (data?.type !== "mcp-response") return false;
     const message = data.message || data.response;
     const requestId = message?.id != null ? String(message.id) : "";
-    if (!requestId || !state.requestIds.has(requestId)) return false;
+    if (!requestId || !(state.requestIds instanceof Map)) return false;
+    const scope = state.requestIds.get(requestId);
+    if (!scope) return false;
     state.requestIds.delete(requestId);
+    if (!isCurrentModelListScope(scope, null, message?.params || data?.params)) return false;
     return patchModelListResult(message?.result) || patchModelListResult(message?.result?.data);
   }};
   const installMessagePatch = () => {{
@@ -2348,8 +2482,15 @@ fn build_model_picker_unlock_script(catalog: &CodexModelCatalogProjection) -> St
         const detail = event?.detail;
         const request = detail?.request;
         if (event?.type === "codex-message-from-view" && detail?.type === "mcp-request" && request?.method === "model/list") {{
-          request.params = {{ ...(request.params || {{}}), includeHidden: true }};
-          if (request.id != null) state.requestIds.add(String(request.id));
+          const viewRequest = {{
+            ...request,
+            hostId: detail?.hostId ?? detail?.host_id ?? request?.hostId ?? request?.host_id,
+          }};
+          const scope = captureModelListScope("model/list", viewRequest, null, true);
+          if (scope) {{
+            request.params = {{ ...(request.params || {{}}), includeHidden: true }};
+            if (request.id != null) state.requestIds.set(String(request.id), scope);
+          }}
         }}
         if (event?.type === "message") patchMcpModelResponseData(event.data);
       }} catch (error) {{
@@ -3762,17 +3903,16 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["included-model", "legacy-model"]
         );
-        assert!(
-            codex_model_catalog_projection_from_value(
-                &json!({
-                    "models": [{ "model": "excluded-model", "enabled": false }]
-                }),
-                None,
-                None
-            )
-            .is_none(),
-            "a catalog containing only excluded models must remain empty for fallback resolution"
-        );
+        let projection = codex_model_catalog_projection_from_value(
+            &json!({
+                "models": [{ "model": "excluded-model", "enabled": false }]
+            }),
+            None,
+            None,
+        )
+        .expect("structurally valid catalog remains authoritative after exclusions");
+        assert!(projection.catalog_available);
+        assert!(projection.model_names.is_empty());
     }
 
     #[test]
@@ -3787,13 +3927,13 @@ mod tests {
     }
 
     #[test]
-    /// 主目录为空时，投影 helper 应允许调用方继续使用 models cache 或内联目录回退。
-    fn catalog_projection_skips_empty_source_and_accepts_fallback_source() {
+    /// 结构上完整的空目录必须阻止陈旧 cache 或内联目录回退。
+    fn catalog_projection_preserves_authoritative_empty_and_accepts_malformed_fallback_source() {
         let empty = json!({ "models": [] });
-        assert!(
-            codex_model_catalog_projection_from_value(&empty, None, None).is_none(),
-            "empty primary catalog must not freeze an empty renderer payload"
-        );
+        let empty_projection = codex_model_catalog_projection_from_value(&empty, None, None)
+            .expect("empty catalog is an authoritative projection");
+        assert!(empty_projection.catalog_available);
+        assert!(empty_projection.model_names.is_empty());
 
         let fallback = json!({
             "models": [
@@ -3813,12 +3953,126 @@ mod tests {
             vec!["gpt-5.6-sol".to_string(), "qwen3.6".to_string()]
         );
         assert_eq!(projection.default_model.as_deref(), Some("qwen3.6"));
+        assert!(projection.catalog_available);
+        assert!(
+            codex_model_catalog_projection_from_value(&json!({ "unexpected": true }), None, None)
+                .is_none(),
+            "malformed catalog values remain unavailable and may use a fallback source"
+        );
+    }
+
+    #[test]
+    fn catalog_payload_selection_preserves_only_same_provider_usable_catalogs() {
+        let previous = json!({
+            "modelProvider": "codex_model_router_v2",
+            "catalogAvailable": true,
+            "defaultModel": "sol-relay",
+            "modelNames": ["sol-relay"],
+            "models": [{"model": "sol-relay"}]
+        });
+        let unavailable_same_provider = run_catalog_payload_selection_probe(
+            previous.clone(),
+            json!({
+                "modelProvider": "codex_model_router_v2",
+                "catalogAvailable": false,
+                "defaultModel": null,
+                "modelNames": [],
+                "models": []
+            }),
+        );
+        assert_eq!(
+            unavailable_same_provider["modelNames"],
+            json!(["sol-relay"])
+        );
+        assert_eq!(unavailable_same_provider["catalogAvailable"], true);
+
+        let unavailable_other_provider = run_catalog_payload_selection_probe(
+            previous.clone(),
+            json!({
+                "modelProvider": "openrouter",
+                "catalogAvailable": false,
+                "modelNames": [],
+                "models": []
+            }),
+        );
+        assert_eq!(unavailable_other_provider["modelNames"], json!([]));
+        assert_eq!(unavailable_other_provider["catalogAvailable"], false);
+
+        let authoritative_empty = run_catalog_payload_selection_probe(
+            previous,
+            json!({
+                "modelProvider": "codex_model_router_v2",
+                "catalogAvailable": true,
+                "defaultModel": null,
+                "modelNames": [],
+                "models": []
+            }),
+        );
+        assert_eq!(authoritative_empty["modelNames"], json!([]));
+        assert_eq!(authoritative_empty["models"], json!([]));
+        assert_eq!(authoritative_empty["catalogAvailable"], true);
+    }
+
+    #[test]
+    fn model_list_patch_scope_requires_local_host_current_provider_and_epoch() {
+        let result = run_model_list_scope_probe(
+            json!({
+                "modelProvider": "codex_model_router_v2",
+                "catalogAvailable": true
+            }),
+            r#"
+const local = {hostId: "local"};
+const remote = {hostId: "remote"};
+const localParams = {modelProvider: "codex_model_router_v2"};
+const scope = captureModelListScope("model/list", localParams, local);
+const remoteScope = captureModelListScope("model/list", localParams, remote);
+const missingHostScope = captureModelListScope("model/list", localParams, {});
+const localViewScope = captureModelListScope("model/list", localParams, null, true);
+const remoteViewScope = captureModelListScope(
+  "model/list", {...localParams, hostId: "remote"}, null, true
+);
+const wrongProviderScope = captureModelListScope(
+  "model/list", {modelProvider: "openai"}, local
+);
+const current = isCurrentModelListScope(scope, local, localParams);
+state.catalogProviderEpoch = 1;
+const stale = isCurrentModelListScope(scope, local, localParams);
+state.payload = {...state.payload, modelProvider: "openrouter"};
+const switched = isCurrentModelListScope(scope, local, localParams);
+JSON.stringify({
+  local: Boolean(scope),
+  remote: remoteScope,
+  missingHost: missingHostScope,
+  localView: Boolean(localViewScope),
+  remoteView: remoteViewScope,
+  wrongProvider: wrongProviderScope,
+  current,
+  stale,
+  switched,
+});
+"#,
+        );
+        assert_eq!(
+            result,
+            json!({
+                "local": true,
+                "remote": null,
+                "missingHost": null,
+                "localView": true,
+                "remoteView": null,
+                "wrongProvider": null,
+                "current": true,
+                "stale": false,
+                "switched": false
+            })
+        );
     }
 
     fn run_model_picker_patch_core_probe(probe: &str) -> serde_json::Value {
         run_model_picker_patch_core_probe_with_payload(
             json!({
                 "defaultModel": "qwen3.6",
+                "catalogAvailable": true,
                 "modelNames": ["qwen3.6", "deepseek-v4-flash"],
                 "models": [
                     {"model": "qwen3.6", "displayName": "Qwen 3.6", "hidden": false},
@@ -3829,6 +4083,45 @@ mod tests {
         )
     }
 
+    fn run_catalog_payload_selection_probe(previous: Value, incoming: Value) -> Value {
+        let runtime = rquickjs::Runtime::new().expect("create JavaScript runtime");
+        let context = rquickjs::Context::full(&runtime).expect("create JavaScript context");
+        let script = format!(
+            "const previousPayload = {};\nconst incomingPayload = {};\n{}\nJSON.stringify(selectCatalogPayload(previousPayload, incomingPayload));",
+            previous,
+            incoming,
+            catalog_payload_selection_core_script(),
+        );
+        context.with(|ctx| {
+            let json_text: String = ctx
+                .eval(script)
+                .expect("execute catalog payload selection core");
+            serde_json::from_str(&json_text).expect("parse catalog payload selection result")
+        })
+    }
+
+    fn run_model_list_scope_probe(payload: Value, probe: &str) -> Value {
+        let runtime = rquickjs::Runtime::new().expect("create JavaScript runtime");
+        let context = rquickjs::Context::full(&runtime).expect("create JavaScript context");
+        let script = format!(
+            r#"
+const state = {{ payload: {}, catalogProviderEpoch: 0 }};
+const currentModelProvider = () => state.payload?.modelProvider || null;
+const normalizedCatalogProvider = (value) =>
+  typeof value === "string" && value.trim() ? value.trim() : null;
+{}
+{}
+"#,
+            payload,
+            app_server_model_list_scope_core_script(),
+            probe,
+        );
+        context.with(|ctx| {
+            let json_text: String = ctx.eval(script).expect("execute model list scope core");
+            serde_json::from_str(&json_text).expect("parse model list scope result")
+        })
+    }
+
     fn run_model_picker_patch_core_probe_with_payload(
         payload: Value,
         probe: &str,
@@ -3836,7 +4129,7 @@ mod tests {
         let runtime = rquickjs::Runtime::new().expect("create JavaScript runtime");
         let context = rquickjs::Context::full(&runtime).expect("create JavaScript context");
         let script = format!(
-            "const payload = {};\nconst state = {{ payload }};\n{}\n{}",
+            "const payload = {{ catalogAvailable: true, ...{} }};\nconst state = {{ payload }};\n{}\n{}",
             payload,
             model_picker_patch_core_script(),
             probe
@@ -3961,6 +4254,191 @@ const clearTimeout = () => {{}};
                 .expect("read Codex continuation probe result");
             serde_json::from_str(&json_text).expect("parse Codex continuation probe result")
         })
+    }
+
+    fn run_summary_handoff_probe(probe: &str) -> Value {
+        let runtime = rquickjs::Runtime::new().expect("create JavaScript runtime");
+        let context = rquickjs::Context::full(&runtime).expect("create JavaScript context");
+        let script = format!(
+            r#"
+const state = {{}};
+const installAppServerPatch = async () => {{}};
+const recordFailure = () => {{}};
+const setTimeout = (callback) => {{ callback(); return 1; }};
+{}
+{}
+"#,
+            summary_handoff_core_script(),
+            probe
+        );
+        context.with(|ctx| {
+            ctx.eval::<(), _>(script)
+                .expect("start manual summary handoff probe");
+        });
+        while runtime
+            .execute_pending_job()
+            .expect("execute manual summary handoff job")
+        {}
+        context.with(|ctx| {
+            let json_text: String = ctx
+                .eval("globalThis.__summaryHandoffResult")
+                .expect("read manual summary handoff result");
+            serde_json::from_str(&json_text).expect("parse manual summary handoff result")
+        })
+    }
+
+    fn run_request_health_warning_probe(suppressed: bool, setup: &str, probe: &str) -> Value {
+        let runtime = rquickjs::Runtime::new().expect("create JavaScript runtime");
+        let context = rquickjs::Context::full(&runtime).expect("create JavaScript context");
+        let script = format!(
+            r#"
+const state = {{}};
+const storage = new Map();
+const localStorage = {{
+  getItem: (key) => storage.get(key) ?? null,
+  setItem: (key, value) => storage.set(key, value),
+  removeItem: (key) => storage.delete(key),
+}};
+const timers = new Map();
+let nextTimer = 1;
+const setTimeout = (callback) => {{ const id = nextTimer++; timers.set(id, callback); return id; }};
+const clearTimeout = (id) => timers.delete(id);
+class Element {{
+  constructor(tag) {{ this.tag = tag; this.children = []; this.style = {{}}; this.attributes = {{}}; }}
+  appendChild(child) {{ child.parent = this; this.children.push(child); return child; }}
+  append(...children) {{ children.forEach((child) => this.appendChild(child)); }}
+  replaceChildren(...children) {{ this.children = []; this.append(...children); }}
+  setAttribute(name, value) {{ this.attributes[name] = String(value); }}
+  getAttribute(name) {{ return this.attributes[name] ?? null; }}
+  remove() {{
+    if (this.parent) this.parent.children = this.parent.children.filter((child) => child !== this);
+    this.parent = null;
+  }}
+  querySelectorAll(selector) {{
+    const attribute = selector.slice(1, -1);
+    return this.children.flatMap((child) => [
+      ...(Object.hasOwn(child.attributes, attribute) ? [child] : []),
+      ...child.querySelectorAll(selector),
+    ]);
+  }}
+}}
+const root = new Element("body");
+const document = {{
+  body: root,
+  documentElement: root,
+  createElement: (tag) => new Element(tag),
+  getElementById: (id) => {{
+    const find = (element) => element.id === id ? element : element.children.map(find).find(Boolean);
+    return find(root) || null;
+  }},
+}};
+const warning = {{ token: "pending-review", expiresAtMs: Date.now() + 60000, title: "Request paused" }};
+const storageKey = "ccswitch-request-health-warnings-v1";
+const containerId = "ccswitch-request-health-warning-container";
+{}
+{}
+{}
+"#,
+            setup,
+            request_health_warning_core_script(suppressed),
+            probe
+        );
+        context.with(|ctx| {
+            let json_text: String = ctx
+                .eval(script)
+                .expect("execute Request Health warning overlay");
+            serde_json::from_str(&json_text).expect("parse Request Health warning overlay result")
+        })
+    }
+
+    #[test]
+    fn manual_summary_uses_the_runtime_bypass_discriminator() {
+        let result = run_summary_handoff_probe(
+            r#"
+let summaryPrompt = null;
+state.appServerClients = [{ sendRequest: async (method, params) => {
+  if (method === "turn/start") {
+    summaryPrompt = params.input[0].text;
+    return { turn: { id: "summary-turn" } };
+  }
+  return { thread: { id: "source-thread", status: { type: "idle" }, turns: [
+    { id: "summary-turn", status: "completed", items: [{ role: "assistant", text: "Handoff summary" }] },
+  ] } };
+} }];
+void runSummarizeSession("source-thread").then((result) => {
+  globalThis.__summaryHandoffResult = JSON.stringify({ result, summaryPrompt });
+});
+"#,
+        );
+        let prompt = result["summaryPrompt"]
+            .as_str()
+            .expect("summary turn prompt");
+        assert_eq!(prompt, manual_summary_request_prompt());
+        assert!(prompt.contains(MANUAL_SUMMARY_REQUEST_MARKER));
+        assert!(
+            prompt.contains(MANUAL_SUMMARY_REQUEST_INSTRUCTION),
+            "the production summary prompt must match the Request Health bypass guard"
+        );
+        assert_eq!(result["result"]["summary"], "Handoff summary");
+    }
+
+    #[test]
+    fn request_health_warning_overlay_can_enable_after_suppressed_injection() {
+        let result = run_request_health_warning_probe(
+            true,
+            "",
+            r#"
+state.syncRequestHealthWarnings([warning], false);
+JSON.stringify({
+  cards: document.getElementById(containerId)?.children.length || 0,
+  stored: JSON.parse(localStorage.getItem(storageKey) || "[]").map((item) => item.token),
+});
+"#,
+        );
+        assert_eq!(result["cards"], 1);
+        assert_eq!(result["stored"], json!(["pending-review"]));
+    }
+
+    #[test]
+    fn request_health_warning_overlay_disable_clears_and_rejects_stale_updates() {
+        let result = run_request_health_warning_probe(
+            false,
+            "",
+            r#"
+state.syncRequestHealthWarnings([warning], false);
+const staleExpiryCallbacks = [...timers.values()];
+state.syncRequestHealthWarnings([], true);
+state.syncRequestHealthWarnings([warning]);
+for (const callback of staleExpiryCallbacks) callback();
+JSON.stringify({
+  containerPresent: Boolean(document.getElementById(containerId)),
+  stored: localStorage.getItem(storageKey),
+  timer: state.requestHealthWarningExpiryTimer,
+  scheduledTimers: timers.size,
+});
+"#,
+        );
+        assert_eq!(result["containerPresent"], false);
+        assert_eq!(result["stored"], Value::Null);
+        assert_eq!(result["timer"], Value::Null);
+        assert_eq!(result["scheduledTimers"], 0);
+    }
+
+    #[test]
+    fn request_health_warning_overlay_does_not_restore_storage_after_reenable() {
+        let result = run_request_health_warning_probe(
+            true,
+            "localStorage.setItem(storageKey, JSON.stringify([warning]));",
+            r#"
+state.syncRequestHealthWarnings([], false);
+JSON.stringify({
+  containerPresent: Boolean(document.getElementById(containerId)),
+  stored: localStorage.getItem(storageKey),
+});
+"#,
+        );
+        assert_eq!(result["containerPresent"], false);
+        assert_eq!(result["stored"], Value::Null);
     }
 
     #[test]
@@ -4539,7 +5017,7 @@ JSON.stringify({
   v6NeedsPatch: appServerRequestClientNeedsPatch({ __ccSwitchModelRequestPatch: "6" }),
   v7NeedsPatch: appServerRequestClientNeedsPatch({ __ccSwitchModelRequestPatch: "7" }),
   v8NeedsPatch: appServerRequestClientNeedsPatch({ __ccSwitchModelRequestPatch: "8" }),
-  currentNeedsPatch: appServerRequestClientNeedsPatch({ __ccSwitchModelRequestPatch: "10" }),
+  currentNeedsPatch: appServerRequestClientNeedsPatch({ __ccSwitchModelRequestPatch: "11" }),
   missingNeedsPatch: appServerRequestClientNeedsPatch({}),
   patchVersion: appServerRequestPatchVersion,
 });
@@ -4552,7 +5030,7 @@ JSON.stringify({
         assert_eq!(result["v8NeedsPatch"], true);
         assert_eq!(result["currentNeedsPatch"], false);
         assert_eq!(result["missingNeedsPatch"], true);
-        assert_eq!(result["patchVersion"], "10");
+        assert_eq!(result["patchVersion"], "11");
     }
 
     #[test]
@@ -4841,6 +5319,175 @@ JSON.stringify({
     }
 
     #[test]
+    fn model_picker_restores_catalog_efforts_after_renderer_preference_filters() {
+        let result = run_model_picker_patch_core_probe_with_payload(
+            json!({
+                "modelProvider": "codex_model_router_v2",
+                "modelNames": ["sol-relay", "luna-relay", "plain-relay"],
+                "models": [
+                    {
+                        "model": "sol-relay",
+                        "defaultReasoningEffort": "high",
+                        "supported_reasoning_levels": ["low", "medium", "high", "xhigh", "max", "ultra"]
+                    },
+                    {
+                        "model": "luna-relay",
+                        "supportedReasoningEfforts": [
+                            {"reasoningEffort": "low"}, {"reasoningEffort": "medium"},
+                            {"reasoningEffort": "high"}, {"reasoningEffort": "xhigh"},
+                            {"reasoningEffort": "max"}
+                        ]
+                    },
+                    {"model": "plain-relay"}
+                ]
+            }),
+            r#"
+const key = ["models", "list", "local", "chatgpt", 100, "codex_model_router_v2", "catalog.json"];
+const levels = ["low", "medium", "high", "xhigh"];
+const official = {model: "official", supportedReasoningEfforts: [{reasoningEffort: "high"}]};
+const filtered = {
+  models: [
+    {model: "sol-relay", defaultReasoningEffort: "high", supportedReasoningEfforts: levels.map(reasoningEffort => ({reasoningEffort}))},
+    {model: "luna-relay", supportedReasoningEfforts: levels.map(reasoningEffort => ({reasoningEffort}))},
+    {model: "plain-relay", defaultReasoningEffort: "high", supportedReasoningEfforts: [{reasoningEffort: "high"}]},
+    official,
+  ],
+  hasModelSupportingMaxReasoningEffort: false,
+  hasModelSupportingUltraReasoningEffort: false,
+};
+filtered.defaultModel = filtered.models[0];
+const before = JSON.stringify(filtered);
+const restored = restoreCodexCatalogReasoningSelection(key, filtered);
+JSON.stringify({
+  efforts: restored.models.map(model => model.supportedReasoningEfforts.map(level => level.reasoningEffort)),
+  officialUnchanged: restored.models[3] === official,
+  sourceUnchanged: JSON.stringify(filtered) === before,
+  defaultIdentity: restored.defaultModel === restored.models[0],
+  unknownHasDefault: "defaultReasoningEffort" in restored.models[2],
+  max: restored.hasModelSupportingMaxReasoningEffort,
+  ultra: restored.hasModelSupportingUltraReasoningEffort,
+});
+"#,
+        );
+        assert_eq!(
+            result["efforts"],
+            json!([
+                ["low", "medium", "high", "xhigh", "max", "ultra"],
+                ["low", "medium", "high", "xhigh", "max"],
+                [],
+                ["high"]
+            ])
+        );
+        assert_eq!(result["officialUnchanged"], true);
+        assert_eq!(result["sourceUnchanged"], true);
+        assert_eq!(result["defaultIdentity"], true);
+        assert_eq!(result["unknownHasDefault"], false);
+        assert_eq!(result["max"], true);
+        assert_eq!(result["ultra"], true);
+    }
+
+    #[test]
+    fn model_picker_post_filter_projection_is_scoped_and_never_adds_models() {
+        let result = run_model_picker_patch_core_probe_with_payload(
+            json!({
+                "modelProvider": "codex_model_router_v2",
+                "modelNames": ["relay", "excluded"],
+                "models": [
+                    {"model": "relay", "supported_reasoning_levels": ["high", "max", "ultra"]},
+                    {"model": "excluded", "enabled": false, "supported_reasoning_levels": ["ultra"]}
+                ]
+            }),
+            r#"
+const key = ["models", "list", "local", "chatgpt", 100, "codex_model_router_v2"];
+const excluded = {model: "excluded", supportedReasoningEfforts: []};
+const filtered = {models: [{model: "relay", supportedReasoningEfforts: []}, excluded]};
+const remote = key.map((value) => value === "local" ? "remote" : value);
+const otherProvider = key.map((value) => value === "codex_model_router_v2" ? "openai" : value);
+const copilot = key.map((value) => value === "chatgpt" ? "copilot" : value);
+const result = restoreCodexCatalogReasoningSelection(key, filtered);
+JSON.stringify({
+  remoteUnchanged: restoreCodexCatalogReasoningSelection(remote, filtered) === filtered,
+  providerUnchanged: restoreCodexCatalogReasoningSelection(otherProvider, filtered) === filtered,
+  authUnchanged: restoreCodexCatalogReasoningSelection(copilot, filtered) === filtered,
+  otherQueryUnchanged: restoreCodexCatalogReasoningSelection(["threads", "list", ...key], filtered) === filtered,
+  rawUnchanged: restoreCodexCatalogReasoningSelection(key, {data: filtered.models}).data === filtered.models,
+  excludedAbsent: !result.models.includes(excluded),
+  absentNotAdded: restoreCodexCatalogReasoningSelection(key, {models: []}).models.length,
+  nullUnchanged: restoreCodexCatalogReasoningSelection(key, null) === null,
+});
+"#,
+        );
+        assert_eq!(
+            result,
+            json!({
+                "remoteUnchanged": true, "providerUnchanged": true, "authUnchanged": true,
+                "otherQueryUnchanged": true,
+                "rawUnchanged": true, "excludedAbsent": true, "absentNotAdded": 0,
+                "nullUnchanged": true
+            })
+        );
+    }
+
+    #[test]
+    fn model_picker_query_observers_reproject_cached_and_future_filtered_results() {
+        let result = run_model_picker_patch_core_probe_with_payload(
+            json!({
+                "modelProvider": "codex_model_router_v2",
+                "modelNames": ["relay"],
+                "models": [{"model": "relay", "supported_reasoning_levels": ["high", "max", "ultra"]}]
+            }),
+            r#"
+const key = ["models", "list", "local", "chatgpt", 100, "codex_model_router_v2"];
+const data = {data: [{model: "relay", supportedReasoningEfforts: ["high", "max", "ultra"].map(reasoningEffort => ({reasoningEffort}))}]};
+const filter = (raw) => ({models: raw.data.map(model => ({
+  ...model, supportedReasoningEfforts: model.supportedReasoningEfforts.filter(level => level.reasoningEffort === "high"),
+}))});
+let notify = () => {};
+let subscriptions = 0;
+let optionUpdates = 0;
+const observer = {
+  options: {queryKey: key, select: filter},
+  setOptions(options) {
+    optionUpdates += 1;
+    this.options = options;
+    this.result = options.select(data);
+    notify({type: "observerOptionsUpdated", query, observer: this});
+  },
+};
+const query = {queryKey: key, observers: [observer]};
+const cache = {getAll: () => [query], subscribe(callback) {subscriptions += 1; notify = callback; return () => {};}};
+const efforts = () => observer.result.models[0].supportedReasoningEfforts.map(level => level.reasoningEffort);
+patchCodexModelReasoningQueryCache(cache);
+const cached = efforts();
+const firstUpdates = optionUpdates;
+patchCodexModelReasoningQueryCache(cache);
+const idempotent = optionUpdates === firstUpdates;
+observer.setOptions({queryKey: key, select: raw => filter(raw)});
+const replacedSelector = efforts();
+state.payload = {...state.payload, models: [{model: "relay", supported_reasoning_levels: ["high", "max"]}]};
+patchCodexModelReasoningQueryCache(cache);
+const changedCatalog = efforts();
+const later = {...observer, options: {queryKey: key, select: filter}};
+query.observers.push(later);
+notify({type: "observerAdded", query, observer: later});
+const addedObserver = later.result.models[0].supportedReasoningEfforts.map(level => level.reasoningEffort);
+observer.setOptions({queryKey: ["models", "list", "remote", "chatgpt", 100, "codex_model_router_v2"], select: filter});
+const movedRemote = efforts();
+state.payload = {...state.payload, modelNames: [], models: []};
+patchCodexModelReasoningQueryCache(cache);
+JSON.stringify({cached, idempotent, subscriptions, replacedSelector, changedCatalog, addedObserver, movedRemote});
+"#,
+        );
+        assert_eq!(result["cached"], json!(["high", "max", "ultra"]));
+        assert_eq!(result["idempotent"], true);
+        assert_eq!(result["subscriptions"], 1);
+        assert_eq!(result["replacedSelector"], json!(["high", "max", "ultra"]));
+        assert_eq!(result["changedCatalog"], json!(["high", "max"]));
+        assert_eq!(result["addedObserver"], json!(["high", "max"]));
+        assert_eq!(result["movedRemote"], json!(["high"]));
+    }
+
+    #[test]
     fn model_picker_preserves_grouped_key_display_and_provider_labels() {
         let result = run_model_picker_patch_core_probe_with_payload(
             json!({
@@ -4963,12 +5610,14 @@ JSON.stringify({
         let catalog = CodexModelCatalogProjection {
             default_model: Some("qwen3.6".to_string()),
             model_provider: Some("codex_model_router_v2".to_string()),
+            catalog_available: true,
             model_names: vec!["qwen3.6".to_string(), "deepseek-v4-flash".to_string()],
             models: vec![json!({ "model": "qwen3.6", "hidden": false })],
         };
         let script = build_model_picker_unlock_script(&catalog);
         assert!(script.contains("qwen3.6"));
         assert!(script.contains("deepseek-v4-flash"));
+        assert!(script.contains("\"catalogAvailable\":true"));
         assert!(script.contains("available_models"));
         assert!(script.contains("use_hidden_models: false"));
         assert!(script.contains("107580212"));
@@ -4977,9 +5626,9 @@ JSON.stringify({
         assert!(script.contains("patchModelArray(result.data, true)"));
         assert!(script.contains("isModelListMethod(method)"));
         assert!(script.contains("await installAppServerPatch()"));
-        assert!(script.contains("!state.requestIds.has(requestId)"));
+        assert!(script.contains("state.requestIds.get(requestId)"));
         assert!(script.contains("__ccSwitchCodexAppCompatibilityV9"));
-        assert!(script.contains("appServerRequestPatchVersion = \"10\""));
+        assert!(script.contains("appServerRequestPatchVersion = \"11\""));
         assert!(script.contains("rehydrateStaleHistoryLineages(manager)"));
         assert!(
             script.contains("state.reactRequestClientPatchVersion = appServerRequestPatchVersion")
@@ -4996,11 +5645,9 @@ JSON.stringify({
         assert!(script.contains("isGuardianV2FeatureTomlError(error)"));
         assert!(script.contains("guardianV2FallbackRequestParams"));
         assert!(script.contains("auth.setAuthMethod(\"chatgpt\")"));
-        assert!(script.contains("requestHealthWarningsSuppressed"));
-        assert!(script.contains(
-            "if (!requestHealthWarningsSuppressed) renderRequestHealthWarnings(warnings)"
-        ));
-        assert!(script.contains("if (!requestHealthWarningsSuppressed) {"));
+        assert!(script.contains("state.requestHealthWarningsSuppressed"));
+        assert!(script.contains("state.requestHealthWarningsSuppressed = Boolean(suppressed)"));
+        assert!(script.contains("if (!state.requestHealthWarningsSuppressed) {"));
     }
 
     /// 验证新版历史兼容层同时恢复官方目录同步，并把 Desktop 的全量历史查询
@@ -5033,7 +5680,9 @@ JSON.stringify({
     fn codex_app_compatibility_heartbeat_does_not_repeat_full_react_scan() {
         let script = build_model_picker_unlock_script(&CodexModelCatalogProjection::empty());
 
-        assert!(script.contains("const rendererSchedulerVersion = \"4\""));
+        assert!(script.contains("const rendererSchedulerVersion = \"6\""));
+        assert!(script
+            .contains("patchCodexModelReasoningQueryCache(scope.queryClient?.getQueryCache())"));
         assert!(script.contains("clearInterval(state.interval)"));
         assert!(script.contains("const patchAppServerModuleClients"));
         assert!(script.contains("state.reactDiscoveryPromise"));

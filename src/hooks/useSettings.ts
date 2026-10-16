@@ -1,4 +1,4 @@
-import { useCallback, useMemo } from "react";
+import { useCallback, useMemo, useRef } from "react";
 import { useTranslation } from "react-i18next";
 import { toast } from "sonner";
 import { useQueryClient } from "@tanstack/react-query";
@@ -53,6 +53,36 @@ const sanitizeDir = (value?: string | null): string | undefined => {
   return trimmed.length > 0 ? trimmed : undefined;
 };
 
+const buildSettingsPayload = (source: Settings): Settings => {
+  const sanitizedClaudeDir = sanitizeDir(source.claudeConfigDir);
+  const sanitizedCodexDir = sanitizeDir(source.codexConfigDir);
+  const sanitizedGeminiDir = sanitizeDir(source.geminiConfigDir);
+  const sanitizedGrokDir = sanitizeDir(source.grokConfigDir);
+  const sanitizedOpencodeDir = sanitizeDir(source.opencodeConfigDir);
+  const sanitizedOpenclawDir = sanitizeDir(source.openclawConfigDir);
+  const {
+    webdavSync: _ignoredWebdavSync,
+    s3Sync: _ignoredS3Sync,
+    ...restSettings
+  } = source;
+  // Preset registry is device-local and has a dedicated command surface. It
+  // is intentionally not part of the public Settings type, but older
+  // renderer snapshots may still carry it at runtime.
+  delete (restSettings as Settings & { presetRegistry?: unknown })
+    .presetRegistry;
+
+  return {
+    ...restSettings,
+    claudeConfigDir: sanitizedClaudeDir,
+    codexConfigDir: sanitizedCodexDir,
+    geminiConfigDir: sanitizedGeminiDir,
+    grokConfigDir: sanitizedGrokDir,
+    opencodeConfigDir: sanitizedOpencodeDir,
+    openclawConfigDir: sanitizedOpenclawDir,
+    language: source.language,
+  };
+};
+
 /**
  * useSettings - 组合层
  * 负责：
@@ -65,6 +95,7 @@ export function useSettings(): UseSettingsResult {
   const { data } = useSettingsQuery();
   const saveMutation = useSaveSettingsMutation();
   const queryClient = useQueryClient();
+  const saveQueue = useRef<Promise<unknown>>(Promise.resolve());
 
   // 1️⃣ 表单状态管理
   const {
@@ -180,44 +211,23 @@ export function useSettings(): UseSettingsResult {
 
   // 即时保存设置（用于 General 标签页的实时更新）
   // 保存基础配置 + 独立的系统 API 调用（开机自启）
-  const autoSaveSettings = useCallback(
+  const persistSettingsUpdates = useCallback(
     async (updates: Partial<SettingsFormState>): Promise<SaveResult | null> => {
-      const mergedSettings = settings ? { ...settings, ...updates } : null;
-      if (!mergedSettings) return null;
+      const persistedSettings =
+        queryClient.getQueryData<Settings>(["settings"]) ?? data;
+      if (!settings || !persistedSettings) return null;
 
       try {
-        const sanitizedClaudeDir = sanitizeDir(mergedSettings.claudeConfigDir);
-        const sanitizedCodexDir = sanitizeDir(mergedSettings.codexConfigDir);
-        const sanitizedGeminiDir = sanitizeDir(mergedSettings.geminiConfigDir);
-        const sanitizedGrokDir = sanitizeDir(mergedSettings.grokConfigDir);
-        const sanitizedOpencodeDir = sanitizeDir(
-          mergedSettings.opencodeConfigDir,
-        );
-        const sanitizedOpenclawDir = sanitizeDir(
-          mergedSettings.openclawConfigDir,
-        );
-        const {
-          webdavSync: _ignoredWebdavSync,
-          s3Sync: _ignoredS3Sync,
-          ...restSettings
-        } = mergedSettings;
-
-        const payload: Settings = {
-          ...restSettings,
-          claudeConfigDir: sanitizedClaudeDir,
-          codexConfigDir: sanitizedCodexDir,
-          geminiConfigDir: sanitizedGeminiDir,
-          grokConfigDir: sanitizedGrokDir,
-          opencodeConfigDir: sanitizedOpencodeDir,
-          openclawConfigDir: sanitizedOpenclawDir,
-          language: mergedSettings.language,
-        };
+        // General autosaves must not publish unrelated Advanced drafts.
+        const payload = buildSettingsPayload({
+          ...persistedSettings,
+          ...updates,
+        });
 
         // 在 mutate 之前从实时缓存捕获上一次持久化的插件集成状态，
         // 避免 closure 里的 data 因 React 尚未 re-render 而滞后
-        const prevPluginEnabled = queryClient.getQueryData<Settings>([
-          "settings",
-        ])?.enableClaudePluginIntegration;
+        const prevPluginEnabled =
+          persistedSettings.enableClaudePluginIntegration;
 
         // 保存到配置文件
         const saveOutcome = await saveMutation.mutateAsync(payload);
@@ -225,7 +235,7 @@ export function useSettings(): UseSettingsResult {
         // 如果开机自启状态改变，调用系统 API
         if (
           payload.launchOnStartup !== undefined &&
-          payload.launchOnStartup !== data?.launchOnStartup
+          payload.launchOnStartup !== persistedSettings.launchOnStartup
         ) {
           try {
             await settingsApi.setAutoLaunch(payload.launchOnStartup);
@@ -244,7 +254,8 @@ export function useSettings(): UseSettingsResult {
         const nextSkipClaudeOnboarding = updates.skipClaudeOnboarding;
         if (
           nextSkipClaudeOnboarding !== undefined &&
-          nextSkipClaudeOnboarding !== (data?.skipClaudeOnboarding ?? false)
+          nextSkipClaudeOnboarding !==
+            (persistedSettings.skipClaudeOnboarding ?? false)
         ) {
           try {
             if (nextSkipClaudeOnboarding) {
@@ -316,7 +327,7 @@ export function useSettings(): UseSettingsResult {
 
   // 完整保存设置（用于 Advanced 标签页的手动保存）
   // 包含所有系统 API 调用和完整的验证流程
-  const saveSettings = useCallback(
+  const persistSettings = useCallback(
     async (
       overrides?: Partial<SettingsFormState>,
       options?: { silent?: boolean },
@@ -324,46 +335,30 @@ export function useSettings(): UseSettingsResult {
       const mergedSettings = settings ? { ...settings, ...overrides } : null;
       if (!mergedSettings) return null;
       try {
+        const persistedSettings =
+          queryClient.getQueryData<Settings>(["settings"]) ?? data;
         const sanitizedAppDir = sanitizeDir(appConfigDir);
-        const sanitizedClaudeDir = sanitizeDir(mergedSettings.claudeConfigDir);
-        const sanitizedCodexDir = sanitizeDir(mergedSettings.codexConfigDir);
-        const sanitizedGeminiDir = sanitizeDir(mergedSettings.geminiConfigDir);
-        const sanitizedGrokDir = sanitizeDir(mergedSettings.grokConfigDir);
-        const sanitizedOpencodeDir = sanitizeDir(
-          mergedSettings.opencodeConfigDir,
-        );
-        const sanitizedOpenclawDir = sanitizeDir(
-          mergedSettings.openclawConfigDir,
-        );
         const previousAppDir = initialAppConfigDir;
-        const previousClaudeDir = sanitizeDir(data?.claudeConfigDir);
-        const previousCodexDir = sanitizeDir(data?.codexConfigDir);
-        const previousGeminiDir = sanitizeDir(data?.geminiConfigDir);
-        const previousGrokDir = sanitizeDir(data?.grokConfigDir);
-        const previousOpencodeDir = sanitizeDir(data?.opencodeConfigDir);
-        const previousOpenclawDir = sanitizeDir(data?.openclawConfigDir);
-        const {
-          webdavSync: _ignoredWebdavSync,
-          s3Sync: _ignoredS3Sync,
-          ...restSettings
-        } = mergedSettings;
-
-        const payload: Settings = {
-          ...restSettings,
-          claudeConfigDir: sanitizedClaudeDir,
-          codexConfigDir: sanitizedCodexDir,
-          geminiConfigDir: sanitizedGeminiDir,
-          grokConfigDir: sanitizedGrokDir,
-          opencodeConfigDir: sanitizedOpencodeDir,
-          openclawConfigDir: sanitizedOpenclawDir,
-          language: mergedSettings.language,
-        };
+        const previousClaudeDir = sanitizeDir(
+          persistedSettings?.claudeConfigDir,
+        );
+        const previousCodexDir = sanitizeDir(persistedSettings?.codexConfigDir);
+        const previousGeminiDir = sanitizeDir(
+          persistedSettings?.geminiConfigDir,
+        );
+        const previousGrokDir = sanitizeDir(persistedSettings?.grokConfigDir);
+        const previousOpencodeDir = sanitizeDir(
+          persistedSettings?.opencodeConfigDir,
+        );
+        const previousOpenclawDir = sanitizeDir(
+          persistedSettings?.openclawConfigDir,
+        );
+        const payload = buildSettingsPayload(mergedSettings);
 
         // 在 mutate 之前从实时缓存捕获上一次持久化的插件集成状态，
         // 避免 closure 里的 data 因 React 尚未 re-render 而滞后
-        const prevPluginEnabled = queryClient.getQueryData<Settings>([
-          "settings",
-        ])?.enableClaudePluginIntegration;
+        const prevPluginEnabled =
+          persistedSettings?.enableClaudePluginIntegration;
 
         const saveOutcome = await saveMutation.mutateAsync(payload);
 
@@ -372,7 +367,7 @@ export function useSettings(): UseSettingsResult {
         // 只在开机自启状态真正改变时调用系统 API
         if (
           payload.launchOnStartup !== undefined &&
-          payload.launchOnStartup !== data?.launchOnStartup
+          payload.launchOnStartup !== persistedSettings?.launchOnStartup
         ) {
           try {
             await settingsApi.setAutoLaunch(payload.launchOnStartup);
@@ -387,7 +382,8 @@ export function useSettings(): UseSettingsResult {
         }
 
         // Claude Code 初次安装确认：开=写入 hasCompletedOnboarding=true；关=删除该字段
-        const prevSkipClaudeOnboarding = data?.skipClaudeOnboarding ?? false;
+        const prevSkipClaudeOnboarding =
+          persistedSettings?.skipClaudeOnboarding ?? false;
         const nextSkipClaudeOnboarding = payload.skipClaudeOnboarding ?? false;
         if (nextSkipClaudeOnboarding !== prevSkipClaudeOnboarding) {
           try {
@@ -437,12 +433,14 @@ export function useSettings(): UseSettingsResult {
 
         // 如果 Claude/Codex/Gemini/OpenCode/OpenClaw 的目录覆盖发生变化，则立即将"当前使用的供应商"写回对应应用的 live 配置
         // 如果插件同步已经执行过 syncCurrentProvidersLiveSafe，则跳过避免重复
-        const claudeDirChanged = sanitizedClaudeDir !== previousClaudeDir;
-        const codexDirChanged = sanitizedCodexDir !== previousCodexDir;
-        const geminiDirChanged = sanitizedGeminiDir !== previousGeminiDir;
-        const grokDirChanged = sanitizedGrokDir !== previousGrokDir;
-        const opencodeDirChanged = sanitizedOpencodeDir !== previousOpencodeDir;
-        const openclawDirChanged = sanitizedOpenclawDir !== previousOpenclawDir;
+        const claudeDirChanged = payload.claudeConfigDir !== previousClaudeDir;
+        const codexDirChanged = payload.codexConfigDir !== previousCodexDir;
+        const geminiDirChanged = payload.geminiConfigDir !== previousGeminiDir;
+        const grokDirChanged = payload.grokConfigDir !== previousGrokDir;
+        const opencodeDirChanged =
+          payload.opencodeConfigDir !== previousOpencodeDir;
+        const openclawDirChanged =
+          payload.openclawConfigDir !== previousOpenclawDir;
         if (
           !pluginSynced &&
           (claudeDirChanged ||
@@ -502,6 +500,27 @@ export function useSettings(): UseSettingsResult {
       syncClaudePluginIfChanged,
       t,
     ],
+  );
+
+  const enqueueSave = useCallback((save: () => Promise<SaveResult | null>) => {
+    const result = saveQueue.current.then(save, save);
+    saveQueue.current = result.then(
+      () => undefined,
+      () => undefined,
+    );
+    return result;
+  }, []);
+
+  const autoSaveSettings = useCallback(
+    (updates: Partial<SettingsFormState>) =>
+      enqueueSave(() => persistSettingsUpdates(updates)),
+    [enqueueSave, persistSettingsUpdates],
+  );
+
+  const saveSettings = useCallback(
+    (overrides?: Partial<SettingsFormState>, options?: { silent?: boolean }) =>
+      enqueueSave(() => persistSettings(overrides, options)),
+    [enqueueSave, persistSettings],
   );
 
   const isLoading = useMemo(

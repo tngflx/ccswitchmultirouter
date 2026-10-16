@@ -329,6 +329,18 @@ export type CodexApiFormat =
 
 export type CodexProtocolOverride = "openai_responses" | "openai_chat";
 
+/** Provider API declarations are transport evidence, not a verified deep probe. */
+export interface CodexModelProtocolCapability {
+  schemaVersion: 1;
+  source: "provider_api";
+  baseUrl: string;
+  upstreamModel: string;
+  supportedEndpoints: CodexProtocolOverride[];
+  supportsTools?: boolean;
+  supportsStreaming?: boolean;
+  supportsToolContinuation?: boolean;
+}
+
 export type CodexReasoningEffort =
   "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | "ultra";
 
@@ -376,7 +388,16 @@ export interface CodexModelReasoningCapability {
     effortMap?: Partial<Record<CodexReasoningEffort, CodexReasoningEffort>>;
   };
   outputFormat?: CodexChatReasoningOutputFormat;
-  source?: "provider" | "builtin" | "user" | "legacy" | "protocol";
+  source?:
+    | "provider"
+    | "builtin"
+    | "user"
+    | "legacy"
+    | "protocol"
+    | "detection"
+    | "library"
+    | "provider_config"
+    | "official";
   /** 证据等级（schema v2）。易变元数据，不进入能力指纹。 */
   confidence?: CodexReasoningConfidence;
   /** 检测时间（schema v2）。易变元数据，不进入能力指纹。 */
@@ -422,6 +443,7 @@ export interface CodexCatalogModel {
   supports_parallel_tool_calls?: boolean;
   baseInstructions?: string;
   base_instructions?: string;
+  protocolCapability?: CodexModelProtocolCapability;
   reasoning?: CodexModelReasoningCapability;
   /** Codex 产品层设置，不属于 Provider capability 或其来源。 */
   codexUltra?: {
@@ -521,6 +543,7 @@ export interface OrchestrationBudget {
 export interface OrchestrationProfile {
   id: string;
   displayName: string;
+  /** Disabled profiles are drafts: role references may be incomplete and never route. */
   enabled: boolean;
   scope: OrchestrationAppScope;
   orchestrator: OrchestrationModelRef;

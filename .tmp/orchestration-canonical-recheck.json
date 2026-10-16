@@ -1,0 +1,29 @@
+{
+  "checkedAt": "2026-10-16T00:44:43.772942+08:00",
+  "canonicalDatabase": "C:\\Users\\Felix\\.cc-switch\\cc-switch.db",
+  "orchestrationEnabled": true,
+  "activeProfileId": "profile-1791855841117-0",
+  "profiles": [
+    {
+      "id": "profile-1791855841117-0",
+      "name": "Claude + GPT 6.1 Sol",
+      "enabled": true,
+      "scope": "all",
+      "alias": "ccsm-orch/profile-1791855841117-0",
+      "inManagedCatalog": true
+    },
+    {
+      "id": "research-ensemble",
+      "name": "Research Ensemble",
+      "enabled": true,
+      "scope": "codex",
+      "alias": "ccsm-orch/research-ensemble",
+      "inManagedCatalog": false
+    }
+  ],
+  "managedAliases": [
+    "ccsm-orch/profile-1791855841117-0",
+    "ccsm-role/profile-1791855841117-0/worker"
+  ],
+  "warning": "Generated-catalog agreement alone cannot prove publication of every saved profile or live inference."
+}

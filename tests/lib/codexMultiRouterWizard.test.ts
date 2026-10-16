@@ -286,12 +286,9 @@ wire_api = "responses"
       buildWizardModelCatalog([disabled], { includeDisabled: true }).models,
     ).toEqual([{ model: "kept-for-recovery", enabled: false }]);
     expect(
-      buildCodexMultiRouterWizardPlan(
-        [disabled],
-        [disabled],
-        null,
-        { catalogModelOrder: ["kept-for-recovery"] },
-      ).sourceProviders,
+      buildCodexMultiRouterWizardPlan([disabled], [disabled], null, {
+        catalogModelOrder: ["kept-for-recovery"],
+      }).sourceProviders,
     ).toEqual([]);
   });
 
@@ -467,6 +464,13 @@ wire_api = "responses"
         upstreamModel: "kept-upstream",
         displayName: "Kept",
         contextWindow: 262144,
+      },
+      {
+        model: "removed-upstream",
+        upstreamModel: "removed-upstream",
+        displayName: "removed-upstream",
+        contextWindow: 131072,
+        enabled: false,
       },
     ]);
     expect(refreshed.settingsConfig.modelCatalog.spawnAgentModels).toEqual([

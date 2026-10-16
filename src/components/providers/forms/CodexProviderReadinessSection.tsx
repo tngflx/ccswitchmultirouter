@@ -1,5 +1,6 @@
 import type { Ref } from "react";
 import {
+  BadgeDollarSign,
   CheckCircle2,
   Download,
   Eye,
@@ -7,16 +8,25 @@ import {
   Route,
   Server,
 } from "lucide-react";
+import { useTranslation } from "react-i18next";
 
 import { Button } from "@/components/ui/button";
+import { readCodexModelProtocolCapability } from "@/lib/codexProtocolCapability";
+import { normalizeCodexPublicModelKey } from "@/lib/protocol-lab/codex-overrides";
 import { cn } from "@/lib/utils";
-import type { CodexApiFormat, CodexCatalogModel } from "@/types";
+import type {
+  CodexApiFormat,
+  CodexCatalogModel,
+  CodexProtocolOverride,
+  Provider,
+} from "@/types";
 import type { CodexProviderAdaptationView } from "@/lib/api/protocol-compatibility";
 
 type ValidationTone = "muted" | "success" | "warning" | "error";
 
 interface CodexProviderReadinessSectionProps {
   models: CodexCatalogModel[];
+  provider?: Pick<Provider, "settingsConfig" | "meta">;
   defaultModel?: string;
   apiFormat: CodexApiFormat;
   adaptation?: CodexProviderAdaptationView | null;
@@ -29,6 +39,9 @@ interface CodexProviderReadinessSectionProps {
   syncButtonRef?: Ref<HTMLButtonElement>;
   sectionRef?: Ref<HTMLElement>;
   onSyncModels: () => void;
+  confirmedFreeModelCount?: number;
+  canUseFreeModelsOnly?: boolean;
+  onUseFreeModelsOnly?: () => void;
   onValidateConnection: () => void;
   onViewCompatibilityDetails?: () => void;
 }
@@ -46,6 +59,7 @@ function apiFormatLabel(apiFormat: CodexApiFormat): string {
 
 export function CodexProviderReadinessSection({
   models,
+  provider,
   defaultModel,
   apiFormat,
   adaptation = null,
@@ -58,9 +72,13 @@ export function CodexProviderReadinessSection({
   syncButtonRef,
   sectionRef,
   onSyncModels,
+  confirmedFreeModelCount = 0,
+  canUseFreeModelsOnly = false,
+  onUseFreeModelsOnly,
   onValidateConnection,
   onViewCompatibilityDetails,
 }: CodexProviderReadinessSectionProps) {
+  const { t } = useTranslation();
   const configuredModels = models.filter((model) => model.model.trim());
   const enabledModels = configuredModels.filter(
     (model) => model.enabled !== false,
@@ -80,10 +98,90 @@ export function CodexProviderReadinessSection({
       adaptation.expiresAt <= Math.floor(Date.now() / 1000));
   const persistedEvidenceReady =
     adaptation?.status === "ready" && !evidenceExpired;
+  const hasPersistedEvidence = Boolean(
+    adaptation?.models.some((model) => model.responses || model.chat),
+  );
+  const explicitTransportFor = (
+    model: CodexCatalogModel,
+  ): CodexProtocolOverride | null => {
+    const override =
+      provider?.meta?.codexProtocolOverrides?.[
+        normalizeCodexPublicModelKey(model.model)
+      ];
+    if (override === "openai_chat" || override === "openai_responses") {
+      return override;
+    }
+    return provider?.meta?.codexProtocolMode === "manual" &&
+      (apiFormat === "openai_chat" || apiFormat === "openai_responses")
+      ? apiFormat
+      : null;
+  };
+  const apiDeclaredModels = provider
+    ? enabledModels.flatMap((model) => {
+        const explicitTransport = explicitTransportFor(model);
+        const transport = readCodexModelProtocolCapability(
+          explicitTransport
+            ? {
+                ...provider,
+                meta: { ...provider.meta, apiFormat: explicitTransport },
+              }
+            : provider,
+          model,
+        );
+        return transport
+          ? [
+              {
+                model: model.model.trim(),
+                transport,
+                appliesToSelection:
+                  !explicitTransport || explicitTransport === transport,
+              },
+            ]
+          : [];
+      })
+    : [];
+  const apiDeclaredModelNames = new Set(
+    apiDeclaredModels
+      .filter((model) => model.appliesToSelection)
+      .map((model) => model.model),
+  );
+  const hasCurrentProbeIssues =
+    !evidenceExpired &&
+    adaptation?.models.some(
+      (evidence) =>
+        evidence.readiness !== "verified" &&
+        Boolean(evidence.responses || evidence.chat) &&
+        enabledModels.some(
+          (model) =>
+            evidence.publicModel.trim() === model.model.trim() &&
+            evidence.upstreamModel.trim() ===
+              (
+                model.upstreamModel ??
+                model.upstream_model ??
+                model.model
+              ).trim(),
+        ),
+    );
+  const capabilitiesReady =
+    !hasCurrentProbeIssues &&
+    enabledModels.every(
+      (model) =>
+        apiDeclaredModelNames.has(model.model.trim()) ||
+        (!evidenceExpired &&
+          adaptation?.models.some(
+            (evidence) =>
+              evidence.publicModel.trim() === model.model.trim() &&
+              evidence.readiness === "verified" &&
+              evidence.effectiveTransport !== null,
+          )),
+    );
   const validationPassed =
     validationTone === "success" ||
     (validationTone !== "error" && persistedEvidenceReady);
-  const ready = hasModels && validationPassed;
+  const ready =
+    hasModels &&
+    validationTone !== "error" &&
+    (validationPassed || capabilitiesReady);
   const readinessLabel =
     configuredModels.length === 0
       ? "Sync models"
@@ -94,24 +192,65 @@ export function CodexProviderReadinessSection({
           : validationTone === "error"
             ? "Connection validation failed"
             : "Validate the connection first";
-  const effectiveProtocolLabel = adaptation
-    ? adaptation.persistence === "split" ||
-      adaptation.effectiveTransport === "mixed"
-      ? "Automatic adaptation · Responses + Chat"
-      : adaptation.effectiveTransport === "open_ai_responses"
+  const hasExplicitTransport = enabledModels.some(
+    (model) => explicitTransportFor(model) !== null,
+  );
+  const resolvedTransports = new Set(
+    enabledModels.flatMap((model) => {
+      const explicitTransport = explicitTransportFor(model);
+      if (explicitTransport) return [explicitTransport];
+      const verified = !evidenceExpired
+        ? adaptation?.models.find(
+            (evidence) =>
+              evidence.publicModel.trim() === model.model.trim() &&
+              evidence.readiness === "verified",
+          )?.effectiveTransport
+        : null;
+      if (verified) {
+        return [
+          verified === "open_ai_responses"
+            ? ("openai_responses" as const)
+            : ("openai_chat" as const),
+        ];
+      }
+      const declared = apiDeclaredModels.find(
+        (declaration) => declaration.model === model.model.trim(),
+      );
+      return declared ? [declared.transport] : [];
+    }),
+  );
+  const apiProtocolLabel =
+    resolvedTransports.size > 1
+      ? t("codexProviderReadiness.apiMixedProtocol", {
+          defaultValue: "API-declared · Responses + Chat",
+        })
+      : resolvedTransports.has("openai_responses")
         ? "Responses"
-        : adaptation.effectiveTransport === "open_ai_chat"
-          ? "Chat"
-          : adaptation.persistence === "legacy_mixed"
-            ? "Legacy mixed protocol"
-            : apiFormatLabel(apiFormat)
-    : apiFormatLabel(apiFormat);
+        : "Chat";
+  const effectiveProtocolLabel =
+    hasExplicitTransport && hasModels
+      ? resolvedTransports.size > 1
+        ? t("codexProviderReadiness.manualMixedProtocol", {
+            defaultValue: "Manual selection · Responses + Chat",
+          })
+        : apiFormatLabel([...resolvedTransports][0] ?? apiFormat)
+      : !validationPassed && ready && apiDeclaredModels.length > 0
+        ? apiProtocolLabel
+        : adaptation
+          ? adaptation.persistence === "split" ||
+            adaptation.effectiveTransport === "mixed"
+            ? "Automatic adaptation · Responses + Chat"
+            : adaptation.effectiveTransport === "open_ai_responses"
+              ? "Responses"
+              : adaptation.effectiveTransport === "open_ai_chat"
+                ? "Chat"
+                : adaptation.persistence === "legacy_mixed"
+                  ? "Legacy mixed protocol"
+                  : apiFormatLabel(apiFormat)
+          : apiFormatLabel(apiFormat);
   const evidenceTime = adaptation?.testedAt
     ? new Date(adaptation.testedAt * 1000).toLocaleString()
     : "Not validated";
-  const hasPersistedEvidence = Boolean(
-    adaptation?.models.some((model) => model.responses || model.chat),
-  );
 
   return (
     <section
@@ -152,6 +291,30 @@ export function CodexProviderReadinessSection({
             )}
             Sync models
           </Button>
+          {canUseFreeModelsOnly &&
+            (confirmedFreeModelCount ?? 0) > 0 &&
+            onUseFreeModelsOnly && (
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                className="h-8 gap-1"
+                onClick={onUseFreeModelsOnly}
+                disabled={isSyncingModels}
+                title={t("codexConfig.useFreeModelsOnlyHint", {
+                  defaultValue:
+                    "Enable only models that the provider explicitly identifies as free.",
+                })}
+              >
+                <BadgeDollarSign className="h-3.5 w-3.5" />
+                {t("codexConfig.useFreeModelsOnly", {
+                  defaultValue: "Use free models only",
+                })}
+                <span className="text-[11px] opacity-75">
+                  ({confirmedFreeModelCount})
+                </span>
+              </Button>
+            )}
           <Button
             type="button"
             variant="outline"
@@ -160,7 +323,10 @@ export function CodexProviderReadinessSection({
             disabled={isValidatingConnection}
             onClick={onValidateConnection}
             aria-label="Validate connection"
-            title="Send real Requests to Responses and Chat to validate SSE, reasoning, tool calls, and tool continuations"
+            title={t("codexProviderReadiness.optionalProbeHint", {
+              defaultValue:
+                "Optional live verification of credentials, streaming, tool calls, and tool continuations.",
+            })}
           >
             {isValidatingConnection ? (
               <Loader2 className="h-3.5 w-3.5 animate-spin" />
@@ -215,11 +381,24 @@ export function CodexProviderReadinessSection({
             Compatibility evidence
           </p>
           <p className="mt-1 text-sm font-medium text-foreground">
-            {adaptation ? `${adaptation.models.length} models` : "Not loaded"}
+            {hasPersistedEvidence
+              ? `${adaptation?.models.length ?? 0} models`
+              : apiDeclaredModels.length > 0
+                ? t("codexProviderReadiness.apiDeclaredModels", {
+                    count: apiDeclaredModels.length,
+                    defaultValue: "API-declared: {{count}} model(s)",
+                  })
+                : adaptation
+                  ? `${adaptation.models.length} models`
+                  : "Not loaded"}
           </p>
           <p className="mt-1 text-[11px] leading-relaxed text-muted-foreground">
-            Evidence time: {evidenceTime}
-            {evidenceExpired ? " · expired" : ""}
+            {hasPersistedEvidence ||
+            (adaptation && apiDeclaredModels.length === 0)
+              ? `Evidence time: ${evidenceTime}${evidenceExpired ? " · expired" : ""}`
+              : t("codexProviderReadiness.notLiveVerified", {
+                  defaultValue: "No live probe verification",
+                })}
           </p>
         </div>
       </div>
@@ -252,7 +431,10 @@ export function CodexProviderReadinessSection({
             <p className="text-xs leading-relaxed text-muted-foreground">
               {isMaintainedPreset
                 ? "Protocol, context, reasoning levels, and the /model catalog are maintained by CCSwitchMulti."
-                : "The deep compatibility probe checks Chat and Responses automatically; use an advanced override only when automatic detection fails."}
+                : t("codexProviderReadiness.automaticCapabilityReadiness", {
+                    defaultValue:
+                      "Provider API capabilities determine protocol readiness. Deep probing is needed when capability data is missing or incomplete.",
+                  })}
             </p>
           </div>
           <span
@@ -272,6 +454,18 @@ export function CodexProviderReadinessSection({
         {isMaintainedPreset && (
           <p className="mt-2 text-xs font-medium text-blue-700 dark:text-blue-300">
             Maintained by CCSwitchMulti
+          </p>
+        )}
+        {ready && (
+          <p className="mt-2 text-xs leading-relaxed text-muted-foreground">
+            {validationPassed
+              ? t("codexProviderReadiness.liveProbeVerified", {
+                  defaultValue: "Live probe verified",
+                })
+              : t("codexProviderReadiness.apiDeclaredReady", {
+                  defaultValue:
+                    "API-declared capabilities; credentials and live tool transactions have not been verified.",
+                })}
           </p>
         )}
         {validationSummary && (

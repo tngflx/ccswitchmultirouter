@@ -1,14 +1,28 @@
 import { invoke } from "@tauri-apps/api/core";
 import type { TFunction } from "i18next";
 import { toast } from "sonner";
-import type { CodexModelReasoningCapability } from "@/types";
+import type {
+  CodexModelProtocolCapability,
+  CodexModelReasoningCapability,
+} from "@/types";
 
 export interface FetchedModel {
   id: string;
   ownedBy: string | null;
+  displayName?: string | null;
+  canonicalSlug?: string | null;
+  slug?: string | null;
+  name?: string | null;
+  aliases?: string[] | Record<string, string> | null;
+  /** Explicit request-model binding; canonicalSlug is only a catalog identity. */
+  upstreamModel?: string | null;
+  /** Explicit upstream billing metadata; null/undefined means unknown. */
+  isFree?: boolean | null;
   contextWindow?: number | null;
   inputModalities?: string[] | null;
   supportsImage?: boolean | null;
+  supportsParallelToolCalls?: boolean | null;
+  protocolCapability?: CodexModelProtocolCapability | null;
   reasoning?: CodexModelReasoningCapability | null;
 }
 

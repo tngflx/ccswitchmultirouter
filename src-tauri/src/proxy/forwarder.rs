@@ -7880,10 +7880,11 @@ where
                 || terminal_quota
                 || retry_count >= super::providers::streaming_retry::STREAM_MAX_RETRIES as usize
             {
-                return Ok(rebuild_consumed_error_response(
+                return Ok(rebuild_codex_error_response(
                     status,
                     &mut response_headers,
                     body_text,
+                    terminal_quota,
                 ));
             }
             let requested_delay = retry_after.unwrap_or_else(|| {
@@ -7936,10 +7937,11 @@ where
         }
 
         if terminal_quota || retry_count >= CODEX_RATE_LIMIT_RETRY_LIMIT {
-            return Ok(rebuild_consumed_error_response(
+            return Ok(rebuild_codex_error_response(
                 http::StatusCode::TOO_MANY_REQUESTS,
                 &mut response_headers,
                 body_text,
+                terminal_quota,
             ));
         }
 
@@ -8028,6 +8030,112 @@ fn rebuild_consumed_error_response(
         headers.clone(),
         Bytes::from(body.unwrap_or_default()),
     )
+}
+
+/// Adapt provider-specific terminal quota errors to the error envelope that the
+/// Codex client can classify without parsing provider-specific text. Some
+/// gateways return a plain-text Go error such as `DAILY_LIMIT_EXCEEDED`.
+/// Preserve the HTTP status but express terminal exhaustion using the structured
+/// usage-limit envelope instead of leaving it indistinguishable from a generic
+/// retryable 429.
+fn rebuild_codex_error_response(
+    status: http::StatusCode,
+    headers: &mut http::HeaderMap,
+    body: Option<String>,
+    terminal_quota: bool,
+) -> ProxyResponse {
+    if terminal_quota {
+        headers.insert(
+            http::header::CONTENT_TYPE,
+            http::HeaderValue::from_static("application/json"),
+        );
+        return rebuild_consumed_error_response(
+            status,
+            headers,
+            Some(normalize_codex_terminal_quota_body(body.as_deref())),
+        );
+    }
+
+    rebuild_consumed_error_response(status, headers, body)
+}
+
+fn normalize_codex_terminal_quota_body(body: Option<&str>) -> String {
+    let body = body.map(str::trim).filter(|body| !body.is_empty());
+    let Some(body) = body else {
+        return json!({
+            "error": {
+                "type": "usage_limit_reached",
+                "code": "usage_limit_reached",
+                "message": "The upstream provider's usage limit has been reached.",
+                "param": Value::Null,
+            }
+        })
+        .to_string();
+    };
+
+    if let Ok(value) = serde_json::from_str::<Value>(body) {
+        let error_type = value
+            .pointer("/error/type")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .unwrap_or_default();
+        if error_type.eq_ignore_ascii_case("usage_limit_reached") {
+            return body.to_string();
+        }
+        if error_type.eq_ignore_ascii_case("usage_not_included") {
+            return json!({
+                "error": {
+                    "type": "usage_not_included",
+                    "code": "usage_not_included",
+                    "message": "This model is not included in the upstream plan.",
+                    "param": Value::Null,
+                }
+            })
+            .to_string();
+        }
+
+        let error_code = value
+            .pointer("/error/code")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .unwrap_or_default();
+        if matches!(
+            error_code.to_ascii_lowercase().as_str(),
+            "insufficient_quota"
+                | "credit_balance_exhausted"
+                | "organization_spend_limit_exceeded"
+                | "project_spend_limit_exceeded"
+                | "organization_usage_limit_exceeded"
+        ) {
+            return body.to_string();
+        }
+    }
+
+    let normalized = body.to_ascii_lowercase();
+    let daily = normalized.contains("daily_limit_exceeded")
+        || normalized.contains("daily usage limit exceeded")
+        || normalized.contains("daily_usage_limit_exceeded");
+    let message = if daily {
+        "Daily usage limit exceeded. The upstream provider's daily Codex allowance is exhausted."
+    } else {
+        "The upstream provider's usage limit has been reached."
+    };
+    let upstream_reason = if daily {
+        "DAILY_LIMIT_EXCEEDED"
+    } else {
+        "USAGE_LIMIT_REACHED"
+    };
+
+    json!({
+        "error": {
+            "type": "usage_limit_reached",
+            "code": "usage_limit_reached",
+            "message": message,
+            "param": Value::Null,
+            "upstream_reason": upstream_reason,
+        }
+    })
+    .to_string()
 }
 
 fn upstream_transport_retry_backoff(attempt: usize) -> Duration {
@@ -15154,10 +15262,25 @@ mod tests {
         )
         .await;
 
+        let response = result.unwrap();
+        assert_eq!(response.status(), http::StatusCode::TOO_MANY_REQUESTS);
+        let body = response
+            .bytes_with_limit(MAX_RESPONSE_BODY_BYTES)
+            .await
+            .expect("daily quota body should be readable");
+        let body: Value = serde_json::from_slice(&body).expect("daily quota body should be JSON");
         assert_eq!(
-            result.unwrap().status(),
-            http::StatusCode::TOO_MANY_REQUESTS
+            body.pointer("/error/type").and_then(Value::as_str),
+            Some("usage_limit_reached")
         );
+        assert_eq!(
+            body.pointer("/error/code").and_then(Value::as_str),
+            Some("usage_limit_reached")
+        );
+        assert!(body
+            .pointer("/error/message")
+            .and_then(Value::as_str)
+            .is_some_and(|message| message.contains("Daily usage limit exceeded")));
         assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 

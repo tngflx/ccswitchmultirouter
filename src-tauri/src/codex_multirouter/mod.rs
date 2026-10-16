@@ -3,6 +3,7 @@ pub mod compiler;
 pub mod migration;
 pub mod mutation;
 pub mod projection;
+pub(crate) mod protocol_capability;
 pub mod provider_set;
 pub mod schema;
 

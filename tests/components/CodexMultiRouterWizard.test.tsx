@@ -979,7 +979,7 @@ describe("CodexMultiRouterWizard", () => {
     expect(providersApi.update).not.toHaveBeenCalled();
   });
 
-  it("refreshes an official OAuth catalog with its bound account without including new models", async () => {
+  it("refreshes an official OAuth catalog with its bound account and excludes new models", async () => {
     vi.mocked(fetchCodexOauthModels).mockResolvedValueOnce([
       { id: "gpt-5.5", ownedBy: "openai", contextWindow: 272000 },
       { id: "gpt-5.6-sol", ownedBy: "openai", contextWindow: 372000 },
@@ -1166,7 +1166,7 @@ describe("CodexMultiRouterWizard", () => {
     expect(savedProvider.settingsConfig).not.toHaveProperty("modelCatalog");
   });
 
-  it("keeps provider curated models when wizard refresh sees extra upstream models", async () => {
+  it("keeps provider selections while retaining extra upstream models as excluded inventory", async () => {
     vi.mocked(fetchModelsForConfig).mockResolvedValueOnce([
       { id: "deepseek-chat", ownedBy: null, contextWindow: 128000 },
       { id: "deepseek-reasoner", ownedBy: null, contextWindow: 64000 },
@@ -1202,17 +1202,16 @@ describe("CodexMultiRouterWizard", () => {
     );
 
     expect(
-      await screen.findByText(/loaded 1 models into the draft/),
+      await screen.findByText(/loaded 2 models into the draft/),
     ).toBeInTheDocument();
+    expect(screen.getByText(/Added 1: deepseek-reasoner/)).toBeInTheDocument();
     expect(providersApi.update).not.toHaveBeenCalled();
     fireEvent.click(screen.getByRole("button", { name: "Choose models" }));
     expect(screen.getByLabelText("Keep deepseek-chat")).toBeInTheDocument();
-    expect(
-      screen.queryByLabelText("Keep deepseek-reasoner"),
-    ).not.toBeInTheDocument();
+    expect(screen.getByLabelText("Keep deepseek-reasoner")).not.toBeChecked();
   });
 
-  it("falls back to data-plane models for AgentPlan without AK/SK when API Key exists", async () => {
+  it("falls back to data-plane models for AgentPlan and retains newly discovered inventory", async () => {
     vi.mocked(fetchModelsForConfig).mockResolvedValueOnce([
       { id: "ark-code-latest", ownedBy: "volcengine" },
       { id: "doubao-seed-1.6", ownedBy: "volcengine" },
@@ -1262,9 +1261,10 @@ describe("CodexMultiRouterWizard", () => {
     });
     expect(
       await screen.findByText(
-        "Read succeeded with no model-list changes; still 1 models.",
+        "Read succeeded; loaded 2 models into the draft.",
       ),
     ).toBeInTheDocument();
+    expect(screen.getByText(/Added 1: doubao-seed-1.6/)).toBeInTheDocument();
   });
 
   it("skips AgentPlan model fetch when both inference key and AK/SK are missing", async () => {
@@ -1366,12 +1366,13 @@ describe("CodexMultiRouterWizard", () => {
       expect(providersApi.update).not.toHaveBeenCalled();
     });
     expect(await screen.findByText("Model list updated")).toBeInTheDocument();
-    expect(screen.getByText("Changed 1: ark-code-latest")).toBeInTheDocument();
+    expect(screen.getByText(/Added 1: doubao-seed-1.6/)).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Choose models" }));
     expect(screen.getByLabelText("Keep ark-code-latest")).not.toBeChecked();
+    expect(screen.getByLabelText("Keep doubao-seed-1.6")).not.toBeChecked();
   });
 
-  it("keeps previous model selections without re-adding newly fetched provider models", async () => {
+  it("keeps previous model selections while retaining newly fetched provider models as excluded", async () => {
     vi.mocked(fetchModelsForConfig).mockResolvedValueOnce([
       { id: "model-a", ownedBy: null },
       { id: "model-b", ownedBy: null },
@@ -1414,15 +1415,13 @@ describe("CodexMultiRouterWizard", () => {
       screen.getByRole("button", { name: "Fetch model lists automatically" }),
     );
 
-    expect(
-      await screen.findByText("No model list changes"),
-    ).toBeInTheDocument();
-    expect(screen.queryByText(/Added 1: model-c/)).not.toBeInTheDocument();
+    expect(await screen.findByText("Model list updated")).toBeInTheDocument();
+    expect(screen.getByText(/Added 1: model-c/)).toBeInTheDocument();
 
     fireEvent.click(screen.getByRole("button", { name: "Choose models" }));
     expect(screen.getByLabelText("Keep model-a")).toBeChecked();
     expect(screen.getByLabelText("Keep model-b")).not.toBeChecked();
-    expect(screen.queryByLabelText("Keep model-c")).not.toBeInTheDocument();
+    expect(screen.getByLabelText("Keep model-c")).not.toBeChecked();
   });
 
   it("opens a provider config page from the model fetch cards", () => {

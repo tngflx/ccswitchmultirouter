@@ -394,9 +394,10 @@ export function mergeFetchedModelsIntoWizardProvider(
   fetchedModels: FetchedModel[],
   options: MergeFetchedWizardModelsOptions = {},
 ): Provider {
+  // Kept for API compatibility; refreshes now always retain the full
+  // inventory while new rows remain excluded when a selection already exists.
+  void options;
   const existingModels = readWizardModelCatalog(provider);
-  const shouldAppendFetchedModels =
-    !options.preserveExistingSelection || existingModels.length === 0;
   const result = reconcileFetchedCodexCatalogRows(
     existingModels,
     fetchedModels,
@@ -406,7 +407,10 @@ export function mergeFetchedModelsIntoWizardProvider(
       baseUrl: readWizardProviderBaseUrl(provider),
     },
     {
-      appendNew: shouldAppendFetchedModels,
+      // Keep the complete upstream inventory visible. Existing selections stay
+      // authoritative because new rows are disabled when a catalog already
+      // exists.
+      appendNew: true,
       createRow: (seed) => {
         const { enabled, ...model } = seed;
         return (
@@ -443,10 +447,12 @@ export function mergeFetchedModelsIntoWizardProvider(
         )
         .slice(0, 5)
     : undefined;
+  const settingsConfig = { ...provider.settingsConfig };
+  delete settingsConfig.model_catalog;
   return {
     ...provider,
     settingsConfig: {
-      ...provider.settingsConfig,
+      ...settingsConfig,
       modelCatalog: {
         ...(readWizardModelCatalogConfig(provider) ?? {}),
         models,

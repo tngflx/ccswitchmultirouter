@@ -1,0 +1,25 @@
+{
+  "expected": [
+    "ccsm-orch/profile-1791855841117-0",
+    "ccsm-role/profile-1791855841117-0/worker"
+  ],
+  "inlineConfigMode": "catalog_pointer_only",
+  "missing": {
+    "managedCatalog": [],
+    "codexCache": [],
+    "localModelsEndpoint": [],
+    "installedCodexModelList": []
+  },
+  "installedCodexModels": [
+    {
+      "id": "ccsm-orch/profile-1791855841117-0",
+      "displayName": "Claude + GPT 6.1 Sol",
+      "hidden": false
+    },
+    {
+      "id": "ccsm-role/profile-1791855841117-0/worker",
+      "displayName": "Claude + GPT 6.1 Sol: worker (gpt-6.1-sol-sublyx)",
+      "hidden": false
+    }
+  ]
+}

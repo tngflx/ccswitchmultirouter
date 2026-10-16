@@ -1,0 +1,1192 @@
+{"providerMetadataStatus":200}
+{
+  "providerMetadata": [
+    {
+      "id": "codex-auto-review",
+      "metadataKeys": [
+        "created",
+        "display_name",
+        "id",
+        "object",
+        "owned_by",
+        "type"
+      ]
+    },
+    {
+      "id": "gpt-5.2",
+      "metadataKeys": [
+        "created",
+        "display_name",
+        "id",
+        "object",
+        "owned_by",
+        "type"
+      ]
+    },
+    {
+      "id": "gpt-5.3-codex-spark",
+      "metadataKeys": [
+        "created",
+        "display_name",
+        "id",
+        "object",
+        "owned_by",
+        "type"
+      ]
+    },
+    {
+      "id": "gpt-5.4",
+      "metadataKeys": [
+        "created",
+        "display_name",
+        "id",
+        "object",
+        "owned_by",
+        "type"
+      ]
+    },
+    {
+      "id": "gpt-5.4-mini",
+      "metadataKeys": [
+        "created",
+        "display_name",
+        "id",
+        "object",
+        "owned_by",
+        "type"
+      ]
+    },
+    {
+      "id": "gpt-5.5",
+      "metadataKeys": [
+        "created",
+        "display_name",
+        "id",
+        "object",
+        "owned_by",
+        "type"
+      ]
+    },
+    {
+      "id": "gpt-5.5-openai-compact",
+      "metadataKeys": [
+        "created",
+        "display_name",
+        "id",
+        "object",
+        "owned_by",
+        "type"
+      ]
+    },
+    {
+      "id": "gpt-5.6",
+      "metadataKeys": [
+        "created",
+        "display_name",
+        "id",
+        "object",
+        "owned_by",
+        "type"
+      ]
+    },
+    {
+      "id": "gpt-5.6-luna",
+      "metadataKeys": [
+        "created",
+        "display_name",
+        "id",
+        "object",
+        "owned_by",
+        "type"
+      ]
+    },
+    {
+      "id": "gpt-5.6-openai-compact",
+      "metadataKeys": [
+        "created",
+        "display_name",
+        "id",
+        "object",
+        "owned_by",
+        "type"
+      ]
+    },
+    {
+      "id": "gpt-5.6-sol",
+      "metadataKeys": [
+        "created",
+        "display_name",
+        "id",
+        "object",
+        "owned_by",
+        "type"
+      ]
+    },
+    {
+      "id": "gpt-5.6-terra",
+      "metadataKeys": [
+        "created",
+        "display_name",
+        "id",
+        "object",
+        "owned_by",
+        "type"
+      ]
+    },
+    {
+      "id": "gpt-6",
+      "metadataKeys": [
+        "created",
+        "display_name",
+        "id",
+        "object",
+        "owned_by",
+        "type"
+      ]
+    },
+    {
+      "id": "gpt-6-astra",
+      "metadataKeys": [
+        "created",
+        "display_name",
+        "id",
+        "object",
+        "owned_by",
+        "type"
+      ]
+    },
+    {
+      "id": "gpt-6-luna",
+      "metadataKeys": [
+        "created",
+        "display_name",
+        "id",
+        "object",
+        "owned_by",
+        "type"
+      ]
+    },
+    {
+      "id": "gpt-6-sol",
+      "metadataKeys": [
+        "created",
+        "display_name",
+        "id",
+        "object",
+        "owned_by",
+        "type"
+      ]
+    },
+    {
+      "id": "gpt-6.1-sol",
+      "metadataKeys": [
+        "created",
+        "display_name",
+        "id",
+        "object",
+        "owned_by",
+        "type"
+      ]
+    },
+    {
+      "id": "gpt-image-1",
+      "metadataKeys": [
+        "created",
+        "display_name",
+        "id",
+        "object",
+        "owned_by",
+        "type"
+      ]
+    },
+    {
+      "id": "gpt-image-1.5",
+      "metadataKeys": [
+        "created",
+        "display_name",
+        "id",
+        "object",
+        "owned_by",
+        "type"
+      ]
+    },
+    {
+      "id": "gpt-image-2",
+      "metadataKeys": [
+        "created",
+        "display_name",
+        "id",
+        "object",
+        "owned_by",
+        "type"
+      ]
+    },
+    {
+      "id": "gpt-image-2.5-flare",
+      "metadataKeys": [
+        "created",
+        "display_name",
+        "id",
+        "object",
+        "owned_by",
+        "type"
+      ]
+    },
+    {
+      "id": "gpt-image-2.5-sunburst",
+      "metadataKeys": [
+        "created",
+        "display_name",
+        "id",
+        "object",
+        "owned_by",
+        "type"
+      ]
+    },
+    {
+      "id": "gpt-reserve",
+      "metadataKeys": [
+        "created",
+        "display_name",
+        "id",
+        "object",
+        "owned_by",
+        "type"
+      ]
+    }
+  ]
+}
+{
+  "providerCatalogs": [
+    {
+      "id": "d0ea2177-c7e8-422d-98f8-fc74e06b96df",
+      "name": "Sublyx",
+      "current": false,
+      "apiFormat": "openai_responses",
+      "models": [
+        {
+          "model": "gpt-5.6-luna-sublyx",
+          "upstreamModel": "gpt-5.6-luna",
+          "enabled": true
+        },
+        {
+          "model": "gpt-5.6-sol-sublyx",
+          "upstreamModel": "gpt-5.6-sol",
+          "enabled": true
+        },
+        {
+          "model": "gpt-5.6-terra-sublyx",
+          "upstreamModel": "gpt-5.6-terra",
+          "enabled": true
+        },
+        {
+          "model": "gpt-6",
+          "enabled": false
+        },
+        {
+          "model": "gpt-6-astra-sublyx",
+          "upstreamModel": "gpt-6-astra",
+          "enabled": true
+        },
+        {
+          "model": "gpt-6-luna-sublyx",
+          "upstreamModel": "gpt-6-luna",
+          "enabled": true
+        },
+        {
+          "model": "gpt-6-sol-sublyx",
+          "upstreamModel": "gpt-6-sol",
+          "enabled": true
+        },
+        {
+          "model": "gpt-6.1-sol-sublyx",
+          "upstreamModel": "gpt-6.1-sol",
+          "enabled": true
+        },
+        {
+          "model": "gpt-5.6",
+          "enabled": false
+        },
+        {
+          "model": "codex-auto-review",
+          "enabled": false
+        },
+        {
+          "model": "gpt-5.2",
+          "enabled": false
+        },
+        {
+          "model": "gpt-5.3-codex-spark",
+          "enabled": false
+        },
+        {
+          "model": "gpt-5.4",
+          "enabled": false
+        },
+        {
+          "model": "gpt-5.4-mini",
+          "enabled": false
+        },
+        {
+          "model": "gpt-5.5",
+          "enabled": false
+        },
+        {
+          "model": "gpt-image-1",
+          "enabled": false
+        },
+        {
+          "model": "gpt-image-1.5",
+          "enabled": false
+        },
+        {
+          "model": "gpt-image-2",
+          "enabled": false
+        },
+        {
+          "model": "gpt-image-2.5-flare",
+          "enabled": false
+        },
+        {
+          "model": "gpt-image-2.5-sunburst",
+          "enabled": false
+        },
+        {
+          "model": "gpt-5.5-openai-compact",
+          "enabled": false
+        },
+        {
+          "model": "gpt-5.6-openai-compact",
+          "enabled": false
+        },
+        {
+          "model": "gpt-reserve",
+          "enabled": false
+        },
+        {
+          "model": "gpt-5.3-codex",
+          "enabled": false
+        }
+      ]
+    },
+    {
+      "id": "codex-multirouter",
+      "name": "Codex MultiRouter",
+      "current": true,
+      "models": []
+    }
+  ],
+  "codexConfig": {
+    "model": "gpt-6.1-sol-sublyx",
+    "reasoningEffort": "xhigh",
+    "modelProvider": "codex_model_router_v2",
+    "modelCatalog": "C:\\Users\\Felix\\.codex\\cc-switch-model-catalog.json",
+    "subagentVersion": "v2"
+  },
+  "managedCatalog": [
+    {
+      "model": "gpt-6.1-sol-sublyx",
+      "levels": [
+        {
+          "description": "low effort",
+          "effort": "low"
+        },
+        {
+          "description": "medium effort",
+          "effort": "medium"
+        },
+        {
+          "description": "high effort",
+          "effort": "high"
+        },
+        {
+          "description": "xhigh effort",
+          "effort": "xhigh"
+        },
+        {
+          "description": "max effort",
+          "effort": "max"
+        },
+        {
+          "description": "ultra effort",
+          "effort": "ultra"
+        }
+      ],
+      "defaultLevel": "xhigh",
+      "desktopLevels": [
+        {
+          "description": "low effort",
+          "reasoningEffort": "low"
+        },
+        {
+          "description": "medium effort",
+          "reasoningEffort": "medium"
+        },
+        {
+          "description": "high effort",
+          "reasoningEffort": "high"
+        },
+        {
+          "description": "xhigh effort",
+          "reasoningEffort": "xhigh"
+        },
+        {
+          "description": "max effort",
+          "reasoningEffort": "max"
+        },
+        {
+          "description": "ultra effort",
+          "reasoningEffort": "ultra"
+        }
+      ]
+    },
+    {
+      "model": "gpt-6-astra-sublyx",
+      "levels": [
+        {
+          "description": "low effort",
+          "effort": "low"
+        },
+        {
+          "description": "medium effort",
+          "effort": "medium"
+        },
+        {
+          "description": "high effort",
+          "effort": "high"
+        },
+        {
+          "description": "xhigh effort",
+          "effort": "xhigh"
+        },
+        {
+          "description": "max effort",
+          "effort": "max"
+        },
+        {
+          "description": "ultra effort",
+          "effort": "ultra"
+        }
+      ],
+      "defaultLevel": "low",
+      "desktopLevels": [
+        {
+          "description": "low effort",
+          "reasoningEffort": "low"
+        },
+        {
+          "description": "medium effort",
+          "reasoningEffort": "medium"
+        },
+        {
+          "description": "high effort",
+          "reasoningEffort": "high"
+        },
+        {
+          "description": "xhigh effort",
+          "reasoningEffort": "xhigh"
+        },
+        {
+          "description": "max effort",
+          "reasoningEffort": "max"
+        },
+        {
+          "description": "ultra effort",
+          "reasoningEffort": "ultra"
+        }
+      ]
+    },
+    {
+      "model": "gpt-6-luna-sublyx",
+      "levels": [
+        {
+          "description": "low effort",
+          "effort": "low"
+        },
+        {
+          "description": "medium effort",
+          "effort": "medium"
+        },
+        {
+          "description": "high effort",
+          "effort": "high"
+        },
+        {
+          "description": "xhigh effort",
+          "effort": "xhigh"
+        },
+        {
+          "description": "max effort",
+          "effort": "max"
+        }
+      ],
+      "defaultLevel": "medium",
+      "desktopLevels": [
+        {
+          "description": "low effort",
+          "reasoningEffort": "low"
+        },
+        {
+          "description": "medium effort",
+          "reasoningEffort": "medium"
+        },
+        {
+          "description": "high effort",
+          "reasoningEffort": "high"
+        },
+        {
+          "description": "xhigh effort",
+          "reasoningEffort": "xhigh"
+        },
+        {
+          "description": "max effort",
+          "reasoningEffort": "max"
+        }
+      ]
+    },
+    {
+      "model": "gpt-6-sol-sublyx",
+      "levels": [
+        {
+          "description": "low effort",
+          "effort": "low"
+        },
+        {
+          "description": "medium effort",
+          "effort": "medium"
+        },
+        {
+          "description": "high effort",
+          "effort": "high"
+        },
+        {
+          "description": "xhigh effort",
+          "effort": "xhigh"
+        },
+        {
+          "description": "max effort",
+          "effort": "max"
+        },
+        {
+          "description": "ultra effort",
+          "effort": "ultra"
+        }
+      ],
+      "defaultLevel": "medium",
+      "desktopLevels": [
+        {
+          "description": "low effort",
+          "reasoningEffort": "low"
+        },
+        {
+          "description": "medium effort",
+          "reasoningEffort": "medium"
+        },
+        {
+          "description": "high effort",
+          "reasoningEffort": "high"
+        },
+        {
+          "description": "xhigh effort",
+          "reasoningEffort": "xhigh"
+        },
+        {
+          "description": "max effort",
+          "reasoningEffort": "max"
+        },
+        {
+          "description": "ultra effort",
+          "reasoningEffort": "ultra"
+        }
+      ]
+    },
+    {
+      "model": "gpt-5.6-luna-sublyx",
+      "levels": [
+        {
+          "description": "low effort",
+          "effort": "low"
+        },
+        {
+          "description": "medium effort",
+          "effort": "medium"
+        },
+        {
+          "description": "high effort",
+          "effort": "high"
+        },
+        {
+          "description": "xhigh effort",
+          "effort": "xhigh"
+        },
+        {
+          "description": "max effort",
+          "effort": "max"
+        }
+      ],
+      "defaultLevel": "medium",
+      "desktopLevels": [
+        {
+          "description": "low effort",
+          "reasoningEffort": "low"
+        },
+        {
+          "description": "medium effort",
+          "reasoningEffort": "medium"
+        },
+        {
+          "description": "high effort",
+          "reasoningEffort": "high"
+        },
+        {
+          "description": "xhigh effort",
+          "reasoningEffort": "xhigh"
+        },
+        {
+          "description": "max effort",
+          "reasoningEffort": "max"
+        }
+      ]
+    },
+    {
+      "model": "gpt-5.6-sol-sublyx",
+      "levels": [
+        {
+          "description": "low effort",
+          "effort": "low"
+        },
+        {
+          "description": "medium effort",
+          "effort": "medium"
+        },
+        {
+          "description": "high effort",
+          "effort": "high"
+        },
+        {
+          "description": "xhigh effort",
+          "effort": "xhigh"
+        },
+        {
+          "description": "max effort",
+          "effort": "max"
+        },
+        {
+          "description": "ultra effort",
+          "effort": "ultra"
+        }
+      ],
+      "defaultLevel": "low",
+      "desktopLevels": [
+        {
+          "description": "low effort",
+          "reasoningEffort": "low"
+        },
+        {
+          "description": "medium effort",
+          "reasoningEffort": "medium"
+        },
+        {
+          "description": "high effort",
+          "reasoningEffort": "high"
+        },
+        {
+          "description": "xhigh effort",
+          "reasoningEffort": "xhigh"
+        },
+        {
+          "description": "max effort",
+          "reasoningEffort": "max"
+        },
+        {
+          "description": "ultra effort",
+          "reasoningEffort": "ultra"
+        }
+      ]
+    },
+    {
+      "model": "gpt-5.6-terra-sublyx",
+      "levels": [
+        {
+          "description": "low effort",
+          "effort": "low"
+        },
+        {
+          "description": "medium effort",
+          "effort": "medium"
+        },
+        {
+          "description": "high effort",
+          "effort": "high"
+        },
+        {
+          "description": "xhigh effort",
+          "effort": "xhigh"
+        },
+        {
+          "description": "max effort",
+          "effort": "max"
+        },
+        {
+          "description": "ultra effort",
+          "effort": "ultra"
+        }
+      ],
+      "defaultLevel": "medium",
+      "desktopLevels": [
+        {
+          "description": "low effort",
+          "reasoningEffort": "low"
+        },
+        {
+          "description": "medium effort",
+          "reasoningEffort": "medium"
+        },
+        {
+          "description": "high effort",
+          "reasoningEffort": "high"
+        },
+        {
+          "description": "xhigh effort",
+          "reasoningEffort": "xhigh"
+        },
+        {
+          "description": "max effort",
+          "reasoningEffort": "max"
+        },
+        {
+          "description": "ultra effort",
+          "reasoningEffort": "ultra"
+        }
+      ]
+    }
+  ],
+  "modelCache": [
+    {
+      "model": "gpt-6.1-sol-sublyx",
+      "levels": [
+        {
+          "description": "low effort",
+          "effort": "low"
+        },
+        {
+          "description": "medium effort",
+          "effort": "medium"
+        },
+        {
+          "description": "high effort",
+          "effort": "high"
+        },
+        {
+          "description": "xhigh effort",
+          "effort": "xhigh"
+        },
+        {
+          "description": "max effort",
+          "effort": "max"
+        },
+        {
+          "description": "ultra effort",
+          "effort": "ultra"
+        }
+      ],
+      "defaultLevel": "xhigh",
+      "desktopLevels": [
+        {
+          "description": "low effort",
+          "reasoningEffort": "low"
+        },
+        {
+          "description": "medium effort",
+          "reasoningEffort": "medium"
+        },
+        {
+          "description": "high effort",
+          "reasoningEffort": "high"
+        },
+        {
+          "description": "xhigh effort",
+          "reasoningEffort": "xhigh"
+        },
+        {
+          "description": "max effort",
+          "reasoningEffort": "max"
+        },
+        {
+          "description": "ultra effort",
+          "reasoningEffort": "ultra"
+        }
+      ]
+    },
+    {
+      "model": "gpt-6-astra-sublyx",
+      "levels": [
+        {
+          "description": "low effort",
+          "effort": "low"
+        },
+        {
+          "description": "medium effort",
+          "effort": "medium"
+        },
+        {
+          "description": "high effort",
+          "effort": "high"
+        },
+        {
+          "description": "xhigh effort",
+          "effort": "xhigh"
+        },
+        {
+          "description": "max effort",
+          "effort": "max"
+        },
+        {
+          "description": "ultra effort",
+          "effort": "ultra"
+        }
+      ],
+      "defaultLevel": "low",
+      "desktopLevels": [
+        {
+          "description": "low effort",
+          "reasoningEffort": "low"
+        },
+        {
+          "description": "medium effort",
+          "reasoningEffort": "medium"
+        },
+        {
+          "description": "high effort",
+          "reasoningEffort": "high"
+        },
+        {
+          "description": "xhigh effort",
+          "reasoningEffort": "xhigh"
+        },
+        {
+          "description": "max effort",
+          "reasoningEffort": "max"
+        },
+        {
+          "description": "ultra effort",
+          "reasoningEffort": "ultra"
+        }
+      ]
+    },
+    {
+      "model": "gpt-6-luna-sublyx",
+      "levels": [
+        {
+          "description": "low effort",
+          "effort": "low"
+        },
+        {
+          "description": "medium effort",
+          "effort": "medium"
+        },
+        {
+          "description": "high effort",
+          "effort": "high"
+        },
+        {
+          "description": "xhigh effort",
+          "effort": "xhigh"
+        },
+        {
+          "description": "max effort",
+          "effort": "max"
+        }
+      ],
+      "defaultLevel": "medium",
+      "desktopLevels": [
+        {
+          "description": "low effort",
+          "reasoningEffort": "low"
+        },
+        {
+          "description": "medium effort",
+          "reasoningEffort": "medium"
+        },
+        {
+          "description": "high effort",
+          "reasoningEffort": "high"
+        },
+        {
+          "description": "xhigh effort",
+          "reasoningEffort": "xhigh"
+        },
+        {
+          "description": "max effort",
+          "reasoningEffort": "max"
+        }
+      ]
+    },
+    {
+      "model": "gpt-6-sol-sublyx",
+      "levels": [
+        {
+          "description": "low effort",
+          "effort": "low"
+        },
+        {
+          "description": "medium effort",
+          "effort": "medium"
+        },
+        {
+          "description": "high effort",
+          "effort": "high"
+        },
+        {
+          "description": "xhigh effort",
+          "effort": "xhigh"
+        },
+        {
+          "description": "max effort",
+          "effort": "max"
+        },
+        {
+          "description": "ultra effort",
+          "effort": "ultra"
+        }
+      ],
+      "defaultLevel": "medium",
+      "desktopLevels": [
+        {
+          "description": "low effort",
+          "reasoningEffort": "low"
+        },
+        {
+          "description": "medium effort",
+          "reasoningEffort": "medium"
+        },
+        {
+          "description": "high effort",
+          "reasoningEffort": "high"
+        },
+        {
+          "description": "xhigh effort",
+          "reasoningEffort": "xhigh"
+        },
+        {
+          "description": "max effort",
+          "reasoningEffort": "max"
+        },
+        {
+          "description": "ultra effort",
+          "reasoningEffort": "ultra"
+        }
+      ]
+    },
+    {
+      "model": "gpt-5.6-luna-sublyx",
+      "levels": [
+        {
+          "description": "low effort",
+          "effort": "low"
+        },
+        {
+          "description": "medium effort",
+          "effort": "medium"
+        },
+        {
+          "description": "high effort",
+          "effort": "high"
+        },
+        {
+          "description": "xhigh effort",
+          "effort": "xhigh"
+        },
+        {
+          "description": "max effort",
+          "effort": "max"
+        }
+      ],
+      "defaultLevel": "medium",
+      "desktopLevels": [
+        {
+          "description": "low effort",
+          "reasoningEffort": "low"
+        },
+        {
+          "description": "medium effort",
+          "reasoningEffort": "medium"
+        },
+        {
+          "description": "high effort",
+          "reasoningEffort": "high"
+        },
+        {
+          "description": "xhigh effort",
+          "reasoningEffort": "xhigh"
+        },
+        {
+          "description": "max effort",
+          "reasoningEffort": "max"
+        }
+      ]
+    },
+    {
+      "model": "gpt-5.6-sol-sublyx",
+      "levels": [
+        {
+          "description": "low effort",
+          "effort": "low"
+        },
+        {
+          "description": "medium effort",
+          "effort": "medium"
+        },
+        {
+          "description": "high effort",
+          "effort": "high"
+        },
+        {
+          "description": "xhigh effort",
+          "effort": "xhigh"
+        },
+        {
+          "description": "max effort",
+          "effort": "max"
+        },
+        {
+          "description": "ultra effort",
+          "effort": "ultra"
+        }
+      ],
+      "defaultLevel": "low",
+      "desktopLevels": [
+        {
+          "description": "low effort",
+          "reasoningEffort": "low"
+        },
+        {
+          "description": "medium effort",
+          "reasoningEffort": "medium"
+        },
+        {
+          "description": "high effort",
+          "reasoningEffort": "high"
+        },
+        {
+          "description": "xhigh effort",
+          "reasoningEffort": "xhigh"
+        },
+        {
+          "description": "max effort",
+          "reasoningEffort": "max"
+        },
+        {
+          "description": "ultra effort",
+          "reasoningEffort": "ultra"
+        }
+      ]
+    },
+    {
+      "model": "gpt-5.6-terra-sublyx",
+      "levels": [
+        {
+          "description": "low effort",
+          "effort": "low"
+        },
+        {
+          "description": "medium effort",
+          "effort": "medium"
+        },
+        {
+          "description": "high effort",
+          "effort": "high"
+        },
+        {
+          "description": "xhigh effort",
+          "effort": "xhigh"
+        },
+        {
+          "description": "max effort",
+          "effort": "max"
+        },
+        {
+          "description": "ultra effort",
+          "effort": "ultra"
+        }
+      ],
+      "defaultLevel": "medium",
+      "desktopLevels": [
+        {
+          "description": "low effort",
+          "reasoningEffort": "low"
+        },
+        {
+          "description": "medium effort",
+          "reasoningEffort": "medium"
+        },
+        {
+          "description": "high effort",
+          "reasoningEffort": "high"
+        },
+        {
+          "description": "xhigh effort",
+          "reasoningEffort": "xhigh"
+        },
+        {
+          "description": "max effort",
+          "reasoningEffort": "max"
+        },
+        {
+          "description": "ultra effort",
+          "reasoningEffort": "ultra"
+        }
+      ]
+    }
+  ],
+  "officialBackup": [
+    {
+      "model": "gpt-5.5",
+      "levels": [
+        {
+          "description": "Fast responses with lighter reasoning",
+          "effort": "low"
+        },
+        {
+          "description": "Balances speed and reasoning depth for everyday tasks",
+          "effort": "medium"
+        },
+        {
+          "description": "Greater reasoning depth for complex problems",
+          "effort": "high"
+        },
+        {
+          "description": "Extra high reasoning depth for complex problems",
+          "effort": "xhigh"
+        }
+      ],
+      "defaultLevel": "medium"
+    },
+    {
+      "model": "codex-auto-review",
+      "levels": [
+        {
+          "description": "Fast responses with lighter reasoning",
+          "effort": "low"
+        },
+        {
+          "description": "Balances speed and reasoning depth for everyday tasks",
+          "effort": "medium"
+        },
+        {
+          "description": "Greater reasoning depth for complex problems",
+          "effort": "high"
+        },
+        {
+          "description": "Extra high reasoning depth for complex problems",
+          "effort": "xhigh"
+        },
+        {
+          "description": "Maximum reasoning depth for the hardest problems",
+          "effort": "max"
+        }
+      ],
+      "defaultLevel": "medium"
+    }
+  ]
+}

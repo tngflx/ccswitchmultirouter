@@ -4151,11 +4151,16 @@ describe("Codex MultiRouter workspace route persistence helpers", () => {
       .mocked(providersApi.update)
       .mock.calls.map(([saved]) => saved)
       .find((saved) => saved.id === provider.id)!;
-    expect(
-      savedProvider.settingsConfig.modelCatalog.models.map(
-        (model: { model: string }) => model.model,
-      ),
-    ).toEqual(["kept-model"]);
+    expect(savedProvider.settingsConfig.modelCatalog.models).toEqual([
+      { model: "kept-model", contextWindow: 128000 },
+      {
+        model: "removed-model",
+        upstreamModel: "removed-model",
+        displayName: "removed-model",
+        contextWindow: 64000,
+        enabled: false,
+      },
+    ]);
     expect(savedProvider.settingsConfig.modelCatalog.spawnAgentModels).toEqual([
       "kept-model",
     ]);
