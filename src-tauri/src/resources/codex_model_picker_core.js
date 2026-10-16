@@ -290,16 +290,18 @@
     Array.isArray(value) &&
     (allowEmpty || value.length > 0) &&
     value.every((item) => modelIdentityValues(item).length > 0);
-  const patchModelNameArray = (models) => {
+  const patchModelNameArray = (models, managedOnly = false) => {
     if (!stringArray(models)) return false;
     const names = modelNames();
     const routed = names.filter((name) => models.includes(name));
     const missing = names.filter((name) => !models.includes(name));
     const routedSet = new Set(names);
     const retired = retiredManagedNames();
-    const untouched = models.filter((name) => !routedSet.has(name) &&
-      !retired.has(normalizedIdentity(name)) &&
-      catalogRowForName(name)?.enabled !== false);
+    const untouched = managedOnly
+      ? []
+      : models.filter((name) => !routedSet.has(name) &&
+        !retired.has(normalizedIdentity(name)) &&
+        catalogRowForName(name)?.enabled !== false);
     const ordered = [...routed, ...untouched, ...missing];
     const changed = models.length !== ordered.length ||
       models.some((name, index) => name !== ordered[index]);
@@ -308,13 +310,14 @@
     }
     return changed;
   };
-  const patchModelArray = (models, allowEmpty = false) => {
+  const patchModelArray = (models, allowEmpty = false, managedOnly = false) => {
     if (!modelArray(models, allowEmpty)) return false;
     const names = modelNames();
     const retired = retiredManagedNames();
     const existing = models.filter((model) =>
       !isRetiredManagedModel(model, retired) &&
-      catalogRowForModel(model)?.enabled !== false);
+      catalogRowForModel(model)?.enabled !== false &&
+      (!managedOnly || catalogRowForModel(model) !== null));
     const descriptors = names.map(descriptorFor);
     const routedByName = new Map();
     const used = new Set();
@@ -347,9 +350,9 @@
     const orderedRouted = names
       .map((name) => routedByName.get(normalizedIdentity(name)))
       .filter(Boolean);
-    const untouched = existing.filter(
-      (model) => !orderedRouted.includes(model),
-    );
+    const untouched = managedOnly
+      ? []
+      : existing.filter((model) => !orderedRouted.includes(model));
     const ordered = [...orderedRouted, ...untouched];
     if (models.length !== ordered.length || models.some((model, index) => model !== ordered[index])) {
       models.splice(0, models.length, ...ordered);
@@ -364,13 +367,14 @@
     container[key] = container[key].filter((name) => !names.has(name));
     return before !== container[key].length;
   };
-  const patchNameSet = (setLike) => {
+  const patchNameSet = (setLike, managedOnly = false) => {
     if (!(setLike instanceof Set)) return false;
     let changed = false;
     const retired = retiredManagedNames();
     for (const name of setLike) {
       if (retired.has(normalizedIdentity(name)) ||
-          catalogRowForName(name)?.enabled === false) {
+          catalogRowForName(name)?.enabled === false ||
+          (managedOnly && catalogRowForName(name) === null)) {
         setLike.delete(name);
         changed = true;
       }
@@ -383,25 +387,25 @@
     }
     return changed;
   };
-  const patchModelContainer = (value) => {
+  const patchModelContainer = (value, managedOnly = false) => {
     if (!value || typeof value !== "object") return false;
     const looksLikeModelGate = "availableModels" in value || "available_models" in value || "useHiddenModels" in value || "use_hidden_models" in value || "defaultModel" in value || "default_model" in value;
     if (!looksLikeModelGate) return false;
 
     let changed = false;
-    if (patchModelArray(value.models, "defaultModel" in value || "availableModels" in value || "available_models" in value)) changed = true;
-    if (patchModelNameArray(value.models)) changed = true;
-    if (patchModelArray(value.data)) changed = true;
-    if (patchModelArray(value.result)) changed = true;
-    if (patchModelArray(value.pages?.[0]?.data)) changed = true;
-    if (patchModelArray(value.result?.data)) changed = true;
-    if (patchModelArray(value.result?.models)) changed = true;
-    if (patchModelArray(value.message?.result?.data)) changed = true;
-    if (patchModelArray(value.message?.result?.models)) changed = true;
-    if (patchNameSet(value.availableModels)) changed = true;
-    if (patchNameSet(value.available_models)) changed = true;
-    if (patchModelNameArray(value.availableModels)) changed = true;
-    if (patchModelNameArray(value.available_models)) changed = true;
+    if (patchModelArray(value.models, "defaultModel" in value || "availableModels" in value || "available_models" in value, managedOnly)) changed = true;
+    if (patchModelNameArray(value.models, managedOnly)) changed = true;
+    if (patchModelArray(value.data, false, managedOnly)) changed = true;
+    if (patchModelArray(value.result, false, managedOnly)) changed = true;
+    if (patchModelArray(value.pages?.[0]?.data, false, managedOnly)) changed = true;
+    if (patchModelArray(value.result?.data, false, managedOnly)) changed = true;
+    if (patchModelArray(value.result?.models, false, managedOnly)) changed = true;
+    if (patchModelArray(value.message?.result?.data, false, managedOnly)) changed = true;
+    if (patchModelArray(value.message?.result?.models, false, managedOnly)) changed = true;
+    if (patchNameSet(value.availableModels, managedOnly)) changed = true;
+    if (patchNameSet(value.available_models, managedOnly)) changed = true;
+    if (patchModelNameArray(value.availableModels, managedOnly)) changed = true;
+    if (patchModelNameArray(value.available_models, managedOnly)) changed = true;
     if (removeHiddenNames(value, "hiddenModels")) changed = true;
     if (removeHiddenNames(value, "hidden_models")) changed = true;
     if ("useHiddenModels" in value && value.useHiddenModels !== false) {
@@ -446,7 +450,10 @@
         return [];
       }
       const name = row?.model || model?.model;
-      if (!names.has(normalizedIdentity(name))) return [model];
+      if (!names.has(normalizedIdentity(name))) {
+        changed = true;
+        return [];
+      }
       const descriptor = descriptorFor(name);
       const next = { ...model };
       if (model.reasoning && typeof model.reasoning === "object")

@@ -36,13 +36,17 @@ import { cn } from "@/lib/utils";
 import {
   buildBaseUrl,
   buildReachableBaseUrl,
+  buildClineConfig,
+  buildCurlSnippet,
   buildJsonConfig,
   buildProfileUpdate,
   buildPythonSnippet,
+  buildKiloSnippet,
   chooseDefaultBackendKey,
   describeBackendTarget,
   groupBackendOptions,
   profileBackendKey,
+  type ExternalClientTarget,
 } from "@/lib/openai/externalProfile";
 import {
   ExternalBackendPicker,
@@ -73,6 +77,8 @@ export function OpenAICompatibleApiPage() {
   const [listenAddress, setListenAddress] = useState("127.0.0.1");
   const [listenPort, setListenPort] = useState("15722");
   const [isSavingListener, setIsSavingListener] = useState(false);
+  const [clientTarget, setClientTarget] =
+    useState<ExternalClientTarget>("cline");
 
   const {
     data: runtimeStatus,
@@ -104,7 +110,8 @@ export function OpenAICompatibleApiPage() {
   const availableModels = selectedBackend?.models ?? [];
   const defaultModel =
     selectedModel ||
-    (profile?.defaultModel && availableModels.includes(profile.defaultModel)
+    (profile?.defaultModel &&
+    (availableModels.length === 0 || availableModels.includes(profile.defaultModel))
       ? profile.defaultModel
       : "") ||
     runtimeStatus?.effectiveModel ||
@@ -507,17 +514,84 @@ export function OpenAICompatibleApiPage() {
 
           <TabsContent value="config" className="mt-3">
             <div className="grid gap-4 lg:grid-cols-2">
+              <section className="rounded-lg border border-blue-700/40 bg-blue-950/10 p-4 lg:col-span-2">
+                <SectionHeader
+                  icon={PlugZap}
+                  title="Client setup targets"
+                  detail="Cline and Kilo use the same local CCSwitch OpenAI-compatible endpoint. This does not connect to their hosted gateways or agent runtimes."
+                />
+                <div className="mt-4 flex flex-wrap gap-2">
+                  {([
+                    ["cline", "Cline"],
+                    ["kilo", "Kilo"],
+                    ["openai", "OpenAI-compatible"],
+                  ] as const).map(([value, label]) => (
+                    <Button
+                      key={value}
+                      variant={clientTarget === value ? "default" : "outline"}
+                      onClick={() => setClientTarget(value)}
+                    >
+                      {label}
+                    </Button>
+                  ))}
+                </div>
+                <div className="mt-3 rounded-md border border-blue-200/30 bg-background/50 p-3 text-xs leading-5 text-muted-foreground">
+                  Base URL: <code>{agentBaseUrl}</code> | Model: <code>{defaultModel}</code>
+                </div>
+              </section>
+              {clientTarget === "cline" ? (
+                <SnippetPanel
+                  title="Cline OpenAI-compatible provider"
+                  value={buildClineConfig(
+                    agentBaseUrl,
+                    runnableApiKey,
+                    defaultModel,
+                  )}
+                  onCopy={() =>
+                    handleCopyRunnableConfig(
+                      buildClineConfig(agentBaseUrl, runnableApiKey, defaultModel),
+                      "Cline configuration",
+                    )
+                  }
+                />
+              ) : clientTarget === "kilo" ? (
+                <SnippetPanel
+                  title="Kilo / OpenAI-compatible client"
+                  value={buildKiloSnippet(
+                    agentBaseUrl,
+                    runnableApiKey,
+                    defaultModel,
+                  )}
+                  onCopy={() =>
+                    handleCopyRunnableConfig(
+                      buildKiloSnippet(agentBaseUrl, runnableApiKey, defaultModel),
+                      "Kilo configuration",
+                    )
+                  }
+                />
+              ) : (
+                <SnippetPanel
+                  title="OpenAI-compatible JSON configuration"
+                  value={buildJsonConfig(
+                    agentBaseUrl,
+                    runnableApiKey,
+                    defaultModel,
+                  )}
+                  onCopy={() =>
+                    handleCopyRunnableConfig(
+                      buildJsonConfig(agentBaseUrl, runnableApiKey, defaultModel),
+                      "OpenAI configuration",
+                    )
+                  }
+                />
+              )}
               <SnippetPanel
-                title="Agent JSON configuration"
-                value={buildJsonConfig(
-                  agentBaseUrl,
-                  runnableApiKey,
-                  defaultModel,
-                )}
+                title="cURL checks"
+                value={buildCurlSnippet(agentBaseUrl, runnableApiKey, defaultModel)}
                 onCopy={() =>
                   handleCopyRunnableConfig(
-                    buildJsonConfig(agentBaseUrl, runnableApiKey, defaultModel),
-                    "Agent JSON configuration",
+                    buildCurlSnippet(agentBaseUrl, runnableApiKey, defaultModel),
+                    "cURL checks",
                   )
                 }
               />

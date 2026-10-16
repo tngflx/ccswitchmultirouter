@@ -20,6 +20,8 @@ export type BackendTargetDescription = {
   compatibility: string[];
 };
 
+export type ExternalClientTarget = "cline" | "kilo" | "openai";
+
 /// 把 app id 转成界面上更自然的分组名，避免用户看到内部枚举。
 export function appDisplayName(appType: string): string {
   const names: Record<string, string> = {
@@ -123,6 +125,66 @@ export function buildJsonConfig(
     null,
     2,
   );
+}
+
+/// 生成 Cline 的 OpenAI-compatible provider 配置；该配置只消费本地 sidecar。
+export function buildClineConfig(
+  baseUrl: string,
+  apiKey: string,
+  model: string,
+): string {
+  return JSON.stringify(
+    {
+      provider: "OpenAI Compatible",
+      baseUrl,
+      apiKey,
+      modelId: model,
+    },
+    null,
+    2,
+  );
+}
+
+/// 生成 Kilo/OpenAI SDK 配置，并明确这是本地 CCSwitch endpoint 而非 Kilo Gateway。
+export function buildKiloSnippet(
+  baseUrl: string,
+  apiKey: string,
+  model: string,
+): string {
+  return [
+    "# Local CCSwitch endpoint (not https://ai-gateway.kilo.ai/api/v1)",
+    `export OPENAI_BASE_URL="${baseUrl}"`,
+    `export OPENAI_API_KEY="${apiKey}"`,
+    `export OPENAI_MODEL="${model}"`,
+    "",
+    "from openai import OpenAI",
+    "import os",
+    "",
+    "client = OpenAI(base_url=os.environ[\"OPENAI_BASE_URL\"], api_key=os.environ[\"OPENAI_API_KEY\"])",
+    "response = client.chat.completions.create(",
+    "    model=os.environ[\"OPENAI_MODEL\"],",
+    '    messages=[{"role": "user", "content": "ping"}],',
+    ")",
+    "print(response.choices[0].message.content)",
+  ].join("\n");
+}
+
+/// 生成便于验证认证、模型列表和 Chat Completions 的 cURL 片段。
+export function buildCurlSnippet(
+  baseUrl: string,
+  apiKey: string,
+  model: string,
+): string {
+  return [
+    `curl ${baseUrl}/models -H "Authorization: Bearer ${apiKey}"`,
+    "",
+    [
+      `curl ${baseUrl}/chat/completions \\`,
+      `  -H "Authorization: Bearer ${apiKey}" \\`,
+      '  -H "Content-Type: application/json" \\',
+      `  -d '{"model":"${model}","messages":[{"role":"user","content":"ping"}]}'`,
+    ].join("\n"),
+  ].join("\n");
 }
 
 /// 选择默认服务来源时优先使用已保存 profile，其次使用可用的官方 OAuth/路由/普通 OpenAI-compatible 来源。

@@ -499,7 +499,10 @@ fn app_server_model_list_scope_core_script() -> &'static str {
       params?.modelProvider, params?.model_provider,
       params?.params?.modelProvider, params?.params?.model_provider,
     ].map(normalizedCatalogProvider).filter(Boolean);
-    return provider && providers.every((value) => value === provider)
+    // Current Codex Desktop sends `model/list` without a provider field. The
+    // local app-server client and active catalog already establish the scope;
+    // rejecting this request leaves the picker with an unpatched response.
+    return provider && (!providers.length || providers.every((value) => value === provider))
       ? { provider, hostId: "local", providerEpoch: state.catalogProviderEpoch || 0 }
       : null;
   };
@@ -1959,7 +1962,7 @@ fn build_model_picker_unlock_script(catalog: &CodexModelCatalogProjection) -> St
   // Bump this whenever the injected app-server/request patch changes. The
   // scheduler closure captures those functions; leaving an older interval
   // alive would reapply stale recovery hooks over the new patch.
-  const rendererSchedulerVersion = "6";
+  const rendererSchedulerVersion = "7";
   if (state.rendererSchedulerVersion !== rendererSchedulerVersion) {{
     if (state.interval) clearInterval(state.interval);
     try {{ state.reactRootObserver?.disconnect(); }} catch {{}}
@@ -1970,7 +1973,7 @@ fn build_model_picker_unlock_script(catalog: &CodexModelCatalogProjection) -> St
     // Older discovery admitted dynamic RPC stubs before patching failed. Drop
     // that registry so continuation can use only declared request clients.
     state.appServerClients = [];
-    state.requestIds = new Set();
+    state.requestIds = new Map();
     state.modelListRequestScopes = new Map();
     state.messagePatchInstalled = false;
     state.appServerModuleRetryAt = 0;
@@ -2181,16 +2184,16 @@ fn build_model_picker_unlock_script(catalog: &CodexModelCatalogProjection) -> St
   const patchModelListResult = (result) => {{
     if (result == null) return false;
     let changed = false;
-    if (Array.isArray(result) && patchModelArray(result, true)) changed = true;
-    if (Array.isArray(result?.data) && patchModelArray(result.data, true)) changed = true;
-    if (Array.isArray(result?.models) && patchModelArray(result.models, true)) changed = true;
-    if (Array.isArray(result?.result) && patchModelArray(result.result, true)) changed = true;
-    if (Array.isArray(result?.result?.data) && patchModelArray(result.result.data, true)) changed = true;
-    if (Array.isArray(result?.result?.models) && patchModelArray(result.result.models, true)) changed = true;
-    if (Array.isArray(result?.pages?.[0]?.data) && patchModelArray(result.pages[0].data, true)) changed = true;
-    if (Array.isArray(result?.message?.result?.data) && patchModelArray(result.message.result.data, true)) changed = true;
-    if (Array.isArray(result?.message?.result?.models) && patchModelArray(result.message.result.models, true)) changed = true;
-    if (patchModelContainer(result)) changed = true;
+     if (Array.isArray(result) && patchModelArray(result, true, true)) changed = true;
+     if (Array.isArray(result?.data) && patchModelArray(result.data, true, true)) changed = true;
+     if (Array.isArray(result?.models) && patchModelArray(result.models, true, true)) changed = true;
+     if (Array.isArray(result?.result) && patchModelArray(result.result, true, true)) changed = true;
+     if (Array.isArray(result?.result?.data) && patchModelArray(result.result.data, true, true)) changed = true;
+     if (Array.isArray(result?.result?.models) && patchModelArray(result.result.models, true, true)) changed = true;
+     if (Array.isArray(result?.pages?.[0]?.data) && patchModelArray(result.pages[0].data, true, true)) changed = true;
+     if (Array.isArray(result?.message?.result?.data) && patchModelArray(result.message.result.data, true, true)) changed = true;
+     if (Array.isArray(result?.message?.result?.models) && patchModelArray(result.message.result.models, true, true)) changed = true;
+     if (patchModelContainer(result, true)) changed = true;
     return changed;
   }};
   const patchAppServerResult = (method, result, scope, client, params) => {{
@@ -4024,7 +4027,9 @@ mod tests {
 const local = {hostId: "local"};
 const remote = {hostId: "remote"};
 const localParams = {modelProvider: "codex_model_router_v2"};
+const localParamsWithoutProvider = {};
 const scope = captureModelListScope("model/list", localParams, local);
+const scopeWithoutProvider = captureModelListScope("model/list", localParamsWithoutProvider, local);
 const remoteScope = captureModelListScope("model/list", localParams, remote);
 const missingHostScope = captureModelListScope("model/list", localParams, {});
 const localViewScope = captureModelListScope("model/list", localParams, null, true);
@@ -4041,6 +4046,7 @@ state.payload = {...state.payload, modelProvider: "openrouter"};
 const switched = isCurrentModelListScope(scope, local, localParams);
 JSON.stringify({
   local: Boolean(scope),
+  localWithoutProvider: Boolean(scopeWithoutProvider),
   remote: remoteScope,
   missingHost: missingHostScope,
   localView: Boolean(localViewScope),
@@ -4056,6 +4062,7 @@ JSON.stringify({
             result,
             json!({
                 "local": true,
+                "localWithoutProvider": true,
                 "remote": null,
                 "missingHost": null,
                 "localView": true,
@@ -5429,6 +5436,26 @@ JSON.stringify({
     }
 
     #[test]
+    fn model_list_projection_replaces_native_rows_with_enabled_catalog_models() {
+        let result = run_model_picker_patch_core_probe_with_payload(
+            json!({
+                "modelProvider": "codex_model_router_v2",
+                "modelNames": ["included"],
+                "models": [{"model": "included", "enabled": true}]
+            }),
+            r#"
+const models = [
+  {model: "provider-fetched-but-not-included"},
+  {model: "included"},
+];
+patchModelArray(models, true, true);
+JSON.stringify(models.map((model) => model.model));
+"#,
+        );
+        assert_eq!(result, json!(["included"]));
+    }
+
+    #[test]
     fn model_picker_query_observers_reproject_cached_and_future_filtered_results() {
         let result = run_model_picker_patch_core_probe_with_payload(
             json!({
@@ -5680,7 +5707,7 @@ JSON.stringify({
     fn codex_app_compatibility_heartbeat_does_not_repeat_full_react_scan() {
         let script = build_model_picker_unlock_script(&CodexModelCatalogProjection::empty());
 
-        assert!(script.contains("const rendererSchedulerVersion = \"6\""));
+        assert!(script.contains("const rendererSchedulerVersion = \"7\""));
         assert!(script
             .contains("patchCodexModelReasoningQueryCache(scope.queryClient?.getQueryCache())"));
         assert!(script.contains("clearInterval(state.interval)"));

@@ -306,10 +306,14 @@ pub fn runtime_status(db: &Database) -> Result<ExternalOpenAiApiRuntimeStatusVie
         .as_deref()
         .and_then(|key| backend_options.iter().find(|option| option.key == key))
         .cloned();
-    let effective_model = profile.default_model.clone().or_else(|| {
-        selected_backend
-            .as_ref()
-            .and_then(|backend| backend.models.first().cloned())
+    let effective_model = selected_backend.as_ref().and_then(|backend| {
+        match profile.default_model.as_ref() {
+            Some(model) if backend.models.is_empty() || backend.models.contains(model) => {
+                Some(model.clone())
+            }
+            Some(_) => None,
+            None => backend.models.first().cloned(),
+        }
     });
 
     let mut issues = Vec::new();
@@ -335,7 +339,11 @@ pub fn runtime_status(db: &Database) -> Result<ExternalOpenAiApiRuntimeStatusVie
         _ => {}
     }
     if effective_model.is_none() {
-        issues.push("model not selected".to_string());
+        issues.push(if profile.default_model.is_some() {
+            "selected model unavailable".to_string()
+        } else {
+            "model not selected".to_string()
+        });
     }
 
     let ready = profile.enabled
