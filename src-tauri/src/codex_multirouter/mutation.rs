@@ -1047,6 +1047,7 @@ pub(crate) fn prepare_codex_provider_deletion(
             "Codex provider does not exist: {provider_id}"
         )));
     };
+    let mut deletion_candidate_providers = providers.clone();
     let mut provider_ids = vec![provider_id.to_string()];
     if source_provider
         .settings_config
@@ -1054,8 +1055,12 @@ pub(crate) fn prepare_codex_provider_deletion(
         .and_then(serde_json::Value::as_str)
         == Some("facade")
     {
-        super::provider_set::restore_logical_codex_provider(source_provider, &providers)
-            .map_err(provider_set_error)?;
+        let logical_source =
+            super::provider_set::restore_logical_codex_provider(source_provider, &providers)
+                .map_err(provider_set_error)?;
+        // Only deletion diagnostics need the facade's logical catalog. Runtime
+        // compilation must continue to require current Provider-owned catalogs.
+        deletion_candidate_providers.insert(provider_id.to_string(), logical_source);
         let marker = source_provider
             .settings_config
             .get("codexProtocolSet")
@@ -1104,7 +1109,7 @@ pub(crate) fn prepare_codex_provider_deletion(
                 router.id
             )));
         };
-        let compiled = compile_v2(&plan, &providers).map_err(|error| {
+        let compiled = compile_v2(&plan, &deletion_candidate_providers).map_err(|error| {
             AppError::InvalidInput(format!("{}: {}", error.code, error.message))
         })?;
         removed_candidates.extend(
@@ -2266,6 +2271,100 @@ mod tests {
         assert_eq!(outcome.disabled_plan_ids, vec!["router-a"]);
         assert_eq!(outcome.removed_candidates, vec!["qwen3.8"]);
         assert_eq!(published.into_inner(), vec!["router-a"]);
+    }
+
+    #[test]
+    fn deleting_split_facade_collects_dependent_alias_candidates_without_snapshot_catalog() {
+        let db = Database::memory().expect("memory db");
+        seed_split_provider_set(&db, chrono::Utc::now().timestamp());
+        let facade = db
+            .get_provider_by_id("relay", "codex")
+            .expect("read facade")
+            .expect("facade exists");
+        assert!(facade.settings_config.get("modelCatalog").is_none());
+        let mut dependent = router("dependent-router", "relay");
+        dependent.settings_config["codexRouting"]["routes"][0]["modelSelection"] =
+            json!({"mode": "include", "models": ["model-a"]});
+        dependent.settings_config["codexRouting"]["routes"][0]["aliases"] =
+            json!({"relay-visible": "upstream-a"});
+        db.save_provider("codex", &dependent)
+            .expect("seed dependent Router");
+
+        let outcome = apply_codex_provider_delete_with_hooks(
+            &db,
+            "relay",
+            None,
+            || panic!("inactive deletion must not restore official"),
+            |artifact| {
+                Ok(ProjectionReadBack::verified(
+                    artifact.dependency_fingerprint.clone(),
+                ))
+            },
+        )
+        .expect("facade deletion must reconcile dependent routes without a snapshot catalog");
+
+        assert_eq!(outcome.removed_candidates, vec!["relay-visible"]);
+        assert_eq!(outcome.disabled_plan_ids, vec!["dependent-router"]);
+        for id in ["relay", "relay--ccsm-responses", "relay--ccsm-chat"] {
+            assert!(db
+                .get_provider_by_id(id, "codex")
+                .expect("read deleted member")
+                .is_none());
+        }
+        let saved = db
+            .get_provider_by_id("dependent-router", "codex")
+            .expect("read dependent Router")
+            .expect("dependent Router remains");
+        assert_eq!(saved.settings_config["codexRouting"]["enabled"], false);
+        assert_eq!(saved.settings_config["codexRouting"]["routes"], json!([]));
+    }
+
+    #[test]
+    fn deleting_split_facade_rejects_malformed_surviving_catalog_before_any_write() {
+        let db = Database::memory().expect("memory db");
+        seed_split_provider_set(&db, chrono::Utc::now().timestamp());
+        let mut surviving = target("openai_responses");
+        surviving.settings_config["modelCatalog"]["models"] = json!("malformed");
+        db.save_provider("codex", &surviving)
+            .expect("seed malformed surviving target");
+        let mut dependent = router("dependent-router", "relay");
+        dependent.settings_config["codexRouting"]["routes"]
+            .as_array_mut()
+            .expect("routes")
+            .push(json!({
+                "id": "surviving-route",
+                "targetProviderId": "qwen",
+                "modelSelection": {"mode": "all"},
+                "authPolicy": {"source": "provider_config"}
+            }));
+        db.save_provider("codex", &dependent)
+            .expect("seed dependent Router");
+
+        let error = apply_codex_provider_delete_with_hooks(
+            &db,
+            "relay",
+            None,
+            || panic!("failed validation must not restore official"),
+            |_| panic!("failed validation must not publish"),
+        )
+        .expect_err("surviving enabled routes must still require a usable catalog");
+
+        assert!(error
+            .to_string()
+            .contains("target_provider_catalog_unavailable"));
+        for id in ["relay", "relay--ccsm-responses", "relay--ccsm-chat"] {
+            assert!(db
+                .get_provider_by_id(id, "codex")
+                .expect("read preserved member")
+                .is_some());
+        }
+        assert_eq!(
+            db.get_provider_by_id("dependent-router", "codex")
+                .expect("read dependent Router")
+                .expect("dependent Router remains")
+                .settings_config,
+            dependent.settings_config
+        );
     }
 
     #[test]

@@ -4591,6 +4591,14 @@ wire_api = "responses"
     async fn update_current_codex_provider_refreshes_and_clears_catalog_during_takeover() {
         let _home = TempHome::new();
         crate::settings::reload_settings().expect("reload settings");
+        let cache_path = crate::codex_config::get_codex_config_dir().join("models_cache.json");
+        let original_cache = json!({
+            "fetched_at": "2026-06-12T00:00:00.000000000Z",
+            "etag": "official-cache",
+            "client_version": "0.140.0",
+            "models": [{"slug": "official-only", "context_window": 128000}]
+        });
+        write_json_file(&cache_path, &original_cache).expect("seed official Codex models cache");
 
         let db = Arc::new(Database::memory().expect("init db"));
         let state = AppState::new(db.clone());
@@ -4699,15 +4707,49 @@ requires_openai_auth = true
         assert!(live_config.contains("model_catalog_json"));
 
         updated.settings_config["modelCatalog"] = json!({ "models": [] });
-        ProviderService::update(&state, AppType::Codex, None, updated)
-            .expect("remove current Codex provider mapping");
+        ProviderService::update(&state, AppType::Codex, None, updated.clone())
+            .expect("empty current Codex provider catalog");
 
         let live_config = fs::read_to_string(crate::codex_config::get_codex_config_path())
-            .expect("read Codex config.toml after mapping removal");
-        assert!(
-            !live_config.contains("model_catalog_json"),
-            "removing mappings during takeover must clear the stale catalog pointer"
+            .expect("read Codex config.toml after emptying catalog");
+        let live_document: toml::Value = toml::from_str(&live_config).expect("parse live config");
+        let managed_pointer = live_document
+            .get("model_catalog_json")
+            .and_then(toml::Value::as_str)
+            .expect("an explicit empty catalog must keep its managed pointer");
+        assert_eq!(std::path::Path::new(managed_pointer), catalog_path);
+        let catalog: Value = read_json_file(&catalog_path).expect("read empty managed catalog");
+        let cache: Value = read_json_file(&cache_path).expect("read empty managed cache");
+        assert_eq!(catalog["models"], json!([]));
+        assert_eq!(cache["models"], json!([]));
+        assert_eq!(
+            cache["ccSwitchModelProvider"].as_str(),
+            live_document
+                .get("model_provider")
+                .and_then(toml::Value::as_str),
+            "the empty cache must remain owned by the active managed provider"
         );
+        assert_ne!(cache["etag"], original_cache["etag"]);
+
+        updated
+            .settings_config
+            .as_object_mut()
+            .expect("provider settings object")
+            .remove("modelCatalog");
+        ProviderService::update(&state, AppType::Codex, None, updated)
+            .expect("remove current Codex provider catalog declaration");
+
+        let live_config = fs::read_to_string(crate::codex_config::get_codex_config_path())
+            .expect("read Codex config.toml after removing catalog declaration");
+        let live_document: toml::Value =
+            toml::from_str(&live_config).expect("parse released config");
+        assert!(
+            live_document.get("model_catalog_json").is_none(),
+            "an absent catalog declaration must release the managed pointer"
+        );
+        let restored_cache: Value =
+            read_json_file(&cache_path).expect("read restored official cache");
+        assert_eq!(restored_cache, original_cache);
 
         state
             .proxy_service
