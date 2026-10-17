@@ -804,6 +804,119 @@ describe("CodexMultiRouterWizard", () => {
     }
   });
 
+  it.each(["supportsTools", "supportsStreaming", "supportsToolContinuation"])(
+    "keeps API-declared %s denials out of the ready state",
+    (field) => {
+      const source: Provider = {
+        id: "unsupported-api",
+        name: "Unsupported API",
+        settingsConfig: {
+          baseUrl: "https://example.invalid/v1",
+          modelCatalog: {
+            models: [
+              {
+                model: " unsupported ",
+                protocolCapability: {
+                  schemaVersion: 1,
+                  source: "provider_api",
+                  baseUrl: "https://example.invalid/v1",
+                  upstreamModel: "unsupported",
+                  supportedEndpoints: ["openai_responses"],
+                  [field]: false,
+                },
+              },
+            ],
+          },
+        },
+      };
+      const batch = {
+        sources: [{ provider: source, receiptIds: [] }],
+        outcomes: [],
+      };
+      const [unsupported] = buildWizardConnectivityResultsFromBatchOutcome(
+        [source],
+        batch,
+        false,
+      );
+      expect(unsupported).toMatchObject({
+        model: "unsupported",
+        canContinue: false,
+        status: "fail",
+      });
+      expect(unsupported.detail).toMatch(/incompatible.*automatic Codex route/);
+
+      const manual: Provider = {
+        ...source,
+        meta: { codexProtocolOverrides: { unsupported: "openai_responses" } },
+      };
+      expect(
+        buildWizardConnectivityResultsFromBatchOutcome(
+          [manual],
+          { sources: [{ provider: manual, receiptIds: [] }], outcomes: [] },
+          false,
+        )[0],
+      ).toMatchObject({ canContinue: true, status: "skipped" });
+      const outcome = protocolOutcome(
+        source,
+        [{ model: "unsupported", transport: "open_ai_responses" }],
+        {},
+      );
+      expect(
+        buildWizardConnectivityResultsFromBatchOutcome(
+          [source],
+          {
+            ...batch,
+            outcomes: [
+              { providerId: source.id, inputProvider: source, outcome },
+            ],
+          },
+          false,
+        )[0],
+      ).toMatchObject({ canContinue: true, status: "pass" });
+    },
+  );
+
+  it("restores verified evidence for models with negative API declarations", async () => {
+    const source: Provider = {
+      id: "previously-verified-api",
+      name: "Previously Verified API",
+      settingsConfig: {
+        baseUrl: "https://example.invalid/v1",
+        modelCatalog: {
+          models: [
+            {
+              model: "verified",
+              protocolCapability: {
+                schemaVersion: 1,
+                source: "provider_api",
+                baseUrl: "https://example.invalid/v1",
+                upstreamModel: "verified",
+                supportedEndpoints: ["openai_responses"],
+                supportsTools: false,
+              },
+            },
+          ],
+        },
+      },
+    };
+    const plan = savedProtocolPlan(source);
+    restoreCodexProviderProtocolEvidence.mockResolvedValueOnce(
+      protocolOutcome(
+        source,
+        [{ model: "verified", transport: "open_ai_responses" }],
+        { "saved-proof": "verified" },
+      ),
+    );
+    renderWizard([source, plan], { mode: "edit", planId: plan.id });
+    fireEvent.click(
+      screen.getByRole("button", { name: "Protocol deep probe" }),
+    );
+    await screen.findByText(/Saved records checked: reusing 1/);
+    expect(
+      screen.getByRole("button", { name: "Choose models" }),
+    ).not.toHaveAttribute("data-read-only", "true");
+  });
+
   it("requires fallback evidence for each unresolved model without reproving API-declared rows", async () => {
     const source: Provider = {
       id: "partial-api",

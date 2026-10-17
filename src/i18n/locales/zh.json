@@ -2184,6 +2184,8 @@
     "frontendCrashTitle": "界面遇到了问题",
     "frontendCrashMessage": "已尝试将错误信息写入应用诊断日志。请重新加载界面；如果问题持续，请在提交 Issue 时附上日志。",
     "reloadInterface": "重新加载界面",
+    "startupTimeoutTitle": "应用启动未响应",
+    "startupTimeoutMessage": "初始化检查耗时过长。请重新加载界面或重启 CCSwitchMulti。您的配置未被更改。",
     "noRenderDetail": "未提供错误详情",
     "appRenderTitle": "应用界面加载失败",
     "appRenderMessage": "请重新加载应用；若仍失败，请将下方错误详情和日志提供给维护者。",
@@ -4009,6 +4011,7 @@
   },
   "codexWizardProtocol": {
     "apiDeclared": "供应商 API 已声明支持 {{protocol}}，无需完整探测。尚未验证真实请求。",
+    "apiUnsupported": "供应商 API 明确标记此模型与 Codex 自动路由不兼容。",
     "manualDeclared": "此供应商已有明确的协议选择，自动探测不会覆盖该选择。",
     "unresolvedModel": "此模型既没有可用的供应商 API 协议声明，也没有可复用的探测证据。",
     "description": "优先使用供应商 API 声明或已保存的证据确定模型协议，仅对未确认的模型进行深度探测。",

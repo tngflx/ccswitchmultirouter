@@ -994,6 +994,30 @@ fn codex_cached_model_context_windows() -> std::collections::HashMap<String, u64
     let Ok(Some(cache)) = read_json_file_if_exists(&get_codex_models_cache_path()) else {
         return codex_oauth_model_context_windows_from_safe_fallback();
     };
+    let trusted_cache = if codex_models_cache_is_cc_switch_owned(&cache) {
+        read_json_file_if_exists(&get_codex_models_cache_backup_path())
+            .ok()
+            .flatten()
+            .filter(|backup| !codex_models_cache_is_cc_switch_owned(backup))
+    } else {
+        Some(cache)
+    };
+    let mut windows = trusted_cache
+        .as_ref()
+        .map(codex_model_context_windows_from_cache)
+        .unwrap_or_default();
+    if windows.is_empty() {
+        windows = codex_oauth_model_context_windows_from_safe_fallback();
+    }
+    if windows.is_empty() {
+        windows = codex_model_context_windows_from_cache(&json!({
+            "models": codex_official_models_cache().unwrap_or_default()
+        }));
+    }
+    windows
+}
+
+fn codex_model_context_windows_from_cache(cache: &Value) -> std::collections::HashMap<String, u64> {
     let mut windows = std::collections::HashMap::new();
 
     if let Some(models) = cache.get("models").and_then(Value::as_array) {
@@ -1042,11 +1066,7 @@ fn codex_cached_model_context_windows() -> std::collections::HashMap<String, u64
         }
     }
 
-    if windows.is_empty() {
-        codex_oauth_model_context_windows_from_safe_fallback()
-    } else {
-        windows
-    }
+    windows
 }
 
 /// 当官方 models_cache 缺失时，返回不会触发 OAuth 刷新的安全上下文窗口兜底。
@@ -1924,6 +1944,21 @@ fn codex_catalog_model_specs(settings: &Value, config_text: &str) -> Vec<CodexCa
     let mut resolver_settings = settings.clone();
     if !config_text.trim().is_empty() {
         resolver_settings["config"] = json!(config_text);
+    }
+    if settings
+        .pointer("/codexRoutingProjection/dependencyFingerprint")
+        .is_some()
+    {
+        if let Some(mut document) = resolver_settings
+            .get("config")
+            .and_then(Value::as_str)
+            .and_then(|config| config.parse::<DocumentMut>().ok())
+        {
+            if codex_document_uses_multi_router(&document) {
+                remove_active_codex_provider_models(&mut document);
+                resolver_settings["config"] = json!(document.to_string());
+            }
+        }
     }
 
     for model_config in models {
@@ -6436,13 +6471,63 @@ fn sync_codex_models_cache_with_cc_switch_catalog(catalog: &Value) -> Result<(),
     sync_codex_models_cache_with_cc_switch_catalog_and_authority(catalog, &HashSet::new())
 }
 
+fn projected_codex_models_cache_entries(
+    catalog: &Value,
+    official_models: &[Value],
+    reasoning_authoritative_ids: &HashSet<String>,
+) -> Option<Vec<Value>> {
+    let models = catalog.get("models")?.as_array()?;
+    let mut merged_models = merge_codex_models_with_reasoning_authority(
+        official_models,
+        models,
+        reasoning_authoritative_ids,
+    );
+    let routed_models_by_id = models
+        .iter()
+        .filter_map(|model| codex_model_stable_id(model).map(|model_id| (model_id, model)))
+        .collect::<HashMap<_, _>>();
+    for merged_model in &mut merged_models {
+        let Some(model_id) = codex_model_stable_id(merged_model) else {
+            continue;
+        };
+        let Some(routed_model) = routed_models_by_id.get(&model_id) else {
+            continue;
+        };
+        let Some(merged_object) = merged_model.as_object_mut() else {
+            continue;
+        };
+        // Final cache projection must not reintroduce presentation or transport
+        // metadata from the pre-takeover official snapshot.
+        let mut projected_fields = vec!["multi_agent_version", "multiAgentVersion"];
+        if catalog
+            .get("ccSwitchRoutingDependencyFingerprint")
+            .is_some()
+        {
+            projected_fields.extend([
+                "display_name",
+                "displayName",
+                "description",
+                "default_reasoning_level",
+                "default_reasoning_effort",
+                "defaultReasoningEffort",
+            ]);
+        }
+        for field in projected_fields {
+            if let Some(value) = routed_model.get(field).cloned() {
+                merged_object.insert(field.to_string(), value);
+            }
+        }
+    }
+    Some(merged_models)
+}
+
 fn sync_codex_models_cache_with_cc_switch_catalog_and_authority(
     catalog: &Value,
     reasoning_authoritative_ids: &HashSet<String>,
 ) -> Result<(), AppError> {
-    let Some(models) = catalog.get("models").and_then(|models| models.as_array()) else {
+    if catalog.get("models").and_then(Value::as_array).is_none() {
         return Ok(());
-    };
+    }
 
     let cache_path = get_codex_models_cache_path();
     let backup_path = get_codex_models_cache_backup_path();
@@ -6481,6 +6566,10 @@ fn sync_codex_models_cache_with_cc_switch_catalog_and_authority(
                 let mut restored = cache.clone();
                 restored["etag"] = Value::Null;
                 restored["models"] = Value::Array(official_models.clone());
+                if let Some(object) = restored.as_object_mut() {
+                    object.remove("ccSwitchModelProvider");
+                    object.remove("ccSwitchRoutingDependencyFingerprint");
+                }
                 write_json_file(&backup_path, &restored)?;
             }
         } else if !backup_path.exists() {
@@ -6491,48 +6580,12 @@ fn sync_codex_models_cache_with_cc_switch_catalog_and_authority(
         }
     }
 
-    let mut merged_models = merge_codex_models_with_reasoning_authority(
+    let merged_models = projected_codex_models_cache_entries(
+        catalog,
         &official_models,
-        models,
         reasoning_authoritative_ids,
-    );
-    let routed_models_by_id = models
-        .iter()
-        .filter_map(|model| codex_model_stable_id(model).map(|model_id| (model_id, model)))
-        .collect::<HashMap<_, _>>();
-    for merged_model in &mut merged_models {
-        let Some(model_id) = codex_model_stable_id(merged_model) else {
-            continue;
-        };
-        let Some(routed_model) = routed_models_by_id.get(&model_id) else {
-            continue;
-        };
-        let Some(merged_object) = merged_model.as_object_mut() else {
-            continue;
-        };
-        // 普通 catalog enrichment 仍以同 slug 官方 transport 元数据为权威；
-        // 只有最终写入 CCSM-owned cache 时，才让当前用户选择的 V1/V2 投影
-        // 覆盖接管前备份，避免第二次合并重新带回过期协议。
-        let mut projected_fields = vec!["multi_agent_version", "multiAgentVersion"];
-        if catalog
-            .get("ccSwitchRoutingDependencyFingerprint")
-            .is_some()
-        {
-            projected_fields.extend([
-                "display_name",
-                "displayName",
-                "description",
-                "default_reasoning_level",
-                "default_reasoning_effort",
-                "defaultReasoningEffort",
-            ]);
-        }
-        for field in projected_fields {
-            if let Some(value) = routed_model.get(field).cloned() {
-                merged_object.insert(field.to_string(), value);
-            }
-        }
-    }
+    )
+    .expect("catalog models array was validated");
 
     // 以现有缓存对象为底稿还能保留新版 App 可能新增的顶层元数据；这里只覆盖
     // CCSM 必须维护的刷新时间、所有权标记、客户端版本和合并后的模型数组。
@@ -6553,6 +6606,16 @@ fn sync_codex_models_cache_with_cc_switch_catalog_and_authority(
     );
     cache_object.insert("client_version".to_string(), Value::String(client_version));
     cache_object.insert("models".to_string(), Value::Array(merged_models));
+    for field in [
+        "ccSwitchModelProvider",
+        "ccSwitchRoutingDependencyFingerprint",
+    ] {
+        if let Some(value) = catalog.get(field) {
+            cache_object.insert(field.to_string(), value.clone());
+        } else {
+            cache_object.remove(field);
+        }
+    }
     write_json_file(&cache_path, &cache)
 }
 
@@ -6830,6 +6893,37 @@ fn compact_codex_router_provider_label(provider: &str) -> String {
     )
 }
 
+fn projected_codex_model_catalog(
+    settings: &Value,
+    config_text: &str,
+    profile: CodexCatalogToolProfile,
+    reasoning_authoritative_ids: &HashSet<String>,
+) -> Result<(Value, Option<String>), AppError> {
+    let generated_catalog = codex_model_catalog_from_settings(settings, config_text, profile)?
+        .unwrap_or_else(|| json!({ "models": [] }));
+    let mut catalog = enrich_codex_catalog_with_official_metadata_and_authority(
+        &generated_catalog,
+        reasoning_authoritative_ids,
+    )?;
+    let router_effort = apply_codex_router_catalog_preferences(&mut catalog, settings);
+    if let Some(fingerprint) = settings
+        .pointer("/codexRoutingProjection/dependencyFingerprint")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|fingerprint| !fingerprint.is_empty())
+    {
+        catalog["ccSwitchRoutingDependencyFingerprint"] = json!(fingerprint);
+    }
+    let document = config_text
+        .parse::<DocumentMut>()
+        .map_err(|e| AppError::Message(format!("Invalid Codex config.toml: {e}")))?;
+    let model_provider = active_codex_model_provider_id(&document)
+        .unwrap_or_else(|| CODEX_OPENAI_MODEL_PROVIDER_ID.to_string());
+    catalog["ccSwitchModelProvider"] = json!(model_provider);
+    apply_codex_multi_agent_transport_policy(&mut catalog, settings);
+    Ok((catalog, router_effort))
+}
+
 fn prepare_codex_config_text_with_model_catalog_impl(
     settings: &Value,
     config_text: &str,
@@ -6844,6 +6938,19 @@ fn prepare_codex_config_text_with_model_catalog_impl(
     // forever when the caller drives its own runtime). Refresh is therefore
     // scheduled in the background instead of awaited.
     schedule_codex_public_official_catalog_refresh();
+    let mut normalized_config = config_text
+        .parse::<DocumentMut>()
+        .map_err(|e| AppError::Message(format!("Invalid Codex config.toml: {e}")))?;
+    let normalized_config_text;
+    let config_text = if codex_multi_router_is_enabled(settings)
+        || codex_document_uses_multi_router(&normalized_config)
+    {
+        remove_multi_router_context_overrides(&mut normalized_config);
+        normalized_config_text = normalized_config.to_string();
+        normalized_config_text.as_str()
+    } else {
+        config_text
+    };
     let catalog_path = get_codex_model_catalog_path();
     let specs = codex_catalog_model_specs(settings, config_text);
     let reasoning_authoritative_ids = specs
@@ -6856,34 +6963,21 @@ fn prepare_codex_config_text_with_model_catalog_impl(
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|fingerprint| !fingerprint.is_empty());
-    let has_catalog_inventory = catalog_models(settings).is_some_and(|models| {
-        models.iter().any(|model| {
-            model
-                .get("model")
-                .and_then(Value::as_str)
-                .is_some_and(|model| !model.trim().is_empty())
-        })
-    });
+    let has_catalog_inventory = catalog_models(settings).is_some();
 
     // 是否写入 provider 内联模型取决于已安装 Desktop 版本；严格诊断生效的
     // Desktop 只保留 catalog 指针。
     let write_inline_provider_models = projection_write_inline_provider_models();
 
     // An explicitly empty included list must replace stale picker models, not
-    // restore official models. Only an absent/cleared inventory relinquishes ownership.
+    // restore official models. Only an absent/malformed inventory relinquishes ownership.
     if !specs.is_empty() || has_catalog_inventory || projection_fingerprint.is_some() {
-        let generated_catalog = codex_model_catalog_from_settings(settings, config_text, profile)?
-            .unwrap_or_else(|| json!({ "models": [] }));
-        let mut catalog = enrich_codex_catalog_with_official_metadata_and_authority(
-            &generated_catalog,
+        let (catalog, router_effort) = projected_codex_model_catalog(
+            settings,
+            config_text,
+            profile,
             &reasoning_authoritative_ids,
         )?;
-        let router_effort = apply_codex_router_catalog_preferences(&mut catalog, settings);
-        if let Some(fingerprint) = projection_fingerprint {
-            catalog["ccSwitchRoutingDependencyFingerprint"] =
-                Value::String(fingerprint.to_string());
-        }
-        apply_codex_multi_agent_transport_policy(&mut catalog, settings);
         let config_text = set_codex_model_catalog_projection_fields(
             config_text,
             Some(&catalog_path),
@@ -7043,30 +7137,92 @@ fn read_back_codex_multirouter_projection_impl(
             )
         })?;
 
+    let live_after = read_codex_config_text()?;
+    let specs = codex_catalog_model_specs(projection_settings, &live_after);
+    let reasoning_authoritative_ids = specs
+        .iter()
+        .filter(|spec| spec.reasoning.is_some())
+        .map(|spec| spec.model.to_ascii_lowercase())
+        .collect::<HashSet<_>>();
+    let (expected_catalog, _) = projected_codex_model_catalog(
+        projection_settings,
+        &live_after,
+        CodexCatalogToolProfile::NativeResponses,
+        &reasoning_authoritative_ids,
+    )?;
     let catalog: Value = read_json_file(&get_codex_model_catalog_path())?;
     let read_fingerprint = catalog
         .get("ccSwitchRoutingDependencyFingerprint")
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_string();
-    let catalog_verified = read_fingerprint == expected_fingerprint;
-    let live_after = read_codex_config_text()?;
+    let catalog_verified = read_fingerprint == expected_fingerprint && catalog == expected_catalog;
     let config_verified = live_after
         .parse::<DocumentMut>()
         .ok()
-        .and_then(|document| {
-            document
+        .is_some_and(|document| {
+            let provider_id = active_codex_model_provider_id(&document);
+            if provider_id.as_deref() != Some(CC_SWITCH_CODEX_ROUTER_MODEL_PROVIDER_ID) {
+                return false;
+            }
+            if document.get("model_context_window").is_some()
+                || document.get("model_auto_compact_token_limit").is_some()
+            {
+                return false;
+            }
+            let pointer_matches = document
                 .get("model_catalog_json")
                 .and_then(|value| value.as_str())
-                .map(str::to_string)
-        })
-        .is_some_and(|path| {
-            Path::new(&path) == get_codex_model_catalog_path()
-                || codex_model_catalog_path_is_cc_switch_owned(&path)
+                .is_some_and(|path| Path::new(path) == get_codex_model_catalog_path());
+            if !pointer_matches {
+                return false;
+            }
+            let mut expected_document = document.clone();
+            if projection_write_inline_provider_models() {
+                set_active_codex_provider_models(
+                    &mut expected_document,
+                    &specs,
+                    Some(&expected_catalog),
+                );
+            } else {
+                remove_active_codex_provider_models(&mut expected_document);
+            }
+            let Ok(observed_config) = live_after.parse::<toml::Value>() else {
+                return false;
+            };
+            let Ok(expected_config) = expected_document.to_string().parse::<toml::Value>() else {
+                return false;
+            };
+            let provider_models = |config: &toml::Value| {
+                config
+                    .get("model_providers")
+                    .and_then(|providers| providers.get(CC_SWITCH_CODEX_ROUTER_MODEL_PROVIDER_ID))
+                    .and_then(|provider| provider.get("models"))
+                    .cloned()
+            };
+            provider_models(&observed_config) == provider_models(&expected_config)
         });
+    let expected_cache_models = projected_codex_models_cache_entries(
+        &expected_catalog,
+        &codex_official_models_cache().unwrap_or_default(),
+        &reasoning_authoritative_ids,
+    )
+    .map(Value::Array);
     let cache_verified = read_json_file_if_exists(&get_codex_models_cache_path())?
         .as_ref()
-        .is_some_and(codex_models_cache_is_cc_switch_owned);
+        .is_some_and(|cache| {
+            codex_models_cache_is_cc_switch_owned(cache)
+                && cache.get("ccSwitchModelProvider")
+                    == expected_catalog.get("ccSwitchModelProvider")
+                && cache
+                    .get("ccSwitchRoutingDependencyFingerprint")
+                    .and_then(Value::as_str)
+                    == Some(expected_fingerprint)
+                && cache
+                    .get("models")
+                    .zip(expected_cache_models.as_ref())
+                    .is_some_and(|(observed, expected)| observed == expected)
+        });
     let agent_files_verified =
         verify_codex_subagent_role_files(projection_settings, provider_context)?
             .iter()
@@ -14477,6 +14633,38 @@ base_url = "http://127.0.0.1:15721/v1"
 
     #[test]
     #[serial]
+    fn multirouter_catalog_specs_do_not_treat_generated_inline_reasoning_as_authority() {
+        let _home = TestHomeGuard::new();
+        let mut settings = json!({
+            "modelCatalog": {"models": [{"model": "unknown-new-model"}]},
+            "codexRoutingProjection": {"dependencyFingerprint": "canonical-source"}
+        });
+        let config = "model_provider = \"codex_model_router_v2\"\n\
+            [[model_providers.codex_model_router_v2.models]]\n\
+            model = \"unknown-new-model\"\n\
+            supported_reasoning_levels = [{ effort = \"low\" }, { effort = \"high\" }]\n\
+            default_reasoning_level = \"high\"\n";
+
+        for from_settings in [false, true] {
+            settings["config"] = json!(config);
+            let specs =
+                codex_catalog_model_specs(&settings, if from_settings { "" } else { config });
+            assert_eq!(specs.len(), 1);
+            assert!(specs[0].reasoning.is_none());
+            assert_ne!(specs[0].reasoning_source, "provider_config");
+        }
+
+        let authored_config = config.replace("codex_model_router_v2", "authored-provider");
+        let specs = codex_catalog_model_specs(&settings, &authored_config);
+        assert_eq!(specs[0].reasoning_source, "provider_config");
+        assert_eq!(
+            specs[0].reasoning.as_ref().unwrap().supported_efforts,
+            vec!["low", "high"]
+        );
+    }
+
+    #[test]
+    #[serial]
     fn codex_model_catalog_prefers_cached_official_context_window_over_default() {
         let _home = TestHomeGuard::new();
         seed_codex_models_cache(json!([{
@@ -18576,6 +18764,56 @@ models = [{ model = "stale-model" }]
 
     #[test]
     #[serial]
+    fn explicit_empty_catalog_keeps_managed_picker_ownership_without_router_fingerprint() {
+        let _home = TestHomeGuard::new();
+        seed_codex_models_cache(json!([{"slug": "official-only"}]));
+        let config = "model_provider = \"custom\"\n\
+            [model_providers.custom]\nbase_url = \"https://example.org/v1\"\n";
+        let previous = prepare_codex_config_text_with_model_catalog_without_provider_context(
+            &json!({
+                "modelCatalog": {"models": [{"model": "previous"}]},
+                "codexRoutingProjection": {"dependencyFingerprint": "previous-dependencies"}
+            }),
+            config,
+            CodexCatalogToolProfile::NativeResponses,
+        )
+        .expect("publish previous inventory");
+
+        let prepared = prepare_codex_config_text_with_model_catalog_without_provider_context(
+            &json!({
+                "modelCatalog": {"models": []},
+                "model_catalog": {"models": [{"model": "stale-legacy"}]}
+            }),
+            &previous,
+            CodexCatalogToolProfile::NativeResponses,
+        )
+        .expect("publish authoritative empty inventory");
+        let document: toml::Value = toml::from_str(&prepared).expect("prepared config");
+        assert_eq!(
+            document["model_catalog_json"].as_str(),
+            get_codex_model_catalog_path().to_str()
+        );
+        assert_eq!(
+            document["model_providers"]["custom"]["models"].as_array(),
+            Some(&Vec::new())
+        );
+        for path in [
+            get_codex_model_catalog_path(),
+            get_codex_models_cache_path(),
+        ] {
+            let output: Value = read_json_file(&path).expect("managed picker projection");
+            assert_eq!(output["models"], json!([]));
+            assert_eq!(output["ccSwitchModelProvider"], "custom");
+        }
+        let cache: Value = read_json_file(&get_codex_models_cache_path()).unwrap();
+        assert!(codex_models_cache_is_cc_switch_owned(&cache));
+        assert!(cache.get("ccSwitchRoutingDependencyFingerprint").is_none());
+        let backup: Value = read_json_file(&get_codex_models_cache_backup_path()).unwrap();
+        assert_eq!(backup["models"], json!([{"slug": "official-only"}]));
+    }
+
+    #[test]
+    #[serial]
     /// custom MultiRouter 应同步 models_cache，让运行中的 Codex 菜单能看到 Qwen/DeepSeek。
     fn model_catalog_syncs_codex_models_cache_for_custom_provider_picker() {
         let _home = TestHomeGuard::new();
@@ -19168,6 +19406,195 @@ wire_api = "responses"
             catalog["ccSwitchRoutingDependencyFingerprint"],
             "fingerprint-v2"
         );
+        assert_eq!(catalog["ccSwitchModelProvider"], "codex_model_router_v2");
+        let cache: Value = read_json_file(&get_codex_models_cache_path()).expect("read cache");
+        assert_eq!(cache["ccSwitchModelProvider"], "codex_model_router_v2");
+        assert_eq!(
+            cache["ccSwitchRoutingDependencyFingerprint"],
+            "fingerprint-v2"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn multirouter_projection_readback_rejects_drift_with_unchanged_ownership_markers() {
+        let _guard = TestHomeGuard::new();
+        write_codex_live_config_atomic(Some(
+            "model_provider = \"codex_model_router_v2\"\n\
+             [model_providers.codex_model_router_v2]\n\
+             base_url = \"http://127.0.0.1:15721/v1\"\nwire_api = \"responses\"\n",
+        ))
+        .expect("seed live config");
+        seed_codex_models_cache(json!([]));
+        let settings = json!({
+            "modelCatalog": {"models": [
+                {"model": "first", "contextWindow": 262144, "inputModalities": ["text"]},
+                {"model": "second", "inputModalities": ["text"]}
+            ]},
+            "codexRouting": {"schemaVersion": 2, "enabled": true, "routes": []},
+            "codexRoutingProjection": {"dependencyFingerprint": "current-dependencies"}
+        });
+        publish_codex_multirouter_projection(&settings).expect("publish projection");
+        let baseline_catalog: Value =
+            read_json_file(&get_codex_model_catalog_path()).expect("catalog");
+        let baseline_cache: Value = read_json_file(&get_codex_models_cache_path()).expect("cache");
+        let baseline_config = read_codex_config_text().expect("config");
+
+        for target in [
+            get_codex_model_catalog_path(),
+            get_codex_models_cache_path(),
+        ] {
+            let baseline = if target == get_codex_model_catalog_path() {
+                &baseline_catalog
+            } else {
+                &baseline_cache
+            };
+            for mutation in [
+                "order",
+                "missing",
+                "extra",
+                "context",
+                "context-default",
+                "display",
+                "reasoning",
+                "provider",
+                "fingerprint",
+            ] {
+                let mut drifted = baseline.clone();
+                match mutation {
+                    "order" => drifted["models"].as_array_mut().unwrap().reverse(),
+                    "missing" => {
+                        drifted["models"].as_array_mut().unwrap().pop();
+                    }
+                    "extra" => drifted["models"]
+                        .as_array_mut()
+                        .unwrap()
+                        .push(json!({"slug": "unrouted"})),
+                    "context" => drifted["models"][0]["context_window"] = json!(42),
+                    "context-default" => drifted["models"][1]["context_window"] = json!(42),
+                    "display" => drifted["models"][0]["display_name"] = json!("stale label"),
+                    "reasoning" => {
+                        drifted["models"][0]["default_reasoning_level"] = json!("stale-effort")
+                    }
+                    "provider" => drifted["ccSwitchModelProvider"] = json!("other-provider"),
+                    "fingerprint" => {
+                        drifted["ccSwitchRoutingDependencyFingerprint"] =
+                            json!("stale-dependencies")
+                    }
+                    _ => unreachable!(),
+                }
+                write_json_file(&target, &drifted).expect("write drifted projection");
+                let readback = read_back_codex_multirouter_projection_impl(&settings, None)
+                    .expect("read drifted projection");
+                if target == get_codex_model_catalog_path() {
+                    assert!(!readback.catalog_verified, "catalog mutation {mutation}");
+                } else {
+                    assert!(!readback.cache_verified, "cache mutation {mutation}");
+                }
+                write_json_file(&target, baseline).expect("restore projection");
+            }
+        }
+
+        for mutation in ["pointer", "provider", "inline", "context", "compact"] {
+            let mut document = baseline_config.parse::<DocumentMut>().unwrap();
+            match mutation {
+                "pointer" => {
+                    document["model_catalog_json"] = toml_edit::value(
+                        get_codex_config_dir()
+                            .join("stale")
+                            .join(CC_SWITCH_CODEX_MODEL_CATALOG_FILENAME)
+                            .to_string_lossy()
+                            .as_ref(),
+                    )
+                }
+                "provider" => document["model_provider"] = toml_edit::value("other-provider"),
+                "inline" => {
+                    document["model_providers"]["codex_model_router_v2"]["models"] =
+                        toml_edit::value(Array::default())
+                }
+                "context" => document["model_context_window"] = toml_edit::value(64000),
+                "compact" => document["model_auto_compact_token_limit"] = toml_edit::value(32000),
+                _ => unreachable!(),
+            }
+            write_codex_live_config_atomic(Some(&document.to_string()))
+                .expect("write config drift");
+            let readback = read_back_codex_multirouter_projection_impl(&settings, None)
+                .expect("read config drift");
+            assert!(!readback.config_verified, "config mutation {mutation}");
+        }
+        write_codex_live_config_atomic(Some(&baseline_config)).expect("restore config");
+        let readback = read_back_codex_multirouter_projection_impl(&settings, None).unwrap();
+        assert!(readback.catalog_verified && readback.cache_verified && readback.config_verified);
+    }
+
+    #[test]
+    #[serial]
+    fn multirouter_projection_readback_uses_normalized_context_defaults() {
+        let _home = TestHomeGuard::new();
+        write_codex_live_config_atomic(Some(
+            "model_provider = \"codex_model_router_v2\"\nmodel_context_window = 64000\n\
+             [model_providers.codex_model_router_v2]\n\
+             base_url = \"http://127.0.0.1:15721/v1\"\nwire_api = \"responses\"\n",
+        ))
+        .expect("seed router with obsolete global context");
+        seed_codex_models_cache(json!([]));
+        let settings = json!({
+            "modelCatalog": {"models": [{"model": "unknown-new-model"}]},
+            "codexRouting": {"schemaVersion": 2, "enabled": true, "routes": []},
+            "codexRoutingProjection": {"dependencyFingerprint": "normalized-context"}
+        });
+
+        let readback = publish_codex_multirouter_projection(&settings).expect("publish projection");
+
+        assert!(readback.catalog_verified && readback.cache_verified && readback.config_verified);
+        let config: toml::Value = toml::from_str(&read_codex_config_text().unwrap()).unwrap();
+        assert!(config.get("model_context_window").is_none());
+        let catalog: Value = read_json_file(&get_codex_model_catalog_path()).unwrap();
+        assert_eq!(catalog["models"][0]["context_window"], 128000);
+    }
+
+    #[test]
+    #[serial]
+    fn multirouter_projection_readback_remains_verified_after_official_backup_rebuild() {
+        for initially_owned in [false, true] {
+            let _home = TestHomeGuard::new();
+            write_codex_live_config_atomic(Some(
+                "model_provider = \"codex_model_router_v2\"\n\
+                 [model_providers.codex_model_router_v2]\n\
+                 base_url = \"http://127.0.0.1:15721/v1\"\nwire_api = \"responses\"\n",
+            ))
+            .expect("seed live router config");
+            seed_codex_models_cache(json!([]));
+            if initially_owned {
+                let mut cache: Value = read_json_file(&get_codex_models_cache_path()).unwrap();
+                cache["etag"] = json!(CC_SWITCH_CODEX_MODELS_CACHE_ETAG);
+                cache["models"] = json!([{"slug": "gpt-6-astra", "context_window": 42}]);
+                write_json_file(&get_codex_models_cache_path(), &cache).unwrap();
+            }
+            let official_context = codex_official_models_cache()
+                .unwrap()
+                .iter()
+                .find(|model| codex_model_stable_id(model).as_deref() == Some("gpt-6-astra"))
+                .and_then(|model| parse_codex_positive_u64(model.get("context_window")))
+                .expect("packaged official context");
+            let settings = json!({
+                "modelCatalog": {"models": [{"model": "gpt-6-astra"}]},
+                "codexRouting": {"schemaVersion": 2, "enabled": true, "routes": []},
+                "codexRoutingProjection": {"dependencyFingerprint": "official-context"}
+            });
+
+            for _ in 0..3 {
+                let readback = publish_codex_multirouter_projection(&settings).unwrap();
+                assert!(
+                    readback.catalog_verified
+                        && readback.cache_verified
+                        && readback.config_verified,
+                    "owned seed: {initially_owned}"
+                );
+                let catalog: Value = read_json_file(&get_codex_model_catalog_path()).unwrap();
+                assert_eq!(catalog["models"][0]["context_window"], official_context);
+            }
+        }
     }
 
     #[test]

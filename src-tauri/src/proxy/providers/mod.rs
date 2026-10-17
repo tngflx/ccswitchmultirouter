@@ -84,7 +84,8 @@ pub(crate) use codex::{
     provider_uses_native_codex_auth, resolve_codex_chat_protocol_target,
     resolve_codex_chat_reasoning_projection, resolve_codex_native_responses_reasoning_projection,
     resolve_codex_primary_route_from_settings, resolve_codex_request_compatibility,
-    strip_legacy_codex_official_auth, CODEX_ACCOUNT_POOL_ENABLED,
+    strip_legacy_codex_official_auth, validate_codex_provider_api_capability,
+    CODEX_ACCOUNT_POOL_ENABLED,
 };
 pub use codex::{
     apply_codex_chat_upstream_model, apply_codex_upstream_model, build_codex_route_probe_provider,

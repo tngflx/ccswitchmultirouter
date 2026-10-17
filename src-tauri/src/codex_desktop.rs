@@ -22,6 +22,7 @@ pub(crate) const CDP_HTTP_TIMEOUT: Duration = Duration::from_secs(2);
 const CDP_CONNECT_TIMEOUT: Duration = Duration::from_secs(4);
 const CDP_COMMAND_TIMEOUT: Duration = Duration::from_secs(4);
 const MODEL_PICKER_PATCH_KEY: &str = "__ccSwitchCodexAppCompatibilityV9";
+const MODEL_PICKER_RENDERER_SCHEDULER_VERSION: &str = "9";
 const REMEMBERED_CODEX_DESKTOP_EXECUTABLE_FILENAME: &str = "codex-desktop-executable.json";
 pub(crate) const MANUAL_SUMMARY_REQUEST_MARKER: &str =
     "[CCSwitch internal request: manual-summary-v1]";
@@ -193,7 +194,7 @@ pub(crate) struct CodexModelCatalogProjection {
 
 impl CodexModelCatalogProjection {
     /// 构造不含路由模型的兼容投影，使历史目录修复不依赖 CCSM 模型目录是否已生成。
-    fn empty() -> Self {
+    pub(crate) fn empty() -> Self {
         Self {
             default_model: None,
             model_provider: None,
@@ -372,20 +373,73 @@ fn codex_desktop_executable_not_found_message() -> String {
 /// 从 cc-switch 生成的 catalog 中读取模型名和 renderer 需要的最小描述。
 pub(crate) fn load_cc_switch_model_catalog_projection(
 ) -> Result<CodexModelCatalogProjection, String> {
-    let catalog_path = crate::codex_config::get_codex_model_catalog_path();
-    let default_model = read_current_codex_default_model();
-    let model_provider = read_current_codex_model_provider();
+    let config_text = crate::codex_config::read_codex_config_text().map_err(|e| e.to_string())?;
+    let config = config_text
+        .parse::<toml::Value>()
+        .map_err(|e| e.to_string())?;
+    let config_dir = crate::codex_config::get_codex_config_dir();
+    let catalog_path =
+        crate::codex_config::resolve_cc_switch_catalog_path(&config_text, &config_dir).ok_or_else(
+            || "The active Codex config does not reference a CCSwitchMulti catalog".to_string(),
+        )?;
+    let default_model = config
+        .get("model")
+        .and_then(toml::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string);
+    let model_provider = config
+        .get("model_provider")
+        .and_then(toml::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+        .or_else(|| Some("openai".to_string()));
+    let catalog = crate::config::read_json_file::<Value>(&catalog_path).ok();
+    let cache_path = config_dir.join("models_cache.json");
+    let cache = crate::config::read_json_file::<Value>(&cache_path).ok();
+    let inline_catalog = read_active_codex_provider_inline_model_catalog(&config);
+    // A provider switch must not bind files read from one config revision to
+    // the provider from another revision. Keep the last renderer payload until
+    // the writer has finished publishing a consistent snapshot.
+    if crate::codex_config::read_codex_config_text().map_err(|e| e.to_string())? != config_text {
+        return Err("The active Codex config changed while reading its catalog".to_string());
+    }
+    select_cc_switch_model_catalog_projection(
+        catalog.as_ref(),
+        cache.as_ref(),
+        inline_catalog.as_ref(),
+        default_model,
+        model_provider,
+    )
+    .ok_or_else(|| {
+        format!(
+            "No routed models were found in {}, the CCSwitchMulti models cache, or the active provider inline catalog",
+            catalog_path.display()
+        )
+    })
+}
+
+fn select_cc_switch_model_catalog_projection(
+    catalog: Option<&Value>,
+    cache: Option<&Value>,
+    inline_catalog: Option<&Value>,
+    default_model: Option<String>,
+    model_provider: Option<String>,
+) -> Option<CodexModelCatalogProjection> {
     // The canonical modelCatalog is authoritative even when it is empty. Do
     // not reinterpret a top-level array as the canonical schema: accepting it
     // here can turn a malformed/legacy value into an empty managed catalog.
-    if let Ok(catalog) = crate::config::read_json_file::<Value>(&catalog_path) {
+    if let Some(catalog) = catalog
+        .filter(|catalog| catalog_matches_model_provider(catalog, model_provider.as_deref(), true))
+    {
         if let Some(projection) = codex_model_catalog_projection_from_value_with_shape(
-            &catalog,
+            catalog,
             default_model.clone(),
             model_provider.clone(),
             false,
         ) {
-            return Ok(projection);
+            return Some(projection);
         }
     }
 
@@ -394,14 +448,15 @@ pub(crate) fn load_cc_switch_model_catalog_projection(
     // from supplying usable models. If every fallback is empty, keep it as an
     // unavailable projection so the renderer does not apply a strict filter.
     let mut empty_fallback = None;
-    let cache_path = crate::codex_config::get_codex_config_dir().join("models_cache.json");
     let mut fallback_candidates = Vec::new();
-    if let Ok(cache) = crate::config::read_json_file::<Value>(&cache_path) {
-        if cache.get("etag").and_then(Value::as_str) == Some("cc-switch-model-catalog") {
+    if let Some(cache) = cache {
+        if cache.get("etag").and_then(Value::as_str) == Some("cc-switch-model-catalog")
+            && catalog_matches_model_provider(cache, model_provider.as_deref(), false)
+        {
             fallback_candidates.push(cache);
         }
     }
-    if let Some(inline_catalog) = read_active_codex_provider_inline_model_catalog() {
+    if let Some(inline_catalog) = inline_catalog {
         fallback_candidates.push(inline_catalog);
     }
     for candidate in &fallback_candidates {
@@ -417,17 +472,24 @@ pub(crate) fn load_cc_switch_model_catalog_projection(
             projection.catalog_available = false;
             empty_fallback.get_or_insert(projection);
         } else {
-            return Ok(projection);
+            return Some(projection);
         }
     }
-    if let Some(projection) = empty_fallback {
-        return Ok(projection);
-    }
+    empty_fallback
+}
 
-    Err(format!(
-        "No routed models were found in {}, the CCSwitchMulti models cache, or the active provider inline catalog",
-        catalog_path.display()
-    ))
+fn catalog_matches_model_provider(
+    catalog: &Value,
+    model_provider: Option<&str>,
+    allow_legacy_unbound: bool,
+) -> bool {
+    let Some(model_provider) = model_provider.filter(|provider| !provider.is_empty()) else {
+        return false;
+    };
+    match catalog.get("ccSwitchModelProvider") {
+        Some(provider) => provider.as_str().map(str::trim) == Some(model_provider),
+        None => allow_legacy_unbound,
+    }
 }
 
 /// 从单个目录值构造 renderer 投影。
@@ -558,9 +620,7 @@ fn app_server_model_list_scope_core_script() -> &'static str {
 /// 生成 live config 时，CCSM 会把同一份路由目录同时投射到 JSON catalog、models cache
 /// 和活动 provider 内联数组。任一 JSON 文件短暂不可读时，内联数组仍能避免整次 Desktop
 /// 会话安装空白名单；这里仅读取活动 provider，不能把未启用 provider 的模型重新注入。
-fn read_active_codex_provider_inline_model_catalog() -> Option<Value> {
-    let text = crate::codex_config::read_codex_config_text().ok()?;
-    let parsed = text.parse::<toml::Value>().ok()?;
+fn read_active_codex_provider_inline_model_catalog(parsed: &toml::Value) -> Option<Value> {
     let provider_id = parsed.get("model_provider").and_then(toml::Value::as_str)?;
     let models = parsed
         .get("model_providers")
@@ -644,18 +704,6 @@ fn project_codex_model_descriptor(entry: &Value, model_name: &str) -> Value {
     }
     object.insert("hidden".to_string(), Value::Bool(false));
     Value::Object(object)
-}
-
-/// 读取当前 Codex 默认模型，用于 renderer 动态配置的 default_model。
-fn read_current_codex_default_model() -> Option<String> {
-    let text = crate::codex_config::read_codex_config_text().ok()?;
-    let parsed = text.parse::<toml::Value>().ok()?;
-    parsed
-        .get("model")
-        .and_then(toml::Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToString::to_string)
 }
 
 /// 读取当前 live Codex Provider，供 renderer 在冷恢复旧任务时覆盖历史 Provider 标签。
@@ -778,12 +826,11 @@ pub(crate) async fn list_cdp_targets(debug_port: u16) -> Result<Vec<CdpTarget>, 
 
 /// 选择最可能属于 Codex Desktop 的 renderer 页面。
 ///
-/// 共享调试端口如 9222 可能属于 Chrome 或其它 Electron 应用，必须看到 Codex
-/// 标识才注入；CCSwitchMulti 自己启动的默认 9229 允许在标题还没初始化时退回
-/// 到第一个 page target。
+/// CDP ports can belong to another application, including the default port.
+/// Wait for a positive Codex marker before injecting into any renderer.
 pub(crate) fn pick_codex_page_targets(
     targets: &[CdpTarget],
-    debug_port: u16,
+    _debug_port: u16,
 ) -> Result<Vec<CdpTarget>, String> {
     let pages = targets.iter().filter(|target| {
         target.target_type == "page"
@@ -792,10 +839,8 @@ pub(crate) fn pick_codex_page_targets(
                 .as_deref()
                 .is_some_and(|url| !url.is_empty())
     });
-    let mut all_pages = Vec::new();
     let mut codex_pages = Vec::new();
     for target in pages {
-        all_pages.push(target.clone());
         if target_matches_codex_desktop(target) {
             codex_pages.push(target.clone());
         }
@@ -803,19 +848,24 @@ pub(crate) fn pick_codex_page_targets(
     if !codex_pages.is_empty() {
         return Ok(codex_pages);
     }
-    if debug_port == DEFAULT_CODEX_DEBUG_PORT && !all_pages.is_empty() {
-        return Ok(all_pages);
-    }
-    Err("No Codex Desktop page target was found on shared CDP port".to_string())
+    Err("No Codex Desktop page target was found on CDP port".to_string())
 }
 
 /// 判断 CDP target 的标题或 URL 是否明确指向 Codex Desktop。
 fn target_matches_codex_desktop(target: &CdpTarget) -> bool {
+    let Ok(url) = url::Url::parse(&target.url) else {
+        return false;
+    };
+    if !matches!(url.scheme(), "app" | "file") {
+        return false;
+    }
     let haystack = format!("{} {}", target.title, target.url).to_ascii_lowercase();
-    haystack.contains("codex") || haystack.contains("app://")
+    haystack.contains("codex")
 }
 
-/// 使用 CDP 同时安装新文档脚本并立即 patch 当前页面。
+/// Patch the current document through CDP. New-document registrations are
+/// session-scoped and disappear when this connection closes; the guardian
+/// verifies the renderer marker and reapplies after navigation instead.
 pub(crate) async fn install_script(
     websocket_url: &str,
     script: &str,
@@ -844,23 +894,9 @@ pub(crate) async fn install_script(
             log::warn!("Codex renderer timezone override was not applied: {error}");
         }
     }
-    session.send_command(3, "Page.enable", json!({})).await?;
-    let registration = session
+    let evaluation = session
         .send_command(
-            4,
-            "Page.addScriptToEvaluateOnNewDocument",
-            json!({ "source": script }),
-        )
-        .await?;
-    let script_identifier = registration
-        .pointer("/result/identifier")
-        .and_then(Value::as_str)
-        .map(ToString::to_string);
-    // 只有 Runtime.evaluate 会返回当前 renderer 的执行结果；新文档脚本注册命令只返回
-    // identifier，不能用来判断 localThreadCatalog 是否真正触发。
-    let evaluation = match session
-        .send_command(
-            5,
+            3,
             "Runtime.evaluate",
             json!({
                 "expression": script,
@@ -869,37 +905,41 @@ pub(crate) async fn install_script(
                 "allowUnsafeEvalBlockedByCSP": true
             }),
         )
-        .await
-    {
-        Ok(evaluation) => evaluation,
-        Err(error) => {
-            if let Some(identifier) = script_identifier.as_deref() {
-                let _ = session
-                    .send_command(
-                        6,
-                        "Page.removeScriptToEvaluateOnNewDocument",
-                        json!({ "identifier": identifier }),
-                    )
-                    .await;
-            }
-            return Err(error);
-        }
-    };
-    match codex_app_compatibility_evidence_from_evaluation(&evaluation) {
-        Ok(evidence) => Ok(evidence),
-        Err(error) => {
-            if let Some(identifier) = script_identifier.as_deref() {
-                let _ = session
-                    .send_command(
-                        6,
-                        "Page.removeScriptToEvaluateOnNewDocument",
-                        json!({ "identifier": identifier }),
-                    )
-                    .await;
-            }
-            Err(error)
-        }
+        .await?;
+    codex_app_compatibility_evidence_from_evaluation(&evaluation)
+}
+
+fn codex_renderer_compatibility_probe_script(catalog: &CodexModelCatalogProjection) -> String {
+    let payload = serde_json::to_string(catalog).unwrap_or_else(|_| "{}".to_string());
+    let catalog_payload_selection_core = catalog_payload_selection_core_script();
+    format!(
+        r#"(() => {{
+          const state = window[{MODEL_PICKER_PATCH_KEY:?}];
+          if (!state || state.rendererSchedulerVersion !== {MODEL_PICKER_RENDERER_SCHEDULER_VERSION:?}
+              || !state.interval || !state.messagePatchInstalled) return false;
+          {catalog_payload_selection_core}
+          const expected = selectCatalogPayload(state.payload, {payload});
+          return JSON.stringify(state.payload) === JSON.stringify(expected);
+        }})()"#
+    )
+}
+
+pub(crate) async fn codex_renderer_compatibility_is_current(
+    websocket_url: &str,
+    catalog: &CodexModelCatalogProjection,
+) -> Result<bool, String> {
+    let evaluation = evaluate_cdp_expression(
+        websocket_url,
+        &codex_renderer_compatibility_probe_script(catalog),
+    )
+    .await?;
+    if evaluation.pointer("/result/exceptionDetails").is_some() {
+        return Ok(false);
     }
+    Ok(evaluation
+        .pointer("/result/result/value")
+        .and_then(Value::as_bool)
+        .unwrap_or(false))
 }
 
 fn codex_timezone_override_parameters(timezone: &str) -> Value {
@@ -2027,6 +2067,8 @@ fn build_model_picker_unlock_script(catalog: &CodexModelCatalogProjection) -> St
     let catalog_payload_selection_core = catalog_payload_selection_core_script();
     let app_server_model_list_scope_core = app_server_model_list_scope_core_script();
     let model_patch_core = model_picker_patch_core_script();
+    let query_cache_lifecycle_core =
+        include_str!("resources/codex_model_picker_cache_lifecycle.js");
     let guardian_v2_patch_core = guardian_v2_compatibility_patch_core_script();
     let request_normalization_core = app_server_request_normalization_core_script();
     let history_lineage_hydration_core = history_lineage_hydration_core_script();
@@ -2053,7 +2095,9 @@ fn build_model_picker_unlock_script(catalog: &CodexModelCatalogProjection) -> St
   // Bump this whenever the injected app-server/request patch changes. The
   // scheduler closure captures those functions; leaving an older interval
   // alive would reapply stale recovery hooks over the new patch.
-  const rendererSchedulerVersion = "8";
+  const rendererSchedulerVersion = "{MODEL_PICKER_RENDERER_SCHEDULER_VERSION}";
+  let reasoningQueryCachesToRebind = [];
+{query_cache_lifecycle_core}
   const cleanupMessagePatch = () => {{
     try {{
       if (typeof state.messagePatchListener === "function")
@@ -2070,18 +2114,11 @@ fn build_model_picker_unlock_script(catalog: &CodexModelCatalogProjection) -> St
     state.messagePatchOriginalDispatchEvent = null;
     state.messagePatchInstalled = false;
   }};
-  const cleanupReasoningQueryCaches = () => {{
-    if (!(state.reasoningQueryCaches instanceof Map)) return;
-    for (const entry of state.reasoningQueryCaches.values()) {{
-      try {{ entry?.unsubscribe?.(); }} catch {{}}
-    }}
-    state.reasoningQueryCaches.clear();
-  }};
   if (state.rendererSchedulerVersion !== rendererSchedulerVersion) {{
     if (state.interval) clearInterval(state.interval);
     try {{ state.reactRootObserver?.disconnect(); }} catch {{}}
     cleanupMessagePatch();
-    cleanupReasoningQueryCaches();
+    reasoningQueryCachesToRebind = prepareCodexModelReasoningQueryCachesForReinjection();
     state.interval = null;
     state.runPromise = null;
     state.reactRootObserver = null;
@@ -2096,6 +2133,7 @@ fn build_model_picker_unlock_script(catalog: &CodexModelCatalogProjection) -> St
     state.pendingReactNodes = new Set();
     state.lastReactFullScanAt = 0;
     state.lastReactIncrementalScanAt = 0;
+    state.reactInitialDiscoveryCompleted = false;
     state.rendererSchedulerVersion = rendererSchedulerVersion;
   }}
   if (normalizedCatalogProvider(previousPayload?.modelProvider) !==
@@ -2117,6 +2155,9 @@ fn build_model_picker_unlock_script(catalog: &CodexModelCatalogProjection) -> St
   }};
   window[patchKey] = state;
 {model_patch_core}
+  for (const cache of reasoningQueryCachesToRebind) {{
+    try {{ patchCodexModelReasoningQueryCache(cache); }} catch (error) {{ recordFailure(error); }}
+  }}
 {guardian_v2_patch_core}
 {request_normalization_core}
 {history_lineage_hydration_core}
@@ -2451,6 +2492,7 @@ fn build_model_picker_unlock_script(catalog: &CodexModelCatalogProjection) -> St
           if (!value || (typeof value !== "object" && typeof value !== "function") || seen.has(value)) continue;
           seen.add(value);
 
+          patchCodexModelReasoningQueryClient(value);
           if (looksLikeAppServerRequestClient(value) && patchRequestClient(value)) patched += 1;
           const nestedClient = value?.requestClient;
           if (looksLikeAppServerRequestClient(nestedClient) && patchRequestClient(nestedClient)) {{
@@ -2576,6 +2618,10 @@ fn build_model_picker_unlock_script(catalog: &CodexModelCatalogProjection) -> St
         try {{ patchCodexModelReasoningQueryCache(scope.queryClient?.getQueryCache()); }}
         catch (error) {{ recordFailure(error); }}
       }}
+      for (const cache of state.reasoningQueryCaches?.keys() || []) {{
+        try {{ patchCodexModelReasoningQueryCache(cache); }}
+        catch (error) {{ recordFailure(error); }}
+      }}
     }}
     state.appServerPatchInstalled = patched > 0;
     if (patched > 0 && state.historyQueryRefreshCompleted) {{
@@ -2677,7 +2723,7 @@ fn build_model_picker_unlock_script(catalog: &CodexModelCatalogProjection) -> St
   await run();
   if (!state.interval) state.interval = setInterval(() => {{ void run(); }}, 1500);
   const historySync = await triggerLocalThreadCatalogSync();
-  return {{ status: "ok", modelCount: modelNames().length, available_models: modelNames(), historySync, historyQueryPatch: state.historyQueryPatch || null, patchKey }};
+  return {{ status: "ok", modelCount: modelNames().length, available_models: modelNames(), appServerPatchInstalled: Boolean(state.appServerPatchInstalled), historySync, historyQueryPatch: state.historyQueryPatch || null, patchKey }};
 }})()
 "#
     )
@@ -4106,6 +4152,92 @@ mod tests {
                 .is_none(),
             "malformed catalog values remain unavailable and may use a fallback source"
         );
+    }
+
+    #[test]
+    fn catalog_source_selection_rejects_cross_provider_catalogs_and_caches() {
+        let stale_catalog = json!({
+            "ccSwitchModelProvider": "old-provider",
+            "models": [{"model": "old-model"}]
+        });
+        let stale_cache = json!({
+            "etag": "cc-switch-model-catalog",
+            "ccSwitchModelProvider": "old-provider",
+            "models": [{"model": "old-cache-model"}]
+        });
+        let inline = json!({"models": [{"model": "current-model"}]});
+        let projection = select_cc_switch_model_catalog_projection(
+            Some(&stale_catalog),
+            Some(&stale_cache),
+            Some(&inline),
+            Some("current-model".into()),
+            Some("current-provider".into()),
+        )
+        .expect("current provider inline fallback");
+        assert_eq!(projection.model_names, vec!["current-model"]);
+        assert!(select_cc_switch_model_catalog_projection(
+            Some(&stale_catalog),
+            Some(&stale_cache),
+            None,
+            None,
+            Some("current-provider".into()),
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn catalog_source_selection_requires_provider_binding_for_fallback_cache() {
+        let cache = json!({
+            "etag": "cc-switch-model-catalog",
+            "models": [{"model": "unknown-owner-model"}]
+        });
+        assert!(select_cc_switch_model_catalog_projection(
+            None,
+            Some(&cache),
+            None,
+            None,
+            Some("current-provider".into()),
+        )
+        .is_none());
+
+        let current_cache = json!({
+            "etag": "cc-switch-model-catalog",
+            "ccSwitchModelProvider": "current-provider",
+            "models": [{"model": "current-model"}]
+        });
+        let projection = select_cc_switch_model_catalog_projection(
+            None,
+            Some(&current_cache),
+            None,
+            None,
+            Some("current-provider".into()),
+        )
+        .expect("same-provider fallback cache");
+        assert_eq!(projection.model_names, vec!["current-model"]);
+    }
+
+    #[test]
+    fn catalog_source_selection_retains_bound_and_legacy_authoritative_empty_catalogs() {
+        let cache = json!({
+            "etag": "cc-switch-model-catalog",
+            "ccSwitchModelProvider": "current-provider",
+            "models": [{"model": "stale-model"}]
+        });
+        for catalog in [
+            json!({"models": []}),
+            json!({"ccSwitchModelProvider": "current-provider", "models": []}),
+        ] {
+            let projection = select_cc_switch_model_catalog_projection(
+                Some(&catalog),
+                Some(&cache),
+                None,
+                None,
+                Some("current-provider".into()),
+            )
+            .expect("current authoritative empty catalog");
+            assert!(projection.catalog_available);
+            assert!(projection.model_names.is_empty());
+        }
     }
 
     #[test]
@@ -5658,6 +5790,50 @@ JSON.stringify({cached, idempotent, subscriptions, replacedSelector, changedCata
     }
 
     #[test]
+    fn model_picker_query_cache_cleanup_restores_owned_observers_before_reinjection() {
+        let result = run_model_picker_patch_core_probe_with_payload(
+            json!({
+                "modelProvider": "codex_model_router_v2",
+                "modelNames": ["relay"],
+                "models": [{"model": "relay", "supported_reasoning_levels": ["high", "max"]}]
+            }),
+            r#"
+const key = ["models", "list", "local", "chatgpt", 100, "codex_model_router_v2"];
+const select = () => ({models: [{model: "relay", supportedReasoningEfforts: []}]});
+const setOptions = function(options) {this.options = options; this.result = options.select();};
+const getOptimisticResult = function() {};
+const fetchOptimistic = function() {};
+const observer = {options: {queryKey: key, select}, setOptions, getOptimisticResult, fetchOptimistic};
+const query = {queryKey: key, observers: [observer]};
+let unsubscribeCount = 0;
+let notify = () => {};
+const cache = {getAll: () => [query], subscribe(callback) {notify = callback; return () => {unsubscribeCount += 1;};}};
+patchCodexModelReasoningQueryCache(cache);
+const firstWrapper = observer.setOptions;
+const externalOptimisticResult = function() {};
+observer.getOptimisticResult = externalOptimisticResult;
+state.reasoningQueryCaches.get(cache).dispose();
+const restored = observer.setOptions === setOptions && observer.fetchOptimistic === fetchOptimistic && observer.options.select === select;
+const externalPreserved = observer.getOptimisticResult === externalOptimisticResult;
+state.reasoningQueryCaches.clear();
+patchCodexModelReasoningQueryCache(cache);
+const reinjected = observer.setOptions !== setOptions && observer.setOptions !== firstWrapper;
+query.observers = [];
+notify({type: "observerRemoved", query, observer});
+const removedRestored = observer.setOptions === setOptions && observer.options.select === select;
+JSON.stringify({restored, externalPreserved, reinjected, removedRestored, unsubscribeCount});
+"#,
+        );
+        assert_eq!(
+            result,
+            json!({
+                "restored": true, "externalPreserved": true, "reinjected": true,
+                "removedRestored": true, "unsubscribeCount": 1
+            })
+        );
+    }
+
+    #[test]
     fn model_picker_preserves_grouped_key_display_and_provider_labels() {
         let result = run_model_picker_patch_core_probe_with_payload(
             json!({
@@ -5850,7 +6026,7 @@ JSON.stringify({
     fn codex_app_compatibility_heartbeat_does_not_repeat_full_react_scan() {
         let script = build_model_picker_unlock_script(&CodexModelCatalogProjection::empty());
 
-        assert!(script.contains("const rendererSchedulerVersion = \"8\""));
+        assert!(script.contains("const rendererSchedulerVersion = \"9\""));
         assert!(script
             .contains("patchCodexModelReasoningQueryCache(scope.queryClient?.getQueryCache())"));
         assert!(script.contains("clearInterval(state.interval)"));
@@ -5863,6 +6039,11 @@ JSON.stringify({
         assert!(script.contains("state.lastReactIncrementalScanAt || 0) >= 5000"));
         assert!(script.contains("new MutationObserver"));
         assert!(script.contains("modulePatched = patchAppServerModuleClients(module)"));
+        assert!(script.contains("patchCodexModelReasoningQueryClient(value)"));
+        assert!(script.contains("for (const cache of state.reasoningQueryCaches?.keys() || [])"));
+        assert!(script.contains("state.reactInitialDiscoveryCompleted = false"));
+        assert!(script.contains("for (const cache of reasoningQueryCachesToRebind)"));
+        assert!(script.contains("if (typeof entry?.dispose !== \"function\") continue"));
         assert!(!script.contains("document.querySelectorAll(\"*\")"));
         assert!(
             !script.contains("if (state.appServerPatchVersion !== appServerRequestPatchVersion)")
@@ -5871,6 +6052,50 @@ JSON.stringify({
         assert!(!script.contains(
             "if (state.historyQueryRefreshCompleted) patched += patchReactAppServerClients()"
         ));
+    }
+
+    #[test]
+    fn fallback_query_client_discovery_reprojects_retained_caches_without_rpc_getters() {
+        let discovery_core = app_server_module_client_discovery_core_script();
+        let result = run_model_picker_patch_core_probe_with_payload(
+            json!({
+                "modelProvider": "codex_model_router_v2",
+                "modelNames": ["relay"],
+                "models": [{"model": "relay", "supported_reasoning_levels": ["high", "max", "ultra"]}]
+            }),
+            &format!(
+                r#"
+const patchRequestClient = () => false;
+const recordFailure = (error) => {{ throw error; }};
+{discovery_core}
+const key = ["models", "list", "local", "chatgpt", 100, "codex_model_router_v2"];
+const observer = {{
+  options: {{queryKey: key, select: () => ({{models: [{{model: "relay", supportedReasoningEfforts: []}}]}})}},
+  setOptions(options) {{ this.options = options; this.result = options.select(); }},
+}};
+const cache = {{getAll: () => [{{queryKey: key, observers: [observer]}}], subscribe: () => () => {{}}}};
+class QueryClient {{ getQueryCache() {{ return cache; }} getQueryData() {{}} setQueryData() {{}} }}
+let propertyReads = 0;
+const rpc = new Proxy({{}}, {{get() {{ propertyReads += 1; return () => {{}}; }}}});
+const getter = {{get getQueryCache() {{ propertyReads += 1; throw new Error("must not read getter"); }}}};
+patchAppServerModuleClients({{queryClient: new QueryClient(), rpc, getter}});
+const efforts = () => observer.result.models[0].supportedReasoningEfforts.map(level => level.reasoningEffort);
+const first = efforts();
+state.payload = {{...state.payload, models: [{{model: "relay", supported_reasoning_levels: ["high", "max"]}}]}};
+for (const retained of state.reasoningQueryCaches.keys()) patchCodexModelReasoningQueryCache(retained);
+JSON.stringify({{first, refreshed: efforts(), caches: state.reasoningQueryCaches.size, propertyReads}});
+"#
+            ),
+        );
+        assert_eq!(
+            result,
+            json!({
+                "first": ["high", "max", "ultra"],
+                "refreshed": ["high", "max"],
+                "caches": 1,
+                "propertyReads": 0
+            })
+        );
     }
 
     #[test]
@@ -6016,6 +6241,109 @@ void (async () => {{
                 .expect("parse renderer compatibility script");
             assert!(parsed);
         });
+    }
+
+    #[test]
+    fn renderer_compatibility_probe_rejects_reloads_stale_versions_and_changed_metadata() {
+        let catalog = CodexModelCatalogProjection {
+            default_model: Some("relay".to_string()),
+            model_provider: Some("codex_model_router_v2".to_string()),
+            catalog_available: true,
+            model_names: vec!["relay".to_string()],
+            models: vec![json!({"model": "relay", "inputModalities": ["text", "image"]})],
+        };
+        let runtime = rquickjs::Runtime::new().expect("create JavaScript runtime");
+        let context = rquickjs::Context::full(&runtime).expect("create JavaScript context");
+        let payload = serde_json::to_string(&catalog).expect("serialize catalog");
+        let probe = codex_renderer_compatibility_probe_script(&catalog);
+        let script = format!(
+            r#"
+const window = {{}};
+const probe = () => {probe};
+const reloaded = probe();
+const state = {{payload: {payload}, rendererSchedulerVersion: {MODEL_PICKER_RENDERER_SCHEDULER_VERSION:?}, interval: 1, messagePatchInstalled: true}};
+window[{MODEL_PICKER_PATCH_KEY:?}] = state;
+const current = probe();
+state.payload.models[0].inputModalities = ["text"];
+const changedMetadata = probe();
+state.payload = {payload};
+state.rendererSchedulerVersion = "old";
+const staleVersion = probe();
+state.rendererSchedulerVersion = {MODEL_PICKER_RENDERER_SCHEDULER_VERSION:?};
+state.interval = null;
+const stopped = probe();
+JSON.stringify({{reloaded, current, changedMetadata, staleVersion, stopped}});
+"#
+        );
+        context.with(|ctx| {
+            let result: String = ctx.eval(script).expect("execute renderer probe");
+            assert_eq!(
+                serde_json::from_str::<Value>(&result).unwrap(),
+                json!({
+                    "reloaded": false, "current": true, "changedMetadata": false,
+                    "staleVersion": false, "stopped": false
+                })
+            );
+        });
+    }
+
+    #[tokio::test]
+    async fn compatibility_install_evaluates_each_document_without_session_scoped_registration() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind CDP test listener");
+        let address = listener.local_addr().expect("read CDP test address");
+        let server = tokio::spawn(async move {
+            let mut methods = Vec::new();
+            for _ in 0..2 {
+                let (socket, _) = listener.accept().await.expect("accept CDP connection");
+                let mut socket = tokio_tungstenite::accept_async(socket)
+                    .await
+                    .expect("accept CDP websocket");
+                for _ in 0..2 {
+                    let message = socket
+                        .next()
+                        .await
+                        .expect("read command")
+                        .expect("valid command");
+                    let command: Value = serde_json::from_str(message.to_text().unwrap()).unwrap();
+                    let method = command["method"].as_str().unwrap();
+                    methods.push(method.to_string());
+                    let result = if method == "Runtime.evaluate" {
+                        json!({"result": {"value": {
+                            "status": "ok", "patchKey": MODEL_PICKER_PATCH_KEY,
+                            "modelCount": 0, "appServerPatchInstalled": true
+                        }}})
+                    } else {
+                        json!({})
+                    };
+                    socket
+                        .send(Message::Text(
+                            json!({"id": command["id"], "result": result})
+                                .to_string()
+                                .into(),
+                        ))
+                        .await
+                        .expect("reply to command");
+                }
+            }
+            methods
+        });
+        for _ in 0..2 {
+            let evidence = install_script(&format!("ws://{address}"), "true", None)
+                .await
+                .expect("install current document script");
+            assert!(evidence.app_server_patch_installed);
+        }
+        assert_eq!(
+            server.await.unwrap(),
+            vec![
+                "Runtime.enable",
+                "Runtime.evaluate",
+                "Runtime.enable",
+                "Runtime.evaluate"
+            ]
+        );
     }
 
     /// 验证 CDP 返回值能准确区分“脚本已安装”和“原生历史同步已请求”。
@@ -6347,7 +6675,7 @@ void (async () => {{
     }
 
     #[test]
-    fn default_cdp_port_allows_initializing_codex_page() {
+    fn default_cdp_port_waits_for_positive_codex_page_identity() {
         let targets = vec![CdpTarget {
             id: "codex-page".to_string(),
             target_type: "page".to_string(),
@@ -6356,9 +6684,39 @@ void (async () => {{
             web_socket_debugger_url: Some("ws://127.0.0.1:9229/devtools/page/1".to_string()),
         }];
 
-        let targets = pick_codex_page_targets(&targets, DEFAULT_CODEX_DEBUG_PORT)
-            .expect("default Codex CDP port should allow early blank targets");
-        assert_eq!(targets[0].id, "codex-page");
+        assert!(pick_codex_page_targets(&targets, DEFAULT_CODEX_DEBUG_PORT).is_err());
+    }
+
+    #[test]
+    fn default_cdp_port_rejects_non_codex_electron_pages() {
+        let targets = vec![CdpTarget {
+            id: "other-app".to_string(),
+            target_type: "page".to_string(),
+            title: "Other Electron App".to_string(),
+            url: "app://other/index.html".to_string(),
+            web_socket_debugger_url: Some("ws://127.0.0.1:9229/devtools/page/1".to_string()),
+        }];
+        assert!(pick_codex_page_targets(&targets, DEFAULT_CODEX_DEBUG_PORT).is_err());
+        assert!(pick_codex_page_targets(&targets, 9222).is_err());
+    }
+
+    #[test]
+    fn cdp_ports_never_treat_codex_web_pages_as_desktop_renderers() {
+        for url in [
+            "https://example.org/codex",
+            "http://localhost:3000/codex",
+            "chrome://newtab/",
+        ] {
+            let targets = vec![CdpTarget {
+                id: "browser-page".to_string(),
+                target_type: "page".to_string(),
+                title: "Codex".to_string(),
+                url: url.to_string(),
+                web_socket_debugger_url: Some("ws://127.0.0.1:9229/devtools/page/1".to_string()),
+            }];
+            assert!(pick_codex_page_targets(&targets, DEFAULT_CODEX_DEBUG_PORT).is_err());
+            assert!(pick_codex_page_targets(&targets, 9222).is_err());
+        }
     }
 
     #[test]

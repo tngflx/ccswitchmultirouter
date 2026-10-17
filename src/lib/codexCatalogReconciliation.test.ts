@@ -119,6 +119,8 @@ describe("reconcileFetchedCodexCatalogRows", () => {
     { supportsImage: false },
     { supports_image: false },
     { vision: false },
+    { textOnly: true },
+    { text_only: true },
   ])(
     "preserves explicit text-only capabilities when filling missing fields: %o",
     (seed) => {
@@ -175,6 +177,77 @@ describe("reconcileFetchedCodexCatalogRows", () => {
       supports_image: true,
     });
   });
+
+  it.each([true, false])(
+    "refreshes every existing image capability alias to %s together",
+    (supportsImage) => {
+      const result = reconcileFetchedCodexCatalogRows(
+        [
+          createRow({
+            model: "wire-model",
+            inputModalities: supportsImage ? ["text"] : ["text", "image"],
+            input_modalities: supportsImage ? ["text"] : ["text", "image"],
+            supportsImage: !supportsImage,
+            supports_image: !supportsImage,
+            vision: !supportsImage,
+            textOnly: supportsImage,
+            text_only: supportsImage,
+          }),
+        ],
+        [
+          {
+            id: "wire-model",
+            inputModalities: supportsImage ? ["text", "image"] : ["text"],
+            supportsImage,
+          },
+        ],
+        {},
+        { appendNew: true, createRow, existingMetadataMode: "refresh" },
+      );
+
+      expect(result.rows[0]).toMatchObject({
+        inputModalities: supportsImage ? ["text", "image"] : ["text"],
+        input_modalities: supportsImage ? ["text", "image"] : ["text"],
+        supportsImage,
+        supports_image: supportsImage,
+        vision: supportsImage,
+        textOnly: !supportsImage,
+        text_only: !supportsImage,
+      });
+    },
+  );
+
+  it.each([true, false])(
+    "reconciles retained input modalities when only image support refreshes to %s",
+    (supportsImage) => {
+      const result = reconcileFetchedCodexCatalogRows(
+        [
+          createRow({
+            model: "wire-model",
+            input_modalities: supportsImage
+              ? ["text", "audio"]
+              : ["text", "image", "audio"],
+            supports_image: !supportsImage,
+            text_only: supportsImage,
+          }),
+        ],
+        [{ id: "wire-model", supportsImage }],
+        {},
+        { appendNew: true, createRow, existingMetadataMode: "refresh" },
+      );
+
+      const modalities = supportsImage
+        ? ["text", "audio", "image"]
+        : ["text", "audio"];
+      expect(result.rows[0]).toMatchObject({
+        inputModalities: modalities,
+        input_modalities: modalities,
+        supportsImage,
+        supports_image: supportsImage,
+        text_only: !supportsImage,
+      });
+    },
+  );
 
   it("hydrates an absent provider label while keeping a custom label and enabled choice", () => {
     const result = reconcileFetchedCodexCatalogRows(

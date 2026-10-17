@@ -8,6 +8,7 @@ export function verifyCodexCatalog() {
   const checks = [
     ["scripts/check-codex-catalog-readers.mjs"],
     ["--test", "scripts/check-codex-catalog-readers.node-test.mjs"],
+    ["--test", "scripts/vitest-discovery.node-test.mjs"],
     [
       "node_modules/vitest/vitest.mjs",
       "run",

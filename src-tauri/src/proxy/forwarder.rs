@@ -611,6 +611,13 @@ impl RequestForwarder {
                 self.router.database(),
                 chrono::Utc::now().timestamp(),
             );
+            super::providers::validate_codex_provider_api_capability(
+                &effective_provider,
+                public_model,
+                &upstream_model,
+                self.router.database(),
+                chrono::Utc::now().timestamp(),
+            )?;
             return Ok(effective_provider);
         }
         let Some(target_provider_id) = super::providers::codex_route_target_provider_id(provider)
@@ -632,6 +639,13 @@ impl RequestForwarder {
                 self.router.database(),
                 chrono::Utc::now().timestamp(),
             );
+            super::providers::validate_codex_provider_api_capability(
+                &effective_provider,
+                public_model,
+                &upstream_model,
+                self.router.database(),
+                chrono::Utc::now().timestamp(),
+            )?;
             return Ok(effective_provider);
         };
         let target_provider = self
@@ -647,12 +661,26 @@ impl RequestForwarder {
                     "Codex retry route 引用了不存在的目标供应商 '{target_provider_id}'"
                 ))
             })?;
-        Ok(
-            super::providers::materialize_codex_routed_provider_from_target(
-                provider,
-                &target_provider,
-            ),
-        )
+        let effective_provider = super::providers::materialize_codex_routed_provider_from_target(
+            provider,
+            &target_provider,
+        );
+        let public_model = body
+            .get("model")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let mut mapped_body = body.clone();
+        let upstream_model =
+            super::providers::apply_codex_upstream_model(&effective_provider, &mut mapped_body)
+                .unwrap_or_else(|| public_model.to_string());
+        super::providers::validate_codex_provider_api_capability(
+            &effective_provider,
+            public_model,
+            &upstream_model,
+            self.router.database(),
+            chrono::Utc::now().timestamp(),
+        )?;
+        Ok(effective_provider)
     }
 
     fn resolve_codex_v2_route(
@@ -11392,6 +11420,252 @@ mod tests {
             chat_fingerprint,
             responses.settings_config["codexRoutingDependencyFingerprint"]
         );
+    }
+
+    fn provider_api_unsupported_target() -> Provider {
+        let mut target = Provider::with_id(
+            "api-target".to_string(),
+            "API Target".to_string(),
+            json!({
+                "base_url": "https://api-target.example/v1",
+                "model": "vendor/text-model",
+                "auth": {"OPENAI_API_KEY": "redacted-test-key"},
+                "modelCatalog": {"models": [{
+                    "model": "text-canonical",
+                    "upstreamModel": "vendor/text-model",
+                    "protocolCapability": {
+                        "schemaVersion": 1,
+                        "source": "provider_api",
+                        "baseUrl": "https://api-target.example/v1",
+                        "upstreamModel": "vendor/text-model",
+                        "supportedEndpoints": ["openai_chat"],
+                        "supportsTools": false
+                    }
+                }]}
+            }),
+            None,
+        );
+        target.meta = Some(ProviderMeta {
+            api_format: Some("openai_chat".to_string()),
+            ..Default::default()
+        });
+        target
+    }
+
+    fn provider_api_unsupported_router() -> Provider {
+        Provider::with_id(
+            "api-router".to_string(),
+            "API Router".to_string(),
+            json!({"codexRouting": {
+                "schemaVersion": 2,
+                "enabled": true,
+                "defaultRouteId": "api",
+                "routes": [{
+                    "id": "api",
+                    "enabled": true,
+                    "targetProviderId": "api-target",
+                    "modelSelection": {"mode": "all"},
+                    "aliases": {"text-visible": "text-canonical"},
+                    "authPolicy": {"source": "provider_config"}
+                }]
+            }}),
+            None,
+        )
+    }
+
+    #[test]
+    fn codex_forwarder_rejects_bound_unsupported_declarations_for_imported_targets() {
+        let forwarder = test_forwarder(Duration::ZERO, Duration::ZERO);
+        let router = provider_api_unsupported_router();
+        for field in [
+            "supportsTools",
+            "supportsStreaming",
+            "supportsToolContinuation",
+        ] {
+            let mut target = provider_api_unsupported_target();
+            let declaration =
+                &mut target.settings_config["modelCatalog"]["models"][0]["protocolCapability"];
+            declaration["supportsTools"] = json!(true);
+            declaration[field] = json!(false);
+            forwarder
+                .router
+                .database()
+                .save_provider("codex", &target)
+                .expect("save existing imported target without service preflight");
+            for (provider, model) in [
+                (&target, "text-canonical"),
+                (&target, "TEXT-CANONICAL"),
+                (&target, "vendor/text-model"),
+                (&target, "unknown-defaults-to-configured-model"),
+                (&router, "text-visible"),
+            ] {
+                let result = forwarder.materialize_codex_forward_attempt_provider(
+                    &AppType::Codex,
+                    provider,
+                    &json!({"model": model}),
+                );
+                assert!(
+                    matches!(result, Err(ProxyError::ConfigError(ref message))
+                    if message.contains("declared unsupported")),
+                    "{field}: {model}"
+                );
+            }
+            assert!(
+                forwarder
+                    .materialize_codex_raw_forward_attempt_provider(
+                        &AppType::Codex,
+                        &target,
+                        &json!({"model": "text-canonical"}),
+                    )
+                    .is_ok(),
+                "raw non-Codex-capability APIs retain their existing behavior"
+            );
+        }
+    }
+
+    #[test]
+    fn codex_forwarder_unsupported_guard_preserves_only_applicable_manual_overrides() {
+        use crate::provider::{CodexProtocolMode, CodexProtocolOverride};
+
+        let forwarder = test_forwarder(Duration::ZERO, Duration::ZERO);
+        let router = provider_api_unsupported_router();
+        let mut target = provider_api_unsupported_target();
+        target.meta.as_mut().unwrap().codex_protocol_mode = Some(CodexProtocolMode::Manual);
+        for (overrides, allowed) in [
+            (vec![], true),
+            (vec!["unrelated-model"], false),
+            (vec![" TEXT-CANONICAL "], true),
+        ] {
+            target.meta.as_mut().unwrap().codex_protocol_overrides = overrides
+                .into_iter()
+                .map(|model| (model.to_string(), CodexProtocolOverride::OpenaiChat))
+                .collect();
+            forwarder
+                .router
+                .database()
+                .save_provider("codex", &target)
+                .expect("save manual target");
+            for (provider, model) in [(&target, "text-canonical"), (&router, "text-visible")] {
+                assert_eq!(
+                    forwarder
+                        .materialize_codex_forward_attempt_provider(
+                            &AppType::Codex,
+                            provider,
+                            &json!({"model": model}),
+                        )
+                        .is_ok(),
+                    allowed,
+                    "manual selection for {model}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn codex_forwarder_unsupported_guard_preserves_exact_current_verified_evidence() {
+        let forwarder = test_forwarder(Duration::ZERO, Duration::ZERO);
+        let db = forwarder.router.database();
+        let router = provider_api_unsupported_router();
+        let target = provider_api_unsupported_target();
+        save_verified_transport_profile(
+            db,
+            &target,
+            "text-canonical",
+            "vendor/text-model",
+            TransportKind::OpenAiChat,
+        );
+        let profile_target = compile_provider_probe_candidate_for_model(
+            &target,
+            "text-canonical".to_string(),
+            "vendor/text-model".to_string(),
+        )
+        .expect("compile exact proof target")
+        .target_key(TransportKind::OpenAiChat)
+        .expect("exact proof target");
+        let current = db
+            .get_protocol_compatibility_result(&profile_target)
+            .expect("read proof")
+            .expect("proof exists");
+        for invalidation in [
+            "current",
+            "expired",
+            "version",
+            "partial",
+            "transport",
+            "credential",
+            "request-policy",
+        ] {
+            let mut target = target.clone();
+            let mut record = current.clone();
+            match invalidation {
+                "expired" => record.expires_at = chrono::Utc::now().timestamp() - 1,
+                "version" => record.probe_version = 0,
+                "partial" => record.result.readiness = ProbeReadiness::Partial,
+                "transport" => {
+                    record.result.selected_transport = Some(TransportKind::OpenAiResponses)
+                }
+                "credential" => {
+                    target.settings_config["auth"]["OPENAI_API_KEY"] =
+                        json!("rotated-redacted-test-key")
+                }
+                "request-policy" => {
+                    target.meta.as_mut().unwrap().custom_user_agent =
+                        Some("changed-test-UA/1".to_string())
+                }
+                _ => {}
+            }
+            db.save_protocol_compatibility_result(&record)
+                .expect("save evidence variant");
+            db.save_provider("codex", &target)
+                .expect("save current target");
+            for (provider, model) in [(&target, "text-canonical"), (&router, "text-visible")] {
+                assert_eq!(
+                    forwarder
+                        .materialize_codex_forward_attempt_provider(
+                            &AppType::Codex,
+                            provider,
+                            &json!({"model": model}),
+                        )
+                        .is_ok(),
+                    invalidation == "current",
+                    "{invalidation}: {model}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn codex_forwarder_unsupported_guard_does_not_block_unavailable_declarations() {
+        let forwarder = test_forwarder(Duration::ZERO, Duration::ZERO);
+        let router = provider_api_unsupported_router();
+        for (field, value) in [
+            ("baseUrl", json!("https://stale.example/v1")),
+            ("upstreamModel", json!("vendor/stale-model")),
+            ("schemaVersion", json!(2)),
+            ("source", json!("unbound-import")),
+            ("supportsTools", json!("false")),
+        ] {
+            let mut target = provider_api_unsupported_target();
+            target.settings_config["modelCatalog"]["models"][0]["protocolCapability"][field] =
+                value;
+            forwarder
+                .router
+                .database()
+                .save_provider("codex", &target)
+                .expect("save stale or malformed declaration");
+            for (provider, model) in [(&target, "text-canonical"), (&router, "text-visible")] {
+                assert!(
+                    forwarder
+                        .materialize_codex_forward_attempt_provider(
+                            &AppType::Codex,
+                            provider,
+                            &json!({"model": model}),
+                        )
+                        .is_ok(),
+                    "{field}: {model}"
+                );
+            }
+        }
     }
 
     #[test]

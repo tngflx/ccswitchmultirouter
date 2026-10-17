@@ -6,11 +6,15 @@
 //! 支持检测官方 Codex 客户端 (codex_vscode, codex_cli_rs)
 
 use super::{AuthInfo, AuthStrategy, ProviderAdapter};
-use crate::codex_multirouter::catalog::catalog_models;
+use crate::codex_multirouter::catalog::{catalog_models, lookup_catalog_model, CatalogModelLookup};
 use crate::codex_multirouter::compiler::{
     compile_provider_v2, CodexRoutingCompileError, CompiledCodexModel, CompiledCodexRoute,
     CompiledCodexRoutingPlan,
 };
+use crate::codex_multirouter::protocol_capability::{
+    provider_api_transport_declaration_for_model, ProviderApiTransportDeclaration,
+};
+use crate::codex_multirouter::provider_set::codex_model_follows_automatic_protocol;
 use crate::codex_multirouter::schema::{
     CodexRouteAuthPolicy, CodexRouteAuthSource, CodexRoutingConfigV2,
 };
@@ -1687,6 +1691,96 @@ where
         .ok()
         .flatten()
         .filter(accepts)
+}
+
+pub(crate) fn validate_codex_provider_api_capability(
+    provider: &Provider,
+    public_model: &str,
+    upstream_model: &str,
+    db: &Database,
+    now: i64,
+) -> Result<(), ProxyError> {
+    let requested_canonical_model = provider
+        .settings_config
+        .get("codexResolvedCanonicalModel")
+        .and_then(JsonValue::as_str)
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
+        .unwrap_or_else(|| public_model.trim());
+    let model_identity = |model: &JsonValue| {
+        ["model", "id", "slug"]
+            .into_iter()
+            .find_map(|field| model.get(field).and_then(JsonValue::as_str))
+            .map(str::trim)
+            .filter(|model| !model.is_empty())
+            .map(ToString::to_string)
+    };
+    let model_upstream = |model: &JsonValue| {
+        ["upstreamModel", "upstream_model"]
+            .into_iter()
+            .find_map(|field| model.get(field).and_then(JsonValue::as_str))
+            .map(str::trim)
+            .filter(|model| !model.is_empty())
+            .map(ToString::to_string)
+            .or_else(|| model_identity(model))
+    };
+    let model = match lookup_catalog_model(&provider.settings_config, requested_canonical_model) {
+        CatalogModelLookup::Found(model)
+            if model_upstream(model).as_deref() == Some(upstream_model.trim()) =>
+        {
+            model
+        }
+        CatalogModelLookup::Ambiguous => return Ok(()),
+        _ => match lookup_catalog_model(&provider.settings_config, upstream_model) {
+            CatalogModelLookup::Found(model)
+                if model_upstream(model).as_deref() == Some(upstream_model.trim()) =>
+            {
+                model
+            }
+            _ => return Ok(()),
+        },
+    };
+    let Some(canonical_model) = model_identity(model) else {
+        return Ok(());
+    };
+    if (provider.uses_manual_codex_protocol() && !provider.has_codex_protocol_overrides())
+        || !codex_model_follows_automatic_protocol(provider, &canonical_model)
+        || provider_api_transport_declaration_for_model(provider, &canonical_model)
+            != ProviderApiTransportDeclaration::Unsupported
+    {
+        return Ok(());
+    }
+
+    let transport = match explain_codex_responses_upstream_protocol(provider).protocol {
+        CodexResponsesUpstreamProtocol::Responses => TransportKind::OpenAiResponses,
+        CodexResponsesUpstreamProtocol::Chat => TransportKind::OpenAiChat,
+        CodexResponsesUpstreamProtocol::Messages | CodexResponsesUpstreamProtocol::Anthropic => {
+            return Ok(());
+        }
+    };
+    // Route aliases may have their own exact profile, or inherit proof for the
+    // canonical target only when the complete request and credential keys match.
+    for model in [public_model, &canonical_model] {
+        let Some(target) =
+            resolve_codex_protocol_target(provider, model, upstream_model, transport)
+        else {
+            continue;
+        };
+        if resolve_route_or_equivalent_provider_profile(provider, &target, db, |record| {
+            record.probe_version == PROBE_PROFILE_VERSION
+                && record.expires_at >= now
+                && record.result.readiness == ProbeReadiness::Verified
+                && record.result.selected_transport == Some(transport)
+        })
+        .is_some()
+        {
+            return Ok(());
+        }
+    }
+
+    Err(ProxyError::ConfigError(format!(
+        "Codex model `{canonical_model}` is declared unsupported by the current provider API; select an explicit protocol override or verify this target before routing requests"
+    )))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

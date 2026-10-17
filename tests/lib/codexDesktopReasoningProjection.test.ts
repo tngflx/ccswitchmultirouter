@@ -10,6 +10,20 @@ const core = readFileSync(
   ),
   "utf8",
 );
+const cacheLifecycleCore = readFileSync(
+  path.resolve(
+    process.cwd(),
+    "src-tauri/src/resources/codex_model_picker_cache_lifecycle.js",
+  ),
+  "utf8",
+);
+const legacyV8QueryCacheCore = readFileSync(
+  path.resolve(
+    process.cwd(),
+    "tests/fixtures/codex-model-picker-v8-query-cache.js",
+  ),
+  "utf8",
+);
 const provider = "codex_model_router_v2";
 const allEfforts = ["low", "medium", "high", "xhigh", "max", "ultra"];
 const key = ["models", "list", "local", "chatgpt", 100, provider];
@@ -40,7 +54,14 @@ type State = {
     modelNames: string[];
     models: ({ model: string } & Record<string, unknown>)[];
   };
-  reasoningQueryCaches?: Map<unknown, { unsubscribe: () => void }>;
+  reasoningQueryCaches?: Map<
+    unknown,
+    {
+      unsubscribe: () => void;
+      dispose?: () => void;
+      selectorSources?: WeakMap<object, object>;
+    }
+  >;
 };
 type Core = {
   patchCodexModelReasoningQueryCache: (
@@ -62,6 +83,10 @@ type Core = {
     [field: string]: unknown;
   };
 };
+const prepareCacheReinjection = new Function(
+  "state",
+  `${cacheLifecycleCore}\nreturn prepareCodexModelReasoningQueryCachesForReinjection();`,
+) as (state: State) => ReturnType<QueryClient["getQueryCache"]>[];
 const loadCore = (state: State) =>
   new Function(
     "state",
@@ -100,7 +125,8 @@ const createHarness = () => {
     patch: () => api.patchCodexModelReasoningQueryCache(client.getQueryCache()),
     dispose: () => {
       for (const entry of state.reasoningQueryCaches?.values() ?? [])
-        entry.unsubscribe();
+        if (entry.dispose) entry.dispose();
+        else entry.unsubscribe();
       unsubscribe();
       client.clear();
     },
@@ -108,6 +134,93 @@ const createHarness = () => {
 };
 
 describe("Codex Desktop post-filter reasoning projection", () => {
+  it("retains the v8 cache entry during upgrade without nesting observer wrappers", () => {
+    const harness = createHarness();
+    try {
+      const installV8 = new Function(
+        "state",
+        `${core}\n{${legacyV8QueryCacheCore}\nreturn patchCodexModelReasoningQueryCache;}`,
+      )(harness.state) as Core["patchCodexModelReasoningQueryCache"];
+      const cache = harness.client.getQueryCache();
+      installV8(cache);
+      const legacyEntry = harness.state.reasoningQueryCaches?.get(cache);
+      expect(legacyEntry?.dispose).toBeUndefined();
+      const legacySetOptions = harness.observer.setOptions;
+      const legacyOptimisticResult = harness.observer.getOptimisticResult;
+      let sourceSelections = 0;
+      harness.observer.setOptions({
+        ...harness.options,
+        select(value) {
+          sourceSelections += 1;
+          return select(value);
+        },
+      });
+      const api = loadCore(harness.state);
+      const selectorDepths = [];
+      for (let index = 0; index < 10; index += 1) {
+        harness.state.payload = {
+          ...harness.state.payload,
+          models: [
+            {
+              model: "sol-relay",
+              supported_reasoning_levels: index % 2 ? ["high"] : ["max"],
+            },
+          ],
+        };
+        expect(prepareCacheReinjection(harness.state)).toEqual([]);
+        api.patchCodexModelReasoningQueryCache(cache);
+        expect(harness.state.reasoningQueryCaches?.get(cache)).toBe(
+          legacyEntry,
+        );
+        expect(harness.observer.setOptions).toBe(legacySetOptions);
+        expect(harness.observer.getOptimisticResult).toBe(
+          legacyOptimisticResult,
+        );
+        expect(harness.efforts()).toEqual(index % 2 ? ["high"] : ["max"]);
+        let selector: object | undefined = harness.observer.options.select;
+        let depth = 0;
+        while (selector && legacyEntry?.selectorSources?.has(selector)) {
+          depth += 1;
+          selector = legacyEntry.selectorSources.get(selector);
+        }
+        selectorDepths.push(depth);
+      }
+      expect(selectorDepths).toEqual(Array(10).fill(1));
+      expect(sourceSelections).toBeLessThanOrEqual(11);
+      expect(harness.client.getQueryData(key)).toBe(raw);
+    } finally {
+      harness.dispose();
+    }
+  });
+
+  it("restores owned QueryObserver methods and selectors before reinjection", () => {
+    const harness = createHarness();
+    try {
+      const originalSetOptions = harness.observer.setOptions;
+      const originalGetOptimisticResult = harness.observer.getOptimisticResult;
+      const originalFetchOptimistic = harness.observer.fetchOptimistic;
+      harness.patch();
+      const firstWrapper = harness.observer.setOptions;
+      expect(firstWrapper).not.toBe(originalSetOptions);
+      const cache = harness.client.getQueryCache();
+      expect(prepareCacheReinjection(harness.state)).toEqual([cache]);
+      expect(harness.state.reasoningQueryCaches?.has(cache)).toBe(false);
+      expect(harness.observer.setOptions).toBe(originalSetOptions);
+      expect(harness.observer.getOptimisticResult).toBe(
+        originalGetOptimisticResult,
+      );
+      expect(harness.observer.fetchOptimistic).toBe(originalFetchOptimistic);
+      expect(harness.observer.options.select).toBe(select);
+      expect(harness.efforts()).toEqual(allEfforts.slice(0, 4));
+      loadCore(harness.state).patchCodexModelReasoningQueryCache(cache);
+      expect(harness.observer.setOptions).not.toBe(firstWrapper);
+      expect(harness.efforts()).toEqual(allEfforts);
+      expect(harness.client.getQueryData(key)).toBe(raw);
+    } finally {
+      harness.dispose();
+    }
+  });
+
   it("restores cached efforts and keeps them through optimistic re-renders", () => {
     const harness = createHarness();
     try {

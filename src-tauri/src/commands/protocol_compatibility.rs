@@ -1577,6 +1577,12 @@ fn compile_preflight_candidates_with_saved_evidence(
         ))
     });
     for record in current_records {
+        if matches!(
+            provider_api_transport_declaration_for_model(provider, &record.target.public_model),
+            ProviderApiTransportDeclaration::Unsupported
+        ) {
+            continue;
+        }
         if record.result.readiness == ProbeReadiness::Verified
             && record.result.selected_transport == Some(record.target.transport)
         {
@@ -3292,6 +3298,62 @@ mod tests {
             automatic.is_empty(),
             "known unsupported API metadata must not open the deep-probe consent flow"
         );
+    }
+
+    #[test]
+    fn automatic_probe_scope_never_readds_known_negative_failed_evidence() {
+        for transient in [false, true] {
+            for field in [
+                "supportsTools",
+                "supportsStreaming",
+                "supportsToolContinuation",
+            ] {
+                let db = Arc::new(Database::memory().unwrap());
+                let state = AppState::new(db.clone());
+                let mut provider = api_declared_provider(true);
+                provider.settings_config["modelCatalog"]["models"][0]["protocolCapability"]
+                    [field] = json!(false);
+                let now = chrono::Utc::now().timestamp();
+                let mut record = provider_set_record(
+                    &provider,
+                    "model-a",
+                    "model-a",
+                    TransportKind::OpenAiResponses,
+                    now,
+                );
+                record.result.selected_transport = None;
+                record.result.readiness = ProbeReadiness::Unverified;
+                if transient {
+                    state
+                        .remember_codex_provider_set_probe_receipt(
+                            record.clone(),
+                            provider_set_observations(&provider, &record),
+                        )
+                        .unwrap();
+                } else {
+                    db.save_protocol_compatibility_result(&record).unwrap();
+                }
+                let (automatic, _) = super::compile_preflight_candidates_with_saved_evidence(
+                    &state,
+                    &provider,
+                    &HashMap::new(),
+                    CodexProtocolProbeScope::AutomaticModels,
+                )
+                .unwrap();
+                assert!(
+                    automatic.is_empty(),
+                    "{field} denial must not be reopened by failed evidence (transient={transient})"
+                );
+                let (explicit, _) = super::compile_preflight_candidates_with_saved_evidence(
+                    &state,
+                    &provider,
+                    &HashMap::new(),
+                    CodexProtocolProbeScope::AllEnabledModels,
+                )
+                .unwrap();
+                assert_eq!(explicit.len(), 2, "explicit probing remains available");
+            }
+        }
     }
 
     #[test]

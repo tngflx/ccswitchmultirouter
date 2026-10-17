@@ -21,11 +21,27 @@ const looksLikeAppServerRequestClient = (value) =>
     codexDeclaredMethod(value, "getCompatibleThreadSortKey") &&
     codexDeclaredMethod(value, "supportsPaginatedThreadHistory"),
   );
+const patchCodexModelReasoningQueryClient = (value) => {
+  const getQueryCache = codexDeclaredMethod(value, "getQueryCache");
+  if (
+    !getQueryCache ||
+    !codexDeclaredMethod(value, "getQueryData") ||
+    !codexDeclaredMethod(value, "setQueryData")
+  )
+    return false;
+  try {
+    return patchCodexModelReasoningQueryCache(getQueryCache.call(value));
+  } catch (error) {
+    recordFailure(error);
+    return false;
+  }
+};
 const patchAppServerModuleClients = (module) => {
   let patched = 0;
   for (const candidate of Object.values(module || {}).filter(
     (item) => item && typeof item === "object",
   )) {
+    patchCodexModelReasoningQueryClient(candidate);
     if (looksLikeAppServerRequestClient(candidate)) {
       if (patchRequestClient(candidate)) patched += 1;
       continue;
@@ -36,6 +52,7 @@ const patchAppServerModuleClients = (module) => {
     if (get && get.length === 0) {
       try {
         const client = get.call(candidate);
+        patchCodexModelReasoningQueryClient(client);
         if (
           looksLikeAppServerRequestClient(client) &&
           patchRequestClient(client)

@@ -3,6 +3,7 @@ import ReactDOM from "react-dom/client";
 import App from "./App";
 import { AppErrorBoundary } from "./components/AppErrorBoundary";
 import { DatabaseUpgrade } from "./components/DatabaseUpgrade";
+import { StartupScreen } from "./components/StartupScreen";
 import { UpdateProvider } from "./contexts/UpdateContext";
 import "./index.css";
 // 导入国际化配置
@@ -25,6 +26,10 @@ import {
   syncModelsDevPricingOnStartup,
 } from "./lib/modelsDevAutoSync";
 import { initializeWindowActivity } from "@/lib/windowActivity";
+import {
+  awaitInitializationCheck,
+  InitializationCheckTimeoutError,
+} from "@/lib/startupInitialization";
 
 installGlobalErrorHandlers();
 
@@ -87,14 +92,28 @@ try {
 }
 
 async function bootstrap() {
+  const root = ReactDOM.createRoot(document.getElementById("root")!);
+  const renderStartup = (timedOut = false) => {
+    root.render(
+      <React.StrictMode>
+        <FrontendErrorBoundary>
+          <ThemeProvider defaultTheme="system" storageKey="cc-switch-theme">
+            <StartupScreen timedOut={timedOut} />
+          </ThemeProvider>
+        </FrontendErrorBoundary>
+      </React.StrictMode>,
+    );
+  };
+  renderStartup();
+
   // 启动早期主动查询后端初始化错误，避免事件竞态
   try {
-    const initError = (await invoke(
-      "get_init_error",
-    )) as ConfigLoadErrorPayload | null;
+    const initError = await awaitInitializationCheck(() =>
+      invoke<ConfigLoadErrorPayload | null>("get_init_error"),
+    );
     if (initError && initError.kind === "db_version_too_new") {
       // 数据库版本过新：渲染应用内「升级应用」恢复界面，不进入正常 App
-      ReactDOM.createRoot(document.getElementById("root")!).render(
+      root.render(
         <React.StrictMode>
           <FrontendErrorBoundary>
             <ThemeProvider defaultTheme="system" storageKey="cc-switch-theme">
@@ -112,13 +131,18 @@ async function bootstrap() {
       return;
     }
   } catch (e) {
-    // 忽略拉取错误，继续渲染
     reportFrontendError("get_init_error", e);
+    // A missing reply must not bypass the initialization safety check.
+    if (e instanceof InitializationCheckTimeoutError) {
+      renderStartup(true);
+      return;
+    }
+    // Preserve browser/dev compatibility when the native command is absent.
   }
 
   initializeWindowActivity();
 
-  ReactDOM.createRoot(document.getElementById("root")!).render(
+  root.render(
     <React.StrictMode>
       <FrontendErrorBoundary>
         <QueryClientProvider client={queryClient}>

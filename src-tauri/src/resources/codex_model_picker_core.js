@@ -591,7 +591,7 @@
             if (!isManagedCodexModelQuery(query.queryKey) ||
                 typeof observer?.setOptions !== "function" ||
                 typeof observer.options?.select !== "function") continue;
-            record = {};
+            record = { methods: new Map() };
             entry.observers.set(observer, record);
             const projectOptions = (options) => {
               let baseSelect = options?.select;
@@ -626,9 +626,11 @@
             for (const method of ["setOptions", "getOptimisticResult", "fetchOptimistic"]) {
               const original = observer[method];
               if (typeof original !== "function") continue;
-              observer[method] = function ccSwitchCatalogReasoningOptions(options, ...args) {
+              const patched = function ccSwitchCatalogReasoningOptions(options, ...args) {
                 return original.call(this, projectOptions(options), ...args);
               };
+              observer[method] = patched;
+              record.methods.set(method, { original, patched });
             }
           }
           if (!isManagedCodexModelQuery(observer.options?.queryKey) &&
@@ -650,10 +652,32 @@
           entry.refreshing = false;
         }
       };
+      entry.restoreObserver = (observer) => {
+        const record = entry.observers.get(observer);
+        if (!record) return;
+        for (const [method, { original, patched }] of record.methods) {
+          if (observer[method] === patched) observer[method] = original;
+        }
+        let select = observer.options?.select;
+        while (entry.selectorSources.has(select))
+          select = entry.selectorSources.get(select);
+        entry.observers.delete(observer);
+        if (select !== observer.options?.select && typeof observer.setOptions === "function")
+          observer.setOptions({ ...observer.options, select });
+      };
       entry.unsubscribe = cache.subscribe((event) => {
-        if (event?.type === "observerAdded" || event?.type === "observerOptionsUpdated")
+        if (event?.type === "observerRemoved") entry.restoreObserver(event.observer);
+        else if (event?.type === "observerAdded" || event?.type === "observerOptionsUpdated")
           entry.refresh(event.query);
       });
+      entry.dispose = () => {
+        entry.unsubscribe?.();
+        for (const query of cache.getAll()) {
+          for (const observer of query?.observers || []) {
+            entry.restoreObserver(observer);
+          }
+        }
+      };
     }
     entry.refresh();
     return true;

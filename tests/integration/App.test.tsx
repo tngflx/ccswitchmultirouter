@@ -645,6 +645,53 @@ describe("App integration with MSW", () => {
     );
   });
 
+  it("selects Pi when it is the only visible app and the saved app is hidden", async () => {
+    const previousApp = localStorage.getItem("cc-switch-last-app");
+    localStorage.setItem("cc-switch-last-app", "claude");
+    setSettings({
+      visibleApps: {
+        claude: false,
+        "claude-desktop": false,
+        codex: false,
+        gemini: false,
+        grokbuild: false,
+        opencode: false,
+        openclaw: false,
+        hermes: false,
+        pi: true,
+      },
+    });
+    setProviders("pi", {
+      "pi-only": {
+        id: "pi-only",
+        name: "Visible Pi provider",
+        settingsConfig: {},
+      },
+    });
+    const { default: App } = await import("@/App");
+    const { unmount, client } = renderApp(App);
+    try {
+      await waitFor(() =>
+        expect(
+          within(screen.getByTestId("app-switcher")).getByText("pi"),
+        ).toBeInTheDocument(),
+      );
+      await waitFor(() =>
+        expect(screen.getByTestId("provider-list").textContent).toContain(
+          "pi-only",
+        ),
+      );
+    } finally {
+      unmount();
+      client.clear();
+      if (previousApp === null) {
+        localStorage.removeItem("cc-switch-last-app");
+      } else {
+        localStorage.setItem("cc-switch-last-app", previousApp);
+      }
+    }
+  }, 30_000);
+
   it("duplicates Pi providers with a key that avoids authoritative native IDs", async () => {
     setProviders("pi", {
       deepseek: {

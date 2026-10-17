@@ -2184,6 +2184,8 @@
     "frontendCrashTitle": "画面で問題が発生しました",
     "frontendCrashMessage": "エラー情報をアプリ診断ログに保存しようとしました。画面を再読み込みし、問題が続く場合は Issue にログを添付してください。",
     "reloadInterface": "画面を再読み込み",
+    "startupTimeoutTitle": "アプリの起動が応答していません",
+    "startupTimeoutMessage": "初期化の確認に時間がかかっています。画面を再読み込みするか、CCSwitchMulti を再起動してください。設定は変更されていません。",
     "noRenderDetail": "エラーの詳細がありません",
     "appRenderTitle": "アプリの画面を読み込めませんでした",
     "appRenderMessage": "アプリを再読み込みしてください。解決しない場合は、以下の詳細とログをメンテナーに共有してください。",
@@ -4009,6 +4011,7 @@
   },
   "codexWizardProtocol": {
     "apiDeclared": "プロバイダー API が {{protocol}} のサポートを宣言しているため、完全なプローブは不要です。実際のリクエストは未検証です。",
+    "apiUnsupported": "プロバイダー API は、このモデルが Codex の自動ルーティングと互換性がないことを明示しています。",
     "manualDeclared": "プロバイダーには明示的なプロトコル設定があり、自動プローブはその設定を上書きしません。",
     "unresolvedModel": "このモデルには有効なプロバイダー API のプロトコル宣言も、再利用できるプローブ証拠もありません。",
     "description": "プロバイダー API の宣言または保存済みの証拠からモデルのプロトコルを判断し、未確定のモデルだけを詳細プローブします。",

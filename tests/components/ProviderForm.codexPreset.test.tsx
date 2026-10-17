@@ -1,4 +1,10 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import {
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+  within,
+} from "@testing-library/react";
 import type { ComponentProps } from "react";
 import { describe, expect, it, vi } from "vitest";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
@@ -1081,26 +1087,36 @@ describe("ProviderForm Codex preset selection", () => {
   it("clears the maintained preset identity after switching to a custom source", async () => {
     const onSubmit = vi.fn();
     renderProviderForm({ showButtons: true, submitLabel: "保存", onSubmit });
+    const presets = within(
+      screen.getByText("Custom model source").closest("button")!.parentElement!,
+    );
 
-    fireEvent.click(screen.getByRole("button", { name: /Zhipu GLM$/ }));
+    fireEvent.click(presets.getByRole("button", { name: /Zhipu GLM$/ }));
     await waitFor(() => {
       expect(screen.getByTestId("codex-catalog")).toHaveTextContent(
         "glm-5.3,glm-5-turbo",
       );
     });
     fireEvent.click(
-      screen.getByRole("button", { name: "Custom model source" }),
+      presets.getByRole("button", { name: "Custom model source" }),
     );
     expect(screen.getByTestId("codex-takeover")).toHaveTextContent("enabled");
     expect(
       screen.getByTestId("codex-menu-projection-editability"),
     ).toHaveTextContent("editable");
-    fireEvent.change(screen.getByRole("textbox", { name: "provider.name" }), {
+    fireEvent.change(screen.getByLabelText("provider.name"), {
       target: { value: "Custom source" },
     });
-    fireEvent.click(screen.getByRole("button", { name: "mock-set-api-key" }));
-    fireEvent.click(screen.getByRole("button", { name: "保存" }));
-    fireEvent.click(await screen.findByRole("button", { name: "仍要保存" }));
+    const details = within(
+      screen.getByRole("region", { name: "codex-provider-details" }),
+    );
+    fireEvent.click(details.getByRole("button", { name: "mock-set-api-key" }));
+    const saveControls = within(
+      screen.getByText("保存", { selector: "button" }).parentElement!,
+    );
+    fireEvent.click(saveControls.getByRole("button", { name: "保存" }));
+    const confirmation = within(await screen.findByRole("dialog"));
+    fireEvent.click(confirmation.getByRole("button", { name: "仍要保存" }));
 
     await waitFor(() => expect(onSubmit).toHaveBeenCalled());
     expect(onSubmit.mock.calls[0][0].meta.codexPresetId).toBeUndefined();

@@ -187,10 +187,36 @@ pub fn ensure_projection_with_publisher<F>(
     db: &Database,
     router_provider_id: &str,
     force: bool,
-    mut publish: F,
+    publish: F,
 ) -> Result<CodexRoutingProjectionStatus, AppError>
 where
     F: FnMut(&CodexRoutingProjectionArtifact) -> Result<ProjectionReadBack, String>,
+{
+    ensure_projection_with_publisher_and_verifier(
+        db,
+        router_provider_id,
+        force,
+        publish,
+        |artifact| {
+            crate::codex_config::read_back_codex_multirouter_projection_for_database(
+                db,
+                &artifact.projection_settings,
+            )
+            .map_err(|error| error.to_string())
+        },
+    )
+}
+
+fn ensure_projection_with_publisher_and_verifier<F, V>(
+    db: &Database,
+    router_provider_id: &str,
+    force: bool,
+    mut publish: F,
+    mut verify: V,
+) -> Result<CodexRoutingProjectionStatus, AppError>
+where
+    F: FnMut(&CodexRoutingProjectionArtifact) -> Result<ProjectionReadBack, String>,
+    V: FnMut(&CodexRoutingProjectionArtifact) -> Result<ProjectionReadBack, String>,
 {
     // The catalog/config/cache files are one shared projection. Build, publish,
     // read back and persist status under the same process-wide boundary so an
@@ -203,6 +229,8 @@ where
         if let Some(status) = read_projection_status(db, router_provider_id)? {
             if status.state == ProjectionState::Ready
                 && status.dependency_fingerprint == artifact.dependency_fingerprint
+                && verify(&artifact)
+                    .is_ok_and(|readback| readback.agrees_with(&artifact.dependency_fingerprint))
             {
                 return Ok(status);
             }
@@ -648,6 +676,28 @@ mod tests {
             .expect("save target");
     }
 
+    fn ensure_mocked_projection_with_publisher<F>(
+        db: &Database,
+        router_provider_id: &str,
+        force: bool,
+        publish: F,
+    ) -> Result<CodexRoutingProjectionStatus, AppError>
+    where
+        F: FnMut(&CodexRoutingProjectionArtifact) -> Result<ProjectionReadBack, String>,
+    {
+        ensure_projection_with_publisher_and_verifier(
+            db,
+            router_provider_id,
+            force,
+            publish,
+            |artifact| {
+                Ok(ProjectionReadBack::verified(
+                    artifact.dependency_fingerprint.clone(),
+                ))
+            },
+        )
+    }
+
     #[test]
     fn projection_publishes_enabled_orchestration_aliases_into_codex_catalog() {
         let db = Database::memory().expect("memory db");
@@ -690,7 +740,7 @@ mod tests {
         let db = Database::memory().expect("memory db");
         save_fixture(&db, "openai_chat");
         let calls = Cell::new(0);
-        let first = ensure_projection_with_publisher(&db, "router", false, |artifact| {
+        let first = ensure_mocked_projection_with_publisher(&db, "router", false, |artifact| {
             calls.set(calls.get() + 1);
             Ok(ProjectionReadBack::verified(
                 artifact.dependency_fingerprint.clone(),
@@ -700,7 +750,7 @@ mod tests {
         assert_eq!(first.state, ProjectionState::Ready);
         assert_eq!(calls.get(), 1);
 
-        let unchanged = ensure_projection_with_publisher(&db, "router", false, |_| {
+        let unchanged = ensure_mocked_projection_with_publisher(&db, "router", false, |_| {
             panic!("matching ready projection must not be republished")
         })
         .expect("unchanged projection");
@@ -711,7 +761,7 @@ mod tests {
 
         db.save_provider("codex", &target("openai_responses"))
             .expect("update target");
-        let changed = ensure_projection_with_publisher(&db, "router", false, |artifact| {
+        let changed = ensure_mocked_projection_with_publisher(&db, "router", false, |artifact| {
             calls.set(calls.get() + 1);
             Ok(ProjectionReadBack::verified(
                 artifact.dependency_fingerprint.clone(),
@@ -721,6 +771,60 @@ mod tests {
         assert_eq!(changed.state, ProjectionState::Ready);
         assert_ne!(changed.dependency_fingerprint, first.dependency_fingerprint);
         assert_eq!(calls.get(), 2);
+    }
+
+    #[test]
+    fn matching_ready_projection_requires_current_readback_before_skipping_publish() {
+        let db = Database::memory().expect("memory db");
+        save_fixture(&db, "openai_responses");
+        ensure_mocked_projection_with_publisher(&db, "router", false, |artifact| {
+            Ok(ProjectionReadBack::verified(
+                artifact.dependency_fingerprint.clone(),
+            ))
+        })
+        .expect("seed ready projection");
+        let publications = Cell::new(0);
+        let verifications = Cell::new(0);
+
+        for expected in ["valid", "drift", "unreadable"] {
+            let status = ensure_projection_with_publisher_and_verifier(
+                &db,
+                "router",
+                false,
+                |artifact| {
+                    publications.set(publications.get() + 1);
+                    Ok(ProjectionReadBack::verified(
+                        artifact.dependency_fingerprint.clone(),
+                    ))
+                },
+                |artifact| {
+                    verifications.set(verifications.get() + 1);
+                    let mut proof =
+                        ProjectionReadBack::verified(artifact.dependency_fingerprint.clone());
+                    match expected {
+                        "valid" => Ok(proof),
+                        "drift" => {
+                            proof.catalog_verified = false;
+                            Ok(proof)
+                        }
+                        "unreadable" => Err("projection cannot be read".to_string()),
+                        _ => unreachable!(),
+                    }
+                },
+            )
+            .expect("verify or repair cached projection");
+            assert_eq!(status.state, ProjectionState::Ready);
+            assert_eq!(
+                publications.get(),
+                match expected {
+                    "valid" => 0,
+                    "drift" => 1,
+                    "unreadable" => 2,
+                    _ => unreachable!(),
+                }
+            );
+        }
+        assert_eq!(verifications.get(), 3);
     }
 
     #[test]
@@ -740,13 +844,14 @@ mod tests {
                 router.settings_config["hostedTools"] = json!({"webSearch": {"enabled": enabled}});
             }
             db.save_provider("codex", &router).expect("save toggle");
-            let status = ensure_projection_with_publisher(&db, &router.id, false, |artifact| {
-                calls.set(calls.get() + 1);
-                Ok(ProjectionReadBack::verified(
-                    artifact.dependency_fingerprint.clone(),
-                ))
-            })
-            .expect("project search mode");
+            let status =
+                ensure_mocked_projection_with_publisher(&db, &router.id, false, |artifact| {
+                    calls.set(calls.get() + 1);
+                    Ok(ProjectionReadBack::verified(
+                        artifact.dependency_fingerprint.clone(),
+                    ))
+                })
+                .expect("project search mode");
             assert_eq!(status.state, ProjectionState::Ready);
             assert_eq!(calls.get(), expected_calls);
         }
@@ -895,7 +1000,7 @@ mod tests {
         let db = Database::memory().expect("memory db");
         save_fixture(&db, "openai_chat");
 
-        let pending = ensure_projection_with_publisher(&db, "router", false, |_| {
+        let pending = ensure_mocked_projection_with_publisher(&db, "router", false, |_| {
             Err("injected catalog write failure".to_string())
         })
         .expect("pending status is diagnostic, not lost");
@@ -917,7 +1022,7 @@ mod tests {
             ProjectionState::Pending
         );
 
-        let ready = ensure_projection_with_publisher(&db, "router", true, |artifact| {
+        let ready = ensure_mocked_projection_with_publisher(&db, "router", true, |artifact| {
             Ok(ProjectionReadBack::verified(
                 artifact.dependency_fingerprint.clone(),
             ))
@@ -932,7 +1037,7 @@ mod tests {
         let db = Database::memory().expect("memory db");
         save_fixture(&db, "openai_chat");
 
-        let status = ensure_projection_with_publisher(&db, "router", false, |_| {
+        let status = ensure_mocked_projection_with_publisher(&db, "router", false, |_| {
             Ok(ProjectionReadBack::verified(
                 "stale-fingerprint".to_string(),
             ))
@@ -950,7 +1055,7 @@ mod tests {
     fn diagnostics_are_secret_free_and_explain_effective_sources() {
         let db = Database::memory().expect("memory db");
         save_fixture(&db, "openai_chat");
-        let status = ensure_projection_with_publisher(&db, "router", false, |artifact| {
+        let status = ensure_mocked_projection_with_publisher(&db, "router", false, |artifact| {
             Ok(ProjectionReadBack::verified(
                 artifact.dependency_fingerprint.clone(),
             ))
@@ -1026,7 +1131,7 @@ mod tests {
 
         let first_db = db.clone();
         let first = std::thread::spawn(move || {
-            ensure_projection_with_publisher(&first_db, "router", true, |artifact| {
+            ensure_mocked_projection_with_publisher(&first_db, "router", true, |artifact| {
                 first_entered_tx
                     .send(artifact.dependency_fingerprint.clone())
                     .expect("signal first publisher");
@@ -1044,7 +1149,7 @@ mod tests {
 
         let second_db = db.clone();
         let second = std::thread::spawn(move || {
-            ensure_projection_with_publisher(&second_db, "router", true, |artifact| {
+            ensure_mocked_projection_with_publisher(&second_db, "router", true, |artifact| {
                 second_entered_tx
                     .send(artifact.dependency_fingerprint.clone())
                     .expect("signal second publisher");

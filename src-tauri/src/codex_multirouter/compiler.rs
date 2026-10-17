@@ -445,9 +445,7 @@ fn provider_display(provider: &Provider) -> String {
     }
 }
 
-fn provider_model_entries(
-    provider: &Provider,
-) -> Result<Vec<&Value>, CodexRoutingCompileError> {
+fn provider_model_entries(provider: &Provider) -> Result<Vec<&Value>, CodexRoutingCompileError> {
     let models =
         catalog_models(&provider.settings_config).ok_or_else(|| CodexRoutingCompileError {
             code: "target_provider_catalog_unavailable".to_string(),

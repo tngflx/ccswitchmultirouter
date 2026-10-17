@@ -89,7 +89,10 @@ import {
   type WizardModelFetchConfig,
 } from "@/lib/codexMultiRouterWizard";
 import { readCodexCatalogSettings } from "@/lib/codexCatalogSchema";
-import { readCodexModelProtocolCapability } from "@/lib/codexProtocolCapability";
+import {
+  codexModelProtocolDeclarationStatus,
+  readCodexModelProtocolCapability,
+} from "@/lib/codexProtocolCapability";
 import { normalizeCodexPublicModelKey } from "@/lib/protocol-lab/codex-overrides";
 import i18n from "@/i18n";
 import {
@@ -788,8 +791,10 @@ async function restoreWizardProtocolEvidence(
       sources.map(async (provider) => {
         if (
           skipsWizardDeepProtocolProbe(provider) &&
-          !readIncludedWizardModelCatalog(provider).some((model) =>
-            readCodexModelProtocolCapability(provider, model),
+          !readIncludedWizardModelCatalog(provider).some(
+            (model) =>
+              codexModelProtocolDeclarationStatus(provider, model) !==
+              "unavailable",
           )
         )
           return null;
@@ -893,12 +898,22 @@ export function buildWizardConnectivityResultsFromBatchOutcome(
     const declaredModels = readIncludedWizardModelCatalog(provider).filter(
       (model) => readCodexModelProtocolCapability(provider, model),
     );
+    const unsupportedModels = new Set(
+      readIncludedWizardModelCatalog(provider)
+        .filter(
+          (model) =>
+            codexModelProtocolDeclarationStatus(provider, model) ===
+            "unsupported",
+        )
+        .map((model) => model.model.trim()),
+    );
     const manualWholeProvider =
       provider.meta?.codexProtocolMode === "manual" &&
       Object.keys(provider.meta.codexProtocolOverrides ?? {}).length === 0;
     if (
       skipsWizardDeepProtocolProbe(provider) &&
-      (declaredModels.length === 0 || manualWholeProvider)
+      ((declaredModels.length === 0 && unsupportedModels.size === 0) ||
+        manualWholeProvider)
     ) {
       results.push(
         skippedWizardDeepProbeResult(
@@ -973,6 +988,18 @@ export function buildWizardConnectivityResultsFromBatchOutcome(
               "Provider API declares {{protocol}} support; no complete probe is required. Live requests have not been verified.",
             protocol:
               declared === "openai_chat" ? "Chat Completions" : "Responses",
+          }),
+        });
+      } else if (unsupportedModels.has(model)) {
+        results.push({
+          providerId: provider.id,
+          providerName: provider.name,
+          model,
+          status: "fail",
+          canContinue: false,
+          detail: i18n.t("codexWizardProtocol.apiUnsupported", {
+            defaultValue:
+              "The provider API explicitly marks this model as incompatible with the automatic Codex route.",
           }),
         });
       } else if (!unresolvedModels.has(model)) {

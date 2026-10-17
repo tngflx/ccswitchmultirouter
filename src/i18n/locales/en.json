@@ -2184,6 +2184,8 @@
     "frontendCrashTitle": "Something went wrong in the interface",
     "frontendCrashMessage": "An attempt was made to write the error to the application diagnostic log. Reload the interface, and attach the log when opening an issue if the problem continues.",
     "reloadInterface": "Reload interface",
+    "startupTimeoutTitle": "Application startup did not respond",
+    "startupTimeoutMessage": "The initialization check is taking too long. Reload the interface or restart CCSwitchMulti. Your configuration has not been changed.",
     "noRenderDetail": "No error details provided",
     "appRenderTitle": "The application interface failed to load",
     "appRenderMessage": "Reload the application. If it still fails, share the error details below and the logs with the maintainers.",
@@ -4009,6 +4011,7 @@
   },
   "codexWizardProtocol": {
     "apiDeclared": "Provider API declares {{protocol}} support; no complete probe is required. Live requests have not been verified.",
+    "apiUnsupported": "The provider API explicitly marks this model as incompatible with the automatic Codex route.",
     "manualDeclared": "The provider has an explicit protocol selection; automatic probing will not override it.",
     "unresolvedModel": "This model has neither a usable provider API protocol declaration nor reusable probe evidence.",
     "description": "Resolve model protocols from provider API declarations or saved evidence; deep probing is the fallback for unresolved models.",
