@@ -581,10 +581,20 @@ impl RequestForwarder {
         app_type: &AppType,
         provider: &Provider,
         body: &Value,
+        endpoint: &str,
     ) -> Result<Provider, ProxyError> {
         if !matches!(app_type, AppType::Codex) {
             return Ok(provider.clone());
         }
+        let validate_api_capability = matches!(
+            split_endpoint_and_query(endpoint).0,
+            "/responses"
+                | "/v1/responses"
+                | "/responses/compact"
+                | "/v1/responses/compact"
+                | "/chat/completions"
+                | "/v1/chat/completions"
+        );
         if codex_provider_has_v2_routing(provider) {
             let mut effective_provider = self
                 .resolve_codex_v2_route(provider, body)?
@@ -611,13 +621,15 @@ impl RequestForwarder {
                 self.router.database(),
                 chrono::Utc::now().timestamp(),
             );
-            super::providers::validate_codex_provider_api_capability(
-                &effective_provider,
-                public_model,
-                &upstream_model,
-                self.router.database(),
-                chrono::Utc::now().timestamp(),
-            )?;
+            if validate_api_capability {
+                super::providers::validate_codex_provider_api_capability(
+                    &effective_provider,
+                    public_model,
+                    &upstream_model,
+                    self.router.database(),
+                    chrono::Utc::now().timestamp(),
+                )?;
+            }
             return Ok(effective_provider);
         }
         let Some(target_provider_id) = super::providers::codex_route_target_provider_id(provider)
@@ -639,13 +651,15 @@ impl RequestForwarder {
                 self.router.database(),
                 chrono::Utc::now().timestamp(),
             );
-            super::providers::validate_codex_provider_api_capability(
-                &effective_provider,
-                public_model,
-                &upstream_model,
-                self.router.database(),
-                chrono::Utc::now().timestamp(),
-            )?;
+            if validate_api_capability {
+                super::providers::validate_codex_provider_api_capability(
+                    &effective_provider,
+                    public_model,
+                    &upstream_model,
+                    self.router.database(),
+                    chrono::Utc::now().timestamp(),
+                )?;
+            }
             return Ok(effective_provider);
         };
         let target_provider = self
@@ -673,13 +687,15 @@ impl RequestForwarder {
         let upstream_model =
             super::providers::apply_codex_upstream_model(&effective_provider, &mut mapped_body)
                 .unwrap_or_else(|| public_model.to_string());
-        super::providers::validate_codex_provider_api_capability(
-            &effective_provider,
-            public_model,
-            &upstream_model,
-            self.router.database(),
-            chrono::Utc::now().timestamp(),
-        )?;
+        if validate_api_capability {
+            super::providers::validate_codex_provider_api_capability(
+                &effective_provider,
+                public_model,
+                &upstream_model,
+                self.router.database(),
+                chrono::Utc::now().timestamp(),
+            )?;
+        }
         Ok(effective_provider)
     }
 
@@ -1627,7 +1643,7 @@ impl RequestForwarder {
         let attempt_providers = route_attempt_providers
             .iter()
             .map(|provider| {
-                self.materialize_codex_forward_attempt_provider(app_type, provider, &body)
+                self.materialize_codex_forward_attempt_provider(app_type, provider, &body, endpoint)
             })
             .collect::<Result<Vec<_>, _>>()
             .map_err(|error| ForwardError {
@@ -11311,6 +11327,7 @@ mod tests {
                 &AppType::Codex,
                 &route_attempts[0],
                 &json!({ "model": "deepseek-v4-flash" }),
+                "/responses",
             )
             .expect("materialize target provider");
 
@@ -11390,7 +11407,12 @@ mod tests {
         let body = json!({"model": "qwen3.8"});
 
         let chat = forwarder
-            .materialize_codex_forward_attempt_provider(&AppType::Codex, &router, &body)
+            .materialize_codex_forward_attempt_provider(
+                &AppType::Codex,
+                &router,
+                &body,
+                "/responses",
+            )
             .expect("materialize chat request");
         let chat_fingerprint = chat.settings_config["codexRoutingDependencyFingerprint"]
             .as_str()
@@ -11407,7 +11429,12 @@ mod tests {
         db.save_provider("codex", &target)
             .expect("update target to responses");
         let responses = forwarder
-            .materialize_codex_forward_attempt_provider(&AppType::Codex, &router, &body)
+            .materialize_codex_forward_attempt_provider(
+                &AppType::Codex,
+                &router,
+                &body,
+                "/responses",
+            )
             .expect("materialize responses request");
 
         assert!(
@@ -11503,6 +11530,7 @@ mod tests {
                     &AppType::Codex,
                     provider,
                     &json!({"model": model}),
+                    "/responses",
                 );
                 assert!(
                     matches!(result, Err(ProxyError::ConfigError(ref message))
@@ -11520,6 +11548,46 @@ mod tests {
                     .is_ok(),
                 "raw non-Codex-capability APIs retain their existing behavior"
             );
+        }
+    }
+
+    #[test]
+    fn codex_forwarder_unsupported_guard_only_applies_to_codex_tool_workflow_endpoints() {
+        let forwarder = test_forwarder(Duration::ZERO, Duration::ZERO);
+        let target = provider_api_unsupported_target();
+        let router = provider_api_unsupported_router();
+        forwarder
+            .router
+            .database()
+            .save_provider("codex", &target)
+            .expect("save imported target");
+        for (endpoint, allowed) in [
+            ("/responses", false),
+            ("/v1/responses?stream=true", false),
+            ("/responses/compact?client=codex", false),
+            ("/v1/responses/compact", false),
+            ("/chat/completions", false),
+            ("/v1/chat/completions?stream=true", false),
+            ("/images/generations", true),
+            ("/v1/images/generations?quality=high", true),
+            ("/audio/speech", true),
+            ("/v1/audio/transcriptions?language=en", true),
+            ("/embeddings", true),
+        ] {
+            for (provider, model) in [(&target, "text-canonical"), (&router, "text-visible")] {
+                assert_eq!(
+                    forwarder
+                        .materialize_codex_forward_attempt_provider(
+                            &AppType::Codex,
+                            provider,
+                            &json!({"model": model}),
+                            endpoint,
+                        )
+                        .is_ok(),
+                    allowed,
+                    "{endpoint}: {model}"
+                );
+            }
         }
     }
 
@@ -11552,6 +11620,7 @@ mod tests {
                             &AppType::Codex,
                             provider,
                             &json!({"model": model}),
+                            "/responses",
                         )
                         .is_ok(),
                     allowed,
@@ -11625,6 +11694,7 @@ mod tests {
                             &AppType::Codex,
                             provider,
                             &json!({"model": model}),
+                            "/responses",
                         )
                         .is_ok(),
                     invalidation == "current",
@@ -11660,6 +11730,7 @@ mod tests {
                             &AppType::Codex,
                             provider,
                             &json!({"model": model}),
+                            "/responses",
                         )
                         .is_ok(),
                     "{field}: {model}"
@@ -11734,6 +11805,7 @@ mod tests {
                 &AppType::Codex,
                 &provider,
                 &json!({"model": "chat-visible"}),
+                "/responses",
             )
             .expect("materialize Chat model");
         let responses = forwarder
@@ -11741,6 +11813,7 @@ mod tests {
                 &AppType::Codex,
                 &provider,
                 &json!({"model": "responses-visible"}),
+                "/responses",
             )
             .expect("materialize Responses model");
 
@@ -11826,6 +11899,7 @@ mod tests {
                 &AppType::Codex,
                 &route_attempts[0],
                 &json!({ "model": "gpt-5.6-sol" }),
+                "/responses",
             )
             .expect("materialize official target provider");
 
