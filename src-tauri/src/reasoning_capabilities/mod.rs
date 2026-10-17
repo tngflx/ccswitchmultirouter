@@ -1112,12 +1112,14 @@ supported_reasoning_levels = ["max"]
                 vec![exact.clone(), disabled.clone()],
             ] {
                 let settings = json!({"modelCatalog": {"models": rows}});
-                let resolved = resolve_codex_model_capability_core(
-                    &settings, None, "wire", None, None, &[],
-                );
+                let resolved =
+                    resolve_codex_model_capability_core(&settings, None, "wire", None, None, &[]);
                 assert_eq!(resolved.source, CapabilitySource::UserConfig);
                 assert_eq!(
-                    resolved.capability.expect("exact enabled row").supported_efforts,
+                    resolved
+                        .capability
+                        .expect("exact enabled row")
+                        .supported_efforts,
                     vec!["low", "high"]
                 );
                 for excluded in ["old", "excluded-alias"] {
@@ -1156,11 +1158,10 @@ supported_reasoning_levels = ["max"]
                 vec![exact.clone(), sibling.clone()],
             ] {
                 let settings = json!({"modelCatalog": {"models": rows}});
-                let capability = resolve_codex_model_capability_core(
-                    &settings, None, "wire", None, None, &[],
-                )
-                .capability
-                .expect("exact row capability");
+                let capability =
+                    resolve_codex_model_capability_core(&settings, None, "wire", None, None, &[])
+                        .capability
+                        .expect("exact row capability");
                 assert_eq!(capability.supported_efforts, vec!["medium", "max"]);
                 assert_eq!(capability.default_effort.as_deref(), Some("medium"));
                 assert_eq!(
@@ -1187,7 +1188,12 @@ supported_reasoning_levels = ["max"]
                 }
             ]}});
             let capability = resolve_codex_model_capability_core(
-                &settings, None, "gpt-5.4", None, None, &official_models_fixture(),
+                &settings,
+                None,
+                "gpt-5.4",
+                None,
+                None,
+                &official_models_fixture(),
             )
             .capability
             .expect("official capability for exact catalog row");

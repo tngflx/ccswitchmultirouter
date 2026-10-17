@@ -488,11 +488,30 @@
     if (!isManagedCodexModelQuery(key) || !Array.isArray(selection?.models))
       return selection;
     const names = new Set(modelNames().map(normalizedIdentity));
+    // An explicit empty catalog is authoritative. A query cache can still
+    // contain rows from before this injection, but none can belong to the
+    // current managed provider. Preserve unmatched native rows only while the
+    // current catalog has at least one visible managed model.
+    const authoritativeEmptyCatalog =
+      currentPayload().catalogAvailable === true &&
+      Array.isArray(currentPayload().modelNames) &&
+      names.size === 0;
     const retired = retiredManagedNames();
     let changed = false;
     const models = selection.models.flatMap((model) => {
       const row = catalogRowForModel(model);
       if (isRetiredManagedModel(model, retired) || row?.enabled === false) {
+        changed = true;
+        return [];
+      }
+      if (authoritativeEmptyCatalog) {
+        changed = true;
+        return [];
+      }
+      // A managed local query is projected strictly from the current CCSwitch
+      // catalog. Native/provider-fetched rows outside that catalog must not
+      // survive the second renderer-side filter.
+      if (!row) {
         changed = true;
         return [];
       }
@@ -534,7 +553,7 @@
             ? normalizedIdentity(model.model) === normalizedIdentity(defaultModel.model)
             : visibleIdentitiesIntersect(model, defaultModel));
       if (matching.length === 1) defaultModel = matching[0];
-      else if (matching.length === 0 ||
+      else if (authoritativeEmptyCatalog || matching.length === 0 ||
                isRetiredManagedModel(defaultModel, retired) ||
                catalogRowForModel(defaultModel)?.enabled === false)
         defaultModel = models[0];

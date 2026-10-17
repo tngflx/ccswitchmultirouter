@@ -25,7 +25,7 @@ import type { CodexCatalogModel, Provider, UniversalProvider } from "@/types";
 
 import { normalizeCodexPublicModelKey } from "./codex-overrides";
 import { readCodexCatalogSettings } from "@/lib/codexCatalogSchema";
-import { readCodexModelProtocolCapability } from "@/lib/codexProtocolCapability";
+import { codexModelProtocolDeclarationStatus } from "@/lib/codexProtocolCapability";
 import type { ProtocolLabAdapter } from "./useProtocolLabWorkflow";
 
 interface SingleCodexProtocolLabApi {
@@ -393,7 +393,7 @@ export function codexProviderModelsRequiringProtocolProbe(
     .filter(
       (model) =>
         !normalizedOverrides.has(normalizeCodexPublicModelKey(model.model)) &&
-        !readCodexModelProtocolCapability(provider, model),
+        codexModelProtocolDeclarationStatus(provider, model) === "unavailable",
     )
     .map((model) => model.model.trim());
 }

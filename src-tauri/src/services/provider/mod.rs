@@ -6159,7 +6159,7 @@ requires_openai_auth = true
     }
 
     #[test]
-    fn ordinary_codex_mutation_still_requires_probe_for_unknown_or_changed_declarations() {
+    fn ordinary_codex_mutation_probes_unknown_declarations_but_blocks_known_unsupported() {
         for scenario in ["unknown", "endpoint", "upstream", "unsupported"] {
             let db = Arc::new(Database::memory().unwrap());
             let state = AppState::new(db.clone());
@@ -6193,10 +6193,13 @@ requires_openai_auth = true
                 &[],
             )
             .unwrap_err();
+            let expected_error = if scenario == "unsupported" {
+                "codex_provider_set_model_blocked"
+            } else {
+                "codex_provider_set_probe_required"
+            };
             assert!(
-                error
-                    .to_string()
-                    .contains("codex_provider_set_probe_required"),
+                error.to_string().contains(expected_error),
                 "{scenario}: {error}"
             );
             assert_eq!(

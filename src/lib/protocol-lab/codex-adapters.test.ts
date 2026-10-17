@@ -106,6 +106,17 @@ describe("single Codex Protocol Lab adapter", () => {
     ).toBe(false);
   });
 
+  it("does not request a probe for a bound API declaration that explicitly denies a capability", () => {
+    const provider = providerWithApiCapability({ supportsTools: false });
+    expect(codexProviderModelsRequiringProtocolProbe(provider)).toEqual([]);
+    expect(
+      createSingleCodexProtocolLabAdapter({} as never).requiresProbe(
+        provider,
+        [],
+      ),
+    ).toBe(false);
+  });
+
   it.each([
     { supportedEndpoints: ["openai_responses"] },
     { supportedEndpoints: ["openai_chat"] },
@@ -181,12 +192,6 @@ describe("single Codex Protocol Lab adapter", () => {
     ["changed provider endpoint", { baseUrl: "https://other.example.test/v1" }],
     ["changed provider path", { baseUrl: "https://example.test/v2" }],
     ["changed upstream model", { upstreamModel: "qwen3.9" }],
-    ["tools explicitly unsupported", { supportsTools: false }],
-    ["streaming explicitly unsupported", { supportsStreaming: false }],
-    [
-      "tool continuation explicitly unsupported",
-      { supportsToolContinuation: false },
-    ],
     ["malformed tool capability", { supportsTools: "true" }],
     ["malformed streaming capability", { supportsStreaming: null }],
     [
@@ -200,6 +205,23 @@ describe("single Codex Protocol Lab adapter", () => {
     expect(adapter.requiresProbe(declaredProvider, [])).toBe(true);
     expect(codexProviderModelsRequiringProtocolProbe(declaredProvider)).toEqual(
       ["qwen3.8"],
+    );
+  });
+
+  it.each([
+    ["tools explicitly unsupported", { supportsTools: false }],
+    ["streaming explicitly unsupported", { supportsStreaming: false }],
+    [
+      "tool continuation explicitly unsupported",
+      { supportsToolContinuation: false },
+    ],
+  ])("does not probe for %s", (_label, capabilityOverrides) => {
+    const adapter = createSingleCodexProtocolLabAdapter({} as never);
+    const declaredProvider = providerWithApiCapability(capabilityOverrides);
+
+    expect(adapter.requiresProbe(declaredProvider, [])).toBe(false);
+    expect(codexProviderModelsRequiringProtocolProbe(declaredProvider)).toEqual(
+      [],
     );
   });
 

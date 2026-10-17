@@ -144,6 +144,8 @@ function blockedReasonLabel(reason: string) {
       return "Probe results conflict; run the probe again";
     case "probe_target_mismatch":
       return "Probe results do not match the current model configuration";
+    case "provider_api_unsupported":
+      return "The provider API explicitly marks this model as incompatible with the automatic Codex route";
     case "duplicate_model_identity":
       return "Duplicate model identifiers exist in the catalog";
     default:

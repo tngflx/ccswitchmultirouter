@@ -208,10 +208,7 @@ pub(crate) enum CatalogModelLookup<'a> {
 
 /// Select the same catalog row for exclusion, capability, and product settings.
 /// Public model/id matches outrank aliases; either tier must identify one row.
-pub(crate) fn lookup_catalog_model<'a>(
-    settings: &'a Value,
-    model: &str,
-) -> CatalogModelLookup<'a> {
+pub(crate) fn lookup_catalog_model<'a>(settings: &'a Value, model: &str) -> CatalogModelLookup<'a> {
     let model = model.trim();
     if model.is_empty() {
         return CatalogModelLookup::Missing;
@@ -219,9 +216,11 @@ pub(crate) fn lookup_catalog_model<'a>(
     let Some(models) = catalog_models(settings) else {
         return CatalogModelLookup::Missing;
     };
-    let exact = unique_model_match(models.iter().filter(|entry| {
-        model_identity_matches(entry, model, &["model", "id"])
-    }));
+    let exact = unique_model_match(
+        models
+            .iter()
+            .filter(|entry| model_identity_matches(entry, model, &["model", "id"])),
+    );
     if !matches!(exact, CatalogModelLookup::Missing) {
         return exact;
     }
@@ -232,9 +231,7 @@ pub(crate) fn lookup_catalog_model<'a>(
     )
 }
 
-fn unique_model_match<'a>(
-    mut entries: impl Iterator<Item = &'a Value>,
-) -> CatalogModelLookup<'a> {
+fn unique_model_match<'a>(mut entries: impl Iterator<Item = &'a Value>) -> CatalogModelLookup<'a> {
     let Some(entry) = entries.next() else {
         return CatalogModelLookup::Missing;
     };

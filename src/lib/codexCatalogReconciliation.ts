@@ -146,9 +146,18 @@ function refreshedCapabilityPatch(
   fetched: FetchedCodexCatalogModel,
 ): Partial<CodexCatalogRowLike> {
   const patch = missingCapabilityPatch(row, fetched, true);
-  if (patch.inputModalities) patch.input_modalities = patch.inputModalities;
-  if (typeof patch.supportsImage === "boolean")
+  if (
+    patch.inputModalities &&
+    Object.prototype.hasOwnProperty.call(row, "input_modalities")
+  ) {
+    patch.input_modalities = patch.inputModalities;
+  }
+  if (
+    typeof patch.supportsImage === "boolean" &&
+    Object.prototype.hasOwnProperty.call(row, "supports_image")
+  ) {
     patch.supports_image = patch.supportsImage;
+  }
   if (typeof patch.supportsParallelToolCalls === "boolean") {
     patch.supports_parallel_tool_calls = patch.supportsParallelToolCalls;
   }
@@ -441,6 +450,15 @@ export function reconcileFetchedCodexCatalogRows<T extends CodexCatalogRowLike>(
     };
     const created = options.createRow({
       ...seed,
+      ...(refresh && fetched.inputModalities?.length
+        ? { input_modalities: [...fetched.inputModalities] }
+        : {}),
+      ...(refresh && typeof fetched.supportsImage === "boolean"
+        ? { supports_image: fetched.supportsImage }
+        : {}),
+      ...(refresh && typeof fetched.supportsParallelToolCalls === "boolean"
+        ? { supports_parallel_tool_calls: fetched.supportsParallelToolCalls }
+        : {}),
       ...(refresh
         ? refreshedCapabilityPatch(seed as CodexCatalogRowLike, fetched)
         : missingCapabilityPatch(seed as CodexCatalogRowLike, fetched)),

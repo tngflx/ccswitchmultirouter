@@ -1,5 +1,7 @@
 use super::catalog::{catalog_models, read_catalog, read_catalog_mut};
-use super::protocol_capability::{configured_transport, provider_api_declared_model_transport};
+use super::protocol_capability::{
+    configured_transport, provider_api_transport_declaration, ProviderApiTransportDeclaration,
+};
 use super::schema::{
     CodexModelSelection, CodexRoutingConfigV2, CodexRoutingDocument, CodexRoutingRouteV2,
 };
@@ -223,9 +225,16 @@ pub fn plan_codex_provider_set(
             })
             .collect::<Vec<_>>();
         if current_records.is_empty() {
-            if let Some(selected) = provider_api_declared_model_transport(source, &model.value) {
-                selections.push((model.clone(), selected));
-                continue;
+            match provider_api_transport_declaration(source, &model.value) {
+                ProviderApiTransportDeclaration::Supported(selected) => {
+                    selections.push((model.clone(), selected));
+                    continue;
+                }
+                ProviderApiTransportDeclaration::Unsupported => {
+                    blocked.push(blocked_model(model, "provider_api_unsupported", None));
+                    continue;
+                }
+                ProviderApiTransportDeclaration::Unavailable => {}
             }
         }
         let matches = if current_records.is_empty() {
@@ -568,7 +577,10 @@ pub fn requires_automatic_codex_protocol_probe(
         .filter(|model| model.enabled)
         .any(|model| {
             codex_model_follows_automatic_protocol(provider, &model.public_model)
-                && provider_api_declared_model_transport(provider, &model.value).is_none()
+                && matches!(
+                    provider_api_transport_declaration(provider, &model.value),
+                    ProviderApiTransportDeclaration::Unavailable
+                )
         }))
 }
 
@@ -1921,6 +1933,26 @@ mod tests {
         assert_eq!(prepared.preview.responses_models, vec!["model-b"]);
         assert!(prepared.profiles.is_empty());
         assert!(!requires_automatic_codex_protocol_probe(&source).unwrap());
+    }
+
+    #[test]
+    fn explicit_negative_provider_api_metadata_blocks_without_requesting_a_probe() {
+        let mut source = source_with_protocol_declarations();
+        source.settings_config["modelCatalog"]["models"][0]["protocolCapability"]
+            ["supportsTools"] = json!(false);
+
+        let prepared = plan_codex_provider_set(&source, &[], &HashMap::new(), 150)
+            .expect("known unsupported capability should produce a blocked plan");
+        let CodexProviderSetPlan::Blocked { models } = prepared.preview.plan else {
+            panic!("known unsupported API metadata must not become an executable route");
+        };
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].model, "model-a");
+        assert_eq!(models[0].reason, "provider_api_unsupported");
+        assert!(
+            !requires_automatic_codex_protocol_probe(&source).unwrap(),
+            "explicit negative API metadata must not trigger a paid deep probe"
+        );
     }
 
     #[test]

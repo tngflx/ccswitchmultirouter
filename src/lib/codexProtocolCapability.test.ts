@@ -5,7 +5,10 @@ import type {
   CodexModelProtocolCapability,
   Provider,
 } from "@/types";
-import { readCodexModelProtocolCapability } from "./codexProtocolCapability";
+import {
+  codexModelProtocolDeclarationStatus,
+  readCodexModelProtocolCapability,
+} from "./codexProtocolCapability";
 
 const declaration: CodexModelProtocolCapability = {
   schemaVersion: 1,
@@ -310,6 +313,29 @@ describe("provider API protocol capability", () => {
       ).toBeNull();
     },
   );
+
+  it("classifies explicit negative capabilities as known unsupported", () => {
+    for (const field of [
+      "supportsTools",
+      "supportsStreaming",
+      "supportsToolContinuation",
+    ] as const) {
+      const capability = { ...declaration, [field]: false };
+      const provider = providerWith(capability);
+      expect(
+        codexModelProtocolDeclarationStatus(provider, "public-model"),
+      ).toBe("unsupported");
+      expect(
+        readCodexModelProtocolCapability(provider, "public-model"),
+      ).toBeNull();
+    }
+    expect(
+      codexModelProtocolDeclarationStatus(
+        providerWith({ ...declaration, supportsTools: "false" }),
+        "public-model",
+      ),
+    ).toBe("unavailable");
+  });
 
   it("keeps excluded rows and canonical empty catalogs out of capability readiness", () => {
     const excluded: CodexCatalogModel = {

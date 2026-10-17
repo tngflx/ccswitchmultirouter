@@ -477,7 +477,9 @@ describe("Codex Desktop post-filter reasoning projection", () => {
         models: [{ model: "provider-fetched-model" }],
         defaultModel: { model: "provider-fetched-model" },
       };
-      expect(harness.api.restoreCodexCatalogReasoningSelection(key, selection)).toBe(selection);
+      expect(
+        harness.api.restoreCodexCatalogReasoningSelection(key, selection),
+      ).toBe(selection);
     } finally {
       harness.dispose();
     }
@@ -490,7 +492,10 @@ describe("Codex Desktop post-filter reasoning projection", () => {
         models: [{ model: "sol-relay", supportedReasoningEfforts: [] }],
         defaultModel: { model: "provider-fetched-model" },
       };
-      const restored = harness.api.restoreCodexCatalogReasoningSelection(key, selection);
+      const restored = harness.api.restoreCodexCatalogReasoningSelection(
+        key,
+        selection,
+      );
       expect(restored.models).toHaveLength(1);
       expect(restored.defaultModel).toBe(restored.models[0]);
     } finally {
@@ -504,18 +509,29 @@ describe("Codex Desktop post-filter reasoning projection", () => {
       const frozenModels = Object.freeze([
         Object.freeze({ model: "sol-relay" }),
       ]) as unknown as Record<string, unknown>[];
-      expect(() => harness.api.patchModelArray(frozenModels, true)).not.toThrow();
+      expect(() =>
+        harness.api.patchModelArray(frozenModels, true),
+      ).not.toThrow();
 
       const sealedModels = Object.seal([
         { model: "sol-relay" },
       ]) as unknown as Record<string, unknown>[];
-      expect(() => harness.api.patchModelArray(sealedModels, true)).not.toThrow();
+      expect(() =>
+        harness.api.patchModelArray(sealedModels, true),
+      ).not.toThrow();
 
       const frozenModel = Object.freeze({ model: "sol-relay" });
-      const mutableModels = [frozenModel] as unknown as Record<string, unknown>[];
-      expect(() => harness.api.patchModelArray(mutableModels, true)).not.toThrow();
+      const mutableModels = [frozenModel] as unknown as Record<
+        string,
+        unknown
+      >[];
+      expect(() =>
+        harness.api.patchModelArray(mutableModels, true),
+      ).not.toThrow();
       expect(mutableModels[0]).not.toBe(frozenModel);
-      expect(mutableModels[0]).toEqual(expect.objectContaining({ model: "sol-relay" }));
+      expect(mutableModels[0]).toEqual(
+        expect.objectContaining({ model: "sol-relay" }),
+      );
     } finally {
       harness.dispose();
     }
@@ -569,6 +585,37 @@ describe("Codex Desktop post-filter reasoning projection", () => {
       harness.api.patchModelArray(models);
       expect(models).toEqual([official]);
       expect(models[0]).toBe(official);
+    } finally {
+      harness.dispose();
+    }
+  });
+
+  it("drops pre-existing cached rows and defaults for a fresh authoritative empty catalog", () => {
+    const harness = createHarness();
+    try {
+      // Simulate the first injection after Desktop has already populated its
+      // query cache: there is no prior managed-name history to classify the
+      // cached row as retired.
+      harness.state.payload = {
+        ...harness.state.payload,
+        catalogAvailable: true,
+        modelNames: [],
+        models: [],
+      };
+      const stale = {
+        model: "stale-managed",
+        supportedReasoningEfforts: [{ reasoningEffort: "high" }],
+      };
+      const restored = harness.api.restoreCodexCatalogReasoningSelection(key, {
+        models: [stale],
+        defaultModel: stale,
+        hasModelSupportingMaxReasoningEffort: true,
+        hasModelSupportingUltraReasoningEffort: true,
+      });
+      expect(restored.models).toEqual([]);
+      expect(restored.defaultModel).toBeUndefined();
+      expect(restored.hasModelSupportingMaxReasoningEffort).toBe(false);
+      expect(restored.hasModelSupportingUltraReasoningEffort).toBe(false);
     } finally {
       harness.dispose();
     }
