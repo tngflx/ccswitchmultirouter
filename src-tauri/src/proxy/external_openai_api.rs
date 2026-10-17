@@ -306,15 +306,16 @@ pub fn runtime_status(db: &Database) -> Result<ExternalOpenAiApiRuntimeStatusVie
         .as_deref()
         .and_then(|key| backend_options.iter().find(|option| option.key == key))
         .cloned();
-    let effective_model = selected_backend.as_ref().and_then(|backend| {
-        match profile.default_model.as_ref() {
-            Some(model) if backend.models.is_empty() || backend.models.contains(model) => {
-                Some(model.clone())
-            }
-            Some(_) => None,
-            None => backend.models.first().cloned(),
-        }
-    });
+    let effective_model =
+        selected_backend
+            .as_ref()
+            .and_then(|backend| match profile.default_model.as_ref() {
+                Some(model) if backend.models.is_empty() || backend.models.contains(model) => {
+                    Some(model.clone())
+                }
+                Some(_) => None,
+                None => backend.models.first().cloned(),
+            });
 
     let mut issues = Vec::new();
     if !profile.enabled {
@@ -1275,6 +1276,97 @@ mod tests {
                 .map(|backend| backend.key.as_str()),
             Some("provider::hermes::hermes-openai::")
         );
+    }
+
+    #[test]
+    fn runtime_status_preserves_saved_default_for_empty_backend_inventory() {
+        let db = Database::memory().expect("memory db");
+        let provider = Provider::with_id(
+            "empty-catalog-provider".to_string(),
+            "Empty Catalog Provider".to_string(),
+            json!({
+                "base_url": "https://example.com/v1",
+                "api_key": "sk-placeholder",
+                "modelCatalog": { "models": [] }
+            }),
+            None,
+        );
+        db.save_provider("hermes", &provider)
+            .expect("save provider");
+        regenerate_api_key(&db).expect("generate key");
+        update_profile(
+            &db,
+            ExternalOpenAiApiProfileUpdate {
+                enabled: true,
+                backend_type: ExternalOpenAiApiBackendType::Provider,
+                app_type: Some("hermes".to_string()),
+                provider_id: Some("empty-catalog-provider".to_string()),
+                route_id: None,
+                default_model: Some("manually-configured-model".to_string()),
+                listen_address: None,
+                listen_port: None,
+            },
+        )
+        .expect("enable profile");
+
+        let status = runtime_status(&db).expect("runtime status");
+
+        assert!(status.ready);
+        assert_eq!(
+            status.effective_model.as_deref(),
+            Some("manually-configured-model")
+        );
+        assert!(status
+            .selected_backend
+            .as_ref()
+            .is_some_and(|backend| backend.models.is_empty()));
+        assert!(!status
+            .issues
+            .iter()
+            .any(|issue| issue == "selected model unavailable"));
+    }
+
+    #[test]
+    fn runtime_status_rejects_saved_default_missing_from_nonempty_backend_inventory() {
+        let db = Database::memory().expect("memory db");
+        let provider = Provider::with_id(
+            "catalog-provider".to_string(),
+            "Catalog Provider".to_string(),
+            json!({
+                "base_url": "https://example.com/v1",
+                "api_key": "sk-placeholder",
+                "modelCatalog": {
+                    "models": [{ "model": "declared-model" }]
+                }
+            }),
+            None,
+        );
+        db.save_provider("hermes", &provider)
+            .expect("save provider");
+        regenerate_api_key(&db).expect("generate key");
+        update_profile(
+            &db,
+            ExternalOpenAiApiProfileUpdate {
+                enabled: true,
+                backend_type: ExternalOpenAiApiBackendType::Provider,
+                app_type: Some("hermes".to_string()),
+                provider_id: Some("catalog-provider".to_string()),
+                route_id: None,
+                default_model: Some("stale-model".to_string()),
+                listen_address: None,
+                listen_port: None,
+            },
+        )
+        .expect("enable profile");
+
+        let status = runtime_status(&db).expect("runtime status");
+
+        assert!(!status.ready);
+        assert_eq!(status.effective_model, None);
+        assert!(status
+            .issues
+            .iter()
+            .any(|issue| issue == "selected model unavailable"));
     }
 
     #[test]

@@ -441,6 +441,14 @@
     if (!isManagedCodexModelQuery(key) || !Array.isArray(selection?.models))
       return selection;
     const names = new Set(modelNames().map(normalizedIdentity));
+    // An explicit empty catalog is authoritative. A query cache can still
+    // contain rows from before this injection, but none can belong to the
+    // current managed provider. Preserve unmatched native rows only while the
+    // current catalog has at least one visible managed model.
+    const authoritativeEmptyCatalog =
+      currentPayload().catalogAvailable === true &&
+      Array.isArray(currentPayload().modelNames) &&
+      names.size === 0;
     const retired = retiredManagedNames();
     let changed = false;
     const models = selection.models.flatMap((model) => {
@@ -449,6 +457,14 @@
         changed = true;
         return [];
       }
+      if (authoritativeEmptyCatalog) {
+        changed = true;
+        return [];
+      }
+      // The renderer can keep native official rows alongside the managed
+      // provider catalog. An absent catalog row therefore means "outside our
+      // ownership", not "stale": preserve it and keep Desktop's decision.
+      if (!row) return [model];
       const name = row?.model || model?.model;
       if (!names.has(normalizedIdentity(name))) {
         changed = true;
@@ -487,7 +503,8 @@
             ? normalizedIdentity(model.model) === normalizedIdentity(defaultModel.model)
             : visibleIdentitiesIntersect(model, defaultModel));
       if (matching.length === 1) defaultModel = matching[0];
-      else if (isRetiredManagedModel(defaultModel, retired) ||
+      else if (authoritativeEmptyCatalog ||
+               isRetiredManagedModel(defaultModel, retired) ||
                catalogRowForModel(defaultModel)?.enabled === false)
         defaultModel = models[0];
     }

@@ -5650,7 +5650,7 @@ JSON.stringify({
         assert!(script.contains("107580212"));
         assert!(script.contains("list-models-for-host"));
         assert!(script.contains("model/list"));
-        assert!(script.contains("patchModelArray(result.data, true)"));
+        assert!(script.contains("patchModelArray(result.data, true, true)"));
         assert!(script.contains("isModelListMethod(method)"));
         assert!(script.contains("await installAppServerPatch()"));
         assert!(script.contains("state.requestIds.get(requestId)"));

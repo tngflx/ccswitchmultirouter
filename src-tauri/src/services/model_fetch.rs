@@ -819,8 +819,16 @@ fn collect_declared_model_metadata_fields(
             {
                 fields.insert("tools");
             }
-        } else if ["metadata", "capability", "capabilities", "limit", "limits"]
-            .contains(&key.as_str())
+        } else if [
+            "metadata",
+            "capability",
+            "capabilities",
+            "protocolCapability",
+            "protocol_capability",
+            "limit",
+            "limits",
+        ]
+        .contains(&key.as_str())
         {
             if let Some(nested) = value.as_object() {
                 collect_declared_model_metadata_fields(nested, fields);
@@ -839,8 +847,16 @@ fn merge_missing_model_metadata(
             if declared.contains(field) || (field == "parameters" && declared.contains("tools")) {
                 continue;
             }
-        } else if ["metadata", "capability", "capabilities", "limit", "limits"]
-            .contains(&key.as_str())
+        } else if [
+            "metadata",
+            "capability",
+            "capabilities",
+            "protocolCapability",
+            "protocol_capability",
+            "limit",
+            "limits",
+        ]
+        .contains(&key.as_str())
         {
             if let Some(nested) = value.as_object() {
                 let entry = target
@@ -861,16 +877,9 @@ fn merge_missing_model_metadata(
 fn model_entry_identity_values(entry: &ModelEntry) -> Vec<String> {
     let mut values = Vec::new();
     push_model_identity(&mut values, &entry.id);
-    for object in [
-        Some(&entry.extra),
-        entry
-            .extra
-            .get("metadata")
-            .and_then(serde_json::Value::as_object),
-    ]
-    .into_iter()
-    .flatten()
-    {
+    let mut scopes = Vec::new();
+    collect_model_metadata_scopes(&entry.extra, &mut scopes, 0);
+    for object in std::iter::once(&entry.extra).chain(scopes) {
         for key in [
             "model",
             "model_id",
@@ -1023,16 +1032,11 @@ pub(crate) struct ModelIdentityFields {
 pub(crate) fn extract_model_identity_fields(
     object: &serde_json::Map<String, serde_json::Value>,
 ) -> ModelIdentityFields {
-    let nested = object
-        .get("metadata")
-        .and_then(serde_json::Value::as_object);
+    let mut nested_scopes = Vec::new();
+    collect_model_metadata_scopes(object, &mut nested_scopes, 0);
     let get_string = |keys: &[&str]| {
         keys.iter()
-            .filter_map(|key| {
-                object
-                    .get(*key)
-                    .or_else(|| nested.and_then(|m| m.get(*key)))
-            })
+            .flat_map(|key| metadata_values_for_key(object, &nested_scopes, key))
             .find_map(|value| {
                 value
                     .as_str()
@@ -1043,11 +1047,7 @@ pub(crate) fn extract_model_identity_fields(
     };
     let aliases = ["aliases", "alias", "model_aliases", "modelAliases"]
         .iter()
-        .filter_map(|key| {
-            object
-                .get(*key)
-                .or_else(|| nested.and_then(|m| m.get(*key)))
-        })
+        .flat_map(|key| metadata_values_for_key(object, &nested_scopes, key))
         .find_map(sanitize_model_aliases);
 
     ModelIdentityFields {
@@ -1058,12 +1058,45 @@ pub(crate) fn extract_model_identity_fields(
         aliases,
         supports_parallel_tool_calls: ["supportsParallelToolCalls", "supports_parallel_tool_calls"]
             .iter()
-            .filter_map(|key| {
-                object
-                    .get(*key)
-                    .or_else(|| nested.and_then(|m| m.get(*key)))
-            })
+            .flat_map(|key| metadata_values_for_key(object, &nested_scopes, key))
             .find_map(serde_json::Value::as_bool),
+    }
+}
+
+fn metadata_values_for_key<'a>(
+    object: &'a serde_json::Map<String, serde_json::Value>,
+    nested_scopes: &[&'a serde_json::Map<String, serde_json::Value>],
+    key: &str,
+) -> Vec<&'a serde_json::Value> {
+    object
+        .get(key)
+        .into_iter()
+        .chain(nested_scopes.iter().filter_map(|scope| scope.get(key)))
+        .collect()
+}
+
+fn collect_model_metadata_scopes<'a>(
+    object: &'a serde_json::Map<String, serde_json::Value>,
+    scopes: &mut Vec<&'a serde_json::Map<String, serde_json::Value>>,
+    depth: u8,
+) {
+    if depth >= 8 {
+        return;
+    }
+    for key in [
+        "metadata",
+        "capability",
+        "capabilities",
+        "protocolCapability",
+        "protocol_capability",
+        "limit",
+        "limits",
+    ] {
+        let Some(nested) = object.get(key).and_then(serde_json::Value::as_object) else {
+            continue;
+        };
+        scopes.push(nested);
+        collect_model_metadata_scopes(nested, scopes, depth + 1);
     }
 }
 
@@ -1251,9 +1284,17 @@ fn collect_protocol_metadata(
         evidence.invalid |=
             !merge_protocol_declaration(&mut evidence.parameters_support_tools, supports_tools);
     }
-    for nested in ["capability", "capabilities", "metadata"]
-        .iter()
-        .filter_map(|key| metadata.get(*key).and_then(serde_json::Value::as_object))
+    for nested in [
+        "capability",
+        "capabilities",
+        "metadata",
+        "protocolCapability",
+        "protocol_capability",
+        "limit",
+        "limits",
+    ]
+    .iter()
+    .filter_map(|key| metadata.get(*key).and_then(serde_json::Value::as_object))
     {
         collect_protocol_metadata(nested, evidence, depth + 1);
     }
@@ -1629,10 +1670,18 @@ fn extract_context_window(obj: &serde_json::Map<String, serde_json::Value>) -> O
         return direct;
     }
 
-    ["limit", "limits", "capabilities", "metadata"]
-        .iter()
-        .filter_map(|key| obj.get(*key).and_then(|value| value.as_object()))
-        .find_map(extract_context_window)
+    [
+        "limit",
+        "limits",
+        "capability",
+        "capabilities",
+        "protocolCapability",
+        "protocol_capability",
+        "metadata",
+    ]
+    .iter()
+    .filter_map(|key| obj.get(*key).and_then(|value| value.as_object()))
+    .find_map(extract_context_window)
 }
 
 /// 从 OpenAI-compatible `/models` 的供应商扩展字段中读取输入模态。
@@ -1641,7 +1690,7 @@ fn extract_context_window(obj: &serde_json::Map<String, serde_json::Value>) -> O
 pub(crate) fn extract_input_modalities(
     obj: &serde_json::Map<String, serde_json::Value>,
 ) -> Option<Vec<String>> {
-    [
+    if let Some(modalities) = [
         "input_modalities",
         "inputModalities",
         "modalities",
@@ -1651,6 +1700,28 @@ pub(crate) fn extract_input_modalities(
     .iter()
     .filter_map(|key| obj.get(*key))
     .find_map(parse_input_modalities)
+    {
+        return Some(modalities);
+    }
+
+    for key in [
+        "metadata",
+        "capability",
+        "capabilities",
+        "protocolCapability",
+        "protocol_capability",
+        "limit",
+        "limits",
+    ] {
+        if let Some(modalities) = obj
+            .get(key)
+            .and_then(serde_json::Value::as_object)
+            .and_then(extract_input_modalities)
+        {
+            return Some(modalities);
+        }
+    }
+    None
 }
 
 fn parse_input_modalities(value: &serde_json::Value) -> Option<Vec<String>> {
@@ -1685,7 +1756,9 @@ fn parse_input_modalities(value: &serde_json::Value) -> Option<Vec<String>> {
     }
 }
 
-fn extract_supports_image(obj: &serde_json::Map<String, serde_json::Value>) -> Option<bool> {
+pub(crate) fn extract_supports_image(
+    obj: &serde_json::Map<String, serde_json::Value>,
+) -> Option<bool> {
     let explicit = [
         "supports_image",
         "supportsImage",
@@ -1700,6 +1773,24 @@ fn extract_supports_image(obj: &serde_json::Map<String, serde_json::Value>) -> O
     .find_map(serde_json::Value::as_bool);
     if explicit.is_some() {
         return explicit;
+    }
+
+    for key in [
+        "metadata",
+        "capability",
+        "capabilities",
+        "protocolCapability",
+        "protocol_capability",
+        "limit",
+        "limits",
+    ] {
+        if let Some(nested) = obj
+            .get(key)
+            .and_then(serde_json::Value::as_object)
+            .and_then(extract_supports_image)
+        {
+            return Some(nested);
+        }
     }
 
     extract_input_modalities(obj).map(|modalities| {
@@ -2982,6 +3073,26 @@ mod tests {
     }
 
     #[test]
+    fn parse_models_response_matches_nested_identity_aliases() {
+        let models = parse_models_response(
+            r#"{
+                "data":[{"id":"nested-alias"}],
+                "models":[{
+                    "id":"wire-model",
+                    "capabilities":{
+                        "aliases":["Nested-Alias"],
+                        "limits":{"contextWindow":777000}
+                    }
+                }]
+            }"#,
+            &[],
+        )
+        .expect("nested identity metadata should bind to data rows");
+
+        assert_eq!(models[0].context_window, Some(777_000));
+    }
+
+    #[test]
     fn parse_models_response_rejects_empty_or_ambiguous_dual_envelopes() {
         for body in [
             r#"{"data":[],"models":[{"slug":"wire-model"}]}"#,
@@ -3919,6 +4030,71 @@ mod tests {
         assert_eq!(extract_supports_image(&data[1].extra), Some(true));
         assert_eq!(extract_supports_image(&data[2].extra), Some(false));
         assert_eq!(extract_supports_image(&data[3].extra), None);
+    }
+
+    #[test]
+    fn test_extract_supports_image_from_nested_capability_metadata() {
+        let json = r#"{"object":"list","data":[{"id":"nested-metadata","metadata":{"capabilities":{"supports_image":false}}},{"id":"nested-limit","limit":{"supportsImage":false}}]}"#;
+        let resp: ModelsResponse = serde_json::from_str(json).unwrap();
+        let data = resp.data.unwrap();
+
+        assert_eq!(extract_supports_image(&data[0].extra), Some(false));
+        assert_eq!(extract_supports_image(&data[1].extra), Some(false));
+    }
+
+    #[test]
+    fn test_extracts_context_and_image_from_protocol_capability_envelopes() {
+        let json = r#"{"object":"list","data":[{"id":"nested-protocol","protocolCapability":{"limits":{"contextWindow":131072},"capabilities":{"supportsImage":false}}},{"id":"nested-protocol-snake","protocol_capability":{"context_window":65536,"supports_image":false}}]}"#;
+        let resp: ModelsResponse = serde_json::from_str(json).unwrap();
+        let data = resp.data.unwrap();
+
+        assert_eq!(extract_context_window(&data[0].extra), Some(131_072));
+        assert_eq!(extract_supports_image(&data[0].extra), Some(false));
+        assert_eq!(extract_context_window(&data[1].extra), Some(65_536));
+        assert_eq!(extract_supports_image(&data[1].extra), Some(false));
+    }
+
+    #[test]
+    fn test_extracts_nested_capability_metadata_without_dropping_false_values() {
+        let json = r#"{"object":"list","data":[{"id":"nested","supportsParallelToolCalls":"malformed","capability":{"limits":{"contextWindow":"262144"},"modalities":{"input":["text","image"]},"supportsParallelToolCalls":false,"protocolCapability":{"supportedEndpoints":["responses"],"supportsTools":false}}},{"id":"nested-metadata","metadata":{"capabilities":{"modalities":{"input":["text","image"]}}}}]}"#;
+        let resp: ModelsResponse = serde_json::from_str(json).unwrap();
+        let mut data = resp.data.unwrap();
+        let metadata_entry = data.pop().unwrap();
+        let entry = data.pop().unwrap();
+
+        assert_eq!(extract_context_window(&entry.extra), Some(262_144));
+        assert_eq!(
+            extract_input_modalities(&entry.extra),
+            Some(vec!["text".to_string(), "image".to_string()])
+        );
+        assert_eq!(
+            extract_model_identity_fields(&entry.extra).supports_parallel_tool_calls,
+            Some(false)
+        );
+        assert_eq!(
+            extract_protocol_capability(
+                &entry.id,
+                &entry.extra,
+                "https://provider.test/v1",
+                "https://provider.test/v1/models",
+            )
+            .expect("nested protocol declaration")["supportedEndpoints"],
+            serde_json::json!(["openai_responses"])
+        );
+        assert_eq!(
+            extract_protocol_capability(
+                &entry.id,
+                &entry.extra,
+                "https://provider.test/v1",
+                "https://provider.test/v1/models",
+            )
+            .expect("nested protocol declaration")["supportsTools"],
+            serde_json::json!(false)
+        );
+        assert_eq!(
+            extract_input_modalities(&metadata_entry.extra),
+            Some(vec!["text".to_string(), "image".to_string()])
+        );
     }
 
     #[test]

@@ -111,7 +111,8 @@ export function OpenAICompatibleApiPage() {
   const defaultModel =
     selectedModel ||
     (profile?.defaultModel &&
-    (availableModels.length === 0 || availableModels.includes(profile.defaultModel))
+    (availableModels.length === 0 ||
+      availableModels.includes(profile.defaultModel))
       ? profile.defaultModel
       : "") ||
     runtimeStatus?.effectiveModel ||
@@ -521,11 +522,13 @@ export function OpenAICompatibleApiPage() {
                   detail="Cline and Kilo use the same local CCSwitch OpenAI-compatible endpoint. This does not connect to their hosted gateways or agent runtimes."
                 />
                 <div className="mt-4 flex flex-wrap gap-2">
-                  {([
-                    ["cline", "Cline"],
-                    ["kilo", "Kilo"],
-                    ["openai", "OpenAI-compatible"],
-                  ] as const).map(([value, label]) => (
+                  {(
+                    [
+                      ["cline", "Cline"],
+                      ["kilo", "Kilo"],
+                      ["openai", "OpenAI-compatible"],
+                    ] as const
+                  ).map(([value, label]) => (
                     <Button
                       key={value}
                       variant={clientTarget === value ? "default" : "outline"}
@@ -536,7 +539,8 @@ export function OpenAICompatibleApiPage() {
                   ))}
                 </div>
                 <div className="mt-3 rounded-md border border-blue-200/30 bg-background/50 p-3 text-xs leading-5 text-muted-foreground">
-                  Base URL: <code>{agentBaseUrl}</code> | Model: <code>{defaultModel}</code>
+                  Base URL: <code>{agentBaseUrl}</code> | Model:{" "}
+                  <code>{defaultModel}</code>
                 </div>
               </section>
               {clientTarget === "cline" ? (
@@ -549,7 +553,11 @@ export function OpenAICompatibleApiPage() {
                   )}
                   onCopy={() =>
                     handleCopyRunnableConfig(
-                      buildClineConfig(agentBaseUrl, runnableApiKey, defaultModel),
+                      buildClineConfig(
+                        agentBaseUrl,
+                        runnableApiKey,
+                        defaultModel,
+                      ),
                       "Cline configuration",
                     )
                   }
@@ -564,7 +572,11 @@ export function OpenAICompatibleApiPage() {
                   )}
                   onCopy={() =>
                     handleCopyRunnableConfig(
-                      buildKiloSnippet(agentBaseUrl, runnableApiKey, defaultModel),
+                      buildKiloSnippet(
+                        agentBaseUrl,
+                        runnableApiKey,
+                        defaultModel,
+                      ),
                       "Kilo configuration",
                     )
                   }
@@ -579,7 +591,11 @@ export function OpenAICompatibleApiPage() {
                   )}
                   onCopy={() =>
                     handleCopyRunnableConfig(
-                      buildJsonConfig(agentBaseUrl, runnableApiKey, defaultModel),
+                      buildJsonConfig(
+                        agentBaseUrl,
+                        runnableApiKey,
+                        defaultModel,
+                      ),
                       "OpenAI configuration",
                     )
                   }
@@ -587,10 +603,18 @@ export function OpenAICompatibleApiPage() {
               )}
               <SnippetPanel
                 title="cURL checks"
-                value={buildCurlSnippet(agentBaseUrl, runnableApiKey, defaultModel)}
+                value={buildCurlSnippet(
+                  agentBaseUrl,
+                  runnableApiKey,
+                  defaultModel,
+                )}
                 onCopy={() =>
                   handleCopyRunnableConfig(
-                    buildCurlSnippet(agentBaseUrl, runnableApiKey, defaultModel),
+                    buildCurlSnippet(
+                      agentBaseUrl,
+                      runnableApiKey,
+                      defaultModel,
+                    ),
                     "cURL checks",
                   )
                 }

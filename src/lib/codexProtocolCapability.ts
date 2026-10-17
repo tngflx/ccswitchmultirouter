@@ -12,6 +12,8 @@ import {
 } from "@/utils/providerConfigUtils";
 
 type ProtocolProvider = Pick<Provider, "settingsConfig" | "meta">;
+export type CodexModelProtocolDeclarationStatus =
+  "supported" | "unsupported" | "unavailable";
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   value !== null && typeof value === "object" && !Array.isArray(value);
@@ -49,9 +51,34 @@ export function readCodexModelProtocolCapability(
   provider: ProtocolProvider,
   model: CodexCatalogModel | string,
 ): CodexProtocolOverride | null {
+  const inspection = inspectCodexModelProtocolCapability(provider, model);
+  return inspection.status === "supported" ? inspection.transport : null;
+}
+
+/**
+ * Classify a bound provider API declaration without collapsing explicit
+ * negative capability metadata into "missing".  A negative declaration is
+ * known evidence that the automatic Codex route cannot be used, so callers
+ * can avoid opening a paid deep-probe flow while still refusing to route it.
+ */
+export function codexModelProtocolDeclarationStatus(
+  provider: ProtocolProvider,
+  model: CodexCatalogModel | string,
+): CodexModelProtocolDeclarationStatus {
+  return inspectCodexModelProtocolCapability(provider, model).status;
+}
+
+function inspectCodexModelProtocolCapability(
+  provider: ProtocolProvider,
+  model: CodexCatalogModel | string,
+): {
+  status: CodexModelProtocolDeclarationStatus;
+  transport: CodexProtocolOverride | null;
+} {
   const row =
     typeof model === "string" ? findCatalogModel(provider, model) : model;
-  if (!row || row.enabled === false || !trimmedString(row.model)) return null;
+  if (!row || row.enabled === false || !trimmedString(row.model))
+    return { status: "unavailable", transport: null };
   const capability: unknown = row.protocolCapability;
   if (
     !isRecord(capability) ||
@@ -64,14 +91,19 @@ export function readCodexModelProtocolCapability(
         endpoint !== "openai_chat" && endpoint !== "openai_responses",
     )
   ) {
-    return null;
+    return { status: "unavailable", transport: null };
   }
+  let explicitlyUnsupported = false;
   for (const key of [
     "supportsTools",
     "supportsStreaming",
     "supportsToolContinuation",
   ]) {
-    if (capability[key] !== undefined && capability[key] !== true) return null;
+    if (capability[key] === undefined) continue;
+    if (typeof capability[key] !== "boolean") {
+      return { status: "unavailable", transport: null };
+    }
+    explicitlyUnsupported ||= capability[key] === false;
   }
   const currentBaseUrl = normalizeCodexProtocolCapabilityBaseUrl(
     providerBaseUrl(provider),
@@ -81,15 +113,18 @@ export function readCodexModelProtocolCapability(
     normalizeCodexProtocolCapabilityBaseUrl(capability.baseUrl) !==
       currentBaseUrl
   ) {
-    return null;
+    return { status: "unavailable", transport: null };
   }
   const upstreamModel =
     trimmedString(row.upstreamModel) ||
     trimmedString(row.upstream_model) ||
     trimmedString(row.model);
-  if (trimmedString(capability.upstreamModel) !== upstreamModel) return null;
+  if (trimmedString(capability.upstreamModel) !== upstreamModel) {
+    return { status: "unavailable", transport: null };
+  }
 
   const configured = configuredTransport(provider);
+  let transport: CodexProtocolOverride | null = null;
   if (provider.meta?.isFullUrl === true) {
     const path = new URL(currentBaseUrl).pathname;
     const fullUrlTransport = path.endsWith("/chat/completions")
@@ -97,17 +132,23 @@ export function readCodexModelProtocolCapability(
       : path.endsWith("/responses")
         ? "openai_responses"
         : configured;
-    return fullUrlTransport &&
+    transport =
+      fullUrlTransport &&
       capability.supportedEndpoints.includes(fullUrlTransport)
-      ? fullUrlTransport
-      : null;
+        ? fullUrlTransport
+        : null;
+  } else if (configured && capability.supportedEndpoints.includes(configured)) {
+    transport = configured;
+  } else {
+    transport = capability.supportedEndpoints.includes("openai_responses")
+      ? "openai_responses"
+      : "openai_chat";
   }
-  if (configured && capability.supportedEndpoints.includes(configured)) {
-    return configured;
-  }
-  return capability.supportedEndpoints.includes("openai_responses")
-    ? "openai_responses"
-    : "openai_chat";
+  if (!transport) return { status: "unavailable", transport: null };
+  return {
+    status: explicitlyUnsupported ? "unsupported" : "supported",
+    transport,
+  };
 }
 
 function findCatalogModel(

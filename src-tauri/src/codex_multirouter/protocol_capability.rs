@@ -36,20 +36,51 @@ pub(crate) fn provider_api_declared_transport(
     provider: &Provider,
     public_model: &str,
 ) -> Option<TransportKind> {
-    let model = catalog_models(&provider.settings_config)?
-        .iter()
-        .find(|model| model_identity(model) == Some(public_model.trim()))?;
-    provider_api_declared_model_transport(provider, model)
+    match provider_api_transport_declaration_for_model(provider, public_model) {
+        ProviderApiTransportDeclaration::Supported(transport) => Some(transport),
+        ProviderApiTransportDeclaration::Unsupported
+        | ProviderApiTransportDeclaration::Unavailable => None,
+    }
 }
 
-pub(crate) fn provider_api_declared_model_transport(
+pub(crate) fn provider_api_transport_declaration_for_model(
+    provider: &Provider,
+    public_model: &str,
+) -> ProviderApiTransportDeclaration {
+    let Some(models) = catalog_models(&provider.settings_config) else {
+        return ProviderApiTransportDeclaration::Unavailable;
+    };
+    let Some(model) = models
+        .iter()
+        .find(|model| model_identity(model) == Some(public_model.trim()))
+    else {
+        return ProviderApiTransportDeclaration::Unavailable;
+    };
+    provider_api_transport_declaration(provider, model)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ProviderApiTransportDeclaration {
+    /// The provider API declared a usable transport for this model.
+    Supported(TransportKind),
+    /// The provider API declaration is structurally valid, but explicitly
+    /// denies a capability required by the automatic Codex route.
+    Unsupported,
+    /// No usable declaration was found (missing, stale, malformed, or
+    /// unbound metadata). These models remain eligible for deep probing.
+    Unavailable,
+}
+
+pub(crate) fn provider_api_transport_declaration(
     provider: &Provider,
     model: &Value,
-) -> Option<TransportKind> {
+) -> ProviderApiTransportDeclaration {
     if model.get("enabled").and_then(Value::as_bool) == Some(false) {
-        return None;
+        return ProviderApiTransportDeclaration::Unavailable;
     }
-    let public_model = model_identity(model)?;
+    let Some(public_model) = model_identity(model) else {
+        return ProviderApiTransportDeclaration::Unavailable;
+    };
     let upstream_model = ["upstreamModel", "upstream_model"]
         .into_iter()
         .find_map(|field| {
@@ -60,7 +91,9 @@ pub(crate) fn provider_api_declared_model_transport(
                 .filter(|value| !value.is_empty())
         })
         .unwrap_or(public_model);
-    let declaration = model.get("protocolCapability")?.as_object()?;
+    let Some(declaration) = model.get("protocolCapability").and_then(Value::as_object) else {
+        return ProviderApiTransportDeclaration::Unavailable;
+    };
     if declaration.get("schemaVersion").and_then(Value::as_u64) != Some(1)
         || declaration.get("source").and_then(Value::as_str) != Some("provider_api")
         || declaration
@@ -69,60 +102,84 @@ pub(crate) fn provider_api_declared_model_transport(
             .map(str::trim)
             != Some(upstream_model)
     {
-        return None;
-    }
-    for field in [
-        "supportsTools",
-        "supportsStreaming",
-        "supportsToolContinuation",
-    ] {
-        if declaration
-            .get(field)
-            .is_some_and(|value| value.as_bool() != Some(true))
-        {
-            return None;
-        }
+        return ProviderApiTransportDeclaration::Unavailable;
     }
 
-    let declared_base =
-        normalize_protocol_capability_base_url(declaration.get("baseUrl")?.as_str()?)?;
-    let current_base_url = CodexAdapter::new().extract_base_url(provider).ok()?;
-    let current_base = normalize_protocol_capability_base_url(&current_base_url)?;
-    if declared_base != current_base {
-        return None;
+    let declared_base = declaration
+        .get("baseUrl")
+        .and_then(Value::as_str)
+        .and_then(normalize_protocol_capability_base_url);
+    let current_base_url = match CodexAdapter::new().extract_base_url(provider) {
+        Ok(value) => value,
+        Err(_) => return ProviderApiTransportDeclaration::Unavailable,
+    };
+    let current_base = normalize_protocol_capability_base_url(&current_base_url);
+    if declared_base.is_none() || current_base.is_none() || declared_base != current_base {
+        return ProviderApiTransportDeclaration::Unavailable;
     }
 
-    let endpoints = declaration.get("supportedEndpoints")?.as_array()?;
+    let Some(endpoints) = declaration
+        .get("supportedEndpoints")
+        .and_then(Value::as_array)
+    else {
+        return ProviderApiTransportDeclaration::Unavailable;
+    };
     let mut responses = false;
     let mut chat = false;
     for endpoint in endpoints {
-        match endpoint.as_str()? {
-            "openai_responses" => responses = true,
-            "openai_chat" => chat = true,
-            _ => return None,
+        match endpoint.as_str() {
+            Some("openai_responses") => responses = true,
+            Some("openai_chat") => chat = true,
+            _ => return ProviderApiTransportDeclaration::Unavailable,
         }
     }
-    if provider.meta.as_ref().and_then(|meta| meta.is_full_url) == Some(true) {
-        let full_url = Url::parse(&current_base_url).ok()?;
+    let transport = if provider.meta.as_ref().and_then(|meta| meta.is_full_url) == Some(true) {
+        let Ok(full_url) = Url::parse(&current_base_url) else {
+            return ProviderApiTransportDeclaration::Unavailable;
+        };
         let path = full_url.path().trim_end_matches('/');
         let transport = if path.ends_with("/chat/completions") {
             TransportKind::OpenAiChat
         } else if path.ends_with("/responses") {
             TransportKind::OpenAiResponses
         } else {
-            configured_transport(provider)?
+            let Some(transport) = configured_transport(provider) else {
+                return ProviderApiTransportDeclaration::Unavailable;
+            };
+            transport
         };
-        return match transport {
-            TransportKind::OpenAiChat if chat => Some(transport),
-            TransportKind::OpenAiResponses if responses => Some(transport),
-            _ => None,
+        match transport {
+            TransportKind::OpenAiChat if chat => transport,
+            TransportKind::OpenAiResponses if responses => transport,
+            _ => return ProviderApiTransportDeclaration::Unavailable,
+        }
+    } else {
+        match (configured_transport(provider), responses, chat) {
+            (Some(TransportKind::OpenAiChat), _, true) => TransportKind::OpenAiChat,
+            (_, true, _) => TransportKind::OpenAiResponses,
+            (_, false, true) => TransportKind::OpenAiChat,
+            _ => return ProviderApiTransportDeclaration::Unavailable,
+        }
+    };
+
+    let mut explicitly_unsupported = false;
+    for field in [
+        "supportsTools",
+        "supportsStreaming",
+        "supportsToolContinuation",
+    ] {
+        let Some(value) = declaration.get(field) else {
+            continue;
         };
+        let Some(value) = value.as_bool() else {
+            return ProviderApiTransportDeclaration::Unavailable;
+        };
+        explicitly_unsupported |= !value;
     }
-    match (configured_transport(provider), responses, chat) {
-        (Some(TransportKind::OpenAiChat), _, true) => Some(TransportKind::OpenAiChat),
-        (_, true, _) => Some(TransportKind::OpenAiResponses),
-        (_, false, true) => Some(TransportKind::OpenAiChat),
-        _ => None,
+    if explicitly_unsupported {
+        ProviderApiTransportDeclaration::Unsupported
+    } else {
+        ProviderApiTransportDeclaration::Supported(transport)
     }
 }
 
@@ -294,6 +351,36 @@ mod tests {
         let mut provider = api_provider();
         provider.settings_config["modelCatalog"]["models"][0]["enabled"] = json!(false);
         assert!(provider_api_declared_transport(&provider, "visible-model").is_none());
+    }
+
+    #[test]
+    fn explicit_negative_capabilities_are_known_unsupported_not_unresolved() {
+        for field in [
+            "supportsTools",
+            "supportsStreaming",
+            "supportsToolContinuation",
+        ] {
+            let mut provider = api_provider();
+            provider.settings_config["modelCatalog"]["models"][0]["protocolCapability"][field] =
+                json!(false);
+            assert_eq!(
+                provider_api_transport_declaration_for_model(&provider, "visible-model"),
+                ProviderApiTransportDeclaration::Unsupported,
+                "{field}"
+            );
+            assert!(
+                provider_api_declared_transport(&provider, "visible-model").is_none(),
+                "negative capability must not produce an executable transport"
+            );
+        }
+
+        let mut malformed = api_provider();
+        malformed.settings_config["modelCatalog"]["models"][0]["protocolCapability"]
+            ["supportsTools"] = json!("false");
+        assert_eq!(
+            provider_api_transport_declaration_for_model(&malformed, "visible-model"),
+            ProviderApiTransportDeclaration::Unavailable
+        );
     }
 
     #[test]

@@ -611,10 +611,27 @@ pub fn provider_reasoning_capability_from_model_entry(
 fn metadata_scopes(
     object: &serde_json::Map<String, Value>,
 ) -> Vec<&serde_json::Map<String, Value>> {
+    const MAX_METADATA_SCOPE_DEPTH: u8 = 8;
+    let envelope_keys = [
+        "metadata",
+        "capability",
+        "capabilities",
+        "protocolCapability",
+        "protocol_capability",
+        "limit",
+        "limits",
+    ];
     let mut scopes = vec![object];
-    for key in ["metadata", "capability", "capabilities"] {
-        if let Some(nested) = object.get(key).and_then(Value::as_object) {
-            scopes.push(nested);
+    let mut pending = vec![(object, 0u8)];
+    while let Some((scope, depth)) = pending.pop() {
+        if depth >= MAX_METADATA_SCOPE_DEPTH {
+            continue;
+        }
+        for key in envelope_keys {
+            if let Some(nested) = scope.get(key).and_then(Value::as_object) {
+                scopes.push(nested);
+                pending.push((nested, depth + 1));
+            }
         }
     }
     scopes
@@ -1484,6 +1501,58 @@ mod tests {
         assert_eq!(capability.upstream.parameter, "reasoning_effort");
         assert_ne!(capability.source.as_deref(), Some("user"));
         capability.validate().expect("valid canonical capability");
+    }
+
+    #[test]
+    fn provider_reasoning_metadata_reads_allowlisted_limit_envelopes() {
+        let capability = provider_reasoning_capability_from_model_entry(
+            &json!({
+                "id": "gateway-model",
+                "limits": {
+                    "metadata": {
+                        "capabilities": {
+                            "reasoning": {
+                                "supported_efforts": ["low", "high", "max"],
+                                "default_effort": "high",
+                                "upstream_format": "string",
+                                "upstream_parameter": "reasoning_effort"
+                            }
+                        }
+                    }
+                }
+            }),
+            false,
+        )
+        .expect("reasoning declaration nested under limits");
+
+        assert_eq!(capability.supported_efforts, ["low", "high", "max"]);
+        assert_eq!(capability.default_effort.as_deref(), Some("high"));
+        assert_eq!(capability.upstream.format, "string");
+        assert_eq!(capability.upstream.parameter, "reasoning_effort");
+    }
+
+    #[test]
+    fn provider_reasoning_metadata_reads_protocol_capability_envelopes() {
+        let capability = provider_reasoning_capability_from_model_entry(
+            &json!({
+                "id": "gateway-model",
+                "protocolCapability": {
+                    "reasoning": {
+                        "supportedEfforts": ["low", "high", "max"],
+                        "defaultEffort": "high",
+                        "upstreamFormat": "string",
+                        "upstreamParameter": "reasoning_effort"
+                    }
+                }
+            }),
+            false,
+        )
+        .expect("reasoning declaration nested under protocol capability");
+
+        assert_eq!(capability.supported_efforts, ["low", "high", "max"]);
+        assert_eq!(capability.default_effort.as_deref(), Some("high"));
+        assert_eq!(capability.upstream.format, "string");
+        assert_eq!(capability.upstream.parameter, "reasoning_effort");
     }
 
     #[test]

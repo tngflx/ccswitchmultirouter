@@ -697,7 +697,7 @@ function mergeFetchedModelsIntoCatalogRows(
   const result = reconcileFetchedCodexCatalogRows(rows, fetchedModels, source, {
     appendNew: true,
     createRow: (seed) => createCatalogRow(seed),
-    existingMetadataMode: "fill-missing",
+    existingMetadataMode: authoritative ? "refresh" : "fill-missing",
     removeMissingRemote: authoritative,
     includeUnboundRemoteRows: true,
     markMissingRemoteDisabled: true,

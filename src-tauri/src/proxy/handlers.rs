@@ -597,6 +597,9 @@ fn codex_catalog_model_id(entry: &Value) -> Option<String> {
 
 /// 将 cc-switch catalog 扩展为同时兼容 raw catalog 和 OpenAI list 的响应。
 fn codex_catalog_models_response(mut catalog: Value) -> Value {
+    if let Some(models) = catalog.get_mut("models").and_then(Value::as_array_mut) {
+        models.retain(|model| model.get("enabled").and_then(Value::as_bool) != Some(false));
+    }
     let mut ids = Vec::new();
     let mut entries = Vec::new();
     collect_string_array(&mut ids, catalog.get("models"));
@@ -2962,6 +2965,12 @@ fn openai_model_entry_with_source(id: &str, owner: &str, source: &Value) -> Valu
         {
             entry["input_modalities"] = json!(modalities);
             entry["inputModalities"] = json!(modalities);
+        }
+        if let Some(supports_image) =
+            crate::services::model_fetch::extract_supports_image(source_object)
+        {
+            entry["supports_image"] = json!(supports_image);
+            entry["supportsImage"] = json!(supports_image);
         }
         if let Some(supported) =
             crate::services::model_fetch::extract_model_identity_fields(source_object)
@@ -7173,6 +7182,7 @@ mod tests {
             "models": [
                 { "slug": "qwen3.6", "display_name": "Qwen 3.6", "context_window": 262144, "upstreamModel": "qwen3.6-upstream" },
                 { "model": "deepseek-v4-flash", "display_name": "DeepSeek V4 Flash", "contextWindow": 1000000 },
+                { "model": "disabled-model", "enabled": false },
                 { "slug": "qwen3.6", "display_name": "duplicate" }
             ]
         }));
@@ -7182,6 +7192,18 @@ mod tests {
             response["models"].as_array().is_some(),
             "raw Codex CLI catalog shape must remain present"
         );
+        let raw_ids: Vec<_> = response["models"]
+            .as_array()
+            .expect("raw catalog models array")
+            .iter()
+            .filter_map(|model| {
+                model
+                    .get("model")
+                    .or_else(|| model.get("slug"))
+                    .and_then(|id| id.as_str())
+            })
+            .collect();
+        assert_eq!(raw_ids, vec!["qwen3.6", "deepseek-v4-flash", "qwen3.6"]);
         let ids: Vec<_> = response["data"]
             .as_array()
             .expect("OpenAI data array")
@@ -9176,6 +9198,10 @@ data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_deepseek\",\"
                                         "effortMap": { "ultra": "ultra" }
                                     }
                                 }
+                            },
+                            {
+                                "model": "text-only-explicit",
+                                "supportsImage": false
                             }
                         ]
                     }
@@ -9254,6 +9280,14 @@ data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_deepseek\",\"
         assert!(malformed.get("reasoning").is_none());
         assert!(malformed.get("input_modalities").is_none());
         assert!(malformed.get("supports_parallel_tool_calls").is_none());
+        let text_only = response["data"]
+            .as_array()
+            .expect("data array")
+            .iter()
+            .find(|model| model["id"] == "text-only-explicit")
+            .expect("text-only model entry");
+        assert_eq!(text_only["supports_image"], json!(false));
+        assert_eq!(text_only["supportsImage"], json!(false));
         assert!(!response.to_string().contains("REDACTED_"));
         assert!(!response.to_string().contains("https://redacted.example"));
     }

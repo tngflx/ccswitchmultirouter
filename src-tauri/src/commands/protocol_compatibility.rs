@@ -17,7 +17,10 @@ use uuid::Uuid;
 use crate::{
     app_config::AppType,
     codex_multirouter::projection::{CodexRoutingProjectionStatus, ProjectionState},
-    codex_multirouter::protocol_capability::provider_api_declared_transport,
+    codex_multirouter::protocol_capability::{
+        provider_api_declared_transport, provider_api_transport_declaration_for_model,
+        ProviderApiTransportDeclaration,
+    },
     codex_multirouter::provider_set::{
         plan_codex_provider_set, plan_manual_codex_provider_set,
         requires_automatic_codex_protocol_probe, CodexProviderSetPlan, CodexProviderSetPreview,
@@ -1614,7 +1617,13 @@ fn compile_preflight_candidates(
                 .flatten()
                 .map(|resolved| resolved.into_effective_provider());
                 effective.as_ref().is_none_or(|effective| {
-                    provider_api_declared_transport(effective, &candidate.public_model).is_none()
+                    matches!(
+                        provider_api_transport_declaration_for_model(
+                            effective,
+                            &candidate.public_model
+                        ),
+                        ProviderApiTransportDeclaration::Unavailable
+                    )
                 })
             });
         }
@@ -1634,8 +1643,15 @@ fn compile_preflight_candidates(
                     crate::codex_multirouter::provider_set::codex_model_follows_automatic_protocol(
                         provider,
                         &candidate.public_model,
-                    ) && provider_api_declared_transport(provider, &candidate.public_model)
-                        .is_none()
+                    ) && {
+                        matches!(
+                            provider_api_transport_declaration_for_model(
+                                provider,
+                                &candidate.public_model
+                            ),
+                            ProviderApiTransportDeclaration::Unavailable
+                        )
+                    }
                 })
                 .collect(),
             false,
@@ -3258,6 +3274,24 @@ mod tests {
         )
         .unwrap();
         assert_eq!(explicit.len(), 2);
+    }
+
+    #[test]
+    fn automatic_probe_scope_skips_known_negative_api_declarations() {
+        let mut provider = api_declared_provider(true);
+        provider.settings_config["modelCatalog"]["models"][0]["protocolCapability"]
+            ["supportsTools"] = json!(false);
+
+        let (automatic, _) = compile_preflight_candidates(
+            &provider,
+            &HashMap::new(),
+            CodexProtocolProbeScope::AutomaticModels,
+        )
+        .unwrap();
+        assert!(
+            automatic.is_empty(),
+            "known unsupported API metadata must not open the deep-probe consent flow"
+        );
     }
 
     #[test]

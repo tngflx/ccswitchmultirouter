@@ -498,6 +498,37 @@ describe("Codex Desktop post-filter reasoning projection", () => {
     }
   });
 
+  it("drops pre-existing cached rows and defaults for a fresh authoritative empty catalog", () => {
+    const harness = createHarness();
+    try {
+      // Simulate the first injection after Desktop has already populated its
+      // query cache: there is no prior managed-name history to classify the
+      // cached row as retired.
+      harness.state.payload = {
+        ...harness.state.payload,
+        catalogAvailable: true,
+        modelNames: [],
+        models: [],
+      };
+      const stale = {
+        model: "stale-managed",
+        supportedReasoningEfforts: [{ reasoningEffort: "high" }],
+      };
+      const restored = harness.api.restoreCodexCatalogReasoningSelection(key, {
+        models: [stale],
+        defaultModel: stale,
+        hasModelSupportingMaxReasoningEffort: true,
+        hasModelSupportingUltraReasoningEffort: true,
+      });
+      expect(restored.models).toEqual([]);
+      expect(restored.defaultModel).toBeUndefined();
+      expect(restored.hasModelSupportingMaxReasoningEffort).toBe(false);
+      expect(restored.hasModelSupportingUltraReasoningEffort).toBe(false);
+    } finally {
+      harness.dispose();
+    }
+  });
+
   it("preserves owned raw rows when a catalog refresh is unavailable", () => {
     const harness = createHarness();
     try {
