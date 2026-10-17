@@ -490,8 +490,8 @@
     const names = new Set(modelNames().map(normalizedIdentity));
     // An explicit empty catalog is authoritative. A query cache can still
     // contain rows from before this injection, but none can belong to the
-    // current managed provider. Preserve unmatched native rows only while the
-    // current catalog has at least one visible managed model.
+    // current managed provider. Every managed selection is restricted to the
+    // current enabled catalog, including when it has no visible rows.
     const authoritativeEmptyCatalog =
       currentPayload().catalogAvailable === true &&
       Array.isArray(currentPayload().modelNames) &&

@@ -24,6 +24,13 @@ const legacyV8QueryCacheCore = readFileSync(
   ),
   "utf8",
 );
+const releaseCore = readFileSync(
+  path.resolve(
+    process.cwd(),
+    "src-tauri/src/resources/codex_model_picker_release_core.js",
+  ),
+  "utf8",
+);
 const provider = "codex_model_router_v2";
 const allEfforts = ["low", "medium", "high", "xhigh", "max", "ultra"];
 const key = ["models", "list", "local", "chatgpt", 100, provider];
@@ -51,9 +58,14 @@ type State = {
   payload: {
     modelProvider: string;
     catalogAvailable: boolean;
+    catalogReleased?: boolean;
     modelNames: string[];
     models: ({ model: string } & Record<string, unknown>)[];
   };
+  catalogReleased?: boolean;
+  catalogProviderEpoch?: number;
+  modelPickerQueryClients?: Map<unknown, QueryClient>;
+  modelPickerReleaseRefresh?: Promise<PromiseSettledResult<unknown>[]>;
   reasoningQueryCaches?: Map<
     unknown,
     {
@@ -134,6 +146,100 @@ const createHarness = () => {
 };
 
 describe("Codex Desktop post-filter reasoning projection", () => {
+  it.each(["current", "v8"])(
+    "releases %s projection to native cached queries and reactivates without nesting",
+    async (version) => {
+      const harness = createHarness();
+      try {
+        const includedPayload = harness.state.payload;
+        let nativeRequests = 0;
+        const native = {
+          data: [{ ...raw.data[0], model: "native-provider-model" }],
+        };
+        harness.observer.setOptions({
+          ...harness.options,
+          queryFn: async () => {
+            nativeRequests += 1;
+            return native;
+          },
+        });
+        const cache = harness.client.getQueryCache();
+        harness.state.modelPickerQueryClients = new Map([
+          [cache, harness.client],
+        ]);
+        const remoteKey = key.map((value) =>
+          value === "local" ? "remote" : value,
+        );
+        harness.client.setQueryData(remoteKey, native);
+        if (version === "v8") {
+          const install = new Function(
+            "state",
+            `${core}\n{${legacyV8QueryCacheCore}\nreturn patchCodexModelReasoningQueryCache;}`,
+          )(harness.state) as Core["patchCodexModelReasoningQueryCache"];
+          install(cache);
+        } else harness.patch();
+        const legacyMethod = harness.observer.setOptions;
+        const release = new Function(
+          "state",
+          `${releaseCore}\nreturn releaseCodexModelPicker;`,
+        )(harness.state) as (provider: string) => boolean;
+        expect(release(provider)).toBe(true);
+        expect(harness.state.payload.catalogReleased).toBe(true);
+        expect(harness.state.payload.catalogAvailable).toBe(false);
+        await harness.state.modelPickerReleaseRefresh;
+        expect(harness.observer.getCurrentResult().data?.models[0].model).toBe(
+          "native-provider-model",
+        );
+        expect(harness.client.getQueryData(remoteKey)).toBe(native);
+        expect(nativeRequests).toBe(1);
+        release(provider);
+        release("another-unmanaged-provider");
+        await harness.state.modelPickerReleaseRefresh;
+        expect(nativeRequests).toBe(1);
+        expect(harness.state.payload.modelProvider).toBe(
+          "another-unmanaged-provider",
+        );
+        expect(harness.state.catalogProviderEpoch).toBe(2);
+        harness.state.payload = includedPayload;
+        harness.state.catalogReleased = false;
+        harness.client.setQueryData(key, raw);
+        const api = loadCore(harness.state);
+        api.patchCodexModelReasoningQueryCache(cache);
+        expect(harness.efforts()).toEqual(allEfforts);
+        if (version === "v8")
+          expect(harness.observer.setOptions).toBe(legacyMethod);
+        const entry = harness.state.reasoningQueryCaches?.get(cache);
+        let selector: object | undefined = harness.observer.options.select;
+        let depth = 0;
+        while (selector && entry?.selectorSources?.has(selector)) {
+          depth += 1;
+          selector = entry.selectorSources.get(selector);
+        }
+        expect(depth).toBe(1);
+      } finally {
+        harness.dispose();
+      }
+    },
+  );
+
+  it("restores only tracked Statsig overrides and never guesses a legacy baseline", () => {
+    const originalValue = { available_models: ["native"] };
+    const projectedValue = { available_models: ["sol-relay"] };
+    const owned = { value: projectedValue };
+    const legacy = { value: projectedValue };
+    const state = {
+      payload: { modelProvider: provider, catalogAvailable: true },
+      modelPickerStatsigOverrides: new Map([
+        [owned, { originalValue, projectedValue }],
+      ]),
+    };
+    new Function("state", `${releaseCore}\nreleaseCodexModelPicker(null);`)(
+      state,
+    );
+    expect(owned.value).toBe(originalValue);
+    expect(legacy.value).toBe(projectedValue);
+  });
+
   it("retains the v8 cache entry during upgrade without nesting observer wrappers", () => {
     const harness = createHarness();
     try {

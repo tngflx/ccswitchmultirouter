@@ -30,7 +30,10 @@ const patchCodexModelReasoningQueryClient = (value) => {
   )
     return false;
   try {
-    return patchCodexModelReasoningQueryCache(getQueryCache.call(value));
+    const cache = getQueryCache.call(value);
+    state.modelPickerQueryClients = state.modelPickerQueryClients || new Map();
+    state.modelPickerQueryClients.set(cache, value);
+    return patchCodexModelReasoningQueryCache(cache);
   } catch (error) {
     recordFailure(error);
     return false;

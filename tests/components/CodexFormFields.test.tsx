@@ -1956,25 +1956,42 @@ describe("CodexFormFields local model routing", () => {
       },
     );
     const { updateIdentity } = renderReadinessIdentityHarness();
+    const readinessRegion = screen.getByRole("region", {
+      name: "Models and compatibility",
+    });
+    const readiness = within(readinessRegion);
 
     const validateCurrentIdentity = async () => {
       fireEvent.click(
-        screen.getByRole("button", { name: "Validate connection" }),
+        readiness.getByRole("button", { name: "Validate connection" }),
       );
-      fireEvent.click(screen.getByRole("button", { name: "Confirm probe" }));
+      const confirmation = within(
+        screen.getByRole("dialog", {
+          name: "Confirm Chat / Responses probe",
+        }),
+      );
+      fireEvent.click(
+        confirmation.getByRole("button", { name: "Confirm probe" }),
+      );
       expect(
-        await screen.findByText("Ready for MultiRouter"),
+        await readiness.findByText("Ready for MultiRouter"),
       ).toBeInTheDocument();
-      fireEvent.click(screen.getByRole("button", { name: "Close" }));
+      const progress = within(
+        screen.getByRole("dialog", { name: "Codex deep compatibility probe" }),
+      );
+      fireEvent.click(progress.getByRole("button", { name: "Close" }));
     };
     const expectInvalidated = async () => {
-      await waitFor(() => {
-        expect(
-          screen.queryByText("Ready for MultiRouter"),
-        ).not.toBeInTheDocument();
-      });
+      await waitFor(
+        () => {
+          expect(
+            readiness.queryByText("Ready for MultiRouter"),
+          ).not.toBeInTheDocument();
+        },
+        { container: readinessRegion },
+      );
       expect(
-        screen.getByText("Validate the connection first"),
+        readiness.getByText("Validate the connection first"),
       ).toBeInTheDocument();
     };
 

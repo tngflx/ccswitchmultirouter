@@ -329,6 +329,16 @@ pub fn read_codex_config_text() -> Result<String, AppError> {
     }
 }
 
+/// Unlike the optional reader, a missing live snapshot is unavailable, not an
+/// intentional empty configuration that relinquishes catalog ownership.
+pub(crate) fn read_existing_codex_config_text() -> Result<String, AppError> {
+    read_existing_codex_config_text_at(&get_codex_config_path())
+}
+
+fn read_existing_codex_config_text_at(path: &Path) -> Result<String, AppError> {
+    std::fs::read_to_string(path).map_err(|error| AppError::io(path, error))
+}
+
 /// 对非空的 TOML 文本进行语法校验
 pub fn validate_config_toml(text: &str) -> Result<(), AppError> {
     if text.trim().is_empty() {
@@ -7492,30 +7502,12 @@ fn build_simplified_catalog_from_texts(config_text: &str, catalog_text: &str) ->
 ///   from the inline `modelCatalog`, or the mapping is lost on restore.
 ///
 /// Gating on the presence of the inline `modelCatalog` key routes each shape
-/// correctly; an empty inline catalog still projects (and so correctly drops a
-/// now-stale pointer), while an absent key leaves the text untouched. This is
+/// correctly; an explicit empty catalog retains an empty managed projection,
+/// while an absent key leaves the snapshot text and model cache untouched. This is
 /// **orthogonal to auth** — a provider-rebuilt backup can pair an inline
 /// `modelCatalog` with empty `auth.json` (the API key living in the config's
 /// `experimental_bearer_token`), so the caller must decide config projection
 /// independently of whether it writes or deletes `auth.json`.
-pub(crate) fn prepare_codex_live_config_text_with_optional_catalog_and_provider_context(
-    settings: &Value,
-    config_text: &str,
-    profile: CodexCatalogToolProfile,
-    provider_context: &ProviderClassificationContext,
-) -> Result<String, AppError> {
-    if read_catalog(settings).is_some() {
-        prepare_codex_config_text_with_model_catalog_and_provider_context(
-            settings,
-            config_text,
-            profile,
-            provider_context,
-        )
-    } else {
-        Ok(config_text.to_string())
-    }
-}
-
 /// Prepare a deleted-provider backup when its target Provider record can no longer be loaded.
 ///
 /// This boundary is intentionally narrow: classification can only use the route's inline auth,
@@ -9196,6 +9188,15 @@ pub fn remove_codex_toml_base_url_if(toml_str: &str, predicate: impl Fn(&str) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn required_live_config_snapshot_distinguishes_missing_from_existing_empty_config() {
+        let directory = tempfile::tempdir().expect("create snapshot directory");
+        let path = directory.path().join("config.toml");
+        assert!(read_existing_codex_config_text_at(&path).is_err());
+        std::fs::write(&path, "").expect("write explicitly empty config");
+        assert_eq!(read_existing_codex_config_text_at(&path).unwrap(), "");
+    }
 
     #[test]
     fn deepseek_vendor_catalog_keeps_mcp_tools_directly_visible() {

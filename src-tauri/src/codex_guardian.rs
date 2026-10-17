@@ -4,9 +4,10 @@ use std::time::Duration;
 use tokio::sync::{watch, Mutex};
 
 use crate::codex_desktop::{
-    candidate_debug_ports, codex_renderer_compatibility_is_current,
-    detect_running_codex_main_process, list_cdp_targets, load_cc_switch_model_catalog_projection,
-    pick_codex_page_targets, try_inject_on_candidate_ports, CodexModelCatalogProjection,
+    candidate_debug_ports, codex_renderer_compatibility_is_current, deactivate_codex_model_picker,
+    detect_running_codex_main_process, list_cdp_targets,
+    load_cc_switch_model_catalog_projection_outcome, pick_codex_page_targets,
+    try_inject_on_candidate_ports, CodexModelCatalogLoadOutcome, CodexModelCatalogProjection,
     DEFAULT_CODEX_DEBUG_PORT,
 };
 
@@ -171,8 +172,13 @@ async fn run_guardian_cycle(
 
     // 3. 同时比较 target 和目录。renderer 补丁持有模型目录状态，因此 Provider
     // 目录变化时，即使 target ID 不变也必须重新注入。
-    let catalog = match load_cc_switch_model_catalog_projection() {
-        Ok(catalog) => catalog,
+    let catalog = match load_cc_switch_model_catalog_projection_outcome() {
+        Ok(CodexModelCatalogLoadOutcome::Managed(catalog)) => catalog,
+        Ok(CodexModelCatalogLoadOutcome::Unmanaged { model_provider }) => {
+            release_unmanaged_picker(&current_targets, model_provider.as_deref(), status, inner)
+                .await;
+            return;
+        }
         Err(error) => {
             let mut s = status.lock().await;
             s.codex_running = true;
@@ -334,6 +340,44 @@ async fn run_guardian_cycle(
     }
 }
 
+async fn release_unmanaged_picker(
+    targets: &[(String, String)],
+    model_provider: Option<&str>,
+    status: &Arc<Mutex<CodexGuardianStatus>>,
+    inner: &Arc<Mutex<GuardianInner>>,
+) {
+    let mut failed = 0;
+    for (_, websocket_url) in targets {
+        match deactivate_codex_model_picker(websocket_url, model_provider).await {
+            Ok(true) => {}
+            Ok(false) => failed += 1,
+            Err(error) => {
+                failed += 1;
+                log::warn!("Codex guardian could not release managed model picker: {error}");
+            }
+        }
+    }
+    {
+        let mut guard = inner.lock().await;
+        guard.injected_target_ids.clear();
+        guard.injected_catalog_fingerprint = None;
+    }
+    let mut s = status.lock().await;
+    s.codex_running = true;
+    s.cdp_available = true;
+    s.injected = false;
+    s.injected_target_count = 0;
+    if failed == 0 {
+        s.last_event = "已退出模型菜单托管".into();
+        s.message = "当前 Codex 配置不由 CCSM 托管，已释放模型菜单兼容层。".into();
+    } else {
+        s.last_event = "模型菜单托管释放未完成".into();
+        s.message = format!(
+            "当前 Codex 配置不由 CCSM 托管；{failed} 个 renderer 的模型菜单兼容层尚未释放，将在下次检查时重试。"
+        );
+    }
+}
+
 async fn current_renderer_target_ids(
     targets: &[(String, String)],
     catalog: &CodexModelCatalogProjection,
@@ -367,6 +411,37 @@ mod tests {
     use serde_json::json;
     use tokio::net::TcpListener;
     use tokio_tungstenite::{accept_async, tungstenite::Message};
+
+    #[tokio::test]
+    async fn unmanaged_catalog_release_clears_previous_guardian_ownership() {
+        let inner = Arc::new(Mutex::new(GuardianInner {
+            injected_target_ids: vec!["previous-renderer".to_string()],
+            injected_catalog_fingerprint: Some("previous-catalog".to_string()),
+            inject_generation: 7,
+        }));
+        let status = Arc::new(Mutex::new(CodexGuardianStatus {
+            active: true,
+            codex_running: true,
+            cdp_available: true,
+            injected_target_count: 1,
+            injected: true,
+            last_event: "previous injection".to_string(),
+            message: "previous managed catalog".to_string(),
+        }));
+
+        release_unmanaged_picker(&[], Some("openai"), &status, &inner).await;
+
+        let guard = inner.lock().await;
+        assert!(guard.injected_target_ids.is_empty());
+        assert!(guard.injected_catalog_fingerprint.is_none());
+        assert_eq!(guard.inject_generation, 7);
+        let current = status.lock().await;
+        assert!(!current.injected);
+        assert_eq!(current.injected_target_count, 0);
+        assert!(current.active);
+        assert!(current.codex_running);
+        assert!(current.cdp_available);
+    }
 
     #[test]
     fn guardian_reinjects_existing_targets_when_catalog_changes() {
