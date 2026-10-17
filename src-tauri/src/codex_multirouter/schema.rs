@@ -225,6 +225,15 @@ pub fn validate_v2(
                 Some(route.id.clone()),
                 "target provider does not exist",
             );
+        } else if catalog_models(&providers[route.target_provider_id.trim()].settings_config)
+            .is_none()
+        {
+            push_issue(
+                &mut issues,
+                "target_provider_catalog_unavailable",
+                Some(route.id.clone()),
+                "target provider model catalog is missing or malformed",
+            );
         }
         if let CodexModelSelection::Include { models } = &route.model_selection {
             let selected = models
@@ -450,6 +459,56 @@ mod tests {
         assert!(codes.contains(&"target_provider_missing".to_string()));
         assert!(codes.contains(&"include_models_empty".to_string()));
         assert!(codes.contains(&"alias_target_not_selected".to_string()));
+    }
+
+    #[test]
+    fn validation_rejects_missing_or_malformed_target_catalogs() {
+        for settings in [
+            json!({}),
+            json!({"modelCatalog": {"models": "not-an-array"}}),
+        ] {
+            let target = Provider::with_id("qwen".to_string(), "Qwen".to_string(), settings, None);
+            let providers = [("qwen".to_string(), target)].into_iter().collect();
+            let value = valid_plan(json!({
+                "id": "router-qwen",
+                "targetProviderId": "qwen",
+                "modelSelection": {"mode": "all"},
+                "authPolicy": {"source": "provider_config"}
+            }));
+            let CodexRoutingDocument::V2(plan) =
+                CodexRoutingDocument::parse(&value).expect("parse v2")
+            else {
+                panic!("expected v2");
+            };
+
+            let issues = validate_v2(&plan, &providers).expect_err("catalog must be required");
+            assert!(issues
+                .iter()
+                .any(|issue| issue.code == "target_provider_catalog_unavailable"));
+        }
+    }
+
+    #[test]
+    fn validation_accepts_authoritative_empty_target_catalog() {
+        let target = Provider::with_id(
+            "qwen".to_string(),
+            "Qwen".to_string(),
+            json!({"modelCatalog": {"models": []}}),
+            None,
+        );
+        let providers = [("qwen".to_string(), target)].into_iter().collect();
+        let value = valid_plan(json!({
+            "id": "router-qwen",
+            "targetProviderId": "qwen",
+            "modelSelection": {"mode": "all"},
+            "authPolicy": {"source": "provider_config"}
+        }));
+        let CodexRoutingDocument::V2(plan) = CodexRoutingDocument::parse(&value).expect("parse v2")
+        else {
+            panic!("expected v2");
+        };
+
+        validate_v2(&plan, &providers).expect("explicit empty catalog is usable");
     }
 
     #[test]

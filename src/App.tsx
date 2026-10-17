@@ -546,10 +546,24 @@ function App() {
               ? "codex-local-routing"
               : null;
 
-  const { data, isLoading, refetch } = useProvidersQuery(activeApp, {
+  const {
+    data,
+    error: providersQueryError,
+    isLoading,
+    refetch,
+  } = useProvidersQuery(activeApp, {
     isProxyRunning: currentAppUsesProxy && isProxyRunning,
   });
   const providers = useMemo(() => data?.providers ?? {}, [data]);
+  const providerLoadError = providersQueryError
+    ? extractErrorMessage(providersQueryError)
+    : (data?.currentProviderError ?? null);
+  const providerLoadErrorMessage = providerLoadError
+    ? t("provider.loadFailed", {
+        defaultValue:
+          "Provider data could not be loaded. Existing data is preserved; retry to reconnect.",
+      }) + ` (${providerLoadError})`
+    : null;
   const codexWizardProviders = useMemo(
     () =>
       activeApp === "codex"
@@ -1483,6 +1497,8 @@ function App() {
           return (
             <CodexRouterWorkspacePage
               providers={codexWizardProviders}
+              providerLoadError={providerLoadErrorMessage}
+              onRetryProviderLoad={() => void refetch()}
               proxyStatus={proxyStatus}
               isProxyRunning={isProxyRunning}
               isCodexTakeoverActive={Boolean(takeoverStatus?.codex)}
@@ -1588,6 +1604,25 @@ function App() {
                     transition={{ duration: 0.15 }}
                     className="space-y-4"
                   >
+                    {providerLoadErrorMessage && (
+                      <div
+                        role="alert"
+                        className="flex items-center justify-between gap-3 rounded-lg border border-amber-300 bg-amber-50 px-4 py-3 text-sm text-amber-900 dark:border-amber-700/60 dark:bg-amber-950/30 dark:text-amber-100"
+                      >
+                        <span>{providerLoadErrorMessage}</span>
+                        <Button
+                          type="button"
+                          variant="outline"
+                          size="sm"
+                          className="shrink-0 gap-2"
+                          onClick={() => void refetch()}
+                          title={t("common.retry", { defaultValue: "Retry" })}
+                        >
+                          <RefreshCw className="h-4 w-4" />
+                          {t("common.retry", { defaultValue: "Retry" })}
+                        </Button>
+                      </div>
+                    )}
                     {activeApp === "codex" && (
                       <OrchestrationSummaryCard
                         onOpen={handleOpenOrchestrationProfiles}

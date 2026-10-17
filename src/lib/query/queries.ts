@@ -51,10 +51,54 @@ export interface ProvidersQueryData {
   currentProviderId: string;
   codexEditorProviders?: Record<string, Provider>;
   codexEditorError?: string;
+  currentProviderError?: string;
 }
 
 export interface UseProvidersQueryOptions {
   isProxyRunning?: boolean; // 代理服务是否运行中
+}
+
+/** Load one provider snapshot without converting backend failures into emptiness. */
+export async function fetchProvidersQueryData(
+  appId: AppId,
+): Promise<ProvidersQueryData> {
+  // Provider inventory is authoritative UI state. Let getAll failures reject
+  // so React Query keeps any previous snapshot and exposes an error instead
+  // of turning a backend/projection failure into `{}`.
+  const providers = await providersApi.getAll(appId);
+  let currentProviderId = "";
+  let currentProviderError: string | undefined;
+  try {
+    currentProviderId = await providersApi.getCurrent(appId);
+  } catch (error) {
+    console.error("获取当前供应商失败:", error);
+    currentProviderError = extractErrorMessage(error);
+  }
+
+  let codexEditorProviders: Record<string, Provider> | undefined;
+  let codexEditorError: string | undefined;
+  if (
+    appId === "codex" &&
+    Object.values(providers).some(isCodexProtocolSetMember)
+  ) {
+    try {
+      codexEditorProviders = sortProviders(
+        await providersApi.getCodexEditorProviders(),
+      );
+    } catch {
+      codexEditorError = i18n.t("codexProviderUi.editorUnsafe", {
+        defaultValue:
+          "Protocol adaptation could not be safely restored. Check the model source configuration and retry.",
+      });
+    }
+  }
+  return {
+    providers: sortProviders(providers),
+    currentProviderId,
+    ...(currentProviderError ? { currentProviderError } : {}),
+    ...(codexEditorProviders ? { codexEditorProviders } : {}),
+    ...(codexEditorError ? { codexEditorError } : {}),
+  };
 }
 
 export const useProvidersQuery = (
@@ -69,46 +113,7 @@ export const useProvidersQuery = (
     // 当代理服务运行时，每 10 秒刷新一次供应商列表
     // 这样可以自动反映后端熔断器自动禁用代理目标的变更
     refetchInterval: isProxyRunning ? 10000 : false,
-    queryFn: async () => {
-      let providers: Record<string, Provider> = {};
-      let currentProviderId = "";
-
-      try {
-        providers = await providersApi.getAll(appId);
-      } catch (error) {
-        console.error("获取供应商列表失败:", error);
-      }
-
-      try {
-        currentProviderId = await providersApi.getCurrent(appId);
-      } catch (error) {
-        console.error("获取当前供应商失败:", error);
-      }
-
-      let codexEditorProviders: Record<string, Provider> | undefined;
-      let codexEditorError: string | undefined;
-      if (
-        appId === "codex" &&
-        Object.values(providers).some(isCodexProtocolSetMember)
-      ) {
-        try {
-          codexEditorProviders = sortProviders(
-            await providersApi.getCodexEditorProviders(),
-          );
-        } catch {
-          codexEditorError = i18n.t("codexProviderUi.editorUnsafe", {
-            defaultValue:
-              "Protocol adaptation could not be safely restored. Check the model source configuration and retry.",
-          });
-        }
-      }
-      return {
-        providers: sortProviders(providers),
-        currentProviderId,
-        ...(codexEditorProviders ? { codexEditorProviders } : {}),
-        ...(codexEditorError ? { codexEditorError } : {}),
-      };
-    },
+    queryFn: () => fetchProvidersQueryData(appId),
   });
 };
 

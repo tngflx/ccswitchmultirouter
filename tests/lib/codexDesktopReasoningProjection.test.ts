@@ -49,6 +49,7 @@ type Core = {
   patchModelArray: (
     models: Record<string, unknown>[],
     allowEmpty?: boolean,
+    managedOnly?: boolean,
   ) => boolean;
   restoreCodexCatalogReasoningSelection: (
     queryKey: unknown[],
@@ -365,8 +366,9 @@ describe("Codex Desktop post-filter reasoning projection", () => {
           description: reasoningEffort,
         })),
       ]);
-      expect(restored.models[3]).toBe(official);
-      expect(restored.models[4]).toBe(unknown);
+      expect(restored.models).toHaveLength(3);
+      expect(restored.models).not.toContain(official);
+      expect(restored.models).not.toContain(unknown);
     } finally {
       harness.dispose();
     }
@@ -440,6 +442,80 @@ describe("Codex Desktop post-filter reasoning projection", () => {
       harness.state.payload.models[0].enabled = false;
       harness.api.patchModelArray(models, true);
       expect(models).toEqual([]);
+    } finally {
+      harness.dispose();
+    }
+  });
+
+  it("does not treat unknown modelNames as managed catalog rows", () => {
+    const harness = createHarness();
+    try {
+      harness.state.payload = {
+        ...harness.state.payload,
+        modelNames: ["stale-provider-model"],
+      };
+      const models: Record<string, unknown>[] = [
+        { model: "stale-provider-model" },
+      ];
+      harness.api.patchModelArray(models, true, true);
+      expect(models).toEqual([]);
+    } finally {
+      harness.dispose();
+    }
+  });
+
+  it("does not post-filter a cached selection while the catalog is unavailable", () => {
+    const harness = createHarness();
+    try {
+      harness.state.payload = {
+        ...harness.state.payload,
+        catalogAvailable: false,
+        modelNames: [],
+        models: [],
+      };
+      const selection = {
+        models: [{ model: "provider-fetched-model" }],
+        defaultModel: { model: "provider-fetched-model" },
+      };
+      expect(harness.api.restoreCodexCatalogReasoningSelection(key, selection)).toBe(selection);
+    } finally {
+      harness.dispose();
+    }
+  });
+
+  it("repairs an unknown defaultModel to the first retained catalog model", () => {
+    const harness = createHarness();
+    try {
+      const selection = {
+        models: [{ model: "sol-relay", supportedReasoningEfforts: [] }],
+        defaultModel: { model: "provider-fetched-model" },
+      };
+      const restored = harness.api.restoreCodexCatalogReasoningSelection(key, selection);
+      expect(restored.models).toHaveLength(1);
+      expect(restored.defaultModel).toBe(restored.models[0]);
+    } finally {
+      harness.dispose();
+    }
+  });
+
+  it("does not throw when patch inputs are frozen or sealed", () => {
+    const harness = createHarness();
+    try {
+      const frozenModels = Object.freeze([
+        Object.freeze({ model: "sol-relay" }),
+      ]) as unknown as Record<string, unknown>[];
+      expect(() => harness.api.patchModelArray(frozenModels, true)).not.toThrow();
+
+      const sealedModels = Object.seal([
+        { model: "sol-relay" },
+      ]) as unknown as Record<string, unknown>[];
+      expect(() => harness.api.patchModelArray(sealedModels, true)).not.toThrow();
+
+      const frozenModel = Object.freeze({ model: "sol-relay" });
+      const mutableModels = [frozenModel] as unknown as Record<string, unknown>[];
+      expect(() => harness.api.patchModelArray(mutableModels, true)).not.toThrow();
+      expect(mutableModels[0]).not.toBe(frozenModel);
+      expect(mutableModels[0]).toEqual(expect.objectContaining({ model: "sol-relay" }));
     } finally {
       harness.dispose();
     }

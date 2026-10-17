@@ -171,6 +171,8 @@ pub struct CodexModelPickerUnlockResult {
 /// renderer 脚本返回的新版历史目录同步证据。
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct CodexAppCompatibilityEvidence {
+    model_count: usize,
+    app_server_patch_installed: bool,
     history_sync_requested: bool,
     history_catalog_complete: Option<bool>,
     history_catalog_count: Option<usize>,
@@ -373,31 +375,53 @@ pub(crate) fn load_cc_switch_model_catalog_projection(
     let catalog_path = crate::codex_config::get_codex_model_catalog_path();
     let default_model = read_current_codex_default_model();
     let model_provider = read_current_codex_model_provider();
-    let mut candidates = Vec::new();
-
+    // The canonical modelCatalog is authoritative even when it is empty. Do
+    // not reinterpret a top-level array as the canonical schema: accepting it
+    // here can turn a malformed/legacy value into an empty managed catalog.
     if let Ok(catalog) = crate::config::read_json_file::<Value>(&catalog_path) {
-        candidates.push(catalog);
-    }
-
-    let cache_path = crate::codex_config::get_codex_config_dir().join("models_cache.json");
-    if let Ok(cache) = crate::config::read_json_file::<Value>(&cache_path) {
-        if cache.get("etag").and_then(Value::as_str) == Some("cc-switch-model-catalog") {
-            candidates.push(cache);
-        }
-    }
-
-    if let Some(inline_catalog) = read_active_codex_provider_inline_model_catalog() {
-        candidates.push(inline_catalog);
-    }
-
-    for candidate in &candidates {
-        if let Some(projection) = codex_model_catalog_projection_from_value(
-            candidate,
+        if let Some(projection) = codex_model_catalog_projection_from_value_with_shape(
+            &catalog,
             default_model.clone(),
             model_provider.clone(),
+            false,
         ) {
             return Ok(projection);
         }
+    }
+
+    // Fallback sources are best-effort snapshots. An empty fallback must not
+    // prevent a later source (notably the active provider's inline catalog)
+    // from supplying usable models. If every fallback is empty, keep it as an
+    // unavailable projection so the renderer does not apply a strict filter.
+    let mut empty_fallback = None;
+    let cache_path = crate::codex_config::get_codex_config_dir().join("models_cache.json");
+    let mut fallback_candidates = Vec::new();
+    if let Ok(cache) = crate::config::read_json_file::<Value>(&cache_path) {
+        if cache.get("etag").and_then(Value::as_str) == Some("cc-switch-model-catalog") {
+            fallback_candidates.push(cache);
+        }
+    }
+    if let Some(inline_catalog) = read_active_codex_provider_inline_model_catalog() {
+        fallback_candidates.push(inline_catalog);
+    }
+    for candidate in &fallback_candidates {
+        let Some(mut projection) = codex_model_catalog_projection_from_value_with_shape(
+            candidate,
+            default_model.clone(),
+            model_provider.clone(),
+            true,
+        ) else {
+            continue;
+        };
+        if projection.model_names.is_empty() {
+            projection.catalog_available = false;
+            empty_fallback.get_or_insert(projection);
+        } else {
+            return Ok(projection);
+        }
+    }
+    if let Some(projection) = empty_fallback {
+        return Ok(projection);
     }
 
     Err(format!(
@@ -410,13 +434,28 @@ pub(crate) fn load_cc_switch_model_catalog_projection(
 ///
 /// `models: []` 是一个结构上完整且权威的目录，不能继续回退到陈旧缓存；
 /// 只有缺少数组或形状损坏的值才返回 `None`，让调用方尝试下一个来源。
+#[cfg(test)]
 fn codex_model_catalog_projection_from_value(
     catalog: &Value,
     default_model: Option<String>,
     model_provider: Option<String>,
 ) -> Option<CodexModelCatalogProjection> {
-    let has_structural_models_array =
-        catalog.get("models").is_some_and(Value::is_array) || catalog.is_array();
+    codex_model_catalog_projection_from_value_with_shape(
+        catalog,
+        default_model,
+        model_provider,
+        false,
+    )
+}
+
+fn codex_model_catalog_projection_from_value_with_shape(
+    catalog: &Value,
+    default_model: Option<String>,
+    model_provider: Option<String>,
+    allow_top_level_array: bool,
+) -> Option<CodexModelCatalogProjection> {
+    let has_structural_models_array = catalog.get("models").is_some_and(Value::is_array)
+        || (allow_top_level_array && catalog.is_array());
     if !has_structural_models_array {
         return None;
     }
@@ -657,12 +696,10 @@ pub(crate) async fn try_inject_on_candidate_ports(
             if let Ok(evidence) =
                 install_script(websocket_url, &script, launch_timezone.as_deref()).await
             {
-                if evidence.history_sync_requested
-                    || evidence.history_catalog_complete.is_some()
-                    || evidence.all_provider_history_patched
-                {
-                    compatibility_evidence = evidence;
+                if evidence.model_count != catalog.model_names.len() {
+                    continue;
                 }
+                compatibility_evidence = evidence;
                 injected_target.get_or_insert(target);
             }
         }
@@ -686,7 +723,13 @@ pub(crate) async fn try_inject_on_candidate_ports(
             history_catalog_count: compatibility_evidence.history_catalog_count,
             all_provider_history_patched: compatibility_evidence.all_provider_history_patched,
             history_refresh_requested: compatibility_evidence.history_refresh_requested,
-            message: if compatibility_evidence.all_provider_history_patched {
+            message: if !catalog.catalog_available {
+                "Codex App compatibility layer was injected, but no usable CCSwitch catalog was available; existing native model data was left untouched until the catalog can be loaded.".to_string()
+            } else if !compatibility_evidence.app_server_patch_installed
+                && !catalog.model_names.is_empty()
+            {
+                "Codex App compatibility layer ran, but no local app-server request client was discovered; the renderer may require a fresh Codex reload before model visibility updates.".to_string()
+            } else if compatibility_evidence.all_provider_history_patched {
                 "Codex App compatibility layer was injected; all-provider history queries were restored and the native history catalog was refreshed without rewriting history data.".to_string()
             } else if compatibility_evidence.history_sync_requested {
                 "Codex App compatibility layer was injected; the native history catalog sync was requested and model visibility was refreshed.".to_string()
@@ -802,16 +845,20 @@ pub(crate) async fn install_script(
         }
     }
     session.send_command(3, "Page.enable", json!({})).await?;
-    session
+    let registration = session
         .send_command(
             4,
             "Page.addScriptToEvaluateOnNewDocument",
             json!({ "source": script }),
         )
         .await?;
+    let script_identifier = registration
+        .pointer("/result/identifier")
+        .and_then(Value::as_str)
+        .map(ToString::to_string);
     // 只有 Runtime.evaluate 会返回当前 renderer 的执行结果；新文档脚本注册命令只返回
     // identifier，不能用来判断 localThreadCatalog 是否真正触发。
-    let evaluation = session
+    let evaluation = match session
         .send_command(
             5,
             "Runtime.evaluate",
@@ -822,8 +869,37 @@ pub(crate) async fn install_script(
                 "allowUnsafeEvalBlockedByCSP": true
             }),
         )
-        .await?;
-    codex_app_compatibility_evidence_from_evaluation(&evaluation)
+        .await
+    {
+        Ok(evaluation) => evaluation,
+        Err(error) => {
+            if let Some(identifier) = script_identifier.as_deref() {
+                let _ = session
+                    .send_command(
+                        6,
+                        "Page.removeScriptToEvaluateOnNewDocument",
+                        json!({ "identifier": identifier }),
+                    )
+                    .await;
+            }
+            return Err(error);
+        }
+    };
+    match codex_app_compatibility_evidence_from_evaluation(&evaluation) {
+        Ok(evidence) => Ok(evidence),
+        Err(error) => {
+            if let Some(identifier) = script_identifier.as_deref() {
+                let _ = session
+                    .send_command(
+                        6,
+                        "Page.removeScriptToEvaluateOnNewDocument",
+                        json!({ "identifier": identifier }),
+                    )
+                    .await;
+            }
+            Err(error)
+        }
+    }
 }
 
 fn codex_timezone_override_parameters(timezone: &str) -> Value {
@@ -845,6 +921,12 @@ fn codex_app_compatibility_evidence_from_evaluation(
     let value = evaluation
         .pointer("/result/result/value")
         .ok_or_else(|| "Codex App compatibility script returned no value".to_string())?;
+    if value.get("status").and_then(Value::as_str) != Some("ok") {
+        return Err("Codex App compatibility script returned no success status".to_string());
+    }
+    if value.get("patchKey").and_then(Value::as_str) != Some(MODEL_PICKER_PATCH_KEY) {
+        return Err("Codex App compatibility script returned an unexpected patch key".to_string());
+    }
     let history_sync = value.get("historySync").unwrap_or(&Value::Null);
     let history_query_patch = value.get("historyQueryPatch").unwrap_or(&Value::Null);
     let history_hydration_failed = history_query_patch
@@ -852,6 +934,15 @@ fn codex_app_compatibility_evidence_from_evaluation(
         .and_then(Value::as_array)
         .is_some_and(|failures| !failures.is_empty());
     Ok(CodexAppCompatibilityEvidence {
+        model_count: value
+            .get("modelCount")
+            .and_then(Value::as_u64)
+            .and_then(|count| usize::try_from(count).ok())
+            .unwrap_or(0),
+        app_server_patch_installed: value
+            .get("appServerPatchInstalled")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
         history_sync_requested: history_sync
             .get("requested")
             .and_then(Value::as_bool)
@@ -1134,7 +1225,7 @@ fn guardian_v2_compatibility_patch_core_script() -> &'static str {
 /// 覆盖历史线程保存的旧入口标签，使跨 Provider 历史在冷恢复后重新经过 CCSM Router。
 fn app_server_request_normalization_core_script() -> &'static str {
     r#"
-  const appServerRequestPatchVersion = "11";
+  const appServerRequestPatchVersion = "12";
   const appServerRequestClientNeedsPatch = (client) => client?.__ccSwitchModelRequestPatch !== appServerRequestPatchVersion;
   const appServerMethod = (method, params) => method === "send-cli-request-for-host" && params?.method ? String(params.method) : String(method || "");
   const currentModelProvider = () => {
@@ -1962,10 +2053,35 @@ fn build_model_picker_unlock_script(catalog: &CodexModelCatalogProjection) -> St
   // Bump this whenever the injected app-server/request patch changes. The
   // scheduler closure captures those functions; leaving an older interval
   // alive would reapply stale recovery hooks over the new patch.
-  const rendererSchedulerVersion = "7";
+  const rendererSchedulerVersion = "8";
+  const cleanupMessagePatch = () => {{
+    try {{
+      if (typeof state.messagePatchListener === "function")
+        window.removeEventListener("message", state.messagePatchListener, true);
+    }} catch {{}}
+    try {{
+      if (state.messagePatchPatchedDispatchEvent
+          && window.dispatchEvent === state.messagePatchPatchedDispatchEvent
+          && typeof state.messagePatchOriginalDispatchEvent === "function")
+        window.dispatchEvent = state.messagePatchOriginalDispatchEvent;
+    }} catch {{}}
+    state.messagePatchListener = null;
+    state.messagePatchPatchedDispatchEvent = null;
+    state.messagePatchOriginalDispatchEvent = null;
+    state.messagePatchInstalled = false;
+  }};
+  const cleanupReasoningQueryCaches = () => {{
+    if (!(state.reasoningQueryCaches instanceof Map)) return;
+    for (const entry of state.reasoningQueryCaches.values()) {{
+      try {{ entry?.unsubscribe?.(); }} catch {{}}
+    }}
+    state.reasoningQueryCaches.clear();
+  }};
   if (state.rendererSchedulerVersion !== rendererSchedulerVersion) {{
     if (state.interval) clearInterval(state.interval);
     try {{ state.reactRootObserver?.disconnect(); }} catch {{}}
+    cleanupMessagePatch();
+    cleanupReasoningQueryCaches();
     state.interval = null;
     state.runPromise = null;
     state.reactRootObserver = null;
@@ -1975,7 +2091,6 @@ fn build_model_picker_unlock_script(catalog: &CodexModelCatalogProjection) -> St
     state.appServerClients = [];
     state.requestIds = new Map();
     state.modelListRequestScopes = new Map();
-    state.messagePatchInstalled = false;
     state.appServerModuleRetryAt = 0;
     state.scopedAppServerScopes = new Set();
     state.pendingReactNodes = new Set();
@@ -2013,16 +2128,16 @@ fn build_model_picker_unlock_script(catalog: &CodexModelCatalogProjection) -> St
     const prepared = prepareStatsigDynamicConfig(name, config, repairLegacyPollution);
     config = prepared.config;
     if (!prepared.patchModelWhitelist) return config;
+    // An unavailable/empty fallback catalog must never turn the native
+    // Statsig whitelist into an empty list. A structurally valid canonical
+    // empty catalog remains authoritative and is still filtered below.
+    if (state.payload?.catalogAvailable !== true) return config;
     const value = config?.value;
     if (!value || typeof value !== "object") return config;
-    const available = Array.isArray(value.available_models) ? [...value.available_models] : [];
-    let changed = false;
-    for (const name of modelNames()) {{
-      if (!available.includes(name)) {{
-        available.push(name);
-        changed = true;
-      }}
-    }}
+    const available = modelNames();
+    const existingAvailable = Array.isArray(value.available_models) ? value.available_models : [];
+    const changed = existingAvailable.length !== available.length ||
+      existingAvailable.some((name, index) => name !== available[index]);
     const nextValue = {{ ...value, available_models: available, use_hidden_models: false, default_model: modelNames()[0] || value.default_model }};
     if (changed || nextValue.default_model !== value.default_model || value.use_hidden_models !== false) {{
       try {{
@@ -2183,6 +2298,7 @@ fn build_model_picker_unlock_script(catalog: &CodexModelCatalogProjection) -> St
 {app_server_model_list_scope_core}
   const patchModelListResult = (result) => {{
     if (result == null) return false;
+    if (state.payload?.catalogAvailable !== true) return false;
     let changed = false;
      if (Array.isArray(result) && patchModelArray(result, true, true)) changed = true;
      if (Array.isArray(result?.data) && patchModelArray(result.data, true, true)) changed = true;
@@ -2455,9 +2571,11 @@ fn build_model_picker_unlock_script(catalog: &CodexModelCatalogProjection) -> St
       refreshRequested: Boolean(state.historyQueryRefreshCompleted),
       lineageHydration: state.historyLineageHydration || null,
     }};
-    for (const scope of state.scopedAppServerScopes || []) {{
-      try {{ patchCodexModelReasoningQueryCache(scope.queryClient?.getQueryCache()); }}
-      catch (error) {{ recordFailure(error); }}
+    if (state.payload?.catalogAvailable === true) {{
+      for (const scope of state.scopedAppServerScopes || []) {{
+        try {{ patchCodexModelReasoningQueryCache(scope.queryClient?.getQueryCache()); }}
+        catch (error) {{ recordFailure(error); }}
+      }}
     }}
     state.appServerPatchInstalled = patched > 0;
     if (patched > 0 && state.historyQueryRefreshCompleted) {{
@@ -2467,20 +2585,25 @@ fn build_model_picker_unlock_script(catalog: &CodexModelCatalogProjection) -> St
   }};
   const patchMcpModelResponseData = (data) => {{
     if (data?.type !== "mcp-response") return false;
-    const message = data.message || data.response;
-    const requestId = message?.id != null ? String(message.id) : "";
+    // Depending on the Desktop build, the MCP response is either nested under
+    // `message`/`response` or carried directly by the envelope itself.
+    const message = data.message || data.response || data;
+    const requestId = message?.id != null
+      ? String(message.id)
+      : data?.id != null ? String(data.id) : "";
     if (!requestId || !(state.requestIds instanceof Map)) return false;
     const scope = state.requestIds.get(requestId);
     if (!scope) return false;
     state.requestIds.delete(requestId);
     if (!isCurrentModelListScope(scope, null, message?.params || data?.params)) return false;
-    return patchModelListResult(message?.result) || patchModelListResult(message?.result?.data);
+    const result = message?.result ?? data?.result;
+    return patchModelListResult(result) || patchModelListResult(result?.data);
   }};
   const installMessagePatch = () => {{
     if (state.messagePatchInstalled) return;
     state.messagePatchInstalled = true;
     const originalDispatchEvent = window.dispatchEvent;
-    window.dispatchEvent = function ccSwitchPatchedDispatchEvent(event) {{
+    const patchedDispatchEvent = function ccSwitchPatchedDispatchEvent(event) {{
       try {{
         const detail = event?.detail;
         const request = detail?.request;
@@ -2501,9 +2624,14 @@ fn build_model_picker_unlock_script(catalog: &CodexModelCatalogProjection) -> St
       }}
       return originalDispatchEvent.call(this, event);
     }};
-    window.addEventListener("message", (event) => {{
+    const messagePatchListener = (event) => {{
       try {{ patchMcpModelResponseData(event?.data); }} catch (error) {{ recordFailure(error); }}
-    }}, true);
+    }};
+    state.messagePatchOriginalDispatchEvent = originalDispatchEvent;
+    state.messagePatchPatchedDispatchEvent = patchedDispatchEvent;
+    state.messagePatchListener = messagePatchListener;
+    window.dispatchEvent = patchedDispatchEvent;
+    window.addEventListener("message", messagePatchListener, true);
   }};
   const reactFiberKeys = (element) => Object.keys(element || {{}}).filter((key) => key.startsWith("__reactFiber") || key.startsWith("__reactInternalInstance") || key.startsWith("__reactProps"));
   // Codex app-server 会根据 requires_openai_auth 暴露 OAuth 状态；旧配置或缓存状态
@@ -3930,6 +4058,22 @@ mod tests {
     }
 
     #[test]
+    fn canonical_projection_rejects_top_level_arrays_but_inline_fallback_accepts_them() {
+        let legacy_array = json!([{"model": "legacy-model"}]);
+        assert!(codex_model_catalog_projection_from_value(&legacy_array, None, None).is_none());
+
+        let fallback = codex_model_catalog_projection_from_value_with_shape(
+            &legacy_array,
+            None,
+            Some("codex_model_router_v2".to_string()),
+            true,
+        )
+        .expect("inline fallback may use the native array shape");
+        assert_eq!(fallback.model_names, vec!["legacy-model"]);
+        assert!(!fallback.model_names.is_empty());
+    }
+
+    #[test]
     /// 结构上完整的空目录必须阻止陈旧 cache 或内联目录回退。
     fn catalog_projection_preserves_authoritative_empty_and_accepts_malformed_fallback_source() {
         let empty = json!({ "models": [] });
@@ -5024,7 +5168,7 @@ JSON.stringify({
   v6NeedsPatch: appServerRequestClientNeedsPatch({ __ccSwitchModelRequestPatch: "6" }),
   v7NeedsPatch: appServerRequestClientNeedsPatch({ __ccSwitchModelRequestPatch: "7" }),
   v8NeedsPatch: appServerRequestClientNeedsPatch({ __ccSwitchModelRequestPatch: "8" }),
-  currentNeedsPatch: appServerRequestClientNeedsPatch({ __ccSwitchModelRequestPatch: "11" }),
+  currentNeedsPatch: appServerRequestClientNeedsPatch({ __ccSwitchModelRequestPatch: "12" }),
   missingNeedsPatch: appServerRequestClientNeedsPatch({}),
   patchVersion: appServerRequestPatchVersion,
 });
@@ -5037,7 +5181,7 @@ JSON.stringify({
         assert_eq!(result["v8NeedsPatch"], true);
         assert_eq!(result["currentNeedsPatch"], false);
         assert_eq!(result["missingNeedsPatch"], true);
-        assert_eq!(result["patchVersion"], "11");
+        assert_eq!(result["patchVersion"], "12");
     }
 
     #[test]
@@ -5367,7 +5511,7 @@ const before = JSON.stringify(filtered);
 const restored = restoreCodexCatalogReasoningSelection(key, filtered);
 JSON.stringify({
   efforts: restored.models.map(model => model.supportedReasoningEfforts.map(level => level.reasoningEffort)),
-  officialUnchanged: restored.models[3] === official,
+  officialUnchanged: restored.models.includes(official),
   sourceUnchanged: JSON.stringify(filtered) === before,
   defaultIdentity: restored.defaultModel === restored.models[0],
   unknownHasDefault: "defaultReasoningEffort" in restored.models[2],
@@ -5381,11 +5525,10 @@ JSON.stringify({
             json!([
                 ["low", "medium", "high", "xhigh", "max", "ultra"],
                 ["low", "medium", "high", "xhigh", "max"],
-                [],
-                ["high"]
+                []
             ])
         );
-        assert_eq!(result["officialUnchanged"], true);
+        assert_eq!(result["officialUnchanged"], false);
         assert_eq!(result["sourceUnchanged"], true);
         assert_eq!(result["defaultIdentity"], true);
         assert_eq!(result["unknownHasDefault"], false);
@@ -5650,12 +5793,12 @@ JSON.stringify({
         assert!(script.contains("107580212"));
         assert!(script.contains("list-models-for-host"));
         assert!(script.contains("model/list"));
-        assert!(script.contains("patchModelArray(result.data, true)"));
+        assert!(script.contains("patchModelArray(result.data, true, true)"));
         assert!(script.contains("isModelListMethod(method)"));
         assert!(script.contains("await installAppServerPatch()"));
         assert!(script.contains("state.requestIds.get(requestId)"));
         assert!(script.contains("__ccSwitchCodexAppCompatibilityV9"));
-        assert!(script.contains("appServerRequestPatchVersion = \"11\""));
+        assert!(script.contains("appServerRequestPatchVersion = \"12\""));
         assert!(script.contains("rehydrateStaleHistoryLineages(manager)"));
         assert!(
             script.contains("state.reactRequestClientPatchVersion = appServerRequestPatchVersion")
@@ -5707,7 +5850,7 @@ JSON.stringify({
     fn codex_app_compatibility_heartbeat_does_not_repeat_full_react_scan() {
         let script = build_model_picker_unlock_script(&CodexModelCatalogProjection::empty());
 
-        assert!(script.contains("const rendererSchedulerVersion = \"7\""));
+        assert!(script.contains("const rendererSchedulerVersion = \"8\""));
         assert!(script
             .contains("patchCodexModelReasoningQueryCache(scope.queryClient?.getQueryCache())"));
         assert!(script.contains("clearInterval(state.interval)"));
@@ -5882,6 +6025,8 @@ void (async () => {{
             "result": {
                 "result": {
                     "value": {
+                        "status": "ok",
+                        "patchKey": MODEL_PICKER_PATCH_KEY,
                         "historySync": {
                             "requested": true,
                             "complete": false,
@@ -5911,6 +6056,8 @@ void (async () => {{
             "result": {
                 "result": {
                     "value": {
+                        "status": "ok",
+                        "patchKey": MODEL_PICKER_PATCH_KEY,
                         "historySync": {"requested": true, "complete": true},
                         "historyQueryPatch": {
                             "patched": true,

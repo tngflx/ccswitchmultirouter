@@ -3182,6 +3182,8 @@ export function buildRouteTrafficRows({
 /// 注意：要让 Codex 请求真正进入路由，仍然必须开启 Codex app takeover，把 Codex live 配置指向本地代理。
 export function CodexRouterWorkspacePage({
   providers,
+  providerLoadError,
+  onRetryProviderLoad,
   proxyStatus,
   isProxyRunning,
   isCodexTakeoverActive,
@@ -3193,6 +3195,8 @@ export function CodexRouterWorkspacePage({
   onCreateProvider,
 }: {
   providers: Provider[];
+  providerLoadError?: string | null;
+  onRetryProviderLoad?: () => void;
   proxyStatus?: ProxyStatus;
   isProxyRunning: boolean;
   isCodexTakeoverActive: boolean;
@@ -3962,6 +3966,27 @@ export function CodexRouterWorkspacePage({
         ref={workspaceScrollRef}
         className="flex min-h-0 flex-1 flex-col gap-4 overflow-y-auto pr-2"
       >
+        {providerLoadError ? (
+          <div
+            role="alert"
+            className="flex items-center justify-between gap-3 rounded-lg border border-amber-300 bg-amber-50 px-4 py-3 text-sm text-amber-900 dark:border-amber-700/60 dark:bg-amber-950/30 dark:text-amber-100"
+          >
+            <span>{providerLoadError}</span>
+            {onRetryProviderLoad ? (
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                className="shrink-0 gap-2"
+                onClick={onRetryProviderLoad}
+                title={tr("common.retry", { defaultValue: "Retry" })}
+              >
+                <RefreshCw className="h-4 w-4" />
+                {tr("common.retry", { defaultValue: "Retry" })}
+              </Button>
+            ) : null}
+          </div>
+        ) : null}
         <HeaderPanel
           onCreatePlan={handleCreatePlan}
           onJump={(tab) => setActiveTab(tab)}

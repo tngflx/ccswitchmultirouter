@@ -38,5 +38,17 @@ describe("normalizeProvidersPayload", () => {
     vi.spyOn(console, "error").mockImplementation(() => undefined);
 
     expect(normalizeProvidersPayload(null)).toEqual({});
+    expect(() =>
+      normalizeProvidersPayload(null, { rejectInvalid: true }),
+    ).toThrow("get_providers returned an invalid payload");
+  });
+
+  it("拒绝只包含无效条目的非空 provider payload", () => {
+    vi.spyOn(console, "error").mockImplementation(() => undefined);
+
+    expect(normalizeProvidersPayload({ broken: null })).toEqual({});
+    expect(() =>
+      normalizeProvidersPayload({ broken: null }, { rejectInvalid: true }),
+    ).toThrow("get_providers returned no valid providers");
   });
 });

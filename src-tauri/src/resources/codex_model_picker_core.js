@@ -33,16 +33,20 @@
     );
     return matches.length === 1 ? matches[0] : null;
   };
+  const catalogNameIsEnabled = (name) => {
+    const row = catalogRowForName(name);
+    return row !== null && row?.enabled !== false;
+  };
   const modelNames = () => {
     const payload = currentPayload();
     const ordered = Array.from(new Set((payload.modelNames || [])
       .filter((name) => typeof name === "string" && name.trim())
       .map((name) => name.trim())))
-      .filter((name) => catalogRowForName(name)?.enabled !== false);
+      .filter(catalogNameIsEnabled);
     if (ordered.length) return ordered;
     if (Array.isArray(payload.modelNames)) return [];
     return typeof payload.defaultModel === "string" && payload.defaultModel.trim() &&
-      catalogRowForName(payload.defaultModel)?.enabled !== false
+      catalogNameIsEnabled(payload.defaultModel)
       ? [payload.defaultModel.trim()]
       : [];
   };
@@ -285,6 +289,34 @@
     }
     return descriptor;
   };
+  const setPropertyIfWritable = (target, key, value) => {
+    if (!target || typeof target !== "object" || Object.isFrozen(target))
+      return false;
+    const property = Object.getOwnPropertyDescriptor(target, key);
+    if (property && "writable" in property && property.writable === false)
+      return false;
+    if (!property && Object.isSealed(target)) return false;
+    if (Object.is(target[key], value)) return false;
+    try {
+      target[key] = value;
+    } catch {
+      return false;
+    }
+    return Object.is(target[key], value);
+  };
+  const mutableModelTarget = (model) => {
+    if (!model || typeof model !== "object") return model;
+    const frozenReasoning = model.reasoning && typeof model.reasoning === "object" &&
+      (Object.isFrozen(model.reasoning) || Object.isSealed(model.reasoning));
+    if (!Object.isFrozen(model) && !Object.isSealed(model) && !frozenReasoning)
+      return model;
+    return {
+      ...model,
+      ...(model.reasoning && typeof model.reasoning === "object"
+        ? { reasoning: { ...model.reasoning } }
+        : {}),
+    };
+  };
   const stringArray = (value) => Array.isArray(value) && value.every((item) => typeof item === "string");
   const modelArray = (value, allowEmpty = false) =>
     Array.isArray(value) &&
@@ -306,12 +338,18 @@
     const changed = models.length !== ordered.length ||
       models.some((name, index) => name !== ordered[index]);
     if (changed) {
-      models.splice(0, models.length, ...ordered);
+      if (Object.isFrozen(models) || Object.isSealed(models)) return false;
+      try {
+        models.splice(0, models.length, ...ordered);
+      } catch {
+        return false;
+      }
     }
     return changed;
   };
   const patchModelArray = (models, allowEmpty = false, managedOnly = false) => {
     if (!modelArray(models, allowEmpty)) return false;
+    if (Object.isFrozen(models) || Object.isSealed(models)) return false;
     const names = modelNames();
     const retired = retiredManagedNames();
     const existing = models.filter((model) =>
@@ -338,12 +376,17 @@
         changed = true;
         continue;
       }
-      used.add(current);
-      if (clearStaleReasoningFields(current, descriptor)) changed = true;
-      for (const [key, value] of Object.entries(descriptor)) {
-        if (assignDescriptorField(current, key, value)) changed = true;
+      const target = mutableModelTarget(current);
+      if (target !== current) {
+        existing[existing.indexOf(current)] = target;
+        changed = true;
       }
-      routedByName.set(normalizedIdentity(name), current);
+      used.add(current);
+      if (clearStaleReasoningFields(target, descriptor)) changed = true;
+      for (const [key, value] of Object.entries(descriptor)) {
+        if (assignDescriptorField(target, key, value)) changed = true;
+      }
+      routedByName.set(normalizedIdentity(name), target);
     }
     // Keep routed models in catalog order (including provider groups) while retaining any
     // unrelated Codex entries after them. Mutate the original array so renderer references live.
@@ -355,7 +398,11 @@
       : existing.filter((model) => !orderedRouted.includes(model));
     const ordered = [...orderedRouted, ...untouched];
     if (models.length !== ordered.length || models.some((model, index) => model !== ordered[index])) {
-      models.splice(0, models.length, ...ordered);
+      try {
+        models.splice(0, models.length, ...ordered);
+      } catch {
+        return false;
+      }
       changed = true;
     }
     return changed;
@@ -364,8 +411,9 @@
     if (!Array.isArray(container?.[key])) return false;
     const names = new Set(modelNames());
     const before = container[key].length;
-    container[key] = container[key].filter((name) => !names.has(name));
-    return before !== container[key].length;
+    const filtered = container[key].filter((name) => !names.has(name));
+    if (before === filtered.length) return false;
+    return setPropertyIfWritable(container, key, filtered);
   };
   const patchNameSet = (setLike, managedOnly = false) => {
     if (!(setLike instanceof Set)) return false;
@@ -409,29 +457,28 @@
     if (removeHiddenNames(value, "hiddenModels")) changed = true;
     if (removeHiddenNames(value, "hidden_models")) changed = true;
     if ("useHiddenModels" in value && value.useHiddenModels !== false) {
-      value.useHiddenModels = false;
-      changed = true;
+      if (setPropertyIfWritable(value, "useHiddenModels", false)) changed = true;
     }
     if ("use_hidden_models" in value && value.use_hidden_models !== false) {
-      value.use_hidden_models = false;
-      changed = true;
+      if (setPropertyIfWritable(value, "use_hidden_models", false)) changed = true;
     }
     if ("default_model" in value && typeof value.default_model === "string" && modelNames().length && !modelNames().includes(value.default_model)) {
-      value.default_model = modelNames()[0];
-      changed = true;
+      if (setPropertyIfWritable(value, "default_model", modelNames()[0])) changed = true;
     }
     if ("defaultModel" in value && value.defaultModel == null && modelNames().length > 0) {
-      value.defaultModel = descriptorFor(modelNames()[0]);
-      changed = true;
+      if (setPropertyIfWritable(value, "defaultModel", descriptorFor(modelNames()[0]))) changed = true;
     }
     return changed;
   };
   const isManagedCodexModelQuery = (key) => {
-    const provider = currentPayload().modelProvider;
+    const payload = currentPayload();
+    const provider = typeof payload.modelProvider === "string"
+      ? payload.modelProvider.trim()
+      : "";
     return Array.isArray(key) &&
       key[0] === "models" && key[1] === "list" && key[2] === "local" &&
       ["chatgpt", "apikey", "no-auth"].includes(key[3]) &&
-      typeof provider === "string" && provider !== "openai" &&
+      payload.catalogAvailable === true && provider !== "openai" &&
       provider.trim().length > 0 && key.slice(5).includes(provider);
   };
   // Desktop filters model/list a second time using app-wide effort preferences
@@ -487,7 +534,8 @@
             ? normalizedIdentity(model.model) === normalizedIdentity(defaultModel.model)
             : visibleIdentitiesIntersect(model, defaultModel));
       if (matching.length === 1) defaultModel = matching[0];
-      else if (isRetiredManagedModel(defaultModel, retired) ||
+      else if (matching.length === 0 ||
+               isRetiredManagedModel(defaultModel, retired) ||
                catalogRowForModel(defaultModel)?.enabled === false)
         defaultModel = models[0];
     }

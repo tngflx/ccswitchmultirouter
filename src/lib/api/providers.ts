@@ -173,8 +173,13 @@ function isRecord(value: unknown): value is Record<string, unknown> {
  */
 export function normalizeProvidersPayload(
   payload: unknown,
+  options: { rejectInvalid?: boolean } = {},
 ): Record<string, Provider> {
+  const rejectInvalid = options.rejectInvalid === true;
   if (!isRecord(payload)) {
+    if (rejectInvalid) {
+      throw new Error("get_providers returned an invalid payload");
+    }
     console.error("[providers] get_providers 返回了非对象 payload", {
       payload,
     });
@@ -182,6 +187,7 @@ export function normalizeProvidersPayload(
   }
 
   const providers: Record<string, Provider> = {};
+  let invalidEntryCount = 0;
   for (const [entryKey, candidate] of Object.entries(payload)) {
     if (
       !isRecord(candidate) ||
@@ -189,6 +195,7 @@ export function normalizeProvidersPayload(
       !candidate.id.trim() ||
       typeof candidate.name !== "string"
     ) {
+      invalidEntryCount += 1;
       console.error("[providers] 已隔离无效 provider 条目", {
         entryKey,
         candidate,
@@ -215,6 +222,17 @@ export function normalizeProvidersPayload(
     } as Provider;
   }
 
+  // A non-empty payload with no usable provider is an IPC contract failure,
+  // not an empty provider catalog. Let the query retain prior data and expose
+  // the error instead of rendering a misleading empty state.
+  if (
+    rejectInvalid &&
+    Object.keys(payload).length > 0 &&
+    invalidEntryCount === Object.keys(payload).length
+  ) {
+    throw new Error("get_providers returned no valid providers");
+  }
+
   return providers;
 }
 
@@ -225,11 +243,13 @@ export const providersApi = {
   async getCodexEditorProviders(): Promise<Record<string, Provider>> {
     return normalizeProvidersPayload(
       await invoke("get_codex_editor_providers"),
+      { rejectInvalid: true },
     );
   },
   async getAll(appId: AppId): Promise<Record<string, Provider>> {
     return normalizeProvidersPayload(
       await invoke<unknown>("get_providers", { app: appId }),
+      { rejectInvalid: true },
     );
   },
 

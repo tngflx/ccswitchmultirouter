@@ -317,7 +317,7 @@ fn collect_candidates<'a>(
                         route.target_provider_id,
                     ),
                 })?;
-        let entries = provider_model_entries(provider);
+        let entries = provider_model_entries(provider)?;
         let selected = match &route.model_selection {
             CodexModelSelection::All => None,
             CodexModelSelection::Include { models } => Some(
@@ -445,15 +445,21 @@ fn provider_display(provider: &Provider) -> String {
     }
 }
 
-fn provider_model_entries(provider: &Provider) -> Vec<&Value> {
-    catalog_models(&provider.settings_config)
-        .map(|models| {
-            models
-                .iter()
-                .filter(|model| model.get("enabled").and_then(Value::as_bool) != Some(false))
-                .collect()
-        })
-        .unwrap_or_default()
+fn provider_model_entries(
+    provider: &Provider,
+) -> Result<Vec<&Value>, CodexRoutingCompileError> {
+    let models =
+        catalog_models(&provider.settings_config).ok_or_else(|| CodexRoutingCompileError {
+            code: "target_provider_catalog_unavailable".to_string(),
+            message: format!(
+                "provider {} has no usable model catalog",
+                provider_display(provider)
+            ),
+        })?;
+    Ok(models
+        .iter()
+        .filter(|model| model.get("enabled").and_then(Value::as_bool) != Some(false))
+        .collect())
 }
 
 fn model_name(model_entry: &Value) -> Option<String> {
@@ -1482,6 +1488,42 @@ mod tests {
         assert_eq!(compiled.visible_models, vec!["qwen-enabled"]);
         assert_eq!(compiled.routes[0].visible_models, vec!["qwen-enabled"]);
         assert_eq!(compiled.spawn_agent_models, vec!["qwen-enabled"]);
+    }
+
+    #[test]
+    fn missing_target_catalog_is_not_compiled_as_an_empty_projection() {
+        let mut provider = provider(
+            "qwen",
+            "Qwen",
+            "openai_responses",
+            json!([{"model": "qwen3.8"}]),
+        );
+        provider
+            .settings_config
+            .as_object_mut()
+            .expect("provider settings object")
+            .remove("modelCatalog");
+
+        let providers = [(provider.id.clone(), provider)].into_iter().collect();
+        let error = compile_v2(
+            &plan(vec![route("router-qwen", "qwen", CodexModelSelection::All)]),
+            &providers,
+        )
+        .expect_err("missing catalog must not compile as empty");
+
+        assert_eq!(error.code, "target_provider_catalog_unavailable");
+    }
+
+    #[test]
+    fn authoritative_empty_target_catalog_compiles_to_empty_projection() {
+        let provider = provider("qwen", "Qwen", "openai_responses", json!([]));
+        let compiled = compile(
+            &plan(vec![route("router-qwen", "qwen", CodexModelSelection::All)]),
+            [provider],
+        );
+
+        assert!(compiled.visible_models.is_empty());
+        assert!(compiled.model_catalog.is_empty());
     }
 
     #[test]
