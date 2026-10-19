@@ -7459,9 +7459,9 @@ describe("Codex MultiRouter workspace route persistence helpers", () => {
           },
         },
       ],
-      lastErrorCode: "projection_stale",
+      lastErrorCode: "projection_live_drift",
       lastError:
-        "Codex MultiRouter projection dependencies changed and regeneration is required",
+        "Codex live catalog, config, cache, or managed Agent files differ from the current Provider-derived projection",
     };
     vi.mocked(
       providersApi.inspectCodexMultiRouterProjection,
@@ -7495,6 +7495,11 @@ describe("Codex MultiRouter workspace route persistence helpers", () => {
         screen.getByText("MultiRouter catalog projection:Pending sync"),
       ).toBeInTheDocument(),
     );
+    expect(plan.settingsConfig.codexRouting.schemaVersion).toBe(2);
+    expect(plan.meta?.apiFormat).toBeUndefined();
+    expect(
+      await screen.findByText(/projection_live_drift/),
+    ).toBeInTheDocument();
     await waitFor(() =>
       expect(screen.getByText("Current active mappings")).toBeInTheDocument(),
     );
@@ -7521,6 +7526,12 @@ describe("Codex MultiRouter workspace route persistence helpers", () => {
       expect(
         screen.getByText("MultiRouter catalog projection:Synchronized"),
       ).toBeInTheDocument(),
+    );
+    expect(
+      screen.queryByRole("button", { name: "Resync catalog" }),
+    ).not.toBeInTheDocument();
+    expect(providersApi.retryCodexMultiRouterProjection).toHaveBeenCalledTimes(
+      1,
     );
   });
 

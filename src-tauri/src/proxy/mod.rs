@@ -25,6 +25,7 @@ mod handlers;
 pub mod http_client;
 pub mod hyper_client;
 pub(crate) mod json_canonical;
+pub(crate) mod listener_address;
 pub mod log_codes;
 pub mod media_sanitizer;
 pub mod model_mapper;

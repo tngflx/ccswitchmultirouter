@@ -90,7 +90,9 @@ recovery fixes and introduced additional cross-layer inconsistencies found below
   not include config source or credential values.
 - Release retains history synchronization and request normalization, including
   provider changes between unmanaged configurations. Reactivation does not nest
-  legacy selector wrappers. Renderer scheduler/request revisions are `10`/`13`.
+  legacy selector wrappers. Renderer runtime and request markers derive from
+  the assembled content fingerprint, so rebuilt integrations invalidate stale
+  hooks without numeric revisions.
 - Fallback-discovered query clients and retained caches are reprojected. Modern
   observer wrappers are restored when disposed. Legacy entries without retained
   originals are reused rather than recursively wrapped during reinjection.
@@ -125,12 +127,14 @@ New source, passing checks, and generated renderer assets do not prove that the
 installed desktop executable was rebuilt or installed. A rebuilt CCSwitch and a
 fresh Codex renderer are required to eliminate preexisting injected closures.
 
-Current revisions track original whitelist values/getters and restore only
-unchanged owned overrides. True legacy v8/v9 sessions may already contain
-whitelist changes whose original values were never recorded. Release does not
-guess or delete those native fields; restoring that legacy baseline may require
-a Codex renderer reload. Native model queries are refetched, and stale catalog
-rows are no longer projected by the released compatibility layer.
+The runtime fingerprint tracks the assembled renderer resources and request
+marker. Original whitelist values/getters are restored only when they are
+still owned by the compatibility layer. True legacy v8/v9 sessions may
+already contain whitelist changes whose original values were never recorded.
+Release does not guess or delete those native fields; restoring that legacy
+baseline may require a Codex renderer reload. Native model queries are
+refetched, and stale catalog rows are no longer projected by the released
+compatibility layer.
 
 ## Verification
 

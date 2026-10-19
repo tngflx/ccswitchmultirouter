@@ -1,9 +1,9 @@
 {
   "version": 1,
   "source": "https://developers.openai.com/api/reference/resources/responses/methods/create.md",
-  "verified_at": "2026-10-14",
+  "verified_at": "2026-10-19",
   "coverage": "Conservative Responses create field types and selected replay invariants; not a complete API or model capability schema.",
-  "declarations_sha256": "d9a20a5e93d4eefaa2c2d8e98f4be3572227c66996cfc00a8b7a267700e0d136",
+  "declarations_sha256": "1f8cfb51b7b9a29e6143ab61255cad5304f60c8cd31f065f1bc0316ac949a79d",
   "top_level_signatures": {
     "access_programs": "optional object { cyber }",
     "background": "optional boolean or null",
@@ -530,7 +530,7 @@
     "10:pattern: string",
     "10:type: \"find_in_page\"",
     "12:\"find_in_page\"",
-    "10:url: string",
+    "10:url: optional string or null",
     "4:FunctionCall object { arguments, call_id, name, 6 more }",
     "6:arguments: string",
     "6:call_id: string",

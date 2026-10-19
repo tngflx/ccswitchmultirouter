@@ -22,7 +22,6 @@ pub(crate) const CDP_HTTP_TIMEOUT: Duration = Duration::from_secs(2);
 const CDP_CONNECT_TIMEOUT: Duration = Duration::from_secs(4);
 const CDP_COMMAND_TIMEOUT: Duration = Duration::from_secs(4);
 const MODEL_PICKER_PATCH_KEY: &str = "__ccSwitchCodexAppCompatibilityV9";
-const MODEL_PICKER_RENDERER_SCHEDULER_VERSION: &str = "10";
 const REMEMBERED_CODEX_DESKTOP_EXECUTABLE_FILENAME: &str = "codex-desktop-executable.json";
 pub(crate) const MANUAL_SUMMARY_REQUEST_MARKER: &str =
     "[CCSwitch internal request: manual-summary-v1]";
@@ -32,8 +31,25 @@ static CODEX_REQUEST_HEALTH_WARNINGS: OnceLock<Mutex<HashMap<String, CodexReques
     OnceLock::new();
 static CODEX_REQUEST_HEALTH_WARNING_SYNC: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 static CODEX_REQUEST_HEALTH_WARNINGS_SUPPRESSED: AtomicBool = AtomicBool::new(false);
+static CODEX_RENDERER_RUNTIME_FINGERPRINT: OnceLock<String> = OnceLock::new();
 #[cfg(any(target_os = "macos", test))]
 const CODEX_DESKTOP_BUNDLE_IDENTIFIER: &str = "com.openai.codex";
+
+fn codex_renderer_runtime_fingerprint() -> &'static str {
+    CODEX_RENDERER_RUNTIME_FINGERPRINT
+        .get_or_init(|| {
+            let mut hasher = Sha256::new();
+            hasher.update(b"ccswitch-codex-renderer-runtime-fingerprint-v2\0");
+            hasher.update(codex_renderer_runtime_template_for_fingerprint().as_bytes());
+            let digest = hasher.finalize();
+            let encoded = digest
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>();
+            format!("sha256-{encoded}")
+        })
+        .as_str()
+}
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -88,11 +104,19 @@ pub(crate) fn hide_codex_request_health_warning(token: &str) {
 }
 
 fn spawn_codex_request_health_warning_sync() {
-    tauri::async_runtime::spawn(async {
-        if let Err(error) = sync_codex_request_health_warnings().await {
-            log::debug!("[RequestHealth] Codex advisory warning was not injected: {error}");
-        }
+    schedule_codex_request_health_warning_sync(|| {
+        tauri::async_runtime::spawn(async {
+            if let Err(error) = sync_codex_request_health_warnings().await {
+                log::debug!("[RequestHealth] Codex advisory warning was not injected: {error}");
+            }
+        });
     });
+}
+
+fn schedule_codex_request_health_warning_sync(spawn_sync: impl FnOnce()) {
+    if crate::config::automatic_codex_desktop_effects_allowed() {
+        spawn_sync();
+    }
 }
 
 async fn sync_codex_request_health_warnings() -> Result<usize, String> {
@@ -173,12 +197,54 @@ pub struct CodexModelPickerUnlockResult {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct CodexAppCompatibilityEvidence {
     model_count: usize,
+    catalog_diagnostics: Option<CodexModelCatalogDiagnostics>,
+    picker_diagnostics: Option<CodexModelPickerDiagnostics>,
+    reasoning_query_cache_count: Option<usize>,
+    catalog_payload_preserved: bool,
     app_server_patch_installed: bool,
     history_sync_requested: bool,
     history_catalog_complete: Option<bool>,
     history_catalog_count: Option<usize>,
     all_provider_history_patched: bool,
     history_refresh_requested: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct CodexModelCatalogDiagnostics {
+    reasoning_model_count: usize,
+    max_effort_model_count: usize,
+    ultra_effort_model_count: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "lowercase")]
+enum CodexModelPickerReadiness {
+    Ready,
+    #[default]
+    Pending,
+    Error,
+    Mismatch,
+    Unverified,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "camelCase")]
+#[serde(default)]
+pub(crate) struct CodexModelPickerDiagnostics {
+    status: CodexModelPickerReadiness,
+    picker_observer_count: usize,
+    success_observer_count: usize,
+    error_observer_count: usize,
+    pending_observer_count: usize,
+    unsupported_observer_count: usize,
+    unreadable_observer_count: usize,
+    effort_mismatch_count: usize,
+    flag_mismatch_count: usize,
+    missing_max_model_count: usize,
+    missing_ultra_model_count: usize,
+    selected_max_model_count: usize,
+    selected_ultra_model_count: usize,
 }
 
 /// 注入脚本需要的模型目录投影，避免把整个 catalog 私有字段泄漏到 renderer。
@@ -230,26 +296,29 @@ pub(crate) struct CdpTarget {
     pub(crate) web_socket_debugger_url: Option<String>,
 }
 
+// A failed managed snapshot must leave the renderer untouched. Only a proven
+// unmanaged config may install an empty payload to release picker ownership.
+fn resolve_codex_model_picker_catalog(
+    outcome: Result<CodexModelCatalogLoadOutcome, String>,
+) -> Result<(CodexModelCatalogProjection, bool), String> {
+    Ok(match outcome? {
+        CodexModelCatalogLoadOutcome::Managed(catalog) => (catalog, false),
+        CodexModelCatalogLoadOutcome::Unmanaged { model_provider } => {
+            let mut projection = CodexModelCatalogProjection::empty();
+            projection.model_provider = model_provider;
+            (projection, true)
+        }
+    })
+}
+
 /// 尝试为当前或新启动的 Codex App 安装 renderer 兼容层。
-/// Summary/restart handoff core for oversized Codex sessions.
 ///
 /// 副作用：
 /// - 若发现已开放 CDP 的 Codex renderer，会触发新版历史目录同步并修复模型菜单；
 /// - 若未发现 CDP 且 Codex 未运行，会以 remote debugging 参数启动 Codex。
 pub async fn unlock_codex_model_picker() -> Result<CodexModelPickerUnlockResult, String> {
-    let (catalog, catalog_released) = match load_cc_switch_model_catalog_projection_outcome() {
-        Ok(CodexModelCatalogLoadOutcome::Managed(catalog)) => (catalog, false),
-        Ok(CodexModelCatalogLoadOutcome::Unmanaged { model_provider }) => {
-            let mut projection = CodexModelCatalogProjection::empty();
-            projection.model_provider = model_provider;
-            (projection, true)
-        }
-        Err(_) => {
-            let mut projection = CodexModelCatalogProjection::empty();
-            projection.model_provider = read_current_codex_model_provider();
-            (projection, false)
-        }
-    };
+    let (catalog, catalog_released) =
+        resolve_codex_model_picker_catalog(load_cc_switch_model_catalog_projection_outcome())?;
     let attempted_ports = candidate_debug_ports(DEFAULT_CODEX_DEBUG_PORT);
 
     if let Some(result) =
@@ -258,12 +327,18 @@ pub async fn unlock_codex_model_picker() -> Result<CodexModelPickerUnlockResult,
         return Ok(result);
     }
 
+    // A renderer target can be reachable over CDP while the compatibility
+    // script is still converging (or while one of its optional discovery
+    // hooks is unavailable). Distinguish that state from a plain Codex launch
+    // with no CDP port so the UI does not tell the user to restart a healthy,
+    // injectable process.
+    let renderer_port = first_codex_renderer_debug_port(&attempted_ports).await;
     let running_main = detect_running_codex_main_process();
     if let Some(running_main) = running_main {
         let remembered = remember_codex_desktop_executable(&running_main).ok();
         return Ok(CodexModelPickerUnlockResult {
             attempted_ports,
-            debug_port: None,
+            debug_port: renderer_port,
             target_id: None,
             target_title: None,
             target_url: None,
@@ -283,7 +358,7 @@ pub async fn unlock_codex_model_picker() -> Result<CodexModelPickerUnlockResult,
             history_catalog_count: None,
             all_provider_history_patched: false,
             history_refresh_requested: false,
-            message: "Codex App is already running without an injectable CDP port. Fully quit Codex, then launch it from CCSwitchMulti so the history catalog and model compatibility layer can be installed.".to_string(),
+            message: codex_renderer_injection_failure_message(renderer_port.is_some()).to_string(),
         });
     }
 
@@ -347,6 +422,26 @@ pub async fn unlock_codex_model_picker() -> Result<CodexModelPickerUnlockResult,
         message: "Codex was launched, but no injectable renderer target appeared before timeout."
             .to_string(),
     }))
+}
+
+async fn first_codex_renderer_debug_port(ports: &[u16]) -> Option<u16> {
+    for port in ports {
+        let Ok(targets) = list_cdp_targets(*port).await else {
+            continue;
+        };
+        if pick_codex_page_targets(&targets, *port).is_ok() {
+            return Some(*port);
+        }
+    }
+    None
+}
+
+fn codex_renderer_injection_failure_message(cdp_target_seen: bool) -> &'static str {
+    if cdp_target_seen {
+        "Codex renderer target detected on a CDP port, but the compatibility layer did not finish installing. Retry the renderer compatibility check before restarting Codex."
+    } else {
+        "Codex App is already running without an injectable CDP port. Fully quit Codex, then launch it from CCSwitchMulti so the history catalog and model compatibility layer can be installed."
+    }
 }
 
 /// 在用户显式开启的“随 CCSwitchMulti 启动 Codex Desktop”设置下启动 Codex。
@@ -501,9 +596,9 @@ fn select_cc_switch_model_catalog_projection(
 
     // Fallback sources are best-effort snapshots. An empty fallback must not
     // prevent a later source (notably the active provider's inline catalog)
-    // from supplying usable models. If every fallback is empty, keep it as an
-    // unavailable projection so the renderer does not apply a strict filter.
-    let mut empty_fallback = None;
+    // from supplying usable models. If every fallback is empty, report a load
+    // failure and retain the existing renderer state until a usable snapshot
+    // is published. Only a canonical empty catalog can clear the picker.
     let mut fallback_candidates = Vec::new();
     if let Some(cache) = cache {
         if cache.get("etag").and_then(Value::as_str) == Some("cc-switch-model-catalog")
@@ -516,7 +611,7 @@ fn select_cc_switch_model_catalog_projection(
         fallback_candidates.push(inline_catalog);
     }
     for candidate in &fallback_candidates {
-        let Some(mut projection) = codex_model_catalog_projection_from_value_with_shape(
+        let Some(projection) = codex_model_catalog_projection_from_value_with_shape(
             candidate,
             default_model.clone(),
             model_provider.clone(),
@@ -524,14 +619,11 @@ fn select_cc_switch_model_catalog_projection(
         ) else {
             continue;
         };
-        if projection.model_names.is_empty() {
-            projection.catalog_available = false;
-            empty_fallback.get_or_insert(projection);
-        } else {
+        if !projection.model_names.is_empty() {
             return Some(projection);
         }
     }
-    empty_fallback
+    None
 }
 
 fn catalog_matches_model_provider(
@@ -591,85 +683,11 @@ fn codex_model_catalog_projection_from_value_with_shape(
 /// injections. A transiently unavailable source may reuse the last complete
 /// catalog for the same provider, but it must never cross a provider boundary.
 fn catalog_payload_selection_core_script() -> &'static str {
-    r#"
-  const normalizedCatalogProvider = (value) =>
-    typeof value === "string" && value.trim() ? value.trim() : null;
-  const selectCatalogPayload = (previousPayload, incomingPayload) => {
-    if (incomingPayload?.catalogReleased === true) return incomingPayload;
-    const incomingProvider = normalizedCatalogProvider(incomingPayload?.modelProvider);
-    const previousProvider = normalizedCatalogProvider(previousPayload?.modelProvider);
-    const preservePreviousCatalog =
-      incomingPayload?.catalogAvailable !== true &&
-      previousPayload?.catalogAvailable === true &&
-      incomingProvider !== null &&
-      incomingProvider === previousProvider;
-    if (!preservePreviousCatalog) return incomingPayload;
-    return {
-      ...incomingPayload,
-      defaultModel: previousPayload.defaultModel,
-      modelNames: Array.isArray(previousPayload.modelNames)
-        ? [...previousPayload.modelNames]
-        : [],
-      models: Array.isArray(previousPayload.models)
-        ? [...previousPayload.models]
-        : [],
-      catalogAvailable: true,
-    };
-  };
-"#
+    include_str!("resources/codex_desktop/catalog_payload_selection.js")
 }
 
 fn app_server_model_list_scope_core_script() -> &'static str {
-    r#"
-  const normalizedHostId = (value) =>
-    typeof value === "string" && value.trim() ? value.trim() : null;
-  const requestHostIds = (client, params) => [
-    client?.hostId,
-    client?.host_id,
-    params?.hostId,
-    params?.host_id,
-    params?.host?.hostId,
-    params?.host?.host_id,
-    params?.params?.hostId,
-    params?.params?.host_id,
-    params?.params?.host?.hostId,
-    params?.params?.host?.host_id,
-  ].map(normalizedHostId).filter(Boolean);
-  const isLocalAppServerTarget = (client, params, sourceIsLocalView = false) => {
-    const hosts = requestHostIds(client, params);
-    return hosts.length > 0
-      ? hosts.every((hostId) => hostId === "local")
-      : sourceIsLocalView;
-  };
-  const currentManagedCatalogProvider = () => {
-    const provider = currentModelProvider();
-    return provider && provider !== "openai" && state.payload?.catalogAvailable === true
-      ? provider
-      : null;
-  };
-  const isModelListMethod = (method) =>
-    method === "list-models-for-host" || method === "model/list";
-  const captureModelListScope = (method, params, client, sourceIsLocalView = false) => {
-    if (!isModelListMethod(method) ||
-        !isLocalAppServerTarget(client, params, sourceIsLocalView)) return null;
-    const provider = currentManagedCatalogProvider();
-    const providers = [
-      params?.modelProvider, params?.model_provider,
-      params?.params?.modelProvider, params?.params?.model_provider,
-    ].map(normalizedCatalogProvider).filter(Boolean);
-    // Current Codex Desktop sends `model/list` without a provider field. The
-    // local app-server client and active catalog already establish the scope;
-    // rejecting this request leaves the picker with an unpatched response.
-    return provider && (!providers.length || providers.every((value) => value === provider))
-      ? { provider, hostId: "local", providerEpoch: state.catalogProviderEpoch || 0 }
-      : null;
-  };
-  const isCurrentModelListScope = (scope, client, params) =>
-    Boolean(scope) &&
-    scope.provider === currentManagedCatalogProvider() &&
-    scope.providerEpoch === (state.catalogProviderEpoch || 0) &&
-    isLocalAppServerTarget(client || scope, params);
-"#
+    include_str!("resources/codex_desktop/app_server_model_list_scope.js")
 }
 
 /// 从当前活动 provider 的 TOML 内联 `models` 读取最后一道模型菜单回退。
@@ -763,18 +781,6 @@ fn project_codex_model_descriptor(entry: &Value, model_name: &str) -> Value {
     Value::Object(object)
 }
 
-/// 读取当前 live Codex Provider，供 renderer 在冷恢复旧任务时覆盖历史 Provider 标签。
-fn read_current_codex_model_provider() -> Option<String> {
-    let text = crate::codex_config::read_codex_config_text().ok()?;
-    let parsed = text.parse::<toml::Value>().ok()?;
-    parsed
-        .get("model_provider")
-        .and_then(toml::Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToString::to_string)
-}
-
 /// 在候选 CDP 端口中寻找 Codex renderer 并安装模型白名单补丁。
 pub(crate) async fn try_inject_on_candidate_ports(
     catalog: &CodexModelCatalogProjection,
@@ -819,6 +825,20 @@ async fn try_inject_on_candidate_ports_with_state(
         let Some(target) = injected_target else {
             continue;
         };
+        let diagnostics = compatibility_evidence.catalog_diagnostics.as_ref();
+        log::info!(
+            "Codex picker catalog payload installed: models={}, reasoning_models={:?}, max_models={:?}, ultra_models={:?}, reasoning_query_caches={:?}, app_server_ready={}, picker_diagnostics={:?}, preserved_previous_payload={}, catalog_fingerprint={}, runtime_fingerprint={}",
+            catalog.model_names.len(),
+            diagnostics.map(|value| value.reasoning_model_count),
+            diagnostics.map(|value| value.max_effort_model_count),
+            diagnostics.map(|value| value.ultra_effort_model_count),
+            compatibility_evidence.reasoning_query_cache_count,
+            compatibility_evidence.app_server_patch_installed,
+            compatibility_evidence.picker_diagnostics,
+            compatibility_evidence.catalog_payload_preserved,
+            catalog.fingerprint(),
+            codex_renderer_runtime_fingerprint(),
+        );
         return Some(CodexModelPickerUnlockResult {
             attempted_ports: ports.to_vec(),
             debug_port: Some(*port),
@@ -895,7 +915,25 @@ pub(crate) async fn list_cdp_targets(debug_port: u16) -> Result<Vec<CdpTarget>, 
 /// Wait for a positive Codex marker before injecting into any renderer.
 pub(crate) fn pick_codex_page_targets(
     targets: &[CdpTarget],
-    _debug_port: u16,
+    debug_port: u16,
+) -> Result<Vec<CdpTarget>, String> {
+    let needs_listener_identity = targets.iter().any(|target| {
+        target.target_type == "page"
+            && target
+                .web_socket_debugger_url
+                .as_deref()
+                .is_some_and(|url| !url.is_empty())
+            && !target_matches_codex_desktop(target, false)
+            && target_matches_codex_desktop(target, true)
+    });
+    let verified_listener =
+        needs_listener_identity && codex_debug_port_has_verified_desktop_listener(debug_port);
+    pick_codex_page_targets_with_listener_identity(targets, verified_listener)
+}
+
+fn pick_codex_page_targets_with_listener_identity(
+    targets: &[CdpTarget],
+    verified_listener: bool,
 ) -> Result<Vec<CdpTarget>, String> {
     let pages = targets.iter().filter(|target| {
         target.target_type == "page"
@@ -906,7 +944,7 @@ pub(crate) fn pick_codex_page_targets(
     });
     let mut codex_pages = Vec::new();
     for target in pages {
-        if target_matches_codex_desktop(target) {
+        if target_matches_codex_desktop(target, verified_listener) {
             codex_pages.push(target.clone());
         }
     }
@@ -916,16 +954,120 @@ pub(crate) fn pick_codex_page_targets(
     Err("No Codex Desktop page target was found on CDP port".to_string())
 }
 
-/// 判断 CDP target 的标题或 URL 是否明确指向 Codex Desktop。
-fn target_matches_codex_desktop(target: &CdpTarget) -> bool {
+/// 判断 CDP target 是否明确指向 Codex Desktop，兼容当前 packaged shell URL。
+fn target_matches_codex_desktop(target: &CdpTarget, verified_listener: bool) -> bool {
     let Ok(url) = url::Url::parse(&target.url) else {
         return false;
     };
     if !matches!(url.scheme(), "app" | "file") {
         return false;
     }
+    // The current packaged Desktop shell serves its renderer from the
+    // scheme-relative `app://-/index.html` URL. Its document title is the
+    // active task title, so it does not contain a stable "Codex" marker.
     let haystack = format!("{} {}", target.title, target.url).to_ascii_lowercase();
     haystack.contains("codex")
+        || (verified_listener
+            && url.scheme() == "app"
+            && url.host_str() == Some("-")
+            && matches!(url.path(), "/" | "/index.html"))
+}
+
+fn parse_cdp_listener_process_ids(output: &str) -> Vec<u32> {
+    output
+        .lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            line.strip_prefix('p').unwrap_or(line).parse::<u32>().ok()
+        })
+        .filter(|pid| *pid != 0)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn cdp_listener_belongs_to_verified_codex_shell(
+    listener_pids: &[u32],
+    processes: &[crate::commands::CodexAppServerProcessDiagnostics],
+) -> bool {
+    !listener_pids.is_empty()
+        && listener_pids.iter().all(|pid| {
+            processes
+                .iter()
+                .any(|process| !process.is_app_server && process.pid == *pid)
+        })
+}
+
+#[cfg(target_os = "windows")]
+fn codex_debug_port_has_verified_desktop_listener(debug_port: u16) -> bool {
+    use std::os::windows::process::CommandExt;
+    let script = format!(
+        "Get-NetTCPConnection -State Listen -LocalPort {debug_port} -ErrorAction SilentlyContinue | Select-Object -ExpandProperty OwningProcess -Unique"
+    );
+    let Ok(output) = Command::new("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+        .creation_flags(0x08000000)
+        .output()
+    else {
+        return false;
+    };
+    if !output.status.success() {
+        return false;
+    }
+    let listener_pids = parse_cdp_listener_process_ids(&String::from_utf8_lossy(&output.stdout));
+    if listener_pids.is_empty() {
+        return false;
+    }
+    let (processes, error) = crate::commands::query_codex_processes();
+    error.is_none() && cdp_listener_belongs_to_verified_codex_shell(&listener_pids, &processes)
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn codex_debug_port_has_verified_desktop_listener(debug_port: u16) -> bool {
+    let Some(output) = command_stdout_trimmed(Command::new("lsof").args([
+        "-nP",
+        "-a",
+        &format!("-iTCP:{debug_port}"),
+        "-sTCP:LISTEN",
+        "-Fp",
+    ])) else {
+        return false;
+    };
+    let listener_pids = parse_cdp_listener_process_ids(&output);
+    !listener_pids.is_empty()
+        && listener_pids.into_iter().all(|pid| {
+            let Some(args) = command_stdout_trimmed(Command::new("ps").args([
+                "-p",
+                &pid.to_string(),
+                "-o",
+                "args=",
+            ])) else {
+                return false;
+            };
+            if args.split_whitespace().any(|arg| {
+                let arg = arg.trim_matches('"');
+                arg == "--type" || arg.starts_with("--type=")
+            }) {
+                return false;
+            }
+            #[cfg(target_os = "linux")]
+            let executable = std::fs::read_link(format!("/proc/{pid}/exe")).ok();
+            #[cfg(target_os = "macos")]
+            let executable = command_stdout_trimmed(Command::new("ps").args([
+                "-p",
+                &pid.to_string(),
+                "-o",
+                "comm=",
+            ]))
+            .map(PathBuf::from);
+            executable.is_some_and(|path| canonical_codex_desktop_executable_path(&path).is_ok())
+        })
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
+fn codex_debug_port_has_verified_desktop_listener(_debug_port: u16) -> bool {
+    false
 }
 
 /// Patch the current document through CDP. New-document registrations are
@@ -976,11 +1118,12 @@ pub(crate) async fn install_script(
 
 fn codex_renderer_compatibility_probe_script(catalog: &CodexModelCatalogProjection) -> String {
     let payload = serde_json::to_string(catalog).unwrap_or_else(|_| "{}".to_string());
+    let runtime_fingerprint = codex_renderer_runtime_fingerprint();
     let catalog_payload_selection_core = catalog_payload_selection_core_script();
     format!(
         r#"(() => {{
           const state = window[{MODEL_PICKER_PATCH_KEY:?}];
-          if (!state || state.rendererSchedulerVersion !== {MODEL_PICKER_RENDERER_SCHEDULER_VERSION:?}
+          if (!state || state.rendererRuntimeFingerprint !== {runtime_fingerprint:?}
               || !state.interval || !state.messagePatchInstalled) return false;
           {catalog_payload_selection_core}
           const expected = selectCatalogPayload(state.payload, {payload});
@@ -1009,7 +1152,7 @@ pub(crate) async fn codex_renderer_compatibility_is_current(
 
 fn codex_model_picker_release_script(model_provider: Option<&str>) -> String {
     let provider = serde_json::to_string(&model_provider).unwrap_or_else(|_| "null".to_string());
-    let release_core = include_str!("resources/codex_model_picker_release_core.js");
+    let release_core = include_str!("resources/codex_desktop/model_picker_release.js");
     format!(
         r#"(() => {{
       const state = window[{MODEL_PICKER_PATCH_KEY:?}];
@@ -1072,6 +1215,22 @@ fn codex_app_compatibility_evidence_from_evaluation(
             .and_then(Value::as_u64)
             .and_then(|count| usize::try_from(count).ok())
             .unwrap_or(0),
+        catalog_diagnostics: value
+            .get("catalogDiagnostics")
+            .cloned()
+            .and_then(|diagnostics| serde_json::from_value(diagnostics).ok()),
+        picker_diagnostics: value
+            .get("pickerDiagnostics")
+            .cloned()
+            .and_then(|diagnostics| serde_json::from_value(diagnostics).ok()),
+        reasoning_query_cache_count: value
+            .get("reasoningQueryCacheCount")
+            .and_then(Value::as_u64)
+            .and_then(|count| usize::try_from(count).ok()),
+        catalog_payload_preserved: value
+            .get("catalogPayloadPreserved")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
         app_server_patch_installed: value
             .get("appServerPatchInstalled")
             .and_then(Value::as_bool)
@@ -1280,7 +1439,7 @@ fn cdp_command_result(response: Value, method: &str) -> Result<Value, String> {
 /// 先通过明确的模型门特征；不能把 React Fiber、Intl context 或普通 API 对象当成模型
 /// 容器遍历和改写。
 fn model_picker_patch_core_script() -> &'static str {
-    include_str!("resources/codex_model_picker_core.js")
+    include_str!("resources/codex_desktop/model_picker_core.js")
 }
 
 /// The V5 renderer patch accidentally added model-whitelist fields to every
@@ -1290,66 +1449,7 @@ fn model_picker_patch_core_script() -> &'static str {
 /// Keep the repair and exact-error fallback independent from model/history code
 /// so the compatibility boundary can be executed directly in QuickJS tests.
 fn guardian_v2_compatibility_patch_core_script() -> &'static str {
-    r#"
-  const guardianV2DynamicConfigName = "2553103476";
-  const guardianV2FlatFeatureKey = "features.guardianv2";
-  const statsigModelWhitelistConfigName = "107580212";
-  const legacyModelWhitelistFields = ["available_models", "use_hidden_models", "default_model"];
-  const guardianV2Enabled = (value) => value?.enabled === true;
-  const isGuardianV2StructuredValue = (value) => Boolean(value) && typeof value === "object" && !Array.isArray(value);
-  const stripLegacyModelWhitelistPollution = (config) => {
-    const value = config?.value;
-    if (!isGuardianV2StructuredValue(value) || !legacyModelWhitelistFields.some((key) => Object.prototype.hasOwnProperty.call(value, key))) return config;
-    const nextValue = { ...value };
-    for (const key of legacyModelWhitelistFields) delete nextValue[key];
-    return { ...config, value: nextValue };
-  };
-  const patchGuardianV2DynamicConfig = (name, config) => {
-    if (String(name || "") !== guardianV2DynamicConfigName) return config;
-    return stripLegacyModelWhitelistPollution(config);
-  };
-  const prepareStatsigDynamicConfig = (name, config, repairLegacyPollution = false) => {
-    const normalizedName = String(name || "");
-    config = patchGuardianV2DynamicConfig(normalizedName, config);
-    if (normalizedName === statsigModelWhitelistConfigName) {
-      return { config, patchModelWhitelist: true };
-    }
-    return {
-      config: repairLegacyPollution ? stripLegacyModelWhitelistPollution(config) : config,
-      patchModelWhitelist: false,
-    };
-  };
-  const isGuardianV2FeatureTomlError = (error) => {
-    const message = String(error?.message || error || "");
-    return message.includes("FeatureToml") && message.includes("features.guardianv2");
-  };
-  const downgradeGuardianV2Config = (config) => {
-    if (!config || typeof config !== "object" || Array.isArray(config)) return config;
-    let next = config;
-    let changed = false;
-    const flat = config[guardianV2FlatFeatureKey];
-    if (isGuardianV2StructuredValue(flat)) {
-      next = { ...next, [guardianV2FlatFeatureKey]: guardianV2Enabled(flat) };
-      changed = true;
-    }
-    const features = config.features;
-    if (isGuardianV2StructuredValue(features) && isGuardianV2StructuredValue(features.guardianv2)) {
-      if (!changed) next = { ...next };
-      next.features = { ...features, guardianv2: guardianV2Enabled(features.guardianv2) };
-      changed = true;
-    }
-    return changed ? next : config;
-  };
-  const guardianV2FallbackRequestParams = (method, params) => {
-    const wrapped = method === "send-cli-request-for-host" && params?.params && typeof params.params === "object";
-    const requestParams = wrapped ? params.params : params;
-    if (!requestParams || typeof requestParams !== "object" || Array.isArray(requestParams)) return params;
-    const nextConfig = downgradeGuardianV2Config(requestParams.config);
-    if (nextConfig === requestParams.config) return params;
-    const nextRequestParams = { ...requestParams, config: nextConfig };
-    return wrapped ? { ...params, params: nextRequestParams } : nextRequestParams;
-  };
-"#
+    include_str!("resources/codex_desktop/guardian_v2_compatibility.js")
 }
 
 /// App-server 请求兼容核心，同时嵌入 renderer 并由 QuickJS 行为测试直接执行。
@@ -1357,35 +1457,7 @@ fn guardian_v2_compatibility_patch_core_script() -> &'static str {
 /// `thread/list` 继续显式查询所有 Provider；`thread/resume` 则以当前 live Provider
 /// 覆盖历史线程保存的旧入口标签，使跨 Provider 历史在冷恢复后重新经过 CCSM Router。
 fn app_server_request_normalization_core_script() -> &'static str {
-    r#"
-  const appServerRequestPatchVersion = "13";
-  const appServerRequestClientNeedsPatch = (client) => client?.__ccSwitchModelRequestPatch !== appServerRequestPatchVersion;
-  const appServerMethod = (method, params) => method === "send-cli-request-for-host" && params?.method ? String(params.method) : String(method || "");
-  const currentModelProvider = () => {
-    const value = state.payload?.modelProvider;
-    return typeof value === "string" && value.trim() ? value.trim() : null;
-  };
-  const normalizeAppServerRequestParams = (method, params) => {
-    const actualMethod = appServerMethod(method, params);
-    if (actualMethod === "thread/list") {
-      if (method === "send-cli-request-for-host" && params?.params?.modelProviders == null) {
-        return { ...params, params: { ...(params?.params || {}), modelProviders: [] } };
-      }
-      if (params == null) return { modelProviders: [] };
-      return params?.modelProviders == null ? { ...params, modelProviders: [] } : params;
-    }
-    if (actualMethod !== "thread/resume") return params;
-    const modelProvider = currentModelProvider();
-    if (!modelProvider) return params;
-    if (method === "send-cli-request-for-host") {
-      const requestParams = params?.params;
-      if (!requestParams || typeof requestParams !== "object" || Array.isArray(requestParams) || requestParams.modelProvider === modelProvider) return params;
-      return { ...params, params: { ...requestParams, modelProvider } };
-    }
-    if (!params || typeof params !== "object" || Array.isArray(params) || params.modelProvider === modelProvider) return params;
-    return { ...params, modelProvider };
-  };
-"#
+    include_str!("resources/codex_desktop/app_server_request_normalization.js")
 }
 
 /// Codex Desktop refreshes thread metadata independently from the loaded transcript. After
@@ -1394,196 +1466,20 @@ fn app_server_request_normalization_core_script() -> &'static str {
 /// Rehydrate only idle conversations whose cached path is demonstrably stale; active turns are
 /// deferred so the compatibility layer never interrupts live work.
 fn history_lineage_hydration_core_script() -> &'static str {
-    r#"
-  const normalizedRolloutPath = (value) => typeof value === "string"
-    ? value.replaceAll("\\", "/").replace(/^\/\/?\?\//, "").toLowerCase()
-    : "";
-  const conversationHasActiveTurn = (conversation) => {
-    if (Array.isArray(conversation?.turns)
-        && conversation.turns.some((turn) => turn?.status === "inProgress")) return true;
-    const history = conversation?.turnHistory?.kind === "canonical"
-      ? conversation.turnHistory.history
-      : null;
-    const entities = history?.entitiesByKey;
-    return entities && typeof entities === "object"
-      ? Object.values(entities).some((turn) => turn?.status === "inProgress")
-      : false;
-  };
-  const canonicalHistoryIsFragmented = (conversation) => {
-    const history = conversation?.turnHistory?.kind === "canonical"
-      ? conversation.turnHistory.history
-      : null;
-    return history?.isComplete !== true
-      && Array.isArray(history?.islands)
-      && history.islands.length > 1;
-  };
-  const planHistoryLineageRehydration = (manager) => {
-    const repair = [];
-    const deferred = [];
-    const conversations = typeof manager?.getCachedConversations === "function"
-      ? manager.getCachedConversations()
-      : [];
-    const metadata = manager?.threadStore?.threadsById;
-    for (const conversation of Array.isArray(conversations) ? conversations : []) {
-      const id = typeof conversation?.id === "string" ? conversation.id : "";
-      if (!id || !metadata || typeof metadata.get !== "function") continue;
-      const currentPath = normalizedRolloutPath(conversation.rolloutPath);
-      const activePath = normalizedRolloutPath(metadata.get(id)?.path);
-      if (!activePath) continue;
-      const pathChanged = currentPath !== activePath;
-      if (!pathChanged && !canonicalHistoryIsFragmented(conversation)) continue;
-      const streaming = typeof manager?.isConversationStreaming === "function"
-        && manager.isConversationStreaming(id);
-      if (streaming || conversationHasActiveTurn(conversation)) deferred.push(id);
-      else repair.push(id);
-    }
-    return { repair, deferred };
-  };
-  const rehydrateStaleHistoryLineages = async (manager) => {
-    const plan = planHistoryLineageRehydration(manager);
-    const repaired = [];
-    const failed = [];
-    for (const id of plan.repair) {
-      const previous = manager.getConversation(id);
-      const activePath = manager.threadStore.threadsById.get(id)?.path;
-      try {
-        manager.updateConversationState(id, (conversation) => {
-          conversation.rolloutPath = activePath;
-          conversation.turns = [];
-          // Codex 26.901 renders canonical turnHistory when present. Clearing only the
-          // legacy turns overlay leaves the stale islands visible and causes resume to
-          // merge the new tail into the broken cache instead of replacing it.
-          delete conversation.turnHistory;
-          conversation.turnsPagination = {
-            olderCursor: null,
-            oldestLoadedTurnId: null,
-            isLoadingOlder: false,
-            hasLoadedOldest: false,
-          };
-          conversation.resumeState = "needs_resume";
-        });
-        const resume = await manager.resumeConversationForUnavailableOwner({
-          conversationId: id,
-          model: null,
-          serviceTier: null,
-          reasoningEffort: null,
-          workspaceRoots: previous?.cwd ? [previous.cwd] : ["/"],
-          collaborationMode: previous?.latestCollaborationMode || null,
-        });
-        if (resume?.status === "not-ready") {
-          throw new Error(`Codex App could not resume history: ${String(resume.reason || "not-ready")}`);
-        }
-        // Resume intentionally hydrates only the newest page for paginated histories.
-        // Ask Codex's own pagination layer to close every remaining boundary so a
-        // fragmented middle cannot remain hidden behind a stale virtual-list island.
-        if (typeof manager.getCompleteConversationTurns === "function") {
-          await manager.getCompleteConversationTurns(id);
-        }
-        repaired.push(id);
-      } catch (error) {
-        if (previous) manager.setConversation(previous);
-        failed.push({ id, error: String(error?.message || error) });
-      }
-    }
-    return { repaired, deferred: plan.deferred, failed };
-  };
-"#
+    include_str!("resources/codex_desktop/history_lineage_hydration.js")
 }
 
 /// Locate real request clients from legacy signals or the current app-shared
 /// scoped registry. Declared descriptors exclude RPC proxies, and retained app
 /// scopes let each heartbeat observe a replaced client without scanning React.
 fn app_server_module_client_discovery_core_script() -> &'static str {
-    include_str!("resources/codex_client_discovery_core.js")
+    include_str!("resources/codex_desktop/client_discovery.js")
 }
 
 fn request_health_warning_core_script(suppressed: bool) -> String {
     let suppressed = if suppressed { "true" } else { "false" };
-    (r###"
-  state.requestHealthWarningsSuppressed = {suppressed};
-  const requestHealthWarningStorageKey = "ccswitch-request-health-warnings-v1";
-  const requestHealthWarningContainerId = "ccswitch-request-health-warning-container";
-  const readStoredRequestHealthWarnings = () => {
-    try {
-      const stored = JSON.parse(localStorage.getItem(requestHealthWarningStorageKey) || "[]");
-      return Array.isArray(stored) ? stored : [];
-    } catch { return []; }
-  };
-  const renderRequestHealthWarnings = (warnings) => {
-    if (state.requestHealthWarningsSuppressed) {
-      try { localStorage.removeItem(requestHealthWarningStorageKey); } catch {}
-      document.getElementById(requestHealthWarningContainerId)?.remove();
-      if (state.requestHealthWarningExpiryTimer) clearTimeout(state.requestHealthWarningExpiryTimer);
-      state.requestHealthWarningExpiryTimer = null;
-      return { active: 0 };
-    }
-    const now = Date.now();
-    const active = (Array.isArray(warnings) ? warnings : [])
-      .filter((warning) => warning && String(warning.token || "").trim() && Number(warning.expiresAtMs) > now)
-      .sort((left, right) => Number(left.expiresAtMs) - Number(right.expiresAtMs));
-    try {
-      if (active.length) localStorage.setItem(requestHealthWarningStorageKey, JSON.stringify(active));
-      else localStorage.removeItem(requestHealthWarningStorageKey);
-    } catch {}
-    let container = document.getElementById(requestHealthWarningContainerId);
-    if (!active.length) {
-      container?.remove();
-      if (state.requestHealthWarningExpiryTimer) clearTimeout(state.requestHealthWarningExpiryTimer);
-      state.requestHealthWarningExpiryTimer = null;
-      return { active: 0 };
-    }
-    if (!container) {
-      container = document.createElement("section");
-      container.id = requestHealthWarningContainerId;
-      container.setAttribute("role", "status");
-      container.setAttribute("aria-live", "assertive");
-      Object.assign(container.style, { position: "fixed", top: "16px", right: "16px", zIndex: "2147483647", display: "grid", gap: "8px", width: "min(420px, calc(100vw - 32px))", maxHeight: "calc(100vh - 32px)", overflowY: "auto", pointerEvents: "none", fontFamily: "system-ui, sans-serif" });
-      (document.body || document.documentElement).appendChild(container);
-    }
-    const activeTokens = new Set(active.map((warning) => String(warning.token)));
-    for (const existing of container.querySelectorAll("[data-ccswitch-request-health-token]")) {
-      if (!activeTokens.has(String(existing.getAttribute("data-ccswitch-request-health-token")))) existing.remove();
-    }
-    for (const warning of active) {
-      const token = String(warning.token);
-      let card = Array.from(container.querySelectorAll("[data-ccswitch-request-health-token]")).find((candidate) => candidate.getAttribute("data-ccswitch-request-health-token") === token);
-      if (!card) {
-        card = document.createElement("article");
-        card.setAttribute("data-ccswitch-request-health-token", token);
-        Object.assign(card.style, { border: "1px solid rgba(245, 158, 11, .65)", borderRadius: "10px", background: "rgba(24, 24, 27, .96)", color: "#fafafa", boxShadow: "0 18px 48px rgba(0,0,0,.38)", padding: "12px 14px", lineHeight: "1.4", pointerEvents: "none" });
-        container.appendChild(card);
-      }
-      card.replaceChildren();
-      const title = document.createElement("strong");
-      title.textContent = String(warning.title || "Request paused for approval");
-      const detail = document.createElement("div");
-      detail.textContent = String(warning.detail || "");
-      const instruction = document.createElement("div");
-      instruction.textContent = String(warning.instruction || "");
-      Object.assign(instruction.style, { marginTop: "7px", fontSize: "12px", fontWeight: "600", color: "#fbbf24" });
-      card.append(title, detail, instruction);
-    }
-    if (state.requestHealthWarningExpiryTimer) clearTimeout(state.requestHealthWarningExpiryTimer);
-    const nextExpiry = Math.min(...active.map((warning) => Number(warning.expiresAtMs)));
-    state.requestHealthWarningExpiryTimer = setTimeout(() => {
-      if (!state.requestHealthWarningsSuppressed) {
-        renderRequestHealthWarnings(readStoredRequestHealthWarnings());
-      }
-    }, Math.max(50, nextExpiry - now + 25));
-    return { active: active.length };
-  };
-  state.syncRequestHealthWarnings = (warnings, suppressed = state.requestHealthWarningsSuppressed) => {
-    state.requestHealthWarningsSuppressed = Boolean(suppressed);
-    return renderRequestHealthWarnings(warnings);
-  };
-  if (state.requestHealthWarningsSuppressed) {
-    try { localStorage.removeItem(requestHealthWarningStorageKey); } catch {}
-    renderRequestHealthWarnings([]);
-  } else {
-    renderRequestHealthWarnings(readStoredRequestHealthWarnings());
-  }
-"###)
-        .replace("{suppressed}", suppressed)
+    include_str!("resources/codex_desktop/request_health_warning.js")
+        .replace("__CCSWITCH_REQUEST_HEALTH_SUPPRESSED__", suppressed)
 }
 
 pub(crate) fn manual_summary_request_prompt() -> String {
@@ -1605,187 +1501,7 @@ pub(crate) fn manual_summary_request_prompt() -> String {
 fn summary_handoff_core_script() -> String {
     let prompt = serde_json::to_string(&manual_summary_request_prompt())
         .expect("serialize manual summary request prompt");
-    (r#"
-  const rememberHandoffClient = (client) => {
-    if (!client || typeof client.sendRequest !== "function") return;
-    state.appServerClients = Array.isArray(state.appServerClients) ? state.appServerClients : [];
-    if (!state.appServerClients.includes(client)) state.appServerClients.push(client);
-  };
-  const readExactHandoffThread = async (client, threadId, includeTurns) => {
-    const response = await client.sendRequest("thread/read", { threadId, includeTurns });
-    const thread = response?.thread || response;
-    const returnedThreadId = String(thread?.id || "").trim();
-    if (returnedThreadId !== threadId) {
-      throw new Error(returnedThreadId
-        ? `Codex returned the wrong task ${returnedThreadId} instead of ${threadId}`
-        : `Codex did not return task ${threadId}`);
-    }
-    return thread;
-  };
-  const discoverHandoffClients = async () => {
-    try { await installAppServerPatch(); } catch (error) { recordFailure(error); }
-    const clients = (Array.isArray(state.appServerClients) ? state.appServerClients : [])
-      .filter((client, index, array) => client && typeof client.sendRequest === "function" && array.indexOf(client) === index);
-    if (!clients.length) throw new Error("Codex Desktop request client was not found");
-    return clients;
-  };
-  const extractAssistantText = (value, seen = new WeakSet()) => {
-    if (!value || typeof value !== "object") return [];
-    if (seen.has(value)) return [];
-    seen.add(value);
-    if (Array.isArray(value)) return value.flatMap((item) => extractAssistantText(item, seen));
-    const type = String(value.type || "").toLowerCase();
-    const role = String(value.role || "").toLowerCase();
-    const own = (role === "assistant" || type === "agentmessage" || type === "assistant_message")
-      ? [value.text, value.content].flatMap((item) => typeof item === "string" ? [item] : extractAssistantText(item, seen)).filter(Boolean)
-      : [];
-    return [...own, ...Object.values(value).flatMap((item) => extractAssistantText(item, seen))];
-  };
-  const runSummarizeSession = async (threadId) => {
-    const normalizedThreadId = String(threadId || "").trim();
-    if (!normalizedThreadId) throw new Error("A Codex thread id is required");
-    const clients = await discoverHandoffClients();
-    let lastError = null;
-    for (const client of clients) {
-      let mutationAttempted = false;
-      try {
-        const idleDeadline = Date.now() + 30000;
-        let before = null;
-        const interrupted = new Set();
-        while (Date.now() < idleDeadline) {
-          before = await readExactHandoffThread(client, normalizedThreadId, true);
-          if (String(before?.status?.type || "") !== "active") break;
-          const active = [...(before?.turns || [])].reverse().find((turn) => String(turn?.status || "") === "inProgress");
-          const activeTurnId = String(active?.id || "").trim();
-          if (activeTurnId && !interrupted.has(activeTurnId)) {
-            interrupted.add(activeTurnId);
-            mutationAttempted = true;
-            await client.sendRequest("turn/interrupt", { threadId: normalizedThreadId, turnId: activeTurnId });
-          }
-          await new Promise((resolve) => setTimeout(resolve, 250));
-        }
-        if (String(before?.status?.type || "") === "active") throw new Error("Timed out interrupting the source turn");
-        mutationAttempted = true;
-        const started = await client.sendRequest("turn/start", {
-          threadId: normalizedThreadId,
-          input: [{ type: "text", text: __CCSWITCH_MANUAL_SUMMARY_PROMPT__ }],
-        });
-        const summaryTurnId = String(started?.turn?.id || started?.turnId || started?.turn_id || "").trim();
-        if (!summaryTurnId) throw new Error("Codex did not return the manual summary turn id");
-        const deadline = Date.now() + 120000;
-        while (Date.now() < deadline) {
-          await new Promise((resolve) => setTimeout(resolve, 750));
-          const current = await readExactHandoffThread(client, normalizedThreadId, true);
-          const turn = (current?.turns || []).find((candidate) => candidate?.id === summaryTurnId);
-          const status = String(turn?.status || "").toLowerCase();
-          if (status === "completed") {
-            const summary = [...new Set(extractAssistantText(turn))].map((value) => String(value).trim()).filter(Boolean).join("\n").trim();
-            if (!summary) throw new Error("Codex completed without a manual handoff summary");
-            return { summary };
-          }
-          if (status === "failed" || status === "interrupted") throw new Error(`Manual summary turn ${status}`);
-        }
-        throw new Error("Timed out waiting for the manual handoff summary");
-      } catch (error) {
-        if (mutationAttempted) throw error;
-        lastError = error;
-      }
-    }
-    throw lastError || new Error("Codex Desktop could not summarize the session");
-  };
-  const verifyFreshHandoff = (thread, source, newThreadId, phase) => {
-    if (String(thread?.id || "").trim() !== newThreadId) throw new Error(`Codex returned the wrong fresh task during ${phase}`);
-    if (String(thread?.projectId || "").trim() !== String(source.projectId || "").trim()) throw new Error(`Fresh session ${phase} changed project ownership`);
-    if (source.cwd && String(thread?.cwd || "").replace(/\//g, "\\").replace(/\\+$/, "").toLowerCase() !== String(source.cwd).replace(/\//g, "\\").replace(/\\+$/, "").toLowerCase()) throw new Error(`Fresh session ${phase} changed workspace`);
-    for (const field of ["model", "modelProvider", "reasoningEffort"]) {
-      if (source[field] != null && JSON.stringify(thread?.[field]) !== JSON.stringify(source[field])) throw new Error(`Fresh session ${phase} changed ${field}`);
-    }
-    return String(thread?.name || "").trim();
-  };
-  const runFreshSessionFromSummary = async (sourceThreadId, summary) => {
-    const sourceId = String(sourceThreadId || "").trim();
-    const handoffSummary = String(summary || "").trim();
-    if (!sourceId) throw new Error("A Codex source thread id is required");
-    if (!handoffSummary) throw new Error("The manual handoff summary is empty");
-    const clients = await discoverHandoffClients();
-    let lastError = null;
-    for (const client of clients) {
-      let mutationAttempted = false;
-      try {
-        const source = await readExactHandoffThread(client, sourceId, false);
-        const startParams = { config: { model_reasoning_effort: String(source?.reasoningEffort || "medium") } };
-        for (const key of ["cwd", "model", "modelProvider"]) if (source?.[key]) startParams[key] = source[key];
-        mutationAttempted = true;
-        const started = await client.sendRequest("thread/start", startParams);
-        let fresh = started?.thread || started;
-        const newThreadId = String(fresh?.id || started?.threadId || started?.thread_id || "").trim();
-        if (!newThreadId || newThreadId === sourceId) throw new Error("Codex did not create a fresh root session");
-        if (fresh?.forkedFromId || fresh?.forked_from_id) throw new Error("Codex created a fork instead of a fresh root session");
-        fresh = await readExactHandoffThread(client, newThreadId, false);
-        let freshName = verifyFreshHandoff(fresh, source, newThreadId, "before acknowledgement");
-        if (!freshName) {
-          await client.sendRequest("thread/name/set", { threadId: newThreadId, name: `Handoff - ${String(source?.name || "continued task").trim()}`.slice(0, 120) });
-          fresh = await readExactHandoffThread(client, newThreadId, false);
-          freshName = verifyFreshHandoff(fresh, source, newThreadId, "after naming");
-        }
-        const acknowledged = await client.sendRequest("turn/start", {
-          threadId: newThreadId,
-          input: [{ type: "text", text: [
-            "Fresh-session handoff from an oversized prior task.",
-            "Use the summary below as reference context only. Do not execute its action items or call tools in this acknowledgement turn; wait for the user's next instruction.",
-            handoffSummary,
-          ].join("\n") }],
-        });
-        const turnId = String(acknowledged?.turn?.id || acknowledged?.turnId || acknowledged?.turn_id || "").trim();
-        if (!turnId) throw new Error("Codex did not return the fresh-session handoff turn id");
-        const deadline = Date.now() + 120000;
-        while (Date.now() < deadline) {
-          await new Promise((resolve) => setTimeout(resolve, 750));
-          const current = await readExactHandoffThread(client, newThreadId, true);
-          const turn = (current?.turns || []).find((candidate) => candidate?.id === turnId);
-          const status = String(turn?.status || "").toLowerCase();
-          if (status === "completed") {
-            freshName = verifyFreshHandoff(current, source, newThreadId, "after acknowledgement") || freshName;
-            try { await triggerLocalThreadCatalogSync(); } catch (error) { recordFailure(error); }
-            return { newThreadId, turnId, name: freshName };
-          }
-          if (status === "failed" || status === "interrupted") throw new Error(`Fresh-session handoff turn ${status}`);
-        }
-        throw new Error("Timed out waiting for the fresh-session handoff");
-      } catch (error) {
-        if (mutationAttempted) throw error;
-        lastError = error;
-      }
-    }
-    throw lastError || new Error("Codex Desktop could not create the fresh handoff session");
-  };
-  state.summarizeJobs = state.summarizeJobs || {};
-  state.startSummarizeSession = (threadId) => {
-    const id = String(threadId || "").trim();
-    if (!id) throw new Error("A Codex thread id is required");
-    const existing = Object.entries(state.summarizeJobs).find(([, job]) => job?.threadId === id && job?.status === "pending");
-    if (existing) return { started: true, jobId: existing[0] };
-    const jobId = `${id}:${Date.now()}:${Math.random().toString(16).slice(2)}`;
-    state.summarizeJobs[jobId] = { status: "pending", threadId: id };
-    void runSummarizeSession(id).then((result) => { state.summarizeJobs[jobId] = { ...state.summarizeJobs[jobId], ...result, status: "completed" }; }, (error) => { state.summarizeJobs[jobId] = { ...state.summarizeJobs[jobId], status: "failed", reason: String(error?.message || error) }; });
-    return { started: true, jobId };
-  };
-  state.readSummarizeJob = (jobId) => state.summarizeJobs[String(jobId || "")] || null;
-  state.freshSessionJobs = state.freshSessionJobs || {};
-  state.startFreshSessionFromSummary = (sourceThreadId, summary) => {
-    const sourceId = String(sourceThreadId || "").trim();
-    const handoffSummary = String(summary || "").trim();
-    if (!sourceId) throw new Error("A Codex source thread id is required");
-    if (!handoffSummary) throw new Error("The manual handoff summary is empty");
-    const existing = Object.entries(state.freshSessionJobs).find(([, job]) => job?.sourceThreadId === sourceId && job?.status === "pending");
-    if (existing) return { started: true, jobId: existing[0] };
-    const jobId = `${sourceId}:${Date.now()}:${Math.random().toString(16).slice(2)}`;
-    state.freshSessionJobs[jobId] = { status: "pending", sourceThreadId: sourceId };
-    void runFreshSessionFromSummary(sourceId, handoffSummary).then((result) => { state.freshSessionJobs[jobId] = { ...state.freshSessionJobs[jobId], ...result, status: "completed" }; }, (error) => { state.freshSessionJobs[jobId] = { ...state.freshSessionJobs[jobId], status: "failed", reason: String(error?.message || error) }; });
-    return { started: true, jobId };
-  };
-  state.readFreshSessionJob = (jobId) => state.freshSessionJobs[String(jobId || "")] || null;
-"#)
+    include_str!("resources/codex_desktop/summary_handoff.js")
         .replace("__CCSWITCH_MANUAL_SUMMARY_PROMPT__", &prompt)
 }
 
@@ -2023,7 +1739,7 @@ pub(crate) struct CodexContinuationResult {
 }
 
 fn codex_continuation_core_script() -> &'static str {
-    include_str!("resources/codex_continuation_core.js")
+    include_str!("resources/codex_desktop/continuation.js")
 }
 
 /// Submit a literal `continue` to the exact failed Codex thread through the
@@ -2160,696 +1876,128 @@ fn build_model_picker_unlock_script(catalog: &CodexModelCatalogProjection) -> St
     build_model_picker_unlock_script_with_state(catalog, false)
 }
 
+/// Assemble the exact renderer program that is injected through CDP.
+///
+/// The same assembly path is used for the runtime fingerprint and for the
+/// live payload. Keeping these paths together means slot wiring and fragment
+/// ordering changes invalidate the installed renderer automatically; they do
+/// not require another hand-maintained scheduler number.
+fn assemble_codex_renderer_runtime_script(
+    catalog_payload: &str,
+    catalog_released: bool,
+    request_health_warning_suppressed: bool,
+    runtime_fingerprint: &str,
+) -> String {
+    let catalog_payload_selection_core = catalog_payload_selection_core_script();
+    let app_server_model_list_scope_core = app_server_model_list_scope_core_script();
+    let model_patch_core = model_picker_patch_core_script();
+    let query_cache_lifecycle_core =
+        include_str!("resources/codex_desktop/model_picker_cache_lifecycle.js");
+    let model_picker_release_core = include_str!("resources/codex_desktop/model_picker_release.js");
+    let model_picker_diagnostics_core =
+        include_str!("resources/codex_desktop/model_picker_diagnostics.js");
+    let guardian_v2_patch_core = guardian_v2_compatibility_patch_core_script();
+    let request_normalization_core = app_server_request_normalization_core_script();
+    let history_lineage_hydration_core = history_lineage_hydration_core_script();
+    let module_client_discovery_core = app_server_module_client_discovery_core_script();
+    let request_health_warning_core =
+        request_health_warning_core_script(request_health_warning_suppressed);
+    let summary_handoff_core = summary_handoff_core_script();
+    let codex_continuation_core = codex_continuation_core_script();
+
+    // Resolve executable fragments before inserting opaque provider metadata.
+    include_str!("resources/codex_desktop/renderer_runtime.js")
+        .replace(
+            "/*__CCSWITCH_CATALOG_PAYLOAD_SELECTION_CORE__*/",
+            catalog_payload_selection_core,
+        )
+        .replace(
+            "/*__CCSWITCH_MODEL_PICKER_RELEASE_CORE__*/",
+            model_picker_release_core,
+        )
+        .replace(
+            "/*__CCSWITCH_QUERY_CACHE_LIFECYCLE_CORE__*/",
+            query_cache_lifecycle_core,
+        )
+        .replace("/*__CCSWITCH_MODEL_PATCH_CORE__*/", model_patch_core)
+        .replace(
+            "/*__CCSWITCH_GUARDIAN_V2_PATCH_CORE__*/",
+            guardian_v2_patch_core,
+        )
+        .replace(
+            "/*__CCSWITCH_REQUEST_NORMALIZATION_CORE__*/",
+            request_normalization_core,
+        )
+        .replace(
+            "/*__CCSWITCH_HISTORY_LINEAGE_HYDRATION_CORE__*/",
+            history_lineage_hydration_core,
+        )
+        .replace(
+            "/*__CCSWITCH_MODULE_CLIENT_DISCOVERY_CORE__*/",
+            module_client_discovery_core,
+        )
+        .replace(
+            "/*__CCSWITCH_MODEL_PICKER_DIAGNOSTICS_CORE__*/",
+            model_picker_diagnostics_core,
+        )
+        .replace(
+            "/*__CCSWITCH_REQUEST_HEALTH_WARNING_CORE__*/",
+            &request_health_warning_core,
+        )
+        .replace(
+            "/*__CCSWITCH_SUMMARY_HANDOFF_CORE__*/",
+            &summary_handoff_core,
+        )
+        .replace(
+            "/*__CCSWITCH_CODEX_CONTINUATION_CORE__*/",
+            codex_continuation_core,
+        )
+        .replace(
+            "/*__CCSWITCH_APP_SERVER_MODEL_LIST_SCOPE_CORE__*/",
+            app_server_model_list_scope_core,
+        )
+        .replace(
+            "__CCSWITCH_CATALOG_RELEASED__",
+            if catalog_released { "true" } else { "false" },
+        )
+        .replace(
+            "__CCSWITCH_PATCH_KEY__",
+            &serde_json::to_string(MODEL_PICKER_PATCH_KEY).expect("serialize renderer patch key"),
+        )
+        .replace(
+            "__CCSWITCH_RENDERER_RUNTIME_FINGERPRINT__",
+            &serde_json::to_string(runtime_fingerprint)
+                .expect("serialize renderer runtime fingerprint"),
+        )
+        .replace("__CCSWITCH_CATALOG_PAYLOAD__", catalog_payload)
+}
+
+fn codex_renderer_runtime_template_for_fingerprint() -> String {
+    // Keep a valid, deterministic payload in the template so the fingerprint
+    // covers the final assembled program without including the live catalog.
+    assemble_codex_renderer_runtime_script(
+        r#"{"__ccswitch_catalog_slot__":true}"#,
+        false,
+        false,
+        "__ccswitch_runtime_fingerprint_slot__",
+    )
+}
+
 fn build_model_picker_unlock_script_with_state(
     catalog: &CodexModelCatalogProjection,
     catalog_released: bool,
 ) -> String {
     let payload = serde_json::to_string(catalog).unwrap_or_else(|_| "{}".to_string());
-    let catalog_payload_selection_core = catalog_payload_selection_core_script();
-    let app_server_model_list_scope_core = app_server_model_list_scope_core_script();
-    let model_patch_core = model_picker_patch_core_script();
-    let query_cache_lifecycle_core =
-        include_str!("resources/codex_model_picker_cache_lifecycle.js");
-    let model_picker_release_core = include_str!("resources/codex_model_picker_release_core.js");
-    let guardian_v2_patch_core = guardian_v2_compatibility_patch_core_script();
-    let request_normalization_core = app_server_request_normalization_core_script();
-    let history_lineage_hydration_core = history_lineage_hydration_core_script();
-    let module_client_discovery_core = app_server_module_client_discovery_core_script();
+    let runtime_fingerprint = codex_renderer_runtime_fingerprint();
     let settings = crate::settings::get_settings();
     let request_health_warning_suppressed = CODEX_REQUEST_HEALTH_WARNINGS_SUPPRESSED
         .load(Ordering::Acquire)
         || !crate::settings::request_health_windows_notifications_active(&settings.request_health);
-    let request_health_warning_core =
-        request_health_warning_core_script(request_health_warning_suppressed);
-    let summary_handoff_core = summary_handoff_core_script();
-    let codex_continuation_core = codex_continuation_core_script();
-    format!(
-        r#"
-(async () => {{
-  const incomingPayload = {payload};
-  if ({catalog_released}) incomingPayload.catalogReleased = true;
-  const patchKey = "{MODEL_PICKER_PATCH_KEY}";
-  const state = window[patchKey] || {{}};
-{catalog_payload_selection_core}
-  const previousPayload = state.payload;
-{model_picker_release_core}
-  if (incomingPayload?.catalogReleased === true) releaseCodexModelPicker(incomingPayload.modelProvider);
-  const payload = selectCatalogPayload(state.payload, incomingPayload);
-  const preservePreviousCatalog =
-    payload !== incomingPayload && payload?.catalogAvailable === true;
-  const installationGeneration = (state.runtimeGeneration || 0) + 1;
-  state.runtimeGeneration = installationGeneration;
-  if (state.interval) clearInterval(state.interval);
-  state.interval = null;
-  state.catalogReleased = incomingPayload?.catalogReleased === true;
-  if (previousPayload?.catalogAvailable === true && !state.modelPickerStatsigOverrides)
-    state.modelPickerLegacyStatsigBaselineUnavailable = true;
-  // Bump this whenever the injected app-server/request patch changes. The
-  // scheduler closure captures those functions; leaving an older interval
-  // alive would reapply stale recovery hooks over the new patch.
-  const rendererSchedulerVersion = "{MODEL_PICKER_RENDERER_SCHEDULER_VERSION}";
-  let reasoningQueryCachesToRebind = [];
-{query_cache_lifecycle_core}
-  const cleanupMessagePatch = () => {{
-    try {{
-      if (typeof state.messagePatchListener === "function")
-        window.removeEventListener("message", state.messagePatchListener, true);
-    }} catch {{}}
-    try {{
-      if (state.messagePatchPatchedDispatchEvent
-          && window.dispatchEvent === state.messagePatchPatchedDispatchEvent
-          && typeof state.messagePatchOriginalDispatchEvent === "function")
-        window.dispatchEvent = state.messagePatchOriginalDispatchEvent;
-    }} catch {{}}
-    state.messagePatchListener = null;
-    state.messagePatchPatchedDispatchEvent = null;
-    state.messagePatchOriginalDispatchEvent = null;
-    state.messagePatchInstalled = false;
-  }};
-  if (state.rendererSchedulerVersion !== rendererSchedulerVersion || previousPayload?.catalogReleased === true) {{
-    if (state.interval) clearInterval(state.interval);
-    try {{ state.reactRootObserver?.disconnect(); }} catch {{}}
-    cleanupMessagePatch();
-    reasoningQueryCachesToRebind = prepareCodexModelReasoningQueryCachesForReinjection();
-    state.interval = null;
-    state.runPromise = null;
-    state.reactRootObserver = null;
-    state.reactDiscoveryPromise = null;
-    // Older discovery admitted dynamic RPC stubs before patching failed. Drop
-    // that registry so continuation can use only declared request clients.
-    state.appServerClients = [];
-    state.requestIds = new Map();
-    state.modelListRequestScopes = new Map();
-    state.appServerModuleRetryAt = 0;
-    state.scopedAppServerScopes = new Set();
-    state.pendingReactNodes = new Set();
-    state.lastReactFullScanAt = 0;
-    state.lastReactIncrementalScanAt = 0;
-    state.reactInitialDiscoveryCompleted = false;
-    state.rendererSchedulerVersion = rendererSchedulerVersion;
-  }}
-  if (normalizedCatalogProvider(previousPayload?.modelProvider) !==
-      normalizedCatalogProvider(payload?.modelProvider)) {{
-    state.catalogProviderEpoch = (state.catalogProviderEpoch || 0) + 1;
-  }}
-  state.payload = payload;
-  state.catalogPayloadPreserved = preservePreviousCatalog;
-  state.requestIds = state.requestIds instanceof Map ? state.requestIds : new Map();
-  state.modelListRequestScopes = state.modelListRequestScopes || new Map();
-  state.modulePromises = state.modulePromises || new Map();
-  state.failures = state.failures || [];
-  state.pendingReactNodes = state.pendingReactNodes || new Set();
-  state.historyManagerCandidates = state.historyManagerCandidates || new Set();
-  const recordFailure = (error) => {{
-    const message = String(error?.message || error);
-    if (state.failures.at(-1) !== message) state.failures.push(message);
-    state.failures = state.failures.slice(-20);
-  }};
-  window[patchKey] = state;
-{model_patch_core}
-  for (const cache of reasoningQueryCachesToRebind) {{
-    try {{ patchCodexModelReasoningQueryCache(cache); }} catch (error) {{ recordFailure(error); }}
-  }}
-{guardian_v2_patch_core}
-{request_normalization_core}
-{history_lineage_hydration_core}
-{module_client_discovery_core}
-{request_health_warning_core}
-{summary_handoff_core}
-{codex_continuation_core}
-  const patchStatsigConfig = (name, config, repairLegacyPollution = false) => {{
-    const prepared = prepareStatsigDynamicConfig(name, config, repairLegacyPollution);
-    config = prepared.config;
-    if (!prepared.patchModelWhitelist) return config;
-    // An unavailable/empty fallback catalog must never turn the native
-    // Statsig whitelist into an empty list. A structurally valid canonical
-    // empty catalog remains authoritative and is still filtered below.
-    if (state.payload?.catalogAvailable !== true) return config;
-    const value = config?.value;
-    if (!value || typeof value !== "object") return config;
-    state.modelPickerStatsigOverrides = state.modelPickerStatsigOverrides || new Map();
-    let owned = state.modelPickerStatsigOverrides.get(config);
-    if (!owned && !state.modelPickerLegacyStatsigBaselineUnavailable) {{
-      owned = {{originalValue: value, projectedValue: null}};
-      state.modelPickerStatsigOverrides.set(config, owned);
-    }}
-    const available = modelNames();
-    const existingAvailable = Array.isArray(value.available_models) ? value.available_models : [];
-    const changed = existingAvailable.length !== available.length ||
-      existingAvailable.some((name, index) => name !== available[index]);
-    const nextValue = {{ ...value, available_models: available, use_hidden_models: false, default_model: modelNames()[0] || value.default_model }};
-    if (changed || nextValue.default_model !== value.default_model || value.use_hidden_models !== false) {{
-      try {{
-        config.value = nextValue;
-        if (owned) owned.projectedValue = nextValue;
-      }} catch {{
-        return {{ ...config, value: nextValue }};
-      }}
-    }}
-    return config;
-  }};
-  const statsigClients = () => {{
-    const root = window.__STATSIG__ || globalThis.__STATSIG__;
-    if (!root || typeof root !== "object") return [];
-    const clients = [root.firstInstance, typeof root.instance === "function" ? root.instance() : null];
-    if (root.instances && typeof root.instances === "object") clients.push(...Object.values(root.instances));
-    return clients.filter((client, index, array) => client && typeof client === "object" && array.indexOf(client) === index);
-  }};
-  const patchStatsig = () => {{
-    for (const client of statsigClients()) {{
-      if (typeof client.getDynamicConfig !== "function") continue;
-      if (client.__ccSwitchStatsigPatchVersion !== "3") {{
-        const repairingLegacyPatch = client.__ccSwitchModelWhitelistPatched === true;
-        const original = client.__ccSwitchOriginalGetDynamicConfig || client.getDynamicConfig.bind(client);
-        client.__ccSwitchOriginalGetDynamicConfig = original;
-        const patched = (name, options) => patchStatsigConfig(name, original(name, options), repairingLegacyPatch);
-        client.getDynamicConfig = patched;
-        state.modelPickerStatsigGetters = state.modelPickerStatsigGetters || new Map();
-        state.modelPickerStatsigGetters.set(client, {{original, patched}});
-        client.__ccSwitchStatsigPatchVersion = "3";
-      }}
-      try {{ patchStatsigConfig("107580212", client.getDynamicConfig("107580212", {{ disableExposureLog: true }})); }} catch {{}}
-      try {{ patchStatsigConfig(guardianV2DynamicConfigName, client.getDynamicConfig(guardianV2DynamicConfigName, {{ disableExposureLog: true }})); }} catch {{}}
-    }}
-  }};
-  const visibleAssetUrls = () => [
-      ...Array.from(document.scripts || []).map((script) => script.src),
-      ...Array.from(document.querySelectorAll("link[href]") || []).map((link) => link.href),
-      ...performance.getEntriesByType("resource").map((entry) => entry.name),
-    ].filter((url, index, urls) => Boolean(url) && urls.indexOf(url) === index);
-  const assetUrl = async (namePart) => {{
-    const urls = visibleAssetUrls();
-    const direct = urls.find((url) => url.includes("/assets/") && url.includes(namePart) && url.split("?")[0].endsWith(".js"));
-    if (direct) return direct;
-
-    // Newer Codex builds keep only index-*.js visible and reference rpc/app chunks
-    // from the Vite dependency table. Follow those same-origin module references
-    // instead of depending on one hashed filename or Performance API behavior.
-    const inspected = new Set();
-    for (let index = 0; index < urls.length && index < 32; index += 1) {{
-      const url = urls[index];
-      if (!url || inspected.has(url) || !url.split("?")[0].endsWith(".js")) continue;
-      inspected.add(url);
-      let source = "";
-      try {{
-        source = await fetch(url).then((response) => response.ok ? response.text() : "");
-      }} catch {{}}
-      for (const match of source.matchAll(/["'](\.\/[^"']+\.js)["']/g)) {{
-        const candidate = new URL(match[1], url).href;
-        if (candidate.includes(namePart)) return candidate;
-        if (!urls.includes(candidate)) urls.push(candidate);
-      }}
-    }}
-    return "";
-  }};
-  const loadAppModule = async (namePart) => {{
-    if (!state.modulePromises.has(namePart)) {{
-      state.modulePromises.set(namePart, Promise.resolve().then(async () => {{
-        const url = await assetUrl(namePart);
-        if (!url) throw new Error(`Codex App asset not found: ${{namePart}}`);
-        return await import(url);
-      }}).catch((error) => {{
-        state.modulePromises.delete(namePart);
-        throw error;
-      }}));
-    }}
-    return await state.modulePromises.get(namePart);
-  }};
-  const localCatalogFromModule = (module) => {{
-    // 26.825+ exports both an unresolved RpcPromise (`appHost`) and the
-    // initialized RpcStub (`appServices`). Prefer the initialized service;
-    // otherwise the first shallow export looks valid but fails inside
-    // readStatus/readSnapshot.
-    const initialized = module?.appServices?.localThreadCatalog;
-    if (initialized && typeof initialized.requestStartupSync === "function") return initialized;
-    const roots = Object.values(module).filter((item) => item && (typeof item === "object" || typeof item === "function"));
-    for (const root of roots) {{
-      const catalog = root.localThreadCatalog;
-      if (catalog && typeof catalog.requestStartupSync === "function") return catalog;
-    }}
-    return null;
-  }};
-  const summarizeCatalogStatus = (status, requested) => {{
-    const local = Array.isArray(status?.hosts) ? status.hosts.find((host) => host?.hostId === "local") : null;
-    return {{
-      requested,
-      complete: local?.isComplete ?? null,
-      revision: local?.revision ?? status?.revision ?? null,
-      source: "status",
-    }};
-  }};
-  // 新版 Codex/ChatGPT App 用 localThreadCatalog 保存统一侧边栏目录。这里只调用
-  // App 自己的 RPC 同步服务，不直接改 codex-dev.db 或历史 provider 元数据。
-  const triggerLocalThreadCatalogSync = async () => {{
-    if (state.historySyncPromise) return await state.historySyncPromise;
-    state.historySyncPromise = Promise.resolve().then(async () => {{
-      const module = await loadAppModule("rpc-");
-      const catalog = localCatalogFromModule(module);
-      if (!catalog || typeof catalog.requestStartupSync !== "function") throw new Error("Codex App localThreadCatalog RPC service was not found");
-
-      // 26.825+ exposes readStatus and can report a complete local catalog before
-      // requestStartupSync. Do not wait on a redundant startup sync RPC forever.
-      try {{
-        const status = await catalog.readStatus();
-        const summary = summarizeCatalogStatus(status, false);
-        if (summary.complete === true) {{
-          state.historySync = summary;
-          return summary;
-        }}
-        state.historySync = summarizeCatalogStatus(status, true);
-        Promise.resolve(catalog.requestStartupSync()).then(async () => {{
-          try {{
-            state.historySync = summarizeCatalogStatus(await catalog.readStatus(), true);
-          }} catch (error) {{
-            recordFailure(error);
-          }}
-        }}).catch(recordFailure);
-        return state.historySync;
-      }} catch (error) {{
-        recordFailure(error);
-      }}
-
-      // Older builds expose readSnapshot instead of readStatus. Preserve that
-      // official cold-sweep path as a capability fallback.
-      try {{
-          const before = typeof catalog.readSnapshot === "function" ? await catalog.readSnapshot() : null;
-          await catalog.requestStartupSync();
-          const after = typeof catalog.readSnapshot === "function" ? await catalog.readSnapshot() : null;
-          state.historySync = {{
-            requested: true,
-            beforeCount: Array.isArray(before?.entries) ? before.entries.length : null,
-            afterCount: Array.isArray(after?.entries) ? after.entries.length : null,
-            complete: after?.isComplete ?? null,
-            source: "snapshot",
-          }};
-          if (after?.isComplete !== true) {{
-            setTimeout(() => {{ state.historySyncPromise = null; }}, 10000);
-          }}
-          return state.historySync;
-      }} catch (error) {{
-        recordFailure(error);
-      }}
-      throw new Error("Codex App localThreadCatalog RPC service was not found");
-    }}).catch((error) => {{
-      state.historySync = {{ requested: false, error: String(error?.message || error) }};
-      recordFailure(error);
-      state.historySyncPromise = null;
-      return state.historySync;
-    }});
-    return await state.historySyncPromise;
-  }};
-{app_server_model_list_scope_core}
-  const patchModelListResult = (result) => {{
-    if (result == null) return false;
-    if (state.payload?.catalogAvailable !== true) return false;
-    let changed = false;
-     if (Array.isArray(result) && patchModelArray(result, true, true)) changed = true;
-     if (Array.isArray(result?.data) && patchModelArray(result.data, true, true)) changed = true;
-     if (Array.isArray(result?.models) && patchModelArray(result.models, true, true)) changed = true;
-     if (Array.isArray(result?.result) && patchModelArray(result.result, true, true)) changed = true;
-     if (Array.isArray(result?.result?.data) && patchModelArray(result.result.data, true, true)) changed = true;
-     if (Array.isArray(result?.result?.models) && patchModelArray(result.result.models, true, true)) changed = true;
-     if (Array.isArray(result?.pages?.[0]?.data) && patchModelArray(result.pages[0].data, true, true)) changed = true;
-     if (Array.isArray(result?.message?.result?.data) && patchModelArray(result.message.result.data, true, true)) changed = true;
-     if (Array.isArray(result?.message?.result?.models) && patchModelArray(result.message.result.models, true, true)) changed = true;
-     if (patchModelContainer(result, true)) changed = true;
-    return changed;
-  }};
-  const patchAppServerResult = (method, result, scope, client, params) => {{
-    if (!isModelListMethod(method) || !isCurrentModelListScope(scope, client, params)) return result;
-    patchModelListResult(result);
-    return result;
-  }};
-  const patchRequestClient = (client) => {{
-    if (!client || typeof client.sendRequest !== "function") return false;
-    if (!isLocalAppServerTarget(client, null)) return false;
-    state.appServerClients = Array.isArray(state.appServerClients) ? state.appServerClients : [];
-    if (!state.appServerClients.includes(client)) state.appServerClients.push(client);
-    if (!appServerRequestClientNeedsPatch(client)) return true;
-    try {{
-      const original = client.__ccSwitchOriginalSendRequest || client.sendRequest.bind(client);
-      client.__ccSwitchOriginalSendRequest = original;
-      client.sendRequest = async function ccSwitchPatchedSendRequest(method, params, options) {{
-        rememberCodexUserTurnAction(method, params);
-        const normalizedParams = normalizeAppServerRequestParams(method, params);
-        const actualMethod = appServerMethod(method, params);
-        const modelListScope = captureModelListScope(actualMethod, normalizedParams, client);
-        try {{
-          const result = await original(method, normalizedParams, options);
-          return patchAppServerResult(actualMethod, result, modelListScope, client, normalizedParams);
-        }} catch (error) {{
-          if (!isGuardianV2FeatureTomlError(error)) throw error;
-          const fallbackParams = guardianV2FallbackRequestParams(method, normalizedParams);
-          if (fallbackParams === normalizedParams) throw error;
-          state.guardianV2FallbackCount = (state.guardianV2FallbackCount || 0) + 1;
-          const result = await original(method, fallbackParams, options);
-          return patchAppServerResult(actualMethod, result, modelListScope, client, fallbackParams);
-        }}
-      }};
-      client.__ccSwitchModelRequestPatch = appServerRequestPatchVersion;
-      return true;
-    }} catch (error) {{
-      // rpc-BaVz... also exposes immutable RpcStub objects whose method shape
-      // resembles AppServerRequestClient. Skip them and keep scanning React.
-      recordFailure(error);
-      return false;
-    }}
-  }};
-  const reactRootValue = (value) => {{
-    let current = value;
-    let hops = 0;
-    try {{
-      while (current?.return && hops < 2048) {{
-        current = current.return;
-        hops += 1;
-      }}
-    }} catch {{}}
-    return current || value;
-  }};
-  const appendReactRootsFromNode = (node, values, seen) => {{
-    for (const key of Object.keys(node || {{}})) {{
-      if (!key.startsWith("__reactContainer") && !key.startsWith("__reactFiber") && !key.startsWith("__reactInternalInstance")) continue;
-      const value = reactRootValue(node[key]);
-      if (value && !seen.has(value)) {{
-        seen.add(value);
-        values.push(value);
-      }}
-    }}
-  }};
-  const initialReactNodes = () => [
-    document.getElementById("root") || document.body,
-    document.documentElement,
-  ].filter(Boolean);
-  const drainPendingReactNodes = () => {{
-    const pending = Array.from(state.pendingReactNodes || []);
-    state.pendingReactNodes.clear();
-    return pending;
-  }};
-  const scheduleHistoryLineageHydration = (manager) => {{
-    if (!state.historyQueryRefreshCompleted
-        || state.historyLineageHydrationPromise
-        || state.historyLineageHydrationCompleted
-        || typeof manager?.getCachedConversations !== "function"
-        || typeof manager?.getConversation !== "function"
-        || typeof manager?.updateConversationState !== "function"
-        || typeof manager?.setConversation !== "function"
-        || typeof manager?.resumeConversationForUnavailableOwner !== "function") return;
-    const wallNow = Date.now();
-    if (wallNow < (state.historyLineageHydrationRetryAt || 0)) return;
-    state.historyLineageHydrationRetryAt = wallNow + 30000;
-    state.historyLineageHydrationPromise = Promise.resolve()
-      .then(() => rehydrateStaleHistoryLineages(manager))
-      .then((result) => {{
-        state.historyLineageHydration = result;
-        for (const failure of result.failed || []) recordFailure(failure.error);
-        state.historyLineageHydrationCompleted = (result.deferred || []).length === 0 && (result.failed || []).length === 0;
-        if (state.historyLineageHydrationCompleted) state.historyManagerCandidates.clear();
-        return result;
-      }})
-      .catch((error) => {{
-        state.historyLineageHydration = {{ repaired: [], deferred: [], failed: [{{ error: String(error?.message || error) }}] }};
-        recordFailure(error);
-      }})
-      .finally(() => {{ state.historyLineageHydrationPromise = null; }});
-  }};
-  const yieldReactDiscovery = () => new Promise((resolve) => {{
-    if (typeof globalThis.requestIdleCallback === "function") {{
-      globalThis.requestIdleCallback(() => resolve(), {{ timeout: 50 }});
-    }} else {{
-      setTimeout(resolve, 0);
-    }}
-  }});
-  const monotonicNow = () => typeof performance?.now === "function" ? performance.now() : Date.now();
-  const patchReactAppServerClients = async (startingNodes) => {{
-    if (state.reactDiscoveryPromise) return await state.reactDiscoveryPromise;
-    state.reactDiscoveryPromise = (async () => {{
-      const roots = [];
-      const rootSeen = new Set();
-      const nodeQueue = startingNodes.filter(Boolean);
-      let nodeCursor = 0;
-      while (nodeCursor < nodeQueue.length) {{
-        const sliceDeadline = monotonicNow() + 4;
-        let sliceCount = 0;
-        while (nodeCursor < nodeQueue.length && sliceCount < 800 && monotonicNow() < sliceDeadline) {{
-          sliceCount += 1;
-          const node = nodeQueue[nodeCursor++];
-          appendReactRootsFromNode(node, roots, rootSeen);
-          try {{
-            for (const child of Array.from(node?.childNodes || [])) nodeQueue.push(child);
-          }} catch {{}}
-        }}
-        if (nodeCursor < nodeQueue.length) await yieldReactDiscovery();
-      }}
-
-      const queue = roots.map((value) => ({{ value, depth: 0 }}));
-      const seen = new Set();
-      let cursor = 0;
-      let patched = 0;
-      while (cursor < queue.length && seen.size < 140000) {{
-        const sliceDeadline = monotonicNow() + 4;
-        let sliceCount = 0;
-        while (cursor < queue.length && seen.size < 140000 && sliceCount < 800 && monotonicNow() < sliceDeadline) {{
-          sliceCount += 1;
-          const {{ value, depth }} = queue[cursor++];
-          if (!value || (typeof value !== "object" && typeof value !== "function") || seen.has(value)) continue;
-          seen.add(value);
-
-          patchCodexModelReasoningQueryClient(value);
-          if (looksLikeAppServerRequestClient(value) && patchRequestClient(value)) patched += 1;
-          const nestedClient = value?.requestClient;
-          if (looksLikeAppServerRequestClient(nestedClient) && patchRequestClient(nestedClient)) {{
-            patched += 1;
-            if (state.historyManagerCandidates.size >= 8 && !state.historyManagerCandidates.has(value)) state.historyManagerCandidates.clear();
-            state.historyManagerCandidates.add(value);
-            if (!state.historyQueryRefreshPromise && !state.historyQueryRefreshCompleted && typeof value?.threadStore?.refreshRecentConversations === "function") {{
-              state.historyQueryRefreshPromise = Promise.resolve().then(() =>
-                value.threadStore.refreshRecentConversations({{ mode: "expanded" }})
-              ).then(() => {{
-                state.historyQueryRefreshCompleted = true;
-              }}).catch((error) => {{
-                state.historyQueryRefreshPromise = null;
-                state.historyQueryRefreshCompleted = false;
-                recordFailure(error);
-                throw error;
-              }});
-            }}
-            scheduleHistoryLineageHydration(value);
-          }}
-
-          if (depth >= 14) continue;
-          let descriptors = {{}};
-          try {{ descriptors = Object.getOwnPropertyDescriptors(value); }} catch {{}}
-          for (const [key, descriptor] of Object.entries(descriptors)) {{
-            if (!["window", "ownerDocument", "parentNode", "parentElement", "nextSibling", "previousSibling"].includes(key) && "value" in descriptor) {{
-              const child = descriptor.value;
-              if (child && ((typeof child === "object" && !(typeof Node !== "undefined" && child instanceof Node)) || typeof child === "function")) {{
-                queue.push({{ value: child, depth: depth + 1 }});
-              }}
-            }}
-          }}
-        }}
-        if (cursor < queue.length && seen.size < 140000) await yieldReactDiscovery();
-      }}
-      state.reactRequestClientPatched = state.reactRequestClientPatched || patched > 0;
-      state.historyQueryPatch = {{
-        patched: Boolean(state.reactRequestClientPatched),
-        clientCount: patched,
-        refreshRequested: Boolean(state.historyQueryRefreshCompleted),
-        lineageHydration: state.historyLineageHydration || null,
-      }};
-      return patched;
-    }})().finally(() => {{ state.reactDiscoveryPromise = null; }});
-    return await state.reactDiscoveryPromise;
-  }};
-  const installReactRootObserver = () => {{
-    if (state.reactRootObserver || typeof MutationObserver !== "function") return;
-    const target = document.documentElement || document.body;
-    if (!target) return;
-    state.reactRootObserver = new MutationObserver((records) => {{
-      for (const record of records) {{
-        for (const node of record.addedNodes || []) {{
-          if (!node || (typeof node !== "object" && typeof node !== "function")) continue;
-          state.pendingReactNodes.add(node);
-          if (state.pendingReactNodes.size > 128) {{
-            state.pendingReactNodes.clear();
-            state.pendingReactNodes.add(document.getElementById("root") || document.body);
-          }}
-        }}
-      }}
-    }});
-    state.reactRootObserver.observe(target, {{ childList: true, subtree: true }});
-  }};
-  const installAppServerPatch = async () => {{
-    let patched = 0;
-    let modulePatched = 0;
-    const wallNow = Date.now();
-    if (!state.appServerModuleRetryAt || wallNow >= state.appServerModuleRetryAt) {{
-      try {{
-        // 26.1007+ merges the signal module into app-shared. Discover the
-        // initialized local manager from its declared registry and app scope.
-        try {{
-          const shared = await loadAppModule("app-shared-");
-          modulePatched = await patchCodexScopedAppServerClients(shared);
-        }} catch {{}}
-        if (modulePatched === 0) {{
-          const module = await loadAppModule("app-server-manager-signals-");
-          modulePatched = patchAppServerModuleClients(module);
-        }}
-        patched += modulePatched;
-        state.appServerModuleRetryAt = modulePatched > 0 ? 0 : wallNow + 30000;
-      }} catch (error) {{
-        recordFailure(error);
-        state.appServerModuleRetryAt = wallNow + 30000;
-      }}
-    }}
-    installReactRootObserver();
-    const fullScanDue = !state.reactInitialDiscoveryCompleted
-      || (modulePatched === 0 && wallNow - (state.lastReactFullScanAt || 0) >= 30000);
-    const incrementalScanDue = modulePatched === 0
-      && state.pendingReactNodes.size > 0
-      && wallNow - (state.lastReactIncrementalScanAt || 0) >= 5000;
-    if (fullScanDue) {{
-      state.pendingReactNodes.clear();
-      state.lastReactFullScanAt = wallNow;
-      patched += await patchReactAppServerClients(initialReactNodes());
-      state.reactInitialDiscoveryCompleted = true;
-    }} else if (incrementalScanDue) {{
-      state.lastReactIncrementalScanAt = wallNow;
-      patched += await patchReactAppServerClients(drainPendingReactNodes());
-    }} else if (modulePatched > 0) {{
-      state.pendingReactNodes.clear();
-    }}
-    if (state.historyQueryRefreshPromise) {{
-      try {{
-        await state.historyQueryRefreshPromise;
-      }} catch {{}}
-    }}
-    for (const manager of state.historyManagerCandidates) scheduleHistoryLineageHydration(manager);
-    if (state.historyLineageHydrationPromise) {{
-      try {{
-        await state.historyLineageHydrationPromise;
-      }} catch {{}}
-    }}
-    state.historyQueryPatch = {{
-      ...(state.historyQueryPatch || {{}}),
-      refreshRequested: Boolean(state.historyQueryRefreshCompleted),
-      lineageHydration: state.historyLineageHydration || null,
-    }};
-    if (state.payload?.catalogAvailable === true) {{
-      for (const scope of state.scopedAppServerScopes || []) {{
-        try {{ patchCodexModelReasoningQueryClient(scope.queryClient); }}
-        catch (error) {{ recordFailure(error); }}
-      }}
-      for (const cache of state.reasoningQueryCaches?.keys() || []) {{
-        try {{ patchCodexModelReasoningQueryCache(cache); }}
-        catch (error) {{ recordFailure(error); }}
-      }}
-    }}
-    state.appServerPatchInstalled = patched > 0;
-    if (patched > 0 && state.historyQueryRefreshCompleted) {{
-      state.reactRequestClientPatchVersion = appServerRequestPatchVersion;
-      state.appServerPatchVersion = appServerRequestPatchVersion;
-    }}
-  }};
-  const patchMcpModelResponseData = (data) => {{
-    if (data?.type !== "mcp-response") return false;
-    // Depending on the Desktop build, the MCP response is either nested under
-    // `message`/`response` or carried directly by the envelope itself.
-    const message = data.message || data.response || data;
-    const requestId = message?.id != null
-      ? String(message.id)
-      : data?.id != null ? String(data.id) : "";
-    if (!requestId || !(state.requestIds instanceof Map)) return false;
-    const scope = state.requestIds.get(requestId);
-    if (!scope) return false;
-    state.requestIds.delete(requestId);
-    if (!isCurrentModelListScope(scope, null, message?.params || data?.params)) return false;
-    const result = message?.result ?? data?.result;
-    return patchModelListResult(result) || patchModelListResult(result?.data);
-  }};
-  const installMessagePatch = () => {{
-    if (state.messagePatchInstalled) return;
-    state.messagePatchInstalled = true;
-    const originalDispatchEvent = window.dispatchEvent;
-    const patchedDispatchEvent = function ccSwitchPatchedDispatchEvent(event) {{
-      try {{
-        const detail = event?.detail;
-        const request = detail?.request;
-        if (event?.type === "codex-message-from-view" && detail?.type === "mcp-request" && request?.method === "model/list") {{
-          const viewRequest = {{
-            ...request,
-            hostId: detail?.hostId ?? detail?.host_id ?? request?.hostId ?? request?.host_id,
-          }};
-          const scope = captureModelListScope("model/list", viewRequest, null, true);
-          if (scope) {{
-            request.params = {{ ...(request.params || {{}}), includeHidden: true }};
-            if (request.id != null) state.requestIds.set(String(request.id), scope);
-          }}
-        }}
-        if (event?.type === "message") patchMcpModelResponseData(event.data);
-      }} catch (error) {{
-        recordFailure(error);
-      }}
-      return originalDispatchEvent.call(this, event);
-    }};
-    const messagePatchListener = (event) => {{
-      try {{ patchMcpModelResponseData(event?.data); }} catch (error) {{ recordFailure(error); }}
-    }};
-    state.messagePatchOriginalDispatchEvent = originalDispatchEvent;
-    state.messagePatchPatchedDispatchEvent = patchedDispatchEvent;
-    state.messagePatchListener = messagePatchListener;
-    window.dispatchEvent = patchedDispatchEvent;
-    window.addEventListener("message", messagePatchListener, true);
-  }};
-  const reactFiberKeys = (element) => Object.keys(element || {{}}).filter((key) => key.startsWith("__reactFiber") || key.startsWith("__reactInternalInstance") || key.startsWith("__reactProps"));
-  // Codex app-server 会根据 requires_openai_auth 暴露 OAuth 状态；旧配置或缓存状态
-  // 可能把 renderer 留在非 chatgpt 模式，这里只修复前端 context，不改请求路由。
-  const authContextValueFrom = (element) => {{
-    for (const key of reactFiberKeys(element)) {{
-      for (let fiber = element?.[key]; fiber; fiber = fiber.return) {{
-        for (const value of [fiber.memoizedProps?.value, fiber.pendingProps?.value]) {{
-          if (value && typeof value === "object" && typeof value.setAuthMethod === "function" && "authMethod" in value) return value;
-        }}
-      }}
-    }}
-    return null;
-  }};
-  const spoofChatGPTAuthMethod = (element) => {{
-    const auth = authContextValueFrom(element);
-    if (!auth || auth.authMethod === "chatgpt") return false;
-    try {{
-      auth.setAuthMethod("chatgpt");
-      return true;
-    }} catch (error) {{
-      recordFailure(error);
-      return false;
-    }}
-  }};
-  const patchReactState = () => {{
-    const nodes = [document.body, ...document.querySelectorAll("button, [role='menu'], [role='dialog'], [data-radix-popper-content-wrapper]")].filter(Boolean);
-    for (const node of nodes.slice(0, 220)) {{
-      spoofChatGPTAuthMethod(node);
-    }}
-  }};
-  const run = async () => {{
-    if (state.runtimeGeneration !== installationGeneration) return;
-    if (state.runPromise) return await state.runPromise;
-    state.runPromise = (async () => {{
-      installMessagePatch();
-      await installAppServerPatch();
-      void triggerLocalThreadCatalogSync();
-      if (!state.catalogReleased) patchStatsig();
-      patchReactState();
-    }})().finally(() => {{ state.runPromise = null; }});
-    return await state.runPromise;
-  }};
-  await run();
-  if (state.runtimeGeneration === installationGeneration && !state.interval)
-    state.interval = setInterval(() => {{ void run(); }}, 1500);
-  const historySync = await triggerLocalThreadCatalogSync();
-  return {{ status: "ok", modelCount: modelNames().length, available_models: modelNames(), appServerPatchInstalled: Boolean(state.appServerPatchInstalled), historySync, historyQueryPatch: state.historyQueryPatch || null, patchKey }};
-}})()
-"#
+    assemble_codex_renderer_runtime_script(
+        &payload,
+        catalog_released,
+        request_health_warning_suppressed,
+        runtime_fingerprint,
     )
 }
 
@@ -4059,6 +3207,16 @@ pub(crate) fn installed_codex_desktop_version() -> Option<Vec<u32>> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn unit_tests_do_not_schedule_live_request_health_warning_sync() {
+        let scheduled = std::cell::Cell::new(false);
+        schedule_codex_request_health_warning_sync(|| scheduled.set(true));
+        assert!(
+            !scheduled.get(),
+            "unit tests must not inject warnings into the running Codex app"
+        );
+    }
+
     /// 返回当前测试平台的 Desktop 主程序文件名。
     fn desktop_test_executable_name() -> &'static str {
         if cfg!(target_os = "windows") {
@@ -4365,6 +3523,69 @@ mod tests {
     }
 
     #[test]
+    fn picker_catalog_load_failure_does_not_become_an_empty_installation() {
+        let error = "The active Codex config changed while reading its catalog".to_string();
+        let result = resolve_codex_model_picker_catalog(Err(error.clone()));
+
+        assert_eq!(result.unwrap_err(), error);
+    }
+
+    #[test]
+    fn picker_catalog_resolution_distinguishes_empty_authority_from_unmanaged_release() {
+        let empty = codex_model_catalog_projection_from_value(
+            &json!({"models": []}),
+            None,
+            Some("managed-provider".to_string()),
+        )
+        .expect("authoritative empty catalog");
+        let (managed, released) =
+            resolve_codex_model_picker_catalog(Ok(CodexModelCatalogLoadOutcome::Managed(empty)))
+                .expect("managed empty catalog is usable");
+        assert!(managed.catalog_available);
+        assert!(managed.model_names.is_empty());
+        assert!(!released);
+
+        let (unmanaged, released) =
+            resolve_codex_model_picker_catalog(Ok(CodexModelCatalogLoadOutcome::Unmanaged {
+                model_provider: Some("openai".to_string()),
+            }))
+            .expect("unmanaged config releases picker ownership");
+        assert_eq!(unmanaged.model_provider.as_deref(), Some("openai"));
+        assert!(!unmanaged.catalog_available);
+        assert!(released);
+    }
+
+    #[test]
+    fn catalog_source_selection_does_not_treat_empty_fallbacks_as_usable() {
+        let cache = json!({
+            "etag": "cc-switch-model-catalog",
+            "ccSwitchModelProvider": "current-provider",
+            "models": []
+        });
+        let inline = json!({"models": []});
+        assert!(select_cc_switch_model_catalog_projection(
+            None,
+            Some(&cache),
+            Some(&inline),
+            None,
+            Some("current-provider".into()),
+        )
+        .is_none());
+
+        let inline = json!({"models": [{"model": "current-model"}]});
+        let projection = select_cc_switch_model_catalog_projection(
+            None,
+            Some(&cache),
+            Some(&inline),
+            None,
+            Some("current-provider".into()),
+        )
+        .expect("empty cache must not shadow usable inline models");
+        assert!(projection.catalog_available);
+        assert_eq!(projection.model_names, vec!["current-model"]);
+    }
+
+    #[test]
     fn catalog_payload_selection_preserves_only_same_provider_usable_catalogs() {
         let previous = json!({
             "modelProvider": "codex_model_router_v2",
@@ -4460,7 +3681,7 @@ mod tests {
 
     #[test]
     fn released_model_picker_preserves_history_normalization_and_rejects_old_model_scopes() {
-        let release_core = include_str!("resources/codex_model_picker_release_core.js");
+        let release_core = include_str!("resources/codex_desktop/model_picker_release.js");
         let scope_core = app_server_model_list_scope_core_script();
         let probe = format!(
             r#"
@@ -4499,7 +3720,9 @@ JSON.stringify({{
         );
         assert!(script.contains("if (true) incomingPayload.catalogReleased = true"));
         assert!(script.contains("await installAppServerPatch()"));
-        assert!(script.contains("const historySync = await triggerLocalThreadCatalogSync()"));
+        assert!(script.contains("void triggerLocalThreadCatalogSync()"));
+        assert!(!script.contains("const historySync = await triggerLocalThreadCatalogSync()"));
+        assert!(!script.contains("await catalog.requestStartupSync()"));
         assert!(script.contains("if (!state.catalogReleased) patchStatsig()"));
     }
 
@@ -5513,6 +4736,7 @@ JSON.stringify({
   v8NeedsPatch: appServerRequestClientNeedsPatch({ __ccSwitchModelRequestPatch: "8" }),
   v12NeedsPatch: appServerRequestClientNeedsPatch({ __ccSwitchModelRequestPatch: "12" }),
   currentNeedsPatch: appServerRequestClientNeedsPatch({ __ccSwitchModelRequestPatch: "13" }),
+  standaloneNeedsPatch: appServerRequestClientNeedsPatch({ __ccSwitchModelRequestPatch: "standalone" }),
   missingNeedsPatch: appServerRequestClientNeedsPatch({}),
   patchVersion: appServerRequestPatchVersion,
 });
@@ -5524,9 +4748,10 @@ JSON.stringify({
         assert_eq!(result["v7NeedsPatch"], true);
         assert_eq!(result["v8NeedsPatch"], true);
         assert_eq!(result["v12NeedsPatch"], true);
-        assert_eq!(result["currentNeedsPatch"], false);
+        assert_eq!(result["currentNeedsPatch"], true);
+        assert_eq!(result["standaloneNeedsPatch"], false);
         assert_eq!(result["missingNeedsPatch"], true);
-        assert_eq!(result["patchVersion"], "13");
+        assert_eq!(result["patchVersion"], "standalone");
     }
 
     #[test]
@@ -5665,7 +4890,9 @@ JSON.stringify({
         let script = build_model_picker_unlock_script(&CodexModelCatalogProjection::empty());
 
         assert!(script.contains("const prepared = prepareStatsigDynamicConfig"));
-        assert!(script.contains("client.__ccSwitchStatsigPatchVersion !== \"3\""));
+        assert!(
+            script.contains("client.__ccSwitchStatsigPatchVersion !== rendererRuntimeFingerprint")
+        );
         assert!(script.contains("client.__ccSwitchModelWhitelistPatched === true"));
     }
 
@@ -5682,12 +4909,17 @@ const descriptor = descriptorFor("unknown-third-party");
 JSON.stringify({
   hasDefault: Object.prototype.hasOwnProperty.call(descriptor, "defaultReasoningEffort"),
   hasEfforts: Object.prototype.hasOwnProperty.call(descriptor, "supportedReasoningEfforts"),
+  efforts: descriptor.supportedReasoningEfforts,
 });
 "#,
         );
 
         assert_eq!(result["hasDefault"], false);
-        assert_eq!(result["hasEfforts"], false);
+        // Codex's native model select reads supportedReasoningEfforts unguarded,
+        // so managed rows must expose the canonical empty array. No effort level
+        // is invented: the descriptor still advertises no reasoning capability.
+        assert_eq!(result["hasEfforts"], true);
+        assert_eq!(result["efforts"], json!([]));
     }
 
     #[test]
@@ -5714,6 +4946,7 @@ JSON.stringify(models.map((model) => ({
   model: model.model,
   hasDefault: Object.prototype.hasOwnProperty.call(model, "defaultReasoningEffort"),
   hasEfforts: Object.prototype.hasOwnProperty.call(model, "supportedReasoningEfforts"),
+  efforts: model.supportedReasoningEfforts,
 })));
 "#,
         );
@@ -5724,12 +4957,14 @@ JSON.stringify(models.map((model) => ({
                 {
                     "model": "xiaomi/mimo-v2.6-flash",
                     "hasDefault": false,
-                    "hasEfforts": false
+                    "hasEfforts": true,
+                    "efforts": []
                 },
                 {
                     "model": "xiaomi/mimo-v2.6-pro",
                     "hasDefault": false,
-                    "hasEfforts": false
+                    "hasEfforts": true,
+                    "efforts": []
                 }
             ])
         );
@@ -6003,6 +5238,106 @@ JSON.stringify({cached, idempotent, subscriptions, replacedSelector, changedCata
     }
 
     #[test]
+    fn model_picker_prototype_projects_first_unsubscribed_snapshots_only_for_registered_queries() {
+        let result = run_model_picker_patch_core_probe_with_payload(
+            json!({
+                "modelProvider": "codex_model_router_v2",
+                "modelNames": ["relay"],
+                "models": [{
+                    "model": "relay",
+                    "supported_reasoning_levels": ["low", "medium", "high", "xhigh", "max", "ultra"]
+                }]
+            }),
+            r#"
+const key = ["models", "list", "local", "apikey", 100, "redacted-session-id", "codex_model_router_v2", "catalog.json"];
+const allEfforts = ["low", "medium", "high", "xhigh", "max", "ultra"];
+const data = {data: [{
+  model: "relay",
+  supportedReasoningEfforts: allEfforts.map(reasoningEffort => ({reasoningEffort})),
+}]};
+const before = JSON.stringify(data);
+const select = (raw) => ({models: raw.data.map(model => ({
+  ...model,
+  supportedReasoningEfforts: model.supportedReasoningEfforts.filter(level =>
+    ["low", "medium", "high", "xhigh"].includes(level.reasoningEffort)),
+}))});
+const query = {queryKey: key, queryHash: "same-query-hash", state: {data}};
+const foreignQuery = {queryKey: [...key], queryHash: query.queryHash, state: {data}};
+let cacheSubscriptions = 0;
+let observerSubscriptions = 0;
+const cache = {
+  getAll: () => [query],
+  get: hash => hash === query.queryHash ? query : undefined,
+  subscribe() { cacheSubscriptions += 1; return () => {}; },
+};
+class Observer {
+  constructor(query, options) {
+    this.query = query;
+    this.setOptions(options);
+  }
+  createResult(query, options) {
+    return {data: options.select(query.state.data)};
+  }
+  getCurrentResult() { return this.result; }
+  getCurrentQuery() { return this.query; }
+  getOptimisticResult(options) {
+    this.result = this.createResult(this.query, options);
+    return this.result;
+  }
+  setOptions(options) {
+    this.options = options;
+    this.result = this.createResult(this.query, options);
+  }
+  subscribe() { observerSubscriptions += 1; return () => {}; }
+}
+const patched = patchCodexModelReasoningQueryObserverPrototype(Observer.prototype);
+const cacheRegistered = patchCodexModelReasoningQueryCache(cache);
+const options = {queryKey: key, select};
+const observer = new Observer(query, options);
+const current = observer.getCurrentResult();
+const optimistic = observer.getOptimisticResult(options);
+const foreign = new Observer(foreignQuery, options);
+const foreignCurrent = foreign.getCurrentResult();
+const foreignOptimistic = foreign.getOptimisticResult(options);
+const efforts = result => result.data.models[0].supportedReasoningEfforts.map(level => level.reasoningEffort);
+JSON.stringify({
+  patched,
+  cacheRegistered,
+  current: efforts(current),
+  optimistic: efforts(optimistic),
+  foreignCurrent: efforts(foreignCurrent),
+  foreignOptimistic: efforts(foreignOptimistic),
+  max: current.data.hasModelSupportingMaxReasoningEffort,
+  ultra: current.data.hasModelSupportingUltraReasoningEffort,
+  cacheSubscriptions,
+  observerSubscriptions,
+  noObserverArrays: !("observers" in query) && !("observers" in foreignQuery),
+  rawUnchanged: JSON.stringify(data) === before,
+  sameKeyAndHash: JSON.stringify(query.queryKey) === JSON.stringify(foreignQuery.queryKey) && query.queryHash === foreignQuery.queryHash,
+});
+"#,
+        );
+        assert_eq!(
+            result,
+            json!({
+                "patched": true,
+                "cacheRegistered": true,
+                "current": ["low", "medium", "high", "xhigh", "max", "ultra"],
+                "optimistic": ["low", "medium", "high", "xhigh", "max", "ultra"],
+                "foreignCurrent": ["low", "medium", "high", "xhigh"],
+                "foreignOptimistic": ["low", "medium", "high", "xhigh"],
+                "max": true,
+                "ultra": true,
+                "cacheSubscriptions": 1,
+                "observerSubscriptions": 0,
+                "noObserverArrays": true,
+                "rawUnchanged": true,
+                "sameKeyAndHash": true
+            })
+        );
+    }
+
+    #[test]
     fn model_picker_query_cache_cleanup_restores_owned_observers_before_reinjection() {
         let result = run_model_picker_patch_core_probe_with_payload(
             json!({
@@ -6187,7 +5522,11 @@ JSON.stringify({
         assert!(script.contains("await installAppServerPatch()"));
         assert!(script.contains("state.requestIds.get(requestId)"));
         assert!(script.contains("__ccSwitchCodexAppCompatibilityV9"));
-        assert!(script.contains("appServerRequestPatchVersion = \"13\""));
+        assert!(script.contains(&format!(
+            "const rendererRuntimeFingerprint = {:?}",
+            codex_renderer_runtime_fingerprint()
+        )));
+        assert!(script.contains("typeof rendererRuntimeFingerprint === \"string\""));
         assert!(script.contains("rehydrateStaleHistoryLineages(manager)"));
         assert!(
             script.contains("state.reactRequestClientPatchVersion = appServerRequestPatchVersion")
@@ -6218,7 +5557,9 @@ JSON.stringify({
         assert!(script.contains("localThreadCatalog"));
         assert!(script.contains("requestStartupSync"));
         assert!(script.contains("readStatus"));
-        assert!(script.contains("const historySync = await triggerLocalThreadCatalogSync()"));
+        assert!(script.contains("void triggerLocalThreadCatalogSync()"));
+        assert!(!script.contains("const historySync = await triggerLocalThreadCatalogSync()"));
+        assert!(!script.contains("await catalog.requestStartupSync()"));
         assert!(script.contains("params?.modelProviders == null"));
         assert!(script.contains("if (params == null) return { modelProviders: [] }"));
         assert!(script.contains("modelProviders: []"));
@@ -6227,8 +5568,252 @@ JSON.stringify({
         assert!(!script.contains("document.querySelectorAll(\"*\")"));
         assert!(script.contains("module?.appServices?.localThreadCatalog"));
         assert!(script.contains("fetch(url)"));
-        assert!(script.contains("await state.historyQueryRefreshPromise"));
+        assert!(!script.contains("await state.historyQueryRefreshPromise"));
+        assert!(!script.contains("await state.historyLineageHydrationPromise"));
+        assert!(!script.contains("await state.historySyncPromise"));
+        assert!(!script.contains("await catalog.requestStartupSync()"));
         assert!(script.contains("state.historyQueryRefreshCompleted = true"));
+    }
+
+    #[test]
+    fn codex_app_compatibility_does_not_block_model_picker_on_history_refresh() {
+        let script = build_model_picker_unlock_script(&CodexModelCatalogProjection::empty());
+
+        assert!(script.contains("state.historyQueryRefreshPromise = Promise.resolve()"));
+        assert!(script.contains("state.historyQueryRefreshCompleted = true"));
+        assert!(!script.contains("await state.historyQueryRefreshPromise"));
+        assert!(!script.contains("await state.historyLineageHydrationPromise"));
+        assert!(!script.contains("await state.historySyncPromise"));
+        assert!(!script.contains("const historySync = await triggerLocalThreadCatalogSync()"));
+        assert!(script.contains("void triggerLocalThreadCatalogSync()"));
+        assert!(script.contains(
+            "if (state.runtimeGeneration === installationGeneration && !state.interval)"
+        ));
+    }
+
+    fn renderer_lifecycle_test_setup() -> &'static str {
+        r#"
+globalThis.__historyAttempts = 0;
+globalThis.__delayedDiscovery = [];
+const client = {
+  hostId: "local",
+  sendRequest: async () => ({data: []}),
+  getCompatibleThreadSortKey() {},
+  supportsPaginatedThreadHistory() {},
+};
+const manager = {
+  requestClient: client,
+  threadStore: {
+    refreshRecentConversations: async () => {
+      if (++globalThis.__historyAttempts === 1) throw new Error("temporary history failure");
+    },
+  },
+};
+const root = {
+  childNodes: [],
+  __reactContainerTest: {memoizedProps: {manager}},
+};
+const document = {
+  scripts: [],
+  body: root,
+  documentElement: root,
+  getElementById: id => id === "root" ? root : null,
+  querySelectorAll: () => [],
+};
+const window = {
+  dispatchEvent() {},
+  addEventListener() {},
+  removeEventListener() {},
+};
+const localStorage = {getItem: () => null, setItem() {}, removeItem() {}};
+const performance = {now: () => 0, getEntriesByType: () => []};
+const setInterval = callback => { globalThis.__heartbeat = callback; return 1; };
+const clearInterval = () => {};
+const setTimeout = callback => {
+  if (globalThis.__deferDiscovery) __delayedDiscovery.push(callback);
+  else callback();
+  return 1;
+};
+const clearTimeout = () => {};
+"#
+    }
+
+    #[test]
+    fn reaudit_background_history_failure_is_handled_and_retried_without_stopping_picker() {
+        let runtime = rquickjs::Runtime::new().expect("create JavaScript runtime");
+        let unhandled = std::sync::Arc::new(std::sync::atomic::AtomicIsize::new(0));
+        let rejection_count = unhandled.clone();
+        runtime.set_host_promise_rejection_tracker(Some(Box::new(move |_, _, _, handled| {
+            rejection_count.fetch_add(if handled { -1 } else { 1 }, Ordering::SeqCst);
+        })));
+        let context = rquickjs::Context::full(&runtime).expect("create JavaScript context");
+        let script = assemble_codex_renderer_runtime_script(
+            r#"{"modelProvider":"codex_model_router_v2","catalogAvailable":true,"modelNames":["worker"],"models":[{"model":"worker"}]}"#,
+            false,
+            true,
+            "reaudit-runtime",
+        );
+        let setup = renderer_lifecycle_test_setup();
+        context.with(|ctx| {
+            ctx.eval::<(), _>(format!(
+                "{setup}\nconst installation = {script}\ninstallation.then(value => {{globalThis.__installation = value;}}, error => {{globalThis.__installationError = String(error);}});"
+            ))
+            .expect("start actual renderer runtime");
+        });
+        while runtime.execute_pending_job().expect("run renderer jobs") {}
+        context.with(|ctx| {
+            let status: String = ctx.eval("globalThis.__installation?.status || globalThis.__installationError").unwrap();
+            assert_eq!(status, "ok");
+            let first: Value = serde_json::from_str(
+                &ctx.eval::<String, _>(format!(
+                    "JSON.stringify({{attempts: __historyAttempts, running: Boolean(window[{MODEL_PICKER_PATCH_KEY:?}].interval), failures: window[{MODEL_PICKER_PATCH_KEY:?}].failures}})"
+                )).unwrap()
+            ).unwrap();
+            assert_eq!(first["attempts"], 1);
+            assert_eq!(first["running"], true);
+            assert!(first["failures"].as_array().unwrap().contains(&json!("temporary history failure")));
+        });
+        assert_eq!(
+            unhandled.load(Ordering::SeqCst),
+            0,
+            "optional history work must not leave an unhandled rejection"
+        );
+        context.with(|ctx| {
+            ctx.eval::<(), _>(format!(
+                "window[{MODEL_PICKER_PATCH_KEY:?}].lastReactFullScanAt = 0; __heartbeat();"
+            ))
+            .unwrap();
+        });
+        while runtime.execute_pending_job().expect("run retry jobs") {}
+        context.with(|ctx| {
+            let retried: bool = ctx.eval(format!(
+                "__historyAttempts === 2 && window[{MODEL_PICKER_PATCH_KEY:?}].historyQueryRefreshCompleted === true && Boolean(window[{MODEL_PICKER_PATCH_KEY:?}].interval)"
+            )).unwrap();
+            assert!(retried, "the next discovery pass must retry failed optional history work");
+        });
+        assert_eq!(unhandled.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn picker_scope_discovery_does_not_block_installation_or_heartbeat() {
+        let runtime = rquickjs::Runtime::new().expect("create JavaScript runtime");
+        let context = rquickjs::Context::full(&runtime).expect("create JavaScript context");
+        let payload = r#"{"modelProvider":"codex_model_router_v2","catalogAvailable":true,"modelNames":["worker"],"models":[{"model":"worker","supported_reasoning_levels":["high","max","ultra"]}]}"#;
+        let script =
+            assemble_codex_renderer_runtime_script(payload, false, true, "scoped-discovery-test");
+        let setup = renderer_lifecycle_test_setup();
+        context.with(|ctx| {
+            ctx.eval::<(), _>(format!(
+                r#"{setup}
+let fiber = root.__reactContainerTest;
+for (let depth = 0; depth < 150; depth += 1) {{
+  fiber.child = {{}};
+  fiber = fiber.child;
+}}
+globalThis.__deferDiscovery = true;
+window[{MODEL_PICKER_PATCH_KEY:?}] = {{
+  modulePromises: new Map([["app-shared-", Promise.resolve({{}})]]),
+}};
+const installation = {script}
+installation.then(() => {{ globalThis.__installationCompleted = true; }});
+"#
+            ))
+            .expect("start renderer with paused scope discovery");
+        });
+        while runtime.execute_pending_job().expect("run renderer jobs") {}
+        context.with(|ctx| {
+            assert!(ctx.eval::<bool, _>("__delayedDiscovery.length > 0").unwrap());
+            assert!(ctx.eval::<bool, _>(format!(
+                "globalThis.__installationCompleted === true && Boolean(window[{MODEL_PICKER_PATCH_KEY:?}].interval)"
+            )).unwrap(), "scope discovery must not hold installation or its heartbeat open");
+            ctx.eval::<(), _>(
+                "globalThis.__deferDiscovery = false; for (const resume of __delayedDiscovery.splice(0)) resume();"
+            ).unwrap();
+        });
+        while runtime
+            .execute_pending_job()
+            .expect("finish scope discovery")
+        {}
+        context.with(|ctx| {
+            assert!(ctx.eval::<bool, _>(format!(
+                "window[{MODEL_PICKER_PATCH_KEY:?}].scopedAppServerDiscoveryPromise === null && Boolean(window[{MODEL_PICKER_PATCH_KEY:?}].interval)"
+            )).unwrap());
+        });
+    }
+
+    #[test]
+    fn reaudit_superseded_renderer_discovery_cannot_replace_newer_request_hooks() {
+        let runtime = rquickjs::Runtime::new().expect("create JavaScript runtime");
+        let context = rquickjs::Context::full(&runtime).expect("create JavaScript context");
+        let payload = r#"{"modelProvider":"codex_model_router_v2","catalogAvailable":true,"modelNames":["worker"],"models":[{"model":"worker"}]}"#;
+        let old = assemble_codex_renderer_runtime_script(payload, false, true, "old-runtime");
+        let new = assemble_codex_renderer_runtime_script(payload, false, true, "new-runtime");
+        let setup = renderer_lifecycle_test_setup();
+        context.with(|ctx| {
+            ctx.eval::<(), _>(format!(
+                r#"{setup}
+root.__reactContainerTest.memoizedProps = {{
+  entries: [...Array.from({{length: 1200}}, () => ({{}})), manager],
+}};
+globalThis.__deferDiscovery = true;
+const oldInstallation = {old}
+oldInstallation.then(() => {{ globalThis.__oldCompleted = true; }});
+"#
+            ))
+            .expect("start old runtime with paused discovery");
+        });
+        while runtime.execute_pending_job().expect("run old runtime jobs") {}
+        context.with(|ctx| {
+            assert!(ctx
+                .eval::<bool, _>("__delayedDiscovery.length > 0 && !globalThis.__oldCompleted")
+                .unwrap());
+            ctx.eval::<(), _>(format!(
+                "globalThis.__deferDiscovery = false;\nconst newInstallation = {new}\nnewInstallation.then(() => {{ globalThis.__newCompleted = true; }});"
+            ))
+            .expect("install replacement runtime");
+        });
+        while runtime.execute_pending_job().expect("run new runtime jobs") {}
+        context.with(|ctx| {
+            assert!(ctx
+                .eval::<bool, _>(
+                    "globalThis.__newCompleted === true && client.__ccSwitchModelRequestPatch === 'new-runtime'"
+                )
+                .unwrap());
+            ctx.eval::<(), _>("for (const resume of __delayedDiscovery.splice(0)) resume();")
+                .unwrap();
+        });
+        while runtime
+            .execute_pending_job()
+            .expect("resume old runtime jobs")
+        {}
+        context.with(|ctx| {
+            assert!(ctx.eval::<bool, _>("globalThis.__oldCompleted === true").unwrap());
+            let fingerprint: String = ctx.eval("client.__ccSwitchModelRequestPatch").unwrap();
+            assert_eq!(
+                fingerprint, "new-runtime",
+                "a superseded async discovery must not reinstall its captured request hooks"
+            );
+            let running: bool = ctx.eval(format!(
+                "window[{MODEL_PICKER_PATCH_KEY:?}].rendererRuntimeFingerprint === 'new-runtime' && Boolean(window[{MODEL_PICKER_PATCH_KEY:?}].interval)"
+            )).unwrap();
+            assert!(running);
+            ctx.eval::<(), _>(format!(
+                "const duplicateInstallation = {new}\nduplicateInstallation.then(() => client.sendRequest('model/list', {{}})).then(result => {{ globalThis.__duplicateModels = result.data.map(model => model.model); }});"
+            )).expect("repeat the current runtime installation");
+        });
+        while runtime
+            .execute_pending_job()
+            .expect("run duplicate runtime jobs")
+        {}
+        context.with(|ctx| {
+            let models: String = ctx
+                .eval("JSON.stringify(globalThis.__duplicateModels)")
+                .unwrap();
+            assert_eq!(
+                models, r#"["worker"]"#,
+                "same-fingerprint reinjection must retain working request hooks"
+            );
+        });
     }
 
     /// The renderer heartbeat must not synchronously walk every DOM node and the
@@ -6239,8 +5824,13 @@ JSON.stringify({
     fn codex_app_compatibility_heartbeat_does_not_repeat_full_react_scan() {
         let script = build_model_picker_unlock_script(&CodexModelCatalogProjection::empty());
 
-        assert!(script.contains("const rendererSchedulerVersion = \"10\""));
-        assert!(script.contains("patchCodexModelReasoningQueryClient(scope.queryClient)"));
+        assert!(script.contains(&format!(
+            "const rendererRuntimeFingerprint = {:?}",
+            codex_renderer_runtime_fingerprint()
+        )));
+        assert!(script.contains("refreshCodexScopedAppServerClients("));
+        assert!(script.contains("const patchedCaches = new Set()"));
+        assert!(script.contains("patchCodexModelReasoningQueryCacheOnce(cache, patchedCaches)"));
         assert!(script.contains("clearInterval(state.interval)"));
         assert!(script.contains("const patchAppServerModuleClients"));
         assert!(script.contains("state.reactDiscoveryPromise"));
@@ -6250,8 +5840,12 @@ JSON.stringify({
         assert!(script.contains("state.lastReactFullScanAt || 0) >= 30000"));
         assert!(script.contains("state.lastReactIncrementalScanAt || 0) >= 5000"));
         assert!(script.contains("new MutationObserver"));
-        assert!(script.contains("modulePatched = patchAppServerModuleClients(module)"));
-        assert!(script.contains("patchCodexModelReasoningQueryClient(value)"));
+        assert!(
+            script.contains("modulePatched = patchAppServerModuleClients(module, patchedCaches)")
+        );
+        assert!(script.contains("patchCodexModelReasoningQueryClient(value, patchedCaches)"));
+        assert!(script.contains("state.scopedAppServerScopeCandidates = new Set()"));
+        assert!(script.contains("state.scopedAppServerRegistryClasses = []"));
         assert!(script.contains("for (const cache of state.reasoningQueryCaches?.keys() || [])"));
         assert!(script.contains("state.reactInitialDiscoveryCompleted = false"));
         assert!(script.contains("for (const cache of reasoningQueryCachesToRebind)"));
@@ -6436,7 +6030,127 @@ void (async () => {{
         context.with(|ctx| {
             let result: String = ctx.eval("globalThis.__scopedClientDiscoveryResult").expect("read scoped discovery result");
             let result: Value = serde_json::from_str(&result).expect("parse scoped discovery result");
-            assert_eq!(result, json!({ "firstCount": 1, "secondCount": 1, "remoteCount": 0, "patched": ["first", "second"], "registryMutations": 0, "scopeScans": 1, "queryClientReads": 0 }));
+            assert_eq!(result, json!({ "firstCount": 1, "secondCount": 1, "remoteCount": 0, "patched": ["first", "second"], "registryMutations": 0, "scopeScans": 1, "queryClientReads": 3 }));
+        });
+    }
+
+    #[test]
+    fn codex_app_renderer_resources_are_valid_javascript_fragments() {
+        let runtime = rquickjs::Runtime::new().expect("create JavaScript runtime");
+        let context = rquickjs::Context::full(&runtime).expect("create JavaScript context");
+        let fragments = [
+            catalog_payload_selection_core_script(),
+            app_server_model_list_scope_core_script(),
+            model_picker_patch_core_script(),
+            include_str!("resources/codex_desktop/model_picker_cache_lifecycle.js"),
+            include_str!("resources/codex_desktop/model_picker_release.js"),
+            guardian_v2_compatibility_patch_core_script(),
+            app_server_request_normalization_core_script(),
+            history_lineage_hydration_core_script(),
+            app_server_module_client_discovery_core_script(),
+            include_str!("resources/codex_desktop/request_health_warning.js"),
+            include_str!("resources/codex_desktop/summary_handoff.js"),
+            codex_continuation_core_script(),
+            include_str!("resources/codex_desktop/renderer_runtime.js"),
+        ];
+
+        context.with(|ctx| {
+            for (index, fragment) in fragments.iter().enumerate() {
+                let encoded = serde_json::to_string(fragment).expect("encode renderer fragment");
+                let parsed: bool = ctx
+                    .eval(format!("new Function({encoded}); true"))
+                    .unwrap_or_else(|error| panic!("parse renderer fragment {index}: {error}"));
+                assert!(parsed);
+            }
+        });
+    }
+
+    #[test]
+    fn codex_app_runtime_template_resolves_every_slot() {
+        let script = build_model_picker_unlock_script(&CodexModelCatalogProjection::empty());
+
+        assert!(!script.contains("__CCSWITCH_"));
+        assert!(script.contains("const incomingPayload = {"));
+        assert!(script.contains("else cancelCodexModelPickerReleaseRefresh();"));
+        assert!(script.contains("pickerDiagnostics: codexModelPickerDiagnostics()"));
+        assert!(script.contains("state.requestHealthWarningsSuppressed = "));
+        assert!(script.contains(&format!(
+            "const rendererRuntimeFingerprint = {:?}",
+            codex_renderer_runtime_fingerprint()
+        )));
+    }
+
+    #[test]
+    fn codex_renderer_identity_is_a_content_fingerprint_of_the_assembled_runtime() {
+        let fingerprint = codex_renderer_runtime_fingerprint();
+        assert!(fingerprint.starts_with("sha256-"));
+        assert_eq!(fingerprint.len(), "sha256-".len() + 64);
+
+        let template = codex_renderer_runtime_template_for_fingerprint();
+        assert!(!template.contains("__CCSWITCH_"));
+        assert!(template.contains("const rendererRuntimeFingerprint ="));
+        assert!(template.contains("__ccswitch_runtime_fingerprint_slot__"));
+
+        let script = build_model_picker_unlock_script(&CodexModelCatalogProjection::empty());
+        assert!(!script.contains("rendererSchedulerVersion"));
+        assert!(script.contains(&format!(
+            "const rendererRuntimeFingerprint = {:?}",
+            fingerprint
+        )));
+    }
+
+    #[test]
+    fn codex_app_runtime_template_preserves_literal_provider_metadata() {
+        let literal_metadata = [
+            "{{braces}} ${template} \"quotes\" \\backslash",
+            "__CCSWITCH_CATALOG_PAYLOAD__",
+            "__CCSWITCH_CATALOG_RELEASED__",
+            "__CCSWITCH_PATCH_KEY__",
+            "__CCSWITCH_RENDERER_RUNTIME_FINGERPRINT__",
+            "/*__CCSWITCH_CATALOG_PAYLOAD_SELECTION_CORE__*/",
+            "/*__CCSWITCH_MODEL_PICKER_RELEASE_CORE__*/",
+            "/*__CCSWITCH_QUERY_CACHE_LIFECYCLE_CORE__*/",
+            "/*__CCSWITCH_MODEL_PATCH_CORE__*/",
+            "/*__CCSWITCH_GUARDIAN_V2_PATCH_CORE__*/",
+            "/*__CCSWITCH_REQUEST_NORMALIZATION_CORE__*/",
+            "/*__CCSWITCH_HISTORY_LINEAGE_HYDRATION_CORE__*/",
+            "/*__CCSWITCH_MODULE_CLIENT_DISCOVERY_CORE__*/",
+            "/*__CCSWITCH_MODEL_PICKER_DIAGNOSTICS_CORE__*/",
+            "/*__CCSWITCH_REQUEST_HEALTH_WARNING_CORE__*/",
+            "/*__CCSWITCH_SUMMARY_HANDOFF_CORE__*/",
+            "/*__CCSWITCH_CODEX_CONTINUATION_CORE__*/",
+            "/*__CCSWITCH_APP_SERVER_MODEL_LIST_SCOPE_CORE__*/",
+            "__CCSWITCH_REQUEST_HEALTH_SUPPRESSED__",
+            "__CCSWITCH_MANUAL_SUMMARY_PROMPT__",
+        ]
+        .join("\n");
+        let catalog = CodexModelCatalogProjection {
+            default_model: Some("literal-model".to_string()),
+            model_provider: Some("codex_model_router_v2".to_string()),
+            catalog_available: true,
+            model_names: vec!["literal-model".to_string()],
+            models: vec![json!({"model": "literal-model", "description": literal_metadata})],
+        };
+        let script = build_model_picker_unlock_script(&catalog);
+        let payload_literal = script
+            .lines()
+            .find_map(|line| line.trim().strip_prefix("const incomingPayload = "))
+            .and_then(|line| line.strip_suffix(';'))
+            .expect("find serialized renderer payload");
+        let actual: Value = serde_json::from_str(payload_literal).expect("parse literal payload");
+        assert_eq!(
+            actual,
+            serde_json::to_value(&catalog).expect("encode catalog")
+        );
+
+        let runtime = rquickjs::Runtime::new().expect("create JavaScript runtime");
+        let context = rquickjs::Context::full(&runtime).expect("create JavaScript context");
+        let encoded = serde_json::to_string(&script).expect("encode renderer script");
+        context.with(|ctx| {
+            let parsed: bool = ctx
+                .eval(format!("new Function({encoded}); true"))
+                .expect("parse renderer script containing literal metadata");
+            assert!(parsed);
         });
     }
 
@@ -6467,21 +6181,22 @@ void (async () => {{
         let runtime = rquickjs::Runtime::new().expect("create JavaScript runtime");
         let context = rquickjs::Context::full(&runtime).expect("create JavaScript context");
         let payload = serde_json::to_string(&catalog).expect("serialize catalog");
+        let runtime_fingerprint = codex_renderer_runtime_fingerprint();
         let probe = codex_renderer_compatibility_probe_script(&catalog);
         let script = format!(
             r#"
 const window = {{}};
 const probe = () => {probe};
 const reloaded = probe();
-const state = {{payload: {payload}, rendererSchedulerVersion: {MODEL_PICKER_RENDERER_SCHEDULER_VERSION:?}, interval: 1, messagePatchInstalled: true}};
+const state = {{payload: {payload}, rendererRuntimeFingerprint: {runtime_fingerprint:?}, interval: 1, messagePatchInstalled: true}};
 window[{MODEL_PICKER_PATCH_KEY:?}] = state;
 const current = probe();
 state.payload.models[0].inputModalities = ["text"];
 const changedMetadata = probe();
 state.payload = {payload};
-state.rendererSchedulerVersion = "old";
+state.rendererRuntimeFingerprint = "old";
 const staleVersion = probe();
-state.rendererSchedulerVersion = {MODEL_PICKER_RENDERER_SCHEDULER_VERSION:?};
+state.rendererRuntimeFingerprint = {runtime_fingerprint:?};
 state.interval = null;
 const stopped = probe();
 JSON.stringify({{reloaded, current, changedMetadata, staleVersion, stopped}});
@@ -6591,6 +6306,92 @@ JSON.stringify({{reloaded, current, changedMetadata, staleVersion, stopped}});
     }
 
     #[test]
+    fn compatibility_evidence_distinguishes_catalog_delivery_from_hook_readiness() {
+        let evaluation = json!({
+            "result": {
+                "result": {
+                    "value": {
+                        "status": "ok",
+                        "patchKey": MODEL_PICKER_PATCH_KEY,
+                        "modelCount": 36,
+                        "catalogDiagnostics": {
+                            "reasoningModelCount": 25,
+                            "maxEffortModelCount": 16,
+                            "ultraEffortModelCount": 9
+                        },
+                        "reasoningQueryCacheCount": 0,
+                        "catalogPayloadPreserved": true,
+                        "appServerPatchInstalled": false,
+                        "pickerDiagnostics": {
+                            "status": "mismatch",
+                            "pickerObserverCount": 1,
+                            "effortMismatchCount": 1,
+                            "missingMaxModelCount": 1
+                        }
+                    }
+                }
+            }
+        });
+
+        let evidence = codex_app_compatibility_evidence_from_evaluation(&evaluation)
+            .expect("catalog delivery evidence");
+        assert_eq!(evidence.model_count, 36);
+        assert_eq!(
+            evidence.catalog_diagnostics,
+            Some(CodexModelCatalogDiagnostics {
+                reasoning_model_count: 25,
+                max_effort_model_count: 16,
+                ultra_effort_model_count: 9,
+            })
+        );
+        assert_eq!(evidence.reasoning_query_cache_count, Some(0));
+        assert!(evidence.catalog_payload_preserved);
+        assert!(!evidence.app_server_patch_installed);
+        assert_eq!(
+            evidence.picker_diagnostics,
+            Some(CodexModelPickerDiagnostics {
+                status: CodexModelPickerReadiness::Mismatch,
+                picker_observer_count: 1,
+                effort_mismatch_count: 1,
+                missing_max_model_count: 1,
+                ..Default::default()
+            })
+        );
+    }
+
+    #[test]
+    fn compatibility_evidence_does_not_invent_missing_or_invalid_catalog_diagnostics() {
+        for diagnostics in [
+            None,
+            Some(Value::Null),
+            Some(json!({"reasoningModelCount": 1})),
+            Some(json!({
+                "reasoningModelCount": -1,
+                "maxEffortModelCount": 0,
+                "ultraEffortModelCount": 0
+            })),
+        ] {
+            let mut value = json!({
+                "status": "ok",
+                "patchKey": MODEL_PICKER_PATCH_KEY,
+                "historySync": {"requested": true}
+            });
+            if let Some(diagnostics) = diagnostics {
+                value["catalogDiagnostics"] = diagnostics;
+            }
+            let evaluation = json!({"result": {"result": {"value": value}}});
+
+            let evidence = codex_app_compatibility_evidence_from_evaluation(&evaluation)
+                .expect("history compatibility remains usable without catalog diagnostics");
+            assert_eq!(evidence.catalog_diagnostics, None);
+            assert_eq!(evidence.reasoning_query_cache_count, None);
+            assert!(!evidence.catalog_payload_preserved);
+            assert!(!evidence.app_server_patch_installed);
+            assert!(evidence.history_sync_requested);
+        }
+    }
+
+    #[test]
     fn compatibility_evidence_does_not_report_history_ready_after_hydration_failure() {
         let evaluation = json!({
             "result": {
@@ -6641,6 +6442,18 @@ JSON.stringify({{reloaded, current, changedMetadata, staleVersion, stopped}});
         }];
 
         assert!(pick_codex_page_targets(&targets, 9222).is_err());
+    }
+
+    #[test]
+    fn renderer_failure_message_distinguishes_detected_cdp_target_from_missing_port() {
+        let reachable = codex_renderer_injection_failure_message(true);
+        assert!(reachable.contains("renderer target detected on a CDP port"));
+        assert!(!reachable.contains("reachable over CDP"));
+        assert!(reachable.contains("before restarting Codex"));
+
+        let missing = codex_renderer_injection_failure_message(false);
+        assert!(missing.contains("without an injectable CDP port"));
+        assert!(missing.contains("Fully quit Codex"));
     }
 
     #[test]
@@ -6910,6 +6723,84 @@ JSON.stringify({{reloaded, current, changedMetadata, staleVersion, stopped}});
         }];
         assert!(pick_codex_page_targets(&targets, DEFAULT_CODEX_DEBUG_PORT).is_err());
         assert!(pick_codex_page_targets(&targets, 9222).is_err());
+    }
+
+    #[test]
+    fn packaged_codex_shell_url_is_accepted_even_when_task_title_has_no_codex_marker() {
+        let targets = vec![CdpTarget {
+            id: "codex-task".to_string(),
+            target_type: "page".to_string(),
+            title: "Fix production payment blockers".to_string(),
+            url: "app://-/index.html".to_string(),
+            web_socket_debugger_url: Some("ws://127.0.0.1:9229/devtools/page/1".to_string()),
+        }];
+
+        assert!(pick_codex_page_targets_with_listener_identity(&targets, false).is_err());
+        let picked = pick_codex_page_targets_with_listener_identity(&targets, true)
+            .expect("the packaged Codex renderer target should be recognized");
+        assert_eq!(picked[0].id, "codex-task");
+    }
+
+    #[test]
+    fn packaged_shell_url_needs_verified_listener_on_shared_cdp_ports() {
+        for url in ["app://-/index.html", "app://-/"] {
+            let target = CdpTarget {
+                id: "generic-shell".to_string(),
+                target_type: "page".to_string(),
+                title: "Other Electron App".to_string(),
+                url: url.to_string(),
+                web_socket_debugger_url: Some("ws://127.0.0.1:9222/devtools/page/1".to_string()),
+            };
+            assert!(!target_matches_codex_desktop(&target, false));
+            assert!(target_matches_codex_desktop(&target, true));
+        }
+    }
+
+    #[test]
+    fn cdp_listener_identity_requires_matching_verified_shell_pid() {
+        let shell = crate::commands::CodexAppServerProcessDiagnostics {
+            pid: 41,
+            name: Some("ChatGPT.exe".to_string()),
+            executable_path: None,
+            command_line: None,
+            started_at: None,
+            is_app_server: false,
+        };
+        let app_server = crate::commands::CodexAppServerProcessDiagnostics {
+            pid: 42,
+            is_app_server: true,
+            ..shell.clone()
+        };
+        let processes = [shell, app_server];
+        assert!(cdp_listener_belongs_to_verified_codex_shell(
+            &[41],
+            &processes
+        ));
+        assert!(!cdp_listener_belongs_to_verified_codex_shell(
+            &[42],
+            &processes
+        ));
+        assert!(!cdp_listener_belongs_to_verified_codex_shell(
+            &[99],
+            &processes
+        ));
+        assert!(!cdp_listener_belongs_to_verified_codex_shell(
+            &[41, 99],
+            &processes
+        ));
+        assert!(!cdp_listener_belongs_to_verified_codex_shell(
+            &[],
+            &processes
+        ));
+        assert!(!cdp_listener_belongs_to_verified_codex_shell(&[41], &[]));
+    }
+
+    #[test]
+    fn cdp_listener_pid_parser_rejects_invalid_and_zero_process_ids() {
+        assert_eq!(
+            parse_cdp_listener_process_ids("41\np42\np42\np0\n-7\nnot-a-pid\n"),
+            vec![41, 42]
+        );
     }
 
     #[test]

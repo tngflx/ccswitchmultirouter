@@ -490,6 +490,16 @@ pub fn snapshot_to_capability(
         .as_deref()
         .map(str::trim)
         .map(str::to_ascii_lowercase);
+    if reasoning.mandatory
+        && (reasoning
+            .supported_efforts
+            .iter()
+            .any(|effort| effort.trim().eq_ignore_ascii_case("none"))
+            || default_effort.as_deref() == Some("none")
+            || reasoning.default_enabled == Some(false))
+    {
+        return None;
+    }
     let default_effort = default_effort.map(|effort| {
         if effort == "ultra" {
             "max".to_string()
@@ -802,6 +812,26 @@ mod tests {
         assert!(capability.disable_allowed);
         assert_eq!(capability.supported_efforts, vec!["none", "high"]);
         assert_eq!(capability.control_kind, Some(ReasoningControlKind::Graded));
+    }
+
+    #[test]
+    fn snapshot_to_capability_rejects_mandatory_disable_declarations() {
+        for (efforts, default, enabled) in [
+            (vec!["high", "none"], Some("high"), Some(true)),
+            (vec!["high"], Some("none"), Some(true)),
+            (vec!["high"], Some("high"), Some(false)),
+        ] {
+            let mut snapshot = openrouter_detection_snapshot();
+            let reasoning = snapshot.reasoning.as_mut().unwrap();
+            reasoning.mandatory = true;
+            reasoning.supported_efforts = efforts.into_iter().map(str::to_string).collect();
+            reasoning.default_effort = default.map(str::to_string);
+            reasoning.default_enabled = enabled;
+            assert!(
+                snapshot_to_capability(&snapshot).is_none(),
+                "mandatory reasoning must never expose disable or off-by-default behavior"
+            );
+        }
     }
 
     #[test]

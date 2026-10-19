@@ -1,6 +1,9 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { readFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import path from "node:path";
+import { spawnSync } from "node:child_process";
 import test from "node:test";
 import * as checker from "./check-openai-responses-contract.mjs";
 
@@ -76,6 +79,13 @@ function fixtureSnapshot() {
 
 test("reviewed snapshot is valid offline", async () => {
   validateSnapshot(JSON.parse(await readFile(snapshotPath, "utf8")));
+});
+
+test("truncated reference without a Returns boundary fails closed", () => {
+  assert.throws(
+    () => extractContract(referenceMarkdown().replace("### Returns", "")),
+    /incomplete|returns|boundary/i,
+  );
 });
 
 test("declaration drift is detected without depending on prose", () => {
@@ -306,4 +316,80 @@ test("refresh continues to require the explicit reviewed-changes flag", async ()
   ]) {
     await assert.rejects(main(args), /after reviewing/);
   }
+});
+
+test("renderer builds fail on a corrupt contract before catalog/Vite and retain all gates on success", async (t) => {
+  const root = await mkdtemp(path.join(tmpdir(), "cc-switch-contract-build-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  await mkdir(path.join(root, "scripts"), { recursive: true });
+  await mkdir(path.join(root, "contracts"));
+  await mkdir(path.join(root, "node_modules", "vite", "bin"), {
+    recursive: true,
+  });
+  await writeFile(path.join(root, "package.json"), '{"type":"module"}');
+  for (const name of [
+    "build-renderer.mjs",
+    "check-openai-responses-contract.mjs",
+  ]) {
+    await writeFile(
+      path.join(root, "scripts", name),
+      await readFile(new URL(name, import.meta.url)),
+    );
+  }
+  await writeFile(
+    path.join(root, "scripts", "verify-codex-catalog.mjs"),
+    'export function verifyCodexCatalog(){console.log("CATALOG_GATE")}',
+  );
+  await writeFile(
+    path.join(root, "node_modules", "vite", "bin", "vite.js"),
+    'console.log("VITE_BUILD")',
+  );
+  const snapshot = JSON.parse(await readFile(snapshotPath, "utf8"));
+  const fixturePath = path.join(root, "contracts", "openai-responses.v1.json");
+  await writeFile(
+    fixturePath,
+    JSON.stringify({ ...snapshot, declarations_sha256: "0".repeat(64) }),
+  );
+  const run = () =>
+    spawnSync(
+      process.execPath,
+      [path.join(root, "scripts", "build-renderer.mjs")],
+      { cwd: root, encoding: "utf8" },
+    );
+  const failed = run();
+  assert.notEqual(
+    failed.status,
+    0,
+    "invalid embedded contract must fail the build",
+  );
+  assert.match(failed.stderr, /declaration.*digest|digest.*declaration/i);
+  assert.doesNotMatch(failed.stdout, /CATALOG_GATE|VITE_BUILD/);
+  await writeFile(fixturePath, JSON.stringify(snapshot));
+  const passed = run();
+  assert.equal(passed.status, 0, passed.stderr);
+  assert.match(
+    passed.stdout,
+    /offline checks passed[\s\S]*CATALOG_GATE[\s\S]*VITE_BUILD/,
+  );
+});
+
+test("live CLI check passes matching public declarations and rejects a changed declaration", async (t) => {
+  const snapshot = JSON.parse(await readFile(snapshotPath, "utf8"));
+  const declarations = snapshot.declarations
+    .map((line) => {
+      const colon = line.indexOf(":");
+      return `${" ".repeat(Number(line.slice(0, colon)))}- \`${line.slice(colon + 1)}\``;
+    })
+    .join("\n");
+  const evidence = snapshot.invariants.map((item) => item.evidence).join("\n");
+  let markdown = `### Body Parameters\n${declarations}\n### Returns\n${evidence}`;
+  t.mock.method(globalThis, "fetch", async () => new Response(markdown));
+  t.mock.method(console, "log", () => {});
+  await main(["--live"]);
+  // Reconstructed markdown uses leading indentation, not the stored depth prefix.
+  markdown = markdown.replace(
+    "          - `url: optional string or null`",
+    "          - `url: string`",
+  );
+  await assert.rejects(main(["--live"]), /declarations changed/);
 });

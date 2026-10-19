@@ -281,16 +281,6 @@ pub fn lookup_baseline_context(
     entry_context_window(entry)
 }
 
-/// 归一化 URL 前缀：大小写、尾斜杠和最终 `/models` 不影响 provider 匹配。
-/// 与 `model_fetch::normalize_url_prefix` 语义一致（本地目录匹配复用同一规则）。
-fn normalize_url_prefix(value: &str) -> String {
-    let mut normalized = value.trim().trim_end_matches('/').to_ascii_lowercase();
-    if let Some(stripped) = normalized.strip_suffix("/models") {
-        normalized = stripped.to_string();
-    }
-    normalized
-}
-
 /// 按 endpoint URL 前缀找到匹配的 provider 名；无匹配返回 `None`。
 ///
 /// 这是跨供应商防误配的关键：只有 endpoint 落在官方 API 基址前缀内才使用
@@ -299,16 +289,11 @@ pub fn find_provider_for_endpoint<'a>(
     bundle: &'a PresetTableBundle,
     endpoint_url: &str,
 ) -> Option<&'a str> {
-    let endpoint = normalize_url_prefix(endpoint_url);
-    if endpoint.is_empty() {
-        return None;
-    }
     bundle
         .providers
         .iter()
         .find(|(_, meta)| {
-            let api = normalize_url_prefix(&meta.api);
-            !api.is_empty() && endpoint.starts_with(&api)
+            crate::services::model_fetch::endpoint_matches_provider_api(endpoint_url, &meta.api)
         })
         .map(|(name, _)| name.as_str())
 }
@@ -512,6 +497,159 @@ mod tests {
             find_provider_for_endpoint(&bundle, "https://evil-api.openai.com.evil.com/v1"),
             None
         );
+    }
+
+    #[test]
+    fn metadata_audit_provider_endpoint_matching_requires_origin_and_segment_boundaries() {
+        let mut bundle = test_bundle();
+        bundle.providers.insert(
+            "provider".to_string(),
+            ProviderMeta {
+                api: "https://api.provider.test/v1".to_string(),
+            },
+        );
+        for endpoint in [
+            "https://api.provider.test/v1",
+            "https://api.provider.test/v1/",
+            "https://api.provider.test/v1/models",
+            "https://api.provider.test/v1/region/models",
+            "https://API.PROVIDER.TEST/v1/models",
+        ] {
+            assert_eq!(
+                find_provider_for_endpoint(&bundle, endpoint),
+                Some("provider"),
+                "expected the same provider scope for {endpoint}"
+            );
+        }
+        for endpoint in [
+            "https://api.provider.test.evil.test/v1",
+            "https://other.api.provider.test/v1",
+            "https://api.provider.test/v10/models",
+            "https://api.provider.test/v1-other/models",
+            "https://api.provider.test/V1/models",
+            "http://api.provider.test/v1/models",
+            "https://api.provider.test:8443/v1/models",
+        ] {
+            assert_eq!(
+                find_provider_for_endpoint(&bundle, endpoint),
+                None,
+                "must not apply provider facts outside the exact scope: {endpoint}"
+            );
+        }
+    }
+
+    #[test]
+    fn metadata_audit_provider_endpoint_matching_rejects_unsafe_urls() {
+        let mut bundle = test_bundle();
+        bundle.providers.insert(
+            "provider".to_string(),
+            ProviderMeta {
+                api: "https://api.provider.test/v1".to_string(),
+            },
+        );
+        for endpoint in [
+            "https://redacted@api.provider.test/v1/models",
+            "https://redacted:masked@api.provider.test/v1/models",
+            "https://api.provider.test/v1/models?scope=other",
+            "https://api.provider.test/v1/models#other",
+            "https://api.provider.test/v1?scope=other",
+            "https://api.provider.test/v1#other",
+            "not a URL",
+            "",
+        ] {
+            assert_eq!(
+                find_provider_for_endpoint(&bundle, endpoint),
+                None,
+                "unsafe endpoint must not inherit trusted facts: {endpoint}"
+            );
+        }
+        for api in [
+            "https://redacted@api.provider.test/v1",
+            "https://redacted:masked@api.provider.test/v1",
+            "https://api.provider.test/v1?scope=other",
+            "https://api.provider.test/v1#other",
+            "not a URL",
+            "",
+        ] {
+            bundle.providers.get_mut("provider").unwrap().api = api.to_string();
+            assert_eq!(
+                find_provider_for_endpoint(&bundle, api),
+                None,
+                "unsafe configured API must not become an authority: {api}"
+            );
+        }
+    }
+
+    #[test]
+    fn metadata_audit_provider_endpoint_matching_keeps_opencode_zen_and_go_separate() {
+        let zen_apis = [
+            "https://opencode.ai/zen/v1",
+            "https://opencode.ai/inference",
+            "https://opencode.ai/inference/openai/v1",
+        ];
+        let go_apis = [
+            "https://opencode.ai/zen/go/v1",
+            "https://opencode.ai/inference/go",
+            "https://opencode.ai/inference/go/openai/v1",
+        ];
+        let scoped_endpoints = [
+            ("https://opencode.ai/zen/v1/models", "opencode"),
+            ("https://opencode.ai/inference/v1/models", "opencode"),
+            ("https://opencode.ai/inference/openai/v1/models", "opencode"),
+            (
+                "https://opencode.ai/inference/anthropic/v1/models",
+                "opencode",
+            ),
+            ("https://opencode.ai/zen/go/v1/models", "opencode-go"),
+            ("https://opencode.ai/inference/go/v1/models", "opencode-go"),
+            (
+                "https://opencode.ai/inference/go/openai/v1/models",
+                "opencode-go",
+            ),
+            (
+                "https://opencode.ai/inference/go/anthropic/v1/models",
+                "opencode-go",
+            ),
+        ];
+        for zen_api in zen_apis {
+            for go_api in go_apis {
+                let mut bundle = test_bundle();
+                bundle.providers = BTreeMap::from([
+                    (
+                        "opencode".to_string(),
+                        ProviderMeta {
+                            api: zen_api.to_string(),
+                        },
+                    ),
+                    (
+                        "opencode-go".to_string(),
+                        ProviderMeta {
+                            api: go_api.to_string(),
+                        },
+                    ),
+                ]);
+                for (endpoint, expected) in scoped_endpoints {
+                    assert_eq!(
+                        find_provider_for_endpoint(&bundle, endpoint),
+                        Some(expected),
+                        "{endpoint} must retain its scope for Zen {zen_api} / Go {go_api}"
+                    );
+                }
+                for endpoint in [
+                    "https://opencode.ai.evil.test/inference/go/v1/models",
+                    "https://redacted@opencode.ai/inference/go/v1/models",
+                    "https://opencode.ai/inference/go/v1/models?scope=other",
+                    "https://opencode.ai/inference/go/v1/models#other",
+                    "https://opencode.ai/inference/go/v1-other/models",
+                ] {
+                    assert_eq!(
+                        find_provider_for_endpoint(&bundle, endpoint),
+                        None,
+                        "{endpoint} must not inherit either OpenCode provider scope"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

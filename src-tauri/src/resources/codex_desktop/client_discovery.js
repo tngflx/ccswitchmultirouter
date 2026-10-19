@@ -1,6 +1,8 @@
 // RpcStub/RpcPromise proxies manufacture a function for every property name.
 // Discover capabilities from declared descriptors so a stub cannot impersonate
 // the app-server client or cause arbitrary RPC calls during object discovery.
+const codexClientDiscoveryIsCurrent = () =>
+  typeof installationIsCurrent !== "function" || installationIsCurrent();
 const codexDeclaredMethod = (value, name) => {
   let current = value;
   for (let depth = 0; current && depth < 5; depth += 1) {
@@ -21,30 +23,92 @@ const looksLikeAppServerRequestClient = (value) =>
     codexDeclaredMethod(value, "getCompatibleThreadSortKey") &&
     codexDeclaredMethod(value, "supportsPaginatedThreadHistory"),
   );
-const patchCodexModelReasoningQueryClient = (value) => {
+const codexDeclaredModuleValues = (module) => {
+  try {
+    return Object.values(Object.getOwnPropertyDescriptors(module || {}))
+      .filter((descriptor) => "value" in descriptor)
+      .map((descriptor) => descriptor.value);
+  } catch {
+    return [];
+  }
+};
+const codexQueryObserverPrototype = (value) => {
+  if (typeof value !== "function") return null;
+  try {
+    const prototype = Object.getOwnPropertyDescriptor(
+      value,
+      "prototype",
+    )?.value;
+    if (!prototype) return null;
+    const methods = Object.getOwnPropertyDescriptors(prototype);
+    return [
+      "createResult",
+      "getCurrentResult",
+      "getOptimisticResult",
+      "getCurrentQuery",
+      "setOptions",
+    ].every((name) => typeof methods[name]?.value === "function")
+      ? prototype
+      : null;
+  } catch {
+    return null;
+  }
+};
+const patchCodexModelReasoningQueryObserverModule = (module) => {
+  if (typeof patchCodexModelReasoningQueryObserverPrototype !== "function")
+    return;
+  for (const value of codexDeclaredModuleValues(module)) {
+    const prototype = codexQueryObserverPrototype(value);
+    if (!prototype) continue;
+    try {
+      patchCodexModelReasoningQueryObserverPrototype(prototype);
+    } catch (error) {
+      recordFailure(error);
+    }
+  }
+};
+const codexModelReasoningQueryCacheForClient = (value) => {
+  if (!codexClientDiscoveryIsCurrent()) return false;
   const getQueryCache = codexDeclaredMethod(value, "getQueryCache");
   if (
     !getQueryCache ||
     !codexDeclaredMethod(value, "getQueryData") ||
     !codexDeclaredMethod(value, "setQueryData")
   )
-    return false;
+    return null;
   try {
-    const cache = getQueryCache.call(value);
+    return getQueryCache.call(value) || null;
+  } catch (error) {
+    recordFailure(error);
+    return null;
+  }
+};
+const patchCodexModelReasoningQueryCacheOnce = (cache, patchedCaches) => {
+  if (patchedCaches?.has(cache)) return true;
+  const patched = patchCodexModelReasoningQueryCache(cache);
+  if (patched) patchedCaches?.add(cache);
+  return patched;
+};
+const patchCodexModelReasoningQueryClient = (value, patchedCaches) => {
+  const cache = codexModelReasoningQueryCacheForClient(value);
+  if (!cache) return false;
+  try {
     state.modelPickerQueryClients = state.modelPickerQueryClients || new Map();
     state.modelPickerQueryClients.set(cache, value);
-    return patchCodexModelReasoningQueryCache(cache);
+    return patchCodexModelReasoningQueryCacheOnce(cache, patchedCaches);
   } catch (error) {
     recordFailure(error);
     return false;
   }
 };
-const patchAppServerModuleClients = (module) => {
+const patchAppServerModuleClients = (module, patchedCaches = new Set()) => {
+  if (!codexClientDiscoveryIsCurrent()) return 0;
+  patchCodexModelReasoningQueryObserverModule(module);
   let patched = 0;
-  for (const candidate of Object.values(module || {}).filter(
+  for (const candidate of codexDeclaredModuleValues(module).filter(
     (item) => item && typeof item === "object",
   )) {
-    patchCodexModelReasoningQueryClient(candidate);
+    patchCodexModelReasoningQueryClient(candidate, patchedCaches);
     if (looksLikeAppServerRequestClient(candidate)) {
       if (patchRequestClient(candidate)) patched += 1;
       continue;
@@ -55,7 +119,7 @@ const patchAppServerModuleClients = (module) => {
     if (get && get.length === 0) {
       try {
         const client = get.call(candidate);
-        patchCodexModelReasoningQueryClient(client);
+        patchCodexModelReasoningQueryClient(client, patchedCaches);
         if (
           looksLikeAppServerRequestClient(client) &&
           patchRequestClient(client)
@@ -112,11 +176,19 @@ const codexScopedRegistryClass = (value) => {
     return false;
   }
 };
+const codexScopeQueryClient = (scope) => scope?.queryClient || null;
 const codexRendererScopeCandidates = async () => {
-  const retained = Array.from(state.scopedAppServerScopes || []).filter(
-    codexDeclaredDependencyScope,
-  );
-  if (retained.length) return retained;
+  if (!codexClientDiscoveryIsCurrent()) return [];
+  const retained = Array.from(
+    state.scopedAppServerScopeCandidates || state.scopedAppServerScopes || [],
+  ).filter(codexDeclaredDependencyScope);
+  const scanStartedAt = Date.now();
+  if (
+    retained.length &&
+    state.scopedAppServerScopesScannedAt != null &&
+    scanStartedAt - state.scopedAppServerScopesScannedAt < 30000
+  )
+    return retained;
   const roots = [window.__codexRoot?._internalRoot?.current];
   const root = document.getElementById("root");
   for (const key of Object.keys(root || {})) {
@@ -125,8 +197,12 @@ const codexRendererScopeCandidates = async () => {
     roots.push(fiber?.stateNode?.current || fiber);
   }
   const fibers = roots.filter(Boolean);
+  if (!fibers.length) return retained;
   const seenFibers = new Set();
-  for (let cursor = 0; cursor < fibers.length && seenFibers.size < 25000;) {
+  const scopes = new Set();
+  let cursor = 0;
+  for (; cursor < fibers.length && seenFibers.size < 25000;) {
+    if (!codexClientDiscoveryIsCurrent()) return [];
     const sliceDeadline = monotonicNow() + 4;
     let inspected = 0;
     while (
@@ -162,8 +238,8 @@ const codexRendererScopeCandidates = async () => {
           continue;
         seenValues.add(value);
         if (codexDeclaredDependencyScope(value)) {
-          state.scopedAppServerScopes = new Set([value]);
-          return [value];
+          scopes.add(value);
+          continue;
         }
         if (depth >= 5) continue;
         let descriptors = {};
@@ -192,42 +268,113 @@ const codexRendererScopeCandidates = async () => {
     if (cursor < fibers.length && seenFibers.size < 25000)
       await yieldReactDiscovery();
   }
-  return [];
+  if (!codexClientDiscoveryIsCurrent()) return [];
+  // The shell and the Codex composer can own different caches. Retaining the
+  // first scope forever misses the picker, including scopes mounted later. A
+  // complete scan with no scopes is authoritative; an incomplete/capped scan
+  // must keep previously discovered owners until the next complete scan.
+  const scanWasCapped = seenFibers.size >= 25000 && cursor < fibers.length;
+  const current = scanWasCapped
+    ? Array.from(new Set([...retained, ...scopes]))
+    : Array.from(scopes);
+  state.scopedAppServerScopeCandidates = new Set(current);
+  state.scopedAppServerScopesScannedAt = scanStartedAt;
+  return current;
 };
-const patchCodexScopedAppServerClients = async (module) => {
-  const registries = Object.values(module || {}).filter(
-    codexScopedRegistryClass,
-  );
-  if (!registries.length) return 0;
-  const scopes = await codexRendererScopeCandidates();
+const refreshCodexScopedAppServerClients = (
+  scopes = state.scopedAppServerScopeCandidates ||
+    state.scopedAppServerScopes ||
+    [],
+  registries = state.scopedAppServerRegistryClasses || [],
+  patchedCaches = new Set(),
+) => {
+  if (!codexClientDiscoveryIsCurrent()) return 0;
   let patched = 0;
+  let queryClientCount = 0;
+  // Scope getters can diverge after navigation even when they currently share
+  // a cache. Retain their identities, but project one cache owner and each
+  // independent request manager so aliases never multiply cache work.
+  const clientCaches = new Map();
+  const seenCaches = new Set();
+  const seenManagers = new Set();
+  const seenRequestClients = new Set();
+  const retainedScopes = new Set();
   for (const scope of scopes) {
+    let client = null;
+    try {
+      client = codexScopeQueryClient(scope);
+    } catch (error) {
+      recordFailure(error);
+    }
+    if (client) {
+      if (!clientCaches.has(client))
+        clientCaches.set(
+          client,
+          codexModelReasoningQueryCacheForClient(client),
+        );
+      const cache = clientCaches.get(client);
+      if (cache && !seenCaches.has(cache)) {
+        seenCaches.add(cache);
+        try {
+          state.modelPickerQueryClients =
+            state.modelPickerQueryClients || new Map();
+          state.modelPickerQueryClients.set(cache, client);
+          if (patchCodexModelReasoningQueryCacheOnce(cache, patchedCaches)) {
+            queryClientCount += 1;
+            retainedScopes.add(scope);
+          }
+        } catch (error) {
+          recordFailure(error);
+        }
+      }
+    }
     for (const Registry of registries) {
       try {
         const registry = new Registry(scope);
         const lookup = codexDeclaredMethod(registry, "getForHostId");
         const manager = lookup.call(registry, "local");
-        const client = Object.getOwnPropertyDescriptor(
+        if (seenManagers.has(manager)) continue;
+        const requestClient = Object.getOwnPropertyDescriptor(
           manager || {},
           "requestClient",
         )?.value;
         const host = Object.getOwnPropertyDescriptor(
-          client || {},
+          requestClient || {},
           "hostId",
         )?.value;
-        if (host !== "local" || !looksLikeAppServerRequestClient(client))
+        if (host !== "local" || !looksLikeAppServerRequestClient(requestClient))
           continue;
-        if (patchRequestClient(client)) patched += 1;
+        seenManagers.add(manager);
+        retainedScopes.add(scope);
+        if (seenRequestClients.has(requestClient)) continue;
+        seenRequestClients.add(requestClient);
+        if (patchRequestClient(requestClient)) patched += 1;
       } catch (error) {
         recordFailure(error);
       }
     }
   }
+  state.scopedAppServerScopes = retainedScopes;
   state.scopedAppServerDiscovery = {
-    scopeCount: scopes.length,
+    scopeCount: retainedScopes.size,
     registryCount: registries.length,
     clientCount: patched,
+    queryClientCount,
   };
-  if (patched === 0) state.scopedAppServerScopes = new Set();
   return patched;
+};
+const patchCodexScopedAppServerClients = async (
+  module,
+  patchedCaches = new Set(),
+) => {
+  if (!codexClientDiscoveryIsCurrent()) return 0;
+  patchCodexModelReasoningQueryObserverModule(module);
+  const registries = codexDeclaredModuleValues(module).filter(
+    codexScopedRegistryClass,
+  );
+  const scopes = await codexRendererScopeCandidates();
+  if (!codexClientDiscoveryIsCurrent()) return 0;
+  state.scopedAppServerScopeCandidates = new Set(scopes);
+  state.scopedAppServerRegistryClasses = registries;
+  return refreshCodexScopedAppServerClients(scopes, registries, patchedCaches);
 };

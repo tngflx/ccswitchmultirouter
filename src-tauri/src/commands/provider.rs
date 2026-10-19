@@ -4544,7 +4544,9 @@ mod codex_protocol_preflight_save_tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn advanced_manual_update_collapses_owned_split_leaves() {
+        let _home = crate::config::TestHomeGuard::new();
         let db = Arc::new(Database::memory().expect("memory database"));
         let state = AppState::new(db.clone());
         let mut source = codex_provider();

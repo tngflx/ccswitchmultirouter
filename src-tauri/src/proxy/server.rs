@@ -140,10 +140,18 @@ impl ProxyServer {
             return Err(ProxyError::AlreadyRunning);
         }
 
-        let addr: SocketAddr =
-            format!("{}:{}", self.config.listen_address, self.config.listen_port)
-                .parse()
-                .map_err(|e| ProxyError::BindFailed(format!("无效的地址: {e}")))?;
+        // Enforce the trust boundary before constructing routes or opening a socket.
+        // The separate External API authenticates requests and may still bind LAN.
+        let ip = match self.mode {
+            ProxyServerMode::FullProxy => {
+                super::listener_address::takeover_listen_ip(&self.config.listen_address)
+            }
+            ProxyServerMode::ExternalOpenAiApiOnly => {
+                super::listener_address::parse_listener_ip(&self.config.listen_address)
+            }
+        }
+        .map_err(ProxyError::BindFailed)?;
+        let addr = SocketAddr::new(ip, self.config.listen_port);
 
         // 创建关闭通道
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
@@ -628,6 +636,34 @@ mod tests {
     use serial_test::serial;
     use std::sync::{Arc, Mutex};
     use tower::ServiceExt;
+
+    #[tokio::test]
+    #[serial]
+    async fn takeover_rejects_wildcard_but_authenticated_external_listener_can_bind_it() {
+        let _home = TestHomeGuard::new();
+        let db = Arc::new(Database::memory().unwrap());
+        let config = ProxyConfig {
+            listen_address: "0.0.0.0".into(),
+            listen_port: 0,
+            ..ProxyConfig::default()
+        };
+        let takeover = ProxyServer::new(config.clone(), db.clone(), None);
+        let result = takeover.start().await;
+        if result.is_ok() {
+            takeover.stop().await.unwrap();
+        }
+        assert!(
+            result.is_err(),
+            "unauthenticated takeover must not bind all interfaces"
+        );
+        assert!(!takeover.get_status().await.running);
+        let external = ProxyServer::new_external_openai_api(config, db, None);
+        external
+            .start()
+            .await
+            .expect("separate authenticated API may bind LAN");
+        external.stop().await.unwrap();
+    }
 
     /// 测试专用 home，用于隔离 Codex live config/catalog 文件。
     struct TestHomeGuard {

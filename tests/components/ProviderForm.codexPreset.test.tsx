@@ -13,6 +13,8 @@ import { ProviderForm } from "@/components/providers/forms/ProviderForm";
 import { CodexProviderSetCancelled } from "@/components/providers/forms/useCodexProviderSetSave";
 import type { Provider } from "@/types";
 import * as providerConfigUtils from "@/utils/providerConfigUtils";
+import { readCodexModelProtocolCapability } from "@/lib/codexProtocolCapability";
+import { createSingleCodexProtocolLabAdapter } from "@/lib/protocol-lab/codex-adapters";
 
 const codexCandidateApiMocks = vi.hoisted(() => ({
   validateProviderCandidate: vi.fn(),
@@ -567,6 +569,82 @@ describe("ProviderForm Codex preset selection", () => {
     expect(savedSettings.modelCatalog.models).toEqual([
       { model: "gpt-5.5", contextWindow: 272000 },
     ]);
+  });
+
+  it("retains API-backed automatic readiness in the actual provider submit payload", async () => {
+    const protocolCapability = {
+      schemaVersion: 1,
+      source: "provider_api",
+      baseUrl: "https://relay.example/v1",
+      upstreamModel: "vendor/wire-model",
+      supportedEndpoints: ["openai_chat", "openai_responses"],
+      supportsTools: true,
+      supportsStreaming: true,
+    };
+    const onSubmit = vi.fn();
+    renderProviderForm({
+      providerId: "relay",
+      showButtons: true,
+      submitLabel: "Save",
+      onSubmit,
+      initialData: {
+        name: "API-backed relay",
+        category: "custom",
+        settingsConfig: {
+          auth: { OPENAI_API_KEY: "redacted-test-key" },
+          config:
+            'model_provider = "relay"\nmodel = "public-model"\n[model_providers.relay]\nbase_url = "https://relay.example/v1"\nwire_api = "responses"\n',
+          modelCatalog: {
+            models: [
+              {
+                model: "public-model",
+                upstreamModel: "vendor/wire-model",
+                protocolCapability,
+              },
+              {
+                model: "excluded-model",
+                upstreamModel: "vendor/wire-model",
+                enabled: false,
+                protocolCapability,
+              },
+            ],
+          },
+        },
+        meta: { apiFormat: "openai_responses" },
+      },
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(onSubmit).toHaveBeenCalledOnce());
+    const payload = onSubmit.mock.calls[0][0];
+    const saved: Provider = {
+      id: "relay",
+      ...payload,
+      settingsConfig: JSON.parse(payload.settingsConfig),
+    };
+
+    expect(saved.settingsConfig.modelCatalog.models).toEqual([
+      {
+        model: "public-model",
+        upstreamModel: "vendor/wire-model",
+        protocolCapability,
+      },
+      {
+        model: "excluded-model",
+        upstreamModel: "vendor/wire-model",
+        enabled: false,
+        protocolCapability,
+      },
+    ]);
+    expect(readCodexModelProtocolCapability(saved, "public-model")).toBe(
+      "openai_responses",
+    );
+    expect(
+      readCodexModelProtocolCapability(saved, "excluded-model"),
+    ).toBeNull();
+    expect(createSingleCodexProtocolLabAdapter().requiresProbe(saved, [])).toBe(
+      false,
+    );
   });
 
   it("cleans removed defaults and dependent model references when saving a changed catalog", async () => {

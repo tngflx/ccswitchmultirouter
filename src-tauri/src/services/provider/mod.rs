@@ -4596,7 +4596,11 @@ wire_api = "responses"
             "fetched_at": "2026-06-12T00:00:00.000000000Z",
             "etag": "official-cache",
             "client_version": "0.140.0",
-            "models": [{"slug": "official-only", "context_window": 128000}]
+            "models": [{
+                "slug": "official-only",
+                "context_window": 128000,
+                "base_instructions": "Native official instructions"
+            }]
         });
         write_json_file(&cache_path, &original_cache).expect("seed official Codex models cache");
 

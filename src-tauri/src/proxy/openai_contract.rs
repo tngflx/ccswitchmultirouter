@@ -26,7 +26,79 @@ pub struct OpenAIResponsesContractStatus {
     pub status: String,
     pub checked_at: Option<String>,
     pub changed_sections: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub declaration_changes: Option<OpenAIContractDeclarationChanges>,
     pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct OpenAIContractDeclarationChanges {
+    pub added_count: usize,
+    pub removed_count: usize,
+    pub added: Vec<String>,
+    pub removed: Vec<String>,
+}
+
+/// Only reviewed public declarations and freshly extracted public documentation
+/// enter this projection. Request/provider payloads must never be supplied here.
+fn declaration_changes(
+    snapshot: &Value,
+    current: &Value,
+) -> Option<OpenAIContractDeclarationChanges> {
+    let declarations = |value: &Value| {
+        value
+            .get("declarations")?
+            .as_array()?
+            .iter()
+            .map(|value| value.as_str().map(ToString::to_string))
+            .collect::<Option<Vec<String>>>()
+    };
+    let previous = declarations(snapshot)?;
+    let next = declarations(current)?;
+    fn excess(values: &[String], baseline: &[String]) -> Vec<String> {
+        let mut remaining = std::collections::BTreeMap::new();
+        for declaration in baseline {
+            *remaining.entry(declaration).or_insert(0usize) += 1;
+        }
+        values
+            .iter()
+            .filter(|declaration| {
+                if let Some(count) = remaining.get_mut(declaration) {
+                    if *count > 0 {
+                        *count -= 1;
+                        return false;
+                    }
+                }
+                true
+            })
+            .cloned()
+            .collect()
+    }
+    let added = excess(&next, &previous);
+    let removed = excess(&previous, &next);
+    let samples = |values: Vec<String>| {
+        values
+            .into_iter()
+            .take(12)
+            .map(|value| {
+                if value.chars().count() > 320 {
+                    format!(
+                        "{} [truncated]",
+                        value.chars().take(320).collect::<String>()
+                    )
+                } else {
+                    value
+                }
+            })
+            .collect()
+    };
+    Some(OpenAIContractDeclarationChanges {
+        added_count: added.len(),
+        removed_count: removed.len(),
+        added: samples(added),
+        removed: samples(removed),
+    })
 }
 
 fn embedded_snapshot() -> &'static Value {
@@ -72,6 +144,7 @@ fn embedded_status() -> OpenAIResponsesContractStatus {
         status: "not_checked".to_string(),
         checked_at: None,
         changed_sections: Vec::new(),
+        declaration_changes: None,
         error: None,
     }
 }
@@ -176,11 +249,13 @@ fn section_literals(
 
 fn extract_contract(markdown: &str) -> Result<Value, String> {
     let markdown = markdown.replace("\r\n", "\n");
-    let body = markdown
-        .split("### Body Parameters\n")
-        .nth(1)
-        .and_then(|value| value.split("### Returns").next())
+    let section = markdown
+        .split_once("### Body Parameters\n")
+        .map(|(_, section)| section)
         .ok_or_else(|| "Official reference body parameters were not found".to_string())?;
+    let (body, _) = section.split_once("### Returns").ok_or_else(|| {
+        "Official reference is incomplete: Returns boundary is missing".to_string()
+    })?;
     let top = top_level_signatures(body);
     if top.len() < 20 {
         return Err("Official reference extraction is incomplete".to_string());
@@ -273,11 +348,24 @@ async fn fetch_reference() -> Result<String, String> {
             response.status()
         ));
     }
-    let bytes = response.bytes().await.map_err(|error| error.to_string())?;
-    if bytes.len() > MAX_REFERENCE_BYTES {
+    read_reference_response(response).await
+}
+
+async fn read_reference_response(mut response: reqwest::Response) -> Result<String, String> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_REFERENCE_BYTES as u64)
+    {
         return Err("Official reference exceeded the 2 MiB limit".to_string());
     }
-    String::from_utf8(bytes.to_vec())
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(|error| error.to_string())? {
+        if chunk.len() > MAX_REFERENCE_BYTES.saturating_sub(bytes.len()) {
+            return Err("Official reference exceeded the 2 MiB limit".to_string());
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    String::from_utf8(bytes)
         .map(|value| value.replace("\r\n", "\n"))
         .map_err(|error| error.to_string())
 }
@@ -291,6 +379,9 @@ pub(crate) async fn check() -> OpenAIResponsesContractStatus {
         let current = extract_contract(&markdown)?;
         let snapshot = embedded_snapshot();
         let changes = changed_sections(snapshot, &current);
+        if snapshot.get("declarations_sha256") != current.get("declarations_sha256") {
+            result.declaration_changes = declaration_changes(snapshot, &current);
+        }
         let invariants_changed = snapshot
             .get("invariants")
             .and_then(Value::as_array)
@@ -327,6 +418,90 @@ pub(crate) async fn check() -> OpenAIResponsesContractStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn public_declaration_diffs_preserve_counts_and_bound_samples() {
+        let diff = declaration_changes(
+            &json!({"declarations":["0:shared", "2:repeat", "2:repeat", "4:removed"]}),
+            &json!({"declarations":["2:repeat", "0:shared", "6:added", "6:added"]}),
+        )
+        .unwrap();
+        assert_eq!(diff.added_count, 2);
+        assert_eq!(diff.removed_count, 2);
+        assert_eq!(diff.added, vec!["6:added", "6:added"]);
+        assert_eq!(diff.removed, vec!["2:repeat", "4:removed"]);
+        let diff = declaration_changes(&json!({"declarations":[]}), &json!({
+            "declarations": (0..20).map(|index| format!("4:field{index}: {}", "x".repeat(800))).collect::<Vec<_>>()
+        })).unwrap();
+        assert_eq!(diff.added_count, 20);
+        assert_eq!(diff.added.len(), 12);
+        assert!(diff
+            .added
+            .iter()
+            .all(|line| line.chars().count() < 350 && line.ends_with("[truncated]")));
+        assert!(declaration_changes(&json!({}), &json!({"declarations":[]})).is_none());
+        let serialized = serde_json::to_value(embedded_status()).unwrap();
+        assert!(serialized.get("declarationChanges").is_none());
+        let serialized = serde_json::to_value(diff).unwrap();
+        assert_eq!(serialized["addedCount"], 20);
+        assert_eq!(serialized["removedCount"], 0);
+    }
+
+    #[test]
+    fn truncated_reference_without_returns_fails_closed() {
+        let snapshot = embedded_snapshot();
+        let body = snapshot["declarations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|value| {
+                let (indent, declaration) = value.as_str().unwrap().split_once(':').unwrap();
+                format!(
+                    "{}- `{declaration}`",
+                    " ".repeat(indent.parse::<usize>().unwrap())
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(extract_contract(&format!("### Body Parameters\n{body}")).is_err());
+    }
+
+    #[tokio::test]
+    async fn reference_limit_is_enforced_before_waiting_for_the_body_to_finish() {
+        use tokio::io::AsyncWriteExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let headers = format!(
+                "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n{:x}\r\n",
+                MAX_REFERENCE_BYTES + 1
+            );
+            socket.write_all(headers.as_bytes()).await.unwrap();
+            socket
+                .write_all(&vec![b'x'; MAX_REFERENCE_BYTES + 1])
+                .await
+                .unwrap();
+            socket.write_all(b"\r\n").await.unwrap();
+            // Do not terminate the body: a bounded reader must reject it already.
+            std::future::pending::<()>().await;
+        });
+        let response = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap()
+            .get(format!("http://{address}/reference"))
+            .send()
+            .await
+            .unwrap();
+        let result =
+            tokio::time::timeout(Duration::from_secs(2), read_reference_response(response)).await;
+        server.abort();
+        assert!(
+            matches!(result, Ok(Err(ref error)) if error.contains("2 MiB")),
+            "must stop after the size limit without reading EOF: {result:?}"
+        );
+    }
 
     #[test]
     fn embedded_status_contains_reviewed_contract_metadata() {

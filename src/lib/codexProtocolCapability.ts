@@ -1,5 +1,6 @@
 import type {
   CodexCatalogModel,
+  CodexModelProtocolCapability,
   CodexProtocolOverride,
   Provider,
 } from "@/types";
@@ -46,6 +47,46 @@ export function normalizeCodexProtocolCapabilityBaseUrl(
   }
 }
 
+/** Keep only the credential-free provider declaration contract at persistence boundaries. */
+export function normalizeCodexModelProtocolCapability(
+  value: unknown,
+): CodexModelProtocolCapability | undefined {
+  if (
+    !isRecord(value) ||
+    value.schemaVersion !== 1 ||
+    value.source !== "provider_api" ||
+    !Array.isArray(value.supportedEndpoints) ||
+    value.supportedEndpoints.some(
+      (endpoint) =>
+        endpoint !== "openai_chat" && endpoint !== "openai_responses",
+    )
+  ) {
+    return undefined;
+  }
+  const baseUrl = normalizeCodexProtocolCapabilityBaseUrl(value.baseUrl);
+  const upstreamModel = trimmedString(value.upstreamModel);
+  if (!baseUrl || !upstreamModel) return undefined;
+  const normalized: CodexModelProtocolCapability = {
+    schemaVersion: 1,
+    source: "provider_api",
+    baseUrl,
+    upstreamModel,
+    supportedEndpoints: [
+      ...new Set(value.supportedEndpoints as CodexProtocolOverride[]),
+    ],
+  };
+  for (const key of [
+    "supportsTools",
+    "supportsStreaming",
+    "supportsToolContinuation",
+  ] as const) {
+    if (value[key] === undefined) continue;
+    if (typeof value[key] !== "boolean") return undefined;
+    normalized[key] = value[key];
+  }
+  return normalized;
+}
+
 /** Select a declared transport without claiming authentication or deep verification. */
 export function readCodexModelProtocolCapability(
   provider: ProtocolProvider,
@@ -79,40 +120,21 @@ function inspectCodexModelProtocolCapability(
     typeof model === "string" ? findCatalogModel(provider, model) : model;
   if (!row || row.enabled === false || !trimmedString(row.model))
     return { status: "unavailable", transport: null };
-  const capability: unknown = row.protocolCapability;
-  if (
-    !isRecord(capability) ||
-    capability.schemaVersion !== 1 ||
-    capability.source !== "provider_api" ||
-    !Array.isArray(capability.supportedEndpoints) ||
-    capability.supportedEndpoints.length === 0 ||
-    capability.supportedEndpoints.some(
-      (endpoint) =>
-        endpoint !== "openai_chat" && endpoint !== "openai_responses",
-    )
-  ) {
+  const capability = normalizeCodexModelProtocolCapability(
+    row.protocolCapability,
+  );
+  if (!capability || capability.supportedEndpoints.length === 0) {
     return { status: "unavailable", transport: null };
   }
-  let explicitlyUnsupported = false;
-  for (const key of [
-    "supportsTools",
-    "supportsStreaming",
-    "supportsToolContinuation",
-  ]) {
-    if (capability[key] === undefined) continue;
-    if (typeof capability[key] !== "boolean") {
-      return { status: "unavailable", transport: null };
-    }
-    explicitlyUnsupported ||= capability[key] === false;
-  }
+  const explicitlyUnsupported = [
+    capability.supportsTools,
+    capability.supportsStreaming,
+    capability.supportsToolContinuation,
+  ].some((value) => value === false);
   const currentBaseUrl = normalizeCodexProtocolCapabilityBaseUrl(
     providerBaseUrl(provider),
   );
-  if (
-    !currentBaseUrl ||
-    normalizeCodexProtocolCapabilityBaseUrl(capability.baseUrl) !==
-      currentBaseUrl
-  ) {
+  if (!currentBaseUrl || capability.baseUrl !== currentBaseUrl) {
     return { status: "unavailable", transport: null };
   }
   const upstreamModel =

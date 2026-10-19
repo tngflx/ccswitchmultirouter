@@ -1,7 +1,10 @@
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { verifyCodexCatalog } from "./verify-codex-catalog.mjs";
+import { main as verifyResponsesContract } from "./check-openai-responses-contract.mjs";
 
+// Validate the embedded baseline offline; builds must not depend on live docs.
+await verifyResponsesContract([]);
 verifyCodexCatalog();
 const result = spawnSync(
   process.execPath,

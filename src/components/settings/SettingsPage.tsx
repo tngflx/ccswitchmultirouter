@@ -98,6 +98,8 @@ export function SettingsPage({
     resetAppConfigDir,
     saveSettings,
     autoSaveSettings,
+    saveRequestHealthSettings,
+    setRequestHealthEnabled,
     requiresRestart,
     acknowledgeRestart,
   } = useSettings();
@@ -609,10 +611,9 @@ export function SettingsPage({
                   isRefreshing={requestHealthLoading}
                   loadError={requestHealthError}
                   onRefresh={() => void refreshRequestHealth()}
+                  onSaveConfig={saveRequestHealthSettings}
+                  onSetEnabled={setRequestHealthEnabled}
                   onSaved={(config) => {
-                    // Keep the local form current without replacing its other
-                    // unsaved fields through a query-cache refresh.
-                    updateSettings({ requestHealth: config });
                     acceptSavedRequestHealthConfig(config);
                     void refreshRequestHealth();
                   }}

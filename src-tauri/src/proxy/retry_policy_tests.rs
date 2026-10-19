@@ -2,8 +2,8 @@ use super::super::{send_codex_request_with_rate_limit_retry, ProxyResponse};
 use super::safe_test_codex_traffic_policy;
 use crate::proxy::error::ProxyError;
 use crate::proxy::providers::streaming_retry::{
-    create_resilient_responses_sse_stream, ByteStream, StreamReconnector,
-    CAPACITY_RETRY_LONG_DELAY, STREAM_MAX_RETRIES,
+    capacity_retry_delay, create_resilient_responses_sse_stream, ByteStream, StreamReconnector,
+    STREAM_MAX_RETRIES,
 };
 use bytes::Bytes;
 use futures::{stream, StreamExt};
@@ -167,13 +167,15 @@ async fn capacity_api_retries_high_demand_at_most_five_times() {
     );
     assert_eq!(
         tokio::time::Instant::now() - started_at,
-        CAPACITY_RETRY_LONG_DELAY * STREAM_MAX_RETRIES,
-        "each explicit high-demand retry must wait ten minutes"
+        (1..=STREAM_MAX_RETRIES)
+            .map(capacity_retry_delay)
+            .sum::<Duration>(),
+        "explicit high-demand retries use five-minute exponential backoff"
     );
 }
 
 #[tokio::test(start_paused = true)]
-async fn capacity_api_retries_concurrent_limit_then_recovers_after_ten_minutes() {
+async fn capacity_api_retries_concurrent_limit_then_recovers_after_five_minutes() {
     let attempts = Arc::new(AtomicUsize::new(0));
     let attempts_for_send = attempts.clone();
     let started_at = tokio::time::Instant::now();
@@ -210,7 +212,7 @@ async fn capacity_api_retries_concurrent_limit_then_recovers_after_ten_minutes()
     assert_eq!(attempts.load(Ordering::SeqCst), 2);
     assert_eq!(
         tokio::time::Instant::now() - started_at,
-        CAPACITY_RETRY_LONG_DELAY,
-        "explicit concurrent-limit responses use the ten-minute tier"
+        capacity_retry_delay(1),
+        "explicit concurrent-limit responses use the five-minute initial tier"
     );
 }

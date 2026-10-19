@@ -1463,6 +1463,10 @@ fn project_codex_desktop_model_fields(
             json!(default_reasoning_effort.clone()),
         );
         entry_obj.insert(
+            "default_reasoning_effort".to_string(),
+            json!(default_reasoning_effort.clone()),
+        );
+        entry_obj.insert(
             "defaultReasoningEffort".to_string(),
             json!(default_reasoning_effort),
         );
@@ -1486,6 +1490,13 @@ fn project_codex_desktop_model_fields(
     entry_obj.insert("hidden".to_string(), json!(false));
     entry_obj.insert("isDefault".to_string(), json!(spec.is_default));
 
+    if let Some(value) = entry_obj
+        .get("supports_parallel_tool_calls")
+        .filter(|value| value.is_boolean())
+        .cloned()
+    {
+        entry_obj.insert("supportsParallelToolCalls".to_string(), value);
+    }
     if let Some(value) = entry_obj.get("additional_speed_tiers").cloned() {
         entry_obj.insert("additionalSpeedTiers".to_string(), value);
     }
@@ -1581,6 +1592,9 @@ fn codex_catalog_model_entry(
         entry_obj.insert("default_reasoning_summary".to_string(), json!("none"));
         entry_obj.insert("defaultReasoningSummary".to_string(), json!("none"));
     }
+    if let Some(parallel) = spec.supports_parallel_tool_calls {
+        entry_obj.insert("supports_parallel_tool_calls".to_string(), json!(parallel));
+    }
     project_codex_desktop_model_fields(entry_obj, spec);
 
     if profile != CodexCatalogToolProfile::ProxyChat {
@@ -1605,9 +1619,6 @@ fn codex_catalog_model_entry(
             .filter(|value| !value.is_empty())
         {
             entry_obj.insert("base_instructions".to_string(), json!(base_instructions));
-        }
-        if let Some(parallel) = spec.supports_parallel_tool_calls {
-            entry_obj.insert("supports_parallel_tool_calls".to_string(), json!(parallel));
         }
     }
 
@@ -1830,6 +1841,14 @@ fn official_models_with_bundled_fallback(
     }
     if let Some(bundled_models) = bundled_models {
         overlay_local_models(&mut models, &mut model_indexes, bundled_models);
+    }
+    // Codex's external model parser has a hard instruction-source contract,
+    // but older official caches (and public snapshots) predate that contract.
+    // Normalize every source before it can become the authority used by
+    // catalog projection or cache restoration. The static template only
+    // backfills parser-required fields and never replaces valid metadata.
+    for model in &mut models {
+        fill_template_fields_from_static(model);
     }
     (!models.is_empty()).then_some(models)
 }
@@ -2618,6 +2637,20 @@ fn codex_catalog_has_instruction_source(model: &Value) -> bool {
             .is_some_and(Value::is_string)
 }
 
+fn backfill_codex_cache_instruction_sources(cache: &mut Value) -> bool {
+    let Some(models) = cache.get_mut("models").and_then(Value::as_array_mut) else {
+        return false;
+    };
+    let mut changed = false;
+    for model in models {
+        if !codex_catalog_has_instruction_source(model) {
+            fill_template_fields_from_static(model);
+            changed |= codex_catalog_has_instruction_source(model);
+        }
+    }
+    changed
+}
+
 fn load_codex_model_catalog_template_uncached() -> Result<Value, AppError> {
     // ① models_cache.json (created by Codex when it connects to OpenAI)
     if let Some(mut template) = load_codex_model_template_from_cache()? {
@@ -2903,6 +2936,17 @@ fn codex_provider_models_toml_array(
         {
             model.insert("input_modalities", input_modalities.clone());
             model.insert("inputModalities", input_modalities);
+        }
+        if let Some(parallel) = catalog_entry
+            .and_then(|entry| {
+                entry
+                    .get("supports_parallel_tool_calls")
+                    .or_else(|| entry.get("supportsParallelToolCalls"))
+            })
+            .and_then(Value::as_bool)
+        {
+            model.insert("supports_parallel_tool_calls", parallel.into());
+            model.insert("supportsParallelToolCalls", parallel.into());
         }
         if let Some(multi_agent_version) = catalog_entry
             .and_then(|entry| {
@@ -6571,9 +6615,17 @@ fn sync_codex_models_cache_with_cc_switch_catalog_and_authority(
                         .get("models")
                         .and_then(Value::as_array)
                         .is_none_or(Vec::is_empty)
+                    || backup
+                        .get("models")
+                        .and_then(Value::as_array)
+                        .is_some_and(|models| {
+                            models
+                                .iter()
+                                .any(|model| !codex_catalog_has_instruction_source(model))
+                        })
             });
             if backup_needs_rebuild && !official_models.is_empty() {
-                let mut restored = cache.clone();
+                let mut restored = backup.unwrap_or_else(|| cache.clone());
                 restored["etag"] = Value::Null;
                 restored["models"] = Value::Array(official_models.clone());
                 if let Some(object) = restored.as_object_mut() {
@@ -6586,7 +6638,12 @@ fn sync_codex_models_cache_with_cc_switch_catalog_and_authority(
             if let Some(parent) = backup_path.parent() {
                 fs::create_dir_all(parent).map_err(|e| AppError::io(parent, e))?;
             }
-            fs::copy(&cache_path, &backup_path).map_err(|e| AppError::io(&backup_path, e))?;
+            let mut backup = cache.clone();
+            if backfill_codex_cache_instruction_sources(&mut backup) {
+                write_json_file(&backup_path, &backup)?;
+            } else {
+                fs::copy(&cache_path, &backup_path).map_err(|e| AppError::io(&backup_path, e))?;
+            }
         }
     }
 
@@ -6719,14 +6776,18 @@ fn restore_codex_models_cache_if_cc_switch_owned() -> Result<(), AppError> {
         return Ok(());
     }
 
-    if let Some(backup) = read_json_file_if_exists(&backup_path)? {
+    if let Some(mut backup) = read_json_file_if_exists(&backup_path)? {
         if codex_models_cache_is_cc_switch_owned(&backup) {
             delete_file(&cache_path)?;
             delete_file(&backup_path)?;
             return Ok(());
         }
-        let backup = fs::read(&backup_path).map_err(|e| AppError::io(&backup_path, e))?;
-        atomic_write(&cache_path, &backup)?;
+        if backfill_codex_cache_instruction_sources(&mut backup) {
+            write_json_file(&cache_path, &backup)?;
+        } else {
+            let backup = fs::read(&backup_path).map_err(|e| AppError::io(&backup_path, e))?;
+            atomic_write(&cache_path, &backup)?;
+        }
         delete_file(&backup_path).ok();
     } else {
         delete_file(&cache_path).ok();
@@ -6821,26 +6882,59 @@ fn apply_codex_router_catalog_preferences(catalog: &mut Value, settings: &Value)
     let requested = source_catalog
         .get("defaultReasoningEffort")
         .and_then(Value::as_str)?;
-    if !matches!(
-        requested,
-        "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max"
-    ) {
-        return None;
-    }
     let first = models.first_mut()?;
+    let first_id = codex_model_stable_id(first)?;
+    let source_model = source_models.iter().find(|source| {
+        source
+            .get("model")
+            .and_then(Value::as_str)
+            .is_some_and(|candidate| candidate.eq_ignore_ascii_case(&first_id))
+    });
     let supported_levels = first
         .get("supported_reasoning_levels")
         .or_else(|| first.get("supported_reasoning_efforts"))
         .or_else(|| first.get("supportedReasoningEfforts"));
-    let supported = supported_levels
-        .and_then(Value::as_array)
-        .is_some_and(|levels| {
-            levels
-                .iter()
-                .any(|level| codex_reasoning_effort_name(level) == Some(requested))
-        });
+    let requested_effort = requested
+        .parse::<crate::proxy::providers::codex_reasoning::CodexReasoningEffort>()
+        .ok()?;
+    let supported = if requested_effort
+        == crate::proxy::providers::codex_reasoning::CodexReasoningEffort::Ultra
+    {
+        if codex_subagent_version(settings).as_str() == "v1" {
+            false
+        } else {
+            source_model
+                .and_then(|source| source.get("reasoning"))
+                .and_then(|reasoning| {
+                    serde_json::from_value::<
+                        crate::proxy::providers::codex_reasoning::CodexModelReasoningCapability,
+                    >(reasoning.clone())
+                    .ok()
+                })
+                .is_some_and(|capability| {
+                    crate::proxy::providers::codex_reasoning::resolve_subagent_reasoning_capability(
+                        Some(&capability),
+                    )
+                    .codex_selectable_efforts
+                    .contains(&requested_effort)
+                })
+        }
+    } else {
+        supported_levels
+            .and_then(Value::as_array)
+            .is_some_and(|levels| {
+                levels
+                    .iter()
+                    .any(|level| codex_reasoning_effort_name(level) == Some(requested))
+            })
+    };
     if !supported {
         return None;
+    }
+    if requested_effort == crate::proxy::providers::codex_reasoning::CodexReasoningEffort::Ultra {
+        // Ultra is a Codex V2 orchestration preference. It is deliberately
+        // kept out of the provider-native catalog default fields.
+        return Some(requested.to_string());
     }
     let object = first.as_object_mut()?;
     for field in [
@@ -6915,7 +7009,6 @@ fn projected_codex_model_catalog(
         &generated_catalog,
         reasoning_authoritative_ids,
     )?;
-    let router_effort = apply_codex_router_catalog_preferences(&mut catalog, settings);
     if let Some(fingerprint) = settings
         .pointer("/codexRoutingProjection/dependencyFingerprint")
         .and_then(Value::as_str)
@@ -6931,6 +7024,7 @@ fn projected_codex_model_catalog(
         .unwrap_or_else(|| CODEX_OPENAI_MODEL_PROVIDER_ID.to_string());
     catalog["ccSwitchModelProvider"] = json!(model_provider);
     apply_codex_multi_agent_transport_policy(&mut catalog, settings);
+    let router_effort = apply_codex_router_catalog_preferences(&mut catalog, settings);
     Ok((catalog, router_effort))
 }
 
@@ -6973,6 +7067,14 @@ fn prepare_codex_config_text_with_model_catalog_impl(
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|fingerprint| !fingerprint.is_empty());
+    // A compiled router has one Codex-facing contract regardless of a caller's
+    // legacy upstream format. Takeover and explicit resync must publish the
+    // same template; per-model transport policy is applied from the catalog.
+    let profile = if projection_fingerprint.is_some() {
+        CodexCatalogToolProfile::NativeResponses
+    } else {
+        profile
+    };
     let has_catalog_inventory = catalog_models(settings).is_some();
 
     // 是否写入 provider 内联模型取决于已安装 Desktop 版本；严格诊断生效的
@@ -14935,6 +15037,163 @@ base_url = "http://127.0.0.1:15721/v1"
     }
 
     #[test]
+    fn metadata_audit_parallel_declarations_survive_all_profiles_cache_and_inline() {
+        let template = json!({
+            "slug": "template",
+            "supports_parallel_tool_calls": true,
+            "supportsParallelToolCalls": true
+        });
+        let config = r#"model_provider = "codex_model_router_v2"
+[model_providers.codex_model_router_v2]
+base_url = "http://127.0.0.1:15721/v1"
+"#;
+        for profile in [
+            CodexCatalogToolProfile::ProxyChat,
+            CodexCatalogToolProfile::NativeResponses,
+            CodexCatalogToolProfile::Anthropic,
+        ] {
+            for declared in [Some(false), Some(true), None] {
+                let settings = json!({"modelCatalog": {"models": [{
+                    "model": "metadata-audit-custom",
+                    "inputModalities": ["text", "image", "audio", "video", "file"]
+                }]}});
+                let mut specs = codex_catalog_model_specs(&settings, "");
+                specs[0].supports_parallel_tool_calls = declared;
+                assert_eq!(
+                    specs[0].input_modalities.as_ref().unwrap().len(),
+                    5,
+                    "canonical provider modalities must not be narrowed"
+                );
+                assert_eq!(specs[0].supports_parallel_tool_calls, declared);
+                let catalog = codex_model_catalog_from_specs(&specs, &template, profile, 128_000);
+                let cache = projected_codex_models_cache_entries(&catalog, &[], &HashSet::new())
+                    .expect("project cache");
+                let projected = set_codex_model_catalog_projection_fields(
+                    config,
+                    Some(Path::new("catalog")),
+                    Some(&specs),
+                    Some(&catalog),
+                    true,
+                )
+                .expect("project inline");
+                let inline: toml::Value = toml::from_str(&projected).unwrap();
+                let inline_model = &inline["model_providers"]["codex_model_router_v2"]["models"][0];
+                let expected = declared.unwrap_or(true);
+                for field in ["supports_parallel_tool_calls", "supportsParallelToolCalls"] {
+                    assert_eq!(
+                        catalog["models"][0][field],
+                        json!(expected),
+                        "catalog {profile:?} {declared:?} {field}"
+                    );
+                    assert_eq!(
+                        cache[0][field],
+                        json!(expected),
+                        "cache {profile:?} {declared:?} {field}"
+                    );
+                    assert_eq!(
+                        inline_model[field].as_bool(),
+                        Some(expected),
+                        "inline {profile:?} {declared:?} {field}"
+                    );
+                }
+                assert_eq!(
+                    catalog["models"][0]["input_modalities"],
+                    json!(["text", "image"]),
+                    "Codex projection uses only its supported input vocabulary"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn metadata_audit_vendor_parallel_override_replaces_both_aliases() {
+        let settings = json!({"modelCatalog": {"models": [{
+            "model": "metadata-audit-custom",
+            "supportsParallelToolCalls": false
+        }]}});
+        let specs = codex_catalog_model_specs(&settings, "");
+        let entry = codex_vendor_catalog_model_entry(
+            &[json!({
+                "slug": "metadata-audit-custom",
+                "supports_parallel_tool_calls": true,
+                "supportsParallelToolCalls": true
+            })],
+            &specs[0],
+            0,
+        );
+        assert_eq!(entry["supports_parallel_tool_calls"], false);
+        assert_eq!(entry["supportsParallelToolCalls"], false);
+    }
+
+    #[test]
+    #[serial]
+    fn metadata_audit_router_ultra_preference_uses_final_transport_capabilities() {
+        let _home = crate::config::TestHomeGuard::new();
+        let config = r#"model = "metadata-audit-custom"
+model_provider = "codex_model_router_v2"
+[model_providers.codex_model_router_v2]
+base_url = "http://127.0.0.1:15721/v1"
+"#;
+        for (version, advertised, expected) in [
+            ("v2", true, Some("ultra")),
+            ("v1", true, None),
+            ("v2", false, None),
+        ] {
+            let settings = json!({
+                "codexRoutingProjection": {"dependencyFingerprint": "metadata-audit"},
+                "codexRouting": {
+                    "enabled": true, "subagentVersion": version,
+                    "routes": [{
+                        "match": {"models": ["metadata-audit-custom"]},
+                        "upstream": {"auth": {"source": "provider_config"}}
+                    }]
+                },
+                "modelCatalog": {
+                    "defaultReasoningEffort": "ultra",
+                    "models": [{
+                        "model": "metadata-audit-custom",
+                        "reasoning": {
+                            "schemaVersion": 2,
+                            "supportStatus": "confirmed_supported",
+                            "controlKind": "graded",
+                            "supportedEfforts": ["low", "high"],
+                            "defaultEffort": "high",
+                            "disableAllowed": false,
+                            "upstream": {
+                                "format": "string",
+                                "parameter": "reasoning_effort",
+                                "effortMap": {"low": "low", "high": "high", "max": "high"}
+                            },
+                            "codexUltraOrchestration": {"enabled": advertised},
+                            "source": "user"
+                        }
+                    }]
+                }
+            });
+            let (catalog, selected) = projected_codex_model_catalog(
+                &settings,
+                config,
+                CodexCatalogToolProfile::ProxyChat,
+                &HashSet::from(["metadata-audit-custom".to_string()]),
+            )
+            .expect("project router");
+            assert_eq!(selected.as_deref(), expected, "{version} {advertised}");
+            let expected_default = "high";
+            for field in [
+                "default_reasoning_level",
+                "default_reasoning_effort",
+                "defaultReasoningEffort",
+            ] {
+                assert_eq!(catalog["models"][0][field], expected_default, "{field}");
+            }
+            assert_eq!(
+                settings["modelCatalog"]["models"][0]["reasoning"]["defaultEffort"], "high",
+                "Codex preference must not change the provider's native default"
+            );
+        }
+    }
+
+    #[test]
     fn codex_model_catalog_text_only_native_responses_never_reenables_image_modality() {
         let template = json!({
             "slug": "gpt-5.5",
@@ -18435,6 +18694,39 @@ base_url = "https://provider.example/v1"
             models[0].get("service_tiers"),
             Some(&json!([{ "id": "priority", "name": "Fast" }]))
         );
+        assert!(
+            codex_catalog_has_instruction_source(&models[0]),
+            "legacy official rows must be parser-valid before reuse"
+        );
+    }
+
+    #[test]
+    fn official_models_backfill_instruction_source_for_legacy_cache_rows() {
+        let legacy_cache = json!({
+            "models": [
+                {"slug": "gpt-6-astra", "default_reasoning_level": "low"}
+            ]
+        });
+
+        let models =
+            official_models_with_bundled_fallback(Some(&legacy_cache), None, None, None, None)
+                .expect("legacy official cache should remain usable");
+
+        assert_eq!(
+            models[0].get("slug").and_then(Value::as_str),
+            Some("gpt-6-astra")
+        );
+        assert!(
+            codex_catalog_has_instruction_source(&models[0]),
+            "legacy cache rows must gain a compatible instruction source"
+        );
+        assert!(
+            models[0]
+                .get("base_instructions")
+                .and_then(Value::as_str)
+                .is_some_and(|value| !value.trim().is_empty()),
+            "the static instruction template should be used as the fallback"
+        );
     }
 
     #[test]
@@ -18732,7 +19024,11 @@ base_url = "https://provider.example/v1"
     #[serial]
     fn all_excluded_provider_catalog_publishes_empty_picker_models() {
         let _home = TestHomeGuard::new();
-        seed_codex_models_cache(json!([{"slug": "official-only"}]));
+        let official_models = json!([{
+            "slug": "official-only",
+            "base_instructions": "Native official instructions"
+        }]);
+        seed_codex_models_cache(official_models.clone());
         let settings = json!({
             "modelCatalog": {"models": [{"model": "hidden", "enabled": false}]}
         });
@@ -18760,14 +19056,18 @@ models = [{ model = "stale-model" }]
         assert_eq!(cache["models"], json!([]));
         assert!(codex_models_cache_is_cc_switch_owned(&cache));
         let backup: Value = read_json_file(&get_codex_models_cache_backup_path()).unwrap();
-        assert_eq!(backup["models"], json!([{"slug": "official-only"}]));
+        assert_eq!(backup["models"], official_models);
     }
 
     #[test]
     #[serial]
     fn explicit_empty_catalog_keeps_managed_picker_ownership_without_router_fingerprint() {
         let _home = TestHomeGuard::new();
-        seed_codex_models_cache(json!([{"slug": "official-only"}]));
+        let official_models = json!([{
+            "slug": "official-only",
+            "base_instructions": "Native official instructions"
+        }]);
+        seed_codex_models_cache(official_models.clone());
         let config = "model_provider = \"custom\"\n\
             [model_providers.custom]\nbase_url = \"https://example.org/v1\"\n";
         let previous = prepare_codex_config_text_with_model_catalog_without_provider_context(
@@ -18810,7 +19110,7 @@ models = [{ model = "stale-model" }]
         assert!(codex_models_cache_is_cc_switch_owned(&cache));
         assert!(cache.get("ccSwitchRoutingDependencyFingerprint").is_none());
         let backup: Value = read_json_file(&get_codex_models_cache_backup_path()).unwrap();
-        assert_eq!(backup["models"], json!([{"slug": "official-only"}]));
+        assert_eq!(backup["models"], official_models);
     }
 
     #[test]
@@ -19209,6 +19509,8 @@ base_url = "http://127.0.0.1:15721/v1"
             "model_messages": { "instructions_template": "template" },
             "context_window": 128000
         }]));
+        let original_cache =
+            fs::read(get_codex_models_cache_path()).expect("read original official cache");
         let settings = json!({
             "modelCatalog": {
                 "models": [
@@ -19254,6 +19556,97 @@ model_catalog_json = "cc-switch-model-catalog.json"
             .filter_map(|model| model.get("slug").and_then(|slug| slug.as_str()))
             .collect::<Vec<_>>();
         assert_eq!(slugs, vec!["gpt-5.5"]);
+        assert_eq!(
+            fs::read(get_codex_models_cache_path()).expect("read restored cache bytes"),
+            original_cache,
+            "valid official caches must be restored without rewriting"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn legacy_cache_takeover_and_immediate_release_preserve_compatible_official_backup() {
+        let _home = TestHomeGuard::new();
+        seed_codex_models_cache(json!([{
+            "slug": "gpt-6-astra",
+            "display_name": "Custom official display",
+            "native_metadata": {"preserve": true},
+            "supported_reasoning_levels": [{"effort": "max", "description": "Native max"}]
+        }]));
+
+        sync_codex_models_cache_with_cc_switch_catalog(&json!({
+            "models": [{"model": "managed-model"}]
+        }))
+        .expect("take over legacy cache");
+
+        let backup: Value =
+            read_json_file(&get_codex_models_cache_backup_path()).expect("read first backup");
+        assert!(
+            codex_catalog_has_instruction_source(&backup["models"][0]),
+            "the first backup must already be safe to restore"
+        );
+
+        restore_codex_models_cache_if_cc_switch_owned().expect("release without a second sync");
+        let restored: Value =
+            read_json_file(&get_codex_models_cache_path()).expect("read restored legacy cache");
+        assert!(codex_catalog_has_instruction_source(&restored["models"][0]));
+        assert_eq!(restored["etag"], json!("official-cache"));
+        assert_eq!(restored["models"][0]["slug"], json!("gpt-6-astra"));
+        assert_eq!(
+            restored["models"][0]["display_name"],
+            json!("Custom official display")
+        );
+        assert_eq!(
+            restored["models"][0]["native_metadata"],
+            json!({"preserve": true})
+        );
+        assert_eq!(
+            restored["models"][0]["supported_reasoning_levels"],
+            json!([{"effort": "max", "description": "Native max"}])
+        );
+        assert!(!get_codex_models_cache_backup_path().exists());
+    }
+
+    #[test]
+    #[serial]
+    fn releasing_catalog_repairs_legacy_backup_without_a_prior_sync() {
+        let _home = TestHomeGuard::new();
+        write_json_file(
+            &get_codex_models_cache_path(),
+            &json!({
+                "client_version": "0.153.0",
+                "etag": CC_SWITCH_CODEX_MODELS_CACHE_ETAG,
+                "models": [{"slug": "managed-model"}]
+            }),
+        )
+        .expect("write owned cache");
+        write_json_file(
+            &get_codex_models_cache_backup_path(),
+            &json!({
+                "client_version": "0.150.1",
+                "etag": "official-cache",
+                "native_top_level": true,
+                "models": [{"slug": "gpt-6-astra", "default_reasoning_level": "low"}]
+            }),
+        )
+        .expect("write legacy official backup");
+
+        restore_codex_models_cache_if_cc_switch_owned().expect("restore old backup directly");
+
+        let restored: Value =
+            read_json_file(&get_codex_models_cache_path()).expect("read repaired official cache");
+        assert!(
+            codex_catalog_has_instruction_source(&restored["models"][0]),
+            "release must not recreate the old model parser failure"
+        );
+        assert_eq!(restored["client_version"], json!("0.150.1"));
+        assert_eq!(restored["etag"], json!("official-cache"));
+        assert_eq!(restored["native_top_level"], json!(true));
+        assert_eq!(
+            restored["models"][0]["default_reasoning_level"],
+            json!("low")
+        );
+        assert!(!get_codex_models_cache_backup_path().exists());
     }
 
     #[test]
@@ -19414,6 +19807,57 @@ wire_api = "responses"
             cache["ccSwitchRoutingDependencyFingerprint"],
             "fingerprint-v2"
         );
+    }
+
+    #[test]
+    #[serial]
+    fn multirouter_resync_uses_same_contract_across_catalog_writer_profiles() {
+        let _home = TestHomeGuard::new();
+        write_codex_live_config_atomic(Some(
+            "model_provider = \"codex_model_router_v2\"\nmodel = \"worker\"\n\
+             [model_providers.codex_model_router_v2]\n\
+             base_url = \"http://127.0.0.1:15721/v1\"\nwire_api = \"responses\"\n",
+        ))
+        .expect("seed live router config");
+        seed_codex_models_cache(json!([]));
+        let settings = json!({
+            "modelCatalog": {"models": [{"model": "worker", "contextWindow": 262144}]},
+            "codexRouting": {"schemaVersion": 2, "enabled": true, "routes": []},
+            "codexRoutingProjection": {"dependencyFingerprint": "same-router-dependencies"}
+        });
+        let baseline = publish_codex_multirouter_projection(&settings).expect("manual resync");
+        assert!(baseline.catalog_verified && baseline.config_verified && baseline.cache_verified);
+        let catalog: Value = read_json_file(&get_codex_model_catalog_path()).unwrap();
+        let cache: Value = read_json_file(&get_codex_models_cache_path()).unwrap();
+        let config: toml::Value = toml::from_str(&read_codex_config_text().unwrap()).unwrap();
+
+        for profile in [
+            CodexCatalogToolProfile::ProxyChat,
+            CodexCatalogToolProfile::Anthropic,
+            CodexCatalogToolProfile::NativeResponses,
+        ] {
+            let live = read_codex_config_text().unwrap();
+            let prepared = prepare_codex_config_text_with_model_catalog_without_provider_context(
+                &settings, &live, profile,
+            )
+            .expect("normal live writer projection");
+            write_codex_live_config_atomic(Some(&prepared)).expect("write projected config");
+            let readback = read_back_codex_multirouter_projection_impl(&settings, None)
+                .expect("inspect after normal writer");
+
+            assert!(
+                readback.catalog_verified
+                    && readback.config_verified
+                    && readback.cache_verified
+                    && readback.agent_files_verified,
+                "writer profile {profile:?} must not invalidate the same router: {readback:?}"
+            );
+            let actual_catalog: Value = read_json_file(&get_codex_model_catalog_path()).unwrap();
+            let actual_cache: Value = read_json_file(&get_codex_models_cache_path()).unwrap();
+            assert_eq!(actual_catalog, catalog);
+            assert_eq!(actual_cache["models"], cache["models"]);
+            assert_eq!(toml::from_str::<toml::Value>(&prepared).unwrap(), config);
+        }
     }
 
     #[test]

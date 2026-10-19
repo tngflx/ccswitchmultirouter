@@ -305,6 +305,11 @@ const PRICING_CHARGE_KEYS: &[&str] = &[
     "cache_write",
     "input_audio",
     "output_audio",
+    "audio_output",
+    "image_output",
+    "image_token",
+    "input_audio_cache",
+    "input_cache_write_1h",
     "audio",
     "video",
     "embedding",
@@ -541,9 +546,10 @@ fn parse_provider_models_response(
     }
     let data = response.data;
     let rich_models = response.models;
+    let native_google_models = is_native_google_models_discovery(base_url, models_url);
     let entries = match (data, rich_models) {
         (Some(mut data), Some(rich)) => {
-            let rich = normalize_rich_model_entries(rich)?;
+            let rich = normalize_rich_model_entries(rich, native_google_models)?;
             validate_rich_model_entries(&rich)?;
             if data.is_empty() && !rich.is_empty() {
                 return Err(
@@ -556,7 +562,7 @@ fn parse_provider_models_response(
         }
         (Some(data), None) => data,
         (None, Some(rich)) => {
-            let rich = normalize_rich_model_entries(rich)?;
+            let rich = normalize_rich_model_entries(rich, native_google_models)?;
             validate_rich_model_entries(&rich)?;
             rich
         }
@@ -571,6 +577,12 @@ fn parse_provider_models_response(
             let protocol_capability =
                 extract_protocol_capability(&entry.id, &entry.extra, base_url, models_url);
             let identity = extract_model_identity_fields(&entry.extra);
+            let supports_parallel_tool_calls =
+                identity.supports_parallel_tool_calls.or_else(|| {
+                    is_openrouter_models_discovery(base_url, models_url)
+                        .then(|| extract_openrouter_parallel_tool_calls(&entry.extra))
+                        .flatten()
+                });
             FetchedModel {
                 context_window: extract_context_window(&entry.extra),
                 id: entry.id,
@@ -583,12 +595,11 @@ fn parse_provider_models_response(
                 name: identity.name,
                 aliases: identity.aliases,
                 upstream_model: None,
-                supports_parallel_tool_calls: identity.supports_parallel_tool_calls,
+                supports_parallel_tool_calls,
                 reasoning: crate::reasoning_capabilities::provider_metadata::
                     provider_reasoning_capability_from_model_entry(
                         &serde_json::Value::Object(entry.extra.clone()),
-                        is_openrouter_api_url(base_url, "/api/v1")
-                            && is_openrouter_api_url(models_url, "/api/v1/models"),
+                        is_openrouter_models_discovery(base_url, models_url),
                     )
                     .and_then(|capability| serde_json::to_value(capability).ok()),
                 protocol_capability,
@@ -598,7 +609,10 @@ fn parse_provider_models_response(
         .collect())
 }
 
-fn normalize_rich_model_entries(value: serde_json::Value) -> Result<Vec<ModelEntry>, String> {
+fn normalize_rich_model_entries(
+    value: serde_json::Value,
+    native_google_models: bool,
+) -> Result<Vec<ModelEntry>, String> {
     let entries = match value {
         serde_json::Value::Array(entries) => entries
             .into_iter()
@@ -633,7 +647,27 @@ fn normalize_rich_model_entries(value: serde_json::Value) -> Result<Vec<ModelEnt
                     .is_some()
             })
         {
-            entry.id = fallback_id;
+            entry.id = if native_google_models {
+                entry
+                    .extra
+                    .get("name")
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|name| {
+                        name.strip_prefix("models/").is_some_and(|model| {
+                            !model.is_empty()
+                                && model != "."
+                                && model != ".."
+                                && model.bytes().all(|character| {
+                                    character.is_ascii_alphanumeric()
+                                        || matches!(character, b'-' | b'_' | b'.')
+                                })
+                        })
+                    })
+                    .map(str::to_string)
+                    .or(fallback_id)
+            } else {
+                fallback_id
+            };
         }
         let Some(entry) = entry.into_model_entry() else {
             return Err("Model fetch response contained a model without an identifier".to_string());
@@ -820,6 +854,7 @@ fn collect_declared_model_metadata_fields(
                 fields.insert("tools");
             }
         } else if [
+            "architecture",
             "metadata",
             "capability",
             "capabilities",
@@ -848,6 +883,7 @@ fn merge_missing_model_metadata(
                 continue;
             }
         } else if [
+            "architecture",
             "metadata",
             "capability",
             "capabilities",
@@ -1170,8 +1206,7 @@ fn extract_protocol_capability(
     let endpoints = match evidence.endpoints {
         Some(endpoints) => endpoints,
         None if evidence.supports_tools == Some(true)
-            && is_openrouter_api_url(&base_url, "/api/v1")
-            && is_openrouter_api_url(models_url, "/api/v1/models") =>
+            && is_openrouter_models_discovery(&base_url, models_url) =>
         {
             vec!["openai_chat"]
         }
@@ -1368,6 +1403,41 @@ fn model_discovery_has_same_origin(base_url: &str, models_url: &str) -> bool {
         && base.origin() == models.origin()
 }
 
+fn extract_openrouter_parallel_tool_calls(
+    metadata: &serde_json::Map<String, serde_json::Value>,
+) -> Option<bool> {
+    let mut declaration: Option<Vec<String>> = None;
+    for value in ["supported_parameters", "supportedParameters"]
+        .iter()
+        .filter_map(|key| metadata.get(*key))
+    {
+        let mut parameters = value
+            .as_array()?
+            .iter()
+            .map(|value| {
+                value
+                    .as_str()
+                    .map(str::trim)
+                    .filter(|parameter| !parameter.is_empty())
+                    .map(str::to_ascii_lowercase)
+            })
+            .collect::<Option<Vec<_>>>()?;
+        parameters.sort();
+        parameters.dedup();
+        if declaration
+            .as_ref()
+            .is_some_and(|previous| previous != &parameters)
+        {
+            return None;
+        }
+        declaration = Some(parameters);
+    }
+    declaration?
+        .iter()
+        .any(|parameter| parameter == "parallel_tool_calls")
+        .then_some(true)
+}
+
 fn is_openrouter_api_url(value: &str, expected_path: &str) -> bool {
     let Ok(url) = reqwest::Url::parse(value.trim()) else {
         return false;
@@ -1380,6 +1450,40 @@ fn is_openrouter_api_url(value: &str, expected_path: &str) -> bool {
         && url.query().is_none()
         && url.fragment().is_none()
         && url.path().trim_end_matches('/') == expected_path
+}
+
+/// Recognize an actual OpenRouter model-list response even when the user
+/// entered the common `https://openrouter.ai/api` base instead of the
+/// normalized `/api/v1` API scope.
+///
+/// Both the configured API scope and the successful model-list endpoint must
+/// identify OpenRouter before applying its provider-specific defaults.
+fn is_openrouter_models_discovery(base_url: &str, models_url: &str) -> bool {
+    (is_openrouter_api_url(base_url, "/api/v1") || is_openrouter_api_url(base_url, "/api"))
+        && is_openrouter_api_url(models_url, "/api/v1/models")
+        && model_discovery_has_same_origin(base_url, models_url)
+}
+
+fn is_native_google_models_discovery(base_url: &str, models_url: &str) -> bool {
+    let (Ok(base), Ok(models)) = (
+        reqwest::Url::parse(base_url.trim()),
+        reqwest::Url::parse(models_url.trim()),
+    ) else {
+        return false;
+    };
+    if base.host_str() != Some("generativelanguage.googleapis.com")
+        || !is_safe_known_gateway_url(&base)
+        || !is_safe_known_gateway_url(&models)
+        || base.origin() != models.origin()
+    {
+        return false;
+    }
+    let expected_path = match base.path().trim_end_matches('/') {
+        "" | "/v1beta" => "/v1beta/models",
+        "/v1" => "/v1/models",
+        _ => return false,
+    };
+    models.path().trim_end_matches('/') == expected_path
 }
 
 /// Derive a conservative free/paid signal from provider model metadata.
@@ -1465,9 +1569,9 @@ fn collect_pricing_evidence(
         if is_charge {
             evidence.has_charge_fields = true;
             let sign = classify_price_value(value);
-            match normalized_key.as_str() {
-                "prompt" => evidence.prompt = Some(sign),
-                "completion" => evidence.completion = Some(sign),
+            match (parent_key, normalized_key.as_str()) {
+                (None, "prompt") => evidence.prompt = Some(sign),
+                (None, "completion") => evidence.completion = Some(sign),
                 _ => {}
             }
             match sign {
@@ -1476,6 +1580,20 @@ fn collect_pricing_evidence(
                 PriceSign::Invalid => evidence.has_invalid = true,
                 PriceSign::Zero => {}
             }
+        }
+        if normalized_key == "overrides" {
+            let Some(overrides) = value.as_array() else {
+                evidence.has_invalid = true;
+                continue;
+            };
+            for override_value in overrides {
+                let Some(override_object) = override_value.as_object() else {
+                    evidence.has_invalid = true;
+                    continue;
+                };
+                collect_pricing_evidence(override_object, Some("overrides"), evidence);
+            }
+            continue;
         }
         if let Some(child) = value.as_object() {
             collect_pricing_evidence(child, Some(normalized_key.as_str()), evidence);
@@ -1694,6 +1812,7 @@ pub(crate) fn extract_input_modalities(
         "input_modalities",
         "inputModalities",
         "modalities",
+        "architecture",
         "capabilities",
         "metadata",
     ]
@@ -1728,11 +1847,13 @@ fn parse_input_modalities(value: &serde_json::Value) -> Option<Vec<String>> {
     let values = match value {
         serde_json::Value::Array(items) => items
             .iter()
-            .filter_map(|item| item.as_str())
-            .map(str::trim)
-            .filter(|item| !item.is_empty())
-            .map(ToString::to_string)
-            .collect::<Vec<_>>(),
+            .map(|item| {
+                item.as_str()
+                    .map(str::trim)
+                    .filter(|item| !item.is_empty())
+                    .map(ToString::to_string)
+            })
+            .collect::<Option<Vec<_>>>()?,
         serde_json::Value::Object(obj) => {
             if let Some(input) = obj
                 .get("input")
@@ -1749,11 +1870,7 @@ fn parse_input_modalities(value: &serde_json::Value) -> Option<Vec<String>> {
         _ => return None,
     };
 
-    if values.is_empty() {
-        None
-    } else {
-        Some(values)
-    }
+    Some(values)
 }
 
 pub(crate) fn extract_supports_image(
@@ -2069,19 +2186,52 @@ fn find_models_dev_provider_models<'a>(
 }
 
 /// 判断 `/models` endpoint 是否属于 models.dev provider.api。
-fn endpoint_matches_provider_api(endpoint_url: &str, provider_api: &str) -> bool {
-    let endpoint = normalize_url_prefix(endpoint_url);
-    let api = normalize_url_prefix(provider_api);
-    !endpoint.is_empty() && !api.is_empty() && endpoint.starts_with(&api)
+pub(crate) fn endpoint_matches_provider_api(endpoint_url: &str, provider_api: &str) -> bool {
+    let Ok(endpoint) = reqwest::Url::parse(endpoint_url.trim()) else {
+        return false;
+    };
+    let Ok(api) = reqwest::Url::parse(provider_api.trim()) else {
+        return false;
+    };
+    if !is_safe_known_gateway_url(&endpoint)
+        || !is_safe_known_gateway_url(&api)
+        || endpoint.scheme() != api.scheme()
+        || !endpoint
+            .host_str()
+            .zip(api.host_str())
+            .is_some_and(|(left, right)| left.eq_ignore_ascii_case(right))
+    {
+        return false;
+    }
+
+    let endpoint_path = endpoint.path().trim_end_matches('/');
+    let endpoint_path = endpoint_path
+        .strip_suffix("/models")
+        .unwrap_or(endpoint_path);
+    let api_path = api.path().trim_end_matches('/');
+    if endpoint
+        .host_str()
+        .is_some_and(|host| host.eq_ignore_ascii_case("opencode.ai"))
+    {
+        let api_path = api_path.strip_suffix("/models").unwrap_or(api_path);
+        return opencode_models_scope(endpoint_path)
+            .zip(opencode_models_scope(api_path))
+            .is_some_and(|(endpoint_scope, api_scope)| endpoint_scope == api_scope);
+    }
+
+    endpoint_path == api_path
+        || endpoint_path
+            .strip_prefix(api_path)
+            .is_some_and(|suffix| suffix.starts_with('/'))
 }
 
-/// 归一化 URL 前缀：大小写、尾斜杠和最终 `/models` 不影响 provider 匹配。
-fn normalize_url_prefix(value: &str) -> String {
-    let mut normalized = value.trim().trim_end_matches('/').to_ascii_lowercase();
-    if let Some(stripped) = normalized.strip_suffix("/models") {
-        normalized = stripped.to_string();
-    }
-    normalized
+fn is_safe_known_gateway_url(url: &reqwest::Url) -> bool {
+    url.scheme() == "https"
+        && url.port().is_none()
+        && url.username().is_empty()
+        && url.password().is_none()
+        && url.query().is_none()
+        && url.fragment().is_none()
 }
 
 /// 在已匹配 provider 的 models.dev 模型表里查找 context window。
@@ -2091,24 +2241,32 @@ fn lookup_models_dev_context(
 ) -> Option<u64> {
     let fetched = normalize_models_dev_model_id(model_id);
     let mut suffix_matches = Vec::new();
+    let mut exact_identity_without_context = false;
 
     for (key, value) in provider_models {
         let Some(model_obj) = value.as_object() else {
             continue;
         };
         let catalog_id = model_obj.get("id").and_then(|id| id.as_str());
+        if models_dev_model_id_matches_exact(&fetched, key, catalog_id) {
+            if let Some(context) = extract_models_dev_entry_context(model_obj) {
+                return Some(context);
+            }
+            exact_identity_without_context = true;
+            continue;
+        }
+        if exact_identity_without_context {
+            continue;
+        }
         let Some(context) = extract_models_dev_entry_context(model_obj) else {
             continue;
         };
-        if models_dev_model_id_matches_exact(&fetched, key, catalog_id) {
-            return Some(context);
-        }
         if models_dev_model_id_matches_suffix(&fetched, key, catalog_id) {
             suffix_matches.push(context);
         }
     }
 
-    if suffix_matches.len() == 1 {
+    if !exact_identity_without_context && suffix_matches.len() == 1 {
         suffix_matches.into_iter().next()
     } else {
         None
@@ -2427,6 +2585,63 @@ pub fn build_models_url_candidates(
             return Ok(vec![models_url]);
         }
         if url.scheme() == "https"
+            && url
+                .host_str()
+                .is_some_and(|host| host.eq_ignore_ascii_case("opencode.ai"))
+            && url.query().is_none()
+            && url.fragment().is_none()
+        {
+            let path = url.path().trim_end_matches('/');
+            let scope = if path == "/zen/go"
+                || path.starts_with("/zen/go/")
+                || path == "/inference/go"
+                || path.starts_with("/inference/go/")
+            {
+                Some(if path.starts_with("/zen/go") {
+                    "/zen/go"
+                } else {
+                    "/inference/go"
+                })
+            } else if path == "/zen"
+                || path.starts_with("/zen/")
+                || path == "/inference"
+                || path.starts_with("/inference/")
+            {
+                Some(if path.starts_with("/zen") {
+                    "/zen"
+                } else {
+                    "/inference"
+                })
+            } else {
+                None
+            };
+            if let Some(scope) = scope {
+                url.set_path(&format!("{scope}/v1/models"));
+                return Ok(vec![url.to_string()]);
+            }
+        }
+        if url.scheme() == "https"
+            && url
+                .host_str()
+                .is_some_and(|host| host.eq_ignore_ascii_case("generativelanguage.googleapis.com"))
+            && url.port().is_none()
+            && url.username().is_empty()
+            && url.password().is_none()
+            && url.query().is_none()
+            && url.fragment().is_none()
+        {
+            let path = url.path().trim_end_matches('/');
+            let version = match path {
+                "" | "/v1beta" => "/v1beta",
+                "/v1" => "/v1",
+                _ => "",
+            };
+            if !version.is_empty() {
+                url.set_path(&format!("{version}/models"));
+                return Ok(vec![url.to_string()]);
+            }
+        }
+        if url.scheme() == "https"
             && matches!(url.host_str(), Some("api.novita.ai" | "api.jiekou.ai"))
             && url.path().trim_end_matches('/') == "/anthropic"
             && url.query().is_none()
@@ -2473,13 +2688,7 @@ pub fn build_models_url_candidates(
 /// generic `/v1/models` convention. Host and path checks are intentionally
 /// strict so a lookalike host cannot redirect discovery to an attacker URL.
 fn known_gateway_models_url(url: &reqwest::Url) -> Option<String> {
-    if url.scheme() != "https"
-        || url.port().is_some()
-        || !url.username().is_empty()
-        || url.password().is_some()
-        || url.query().is_some()
-        || url.fragment().is_some()
-    {
+    if !is_safe_known_gateway_url(url) {
         return None;
     }
 
@@ -2489,6 +2698,14 @@ fn known_gateway_models_url(url: &reqwest::Url) -> Option<String> {
         "/api/gateway/models"
     } else if host.eq_ignore_ascii_case("api.opper.ai") && path == "/v3/compat" {
         "/v3/compat/models"
+    } else if host.eq_ignore_ascii_case("opencode.ai") {
+        opencode_models_scope(path).map(|scope| return_gateway_models_path(scope, path))?
+    } else if host.eq_ignore_ascii_case("generativelanguage.googleapis.com") {
+        match path {
+            "" | "/v1beta" => "/v1beta/models",
+            "/v1" => "/v1/models",
+            _ => return None,
+        }
     } else {
         return None;
     };
@@ -2496,6 +2713,39 @@ fn known_gateway_models_url(url: &reqwest::Url) -> Option<String> {
     let mut models_url = url.clone();
     models_url.set_path(models_path);
     Some(models_url.to_string())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OpenCodeModelScope {
+    Zen,
+    ZenGo,
+}
+
+fn opencode_models_scope(path: &str) -> Option<OpenCodeModelScope> {
+    match path {
+        "/zen" | "/zen/v1" => Some(OpenCodeModelScope::Zen),
+        "/zen/go" | "/zen/go/v1" => Some(OpenCodeModelScope::ZenGo),
+        "/inference"
+        | "/inference/v1"
+        | "/inference/openai/v1"
+        | "/inference/anthropic"
+        | "/inference/anthropic/v1" => Some(OpenCodeModelScope::Zen),
+        "/inference/go"
+        | "/inference/go/v1"
+        | "/inference/go/openai/v1"
+        | "/inference/go/anthropic"
+        | "/inference/go/anthropic/v1" => Some(OpenCodeModelScope::ZenGo),
+        _ => None,
+    }
+}
+
+fn return_gateway_models_path(scope: OpenCodeModelScope, input_path: &str) -> &'static str {
+    match (scope, input_path) {
+        (OpenCodeModelScope::Zen, "/zen" | "/zen/v1") => "/zen/v1/models",
+        (OpenCodeModelScope::ZenGo, "/zen/go" | "/zen/go/v1") => "/zen/go/v1/models",
+        (OpenCodeModelScope::Zen, _) => "/inference/v1/models",
+        (OpenCodeModelScope::ZenGo, _) => "/inference/go/v1/models",
+    }
 }
 
 /// 截断响应体到 [`ERROR_BODY_MAX_CHARS`] 字符，避免 HTML 404 页占用错误串。
@@ -2606,6 +2856,97 @@ mod tests {
             assert_eq!(
                 build_models_url_candidates(base, false, None).unwrap(),
                 vec![format!("{base}/v1/models")],
+            );
+        }
+    }
+
+    #[test]
+    fn metadata_audit_opencode_model_discovery_preserves_legacy_and_modern_provider_scopes() {
+        for (scope, bases) in [
+            ("/zen", vec!["/zen", "/zen/v1"]),
+            ("/zen/go", vec!["/zen/go", "/zen/go/v1"]),
+            (
+                "/inference",
+                vec![
+                    "/inference",
+                    "/inference/v1",
+                    "/inference/openai/v1",
+                    "/inference/anthropic",
+                    "/inference/anthropic/v1",
+                ],
+            ),
+            (
+                "/inference/go",
+                vec![
+                    "/inference/go",
+                    "/inference/go/v1",
+                    "/inference/go/openai/v1",
+                    "/inference/go/anthropic",
+                    "/inference/go/anthropic/v1",
+                ],
+            ),
+        ] {
+            for path in bases {
+                let base = format!("https://opencode.ai{path}");
+                assert_eq!(
+                    build_models_url_candidates(&base, false, None).unwrap(),
+                    vec![format!("https://opencode.ai{scope}/v1/models")],
+                    "{base}",
+                );
+                assert_eq!(
+                    build_models_url_candidates(
+                        &base,
+                        false,
+                        Some("https://custom.test/model-directory"),
+                    )
+                    .unwrap(),
+                    vec!["https://custom.test/model-directory"],
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn metadata_audit_opencode_model_discovery_does_not_rewrite_untrusted_urls() {
+        for base in [
+            "https://opencode.ai.evil.test/inference/go/openai/v1",
+            "https://opencode.ai@evil.test/inference/go/openai/v1",
+            "https://user@opencode.ai/inference/go/openai/v1",
+            "https://opencode.ai:8443/inference/go/openai/v1",
+            "http://opencode.ai/inference/go/openai/v1",
+            "https://opencode.ai/inference/go/openai/v1?scope=other",
+            "https://opencode.ai/inference/go/openai/v1#other",
+            "https://opencode.ai/other/inference/go/openai/v1",
+        ] {
+            let candidates = build_models_url_candidates(base, false, None).unwrap();
+            assert!(
+                !candidates
+                    .iter()
+                    .any(|candidate| candidate == "https://opencode.ai/inference/go/v1/models"),
+                "{base}",
+            );
+        }
+    }
+
+    #[test]
+    fn metadata_audit_gemini_native_model_discovery_uses_its_api_version() {
+        for (base, endpoint) in [
+            (
+                "https://generativelanguage.googleapis.com",
+                "https://generativelanguage.googleapis.com/v1beta/models",
+            ),
+            (
+                "https://generativelanguage.googleapis.com/v1beta",
+                "https://generativelanguage.googleapis.com/v1beta/models",
+            ),
+            (
+                "https://generativelanguage.googleapis.com/v1",
+                "https://generativelanguage.googleapis.com/v1/models",
+            ),
+        ] {
+            assert_eq!(
+                build_models_url_candidates(base, false, None).unwrap(),
+                vec![endpoint],
             );
         }
     }
@@ -2945,6 +3286,199 @@ mod tests {
         assert_eq!(models[0].owned_by.as_deref(), Some("zhipu"));
         assert_eq!(models[0].context_window, Some(200_000));
         assert_eq!(models[0].input_modalities, Some(vec!["text".to_string()]));
+    }
+
+    #[test]
+    fn metadata_audit_openrouter_architecture_preserves_modalities_and_explicit_empty_inputs() {
+        let models = parse_provider_models_response(
+            &serde_json::json!({
+                "data": [
+                    {
+                        "id": "provider/vision",
+                        "architecture": {
+                            "input_modalities": ["text", "image", "audio"],
+                            "output_modalities": ["text"]
+                        }
+                    },
+                    {
+                        "id": "provider/text",
+                        "architecture": {"input_modalities": ["text"]}
+                    },
+                    {
+                        "id": "provider/empty",
+                        "input_modalities": [],
+                        "architecture": {"input_modalities": ["text", "image"]}
+                    },
+                    {
+                        "id": "provider/explicit-false",
+                        "supportsImage": false,
+                        "architecture": {"input_modalities": ["text", "image"]}
+                    },
+                    {
+                        "id": "provider/malformed",
+                        "architecture": {"input_modalities": ["text", 7]}
+                    }
+                ]
+            })
+            .to_string(),
+            &[],
+            "https://openrouter.ai/api/v1",
+            "https://openrouter.ai/api/v1/models",
+        )
+        .expect("parse actual OpenRouter modality shape");
+
+        assert_eq!(
+            models[0].input_modalities,
+            Some(vec!["text".into(), "image".into(), "audio".into()])
+        );
+        assert_eq!(models[0].supports_image, Some(true));
+        assert_eq!(models[1].input_modalities, Some(vec!["text".into()]));
+        assert_eq!(models[1].supports_image, Some(false));
+        assert_eq!(models[2].input_modalities, Some(Vec::new()));
+        assert_eq!(models[2].supports_image, Some(false));
+        assert_eq!(models[3].supports_image, Some(false));
+        assert!(models[4].input_modalities.is_none());
+        assert!(models[4].supports_image.is_none());
+    }
+
+    #[test]
+    fn metadata_audit_data_architecture_blocks_rich_descriptor_input_revival() {
+        let models = parse_models_response(
+            &serde_json::json!({
+                "data": [{
+                    "id": "model",
+                    "architecture": {"input_modalities": []},
+                    "supportsImage": false
+                }],
+                "models": [{
+                    "id": "model",
+                    "input_modalities": ["text", "image"],
+                    "supportsImage": true
+                }]
+            })
+            .to_string(),
+            &[],
+        )
+        .expect("data remains authoritative across modality envelopes");
+
+        assert_eq!(models[0].input_modalities, Some(Vec::new()));
+        assert_eq!(models[0].supports_image, Some(false));
+    }
+
+    #[test]
+    fn metadata_audit_openrouter_parallel_parameter_is_scoped_and_never_overrides_false() {
+        for (base, endpoint, expected) in [
+            (
+                "https://openrouter.ai/api/v1",
+                "https://openrouter.ai/api/v1/models",
+                Some(true),
+            ),
+            (
+                "https://openrouter.ai/api",
+                "https://openrouter.ai/api/v1/models",
+                Some(true),
+            ),
+            (
+                "https://provider.test/v1",
+                "https://provider.test/v1/models",
+                None,
+            ),
+            (
+                "https://openrouter.ai.evil.test/api/v1",
+                "https://openrouter.ai.evil.test/api/v1/models",
+                None,
+            ),
+            (
+                "https://openrouter.ai/api/v1",
+                "https://external.test/models",
+                None,
+            ),
+        ] {
+            let models = parse_provider_models_response(
+                &serde_json::json!({
+                    "data": [
+                        {"id": "declared", "supported_parameters": ["tools", "parallel_tool_calls"]},
+                        {"id": "false", "supportsParallelToolCalls": false, "supported_parameters": ["parallel_tool_calls"]},
+                        {"id": "absent", "supported_parameters": ["tools"]},
+                        {"id": "empty", "supported_parameters": []},
+                        {"id": "malformed", "supported_parameters": ["parallel_tool_calls", 7]},
+                        {"id": "conflicting", "supported_parameters": ["parallel_tool_calls"], "supportedParameters": []}
+                    ]
+                })
+                .to_string(),
+                &[],
+                base,
+                endpoint,
+            )
+            .expect("parse scoped parallel tool declaration");
+
+            assert_eq!(models[0].supports_parallel_tool_calls, expected, "{base}");
+            assert_eq!(models[1].supports_parallel_tool_calls, Some(false));
+            for model in &models[2..] {
+                assert!(model.supports_parallel_tool_calls.is_none(), "{}", model.id);
+            }
+        }
+    }
+
+    #[test]
+    fn metadata_audit_gemini_native_resource_names_are_allowlisted_and_partial_lists_rejected() {
+        let body = serde_json::json!({
+            "models": [{
+                "name": "models/gemini-2.5-pro",
+                "displayName": "Gemini 2.5 Pro",
+                "inputTokenLimit": 1_048_576,
+                "outputTokenLimit": 65_536,
+                "supportedGenerationMethods": ["generateContent", "countTokens"],
+                "temperature": 1,
+                "internalServerPath": "[REDACTED]",
+                "instructions": "untrusted provider instruction"
+            }]
+        });
+        let models = parse_provider_models_response(
+            &body.to_string(),
+            &[],
+            "https://generativelanguage.googleapis.com/v1beta",
+            "https://generativelanguage.googleapis.com/v1beta/models",
+        )
+        .expect("native Gemini uses a resource name as its requestable model identity");
+        assert_eq!(models[0].id, "models/gemini-2.5-pro");
+        assert_eq!(models[0].display_name.as_deref(), Some("Gemini 2.5 Pro"));
+        assert_eq!(models[0].context_window, Some(1_048_576));
+        assert!(models[0].reasoning.is_none());
+        assert!(models[0].protocol_capability.is_none());
+        let serialized = serde_json::to_string(&models[0]).unwrap();
+        assert!(!serialized.contains("[REDACTED]"));
+        assert!(!serialized.contains("untrusted provider instruction"));
+
+        let mut partial = body.clone();
+        partial["nextPageToken"] = serde_json::json!("next-page");
+        assert!(parse_provider_models_response(
+            &partial.to_string(),
+            &[],
+            "https://generativelanguage.googleapis.com/v1beta",
+            "https://generativelanguage.googleapis.com/v1beta/models",
+        )
+        .is_err());
+
+        for (base, endpoint) in [
+            (
+                "https://provider.test/v1",
+                "https://provider.test/v1/models",
+            ),
+            (
+                "https://generativelanguage.googleapis.com.evil.test/v1beta",
+                "https://generativelanguage.googleapis.com.evil.test/v1beta/models",
+            ),
+            (
+                "https://generativelanguage.googleapis.com/v1beta",
+                "https://external.test/models",
+            ),
+        ] {
+            assert!(
+                parse_provider_models_response(&body.to_string(), &[], base, endpoint).is_err(),
+                "{base} / {endpoint}",
+            );
+        }
     }
 
     #[test]
@@ -3568,6 +4102,69 @@ mod tests {
     }
 
     #[test]
+    fn metadata_audit_openrouter_additional_usage_charges_are_not_free() {
+        for field in [
+            "audio_output",
+            "image_output",
+            "image_token",
+            "input_audio_cache",
+            "input_cache_write_1h",
+        ] {
+            for (amount, expected) in [
+                (serde_json::json!("0.000001"), Some(false)),
+                (serde_json::json!("1e-999"), Some(false)),
+                (serde_json::json!(-1), None),
+                (serde_json::Value::Null, None),
+            ] {
+                let mut pricing = serde_json::json!({"prompt": "0", "completion": "0"});
+                pricing[field] = amount;
+                let models = parse_models_response(
+                    &serde_json::json!({
+                        "data": [{"id": "provider/model:free", "isFree": true, "pricing": pricing}]
+                    })
+                    .to_string(),
+                    &[],
+                )
+                .expect("pricing uncertainty does not invalidate the model inventory");
+                assert_eq!(models[0].is_free, expected, "{field}");
+            }
+        }
+    }
+
+    #[test]
+    fn metadata_audit_conditional_pricing_never_proclaims_a_potential_charge_free() {
+        for (overrides, expected) in [
+            (
+                serde_json::json!([{"min_prompt_tokens": 200_000, "prompt": "0.000001"}]),
+                Some(false),
+            ),
+            (
+                serde_json::json!([{"utc_start": 0, "utc_end": 400, "image_output": "0.01"}]),
+                Some(false),
+            ),
+            (serde_json::json!([{"prompt": "0"}]), Some(true)),
+            (serde_json::json!([]), Some(true)),
+            (serde_json::json!([{"prompt": "unknown"}]), None),
+            (serde_json::json!([{"prompt": -1}]), None),
+            (serde_json::json!(["invalid-override"]), None),
+            (serde_json::json!({"prompt": "0.01"}), None),
+        ] {
+            let models = parse_models_response(
+                &serde_json::json!({
+                    "data": [{
+                        "id": "provider/model:free",
+                        "pricing": {"prompt": "0", "completion": "0", "overrides": overrides}
+                    }]
+                })
+                .to_string(),
+                &[],
+            )
+            .expect("parse conditional pricing");
+            assert_eq!(models[0].is_free, expected, "{overrides}");
+        }
+    }
+
+    #[test]
     fn parse_models_response_normalizes_openrouter_reasoning_metadata() {
         let models = parse_provider_models_response(
             r#"{"object":"list","data":[
@@ -3597,10 +4194,7 @@ mod tests {
             .find(|model| model.id == "xiaomi/mimo-v2.6-pro")
             .and_then(|model| model.reasoning.as_ref())
             .expect("Mimo reasoning");
-        assert_eq!(
-            mimo["supportedEfforts"],
-            serde_json::json!(["minimal", "low", "medium", "high", "xhigh"])
-        );
+        assert_eq!(mimo["supportedEfforts"], serde_json::json!([]));
         assert_eq!(mimo["upstream"]["format"], "reasoning_object");
         assert_eq!(mimo["upstream"]["parameter"], "reasoning.effort");
 
@@ -3616,6 +4210,61 @@ mod tests {
         assert_eq!(deepseek["upstream"]["format"], "reasoning_object");
         assert_eq!(deepseek["upstream"]["parameter"], "reasoning.effort");
         assert_eq!(deepseek["defaultEffort"], "high");
+    }
+
+    #[test]
+    fn parse_models_response_normalizes_openrouter_metadata_when_base_omits_v1() {
+        let models = parse_provider_models_response(
+            r#"{"object":"list","data":[
+                {
+                    "id":"openrouter/model",
+                    "supported_parameters":["reasoning","include_reasoning","tools"]
+                }
+            ]}"#,
+            &[],
+            "https://openrouter.ai/api",
+            "https://openrouter.ai/api/v1/models",
+        )
+        .expect("parse OpenRouter metadata from the resolved endpoint");
+
+        let model = &models[0];
+        let reasoning = model.reasoning.as_ref().expect("OpenRouter reasoning");
+        assert_eq!(reasoning["supportedEfforts"], serde_json::json!([]));
+        assert_eq!(reasoning["upstream"]["format"], "reasoning_object");
+        assert_eq!(reasoning["upstream"]["parameter"], "reasoning.effort");
+        assert_eq!(
+            model
+                .protocol_capability
+                .as_ref()
+                .expect("OpenRouter protocol capability")["supportedEndpoints"],
+            serde_json::json!(["openai_chat"])
+        );
+    }
+
+    #[test]
+    fn parse_models_response_does_not_infer_openrouter_metadata_from_unknown_base_scopes() {
+        for base_url in [
+            "https://openrouter.ai/other/api",
+            "https://openrouter.ai/other/api/v1",
+            "https://openrouter.ai/api?scope=other",
+            "https://openrouter.ai/api/v1#other",
+        ] {
+            let models = parse_provider_models_response(
+                r#"{"data":[{"id":"model","supported_parameters":["reasoning","tools"]}]}"#,
+                &[],
+                base_url,
+                "https://openrouter.ai/api/v1/models",
+            )
+            .expect("model inventory remains usable without provider inference");
+            assert!(
+                models[0].reasoning.is_none(),
+                "unknown API scope must not invent effort levels: {base_url}"
+            );
+            assert!(
+                models[0].protocol_capability.is_none(),
+                "unknown API scope must not certify a protocol: {base_url}"
+            );
+        }
     }
 
     fn parse_protocol_metadata(
@@ -3746,6 +4395,10 @@ mod tests {
         for (base_url, models_url) in [
             (
                 "https://openrouter.ai/api/v1",
+                "https://openrouter.ai/api/v1/models",
+            ),
+            (
+                "https://openrouter.ai/api",
                 "https://openrouter.ai/api/v1/models",
             ),
             (
@@ -4294,6 +4947,70 @@ Coding 能力开源 SOTA，从代码生成走向工程交付 | 1M | 128K |
     }
 
     #[test]
+    fn metadata_audit_models_dev_exact_identity_does_not_inherit_sibling_context() {
+        let provider_models = serde_json::json!({
+            "shared-model": {"id": "shared-model"},
+            "provider/shared-model": {
+                "id": "provider/shared-model",
+                "limit": {"context": 200_000}
+            }
+        });
+        assert_eq!(
+            lookup_models_dev_context(provider_models.as_object().unwrap(), "shared-model"),
+            None,
+        );
+    }
+
+    #[test]
+    fn reaudit_exact_model_without_context_blocks_an_earlier_suffix_match() {
+        let provider_models = serde_json::json!({
+            "provider/shared-model": {
+                "id": "provider/shared-model",
+                "limit": {"context": 200_000}
+            },
+            "shared-model": {"id": "shared-model"}
+        });
+        assert_eq!(
+            lookup_models_dev_context(provider_models.as_object().unwrap(), "shared-model"),
+            None,
+            "exact identity must win independently of inventory order"
+        );
+    }
+
+    #[test]
+    fn reaudit_unknown_opencode_scopes_never_match_each_other() {
+        for (endpoint, api) in [
+            (
+                "https://opencode.ai/unknown/models",
+                "https://opencode.ai/other",
+            ),
+            (
+                "https://opencode.ai/unknown/models",
+                "https://opencode.ai/unknown",
+            ),
+            (
+                "https://opencode.ai/zen/v10/models",
+                "https://opencode.ai/zen/v10",
+            ),
+        ] {
+            assert!(
+                !endpoint_matches_provider_api(endpoint, api),
+                "unknown scope is not trusted provider evidence: {endpoint} / {api}"
+            );
+        }
+        let catalog = serde_json::json!({
+            "unknown": {
+                "api": "https://opencode.ai/other",
+                "models": {"model": {"limit": {"context": 200_000}}}
+            }
+        });
+        assert!(
+            find_models_dev_provider_models(&catalog, "https://opencode.ai/unknown/models")
+                .is_none()
+        );
+    }
+
+    #[test]
     fn test_find_models_dev_provider_models_uses_api_prefix() {
         let catalog = serde_json::json!({
             "requesty": {
@@ -4317,6 +5034,72 @@ Coding 能力开源 SOTA，从代码生成走向工程交付 | 1M | 128K |
             lookup_models_dev_context(models, "xai/grok-4-fast"),
             Some(2_000_000)
         );
+    }
+
+    #[test]
+    fn metadata_audit_models_dev_endpoint_matching_rejects_host_and_path_prefix_spoofs() {
+        for endpoint in [
+            "https://api.provider.test.evil.test/v1/models",
+            "https://api.provider.test@evil.test/v1/models",
+            "https://user@api.provider.test/v1/models",
+            "https://api.provider.test:8443/v1/models",
+            "http://api.provider.test/v1/models",
+            "https://api.provider.test/v10/models",
+            "https://api.provider.test/v1-else/models",
+            "https://api.provider.test/v1/models?scope=other",
+            "https://api.provider.test/v1/models#other",
+        ] {
+            assert!(
+                !endpoint_matches_provider_api(endpoint, "https://api.provider.test/v1"),
+                "{endpoint}",
+            );
+        }
+        assert!(endpoint_matches_provider_api(
+            "https://API.PROVIDER.TEST/v1/models/",
+            "https://api.provider.test/v1",
+        ));
+    }
+
+    #[test]
+    fn metadata_audit_models_dev_opencode_aliases_keep_zen_and_go_separate() {
+        let zen_api = "https://opencode.ai/inference/openai/v1";
+        let go_api = "https://opencode.ai/inference/go/openai/v1";
+        let catalog = serde_json::json!({
+            "opencode": {
+                "api": zen_api,
+                "models": {"shared-model": {"limit": {"context": 64_000}}}
+            },
+            "opencode-go": {
+                "api": go_api,
+                "models": {"shared-model": {"limit": {"context": 128_000}}}
+            }
+        });
+        for (endpoint, context) in [
+            ("https://opencode.ai/zen/v1/models", 64_000),
+            ("https://opencode.ai/inference/v1/models", 64_000),
+            ("https://opencode.ai/inference/openai/v1/models", 64_000),
+            ("https://opencode.ai/inference/anthropic/v1", 64_000),
+            ("https://opencode.ai/zen/go/v1/models", 128_000),
+            ("https://opencode.ai/inference/go/v1/models", 128_000),
+            ("https://opencode.ai/inference/go/openai/v1/models", 128_000),
+            ("https://opencode.ai/inference/go/anthropic/v1", 128_000),
+        ] {
+            let models = find_models_dev_provider_models(&catalog, endpoint)
+                .unwrap_or_else(|| panic!("missing same-provider alias: {endpoint}"));
+            assert_eq!(
+                lookup_models_dev_context(models, "shared-model"),
+                Some(context),
+                "{endpoint}",
+            );
+            assert_eq!(
+                endpoint_matches_provider_api(endpoint, zen_api),
+                context == 64_000,
+            );
+            assert_eq!(
+                endpoint_matches_provider_api(endpoint, go_api),
+                context == 128_000,
+            );
+        }
     }
 
     #[test]

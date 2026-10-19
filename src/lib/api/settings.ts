@@ -157,6 +157,12 @@ export const settingsApi = {
     return await invoke("save_request_health_settings", { config });
   },
 
+  async setRequestHealthEnabled(
+    enabled: boolean,
+  ): Promise<RequestHealthConfig> {
+    return await invoke("set_request_health_enabled", { enabled });
+  },
+
   async patch(patch: SettingsPatch): Promise<void> {
     await invoke("patch_settings", { patch });
   },

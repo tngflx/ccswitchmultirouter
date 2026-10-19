@@ -65,6 +65,32 @@ function diagnosticSeverity(
   return findings.length > 0 ? "info" : "healthy";
 }
 
+function findingHelpKey(code: string): string {
+  switch (code) {
+    case "responses_field_type":
+      return "settings.requestHealth.findingHelp.schema";
+    case "undeclared_tool_choice":
+    case "tool_choice_without_tools":
+    case "undeclared_web_search_history":
+      return "settings.requestHealth.findingHelp.tools";
+    case "orphaned_tool_output":
+    case "duplicate_tool_call_id":
+    case "conversation_previous_response_conflict":
+    case "additional_tools_role":
+    case "compaction_trigger_not_last":
+      return "settings.requestHealth.findingHelp.history";
+    case "responses_unverified_extension":
+      return "settings.requestHealth.findingHelp.extension";
+    case "large_request":
+    case "large_history_item":
+    case "codex_input_token_limit":
+    case "sustained_uncached_input_growth":
+      return "settings.requestHealth.findingHelp.size";
+    default:
+      return "settings.requestHealth.findingHelp.general";
+  }
+}
+
 function findingClass(severity: DiagnosticSeverity): string {
   if (severity === "error") return "text-red-800 dark:text-red-200";
   if (severity === "warning") return "text-amber-700 dark:text-amber-300";
@@ -108,6 +134,7 @@ export function RequestHealthPanel({
   onRefresh,
   onSaved,
   onSaveConfig,
+  onSetEnabled,
   mode = "full",
 }: {
   snapshot?: RequestHealthSnapshot;
@@ -118,6 +145,7 @@ export function RequestHealthPanel({
   onSaveConfig?: (
     config: RequestHealthConfig,
   ) => Promise<RequestHealthConfig | null>;
+  onSetEnabled?: (enabled: boolean) => Promise<RequestHealthConfig>;
   mode?: "full" | "settings" | "status";
 }) {
   const { t } = useTranslation();
@@ -128,6 +156,7 @@ export function RequestHealthPanel({
   const [maxTokens, setMaxTokens] = useState("");
   const [timeoutSeconds, setTimeoutSeconds] = useState("");
   const [isSaving, setIsSaving] = useState(false);
+  const [isSettingEnabled, setIsSettingEnabled] = useState(false);
   const [saveMessage, setSaveMessage] = useState<string | null>(null);
   const [contract, setContract] = useState<
     OpenAIResponsesContractStatus | undefined
@@ -137,6 +166,7 @@ export function RequestHealthPanel({
     null,
   );
   const saving = useRef(false);
+  const settingEnabled = useRef(false);
   const editVersion = useRef(0);
   const fieldEditVersions = useRef(
     new Map<keyof RequestHealthConfig, number>(),
@@ -169,7 +199,7 @@ export function RequestHealthPanel({
   );
 
   useEffect(() => {
-    if (!snapshot?.config || saving.current) return;
+    if (!snapshot?.config || saving.current || settingEnabled.current) return;
     adoptConfig(snapshot.config, [...fieldEditVersions.current.keys()]);
   }, [snapshot?.config, adoptConfig]);
 
@@ -208,7 +238,7 @@ export function RequestHealthPanel({
     validNumber(timeoutSeconds, 15, 300);
 
   async function save() {
-    if (saving.current) return;
+    if (saving.current || settingEnabled.current) return;
     if (!draft || !numericInputsValid) {
       const message = t("settings.saveFailedGeneric", {
         defaultValue: "Save failed, please try again",
@@ -253,6 +283,48 @@ export function RequestHealthPanel({
     } finally {
       saving.current = false;
       setIsSaving(false);
+    }
+  }
+
+  async function setEnabled(enabled: boolean) {
+    if (!draft || saving.current || settingEnabled.current) return;
+    const previous = draft.enabled;
+    settingEnabled.current = true;
+    setIsSettingEnabled(true);
+    setSaveMessage(null);
+    setDraft((current) => (current ? { ...current, enabled } : current));
+    try {
+      const saved = await (onSetEnabled ?? settingsApi.setRequestHealthEnabled)(
+        enabled,
+      );
+      if (!saved || typeof saved.enabled !== "boolean") {
+        throw new Error(
+          t("settings.saveFailedGeneric", {
+            defaultValue: "Save failed, please try again",
+          }),
+        );
+      }
+      fieldEditVersions.current.delete("enabled");
+      const pendingEdits = [...fieldEditVersions.current.keys()];
+      adoptConfig(saved, pendingEdits);
+      const message = t(
+        pendingEdits.length > 0
+          ? "settings.requestHealth.savedPendingEdits"
+          : "settings.requestHealth.saved",
+      );
+      setSaveMessage(message);
+      toast.success(message, { closeButton: true });
+      onSaved?.(saved);
+    } catch (error) {
+      setDraft((current) =>
+        current ? { ...current, enabled: previous } : current,
+      );
+      const message = errorMessage(error);
+      setSaveMessage(message);
+      toast.error(message, { closeButton: true });
+    } finally {
+      settingEnabled.current = false;
+      setIsSettingEnabled(false);
     }
   }
 
@@ -335,6 +407,11 @@ export function RequestHealthPanel({
             <p className="mt-1 max-w-3xl text-xs leading-relaxed text-muted-foreground">
               {t("settings.requestHealth.description")}
             </p>
+            {mode === "settings" ? (
+              <p className="mt-2 text-xs text-muted-foreground">
+                {t("settings.requestHealth.statusLocation")}
+              </p>
+            ) : null}
           </div>
         </div>
         <div className="flex gap-2">
@@ -355,7 +432,9 @@ export function RequestHealthPanel({
             <Button
               size="sm"
               onClick={() => void save()}
-              disabled={!draft || !numericInputsValid || isSaving}
+              disabled={
+                !draft || !numericInputsValid || isSaving || isSettingEnabled
+              }
             >
               <Save className="mr-2 h-4 w-4" />
               {t("settings.requestHealth.save")}
@@ -399,7 +478,9 @@ export function RequestHealthPanel({
               <input
                 type="checkbox"
                 checked={draft.enabled}
-                onChange={(event) => update("enabled", event.target.checked)}
+                disabled={isSaving || isSettingEnabled}
+                aria-busy={isSettingEnabled}
+                onChange={(event) => void setEnabled(event.target.checked)}
               />
               {t("settings.requestHealth.enabled")}
             </label>
@@ -651,6 +732,42 @@ export function RequestHealthPanel({
               <div className="mt-1">{contract.changedSections.join(", ")}</div>
             </div>
           ) : null}
+          {contractStatus === "drift_detected" ||
+          contractStatus === "check_failed" ? (
+            <p className="mt-3 text-xs leading-relaxed text-muted-foreground">
+              {t(
+                contractStatus === "drift_detected"
+                  ? "settings.requestHealth.contractDriftHelp"
+                  : "settings.requestHealth.contractFailureHelp",
+              )}
+            </p>
+          ) : null}
+          {contractStatus === "drift_detected" &&
+          contract?.declarationChanges ? (
+            <details className="mt-3 rounded-md border border-border/70 px-3 py-2 text-xs">
+              <summary className="cursor-pointer font-medium">
+                {t("settings.requestHealth.contractDeclarationDiff", {
+                  added: contract.declarationChanges.addedCount,
+                  removed: contract.declarationChanges.removedCount,
+                })}
+              </summary>
+              <p className="mt-2 text-muted-foreground">
+                {t("settings.requestHealth.contractDiffScope")}
+              </p>
+              <div className="mt-2 max-h-64 overflow-auto whitespace-pre-wrap break-all font-mono text-[11px]">
+                {[
+                  ...contract.declarationChanges.removed.map(
+                    (line) => `- ${line}`,
+                  ),
+                  ...contract.declarationChanges.added.map(
+                    (line) => `+ ${line}`,
+                  ),
+                ].map((line, index) => (
+                  <div key={index}>{line}</div>
+                ))}
+              </div>
+            </details>
+          ) : null}
           {contract?.error || contractActionError ? (
             <div
               role="alert"
@@ -751,6 +868,9 @@ export function RequestHealthPanel({
                     {severityLabel[findingSeverity(finding)]}
                   </span>
                   <strong>{finding.code}</strong>: {finding.detail}
+                  <p className="mt-1 leading-relaxed text-muted-foreground">
+                    {t(findingHelpKey(finding.code))}
+                  </p>
                 </div>
               ))}
             </div>

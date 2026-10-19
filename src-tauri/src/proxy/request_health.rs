@@ -404,7 +404,7 @@ pub(crate) fn inspect_and_optimize(
         provider_id: context.provider_id.to_string(),
         provider_name: context.provider_name.to_string(),
         model: context.model.to_string(),
-        endpoint: context.endpoint.to_string(),
+        endpoint: diagnostic_endpoint(context.endpoint),
         client_request_bytes: context.client_request_bytes,
         original_bytes,
         optimized_bytes,
@@ -1395,19 +1395,50 @@ fn image_payload_bytes(value: &Value) -> usize {
     }
 }
 
+fn diagnostic_endpoint(endpoint: &str) -> String {
+    if let Ok(url) = url::Url::parse(endpoint) {
+        return url.path().to_string();
+    }
+    endpoint
+        .split(['?', '#'])
+        .next()
+        .unwrap_or_default()
+        .to_string()
+}
+
 fn item_category(item: &Value) -> String {
     let Some(object) = item.as_object() else {
         return "scalar".to_string();
     };
     if let Some(item_type) = object.get("type").and_then(Value::as_str) {
         if !item_type.is_empty() {
-            return item_type.to_string();
+            // Extension values are arbitrary request data, not safe diagnostic
+            // labels. Keep the wire payload untouched and project a fixed label.
+            return if super::providers::responses_contract::is_known_input_type(item_type)
+                || matches!(
+                    item_type,
+                    "tool_use"
+                        | "tool_result"
+                        | "thinking"
+                        | "redacted_thinking"
+                        | "text"
+                        | "image"
+                ) {
+                item_type.to_string()
+            } else {
+                "extension".to_string()
+            };
         }
     }
     object
         .get("role")
         .and_then(Value::as_str)
-        .map(|role| format!("message:{role}"))
+        .map(|role| match role {
+            "user" | "assistant" | "system" | "developer" | "tool" | "function" | "model" => {
+                format!("message:{role}")
+            }
+            _ => "message:unknown".to_string(),
+        })
         .unwrap_or_else(|| "object".to_string())
 }
 
@@ -1495,6 +1526,48 @@ mod tests {
             compaction_request: false,
             session_client_provided: true,
         }
+    }
+
+    #[test]
+    fn diagnostic_categories_and_endpoints_do_not_retain_untrusted_values() {
+        let mut body = json!({"input":[
+            {"type":"synthetic-type-secret", "content":"x".repeat(LARGE_ITEM_BYTES)},
+            {"role":"synthetic-role-secret", "content":"redacted fixture"},
+            {"type":"function_call", "name":"fixture", "call_id":"fixture", "arguments":"{}"}
+        ]});
+        let before = body.clone();
+        let diagnostic = inspect_and_optimize(
+            &mut body,
+            &RequestHealthConfig::default(),
+            RequestHealthContext {
+                trace_id: Some("category-redaction"),
+                session_id: "category-redaction-session",
+                endpoint: "/v1/responses?api_key=synthetic-query-secret#synthetic-fragment-secret",
+                ..context()
+            },
+        )
+        .expect("diagnostic");
+        let serialized = serde_json::to_string(&diagnostic).unwrap();
+        for secret in [
+            "synthetic-type-secret",
+            "synthetic-role-secret",
+            "synthetic-query-secret",
+            "synthetic-fragment-secret",
+        ] {
+            assert!(
+                !serialized.contains(secret),
+                "diagnostics must not retain untrusted type, role, or query values"
+            );
+        }
+        assert_eq!(diagnostic.endpoint, "/v1/responses");
+        assert!(diagnostic
+            .breakdown
+            .iter()
+            .any(|row| row.category == "function_call"));
+        assert_eq!(
+            body, before,
+            "redaction must never alter the forwarded request"
+        );
     }
 
     #[test]

@@ -104,6 +104,13 @@ fn json_type(value: &Value) -> &'static str {
     }
 }
 
+pub(crate) fn is_known_input_type(kind: &str) -> bool {
+    contract()
+        .input_types
+        .iter()
+        .any(|candidate| candidate == kind)
+}
+
 pub(crate) fn uses_server_history(body: &Value) -> bool {
     ["previous_response_id", "conversation"]
         .iter()
@@ -182,7 +189,7 @@ pub(crate) fn inspect(body: &Value, check_search_history: bool) -> Vec<ContractF
             if inferred_reference || kind == "item_reference" {
                 checks.typed(item.get("id"), &["string"], true, &format!("{path}.id"));
             }
-            if !kind.is_empty() && !contract().input_types.iter().any(|t| t == kind) {
+            if !kind.is_empty() && !is_known_input_type(kind) {
                 checks.unknown();
             }
             match kind {
@@ -504,6 +511,24 @@ mod tests {
         assert_eq!(findings[0].count, 4);
         assert_eq!(findings[0].severity, "info");
         assert!(!findings[0].detail.contains("private"));
+    }
+
+    #[test]
+    fn accepts_reviewed_optional_find_in_page_urls_without_mutating_history() {
+        for url in [
+            None,
+            Some(Value::Null),
+            Some(json!("https://example.invalid/page")),
+        ] {
+            let mut action = json!({"type":"find_in_page", "pattern":"redacted fixture"});
+            if let Some(url) = url {
+                action["url"] = url;
+            }
+            let body = json!({"input":[{"type":"web_search_call", "id":"fixture", "status":"completed", "action":action}]});
+            let before = body.clone();
+            assert!(inspect(&body, false).is_empty());
+            assert_eq!(body, before);
+        }
     }
 
     #[test]

@@ -260,6 +260,12 @@ fn should_run_codex_post_takeover(app_type: &AppType) -> bool {
     matches!(app_type, AppType::Codex)
 }
 
+fn run_automatic_codex_desktop_effect(effect: impl FnOnce()) {
+    if crate::config::automatic_codex_desktop_effects_allowed() {
+        effect();
+    }
+}
+
 /// Select one already-enabled local-proxy app to restore the shared listener.
 ///
 /// All local-proxy apps share one listener, so recovering it once is sufficient.
@@ -2750,7 +2756,7 @@ impl ProxyService {
         }
     }
 
-    /// 构造写入 Live 的代理地址（处理 0.0.0.0 / IPv6 等特殊情况）
+    /// 构造写入 Live 的回环代理地址，并拒绝旧的非回环监听配置
     async fn build_proxy_urls(&self) -> Result<(String, String), String> {
         let config = self
             .db
@@ -2758,13 +2764,8 @@ impl ProxyService {
             .await
             .map_err(|e| format!("获取代理配置失败: {e}"))?;
 
-        // listen_address 可能是 0.0.0.0（用于监听所有网卡），但客户端无法用 0.0.0.0 连接；
-        // 因此写回到各应用配置时，优先使用本机回环地址。
-        let connect_host = match config.listen_address.as_str() {
-            "0.0.0.0" => "127.0.0.1".to_string(),
-            "::" => "::1".to_string(),
-            _ => config.listen_address.clone(),
-        };
+        let connect_host =
+            crate::proxy::listener_address::takeover_listen_ip(&config.listen_address)?.to_string();
         let connect_host_for_url = if connect_host.contains(':') && !connect_host.starts_with('[') {
             format!("[{connect_host}]")
         } else {
@@ -5319,15 +5320,19 @@ impl ProxyService {
     /// 接管写入完成后做一次 best-effort 注入：若 Codex 未运行，会用 CDP 参数启动；
     /// 若 Codex 已经普通启动且没有 CDP，只记录明确提示，不影响路由链路。
     fn try_repair_codex_model_picker_after_takeover(&self) {
-        tauri::async_runtime::spawn(async {
-            match crate::codex_desktop::unlock_codex_model_picker().await {
-                Ok(result) if result.injected => log::info!(
-                    "Codex Desktop 模型菜单白名单已注入，models={}",
-                    result.model_count
-                ),
-                Ok(result) => log::warn!("Codex Desktop 模型菜单白名单未注入: {}", result.message),
-                Err(error) => log::warn!("Codex Desktop 模型菜单白名单注入失败: {error}"),
-            }
+        run_automatic_codex_desktop_effect(|| {
+            tauri::async_runtime::spawn(async {
+                match crate::codex_desktop::unlock_codex_model_picker().await {
+                    Ok(result) if result.injected => log::info!(
+                        "Codex Desktop 模型菜单白名单已注入，models={}",
+                        result.model_count
+                    ),
+                    Ok(result) => {
+                        log::warn!("Codex Desktop 模型菜单白名单未注入: {}", result.message)
+                    }
+                    Err(error) => log::warn!("Codex Desktop 模型菜单白名单注入失败: {error}"),
+                }
+            });
         });
     }
 
@@ -5342,29 +5347,31 @@ impl ProxyService {
     }
 
     fn ensure_codex_guardian_started(&self) {
-        let handle_arc = self.codex_guardian.clone();
-        let status_arc = self.codex_guardian_status.clone();
-        tauri::async_runtime::spawn(async move {
-            let mut guard = handle_arc.lock().await;
-            if guard.is_none() {
-                let handle = codex_guardian::start_codex_guardian();
-                log::info!("Codex 守护: 已启动生命周期监测");
-                // 定期同步状态到 ProxyService 字段，供 Tauri command 读取
-                let handle_status = handle.status.clone();
-                let s = status_arc.clone();
-                tauri::async_runtime::spawn(async move {
-                    loop {
-                        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                        let status = handle_status.lock().await.clone();
-                        if !status.active {
+        run_automatic_codex_desktop_effect(|| {
+            let handle_arc = self.codex_guardian.clone();
+            let status_arc = self.codex_guardian_status.clone();
+            tauri::async_runtime::spawn(async move {
+                let mut guard = handle_arc.lock().await;
+                if guard.is_none() {
+                    let handle = codex_guardian::start_codex_guardian();
+                    log::info!("Codex 守护: 已启动生命周期监测");
+                    // 定期同步状态到 ProxyService 字段，供 Tauri command 读取
+                    let handle_status = handle.status.clone();
+                    let s = status_arc.clone();
+                    tauri::async_runtime::spawn(async move {
+                        loop {
+                            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                            let status = handle_status.lock().await.clone();
+                            if !status.active {
+                                *s.lock().await = status;
+                                break;
+                            }
                             *s.lock().await = status;
-                            break;
                         }
-                        *s.lock().await = status;
-                    }
-                });
-                *guard = Some(handle);
-            }
+                    });
+                    *guard = Some(handle);
+                }
+            });
         });
     }
 
@@ -5748,6 +5755,28 @@ mod tests {
         assert_eq!(env.get(key).and_then(|value| value.as_str()), expected);
     }
 
+    #[tokio::test]
+    async fn takeover_urls_reject_legacy_network_bind_and_format_ipv6_loopback() {
+        let db = Arc::new(Database::memory().unwrap());
+        let service = ProxyService::new(db.clone());
+        // Simulate an imported pre-guard configuration without using the guarded writer.
+        {
+            let conn = db.conn.lock().unwrap();
+            conn.execute("UPDATE proxy_config SET listen_address = '0.0.0.0'", [])
+                .unwrap();
+        }
+        assert!(service.build_proxy_urls().await.is_err());
+        assert!(service.start().await.is_err());
+        assert!(service.server.read().await.is_none());
+        let mut config = db.get_global_proxy_config().await.unwrap();
+        config.listen_address = "[::1]".into();
+        db.update_global_proxy_config(config).await.unwrap();
+        assert_eq!(
+            service.build_proxy_urls().await.unwrap(),
+            ("http://[::1]:15721".into(), "http://[::1]:15721/v1".into())
+        );
+    }
+
     #[test]
     fn stale_listener_owner_pid_ignores_a_live_owner() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind listener");
@@ -5987,6 +6016,16 @@ mod tests {
         assert!(should_run_codex_post_takeover(&AppType::Codex));
         assert!(!should_run_codex_post_takeover(&AppType::Claude));
         assert!(!should_run_codex_post_takeover(&AppType::Gemini));
+    }
+
+    #[test]
+    fn unit_tests_do_not_dispatch_automatic_desktop_side_effects() {
+        let dispatched = std::cell::Cell::new(false);
+        run_automatic_codex_desktop_effect(|| dispatched.set(true));
+        assert!(
+            !dispatched.get(),
+            "unit tests must not start real Desktop/CDP background work"
+        );
     }
 
     #[test]
@@ -7422,6 +7461,105 @@ wire_api = "responses"
             ProxyService::align_codex_takeover_login(config, Some(&provider)).unwrap(),
             config
         );
+    }
+
+    #[test]
+    #[serial]
+    fn codex_multirouter_resync_stays_verified_after_takeover_rewrites() {
+        let _home = TempHome::new();
+        crate::settings::reload_settings().expect("reload isolated settings");
+        let db = Arc::new(Database::memory().expect("memory database"));
+        let service = ProxyService::new(db.clone());
+        let mut source = Provider::with_id(
+            "worker-source".into(),
+            "Worker Source".into(),
+            json!({"modelCatalog": {"models": [{
+                "model": "worker", "contextWindow": 262144
+            }]}}),
+            None,
+        );
+        source.meta = Some(ProviderMeta {
+            api_format: Some("openai_responses".into()),
+            ..Default::default()
+        });
+        db.save_provider("codex", &source).unwrap();
+        let live = "model_provider = \"codex_model_router_v2\"\nmodel = \"worker\"\n\
+                    [model_providers.codex_model_router_v2]\n\
+                    base_url = \"http://127.0.0.1:15721/v1\"\nwire_api = \"responses\"\n";
+        crate::codex_config::write_codex_live_config_atomic(Some(live)).unwrap();
+        crate::config::write_json_file(
+            &crate::codex_config::get_codex_config_dir().join("models_cache.json"),
+            &json!({"client_version": "0.140.0", "etag": "official-cache", "models": []}),
+        )
+        .unwrap();
+        let mut router = Provider::with_id(
+            "router".into(),
+            "Router".into(),
+            json!({
+                "auth": {"OPENAI_API_KEY": PROXY_TOKEN_PLACEHOLDER},
+                "config": live,
+                "codexRouting": {
+                    "schemaVersion": 2, "enabled": true, "defaultRouteId": "worker",
+                    "routes": [{
+                        "id": "worker", "enabled": true, "targetProviderId": "worker-source",
+                        "modelSelection": {"mode": "all"},
+                        "authPolicy": {"source": "provider_config"}
+                    }]
+                }
+            }),
+            None,
+        );
+        for api_format in [
+            None,
+            Some("openai_chat"),
+            Some("anthropic"),
+            Some("openai_responses"),
+        ] {
+            router.meta = api_format.map(|format| ProviderMeta {
+                api_format: Some(format.into()),
+                ..Default::default()
+            });
+            db.save_provider("codex", &router).unwrap();
+            db.set_current_provider("codex", &router.id).unwrap();
+            let artifact =
+                crate::codex_multirouter::projection::build_projection_artifact(&db, &router.id)
+                    .unwrap();
+            let manual = crate::codex_config::publish_codex_multirouter_projection_for_database(
+                &db,
+                &artifact.projection_settings,
+            )
+            .expect("manual catalog resync");
+            assert!(manual.catalog_verified && manual.config_verified && manual.cache_verified);
+
+            for _ in 0..3 {
+                service
+                    .write_codex_takeover_live_for_provider(&router.settings_config, Some(&router))
+                    .expect("normal takeover rewrite");
+                let readback =
+                    crate::codex_config::read_back_codex_multirouter_projection_for_database(
+                        &db,
+                        &artifact.projection_settings,
+                    )
+                    .expect("inspect after takeover rewrite");
+                assert!(
+                    readback.catalog_verified
+                        && readback.config_verified
+                        && readback.cache_verified
+                        && readback.agent_files_verified,
+                    "router metadata {api_format:?} must not undo resync: {readback:?}"
+                );
+                let status =
+                    crate::codex_multirouter::projection::inspect_codex_multirouter_projection(
+                        &db, &router.id,
+                    )
+                    .expect("inspect the active router status");
+                assert_eq!(
+                    status.state,
+                    crate::codex_multirouter::projection::ProjectionState::Ready
+                );
+                assert!(status.last_error_code.is_none());
+            }
+        }
     }
 
     #[test]

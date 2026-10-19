@@ -55,6 +55,9 @@ jobs:
       - name: Check formatting
         run: pnpm format:check
 
+      - name: Verified test runner regression checks
+        run: pnpm test:runner
+
       - name: Unit tests
         run: pnpm test:unit
 

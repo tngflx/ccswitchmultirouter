@@ -12,12 +12,17 @@ const maxDeclarationSamples = 12;
 const maxDeclarationSampleLength = 320;
 
 export function extractContract(markdown) {
-  const body = markdown
+  const bodySection = markdown
     .replace(/\r\n/g, "\n")
-    .split("### Body Parameters\n")[1]
-    ?.split("### Returns")[0];
-  if (!body)
+    .split("### Body Parameters\n")[1];
+  if (!bodySection)
     throw new Error("Official reference body parameters were not found");
+  const returns = bodySection.indexOf("### Returns");
+  if (returns < 0)
+    throw new Error(
+      "Official reference is incomplete: Returns boundary is missing",
+    );
+  const body = bodySection.slice(0, returns);
   const top = [...body.matchAll(/^- `(\w+): ([^\n`]+)`/gm)];
   if (top.length < 20)
     throw new Error("Official reference extraction is incomplete");

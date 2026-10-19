@@ -16,6 +16,7 @@ import {
 import { normalizeTomlText } from "@/utils/textNormalization";
 import { normalizeModelIdentityMetadata } from "@/lib/modelIdentities";
 import { readCodexCatalogSettings } from "@/lib/codexCatalogSchema";
+import { normalizeCodexModelProtocolCapability } from "@/lib/codexProtocolCapability";
 import type {
   CodexApiFormat,
   CodexApiKeyGroup,
@@ -223,6 +224,9 @@ export function extractCodexCatalogModels(
         item?.reasoning && typeof item.reasoning === "object"
           ? item.reasoning
           : undefined;
+      const protocolCapability = normalizeCodexModelProtocolCapability(
+        item?.protocolCapability,
+      );
       const enabled =
         typeof item?.enabled === "boolean" ? item.enabled : undefined;
       const codexUltra =
@@ -267,6 +271,7 @@ export function extractCodexCatalogModels(
         ...(textOnly !== undefined ? { textOnly } : {}),
         ...(baseInstructions ? { baseInstructions } : {}),
         ...(reasoning ? { reasoning } : {}),
+        ...(protocolCapability ? { protocolCapability } : {}),
         ...(codexUltra ? { codexUltra } : {}),
         ...(apiFormat ? { apiFormat } : {}),
         ...(codexCache ? { codexCache } : {}),

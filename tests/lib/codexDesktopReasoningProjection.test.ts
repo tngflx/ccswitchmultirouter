@@ -1,19 +1,19 @@
 import { readFileSync } from "node:fs";
 import path from "node:path";
 import { QueryClient, QueryObserver } from "@tanstack/react-query";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 const core = readFileSync(
   path.resolve(
     process.cwd(),
-    "src-tauri/src/resources/codex_model_picker_core.js",
+    "src-tauri/src/resources/codex_desktop/model_picker_core.js",
   ),
   "utf8",
 );
 const cacheLifecycleCore = readFileSync(
   path.resolve(
     process.cwd(),
-    "src-tauri/src/resources/codex_model_picker_cache_lifecycle.js",
+    "src-tauri/src/resources/codex_desktop/model_picker_cache_lifecycle.js",
   ),
   "utf8",
 );
@@ -27,7 +27,14 @@ const legacyV8QueryCacheCore = readFileSync(
 const releaseCore = readFileSync(
   path.resolve(
     process.cwd(),
-    "src-tauri/src/resources/codex_model_picker_release_core.js",
+    "src-tauri/src/resources/codex_desktop/model_picker_release.js",
+  ),
+  "utf8",
+);
+const discoveryCore = readFileSync(
+  path.resolve(
+    process.cwd(),
+    "src-tauri/src/resources/codex_desktop/client_discovery.js",
   ),
   "utf8",
 );
@@ -46,14 +53,20 @@ const raw = {
     },
   ],
 };
-const select = (value: typeof raw) => ({
-  models: value.data.map((model) => ({
+const select = (value: typeof raw) => {
+  const models = value.data.map((model) => ({
     ...model,
     supportedReasoningEfforts: model.supportedReasoningEfforts.filter((level) =>
       ["low", "medium", "high", "xhigh"].includes(level.reasoningEffort),
     ),
-  })),
-});
+  }));
+  return {
+    models,
+    defaultModel: models[0],
+    hasModelSupportingMaxReasoningEffort: false,
+    hasModelSupportingUltraReasoningEffort: false,
+  };
+};
 type State = {
   payload: {
     modelProvider: string;
@@ -66,6 +79,10 @@ type State = {
   catalogProviderEpoch?: number;
   modelPickerQueryClients?: Map<unknown, QueryClient>;
   modelPickerReleaseRefresh?: Promise<PromiseSettledResult<unknown>[]>;
+  reasoningObserverPrototypes?: Map<
+    unknown,
+    { dispose: () => void; patched: unknown }
+  >;
   reasoningQueryCaches?: Map<
     unknown,
     {
@@ -76,8 +93,16 @@ type State = {
   >;
 };
 type Core = {
+  codexModelCatalogDiagnostics: () => {
+    reasoningModelCount: number;
+    maxEffortModelCount: number;
+    ultraEffortModelCount: number;
+  };
   patchCodexModelReasoningQueryCache: (
     cache: ReturnType<QueryClient["getQueryCache"]>,
+  ) => boolean;
+  patchCodexModelReasoningQueryObserverPrototype: (
+    prototype: object,
   ) => boolean;
   patchModelArray: (
     models: Record<string, unknown>[],
@@ -102,7 +127,7 @@ const prepareCacheReinjection = new Function(
 const loadCore = (state: State) =>
   new Function(
     "state",
-    `${core}\nreturn { patchCodexModelReasoningQueryCache, patchModelArray, restoreCodexCatalogReasoningSelection };`,
+    `${core}\nreturn { codexModelCatalogDiagnostics, patchCodexModelReasoningQueryCache, patchCodexModelReasoningQueryObserverPrototype, patchModelArray, restoreCodexCatalogReasoningSelection };`,
   )(state) as Core;
 const createHarness = () => {
   const state: State = {
@@ -136,6 +161,9 @@ const createHarness = () => {
     api,
     patch: () => api.patchCodexModelReasoningQueryCache(client.getQueryCache()),
     dispose: () => {
+      for (const entry of state.reasoningObserverPrototypes?.values() ?? [])
+        entry.dispose();
+      state.reasoningObserverPrototypes?.clear();
       for (const entry of state.reasoningQueryCaches?.values() ?? [])
         if (entry.dispose) entry.dispose();
         else entry.unsubscribe();
@@ -145,7 +173,153 @@ const createHarness = () => {
   };
 };
 
+const deferred = <T>() => {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  const promise = new Promise<T>((done) => {
+    resolve = done;
+  });
+  return { promise, resolve };
+};
+
+const createReleaseRaceHarness = () => {
+  const harness = createHarness();
+  harness.observer.destroy();
+  harness.client.clear();
+  const queryKey = ["models", "list", "local", "chatgpt", 100];
+  let activeProvider = provider;
+  const requests: {
+    provider: string;
+    signal: AbortSignal;
+    response: ReturnType<typeof deferred<typeof raw>>;
+  }[] = [];
+  harness.client.setQueryData(queryKey, raw);
+  const observer = new QueryObserver(harness.client, {
+    queryKey,
+    enabled: false,
+    select,
+    queryFn: ({ signal }) => {
+      const response = deferred<typeof raw>();
+      requests.push({ provider: activeProvider, signal, response });
+      return response.promise;
+    },
+  });
+  const unsubscribe = observer.subscribe(() => {});
+  harness.state.modelPickerQueryClients = new Map([
+    [harness.client.getQueryCache(), harness.client],
+  ]);
+  harness.patch();
+  const query = harness.client.getQueryCache().find({ queryKey })!;
+  const releaseApi = new Function(
+    "state",
+    `${releaseCore}\nreturn {
+      release: releaseCodexModelPicker,
+      cancel: () => cancelCodexModelPickerReleaseRefresh(),
+    };`,
+  )(harness.state) as {
+    release: (provider: string) => boolean;
+    cancel: () => void;
+  };
+  return {
+    ...harness,
+    queryKey,
+    query,
+    observer,
+    requests,
+    releaseApi,
+    setActiveProvider: (next: string) => {
+      activeProvider = next;
+    },
+    dispose: () => {
+      unsubscribe();
+      observer.destroy();
+      harness.dispose();
+    },
+  };
+};
+
 describe("Codex Desktop post-filter reasoning projection", () => {
+  it("reports normalized payload effort counts without counting excluded or stale rows", () => {
+    const harness = createHarness();
+    try {
+      harness.state.payload.models = [
+        {
+          model: "snake",
+          supported_reasoning_levels: ["high", "max", "ultra"],
+        },
+        {
+          model: "camel",
+          supportedReasoningEfforts: [
+            { reasoningEffort: "low" },
+            { reasoningEffort: "max" },
+            { reasoningEffort: "max" },
+          ],
+        },
+        {
+          model: "nested",
+          reasoning: { supportedEfforts: ["medium", "ultra"] },
+        },
+        {
+          model: "explicit-empty",
+          supportedReasoningEfforts: [],
+          reasoning: { supportedEfforts: ["max", "ultra"] },
+        },
+        {
+          model: "excluded",
+          enabled: false,
+          supported_reasoning_levels: ["max", "ultra"],
+        },
+      ];
+      harness.state.payload.modelNames = [
+        "snake",
+        "camel",
+        "nested",
+        "explicit-empty",
+        "excluded",
+        "stale-name",
+        "snake",
+      ];
+      const before = JSON.stringify(harness.state.payload);
+
+      expect(harness.api.codexModelCatalogDiagnostics()).toEqual({
+        reasoningModelCount: 3,
+        maxEffortModelCount: 2,
+        ultraEffortModelCount: 2,
+      });
+      expect(JSON.stringify(harness.state.payload)).toBe(before);
+
+      harness.state.payload.modelNames = [];
+      expect(harness.api.codexModelCatalogDiagnostics()).toEqual({
+        reasoningModelCount: 0,
+        maxEffortModelCount: 0,
+        ultraEffortModelCount: 0,
+      });
+    } finally {
+      harness.dispose();
+    }
+  });
+
+  it("projects the provider-less local model query used by current Desktop builds", () => {
+    const harness = createHarness();
+    try {
+      const providerlessKey = ["models", "list", "local", "chatgpt", 100];
+      const projected = harness.api.restoreCodexCatalogReasoningSelection(
+        providerlessKey,
+        select(raw),
+      );
+      const projectedEfforts = projected.models[0]
+        ?.supportedReasoningEfforts as
+        { reasoningEffort: string }[] | undefined;
+
+      expect(projectedEfforts?.map((level) => level.reasoningEffort)).toEqual(
+        allEfforts,
+      );
+      expect(projected.hasModelSupportingMaxReasoningEffort).toBe(true);
+      expect(projected.hasModelSupportingUltraReasoningEffort).toBe(true);
+    } finally {
+      harness.dispose();
+    }
+  });
+
   it.each(["current", "v8"])(
     "releases %s projection to native cached queries and reactivates without nesting",
     async (version) => {
@@ -352,6 +526,765 @@ describe("Codex Desktop post-filter reasoning projection", () => {
     }
   });
 
+  it("preserves catalog efforts in query-signal snapshots before subscription", () => {
+    const harness = createHarness();
+    let snapshot: typeof harness.observer | undefined;
+    try {
+      harness.patch();
+      snapshot = new QueryObserver(harness.client, harness.options);
+      const query = harness.client.getQueryCache().find({ queryKey: key });
+      expect(query?.observers).not.toContain(snapshot);
+      const optimistic = snapshot.getOptimisticResult(
+        harness.client.defaultQueryOptions(harness.options),
+      );
+      expect(
+        optimistic.data?.models[0].supportedReasoningEfforts.map(
+          (level) => level.reasoningEffort,
+        ),
+      ).toEqual(allEfforts);
+      expect(
+        snapshot
+          .getCurrentResult()
+          .data?.models[0].supportedReasoningEfforts.map(
+            (level) => level.reasoningEffort,
+          ),
+      ).toEqual(allEfforts);
+      expect(harness.client.getQueryData(key)).toBe(raw);
+    } finally {
+      snapshot?.destroy();
+      harness.dispose();
+    }
+  });
+
+  it.each(["chatgpt", "apikey", "no-auth"])(
+    "projects the first %s observer with no subscribed cache readers",
+    (authMethod) => {
+      const harness = createHarness();
+      const client = new QueryClient();
+      let snapshot: typeof harness.observer | undefined;
+      try {
+        const queryKey = [
+          "models",
+          "list",
+          "local",
+          authMethod,
+          100,
+          ...(authMethod === "apikey" ? ["redacted-session-id"] : []),
+          provider,
+          "test-catalog.json",
+        ];
+        client.setQueryData(queryKey, raw);
+        harness.api.patchCodexModelReasoningQueryObserverPrototype(
+          QueryObserver.prototype,
+        );
+        harness.api.patchCodexModelReasoningQueryCache(client.getQueryCache());
+        expect(client.getQueryCache().getAll()[0].observers).toEqual([]);
+        const options = { ...harness.options, queryKey };
+        snapshot = new QueryObserver(client, options);
+        const initial = snapshot.getCurrentResult();
+        expect(
+          initial.data?.models[0].supportedReasoningEfforts.map(
+            (level) => level.reasoningEffort,
+          ),
+        ).toEqual(allEfforts);
+        expect(initial.data?.defaultModel).toBe(initial.data?.models[0]);
+        expect(initial.data?.hasModelSupportingMaxReasoningEffort).toBe(true);
+        expect(initial.data?.hasModelSupportingUltraReasoningEffort).toBe(true);
+        for (let index = 0; index < 5; index += 1) {
+          expect(
+            snapshot.getOptimisticResult(client.defaultQueryOptions(options))
+              .data,
+          ).toBe(initial.data);
+        }
+        expect(client.getQueryData(queryKey)).toBe(raw);
+      } finally {
+        snapshot?.destroy();
+        harness.dispose();
+        client.clear();
+      }
+    },
+  );
+
+  it("reprojects unmounted snapshots from current declarations, including empty capabilities", () => {
+    const harness = createHarness();
+    let snapshot: typeof harness.observer | undefined;
+    try {
+      harness.patch();
+      snapshot = new QueryObserver(harness.client, harness.options);
+      for (const declared of [["max", "ultra"], ["max"], []]) {
+        harness.state.payload = {
+          ...harness.state.payload,
+          models: [
+            { model: "sol-relay", supported_reasoning_levels: declared },
+          ],
+        };
+        const optimistic = snapshot.getOptimisticResult(
+          harness.client.defaultQueryOptions(harness.options),
+        );
+        expect(
+          optimistic.data?.models[0].supportedReasoningEfforts.map(
+            (level) => level.reasoningEffort,
+          ),
+        ).toEqual(declared);
+        expect(snapshot.getCurrentResult().data).toBe(optimistic.data);
+      }
+      harness.state.payload = {
+        ...harness.state.payload,
+        modelNames: [],
+        models: [],
+      };
+      expect(
+        snapshot.getOptimisticResult(
+          harness.client.defaultQueryOptions(harness.options),
+        ).data?.models,
+      ).toEqual([]);
+    } finally {
+      snapshot?.destroy();
+      harness.dispose();
+    }
+  });
+
+  it("does not project foreign caches, remote hosts, unrelated providers, or raw selectors", () => {
+    const harness = createHarness();
+    const foreign = new QueryClient();
+    const observers: { destroy: () => void }[] = [];
+    try {
+      harness.patch();
+      foreign.setQueryData(key, raw);
+      const foreignObserver = new QueryObserver(foreign, harness.options);
+      observers.push(foreignObserver);
+      expect(
+        foreignObserver
+          .getCurrentResult()
+          .data?.models[0].supportedReasoningEfforts.map(
+            (level) => level.reasoningEffort,
+          ),
+      ).toEqual(allEfforts.slice(0, 4));
+      for (const queryKey of [
+        key.map((part) => (part === "local" ? "remote" : part)),
+        key.map((part) => (part === provider ? "another-provider" : part)),
+      ]) {
+        harness.client.setQueryData(queryKey, raw);
+        const observer = new QueryObserver(harness.client, {
+          ...harness.options,
+          queryKey,
+        });
+        observers.push(observer);
+        expect(
+          observer
+            .getCurrentResult()
+            .data?.models[0].supportedReasoningEfforts.map(
+              (level) => level.reasoningEffort,
+            ),
+        ).toEqual(allEfforts.slice(0, 4));
+      }
+      const identity = new QueryObserver(harness.client, {
+        ...harness.options,
+        select: (value: typeof raw) => value,
+      });
+      observers.push(identity);
+      expect(identity.getCurrentResult().data).toBe(raw);
+      expect(harness.client.getQueryData(key)).toBe(raw);
+    } finally {
+      for (const observer of observers) observer.destroy();
+      harness.dispose();
+      foreign.clear();
+    }
+  });
+
+  it("unwraps copied managed selectors before foreign-cache or remote-host reads", () => {
+    const harness = createHarness();
+    const foreign = new QueryClient();
+    const observers: { destroy: () => void }[] = [];
+    try {
+      harness.patch();
+      const copiedOptions = harness.observer.options;
+      expect(copiedOptions.select).not.toBe(select);
+      foreign.setQueryData(key, raw);
+      const foreignObserver = new QueryObserver(foreign, copiedOptions);
+      observers.push(foreignObserver);
+      const remoteKey = key.map((part) => (part === "local" ? "remote" : part));
+      harness.client.setQueryData(remoteKey, raw);
+      const remoteObserver = new QueryObserver(harness.client, {
+        ...copiedOptions,
+        queryKey: remoteKey,
+      });
+      observers.push(remoteObserver);
+      for (const observer of [foreignObserver, remoteObserver]) {
+        expect(
+          observer
+            .getCurrentResult()
+            .data?.models[0].supportedReasoningEfforts.map(
+              (level) => level.reasoningEffort,
+            ),
+        ).toEqual(allEfforts.slice(0, 4));
+      }
+    } finally {
+      for (const observer of observers) observer.destroy();
+      harness.dispose();
+      foreign.clear();
+    }
+  });
+
+  it("restores the owned prototype on reinjection without replacing another patch", () => {
+    const harness = createHarness();
+    const prototype = QueryObserver.prototype;
+    const original = Object.getOwnPropertyDescriptor(
+      prototype,
+      "createResult",
+    )!;
+    try {
+      harness.patch();
+      const firstWrapper = Object.getOwnPropertyDescriptor(
+        prototype,
+        "createResult",
+      )!.value;
+      expect(firstWrapper).not.toBe(original.value);
+      prepareCacheReinjection(harness.state);
+      expect(
+        Object.getOwnPropertyDescriptor(prototype, "createResult"),
+      ).toEqual(original);
+      loadCore(harness.state).patchCodexModelReasoningQueryCache(
+        harness.client.getQueryCache(),
+      );
+      const secondWrapper = Object.getOwnPropertyDescriptor(
+        prototype,
+        "createResult",
+      )!.value;
+      expect(secondWrapper).not.toBe(firstWrapper);
+      const external = function externalResult(
+        this: unknown,
+        ...args: unknown[]
+      ) {
+        return original.value.apply(this, args);
+      };
+      Object.defineProperty(prototype, "createResult", {
+        ...original,
+        value: external,
+      });
+      prepareCacheReinjection(harness.state);
+      expect(
+        Object.getOwnPropertyDescriptor(prototype, "createResult")!.value,
+      ).toBe(external);
+    } finally {
+      harness.dispose();
+      Object.defineProperty(prototype, "createResult", original);
+    }
+  });
+
+  it("does not reinstall the shared result hook after the managed catalog is released", () => {
+    const harness = createHarness();
+    const original = Object.getOwnPropertyDescriptor(
+      QueryObserver.prototype,
+      "createResult",
+    );
+    try {
+      harness.observer.setOptions({
+        ...harness.options,
+        queryFn: async () => raw,
+      });
+      harness.patch();
+      new Function(
+        "state",
+        `${releaseCore}\nreleaseCodexModelPicker("openai");`,
+      )(harness.state);
+      expect(
+        Object.getOwnPropertyDescriptor(
+          QueryObserver.prototype,
+          "createResult",
+        ),
+      ).toEqual(original);
+      expect(
+        harness.api.patchCodexModelReasoningQueryObserverPrototype(
+          QueryObserver.prototype,
+        ),
+      ).toBe(false);
+      expect(
+        Object.getOwnPropertyDescriptor(
+          QueryObserver.prototype,
+          "createResult",
+        ),
+      ).toEqual(original);
+    } finally {
+      harness.dispose();
+    }
+  });
+
+  it("releases the provider-less local query when the managed provider changes", async () => {
+    const harness = createHarness();
+    const providerlessKey = ["models", "list", "local", "chatgpt", 100];
+    let nativeRefetches = 0;
+    try {
+      harness.client.clear();
+      harness.client.setQueryDefaults(providerlessKey, {
+        queryFn: async () => {
+          nativeRefetches += 1;
+          return raw;
+        },
+      });
+      harness.client.setQueryData(providerlessKey, raw);
+      harness.state.modelPickerQueryClients = new Map([
+        [harness.client, harness.client],
+      ]);
+
+      new Function(
+        "state",
+        `${releaseCore}\nreleaseCodexModelPicker("openai");`,
+      )(harness.state);
+      await harness.state.modelPickerReleaseRefresh;
+
+      expect(nativeRefetches).toBe(1);
+      expect(harness.client.getQueryData(providerlessKey)).toEqual(raw);
+    } finally {
+      harness.dispose();
+    }
+  });
+
+  it("cancels an in-flight managed query before fetching the native release catalog", async () => {
+    const harness = createReleaseRaceHarness();
+    const native = { data: [{ ...raw.data[0], model: "native-release" }] };
+    try {
+      const pending = harness.query.fetch().catch(() => undefined);
+      expect(harness.requests.map((request) => request.provider)).toEqual([
+        provider,
+      ]);
+      harness.setActiveProvider("openai");
+      harness.releaseApi.release("openai");
+      harness.requests[0].response.resolve(raw);
+
+      await vi.waitFor(() => expect(harness.requests).toHaveLength(2));
+      expect(harness.requests[0].signal.aborted).toBe(true);
+      harness.requests[1].response.resolve(native);
+      await Promise.all([pending, harness.state.modelPickerReleaseRefresh]);
+
+      expect(harness.requests.map((request) => request.provider)).toEqual([
+        provider,
+        "openai",
+      ]);
+      expect(harness.client.getQueryData(harness.queryKey)).toEqual(native);
+      expect(harness.observer.getCurrentResult().status).toBe("success");
+      expect(
+        harness.observer
+          .getCurrentResult()
+          .data?.models.map((row) => row.model),
+      ).toEqual(["native-release"]);
+    } finally {
+      harness.dispose();
+    }
+  });
+
+  it("does not clear a reactivated catalog when release cancellation settles late", async () => {
+    const harness = createReleaseRaceHarness();
+    const cancellationGate = deferred<void>();
+    const cancel = harness.query.cancel.bind(harness.query);
+    harness.query.cancel = (...args) =>
+      Promise.all([cancel(...args), cancellationGate.promise]).then(
+        () => undefined,
+      );
+    const next = { data: [{ ...raw.data[0], model: "reactivated-relay" }] };
+    try {
+      const pending = harness.query.fetch().catch(() => undefined);
+      harness.setActiveProvider("openai");
+      harness.releaseApi.release("openai");
+      const releaseRefresh = harness.state.modelPickerReleaseRefresh;
+
+      harness.releaseApi.cancel();
+      harness.state.catalogReleased = false;
+      harness.state.payload = {
+        modelProvider: "next-managed-provider",
+        catalogAvailable: true,
+        modelNames: ["reactivated-relay"],
+        models: [
+          {
+            model: "reactivated-relay",
+            supported_reasoning_levels: [...allEfforts],
+          },
+        ],
+      };
+      harness.client.setQueryData(harness.queryKey, next);
+      loadCore(harness.state).patchCodexModelReasoningQueryCache(
+        harness.client.getQueryCache(),
+      );
+      cancellationGate.resolve();
+      harness.requests[0].response.resolve(raw);
+      await Promise.all([pending, releaseRefresh]);
+
+      expect(harness.requests).toHaveLength(1);
+      expect(harness.client.getQueryData(harness.queryKey)).toEqual(next);
+      expect(harness.observer.getCurrentResult().status).toBe("success");
+      expect(harness.observer.getCurrentResult().fetchStatus).toBe("idle");
+      expect(
+        harness.observer
+          .getCurrentResult()
+          .data?.models.map((row) => row.model),
+      ).toEqual(["reactivated-relay"]);
+      expect(
+        harness.observer
+          .getCurrentResult()
+          .data?.models[0].supportedReasoningEfforts.map(
+            (level) => level.reasoningEffort,
+          ),
+      ).toEqual(allEfforts);
+    } finally {
+      cancellationGate.resolve();
+      harness.dispose();
+    }
+  });
+
+  it.each(["pending", "fulfilled"])(
+    "cancels its %s native refresh before a managed catalog reactivates",
+    async (resolution) => {
+      const harness = createReleaseRaceHarness();
+      const next = { data: [{ ...raw.data[0], model: "reactivated-relay" }] };
+      try {
+        harness.setActiveProvider("openai");
+        harness.releaseApi.release("openai");
+        await vi.waitFor(() => expect(harness.requests).toHaveLength(1));
+        const releaseRefresh = harness.state.modelPickerReleaseRefresh;
+        const obsolete = {
+          data: [{ ...raw.data[0], model: "obsolete-native" }],
+        };
+        if (resolution === "fulfilled")
+          harness.requests[0].response.resolve(obsolete);
+
+        harness.releaseApi.cancel();
+        harness.state.catalogReleased = false;
+        harness.state.payload = {
+          modelProvider: provider,
+          catalogAvailable: true,
+          modelNames: ["reactivated-relay"],
+          models: [
+            {
+              model: "reactivated-relay",
+              supported_reasoning_levels: [...allEfforts],
+            },
+          ],
+        };
+        harness.client.setQueryData(harness.queryKey, next);
+        loadCore(harness.state).patchCodexModelReasoningQueryCache(
+          harness.client.getQueryCache(),
+        );
+        if (resolution === "pending")
+          harness.requests[0].response.resolve(obsolete);
+        await releaseRefresh;
+
+        expect(harness.requests[0].signal.aborted).toBe(true);
+        expect(harness.client.getQueryData(harness.queryKey)).toEqual(next);
+        expect(harness.observer.getCurrentResult().fetchStatus).toBe("idle");
+        expect(
+          harness.observer
+            .getCurrentResult()
+            .data?.models.map((row) => row.model),
+        ).toEqual(["reactivated-relay"]);
+      } finally {
+        harness.dispose();
+      }
+    },
+  );
+
+  it("retargets a pending native refresh when the released provider changes", async () => {
+    const harness = createReleaseRaceHarness();
+    const newest = { data: [{ ...raw.data[0], model: "newest-native" }] };
+    try {
+      harness.setActiveProvider("openai");
+      harness.releaseApi.release("openai");
+      await vi.waitFor(() => expect(harness.requests).toHaveLength(1));
+      const oldRefresh = harness.state.modelPickerReleaseRefresh;
+
+      harness.setActiveProvider("another-native-provider");
+      harness.releaseApi.release("another-native-provider");
+      harness.requests[0].response.resolve({
+        data: [{ ...raw.data[0], model: "obsolete-native" }],
+      });
+      await vi.waitFor(() => expect(harness.requests).toHaveLength(2));
+      expect(harness.requests[0].signal.aborted).toBe(true);
+      const middleRefresh = harness.state.modelPickerReleaseRefresh;
+      await oldRefresh;
+      harness.setActiveProvider("newest-native-provider");
+      harness.releaseApi.release("newest-native-provider");
+      harness.requests[1].response.resolve({
+        data: [{ ...raw.data[0], model: "obsolete-middle" }],
+      });
+      await vi.waitFor(() => expect(harness.requests).toHaveLength(3));
+      expect(harness.requests[1].signal.aborted).toBe(true);
+      harness.requests[2].response.resolve(newest);
+      await Promise.all([
+        middleRefresh,
+        harness.state.modelPickerReleaseRefresh,
+      ]);
+
+      expect(harness.requests.map((request) => request.provider)).toEqual([
+        "openai",
+        "another-native-provider",
+        "newest-native-provider",
+      ]);
+      expect(harness.state.payload.modelProvider).toBe(
+        "newest-native-provider",
+      );
+      expect(harness.client.getQueryData(harness.queryKey)).toEqual(newest);
+      expect(
+        harness.observer
+          .getCurrentResult()
+          .data?.models.map((row) => row.model),
+      ).toEqual(["newest-native"]);
+    } finally {
+      harness.dispose();
+    }
+  });
+
+  it("does not cancel a newer external fetch that replaced its native refresh", async () => {
+    const harness = createReleaseRaceHarness();
+    const newest = { data: [{ ...raw.data[0], model: "external-newest" }] };
+    try {
+      harness.setActiveProvider("openai");
+      harness.releaseApi.release("openai");
+      await vi.waitFor(() => expect(harness.requests).toHaveLength(1));
+      const releaseRefresh = harness.state.modelPickerReleaseRefresh;
+
+      const cancellation = harness.query.cancel({ silent: true });
+      harness.setActiveProvider("external-new-provider");
+      const externalFetch = harness.query.fetch();
+      expect(harness.requests).toHaveLength(2);
+      harness.releaseApi.cancel();
+      expect(harness.requests[1].signal.aborted).toBe(false);
+      harness.requests[0].response.resolve(raw);
+      harness.requests[1].response.resolve(newest);
+      await Promise.all([cancellation, releaseRefresh, externalFetch]);
+
+      expect(harness.client.getQueryData(harness.queryKey)).toEqual(newest);
+      expect(harness.observer.getCurrentResult().status).toBe("success");
+    } finally {
+      harness.dispose();
+    }
+  });
+
+  it("preserves newer query data written while release cancellation is pending", async () => {
+    const harness = createReleaseRaceHarness();
+    const cancellationGate = deferred<void>();
+    const cancel = harness.query.cancel.bind(harness.query);
+    harness.query.cancel = (...args) =>
+      Promise.all([cancel(...args), cancellationGate.promise]).then(
+        () => undefined,
+      );
+    const newest = { data: [{ ...raw.data[0], model: "newer-native-cache" }] };
+    try {
+      const pending = harness.query.fetch().catch(() => undefined);
+      harness.setActiveProvider("openai");
+      harness.releaseApi.release("openai");
+      harness.client.setQueryData(harness.queryKey, newest);
+      cancellationGate.resolve();
+      harness.requests[0].response.resolve(raw);
+      await Promise.all([pending, harness.state.modelPickerReleaseRefresh]);
+
+      expect(harness.requests).toHaveLength(1);
+      expect(harness.client.getQueryData(harness.queryKey)).toEqual(newest);
+      expect(harness.observer.getCurrentResult().status).toBe("success");
+      expect(harness.observer.getCurrentResult().fetchStatus).toBe("idle");
+    } finally {
+      cancellationGate.resolve();
+      harness.dispose();
+    }
+  });
+
+  it("preserves the cache if cancellation fails instead of clearing a live query", async () => {
+    const harness = createReleaseRaceHarness();
+    const cancel = harness.query.cancel;
+    const cancellationFailure = new Error(
+      "synthetic catalog cancellation failure",
+    );
+    harness.query.cancel = () => {
+      throw cancellationFailure;
+    };
+    try {
+      harness.setActiveProvider("openai");
+      harness.releaseApi.release("openai");
+      await Promise.resolve();
+
+      expect(harness.client.getQueryData(harness.queryKey)).toEqual(raw);
+      expect(harness.requests).toHaveLength(0);
+      expect(await harness.state.modelPickerReleaseRefresh).toEqual([
+        { status: "fulfilled", value: undefined },
+        { status: "rejected", reason: cancellationFailure },
+      ]);
+    } finally {
+      harness.query.cancel = cancel;
+      harness.dispose();
+    }
+  });
+
+  it("connects private-registry module discovery to the first real picker snapshot", async () => {
+    const harness = createHarness();
+    const client = new QueryClient();
+    let snapshot: typeof harness.observer | undefined;
+    try {
+      client.setQueryData(key, raw);
+      const scope = {
+        chain: {},
+        node: {},
+        get() {},
+        set() {},
+        watch() {},
+        get queryClient() {
+          return client;
+        },
+      };
+      const discover = new Function(
+        "state",
+        "window",
+        "document",
+        `${core}
+${discoveryCore}
+const patchRequestClient = () => false;
+const recordFailure = (error) => { throw error; };
+const monotonicNow = () => 0;
+const yieldReactDiscovery = async () => {};
+return patchCodexScopedAppServerClients;`,
+      )(
+        harness.state,
+        {
+          __codexRoot: {
+            _internalRoot: {
+              current: {
+                dependencies: { firstContext: { memoizedValue: scope } },
+              },
+            },
+          },
+        },
+        { getElementById: () => null },
+      ) as (module: object) => Promise<number>;
+      expect(await discover({ minifiedObserverAlias: QueryObserver })).toBe(0);
+      expect(client.getQueryCache().getAll()[0].observers).toEqual([]);
+      snapshot = new QueryObserver(client, harness.options);
+      expect(
+        snapshot
+          .getCurrentResult()
+          .data?.models[0].supportedReasoningEfforts.map(
+            (level) => level.reasoningEffort,
+          ),
+      ).toEqual(allEfforts);
+      expect(
+        snapshot.getOptimisticResult(
+          client.defaultQueryOptions(harness.options),
+        ).data,
+      ).toBe(snapshot.getCurrentResult().data);
+    } finally {
+      snapshot?.destroy();
+      harness.dispose();
+      client.clear();
+    }
+  });
+
+  it("restores the missing Max stop when a shell scope precedes the picker scope", async () => {
+    const harness = createHarness();
+    const shell = new QueryClient();
+    const picker = new QueryClient();
+    let snapshot: typeof harness.observer | undefined;
+    let mounted: typeof harness.observer | undefined;
+    let unsubscribe = () => {};
+    const scopeFor = (queryClient: QueryClient) => ({
+      chain: {},
+      node: {},
+      get() {},
+      set() {},
+      watch() {},
+      get queryClient() {
+        return queryClient;
+      },
+    });
+    try {
+      picker.setQueryData(key, raw);
+      const discover = new Function(
+        "state",
+        "window",
+        "document",
+        [
+          core,
+          discoveryCore,
+          "const patchRequestClient = () => false;",
+          "const recordFailure = (error) => { throw error; };",
+          "const monotonicNow = () => 0;",
+          "const yieldReactDiscovery = async () => {};",
+          "return patchCodexScopedAppServerClients;",
+        ].join("\n"),
+      )(
+        harness.state,
+        {
+          __codexRoot: {
+            _internalRoot: {
+              current: {
+                dependencies: {
+                  firstContext: { memoizedValue: scopeFor(shell) },
+                },
+                child: {
+                  dependencies: {
+                    firstContext: { memoizedValue: scopeFor(picker) },
+                  },
+                },
+              },
+            },
+          },
+        },
+        { getElementById: () => null },
+      ) as (module: object) => Promise<number>;
+      const options = {
+        ...harness.options,
+        select: (value: typeof raw) => {
+          const models = value.data.map((model) => ({
+            ...model,
+            supportedReasoningEfforts: model.supportedReasoningEfforts.filter(
+              ({ reasoningEffort }) => reasoningEffort !== "max",
+            ),
+          }));
+          return {
+            models,
+            defaultModel: models[0],
+            hasModelSupportingMaxReasoningEffort: true,
+            hasModelSupportingUltraReasoningEffort: true,
+          };
+        },
+      };
+      snapshot = new QueryObserver(picker, options);
+      const stops = () =>
+        snapshot!
+          .getCurrentResult()
+          .data!.models[0].supportedReasoningEfforts.map(
+            ({ reasoningEffort }) => reasoningEffort,
+          );
+      expect(stops()).toEqual(["low", "medium", "high", "xhigh", "ultra"]);
+      mounted = new QueryObserver(picker, options);
+      const updates: string[][] = [];
+      unsubscribe = mounted.subscribe((result) => {
+        updates.push(
+          result.data!.models[0].supportedReasoningEfforts.map(
+            ({ reasoningEffort }) => reasoningEffort,
+          ),
+        );
+      });
+      await discover({ minifiedObserverAlias: QueryObserver });
+      expect(
+        mounted
+          .getCurrentResult()
+          .data!.models[0].supportedReasoningEfforts.map(
+            ({ reasoningEffort }) => reasoningEffort,
+          ),
+      ).toEqual(allEfforts);
+      expect(updates).toContainEqual(allEfforts);
+      snapshot.getOptimisticResult(picker.defaultQueryOptions(options));
+      expect(stops()).toEqual(allEfforts);
+      expect(picker.getQueryData(key)).toBe(raw);
+      expect(
+        harness.state.reasoningQueryCaches?.has(picker.getQueryCache()),
+      ).toBe(true);
+    } finally {
+      unsubscribe();
+      mounted?.destroy();
+      snapshot?.destroy();
+      harness.dispose();
+      shell.clear();
+      picker.clear();
+    }
+  });
+
   it("uses current catalog capabilities and does not affect remote queries", () => {
     const harness = createHarness();
     try {
@@ -508,7 +1441,6 @@ describe("Codex Desktop post-filter reasoning projection", () => {
       for (const field of [
         "defaultReasoningEffort",
         "default_reasoning_level",
-        "supportedReasoningEfforts",
         "supportedReasoningLevels",
         "supported_reasoning_levels",
         "supported_reasoning_efforts",
@@ -516,8 +1448,190 @@ describe("Codex Desktop post-filter reasoning projection", () => {
       ]) {
         expect(models[0]).not.toHaveProperty(field);
       }
+      // Codex's native model select reads supportedReasoningEfforts unguarded.
+      // A managed row with no declared efforts keeps the canonical empty array
+      // instead of dropping the field and crashing the picker.
+      expect(models[0].supportedReasoningEfforts).toEqual([]);
       expect(models[0].inputModalities).toEqual(["text", "image"]);
       expect(models[0].unknownMetadata).toEqual({ preserve: true });
+    } finally {
+      harness.dispose();
+    }
+  });
+
+  it("keeps the native model select alive when a managed row declares no efforts", () => {
+    const harness = createHarness();
+    try {
+      harness.state.payload.modelNames = ["sol-relay", "plain-relay"];
+      harness.state.payload.models = [
+        { model: "sol-relay", supported_reasoning_levels: [...allEfforts] },
+        { model: "plain-relay", supported_reasoning_levels: [] },
+      ];
+      const mixedRaw = Object.freeze({
+        data: Object.freeze([
+          Object.freeze({
+            model: "sol-relay",
+            supportedReasoningEfforts: Object.freeze(
+              allEfforts.map((reasoningEffort) =>
+                Object.freeze({
+                  reasoningEffort,
+                  description: reasoningEffort,
+                }),
+              ),
+            ),
+          }),
+          // The provider declares no efforts, so the raw response omits the
+          // field entirely and the native select throws on it.
+          Object.freeze({ model: "plain-relay", displayName: "Plain" }),
+        ]),
+      });
+      harness.client.setQueryData(key, mixedRaw);
+      const cachedRaw = harness.client.getQueryData<typeof mixedRaw>(key)!;
+      // TanStack can reuse existing rows while accepting new data. Freeze the
+      // actual cache value as well as the input fixture before native selection.
+      for (const row of cachedRaw.data) Object.freeze(row);
+      Object.freeze(cachedRaw.data);
+      Object.freeze(cachedRaw);
+      harness.observer.setOptions({
+        ...harness.options,
+        select: (value) => ({
+          ...select(value),
+          hasModelSupportingMaxReasoningEffort: value.data.some((model) =>
+            model.supportedReasoningEfforts.some(
+              (level) => level.reasoningEffort === "max",
+            ),
+          ),
+          hasModelSupportingUltraReasoningEffort: value.data.some((model) =>
+            model.supportedReasoningEfforts.some(
+              (level) => level.reasoningEffort === "ultra",
+            ),
+          ),
+        }),
+      });
+
+      harness.patch();
+      const result = harness.observer.getCurrentResult();
+
+      expect(result.status).toBe("success");
+      expect(result.data?.models.map((model) => model.model)).toEqual([
+        "sol-relay",
+        "plain-relay",
+      ]);
+      expect(result.data?.models[1].supportedReasoningEfforts).toEqual([]);
+      expect(result.data?.models[1]).not.toHaveProperty(
+        "defaultReasoningEffort",
+      );
+      expect(
+        result.data?.models[0].supportedReasoningEfforts.map(
+          (level) => level.reasoningEffort,
+        ),
+      ).toEqual(allEfforts);
+      expect(result.data?.hasModelSupportingMaxReasoningEffort).toBe(true);
+      expect(result.data?.hasModelSupportingUltraReasoningEffort).toBe(true);
+      expect(harness.client.getQueryData(key)).toBe(cachedRaw);
+      expect(cachedRaw).toStrictEqual(mixedRaw);
+      expect(mixedRaw.data[1]).not.toHaveProperty("supportedReasoningEfforts");
+      for (let pass = 0; pass < 5; pass += 1) harness.patch();
+      expect(harness.observer.getCurrentResult().data).toBe(result.data);
+    } finally {
+      harness.dispose();
+    }
+  });
+
+  it("preserves a mixed effort inventory through reinjection, release, and provider change", async () => {
+    const harness = createHarness();
+    const includedPayload = {
+      ...harness.state.payload,
+      modelNames: ["sol-relay", "plain-relay"],
+      models: [
+        { model: "sol-relay", supported_reasoning_levels: [...allEfforts] },
+        { model: "plain-relay", supported_reasoning_levels: [] },
+      ],
+    };
+    const mixedRaw = {
+      data: [raw.data[0], { model: "plain-relay", displayName: "Plain" }],
+    };
+    const assertMixed = (expectedEfforts: string[]) => {
+      const result = harness.observer.getCurrentResult();
+      expect(result.status).toBe("success");
+      expect(result.data?.models.map((model) => model.model)).toEqual([
+        "sol-relay",
+        "plain-relay",
+      ]);
+      expect(
+        result.data?.models[0].supportedReasoningEfforts.map(
+          (level) => level.reasoningEffort,
+        ),
+      ).toEqual(expectedEfforts);
+      expect(result.data?.models[1].supportedReasoningEfforts).toEqual([]);
+      expect(result.data?.models[1]).not.toHaveProperty(
+        "defaultReasoningEffort",
+      );
+    };
+    try {
+      harness.state.payload = includedPayload;
+      harness.client.setQueryData(key, mixedRaw);
+      harness.patch();
+      assertMixed(allEfforts);
+
+      const caches = prepareCacheReinjection(harness.state);
+      const reinstalled = loadCore(harness.state);
+      for (const cache of caches)
+        reinstalled.patchCodexModelReasoningQueryCache(cache);
+      assertMixed(allEfforts);
+
+      let nativeRequests = 0;
+      const native = { data: [{ ...raw.data[0], model: "official-native" }] };
+      harness.state.modelPickerQueryClients = new Map([
+        [harness.client.getQueryCache(), harness.client],
+      ]);
+      harness.observer.setOptions({
+        ...harness.options,
+        queryFn: async () => {
+          nativeRequests += 1;
+          return native;
+        },
+      });
+      const release = new Function(
+        "state",
+        releaseCore + "\nreturn releaseCodexModelPicker;",
+      )(harness.state) as (provider: string) => boolean;
+      expect(release("openai")).toBe(true);
+      await harness.state.modelPickerReleaseRefresh;
+      expect(nativeRequests).toBe(1);
+      expect(harness.observer.getCurrentResult().status).toBe("success");
+      expect(
+        harness.observer
+          .getCurrentResult()
+          .data?.models.map((model) => model.model),
+      ).toEqual(["official-native"]);
+      expect(harness.observer.options.select).toBe(select);
+
+      const otherProvider = "another-managed-provider";
+      const otherKey = key.map((part) =>
+        part === provider ? otherProvider : part,
+      );
+      harness.state.payload = {
+        ...includedPayload,
+        modelProvider: otherProvider,
+        models: [
+          { model: "sol-relay", supported_reasoning_levels: ["medium", "max"] },
+          { model: "plain-relay", supported_reasoning_levels: [] },
+        ],
+      };
+      harness.state.catalogReleased = false;
+      harness.client.setQueryData(otherKey, mixedRaw);
+      harness.observer.setOptions({ ...harness.options, queryKey: otherKey });
+      loadCore(harness.state).patchCodexModelReasoningQueryCache(
+        harness.client.getQueryCache(),
+      );
+      assertMixed(["medium", "max"]);
+      expect(
+        harness.observer.getCurrentResult().data
+          ?.hasModelSupportingUltraReasoningEffort,
+      ).toBe(false);
+      expect(harness.client.getQueryData(otherKey)).toBe(mixedRaw);
+      expect(mixedRaw.data[1]).not.toHaveProperty("supportedReasoningEfforts");
     } finally {
       harness.dispose();
     }

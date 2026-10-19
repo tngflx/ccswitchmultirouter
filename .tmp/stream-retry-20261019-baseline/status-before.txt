@@ -1,0 +1,89 @@
+ M .github/workflows/ci.yml
+ M contracts/openai-responses.v1.json
+ M docs/audits/2026-10-17-codex-upstream-integration-audit.md
+ M package.json
+ M scripts/__pycache__/verify_third_party_hosted_web_search.cpython-312.pyc
+ M scripts/build-renderer.mjs
+ M scripts/check-openai-responses-contract.mjs
+ M scripts/check-openai-responses-contract.node-test.mjs
+ M scripts/tests/__pycache__/test_hosted_web_search_canary.cpython-312.pyc
+ M scripts/verify-codex-catalog.mjs
+ M src-tauri/src/codex_config.rs
+ M src-tauri/src/codex_desktop.rs
+ M src-tauri/src/codex_multirouter/compiler.rs
+ M src-tauri/src/commands/provider.rs
+ M src-tauri/src/commands/settings.rs
+ M src-tauri/src/config.rs
+ M src-tauri/src/database/dao/providers.rs
+ M src-tauri/src/database/dao/proxy.rs
+ M src-tauri/src/lib.rs
+ M src-tauri/src/proxy/mod.rs
+ M src-tauri/src/proxy/openai_contract.rs
+ M src-tauri/src/proxy/providers/responses_contract.rs
+ M src-tauri/src/proxy/request_health.rs
+ M src-tauri/src/proxy/server.rs
+ M src-tauri/src/reasoning_capabilities/mod.rs
+ M src-tauri/src/reasoning_capabilities/provider_metadata.rs
+ D src-tauri/src/resources/codex_client_discovery_core.js
+ D src-tauri/src/resources/codex_continuation_core.js
+ D src-tauri/src/resources/codex_model_picker_cache_lifecycle.js
+ D src-tauri/src/resources/codex_model_picker_core.js
+ D src-tauri/src/resources/codex_model_picker_release_core.js
+ M src-tauri/src/services/model_fetch.rs
+ M src-tauri/src/services/preset_catalog.rs
+ M src-tauri/src/services/provider/mod.rs
+ M src-tauri/src/services/proxy.rs
+ M src-tauri/src/settings.rs
+ M src/components/codex/CodexRouterWorkspacePage.test.ts
+ M src/components/providers/forms/OpenCodeFormFields.tsx
+ M src/components/providers/forms/ProviderForm.tsx
+ M src/components/providers/forms/hooks/useCodexConfigState.ts
+ M src/components/proxy/ProxyPanel.tsx
+ M src/components/settings/RequestHealthPanel.tsx
+ M src/components/settings/SettingsPage.tsx
+ M src/hooks/useSettings.ts
+ M src/i18n/locales/en.json
+ M src/i18n/locales/ja.json
+ M src/i18n/locales/zh-TW.json
+ M src/i18n/locales/zh.json
+ M src/lib/api/settings.ts
+ M src/lib/codexProtocolCapability.ts
+ M src/types/proxy.ts
+ M tests/components/OpenCodeFormFields.test.tsx
+ M tests/components/ProviderForm.codexCatalog.test.ts
+ M tests/components/ProviderForm.codexPreset.test.tsx
+ M tests/components/RequestHealthPanel.test.tsx
+ M tests/hooks/useSettings.persistence.test.tsx
+ M tests/integration/SettingsDialog.test.tsx
+ M tests/lib/codexDesktopReasoningProjection.test.ts
+ M tests/msw/handlers.ts
+?? .tmp/cdp-readonly-state.mjs
+?? .tmp/improvements-20261019-baseline/
+?? .tmp/reaudit-schema-20261019-baseline/
+?? .tmp/stream-retry-20261019-baseline/
+?? docs/audits/2026-10-17-codex-picker-effort-audit.md
+?? docs/audits/2026-10-17-request-health-persistence-audit.md
+?? docs/audits/2026-10-18-codex-catalog-sync-log-audit.md
+?? docs/audits/2026-10-18-codex-picker-scope-sync.md
+?? docs/audits/2026-10-18-codex-picker-select-crash.md
+?? docs/audits/2026-10-18-codex-projection-resync-root-cause.md
+?? docs/audits/2026-10-18-working-tree-regression-reaudit.md
+?? docs/audits/2026-10-19-bigstrongsun-parity-review.md
+?? docs/audits/2026-10-19-codebase-request-schema-reaudit.md
+?? docs/audits/2026-10-19-codex-picker-boundary-review.md
+?? docs/audits/2026-10-19-remaining-audit-hardening.md
+?? output/picker-crash-fix-20261018/
+?? output/picker-sync-fix-20261018/
+?? scripts/run-unit-tests.mjs
+?? scripts/run-unit-tests.node-test.mjs
+?? scripts/vitest-completion-reporter.mjs
+?? src-tauri/src/proxy/listener_address.rs
+?? src-tauri/src/resources/codex_desktop/
+?? src/components/providers/forms/helpers/opencodeFetchedModels.ts
+?? src/lib/takeoverListenerAddress.ts
+?? tests/components/ProxyPanel.listenerSafety.test.tsx
+?? tests/lib/codexDesktopClientDiscovery.test.ts
+?? tests/lib/codexDesktopPickerDiagnostics.test.ts
+?? tests/lib/codexDesktopScopeOwnership.test.ts
+?? tests/lib/opencodeFetchedModels.test.ts
+?? tests/lib/takeoverListenerAddress.test.ts

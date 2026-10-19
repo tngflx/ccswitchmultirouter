@@ -6,6 +6,7 @@ import { providersApi, settingsApi } from "@/lib/api";
 import { syncCurrentProvidersLiveSafe } from "@/utils/postChangeSync";
 import { useSettingsQuery, useSaveSettingsMutation } from "@/lib/query";
 import type { EnvInjectionSyncReport, Settings } from "@/types";
+import type { RequestHealthConfig } from "@/types/proxy";
 import { useSettingsForm, type SettingsFormState } from "./useSettingsForm";
 import {
   useDirectorySettings,
@@ -41,6 +42,10 @@ export interface UseSettingsResult {
   autoSaveSettings: (
     updates: Partial<SettingsFormState>,
   ) => Promise<SaveResult | null>;
+  saveRequestHealthSettings: (
+    config: RequestHealthConfig,
+  ) => Promise<RequestHealthConfig>;
+  setRequestHealthEnabled: (enabled: boolean) => Promise<RequestHealthConfig>;
   resetSettings: () => void;
   acknowledgeRestart: () => void;
 }
@@ -502,7 +507,7 @@ export function useSettings(): UseSettingsResult {
     ],
   );
 
-  const enqueueSave = useCallback((save: () => Promise<SaveResult | null>) => {
+  const enqueueSave = useCallback(<T>(save: () => Promise<T>): Promise<T> => {
     const result = saveQueue.current.then(save, save);
     saveQueue.current = result.then(
       () => undefined,
@@ -521,6 +526,39 @@ export function useSettings(): UseSettingsResult {
     (overrides?: Partial<SettingsFormState>, options?: { silent?: boolean }) =>
       enqueueSave(() => persistSettings(overrides, options)),
     [enqueueSave, persistSettings],
+  );
+
+  const persistRequestHealth = useCallback(
+    async (
+      persist: () => Promise<RequestHealthConfig>,
+    ): Promise<RequestHealthConfig> => {
+      const config = await persist();
+      // A read begun before this save must not republish the old master switch.
+      await queryClient.cancelQueries({ queryKey: ["settings"] });
+      queryClient.setQueryData<Settings>(["settings"], (current) =>
+        current ? { ...current, requestHealth: config } : current,
+      );
+      return config;
+    },
+    [queryClient],
+  );
+
+  const saveRequestHealthSettings = useCallback(
+    (config: RequestHealthConfig) =>
+      enqueueSave(() =>
+        persistRequestHealth(() => settingsApi.saveRequestHealthConfig(config)),
+      ),
+    [enqueueSave, persistRequestHealth],
+  );
+
+  const setRequestHealthEnabled = useCallback(
+    (enabled: boolean) =>
+      enqueueSave(() =>
+        persistRequestHealth(() =>
+          settingsApi.setRequestHealthEnabled(enabled),
+        ),
+      ),
+    [enqueueSave, persistRequestHealth],
   );
 
   const isLoading = useMemo(
@@ -545,6 +583,8 @@ export function useSettings(): UseSettingsResult {
     resetAppConfigDir,
     saveSettings,
     autoSaveSettings,
+    saveRequestHealthSettings,
+    setRequestHealthEnabled,
     resetSettings,
     acknowledgeRestart,
   };

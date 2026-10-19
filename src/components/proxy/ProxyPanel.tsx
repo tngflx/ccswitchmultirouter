@@ -33,6 +33,7 @@ import { proxyApi } from "@/lib/api/proxy";
 import type { ProxyStatus, ProxyTakeoverStatus } from "@/types/proxy";
 import { useTranslation } from "react-i18next";
 import { AnimatePresence, motion } from "framer-motion";
+import { normalizeTakeoverListenAddress } from "@/lib/takeoverListenerAddress";
 import { extractErrorMessage } from "@/utils/errorUtils";
 
 interface ProxyPanelProps {
@@ -75,6 +76,7 @@ export function ProxyPanel({
   const queryClient = useQueryClient();
   const { data: status } = useProxyStatusQuery();
   const isRunning = status?.running ?? false;
+  const canEditListener = status?.running === false;
 
   // 获取应用接管状态
   const { data: takeoverStatus } = useProxyTakeoverStatus();
@@ -184,42 +186,11 @@ export function ProxyPanel({
   };
 
   const handleSaveBasicConfig = async () => {
-    if (!globalConfig) return;
+    if (!globalConfig || !canEditListener) return;
 
-    // 校验地址格式（IPv4 / IPv6 字面量 / localhost）
-    const addressTrimmed = listenAddress.trim();
-    const ipv4Regex = /^(\d{1,3}\.){3}\d{1,3}$/;
-    const isValidIpv4 = (addr: string): boolean =>
-      ipv4Regex.test(addr) &&
-      addr.split(".").every((n) => {
-        const num = parseInt(n, 10);
-        return num >= 0 && num <= 255;
-      });
-    // IPv6 字面量校验：必须含 `:` 且能在 [..] 包装后被 URL 解析器接受。
-    // 后端 (services/proxy.rs) 会把 `::` 改写成 `::1`，所以这里也接受 `::`。
-    const isValidIpv6 = (addr: string): boolean => {
-      if (!addr.includes(":")) return false;
-      try {
-        new URL(`http://[${addr}]/`);
-        return true;
-      } catch {
-        return false;
-      }
-    };
-    const normalizedAddress =
-      addressTrimmed === "localhost" ? "127.0.0.1" : addressTrimmed;
-    const isValidAddress =
-      addressTrimmed === "localhost" ||
-      addressTrimmed === "0.0.0.0" ||
-      isValidIpv4(addressTrimmed) ||
-      isValidIpv6(addressTrimmed);
-    if (!isValidAddress) {
-      toast.error(
-        t("proxy.settings.invalidAddress", {
-          defaultValue:
-            "Invalid address. Enter an IPv4 address (for example, 127.0.0.1), IPv6 address (for example, ::1), or localhost.",
-        }),
-      );
+    const normalizedAddress = normalizeTakeoverListenAddress(listenAddress);
+    if (!normalizedAddress) {
+      toast.error(t("proxy.settings.loopbackOnly"));
       return;
     }
 
@@ -263,6 +234,25 @@ export function ProxyPanel({
     }
   };
 
+  const [isRepairingAddress, setIsRepairingAddress] = useState(false);
+  const unsafeSavedAddress =
+    globalConfig && !normalizeTakeoverListenAddress(globalConfig.listenAddress);
+  const handleUseLocalhost = async () => {
+    if (!globalConfig || !canEditListener || isRepairingAddress) return;
+    setIsRepairingAddress(true);
+    try {
+      await updateGlobalConfig.mutateAsync({
+        ...globalConfig,
+        listenAddress: "127.0.0.1",
+      });
+      setListenAddress("127.0.0.1");
+    } catch {
+      toast.error(t("proxy.settings.configSaveFailed"));
+    } finally {
+      setIsRepairingAddress(false);
+    }
+  };
+
   const formatUptime = (seconds: number): string => {
     const hours = Math.floor(seconds / 3600);
     const minutes = Math.floor((seconds % 3600) / 60);
@@ -295,6 +285,33 @@ export function ProxyPanel({
           checked={enableLocalProxy}
           onCheckedChange={onEnableLocalProxyChange}
         />
+
+        {unsafeSavedAddress && (
+          <div
+            role="alert"
+            className="space-y-3 rounded-xl border border-amber-500/40 bg-amber-500/10 p-4"
+          >
+            <p className="text-sm">{t("proxy.settings.loopbackOnly")}</p>
+            <p className="text-xs text-muted-foreground">
+              {t("proxy.settings.externalApiForLan")}
+            </p>
+            {!canEditListener && (
+              <p className="text-xs">{t("proxy.settings.stopBeforeRepair")}</p>
+            )}
+            <Button
+              type="button"
+              variant="outline"
+              onClick={() => void handleUseLocalhost()}
+              disabled={
+                !canEditListener ||
+                isRepairingAddress ||
+                updateGlobalConfig.isPending
+              }
+            >
+              {t("proxy.settings.useLocalhost")}
+            </Button>
+          </div>
+        )}
 
         {/* [2] Proxy service toggle — always visible */}
         <div className="flex items-center justify-between rounded-xl border border-border bg-card/50 p-4 transition-colors hover:bg-muted/50">
@@ -668,7 +685,7 @@ export function ProxyPanel({
                   <p className="text-xs text-muted-foreground">
                     {t("proxy.settings.fields.listenAddress.description", {
                       defaultValue:
-                        "IP address where the proxy service listens (recommended: 127.0.0.1)",
+                        "Loopback address only (127.0.0.1 or ::1). Use the authenticated External API for LAN access.",
                     })}
                   </p>
                 </div>
@@ -704,7 +721,7 @@ export function ProxyPanel({
                 <Button
                   size="sm"
                   onClick={handleSaveBasicConfig}
-                  disabled={updateGlobalConfig.isPending}
+                  disabled={updateGlobalConfig.isPending || !canEditListener}
                 >
                   {updateGlobalConfig.isPending ? (
                     <>

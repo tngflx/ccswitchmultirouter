@@ -469,6 +469,16 @@ export const handlers = [
   }),
 
   http.post(
+    `${TAURI_ENDPOINT}/set_request_health_enabled`,
+    async ({ request }) => {
+      const { enabled } = await withJson<{ enabled: boolean }>(request);
+      const canonical = { ...getSettings().requestHealth!, enabled };
+      setSettings({ requestHealth: canonical });
+      return success(canonical);
+    },
+  ),
+
+  http.post(
     `${TAURI_ENDPOINT}/save_request_health_settings`,
     async ({ request }) => {
       const { config } = await withJson<{ config: RequestHealthConfig }>(

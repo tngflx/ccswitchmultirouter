@@ -1630,6 +1630,7 @@ pub fn run() {
             commands::save_settings,
             commands::patch_settings,
             commands::save_request_health_settings,
+            commands::set_request_health_enabled,
             commands::inspect_env_injection_status,
             commands::retry_env_injection_sync,
             commands::has_codex_unify_history_backup,

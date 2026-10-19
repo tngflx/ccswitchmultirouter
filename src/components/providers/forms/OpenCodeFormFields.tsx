@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
 import { useTranslation } from "react-i18next";
 import { FormLabel } from "@/components/ui/form";
 import { Input } from "@/components/ui/input";
@@ -41,6 +41,14 @@ import {
   OPENCODE_HEADER_DRAFT_PREFIX,
 } from "./helpers/opencodeFormUtils";
 import type { ProviderCategory, OpenCodeModel } from "@/types";
+import { applyFetchedOpenCodeModel } from "./helpers/opencodeFetchedModels";
+
+const MODEL_FETCH_API_FORMAT_BY_NPM = new Map([
+  ["@ai-sdk/openai", "openai_responses"],
+  ["@ai-sdk/openai-compatible", "openai_chat"],
+  ["@ai-sdk/anthropic", "anthropic"],
+  ["@ai-sdk/google", "gemini_native"],
+]);
 
 /**
  * Model ID input with local state to prevent focus loss.
@@ -54,7 +62,7 @@ function ModelIdInput({
   placeholder,
 }: {
   modelId: string;
-  onChange: (newId: string) => void;
+  onChange: (newId: string) => boolean | void;
   placeholder?: string;
 }) {
   const [localValue, setLocalValue] = useState(modelId);
@@ -70,7 +78,7 @@ function ModelIdInput({
       onChange={(e) => setLocalValue(e.target.value)}
       onBlur={() => {
         if (localValue !== modelId && localValue.trim()) {
-          onChange(localValue);
+          if (onChange(localValue) === false) setLocalValue(modelId);
         }
       }}
       placeholder={placeholder}
@@ -219,10 +227,17 @@ export function OpenCodeFormFields({
 
   const [fetchedModels, setFetchedModels] = useState<FetchedModel[]>([]);
   const [isFetchingModels, setIsFetchingModels] = useState(false);
+  const fetchModelsSeqRef = useRef(0);
   const [extraOptionsOpen, setExtraOptionsOpen] = useState(
     () => Object.keys(extraOptions).length > 0,
   );
   const hasZenFreeModel = hasOpenCodeZenFreeModel(baseUrl, models);
+
+  useEffect(() => {
+    fetchModelsSeqRef.current += 1;
+    setFetchedModels([]);
+    setIsFetchingModels(false);
+  }, [baseUrl, apiKey, npm, headers]);
 
   useEffect(() => {
     if (Object.keys(extraOptions).length > 0) {
@@ -238,9 +253,19 @@ export function OpenCodeFormFields({
       });
       return;
     }
+    const seq = ++fetchModelsSeqRef.current;
     setIsFetchingModels(true);
-    fetchModelsForConfig(baseUrl, apiKey)
+    const requestHeaders = Object.fromEntries(
+      Object.entries(headers).filter(
+        ([key]) => !key.startsWith(OPENCODE_HEADER_DRAFT_PREFIX),
+      ),
+    );
+    fetchModelsForConfig(baseUrl, apiKey, false, undefined, undefined, {
+      apiFormat: MODEL_FETCH_API_FORMAT_BY_NPM.get(npm),
+      requestHeaders,
+    })
       .then((models) => {
+        if (seq !== fetchModelsSeqRef.current) return;
         setFetchedModels(models);
         if (models.length === 0) {
           toast.info(t("providerForm.fetchModelsEmpty"));
@@ -251,11 +276,14 @@ export function OpenCodeFormFields({
         }
       })
       .catch((err) => {
+        if (seq !== fetchModelsSeqRef.current) return;
         console.warn("[ModelFetch] Failed:", err);
         showFetchModelsError(err, t);
       })
-      .finally(() => setIsFetchingModels(false));
-  }, [baseUrl, apiKey, t]);
+      .finally(() => {
+        if (seq === fetchModelsSeqRef.current) setIsFetchingModels(false);
+      });
+  }, [baseUrl, apiKey, npm, headers, t]);
 
   // Track which models have expanded options panel
   const [expandedModels, setExpandedModels] = useState<Set<string>>(new Set());
@@ -292,17 +320,23 @@ export function OpenCodeFormFields({
     });
   };
 
-  // Update model ID (key)
-  const handleModelIdChange = (oldKey: string, newKey: string) => {
-    if (oldKey === newKey || !newKey.trim()) return;
-    const newModels: Record<string, OpenCodeModel> = {};
-    for (const [k, v] of Object.entries(models)) {
-      if (k === oldKey) {
-        newModels[newKey] = v;
-      } else {
-        newModels[k] = v;
-      }
+  const replaceModel = (
+    oldKey: string,
+    newKey: string,
+    model: OpenCodeModel,
+  ) => {
+    if (
+      !newKey.trim() ||
+      (oldKey !== newKey &&
+        Object.prototype.hasOwnProperty.call(models, newKey))
+    ) {
+      return false;
     }
+    const newModels = Object.fromEntries(
+      Object.entries(models).map(([key, value]) =>
+        key === oldKey ? [newKey, model] : [key, value],
+      ),
+    );
     onModelsChange(newModels);
     // Update expanded set if this model was expanded
     if (expandedModels.has(oldKey)) {
@@ -313,6 +347,29 @@ export function OpenCodeFormFields({
         return next;
       });
     }
+    return true;
+  };
+
+  // A manual key edit can rename a user alias without changing its model facts.
+  const handleModelIdChange = (oldKey: string, newKey: string) => {
+    if (oldKey === newKey) return true;
+    return replaceModel(oldKey, newKey, models[oldKey]);
+  };
+
+  const handleFetchedModelSelect = (oldKey: string, id: string) => {
+    const fetched = fetchedModels.find((model) => model.id === id);
+    if (!fetched) return;
+    replaceModel(
+      oldKey,
+      id,
+      applyFetchedOpenCodeModel(
+        models[oldKey],
+        fetched,
+        npm,
+        oldKey !== id,
+        baseUrl,
+      ),
+    );
   };
 
   // Update model name
@@ -905,7 +962,7 @@ export function OpenCodeFormFields({
                     {fetchedModels.length > 0 && (
                       <ModelDropdown
                         models={fetchedModels}
-                        onSelect={(id) => handleModelIdChange(key, id)}
+                        onSelect={(id) => handleFetchedModelSelect(key, id)}
                       />
                     )}
                   </div>

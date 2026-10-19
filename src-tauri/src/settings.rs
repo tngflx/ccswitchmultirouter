@@ -1242,6 +1242,13 @@ pub fn update_request_health_config(
     })
 }
 
+pub fn set_request_health_enabled(enabled: bool) -> Result<RequestHealthConfig, AppError> {
+    mutate_settings(|settings| {
+        settings.request_health.enabled = enabled;
+        settings.request_health.clone()
+    })
+}
+
 pub fn set_tool_auto_update(tool: &str, enabled: bool) -> Result<(), AppError> {
     mutate_settings(|settings| settings.set_tool_auto_update(tool, enabled))
 }

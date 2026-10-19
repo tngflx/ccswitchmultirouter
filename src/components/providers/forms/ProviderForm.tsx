@@ -17,6 +17,7 @@ export { normalizeCodexChatReasoningForSave } from "@/lib/codexChatReasoning";
 import { parseCodexSubagentCandidateError } from "@/lib/codexSubagentCandidateError";
 import { normalizeModelIdentityMetadata } from "@/lib/modelIdentities";
 import { readCodexCatalogSettings } from "@/lib/codexCatalogSchema";
+import { normalizeCodexModelProtocolCapability } from "@/lib/codexProtocolCapability";
 import {
   buildCodexProtocolMeta,
   readCodexProtocolSettings,
@@ -253,6 +254,9 @@ export const normalizeCodexCatalogModelsForSave = (
     );
 
     const baseInstructions = item.baseInstructions?.trim();
+    const protocolCapability = normalizeCodexModelProtocolCapability(
+      item.protocolCapability,
+    );
     const rawReasoning = item.reasoning;
     const reasoning =
       rawReasoning &&
@@ -357,6 +361,7 @@ export const normalizeCodexCatalogModelsForSave = (
         : {}),
       ...(baseInstructions ? { baseInstructions } : {}),
       ...(reasoning ? { reasoning } : {}),
+      ...(protocolCapability ? { protocolCapability } : {}),
       ...(item.apiFormat ? { apiFormat: item.apiFormat } : {}),
       ...(item.codexCache ? { codexCache: { ...item.codexCache } } : {}),
       ...(typeof item.sortIndex === "number" &&

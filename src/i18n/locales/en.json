@@ -511,7 +511,20 @@
       "contractNeverChecked": "Never",
       "contractCoverage": "Coverage",
       "contractChanged": "Official declarations changed",
-      "contractLoading": "Loading contract metadata..."
+      "contractLoading": "Loading contract metadata...",
+      "contractDriftHelp": "The official reference changed; this does not mean your requests failed. The reviewed runtime rules remain unchanged. For a release fix, a maintainer must review the declaration diff, update affected validators/adapters and regression tests if necessary, then refresh the reviewed baseline and rebuild. Do not disable validation or automatically rewrite request history.",
+      "contractFailureHelp": "The documentation check could not finish. Check network/proxy access and try Check official contract again. This is not evidence of a provider or request-schema failure; the embedded runtime rules remain active.",
+      "contractDeclarationDiff": "Public declaration changes: {{added}} added, {{removed}} removed",
+      "contractDiffScope": "Bounded samples from public documentation only, not request data. Repeated declarations may appear identical without their parent context; use the full documentation/source diff when reviewing a fix.",
+      "statusLocation": "Schema findings and official-contract checks are in Codex → Status → Request Health.",
+      "findingHelp": {
+        "schema": "Check the redacted field paths and selected wire protocol. Correct the originating client or provider adapter and add a regression test; retrying the unchanged payload will not correct a type error.",
+        "tools": "Match tool_choice and replayed tool calls with tools actually declared and supported by the selected provider. Correct the client/adapter; do not invent capabilities or delete tool results to silence this finding.",
+        "history": "Review history assembly, call IDs and continuation fields in the originating client/adapter. Preserve the complete history; do not automatically drop or rewrite calls, outputs or compaction items.",
+        "extension": "This is an unverified extension, not a confirmed schema error. Leave it unchanged unless the provider rejects it; verify the provider protocol/capability evidence before changing routing.",
+        "size": "Compare actual input/cache usage with this estimate. Large images or history may explain it. Reduce attachments or use the client’s supported compaction when appropriate; a byte estimate alone must not block or truncate a request.",
+        "general": "Inspect the redacted diagnostic and provider response, then fix the responsible client/adapter with a regression test. Do not disable checks or repeatedly resend an unchanged invalid request."
+      }
     },
     "codexPluginHealth": {
       "loading": "Checking Codex plugins...",
@@ -3022,6 +3035,10 @@
       }
     },
     "settings": {
+      "loopbackOnly": "Takeover has no network authentication. Its listener must use a loopback address (127.0.0.1 or ::1).",
+      "externalApiForLan": "For LAN access, use the separate External API listener with its API key. Changing this setting does not change that listener.",
+      "stopBeforeRepair": "Stop the takeover proxy and restore client configurations before repairing the address. Then start it again.",
+      "useLocalhost": "Use localhost",
       "title": "Routing Service Settings",
       "description": "Configure local routing server listening address, port and runtime parameters. Changes take effect immediately after saving.",
       "alert": {
@@ -3043,7 +3060,7 @@
         "listenAddress": {
           "label": "Listen Address",
           "placeholder": "127.0.0.1",
-          "description": "IP address the routing server listens on (recommended: 127.0.0.1)"
+          "description": "Loopback address only (127.0.0.1 or ::1). Use the authenticated External API for LAN access."
         },
         "listenPort": {
           "label": "Listen Port",
@@ -3143,7 +3160,7 @@
     },
     "capacityRetry": {
       "label": "Auto-resume model capacity errors",
-      "description": "Automatically retries model-capacity and server-overload failures only before any text, reasoning delta, or tool call is emitted, preventing duplicate execution.",
+      "description": "Automatically retries model-capacity and server-overload failures before any text, reasoning delta, or tool call is emitted. The first retry waits 5 minutes, then the delay doubles up to 80 minutes. Streaming requests also require Stream retry mode Safe or Aggressive; requests are never replayed after semantic output.",
       "saved": "Capacity error auto-resume setting saved",
       "saveFailed": "Failed to save capacity error auto-resume setting: {{error}}"
     },

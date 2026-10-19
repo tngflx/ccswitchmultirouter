@@ -5,6 +5,7 @@
 use std::str::FromStr;
 
 use crate::error::AppError;
+use crate::proxy::listener_address::takeover_listen_ip;
 use crate::proxy::types::*;
 use rust_decimal::Decimal;
 
@@ -110,6 +111,18 @@ impl Database {
         &self,
         config: GlobalProxyConfig,
     ) -> Result<(), AppError> {
+        let mut config = config;
+        match takeover_listen_ip(&config.listen_address) {
+            Ok(ip) => config.listen_address = ip.to_string(),
+            Err(error) => {
+                // An old unsafe configuration must remain stoppable without
+                // silently migrating it. Only retaining it while disabled is allowed.
+                let previous = self.get_global_proxy_config().await?;
+                if config.proxy_enabled || config.listen_address != previous.listen_address {
+                    return Err(AppError::Config(error));
+                }
+            }
+        }
         {
             let conn = lock_conn!(self.conn);
             conn.execute(
@@ -509,6 +522,10 @@ impl Database {
 
     /// 更新代理配置（兼容旧接口，更新所有三行的公共字段）
     pub async fn update_proxy_config(&self, config: ProxyConfig) -> Result<(), AppError> {
+        let mut config = config;
+        config.listen_address = takeover_listen_ip(&config.listen_address)
+            .map_err(AppError::Config)?
+            .to_string();
         let conn = lock_conn!(self.conn);
 
         // 更新所有三行的公共字段
@@ -1070,5 +1087,67 @@ mod tests {
                 .codex_respect_system_proxy
         );
         Ok(())
+    }
+    #[tokio::test]
+    async fn takeover_addresses_reject_network_exposure_without_partial_writes() {
+        let db = Database::memory().unwrap();
+        let initial = db.get_global_proxy_config().await.unwrap();
+        for address in ["0.0.0.0", "192.0.2.1", "::", "::ffff:192.0.2.1"] {
+            let mut config = initial.clone();
+            config.listen_address = address.into();
+            config.codex_respect_system_proxy = true;
+            assert!(
+                db.update_global_proxy_config(config).await.is_err(),
+                "{address}"
+            );
+            assert_eq!(
+                db.get_global_proxy_config().await.unwrap().listen_address,
+                initial.listen_address
+            );
+            assert!(!db.get_codex_respect_system_proxy().unwrap());
+
+            let mut legacy = db.get_proxy_config().await.unwrap();
+            legacy.listen_address = address.into();
+            assert!(
+                db.update_proxy_config(legacy).await.is_err(),
+                "legacy: {address}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn takeover_addresses_normalize_and_legacy_network_config_can_be_disabled() {
+        let db = Database::memory().unwrap();
+        for (address, expected) in [
+            (" localhost ", "127.0.0.1"),
+            ("[::1]", "::1"),
+            ("127.0.0.2", "127.0.0.2"),
+        ] {
+            let mut config = db.get_global_proxy_config().await.unwrap();
+            config.listen_address = address.into();
+            db.update_global_proxy_config(config).await.unwrap();
+            assert_eq!(
+                db.get_global_proxy_config().await.unwrap().listen_address,
+                expected
+            );
+        }
+        // Simulate a pre-guard database. Reading and disabling remain possible;
+        // enabling it or introducing a different unsafe address must fail.
+        {
+            let conn = db.conn.lock().unwrap();
+            conn.execute(
+                "UPDATE proxy_config SET listen_address = '0.0.0.0', proxy_enabled = 1",
+                [],
+            )
+            .unwrap();
+        }
+        let mut config = db.get_global_proxy_config().await.unwrap();
+        assert!(db.update_global_proxy_config(config.clone()).await.is_err());
+        config.proxy_enabled = false;
+        db.update_global_proxy_config(config.clone()).await.unwrap();
+        config.listen_address = "192.0.2.1".into();
+        assert!(db.update_global_proxy_config(config.clone()).await.is_err());
+        config.listen_address = "127.0.0.1".into();
+        db.update_global_proxy_config(config).await.unwrap();
     }
 }

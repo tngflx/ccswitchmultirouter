@@ -49,15 +49,22 @@ use std::time::Duration;
 /// 错误分类上不同，任何路径都不能把单个请求扩展到五次以上重试。
 pub(crate) const STREAM_MAX_RETRIES: u32 = 5;
 
-/// 明确要求稍后再试的容量/并发失败，在没有 `Retry-After` 时等待十分钟。
-///
-/// 这不是普通断流的退避，也不适用于额度、认证或参数错误。它只用于上游
-/// 明确返回“并发上限/高需求”文案的容量失败。
-pub(crate) const CAPACITY_RETRY_LONG_DELAY: Duration = Duration::from_secs(10 * 60);
+/// 明确要求稍后再试的容量/并发失败，在没有 `Retry-After` 时先等待五分钟。
+/// 后续尝试按 2^n 增长（5、10、20、40、80 分钟），避免在持续过载时
+/// 以几百毫秒的快速重放把同一个拥塞窗口打得更糟。
+pub(crate) const CAPACITY_RETRY_LONG_DELAY: Duration = Duration::from_secs(5 * 60);
 
-/// 长等待仍然受容量重试次数约束：最多五次，每次最多十分钟。
+/// 长等待仍然受容量重试次数约束：最多五次，退避总和为 155 分钟。
 pub(crate) const CAPACITY_RETRY_LONG_TOTAL_DELAY_BUDGET: Duration =
-    Duration::from_secs(10 * 60 * STREAM_MAX_RETRIES as u64);
+    Duration::from_secs(5 * 60 * ((1u64 << STREAM_MAX_RETRIES) - 1));
+
+/// Capacity retry delay for a one-based retry attempt.
+pub(crate) fn capacity_retry_delay(attempt: u32) -> Duration {
+    let shift = attempt.saturating_sub(1).min(STREAM_MAX_RETRIES - 1);
+    CAPACITY_RETRY_LONG_DELAY
+        .checked_mul(1u32 << shift)
+        .unwrap_or(CAPACITY_RETRY_LONG_TOTAL_DELAY_BUDGET)
+}
 
 /// 重连等待与正常流转静默期间向下游发 keepalive 的间隔。
 ///
@@ -491,7 +498,7 @@ pub(crate) fn create_resilient_anthropic_upstream_sse_stream(
                     yield Ok(Bytes::from_static(b": ping\n\n"));
                 }
                 let delay = if is_capacity_retry && long_wait_capacity_mode {
-                    CAPACITY_RETRY_LONG_DELAY
+                    capacity_retry_delay(retry_attempt)
                 } else {
                     backoff_delay(retry_attempt)
                 };
@@ -674,6 +681,7 @@ pub(crate) fn capacity_error_requires_long_wait(payload: &Value) -> bool {
 
     [
         "currently experiencing high demand",
+        "servers are currently overloaded",
         "concurrent limit reached",
         "concurrency limit reached",
         "concurrent request limit",
@@ -1232,7 +1240,7 @@ pub(crate) fn create_resilient_responses_sse_stream_with_context(
                     yield Ok(Bytes::from_static(b": ping\n\n"));
                 }
                 let delay = if retrying_capacity && capacity_retry_long_wait_mode {
-                    CAPACITY_RETRY_LONG_DELAY
+                    capacity_retry_delay(retry_attempt)
                 } else {
                     backoff_delay(retry_attempt)
                 };
@@ -1519,7 +1527,7 @@ pub(crate) fn create_resilient_chat_sse_stream_with_context(
                         yield Ok(Bytes::from_static(b": ping\n\n"));
                     }
                     let delay = if capacity_retry && capacity_long_wait_mode {
-                        CAPACITY_RETRY_LONG_DELAY
+                        capacity_retry_delay(attempt)
                     } else {
                         backoff_delay(attempt)
                     };
@@ -2813,7 +2821,7 @@ mod tests {
             created().as_str(),
             capacity_failed(
                 "server_is_overloaded",
-                "We're currently experiencing high demand",
+                "Our servers are currently overloaded. Please try again later.",
             )
             .as_str(),
         ]);
@@ -2830,8 +2838,8 @@ mod tests {
         assert_eq!(out.matches("event: response.created").count(), 1);
         assert!(out.contains("recovered"));
         assert!(
-            out.matches(": ping").count() >= 50,
-            "long capacity wait must keep the downstream stream alive"
+            out.matches(": ping").count() >= 30,
+            "five-minute capacity wait must keep the downstream stream alive"
         );
         assert!(!out.contains("server_is_overloaded"));
     }
@@ -2906,8 +2914,8 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 2);
         assert_eq!(
             tokio::time::Instant::now() - started_at,
-            CAPACITY_RETRY_LONG_DELAY * 2,
-            "Chat capacity failures must use the ten-minute tier"
+            capacity_retry_delay(1) + capacity_retry_delay(2),
+            "Chat capacity failures must use five-minute exponential backoff"
         );
         assert_eq!(out.matches("event: response.created").count(), 1);
         assert!(out.contains("recovered chat"));
@@ -3062,6 +3070,13 @@ mod tests {
             json!({"error":{"type":"server_is_overloaded","message":"Please try again later"}});
         assert!(is_capacity_error_payload(&ordinary, None));
         assert!(!capacity_error_requires_long_wait(&ordinary));
+        let overloaded = json!({"error":{"type":"server_error","message":"Our servers are currently overloaded. Please try again later."}});
+        assert!(is_capacity_error_payload(&overloaded, None));
+        assert!(capacity_error_requires_long_wait(&overloaded));
+        assert_eq!(capacity_retry_delay(1), Duration::from_secs(5 * 60));
+        assert_eq!(capacity_retry_delay(2), Duration::from_secs(10 * 60));
+        assert_eq!(capacity_retry_delay(3), Duration::from_secs(20 * 60));
+        assert_eq!(capacity_retry_delay(5), Duration::from_secs(80 * 60));
         assert!(!capacity_error_body_requires_long_wait(Some(
             r#"{"error":{"type":"insufficient_quota","message":"quota exhausted"}}"#
         )));

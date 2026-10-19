@@ -135,6 +135,13 @@ export interface RequestHealthSnapshot {
 export type OpenAIResponsesContractStatusKind =
   "not_checked" | "up_to_date" | "drift_detected" | "check_failed";
 
+export interface OpenAIContractDeclarationChanges {
+  addedCount: number;
+  removedCount: number;
+  added: string[];
+  removed: string[];
+}
+
 export interface OpenAIResponsesContractStatus {
   version: number;
   source: string;
@@ -144,6 +151,7 @@ export interface OpenAIResponsesContractStatus {
   status: OpenAIResponsesContractStatusKind;
   checkedAt: string | null;
   changedSections: string[];
+  declarationChanges?: OpenAIContractDeclarationChanges;
   error: string | null;
 }
 

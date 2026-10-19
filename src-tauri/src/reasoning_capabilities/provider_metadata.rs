@@ -121,12 +121,26 @@ fn now_millis() -> i64 {
 }
 
 fn base_url(provider: &Provider) -> Option<String> {
-    provider
+    let explicit = provider
         .settings_config
         .get("base_url")
         .or_else(|| provider.settings_config.get("baseURL"))
         .or_else(|| provider.settings_config.get("baseUrl"))
         .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|url| !url.is_empty())
+        .map(ToString::to_string);
+    if explicit.is_some() {
+        return explicit;
+    }
+    let config = provider.settings_config.get("config")?.as_str()?;
+    let config = toml::from_str::<toml::Value>(config).ok()?;
+    let selected = config.get("model_provider")?.as_str()?;
+    config
+        .get("model_providers")?
+        .get(selected)?
+        .get("base_url")?
+        .as_str()
         .map(str::trim)
         .filter(|url| !url.is_empty())
         .map(ToString::to_string)
@@ -209,260 +223,42 @@ pub async fn discover_openrouter(provider: &Provider, model: &str) -> DiscoveryO
     DiscoveryOutcome::Found(snapshot)
 }
 
-/// Convert the allowlisted OpenRouter model metadata into a reasoning snapshot.
-///
-/// OpenRouter sometimes advertises a positive `reasoning` capability without
-/// model-specific effort levels. In that case use OpenRouter's documented
-/// standard effort enum so the picker can represent the provider contract.
+/// Both discovery paths use the same normalization before building a snapshot.
 fn openrouter_reasoning_snapshot(entry: &Value) -> Option<ReasoningCapabilitySnapshot> {
-    let reasoning = entry
-        .get("reasoning")
-        .cloned()
-        .unwrap_or_else(|| Value::Object(Default::default()));
-    let reasoning_object = reasoning.as_object()?;
-    let supported_parameters = strict_openrouter_string_array(
-        entry
-            .get("supported_parameters")
-            .or_else(|| entry.get("supportedParameters")),
-    )?
-    .unwrap_or_default();
-    let supports_reasoning_object = supported_parameters
-        .iter()
-        .any(|parameter| parameter == "reasoning");
-    let supports_reasoning_effort = supported_parameters
-        .iter()
-        .any(|parameter| parameter == "reasoning_effort");
-    let (efforts_declared, mut supported_efforts) = collect_openrouter_efforts(reasoning_object)?;
-    if !efforts_declared && (supports_reasoning_object || supports_reasoning_effort) {
-        supported_efforts = ["minimal", "low", "medium", "high", "xhigh"]
-            .into_iter()
-            .map(ToString::to_string)
-            .collect();
-    }
-    let default_effort =
-        consistent_optional_string(reasoning_object, &["default_effort", "defaultEffort"])?;
-    if default_effort
-        .as_deref()
-        .is_some_and(|effort| !supported_efforts.iter().any(|item| item == effort))
-    {
+    let capability = provider_reasoning_capability_from_model_entry(entry, true)?;
+    if capability.effective_support_status() != ReasoningSupportStatus::ConfirmedSupported {
         return None;
     }
-    let mandatory = consistent_optional_bool(reasoning_object, &["mandatory"])?.unwrap_or(false);
-    let default_enabled =
-        consistent_optional_bool(reasoning_object, &["default_enabled", "defaultEnabled"])?;
-    let supports_max_tokens = consistent_optional_bool(
-        reasoning_object,
-        &["supports_max_tokens", "supportsMaxTokens"],
-    )?
-    .unwrap_or(false);
-    let upstream_format = consistent_optional_wire_string(
-        reasoning_object,
-        &["upstream_format", "upstreamFormat"],
-        true,
-    )?
-    .or_else(|| Some("reasoning_object".to_string()));
-    let upstream_parameter = consistent_optional_wire_string(
-        reasoning_object,
-        &["upstream_parameter", "upstreamParameter"],
-        false,
-    )?
-    .or_else(|| {
-        if upstream_format.as_deref() == Some("string") {
-            Some("reasoning_effort".to_string())
-        } else {
-            Some("reasoning.effort".to_string())
-        }
-    });
-    let output_format = consistent_optional_wire_string(
-        reasoning_object,
-        &["output_format", "outputFormat"],
-        true,
-    )?
-    .or_else(|| Some("auto".to_string()));
-
+    let object = entry.as_object()?;
+    let mut scopes = metadata_scopes(object);
+    if let Some(reasoning) = object.get("reasoning").and_then(Value::as_object) {
+        scopes.insert(0, reasoning);
+    }
     Some(ReasoningCapabilitySnapshot {
-        supported_efforts,
-        default_effort,
-        mandatory,
-        default_enabled,
-        supports_max_tokens,
-        upstream_format,
-        upstream_parameter,
-        output_format,
+        supported_efforts: capability.supported_efforts,
+        default_effort: capability.default_effort,
+        mandatory: !capability.disable_allowed,
+        default_enabled: lookup_bool(&scopes, &["default_enabled", "defaultEnabled"]).ok()?,
+        supports_max_tokens: lookup_bool(&scopes, &["supports_max_tokens", "supportsMaxTokens"])
+            .ok()?
+            .unwrap_or(false),
+        upstream_format: Some(capability.upstream.format),
+        upstream_parameter: Some(capability.upstream.parameter),
+        output_format: capability
+            .output_format
+            .or_else(|| Some("auto".to_string())),
     })
-}
-
-fn strict_openrouter_string_array(value: Option<&Value>) -> Option<Option<Vec<String>>> {
-    let Some(value) = value else {
-        return Some(None);
-    };
-    let items = value.as_array()?;
-    let mut values = Vec::with_capacity(items.len());
-    for item in items {
-        let value = item.as_str()?.trim().to_ascii_lowercase();
-        if value.is_empty() {
-            return None;
-        }
-        values.push(value);
-    }
-    values.dedup();
-    Some(Some(values))
-}
-
-fn collect_openrouter_efforts(
-    reasoning: &serde_json::Map<String, Value>,
-) -> Option<(bool, Vec<String>)> {
-    let mut declared = false;
-    let mut found: Option<Vec<String>> = None;
-    for key in ["supported_efforts", "supportedEfforts", "efforts"] {
-        let Some(value) = reasoning.get(key) else {
-            continue;
-        };
-        declared = true;
-        let values = strict_openrouter_string_array(Some(value))?;
-        let values = values?;
-        if values.iter().any(|value| {
-            !matches!(
-                value.as_str(),
-                "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | "ultra"
-            )
-        }) {
-            return None;
-        }
-        let mut normalized_values = values.clone();
-        normalized_values.sort();
-        let mut previous_values = found.clone().unwrap_or_default();
-        previous_values.sort();
-        if found.is_some() && previous_values != normalized_values {
-            return None;
-        }
-        found = Some(values);
-    }
-    Some((declared, found.unwrap_or_default()))
-}
-
-fn consistent_optional_string(
-    object: &serde_json::Map<String, Value>,
-    keys: &[&str],
-) -> Option<Option<String>> {
-    let mut found = None;
-    for key in keys {
-        let Some(value) = object.get(*key) else {
-            continue;
-        };
-        let value = value.as_str()?.trim().to_ascii_lowercase();
-        if value.is_empty() || found.as_ref().is_some_and(|previous| previous != &value) {
-            return None;
-        }
-        found = Some(value);
-    }
-    Some(found)
-}
-
-fn consistent_optional_bool(
-    object: &serde_json::Map<String, Value>,
-    keys: &[&str],
-) -> Option<Option<bool>> {
-    let mut found = None;
-    for key in keys {
-        let Some(value) = object.get(*key) else {
-            continue;
-        };
-        let value = value.as_bool()?;
-        if found.is_some_and(|previous| previous != value) {
-            return None;
-        }
-        found = Some(value);
-    }
-    Some(found)
-}
-
-fn consistent_optional_wire_string(
-    object: &serde_json::Map<String, Value>,
-    keys: &[&str],
-    format: bool,
-) -> Option<Option<String>> {
-    let value = consistent_optional_string(object, keys)?;
-    if value.as_deref().is_some_and(|value| {
-        if format {
-            !matches!(
-                value,
-                "auto"
-                    | "text"
-                    | "summary"
-                    | "object"
-                    | "reasoning_object"
-                    | "string"
-                    | "boolean"
-                    | "none"
-                    | "budget"
-            )
-        } else {
-            !matches!(
-                value,
-                "reasoning"
-                    | "reasoning.effort"
-                    | "reasoning_effort"
-                    | "enable_thinking"
-                    | "thinking"
-                    | "thinking_budget"
-                    | "max_tokens"
-                    | "reasoning.max_tokens"
-                    | "none"
-            )
-        }
-    }) {
-        return None;
-    }
-    Some(value.map(|value| {
-        if format && value == "object" {
-            "reasoning_object".to_string()
-        } else {
-            value
-        }
-    }))
 }
 
 /// Convert a raw OpenRouter `/models` entry into the same validated capability
 /// schema used by the resolver and Codex catalog projection.
 ///
-/// This is intentionally strict about OpenRouter's `supported_parameters`
-/// contract: generic providers must not inherit OpenRouter's standard effort
-/// enum merely because they use a field named `reasoning`.
+/// The caller must have established the OpenRouter API scope. A generic
+/// provider's null effort declaration must never inherit gateway semantics.
 pub fn openrouter_reasoning_capability_from_model_entry(
     entry: &Value,
 ) -> Option<CodexModelReasoningCapability> {
-    let supported_parameters = entry
-        .get("supported_parameters")
-        .or_else(|| entry.get("supportedParameters"))
-        .and_then(Value::as_array);
-    let is_openrouter_reasoning_entry = supported_parameters.is_some_and(|parameters| {
-        parameters.iter().any(|value| {
-            value.as_str().is_some_and(|parameter| {
-                matches!(
-                    parameter.trim().to_ascii_lowercase().as_str(),
-                    "reasoning" | "reasoning_effort"
-                )
-            })
-        })
-    });
-    if !is_openrouter_reasoning_entry {
-        return None;
-    }
-
-    let snapshot = openrouter_reasoning_snapshot(entry)?;
-    crate::reasoning_capabilities::snapshot_to_capability(&ProviderCapabilitySnapshot {
-        provider_key: "openrouter".to_string(),
-        model: entry
-            .get("id")
-            .or_else(|| entry.get("model"))
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string(),
-        fetched_at: now_millis(),
-        source: "openrouter_api".to_string(),
-        reasoning: Some(snapshot),
-    })
+    provider_reasoning_capability_from_model_entry(entry, true)
 }
 
 pub fn provider_reasoning_capability_from_model_entry(
@@ -470,7 +266,7 @@ pub fn provider_reasoning_capability_from_model_entry(
     openrouter_contract: bool,
 ) -> Option<CodexModelReasoningCapability> {
     let object = entry.as_object()?;
-    let scopes = metadata_scopes(object);
+    let mut scopes = metadata_scopes(object);
     let declared_supported = match lookup_bool(
         &scopes,
         &[
@@ -499,6 +295,7 @@ pub fn provider_reasoning_capability_from_model_entry(
     // A present canonical declaration is authoritative for this response. Do
     // not reinterpret a malformed canonical object as a weaker lightweight
     // declaration: that would make a bad upstream row look supported.
+    let mut reasoning_boolean = None;
     if let Some(reasoning) = first_declared_value(&scopes, &["reasoning"]) {
         if reasoning.is_null() {
             return None;
@@ -507,40 +304,28 @@ pub fn provider_reasoning_capability_from_model_entry(
             if declared_supported == Some(false) {
                 return None;
             }
-            if let Some(capability) = parse_canonical_provider_reasoning(reasoning) {
-                return Some(capability);
-            }
             if looks_like_canonical_reasoning(reasoning) {
-                return None;
+                return parse_canonical_provider_reasoning(reasoning);
             }
-            if let Some(capability) = parse_lightweight_reasoning_object(reasoning) {
-                return Some(capability);
+            // A lightweight reasoning object can be completed by sibling
+            // declarations at the model-entry level (default, mandatory,
+            // wire format and effort list). Add it as a scope and resolve
+            // the complete declaration below.
+            if let Some(reasoning_object) = reasoning.as_object() {
+                scopes.insert(0, reasoning_object);
             }
         } else if reasoning.is_boolean() {
-            return build_boolean_or_unknown_capability(
-                reasoning.as_bool()?,
-                match lookup_bool(&scopes, &["mandatory", "reasoningMandatory"]) {
-                    Ok(value) => value,
-                    Err(()) => return None,
-                },
-            );
+            reasoning_boolean = Some(reasoning.as_bool()?);
         } else {
             return None;
         }
     }
 
-    // Explicit top-level/nested flags retain the distinction between absent,
-    // positive, and negative declarations. A positive flag alone proves only
-    // that reasoning exists; it does not invent effort levels or a wire shape.
-    let supported = declared_supported;
-    if let Some(supported) = supported {
-        return build_boolean_or_unknown_capability(
-            supported,
-            match lookup_bool(&scopes, &["mandatory", "reasoningMandatory"]) {
-                Ok(value) => value,
-                Err(()) => return None,
-            },
-        );
+    if declared_supported.is_some()
+        && reasoning_boolean.is_some()
+        && declared_supported != reasoning_boolean
+    {
+        return None;
     }
 
     let supported_efforts = match collect_effort_declaration(&scopes) {
@@ -554,6 +339,65 @@ pub fn provider_reasoning_capability_from_model_entry(
         Ok(value) => value.unwrap_or_default(),
         Err(()) => return None,
     };
+    let mandatory = match lookup_bool(&scopes, &["mandatory", "reasoningMandatory"]) {
+        Ok(value) => value,
+        Err(()) => return None,
+    };
+    let has_explicit_controls = supported_efforts.is_some()
+        || !supported_parameters.is_empty()
+        || has_declared_key(
+            &scopes,
+            &[
+                "supports_max_tokens",
+                "supportsMaxTokens",
+                "disable_allowed",
+                "disableAllowed",
+                "default_enabled",
+                "defaultEnabled",
+                "mandatory",
+                "reasoningMandatory",
+            ],
+        )
+        || lookup_effort_string(
+            &scopes,
+            &[
+                "default_effort",
+                "defaultEffort",
+                "default_reasoning_level",
+                "defaultReasoningLevel",
+                "default_reasoning_effort",
+                "defaultReasoningEffort",
+            ],
+        )
+        .is_none()
+        || lookup_wire_string(
+            &scopes,
+            &[
+                "reasoning_format",
+                "reasoningFormat",
+                "upstream_format",
+                "upstreamFormat",
+                "reasoning_parameter",
+                "reasoningParameter",
+                "upstream_parameter",
+                "upstreamParameter",
+            ],
+        )
+        .is_none();
+
+    // Explicit negative evidence conflicts with any positive control
+    // declaration. A positive boolean can be completed by those controls.
+    if declared_supported == Some(false) || reasoning_boolean == Some(false) {
+        if has_explicit_controls {
+            return None;
+        }
+        return build_boolean_or_unknown_capability(false, mandatory);
+    }
+    if (declared_supported == Some(true) || reasoning_boolean == Some(true))
+        && !has_explicit_controls
+    {
+        return build_boolean_or_unknown_capability(true, mandatory);
+    }
 
     if supported_efforts.is_none() {
         if openrouter_contract
@@ -561,21 +405,31 @@ pub fn provider_reasoning_capability_from_model_entry(
                 .iter()
                 .any(|parameter| matches!(parameter.as_str(), "reasoning" | "reasoning_effort"))
         {
+            let efforts = if has_null_effort_declaration(&scopes) {
+                let mut efforts = ["max", "xhigh", "high", "medium", "low", "minimal"]
+                    .into_iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>();
+                if mandatory != Some(true) {
+                    efforts.push("none".to_string());
+                }
+                efforts
+            } else {
+                Vec::new()
+            };
             return build_reasoning_capability(
-                vec![
-                    "minimal".to_string(),
-                    "low".to_string(),
-                    "medium".to_string(),
-                    "high".to_string(),
-                    "xhigh".to_string(),
-                ],
+                efforts,
                 &scopes,
                 true,
                 Some("reasoning_object".to_string()),
                 Some("reasoning.effort".to_string()),
             );
         }
-        return None;
+        return if declared_supported == Some(true) || reasoning_boolean == Some(true) {
+            build_boolean_or_unknown_capability(true, mandatory)
+        } else {
+            None
+        };
     }
 
     let efforts = supported_efforts.expect("checked above");
@@ -597,7 +451,13 @@ pub fn provider_reasoning_capability_from_model_entry(
             "upstreamParameter",
         ],
     )?;
-    let format = format.or_else(|| Some("string".to_string()));
+    let format = format.or_else(|| {
+        if openrouter_contract {
+            Some("reasoning_object".to_string())
+        } else {
+            Some("string".to_string())
+        }
+    });
     let parameter = parameter.or_else(|| {
         if format.as_deref() == Some("reasoning_object") {
             Some("reasoning.effort".to_string())
@@ -605,7 +465,7 @@ pub fn provider_reasoning_capability_from_model_entry(
             Some("reasoning_effort".to_string())
         }
     });
-    build_reasoning_capability(efforts, &scopes, false, format, parameter)
+    build_reasoning_capability(efforts, &scopes, openrouter_contract, format, parameter)
 }
 
 fn metadata_scopes(
@@ -680,6 +540,9 @@ fn collect_string_array_declaration(
             let Some(value) = scope.get(*key) else {
                 continue;
             };
+            if value.is_null() {
+                continue;
+            }
             let Some(items) = value.as_array() else {
                 return Err(());
             };
@@ -727,6 +590,9 @@ fn collect_effort_declaration(
             let Some(value) = scope.get(key) else {
                 continue;
             };
+            if value.is_null() {
+                continue;
+            }
             let Some(items) = value.as_array() else {
                 return Err(());
             };
@@ -775,6 +641,30 @@ fn collect_effort_declaration(
         }
     }
     Ok(found)
+}
+
+fn has_null_effort_declaration(scopes: &[&serde_json::Map<String, Value>]) -> bool {
+    [
+        "supported_efforts",
+        "supportedEfforts",
+        "efforts",
+        "supported_reasoning_levels",
+        "supportedReasoningLevels",
+        "supported_reasoning_efforts",
+        "supportedReasoningEfforts",
+    ]
+    .iter()
+    .any(|key| {
+        scopes
+            .iter()
+            .any(|scope| scope.get(*key).is_some_and(Value::is_null))
+    })
+}
+
+fn has_declared_key(scopes: &[&serde_json::Map<String, Value>], keys: &[&str]) -> bool {
+    scopes
+        .iter()
+        .any(|scope| keys.iter().any(|key| scope.contains_key(*key)))
 }
 
 fn lookup_wire_string(
@@ -898,39 +788,6 @@ fn looks_like_canonical_reasoning(value: &Value) -> bool {
     .any(|key| object.contains_key(*key))
 }
 
-fn parse_lightweight_reasoning_object(
-    value: &serde_json::Value,
-) -> Option<CodexModelReasoningCapability> {
-    let object = value.as_object()?;
-    let scopes = vec![object];
-    let efforts = collect_effort_declaration(&scopes).ok()??;
-    let format = lookup_wire_string(
-        &scopes,
-        &[
-            "upstream_format",
-            "upstreamFormat",
-            "reasoning_format",
-            "reasoningFormat",
-        ],
-    )?;
-    let parameter = lookup_wire_string(
-        &scopes,
-        &[
-            "upstream_parameter",
-            "upstreamParameter",
-            "reasoning_parameter",
-            "reasoningParameter",
-        ],
-    )?;
-    build_reasoning_capability(
-        efforts,
-        &scopes,
-        false,
-        format.or_else(|| Some("reasoning_object".to_string())),
-        parameter.or_else(|| Some("reasoning.effort".to_string())),
-    )
-}
-
 fn build_boolean_or_unknown_capability(
     supported: bool,
     mandatory: Option<bool>,
@@ -989,7 +846,7 @@ fn build_boolean_or_unknown_capability(
 fn build_reasoning_capability(
     mut efforts: Vec<String>,
     scopes: &[&serde_json::Map<String, Value>],
-    openrouter_default: bool,
+    openrouter_contract: bool,
     format: Option<String>,
     parameter: Option<String>,
 ) -> Option<CodexModelReasoningCapability> {
@@ -1013,13 +870,21 @@ fn build_reasoning_capability(
             "defaultReasoningEffort",
         ],
     )?;
-    let default_effort = match default_effort.map(|effort| {
-        if effort == "ultra" {
-            "max".to_string()
-        } else {
-            effort
-        }
-    }) {
+    if mandatory && default_effort.as_deref() == Some("none") {
+        return None;
+    }
+    let default_effort = match default_effort
+        .map(|effort| {
+            if effort == "ultra" {
+                "max".to_string()
+            } else {
+                effort
+            }
+        })
+        // OpenRouter's `default_effort: "none"` means reasoning is
+        // disabled by default; it is not a Codex selector declaration.
+        .filter(|effort| effort != "none" || !openrouter_contract)
+    {
         Some(value) if efforts.contains(&value) => Some(value),
         Some(_) => return None,
         None => None,
@@ -1027,14 +892,20 @@ fn build_reasoning_capability(
     let supports_max_tokens = lookup_bool(scopes, &["supports_max_tokens", "supportsMaxTokens"])
         .ok()?
         .unwrap_or(false);
+    let default_enabled = lookup_bool(scopes, &["default_enabled", "defaultEnabled"]).ok()?;
+    if mandatory
+        && (efforts.iter().any(|effort| effort == "none") || default_enabled == Some(false))
+    {
+        return None;
+    }
     let disable_allowed = lookup_bool(scopes, &["disable_allowed", "disableAllowed"])
         .ok()?
         .unwrap_or(!mandatory || efforts.iter().any(|effort| effort == "none"));
-    if mandatory && disable_allowed && !efforts.iter().any(|effort| effort == "none") {
+    if mandatory && disable_allowed {
         return None;
     }
     let format = format.unwrap_or_else(|| {
-        if openrouter_default {
+        if openrouter_contract {
             "reasoning_object".to_string()
         } else {
             "string".to_string()
@@ -1104,6 +975,8 @@ fn openrouter_models_url(base: &str) -> String {
     let trimmed = base.trim_end_matches('/');
     if trimmed.to_ascii_lowercase().ends_with("/api/v1") {
         format!("{trimmed}/models")
+    } else if trimmed.to_ascii_lowercase().ends_with("/api") {
+        format!("{trimmed}/v1/models")
     } else if trimmed.to_ascii_lowercase().ends_with("/models") {
         trimmed.to_string()
     } else {
@@ -1330,19 +1203,51 @@ mod tests {
             openrouter_models_url("https://openrouter.ai/api/v1/"),
             "https://openrouter.ai/api/v1/models"
         );
+        assert_eq!(
+            openrouter_models_url("https://openrouter.ai/api"),
+            "https://openrouter.ai/api/v1/models"
+        );
     }
 
     #[test]
-    fn openrouter_reasoning_metadata_derives_standard_efforts_when_openrouter_omits_levels() {
+    fn discovery_reads_only_the_selected_codex_toml_provider_base() {
+        let mut provider = provider("Saved OpenRouter", "");
+        provider.settings_config = json!({
+            "config": r#"
+                model_provider = "selected"
+                [model_providers.unselected]
+                base_url = "https://unselected.test/v1"
+                [model_providers.selected]
+                base_url = "https://openrouter.ai/api/v1"
+            "#
+        });
+        assert_eq!(
+            base_url(&provider).as_deref(),
+            Some("https://openrouter.ai/api/v1")
+        );
+        provider.settings_config["baseUrl"] = json!("https://explicit.test/v1");
+        assert_eq!(
+            base_url(&provider).as_deref(),
+            Some("https://explicit.test/v1")
+        );
+        provider.settings_config = json!({
+            "config": r#"
+                model_provider = "missing"
+                [model_providers.unselected]
+                base_url = "https://unselected.test/v1"
+            "#
+        });
+        assert!(base_url(&provider).is_none());
+    }
+
+    #[test]
+    fn openrouter_reasoning_metadata_omitted_efforts_do_not_invent_a_selector() {
         let snapshot = openrouter_reasoning_snapshot(&json!({
             "reasoning": {"mandatory": false},
             "supported_parameters": ["reasoning", "include_reasoning"]
         }))
         .expect("reasoning metadata");
-        assert_eq!(
-            snapshot.supported_efforts,
-            ["minimal", "low", "medium", "high", "xhigh"]
-        );
+        assert!(snapshot.supported_efforts.is_empty());
         assert_eq!(snapshot.default_effort, None);
         assert_eq!(
             snapshot.upstream_format.as_deref(),
@@ -1430,9 +1335,10 @@ mod tests {
             "reasoning": {"mandatory": false}
         }))
         .expect("Mimo reasoning capability");
+        assert!(capability.supported_efforts.is_empty());
         assert_eq!(
-            capability.supported_efforts,
-            ["minimal", "low", "medium", "high", "xhigh"]
+            capability.effective_control_kind(),
+            ReasoningControlKind::None
         );
         assert_eq!(capability.upstream.format, "reasoning_object");
         assert_eq!(capability.upstream.parameter, "reasoning.effort");
@@ -1468,9 +1374,10 @@ mod tests {
             "supported_parameters": ["reasoning", "include_reasoning"]
         }))
         .expect("parameter-only OpenRouter reasoning capability");
+        assert!(capability.supported_efforts.is_empty());
         assert_eq!(
-            capability.supported_efforts,
-            ["minimal", "low", "medium", "high", "xhigh"]
+            capability.effective_control_kind(),
+            ReasoningControlKind::None
         );
         assert_eq!(capability.upstream.format, "reasoning_object");
         assert_eq!(capability.upstream.parameter, "reasoning.effort");
@@ -1694,11 +1601,256 @@ mod tests {
             json!({"id": "model", "supported_parameters": ["reasoning", "include_reasoning"]});
         assert!(provider_reasoning_capability_from_model_entry(&entry, false).is_none());
         let openrouter = provider_reasoning_capability_from_model_entry(&entry, true)
-            .expect("verified OpenRouter contract may provide its documented enum");
+            .expect("verified OpenRouter reasoning support without effort selection");
+        assert!(openrouter.supported_efforts.is_empty());
         assert_eq!(
-            openrouter.supported_efforts,
-            ["minimal", "low", "medium", "high", "xhigh"]
+            openrouter.effective_control_kind(),
+            ReasoningControlKind::None
         );
+    }
+
+    #[test]
+    fn provider_reasoning_positive_flags_compose_with_explicit_sibling_controls() {
+        for support in [
+            json!({"supportsReasoning": true}),
+            json!({"reasoning": true}),
+            json!({"capabilities": {"supports_thinking": true, "reasoning": true}}),
+        ] {
+            let mut entry = support;
+            entry["supported_reasoning_efforts"] = json!(["low", "high", "max"]);
+            entry["default_reasoning_effort"] = json!("max");
+            entry["reasoning_format"] = json!("string");
+            entry["reasoning_parameter"] = json!("reasoning_effort");
+            entry["mandatory"] = json!(true);
+            let capability = provider_reasoning_capability_from_model_entry(&entry, false)
+                .expect("positive flags must not erase explicit controls");
+            assert_eq!(capability.supported_efforts, ["low", "high", "max"]);
+            assert_eq!(capability.default_effort.as_deref(), Some("max"));
+            assert_eq!(
+                capability.effective_control_kind(),
+                ReasoningControlKind::Graded
+            );
+            assert!(!capability.disable_allowed);
+            assert_eq!(capability.upstream.format, "string");
+            assert_eq!(capability.upstream.parameter, "reasoning_effort");
+        }
+    }
+
+    #[test]
+    fn provider_reasoning_objects_compose_with_sibling_defaults_and_wire_metadata() {
+        let capability = provider_reasoning_capability_from_model_entry(
+            &json!({
+                "reasoning": {"supported_efforts": ["low", "high", "max"]},
+                "defaultReasoningEffort": "max",
+                "upstream_format": "string",
+                "upstream_parameter": "reasoning_effort",
+                "mandatory": true
+            }),
+            false,
+        )
+        .expect("consistent siblings complete a lightweight reasoning object");
+        assert_eq!(capability.default_effort.as_deref(), Some("max"));
+        assert_eq!(capability.upstream.format, "string");
+        assert_eq!(capability.upstream.parameter, "reasoning_effort");
+        assert!(!capability.disable_allowed);
+    }
+
+    #[test]
+    fn provider_reasoning_rejects_cross_shape_boolean_and_control_conflicts() {
+        for entry in [
+            json!({"reasoning": true, "supportsReasoning": false}),
+            json!({"reasoning": false, "supportsReasoning": true}),
+            json!({"reasoning": false, "supportedEfforts": ["high"]}),
+            json!({"supportsReasoning": false, "supports_max_tokens": true}),
+            json!({"reasoning": true, "supportedEfforts": ["high", 7]}),
+            json!({"reasoning": {"supportedEfforts": ["high"]}, "supportedEfforts": ["max"]}),
+            json!({"reasoning": {"supportedEfforts": ["high"], "mandatory": true}, "mandatory": false}),
+            json!({"reasoning": {"supportedEfforts": ["high"], "defaultEffort": "high"}, "defaultEffort": "max"}),
+            json!({"reasoning": {"supportedEfforts": ["high"], "upstream_format": "string"}, "upstreamFormat": "reasoning_object"}),
+        ] {
+            for openrouter in [false, true] {
+                assert!(
+                    provider_reasoning_capability_from_model_entry(&entry, openrouter).is_none(),
+                    "contradictory or invalid declaration must fail atomically: {entry}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn provider_reasoning_malformed_canonical_does_not_reopen_lightweight_fallback() {
+        for canonical in [
+            json!({"schemaVersion": 2, "supportedEfforts": ["high"]}),
+            json!({
+                "schemaVersion": 2,
+                "supportStatus": "confirmed_supported",
+                "controlKind": "graded",
+                "supportedEfforts": ["high"],
+                "defaultEffort": "max",
+                "disableAllowed": false,
+                "upstream": {"format": "string", "parameter": "reasoning_effort"}
+            }),
+        ] {
+            let entry = json!({
+                "reasoning": canonical,
+                "supportsReasoning": true,
+                "supportedEfforts": ["low", "high", "max"],
+                "supported_parameters": ["reasoning"]
+            });
+            for openrouter in [false, true] {
+                assert!(
+                    provider_reasoning_capability_from_model_entry(&entry, openrouter).is_none(),
+                    "{entry}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn openrouter_null_efforts_expand_the_gateway_vocabulary_without_ultra() {
+        for mandatory in [false, true] {
+            let entry = json!({
+                "id": "provider/model",
+                "supported_parameters": ["reasoning"],
+                "reasoning": {
+                    "supported_efforts": null,
+                    "default_effort": "max",
+                    "mandatory": mandatory
+                }
+            });
+            let expected = if mandatory {
+                vec!["max", "xhigh", "high", "medium", "low", "minimal"]
+            } else {
+                vec!["max", "xhigh", "high", "medium", "low", "minimal", "none"]
+            };
+            let generic = provider_reasoning_capability_from_model_entry(&entry, true)
+                .expect("null is an unbounded OpenRouter gateway effort allowlist");
+            let dedicated = openrouter_reasoning_capability_from_model_entry(&entry)
+                .expect("dedicated discovery uses the same normalization");
+            let snapshot = openrouter_reasoning_snapshot(&entry).expect("snapshot");
+            assert_eq!(generic.supported_efforts, expected);
+            assert_eq!(dedicated.supported_efforts, expected);
+            assert_eq!(snapshot.supported_efforts, expected);
+            assert_eq!(generic.default_effort.as_deref(), Some("max"));
+            assert_eq!(generic.disable_allowed, !mandatory);
+            assert!(generic.codex_ultra_orchestration.is_none());
+            assert!(provider_reasoning_capability_from_model_entry(&entry, false).is_none());
+        }
+    }
+
+    #[test]
+    fn openrouter_explicit_effort_allowlists_remain_exact_across_entry_points() {
+        for efforts in [json!(["max", "high"]), json!([])] {
+            let entry = json!({
+                "id": "provider/model",
+                "supported_parameters": ["reasoning"],
+                "reasoning": {"supported_efforts": efforts, "mandatory": false}
+            });
+            let generic = provider_reasoning_capability_from_model_entry(&entry, true)
+                .expect("valid explicit OpenRouter allowlist");
+            let dedicated = openrouter_reasoning_capability_from_model_entry(&entry)
+                .expect("dedicated OpenRouter capability");
+            assert_eq!(
+                serde_json::to_value(&generic.supported_efforts).unwrap(),
+                efforts
+            );
+            assert_eq!(generic.supported_efforts, dedicated.supported_efforts);
+        }
+    }
+
+    #[test]
+    fn openrouter_omitted_efforts_preserve_budget_only_reasoning_without_graded_defaults() {
+        let entry = json!({
+            "id": "anthropic/model",
+            "supported_parameters": ["reasoning"],
+            "reasoning": {
+                "mandatory": false,
+                "supports_max_tokens": true,
+                "default_enabled": true
+            }
+        });
+        for capability in [
+            provider_reasoning_capability_from_model_entry(&entry, true),
+            openrouter_reasoning_capability_from_model_entry(&entry),
+        ] {
+            let capability = capability.expect("budget-only support");
+            assert_eq!(
+                capability.effective_control_kind(),
+                ReasoningControlKind::Budget
+            );
+            assert!(capability.supported_efforts.is_empty());
+            assert!(capability.default_effort.is_none());
+            assert!(capability.disable_allowed);
+        }
+        let snapshot = openrouter_reasoning_snapshot(&entry).expect("budget snapshot");
+        assert!(snapshot.supports_max_tokens);
+        assert_eq!(snapshot.default_enabled, Some(true));
+    }
+
+    #[test]
+    fn openrouter_default_off_is_not_an_automatic_disable_effort() {
+        for efforts in [None, Some(json!(["high", "low"])), Some(Value::Null)] {
+            let mut entry = json!({
+                "id": "provider/model",
+                "supported_parameters": ["reasoning"],
+                "reasoning": {
+                    "mandatory": false,
+                    "default_effort": "none",
+                    "default_enabled": false
+                }
+            });
+            if let Some(efforts) = efforts {
+                entry["reasoning"]["supported_efforts"] = efforts;
+            }
+            let capability = provider_reasoning_capability_from_model_entry(&entry, true)
+                .expect("off-by-default does not invalidate advertised reasoning support");
+            assert!(capability.default_effort.is_none());
+            assert_eq!(
+                openrouter_reasoning_snapshot(&entry)
+                    .unwrap()
+                    .default_enabled,
+                Some(false)
+            );
+        }
+    }
+
+    #[test]
+    fn reaudit_generic_provider_preserves_an_explicit_none_selector_default() {
+        let entry = json!({
+            "reasoning": {
+                "supported_efforts": ["none", "high"],
+                "default_effort": "none",
+                "mandatory": false
+            }
+        });
+        let capability = provider_reasoning_capability_from_model_entry(&entry, false)
+            .expect("valid provider-native disable effort");
+        assert_eq!(capability.default_effort.as_deref(), Some("none"));
+        assert_eq!(capability.supported_efforts, ["none", "high"]);
+        assert!(capability.disable_allowed);
+
+        let openrouter = provider_reasoning_capability_from_model_entry(&entry, true)
+            .expect("OpenRouter off-by-default declaration");
+        assert!(openrouter.default_effort.is_none());
+    }
+
+    #[test]
+    fn provider_reasoning_mandatory_rejects_disable_and_off_defaults() {
+        for reasoning in [
+            json!({"supported_efforts": ["none", "high"], "mandatory": true}),
+            json!({"supported_efforts": ["high"], "mandatory": true, "disable_allowed": true}),
+            json!({"supported_efforts": ["high"], "mandatory": true, "default_enabled": false}),
+            json!({"supported_efforts": ["high"], "mandatory": true, "default_effort": "none"}),
+        ] {
+            let entry = json!({"id": "model", "reasoning": reasoning, "supported_parameters": ["reasoning"]});
+            for openrouter in [false, true] {
+                assert!(
+                    provider_reasoning_capability_from_model_entry(&entry, openrouter).is_none(),
+                    "{entry}"
+                );
+            }
+            assert!(openrouter_reasoning_capability_from_model_entry(&entry).is_none());
+        }
     }
 
     #[test]

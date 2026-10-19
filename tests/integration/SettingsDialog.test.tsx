@@ -345,6 +345,67 @@ describe("SettingsPage integration", () => {
     );
   });
 
+  it("acknowledges disabled Request Health before an unrelated General autosave", async () => {
+    const config: RequestHealthConfig = {
+      enabled: true,
+      optimizationMode: "safe",
+      largeRequestThresholdBytes: 384 * 1024,
+      maxCodexInputTokens: 200_000,
+      reviewTimeoutSeconds: 60,
+      reviewMode: "first_large_request",
+      summarizeAndRestartEnabled: true,
+      windowsNotificationsEnabled: true,
+      windowsNotificationSnoozeHours: 4,
+      windowsNotificationsSnoozedUntilMs: null,
+    };
+    setSettings({ requestHealth: config });
+    const fullSave = vi.fn();
+    server.use(
+      http.post("http://tauri.local/get_request_health_diagnostics", () =>
+        HttpResponse.json({
+          config: getSettings().requestHealth,
+          diagnostics: [],
+        }),
+      ),
+      http.post("http://tauri.local/save_settings", async ({ request }) => {
+        const { settings } = (await request.json()) as { settings: Settings };
+        fullSave(settings);
+        setSettings({
+          ...settings,
+          requestHealth: getSettings().requestHealth,
+        });
+        return HttpResponse.json(true);
+      }),
+    );
+    const first = renderDialog();
+    await screen.findByText("language:zh");
+    fireEvent.click(screen.getByText("settings.tabRequestHealthSettings"));
+    fireEvent.click(
+      await screen.findByRole("checkbox", {
+        name: "settings.requestHealth.enabled",
+      }),
+    );
+    await screen.findByText("settings.requestHealth.saved");
+
+    fireEvent.click(screen.getByText("settings.tabGeneral"));
+    fireEvent.click(await screen.findByText("window-settings"));
+    await waitFor(() => expect(fullSave).toHaveBeenCalledOnce());
+    expect(fullSave).toHaveBeenCalledWith(
+      expect.objectContaining({
+        requestHealth: expect.objectContaining({ enabled: false }),
+      }),
+    );
+    expect(getSettings().requestHealth?.enabled).toBe(false);
+
+    first.unmount();
+    renderDialog({ defaultTab: "request-health" });
+    expect(
+      await screen.findByRole("checkbox", {
+        name: "settings.requestHealth.enabled",
+      }),
+    ).not.toBeChecked();
+  });
+
   it("recovers from an initial Request Health load failure using Retry", async () => {
     let attempts = 0;
     server.use(

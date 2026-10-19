@@ -4,8 +4,275 @@ import {
   normalizeCodexChatReasoningForSave,
 } from "@/components/providers/forms/ProviderForm";
 import { extractCodexCatalogModels } from "@/components/providers/forms/hooks/useCodexConfigState";
+import {
+  codexModelProtocolDeclarationStatus,
+  readCodexModelProtocolCapability,
+} from "@/lib/codexProtocolCapability";
+import { reconcileFetchedCodexCatalogRows } from "@/lib/codexCatalogReconciliation";
+import { createSingleCodexProtocolLabAdapter } from "@/lib/protocol-lab/codex-adapters";
+import type {
+  CodexCatalogModel,
+  CodexModelProtocolCapability,
+  CodexModelReasoningCapability,
+  Provider,
+} from "@/types";
+
+const protocolDeclaration: CodexModelProtocolCapability = {
+  schemaVersion: 1,
+  source: "provider_api",
+  baseUrl: "https://relay.example/v1",
+  upstreamModel: "vendor/wire-model",
+  supportedEndpoints: ["openai_chat", "openai_responses"],
+  supportsTools: true,
+  supportsStreaming: true,
+  supportsToolContinuation: true,
+};
+
+const providerWithCatalog = (models: CodexCatalogModel[]): Provider => ({
+  id: "api-provider",
+  name: "API Provider",
+  settingsConfig: {
+    baseUrl: protocolDeclaration.baseUrl,
+    modelCatalog: { models },
+  },
+});
 
 describe("ProviderForm Codex catalog helpers", () => {
+  it("preserves bound provider API declarations when opening a saved provider", () => {
+    const [loaded] = extractCodexCatalogModels({
+      models: [
+        {
+          model: "public-model",
+          upstreamModel: protocolDeclaration.upstreamModel,
+          protocolCapability: protocolDeclaration,
+        },
+      ],
+    });
+
+    expect(loaded.protocolCapability).toEqual(protocolDeclaration);
+    expect(
+      readCodexModelProtocolCapability(providerWithCatalog([loaded]), loaded),
+    ).toBe("openai_responses");
+  });
+
+  it("preserves provider API declarations when constructing the save payload", () => {
+    const [saved] = normalizeCodexCatalogModelsForSave([
+      {
+        model: "public-model",
+        upstreamModel: protocolDeclaration.upstreamModel,
+        protocolCapability: protocolDeclaration,
+      },
+    ]);
+
+    expect(saved.protocolCapability).toEqual(protocolDeclaration);
+    expect(
+      readCodexModelProtocolCapability(providerWithCatalog([saved]), saved),
+    ).toBe("openai_responses");
+  });
+
+  it("round-trips fetched capability evidence and exact reasoning efforts through saving and reopening", () => {
+    const efforts = ["low", "medium", "high", "xhigh", "max", "ultra"] as const;
+    const reasoning: CodexModelReasoningCapability = {
+      schemaVersion: 2,
+      supportStatus: "confirmed_supported",
+      controlKind: "graded",
+      supportedEfforts: [...efforts],
+      defaultEffort: "ultra",
+      disableAllowed: false,
+      upstream: {
+        format: "reasoning_object",
+        parameter: "reasoning.effort",
+        effortMap: Object.fromEntries(
+          efforts.map((effort) => [effort, effort]),
+        ),
+      },
+      source: "provider",
+      confidence: "authoritative",
+    };
+    const refreshed = reconcileFetchedCodexCatalogRows(
+      [
+        { model: "public-model", upstreamModel: "vendor/wire-model" },
+        {
+          model: "excluded-model",
+          upstreamModel: "vendor/wire-model",
+          enabled: false,
+        },
+      ],
+      [
+        {
+          id: "vendor/wire-model",
+          displayName: "Provider Model",
+          contextWindow: 262144,
+          inputModalities: ["text"],
+          supportsImage: false,
+          supportsParallelToolCalls: false,
+          protocolCapability: protocolDeclaration,
+          reasoning,
+        },
+      ],
+      { baseUrl: protocolDeclaration.baseUrl },
+      {
+        appendNew: true,
+        existingMetadataMode: "refresh",
+        createRow: (seed) => seed as CodexCatalogModel,
+      },
+    );
+    const saved = normalizeCodexCatalogModelsForSave(refreshed.rows);
+    const reopened = extractCodexCatalogModels(
+      JSON.parse(JSON.stringify({ models: saved })),
+    );
+    const provider = providerWithCatalog(reopened);
+
+    expect(reopened).toEqual(saved);
+    expect(reopened[0]).toMatchObject({
+      contextWindow: 262144,
+      inputModalities: ["text"],
+      supportsImage: false,
+      supportsParallelToolCalls: false,
+      protocolCapability: protocolDeclaration,
+      reasoning,
+    });
+    expect(reopened[0].reasoning?.supportedEfforts).toEqual([...efforts]);
+    expect(reopened[0].reasoning?.defaultEffort).toBe("ultra");
+    expect(readCodexModelProtocolCapability(provider, "public-model")).toBe(
+      "openai_responses",
+    );
+    expect(
+      createSingleCodexProtocolLabAdapter().requiresProbe(provider, []),
+    ).toBe(false);
+    expect(reopened[1].enabled).toBe(false);
+    expect(reopened[1].protocolCapability).toEqual(protocolDeclaration);
+    expect(
+      readCodexModelProtocolCapability(provider, "excluded-model"),
+    ).toBeNull();
+  });
+
+  it.each([
+    ["supportsTools", false],
+    ["supportsStreaming", false],
+    ["supportsToolContinuation", false],
+  ] as const)(
+    "preserves explicit negative %s evidence without granting readiness",
+    (field, value) => {
+      const capability = { ...protocolDeclaration, [field]: value };
+      const reopened = extractCodexCatalogModels({
+        models: normalizeCodexCatalogModelsForSave([
+          {
+            model: "public-model",
+            upstreamModel: capability.upstreamModel,
+            protocolCapability: capability,
+          },
+        ]),
+      });
+      const provider = providerWithCatalog(reopened);
+
+      expect(reopened[0].protocolCapability).toEqual(capability);
+      expect(
+        codexModelProtocolDeclarationStatus(provider, "public-model"),
+      ).toBe("unsupported");
+      expect(
+        readCodexModelProtocolCapability(provider, "public-model"),
+      ).toBeNull();
+    },
+  );
+
+  it("preserves an explicit empty endpoint declaration without granting readiness", () => {
+    const capability = { ...protocolDeclaration, supportedEndpoints: [] };
+    const reopened = extractCodexCatalogModels({
+      models: normalizeCodexCatalogModelsForSave([
+        {
+          model: "public-model",
+          upstreamModel: capability.upstreamModel,
+          protocolCapability: capability,
+        },
+      ]),
+    });
+
+    expect(reopened[0].protocolCapability).toEqual(capability);
+    expect(
+      readCodexModelProtocolCapability(
+        providerWithCatalog(reopened),
+        "public-model",
+      ),
+    ).toBeNull();
+  });
+
+  it.each([
+    { schemaVersion: 2 },
+    { source: "inferred" },
+    { supportedEndpoints: ["openai_chat", "unknown"] },
+    { supportedEndpoints: "openai_chat" },
+    { supportsTools: "false" },
+    { supportsStreaming: null },
+    { baseUrl: "https://redacted@relay.example/v1" },
+    { baseUrl: "https://relay.example/v1?token=redacted" },
+    { baseUrl: "https://relay.example/v1#redacted" },
+    { baseUrl: "not-a-url" },
+    { upstreamModel: "" },
+  ])("does not persist unsafe or malformed protocol evidence: %j", (patch) => {
+    const row = {
+      model: "public-model",
+      upstreamModel: protocolDeclaration.upstreamModel,
+      protocolCapability: { ...protocolDeclaration, ...patch },
+    } as unknown as CodexCatalogModel;
+    const [loaded] = extractCodexCatalogModels({ models: [row] });
+    const [saved] = normalizeCodexCatalogModelsForSave([row]);
+
+    expect(loaded).not.toHaveProperty("protocolCapability");
+    expect(saved).not.toHaveProperty("protocolCapability");
+    expect(
+      readCodexModelProtocolCapability(providerWithCatalog([saved]), saved),
+    ).toBeNull();
+  });
+
+  it("canonicalizes provider declarations without persisting unrelated or secret fields", () => {
+    const row = {
+      model: "public-model",
+      upstreamModel: protocolDeclaration.upstreamModel,
+      protocolCapability: {
+        ...protocolDeclaration,
+        baseUrl: "https://RELAY.example:443/v1///",
+        apiKey: "redacted",
+        requestHeaders: { Authorization: "redacted" },
+      },
+    };
+    const [loaded] = extractCodexCatalogModels({
+      models: [row],
+    });
+    const [saved] = normalizeCodexCatalogModelsForSave([row]);
+
+    expect(loaded.protocolCapability).toEqual(protocolDeclaration);
+    expect(saved.protocolCapability).toEqual(protocolDeclaration);
+    expect(JSON.stringify(loaded)).not.toContain("redacted");
+    expect(JSON.stringify(saved)).not.toContain("redacted");
+  });
+
+  it.each([
+    { baseUrl: "https://other.example/v1" },
+    { upstreamModel: "vendor/other-model" },
+  ])(
+    "does not reuse a declaration with a foreign endpoint or model binding: %j",
+    (patch) => {
+      const capability = { ...protocolDeclaration, ...patch };
+      const reopened = extractCodexCatalogModels({
+        models: normalizeCodexCatalogModelsForSave([
+          {
+            model: "public-model",
+            upstreamModel: protocolDeclaration.upstreamModel,
+            protocolCapability: capability,
+          },
+        ]),
+      });
+
+      expect(
+        readCodexModelProtocolCapability(
+          providerWithCatalog(reopened),
+          "public-model",
+        ),
+      ).toBeNull();
+    },
+  );
+
   it("round-trips searchable model identities and excluded inventory through load and save", () => {
     const loaded = extractCodexCatalogModels({
       models: [

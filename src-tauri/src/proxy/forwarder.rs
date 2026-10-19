@@ -7984,7 +7984,9 @@ where
             }
             let requested_delay = retry_after.unwrap_or_else(|| {
                 if capacity_long_wait_mode {
-                    super::providers::streaming_retry::CAPACITY_RETRY_LONG_DELAY
+                    super::providers::streaming_retry::capacity_retry_delay(
+                        (retry_count + 1) as u32,
+                    )
                 } else {
                     codex_rate_limit_backoff(retry_count)
                 }
@@ -8004,7 +8006,9 @@ where
             }
             let delay = requested_delay
                 .min(if capacity_long_wait_mode {
-                    super::providers::streaming_retry::CAPACITY_RETRY_LONG_DELAY
+                    super::providers::streaming_retry::capacity_retry_delay(
+                        (retry_count + 1) as u32,
+                    )
                 } else {
                     CODEX_RATE_LIMIT_MAX_SINGLE_DELAY
                 })
@@ -15769,7 +15773,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn codex_capacity_retry_uses_ten_minute_fallback_for_explicit_high_demand() {
+    async fn codex_capacity_retry_uses_five_minute_exponential_fallback_for_explicit_high_demand() {
         let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let attempts_for_send = attempts.clone();
         let started_at = tokio::time::Instant::now();
@@ -15805,12 +15809,12 @@ mod tests {
         assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 2);
         assert_eq!(
             tokio::time::Instant::now() - started_at,
-            crate::proxy::providers::streaming_retry::CAPACITY_RETRY_LONG_DELAY
+            crate::proxy::providers::streaming_retry::capacity_retry_delay(1)
         );
     }
 
     #[tokio::test(start_paused = true)]
-    async fn codex_capacity_retry_uses_ten_minute_fallback_for_concurrent_limit() {
+    async fn codex_capacity_retry_uses_five_minute_initial_fallback_for_concurrent_limit() {
         let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let attempts_for_send = attempts.clone();
         let started_at = tokio::time::Instant::now();
@@ -15846,7 +15850,7 @@ mod tests {
         assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 2);
         assert_eq!(
             tokio::time::Instant::now() - started_at,
-            crate::proxy::providers::streaming_retry::CAPACITY_RETRY_LONG_DELAY
+            crate::proxy::providers::streaming_retry::capacity_retry_delay(1)
         );
     }
 

@@ -27,10 +27,75 @@ pub fn get_home_dir() -> PathBuf {
         }
     }
 
-    dirs::home_dir().unwrap_or_else(|| {
-        log::warn!("无法获取用户主目录，回退到当前目录");
-        PathBuf::from(".")
-    })
+    #[cfg(test)]
+    {
+        static TEST_HOME: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
+        // Indirect settings writers and background work can outlive per-test
+        // overrides. The unit-test process must never fall back to user data.
+        TEST_HOME
+            .get_or_init(|| {
+                tempfile::Builder::new()
+                    .prefix("cc-switch-unit-test-home-")
+                    .tempdir()
+                    .expect("create isolated unit-test home")
+            })
+            .path()
+            .to_path_buf()
+    }
+
+    #[cfg(not(test))]
+    {
+        dirs::home_dir().unwrap_or_else(|| {
+            log::warn!("无法获取用户主目录，回退到当前目录");
+            PathBuf::from(".")
+        })
+    }
+}
+
+fn automatic_codex_desktop_effects_allowed_for(unit_test: bool, test_home: Option<&str>) -> bool {
+    !unit_test && test_home.is_none_or(|home| home.trim().is_empty())
+}
+
+pub(crate) fn automatic_codex_desktop_effects_allowed() -> bool {
+    // An isolated instance does not own the user's running Desktop. Explicit
+    // manual commands remain available; only automatic background work is gated.
+    automatic_codex_desktop_effects_allowed_for(
+        cfg!(test),
+        std::env::var("CC_SWITCH_TEST_HOME").ok().as_deref(),
+    )
+}
+
+#[cfg(test)]
+/// Requires `#[serial_test::serial]` because the home override is process-wide.
+pub(crate) struct TestHomeGuard {
+    dir: tempfile::TempDir,
+    previous: Option<std::ffi::OsString>,
+}
+
+#[cfg(test)]
+impl TestHomeGuard {
+    pub(crate) fn new() -> Self {
+        let dir = tempfile::tempdir().expect("create isolated unit-test home");
+        let previous = std::env::var_os("CC_SWITCH_TEST_HOME");
+        std::env::set_var("CC_SWITCH_TEST_HOME", dir.path());
+        crate::settings::reload_settings().expect("load isolated settings");
+        Self { dir, previous }
+    }
+
+    pub(crate) fn path(&self) -> &Path {
+        self.dir.path()
+    }
+}
+
+#[cfg(test)]
+impl Drop for TestHomeGuard {
+    fn drop(&mut self) {
+        match &self.previous {
+            Some(value) => std::env::set_var("CC_SWITCH_TEST_HOME", value),
+            None => std::env::remove_var("CC_SWITCH_TEST_HOME"),
+        }
+        let _ = crate::settings::reload_settings();
+    }
 }
 
 /// 获取 Claude Code 配置目录路径
@@ -208,12 +273,12 @@ pub fn get_app_config_dir() -> PathBuf {
     let default_dir = get_home_dir().join(".cc-switch");
 
     // `CC_SWITCH_TEST_HOME` is an explicit test/debug isolation boundary. Once it
-    // supplied the home used above, the Windows v3.10.3 compatibility fallback
-    // must not consult the process-wide `HOME` again: doing so can redirect an
-    // isolated QA instance back into the user's real legacy database.
-    if std::env::var("CC_SWITCH_TEST_HOME")
-        .ok()
-        .is_some_and(|home| !home.trim().is_empty())
+    // supplied the home used above (or this is a unit-test binary), the Windows
+    // v3.10.3 fallback must not consult the process-wide `HOME` again.
+    if cfg!(test)
+        || std::env::var("CC_SWITCH_TEST_HOME")
+            .ok()
+            .is_some_and(|home| !home.trim().is_empty())
     {
         return default_dir;
     }
@@ -608,6 +673,104 @@ fn atomic_write_with_unix_mode(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn automatic_desktop_effects_require_a_normal_non_test_instance() {
+        for test_home in [None, Some(""), Some(" \t\r\n ")] {
+            assert!(automatic_codex_desktop_effects_allowed_for(
+                false, test_home
+            ));
+            assert!(!automatic_codex_desktop_effects_allowed_for(
+                true, test_home
+            ));
+        }
+        for test_home in [Some("isolated-home"), Some(" C:/isolated-home ")] {
+            assert!(!automatic_codex_desktop_effects_allowed_for(
+                false, test_home
+            ));
+            assert!(!automatic_codex_desktop_effects_allowed_for(
+                true, test_home
+            ));
+        }
+        assert!(!automatic_codex_desktop_effects_allowed());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn unit_test_default_home_cannot_reach_real_or_legacy_user_data() {
+        struct EnvRestore {
+            test_home: Option<std::ffi::OsString>,
+            home: Option<std::ffi::OsString>,
+        }
+
+        impl Drop for EnvRestore {
+            fn drop(&mut self) {
+                match &self.test_home {
+                    Some(value) => std::env::set_var("CC_SWITCH_TEST_HOME", value),
+                    None => std::env::remove_var("CC_SWITCH_TEST_HOME"),
+                }
+                match &self.home {
+                    Some(value) => std::env::set_var("HOME", value),
+                    None => std::env::remove_var("HOME"),
+                }
+            }
+        }
+
+        let _restore = EnvRestore {
+            test_home: std::env::var_os("CC_SWITCH_TEST_HOME"),
+            home: std::env::var_os("HOME"),
+        };
+        let legacy_home = tempfile::tempdir().expect("create legacy home");
+        let legacy_config_dir = legacy_home.path().join(".cc-switch");
+        fs::create_dir_all(&legacy_config_dir).expect("create legacy config directory");
+        fs::write(legacy_config_dir.join("cc-switch.db"), b"legacy")
+            .expect("seed legacy database marker");
+        std::env::set_var("HOME", legacy_home.path());
+        std::env::remove_var("CC_SWITCH_TEST_HOME");
+
+        let default_home = get_home_dir();
+        assert_ne!(Some(default_home.clone()), dirs::home_dir());
+        assert_ne!(default_home, legacy_home.path());
+        assert!(default_home
+            .file_name()
+            .expect("unit-test home name")
+            .to_string_lossy()
+            .starts_with("cc-switch-unit-test-home-"));
+        assert_eq!(get_home_dir(), default_home);
+        assert_eq!(get_app_config_dir(), default_home.join(".cc-switch"));
+
+        let explicit_home = tempfile::tempdir().expect("create explicit home");
+        std::env::set_var("CC_SWITCH_TEST_HOME", explicit_home.path());
+        assert_eq!(get_home_dir(), explicit_home.path());
+        assert_eq!(
+            get_app_config_dir(),
+            explicit_home.path().join(".cc-switch")
+        );
+
+        std::env::set_var("CC_SWITCH_TEST_HOME", "   ");
+        assert_eq!(get_home_dir(), default_home);
+        assert_eq!(get_app_config_dir(), default_home.join(".cc-switch"));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_home_guard_restores_the_previous_settings_context() {
+        let _outer_home = TestHomeGuard::new();
+        let mut outer_settings = crate::settings::get_settings();
+        outer_settings.request_health.enabled = false;
+        crate::settings::update_settings(outer_settings).expect("save outer settings");
+        let outer_path = get_home_dir();
+
+        {
+            let inner_home = TestHomeGuard::new();
+            assert_eq!(get_home_dir(), inner_home.path());
+            assert_ne!(get_home_dir(), outer_path);
+            assert!(crate::settings::get_settings().request_health.enabled);
+        }
+
+        assert_eq!(get_home_dir(), outer_path);
+        assert!(!crate::settings::get_settings().request_health.enabled);
+    }
 
     #[cfg(windows)]
     #[test]

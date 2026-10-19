@@ -329,6 +329,14 @@ pub async fn save_request_health_settings(
     crate::settings::update_request_health_config(config).map_err(|e| e.to_string())
 }
 
+/// Persist the master switch without publishing other Request Health drafts.
+#[tauri::command]
+pub async fn set_request_health_enabled(
+    enabled: bool,
+) -> Result<crate::settings::RequestHealthConfig, String> {
+    crate::settings::set_request_health_enabled(enabled).map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 pub async fn inspect_env_injection_status(
 ) -> Result<crate::env_injection::EnvInjectionSyncReport, String> {
@@ -591,6 +599,83 @@ mod tests {
 
         assert_eq!(merged.request_health, existing.request_health);
         assert_eq!(merged.language.as_deref(), Some("ja"));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn request_health_master_switch_survives_reload_and_stale_general_saves() {
+        use crate::settings::{
+            RequestHealthConfig, RequestHealthReviewMode, RequestOptimizationMode,
+        };
+
+        let home = crate::config::TestHomeGuard::new();
+        let initial = AppSettings {
+            language: Some("en".to_string()),
+            request_health: RequestHealthConfig {
+                enabled: true,
+                optimization_mode: RequestOptimizationMode::Diagnose,
+                large_request_threshold_bytes: 512 * 1024,
+                max_codex_input_tokens: 150_000,
+                review_timeout_seconds: 120,
+                review_mode: RequestHealthReviewMode::SustainedGrowth,
+                summarize_and_restart_enabled: false,
+                windows_notifications_enabled: false,
+                windows_notification_snooze_hours: 7,
+                windows_notifications_snoozed_until_ms: Some(9_999_999_999_999),
+            },
+            ..AppSettings::default()
+        };
+        crate::settings::update_settings(initial.clone()).expect("persist initial settings");
+        let mut expected = initial.request_health.clone();
+        expected.enabled = false;
+
+        let disabled = super::set_request_health_enabled(false)
+            .await
+            .expect("persist master switch without a full form save");
+
+        assert_eq!(disabled, expected);
+        crate::settings::reload_settings().expect("reload settings after a restart");
+        assert_eq!(crate::settings::get_settings().request_health, expected);
+        crate::settings::set_tool_auto_update("codex", true).expect("save unrelated preference");
+        let mut stale_form = initial.clone();
+        stale_form.language = Some("ja".to_string());
+        crate::settings::update_settings_preserving_dedicated_settings(stale_form)
+            .expect("persist stale General form");
+        crate::settings::reload_settings().expect("reload after unrelated saves");
+
+        let persisted: AppSettings = serde_json::from_slice(
+            &std::fs::read(home.path().join(".cc-switch/settings.json"))
+                .expect("read durable settings"),
+        )
+        .expect("parse durable settings");
+        assert_eq!(persisted.request_health, expected);
+        assert_eq!(persisted.language.as_deref(), Some("ja"));
+        assert!(persisted.tool_auto_update_enabled("codex"));
+
+        let mut edited = expected.clone();
+        edited.large_request_threshold_bytes = 768 * 1024;
+        edited.windows_notifications_snoozed_until_ms = None;
+        let saved = super::save_request_health_settings(edited)
+            .await
+            .expect("save other Request Health options while disabled");
+        expected.large_request_threshold_bytes = 768 * 1024;
+        assert_eq!(saved, expected);
+        crate::settings::reload_settings().expect("reload full Request Health save");
+        assert_eq!(crate::settings::get_settings().request_health, expected);
+
+        expected.enabled = true;
+        assert_eq!(
+            super::set_request_health_enabled(true)
+                .await
+                .expect("re-enable without replacing options"),
+            expected
+        );
+        crate::settings::reload_settings().expect("reload re-enabled Request Health");
+        assert_eq!(crate::settings::get_settings().request_health, expected);
+        assert_eq!(
+            crate::settings::get_settings().language.as_deref(),
+            Some("ja")
+        );
     }
 
     #[test]

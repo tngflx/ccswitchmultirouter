@@ -4,6 +4,9 @@ use crate::codex_multirouter::schema::{
     CodexRoutingRouteV2,
 };
 use crate::proxy::json_canonical::{canonical_json_string, short_sha256_hex};
+use crate::proxy::providers::codex_reasoning::{
+    resolve_subagent_reasoning_capability, CodexModelReasoningCapability, CodexReasoningEffort,
+};
 use crate::Provider;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
@@ -234,7 +237,10 @@ pub fn compile_v2(
     }
 
     apply_router_model_order(plan, &mut model_catalog);
-    if let Some(effort) = supported_router_default_effort(plan, &model_catalog) {
+    // Ultra is a Codex orchestration preference, never a Provider-native default.
+    if let Some(effort) =
+        supported_router_default_effort(plan, &model_catalog).filter(|effort| effort != "ultra")
+    {
         if let Some(reasoning) = model_catalog
             .first_mut()
             .and_then(|model| model.capability_summary.reasoning.as_mut())
@@ -567,20 +573,22 @@ pub(crate) fn supported_router_default_effort(
     models: &[CompiledCodexModel],
 ) -> Option<String> {
     let requested = plan.extensions.get("defaultReasoningEffort")?.as_str()?;
-    if !matches!(
-        requested,
-        "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max"
-    ) {
-        return None;
+    let requested_effort = requested.parse::<CodexReasoningEffort>().ok()?;
+    let reasoning = models.first()?.capability_summary.reasoning.as_ref()?;
+    if requested_effort == CodexReasoningEffort::Ultra {
+        if plan.subagent_version.as_deref() == Some("v1") {
+            return None;
+        }
+        let capability: CodexModelReasoningCapability =
+            serde_json::from_value(reasoning.clone()).ok()?;
+        return resolve_subagent_reasoning_capability(Some(&capability))
+            .codex_selectable_efforts
+            .contains(&requested_effort)
+            .then(|| requested.to_string());
     }
-    let declared = models
-        .first()?
-        .capability_summary
-        .reasoning
-        .as_ref()?
+    reasoning
         .get("supportedEfforts")?
-        .as_array()?;
-    declared
+        .as_array()?
         .iter()
         .any(|effort| effort.as_str() == Some(requested))
         .then(|| requested.to_string())
@@ -2300,6 +2308,238 @@ mod tests {
             supported_router_default_effort(&plan, &compile(&plan, [source]).model_catalog),
             None
         );
+    }
+
+    #[test]
+    fn router_ultra_default_uses_selectable_orchestration_without_changing_provider_default() {
+        let source = provider(
+            "source",
+            "Source",
+            "openai_responses",
+            json!([{"model": "custom", "reasoning": {
+                "schemaVersion": 2,
+                "supportStatus": "confirmed_supported",
+                "controlKind": "graded",
+                "supportedEfforts": ["low", "high"],
+                "defaultEffort": "high",
+                "disableAllowed": false,
+                "upstream": {
+                    "format": "string",
+                    "parameter": "reasoning_effort",
+                    "effortMap": {"low": "low", "high": "high", "max": "high"}
+                },
+                "codexUltraOrchestration": {"enabled": true},
+                "source": "user"
+            }}]),
+        );
+        let original_settings = source.settings_config.clone();
+        for version in [None, Some("v2")] {
+            let mut plan = plan(vec![route(
+                "source-route",
+                "source",
+                CodexModelSelection::All,
+            )]);
+            plan.subagent_version = version.map(ToString::to_string);
+            plan.extensions
+                .insert("defaultReasoningEffort".into(), json!("ultra"));
+            let compiled = compile(&plan, [source.clone()]);
+
+            assert_eq!(
+                supported_router_default_effort(&plan, &compiled.model_catalog),
+                Some("ultra".into()),
+                "V2 Ultra is selectable through the resolved orchestration contract"
+            );
+            let reasoning = compiled.model_catalog[0]
+                .capability_summary
+                .reasoning
+                .as_ref()
+                .expect("valid provider reasoning must remain routable");
+            assert_eq!(reasoning["defaultEffort"], "high");
+            assert_eq!(reasoning["supportedEfforts"], json!(["low", "high"]));
+            let capability: crate::proxy::providers::codex_reasoning::CodexModelReasoningCapability =
+                serde_json::from_value(reasoning.clone()).expect("canonical capability");
+            assert!(
+                capability.validate().is_ok(),
+                "a Codex-only preference must not invalidate provider-native metadata"
+            );
+            let resolved =
+                crate::proxy::providers::codex_reasoning::resolve_subagent_reasoning_capability(
+                    Some(&capability),
+                );
+            assert!(resolved
+                .codex_selectable_efforts
+                .contains(&crate::proxy::providers::codex_reasoning::CodexReasoningEffort::Ultra));
+            assert!(!resolved
+                .provider_accepted_efforts
+                .contains(&crate::proxy::providers::codex_reasoning::CodexReasoningEffort::Ultra));
+        }
+        assert_eq!(source.settings_config, original_settings);
+    }
+
+    #[test]
+    fn router_ultra_default_requires_v2_and_valid_orchestration_evidence() {
+        let reasoning = json!({
+            "schemaVersion": 2,
+            "supportStatus": "confirmed_supported",
+            "controlKind": "graded",
+            "supportedEfforts": ["low", "high"],
+            "defaultEffort": "high",
+            "disableAllowed": false,
+            "upstream": {
+                "format": "string",
+                "parameter": "reasoning_effort",
+                "effortMap": {"low": "low", "high": "high", "max": "high"}
+            },
+            "codexUltraOrchestration": {"enabled": true},
+            "source": "user"
+        });
+        let mut without_orchestration = reasoning.clone();
+        without_orchestration
+            .as_object_mut()
+            .unwrap()
+            .remove("codexUltraOrchestration");
+        let mut without_max_path = reasoning.clone();
+        without_max_path["upstream"]["effortMap"]
+            .as_object_mut()
+            .unwrap()
+            .remove("max");
+        let mut disabled_orchestration = reasoning.clone();
+        disabled_orchestration["codexUltraOrchestration"]["enabled"] = json!(false);
+
+        for (version, reasoning) in [
+            (Some("v1"), reasoning),
+            (Some("v2"), without_orchestration),
+            (Some("v2"), without_max_path),
+            (Some("v2"), disabled_orchestration),
+        ] {
+            let source = provider(
+                "source",
+                "Source",
+                "openai_responses",
+                json!([{"model": "custom", "reasoning": reasoning}]),
+            );
+            let mut plan = plan(vec![route(
+                "source-route",
+                "source",
+                CodexModelSelection::All,
+            )]);
+            plan.subagent_version = version.map(ToString::to_string);
+            plan.extensions
+                .insert("defaultReasoningEffort".into(), json!("ultra"));
+            let compiled = compile(&plan, [source]);
+
+            assert_eq!(
+                supported_router_default_effort(&plan, &compiled.model_catalog),
+                None,
+                "Ultra requires a selectable V2 orchestration capability"
+            );
+            assert_ne!(
+                compiled.model_catalog[0]
+                    .capability_summary
+                    .reasoning
+                    .as_ref()
+                    .and_then(|reasoning| reasoning.get("defaultEffort"))
+                    .and_then(Value::as_str),
+                Some("ultra"),
+                "rejected preferences must not leak into provider metadata"
+            );
+        }
+    }
+
+    #[test]
+    fn router_default_effort_does_not_advertise_mapping_only_levels() {
+        let source = provider(
+            "source",
+            "Source",
+            "openai_responses",
+            json!([{"model": "custom", "reasoning": {
+                "schemaVersion": 2,
+                "supportStatus": "confirmed_supported",
+                "controlKind": "graded",
+                "supportedEfforts": ["low", "high"],
+                "defaultEffort": "high",
+                "disableAllowed": false,
+                "upstream": {
+                    "format": "string",
+                    "parameter": "reasoning_effort",
+                    "effortMap": {"low": "low", "high": "high", "max": "high"}
+                },
+                "codexUltraOrchestration": {"enabled": true},
+                "source": "user"
+            }}]),
+        );
+        let mut plan = plan(vec![route(
+            "source-route",
+            "source",
+            CodexModelSelection::All,
+        )]);
+        plan.extensions
+            .insert("defaultReasoningEffort".into(), json!("max"));
+        let compiled = compile(&plan, [source]);
+
+        assert_eq!(
+            supported_router_default_effort(&plan, &compiled.model_catalog),
+            None,
+            "an outbound mapping alone must not advertise an extra selectable effort"
+        );
+        assert_eq!(
+            compiled.model_catalog[0]
+                .capability_summary
+                .reasoning
+                .as_ref()
+                .unwrap()["defaultEffort"],
+            "high"
+        );
+    }
+
+    #[test]
+    fn router_default_effort_preserves_supported_provider_native_preferences() {
+        let source = provider(
+            "source",
+            "Source",
+            "openai_responses",
+            json!([{"model": "custom", "reasoning": {
+                "schemaVersion": 2,
+                "supportStatus": "confirmed_supported",
+                "controlKind": "graded",
+                "supportedEfforts": ["none", "minimal", "low", "medium", "high", "xhigh", "max"],
+                "defaultEffort": "low",
+                "disableAllowed": true,
+                "upstream": {
+                    "format": "string",
+                    "parameter": "reasoning_effort",
+                    "effortMap": {
+                        "none": "none", "minimal": "minimal", "low": "low", "medium": "medium",
+                        "high": "high", "xhigh": "xhigh", "max": "max"
+                    }
+                },
+                "source": "user"
+            }}]),
+        );
+        for effort in ["none", "minimal", "low", "medium", "high", "xhigh", "max"] {
+            let mut plan = plan(vec![route(
+                "source-route",
+                "source",
+                CodexModelSelection::All,
+            )]);
+            plan.extensions
+                .insert("defaultReasoningEffort".into(), json!(effort));
+            let compiled = compile(&plan, [source.clone()]);
+
+            assert_eq!(
+                supported_router_default_effort(&plan, &compiled.model_catalog),
+                Some(effort.to_string())
+            );
+            assert_eq!(
+                compiled.model_catalog[0]
+                    .capability_summary
+                    .reasoning
+                    .as_ref()
+                    .unwrap()["defaultEffort"],
+                effort,
+                "native preferences retain their existing provider-default behavior"
+            );
+        }
     }
 
     #[test]

@@ -1546,6 +1546,182 @@ mod tests {
         assert_eq!(stored_config, "{}");
     }
 
+    #[test]
+    fn codex_provider_dao_round_trips_canonical_api_metadata_across_save_list_and_updates() {
+        let db = Database::memory().expect("create in-memory database");
+        let catalog = json!({
+            "models": [{
+                "model": "public-model",
+                "upstreamModel": "vendor/wire-model",
+                "canonicalSlug": "vendor/canonical-model",
+                "aliases": ["old-public-model"],
+                "contextWindow": 262144,
+                "inputModalities": ["text"],
+                "supportsImage": false,
+                "supportsParallelToolCalls": false,
+                "protocolCapability": {
+                    "schemaVersion": 1,
+                    "source": "provider_api",
+                    "baseUrl": "https://relay.example/v1",
+                    "upstreamModel": "vendor/wire-model",
+                    "supportedEndpoints": ["openai_chat", "openai_responses"],
+                    "supportsTools": true,
+                    "supportsStreaming": true
+                },
+                "reasoning": {
+                    "schemaVersion": 2,
+                    "supportStatus": "confirmed_supported",
+                    "controlKind": "graded",
+                    "supportedEfforts": ["low", "medium", "high", "xhigh", "max", "ultra"],
+                    "defaultEffort": "max",
+                    "disableAllowed": false,
+                    "upstream": {
+                        "format": "reasoning_object",
+                        "parameter": "reasoning.effort",
+                        "effortMap": {
+                            "low": "low",
+                            "medium": "medium",
+                            "high": "high",
+                            "xhigh": "xhigh",
+                            "max": "max",
+                            "ultra": "ultra"
+                        }
+                    },
+                    "source": "provider",
+                    "confidence": "authoritative"
+                }
+            }, {
+                "model": "excluded-model",
+                "enabled": false,
+                "supportsImage": false,
+                "protocolCapability": {
+                    "schemaVersion": 1,
+                    "source": "provider_api",
+                    "baseUrl": "https://relay.example/v1",
+                    "upstreamModel": "excluded-model",
+                    "supportedEndpoints": [],
+                    "supportsTools": false
+                }
+            }]
+        });
+        let provider = Provider::with_id(
+            "metadata-provider".to_string(),
+            "Metadata Provider".to_string(),
+            json!({
+                "baseUrl": "https://relay.example/v1",
+                "modelCatalog": catalog.clone(),
+                "model_catalog": {"models": [{"model": "stale-legacy-model"}]}
+            }),
+            None,
+        );
+        let assert_canonical_metadata = |saved: &Provider| {
+            assert_eq!(
+                crate::codex_multirouter::catalog::read_catalog(&saved.settings_config),
+                Some(&catalog)
+            );
+            assert!(saved.settings_config.get("model_catalog").is_none());
+            assert_eq!(
+                crate::codex_multirouter::protocol_capability::provider_api_declared_transport(
+                    saved,
+                    "public-model",
+                ),
+                Some(TransportKind::OpenAiResponses)
+            );
+            assert_eq!(
+                crate::codex_multirouter::protocol_capability::provider_api_declared_transport(
+                    saved,
+                    "excluded-model",
+                ),
+                None
+            );
+        };
+
+        db.save_provider("codex", &provider)
+            .expect("save canonical model metadata");
+        let mut saved = db
+            .get_provider_by_id(&provider.id, "codex")
+            .expect("read saved provider")
+            .expect("provider exists");
+        assert_canonical_metadata(&saved);
+        let listed = db.get_all_providers("codex").expect("list saved providers");
+        assert_canonical_metadata(listed.get(&provider.id).expect("provider is listed"));
+
+        saved.settings_config["unrelatedProviderField"] = json!({"preserve": true});
+        db.update_provider_settings_config("codex", &provider.id, &saved.settings_config)
+            .expect("update settings without changing catalog");
+        let mut updated = db
+            .get_provider_by_id(&provider.id, "codex")
+            .expect("read updated provider")
+            .expect("updated provider exists");
+        assert_canonical_metadata(&updated);
+        updated.name = "Renamed Metadata Provider".to_string();
+        db.save_provider("codex", &updated)
+            .expect("resave renamed provider");
+        let listed = db
+            .get_all_providers("codex")
+            .expect("list updated providers");
+        let updated = listed
+            .get(&provider.id)
+            .expect("updated provider is listed");
+        assert_canonical_metadata(updated);
+        assert_eq!(
+            updated.settings_config["unrelatedProviderField"],
+            json!({"preserve": true})
+        );
+    }
+
+    #[test]
+    fn codex_provider_dao_never_revives_legacy_inventory_over_a_valid_empty_catalog() {
+        let db = Database::memory().expect("create in-memory database");
+        let mut provider = Provider::with_id(
+            "empty-catalog-provider".to_string(),
+            "Empty Catalog Provider".to_string(),
+            json!({
+                "modelCatalog": {"models": []},
+                "model_catalog": {"models": [{"model": "stale-legacy-model"}]}
+            }),
+            None,
+        );
+
+        db.save_provider("codex", &provider)
+            .expect("save authoritative empty catalog");
+        provider.settings_config["unrelatedProviderField"] = json!(false);
+        db.update_provider_settings_config("codex", &provider.id, &provider.settings_config)
+            .expect("update authoritative empty catalog with stale legacy input");
+        let saved = db
+            .get_provider_by_id(&provider.id, "codex")
+            .expect("read empty catalog")
+            .expect("provider exists");
+        let listed = db.get_all_providers("codex").expect("list empty catalog");
+        for saved in [
+            &saved,
+            listed.get(&provider.id).expect("provider is listed"),
+        ] {
+            assert_eq!(
+                crate::codex_multirouter::catalog::catalog_models(&saved.settings_config),
+                Some([].as_slice())
+            );
+            assert!(saved.settings_config.get("model_catalog").is_none());
+            assert_eq!(
+                saved.settings_config["unrelatedProviderField"],
+                json!(false)
+            );
+        }
+
+        let conn = db.conn.lock().expect("lock database");
+        let stored: String = conn
+            .query_row(
+                "SELECT settings_config FROM providers WHERE id = ?1 AND app_type = ?2",
+                params![provider.id, "codex"],
+                |row| row.get(0),
+            )
+            .expect("read persisted empty catalog");
+        let stored: serde_json::Value =
+            serde_json::from_str(&stored).expect("stored JSON is valid");
+        assert_eq!(stored["modelCatalog"], json!({"models": []}));
+        assert!(stored.get("model_catalog").is_none());
+    }
+
     /// Deterministic TOCTOU regression: the editor's stale snapshot is read first, then a
     /// catalog/alias refresh lands, and finally the focused V2 write must merge into that latest
     /// row instead of replacing it with the stale snapshot.
